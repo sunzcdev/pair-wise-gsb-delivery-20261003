@@ -311,6 +311,8 @@ Read Buffering
    caching.BlockCache
    caching.BytesCache
    caching.MMapCache
+   caching.SharedMMapSession
+   caching.CacheCorruptionError
    caching.ReadAheadCache
    caching.FirstChunkCache
    caching.BackgroundBlockCache
@@ -322,6 +324,12 @@ Read Buffering
    :members:
 
 .. autoclass:: fsspec.caching.MMapCache
+   :members:
+
+.. autoclass:: fsspec.caching.SharedMMapSession
+   :members:
+
+.. autoclass:: fsspec.caching.CacheCorruptionError
    :members:
 
 .. autoclass:: fsspec.caching.ReadAheadCache

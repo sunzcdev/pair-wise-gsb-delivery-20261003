@@ -95,6 +95,205 @@ class BaseCache:
         """
 
 
+class CacheCorruptionError(RuntimeError):
+    """The file backing a shared mmap cache was changed externally.
+
+    Raised when the backing file of a shared mapping no longer has the
+    expected size (e.g. it was truncated by another process). Further
+    access to the mapping is unsafe, so this error is reported instead of
+    letting the low-level mapping fail or silently returning empty data.
+    """
+
+
+class SharedMMapSession:
+    """Explicit in-process shared session for an mmap cache file.
+
+    Multiple file handles (e.g. several :class:`MMapCache` instances) can
+    attach to the same mapping through one session. The session keeps the
+    underlying file object and mapping alive until the *last* lease is
+    released, so closing one handle never invalidates the mapping that
+    other handles are still using.
+
+    Each call to :meth:`acquire` returns a lease token together with the
+    shared mapping and must be balanced by exactly one :meth:`release`
+    with that token. The lease that creates the mapping is recorded as its
+    *owner*; leases attaching to an already-live mapping are *readers*.
+    This is informational only - every lease keeps the mapping alive, and
+    the resources are closed once the final lease (owner or reader) is
+    released.
+
+    Notes
+    -----
+    The sharing guarantee is limited to leases held within this process:
+    the session does **not** pin the backing file against other processes.
+    If the file is truncated externally, the next :meth:`read` or
+    :meth:`write` raises :class:`CacheCorruptionError` rather than
+    surfacing a low-level mapping error or returning empty data.
+
+    Once the last lease is released, the mapping and file object are
+    closed and the session statistics are reset. Acquiring again
+    afterwards opens a fresh mapping with fresh statistics - nothing is
+    inherited from the previous, closed generation.
+
+    Parameters
+    ----------
+    location: str or None
+        Path of the backing cache file. If None, an anonymous temporary
+        file is used. An existing file is reused (and extended to ``size``
+        if it had been truncated).
+    size: int
+        Size of the file being cached, i.e. the length of the mapping.
+    """
+
+    def __init__(self, location: str | None = None, size: int = 0) -> None:
+        self.location = location
+        self.size = size
+        self._lock = threading.Lock()
+        self._fd = None
+        self._mmap = None
+        self._leases: dict[int, str] = {}
+        self._next_token = 0
+        self._owner_token: int | None = None
+        self._reset_stats()
+
+    def _reset_stats(self) -> None:
+        self.stats = {"acquires": 0, "releases": 0, "reads": 0, "writes": 0}
+
+    @property
+    def closed(self) -> bool:
+        """Whether the shared mapping is currently closed (no live leases)."""
+        return self._mmap is None
+
+    @property
+    def leases(self) -> int:
+        """Number of currently active leases on the mapping."""
+        return len(self._leases)
+
+    @property
+    def owner(self) -> int | None:
+        """Token of the lease that created the current mapping.
+
+        None if the mapping is closed or the owner lease has already been
+        released (readers may still be active).
+        """
+        if self._owner_token in self._leases:
+            return self._owner_token
+        return None
+
+    @property
+    def readers(self) -> int:
+        """Number of active non-owner leases."""
+        return sum(1 for role in self._leases.values() if role == "reader")
+
+    def acquire(self) -> tuple[int, Any]:
+        """Lease the shared mapping, creating it on first use.
+
+        Returns
+        -------
+        (token, mapping)
+            ``token`` must be passed to :meth:`release` when the caller is
+            done; ``mapping`` is the shared ``mmap.mmap`` (or a
+            ``bytearray`` for empty files).
+        """
+        with self._lock:
+            if self._mmap is None:
+                self._open()
+            token = self._next_token
+            self._next_token += 1
+            role = "owner" if not self._leases else "reader"
+            self._leases[token] = role
+            if role == "owner":
+                self._owner_token = token
+            self.stats["acquires"] += 1
+            return token, self._mmap
+
+    def release(self, token: int) -> None:
+        """Release a lease obtained from :meth:`acquire`.
+
+        The mapping and backing file object are closed only once the last
+        active lease is released.
+        """
+        with self._lock:
+            if self._leases.pop(token, None) is None:
+                raise ValueError(f"Unknown or already released lease: {token!r}")
+            self.stats["releases"] += 1
+            if not self._leases:
+                self._close_mapping()
+
+    def _open(self) -> None:
+        import mmap
+        import tempfile
+
+        if self.size == 0:
+            self._mmap = bytearray()
+            self._fd = None
+        else:
+            if self.location is None:
+                self._fd = tempfile.TemporaryFile()
+            elif os.path.exists(self.location):
+                self._fd = open(self.location, "r+b")
+            else:
+                self._fd = open(self.location, "wb+")
+            if os.fstat(self._fd.fileno()).st_size < self.size:
+                # fresh or externally truncated file: (re)extend to full size
+                self._fd.seek(self.size - 1)
+                self._fd.write(b"1")
+                self._fd.flush()
+            self._mmap = mmap.mmap(self._fd.fileno(), self.size)
+        self._owner_token = None
+        self._reset_stats()
+
+    def _close_mapping(self) -> None:
+        mm, fd = self._mmap, self._fd
+        self._mmap = None
+        self._fd = None
+        self._owner_token = None
+        if hasattr(mm, "close"):
+            mm.close()
+        if fd is not None:
+            fd.close()
+
+    def _require_open(self) -> None:
+        if self._mmap is None:
+            raise ValueError(
+                "SharedMMapSession mapping is closed; acquire a lease first"
+            )
+
+    def check(self) -> None:
+        """Verify the backing file still has the expected size.
+
+        Raises
+        ------
+        CacheCorruptionError
+            If the backing file was truncated externally.
+        """
+        fd = self._fd
+        if fd is None:
+            # empty cache backed by a bytearray: nothing to truncate
+            return
+        actual = os.fstat(fd.fileno()).st_size
+        if actual < self.size:
+            raise CacheCorruptionError(
+                f"Backing file {self.location!r} was truncated externally "
+                f"({actual} < {self.size} bytes); the shared mapping is no "
+                "longer safe to access"
+            )
+
+    def read(self, start: int, end: int) -> bytes:
+        """Read ``start:end`` from the shared mapping, with corruption check."""
+        self._require_open()
+        self.check()
+        self.stats["reads"] += 1
+        return self._mmap[start:end]
+
+    def write(self, start: int, end: int, data: bytes) -> None:
+        """Write ``data`` at ``start:end`` in the shared mapping."""
+        self._require_open()
+        self.check()
+        self.stats["writes"] += 1
+        self._mmap[start:end] = data
+
+
 class MMapCache(BaseCache):
     """memory-mapped sparse file cache
 
@@ -122,6 +321,14 @@ class MMapCache(BaseCache):
         Function of the form f([(start, end)]) which gets bytes from remote
         as specified. This function is used to fetch multiple blocks at once.
         If not specified, the fetcher function is used instead.
+    session: SharedMMapSession
+        Explicit shared cache session to attach to. When given, this cache
+        leases the session's shared mapping instead of creating a private
+        one: closing this cache only releases its lease, and the mapping is
+        closed once the session's last lease is released. The session's
+        ``size`` must match ``size``; ``location`` is taken from the
+        session. Note that the sharing guarantee is per-process only (see
+        SharedMMapSession).
     """
 
     name = "mmap"
@@ -134,12 +341,29 @@ class MMapCache(BaseCache):
         location: str | None = None,
         blocks: set[int] | None = None,
         multi_fetcher: MultiFetcher | None = None,
+        session: SharedMMapSession | None = None,
     ) -> None:
         super().__init__(blocksize, fetcher, size)
         self.blocks = set() if blocks is None else blocks
         self.location = location
         self.multi_fetcher = multi_fetcher
-        self.cache = self._makefile()
+        self.session = session
+        self._lease: int | None = None
+        if session is not None:
+            if session.size != size:
+                raise ValueError(
+                    f"Session size {session.size} does not match file size {size}"
+                )
+            if location is not None and session.location is not None:
+                if os.path.abspath(location) != os.path.abspath(session.location):
+                    raise ValueError(
+                        f"Session location {session.location!r} does not match "
+                        f"location {location!r}"
+                    )
+            self.location = session.location
+            self._lease, self.cache = session.acquire()
+        else:
+            self.cache = self._makefile()
 
     def _makefile(self) -> mmap.mmap | bytearray:
         import mmap
@@ -209,31 +433,54 @@ class MMapCache(BaseCache):
             self.miss_count += len(_blocks)
 
         if not ranges:
-            return self.cache[start:end]
+            return self._read_cache(start, end)
 
         if self.multi_fetcher:
             logger.debug(f"MMap get blocks {ranges}")
             for idx, r in enumerate(self.multi_fetcher(ranges)):
                 sstart, send = ranges[idx]
                 logger.debug(f"MMap copy block ({sstart}-{send}")
-                self.cache[sstart:send] = r
+                self._write_cache(sstart, send, r)
                 self.blocks.update(block_groups[idx])
         else:
             for idx, (sstart, send) in enumerate(ranges):
                 logger.debug(f"MMap get block ({sstart}-{send}")
-                self.cache[sstart:send] = self.fetcher(sstart, send)
+                self._write_cache(sstart, send, self.fetcher(sstart, send))
                 self.blocks.update(block_groups[idx])
 
+        return self._read_cache(start, end)
+
+    def _read_cache(self, start: int, end: int) -> bytes:
+        if self.session is not None:
+            # raises CacheCorruptionError on external truncation rather
+            # than turning mapping failures into empty reads
+            return self.session.read(start, end)
         return self.cache[start:end]
 
+    def _write_cache(self, start: int, end: int, data: bytes) -> None:
+        if self.session is not None:
+            self.session.write(start, end, data)
+        else:
+            self.cache[start:end] = data
+
     def close(self) -> None:
-        if hasattr(self.cache, "close"):
+        if self.session is not None:
+            # only release our lease; the shared mapping is closed by the
+            # session once its last lease is released
+            if self._lease is not None:
+                self.session.release(self._lease)
+                self._lease = None
+        elif hasattr(self.cache, "close"):
             self.cache.close()
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         # Remove the unpicklable entries.
         del state["cache"]
+        # A session holds a live mapping, file object and lock; a restored
+        # cache falls back to a private mapping on its location.
+        state["session"] = None
+        state["_lease"] = None
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:

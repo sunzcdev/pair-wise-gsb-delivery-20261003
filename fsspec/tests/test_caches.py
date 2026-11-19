@@ -1,3 +1,4 @@
+import os
 import pickle
 import string
 
@@ -7,9 +8,11 @@ from fsspec.caching import (
     BackgroundBlockCache,
     BlockCache,
     BytesCache,
+    CacheCorruptionError,
     FirstChunkCache,
     MMapCache,
     ReadAheadCache,
+    SharedMMapSession,
     caches,
     register_cache,
 )
@@ -420,6 +423,171 @@ def test_mmap_cache_http_reader_recreates_location(server, tmp_path):
             assert reader.read(2) == expected
         finally:
             reader.cache.cache.close()
+
+
+def test_mmap_shared_session_close_keeps_other_handles(tmp_path):
+    # closing one handle must not invalidate the mapping for the others
+    session = SharedMMapSession(str(tmp_path / "shared"), 52)
+    first = MMapCache(5, letters_fetcher, 52, session=session)
+    second = MMapCache(5, letters_fetcher, 52, session=session)
+    try:
+        assert first.cache is second.cache
+        assert session.leases == 2
+        assert session.owner is not None
+        assert session.readers == 1
+
+        assert first._fetch(0, 10) == letters_fetcher(0, 10)
+        first.close()
+        assert session.leases == 1
+        assert not session.closed
+        assert not first.cache.closed
+
+        # the surviving handle still reads from the shared mapping,
+        # including blocks fetched by the closed handle
+        assert second._fetch(0, 10) == letters_fetcher(0, 10)
+        assert second._fetch(10, 20) == letters_fetcher(10, 20)
+    finally:
+        second.close()
+    assert session.closed
+    assert session.leases == 0
+    assert first.cache.closed
+
+
+def test_mmap_shared_session_owner_release_leaves_readers(tmp_path):
+    session = SharedMMapSession(str(tmp_path / "shared"), 52)
+    owner = MMapCache(5, letters_fetcher, 52, session=session)
+    reader = MMapCache(5, letters_fetcher, 52, session=session)
+    try:
+        assert session.readers == 1
+        owner.close()
+        # owner is gone but the reader keeps the mapping alive
+        assert session.owner is None
+        assert session.readers == 1
+        assert not session.closed
+        assert reader._fetch(6, 8) == letters_fetcher(6, 8)
+    finally:
+        reader.close()
+    assert session.closed
+
+
+def test_mmap_shared_session_reopen_gets_fresh_mapping_and_stats(tmp_path):
+    session = SharedMMapSession(str(tmp_path / "shared"), 52)
+    cache = MMapCache(5, letters_fetcher, 52, session=session)
+    old_mapping = cache.cache
+    assert cache._fetch(0, 10) == letters_fetcher(0, 10)
+    assert session.stats["reads"] > 0
+    cache.close()
+    assert session.closed
+    assert old_mapping.closed
+
+    # reopening must not inherit the closed mapping or the old statistics
+    reopened = MMapCache(5, letters_fetcher, 52, session=session)
+    try:
+        assert reopened.cache is not old_mapping
+        assert not reopened.cache.closed
+        assert session.stats == {
+            "acquires": 1,
+            "releases": 0,
+            "reads": 0,
+            "writes": 0,
+        }
+        assert reopened._fetch(0, 10) == letters_fetcher(0, 10)
+    finally:
+        reopened.close()
+    assert session.closed
+
+
+def test_mmap_shared_session_detects_external_truncation(tmp_path, monkeypatch):
+    location = tmp_path / "shared"
+    session = SharedMMapSession(str(location), 52)
+    cache = MMapCache(5, letters_fetcher, 52, session=session)
+    try:
+        assert cache._fetch(0, 10) == letters_fetcher(0, 10)
+
+        # simulate the backing file being truncated by another process
+        # (on Windows a real truncation is refused while the file is
+        # mapped, so the size report is patched instead)
+        real_fstat = os.fstat
+        fileno = session._fd.fileno()
+
+        def truncated_fstat(fd, *args, **kwargs):
+            stat = real_fstat(fd, *args, **kwargs)
+            if fd == fileno:
+                return os.stat_result(tuple(stat[:6]) + (10,) + tuple(stat[7:]))
+            return stat
+
+        monkeypatch.setattr("fsspec.caching.os.fstat", truncated_fstat)
+
+        # access stops with a corruption report, not an empty/partial read
+        with pytest.raises(CacheCorruptionError, match="truncated"):
+            cache._fetch(0, 10)
+        with pytest.raises(CacheCorruptionError, match="truncated"):
+            cache._fetch(40, 52)
+    finally:
+        cache.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows refuses to truncate a mapped file")
+def test_mmap_shared_session_detects_real_external_truncation(tmp_path):
+    location = tmp_path / "shared"
+    session = SharedMMapSession(str(location), 52)
+    cache = MMapCache(5, letters_fetcher, 52, session=session)
+    try:
+        assert cache._fetch(0, 10) == letters_fetcher(0, 10)
+
+        # another process truncates the backing file
+        with open(location, "r+b") as f:
+            f.truncate(10)
+
+        # access stops with a corruption report, not an empty/partial read
+        with pytest.raises(CacheCorruptionError, match="truncated"):
+            cache._fetch(0, 10)
+        with pytest.raises(CacheCorruptionError, match="truncated"):
+            cache._fetch(40, 52)
+    finally:
+        cache.close()
+
+
+def test_mmap_shared_session_size_mismatch(tmp_path):
+    session = SharedMMapSession(str(tmp_path / "shared"), 52)
+    with pytest.raises(ValueError, match="size"):
+        MMapCache(5, letters_fetcher, 26, session=session)
+    with pytest.raises(ValueError, match="location"):
+        MMapCache(
+            5, letters_fetcher, 52, location=str(tmp_path / "other"), session=session
+        )
+
+
+def test_mmap_shared_session_release_unknown_lease(tmp_path):
+    session = SharedMMapSession(str(tmp_path / "shared"), 52)
+    cache = MMapCache(5, letters_fetcher, 52, session=session)
+    cache.close()
+    # double close is a no-op for the cache, but the session rejects
+    # unknown/duplicate lease releases
+    cache.close()
+    with pytest.raises(ValueError, match="lease"):
+        session.release(12345)
+    with pytest.raises(ValueError, match="closed"):
+        session.read(0, 10)
+
+
+def test_mmap_shared_session_pickle_falls_back_to_private(tmp_path):
+    location = tmp_path / "shared"
+    session = SharedMMapSession(str(location), 52)
+    cache = MMapCache(5, letters_fetcher, 52, session=session)
+    try:
+        assert cache._fetch(6, 8) == letters_fetcher(6, 8)
+        payload = pickle.dumps(cache)
+    finally:
+        cache.close()
+    assert session.closed
+
+    restored = pickle.loads(payload)
+    try:
+        assert restored.session is None
+        assert restored._fetch(6, 8) == letters_fetcher(6, 8)
+    finally:
+        restored.close()
 
 
 @pytest.mark.parametrize("use_multi_fetcher", [False, True])
