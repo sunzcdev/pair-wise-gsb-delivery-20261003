@@ -6,6 +6,33 @@ What's New in dnspython
 2.10.0 (in development)
 -----------------------
 
+* ``dns.xfr.Inbound`` now exposes the progress of a multi-message transfer
+  as ``phase``, an ``InboundPhase`` which moves from ``START_SOA`` through
+  ``ZONE_IDENTITY`` and ``DATA`` to ``END_SOA`` and ``DONE`` (or ``FAILED``),
+  and records the phases entered in ``history``.  The ``complete``,
+  ``failed``, and ``committed`` properties summarize them.  The new zone
+  version is committed only after the closing SOA of an AXFR has been matched
+  against the opening SOA and the rest of that message has been checked, so
+  data arriving after the closing SOA no longer produces a committed but
+  truncated zone.
+
+* ``dns.xfr.Inbound`` now rejects records whose owner name is not in the zone
+  (``OutOfZoneName``) and records of the wrong class (``ClassMismatch``), in
+  addition to the existing checks, and reports data after the closing SOA as
+  ``DuplicateEnd``.  Out-of-zone records that are glue for an in-zone
+  delegation are still ignored; pass ``allow_out_of_zone=True`` to ignore all
+  out-of-zone records, and ``raise_on_duplicate_end=False`` to ignore data
+  after the closing SOA.  The new exceptions all derive from
+  ``dns.exception.FormError``, so existing handlers are unaffected.
+
+* A failed ``dns.xfr.Inbound`` now rolls its transaction back before the
+  exception leaves ``process_message()``, and an ``Inbound`` left unclosed
+  when its context manager exits is abandoned the same way, so a failure or
+  an interrupted stream never leaves a partly replaced zone.  A failed
+  ``Inbound`` raises ``TransferAborted`` if it is used again; create a new
+  one with the same transaction manager to retry, which readers of the old
+  version continue to see meanwhile.
+
 * The text form of an IPSECKEY record may now omit the public key, which RFC
   4025 section 3.1 makes optional, e.g. ``10 1 0 192.0.2.38`` with algorithm
   0, which means that no key is present.  Such a record could not be read from

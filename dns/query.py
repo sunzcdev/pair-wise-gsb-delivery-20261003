@@ -1501,6 +1501,7 @@ def _inbound_xfr(
     timeout: float | None,
     expiration: float | None,
     raise_on_serial_went_backwards: bool,
+    allow_out_of_zone: bool = False,
 ) -> Any:
     """Given a socket, does the zone transfer."""
     rdtype = query.question[0].rdtype
@@ -1514,7 +1515,12 @@ def _inbound_xfr(
         tcpmsg = struct.pack("!H", len(wire)) + wire
         _net_write(s, tcpmsg, expiration)
     with dns.xfr.Inbound(
-        txn_manager, rdtype, serial, is_udp, raise_on_serial_went_backwards
+        txn_manager,
+        rdtype,
+        serial,
+        is_udp,
+        raise_on_serial_went_backwards,
+        allow_out_of_zone=allow_out_of_zone,
     ) as inbound:
         done = False
         first = True
@@ -1660,7 +1666,17 @@ def xfr(
     with make_socket(af, sock_type, source) as s:
         _connect(s, destination, expiration)
         yield from _inbound_xfr(
-            tm, s, q, serial, timeout, expiration, raise_on_serial_went_backwards
+            tm,
+            s,
+            q,
+            serial,
+            timeout,
+            expiration,
+            raise_on_serial_went_backwards,
+            # This generator only produces messages for dns.zone.from_xfr(),
+            # which tolerates out-of-zone records, so the state machine is
+            # told not to reject them.
+            allow_out_of_zone=True,
         )
 
 

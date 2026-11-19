@@ -1,19 +1,28 @@
 # Copyright (C) Dnspython Contributors, see LICENSE for text of ISC license
 
 import asyncio
+import socket
+import struct
 import sys
+import threading
 
 import pytest
 
 import dns.asyncbackend
 import dns.asyncquery
+import dns.exception
 import dns.flags
 import dns.message
+import dns.name
 import dns.opcode
 import dns.query
+import dns.rdata
+import dns.rdataclass
+import dns.rdatatype
 import dns.tsigkeyring
 import dns.versioned
 import dns.xfr
+import dns.zone
 
 # Some tests use a "nano nameserver" for testing.  It requires trio
 # and threading, so try to import it and if it doesn't work, skip
@@ -1239,3 +1248,835 @@ def test_asyncio_inbound_xfr_empty_question():
                 await dns.asyncquery.inbound_xfr(where, zone, port=port)
 
     asyncio.run(run())
+
+
+#
+# --- Incremental acceptance of a multi-message AXFR -----------------------
+#
+# The tests below feed dns.xfr.Inbound a sequence of messages, without any
+# network I/O, and check the receiving state, the commit boundary, and the
+# rejection of malformed streams.  Nothing here opens a socket.
+#
+
+progressive_part1 = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. IN AXFR
+;ANSWER
+@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns1
+@ 3600 IN NS ns2
+"""
+
+progressive_part2 = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;ANSWER
+bar.foo 300 IN MX 0 blaz.foo
+ns1 3600 IN A 10.0.0.1
+"""
+
+progressive_part3 = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;ANSWER
+ns2 3600 IN A 10.0.0.2
+@ 3600 IN SOA foo bar 1 2 3 4 5
+"""
+
+
+def _messages(origin, *texts):
+    return [
+        dns.message.from_text(t, origin=origin, one_rr_per_rrset=True) for t in texts
+    ]
+
+
+def _zone_serial(zone):
+    with zone.reader() as txn:
+        rds = txn.get(dns.name.empty, "SOA")
+        assert rds is not None
+        return rds[0].serial
+
+
+def _zone_names(zone):
+    with zone.reader() as txn:
+        return {name for name in txn.iterate_names()}
+
+
+def test_progressive_axfr_phases_and_commit_boundary():
+    z = dns.versioned.Zone("example.")
+    m1, m2, m3 = _messages(
+        z.origin, progressive_part1, progressive_part2, progressive_part3
+    )
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        assert xfr.phase == dns.xfr.InboundPhase.START_SOA
+        assert not xfr.complete
+        assert not xfr.committed
+
+        assert xfr.process_message(m1) is False
+        assert xfr.phase == dns.xfr.InboundPhase.DATA
+        assert not xfr.complete
+        # The opening SOA and the two apex NS records have been seen.
+        assert xfr.rrset_count == 3
+
+        assert xfr.process_message(m2) is False
+        assert xfr.phase == dns.xfr.InboundPhase.DATA
+        assert xfr.rrset_count == 5
+        assert not xfr.committed
+
+        assert xfr.process_message(m3) is True
+        assert xfr.phase == dns.xfr.InboundPhase.DONE
+        assert xfr.complete
+        assert xfr.committed
+        assert xfr.serial_number == 1
+        # Every stage is entered, in order, exactly once.
+        assert xfr.history == [
+            dns.xfr.InboundPhase.START_SOA,
+            dns.xfr.InboundPhase.ZONE_IDENTITY,
+            dns.xfr.InboundPhase.DATA,
+            dns.xfr.InboundPhase.END_SOA,
+            dns.xfr.InboundPhase.DONE,
+        ]
+    assert z == dns.zone.from_text(base, "example.")
+
+
+def test_zone_identity_phase_before_any_data():
+    z = dns.versioned.Zone("example.")
+    m = dns.message.from_text(
+        """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. IN AXFR
+;ANSWER
+@ 3600 IN SOA foo bar 1 2 3 4 5
+""",
+        origin=z.origin,
+        one_rr_per_rrset=True,
+    )
+    xfr = dns.xfr.Inbound(z, dns.rdatatype.AXFR)
+    assert xfr.process_message(m) is False
+    # Only the opening SOA has arrived: the zone identity is known, but no
+    # zone data has been accepted yet.
+    assert xfr.phase == dns.xfr.InboundPhase.ZONE_IDENTITY
+    assert xfr.history == [
+        dns.xfr.InboundPhase.START_SOA,
+        dns.xfr.InboundPhase.ZONE_IDENTITY,
+    ]
+    assert not xfr.committed
+    with z.reader() as txn:
+        assert txn.get(dns.name.empty, "SOA") is None
+    xfr.__exit__(None, None, None)
+    assert z == dns.versioned.Zone("example.")
+
+
+def test_reader_sees_old_version_until_close():
+    old = dns.zone.from_text(base, "example.")
+    z = dns.versioned.Zone("example.")
+    with z.writer() as txn:
+        txn.add(
+            "@", 3600, dns.rdata.from_text("IN", "SOA", "foo bar 1 2 3 4 5")
+        )
+    reader = z.reader()
+    before = set(reader.iterate_names())
+    m1, m2, m3 = _messages(
+        z.origin, progressive_part1, progressive_part2, progressive_part3
+    )
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        xfr.process_message(m1)
+        xfr.process_message(m2)
+        # The transfer has not closed, so the open reader still sees the old
+        # version, and so does a fresh reader.
+        assert set(reader.iterate_names()) == before
+        with z.reader() as txn2:
+            assert set(txn2.iterate_names()) == before
+        xfr.process_message(m3)
+        assert xfr.complete
+        # A reader opened before the commit keeps the version it started with.
+        assert set(reader.iterate_names()) == before
+    reader.rollback()
+    # A new reader now sees the committed version.
+    with z.reader() as txn3:
+        assert set(txn3.iterate_names()) == {
+            dns.name.empty,
+            dns.name.from_text("ns1", None),
+            dns.name.from_text("ns2", None),
+            dns.name.from_text("bar.foo", None),
+        }
+    assert z == dns.zone.from_text(base, "example.")
+
+
+ns1 = dns.name.from_text("ns1", None)
+ns2 = dns.name.from_text("ns2", None)
+barfoo = dns.name.from_text("bar.foo", None)
+
+
+def test_duplicate_closing_soa_in_same_message():
+    z = dns.versioned.Zone("example.")
+    m = dns.message.from_text(axfr, origin=z.origin, one_rr_per_rrset=True)
+    soa = m.answer[-1]
+    m.answer.append(soa)
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        with pytest.raises(dns.xfr.DuplicateEnd):
+            xfr.process_message(m)
+        assert xfr.phase == dns.xfr.InboundPhase.FAILED
+        assert xfr.failed
+        assert not xfr.complete
+        assert not xfr.committed
+    # The zone was not partly replaced.
+    assert z == dns.versioned.Zone("example.")
+
+
+def test_message_after_closing_soa():
+    z = dns.versioned.Zone("example.")
+    m1 = dns.message.from_text(axfr, origin=z.origin, one_rr_per_rrset=True)
+    m2 = dns.message.from_text(progressive_part3, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        assert xfr.process_message(m1) is True
+        with pytest.raises(dns.xfr.DuplicateEnd):
+            xfr.process_message(m2)
+        # The transfer had already closed successfully; the extra message does
+        # not undo the commit.
+        assert xfr.committed
+    assert z == dns.zone.from_text(base, "example.")
+
+
+def test_message_after_closing_soa_can_be_ignored():
+    z = dns.versioned.Zone("example.")
+    m1 = dns.message.from_text(axfr, origin=z.origin, one_rr_per_rrset=True)
+    m2 = dns.message.from_text(progressive_part3, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(
+        z, dns.rdatatype.AXFR, raise_on_duplicate_end=False
+    ) as xfr:
+        assert xfr.process_message(m1) is True
+        assert xfr.process_message(m2) is True
+        assert xfr.complete
+    assert z == dns.zone.from_text(base, "example.")
+
+
+def test_answers_after_final_soa_rejected_without_partial_zone():
+    z = dns.versioned.Zone("example.")
+    m = dns.message.from_text(
+        axfr_answers_after_final_soa, origin=z.origin, one_rr_per_rrset=True
+    )
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        with pytest.raises(dns.xfr.DuplicateEnd):
+            xfr.process_message(m)
+        assert xfr.failed
+    assert z == dns.versioned.Zone("example.")
+
+
+def test_out_of_zone_name_rejected():
+    z = dns.versioned.Zone("example.")
+    text = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. IN AXFR
+;ANSWER
+@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns1
+evil.other. 300 IN A 10.9.9.9
+@ 3600 IN SOA foo bar 1 2 3 4 5
+"""
+    m = dns.message.from_text(text, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        with pytest.raises(dns.xfr.OutOfZoneName) as excinfo:
+            xfr.process_message(m)
+        # OutOfZoneName is a ZoneIdentityError and a FormError.
+        assert isinstance(excinfo.value, dns.xfr.ZoneIdentityError)
+        assert isinstance(excinfo.value, dns.exception.FormError)
+        assert xfr.failed
+    assert z == dns.versioned.Zone("example.")
+
+
+def test_out_of_zone_name_can_be_allowed():
+    z = dns.versioned.Zone("example.")
+    text = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. IN AXFR
+;ANSWER
+@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns1
+evil.other. 300 IN A 10.9.9.9
+@ 3600 IN SOA foo bar 1 2 3 4 5
+"""
+    m = dns.message.from_text(text, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR, allow_out_of_zone=True) as xfr:
+        assert xfr.process_message(m) is True
+    ez = dns.zone.from_text(
+        """@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns1
+""",
+        "example.",
+    )
+    assert z == ez
+
+
+def test_wrong_class_rejected():
+    z = dns.versioned.Zone("example.")
+    text = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. IN AXFR
+;ANSWER
+@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns1
+foo 300 CH TXT "wrong"
+@ 3600 IN SOA foo bar 1 2 3 4 5
+"""
+    m = dns.message.from_text(text, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        with pytest.raises(dns.xfr.ClassMismatch) as excinfo:
+            xfr.process_message(m)
+        assert isinstance(excinfo.value, dns.xfr.ZoneIdentityError)
+        assert xfr.failed
+    assert z == dns.versioned.Zone("example.")
+
+
+def test_wrong_class_ch_zone():
+    # The check is against the manager's class, not against IN specifically.
+    z = dns.versioned.Zone("example.", dns.rdataclass.CH)
+    text = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. CH AXFR
+;ANSWER
+@ 3600 CH SOA foo bar 1 2 3 4 5
+@ 3600 IN A 10.0.0.1
+@ 3600 CH SOA foo bar 1 2 3 4 5
+"""
+    m = dns.message.from_text(text, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        with pytest.raises(dns.xfr.ClassMismatch):
+            xfr.process_message(m)
+    assert z == dns.versioned.Zone("example.", dns.rdataclass.CH)
+
+
+def test_aborted_stream_can_be_replaced_by_new_transfer():
+    z = dns.versioned.Zone("example.")
+    m1, m2, m3 = _messages(
+        z.origin, progressive_part1, progressive_part2, progressive_part3
+    )
+    with pytest.raises(dns.exception.FormError):
+        with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+            xfr.process_message(m1)
+            xfr.process_message(m2)
+            # The stream dies before the closing SOA: the context manager sees
+            # the exception and rolls back.  Nothing is left behind.
+            raise dns.exception.FormError("stream error")
+    assert z == dns.versioned.Zone("example.")
+    # A brand-new Inbound on the same manager can now do a full transfer.
+    full = dns.message.from_text(axfr, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr2:
+        assert xfr2.process_message(full) is True
+        assert xfr2.committed
+    assert z == dns.zone.from_text(base, "example.")
+
+
+def test_failed_transfer_cannot_be_reused():
+    z = dns.versioned.Zone("example.")
+    m = dns.message.from_text(
+        axfr_answers_after_final_soa, origin=z.origin, one_rr_per_rrset=True
+    )
+    good = dns.message.from_text(axfr, origin=z.origin, one_rr_per_rrset=True)
+    xfr = dns.xfr.Inbound(z, dns.rdatatype.AXFR)
+    with pytest.raises(dns.xfr.DuplicateEnd):
+        xfr.process_message(m)
+    assert xfr.failed
+    with pytest.raises(dns.xfr.TransferAborted):
+        xfr.process_message(good)
+    assert z == dns.versioned.Zone("example.")
+
+
+def test_context_exit_without_close_rolls_back():
+    z = dns.versioned.Zone("example.")
+    m1 = dns.message.from_text(
+        progressive_part1, origin=z.origin, one_rr_per_rrset=True
+    )
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        xfr.process_message(m1)
+        assert xfr.phase == dns.xfr.InboundPhase.DATA
+    # Leaving the context without the closing SOA abandons the transfer.
+    assert xfr.failed
+    assert z == dns.versioned.Zone("example.")
+
+
+def test_split_boundaries_do_not_change_the_outcome():
+    # The same records, delivered with different message boundaries, must give
+    # the same zone: nothing may depend on a message happening to end on a
+    # phase boundary.
+    texts = [
+        "@ 3600 IN SOA foo bar 1 2 3 4 5",
+        "@ 3600 IN NS ns1",
+        "@ 3600 IN NS ns2",
+        "bar.foo 300 IN MX 0 blaz.foo",
+        "ns1 3600 IN A 10.0.0.1",
+        "ns2 3600 IN A 10.0.0.2",
+        "@ 3600 IN SOA foo bar 1 2 3 4 5",
+    ]
+
+    def run(groupings):
+        z = dns.versioned.Zone("example.")
+        phase = dns.xfr.InboundPhase.START_SOA
+        with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+            for group in groupings:
+                body = ";ANSWER\n" + "\n".join(group) + "\n"
+                m = dns.message.from_text(
+                    "id 1\nopcode QUERY\nrcode NOERROR\nflags QR AA\n" + body,
+                    origin=z.origin,
+                    one_rr_per_rrset=True,
+                )
+                done = xfr.process_message(m)
+                # Phases never move backwards.
+                assert xfr.phase.value >= phase.value or xfr.phase == (
+                    dns.xfr.InboundPhase.DONE
+                )
+                phase = xfr.phase
+                assert done == xfr.complete
+        return z
+
+    whole = run([texts])
+    pairs = run([[texts[0]], [texts[1], texts[2]], texts[3:5], texts[5:]])
+    singles = run([[t] for t in texts])
+    expected = dns.zone.from_text(base, "example.")
+    assert whole == expected
+    assert pairs == expected
+    assert singles == expected
+
+
+def test_first_message_question_name_mismatch():
+    z = dns.versioned.Zone("example.")
+    text = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+not-example. IN AXFR
+;ANSWER
+@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN SOA foo bar 1 2 3 4 5
+"""
+    m = dns.message.from_text(text, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        with pytest.raises(dns.xfr.ZoneIdentityError):
+            xfr.process_message(m)
+
+
+def test_continuation_question_name_mismatch():
+    z = dns.versioned.Zone("example.")
+    m1 = dns.message.from_text(
+        progressive_part1, origin=z.origin, one_rr_per_rrset=True
+    )
+    m2 = dns.message.from_text(
+        """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+other. IN AXFR
+;ANSWER
+ns1 3600 IN A 10.0.0.1
+@ 3600 IN SOA foo bar 1 2 3 4 5
+""",
+        origin=z.origin,
+        one_rr_per_rrset=True,
+    )
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        xfr.process_message(m1)
+        with pytest.raises(dns.xfr.ZoneIdentityError):
+            xfr.process_message(m2)
+        assert xfr.failed
+    assert z == dns.versioned.Zone("example.")
+
+
+def test_closing_soa_must_match_opening_soa():
+    z = dns.versioned.Zone("example.")
+    text = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. IN AXFR
+;ANSWER
+@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns1
+@ 3600 IN SOA foo bar 2 2 3 4 5
+"""
+    m = dns.message.from_text(text, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        # A different origin SOA is a second, non-final SOA in an AXFR, which
+        # is malformed.
+        with pytest.raises(dns.exception.FormError):
+            xfr.process_message(m)
+        assert xfr.failed
+    assert z == dns.versioned.Zone("example.")
+
+
+def test_truncated_stream_leaves_no_partial_zone_and_is_retryable():
+    z = dns.versioned.Zone("example.")
+    m1 = dns.message.from_text(
+        progressive_part1, origin=z.origin, one_rr_per_rrset=True
+    )
+    # First attempt: stops after the first message.
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as attempt1:
+        attempt1.process_message(m1)
+    assert attempt1.failed
+    assert z == dns.versioned.Zone("example.")
+    # Second attempt on the very same manager, this time complete.
+    m1b, m2, m3 = _messages(
+        z.origin, progressive_part1, progressive_part2, progressive_part3
+    )
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as attempt2:
+        assert attempt2.process_message(m1b) is False
+        assert attempt2.process_message(m2) is False
+        assert attempt2.process_message(m3) is True
+        assert attempt2.committed
+    assert z == dns.zone.from_text(base, "example.")
+
+
+def test_unversioned_zone_progressive_axfr():
+    z = dns.zone.Zone("example.")
+    m1, m2, m3 = _messages(
+        z.origin, progressive_part1, progressive_part2, progressive_part3
+    )
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        assert xfr.process_message(m1) is False
+        assert xfr.process_message(m2) is False
+        assert xfr.process_message(m3) is True
+    assert z == dns.zone.from_text(base, "example.")
+
+
+def test_progressive_axfr_convenience_properties():
+    z = dns.versioned.Zone("example.")
+    m = dns.message.from_text(axfr, origin=z.origin, one_rr_per_rrset=True)
+    xfr = dns.xfr.Inbound(z, dns.rdatatype.AXFR)
+    assert xfr.phase is dns.xfr.InboundPhase.START_SOA
+    assert not xfr.complete and not xfr.failed and not xfr.committed
+    assert xfr.process_message(m) is True
+    assert xfr.phase is dns.xfr.InboundPhase.DONE
+    assert xfr.complete and not xfr.failed and xfr.committed
+
+
+#
+# The out-of-zone rejection also applies when the transfer is driven through
+# dns.query.inbound_xfr(); a failed transfer leaves the zone alone and the same
+# manager accepts a new transfer afterwards.  dns.query.xfr() is a message
+# generator for dns.zone.from_xfr(), which tolerates out-of-zone data, so it
+# keeps working.
+#
+axfr_with_out_of_zone = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. IN AXFR
+;ANSWER
+@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns1
+ns1 3600 IN A 10.0.0.1
+www.victim.com. 300 IN A 10.9.9.9
+@ 3600 IN SOA foo bar 1 2 3 4 5
+"""
+
+
+class OutOfZoneXFRNanoNameserver(Server):
+    def __init__(self, text):
+        super().__init__(origin=dns.name.from_text("example"))
+        self.text = text
+
+    def handle(self, request):
+        try:
+            r = dns.message.from_text(
+                self.text, one_rr_per_rrset=True, origin=self.origin
+            )
+            r.id = request.message.id
+            return r
+        except Exception:
+            pass
+
+
+@pytest.mark.skipif(not _nanonameserver_available, reason="requires nanonameserver")
+def test_sync_inbound_xfr_rejects_out_of_zone_then_retries():
+    with OutOfZoneXFRNanoNameserver(axfr_with_out_of_zone) as ns:
+        where, port = ns.tcp_address
+        zone = dns.versioned.Zone("example")
+        with pytest.raises(dns.xfr.OutOfZoneName):
+            dns.query.inbound_xfr(where, zone, port=port)
+        # The failed attempt left the zone alone.
+        assert zone == dns.versioned.Zone("example")
+    with OutOfZoneXFRNanoNameserver(axfr) as ns:
+        where, port = ns.tcp_address
+        dns.query.inbound_xfr(where, zone, port=port)
+        assert zone == dns.zone.from_text(base, "example")
+
+
+async def async_inbound_xfr_rejects_out_of_zone_then_retries():
+    with OutOfZoneXFRNanoNameserver(axfr_with_out_of_zone) as ns:
+        where, port = ns.tcp_address
+        zone = dns.versioned.Zone("example")
+        with pytest.raises(dns.xfr.OutOfZoneName):
+            await dns.asyncquery.inbound_xfr(where, zone, port=port)
+        assert zone == dns.versioned.Zone("example")
+    with OutOfZoneXFRNanoNameserver(axfr) as ns:
+        where, port = ns.tcp_address
+        await dns.asyncquery.inbound_xfr(where, zone, port=port)
+        assert zone == dns.zone.from_text(base, "example")
+
+
+@pytest.mark.skipif(not _nanonameserver_available, reason="requires nanonameserver")
+def test_asyncio_inbound_xfr_rejects_out_of_zone_then_retries():
+    dns.asyncbackend.set_default_backend("asyncio")
+    asyncio.run(async_inbound_xfr_rejects_out_of_zone_then_retries())
+
+
+@pytest.mark.skipif(not _nanonameserver_available, reason="requires nanonameserver")
+def test_sync_query_xfr_generator_tolerates_out_of_zone():
+    # dns.zone.from_xfr() ignores out-of-zone data, so the generator which
+    # feeds it must not reject the transfer.
+    with OutOfZoneXFRNanoNameserver(axfr_with_out_of_zone) as ns:
+        where, port = ns.tcp_address
+        xfr = dns.query.xfr(where, "example", port=port)
+        zone = dns.zone.from_xfr(xfr)
+        assert zone == dns.zone.from_text(base, "example")
+        assert dns.name.from_text("www.victim.com.") not in zone
+
+
+#
+# The transport plumbing is exercised over a socketpair, which is local and
+# involves no DNS server: the peer just writes a fixed sequence of transfer
+# messages.  This covers the query-side arguments and the "stream dies" case.
+#
+def _serve_messages(b, messages, die_after=None, question_echo=None):
+    """Read one query from *b*, then write *messages*, optionally dying."""
+
+    def run():
+        try:
+            b.recv(65535)
+            for i, m in enumerate(messages):
+                if die_after is not None and i >= die_after:
+                    break
+                if question_echo is not None:
+                    m.id = question_echo.id
+                    if i > 0:
+                        m.question = []
+                wire = m.to_wire()
+                b.sendall(struct.pack("!H", len(wire)) + wire)
+        finally:
+            b.close()
+
+    t = threading.Thread(target=run)
+    t.start()
+    return t
+
+
+def test_socket_stream_rejects_out_of_zone():
+    z = dns.versioned.Zone("example.")
+    q = dns.message.make_query("example", "AXFR")
+    a, b = socket.socketpair()
+    m = dns.message.from_text(
+        axfr_with_out_of_zone, origin=z.origin, one_rr_per_rrset=True
+    )
+    t = _serve_messages(b, [m], question_echo=q)
+    try:
+        with pytest.raises(dns.xfr.OutOfZoneName):
+            list(
+                dns.query._inbound_xfr(
+                    z, a, q, None, None, None, True, allow_out_of_zone=False
+                )
+            )
+    finally:
+        a.close()
+        t.join()
+    assert z == dns.versioned.Zone("example.")
+
+
+def test_socket_stream_dies_before_closing_soa_then_retries():
+    z = dns.versioned.Zone("example.")
+    q = dns.message.make_query("example", "AXFR")
+    texts = [progressive_part1, progressive_part2, progressive_part3]
+    msgs = [
+        dns.message.from_text(x, origin=z.origin, one_rr_per_rrset=True) for x in texts
+    ]
+    # The server sends the data but never the closing SOA and then hangs up.
+    a, b = socket.socketpair()
+    t = _serve_messages(b, msgs, die_after=2, question_echo=q)
+    try:
+        with pytest.raises(EOFError):
+            list(
+                dns.query._inbound_xfr(
+                    z, a, q, None, None, None, True, allow_out_of_zone=False
+                )
+            )
+    finally:
+        a.close()
+        t.join()
+    # Leaving the generator normally (or via an error) releases the writer and
+    # leaves the zone untouched, and a new transfer on the same manager works.
+    assert z == dns.versioned.Zone("example.")
+    a, b = socket.socketpair()
+    m = dns.message.from_text(axfr, origin=z.origin, one_rr_per_rrset=True)
+    t = _serve_messages(b, [m], question_echo=q)
+    try:
+        list(
+            dns.query._inbound_xfr(
+                z, a, q, None, None, None, True, allow_out_of_zone=False
+            )
+        )
+    finally:
+        a.close()
+        t.join()
+    assert z == dns.zone.from_text(base, "example.")
+
+
+def test_socket_generator_path_tolerates_out_of_zone():
+    # The dns.query.xfr() generator sets allow_out_of_zone so that
+    # dns.zone.from_xfr() keeps ignoring out-of-zone data, as documented.
+    z = dns.versioned.Zone("example.")
+    q = dns.message.make_query("example", "AXFR")
+    m = dns.message.from_text(
+        axfr_with_out_of_zone, origin=z.origin, one_rr_per_rrset=True
+    )
+    a, b = socket.socketpair()
+    t = _serve_messages(b, [m], question_echo=q)
+    try:
+        for _ in dns.query._inbound_xfr(
+            z, a, q, None, None, None, True, allow_out_of_zone=True
+        ):
+            pass
+    finally:
+        a.close()
+        t.join()
+    ez = dns.zone.from_text(
+        """@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns1
+ns1 3600 IN A 10.0.0.1
+""",
+        "example.",
+    )
+    assert z == ez
+
+
+def test_wrong_class_opening_soa():
+    z = dns.versioned.Zone("example.")
+    text = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. IN AXFR
+;ANSWER
+@ 3600 CH SOA foo bar 1 2 3 4 5
+@ 3600 CH SOA foo bar 1 2 3 4 5
+"""
+    m = dns.message.from_text(text, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        with pytest.raises(dns.xfr.ClassMismatch):
+            xfr.process_message(m)
+        assert xfr.failed
+    assert z == dns.versioned.Zone("example.")
+
+
+def test_retransmitted_closing_message_is_duplicate_end():
+    z = dns.versioned.Zone("example.")
+    closing = dns.message.from_text(
+        progressive_part3, origin=z.origin, one_rr_per_rrset=True
+    )
+    first = dns.message.from_text(
+        progressive_part1, origin=z.origin, one_rr_per_rrset=True
+    )
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        xfr.process_message(first)
+        assert xfr.process_message(closing) is True
+        # A retransmission of the closing message means the stream ended twice.
+        with pytest.raises(dns.xfr.DuplicateEnd):
+            xfr.process_message(closing)
+        # The successful close is unaffected.
+        assert xfr.committed
+    assert z == dns.zone.from_text(
+        """@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns1
+@ 3600 IN NS ns2
+ns2 3600 IN A 10.0.0.2
+""",
+        "example.",
+    )
+
+
+def test_question_class_mismatch():
+    z = dns.versioned.Zone("example.")
+    text = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. CH AXFR
+;ANSWER
+@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN SOA foo bar 1 2 3 4 5
+"""
+    m = dns.message.from_text(text, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        with pytest.raises(dns.xfr.ClassMismatch):
+            xfr.process_message(m)
+        assert xfr.failed
+    assert z == dns.versioned.Zone("example.")
+
+
+def test_ch_zone_transfer_succeeds():
+    z = dns.versioned.Zone("example.", dns.rdataclass.CH)
+    text = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. CH AXFR
+;ANSWER
+@ 3600 CH SOA foo bar 1 2 3 4 5
+@ 3600 CH TXT "hello"
+@ 3600 CH SOA foo bar 1 2 3 4 5
+"""
+    m = dns.message.from_text(text, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR) as xfr:
+        assert xfr.process_message(m) is True
+    assert z == dns.zone.from_text(
+        """@ 3600 CH SOA foo bar 1 2 3 4 5
+@ 3600 CH TXT "hello"
+""",
+        "example.",
+        rdclass=dns.rdataclass.CH,
+        check_origin=False,
+    )
+
+
+def test_transaction_setup_failure_releases_writer():
+    z = dns.versioned.Zone("example.")
+    m = dns.message.from_text(axfr, origin=z.origin, one_rr_per_rrset=True)
+
+    class Boom(Exception):
+        pass
+
+    def setup(txn):
+        raise Boom
+
+    with dns.xfr.Inbound(z, dns.rdatatype.AXFR, transaction_setup=setup) as xfr:
+        with pytest.raises(Boom):
+            xfr.process_message(m)
+        assert xfr.failed
+    assert z == dns.versioned.Zone("example.")
+    # The failed writer was released, so a new writer can be had.
+    with z.writer() as txn:
+        txn.add("@", 300, dns.rdata.from_text("IN", "SOA", ". . 1 2 3 4 5"))

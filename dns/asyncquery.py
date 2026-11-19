@@ -851,6 +851,7 @@ async def _inbound_xfr(
     timeout: float | None,
     expiration: float | None,
     raise_on_serial_went_backwards: bool,
+    allow_out_of_zone: bool = False,
 ) -> Any:
     """Given a socket, does the zone transfer."""
     rdtype = query.question[0].rdtype
@@ -866,7 +867,12 @@ async def _inbound_xfr(
         tcpmsg = struct.pack("!H", len(wire)) + wire
         await tcp_sock.sendall(tcpmsg, expiration)
     with dns.xfr.Inbound(
-        txn_manager, rdtype, serial, is_udp, raise_on_serial_went_backwards
+        txn_manager,
+        rdtype,
+        serial,
+        is_udp,
+        raise_on_serial_went_backwards,
+        allow_out_of_zone=allow_out_of_zone,
     ) as inbound:
         done = False
         first = True
