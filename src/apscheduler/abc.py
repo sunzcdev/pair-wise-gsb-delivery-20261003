@@ -11,7 +11,14 @@ from uuid import UUID
 if TYPE_CHECKING:
     from ._enums import ConflictPolicy
     from ._events import Event, T_Event
-    from ._structures import Job, JobResult, Schedule, ScheduleResult, Task
+    from ._structures import (
+        CleanupResult,
+        Job,
+        JobResult,
+        Schedule,
+        ScheduleResult,
+        Task,
+    )
 
 
 class Trigger(Iterator[datetime], metaclass=ABCMeta):
@@ -387,7 +394,7 @@ class DataStore(metaclass=ABCMeta):
         """
 
     @abstractmethod
-    async def cleanup(self) -> None:
+    async def cleanup(self, limit: int | None = None) -> CleanupResult:
         """
         Perform clean-up operations on the data store.
 
@@ -400,6 +407,15 @@ class DataStore(metaclass=ABCMeta):
           :class:`~apscheduler.ScheduleUpdated` event for each of them
         * Purge finished schedules (where ``next_run_time`` is ``None``) that have no
           running jobs associated with them
+
+        The current time must be resolved only once, at the beginning of the call, and
+        then used as the fixed time reference for all the operations above.
+
+        :param limit: the maximum number of expired job results to delete in this
+            call, or ``None`` to delete all of them at once
+        :return: the outcome of the cleanup operation, containing the number of
+            deleted job results, the number of removed finished schedules and whether
+            there may be more expired job results left to delete
         """
 
 

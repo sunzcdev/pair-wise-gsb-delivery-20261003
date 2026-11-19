@@ -50,6 +50,7 @@ from .._exceptions import (
 )
 from .._marshalling import callable_from_ref, callable_to_ref
 from .._structures import (
+    CleanupResult,
     Job,
     JobResult,
     MetadataType,
@@ -219,10 +220,23 @@ class AsyncScheduler:
         """The current running state of the scheduler."""
         return self._state
 
-    async def cleanup(self) -> None:
-        """Clean up expired job results and finished schedules."""
-        await self.data_store.cleanup()
-        self.logger.info("Cleaned up expired job results and finished schedules")
+    async def cleanup(self, limit: int | None = None) -> CleanupResult:
+        """
+        Clean up expired job results and finished schedules.
+
+        :param limit: the maximum number of expired job results to delete in this
+            call, or ``None`` to delete all of them at once
+        :return: the outcome of the cleanup operation, containing the number of
+            deleted job results, the number of removed finished schedules and whether
+            there may be more expired job results left to delete
+        """
+        result = await self.data_store.cleanup(limit)
+        self.logger.info(
+            "Cleaned up %d expired job results and %d finished schedules",
+            result.deleted_results,
+            result.finished_schedules,
+        )
+        return result
 
     @overload
     def subscribe(

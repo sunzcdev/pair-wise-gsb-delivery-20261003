@@ -23,11 +23,12 @@ from .._events import (
     TaskUpdated,
 )
 from .._exceptions import ConflictingIdError, TaskLookupError
-from .._structures import Job, JobResult, Schedule, ScheduleResult, Task
+from .._structures import CleanupResult, Job, JobResult, Schedule, ScheduleResult, Task
 from .._utils import create_repr
 from .base import BaseDataStore
 
 max_datetime = datetime(MAXYEAR, 12, 31, 23, 59, 59, 999999, tzinfo=UTC)
+max_uuid = UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")
 
 
 @attrs.define(eq=False, repr=False)
@@ -48,6 +49,7 @@ class MemoryDataStore(BaseDataStore):
     _jobs_by_task_id: dict[str, set[Job]] = attrs.Factory(partial(defaultdict, set))
     _jobs_by_schedule_id: dict[str, set[Job]] = attrs.Factory(partial(defaultdict, set))
     _job_results: dict[UUID, JobResult] = attrs.Factory(dict)
+    _job_results_expirations: list[tuple[datetime, UUID]] = attrs.Factory(list)
 
     def __repr__(self) -> str:
         return create_repr(self)
@@ -302,6 +304,9 @@ class MemoryDataStore(BaseDataStore):
         # Record the job result
         if result.expires_at > result.finished_at:
             self._job_results[result.job_id] = result
+            insort_right(
+                self._job_results_expirations, (result.expires_at, result.job_id)
+            )
 
         # Decrement the number of running jobs for this task
         if job.acquired_by:
@@ -336,7 +341,18 @@ class MemoryDataStore(BaseDataStore):
         )
 
     async def get_job_result(self, job_id: UUID) -> JobResult | None:
-        return self._job_results.pop(job_id, None)
+        result = self._job_results.pop(job_id, None)
+        if result is not None:
+            # Remove the corresponding entry from the expiration index
+            key = (result.expires_at, job_id)
+            index = bisect_left(self._job_results_expirations, key)
+            if (
+                index < len(self._job_results_expirations)
+                and self._job_results_expirations[index] == key
+            ):
+                del self._job_results_expirations[index]
+
+        return result
 
     async def extend_acquired_schedule_leases(
         self, scheduler_id: str, schedule_ids: set[str], duration: timedelta
@@ -363,16 +379,28 @@ class MemoryDataStore(BaseDataStore):
                 )
                 await self.release_job(job.acquired_by, job, result)
 
-    async def cleanup(self) -> None:
-        # Clean up expired job results
+    async def cleanup(self, limit: int | None = None) -> CleanupResult:
+        # Resolve the current time only once and use it as the fixed time reference
+        # for all the checks in this cleanup pass
         now = datetime.now(UTC)
-        expired_job_ids = [
-            result.job_id
-            for result in self._job_results.values()
-            if result.expires_at <= now
-        ]
-        for job_id in expired_job_ids:
+
+        # Clean up expired job results, up to the given limit. The expiration index
+        # is sorted by expiration time, so expired results always form a prefix of
+        # the index. Unexpired results are never scanned, and continued calls resume
+        # directly from the first remaining expired entry instead of scanning
+        # through all the live results again.
+        expirations = self._job_results_expirations
+        num_expired = bisect_right(expirations, (now, max_uuid))
+        if limit is None:
+            num_deletions = num_expired
+        else:
+            num_deletions = min(num_expired, limit)
+
+        for _, job_id in expirations[:num_deletions]:
             del self._job_results[job_id]
+
+        del expirations[:num_deletions]
+        completed = num_deletions == num_expired
 
         # Finish any jobs whose leases have expired
         expired_jobs = [
@@ -399,11 +427,20 @@ class MemoryDataStore(BaseDataStore):
                 )
                 await self._event_broker.publish(event)
 
-        # Clean up finished schedules that have no running jobs
-        finished_schedule_ids = [
-            schedule_id
-            for schedule_id, schedule in self._schedules_by_id.items()
-            if schedule.next_fire_time is None
-            and schedule_id not in self._jobs_by_schedule_id
-        ]
+        # Clean up finished schedules that have no running jobs. Exhausted
+        # schedules sort last in the schedules list, so only that suffix needs to
+        # be scanned.
+        finished_schedule_ids: list[str] = []
+        for schedule in reversed(self._schedules):
+            if schedule.next_fire_time is not None:
+                break
+            if schedule.id not in self._jobs_by_schedule_id:
+                finished_schedule_ids.append(schedule.id)
+
         await self.remove_schedules(finished_schedule_ids, finished=True)
+
+        return CleanupResult(
+            deleted_results=num_deletions,
+            finished_schedules=len(finished_schedule_ids),
+            completed=completed,
+        )

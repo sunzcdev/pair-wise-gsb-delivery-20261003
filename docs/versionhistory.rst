@@ -6,6 +6,14 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **UNRELEASED**
 
+- **BREAKING** Changed the ``cleanup()`` data store and scheduler methods to return a
+  ``CleanupResult`` (containing the number of deleted job results, the number of
+  removed finished schedules and whether more expired job results may remain), and
+  added an optional ``limit`` parameter that bounds the number of expired job results
+  deleted per call, allowing clean-up to be split into multiple rounds
+- Made the memory data store's clean-up only scan the expired prefix of its job
+  results (kept sorted by expiration time), so repeated bounded clean-up calls no
+  longer rescan all the unexpired results
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+

@@ -32,6 +32,7 @@ from pytest_mock import MockerFixture, MockFixture
 
 from apscheduler import (
     AsyncScheduler,
+    CleanupResult,
     CoalescePolicy,
     Event,
     Job,
@@ -911,7 +912,9 @@ class TestAsyncScheduler:
             # After the sleeping past the expiration time and performing a cleanup, the
             # result should not be there anymore
             await sleep(0.1)
-            await scheduler.cleanup()
+            outcome = await scheduler.cleanup()
+            assert outcome.deleted_results == 1
+            assert outcome.completed
             with pytest.raises(JobLookupError):
                 await scheduler.get_job_result(job_id)
 
@@ -929,7 +932,9 @@ class TestAsyncScheduler:
             assert schedule.next_fire_time is None
 
             # After the cleanup, the schedule should be gone
-            await scheduler.cleanup()
+            outcome = await scheduler.cleanup()
+            assert outcome.finished_schedules == 1
+            assert outcome.completed
             with pytest.raises(ScheduleLookupError):
                 await scheduler.get_schedule("event_set")
 
@@ -995,7 +1000,14 @@ class TestAsyncScheduler:
         """
         async with AsyncScheduler() as scheduler:
             event = anyio.Event()
-            mocker.patch.object(scheduler.data_store, "cleanup", side_effect=event.set)
+
+            def cleanup(limit: int | None = None) -> CleanupResult:
+                event.set()
+                return CleanupResult(
+                    deleted_results=0, finished_schedules=0, completed=True
+                )
+
+            mocker.patch.object(scheduler.data_store, "cleanup", side_effect=cleanup)
             await scheduler.start_in_background()
             with fail_after(3):
                 await event.wait()
@@ -1577,7 +1589,14 @@ class TestSyncScheduler:
         """
         with Scheduler() as scheduler:
             event = threading.Event()
-            mocker.patch.object(scheduler.data_store, "cleanup", side_effect=event.set)
+
+            def cleanup(limit: int | None = None) -> CleanupResult:
+                event.set()
+                return CleanupResult(
+                    deleted_results=0, finished_schedules=0, completed=True
+                )
+
+            mocker.patch.object(scheduler.data_store, "cleanup", side_effect=cleanup)
             scheduler.start_in_background()
             assert event.wait(3)
 

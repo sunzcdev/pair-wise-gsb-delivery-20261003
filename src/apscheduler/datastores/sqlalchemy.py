@@ -75,7 +75,14 @@ from .._exceptions import (
     SerializationError,
     TaskLookupError,
 )
-from .._structures import Job, JobResult, Schedule, ScheduleResult, Task
+from .._structures import (
+    CleanupResult,
+    Job,
+    JobResult,
+    Schedule,
+    ScheduleResult,
+    Task,
+)
 from .._utils import create_repr, current_async_library
 from ..abc import EventBroker
 from .base import BaseExternalDataStore
@@ -1165,19 +1172,46 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
             for event in events:
                 await self._event_broker.publish(event)
 
-    async def cleanup(self) -> None:
+    async def cleanup(self, limit: int | None = None) -> CleanupResult:
+        deleted_results = 0
+        finished_schedule_count = 0
+        completed = True
         async for attempt in self._retry():
             with attempt:
                 events: list[Event] = []
                 async with self._begin_transaction() as conn:
-                    # Purge expired job results
-                    delete = self._t_job_results.delete().where(
-                        self._t_job_results.c.expires_at <= datetime.now(UTC)
-                    )
-                    await self._execute(conn, delete)
+                    # Resolve the current time only once and use it as the fixed
+                    # time reference for the entire cleanup pass
+                    now = datetime.now(UTC)
+
+                    # Purge expired job results (up to the given limit)
+                    if limit is None:
+                        delete = self._t_job_results.delete().where(
+                            self._t_job_results.c.expires_at <= now
+                        )
+                        result = await self._execute(conn, delete)
+                        deleted_results = result.rowcount
+                    else:
+                        query = (
+                            select(self._t_job_results.c.job_id)
+                            .where(self._t_job_results.c.expires_at <= now)
+                            .limit(limit)
+                        )
+                        expired_ids = [
+                            row[0] for row in await self._execute(conn, query)
+                        ]
+                        if expired_ids:
+                            delete = self._t_job_results.delete().where(
+                                self._t_job_results.c.job_id.in_(expired_ids)
+                            )
+                            result = await self._execute(conn, delete)
+                            deleted_results = result.rowcount
+                        else:
+                            deleted_results = 0
+
+                        completed = len(expired_ids) < limit
 
                     # Finish any jobs whose leases have expired
-                    now = datetime.now(UTC)
                     query = select(
                         self._t_jobs.c.id,
                         self._t_jobs.c.task_id,
@@ -1259,6 +1293,8 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         )
                         await self._execute(conn, delete)
 
+                    finished_schedule_count = len(finished_schedule_ids)
+
                     for schedule_id, task_id in finished_schedule_ids.items():
                         events.append(
                             ScheduleRemoved(
@@ -1271,3 +1307,9 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                 # Publish any events produced from the operations
                 for event in events:
                     await self._event_broker.publish(event)
+
+        return CleanupResult(
+            deleted_results=deleted_results,
+            finished_schedules=finished_schedule_count,
+            completed=completed,
+        )

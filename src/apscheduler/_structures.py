@@ -433,6 +433,25 @@ class JobResult:
     def __hash__(self) -> int:
         return hash(self.job_id)
 
+
+@attrs.define(kw_only=True, frozen=True)
+class CleanupResult:
+    """
+    Contains the outcome of a data store cleanup operation.
+
+    :var int deleted_results: the number of expired job results deleted during this
+        cleanup pass
+    :var int finished_schedules: the number of finished schedules removed during this
+        cleanup pass
+    :var bool completed: ``True`` if there is no more cleanup work left to do,
+        ``False`` if there may still be expired job results left, in which case
+        :meth:`~apscheduler.abc.DataStore.cleanup` should be called again
+    """
+
+    deleted_results: int
+    finished_schedules: int
+    completed: bool
+
     def __eq__(self, other: object) -> bool:
         if isinstance(other, JobResult):
             return self.job_id == other.job_id

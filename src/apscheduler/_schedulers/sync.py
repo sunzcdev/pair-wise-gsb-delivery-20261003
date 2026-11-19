@@ -18,7 +18,15 @@ from anyio.from_thread import BlockingPortal, start_blocking_portal
 from .. import current_scheduler
 from .._enums import CoalescePolicy, ConflictPolicy, RunState, SchedulerRole
 from .._events import Event, T_Event
-from .._structures import Job, JobResult, MetadataType, Schedule, Task, TaskDefaults
+from .._structures import (
+    CleanupResult,
+    Job,
+    JobResult,
+    MetadataType,
+    Schedule,
+    Task,
+    TaskDefaults,
+)
 from .._utils import UnsetValue, create_repr, unset
 from ..abc import DataStore, EventBroker, JobExecutor, Subscription, Trigger
 from .async_ import AsyncScheduler, TaskType
@@ -168,9 +176,9 @@ class Scheduler:
     def __repr__(self) -> str:
         return create_repr(self, "identity", "role", "data_store", "event_broker")
 
-    def cleanup(self) -> None:
+    def cleanup(self, limit: int | None = None) -> CleanupResult:
         portal = self._ensure_services_ready()
-        return portal.call(self._async_scheduler.cleanup)
+        return portal.call(self._async_scheduler.cleanup, limit)
 
     @overload
     def subscribe(

@@ -43,7 +43,14 @@ from .._exceptions import (
     SerializationError,
     TaskLookupError,
 )
-from .._structures import Job, JobResult, Schedule, ScheduleResult, Task
+from .._structures import (
+    CleanupResult,
+    Job,
+    JobResult,
+    Schedule,
+    ScheduleResult,
+    Task,
+)
 from .._utils import create_repr
 from ..abc import EventBroker
 from .base import BaseExternalDataStore
@@ -827,16 +834,42 @@ class MongoDBDataStore(BaseExternalDataStore):
             for event in events:
                 await self._event_broker.publish(event)
 
-    async def cleanup(self) -> None:
+    async def cleanup(self, limit: int | None = None) -> CleanupResult:
         events: list[JobReleased | ScheduleRemoved | ScheduleUpdated] = []
+        deleted_results = 0
+        finished_schedule_count = 0
+        completed = True
         async for attempt in self._retry():
             with attempt:
                 async with self._client.start_session() as session:
-                    # Purge expired job results
+                    # Resolve the current time only once and use it as the fixed
+                    # time reference for the entire cleanup pass
                     now = datetime.now(UTC)
-                    await self._jobs_results.delete_many(
-                        {"expires_at": {"$lte": now.timestamp()}}, session=session
-                    )
+
+                    # Purge expired job results (up to the given limit)
+                    if limit is None:
+                        outcome = await self._jobs_results.delete_many(
+                            {"expires_at": {"$lte": now.timestamp()}}, session=session
+                        )
+                        deleted_results = outcome.deleted_count
+                    else:
+                        async with self._jobs_results.find(
+                            {"expires_at": {"$lte": now.timestamp()}},
+                            projection=["_id"],
+                            limit=limit,
+                            session=session,
+                        ) as cursor:
+                            expired_ids = [doc["_id"] async for doc in cursor]
+
+                        if expired_ids:
+                            outcome = await self._jobs_results.delete_many(
+                                {"_id": {"$in": expired_ids}}, session=session
+                            )
+                            deleted_results = outcome.deleted_count
+                        else:
+                            deleted_results = 0
+
+                        completed = len(expired_ids) < limit
 
                     # Find finished schedules
                     async with self._schedules.find(
@@ -855,6 +888,8 @@ class MongoDBDataStore(BaseExternalDataStore):
                                 session=session,
                             ):
                                 finished_schedules.pop(schedule_id)
+
+                    finished_schedule_count = len(finished_schedules)
 
                     # Finish any jobs whose leases have expired
                     filters = {"acquired_until": {"$lt": now.timestamp()}}
@@ -944,3 +979,9 @@ class MongoDBDataStore(BaseExternalDataStore):
         # Publish any events produced from the operations
         for event in events:
             await self._event_broker.publish(event)
+
+        return CleanupResult(
+            deleted_results=deleted_results,
+            finished_schedules=finished_schedule_count,
+            completed=completed,
+        )

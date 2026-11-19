@@ -10,6 +10,7 @@ Data structures
 .. autoclass:: apscheduler.ScheduleResult
 .. autoclass:: apscheduler.Job
 .. autoclass:: apscheduler.JobResult
+.. autoclass:: apscheduler.CleanupResult
 
 Decorators
 ----------

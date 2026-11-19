@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import Mock
 from urllib.parse import unquote
+from uuid import UUID
 
 import anyio
 import pytest
@@ -756,6 +757,107 @@ async def test_cleanup_expired_schedule_leases(
 
     acquired = await datastore.acquire_schedules("scheduler2", timedelta(seconds=30), 1)
     assert [schedule.id for schedule in acquired] == [schedules[0].id]
+
+
+async def test_cleanup_expired_job_results_bounded(datastore: DataStore) -> None:
+    """
+    Test that clean-up deletes expired job results in bounded rounds and reports
+    its progress, and that valid results written between two rounds survive and
+    remain readable.
+
+    """
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    now = datetime.now(UTC)
+
+    async def add_result(expires_at: datetime) -> UUID:
+        job = Job(task_id="task1", executor="async")
+        await datastore.add_job(job)
+        acquired = await datastore.acquire_jobs("worker_id", timedelta(seconds=30), 1)
+        assert acquired[0].id == job.id
+        result = JobResult(
+            job_id=job.id,
+            outcome=JobOutcome.success,
+            finished_at=expires_at - timedelta(hours=1),
+            expires_at=expires_at,
+        )
+        await datastore.release_job("worker_id", acquired[0], result)
+        return job.id
+
+    # Add 5 expired results and one that is still valid
+    expired_ids = [await add_result(now - timedelta(seconds=10)) for _ in range(5)]
+    valid_id = await add_result(now + timedelta(hours=1))
+
+    # The first round only deletes up to the given number of results
+    outcome = await datastore.cleanup(limit=2)
+    assert outcome.deleted_results == 2
+    assert not outcome.completed
+
+    # A valid result written between two clean-up rounds must survive and remain
+    # readable
+    between_id = await add_result(now + timedelta(hours=2))
+
+    # The second round continues where the first one left off
+    outcome = await datastore.cleanup(limit=2)
+    assert outcome.deleted_results == 2
+    assert not outcome.completed
+
+    result = await datastore.get_job_result(valid_id)
+    assert result is not None
+    assert result.job_id == valid_id
+    result = await datastore.get_job_result(between_id)
+    assert result is not None
+    assert result.job_id == between_id
+
+    # The last round deletes the remaining expired result and reports completion
+    outcome = await datastore.cleanup(limit=2)
+    assert outcome.deleted_results == 1
+    assert outcome.completed
+
+    # All the expired results are gone now
+    for job_id in expired_ids:
+        assert await datastore.get_job_result(job_id) is None
+
+
+async def test_cleanup_result_reporting(datastore: DataStore) -> None:
+    """
+    Test that clean-up reports the number of deleted results and finished
+    schedules, and completes in a single unbounded call.
+
+    """
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+
+    # Add a finished schedule (one that has no next fire time)
+    trigger = DateTrigger(datetime(2020, 9, 13, tzinfo=UTC))
+    schedule = Schedule(id="s1", task_id="task1", job_executor="async", trigger=trigger)
+    await datastore.add_schedule(schedule, ConflictPolicy.exception)
+
+    # Add an expired job result
+    now = datetime.now(UTC)
+    job = Job(task_id="task1", executor="async")
+    await datastore.add_job(job)
+    acquired = await datastore.acquire_jobs("worker_id", timedelta(seconds=30), 1)
+    result = JobResult(
+        job_id=job.id,
+        outcome=JobOutcome.success,
+        finished_at=now - timedelta(hours=2),
+        expires_at=now - timedelta(hours=1),
+    )
+    await datastore.release_job("worker_id", acquired[0], result)
+
+    outcome = await datastore.cleanup()
+    assert outcome.deleted_results == 1
+    assert outcome.finished_schedules == 1
+    assert outcome.completed
+
+    # A second call should have nothing left to do
+    outcome = await datastore.cleanup()
+    assert outcome.deleted_results == 0
+    assert outcome.finished_schedules == 0
+    assert outcome.completed
 
 
 @pytest.mark.skipif(
