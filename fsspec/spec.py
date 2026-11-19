@@ -210,6 +210,11 @@ class AbstractFileSystem(metaclass=_Cached):
     mirror_sync_methods = False
     root_marker = ""  # For some FSs, may require leading '/' or other character
     transaction_type = Transaction
+    #: Whether renaming a file onto another path in the same directory is
+    #: a safe (atomic) publish.  Backends that cannot guarantee this must
+    #: keep the default False and must not claim whole-object atomic
+    #: completion (see fsspec.resumable).
+    atomic_publish = False
 
     #: Extra *class attributes* that should be considered when hashing.
     _extra_tokenize_attributes = ()
@@ -1250,6 +1255,24 @@ class AbstractFileSystem(metaclass=_Cached):
 
     def cp_file(self, path1, path2, **kwargs):
         raise NotImplementedError
+
+    def cp_file_resumable(self, path1, path2, **kwargs):
+        """Copy one file with explicit, checkpointed resume support.
+
+        Copies ``path1`` to ``path2`` via a staging file, checkpointing
+        the confirmed prefix after every block.  Calling this again with
+        the same arguments resumes an interrupted copy from the
+        checkpointed, verified prefix instead of guessing an offset from
+        the target's size.  The final target is only published once the
+        whole object is staged; the returned dict's ``atomic`` flag says
+        whether the backend guarantees that publish to be atomic.
+
+        Keyword arguments are documented in
+        :func:`fsspec.resumable.resumable_copy`.
+        """
+        from .resumable import resumable_copy
+
+        return resumable_copy(self, path1, path2, **kwargs)
 
     def copy(
         self, path1, path2, recursive=False, maxdepth=None, on_error=None, **kwargs

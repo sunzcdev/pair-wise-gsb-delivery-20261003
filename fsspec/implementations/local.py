@@ -31,6 +31,9 @@ class LocalFileSystem(AbstractFileSystem):
     root_marker = "/"
     protocol = "file", "local"
     local_file = True
+    # staging and target live in the same directory, so publishing is a
+    # same-filesystem rename, which is atomic
+    atomic_publish = True
 
     def __init__(self, auto_mkdir=False, **kwargs):
         super().__init__(**kwargs)
