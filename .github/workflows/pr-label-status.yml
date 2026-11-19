@@ -1,0 +1,151 @@
+name: PR Label Manager
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, edited]
+  pull_request_review:
+    types: [submitted, dismissed]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+concurrency:
+  group: pr-label-status-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  manage-labels:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Update PR Labels
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            // Configuration
+            const fs = require('fs');
+            const path = require('path');
+            const MAINTAINERS_LIST = fs
+              .readFileSync(path.join(process.cwd(), 'MAINTAINERS'), 'utf8')
+              .split('\n')
+              .map((name) => name.trim())
+              .filter(Boolean);
+
+            const LABELS = {
+              CHANGES: 'waiting-for-changes',
+              REVIEW: 'waiting-for-review',
+              MERGE: 'waiting-for-merge'
+            };
+
+            let prs;
+            if (context.payload.pull_request) {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number
+              });
+              prs = [pr];
+            } else {
+              prs = await github.paginate(github.rest.pulls.list, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                per_page: 100
+              });
+            }
+
+            for (const pr of prs) {
+              if (pr.state !== 'open') {
+                continue;
+              }
+              // Skip draft PRs and WIP PRs
+              if (pr.draft || pr.title.toLowerCase().includes('wip')) {
+                continue;
+              }
+
+              // Get all reviews for this PR (with pagination)
+              const reviews = await github.paginate(
+                github.rest.pulls.listReviews,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  per_page: 100
+                }
+              );
+
+              // Track the latest decision per reviewer.
+              // A later COMMENTED review should not override CHANGES_REQUESTED/APPROVED.
+              const latestDecisionByReviewer = new Map();
+              for (const review of reviews) {
+                const reviewer = review.user.login;
+
+                if (review.state === 'CHANGES_REQUESTED' || review.state === 'APPROVED') {
+                  latestDecisionByReviewer.set(reviewer, {
+                    state: review.state,
+                    commitId: review.commit_id
+                  });
+                } else if (review.state === 'DISMISSED') {
+                  latestDecisionByReviewer.delete(reviewer);
+                }
+              }
+
+              // Determine appropriate label
+              let newLabel = LABELS.REVIEW;  // default
+
+              for (const [reviewer, decision] of latestDecisionByReviewer) {
+                if (MAINTAINERS_LIST.includes(reviewer)) {
+                  const state = decision.state;
+
+                  // A review decision on an older commit is stale once head moves.
+                  const staleDecision =
+                    decision.commitId && decision.commitId !== pr.head.sha;
+                  if (staleDecision) {
+                    continue;
+                  }
+
+                  if (state === 'CHANGES_REQUESTED') {
+                    newLabel = LABELS.CHANGES;
+                    break;
+                  } else if (state === 'APPROVED') {
+                    newLabel = LABELS.MERGE;
+                    // Don't break here - keep checking in case there's a newer "changes requested"
+                  }
+                }
+              }
+
+              // Remove all managed labels except the new one
+              const allLabels = Object.values(LABELS);
+              for (const label of pr.labels) {
+                if (allLabels.includes(label.name) && label.name !== newLabel) {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    name: label.name
+                  });
+                }
+              }
+
+              // Add new label if not present
+              if (!pr.labels.some(label => label.name === newLabel)) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  labels: [newLabel]
+                });
+              }
+
+              console.log(`PR #${pr.number}: Applied label ${newLabel}`);
+            }

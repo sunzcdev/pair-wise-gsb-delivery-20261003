@@ -1,0 +1,185 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+      - '*-stable'
+    paths: &test_paths
+      - '**/*'
+      - '!**/*.md'
+      - '!docs/**'
+      - '!.agents/**'
+      - '!benchmarks/**'
+      - '!.github/workflows/*.yml'
+      - '.github/workflows/tests.yml'
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths: *test_paths
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+jobs:
+  rubocop:
+    name: RuboCop linting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: 3.1
+          bundler-cache: true # `bundle install` and cache
+      - name: rubocop
+        run: bundle exec rake rubocop
+
+  test_mri:
+    name: >-
+      ${{ matrix.os }} ${{ matrix.ruby }}${{ matrix.no-ssl }}${{ matrix.yjit }}${{ matrix.rack-v }}
+    env:
+      CI: true
+      PUMA_TEST_DEBUG: true
+      TESTOPTS: -v
+      PUMA_NO_RUBOCOP: true
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    if: |
+      github.event.pull_request.draft != true
+      && !(   contains(github.event.pull_request.title,  '[ci skip]')
+           || contains(github.event.pull_request.title,  '[skip ci]'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04    , ruby: '3.0' }
+          - { os: ubuntu-22.04    , ruby: '3.0' , no-ssl: ' no SSL' }
+          - { os: ubuntu-22.04    , ruby: '3.0' , rack-v: ' rack2'  }
+          - { os: ubuntu-24.04    , ruby: '3.0' }
+          - { os: ubuntu-24.04    , ruby:  3.1  }
+          - { os: ubuntu-24.04    , ruby:  3.2  }
+          - { os: ubuntu-24.04    , ruby:  3.3  }
+          - { os: ubuntu-24.04    , ruby:  3.4  }
+          - { os: ubuntu-24.04    , ruby: '4.0' }
+          - { os: ubuntu-26.04    , ruby: '4.0' }
+          - { os: ubuntu-26.04    , ruby:  head , yjit: ' yjit'     }
+          - { os: ubuntu-22.04-arm, ruby: '3.0' }
+          - { os: ubuntu-26.04-arm, ruby: '4.0' }
+          - { os: macos-15        , ruby: '3.0' }
+          - { os: macos-26        , ruby: '4.0' }
+          - { os: macos-15-intel  , ruby: '3.0' }
+          - { os: macos-26-intel  , ruby: '4.0' }
+          - { os: windows-2022    , ruby: '3.0' }
+          - { os: windows-2022    , ruby: '3.0' , no-ssl: ' no SSL' }
+          - { os: windows-2025    , ruby: '4.0' }
+          - { os: windows-2025    , ruby:  ucrt }
+          - { os: windows-2025    , ruby:  mswin }
+          - { os: windows-11-arm  , ruby:  3.4  }
+          - { os: windows-11-arm  , ruby: '4.0' }
+
+    steps:
+      - name: repo checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compile Puma without SSL support
+        if: matrix.no-ssl == ' no SSL'
+        shell: bash
+        run: echo 'PUMA_DISABLE_SSL=true' >> "$GITHUB_ENV"
+
+      - name: Set Rack version, see Gemfile
+        shell: bash
+        run: echo 'PUMA_CI_RACK=${{ matrix.rack-v }}' >> "$GITHUB_ENV"
+
+      - name: load ruby
+        uses: ruby/setup-ruby-pkgs@2233d39c1315c667a2970436418b520a6300124e # v1.33.5
+        with:
+          # see https://github.com/ruby/setup-ruby/blob/master/action.yml for info
+          ruby-version: ${{ matrix.ruby }}
+          rubygems: default
+          bundler: default
+          bundler-cache: true
+          cache-version: tests
+        timeout-minutes: 10
+
+      - name: Repo & Commit Info
+        run: ruby .github/workflows/github_actions_info.rb
+
+      - name: set WERRORFLAG
+        if: |
+          !(contains(matrix.os, 'ubuntu') && contains(matrix.os, 'arm'))
+        shell: bash
+        run: echo 'PUMA_MAKE_WARNINGS_INTO_ERRORS=true' >> "$GITHUB_ENV"
+
+      - name: compile
+        run: bundle exec rake compile
+
+      - name: Use yjit
+        if: matrix.yjit == ' yjit'
+        shell: bash
+        run: echo 'RUBYOPT=--yjit' >> "$GITHUB_ENV"
+
+      # Integration tests open many short-lived loopback connections. macOS keeps
+      # each closed client port in TIME_WAIT for 2 * MSL (30s by default), and with
+      # parallel tests the ephemeral port range runs out (Errno::EADDRNOTAVAIL).
+      - name: Shorten TCP TIME_WAIT on macOS
+        if: startsWith(matrix.os, 'macos')
+        run: sudo sysctl -w net.inet.tcp.msl=1000
+
+      - name: test
+        timeout-minutes: 10
+        run: test/runner --verbose
+
+  test_non_mri:
+    name: >-
+      ${{ matrix.os }} ${{ matrix.ruby }}
+    env:
+      CI: true
+      PUMA_TEST_DEBUG: true
+      TESTOPTS: -v
+      PUMA_NO_RUBOCOP: true
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    if: |
+      github.event.pull_request.draft != true
+      && !(   contains(github.event.pull_request.title,  '[ci skip]')
+           || contains(github.event.pull_request.title,  '[skip ci]'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-26.04 , ruby: jruby }
+          - { os: ubuntu-26.04 , ruby: jruby-head }
+          - { os: ubuntu-26.04 , ruby: truffleruby }
+          - { os: ubuntu-26.04 , ruby: truffleruby-head }
+
+    steps:
+      - name: repo checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: load ruby
+        uses: ruby/setup-ruby-pkgs@2233d39c1315c667a2970436418b520a6300124e # v1.33.5
+        with:
+          # see https://github.com/ruby/setup-ruby/blob/master/action.yml for info
+          ruby-version: ${{ matrix.ruby }}
+          rubygems: default
+          bundler: default
+          bundler-cache: true
+        timeout-minutes: 10
+
+      - name: set WERRORFLAG
+        shell: bash
+        run: echo 'PUMA_MAKE_WARNINGS_INTO_ERRORS=true' >> "$GITHUB_ENV"
+
+      - name: compile
+        run: bundle exec rake compile
+
+      - name: test
+        timeout-minutes: 8
+        run: test/runner --verbose

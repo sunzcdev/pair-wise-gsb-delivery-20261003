@@ -1,0 +1,86 @@
+name: ragel
+
+on:
+  push:
+    branches:
+      - main
+    paths: &ragel_paths
+      - 'ext/puma_http11/*.rl'
+      - 'ext/puma_http11/http11_parser.c'
+      - 'ext/puma_http11/org/jruby/puma/Http11Parser.java'
+      - 'Rakefile'
+      - '.github/workflows/ragel.yml'
+  pull_request:
+    paths: *ragel_paths
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+jobs:
+  ragel:
+    name: >-
+      ragel ${{ matrix.os }} ${{ matrix.ruby }}
+    env:
+      PUMA_NO_RUBOCOP: true
+      PUMA_TEST_DEBUG: true
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    if: |
+      !(   contains(github.event.pull_request.title,  '[ci skip]')
+        || contains(github.event.pull_request.title,  '[skip ci]'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04 , ruby: head }
+
+    steps:
+      - name: skip duplicate runs
+        id: skip
+        uses: fkirc/skip-duplicate-actions@b974a9395958c231af965b70070979a577efa578 # v5.3.2
+        with:
+          paths_ignore: '["**.md"]'
+          paths: '["ext/puma_http11/*.rl", "ext/puma_http11/http11_parser.c", "ext/puma_http11/org/jruby/puma/Http11Parser.java", "Rakefile", ".github/workflows/ragel.yml"]'
+          concurrent_skipping: 'never'
+          skip_after_successful_duplicate: 'true'
+
+      - name: repo checkout
+        if: steps.skip.outputs.should_skip != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: load ruby
+        if: steps.skip.outputs.should_skip != 'true'
+        uses: ruby/setup-ruby-pkgs@2233d39c1315c667a2970436418b520a6300124e # v1.33.5
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          apt-get: ragel
+          bundler-cache: true
+          cache-version: ragel
+        timeout-minutes: 10
+
+      - name: check ragel generation
+        if: steps.skip.outputs.should_skip != 'true'
+        run: |
+          ragel --version
+          rm ext/puma_http11/http11_parser.c ext/puma_http11/org/jruby/puma/Http11Parser.java
+          bundle exec rake ragel
+          if [ -n "$(git status --porcelain)" ]; then
+            git --no-pager diff
+            echo "bundle exec rake ragel changes a file"
+            exit 1
+          fi
+
+      - name: save ragel generated files on fail
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ failure() }}
+        with:
+          name: ${{ matrix.os }}-ragel-generated-files
+          path: |
+            ext/puma_http11/http11_parser.c
+            ext/puma_http11/org/jruby/puma/Http11Parser.java
