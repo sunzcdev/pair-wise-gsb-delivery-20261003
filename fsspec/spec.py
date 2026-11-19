@@ -7,6 +7,7 @@ import os
 import threading
 import warnings
 import weakref
+from dataclasses import dataclass
 from errno import ESPIPE
 from glob import has_magic
 from hashlib import sha256
@@ -188,6 +189,45 @@ class _Cached(type):
                 cls._latest = token
                 cls._cache[token] = obj
         return obj
+
+
+@dataclass(frozen=True)
+class CopyCapabilities:
+    """A backend's own declaration of what its native copy can do.
+
+    These flags describe *declared* behaviour only; the generic copy layer
+    must not claim that any property was verified when the backend did not
+    commit to it.
+
+    Attributes
+    ----------
+    native_copy:
+        Whether the backend exposes a server-side copy. ``None`` means the
+        backend made no declaration, in which case its copy method is simply
+        attempted. ``False`` means the backend promises that calling its copy
+        method raises before touching any target, so the generic layer can
+        plan a read/write fallback without side effects.
+    versioned_copy:
+        Whether a native copy honours an explicit source/destination version
+        argument. Only meaningful when ``native_copy`` is True.
+    metadata:
+        What happens to user metadata on a native copy: ``"preserved"`` when
+        the backend guarantees it, ``"reset"`` when the target gets fresh
+        metadata, and ``"unknown"`` when no guarantee is made.
+    """
+
+    native_copy: bool | None = None
+    versioned_copy: bool = False
+    metadata: str = "unknown"
+
+    def __post_init__(self):
+        if self.metadata not in ("preserved", "reset", "unknown"):
+            raise ValueError(
+                "metadata must be one of 'preserved', 'reset' or 'unknown', "
+                f"got {self.metadata!r}"
+            )
+        if self.versioned_copy and self.native_copy is not True:
+            raise ValueError("versioned_copy requires native_copy to be True")
 
 
 class AbstractFileSystem(metaclass=_Cached):
@@ -1250,6 +1290,16 @@ class AbstractFileSystem(metaclass=_Cached):
 
     def cp_file(self, path1, path2, **kwargs):
         raise NotImplementedError
+
+    def copy_capabilities(self):
+        """Declare what this backend's native copy can guarantee.
+
+        Backends override this to return a :class:`CopyCapabilities` instance.
+        The conservative default makes no promises, so the generic layer never
+        assumes server-side copying, version handling or metadata preservation
+        unless the backend explicitly states it.
+        """
+        return CopyCapabilities()
 
     def copy(
         self, path1, path2, recursive=False, maxdepth=None, on_error=None, **kwargs

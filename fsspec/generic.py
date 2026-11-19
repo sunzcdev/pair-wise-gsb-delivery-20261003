@@ -4,14 +4,29 @@ import inspect
 import logging
 import os
 import uuid
+from dataclasses import dataclass, field
 
 from .asyn import AsyncFileSystem, _run_coros_in_chunks, sync_wrapper
 from .callbacks import DEFAULT_CALLBACK
 from .core import filesystem, get_filesystem_class, split_protocol, url_to_fs
+from .exceptions import CopyIncompleteError
 from .utils import check_contained
 
 _generic_fs = {}
 logger = logging.getLogger("fsspec.generic")
+
+#: kwargs that pin a specific object version on either side of a copy
+VERSION_COPY_KWARGS = (
+    "version_id",
+    "source_version_id",
+    "target_version_id",
+    "version_aware",
+)
+
+#: the backend performs the whole copy itself, without bytes passing through us
+NATIVE_COPY = "native"
+#: bytes are read from the source and written to the destination by fsspec
+READ_WRITE_FALLBACK = "read_write"
 
 
 def set_generic_fs(protocol, **storage_options):
@@ -35,6 +50,175 @@ def _resolve_fs(url, method, protocol=None, storage_options=None):
         fs, _ = url_to_fs(url, **storage_options.get(protocol, {}))
         return fs
     raise ValueError(f"Unknown FS resolution method: {method}")
+
+
+def _fs_label(fs):
+    """Human-readable identity of a storage *instance*.
+
+    Two backends sharing a protocol string (e.g. two S3 accounts, two memory
+    stores) are not the same instance, so the object id is included.
+    """
+    proto = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
+    return f"{proto}:{type(fs).__name__}#{id(fs):x}"
+
+
+def _version_kwargs(kwargs):
+    return {key: kwargs[key] for key in VERSION_COPY_KWARGS if key in kwargs}
+
+
+@dataclass(frozen=True)
+class CopyOperation:
+    """One source/destination pair plus the resolved backend instances."""
+
+    source: str
+    destination: str
+    source_fs: object
+    destination_fs: object
+    kwargs: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CopyPlan:
+    """The route chosen for a copy batch, before any side effect happens.
+
+    ``mode`` is :data:`NATIVE_COPY` when the same backend instance performs the
+    whole copy, or :data:`READ_WRITE_FALLBACK` when fsspec must stream the bytes
+    itself. Every reason that contributed to the decision is recorded, so the
+    plan can explain itself via :meth:`explain`.
+    """
+
+    operations: tuple[CopyOperation, ...]
+    mode: str
+    reasons: tuple[str, ...]
+    backend: object | None = None
+    capabilities: object | None = None
+    metadata: str = "unknown"
+    version_kwargs: dict = field(default_factory=dict)
+
+    def explain(self):
+        """Return a human-readable explanation of the chosen route."""
+        routes = {
+            "native": "backend-native server-side copy",
+            "read_write": "read/write fallback (bytes streamed through fsspec)",
+        }
+        lines = [
+            f"Copy plan: {routes[self.mode]} for {len(self.operations)} file(s)"
+        ]
+        first = self.operations[0]
+        lines.append(
+            f"  source backend:      {_fs_label(first.source_fs)}"
+        )
+        lines.append(
+            f"  destination backend: {_fs_label(first.destination_fs)}"
+        )
+        if self.version_kwargs:
+            lines.append(f"  version arguments:   {self.version_kwargs}")
+        lines.append(f"  metadata handling:   {self.metadata} (not re-verified)")
+        for reason in self.reasons:
+            lines.append(f"  - {reason}")
+        return "\n".join(lines)
+
+
+@dataclass
+class VerificationReport:
+    """What was actually checked after a copy.
+
+    A property only appears as ``"verified"`` when fsspec itself performed the
+    check. Guarantees made by the backend's declared capabilities are reported
+    as ``"guaranteed"``; everything that cannot be proven is ``"not_verified"``.
+    """
+
+    destination: str
+    existence: str
+    size: str
+    metadata: str
+    detail: dict = field(default_factory=dict)
+
+
+@dataclass
+class CopyResult:
+    """Outcome of executing a :class:`CopyPlan`."""
+
+    plan: CopyPlan
+    completed: list = field(default_factory=list)
+    failures: dict = field(default_factory=dict)
+    attempted: list = field(default_factory=list)
+    fallback_used: bool = False
+    native_fallback: bool = False
+
+    @property
+    def incomplete(self):
+        """Destinations that were attempted but not confirmed complete."""
+        return [u for u in self.attempted if u not in self.completed]
+
+    def _raise_if_incomplete(self):
+        if not self.failures and not self.incomplete:
+            return
+        # When every attempt failed and nothing was written, surface the
+        # original exception rather than hiding it behind a wrapper.
+        if not self.completed and len(self.failures) == len(self.attempted):
+            raise next(iter(self.failures.values()))
+        raise CopyIncompleteError(
+            "Copy did not complete for all destinations; no retry was "
+            "attempted because some targets may already have been written",
+            completed=self.completed,
+            incomplete=self.incomplete,
+            failures=self.failures,
+        )
+
+    def verify(self):
+        """Check the destinations that were reported complete.
+
+        Existence and size are checked when the source size is known. Metadata
+        is never inspected by the generic layer: it is only reported as
+        guaranteed when the backend's capabilities promise preservation.
+        """
+        reports = []
+        for op in self.plan.operations:
+            if op.destination not in self.completed:
+                continue
+            size_state = "not_verified"
+            existence_state = "not_verified"
+            detail = {}
+            try:
+                info = op.destination_fs.info(op.destination)
+            except Exception as exc:  # nothing else safe to claim
+                reports.append(
+                    VerificationReport(
+                        op.destination,
+                        existence="not_verified",
+                        size="not_verified",
+                        metadata="not_verified",
+                        detail={"error": repr(exc)},
+                    )
+                )
+                continue
+            existence_state = "verified" if info else "not_verified"
+            try:
+                source_info = op.source_fs.info(op.source)
+                if (
+                    "size" in source_info
+                    and "size" in info
+                    and source_info["size"] == info["size"]
+                ):
+                    size_state = "verified"
+                    detail["size"] = info["size"]
+            except Exception:
+                pass
+            if self.plan.metadata == "preserved":
+                metadata_state = "guaranteed"
+            else:
+                metadata_state = "not_verified"
+            reports.append(
+                VerificationReport(
+                    op.destination,
+                    existence_state,
+                    size_state,
+                    metadata_state,
+                    detail=detail,
+                )
+            )
+        return reports
 
 
 def rsync(
@@ -288,6 +472,248 @@ class GenericFileSystem(AsyncFileSystem):
         """
         rsync(source, destination, fs=self, **kwargs)
 
+    def plan_copy(self, path1, path2, **kwargs):
+        """Decide how a copy batch will be executed, without performing it.
+
+        The decision is based on the resolved backend *instances* (two
+        backends using the same protocol string are treated as different
+        stores), any version arguments and the capabilities the backends
+        declare. No target is touched while building the plan.
+
+        Returns
+        -------
+        CopyPlan
+        """
+        path1 = [path1] if isinstance(path1, str) else list(path1)
+        path2 = [path2] if isinstance(path2, str) else list(path2)
+        if len(path1) != len(path2):
+            raise ValueError("source and destination lists must have equal length")
+
+        sources = [
+            _resolve_fs(u, self.method, storage_options=self.st_opts) for u in path1
+        ]
+        dests = [
+            _resolve_fs(u, self.method, storage_options=self.st_opts) for u in path2
+        ]
+
+        # Validate the whole batch before planning any side effect.
+        fs, fs2 = sources[0], dests[0]
+        for side, backends, expected in (
+            ("source", sources, fs),
+            ("destination", dests, fs2),
+        ):
+            if any(backend is not expected for backend in backends[1:]):
+                raise ValueError(f"Multiple {side} backends are not supported")
+
+        operations = tuple(
+            CopyOperation(u1, u2, f1, f2, dict(kwargs))
+            for u1, u2, f1, f2 in zip(path1, path2, sources, dests)
+        )
+        versions = _version_kwargs(kwargs)
+        reasons = []
+        same_instance = fs is fs2
+
+        if not same_instance:
+            reasons.append(
+                f"source and destination are different storage instances "
+                f"({_fs_label(fs)} vs {_fs_label(fs2)}); a native server-side "
+                "copy cannot cross them"
+            )
+            return CopyPlan(
+                operations,
+                READ_WRITE_FALLBACK,
+                tuple(reasons),
+                version_kwargs=versions,
+                metadata="unknown",
+            )
+
+        capabilities = fs.copy_capabilities()
+        if capabilities.native_copy is False:
+            reasons.append(
+                f"{_fs_label(fs)} declares that it does not support native copy"
+            )
+            return CopyPlan(
+                operations,
+                READ_WRITE_FALLBACK,
+                tuple(reasons),
+                backend=fs,
+                capabilities=capabilities,
+                version_kwargs=versions,
+                metadata="unknown",
+            )
+
+        if versions and not capabilities.versioned_copy:
+            reasons.append(
+                "version arguments were requested "
+                f"({sorted(versions)}) but {_fs_label(fs)} does not declare "
+                "version-aware native copy"
+            )
+            return CopyPlan(
+                operations,
+                READ_WRITE_FALLBACK,
+                tuple(reasons),
+                backend=fs,
+                capabilities=capabilities,
+                version_kwargs=versions,
+                metadata="unknown",
+            )
+
+        if capabilities.native_copy is True:
+            reasons.append(f"{_fs_label(fs)} declares native server-side copy support")
+        else:
+            reasons.append(
+                f"{_fs_label(fs)} makes no native-copy declaration; its copy "
+                "method will be attempted"
+            )
+        if versions:
+            reasons.append("the backend declares version-aware native copy")
+        reasons.append(
+            f"metadata handling on the native path is '{capabilities.metadata}'"
+        )
+        return CopyPlan(
+            operations,
+            NATIVE_COPY,
+            tuple(reasons),
+            backend=fs,
+            capabilities=capabilities,
+            version_kwargs=versions,
+            metadata=capabilities.metadata,
+        )
+
+    async def _execute_plan(
+        self, plan, tempdir=None, batch_size=None, on_error="ignore"
+    ):
+        """Execute a plan, tracking what was actually attempted and completed."""
+        result = CopyResult(plan=plan)
+        if plan.mode is READ_WRITE_FALLBACK:
+            await self._run_read_write(
+                plan, result, tempdir=tempdir, batch_size=batch_size, on_error=on_error
+            )
+            return result
+
+        # Native path: one backend instance handles the whole batch.
+        fs = plan.backend
+        sources = [op.source for op in plan.operations]
+        targets = [op.destination for op in plan.operations]
+        kwargs = plan.operations[0].kwargs
+        before = {url: self._target_marker(fs, url) for url in targets}
+        try:
+            if fs.async_impl:
+                await fs._copy(sources, targets, **kwargs)
+            else:
+                fs.copy(sources, targets, **kwargs)
+        except NotImplementedError as exc:
+            # Only safe when nothing could have been written yet. Compare the
+            # targets against their pre-call state to prove no side effect.
+            changed = [
+                url
+                for url in targets
+                if self._target_marker(fs, url) != before[url]
+            ]
+            if changed:
+                result.attempted.extend(targets)
+                for url in changed:
+                    result.failures[url] = exc
+                logger.warning(
+                    "Native copy failed after targets were touched; not retrying: %s",
+                    changed,
+                )
+                result._raise_if_incomplete()
+            logger.info(
+                "Backend %s raised NotImplementedError before any side effect; "
+                "falling back to read/write copy: %s",
+                _fs_label(fs),
+                exc,
+            )
+            result.fallback_used = True
+            result.native_fallback = True
+            fallback = CopyPlan(
+                plan.operations,
+                READ_WRITE_FALLBACK,
+                plan.reasons
+                + (
+                    "native copy raised NotImplementedError before writing; "
+                    "falling back while still side-effect free",
+                ),
+                backend=fs,
+                capabilities=plan.capabilities,
+                version_kwargs=plan.version_kwargs,
+                metadata="unknown",
+            )
+            result.plan = fallback
+            await self._run_read_write(
+                fallback,
+                result,
+                tempdir=tempdir,
+                batch_size=batch_size,
+                on_error=on_error,
+            )
+            return result
+        except Exception as exc:
+            # The batch may be partially written. Never blindly resend; the
+            # target states are unknown even for the ones that did not raise.
+            result.attempted.extend(targets)
+            for url in targets:
+                result.failures[url] = exc
+            logger.error(
+                "Native copy failed with target state unknown; no retry is "
+                "attempted: %s",
+                exc,
+            )
+            if on_error == "raise":
+                raise CopyIncompleteError(
+                    "Native copy failed with the state of some targets "
+                    "unknown; no retry was attempted because data may already "
+                    "have been written",
+                    completed=result.completed,
+                    incomplete=result.incomplete,
+                    failures=result.failures,
+                ) from exc
+            return result
+
+        result.completed.extend(targets)
+        result.attempted.extend(targets)
+        return result
+
+    @staticmethod
+    def _target_marker(fs, url):
+        """Cheap fingerprint used only to detect writes during a failed copy."""
+        try:
+            info = fs.info(url)
+        except Exception as exc:
+            return ("missing", type(exc).__name__)
+        return ("present", info.get("size"), info.get("modified"))
+
+    async def _run_read_write(
+        self, plan, result, tempdir=None, batch_size=None, on_error="ignore"
+    ):
+        import tempfile
+
+        result.attempted.extend(op.destination for op in plan.operations)
+        with tempfile.TemporaryDirectory(dir=tempdir) as staging:
+            coros = [
+                _copy_file_op(
+                    op.source_fs,
+                    op.source,
+                    op.destination_fs,
+                    op.destination,
+                    os.path.join(staging, uuid.uuid4().hex),
+                )
+                for op in plan.operations
+            ]
+            outcomes = await _run_coros_in_chunks(
+                coros, batch_size=batch_size, return_exceptions=True
+            )
+        for op, outcome in zip(plan.operations, outcomes):
+            if isinstance(outcome, Exception):
+                result.failures[op.destination] = outcome
+                if on_error == "raise":
+                    result._raise_if_incomplete()
+            else:
+                result.completed.append(op.destination)
+        if on_error == "raise":
+            result._raise_if_incomplete()
+
     async def _cp_file(
         self,
         url,
@@ -297,15 +723,13 @@ class GenericFileSystem(AsyncFileSystem):
         tempdir: str | None = None,
         **kwargs,
     ):
-        fs = _resolve_fs(url, self.method, storage_options=self.st_opts)
-        fs2 = _resolve_fs(url2, self.method, storage_options=self.st_opts)
-        if fs is fs2:
-            # pure remote
-            if fs.async_impl:
-                return await fs._copy(url, url2, **kwargs)
-            else:
-                return fs.copy(url, url2, **kwargs)
-        await copy_file_op(fs, [url], fs2, [url2], tempdir, 1, on_error="raise")
+        plan = self.plan_copy(url, url2, **kwargs)
+        logger.debug("%s", plan.explain())
+        result = await self._execute_plan(
+            plan, tempdir=tempdir, batch_size=1, on_error="raise"
+        )
+        result._raise_if_incomplete()
+        return result
 
     async def _make_many_dirs(self, urls, exist_ok=True):
         fs = _resolve_fs(urls[0], self.method, storage_options=self.st_opts)
@@ -336,35 +760,27 @@ class GenericFileSystem(AsyncFileSystem):
         path1 = [path1] if isinstance(path1, str) else path1
         path2 = [path2] if isinstance(path2, str) else path2
 
-        fs = _resolve_fs(path1, self.method, storage_options=self.st_opts)
-        fs2 = _resolve_fs(path2, self.method, storage_options=self.st_opts)
-
-        # Validate both entire batches before copying any files.
-        for paths, backend, side in (
-            (path1, fs, "source"),
-            (path2, fs2, "destination"),
-        ):
-            if any(
-                _resolve_fs(path, self.method, storage_options=self.st_opts)
-                is not backend
-                for path in paths
-            ):
-                raise ValueError(f"Multiple {side} backends are not supported")
-
-        if fs is fs2:
-            if fs.async_impl:
-                return await fs._copy(path1, path2, **kwargs)
-            else:
-                return fs.copy(path1, path2, **kwargs)
-
-        await copy_file_op(
-            fs, path1, fs2, path2, tempdir, batch_size, on_error=on_error
+        # Planning validates the whole batch (including rejecting mixed
+        # backends) before any destination is touched.
+        plan = self.plan_copy(path1, path2, **kwargs)
+        logger.debug("%s", plan.explain())
+        result = await self._execute_plan(
+            plan, tempdir=tempdir, batch_size=batch_size, on_error=on_error
         )
+        if on_error == "raise":
+            result._raise_if_incomplete()
+        return result
 
 
 async def copy_file_op(
     fs1, url1, fs2, url2, tempdir=None, batch_size=20, on_error="ignore"
 ):
+    """Stream a batch of files from ``fs1`` to ``fs2`` via a local staging dir.
+
+    Kept as a module-level helper for callers that already work with resolved
+    backend instances. Returns the per-file outcome list (exceptions included)
+    when ``on_error == "return"``.
+    """
     import tempfile
 
     with tempfile.TemporaryDirectory(dir=tempdir) as tempdir:

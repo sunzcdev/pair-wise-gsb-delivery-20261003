@@ -9,6 +9,7 @@ from typing import Any
 
 from fsspec import AbstractFileSystem
 from fsspec.implementations.local import LocalFileSystem
+from fsspec.spec import CopyCapabilities
 from fsspec.utils import stringify_path, tokenize
 
 logger = logging.getLogger("fsspec.memoryfs")
@@ -376,6 +377,13 @@ class MemoryFileSystem(AbstractFileSystem):
                 raise FileExistsError(path2)
             if path2 not in self.pseudo_dirs:
                 self.pseudo_dirs.append(path2)
+
+    def copy_capabilities(self):
+        # cp_file materialises a fresh MemoryFile, so timestamps are recreated
+        # and no user metadata exists to carry over.
+        return CopyCapabilities(
+            native_copy=True, versioned_copy=False, metadata="reset"
+        )
 
     def cat_file(self, path, start=None, end=None, **kwargs):
         logger.debug("cat: %s", path)
