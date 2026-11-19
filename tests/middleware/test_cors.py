@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -6,6 +10,9 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 from tests.types import TestClientFactory
+
+if TYPE_CHECKING:
+    from starlette.testclient import TestClient
 
 
 def test_cors_allow_all(
@@ -625,3 +632,196 @@ def test_cors_vary_origin_with_gzip(test_client_factory: TestClientFactory) -> N
         "Accept-Encoding",
         "Origin",
     }
+
+
+def _make_cache_friendly_app(test_client_factory: TestClientFactory) -> TestClient:
+    def homepage(request: Request) -> PlainTextResponse:  # pragma: no cover
+        return PlainTextResponse("Homepage", status_code=200)
+
+    app = Starlette(
+        routes=[Route("/", endpoint=homepage)],
+        middleware=[
+            Middleware(
+                CORSMiddleware,
+                allow_origins=["https://example.org"],
+                allow_methods=["GET", "POST"],
+                allow_headers=["X-Allowed"],
+                cache_friendly=True,
+            )
+        ],
+    )
+    return test_client_factory(app)
+
+
+def test_cors_cache_friendly_preflight_varies_on_requested_method_and_headers(
+    test_client_factory: TestClientFactory,
+) -> None:
+    client = _make_cache_friendly_app(test_client_factory)
+
+    headers = {
+        "Origin": "https://example.org",
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "X-Allowed",
+    }
+    response = client.options("/", headers=headers)
+    assert response.status_code == 200
+    assert response.text == "OK"
+    assert response.headers["access-control-allow-origin"] == "https://example.org"
+    assert response.headers["vary"] == (
+        "Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Access-Control-Request-Private-Network"
+    )
+
+
+def test_cors_cache_friendly_disallowed_preflight_still_varies(
+    test_client_factory: TestClientFactory,
+) -> None:
+    client = _make_cache_friendly_app(test_client_factory)
+
+    headers = {
+        "Origin": "https://example.org",
+        "Access-Control-Request-Method": "DELETE",
+        "Access-Control-Request-Headers": "X-Nope",
+    }
+    response = client.options("/", headers=headers)
+    assert response.status_code == 400
+    assert response.text == "Disallowed CORS method, headers"
+    # A rejection is cacheable too, so it has to carry the same key fields.
+    assert response.headers["vary"] == (
+        "Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Access-Control-Request-Private-Network"
+    )
+
+
+def test_cors_cache_friendly_merges_existing_vary_values(
+    test_client_factory: TestClientFactory,
+) -> None:
+    def homepage(request: Request) -> PlainTextResponse:  # pragma: no cover
+        return PlainTextResponse("Homepage", status_code=200)
+
+    middleware = CORSMiddleware(
+        Starlette(routes=[Route("/", endpoint=homepage)]),
+        allow_origins=["https://example.org"],
+        cache_friendly=True,
+    )
+    # Simulate a `Vary` value already declared by something else, including a
+    # differently cased duplicate of one of the preflight field names.
+    middleware.preflight_headers["Vary"] = "Accept-Encoding, access-control-request-method"
+
+    client = test_client_factory(middleware)
+    response = client.options(
+        "/",
+        headers={"Origin": "https://example.org", "Access-Control-Request-Method": "GET"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["vary"] == (
+        "Accept-Encoding, access-control-request-method, Origin, "
+        "Access-Control-Request-Headers, Access-Control-Request-Private-Network"
+    )
+
+
+def test_cors_cache_friendly_merges_vary_of_simple_response(
+    test_client_factory: TestClientFactory,
+) -> None:
+    def homepage(request: Request) -> PlainTextResponse:
+        response = PlainTextResponse("Homepage", headers={"Vary": "Accept-Encoding"})
+        # A differently cased duplicate of the field `CORSMiddleware` adds.
+        response.headers.append("Vary", "origin")
+        return response
+
+    app = Starlette(
+        routes=[Route("/", endpoint=homepage)],
+        middleware=[Middleware(CORSMiddleware, allow_origins=["https://example.org"], cache_friendly=True)],
+    )
+    client = test_client_factory(app)
+
+    response = client.get("/", headers={"Origin": "https://example.org"})
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://example.org"
+    # The existing casing wins and `Origin` is not repeated.
+    assert response.headers["vary"] == "Accept-Encoding, origin"
+
+
+def test_cors_cache_friendly_does_not_reuse_preflight_for_other_requested_headers(
+    test_client_factory: TestClientFactory,
+) -> None:
+    client = _make_cache_friendly_app(test_client_factory)
+
+    # A tiny shared cache that knows nothing about CORS: it stores a response
+    # under the field names found in its own `Vary` header, and only reuses it
+    # for a request carrying the same values for those fields.
+    def cache_key(vary: str, request_headers: dict[str, str]) -> tuple[tuple[str, str], ...]:
+        lookup = {name.lower(): value for name, value in request_headers.items()}
+        field_names = [field.strip().lower() for field in vary.split(",")]
+        return tuple((name, lookup.get(name, "")) for name in field_names)
+
+    cache: list[tuple[tuple[tuple[str, str], ...], Any]] = []
+    evaluated: list[dict[str, str]] = []
+
+    def preflight(request_headers: dict[str, str]) -> tuple[bool, Any]:
+        for key, response in cache:
+            if key == cache_key(response.headers["vary"], request_headers):
+                return True, response
+        evaluated.append(request_headers)
+        response = client.options("/", headers=request_headers)
+        cache.append((cache_key(response.headers["vary"], request_headers), response))
+        return False, response
+
+    allowed = {
+        "Origin": "https://example.org",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "X-Allowed",
+    }
+    # Same `Origin`, but this one asks for a method and a header that are not
+    # allowed.
+    denied = {
+        "Origin": "https://example.org",
+        "Access-Control-Request-Method": "DELETE",
+        "Access-Control-Request-Headers": "X-Other",
+    }
+
+    hit, first = preflight(allowed)
+    assert hit is False
+    assert first.status_code == 200
+    assert first.text == "OK"
+
+    hit, second = preflight(denied)
+    # The second request was evaluated on its own instead of reusing the
+    # approval stored for the first one.
+    assert hit is False
+    assert second.status_code == 400
+    assert second.text == "Disallowed CORS method, headers"
+    assert evaluated == [allowed, denied]
+
+    # Both entries are now stored, and each is only served for its own
+    # request.
+    hit, again = preflight(allowed)
+    assert hit is True
+    assert again.status_code == 200
+    assert again.text == "OK"
+    hit, repeat = preflight(denied)
+    assert hit is True
+    assert repeat.status_code == 400
+    assert repeat.text == "Disallowed CORS method, headers"
+    assert evaluated == [allowed, denied]
+
+
+def test_cors_cache_friendly_simple_response_only_varies_on_origin(
+    test_client_factory: TestClientFactory,
+) -> None:
+    def homepage(request: Request) -> PlainTextResponse:
+        return PlainTextResponse("Homepage", status_code=200, headers={"Vary": "Accept-Encoding"})
+
+    app = Starlette(
+        routes=[Route("/", endpoint=homepage)],
+        middleware=[Middleware(CORSMiddleware, allow_origins=["https://example.org"], cache_friendly=True)],
+    )
+    client = test_client_factory(app)
+
+    response = client.get("/", headers={"Origin": "https://example.org"})
+    assert response.status_code == 200
+    assert response.headers["vary"] == "Accept-Encoding, Origin"
+
+    response = client.get("/", headers={"Origin": "https://other.org"})
+    assert "access-control-allow-origin" not in response.headers
+    assert response.headers["vary"] == "Accept-Encoding, Origin"

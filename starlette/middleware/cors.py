@@ -11,6 +11,21 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 ALL_METHODS = ("DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "QUERY")
 SAFELISTED_HEADERS = {"Accept", "Accept-Language", "Content-Language", "Content-Type"}
 
+# Request header fields that take part in the decision made for a preflight
+# request. Any of them can change the response served for the same URL and
+# `Origin`, so a shared cache has to key on all of them.
+PREFLIGHT_VARY_FIELD_NAMES = (
+    "Origin",
+    "Access-Control-Request-Method",
+    "Access-Control-Request-Headers",
+    "Access-Control-Request-Private-Network",
+)
+PREFLIGHT_VARY = ", ".join(PREFLIGHT_VARY_FIELD_NAMES)
+
+# The only request header field a simple (non-preflight) CORS response depends
+# on.
+SIMPLE_VARY = "Origin"
+
 
 class CORSMiddleware:
     def __init__(
@@ -24,6 +39,7 @@ class CORSMiddleware:
         allow_private_network: bool = False,
         expose_headers: Collection[str] = (),
         max_age: int = 600,
+        cache_friendly: bool = False,
     ) -> None:
         if "*" in allow_methods:
             allow_methods = ALL_METHODS
@@ -44,9 +60,12 @@ class CORSMiddleware:
         if expose_headers:
             simple_headers["Access-Control-Expose-Headers"] = ", ".join(expose_headers)
 
-        preflight_headers: dict[str, str] = {
-            "Vary": "Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Access-Control-Request-Private-Network"  # noqa: E501  # fmt: skip
-        }
+        preflight_headers: dict[str, str] = {}
+        if not cache_friendly:
+            # The historical behaviour publishes a single static value. In
+            # cache-friendly mode the field names are merged into whatever the
+            # response already declares, see `preflight_response()`.
+            preflight_headers["Vary"] = PREFLIGHT_VARY
         if not preflight_explicit_allow_origin:
             preflight_headers["Access-Control-Allow-Origin"] = "*"
         preflight_headers.update(
@@ -73,6 +92,7 @@ class CORSMiddleware:
         self.allow_private_network = allow_private_network
         self.simple_headers = simple_headers
         self.preflight_headers = preflight_headers
+        self.cache_friendly = cache_friendly
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":  # pragma: no cover
@@ -140,9 +160,19 @@ class CORSMiddleware:
         # if we do.
         if failures:
             failure_text = "Disallowed CORS " + ", ".join(failures)
-            return PlainTextResponse(failure_text, status_code=400, headers=headers)
+            response = PlainTextResponse(failure_text, status_code=400, headers=headers)
+        else:
+            response = PlainTextResponse("OK", status_code=200, headers=headers)
 
-        return PlainTextResponse("OK", status_code=200, headers=headers)
+        if self.cache_friendly:
+            # Merge the request fields that took part in this decision into
+            # whatever `Vary` value the response already has. This is done for
+            # rejected preflights too, so a shared cache can neither reuse an
+            # approval nor a rejection for a different requested method or
+            # header set coming from the same origin.
+            response.headers.add_vary_header(PREFLIGHT_VARY)
+
+        return response
 
     async def simple_response(self, scope: Scope, receive: Receive, send: Send, request_headers: Headers) -> None:
         send = functools.partial(self.send, send=send, request_headers=request_headers)
@@ -159,19 +189,32 @@ class CORSMiddleware:
         if origin is not None:
             headers.update(self.simple_headers)
 
-        # If credentials are allowed, then we must respond with the specific origin instead of '*'.
-        if origin is not None and self.allow_all_origins and self.allow_credentials:
-            self.allow_explicit_origin(headers, origin)
+            # If credentials are allowed, then we must respond with the specific origin instead of '*'.
+            if self.allow_all_origins and self.allow_credentials:
+                self.allow_explicit_origin(headers, origin)
+            # If we only allow specific origins, then we have to mirror back the Origin header in the response.
+            elif not self.allow_all_origins and self.is_allowed_origin(origin=origin):
+                self.allow_explicit_origin(headers, origin)
 
-        # If we only allow specific origins, then we have to mirror back the Origin header in the response.
-        elif origin is not None and not self.allow_all_origins and self.is_allowed_origin(origin=origin):
-            self.allow_explicit_origin(headers, origin)
-        else:
-            headers["Vary"] = ", ".join([*headers.getlist("Vary"), "Origin"])
+        # Simple responses depend on the `Origin` header, whether they carry
+        # CORS headers or not.
+        self.add_vary(headers, SIMPLE_VARY)
 
         await send(message)
 
     @staticmethod
     def allow_explicit_origin(headers: MutableHeaders, origin: str) -> None:
         headers["Access-Control-Allow-Origin"] = origin
-        headers["Vary"] = ", ".join([*headers.getlist("Vary"), "Origin"])
+
+    def add_vary(self, headers: MutableHeaders, field_names: str) -> None:
+        """
+        Declare the request fields this response depends on in `Vary`.
+
+        In cache-friendly mode the field names are merged with whatever value the
+        response already carries, ignoring case and repeated field names. The
+        default mode appends to the existing values, as it always did.
+        """
+        if self.cache_friendly:
+            headers.add_vary_header(field_names)
+        else:
+            headers["Vary"] = ", ".join([*headers.getlist("Vary"), field_names])

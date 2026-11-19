@@ -679,7 +679,27 @@ class MutableHeaders(Headers):
         self._list.append((append_key, append_value))
 
     def add_vary_header(self, vary: str) -> None:
-        self["vary"] = ", ".join([*self.getlist("vary"), vary])
+        """
+        Add one or more field names to the `Vary` header.
+
+        Existing `Vary` values are preserved, merged case-insensitively and
+        deduplicated, so callers can add their own field names without
+        discarding what was already set. A `Vary: *` value is kept as is,
+        since it already prevents any reuse of the response.
+        """
+        field_names: list[str] = []
+        seen: set[str] = set()
+        for value in (*self.getlist("vary"), vary):
+            for field_name in value.split(","):
+                field_name = field_name.strip()
+                if not field_name or field_name.lower() in seen:
+                    continue
+                seen.add(field_name.lower())
+                field_names.append(field_name)
+        if "*" in seen:
+            self["vary"] = "*"
+        elif field_names:
+            self["vary"] = ", ".join(field_names)
 
 
 class State:

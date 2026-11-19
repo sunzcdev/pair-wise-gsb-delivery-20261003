@@ -170,6 +170,8 @@ The following arguments are supported:
 * `allow_private_network` - Indicates whether to accept cross-origin requests over a private network. Defaults to `False`.
 * `expose_headers` - Indicate any response headers that should be made accessible to the browser. Defaults to `[]`.
 * `max_age` - Sets a maximum time in seconds for browsers to cache CORS responses. Defaults to `600`.
+* `cache_friendly` - Merge the request fields that a response depends on into its `Vary` header, so shared caches
+  key preflight responses on the requested method and headers, not just the `Origin`. Defaults to `False`.
 
 The middleware responds to two particular types of HTTP request...
 
@@ -178,6 +180,14 @@ The middleware responds to two particular types of HTTP request...
 These are any `OPTIONS` request with `Origin` and `Access-Control-Request-Method` headers.
 In this case the middleware will intercept the incoming request and respond with
 appropriate CORS headers, and either a 200 or 400 response for informational purposes.
+
+A preflight response depends on more than the `Origin`: the requested method and the
+requested headers also take part in the decision. When the middleware is created with
+`cache_friendly=True`, those fields are merged into the `Vary` header of every preflight
+response, including the 400 rejections. This lets a shared cache store the response for
+one `(Origin, method, headers)` combination without serving it for another one. Existing
+`Vary` values are kept, and repeated field names are only listed once, regardless of the
+case they were written in. Simple (non-preflight) responses still only vary on `Origin`.
 
 #### Simple requests
 

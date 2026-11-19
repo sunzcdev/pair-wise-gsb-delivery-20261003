@@ -424,6 +424,39 @@ def test_mutable_headers_from_scope() -> None:
     assert list(h.raw) == [(b"a", b"1"), (b"b", b"2")]
 
 
+def test_mutable_headers_add_vary_header() -> None:
+    h = MutableHeaders()
+    h.add_vary_header("Origin")
+    assert h["vary"] == "Origin"
+
+    h.add_vary_header("Accept-Encoding")
+    assert h["vary"] == "Origin, Accept-Encoding"
+
+    h.add_vary_header("origin")
+    assert h["vary"] == "Origin, Accept-Encoding"
+
+
+def test_mutable_headers_add_vary_header_merges_existing_values() -> None:
+    h = MutableHeaders()
+    h.append("Vary", "Accept-Encoding")
+    h.append("vary", "accept-language, Origin")
+
+    h.add_vary_header("Origin, Accept-Encoding")
+
+    assert h.getlist("vary") == ["Accept-Encoding, accept-language, Origin"]
+
+
+def test_mutable_headers_add_vary_header_star() -> None:
+    h = MutableHeaders({"Vary": "Accept-Encoding"})
+
+    h.add_vary_header("*")
+
+    assert h["vary"] == "*"
+
+    h.add_vary_header("Origin")
+    assert h["vary"] == "*"
+
+
 def test_url_blank_params() -> None:
     q = QueryParams("a=123&abc&def&b=456")
     assert "a" in q
