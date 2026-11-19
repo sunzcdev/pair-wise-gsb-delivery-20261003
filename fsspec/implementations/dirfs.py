@@ -310,6 +310,14 @@ class DirFileSystem(AsyncFileSystem, ChainedFileSystem):
     def checksum(self, path):
         return self.fs.checksum(self._join(path))
 
+    @property
+    def checksum_capability(self):
+        # pass through the real source of checksum guarantees
+        return self.fs.checksum_capability
+
+    def checksum_report(self, path, **kwargs):
+        return self.fs.checksum_report(self._join(path), **kwargs)
+
     async def _exists(self, path):
         return await self.fs._exists(self._join(path))
 

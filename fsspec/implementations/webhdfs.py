@@ -316,6 +316,18 @@ class WebHDFS(AbstractFileSystem):
             out.raise_for_status()
             return out.json()["FileChecksum"]
 
+    checksum_capability = "backend"
+
+    def _backend_checksum_report(self, path, algorithm=None):
+        # HDFS computes the checksum server-side; the response names the
+        # algorithm and the number of bytes it covers
+        out = self.ukey(path)
+        return {
+            "algorithm": out["algorithm"],
+            "value": out["bytes"],
+            "range": (0, out["length"]),
+        }
+
     def home_directory(self):
         """Get user's home directory"""
         out = self._call("GETHOMEDIRECTORY")

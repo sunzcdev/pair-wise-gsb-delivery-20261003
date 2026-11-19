@@ -15,10 +15,12 @@ except (ImportError, ModuleNotFoundError, OSError):
     yarl = False
 
 from fsspec.callbacks import _DEFAULT_CALLBACK
+from fsspec.exceptions import ChecksumUnsupported
 from fsspec.registry import register_implementation
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 from fsspec.utils import (
     DEFAULT_BLOCK_SIZE,
+    http_content_digest,
     isfilelike,
     nullcontext,
     range_response_window,
@@ -555,6 +557,23 @@ class HTTPFileSystem(AbstractFileSystem):
     def ukey(self, url):
         """Unique identifier; assume HTTP files are static, unchanging"""
         return tokenize(url, self.kwargs, self.protocol)
+
+    checksum_capability = "backend"
+
+    def _backend_checksum_report(self, path, algorithm=None):
+        info = self.info(path)
+        out = http_content_digest(info)
+        if out is None:
+            raise ChecksumUnsupported(
+                f"server provided no content digest for {path}"
+            )
+        alg, value = out
+        size = info.get("size")
+        return {
+            "algorithm": alg,
+            "value": value,
+            "range": (0, size) if size is not None else None,
+        }
 
     def info(self, url, **kwargs):
         """Get info of URL

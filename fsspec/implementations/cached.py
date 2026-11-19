@@ -728,6 +728,14 @@ class WholeFileCacheFileSystem(CachingFileSystem):
             return sha256(str(await self.fs._info(path)).encode()).hexdigest()
         return await asyncio.to_thread(self.fs.ukey, path)
 
+    @property
+    def checksum_capability(self):
+        # pass through the real source of checksum guarantees
+        return self.fs.checksum_capability
+
+    def checksum_report(self, path, **kwargs):
+        return self.fs.checksum_report(path, **kwargs)
+
     async def _check_file_async(self, path):
         # _check_file, with the async-safe ukey for check_files
         self._check_cache()

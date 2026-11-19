@@ -12,11 +12,12 @@ import yarl
 
 from fsspec.asyn import AbstractAsyncStreamedFile, AsyncFileSystem, sync, sync_wrapper
 from fsspec.callbacks import DEFAULT_CALLBACK
-from fsspec.exceptions import FSTimeoutError
+from fsspec.exceptions import ChecksumUnsupported, FSTimeoutError
 from fsspec.spec import AbstractBufferedFile
 from fsspec.utils import (
     DEFAULT_BLOCK_SIZE,
     glob_translate,
+    http_content_digest,
     isfilelike,
     nullcontext,
     range_response_window,
@@ -550,6 +551,23 @@ class HTTPFileSystem(AsyncFileSystem):
     def ukey(self, url):
         """Unique identifier; assume HTTP files are static, unchanging"""
         return tokenize(url, self.kwargs, self.protocol)
+
+    checksum_capability = "backend"
+
+    def _backend_checksum_report(self, path, algorithm=None):
+        info = self.info(path)
+        out = http_content_digest(info)
+        if out is None:
+            raise ChecksumUnsupported(
+                f"server provided no content digest for {path}"
+            )
+        alg, value = out
+        size = info.get("size")
+        return {
+            "algorithm": alg,
+            "value": value,
+            "range": (0, size) if size is not None else None,
+        }
 
     async def _info(self, url, **kwargs):
         """Get info of URL

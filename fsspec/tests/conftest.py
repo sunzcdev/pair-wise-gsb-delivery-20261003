@@ -1,5 +1,6 @@
 import contextlib
 import gzip
+import hashlib
 import json
 import os
 import threading
@@ -240,6 +241,13 @@ class HTTPTestHandler(BaseHTTPRequestHandler):
             r_headers["Content-Range"] = f"0-{len(file_data) - 1}/{len(file_data)}"
         elif "give_etag" in self.headers:
             r_headers["ETag"] = "xxx"
+
+        if "give_md5_etag" in self.headers:
+            # single-part style ETag: the content MD5, hex-encoded
+            r_headers["ETag"] = '"%s"' % hashlib.md5(file_data).hexdigest()
+        elif "give_composite_etag" in self.headers:
+            # multipart style ETag: NOT a content digest of the object
+            r_headers["ETag"] = '"%s-2"' % hashlib.md5(file_data).hexdigest()
 
         if self.headers.get("accept_range") == "none":
             r_headers["Accept-Ranges"] = "none"

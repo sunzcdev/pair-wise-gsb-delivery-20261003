@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -15,6 +16,7 @@ from typing import Any
 from .callbacks import DEFAULT_CALLBACK
 from .config import apply_config, conf
 from .dircache import DirCache
+from .exceptions import ChecksumUnsupported
 from .transaction import Transaction
 from .utils import (
     _unstrip_protocol,
@@ -28,6 +30,17 @@ from .utils import (
 )
 
 logger = logging.getLogger("fsspec")
+
+#: Checksum guarantee levels, from weakest to strongest:
+#:
+#: - ``"version"``: an identity token for the file version, derived from
+#:   metadata (e.g. name, size, timestamps). Change detection only - it is
+#:   NOT a digest of the content and must not be used as one.
+#: - ``"backend"``: a content digest computed or stored by the storage
+#:   backend itself (e.g. an S3/HDFS checksum).
+#: - ``"client"``: a digest computed by this client while actually reading
+#:   the file's bytes.
+CHECKSUM_LEVELS = ("version", "backend", "client")
 
 
 def make_instance(cls, args, kwargs):
@@ -210,6 +223,14 @@ class AbstractFileSystem(metaclass=_Cached):
     mirror_sync_methods = False
     root_marker = ""  # For some FSs, may require leading '/' or other character
     transaction_type = Transaction
+
+    #: The checksum guarantee this filesystem can provide natively, without
+    #: reading file contents: ``"version"`` (an identity token derived from
+    #: file metadata; the default) or ``"backend"`` (a content digest
+    #: computed or stored by the storage backend). Client-computed digests
+    #: (``"client"``) are available on any readable filesystem regardless.
+    #: See `AbstractFileSystem.checksum_report`.
+    checksum_capability = "version"
 
     #: Extra *class attributes* that should be considered when hashing.
     _extra_tokenize_attributes = ()
@@ -818,6 +839,139 @@ class AbstractFileSystem(metaclass=_Cached):
         access timestamp (which would be bad)
         """
         return int(tokenize(self.info(path)), 16)
+
+    def checksum_report(self, path, level=None, algorithm=None, byte_range=None):
+        """Checksum of a file, with an explicit guarantee level
+
+        Unlike `ukey` (a version-identity token derived from file metadata)
+        and `checksum` (a bare unique value), this method states exactly
+        what kind of guarantee the returned value carries, so that callers
+        performing tasks like copy verification can require a real content
+        digest instead of silently accepting a metadata token.
+
+        Parameters
+        ----------
+        path: str
+            URL of file on this filesystem
+        level: "version" | "backend" | "client" | None
+            The guarantee required:
+
+            - ``"version"``: version identity only (like `ukey`); always
+              available.
+            - ``"backend"``: a content digest provided by the storage
+              backend. Raises `fsspec.exceptions.ChecksumUnsupported` if
+              this filesystem has no backend-provided digest for the path -
+              it does NOT fall back to a weaker guarantee and report
+              success.
+            - ``"client"``: a digest computed here, by reading the file's
+              bytes. Available on any readable filesystem.
+            - ``None`` (default): the strongest natively available level
+              (``self.checksum_capability``), falling back to ``"version"``
+              if the backend happens not to provide a digest for this path.
+        algorithm: str | None
+            Digest algorithm for ``level="client"`` (anything accepted by
+            ``hashlib.new``; default ``"sha256"``). Backends may also use it
+            to select among the digests they provide.
+        byte_range: tuple(int, int) | None
+            For ``level="client"`` only: ``(offset, length)`` of the byte
+            range to digest; the default digests the whole file.
+
+        Returns
+        -------
+        dict with keys:
+
+        - ``"level"``: the guarantee level actually provided
+        - ``"algorithm"``: name of the digest algorithm (``"ukey"`` for
+          version identity)
+        - ``"value"``: the digest/identity value
+        - ``"range"``: ``(offset, length)`` of the bytes covered, or None
+          when the digest covers the whole stored object
+        - ``"version"``: the file's `ukey` at the time of reading, so a
+          caller can tell whether the file changed since the digest was
+          produced
+        """
+        requested = level
+        if level is None:
+            level = self.checksum_capability
+        if level not in CHECKSUM_LEVELS:
+            raise ValueError(
+                f"checksum level must be one of {CHECKSUM_LEVELS}, got {level!r}"
+            )
+        if level == "backend":
+            try:
+                report = dict(self._backend_checksum_report(path, algorithm=algorithm))
+            except ChecksumUnsupported:
+                if requested is not None:
+                    # an explicit guarantee was demanded: fail, don't fake it
+                    raise
+                level = "version"
+            else:
+                report["level"] = "backend"
+                report.setdefault("range", None)
+                report.setdefault("version", self.ukey(path))
+                return report
+        if level == "client":
+            return self._client_checksum_report(
+                path, algorithm=algorithm, byte_range=byte_range
+            )
+        # version identity: explicitly not a content digest
+        version = self.ukey(path)
+        return {
+            "level": "version",
+            "algorithm": "ukey",
+            "value": version,
+            "range": None,
+            "version": version,
+        }
+
+    def _backend_checksum_report(self, path, algorithm=None):
+        """Backend-provided content digest for path
+
+        Implementations overriding this should return a dict with at least
+        ``"algorithm"`` and ``"value"`` keys (see `checksum_report`), and
+        raise `fsspec.exceptions.ChecksumUnsupported` when the backend has
+        no content digest for the path. Composite/opaque backend tokens
+        (e.g. multipart ETags) are version identity, not digests, and must
+        not be reported here.
+        """
+        raise ChecksumUnsupported(
+            f"{type(self).__name__} does not provide a backend content digest"
+        )
+
+    def _client_checksum_report(self, path, algorithm=None, byte_range=None):
+        """Compute a content digest by reading the file's bytes"""
+        algorithm = (algorithm or "sha256").lower()
+        try:
+            hashobj = hashlib.new(algorithm)
+        except ValueError:
+            raise ValueError(f"unknown checksum algorithm: {algorithm!r}") from None
+        # version of the file at the time of reading
+        version = self.ukey(path)
+        start, length = byte_range if byte_range is not None else (0, None)
+        size = 0
+        with self.open(path, "rb") as f:
+            if start:
+                f.seek(start)
+            while True:
+                to_read = (
+                    self.blocksize
+                    if length is None
+                    else min(self.blocksize, length - size)
+                )
+                if to_read <= 0:
+                    break
+                chunk = f.read(to_read)
+                if not chunk:
+                    break
+                hashobj.update(chunk)
+                size += len(chunk)
+        return {
+            "level": "client",
+            "algorithm": algorithm,
+            "value": hashobj.hexdigest(),
+            "range": (start, size),
+            "version": version,
+        }
 
     def size(self, path):
         """Size in bytes of file"""

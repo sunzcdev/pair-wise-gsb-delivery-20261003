@@ -2,10 +2,12 @@ import io
 import json
 import os
 import time
+from hashlib import md5, sha256
 
 import pytest
 
 import fsspec.utils
+from fsspec.exceptions import ChecksumUnsupported
 from fsspec.tests.conftest import (  # noqa: F401
     HTTPTestHandler,
     data,
@@ -49,6 +51,49 @@ def test_list(server, sync):
     h = fsspec.filesystem("http")
     out = h.glob(server.address + "/index/*")
     assert out == [server.address + "/index/realfile"]
+
+
+def test_checksum_report_backend_md5_etag(server, sync):
+    h = fsspec.filesystem(
+        "http",
+        headers={"head_ok": "true", "give_length": "true", "give_md5_etag": "true"},
+    )
+    report = h.checksum_report(server.realfile, level="backend")
+    assert report["level"] == "backend"
+    assert report["algorithm"] == "md5"
+    assert report["value"] == md5(data).hexdigest()
+    assert report["range"] == (0, len(data))
+    assert report["version"] == h.ukey(server.realfile)
+
+
+def test_checksum_report_composite_etag_is_not_md5(server, sync):
+    h = fsspec.filesystem(
+        "http",
+        headers={
+            "head_ok": "true",
+            "give_length": "true",
+            "give_composite_etag": "true",
+        },
+    )
+    # a composite ETag must not be guessed as a content MD5
+    with pytest.raises(ChecksumUnsupported):
+        h.checksum_report(server.realfile, level="backend")
+    # without an explicit requirement, fall back to version identity
+    report = h.checksum_report(server.realfile)
+    assert report["level"] == "version"
+    assert report["algorithm"] == "ukey"
+
+
+def test_checksum_report_client_computed(server, sync):
+    h = fsspec.filesystem(
+        "http", headers={"head_ok": "true", "give_length": "true"}
+    )
+    report = h.checksum_report(server.realfile, level="client")
+    assert report["level"] == "client"
+    assert report["algorithm"] == "sha256"
+    assert report["value"] == sha256(data).hexdigest()
+    assert report["range"] == (0, len(data))
+    assert report["version"] == h.ukey(server.realfile)
 
 
 def test_list_pathological_listing(server, sync, reset_files):

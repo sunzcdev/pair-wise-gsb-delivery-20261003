@@ -924,3 +924,63 @@ def _fast_slice(src_bytes: bytes, offset: int, read_size: int) -> bytes:
     else:
         # Standard fallback for PyPy/non-CPython
         return src_bytes[offset : offset + read_size]
+
+
+# HTTP "Digest" header algorithms we recognise as content digests
+_HTTP_DIGEST_ALGORITHMS = {
+    "md5": "md5",
+    "sha": "sha1",
+    "sha-1": "sha1",
+    "sha-256": "sha256",
+    "sha-512": "sha512",
+    "unixsum": "unixsum",
+    "unixcksum": "unixcksum",
+}
+
+
+def http_content_digest(info):
+    """Extract a backend-provided content digest from HTTP header info
+
+    Parameters
+    ----------
+    info: dict
+        File info containing response headers, as produced by the HTTP
+        filesystems (keys among ``"Digest"``, ``"Content-MD5"``, ``"ETag"``).
+
+    Returns
+    -------
+    tuple(algorithm, value) or None
+        The digest algorithm name and the value exactly as provided by the
+        server, or None if the headers carry no usable content digest.
+
+    Notes
+    -----
+    A composite ETag (e.g. an S3 multipart ETag of the form
+    ``"<md5-of-md5s>-<part-count>"``) is *not* a content digest of the
+    object and is never reported as MD5; likewise weak (``W/``) ETag
+    validators are only version identity. A plain 32-hex-digit ETag is
+    reported as MD5, the de-facto convention for single-part objects.
+    """
+    digest = info.get("Digest")
+    if digest:
+        # e.g. "sha-256=abc=, md5=def="; take the first recognised algorithm
+        for part in str(digest).split(","):
+            algorithm, _, value = part.partition("=")
+            algorithm = algorithm.strip().lower()
+            if value.strip() and algorithm in _HTTP_DIGEST_ALGORITHMS:
+                return _HTTP_DIGEST_ALGORITHMS[algorithm], value.strip()
+    content_md5 = info.get("Content-MD5")
+    if content_md5:
+        return "md5", str(content_md5).strip()
+    etag = info.get("ETag")
+    if etag:
+        etag = str(etag).strip()
+        if etag.startswith("W/"):
+            # weak validator: not computed over the content bytes
+            return None
+        etag = etag.strip('"')
+        if re.fullmatch(r"[0-9a-fA-F]{32}", etag):
+            return "md5", etag.lower()
+        # composite ("<hex>-<n>") or otherwise opaque ETag: version
+        # identity only, must not be guessed as a content digest
+    return None

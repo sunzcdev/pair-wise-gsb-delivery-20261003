@@ -288,6 +288,15 @@ class GenericFileSystem(AsyncFileSystem):
         """
         rsync(source, destination, fs=self, **kwargs)
 
+    def checksum_report(self, url, **kwargs):
+        """Checksum report from the filesystem really serving this URL
+
+        The guarantee level, algorithm, byte range and version all come
+        from the resolved backend filesystem, not from this wrapper.
+        """
+        fs = _resolve_fs(url, self.method, storage_options=self.st_opts)
+        return fs.checksum_report(url, **kwargs)
+
     async def _cp_file(
         self,
         url,

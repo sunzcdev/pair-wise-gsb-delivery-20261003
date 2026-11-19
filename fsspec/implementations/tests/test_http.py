@@ -1,5 +1,6 @@
 import asyncio
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -15,6 +16,7 @@ import pytest
 
 import fsspec.asyn
 import fsspec.utils
+from fsspec.exceptions import ChecksumUnsupported
 from fsspec.implementations.http import (
     _RETRYABLE_STATUSES,
     HTTPStreamFile,
@@ -95,6 +97,49 @@ def encoded_range_server(request):
             httpd.shutdown()
             thread.join(timeout=5)
             assert not thread.is_alive()
+
+
+def test_checksum_report_backend_md5_etag(server):
+    h = fsspec.filesystem(
+        "http",
+        headers={"head_ok": "true", "give_length": "true", "give_md5_etag": "true"},
+    )
+    report = h.checksum_report(server.realfile, level="backend")
+    assert report["level"] == "backend"
+    assert report["algorithm"] == "md5"
+    assert report["value"] == hashlib.md5(data).hexdigest()
+    assert report["range"] == (0, len(data))
+    assert report["version"] == h.ukey(server.realfile)
+
+
+def test_checksum_report_composite_etag_is_not_md5(server):
+    h = fsspec.filesystem(
+        "http",
+        headers={
+            "head_ok": "true",
+            "give_length": "true",
+            "give_composite_etag": "true",
+        },
+    )
+    # a composite ETag must not be guessed as a content MD5
+    with pytest.raises(ChecksumUnsupported):
+        h.checksum_report(server.realfile, level="backend")
+    # without an explicit requirement, fall back to version identity
+    report = h.checksum_report(server.realfile)
+    assert report["level"] == "version"
+    assert report["algorithm"] == "ukey"
+
+
+def test_checksum_report_client_computed(server):
+    h = fsspec.filesystem(
+        "http", headers={"head_ok": "true", "give_length": "true"}
+    )
+    report = h.checksum_report(server.realfile, level="client")
+    assert report["level"] == "client"
+    assert report["algorithm"] == "sha256"
+    assert report["value"] == hashlib.sha256(data).hexdigest()
+    assert report["range"] == (0, len(data))
+    assert report["version"] == h.ukey(server.realfile)
 
 
 @pytest.mark.parametrize("start", [0, 4096])
