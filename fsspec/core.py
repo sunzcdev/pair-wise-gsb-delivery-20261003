@@ -10,6 +10,7 @@ from pathlib import Path
 
 # for backwards compat, we export cache things from here too
 from fsspec.caching import (  # noqa: F401
+    AdaptiveReadAheadCache,
     BaseCache,
     BlockCache,
     BytesCache,

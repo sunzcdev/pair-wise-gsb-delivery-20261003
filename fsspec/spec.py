@@ -2047,8 +2047,13 @@ class AbstractBufferedFile(io.IOBase):
         autocommit: bool
             Whether to write to final destination; may only impact what
             happens when file is being closed.
-        cache_type: {"readahead", "none", "mmap", "bytes"}, default "readahead"
-            Caching policy in read mode. See the definitions in ``core``.
+        cache_type:
+            {"readahead", "adaptive_readahead", "none", "mmap", "bytes"},
+            default "readahead". Caching policy in read mode. See the
+            definitions in ``core``. ``adaptive_readahead`` keeps a single
+            read-ahead window but only prefetches once a sequential access
+            pattern has been observed and bounds the amount of discarded
+            prefetch data.
         cache_options : dict
             Additional options passed to the constructor for the cache specified
             by `cache_type`.

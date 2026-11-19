@@ -4,6 +4,7 @@ import string
 import pytest
 
 from fsspec.caching import (
+    AdaptiveReadAheadCache,
     BackgroundBlockCache,
     BlockCache,
     BytesCache,
@@ -206,6 +207,290 @@ def test_readahead_cache():
     assert len(cache.cache) == 9
     total_requested_bytes += (4 - 0) + block_size
     assert cache.total_requested_bytes == total_requested_bytes
+
+
+def _tracking_fetcher(data):
+    """Return a fetcher recording every requested (start, end) interval."""
+    calls = []
+
+    def fetch(start, end):
+        calls.append((start, end))
+        assert 0 <= start < end <= len(data)
+        return data[start:end]
+
+    return fetch, calls
+
+
+def test_adaptive_readahead_registered_and_pickleable():
+    assert caches["adaptive_readahead"] is AdaptiveReadAheadCache
+    cache = AdaptiveReadAheadCache(8, letters_fetcher, len(string.ascii_letters))
+    assert cache.adaptive is True
+    cache._fetch(0, 4)
+    restored = pickle.loads(pickle.dumps(cache))
+    assert isinstance(restored, AdaptiveReadAheadCache)
+    assert restored.adaptive is True
+    assert restored._fetch(0, 6) == letters_fetcher(0, 6)
+
+
+def test_readahead_adaptive_keyword_equivalent():
+    data = string.ascii_letters.encode()
+    fetch, calls = _tracking_fetcher(data)
+    cache = ReadAheadCache(8, fetch, len(data), adaptive=True)
+    assert cache.name == "readahead"
+    assert cache.adaptive is True
+    # before any sequential pattern is established, only demand is fetched
+    assert cache._fetch(10, 12) == data[10:12]
+    assert calls == [(10, 12)]
+
+
+def test_adaptive_readahead_random_trace_does_not_prefetch():
+    """Random small reads pull exactly the demanded bytes, never blocks."""
+    data = string.ascii_letters.encode()
+    fetch, calls = _tracking_fetcher(data)
+    cache = AdaptiveReadAheadCache(8, fetch, len(data))
+    trace = [40, 0, 20, 44, 4, 26, 10, 34, 16, 48]
+
+    for start in trace:
+        assert cache._fetch(start, start + 2) == data[start : start + 2]
+
+    assert calls == [(start, start + 2) for start in trace]
+    assert cache.prefetch_bytes == 0
+    assert cache.wasted_prefetch_bytes == 0
+    assert cache.total_requested_bytes == 2 * len(trace)
+    assert cache.demand_bytes == 2 * len(trace)
+
+
+def test_adaptive_readahead_sequential_trace_ramps_then_reads_ahead():
+    """Forward contiguous reads progressively enable the block read-ahead."""
+    data = string.ascii_letters.encode()
+    fetch, calls = _tracking_fetcher(data)
+    cache = AdaptiveReadAheadCache(8, fetch, len(data))
+
+    for start in range(0, 24, 2):
+        assert cache._fetch(start, start + 2) == data[start : start + 2]
+
+    # demand-only, then half a block, then full blocksize read-ahead
+    assert calls[0] == (0, 2)
+    assert calls[1] == (2, 6)
+    assert calls[2] == (6, 16)
+    assert all(end - start == 10 for start, end in calls[2:])
+    assert cache.prefetch_bytes > 0
+    assert cache.demand_bytes + cache.prefetch_bytes == cache.total_requested_bytes
+
+
+def test_adaptive_readahead_reverse_seek_is_bounded():
+    """A reverse seek replaces the window with a bounded, demand-only fetch."""
+    data = string.ascii_letters.encode()
+    fetch, calls = _tracking_fetcher(data)
+    cache = AdaptiveReadAheadCache(8, fetch, len(data))
+
+    assert cache._fetch(40, 44) == data[40:44]
+    assert cache._fetch(0, 4) == data[0:4]
+
+    assert calls == [(40, 44), (0, 4)]
+    # no request is allowed to speculate all the way to the end of the file
+    assert all(end - start <= 8 for start, end in calls)
+    assert cache._forward_streak == 0
+
+
+def test_adaptive_readahead_interleaved_windows_stop_prefetching():
+    """Repeated window jumps burn the waste budget and disable prefetch."""
+    data = string.ascii_letters.encode()
+    fetch, calls = _tracking_fetcher(data)
+    cache = AdaptiveReadAheadCache(
+        8,
+        fetch,
+        len(data),
+        min_prefetch_bytes=2,
+        max_wasted_prefetch_bytes=4,
+    )
+
+    # two forward steps build a small prefetch window, then we jump away
+    for base in (0, 20, 40):
+        cache._fetch(base, base + 2)
+        cache._fetch(base + 2, base + 4)
+        cache._fetch(base + 10, base + 12)
+
+    assert cache.wasted_prefetch_bytes >= 4
+    assert cache._prefetch_disabled is True
+
+    before = len(calls)
+    assert cache._fetch(48, 50) == data[48:50]
+    # once disabled, fetches carry no speculative bytes
+    assert calls[before] == (48, 50)
+    # every single fetch stays well below a whole-file read
+    assert all(end - start <= 10 for start, end in calls)
+
+
+def test_adaptive_readahead_single_fetch_capped_by_waste_budget():
+    data = string.ascii_letters.encode()
+    fetch, calls = _tracking_fetcher(data)
+    cache = AdaptiveReadAheadCache(64, fetch, len(data), max_wasted_prefetch_bytes=4)
+    cache._fetch(0, 2)
+    cache._fetch(2, 4)
+    cache._fetch(4, 6)
+    # even in a sequential run, one fetch never exceeds demand + budget
+    assert all(end - start <= 2 + 4 for start, end in calls)
+
+
+def test_adaptive_readahead_zero_waste_budget_disables_prefetch():
+    data = string.ascii_letters.encode()
+    fetch, calls = _tracking_fetcher(data)
+    cache = AdaptiveReadAheadCache(8, fetch, len(data), max_wasted_prefetch_bytes=0)
+    cache._fetch(0, 2)
+    cache._fetch(2, 4)
+    cache._fetch(4, 6)
+    assert calls == [(0, 2), (2, 4), (4, 6)]
+    assert cache.prefetch_bytes == 0
+    assert cache.total_requested_bytes == 6
+
+
+def test_adaptive_readahead_short_read_retries_once_then_clamps():
+    """A source short read gets one bounded retry, then the window is clamped."""
+    data = string.ascii_letters.encode()
+    calls = []
+
+    def short_fetcher(start, end):
+        calls.append((start, end))
+        real_end = min(end, 30)
+        if real_end <= start:
+            return b""
+        return data[start:real_end]
+
+    cache = AdaptiveReadAheadCache(8, short_fetcher, len(data))
+    assert cache._fetch(28, 34) == data[28:30]
+    # initial fetch plus a single retry confined to the unmet demand
+    assert calls == [(28, 34), (30, 34)]
+    assert cache.end == 30
+
+    # demands past the source end return empty without whole-file fetches
+    assert cache._fetch(40, 44) == b""
+    assert all(start >= 40 and end - start <= 4 for start, end in calls[2:])
+
+
+def test_adaptive_readahead_persistent_short_read_converges():
+    """A source that always short-reads must not loop or read the whole file."""
+    data = string.ascii_letters.encode()
+    calls = []
+
+    def always_short(start, end):
+        calls.append((start, end))
+        if start >= 10:
+            return b""
+        return data[start : min(end, 10)]
+
+    cache = AdaptiveReadAheadCache(8, always_short, len(data))
+    assert cache._fetch(8, 20) == data[8:10]
+    assert len(calls) == 2  # exactly one retry, no speculation to EOF
+    assert cache.end == 10
+
+
+def test_readahead_short_read_policy_in_fixed_mode():
+    data = string.ascii_letters.encode()
+    calls = []
+
+    def short_fetcher(start, end):
+        calls.append((start, end))
+        real_end = min(end, 12)
+        return data[start:real_end] if real_end > start else b""
+
+    cache = ReadAheadCache(8, short_fetcher, len(data))
+    assert cache._fetch(8, 14) == data[8:12]
+    assert calls == [(8, 22), (12, 14)]
+    assert cache.end == 12
+
+
+def test_adaptive_readahead_partial_hit_content():
+    data = string.ascii_letters.encode()
+    cache = AdaptiveReadAheadCache(10, letters_fetcher, len(data))
+    # warm a window, then extend beyond it: the suffix must be stitched on
+    assert cache._fetch(0, 10) == data[0:10]
+    assert cache._fetch(5, 18) == data[5:18]
+    assert cache._fetch(5, 18) == data[5:18]
+
+
+def test_adaptive_readahead_stats_accounting():
+    data = string.ascii_letters.encode()
+    fetch, _ = _tracking_fetcher(data)
+    cache = AdaptiveReadAheadCache(8, fetch, len(data))
+
+    cache._fetch(0, 4)
+    cache._fetch(4, 8)
+    cache._fetch(8, 12)
+    cache._fetch(0, 2)  # reverse jump discards the prefetched tail
+
+    assert cache.demand_bytes + cache.prefetch_bytes == cache.total_requested_bytes
+    assert 0 <= cache.wasted_prefetch_bytes <= cache.prefetch_bytes
+    assert cache.hit_count + cache.miss_count == 4
+
+    cache._reset_stats()
+    assert (
+        cache.hit_count,
+        cache.miss_count,
+        cache.total_requested_bytes,
+        cache.demand_bytes,
+        cache.prefetch_bytes,
+        cache.wasted_prefetch_bytes,
+    ) == (0, 0, 0, 0, 0, 0)
+
+
+def test_adaptive_readahead_sequential_and_random_trace_parity():
+    """Same requested content under both traces; fetch intervals are recorded."""
+    data = string.ascii_letters.encode()
+    sequential = [(i, min(i + 3, len(data))) for i in range(0, len(data), 3)]
+    random = [(s, s + 2) for s in (40, 0, 20, 44, 4, 26, 10, 34, 16, 48)]
+
+    def run(trace, adaptive):
+        fetch, calls = _tracking_fetcher(data)
+        if adaptive:
+            cache = AdaptiveReadAheadCache(8, fetch, len(data))
+        else:
+            cache = ReadAheadCache(8, fetch, len(data))
+        content = b"".join(cache._fetch(start, end) for start, end in trace)
+        return content, calls
+
+    expected_random = b"".join(data[s:e] for s, e in random)
+    expected_sequential = b"".join(data[s:e] for s, e in sequential)
+
+    random_content, random_calls = run(random, adaptive=True)
+    sequential_content, sequential_calls = run(sequential, adaptive=True)
+    fixed_content, fixed_calls = run(random, adaptive=False)
+
+    # content is identical regardless of the caching strategy
+    assert random_content == expected_random
+    assert sequential_content == expected_sequential
+    assert fixed_content == expected_random
+
+    # adaptive random access fetches far fewer bytes than both sequential
+    # adaptive access and the classic fixed readahead on the same trace
+    def volume(intervals):
+        return sum(end - start for start, end in intervals)
+
+    assert volume(random_calls) < volume(sequential_calls)
+    assert volume(random_calls) < volume(fixed_calls)
+
+
+def test_adaptive_readahead_selected_in_open_flow():
+    from fsspec.spec import AbstractBufferedFile
+
+    data = string.ascii_letters.encode()
+
+    class TestFile(AbstractBufferedFile):
+        DEFAULT_BLOCK_SIZE = 8
+
+        def _fetch_range(self, start, end):
+            return data[start:end]
+
+    with TestFile(
+        None,
+        "afile",
+        mode="rb",
+        cache_type="adaptive_readahead",
+        size=len(data),
+    ) as f:
+        assert isinstance(f.cache, AdaptiveReadAheadCache)
+        assert f.cache.adaptive is True
+        assert f.read(12) == data[:12]
 
 
 def test_bytes_cache_range_ending_at_cache_end():

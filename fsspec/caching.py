@@ -248,15 +248,191 @@ class ReadAheadCache(BaseCache):
     This is a much simpler version of BytesCache, and does not attempt to
     fill holes in the cache or keep fragments alive. It is best suited to
     many small reads in a sequential order (e.g., reading lines from a file).
+
+    An optional *adaptive* mode keeps the single sliding window of the
+    ordinary readahead cache but makes the speculative read-ahead react to
+    the access pattern that has been observed so far:
+
+    * the first few reads and any reverse seek / disjoint jump fetch only the
+      bytes that were actually demanded;
+    * a run of forward, contiguous or overlapping reads gradually ramps the
+      read-ahead up to ``blocksize``;
+    * once the cumulative amount of prefetched data that was discarded
+      unread exceeds ``max_wasted_prefetch_bytes``, speculative prefetching is
+      switched off for the rest of the file. This bounds the waste caused by
+      random, reverse-seeking or interleaved-window access instead of
+      pulling a block (or, in the worst case, the rest of the file) per
+      read.
+
+    In either mode the cache never holds more than one window, so a reverse
+    seek replaces the current window with a fresh, bounded fetch - the whole
+    file is never read on the off chance that it might be needed later.
+
+    Parameters
+    ----------
+    blocksize: int
+        How far to read ahead in numbers of bytes when a sequential pattern
+        has been established.
+    fetcher: func
+        Function of the form f(start, end) which gets bytes from remote as
+        specified
+    size: int
+        How big this file is
+    adaptive: bool
+        When True, enable the pattern-aware prefetch strategy described
+        above. Defaults to False, which preserves the classic behaviour of
+        always extending a fetch by ``blocksize``.
+    sequential_threshold: int
+        Number of consecutive forward reads required before the full
+        ``blocksize`` read-ahead is used. Before that, prefetch grows
+        linearly from ``min_prefetch_bytes``.
+    min_prefetch_bytes: int
+        Minimum number of speculative bytes appended to a fetch in adaptive
+        mode. Set to 0 to demand-read until the pattern is proven
+        sequential.
+    max_wasted_prefetch_bytes: int | None
+        Upper bound on the cumulative number of prefetched bytes that may be
+        discarded unread. Once reached, further fetches only contain
+        demanded bytes. None disables the bound.
     """
 
     name = "readahead"
 
-    def __init__(self, blocksize: int, fetcher: Fetcher, size: int) -> None:
+    def __init__(
+        self,
+        blocksize: int,
+        fetcher: Fetcher,
+        size: int,
+        *,
+        adaptive: bool = False,
+        sequential_threshold: int = 3,
+        min_prefetch_bytes: int = 0,
+        max_wasted_prefetch_bytes: int | None = None,
+    ) -> None:
         super().__init__(blocksize, fetcher, size)
         self.cache = b""
         self.start = 0
         self.end = 0
+        self.adaptive = adaptive
+        self.sequential_threshold = max(1, sequential_threshold)
+        self.min_prefetch_bytes = max(0, min_prefetch_bytes)
+        self.max_wasted_prefetch_bytes = max_wasted_prefetch_bytes
+        # position of the previous demand window, used to classify the
+        # access pattern in adaptive mode
+        self._last_start: int | None = None
+        self._last_end: int | None = None
+        # length of the current run of forward, overlapping/adjacent reads
+        self._forward_streak = 0
+        # highest offset actually demanded within the current window
+        self._demand_end = 0
+        # set once the wasted-prefetch budget is exhausted
+        self._prefetch_disabled = False
+        # bytes explicitly requested by callers, versus bytes only fetched
+        # speculatively ahead of the demand
+        self.demand_bytes = 0
+        self.prefetch_bytes = 0
+        # subset of prefetch_bytes that was replaced before being demanded
+        self.wasted_prefetch_bytes = 0
+
+    def _reset_stats(self) -> None:
+        """Reset hit/miss and byte accounting for a more granular report."""
+        super()._reset_stats()
+        self.demand_bytes = 0
+        self.prefetch_bytes = 0
+        self.wasted_prefetch_bytes = 0
+
+    def _log_stats(self) -> str:
+        if self.hit_count == 0 and self.miss_count == 0:
+            return ""
+        return (
+            f" , {self.name}: {self.hit_count} hits, {self.miss_count} misses, "
+            f"{self.demand_bytes} demand bytes, {self.prefetch_bytes} prefetch "
+            f"bytes ({self.wasted_prefetch_bytes} wasted), "
+            f"{self.total_requested_bytes} total requested bytes"
+        )
+
+    def _retire_window(self) -> None:
+        """Account for prefetched bytes discarded when replacing the window."""
+        if self.end > self._demand_end:
+            self.wasted_prefetch_bytes += max(0, self.end - self._demand_end)
+        self.cache = b""
+        self.start = 0
+        self.end = 0
+        self._demand_end = 0
+        if (
+            self.adaptive
+            and self.max_wasted_prefetch_bytes is not None
+            and self.wasted_prefetch_bytes >= self.max_wasted_prefetch_bytes
+        ):
+            # The observed pattern is wasting too much speculative data:
+            # stop prefetching for the remainder of the file.
+            self._prefetch_disabled = True
+
+    def _classify(self, start: int, end: int) -> None:
+        """Update the sequentiality judgement from the latest demand.
+
+        Runs for every demand (including cache hits) so that reads served
+        from the current window still advance the tracked position.
+        """
+        if (
+            self._last_start is not None
+            and start >= self._last_start
+            and start <= self._last_end
+        ):
+            # forward and adjacent to / overlapping the previous demand
+            self._forward_streak += 1
+        else:
+            # reverse seek, disjoint jump or first read: no evidence yet
+            self._forward_streak = 0
+        self._last_start = start
+        self._last_end = end
+
+    def _prefetch_amount(self, length: int) -> int:
+        """Speculative bytes to append to a fetch of ``length`` demanded bytes."""
+        if not self.adaptive:
+            return self.blocksize
+        if self._prefetch_disabled or self.blocksize <= 0:
+            return 0
+        if self._forward_streak >= self.sequential_threshold:
+            amount = self.blocksize
+        else:
+            amount = (
+                self.min_prefetch_bytes
+                + (self.blocksize - self.min_prefetch_bytes)
+                * self._forward_streak
+                // self.sequential_threshold
+            )
+        if self.max_wasted_prefetch_bytes is not None:
+            # never allow a single speculative fetch to exceed the total
+            # waste budget either; a zero budget therefore means no prefetch
+            amount = min(amount, self.max_wasted_prefetch_bytes)
+        return max(0, amount)
+
+    def _fetch_window(self, start: int, demanded: int) -> bytes:
+        """Fetch ``demanded`` bytes from ``start`` plus bounded read-ahead.
+
+        A short read from the source is treated as an explicit signal that
+        no more data is available rather than as a reason to speculatively
+        retry over the rest of the file. One bounded, non-prefetching retry
+        covers the still-missing demand; afterwards the window simply ends
+        where the source stopped.
+        """
+        prefetch = self._prefetch_amount(demanded)
+        requested_end = min(self.size, start + demanded + prefetch)
+        self.total_requested_bytes += requested_end - start
+        data = self.fetcher(start, requested_end)
+        missing = demanded - len(data)
+        if missing > 0 and requested_end < self.size:
+            # source short read: retry the unmet demand once, without any
+            # speculative extension
+            retry_end = min(self.size, start + len(data) + missing)
+            self.total_requested_bytes += retry_end - (start + len(data))
+            data += self.fetcher(start + len(data), retry_end)
+        got = len(data)
+        prefetch_got = max(0, got - demanded)
+        self.demand_bytes += min(got, demanded)
+        self.prefetch_bytes += prefetch_got
+        return data
 
     def _fetch(self, start: int | None, end: int | None) -> bytes:
         if start is None:
@@ -265,27 +441,70 @@ class ReadAheadCache(BaseCache):
             end = self.size
         if start >= self.size or start >= end:
             return b""
-        l = end - start
+        length = end - start
+        # track the access pattern from every demand, including cache hits
+        self._classify(start, end)
         if start >= self.start and end <= self.end:
             # cache hit
             self.hit_count += 1
+            self._demand_end = max(self._demand_end, end)
             return self.cache[start - self.start : end - self.start]
-        elif self.start <= start < self.end:
-            # partial hit
+        if self.start <= start < self.end:
+            # partial hit: keep the suffix already in cache
             self.miss_count += 1
             part = self.cache[start - self.start :]
-            l -= len(part)
+            self._demand_end = max(self._demand_end, end)
+            length -= len(part)
             start = self.end
         else:
-            # miss
+            # full miss, possibly replacing a window whose prefetch never
+            # got used
             self.miss_count += 1
+            if self.end > self.start:
+                self._retire_window()
             part = b""
-        end = min(self.size, end + self.blocksize)
-        self.total_requested_bytes += end - start
-        self.cache = self.fetcher(start, end)  # new block replaces old
+        data = self._fetch_window(start, length)
+        self.cache = data  # new block replaces old
         self.start = start
-        self.end = self.start + len(self.cache)
-        return part + self.cache[:l]
+        self.end = start + len(data)
+        self._demand_end = max(self._demand_end, min(end, self.end))
+        if part:
+            # only the unmet suffix of the original demand comes from the
+            # newly fetched window
+            return part + data[:length]
+        return data[: max(0, end - start)]
+
+
+class AdaptiveReadAheadCache(ReadAheadCache):
+    """Read-ahead cache with pattern-aware, bounded prefetching.
+
+    Thin selector over :class:`ReadAheadCache` that turns on adaptive mode,
+    so the strategy can be chosen through ``cache_type="adaptive_readahead"``
+    without passing extra keyword arguments. See :class:`ReadAheadCache` for
+    the detailed policy and the available ``cache_options``.
+    """
+
+    name = "adaptive_readahead"
+
+    def __init__(
+        self,
+        blocksize: int,
+        fetcher: Fetcher,
+        size: int,
+        *,
+        sequential_threshold: int = 3,
+        min_prefetch_bytes: int = 0,
+        max_wasted_prefetch_bytes: int | None = None,
+    ) -> None:
+        super().__init__(
+            blocksize,
+            fetcher,
+            size,
+            adaptive=True,
+            sequential_threshold=sequential_threshold,
+            min_prefetch_bytes=min_prefetch_bytes,
+            max_wasted_prefetch_bytes=max_wasted_prefetch_bytes,
+        )
 
 
 class AdaptiveReadaheadCache(BaseCache):
@@ -1148,6 +1367,7 @@ for c in (
     MMapCache,
     BytesCache,
     ReadAheadCache,
+    AdaptiveReadAheadCache,
     AdaptiveReadaheadCache,
     BlockCache,
     FirstChunkCache,

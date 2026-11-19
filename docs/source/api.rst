@@ -312,6 +312,7 @@ Read Buffering
    caching.BytesCache
    caching.MMapCache
    caching.ReadAheadCache
+   caching.AdaptiveReadAheadCache
    caching.FirstChunkCache
    caching.BackgroundBlockCache
 
@@ -325,6 +326,9 @@ Read Buffering
    :members:
 
 .. autoclass:: fsspec.caching.ReadAheadCache
+   :members:
+
+.. autoclass:: fsspec.caching.AdaptiveReadAheadCache
    :members:
 
 .. autoclass:: fsspec.caching.FirstChunkCache
