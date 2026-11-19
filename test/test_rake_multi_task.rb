@@ -103,4 +103,88 @@ class TestRakeMultiTask < Rake::TestCase # :nodoc:
       refute task_two_was_executed
     end
   end
+
+  def test_parallel_sh_chdir_writes_each_output_in_its_own_directory
+    omit "JRuby does not support spawn options" if jruby90?
+
+    FileUtils.mkdir_p "alpha dir"
+    FileUtils.mkdir_p "beta dir"
+    original = Dir.pwd
+
+    task :alpha do
+      3.times do
+        sh RUBY, "-e", "File.write('alpha.txt', 'a')",
+          chdir: "alpha dir", verbose: false
+      end
+    end
+
+    task :beta do
+      3.times do
+        sh RUBY, "-e", "File.write('beta.txt', 'b')",
+          chdir: "beta dir", verbose: false
+      end
+    end
+
+    multitask parallel_chdir: [:alpha, :beta]
+
+    Rake::Task[:parallel_chdir].invoke
+
+    assert File.exist?(File.join("alpha dir", "alpha.txt")),
+      "alpha output must land in its own working directory"
+    assert File.exist?(File.join("beta dir", "beta.txt")),
+      "beta output must land in its own working directory"
+    refute File.exist?("alpha.txt"), "no output may leak into the process directory"
+    refute File.exist?("beta.txt"), "no output may leak into the process directory"
+    assert_equal original, Dir.pwd
+  end
+
+  def test_parallel_in_dir_blocks_are_serialized_and_restore_pwd
+    FileUtils.mkdir_p "one dir"
+    FileUtils.mkdir_p "two dir"
+    original = Dir.pwd
+    inside_mutex = Mutex.new
+    inside = {}
+    concurrent = 0
+    max_concurrent = 0
+
+    task :one do
+      in_dir "one dir" do
+        inside_mutex.synchronize do
+          inside[:one] = Dir.pwd
+          concurrent += 1
+          max_concurrent = concurrent if concurrent > max_concurrent
+        end
+        sleep 0.05
+        File.write "one.txt", "1"
+        inside_mutex.synchronize { concurrent -= 1 }
+      end
+    end
+
+    task :two do
+      in_dir "two dir" do
+        inside_mutex.synchronize do
+          inside[:two] = Dir.pwd
+          concurrent += 1
+          max_concurrent = concurrent if concurrent > max_concurrent
+        end
+        File.write "two.txt", "2"
+        inside_mutex.synchronize { concurrent -= 1 }
+      end
+    end
+
+    multitask parallel_in_dir: [:one, :two]
+
+    Rake::Task[:parallel_in_dir].invoke
+
+    assert File.exist?(File.join("one dir", "one.txt"))
+    assert File.exist?(File.join("two dir", "two.txt"))
+    refute File.exist?("one.txt")
+    refute File.exist?("two.txt")
+    assert_equal original, Dir.pwd
+
+    assert_equal File.expand_path("one dir"), inside[:one]
+    assert_equal File.expand_path("two dir"), inside[:two]
+    assert_equal 1, max_concurrent,
+      "the process wide chdir blocks must never run at the same time"
+  end
 end

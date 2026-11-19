@@ -1,3 +1,20 @@
+=== Unreleased
+
+==== Enhancements
+
+* Add Rake::FileUtilsExt#in_dir for changing the process wide working
+  directory inside a block.  Dir.chdir is process global rather than
+  thread local, so the change is serialized through
+  Rake::FileUtilsExt::CHDIR_LOCK and the original directory is always
+  restored, including when the block raises.  Prefer
+  <tt>sh "command", chdir: "dir"</tt> for a single external command: it
+  starts the subprocess in that directory through the native spawn
+  +chdir+ option without touching Dir.pwd, so it stays safe inside a
+  multitask and handles paths containing spaces when passed as argv.
+
+* Rake::PackageTask now passes +chdir:+ to #sh instead of wrapping the
+  command in a process wide Dir.chdir block.
+
 === 13.2.1
 
 * Suppressed "internal:array:52:in 'Array#each'" from backtrace by @hsbt in #554

@@ -23,9 +23,22 @@ module FileUtils
   # tasks are not vulnerable to users providing an argument like
   # <code>; rm # -rf /</code>.
   #
+  # The +chdir:+ option runs the command with the given working directory.
+  # It is forwarded to the native Kernel::system +chdir:+ option, so the
+  # child process starts in that directory while the process wide
+  # Dir.pwd is left untouched.  Relative paths in other (possibly parallel)
+  # tasks are therefore unaffected, and it is safe to use inside a
+  # multitask.  Pass the directory as one of the argv arguments instead of
+  # building a shell string so that paths containing spaces (common on
+  # Windows) keep working:
+  #
+  #   sh RUBY, "generate.rb", chdir: "C:\\work\\build dir"
+  #
   # If a block is given, upon command completion the block is called with an
   # OK flag (true on a zero exit status) and a Process::Status object.
   # Without a block a RuntimeError is raised when the command exits non-zero.
+  # The working directory of the current process is never changed by either
+  # outcome, including a failed command.
   #
   # Examples:
   #

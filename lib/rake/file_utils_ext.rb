@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+require "monitor"
 require_relative "file_utils"
 
 module Rake
@@ -18,6 +19,16 @@ module Rake
 
     FileUtilsExt.verbose_flag = DEFAULT
     FileUtilsExt.nowrite_flag = false
+
+    # Process wide lock that serializes every block which changes the
+    # process wide working directory through #in_dir.
+    #
+    # Dir.chdir is global for the whole process (it is not scoped to the
+    # current Thread), so a multitask running its prerequisites in parallel
+    # cannot rely on two blocks each calling Dir.chdir at the same time.
+    # Holding this lock while the directory is changed makes that boundary
+    # explicit and guarantees such blocks never interleave.
+    CHDIR_LOCK = Monitor.new
 
     FileUtils.commands.each do |name|
       opts = FileUtils.options_of name
@@ -110,6 +121,42 @@ module Rake
         $stderr.puts "DRYRUN: #{msg}" if msg
       else
         yield
+      end
+    end
+
+    # Run a block with +dir+ as the process wide working directory.
+    #
+    # Unlike Kernel#Dir.chdir this helper never pretends to be thread local:
+    # the working directory is shared by every thread in the process, so the
+    # whole change (chdir, block and the restore of the original directory)
+    # is wrapped in the process wide FileUtilsExt::CHDIR_LOCK.  When this
+    # helper is used inside a +multitask+ the affected blocks therefore run
+    # one at a time instead of racing on Dir.pwd.
+    #
+    # The original working directory is always restored, even when the block
+    # raises, so a failing command cannot leave the process in +dir+.
+    #
+    # Prefer <tt>sh "command", chdir: "dir"</tt> when a block only launches an
+    # external command.  The +chdir:+ option starts that single subprocess in
+    # +dir+ through the native spawn +chdir+ option and does not touch the
+    # process wide directory at all, which stays safe for parallel tasks.
+    #
+    # Example:
+    #
+    #   in_dir "build" do
+    #     File.write "config.log", "configured"
+    #   end
+    #
+    def in_dir(dir)
+      raise ArgumentError, "a block is required" unless block_given?
+      FileUtilsExt::CHDIR_LOCK.synchronize do
+        original = Dir.pwd
+        begin
+          Dir.chdir dir
+          yield
+        ensure
+          Dir.chdir original
+        end
       end
     end
 

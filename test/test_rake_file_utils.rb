@@ -255,6 +255,101 @@ class TestRakeFileUtils < Rake::TestCase # :nodoc:
     assert_empty out
   end
 
+  def test_sh_chdir_starts_subprocess_in_directory_without_moving_pwd
+    omit "JRuby does not support spawn options" if jruby90?
+
+    Dir.mkdir "work"
+    original = Dir.pwd
+
+    verbose(false) {
+      sh RUBY, "-e", "File.write('made.txt', 'data')", chdir: "work"
+    }
+
+    assert File.exist?(File.join("work", "made.txt"))
+    refute File.exist?("made.txt"), "output must not leak into the process directory"
+    assert_equal original, Dir.pwd, "the process wide working directory must be untouched"
+  end
+
+  def test_sh_chdir_with_path_containing_spaces_uses_argv
+    omit "JRuby does not support spawn options" if jruby90?
+
+    spaced = File.join(Dir.pwd, "work dir")
+    Dir.mkdir spaced
+
+    verbose(false) {
+      sh RUBY, "-e", "File.write('made.txt', 'spaced')", chdir: spaced
+    }
+
+    assert File.exist?(File.join(spaced, "made.txt"))
+  end
+
+  def test_sh_chdir_keeps_working_directory_after_failure
+    omit "JRuby does not support spawn options" if jruby90?
+
+    Dir.mkdir "failing_work"
+    original = Dir.pwd
+
+    assert_raises(RuntimeError) {
+      verbose(false) {
+        sh RUBY, "-e", "exit 1", chdir: "failing_work"
+      }
+    }
+
+    assert_equal original, Dir.pwd,
+      "a failing command must leave the process working directory unchanged"
+  end
+
+  def test_in_dir_runs_block_in_the_given_directory
+    Dir.mkdir "inside"
+
+    in_dir "inside" do
+      File.write "made.txt", "data"
+    end
+
+    assert File.exist?(File.join("inside", "made.txt"))
+    refute File.exist?("made.txt")
+  end
+
+  def test_in_dir_restores_working_directory
+    original = Dir.pwd
+    Dir.mkdir "restore"
+
+    in_dir "restore" do
+      refute_equal original, Dir.pwd
+    end
+
+    assert_equal original, Dir.pwd
+  end
+
+  def test_in_dir_restores_working_directory_when_block_raises
+    original = Dir.pwd
+    Dir.mkdir "restore_fail"
+
+    assert_raises(RuntimeError) {
+      in_dir "restore_fail" do
+        raise "boom"
+      end
+    }
+
+    assert_equal original, Dir.pwd,
+      "the original directory must be restored even when the block fails"
+  end
+
+  def test_in_dir_requires_a_block
+    Dir.mkdir "blockless"
+
+    assert_raises(ArgumentError) { in_dir "blockless" }
+  end
+
+  def test_in_dir_is_serialized_process_wide
+    assert_kind_of Monitor, Rake::FileUtilsExt::CHDIR_LOCK
+
+    object = Object.new
+    object.extend Rake::FileUtilsExt
+
+    assert_respond_to object, :in_dir
+  end
+
   def test_sh_bad_option
     # Skip on JRuby because option checking is performed by spawn via system
     # now.
