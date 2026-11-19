@@ -27,6 +27,7 @@ from peewee import query_to_string
 
 from .base import BaseTestCase
 from .base import __sql__
+from .base import db
 
 
 User = Table('users')
@@ -3824,3 +3825,193 @@ class TestContextAndAliasManager(BaseTestCase):
         # An explicit alias is content-based, so it survives cloning.
         aliased = User.select(User.c.id).alias('u')
         self.assertEqual(hash(aliased), hash(aliased.where(User.c.id > 1)))
+
+
+# ===========================================================================
+# Compilation explanation (per-parameter annotations).
+# ===========================================================================
+
+class TestSqlExplain(BaseTestCase):
+    def compile_explain(self, query, **state):
+        state.setdefault('conflict_statement', db.conflict_statement)
+        state.setdefault('conflict_update', db.conflict_update)
+        ctx = Context(explain=True, **state)
+        sql, params = ctx.sql(query).query()
+        return sql, params, ctx.explain
+
+    def test_sql_remains_two_tuple(self):
+        query = User.select(User.c.id).where(User.c.username == 'foo')
+        result = query.sql()
+        self.assertEqual(len(result), 2)
+        sql, params = result
+        self.assertEqual(params, ['foo'])
+
+        # Context.query() is likewise unaffected when explain is enabled.
+        ctx = Context(explain=True)
+        sql, params = ctx.sql(query).query()
+        self.assertEqual(params, ['foo'])
+
+    def test_basic_explain(self):
+        query = (User
+                 .select(User.c.id)
+                 .where((User.c.username == 's3cret') &
+                        (User.c.id << [1, 2, 1])))
+        sql, params, explain = query.sql_with_explain()
+        self.assertEqual(params, ['s3cret', 1, 2, 1])
+        self.assertEqual([a['index'] for a in explain], [0, 1, 2, 3])
+
+        # The same value appearing multiple times maps to distinct
+        # positions, one annotation per placeholder.
+        self.assertEqual(explain[1]['purpose'], 'in-list item (IN)')
+        self.assertEqual(explain[3]['purpose'], 'in-list item (IN)')
+        self.assertNotEqual(explain[1]['index'], explain[3]['index'])
+
+        first = explain[0]
+        self.assertEqual(first['purpose'], 'expression operand (=)')
+        self.assertEqual(first['path'],
+                         ('Select', 'Expression(AND)', 'Expression(=)',
+                          'Value'))
+        self.assertEqual(first['query'], 'select#1')
+        self.assertEqual(first['query_path'], ('select#1',))
+        self.assertEqual(first['value_type'], 'str')
+
+        # Annotations never contain actual parameter values.
+        self.assertNotIn('s3cret', repr(explain))
+
+    def test_subquery_ownership(self):
+        inner = Tweet.select(Tweet.c.user_id).where(Tweet.c.content == 'x')
+        query = User.select(User.c.id).where(User.c.id << inner)
+        sql, params, explain = query.sql_with_explain()
+        self.assertEqual(params, ['x'])
+        ann, = explain
+        self.assertEqual(len(ann['query_path']), 2)
+        self.assertEqual(ann['query'], ann['query_path'][-1])
+        self.assertNotEqual(ann['query_path'][0], ann['query_path'][1])
+        self.assertTrue(all(label.startswith('select#')
+                            for label in ann['query_path']))
+
+    def test_cte_ownership(self):
+        cte = (User
+               .select(User.c.id, User.c.username)
+               .where(User.c.id > 10)
+               .cte('u'))
+        query = cte.select_from(cte.c.id).where(cte.c.id < 100).with_cte(cte)
+        sql, params, explain = query.sql_with_explain()
+        self.assertEqual(params, [10, 100])
+        in_cte, outer = explain
+        self.assertEqual(len(outer['query_path']), 1)
+        # The CTE parameter belongs to the select inside the CTE, which is
+        # nested inside the CTE and the outer query.
+        self.assertEqual(len(in_cte['query_path']), 3)
+        self.assertEqual(in_cte['query_path'][0], outer['query'])
+        self.assertTrue(in_cte['query_path'][1].startswith('cte(u)#'))
+        self.assertTrue(in_cte['query'].startswith('select#'))
+        self.assertIn('CTE(u)', in_cte['path'])
+
+    def test_insert_update_delete(self):
+        query = User.insert({User.c.id: 1, User.c.username: 'foo'})
+        sql, params, explain = query.sql_with_explain()
+        self.assertEqual(params, [1, 'foo'])
+        self.assertEqual([a['purpose'] for a in explain],
+                         ['insert value', 'insert value'])
+        self.assertTrue(all(a['query'].startswith('insert#')
+                            for a in explain))
+
+        query = (User
+                 .update({User.c.username: 'bar'})
+                 .where(User.c.id == 7))
+        sql, params, explain = query.sql_with_explain()
+        self.assertEqual(params, ['bar', 7])
+        self.assertEqual([a['purpose'] for a in explain],
+                         ['update assignment', 'expression operand (=)'])
+
+        query = User.delete().where(User.c.id == 9)
+        sql, params, explain = query.sql_with_explain()
+        self.assertEqual(params, [9])
+        self.assertEqual(explain[0]['purpose'], 'expression operand (=)')
+        self.assertTrue(explain[0]['query'].startswith('delete#'))
+
+    def test_on_conflict_update(self):
+        query = (User
+                 .insert({User.c.id: 1, User.c.username: 'foo'})
+                 .on_conflict(conflict_target=[User.c.id],
+                              update={User.c.username: 'bar'}))
+        sql, params, explain = self.compile_explain(query)
+        self.assertEqual(params, [1, 'foo', 'bar'])
+        self.assertEqual([a['index'] for a in explain], [0, 1, 2])
+        self.assertEqual([a['purpose'] for a in explain],
+                         ['insert value', 'insert value',
+                          'on-conflict update'])
+
+    def test_limit_offset(self):
+        query = (User
+                 .select(User.c.id)
+                 .order_by(User.c.id)
+                 .limit(10)
+                 .offset(20))
+        sql, params, explain = query.sql_with_explain()
+        self.assertEqual(params, [10, 20])
+        self.assertEqual([a['purpose'] for a in explain], ['limit', 'offset'])
+
+    def test_window_function(self):
+        query = (User
+                 .select(User.c.id,
+                         fn.lag(User.c.id, 1)
+                         .over(order_by=User.c.id)
+                         .alias('prev'))
+                 .where(User.c.id > 3))
+        sql, params, explain = query.sql_with_explain()
+        # The window function argument precedes the WHERE predicate value.
+        self.assertEqual(params, [1, 3])
+        self.assertEqual(explain[0]['purpose'], 'function argument (lag)')
+        self.assertEqual(explain[1]['purpose'], 'expression operand (>)')
+        self.assertEqual([a['index'] for a in explain], [0, 1])
+
+    def test_subcontext_merge(self):
+        ctx = Context(explain=True)
+        ctx.sql(User.select(User.c.id).where(User.c.id == 1))
+        sub = ctx.as_new()
+        sub.sql(User.select(User.c.id).where(User.c.id == 2))
+        ctx.sql(sub)
+        sql, params, explain = ctx.query_with_explain()
+        self.assertEqual(params, [1, 2])
+        # Positions are adjusted to the parent context's parameter list.
+        self.assertEqual([a['index'] for a in explain], [0, 1])
+        # Query labels remain unique across merged sub-contexts.
+        self.assertNotEqual(explain[0]['query'], explain[1]['query'])
+
+    def test_context_of_unexplained_subcontext(self):
+        ctx = Context(explain=True)
+        sub = Context()
+        sub.sql(User.select(User.c.id).where(User.c.id == 2))
+        ctx.sql(sub)
+        sql, params, explain = ctx.query_with_explain()
+        self.assertEqual(params, [2])
+        # Still one annotation per parameter, positions line up.
+        self.assertEqual([a['index'] for a in explain], [0])
+
+    def test_explain_disabled(self):
+        ctx = Context()
+        sql, params = ctx.sql(
+            User.select(User.c.id).where(User.c.id == 1)).query()
+        self.assertEqual(params, [1])
+        self.assertTrue(ctx.explain is None)
+        sql, params, explain = ctx.query_with_explain()
+        self.assertEqual(explain, [])
+
+    def test_annotations_never_contain_values(self):
+        query = (User
+                 .select(User.c.id)
+                 .where((User.c.username == 'hunter2') &
+                        (User.c.id << [4242, 4243])))
+        sql, params, explain = query.sql_with_explain()
+        rendered = repr(explain)
+        for fragment in ('hunter2', '4242', '4243'):
+            self.assertNotIn(fragment, rendered)
+        self.assertEqual(len(explain), len(params))
+
+    def test_query_to_string_unchanged(self):
+        query = User.select(User.c.id).where(User.c.id == 1)
+        self.assertEqual(query_to_string(query),
+                         'SELECT "t1"."id" FROM "users" AS "t1" '
+                         'WHERE ("t1"."id" = 1)')

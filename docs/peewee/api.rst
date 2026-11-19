@@ -5729,6 +5729,43 @@ Queries
 
       :return: A 2-tuple consisting of the query's SQL and parameters.
 
+   .. method:: sql_with_explain()
+
+      :return: A 3-tuple of ``(sql, params, annotations)``.
+
+      Debugging aid for complex queries. Along with the SQL and parameters it
+      returns one annotation per bound parameter, as a dict with the keys:
+
+      * ``index``: position of the parameter in ``params``. A value appearing
+        in several places yields one annotation per position.
+      * ``path``: tuple of node descriptions from the root of the query down to
+        the node that emitted the parameter (e.g. ``('Select',
+        'Expression(=)', 'Value')``).
+      * ``purpose``: what the parameter is used for, such as an expression
+        operand, an IN-list item, a function argument, an insert / update /
+        on-conflict-update value, or ``limit`` / ``offset``.
+      * ``query``: label of the innermost (sub)query or CTE that owns the
+        parameter, and ``query_path``, the labels of all enclosing queries
+        from the outermost inwards (the two are equal for a top-level query).
+      * ``value_type``: the type of the bound value (e.g. ``'str'``), never the
+        value itself.
+
+      The annotations are recorded while the query is being compiled, so they
+      describe that exact compilation and the parameter order (including IN
+      lists, window functions, CTEs and upserts) always matches ``params``.
+      The parameter values are never included. :py:meth:`sql` is unaffected
+      and still returns the 2-tuple.
+
+      .. code-block:: python
+
+         query = (User
+                  .select(User.id)
+                  .where((User.username == username) & (User.id << ids)))
+         sql, params, annotations = query.sql_with_explain()
+         for annotation in annotations:
+             print(annotation['index'], annotation['purpose'],
+                   annotation['query'], annotation['path'])
+
    .. method:: execute(database)
 
       :param Database database: Database to execute query against. Not

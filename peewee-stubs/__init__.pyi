@@ -139,7 +139,17 @@ class State:
     def __getattr__(self, attr_name: str): ...
 
 class Context:
-    __slots__ = ("stack", "_sql", "_values", "alias_manager", "state")
+    __slots__ = (
+        "stack",
+        "_sql",
+        "_values",
+        "alias_manager",
+        "state",
+        "_explain",
+        "_node_path",
+        "_query_stack",
+        "_query_counter",
+    )
     stack: list[Incomplete]
     alias_manager: AliasManager
     state: State
@@ -169,6 +179,9 @@ class Context:
     def __sql__(self, ctx): ...
     def parse(self, node): ...
     def query(self) -> tuple[str, list[Incomplete]]: ...
+    @property
+    def explain(self) -> list[dict[str, Incomplete]] | None: ...
+    def query_with_explain(self) -> tuple[str, list[Incomplete], list[dict[str, Incomplete]]]: ...
 
 class Node:
     __isabstractmethod__: bool
@@ -593,6 +606,7 @@ class BaseQuery(Node):
     def objects(self, constructor=None) -> Self: ...
     def __sql__(self, ctx) -> None: ...
     def sql(self) -> tuple[str, list[Any]]: ...  # Returns (sql, params), params are bound query values
+    def sql_with_explain(self) -> tuple[str, list[Any], list[dict[str, Incomplete]]]: ...  # (sql, params, annotations)
     def execute(self, database: _DatabaseType | None = None): ...
     async def aexecute(self, database: _DatabaseType | None = None): ...
     def iterator(self, database: _DatabaseType | None = None): ...

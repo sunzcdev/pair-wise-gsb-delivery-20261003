@@ -7,6 +7,16 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Add optional compilation explanation for debugging complex queries:
+  `query.sql_with_explain()` (or `Context(explain=True)` plus
+  `Context.query_with_explain()`) returns the SQL and parameters along with
+  one annotation per bound parameter, giving its position, the node path that
+  produced it, its purpose (predicate operand, IN-list item, insert / update /
+  on-conflict-update value, limit / offset, ...) and the owning
+  (sub)query/CTE. Annotations are recorded during the compilation they
+  describe -- a parameter is never matched up by compiling the query again --
+  and they never contain the actual parameter values. `sql()` continues to
+  return the 2-tuple `(sql, params)`.
 * Clear `after_commit` callbacks registered on a savepoint if that savepoint is
   then rolled-back.
 * Re-create triggers during sqlite migrator table rebuilds.

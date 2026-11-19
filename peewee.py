@@ -643,19 +643,36 @@ def __scope_context__(scope):
 
 
 class Context(object):
-    __slots__ = ('stack', '_sql', '_values', 'alias_manager', 'state')
+    __slots__ = ('stack', '_sql', '_values', 'alias_manager', 'state',
+                 '_explain', '_node_path', '_query_stack', '_query_counter')
 
     def __init__(self, **settings):
         scope = settings.pop('scope', SCOPE_NORMAL)
         parentheses = settings.pop('parentheses', False)
+        explain = settings.pop('explain', False)
         self.stack = []
         self._sql = []
         self._values = []
         self.alias_manager = AliasManager()
         self.state = State(scope, parentheses, settings)
+        # Optional compilation explanation. When enabled, every parameter that
+        # is appended to "_values" is annotated with the node path that
+        # produced it, its purpose and the (sub)query that owns it. The notes
+        # are recorded *while* the query is compiled, so they describe this
+        # exact compilation (parameters are never matched up by compiling a
+        # second time). Annotations never include the bound values themselves.
+        self._explain = [] if explain else None
+        self._node_path = []
+        self._query_stack = []
+        self._query_counter = 0
 
     def as_new(self):
-        return Context(**self.state.settings)
+        ctx = Context(**self.state.settings)
+        if self._explain is not None:
+            # A sub-context gathers its own annotations, which are merged back
+            # into the parent context by Context.__sql__().
+            ctx._explain = []
+        return ctx
 
     def column_sort_key(self, item):
         return item[0].get_sort_key(self)
@@ -702,13 +719,51 @@ class Context(object):
         yield
         self.alias_manager.pop()
 
+    @contextmanager
+    def _purpose_hint(self, purpose):
+        # Tag values emitted within this block with a purpose (e.g. "limit"),
+        # but only when a compilation explanation is being recorded -- this
+        # keeps the (unexplained) hot path free of extra state copies.
+        if self._explain is None:
+            yield
+        else:
+            with self(purpose=purpose):
+                yield
+
     def sql(self, obj):
         if isinstance(obj, (Node, Context)):
+            if self._explain is not None and isinstance(obj, Node):
+                return self._tracked_sql(obj)
             return obj.__sql__(self)
         elif is_model(obj):
             return obj._meta.table.__sql__(self)
         else:
             return self.sql(Value(obj))
+
+    def _tracked_sql(self, obj):
+        # Keep track of the node being compiled, so that any parameters it
+        # emits can be annotated with their location in the query tree. Queries
+        # and CTEs are additionally tracked on a separate stack, so that a
+        # parameter can be attributed to the (sub)query that owns it.
+        self._node_path.append(obj)
+        query_kind = self._query_kind(obj)
+        if query_kind is not None:
+            self._query_counter += 1
+            self._query_stack.append(
+                (query_kind, '%s#%s' % (query_kind, self._query_counter)))
+        try:
+            return obj.__sql__(self)
+        finally:
+            self._node_path.pop()
+            if query_kind is not None:
+                self._query_stack.pop()
+
+    @staticmethod
+    def _query_kind(obj):
+        if isinstance(obj, CTE):
+            return 'cte(%s)' % obj._alias
+        elif isinstance(obj, BaseQuery):
+            return type(obj).__name__.lower()
 
     def literal(self, keyword):
         self._sql.append(keyword)
@@ -737,9 +792,103 @@ class Context(object):
             return self.literal(_query_val_transform(value))
 
         self._values.append(value)
+        if self._explain is not None:
+            self._explain.append(self._annotate_param(value))
         return self.literal(self.state.param or '?') if add_param else self
 
+    @staticmethod
+    def _describe_node(node):
+        # Compact description of a node for the explanation path. Never include
+        # the actual value -- path components must not be sensitive.
+        desc = type(node).__name__
+        if isinstance(node, Expression):
+            return '%s(%s)' % (desc, node.op)
+        elif isinstance(node, Field):
+            return '%s(%s)' % (desc, node.column_name)
+        elif isinstance(node, Function):
+            return '%s(%s)' % (desc, node.name)
+        elif isinstance(node, CTE):
+            return '%s(%s)' % (desc, node._alias)
+        return desc
+
+    def _infer_purpose(self):
+        # An explicit hint (e.g. "limit", or "on-conflict update") attached to
+        # the compilation state by the node emitting the value describes the
+        # surrounding clause, so it takes precedence over the node path (which
+        # would only describe the immediate expression).
+        if self.state.purpose:
+            return self.state.purpose
+
+        for node in reversed(self._node_path):
+            if isinstance(node, Expression):
+                if node.op in (OP.IN, OP.NOT_IN):
+                    return 'in-list item (%s)' % node.op
+                return 'expression operand (%s)' % node.op
+            elif isinstance(node, Function):
+                return 'function argument (%s)' % node.name
+            elif isinstance(node, Case):
+                return 'case expression operand'
+            elif isinstance(node, Window):
+                return 'window definition'
+            elif isinstance(node, ValuesList):
+                return 'values-list row item'
+
+        if self.scope == SCOPE_VALUES and self._query_stack:
+            query_kind, _ = self._query_stack[-1]
+            if query_kind.endswith('insert'):
+                return 'insert value'
+            elif query_kind.endswith('update'):
+                return 'update assignment'
+        return 'value'
+
+    def _annotate_param(self, value):
+        query_path = tuple(label for _, label in self._query_stack)
+        return {
+            # Position of this parameter in the list of bound values. The same
+            # value appearing more than once gets one entry per position.
+            'index': len(self._values) - 1,
+            # Nodes from the root of the query down to the one that emitted
+            # this parameter.
+            'path': tuple(self._describe_node(node)
+                          for node in self._node_path),
+            'purpose': self._infer_purpose(),
+            # Innermost query/subquery/CTE being compiled, and the full chain
+            # of enclosing queries (outermost first).
+            'query': query_path[-1] if query_path else None,
+            'query_path': query_path,
+            # Only the type of the bound value, never the value itself.
+            'value_type': type(value).__name__,
+        }
+
     def __sql__(self, ctx):
+        if ctx._explain is not None:
+            if self._explain:
+                # Merge the annotations gathered in this sub-context, shifting
+                # parameter positions and query labels so that they stay
+                # correct and unique within the parent context.
+                offset = len(ctx._values)
+                qoffset = ctx._query_counter
+                ctx._query_counter += self._query_counter
+                for annotation in self._explain:
+                    annotation = annotation.copy()
+                    annotation['index'] += offset
+                    if qoffset:
+                        query_path = tuple(
+                            _bump_query_label(label, qoffset)
+                            for label in annotation['query_path'])
+                        annotation['query_path'] = query_path
+                        annotation['query'] = (query_path[-1]
+                                               if query_path else None)
+                    ctx._explain.append(annotation)
+            elif self._values:
+                # Sub-context compiled without explanation, but the parent has
+                # it enabled: still record one annotation per bound parameter
+                # so that positions line up with the merged value list.
+                offset = len(ctx._values)
+                for i, value in enumerate(self._values):
+                    annotation = ctx._annotate_param(value)
+                    annotation['index'] = offset + i
+                    ctx._explain.append(annotation)
         ctx._sql.extend(self._sql)
         ctx._values.extend(self._values)
         return ctx
@@ -749,6 +898,21 @@ class Context(object):
 
     def query(self):
         return ''.join(self._sql), self._values
+
+    @property
+    def explain(self):
+        # Per-parameter annotations recorded during compilation, or None if
+        # explanation was not enabled for this context.
+        return self._explain
+
+    def query_with_explain(self):
+        sql, params = self.query()
+        return sql, params, list(self._explain) if self._explain else []
+
+
+def _bump_query_label(label, offset):
+    kind, _, num = label.rpartition('#')
+    return '%s#%s' % (kind, int(num) + offset)
 
 
 def query_to_string(query):
@@ -2195,6 +2359,18 @@ class BaseQuery(Node):
             context = Context()
         return context.parse(self)
 
+    def sql_with_explain(self):
+        # Like sql(), but returns (sql, params, annotations). The annotations
+        # list has one entry per bound parameter describing where it came
+        # from: the node path, its purpose, and the owning (sub)query. They are
+        # recorded during this compilation and carry no parameter values.
+        if self._database:
+            context = self._database.get_sql_context(explain=True)
+        else:
+            context = Context(explain=True)
+        context.sql(self)
+        return context.query_with_explain()
+
     @database_required
     def execute(self, database):
         return self._execute(database)
@@ -2311,9 +2487,13 @@ class Query(BaseQuery):
         if self._limit is not None or (self._offset is not None and
                                        ctx.state.limit_max):
             limit = ctx.state.limit_max if self._limit is None else self._limit
-            ctx.literal(' LIMIT ').sql(limit)
+            ctx.literal(' LIMIT ')
+            with ctx._purpose_hint('limit'):
+                ctx.sql(limit)
         if self._offset is not None:
-            ctx.literal(' OFFSET ').sql(self._offset)
+            ctx.literal(' OFFSET ')
+            with ctx._purpose_hint('offset'):
+                ctx.sql(self._offset)
         return ctx
 
     def __sql__(self, ctx):
@@ -3014,7 +3194,7 @@ class Insert(_WriteQuery):
             if self._on_conflict is not None:
                 update = self._on_conflict.get_conflict_update(ctx, self)
                 if update is not None:
-                    with ctx(subquery=True):
+                    with ctx(subquery=True, purpose='on-conflict update'):
                         ctx.literal(' ').sql(update)
 
             return self.apply_returning(ctx)
