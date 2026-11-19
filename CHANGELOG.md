@@ -7,6 +7,17 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Add `CompositeForeignKeyField` for explicit multi-column foreign keys to
+  models with composite primary keys. The same ordered column set is used for
+  the table constraint, the join predicates and the relation accessors;
+  partial-NULL keys follow the declared match rule (`match='SIMPLE'` /
+  `'FULL'`), and `MATCH FULL` constraints are only generated for databases
+  that enforce them (a `NotSupportedError` is raised otherwise).
+  Back-references, recursive `delete_instance()`, dependency ordering,
+  deferred constraints, `insert()`/`update()`, auto-generated migrations and
+  `model_to_dict()` are supported; `prefetch()`, `Load()` / `with_related()`,
+  deferred model references and `SchemaMigrator.add_column()` raise a clear
+  error instead.
 * Clear `after_commit` callbacks registered on a savepoint if that savepoint is
   then rolled-back.
 * Re-create triggers during sqlite migrator table rebuilds.

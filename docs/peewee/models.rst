@@ -1278,9 +1278,8 @@ columns as a composite primary key:
            primary_key = CompositeKey('tweet', 'tag')
 
 Composite primary keys are most appropriate for junction tables in many-to-many
-relationships. Peewee has limited support for foreign keys *to* models with
-composite primary keys, so avoid them in models that other models will
-reference.
+relationships. To reference a model that has a composite primary key, use
+:class:`CompositeForeignKeyField` (see :ref:`composite-foreign-keys`).
 
 Models without a primary key
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1309,7 +1308,9 @@ Peewee allows arbitrary constraints to :class:`Model` classes.
 
 Suppose you have a *people* table with a composite primary key of two columns:
 the person's first and last name. You wish to have another table relate to the
-*people* table. To do this define a multi-column foreign key constraint:
+*people* table. The recommended way is :class:`CompositeForeignKeyField` (see
+:ref:`composite-foreign-keys`), which creates the component columns, the
+constraint, the join predicates and the relation accessors for you:
 
 .. code-block:: python
 
@@ -1319,6 +1320,14 @@ the person's first and last name. You wish to have another table relate to the
 
        class Meta:
            primary_key = CompositeKey('first', 'last')
+
+   class Pet(Model):
+       owner = CompositeForeignKeyField(Person, backref='pets')
+       pet_name = CharField()
+
+Alternatively, the constraint can be declared by hand as a table constraint:
+
+.. code-block:: python
 
    class Pet(Model):
        owner_first = CharField()

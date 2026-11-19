@@ -161,6 +161,107 @@ To retrieve the related object(s), select both sources and issue a
    for tweet in query:
        print(tweet.user.username)  # No extra query needed.
 
+.. _composite-foreign-keys:
+
+Composite foreign keys
+----------------------
+
+When a model is identified by a :class:`CompositeKey`, use
+:class:`CompositeForeignKeyField` to declare an explicit multi-column foreign
+key to it:
+
+.. code-block:: python
+
+   class Person(BaseModel):
+       first = CharField()
+       last = CharField()
+
+       class Meta:
+           primary_key = CompositeKey('first', 'last')
+
+   class Pet(BaseModel):
+       owner = CompositeForeignKeyField(Person, backref='pets')
+       pet_name = CharField()
+
+The field automatically creates one local column per referenced column, named
+``<field name>_<referenced field name>`` (``owner_first`` and ``owner_last``
+above), mirroring the referenced column's type. The *same ordered column set*
+is used everywhere:
+
+* the ``FOREIGN KEY (owner_first, owner_last) REFERENCES person (first,
+  last)`` table constraint,
+* the ``ON`` clause of automatic joins (``Pet.select().join(Person)`` and the
+  back-reference join ``Person.select().join(Pet)``),
+* object access (``pet.owner``) and the object-id accessor (``pet.owner_id``,
+  which returns a tuple).
+
+An index on the component columns is created by default (disable it with
+``index=False``). To customize a component column -- for example, to make only
+one of the columns nullable -- declare it yourself before the composite
+foreign key; existing columns with the derived names are reused.
+
+The referenced columns default to the related model's composite primary key,
+but any ordered set of columns covered by a primary key or unique constraint
+may be given explicitly:
+
+.. code-block:: python
+
+   class Membership(BaseModel):
+       team = CompositeForeignKeyField(Team, fields=('org', 'team_no'),
+                                       backref='memberships')
+
+Assigning and comparing work with model instances or tuples of key values:
+
+.. code-block:: pycon
+
+   >>> pet.owner = some_person      # assign an instance
+   >>> pet.owner = ('huey', 'cat')  # or a tuple of key values
+   >>> pet.owner_id                 # object-id accessor returns a tuple
+   ('huey', 'cat')
+   >>> Pet.select().where(Pet.owner == some_person)  # compares all columns
+
+The field may also be given to ``insert()`` / ``update()`` by name:
+
+.. code-block:: python
+
+   Pet.insert(owner=('huey', 'cat'), pet_name='mickey').execute()
+
+NULL components and match rules
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+By default (``MATCH SIMPLE``) a foreign key in which *any* component is NULL
+is not checked by the database and cannot reference a row. Peewee follows the
+declared match rule: accessing the relation on an instance whose key contains
+a NULL component returns ``None`` rather than issuing a query that could never
+match, and join predicates always compare the complete ordered column set --
+they never degrade to comparing only the first column.
+
+``match='FULL'`` may be declared to require all-or-nothing NULLs. Because
+SQLite and MySQL do not enforce ``MATCH FULL`` (it is parsed but ignored),
+peewee raises :class:`NotSupportedError` when generating the constraint on
+those databases rather than silently creating a constraint that would not be
+enforced. Postgresql enforces ``MATCH FULL`` and is fully supported.
+
+Limitations
+^^^^^^^^^^^
+
+The following are rejected at configuration time:
+
+* Deferred model references: :class:`CompositeForeignKeyField` requires the
+  related model class, or the string ``'self'`` for a self-referential
+  foreign-key. Unresolved string references like :class:`DeferredForeignKey`
+  raise :class:`ImproperlyConfigured`.
+* :func:`prefetch` and :class:`Load` / ``with_related()`` do not support
+  composite foreign keys and raise an error.
+* ``SchemaMigrator.add_column()`` cannot add a composite foreign-key (it spans
+  multiple columns).
+
+Recursive deletes (:meth:`Model.delete_instance` with ``recursive=True``),
+dependency ordering (:py:func:`sort_models`) and deferred constraints
+(``deferrable=``) fully support composite foreign keys, including transitive
+dependencies, which are expressed as row-value ``IN`` subqueries, e.g.
+``(c1, c2) IN (SELECT r1, r2 ...)``.
+
 .. _backreferences:
 
 Back-references

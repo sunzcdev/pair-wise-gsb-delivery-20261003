@@ -345,6 +345,11 @@ class SchemaMigrator(object):
     @operation
     def add_column(self, table, column_name, field, allow_not_null=False):
         field = field.clone()
+        if isinstance(field, CompositeForeignKeyField):
+            raise ValueError(
+                'Cannot add a composite foreign-key with add_column(): it '
+                'spans multiple columns. Add each component column, then the '
+                'constraint, separately.')
         # Adding a column is complicated by the fact that if there are rows
         # present and the field is non-null, then we need to first add the
         # column as a nullable field, then set the value, then add a not null

@@ -832,6 +832,7 @@ class Database(_callable_context_manager):
     quote: str
     server_version: Incomplete
     compound_select_parentheses: Incomplete
+    fk_match_full: bool
     for_update: bool
     index_schema_prefix: bool
     index_using_precedes_table: bool
@@ -1041,6 +1042,7 @@ class PostgresqlDatabase(Database):
     operations: Incomplete
     param: str
     compound_select_parentheses: Incomplete
+    fk_match_full: bool
     for_update: bool
     nulls_ordering: bool
     returning_clause: bool
@@ -1086,6 +1088,7 @@ class MySQLDatabase(Database):
     param: str
     quote: str
     compound_select_parentheses: Incomplete
+    fk_match_full: bool
     for_update: bool
     index_using_precedes_table: bool
     limit_max: Incomplete
@@ -1219,6 +1222,26 @@ class BackrefAccessor:
     def __get__(self, instance, instance_type=None): ...
 
 class ObjectIdAccessor:
+    field: Incomplete
+    def __init__(self, field) -> None: ...
+    def __get__(self, instance, instance_type=None): ...
+    def __set__(self, instance, value) -> None: ...
+
+class CompositeForeignKeyAccessor(FieldAccessor):
+    rel_model: Incomplete
+    def __init__(self, model, field, name) -> None: ...
+    def get_rel_instance(self, instance): ...
+    def __get__(self, instance, instance_type=None): ...
+    def __set__(self, instance, obj) -> None: ...
+
+class CompositeBackrefAccessor:
+    field: Incomplete
+    model: Incomplete
+    rel_model: Incomplete
+    def __init__(self, field) -> None: ...
+    def __get__(self, instance, instance_type=None): ...
+
+class CompositeObjectIdAccessor:
     field: Incomplete
     def __init__(self, field) -> None: ...
     def __get__(self, instance, instance_type=None): ...
@@ -1670,6 +1693,61 @@ class MetaField(Field):
     model: Incomplete
     name: Incomplete
     primary_key: bool
+
+class _CompositeFKComponentField(Field):
+    rel_field: Incomplete
+    def __init__(self, rel_field, **kwargs) -> None: ...
+    @property
+    def field_type(self): ...  # type: ignore[override]
+    def get_modifiers(self): ...
+    def adapt(self, value): ...
+    def db_value(self, value): ...
+    def python_value(self, value): ...
+
+class CompositeForeignKeyField(MetaField):
+    accessor_class: Incomplete
+    backref_accessor_class: Incomplete
+    object_id_accessor_class: Incomplete
+    rel_model: Incomplete
+    rel_fields: Incomplete
+    field_names: Incomplete
+    declared_backref: Incomplete
+    backref: Incomplete
+    on_delete: Incomplete
+    on_update: Incomplete
+    deferrable: Incomplete
+    deferred: Incomplete
+    match: Incomplete
+    null: Incomplete
+    index: Incomplete
+    object_id_name: Incomplete
+    lazy_load: Incomplete
+    constraint_name: str | None
+    def __init__(
+        self,
+        model,
+        fields: Incomplete = None,
+        backref: Incomplete = None,
+        on_delete: Incomplete = None,
+        on_update: Incomplete = None,
+        deferrable: Incomplete = None,
+        match: Incomplete = None,
+        null: bool = ...,
+        index: bool = ...,
+        object_id_name: Incomplete = None,
+        lazy_load: bool = ...,
+        constraint_name: str | None = ...,
+        _deferred: Incomplete = None,
+    ) -> None: ...
+    @property
+    def rel_field(self): ...
+    @property
+    def fields(self): ...
+    def bind(self, model, name, set_attribute: bool = True) -> None: ...
+    def get_constraint_name(self) -> str: ...
+    def foreign_key_constraint(self, explicit_name: bool = False) -> NodeList: ...
+    def __eq__(self, other): ...  # type: ignore[override]
+    def __ne__(self, other): ...  # type: ignore[override]
 
 class ManyToManyFieldAccessor(FieldAccessor):
     model: Incomplete
@@ -2155,6 +2233,7 @@ __all__ = [
     "Check",
     "chunked",
     "Column",
+    "CompositeForeignKeyField",
     "CompositeKey",
     "Context",
     "Database",

@@ -86,6 +86,11 @@ Database
       Whether the database supports sequences. ``False`` by default,
       ``True`` for Postgres.
 
+   .. attribute:: fk_match_full
+
+      Whether the database enforces the ``MATCH FULL`` foreign-key match
+      rule. ``False`` by default, ``True`` for Postgres.
+
    .. attribute:: Model
 
       Property which returns a base :class:`Model` class bound to this
@@ -4121,6 +4126,68 @@ Fields
       ``pragmas={'foreign_keys': 1}`` when you instantiate
       :class:`SqliteDatabase`.
 
+.. class:: CompositeForeignKeyField(model, fields=None, backref=None, on_delete=None, on_update=None, deferrable=None, match=None, null=False, index=True, object_id_name=None, lazy_load=True, constraint_name=None)
+
+   :param Model model: Model to reference, or the string ``'self'`` for a
+       self-referential foreign key. Deferred model references (strings other
+       than ``'self'``) are not supported.
+   :param fields: Ordered tuple of field names (or fields) on ``model`` to
+       reference (default is the model's composite primary key). The
+       referenced columns must together be a primary key or have a unique
+       constraint.
+   :param str backref: Accessor name for the back-reference, or "+" to disable
+       the back-reference accessor.
+   :param str on_delete: ON DELETE action, e.g. ``'CASCADE'``.
+   :param str on_update: ON UPDATE action.
+   :param str deferrable: Control when the constraint is enforced, e.g.
+       ``'INITIALLY DEFERRED'``.
+   :param str match: Foreign-key match rule, ``'SIMPLE'`` or ``'FULL'``.
+       ``MATCH FULL`` is only generated for databases that enforce it
+       (currently Postgresql); elsewhere a :class:`NotSupportedError` is
+       raised when the constraint SQL is generated, rather than silently
+       creating an unenforced constraint.
+   :param bool null: Whether the component columns accept NULL.
+   :param bool index: Create an index on the component columns.
+   :param str object_id_name: Name for the object-id accessor (default is the
+       field name plus ``_id``); it returns a tuple of the component values.
+   :param bool lazy_load: Fetch the related object when the foreign-key field
+       attribute is accessed.
+   :param str constraint_name: (optional) name to use for the foreign-key
+       constraint.
+
+   Field class for an explicit multi-column foreign key. Local columns named
+   ``<name>_<referenced field name>`` are created automatically (unless
+   fields with those names already exist on the model), and the same ordered
+   column set is used for the table constraint, the join predicates and the
+   relation accessors.
+
+   .. code-block:: python
+
+      class Person(Model):
+          first = CharField()
+          last = CharField()
+
+          class Meta:
+              primary_key = CompositeKey('first', 'last')
+
+      class Pet(Model):
+          owner = CompositeForeignKeyField(Person, backref='pets')
+          pet_name = CharField()
+
+      # Columns "owner_first" and "owner_last" are created automatically,
+      # along with a FOREIGN KEY (owner_first, owner_last) constraint and
+      # an index on the two columns.
+
+   When any component of the key is NULL, the key cannot reference a row (per
+   the SQL match rules) and accessing the relation returns ``None`` rather
+   than querying with a partial key.
+
+   .. note::
+      :func:`prefetch` and :class:`Load` / ``with_related()`` do not support
+      composite foreign keys.
+
+   See :ref:`composite-foreign-keys` for additional discussion.
+
 .. class:: DeferredForeignKey(rel_model_name, **kwargs)
 
    :param str rel_model_name: Model name to reference.
@@ -4531,7 +4598,9 @@ Schema Manager
 
    .. method:: create_foreign_key(field)
 
-      :param ForeignKeyField field: Foreign-key field constraint to add.
+      :param field: Foreign-key field constraint to add. May be a
+          :class:`ForeignKeyField` (e.g. a deferred foreign-key being resolved
+          after table creation) or a :class:`CompositeForeignKeyField`.
 
       Add a foreign-key constraint for the given field. This method should
       not be necessary in most cases, as foreign-key constraints are created

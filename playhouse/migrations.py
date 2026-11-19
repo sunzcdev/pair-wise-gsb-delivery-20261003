@@ -311,6 +311,29 @@ def _build_field_args(field, imports, todos, targets=None, unbound=False):
 
     return args
 
+def _build_composite_fk(field, targets=None, unbound=False):
+    rel_model = field.rel_model
+    if not unbound and rel_model is field.model:
+        rel_name = "'self'"
+    else:
+        rel_name = targets[rel_model]
+    args = [rel_name, 'fields=(%s)' % ', '.join(
+        repr(rel_field.name) for rel_field in field.rel_fields)]
+    if field.backref:
+        args.append('backref=%r' % field.backref)
+    if field.on_delete: args.append('on_delete=%r' % field.on_delete)
+    if field.on_update: args.append('on_update=%r' % field.on_update)
+    if field.deferrable: args.append('deferrable=%r' % field.deferrable)
+    if field.match: args.append('match=%r' % field.match)
+    if field.null: args.append('null=True')
+    if not field.index: args.append('index=False')
+    if field.object_id_name != '%s_id' % field.name:
+        args.append('object_id_name=%r' % field.object_id_name)
+    if not field.lazy_load: args.append('lazy_load=False')
+    if field.constraint_name:
+        args.append('constraint_name=%r' % field.constraint_name)
+    return 'CompositeForeignKeyField(%s)' % ', '.join(args)
+
 def _build_field(field, imports, todos, targets=None, unbound=False):
     cls = type(field)
     if isinstance(field, EnumFieldMixin):
@@ -329,12 +352,27 @@ def _is_implicit_id(field):
 def _build_model(model, imports, todos, targets):
     meta = model._meta
     lines = ['class %s(Model):' % model.__name__]
+    # Component columns auto-created by a composite foreign-key are
+    # re-created by the field itself; user-declared ones must still be
+    # emitted (the composite fk reuses them when present).
+    auto_components = set()
+    for fk_field in meta.composite_fks.values():
+        for field_name in fk_field.field_names:
+            if getattr(meta.fields[field_name], '_auto_composite_fk', False):
+                auto_components.add(field_name)
     for field in meta.sorted_fields:
         if _is_implicit_id(field):
+            continue
+        if field.name in auto_components:
             continue
         lines.append('    %s = %s' % (
             field.name,
             _build_field(field, imports, todos, targets)))
+
+    for fk_field in meta.composite_fks.values():
+        lines.append('    %s = %s' % (
+            fk_field.name,
+            _build_composite_fk(fk_field, targets)))
 
     lines.append('    class Meta:')
     lines.append('        database = db')
@@ -414,9 +452,8 @@ def template(diff):
     # Ensure all FK reference targets exist, either as classes or stubs.
     fks = []
     for model in diff.create_tables:
-        fks.extend(f for f in model._meta.sorted_fields
-                   if isinstance(f, ForeignKeyField) and
-                   f.rel_model is not model)
+        fks.extend(f for f in model._meta.refs
+                   if f.rel_model is not model)
     fks.extend(f for f in diff.add_columns
                if isinstance(f, ForeignKeyField))
 
@@ -428,8 +465,11 @@ def template(diff):
             continue
         if rel not in stubs:
             stubs[rel] = {}  # A stub renders even when only its name is used.
-        if not _is_implicit_id(field.rel_field):
-            stubs[rel][field.rel_field.name] = field.rel_field
+        for rel_field in (field.rel_fields
+                          if isinstance(field, CompositeForeignKeyField)
+                          else (field.rel_field,)):
+            if not _is_implicit_id(rel_field):
+                stubs[rel][rel_field.name] = rel_field
     targets = {model: model.__name__ for model in created | set(stubs)}
 
     # Build any stub models needed for FKs to resolve properly.
@@ -469,6 +509,14 @@ def template(diff):
 
     for field in diff.add_columns:
         meta = field.model._meta
+        if isinstance(field, CompositeForeignKeyField):
+            # A composite fk adds one column per referenced column, which
+            # add_column() (single column) cannot express.
+            todos.append('%s.%s: composite foreign-key must be added by hand '
+                         '(add columns %s, then the constraint)' %
+                         (meta.table_name, field.name,
+                          ', '.join(field.field_names or ())))
+            continue
         source = _build_field(field, imports, todos, targets, unbound=True)
         if not field.null and field.default is None:
             todos.append('%s.%s: not-null column needs a default or '
