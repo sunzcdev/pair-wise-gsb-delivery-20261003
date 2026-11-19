@@ -15,7 +15,7 @@ from typing import Any
 from .callbacks import DEFAULT_CALLBACK
 from .config import apply_config, conf
 from .dircache import DirCache
-from .transaction import Transaction
+from .transaction import Transaction, active_transaction
 from .utils import (
     _unstrip_protocol,
     check_contained,
@@ -248,8 +248,8 @@ class AbstractFileSystem(metaclass=_Cached):
             # reusing instance, don't change
             return
         self._cached = True
-        self._intrans = False
-        self._transaction = None
+        # Transaction state is context-local (see fsspec.transaction); these
+        # attributes only back the compatibility properties below.
         self._invalidated_caches_in_transaction = []
         self.dircache = DirCache(**storage_options)
 
@@ -336,30 +336,53 @@ class AbstractFileSystem(metaclass=_Cached):
         return cls()
 
     @property
+    def _intrans(self):
+        """Whether a transaction is active on this filesystem in this context.
+
+        Context-local: because instances are cached and shared, a transaction
+        opened in another thread/context does not make writes here deferred.
+        """
+        return active_transaction(self) is not None
+
+    @property
+    def _transaction(self):
+        """The transaction active in this context, or ``None``"""
+        return active_transaction(self)
+
+    @property
     def transaction(self):
         """A context within which files are committed together upon exit
 
         Requires the file class to implement `.commit()` and `.discard()`
         for the normal and exception cases.
+
+        The returned object is bound to the current context: entering it only
+        defers writes made from this context, while ordinary writes from other
+        contexts on the same cached instance commit immediately. Re-entering
+        the same transaction joins it; starting a different transaction while
+        one is active raises ``RuntimeError``.
         """
-        if self._transaction is None:
-            self._transaction = self.transaction_type(self)
-        return self._transaction
+        current = active_transaction(self)
+        if current is not None:
+            return current
+        return self.transaction_type(self)
 
     def start_transaction(self):
         """Begin write transaction for deferring files, non-context version"""
-        self._intrans = True
-        self._transaction = self.transaction_type(self)
-        return self.transaction
+        transaction = self.transaction
+        transaction.start()
+        return transaction
 
     def end_transaction(self):
-        """Finish write transaction, non-context version"""
-        self.transaction.complete()
-        self._transaction = None
-        # The invalid cache must be cleared after the transaction is completed.
-        for path in self._invalidated_caches_in_transaction:
-            self.invalidate_cache(path)
-        self._invalidated_caches_in_transaction.clear()
+        """Finish write transaction, non-context version
+
+        Only the transaction active in this context is finalised; transactions
+        opened in other contexts on the same (cached) instance are untouched.
+        """
+        transaction = active_transaction(self)
+        if transaction is None:
+            raise RuntimeError("No transaction is active in this context.")
+        transaction._unwind(commit=True)
 
     def invalidate_cache(self, path=None):
         """
@@ -375,8 +398,9 @@ class AbstractFileSystem(metaclass=_Cached):
         # But if have, you should call this method of parent class from your
         # subclass to ensure expiring caches after transacations correctly.
         # See the implementation of FTPFileSystem in ftp.py
-        if self._intrans:
-            self._invalidated_caches_in_transaction.append(path)
+        transaction = active_transaction(self)
+        if transaction is not None:
+            transaction.invalidated_caches.append(path)
 
     def mkdir(self, path, create_parents=True, **kwargs):
         """
@@ -1507,7 +1531,8 @@ class AbstractFileSystem(metaclass=_Cached):
                 **text_kwargs,
             )
         else:
-            ac = kwargs.pop("autocommit", not self._intrans)
+            transaction = active_transaction(self)
+            ac = kwargs.pop("autocommit", transaction is None)
             f = self._open(
                 path,
                 mode=mode,
@@ -1516,8 +1541,11 @@ class AbstractFileSystem(metaclass=_Cached):
                 cache_options=cache_options,
                 **kwargs,
             )
-            if not ac and "r" not in mode:
-                self.transaction.files.append(f)
+            if not ac and "r" not in mode and transaction is not None:
+                # attribute the deferred file to the transaction of *this*
+                # context, never to one opened by another context on the same
+                # cached filesystem
+                transaction.files.append(f)
             if compression is not None:
                 from fsspec.compression import compr
                 from fsspec.core import get_compression

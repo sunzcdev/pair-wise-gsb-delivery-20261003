@@ -139,6 +139,17 @@ file target locations untouched.
 The class :func:`fsspec.spec.Transaction` allows for fine-tuning of the operation, and every
 ``fsspec`` instance has an instance of this as an attribute ``.transaction`` to give access.
 
+Transactions are bound to the execution context (thread or ``contextvars`` context) in which
+they are opened rather than to the filesystem instance. Because filesystem instances are cached
+and shared, a transaction only defers writes made from its own context: ordinary writes from
+another context on the same instance commit immediately, and each transaction owns the queue of
+files it created. Ending a transaction from a different context than the one that started it,
+or starting a second, distinct transaction while one is already active in the same context,
+raises ``RuntimeError``. Re-entering the same transaction (for example, nested
+``with fs.transaction:`` blocks) joins the existing transaction, and only the outermost exit
+commits or discards the files. If committing one transaction fails, its own remaining files are
+still discarded and any other transaction is unaffected.
+
 Note that synchronising transactions across multiple instances, perhaps across a cluster,
 is a harder problem to solve, and the implementation described here is only part of the solution.
 

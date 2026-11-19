@@ -71,17 +71,14 @@ def _atomic_get(fs, rpaths, lpaths, callback=DEFAULT_CALLBACK):
 
 
 class WriteCachedTransaction(Transaction):
-    def complete(self, commit=True):
-        if not commit:
-            return super().complete(commit=False)
+    def _commit_files(self):
+        # upload all of this transaction's local cache files in one bulk put;
+        # keep the files queued on failure so the standard cleanup discards
+        # their local temporary copies
         rpaths = [f.path for f in self.files]
         lpaths = [f.fn for f in self.files]
-        if commit:
-            self.fs.put(lpaths, rpaths)
+        self.fs.put(lpaths, rpaths)
         self.files.clear()
-        self.fs._intrans = False
-        self.fs._transaction = None
-        self.fs = None  # break cycle
 
 
 class CachingFileSystem(ChainedFileSystem):
@@ -567,6 +564,11 @@ class CachingFileSystem(ChainedFileSystem):
         if item in ["transaction"]:
             # property
             return type(self).transaction.__get__(self)
+        if item in {"_intrans", "_transaction"}:
+            # context-local transaction properties defined on the base class;
+            # they must resolve against this caching filesystem, not delegate
+            # to the wrapped filesystem
+            return getattr(type(self), item).__get__(self)
         if item in {"_cache", "transaction_type", "protocol"}:
             # class attributes
             return getattr(type(self), item)

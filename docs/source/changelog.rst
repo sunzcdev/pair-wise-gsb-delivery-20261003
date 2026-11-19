@@ -17,6 +17,14 @@ Enhancements
 
 Fixes
 
+- Make write transactions context-local: a transaction only defers writes made
+  from the thread/``contextvars`` context that opened it, so ordinary writes
+  from another context on a cached filesystem are no longer delayed and each
+  transaction owns its own file queue. Re-entering the same transaction joins
+  it, distinct nested transactions and cross-context completion raise
+  ``RuntimeError``, and a failed commit only cleans up the failing
+  transaction's files.
+
 - Avoid empty backend range requests at EOF with the first-chunk cache.
 
 - Forward per-call reference ``cat_file`` options to the target filesystem.
