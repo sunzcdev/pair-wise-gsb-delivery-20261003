@@ -1,0 +1,5944 @@
+require_relative '../helper'
+require 'fluent/test/driver/input'
+require 'fluent/plugin/in_tail'
+require 'fluent/plugin/buffer'
+require 'fluent/system_config'
+require 'fluent/file_wrapper'
+require 'net/http'
+require 'flexmock/test_unit'
+require 'timecop'
+require 'tmpdir'
+require 'securerandom'
+
+class TailInputTest < Test::Unit::TestCase
+  include FlexMock::TestCase
+
+  def tmp_dir
+    File.join(File.dirname(__FILE__), "..", "tmp", "tail#{ENV['TEST_ENV_NUMBER']}", SecureRandom.hex(10))
+  end
+
+  def setup
+    Fluent::Test.setup
+    @tmp_dir = tmp_dir
+    cleanup_directory(@tmp_dir)
+  end
+
+  def teardown
+    super
+    cleanup_directory(@tmp_dir)
+    Fluent::Engine.stop
+    Timecop.return
+  end
+
+  def cleanup_directory(path)
+    unless Dir.exist?(path)
+      FileUtils.mkdir_p(path)
+      return
+    end
+
+    FileUtils.remove_entry_secure(path, true)
+  end
+
+  def cleanup_file(path)
+    FileUtils.remove_entry_secure(path, true)
+  end
+
+  def create_target_info(path)
+    Fluent::Plugin::TailInput::TargetInfo.new(path, Fluent::FileWrapper.stat(path).ino)
+  end
+
+  ROOT_CONFIG = config_element("ROOT", "", {
+                            "tag" => "t1",
+                            "rotate_wait" => "2s",
+                            "refresh_interval" => "1s"
+                               })
+
+  def base_config
+    ROOT_CONFIG + config_element("", "", { "path" => "#{@tmp_dir}/tail.txt" })
+  end
+
+  def common_config
+    base_config + config_element("", "", { "pos_file" => "#{@tmp_dir}/tail.pos" })
+  end
+
+  def common_follow_inode_config
+    config_element("ROOT", "", {
+                     "path" => "#{@tmp_dir}/tail.txt*",
+                     "pos_file" => "#{@tmp_dir}/tail.pos",
+                     "tag" => "t1",
+                     "refresh_interval" => "1s",
+                     "read_from_head" => "true",
+                     "format" => "none",
+                     "rotate_wait" => "1s",
+                     "follow_inodes" => "true"
+                   })
+  end
+
+  CONFIG_READ_FROM_HEAD = config_element("", "", { "read_from_head" => true })
+  CONFIG_DISABLE_WATCH_TIMER = config_element("", "", { "enable_watch_timer" => false })
+  CONFIG_DISABLE_STAT_WATCHER = config_element("", "", { "enable_stat_watcher" => false })
+  CONFIG_OPEN_ON_EVERY_UPDATE = config_element("", "", { "open_on_every_update" => true })
+  SINGLE_LINE_CONFIG = config_element("", "", { "format" => "/(?<message>.*)/" })
+  PARSE_SINGLE_LINE_CONFIG = config_element("", "", {}, [config_element("parse", "", { "@type" => "/(?<message>.*)/" })])
+  MULTILINE_CONFIG = config_element(
+    "", "", {
+      "format" => "multiline",
+      "format1" => "/^s (?<message1>[^\\n]+)(\\nf (?<message2>[^\\n]+))?(\\nf (?<message3>.*))?/",
+      "format_firstline" => "/^[s]/"
+    })
+  PARSE_MULTILINE_CONFIG = config_element(
+    "", "", {},
+    [config_element("parse", "", {
+                      "@type" => "multiline",
+                      "format1" => "/^s (?<message1>[^\\n]+)(\\nf (?<message2>[^\\n]+))?(\\nf (?<message3>.*))?/",
+                      "format_firstline" => "/^[s]/"
+                    })
+    ])
+
+  MULTILINE_CONFIG_WITH_NEWLINE = config_element(
+    "", "", {
+      "format" => "multiline",
+      "format1" => "/^s (?<message1>[^\\n]+)(\\nf (?<message2>[^\\n]+))?(\\nf (?<message3>.[^\\n]+))?/",
+      "format_firstline" => "/^[s]/"
+    })
+  PARSE_MULTILINE_CONFIG_WITH_NEWLINE = config_element(
+    "", "", {},
+    [config_element("parse", "", {
+                      "@type" => "multiline",
+                      "format1" => "/^s (?<message1>[^\\n]+)(\\nf (?<message2>[^\\n]+))?(\\nf (?<message3>.[^\\n]+))?/",
+                      "format_firstline" => "/^[s]/"
+                    })
+    ])
+
+  # A parser which never matches, like parser plugins which don't implement
+  # the `unmatched_lines` feature. Such parsers yield (nil, nil) to the caller.
+  class NeverMatchingParser
+    def parse(text, &block)
+      block.call(nil, nil)
+      nil
+    end
+  end
+
+  EX_ROTATE_WAIT = 0
+  EX_FOLLOW_INODES = false
+
+  def ex_config
+    config_element("", "", {
+                     "tag" => "tail",
+                     "path" => "test/plugin/*/%Y/%m/%Y%m%d-%H%M%S.log,test/plugin/data/log/**/*.log",
+                     "format" => "none",
+                     "pos_file" => "#{@tmp_dir}/tail.pos",
+                     "read_from_head" => true,
+                     "refresh_interval" => 30,
+                     "rotate_wait" => "#{EX_ROTATE_WAIT}s",
+                     "follow_inodes" => "#{EX_FOLLOW_INODES}",
+                   })
+  end
+
+  def tailing_group_pattern
+    "/#{@tmp_dir}\/(?<podname>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\/[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace>[^_]+)_(?<container>.+)-(?<docker_id>[a-z0-9]{6})\.log$/"
+  end
+
+  DEBUG_LOG_LEVEL = config_element("", "", {
+    "@log_level" => "debug"
+  })
+
+  def create_group_directive(pattern, rate_period, *rules)
+    config_element("", "", {}, [
+      config_element("group", "", {
+        "pattern" => pattern,
+        "rate_period" => rate_period
+      }, rules)
+    ])
+  end
+
+  def create_rule_directive(match_named_captures, limit)
+    params = {
+      "limit" => limit,
+      "match" => match_named_captures,
+    }
+
+    config_element("rule", "", params)
+  end
+
+  def create_path_element(path)
+    config_element("source", "", { "path" => "#{@tmp_dir}/#{path}" })
+  end
+
+  def create_driver(conf = SINGLE_LINE_CONFIG, use_common_conf = true, klass: Fluent::Plugin::TailInput)
+    config = use_common_conf ? common_config + conf : conf
+    Fluent::Test::Driver::Input.new(klass).configure(config)
+  end
+
+  def wrap_worker_pool_process(pool, &before_process)
+    original_process = pool.instance_variable_get(:@process)
+    pool.instance_variable_set(:@process, lambda do |index, payload|
+      before_process.call(payload)
+      original_process.call(index, payload)
+    end)
+  end
+
+  sub_test_case "configure" do
+    test "plain single line" do
+      d = create_driver
+      assert_equal(["#{@tmp_dir}/tail.txt"], d.instance.paths)
+      assert_equal("t1", d.instance.tag)
+      assert_equal(2, d.instance.rotate_wait)
+      assert_equal("#{@tmp_dir}/tail.pos", d.instance.pos_file)
+      assert_equal(1000, d.instance.read_lines_limit)
+      assert_equal(-1, d.instance.read_bytes_limit_per_second)
+      assert_equal(false, d.instance.ignore_repeated_permission_error)
+      assert_nothing_raised do
+        d.instance.have_read_capability?
+      end
+    end
+
+    test "num_threads must be positive" do
+      [0, -1].each do |num_threads|
+        conf = SINGLE_LINE_CONFIG + config_element('', '', { 'num_threads' => num_threads })
+        assert_raise(Fluent::ConfigError) { create_driver(conf) }
+      end
+    end
+
+    data('without *': { tag: 'tail', tag_prefix: nil, tag_suffix: nil },
+         'only *': { tag: '*', tag_prefix: '', tag_suffix: '' },
+         'prefix': { tag: 'pre.*', tag_prefix: 'pre.', tag_suffix: '' },
+         'suffix': { tag: '*.post', tag_prefix: '', tag_suffix: '.post' },
+         'prefix and suffix': { tag: 'pre.*.post', tag_prefix: 'pre.', tag_suffix: '.post' },
+         'extra * is ignored': { tag: 'pre.*.post*ignore', tag_prefix: 'pre.', tag_suffix: '.post' })
+    test "tag with * is split into tag_prefix and tag_suffix" do |data|
+      conf = config_element("ROOT", "", { "tag" => data[:tag], "path" => "#{@tmp_dir}/tail.txt", "format" => "none" })
+      d = create_driver(conf, false)
+      assert_equal(data[:tag_prefix], d.instance.instance_variable_get(:@tag_prefix))
+      assert_equal(data[:tag_suffix], d.instance.instance_variable_get(:@tag_suffix))
+    end
+
+    data("empty" => config_element,
+         "w/o @type" => config_element("", "", {}, [config_element("parse", "", {})]))
+    test "w/o parse section" do |conf|
+      assert_raise(Fluent::ConfigError) do
+        create_driver(conf)
+      end
+    end
+
+    test "multi paths with path_delimiter" do
+      c = config_element("ROOT", "", { "path" => "tail.txt|test2|tmp,dev", "tag" => "t1", "path_delimiter" => "|" })
+      d = create_driver(c + PARSE_SINGLE_LINE_CONFIG, false)
+      assert_equal(["tail.txt", "test2", "tmp,dev"], d.instance.paths)
+    end
+
+    test "multi paths with same path configured twice" do
+      c = config_element("ROOT", "", { "path" => "test1.txt,test2.txt,test1.txt", "tag" => "t1", "path_delimiter" => "," })
+      d = create_driver(c + PARSE_SINGLE_LINE_CONFIG, false)
+      assert_equal(["test2.txt","test1.txt"].sort, d.instance.paths.sort)
+    end
+
+    test "multi paths with invalid path_delimiter" do
+      c = config_element("ROOT", "", { "path" => "tail.txt|test2|tmp,dev", "tag" => "t1", "path_delimiter" => "*" })
+      assert_raise(Fluent::ConfigError) do
+        create_driver(c + PARSE_SINGLE_LINE_CONFIG, false)
+      end
+    end
+
+    test "follow_inodes w/o pos file" do
+      assert_raise(Fluent::ConfigError) do
+        create_driver(base_config + config_element('', '', {'follow_inodes' => 'true'}))
+      end
+    end
+
+    sub_test_case "log throttling per file" do
+      test "w/o watcher timer is invalid" do
+        conf = CONFIG_DISABLE_WATCH_TIMER + config_element("ROOT", "", {"read_bytes_limit_per_second" => "8k"})
+        assert_raise(Fluent::ConfigError) do
+          create_driver(conf)
+        end
+      end
+
+      test "valid" do
+        conf = config_element("ROOT", "", {"read_bytes_limit_per_second" => "8k"})
+        assert_raise(Fluent::ConfigError) do
+          create_driver(conf)
+        end
+      end
+    end
+
+    test "both enable_watch_timer and enable_stat_watcher are false" do
+      assert_raise(Fluent::ConfigError) do
+        create_driver(CONFIG_DISABLE_WATCH_TIMER + CONFIG_DISABLE_STAT_WATCHER + PARSE_SINGLE_LINE_CONFIG)
+      end
+    end
+
+    sub_test_case "encoding" do
+      test "valid" do
+        conf = SINGLE_LINE_CONFIG + config_element("", "", { "encoding" => "utf-8" })
+        d = create_driver(conf)
+        assert_equal(Encoding::UTF_8, d.instance.encoding)
+      end
+
+      test "invalid" do
+        conf = SINGLE_LINE_CONFIG + config_element("", "", { "encoding" => "no-such-encoding" })
+        assert_raise(Fluent::ConfigError) do
+          create_driver(conf)
+        end
+      end
+    end
+
+    sub_test_case "from_encoding" do
+      test "only specified from_encoding raise ConfigError" do
+        conf = SINGLE_LINE_CONFIG + config_element("", "", { "from_encoding" => "utf-8" })
+        assert_raise(Fluent::ConfigError) do
+          create_driver(conf)
+        end
+      end
+
+      test "valid" do
+        conf = SINGLE_LINE_CONFIG + config_element("", "", {
+                                                     "from_encoding" => "utf-8",
+                                                     "encoding" => "utf-8"
+                                                   })
+        d = create_driver(conf)
+        assert_equal(Encoding::UTF_8, d.instance.from_encoding)
+      end
+
+      test "invalid" do
+        conf = SINGLE_LINE_CONFIG + config_element("", "", {
+                                                     "from_encoding" => "no-such-encoding",
+                                                     "encoding" => "utf-8"
+                                                   })
+        assert_raise(Fluent::ConfigError) do
+          create_driver(conf)
+        end
+      end
+    end
+  end
+
+  sub_test_case "configure group" do
+    test "<rule> required" do
+      conf = create_group_directive('.', '1m') + SINGLE_LINE_CONFIG
+      assert_raise(Fluent::ConfigError) do
+        create_driver(conf)
+      end
+    end
+
+    test "valid configuration" do
+      rule1 = create_rule_directive({
+        "namespace"=> "/namespace-a/",
+        "podname"=> "/podname-[b|c]/"
+      }, 100)
+      rule2 = create_rule_directive({
+        "namespace"=> "/namespace-[d|e]/",
+        "podname"=> "/podname-f/",
+      }, 50)
+      rule3 = create_rule_directive({
+        "podname"=> "/podname-g/",
+      }, -1)
+      rule4 = create_rule_directive({
+        "namespace"=> "/namespace-h/",
+      }, 0)
+
+      conf = create_group_directive(tailing_group_pattern, '1m', rule1, rule2, rule3, rule4) + SINGLE_LINE_CONFIG
+      assert_nothing_raised do
+        create_driver(conf)
+      end
+    end
+
+    test "limit should be greater than DEFAULT_LIMIT (-1)" do
+      rule1 = create_rule_directive({
+        "namespace"=> "/namespace-a/",
+        "podname"=> "/podname-[b|c]/",
+      }, -100)
+      rule2 = create_rule_directive({
+        "namespace"=> "/namespace-[d|e]/",
+        "podname"=> "/podname-f/",
+      }, 50)
+      conf = create_group_directive(tailing_group_pattern, '1m', rule1, rule2) + SINGLE_LINE_CONFIG
+      assert_raise(RuntimeError) do
+        create_driver(conf)
+      end
+    end
+  end
+
+  sub_test_case "group rules line limit resolution" do
+    test "valid" do
+      rule1 = create_rule_directive({
+        "namespace"=> "/namespace-a/",
+        "podname"=> "/podname-[b|c]/",
+      }, 50)
+      rule2 = create_rule_directive({
+        "podname"=> "/podname-[b|c]/",
+      }, 400)
+      rule3 = create_rule_directive({
+        "namespace"=> "/namespace-a/",
+      }, 100)
+
+      conf = create_group_directive(tailing_group_pattern, '1m', rule3, rule1, rule2) + SINGLE_LINE_CONFIG
+      assert_nothing_raised do
+        d = create_driver(conf)
+        instance = d.instance
+
+        metadata = {
+          "namespace"=> "namespace-a",
+          "podname"=> "podname-b",
+        }
+        assert_equal(50, instance.find_group(metadata).limit)
+
+        metadata = {
+          "namespace" => "namespace-a",
+          "podname" => "podname-c",
+        }
+        assert_equal(50, instance.find_group(metadata).limit)
+
+        metadata = {
+          "namespace" => "namespace-a",
+          "podname" => "podname-d",
+        }
+        assert_equal(100, instance.find_group(metadata).limit)
+
+        metadata = {
+          "namespace" => "namespace-f",
+          "podname" => "podname-b",
+        }
+        assert_equal(400, instance.find_group(metadata).limit)
+
+        metadata = {
+          "podname" => "podname-c",
+        }
+        assert_equal(400, instance.find_group(metadata).limit)
+
+        assert_equal(-1, instance.find_group({}).limit)
+      end
+    end
+  end
+
+  sub_test_case "files should be placed in groups" do
+    test "invalid regex pattern places files in default group" do
+      rule1 = create_rule_directive({}, 100) ## limits default groups
+      conf = ROOT_CONFIG + DEBUG_LOG_LEVEL + create_group_directive(tailing_group_pattern, '1m', rule1) + create_path_element("test*.txt") + SINGLE_LINE_CONFIG
+
+      d = create_driver(conf, false)
+      Fluent::FileWrapper.open("#{@tmp_dir}/test1.txt", 'w')
+      Fluent::FileWrapper.open("#{@tmp_dir}/test2.txt", 'w')
+      Fluent::FileWrapper.open("#{@tmp_dir}/test3.txt", 'w')
+
+      d.run do
+        ## checking default group_watcher's paths
+        instance = d.instance
+        key = instance.default_group_key
+
+        assert_equal(3, instance.log.logs.count{|a| a.match?("Cannot find group from metadata, Adding file in the default group\n")})
+        assert_equal(3, instance.group_watchers[key].size)
+        assert_true(instance.group_watchers[key].include? File.join(@tmp_dir, 'test1.txt'))
+        assert_true(instance.group_watchers[key].include? File.join(@tmp_dir, 'test2.txt'))
+        assert_true(instance.group_watchers[key].include? File.join(@tmp_dir, 'test3.txt'))
+      end
+    end
+
+    test "valid regex pattern places file in their respective groups" do
+      rule1 = create_rule_directive({
+        "namespace"=> "/test-namespace1/",
+        "podname"=> "/test-podname1/",
+      }, 100)
+      rule2 = create_rule_directive({
+        "namespace"=> "/test-namespace1/",
+      }, 200)
+      rule3 = create_rule_directive({
+        "podname"=> "/test-podname2/",
+      }, 300)
+      rule4 = create_rule_directive({}, 400)
+
+      path_element = create_path_element("test-podname*.log")
+
+      conf = ROOT_CONFIG + create_group_directive(tailing_group_pattern, '1m', rule4, rule3, rule2, rule1) + path_element + SINGLE_LINE_CONFIG
+      d = create_driver(conf, false)
+
+      file1 = File.join(@tmp_dir, "test-podname1_test-namespace1_test-container-15fabq.log")
+      file2 = File.join(@tmp_dir, "test-podname3_test-namespace1_test-container-15fabq.log")
+      file3 = File.join(@tmp_dir, "test-podname2_test-namespace2_test-container-15fabq.log")
+      file4 = File.join(@tmp_dir, "test-podname4_test-namespace3_test-container-15fabq.log")
+
+      d.run do
+        Fluent::FileWrapper.open(file1, 'w')
+        Fluent::FileWrapper.open(file2, 'w')
+        Fluent::FileWrapper.open(file3, 'w')
+        Fluent::FileWrapper.open(file4, 'w')
+
+        instance = d.instance
+        assert_equal(100, instance.find_group_from_metadata(file1).limit)
+        assert_equal(200, instance.find_group_from_metadata(file2).limit)
+        assert_equal(300, instance.find_group_from_metadata(file3).limit)
+        assert_equal(400, instance.find_group_from_metadata(file4).limit)
+      end
+    end
+  end
+
+  sub_test_case "GroupWatcher" do
+    test "path stays registered until the last watcher deletes it" do
+      gw = Fluent::Plugin::TailInput::GroupWatcher.new(1, 10)
+      first = Object.new
+      second = Object.new
+      gw.add("#{@tmp_dir}/tail.log", first)
+      gw.add("#{@tmp_dir}/tail.log", second)
+      gw.delete("#{@tmp_dir}/tail.log", first)
+      gw.delete("#{@tmp_dir}/tail.log", first)
+      assert_true(gw.include?("#{@tmp_dir}/tail.log"))
+      assert_equal(1, gw.size)
+      gw.delete("#{@tmp_dir}/tail.log", second)
+      assert_false(gw.include?("#{@tmp_dir}/tail.log"))
+    end
+
+    test "limit_lines_reached? allows a path that has not started reading when the limit is shared" do
+      gw = Fluent::Plugin::TailInput::GroupWatcher.new(1, 1)
+      gw.add("#{@tmp_dir}/old.log", Object.new)
+      gw.add("#{@tmp_dir}/new.log", Object.new)
+      assert_false(gw.limit_lines_reached?("#{@tmp_dir}/new.log"))
+    end
+  end
+
+  sub_test_case "singleline" do
+    data(flat: SINGLE_LINE_CONFIG,
+         parse: PARSE_SINGLE_LINE_CONFIG)
+    def test_emit(data)
+      config = data
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+
+      d = create_driver(config)
+
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+          f.puts "test3\ntest4"
+        }
+      end
+
+      events = d.events
+      assert_equal(true, events.length > 0)
+      assert_equal({"message" => "test3"}, events[0][2])
+      assert_equal({"message" => "test4"}, events[1][2])
+      assert(events[0][1].is_a?(Fluent::EventTime))
+      assert(events[1][1].is_a?(Fluent::EventTime))
+      assert_equal(1, d.emit_count)
+    end
+
+    def test_emit_with_emit_unmatched_lines_true
+      config = config_element("", "", { "format" => "/^(?<message>test.*)/", "emit_unmatched_lines" => true })
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f| }
+
+      d = create_driver(config)
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+          f.puts "test line 1"
+          f.puts "test line 2"
+          f.puts "bad line 1"
+          f.puts "test line 3"
+        }
+      end
+
+      events = d.events
+      assert_equal(4, events.length)
+      assert_equal({"message" => "test line 1"}, events[0][2])
+      assert_equal({"message" => "test line 2"}, events[1][2])
+      assert_equal({"unmatched_line" => "bad line 1"}, events[2][2])
+      assert_equal({"message" => "test line 3"}, events[3][2])
+    end
+
+    data('flat 1' => [:flat, 1, 2],
+         'flat 10' => [:flat, 10, 1],
+         'parse 1' => [:parse, 1, 2],
+         'parse 10' => [:parse, 10, 1])
+    def test_emit_with_read_lines_limit(data)
+      config_style, limit, num_events = data
+      case config_style
+      when :flat
+        config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element("", "", { "read_lines_limit" => limit })
+      when :parse
+        config = CONFIG_READ_FROM_HEAD + config_element("", "", { "read_lines_limit" => limit }) + PARSE_SINGLE_LINE_CONFIG
+      end
+      d = create_driver(config)
+      msg = 'x' * 65000 # in_tail reads 65536 bytes at once.
+
+      d.run(expect_emits: num_events, timeout: 10) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+          f.puts msg
+          f.puts msg
+        }
+      end
+
+      events = d.events
+      assert_equal(true, events.length > 0)
+      assert_equal({"message" => msg}, events[0][2])
+      assert_equal({"message" => msg}, events[1][2])
+      assert num_events <= d.emit_count
+    end
+
+    sub_test_case "log throttling per file" do
+      teardown do
+        cleanup_file("#{@tmp_dir}/tail.txt")
+      end
+
+      sub_test_case "reads_bytes_per_second w/o throttled" do
+        data("flat 65536 bytes, 2 events"        => [:flat, 100, 65536, 2],
+             "flat 65536 bytes, 2 events w/o stat watcher" => [:flat_without_stat, 100, 65536, 2],
+             "flat #{65536*10} bytes, 20 events"  => [:flat, 100, (65536 * 10), 20],
+             "flat #{65536*10} bytes, 20 events w/o stat watcher"  => [:flat_without_stat, 100, (65536 * 10), 20],
+             "parse #{65536*4} bytes, 8 events"  => [:parse, 100, (65536 * 4), 8],
+             "parse #{65536*4} bytes, 8 events w/o stat watcher"  => [:parse_without_stat, 100, (65536 * 4), 8],
+             "parse #{65536*10} bytes, 20 events" => [:parse, 100, (65536 * 10), 20],
+             "parse #{65536*10} bytes, 20 events w/o stat watcher" => [:parse_without_stat, 100, (65536 * 10), 20],
+             "flat 64k bytes with unit, 2 events" => [:flat, 100, "64k", 2])
+        def test_emit_with_read_bytes_limit_per_second(data)
+          config_style, limit, limit_bytes, num_events = data
+          case config_style
+          when :flat
+            config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes })
+          when :parse
+            config = CONFIG_READ_FROM_HEAD + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes }) + PARSE_SINGLE_LINE_CONFIG
+          when :flat_without_stat
+            config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + CONFIG_DISABLE_STAT_WATCHER + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes })
+          when :parse_without_stat
+            config = CONFIG_READ_FROM_HEAD + CONFIG_DISABLE_STAT_WATCHER + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes }) + PARSE_SINGLE_LINE_CONFIG
+          end
+
+          msg = 'x' * 65000 # in_tail reads 65536 bytes at once.
+          start_time = Fluent::Clock.now
+
+          d = create_driver(config)
+          d.run(expect_emits: 2) do
+            Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+              100.times do
+                f.puts msg
+              end
+            }
+          end
+
+          assert_true(Fluent::Clock.now - start_time > 1)
+          assert_equal(num_events, d.events.size)
+          assert_true(d.events.all? { |event| {"message" => msg} == event[2]})
+        end
+
+        def test_read_bytes_limit_precede_read_lines_limit
+          config = CONFIG_READ_FROM_HEAD +
+                   SINGLE_LINE_CONFIG +
+                   config_element("", "", {
+                                    "read_lines_limit" => 1000,
+                                    "read_bytes_limit_per_second" => 8192
+                                  })
+          msg = 'abc' * 8
+          start_time = Fluent::Clock.now
+          d = create_driver(config)
+          d.run(expect_emits: 2) do
+            Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+              8000.times do
+                f.puts msg
+              end
+            }
+          end
+
+          assert_true(Fluent::Clock.now - start_time > 1)
+
+          # Line length: msg = 'abc' * 8 is 24 bytes, plus \n (1 byte) = 25 bytes/line.
+          # Buffer size: BYTES_TO_READ is now 65,536 bytes.
+          # In this test environment, before the shutdown gracefully halts the read loop, in_tail manages to execute exactly two readpartial calls.
+          # Total bytes read = 65,536 * 2 = 131,072 bytes.
+          # 131,072 bytes / 25 bytes per line = 5242 lines (with a remainder of 22 bytes).
+          expected_read_lines = (65536 * 2) / ('abc' * 8 + "\n").size
+          assert_equal(expected_read_lines, d.events.size)
+
+          assert_true(d.events.all? { |event| {"message" => msg} == event[2]})
+        end
+      end
+
+      sub_test_case "reads_bytes_per_second w/ throttled already" do
+        data("flat 65536 bytes"  => [:flat, 100, 65536],
+             "parse 65536 bytes" => [:parse, 100, 65536])
+        def test_emit_with_read_bytes_limit_per_second(data)
+          config_style, limit, limit_bytes = data
+          case config_style
+          when :flat
+            config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes })
+          when :parse
+            config = CONFIG_READ_FROM_HEAD + config_element("", "", { "read_lines_limit" => limit, "read_bytes_limit_per_second" => limit_bytes }) + PARSE_SINGLE_LINE_CONFIG
+          end
+          d = create_driver(config)
+          msg = 'x' * 65000 # in_tail reads 65536 bytes at once.
+
+          mock.proxy(d.instance).io_handler(anything, anything) do |io_handler|
+            require 'fluent/config/types'
+            limit_bytes_value = Fluent::Config.size_value(limit_bytes)
+            io_handler.instance_variable_set(:@number_bytes_read, limit_bytes_value)
+            if Fluent.linux? || Fluent.windows?
+              mock.proxy(io_handler).handle_notify.at_least(5)
+            else
+              mock.proxy(io_handler).handle_notify.twice
+            end
+            io_handler
+          end
+
+          Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") do |f|
+            100.times do
+              f.puts msg
+            end
+          end
+
+          # We should not do shutdown here due to hard timeout.
+          d.run do
+            if Fluent.linux? || Fluent.windows?
+              # Other platforms receive no stat notification while appending, so it
+              # would just consume the throttling window and make this test flaky.
+              start_time = Fluent::Clock.now
+              while d.instance.statistics['input']['throttled_log_count'] < 5 &&
+                    Fluent::Clock.now - start_time < 0.8 do
+                Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") do |f|
+                  f.puts msg
+                  f.flush
+                end
+                sleep 0.05
+              end
+            end
+          end
+
+          assert_equal([], d.events)
+        end
+      end
+
+      sub_test_case "EOF with reads_bytes_per_second" do
+        def test_longer_than_rotate_wait
+          limit_bytes = 8192
+          num_lines = 1024 * 3
+          msg = "08bytes"
+
+          Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") do |f|
+            f.write("#{msg}\n" * num_lines)
+          end
+
+          config = CONFIG_READ_FROM_HEAD +
+                   SINGLE_LINE_CONFIG +
+                   config_element("", "", {
+                                    "read_bytes_limit_per_second" => limit_bytes,
+                                    "rotate_wait" => 0.1,
+                                    "refresh_interval" => 0.5,
+                                  })
+
+          rotated = false
+          d = create_driver(config)
+          d.run(timeout: 10) do
+            while d.events.size < num_lines do
+              if d.events.size > 0 && !rotated
+                cleanup_file("#{@tmp_dir}/tail.txt")
+                FileUtils.touch("#{@tmp_dir}/tail.txt")
+                rotated = true
+              end
+              sleep 0.3
+            end
+          end
+
+          assert_equal(num_lines,
+                       d.events.count do |event|
+                         event[2]["message"] == msg
+                       end)
+        end
+
+        def test_shorter_than_rotate_wait
+          limit_bytes = 8192
+          num_lines = 1024 * 2
+          msg = "08bytes"
+
+          Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") do |f|
+            f.write("#{msg}\n" * num_lines)
+          end
+
+          config = CONFIG_READ_FROM_HEAD +
+                   SINGLE_LINE_CONFIG +
+                   config_element("", "", {
+                                    "read_bytes_limit_per_second" => limit_bytes,
+                                    "rotate_wait" => 2,
+                                    "refresh_interval" => 0.5,
+                                  })
+
+          start_time = Fluent::Clock.now
+          rotated = false
+          detached = false
+          d = create_driver(config)
+          mock.proxy(d.instance).setup_watcher(anything, anything) do |tw|
+            mock.proxy(tw).detach(anything) do |v|
+              detached = true
+              v
+            end
+            tw
+          end.twice
+
+          d.run(timeout: 10) do
+            until detached do
+              if d.events.size > 0 && !rotated
+                cleanup_file("#{@tmp_dir}/tail.txt")
+                FileUtils.touch("#{@tmp_dir}/tail.txt")
+                rotated = true
+              end
+              sleep 0.3
+            end
+          end
+
+          assert_true(Fluent::Clock.now - start_time > 2)
+          assert_equal(num_lines,
+                       d.events.count do |event|
+                         event[2]["message"] == msg
+                       end)
+        end
+      end
+    end
+
+    data(flat: CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG,
+         parse: CONFIG_READ_FROM_HEAD + PARSE_SINGLE_LINE_CONFIG)
+    def test_emit_with_read_from_head(data)
+      config = data
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+
+      d = create_driver(config)
+
+      d.run(expect_emits: 2) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+          f.puts "test3"
+          f.puts "test4"
+        }
+      end
+
+      events = d.events
+      assert(events.length > 0)
+      assert_equal({"message" => "test1"}, events[0][2])
+      assert_equal({"message" => "test2"}, events[1][2])
+      assert_equal({"message" => "test3"}, events[2][2])
+      assert_equal({"message" => "test4"}, events[3][2])
+    end
+
+    def test_emit_with_worker_threads
+      records = Array.new(2000) { |index| format('worker%04d %s', index, 'x' * 90) }
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |file| records.each { |record| file.puts(record) } }
+      config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element("", "", { "num_threads" => 2, "read_lines_limit" => 100 })
+      driver = create_driver(config)
+
+      driver.run(expect_records: records.size, timeout: 5) {}
+
+      assert_equal records, driver.events.map { |event| event[2]["message"] }
+      assert_equal 2, driver.instance.instance_variable_get(:@worker_parsers).size
+      assert_equal 0, driver.instance.instance_variable_get(:@worker_pool).statistics[:tasks]
+      assert_true driver.instance.instance_variable_get(:@tails).values.all?(&:eof?)
+      assert_true driver.logs.any? { |line| line.include?('worker parsing enabled with 2 threads') }
+      assert_equal 0, driver.instance.statistics['input']['worker_pending_batch_count']
+      assert_equal 0, driver.instance.statistics['input']['worker_pending_bytes']
+      assert_equal 0, driver.instance.statistics['input']['worker_parse_error_count']
+    end
+
+    def test_worker_completion_detects_rotation_and_drains_both_files
+      path = "#{@tmp_dir}/tail.txt"
+      Fluent::FileWrapper.open(path, 'wb') {}
+      config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element('', '', {
+        'path' => path,
+        'pos_file' => "#{@tmp_dir}/tail.pos",
+        'tag' => 't1',
+        'num_threads' => 2,
+        'read_lines_limit' => 1,
+        'rotate_wait' => '1s',
+        'refresh_interval' => '1h',
+        'enable_stat_watcher' => false,
+      })
+      driver = create_driver(config, false)
+      parse_started = Queue.new
+      continue_parse = Queue.new
+
+      driver.run(expect_records: 2, timeout: 10) do
+        pool = driver.instance.instance_variable_get(:@worker_pool)
+        wrap_worker_pool_process(pool) do |batch|
+          if batch.lines.any? { |line| line.include?('old-file') }
+            parse_started << true
+            continue_parse.pop
+          end
+        end
+
+        Fluent::FileWrapper.open(path, 'ab') { |file| file.puts('old-file') }
+        waiting(5) { sleep 0.01 until parse_started.size == 1 }
+        FileUtils.move(path, "#{path}.1")
+        Fluent::FileWrapper.open(path, 'wb') { |file| file.puts('new-file') }
+        continue_parse << true
+      end
+
+      assert_equal %w[new-file old-file], driver.events.map { |event| event[2]['message'] }.sort
+    end
+
+    def test_worker_completion_drains_file_during_unwatch
+      path = "#{@tmp_dir}/tail.txt"
+      Fluent::FileWrapper.open(path, 'wb') {}
+      config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element('', '', {
+        'path' => path,
+        'pos_file' => "#{@tmp_dir}/tail.pos",
+        'tag' => 't1',
+        'num_threads' => 2,
+        'read_lines_limit' => 1,
+        'refresh_interval' => '1h',
+        'enable_stat_watcher' => true,
+        'enable_watch_timer' => false,
+      })
+      driver = create_driver(config, false)
+      parse_started = Queue.new
+      continue_parse = Queue.new
+      position_entry = nil
+
+      driver.run(expect_records: 1, timeout: 10) do
+        plugin = driver.instance
+        pool = plugin.instance_variable_get(:@worker_pool)
+        wrap_worker_pool_process(pool) do |batch|
+          if batch.lines.any? { |line| line.include?('unwatch-record') }
+            parse_started << true
+            continue_parse.pop
+          end
+        end
+        Fluent::FileWrapper.open(path, 'ab') { |file| file.puts('unwatch-record') }
+        tail_watcher = plugin.instance_variable_get(:@tails)[path]
+        # StatWatcher polls about every five seconds without inotify. Trigger
+        # only the initial read; completion must drain without a watch timer.
+        plugin.timer_execute(:test_worker_initial_read, 0.01, repeat: false) { tail_watcher.on_notify }
+        waiting(5) { sleep 0.01 until parse_started.size == 1 }
+        waiting(5) { sleep 0.01 until tail_watcher.pending? }
+        target = Fluent::Plugin::TailInput::TargetInfo.new(path, Fluent::FileWrapper.stat(path).ino)
+        assert_true tail_watcher.pending?
+        position_entry = plugin.instance_variable_get(:@pf)[target]
+        plugin.send(:stop_watchers, { path => target }, immediate: true, unwatched: true)
+        assert_true plugin.instance_variable_get(:@worker_deferred_unwatch).key?(tail_watcher)
+        1.times { continue_parse << true }
+      ensure
+        continue_parse.close
+      end
+
+      assert_equal ['unwatch-record'], driver.events.map { |event| event[2]['message'] }
+      assert_equal 0, driver.instance.instance_variable_get(:@worker_pool).statistics[:tasks]
+      assert_equal Fluent::Plugin::TailInput::PositionFile::UNWATCHED_POSITION, position_entry.read_pos
+    end
+
+    def test_worker_batch_submitted_by_detach_keeps_its_position_entry_until_completion
+      paths = %w[tail-a.txt tail-b.txt].map { |name| "#{@tmp_dir}/#{name}" }
+      paths.each { |path| File.binwrite(path, '') }
+      config = SINGLE_LINE_CONFIG + config_element('', '', {
+        'path' => "#{@tmp_dir}/tail-*.txt",
+        'pos_file' => "#{@tmp_dir}/tail.pos",
+        'tag' => 't1',
+        'num_threads' => 2,
+        'read_from_head' => true,
+        'follow_inodes' => true,
+        'enable_stat_watcher' => false,
+      })
+      driver = create_driver(config, false)
+      started = Queue.new
+      release = Queue.new
+      driver.run(expect_records: 1, timeout: 5) do
+        plugin = driver.instance
+        tails = plugin.instance_variable_get(:@tails)
+        tails.each_value do |watcher|
+          watcher.watchers.each { |trigger| plugin.event_loop_detach(trigger) }
+        end
+        first, second = paths.map { |path| tails[path] }
+        second.pe.update_pos(130)
+        pool = plugin.instance_variable_get(:@worker_pool)
+        wrap_worker_pool_process(pool) { started << true; release.pop }
+        File.binwrite(paths.first, "detached-batch\n")
+        assert_false first.pending?
+        first.unwatched = true
+        tails.delete(first.path)
+        plugin.detach_watcher(first, first.ino)
+        waiting(5) { sleep 0.01 until started.size == 1 }
+
+        assert_true plugin.instance_variable_get(:@worker_deferred_unwatch).key?(first)
+        pf = plugin.instance_variable_get(:@pf)
+        pf.try_compact
+        release.close
+        waiting(5) do
+          sleep 0.01 until plugin.instance_variable_get(:@worker_deferred_unwatch).empty?
+        end
+        pf.try_compact
+        entries = File.binread("#{@tmp_dir}/tail.pos").lines.map { |line| line.split("\t") }
+        assert_equal [paths.last], entries.map(&:first)
+        assert_equal 130, entries.first[1].to_i(16)
+      ensure
+        release.close
+      end
+    end
+
+    data(rotate_wait: false, deferred_unwatch: true)
+    def test_follow_inodes_refresh_preserves_worker_draining_position_entries(immediate_unwatch)
+      paths = %w[tail-a.txt tail-b.txt].map { |name| "#{@tmp_dir}/#{name}" }
+      File.binwrite(paths.first, "a1\n")
+      File.binwrite(paths.last, "#{'b' * 129}\n")
+      config = SINGLE_LINE_CONFIG + config_element('', '', {
+        'path' => "#{@tmp_dir}/tail-*.txt",
+        'pos_file' => "#{@tmp_dir}/tail.pos",
+        'tag' => 't1',
+        'num_threads' => 2,
+        'read_from_head' => true,
+        'follow_inodes' => true,
+        'enable_stat_watcher' => false,
+        'refresh_interval' => '1h',
+        'rotate_wait' => '1h',
+      })
+      driver = create_driver(config, false)
+      started = Queue.new
+      release = Queue.new
+      driver.run(expect_records: 3, timeout: 5) do
+        plugin = driver.instance
+        waiting(5) { sleep 0.01 until driver.events.size == 2 }
+        plugin.send(:process_worker_completions)
+        tails = plugin.instance_variable_get(:@tails)
+        tails.each_value do |watcher|
+          watcher.watchers.each { |trigger| plugin.event_loop_detach(trigger) }
+        end
+        first = tails[paths.first]
+        pool = plugin.instance_variable_get(:@worker_pool)
+        wrap_worker_pool_process(pool) { started << true; release.pop }
+        File.open(paths.first, 'ab') { |file| file.puts('late-record') }
+        File.rename(paths.first, "#{@tmp_dir}/rotated.log")
+
+        if immediate_unwatch
+          tails.delete(first.path)
+          first.unwatched = true
+          plugin.detach_watcher(first, first.ino, false)
+          assert_true plugin.instance_variable_get(:@worker_deferred_unwatch).key?(first)
+          assert_not_include plugin.instance_variable_get(:@worker_detached_watchers), first
+        else
+          plugin.refresh_watchers
+          rotation = plugin.instance_variable_get(:@tails_rotate_wait).fetch(first)
+          plugin.event_loop_detach(rotation[:timer])
+          rotation[:timer].on_timer
+          assert_include plugin.instance_variable_get(:@worker_detached_watchers), first
+          assert_empty plugin.instance_variable_get(:@worker_deferred_unwatch)
+        end
+        waiting(5) { sleep 0.01 until started.size == 1 }
+        assert_true first.pending?
+        assert_false plugin.instance_variable_get(:@tails_rotate_wait).key?(first)
+
+        pf = plugin.instance_variable_get(:@pf)
+        plugin.refresh_watchers
+        pf.try_compact
+        entries = File.binread("#{@tmp_dir}/tail.pos").lines.map { |line| line.split("\t") }
+        assert_equal paths.sort, entries.map(&:first).sort
+
+        release.close
+        waiting(5) { sleep 0.01 until pool.statistics[:tasks].zero? && !first.pending? }
+        plugin.send(:process_worker_completions)
+        entries = File.binread("#{@tmp_dir}/tail.pos").lines.map { |line| line.split("\t") }
+        assert_equal 130, entries.find { |entry| entry.first == paths.last }[1].to_i(16)
+
+        plugin.refresh_watchers
+        pf.try_compact
+        entries = File.binread("#{@tmp_dir}/tail.pos").lines.map { |line| line.split("\t") }
+        assert_equal [paths.last], entries.map(&:first)
+        assert_equal 130, entries.first[1].to_i(16)
+      ensure
+        release.close
+        first.force_close if first && !first.pending?
+      end
+      assert_equal ['a1', 'b' * 129, 'late-record'].sort, driver.events.map { |event| event[2]['message'] }.sort
+    end
+
+    def test_worker_position_write_error_does_not_stop_completion_processing
+      paths = %w[tail-a.txt tail-b.txt].map { |name| "#{@tmp_dir}/#{name}" }
+      paths.each { |path| File.binwrite(path, '') }
+      config = SINGLE_LINE_CONFIG + config_element('', '', {
+        'path' => "#{@tmp_dir}/tail-*.txt",
+        'pos_file' => "#{@tmp_dir}/tail.pos",
+        'tag' => 't1',
+        'num_threads' => 2,
+        'enable_stat_watcher' => false,
+      })
+      driver = create_driver(config, false)
+      driver.run(expect_records: 3, timeout: 5) do
+        plugin = driver.instance
+        watchers = paths.map { |path| plugin.instance_variable_get(:@tails)[path] }
+        watchers.each do |watcher|
+          watcher.watchers.each { |trigger| plugin.event_loop_detach(trigger) }
+        end
+        pe = watchers.first.pe
+        original_update = pe.method(:update_pos)
+        failed = false
+        pe.define_singleton_method(:update_pos) do |position|
+          unless failed
+            failed = true
+            raise Errno::ENOSPC, 'controlled position write failure'
+          end
+          original_update.call(position)
+        end
+        paths.each { |path| File.binwrite(path, "line\n") }
+        watchers.each(&:on_notify)
+        pool = plugin.instance_variable_get(:@worker_pool)
+        waiting(5) { sleep 0.01 until driver.events.size == 2 && pool.statistics[:tasks].zero? && watchers.none?(&:pending?) }
+        assert_equal 0, watchers.first.pe.read_pos
+        assert_equal 5, watchers.last.pe.read_pos
+        watchers.first.on_notify
+        waiting(5) { sleep 0.01 until watchers.first.pe.read_pos == 5 }
+      end
+      assert_equal ['line', 'line', 'line'], driver.events.map { |event| event[2]['message'] }
+      assert_true driver.logs.any? { |line| line.include?('controlled position write failure') }
+    end
+
+    def test_worker_completion_handles_truncation_during_parse
+      path = "#{@tmp_dir}/tail.txt"
+      Fluent::FileWrapper.open(path, 'wb') { |file| file.puts('before-truncate') }
+      config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element('', '', {
+        'num_threads' => 2,
+        'read_lines_limit' => 1,
+        'enable_watch_timer' => false,
+        'enable_stat_watcher' => true,
+      })
+      driver = create_driver(config)
+      parse_started = Queue.new
+      continue_parse = Queue.new
+
+      driver.run(expect_records: 3, timeout: 10) do
+        pool = driver.instance.instance_variable_get(:@worker_pool)
+        wrap_worker_pool_process(pool) do |batch|
+          if batch.lines.any? { |line| line.include?('blocked-before-truncate') }
+            parse_started << true
+            continue_parse.pop
+          end
+        end
+        waiting(5) { sleep 0.01 until driver.events.size == 1 }
+        Fluent::FileWrapper.open(path, 'ab') { |file| file.puts('blocked-before-truncate') }
+        tail_watcher = driver.instance.instance_variable_get(:@tails)[path]
+        # Avoid depending on the platform's stat polling interval. No further
+        # timer notification should be needed to detect truncation on completion.
+        driver.instance.timer_execute(:test_worker_initial_read, 0.01, repeat: false) { tail_watcher.on_notify }
+        waiting(5) { sleep 0.01 until parse_started.size == 1 }
+        Fluent::FileWrapper.open(path, 'wb') { |file| file.puts('after-truncate') }
+        continue_parse << true
+      ensure
+        continue_parse.close
+      end
+
+      assert_equal %w[before-truncate blocked-before-truncate after-truncate], driver.events.map { |event| event[2]['message'] }
+      assert_equal 0, driver.instance.instance_variable_get(:@worker_pool).statistics[:tasks]
+    end
+
+    data(forward: :each, reverse: :reverse_each)
+    def test_worker_queue_saturation_reschedules_waiting_files(notification_order)
+      paths = %w[tail-a.txt tail-b.txt tail-c.txt tail-d.txt tail-e.txt tail-f.txt].map { |name| "#{@tmp_dir}/#{name}" }
+      notification_paths = paths.public_send(notification_order).to_a
+      parked_path = notification_paths.last
+      records = paths.each_index.map do |index|
+        Array.new(200) { |line| "file-#{index}-#{line} #{'x' * 1000}" }
+      end
+      paths.each { |path| Fluent::FileWrapper.open(path, 'wb') {} }
+      config = config_element('ROOT', '', {
+        'path' => "#{@tmp_dir}/tail-*.txt",
+        'pos_file' => "#{@tmp_dir}/tail.pos",
+        'tag' => 't1',
+        'read_from_head' => true,
+        'format' => '/(?<message>.*)/',
+        'num_threads' => 2,
+        'read_lines_limit' => 50,
+        'enable_stat_watcher' => false,
+      })
+      driver = create_driver(config, false)
+      parse_started = Queue.new
+      continue_parse = Queue.new
+
+      driver.run(expect_records: records.flatten.size, timeout: 10) do
+        plugin = driver.instance
+        plugin.instance_variable_get(:@tails).each_value do |watcher|
+          watcher.watchers.each { |trigger| plugin.event_loop_detach(trigger) }
+        end
+        pool = driver.instance.instance_variable_get(:@worker_pool)
+        # Block whichever files arrive first so notification order cannot
+        # allow completed batches to free capacity before the queue fills.
+        wrap_worker_pool_process(pool) do |_batch|
+          parse_started << true
+          continue_parse.pop
+        end
+        paths.each_with_index do |path, index|
+          lines = path == parked_path ? records[index].first(26) : records[index]
+          Fluent::FileWrapper.open(path, 'ab') { |file| file.puts(lines) }
+        end
+        notification_paths.each do |path|
+          driver.instance.instance_variable_get(:@tails)[path].on_notify
+        end
+        waiting(5) { sleep 0.01 until parse_started.size == 2 }
+        waiting(5) do
+          until pool.statistics[:tasks] == 4 && driver.instance.instance_variable_get(:@worker_waiting_watchers).any?
+            sleep 0.01
+          end
+        end
+        watcher = plugin.instance_variable_get(:@tails)[parked_path]
+        assert_include plugin.instance_variable_get(:@worker_waiting_watchers), watcher
+        assert_true watcher.eof?
+        Fluent::FileWrapper.open(parked_path, 'ab') { |file| file.puts(records[paths.index(parked_path)].drop(26)) }
+        watcher.on_notify
+        continue_parse.close
+        waiting(5) { sleep 0.01 until driver.events.size == records.flatten.size }
+      ensure
+        continue_parse.close
+      end
+
+      assert_equal records.flatten.sort, driver.events.map { |event| event[2]['message'] }.sort
+      assert_equal 0, driver.instance.instance_variable_get(:@worker_pool).statistics[:tasks]
+    end
+
+    data(forward: :each, reverse: :reverse_each)
+    def test_worker_queue_saturation_drains_detached_waiting_file(notification_order)
+      paths = %w[tail-a.txt tail-b.txt tail-c.txt tail-d.txt tail-e.txt tail-f.txt].map { |name| "#{@tmp_dir}/#{name}" }
+      paths.each { |path| Fluent::FileWrapper.open(path, 'wb') {} }
+      config = config_element('ROOT', '', {
+        'path' => "#{@tmp_dir}/tail-*.txt",
+        'pos_file' => "#{@tmp_dir}/tail.pos",
+        'tag' => 't1',
+        'read_from_head' => true,
+        'format' => '/(?<message>.*)/',
+        'num_threads' => 2,
+        'read_lines_limit' => 1,
+        'enable_stat_watcher' => false,
+      })
+      driver = create_driver(config, false)
+      parse_started = Queue.new
+      continue_parse = Queue.new
+      position_entry = nil
+
+      driver.run(expect_records: paths.size, timeout: 10) do
+        plugin = driver.instance
+        pool = plugin.instance_variable_get(:@worker_pool)
+        wrap_worker_pool_process(pool) do |_batch|
+          parse_started << true
+          continue_parse.pop
+        end
+        paths.each_with_index do |path, index|
+          Fluent::FileWrapper.open(path, 'ab') { |file| file.puts("file-#{index}") }
+        end
+        paths.public_send(notification_order) do |path|
+          plugin.instance_variable_get(:@tails)[path].on_notify
+        end
+        waiting(5) { sleep 0.01 until parse_started.size == 2 }
+        waiting(5) do
+          until pool.statistics[:tasks] == 4 && plugin.instance_variable_get(:@worker_waiting_watchers).any?
+            sleep 0.01
+          end
+        end
+
+        watcher = plugin.instance_variable_get(:@worker_waiting_watchers).first
+        target = Fluent::Plugin::TailInput::TargetInfo.new(watcher.path, watcher.ino)
+        position_entry = plugin.instance_variable_get(:@pf)[target]
+        plugin.send(:stop_watchers, { watcher.path => target }, immediate: true, unwatched: true)
+        assert_true plugin.instance_variable_get(:@worker_deferred_unwatch).key?(watcher)
+        assert_false watcher.eof?
+        continue_parse.close
+      ensure
+        continue_parse.close
+      end
+
+      assert_equal (0...paths.size).map { |index| "file-#{index}" }, driver.events.map { |event| event[2]['message'] }.sort
+      assert_equal 0, driver.instance.instance_variable_get(:@worker_pool).statistics[:tasks]
+      assert_equal Fluent::Plugin::TailInput::PositionFile::UNWATCHED_POSITION, position_entry.read_pos
+      assert_empty driver.instance.instance_variable_get(:@worker_deferred_unwatch)
+    end
+
+    def test_oversized_worker_batch_does_not_block_other_files
+      tail_input = Fluent::Plugin::TailInput
+      original_byte_limit = tail_input.const_get(:WORKER_QUEUE_BYTES)
+      tail_input.send(:remove_const, :WORKER_QUEUE_BYTES)
+      tail_input.const_set(:WORKER_QUEUE_BYTES, 6)
+      large_path = "#{@tmp_dir}/tail-large.txt"
+      short_path = "#{@tmp_dir}/tail-short.txt"
+      [large_path, short_path].each { |path| Fluent::FileWrapper.open(path, 'wb') {} }
+      config = config_element('ROOT', '', {
+        'path' => "#{@tmp_dir}/tail-*.txt",
+        'pos_file' => "#{@tmp_dir}/tail.pos",
+        'tag' => 't1',
+        'read_from_head' => true,
+        'format' => '/(?<message>.*)/',
+        'num_threads' => 2,
+        'read_lines_limit' => 1,
+        'enable_stat_watcher' => false,
+      })
+      driver = create_driver(config, false)
+      large_started = Queue.new
+      continue_large = Queue.new
+      released = false
+
+      driver.run(expect_records: 2, timeout: 10) do
+        pool = driver.instance.instance_variable_get(:@worker_pool)
+        wrap_worker_pool_process(pool) do |batch|
+          if batch.lines.any? { |line| line.include?('oversized-record') }
+            large_started << true
+            continue_large.pop
+          end
+        end
+        Fluent::FileWrapper.open(large_path, 'ab') { |file| file.puts('oversized-record') }
+        Fluent::FileWrapper.open(short_path, 'ab') { |file| file.puts('x') }
+        waiting(5) { sleep 0.01 until large_started.size == 1 }
+        waiting(5) { sleep 0.01 until driver.events.any? { |event| event[2]['message'] == 'x' } }
+        continue_large << true
+        released = true
+      end
+
+      assert_equal %w[oversized-record x], driver.events.map { |event| event[2]['message'] }.sort
+    ensure
+      continue_large << true if continue_large && !released
+      tail_input.send(:remove_const, :WORKER_QUEUE_BYTES) if tail_input.const_defined?(:WORKER_QUEUE_BYTES, false)
+      tail_input.const_set(:WORKER_QUEUE_BYTES, original_byte_limit) if original_byte_limit
+    end
+
+    data(forward: :each, reverse: :reverse_each)
+    def test_worker_queue_saturation_drains_rotated_file(notification_order)
+      paths = %w[tail-a.txt tail-b.txt tail-c.txt tail-d.txt tail-e.txt tail-f.txt].map { |name| "#{@tmp_dir}/#{name}" }
+      paths.each { |path| Fluent::FileWrapper.open(path, 'wb') {} }
+      config = config_element('ROOT', '', {
+        'path' => "#{@tmp_dir}/tail-*.txt",
+        'pos_file' => "#{@tmp_dir}/tail.pos",
+        'tag' => 't1',
+        'read_from_head' => true,
+        'format' => '/(?<message>.*)/',
+        'num_threads' => 2,
+        'read_lines_limit' => 1,
+        'refresh_interval' => '0.05s',
+        'rotate_wait' => '0.1s',
+        'enable_stat_watcher' => false,
+      })
+      driver = create_driver(config, false)
+      parse_started = Queue.new
+      continue_parse = Queue.new
+
+      driver.run(expect_records: paths.size + 1, timeout: 10) do
+        pool = driver.instance.instance_variable_get(:@worker_pool)
+        wrap_worker_pool_process(pool) do |_batch|
+          parse_started << true
+          continue_parse.pop
+        end
+        paths.each_with_index do |path, index|
+          Fluent::FileWrapper.open(path, 'ab') { |file| file.puts("file-#{index}") }
+        end
+        paths.public_send(notification_order) do |path|
+          driver.instance.instance_variable_get(:@tails)[path].on_notify
+        end
+        waiting(5) { sleep 0.01 until parse_started.size == 2 }
+        waiting(5) do
+          until pool.statistics[:tasks] == 4 && driver.instance.instance_variable_get(:@worker_waiting_watchers).any?
+            sleep 0.01
+          end
+        end
+
+        FileUtils.move(paths.first, "#{paths.first}.1")
+        Fluent::FileWrapper.open(paths.first, 'wb') { |file| file.puts('replacement-file') }
+        continue_parse.close
+      ensure
+        continue_parse.close
+      end
+
+      messages = driver.events.map { |event| event[2]['message'] }.sort
+      assert_equal (0...paths.size).map { |index| "file-#{index}" } + ['replacement-file'], messages
+      assert_equal 0, driver.instance.instance_variable_get(:@worker_pool).statistics[:tasks]
+      assert_empty driver.instance.instance_variable_get(:@worker_waiting_watchers)
+    end
+
+    def test_shutdown_drains_a_worker_batch_before_stopping
+      path = "#{@tmp_dir}/tail.txt"
+      Fluent::FileWrapper.open(path, 'wb') {}
+      config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element('', '', {
+        'num_threads' => 2,
+        'read_lines_limit' => 1,
+        'enable_stat_watcher' => false,
+      })
+      driver = create_driver(config)
+      parse_started = Queue.new
+      continue_parse = Queue.new
+      pool = nil
+
+      driver.run(shutdown: false, timeout: 5) do
+        pool = driver.instance.instance_variable_get(:@worker_pool)
+        wrap_worker_pool_process(pool) do |_batch|
+          parse_started << true
+          continue_parse.pop
+        end
+        Fluent::FileWrapper.open(path, 'ab') { |file| file.puts('shutdown-record') }
+        waiting(5) { sleep 0.01 until parse_started.size == 1 }
+
+        shutdown_thread = Thread.new { driver.instance_shutdown }
+        sleep 0.1
+        continue_parse << true
+        shutdown_thread.value
+      end
+
+      assert_equal ['shutdown-record'], driver.events.map { |event| event[2]['message'] }
+      assert_equal 0, pool.statistics[:tasks]
+      assert_true pool.instance_variable_get(:@threads).none?(&:alive?)
+    end
+
+    def test_worker_shutdown_does_not_wait_for_a_throttled_backlog_to_reach_eof
+      path = "#{@tmp_dir}/tail.txt"
+      File.binwrite(path, '')
+      config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element('', '', {
+        'num_threads' => 2,
+        'read_bytes_limit_per_second' => 65536,
+        'enable_stat_watcher' => false,
+      })
+      driver = create_driver(config)
+      driver.run(shutdown: false) do
+        plugin = driver.instance
+        watcher = plugin.instance_variable_get(:@tails)[path]
+        File.binwrite(path, "#{'x' * 1000}\n" * 1200)
+        watcher.on_notify
+        waiting(5) { sleep 0.01 until driver.events.any? }
+        assert_false watcher.eof?
+        handler = watcher.instance_variable_get(:@io_handler)
+
+        started = Fluent::Clock.now
+        driver.instance_shutdown
+        assert_operator Fluent::Clock.now - started, :<, Fluent::Plugin::TailInput::TailWatcher::IOHandler::SHUTDOWN_TIMEOUT
+        assert_false handler.opened?
+        assert_true plugin.instance_variable_get(:@pf_file).closed?
+        assert_empty driver.logs.grep(/worker pool did not drain/)
+      end
+    ensure
+      driver&.instance_shutdown unless driver&.instance&.terminated?
+    end
+
+    data(completes_during_join: true, blocked_until_killed: false)
+    def test_worker_shutdown_handles_results_published_during_join(finish_parse)
+      io_handler_class = Fluent::Plugin::TailInput::TailWatcher::IOHandler
+      original_timeout = io_handler_class::SHUTDOWN_TIMEOUT
+      io_handler_class.send(:remove_const, :SHUTDOWN_TIMEOUT)
+      io_handler_class.const_set(:SHUTDOWN_TIMEOUT, 0.05)
+      path = "#{@tmp_dir}/tail.txt"
+      File.binwrite(path, '')
+      config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element('', '', {
+        'num_threads' => 2,
+        'enable_stat_watcher' => false,
+      })
+      driver = create_driver(config)
+      started = Queue.new
+      release = Queue.new
+
+      driver.run(shutdown: false) do
+        plugin = driver.instance
+        pool = plugin.instance_variable_get(:@worker_pool)
+        wrap_worker_pool_process(pool) { started << true; release.pop }
+        watcher = plugin.instance_variable_get(:@tails)[path]
+        File.binwrite(path, "last-batch\n")
+        watcher.on_notify
+        waiting(5) { sleep 0.01 until started.size == 1 }
+        handler = watcher.instance_variable_get(:@io_handler)
+        rotation_timer = plugin.timer_execute(:test_rotation_during_shutdown, 60, repeat: false) {}
+        plugin.instance_variable_get(:@tails).delete(path)
+        plugin.instance_variable_get(:@tails_rotate_wait)[watcher] = { ino: watcher.ino, timer: rotation_timer }
+        original_stop = pool.method(:stop)
+        rotation_timer_attached_at_stop = nil
+        pool.define_singleton_method(:stop) do
+          rotation_timer_attached_at_stop = rotation_timer.attached?
+          original_stop.call
+        end
+        plugin.event_loop_detach(plugin.instance_variable_get(:@worker_completion_watcher))
+        if finish_parse
+          original_join = pool.method(:join)
+          pool.define_singleton_method(:join) do |timeout: nil|
+            release << true
+            original_join.call(timeout: 5)
+          end
+        end
+
+        plugin.stop
+        plugin.before_shutdown
+        plugin.shutdown
+        assert_equal(finish_parse ? ['last-batch'] : [], driver.events.map { |event| event[2]['message'] })
+        assert_equal(finish_parse ? 11 : 0, watcher.pe.read_pos)
+        assert_equal 0, pool.statistics[:tasks]
+        assert_false rotation_timer_attached_at_stop
+        assert_false handler.pending?
+        assert_true pool.instance_variable_get(:@threads).none?(&:alive?)
+
+        driver.instance_shutdown
+        assert_false handler.opened?
+        assert_true plugin.instance_variable_get(:@pf_file).closed?
+      end
+    ensure
+      release&.close
+      driver&.instance_shutdown unless driver&.instance&.terminated?
+      if original_timeout
+        io_handler_class.send(:remove_const, :SHUTDOWN_TIMEOUT)
+        io_handler_class.const_set(:SHUTDOWN_TIMEOUT, original_timeout)
+      end
+    end
+
+    def test_worker_shutdown_waits_for_a_completion_after_pool_acknowledgment
+      io_handler_class = Fluent::Plugin::TailInput::TailWatcher::IOHandler
+      original_timeout = io_handler_class::SHUTDOWN_TIMEOUT
+      io_handler_class.send(:remove_const, :SHUTDOWN_TIMEOUT)
+      io_handler_class.const_set(:SHUTDOWN_TIMEOUT, 0.05)
+      path = "#{@tmp_dir}/tail.txt"
+      File.binwrite(path, '')
+      config = SINGLE_LINE_CONFIG + config_element('', '', {
+        'num_threads' => 2,
+        'enable_stat_watcher' => false,
+      })
+      driver = create_driver(config)
+      acknowledged = Queue.new
+      release = Queue.new
+      shutdown_thread = nil
+      driver.run(shutdown: false) do
+        plugin = driver.instance
+        pool = plugin.instance_variable_get(:@worker_pool)
+        original_acknowledge = pool.method(:acknowledge)
+        pool.define_singleton_method(:acknowledge) do |result|
+          original_acknowledge.call(result)
+          acknowledged << true
+          release.pop
+        end
+        watcher = plugin.instance_variable_get(:@tails)[path]
+        File.binwrite(path, "line\n")
+        watcher.on_notify
+        waiting(5) { sleep 0.01 until acknowledged.size == 1 }
+        assert_equal 0, pool.statistics[:tasks]
+
+        shutdown_thread = Thread.new { driver.instance_shutdown }
+        assert_nil shutdown_thread.join(0.2)
+        release.close
+        assert_not_nil shutdown_thread.join(5)
+        assert_equal 5, watcher.pe.read_pos
+        assert_false watcher.pending?
+        assert_true plugin.instance_variable_get(:@pf_file).closed?
+      end
+    ensure
+      release&.close
+      shutdown_thread&.join(5)
+      driver&.instance_shutdown unless driver&.instance&.terminated?
+      if original_timeout
+        io_handler_class.send(:remove_const, :SHUTDOWN_TIMEOUT)
+        io_handler_class.const_set(:SHUTDOWN_TIMEOUT, original_timeout)
+      end
+    end
+
+    def test_worker_detached_emit_failure_closes_the_file_without_a_position_file
+      path = "#{@tmp_dir}/tail.txt"
+      File.binwrite(path, '')
+      config = SINGLE_LINE_CONFIG + config_element('', '', {
+        'path' => path,
+        'tag' => 't1',
+        'num_threads' => 2,
+        'enable_stat_watcher' => false,
+      })
+      driver = create_driver(config, false)
+      started = Queue.new
+      release = Queue.new
+      driver.run(shutdown: false) do
+        plugin = driver.instance
+        pool = plugin.instance_variable_get(:@worker_pool)
+        wrap_worker_pool_process(pool) { started << true; release.pop }
+        plugin.instance_variable_get(:@line_feeder).define_singleton_method(:emit) { |_events, _watcher| false }
+        watcher = plugin.instance_variable_get(:@tails)[path]
+        File.binwrite(path, "blocked-emit\n")
+        watcher.on_notify
+        waiting(5) { sleep 0.01 until started.size == 1 }
+        handler = watcher.instance_variable_get(:@io_handler)
+        plugin.instance_variable_get(:@tails).delete(path)
+        plugin.detach_watcher(watcher, watcher.ino)
+        release.close
+
+        waiting(5) { sleep 0.01 until pool.statistics[:tasks].zero? && !handler.opened? }
+        assert_false handler.pending?
+        assert_equal 0, watcher.pe.read_pos
+        assert_empty plugin.instance_variable_get(:@worker_detached_watchers)
+        assert_empty driver.events
+      end
+    ensure
+      release&.close
+      driver&.instance_shutdown unless driver&.instance&.terminated?
+    end
+
+    def test_worker_threads_do_not_leak_across_plugin_restarts
+      path = "#{@tmp_dir}/tail.txt"
+      Fluent::FileWrapper.open(path, 'wb') {}
+      config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element('', '', {
+        'num_threads' => 2,
+        'read_lines_limit' => 1,
+        'enable_stat_watcher' => false,
+      })
+
+      3.times do |index|
+        Fluent::FileWrapper.open(path, 'ab') { |file| file.puts("restart-#{index}") }
+        driver = create_driver(config)
+        driver.run(expect_records: 1, timeout: 5) {}
+
+        pool = driver.instance.instance_variable_get(:@worker_pool)
+        assert_equal ["restart-#{index}"], driver.events.map { |event| event[2]['message'] }
+        assert_true pool.instance_variable_get(:@threads).none?(&:alive?)
+      end
+
+      assert_empty Thread.list.select { |thread| thread.name&.start_with?('in_tail_worker_') }
+    end
+
+    def test_worker_parse_error_retries_synchronously
+      path = "#{@tmp_dir}/tail.txt"
+      Fluent::FileWrapper.open(path, 'wb') {}
+      config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG + config_element('', '', {
+        'num_threads' => 2,
+        'read_lines_limit' => 1,
+      })
+      driver = create_driver(config)
+
+      driver.run(expect_records: 1, timeout: 5) do
+        pool = driver.instance.instance_variable_get(:@worker_pool)
+        original_process = pool.instance_variable_get(:@process)
+        failed_once = false
+        pool.instance_variable_set(:@process, lambda do |index, payload|
+          unless failed_once
+            failed_once = true
+            raise 'controlled worker parse error'
+          end
+          original_process.call(index, payload)
+        end)
+        Fluent::FileWrapper.open(path, 'ab') { |file| file.puts('retry-record') }
+        driver.instance.instance_variable_get(:@tails)[path].on_notify
+      end
+
+      assert_equal ['retry-record'], driver.events.map { |event| event[2]['message'] }
+      assert_true driver.logs.any? { |line| line.include?('worker parsing failed; retrying synchronously') }
+      assert_equal 0, driver.instance.instance_variable_get(:@worker_pool).statistics[:tasks]
+      assert_equal 1, driver.instance.statistics['input']['worker_parse_error_count']
+    end
+
+    data(flat: CONFIG_DISABLE_WATCH_TIMER + SINGLE_LINE_CONFIG,
+         parse: CONFIG_DISABLE_WATCH_TIMER + PARSE_SINGLE_LINE_CONFIG)
+    def test_emit_without_watch_timer(data)
+      config = data
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+
+      d = create_driver(config)
+
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+          f.puts "test3"
+          f.puts "test4"
+        }
+        # according to cool.io's stat_watcher.c, systems without inotify will use
+        # an "automatic" value, typically around 5 seconds
+      end
+
+      events = d.events
+      assert(events.length > 0)
+      assert_equal({"message" => "test3"}, events[0][2])
+      assert_equal({"message" => "test4"}, events[1][2])
+    end
+
+    # https://github.com/fluent/fluentd/pull/3541#discussion_r740197711
+    def test_watch_wildcard_path_without_watch_timer
+      omit "need file change notifications" unless Fluent.linux? || Fluent.windows?
+
+      config = config_element("ROOT", "", {
+                                "path" => "#{@tmp_dir}/tail*.txt",
+                                "tag" => "t1",
+                              })
+      config = config + CONFIG_DISABLE_WATCH_TIMER + SINGLE_LINE_CONFIG
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+
+      d = create_driver(config, false)
+
+      d.run(expect_emits: 1, timeout: 10) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+          f.puts "test3"
+          f.puts "test4"
+        }
+      end
+
+      assert_equal(
+        [
+          {"message" => "test3"},
+          {"message" => "test4"},
+        ],
+        d.events.collect { |event| event[2] })
+    end
+
+    data(flat: CONFIG_DISABLE_STAT_WATCHER + SINGLE_LINE_CONFIG,
+         parse: CONFIG_DISABLE_STAT_WATCHER + PARSE_SINGLE_LINE_CONFIG)
+    def test_emit_with_disable_stat_watcher(data)
+      config = data
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+
+      d = create_driver(config)
+
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+          f.puts "test3"
+          f.puts "test4"
+        }
+      end
+
+      events = d.events
+      assert(events.length > 0)
+      assert_equal({"message" => "test3"}, events[0][2])
+      assert_equal({"message" => "test4"}, events[1][2])
+    end
+
+    def test_always_read_from_head_on_detecting_a_new_file
+      d = create_driver(SINGLE_LINE_CONFIG)
+
+      d.run(expect_emits: 1, timeout: 10) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+          f.puts "test1\ntest2\n"
+        }
+      end
+
+      assert_equal(
+        [
+          {"message" => "test1"},
+          {"message" => "test2"},
+        ],
+        d.events.collect { |event| event[2] })
+    end
+  end
+
+  class TestWithSystem < self
+    include Fluent::SystemConfig::Mixin
+
+    OVERRIDE_FILE_PERMISSION = 0620
+    CONFIG_SYSTEM = %[
+      <system>
+        file_permission #{OVERRIDE_FILE_PERMISSION}
+      </system>
+    ]
+
+    def setup
+      omit "NTFS doesn't support UNIX like permissions" if Fluent.windows?
+      super
+      # Store default permission
+      @default_permission = system_config.instance_variable_get(:@file_permission)
+    end
+
+    def teardown
+      return if Fluent.windows?
+      super
+      # Restore default permission
+      system_config.instance_variable_set(:@file_permission, @default_permission)
+    end
+
+    def parse_system(text)
+      basepath = File.expand_path(File.dirname(__FILE__) + '/../../')
+      Fluent::Config.parse(text, '(test)', basepath, true).elements.find { |e| e.name == 'system' }
+    end
+
+    def test_emit_with_system
+      system_conf = parse_system(CONFIG_SYSTEM)
+      sc = Fluent::SystemConfig.new(system_conf)
+      Fluent::Engine.init(sc)
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+
+      d = create_driver
+
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+          f.puts "test3"
+          f.puts "test4"
+        }
+      end
+
+      events = d.events
+      assert_equal(true, events.length > 0)
+      assert_equal({"message" => "test3"}, events[0][2])
+      assert_equal({"message" => "test4"}, events[1][2])
+      assert(events[0][1].is_a?(Fluent::EventTime))
+      assert(events[1][1].is_a?(Fluent::EventTime))
+      assert_equal(1, d.emit_count)
+      pos = d.instance.instance_variable_get(:@pf_file)
+      mode = "%o" % File.stat(pos).mode
+      assert_equal OVERRIDE_FILE_PERMISSION, mode[-3, 3].to_i
+    end
+  end
+
+  sub_test_case "rotate file" do
+    def create_driver(conf = SINGLE_LINE_CONFIG)
+      config = common_config + conf
+      Fluent::Test::Driver::Input.new(Fluent::Plugin::TailInput).configure(config)
+    end
+
+    data(flat: SINGLE_LINE_CONFIG,
+         parse: PARSE_SINGLE_LINE_CONFIG)
+    def test_rotate_file(data)
+      config = data
+      events = sub_test_rotate_file(config, expect_emits: 2)
+      assert_equal(3.upto(6).collect { |i| {"message" => "test#{i}"} },
+                   events.collect { |event| event[2] })
+    end
+
+    data(flat: CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG,
+         parse: CONFIG_READ_FROM_HEAD + PARSE_SINGLE_LINE_CONFIG)
+    def test_rotate_file_with_read_from_head(data)
+      config = data
+      events = sub_test_rotate_file(config, expect_records: 6)
+      assert_equal(1.upto(6).collect { |i| {"message" => "test#{i}"} },
+                   events.collect { |event| event[2] })
+    end
+
+    data(flat: CONFIG_OPEN_ON_EVERY_UPDATE + CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG,
+         parse: CONFIG_OPEN_ON_EVERY_UPDATE + CONFIG_READ_FROM_HEAD + PARSE_SINGLE_LINE_CONFIG)
+    def test_rotate_file_with_open_on_every_update(data)
+      config = data
+      events = sub_test_rotate_file(config, expect_records: 6)
+      assert_equal(1.upto(6).collect { |i| {"message" => "test#{i}"} },
+                   events.collect { |event| event[2] })
+    end
+
+    data(flat: SINGLE_LINE_CONFIG,
+         parse: PARSE_SINGLE_LINE_CONFIG)
+    def test_rotate_file_with_write_old(data)
+      config = data
+      events = sub_test_rotate_file(config, expect_emits: 3) { |rotated_file|
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f| }
+        rotated_file.puts "test7"
+        rotated_file.puts "test8"
+        rotated_file.flush
+
+        sleep 1
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") { |f|
+          f.puts "test5"
+          f.puts "test6"
+        }
+      }
+      # This test sometimes fails and it shows a potential bug of in_tail
+      # https://github.com/fluent/fluentd/issues/1434
+      assert_equal([3, 4, 7, 8, 5, 6].collect { |i| {"message" => "test#{i}"} },
+                   events.collect { |event| event[2] })
+    end
+
+    data(flat: SINGLE_LINE_CONFIG,
+         parse: PARSE_SINGLE_LINE_CONFIG)
+    def test_rotate_file_with_write_old_and_no_new_file(data)
+      config = data
+      events = sub_test_rotate_file(config, expect_emits: 2) { |rotated_file|
+        rotated_file.puts "test7"
+        rotated_file.puts "test8"
+        rotated_file.flush
+      }
+      assert_equal([3, 4, 7, 8].collect { |i| {"message" => "test#{i}"} },
+                   events.collect { |event| event[2] })
+    end
+
+    def sub_test_rotate_file(config = nil, expect_emits: nil, expect_records: nil, timeout: 5)
+      file = Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb")
+      file.puts "test1"
+      file.puts "test2"
+      file.flush
+
+      d = create_driver(config)
+      d.run(expect_emits: expect_emits, expect_records: expect_records, timeout: timeout) do
+        sleep(0.1) while d.instance.instance_variable_get(:@startup)
+        size = d.emit_count
+        file.puts "test3"
+        file.puts "test4"
+        file.flush
+        sleep(0.1) until d.emit_count >= size + 1
+        size = d.emit_count
+
+        if Fluent.windows?
+          file.close
+          FileUtils.mv("#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail2.txt", force: true)
+          file = Fluent::FileWrapper.open("#{@tmp_dir}/tail2.txt", "ab")
+        else
+          FileUtils.mv("#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail2.txt")
+        end
+        if block_given?
+          yield file
+        else
+          Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f| }
+          sleep 1
+
+          Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") { |f|
+            f.puts "test5"
+            f.puts "test6"
+          }
+        end
+      end
+
+      d.events
+    ensure
+      file.close if file && !file.closed?
+    end
+  end
+
+  def test_truncate_file
+    config = SINGLE_LINE_CONFIG
+    Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+      f.puts "test1"
+      f.puts "test2"
+      f.flush
+    }
+
+    d = create_driver(config)
+
+    d.run(expect_emits: 2) do
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+        f.puts "test3\ntest4"
+        f.flush
+      }
+      waiting(2) { sleep 0.1 until d.events.length == 2 }
+      if Fluent.windows?
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f|
+          f.puts("test1");
+        }
+      else
+        File.truncate("#{@tmp_dir}/tail.txt", 6)
+      end
+    end
+
+    expected = {
+      emit_count: 2,
+      events: [
+        [Fluent::EventTime, {"message" => "test3"}],
+        [Fluent::EventTime, {"message" => "test4"}],
+        [Fluent::EventTime, {"message" => "test1"}],
+      ]
+    }
+    actual = {
+      emit_count: d.emit_count,
+      events: d.events.collect{|event| [event[1].class, event[2]]}
+    }
+    assert_equal(expected, actual)
+  end
+
+  def test_move_truncate_move_back
+    config = SINGLE_LINE_CONFIG
+    Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+      f.puts "test1"
+      f.puts "test2"
+    }
+
+    d = create_driver(config)
+
+    d.run(expect_emits: 1) do
+      if Fluent.windows?
+        FileUtils.mv("#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail2.txt", force: true)
+      else
+        FileUtils.mv("#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail2.txt")
+      end
+      sleep(1)
+      if Fluent.windows?
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail2.txt", "wb") { |f|
+          f.puts("test1");
+        }
+      else
+        File.truncate("#{@tmp_dir}/tail2.txt", 6)
+      end
+      sleep(1)
+      if Fluent.windows?
+        FileUtils.mv("#{@tmp_dir}/tail2.txt", "#{@tmp_dir}/tail.txt", force: true)
+      else
+        FileUtils.mv("#{@tmp_dir}/tail2.txt", "#{@tmp_dir}/tail.txt")
+      end
+    end
+
+    events = d.events
+    assert_equal(1, events.length)
+    assert_equal({"message" => "test1"}, events[0][2])
+    assert(events[0][1].is_a?(Fluent::EventTime))
+    assert_equal(1, d.emit_count)
+  end
+
+  def test_lf
+    Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| }
+
+    d = create_driver
+
+    d.run(expect_emits: 1) do
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+        f.print "test3"
+      }
+      sleep 1
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+        f.puts "test4"
+      }
+    end
+
+    events = d.events
+    assert_equal(true, events.length > 0)
+    assert_equal({"message" => "test3test4"}, events[0][2])
+  end
+
+  def test_whitespace
+    Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| }
+
+    d = create_driver
+
+    d.run(expect_emits: 1) do
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+        f.puts "    "		# 4 spaces
+        f.puts "    4 spaces"
+        f.puts "4 spaces    "
+        f.puts "	"	# tab
+        f.puts "	tab"
+        f.puts "tab	"
+      }
+    end
+
+    events = d.events
+    assert_equal(true, events.length > 0)
+    assert_equal({"message" => "    "}, events[0][2])
+    assert_equal({"message" => "    4 spaces"}, events[1][2])
+    assert_equal({"message" => "4 spaces    "}, events[2][2])
+    assert_equal({"message" => "	"}, events[3][2])
+    assert_equal({"message" => "	tab"}, events[4][2])
+    assert_equal({"message" => "tab	"}, events[5][2])
+  end
+
+  data(
+    'flat default encoding' => [SINGLE_LINE_CONFIG, Encoding::ASCII_8BIT],
+    'flat explicit encoding config' => [SINGLE_LINE_CONFIG + config_element("", "", { "encoding" => "utf-8" }), Encoding::UTF_8],
+    'parse default encoding' => [PARSE_SINGLE_LINE_CONFIG, Encoding::ASCII_8BIT],
+    'parse explicit encoding config' => [PARSE_SINGLE_LINE_CONFIG + config_element("", "", { "encoding" => "utf-8" }), Encoding::UTF_8])
+  def test_encoding(data)
+    encoding_config, encoding = data
+
+    d = create_driver(CONFIG_READ_FROM_HEAD + encoding_config)
+
+    d.run(expect_emits: 1) do
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test"
+      }
+    end
+
+    events = d.events
+    assert_equal(encoding, events[0][2]['message'].encoding)
+  end
+
+  def test_from_encoding
+    conf = config_element(
+      "", "", {
+        "format" => "/(?<message>.*)/",
+        "read_from_head" => "true",
+        "from_encoding" => "cp932",
+        "encoding" => "utf-8"
+      })
+    d = create_driver(conf)
+    cp932_message = "\x82\xCD\x82\xEB\x81\x5B\x82\xED\x81\x5B\x82\xE9\x82\xC7".force_encoding(Encoding::CP932)
+    utf8_message = cp932_message.encode(Encoding::UTF_8)
+
+    d.run(expect_emits: 1) do
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "w:cp932") {|f|
+        f.puts cp932_message
+      }
+    end
+
+    events = d.events
+    assert_equal(utf8_message, events[0][2]['message'])
+    assert_equal(Encoding::UTF_8, events[0][2]['message'].encoding)
+  end
+
+  def test_from_encoding_utf16
+    conf = config_element(
+      "", "", {
+        "format" => "/(?<message>.*)/",
+        "read_from_head" => "true",
+        "from_encoding" => "utf-16le",
+        "encoding" => "utf-8"
+      })
+    d = create_driver(conf)
+    utf16_message = "\u306F\u308D\u30FC\u308F\u30FC\u308B\u3069\n".encode(Encoding::UTF_16LE)
+    utf8_message = utf16_message.encode(Encoding::UTF_8).strip
+
+    d.run(expect_emits: 1) do
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "w:utf-16le") { |f|
+        f.write utf16_message
+      }
+    end
+
+    events = d.events
+    assert_equal(utf8_message, events[0][2]['message'])
+    assert_equal(Encoding::UTF_8, events[0][2]['message'].encoding)
+  end
+
+  def test_encoding_with_bad_character
+    conf = config_element(
+      "", "", {
+        "format" => "/(?<message>.*)/",
+        "read_from_head" => "true",
+        "from_encoding" => "ASCII-8BIT",
+        "encoding" => "utf-8"
+      })
+    d = create_driver(conf)
+
+    d.run(expect_emits: 1) do
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "w") { |f|
+        f.write "te\x86st\n"
+      }
+    end
+
+    events = d.events
+    assert_equal("te\uFFFDst", events[0][2]['message'])
+    assert_equal(Encoding::UTF_8, events[0][2]['message'].encoding)
+  end
+
+  def test_encoding_for_regular_expression_parsing
+    conf = CONFIG_READ_FROM_HEAD +
+           config_element("", "" , { "encoding" => "utf-8" },
+                          [config_element("parse", "", { "@type" => "/^あ(?<name>.*)お$/" })])
+
+    d = create_driver(conf)
+    d.run(expect_emits: 1, timeout: 5) do
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f|
+        f.puts "あいうえお"
+      }
+    end
+    events = d.events
+    assert_equal(true, events.length > 0)
+    assert_equal({"name" => "いうえ"}, events[0][2])
+  end
+
+  sub_test_case "multiline" do
+    data(flat: MULTILINE_CONFIG,
+         parse: PARSE_MULTILINE_CONFIG)
+    def test_multiline(data)
+      config = data
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f| }
+
+      d = create_driver(config)
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") { |f|
+          f.puts "f test1"
+          f.puts "s test2"
+          f.puts "f test3"
+          f.puts "f test4"
+          f.puts "s test5"
+          f.puts "s test6"
+          f.puts "f test7"
+          f.puts "s test8"
+        }
+      end
+
+      events = d.events
+      assert_equal(4, events.length)
+      assert_equal({"message1" => "test2", "message2" => "test3", "message3" => "test4"}, events[0][2])
+      assert_equal({"message1" => "test5"}, events[1][2])
+      assert_equal({"message1" => "test6", "message2" => "test7"}, events[2][2])
+      assert_equal({"message1" => "test8"}, events[3][2])
+    end
+
+    data(flat: MULTILINE_CONFIG,
+         parse: PARSE_MULTILINE_CONFIG)
+    def test_multiline_with_emit_unmatched_lines_true(data)
+      config = data + config_element("", "", { "emit_unmatched_lines" => true })
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f| }
+
+      d = create_driver(config)
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") { |f|
+          f.puts "f test1"
+          f.puts "s test2"
+          f.puts "f test3"
+          f.puts "f test4"
+          f.puts "s test5"
+          f.puts "s test6"
+          f.puts "f test7"
+          f.puts "s test8"
+        }
+      end
+
+      events = d.events
+      assert_equal(5, events.length)
+      assert_equal({"unmatched_line" => "f test1"}, events[0][2])
+      assert_equal({"message1" => "test2", "message2" => "test3", "message3" => "test4"}, events[1][2])
+      assert_equal({"message1" => "test5"}, events[2][2])
+      assert_equal({"message1" => "test6", "message2" => "test7"}, events[3][2])
+      assert_equal({"message1" => "test8"}, events[4][2])
+    end
+
+    data(flat: MULTILINE_CONFIG,
+         parse: PARSE_MULTILINE_CONFIG)
+    def test_multiline_flush_buffer_with_emit_unmatched_lines_and_path_key(data)
+      config = data + config_element("", "", { "emit_unmatched_lines" => true, "path_key" => "path" })
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f| }
+
+      d = create_driver(config)
+      d.run(expect_emits: 1) do
+        plugin = d.instance
+        # `unmatched_lines` is a feature of each parser plugin, so a parser
+        # which doesn't implement it yields (nil, nil) even if
+        # `emit_unmatched_lines` is enabled. in_tail must emit the buffered
+        # line as `unmatched_line` in that case.
+        line_feeder = plugin.instance_variable_get(:@line_feeder)
+        line_feeder.instance_variable_set(:@parser, NeverMatchingParser.new)
+        tw = Fluent::Plugin::TailInput::TailWatcher.new(
+          create_target_info("#{@tmp_dir}/tail.txt"), nil, $log, true, false, nil, nil, nil, nil
+        )
+        line_feeder.flush_buffer(tw, "incomplete line\n")
+      end
+
+      events = d.events
+      assert_equal(1, events.length)
+      assert_equal("t1", events[0][0])
+      assert_equal({ "unmatched_line" => "incomplete line", "path" => "#{@tmp_dir}/tail.txt" }, events[0][2])
+    end
+
+    data(
+      flat: MULTILINE_CONFIG_WITH_NEWLINE,
+      parse: PARSE_MULTILINE_CONFIG_WITH_NEWLINE)
+    def test_multiline_with_emit_unmatched_lines2(data)
+      config = data + config_element("", "", { "emit_unmatched_lines" => true })
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f| }
+
+      d = create_driver(config)
+      d.run(expect_emits: 0, timeout: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") { |f|
+          f.puts "s test0"
+          f.puts "f test1"
+          f.puts "f test2"
+
+          f.puts "f test3"
+
+          f.puts "s test4"
+          f.puts "f test5"
+          f.puts "f test6"
+        }
+      end
+
+      events = d.events
+      assert_equal({"message1" => "test0", "message2" => "test1", "message3" => "test2"}, events[0][2])
+      assert_equal({ 'unmatched_line' => "f test3" }, events[1][2])
+      assert_equal({"message1" => "test4", "message2" => "test5", "message3" => "test6"}, events[2][2])
+    end
+
+    data(flat: MULTILINE_CONFIG,
+         parse: PARSE_MULTILINE_CONFIG)
+    def test_multiline_with_flush_interval(data)
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f| }
+
+      config = data + config_element("", "", { "multiline_flush_interval" => "2s" })
+      d = create_driver(config)
+
+      assert_equal(2, d.instance.multiline_flush_interval)
+
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") { |f|
+          f.puts "f test1"
+          f.puts "s test2"
+          f.puts "f test3"
+          f.puts "f test4"
+          f.puts "s test5"
+          f.puts "s test6"
+          f.puts "f test7"
+          f.puts "s test8"
+        }
+      end
+
+      events = d.events
+      assert_equal(4, events.length)
+      assert_equal({"message1" => "test2", "message2" => "test3", "message3" => "test4"}, events[0][2])
+      assert_equal({"message1" => "test5"}, events[1][2])
+      assert_equal({"message1" => "test6", "message2" => "test7"}, events[2][2])
+      assert_equal({"message1" => "test8"}, events[3][2])
+    end
+
+    data(
+      'flat default encoding' => [MULTILINE_CONFIG, Encoding::ASCII_8BIT],
+      'flat explicit encoding config' => [MULTILINE_CONFIG + config_element("", "", { "encoding" => "utf-8" }), Encoding::UTF_8],
+      'parse default encoding' => [PARSE_MULTILINE_CONFIG, Encoding::ASCII_8BIT],
+      'parse explicit encoding config' => [PARSE_MULTILINE_CONFIG + config_element("", "", { "encoding" => "utf-8" }), Encoding::UTF_8])
+    def test_multiline_encoding_of_flushed_record(data)
+      encoding_config, encoding = data
+
+      config = config_element("", "", {
+                                "multiline_flush_interval" => "2s",
+                                "read_from_head" => "true",
+                              })
+      d = create_driver(config + encoding_config)
+
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f|
+          f.puts "s test"
+        }
+      end
+      events = d.events
+      assert_equal(1, events.length)
+      assert_equal(encoding, events[0][2]['message1'].encoding)
+    end
+
+    def test_multiline_from_encoding_of_flushed_record
+      conf = MULTILINE_CONFIG + config_element(
+               "", "",
+               {
+                 "multiline_flush_interval" => "1s",
+                 "read_from_head" => "true",
+                 "from_encoding" => "cp932",
+                 "encoding" => "utf-8"
+               })
+      d = create_driver(conf)
+
+      cp932_message = "s \x82\xCD\x82\xEB\x81\x5B\x82\xED\x81\x5B\x82\xE9\x82\xC7".force_encoding(Encoding::CP932)
+      utf8_message = "\x82\xCD\x82\xEB\x81\x5B\x82\xED\x81\x5B\x82\xE9\x82\xC7".encode(Encoding::UTF_8, Encoding::CP932)
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "w:cp932") { |f|
+          f.puts cp932_message
+        }
+      end
+
+      events = d.events
+      assert_equal(1, events.length)
+      assert_equal(utf8_message, events[0][2]['message1'])
+      assert_equal(Encoding::UTF_8, events[0][2]['message1'].encoding)
+    end
+
+    data(flat: config_element(
+           "", "", {
+             "format" => "multiline",
+             "format1" => "/^s (?<message1>[^\\n]+)\\n?/",
+             "format2" => "/(f (?<message2>[^\\n]+)\\n?)?/",
+             "format3" => "/(f (?<message3>.*))?/",
+             "format_firstline" => "/^[s]/"
+           }),
+         parse: config_element(
+           "", "", {},
+           [config_element("parse", "", {
+                             "@type" => "multiline",
+                             "format1" => "/^s (?<message1>[^\\n]+)\\n?/",
+                             "format2" => "/(f (?<message2>[^\\n]+)\\n?)?/",
+                             "format3" => "/(f (?<message3>.*))?/",
+                             "format_firstline" => "/^[s]/"
+                           })
+           ])
+        )
+    def test_multiline_with_multiple_formats(data)
+      config = data
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f| }
+
+      d = create_driver(config)
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") { |f|
+          f.puts "f test1"
+          f.puts "s test2"
+          f.puts "f test3"
+          f.puts "f test4"
+          f.puts "s test5"
+          f.puts "s test6"
+          f.puts "f test7"
+          f.puts "s test8"
+        }
+      end
+
+      events = d.events
+      assert(events.length > 0)
+      assert_equal({"message1" => "test2", "message2" => "test3", "message3" => "test4"}, events[0][2])
+      assert_equal({"message1" => "test5"}, events[1][2])
+      assert_equal({"message1" => "test6", "message2" => "test7"}, events[2][2])
+      assert_equal({"message1" => "test8"}, events[3][2])
+    end
+
+    data(flat: config_element(
+           "", "", {
+             "format" => "multiline",
+             "format1" => "/^[s|f] (?<message>.*)/",
+             "format_firstline" => "/^[s]/"
+           }),
+         parse: config_element(
+           "", "", {},
+           [config_element("parse", "", {
+                             "@type" => "multiline",
+                             "format1" => "/^[s|f] (?<message>.*)/",
+                             "format_firstline" => "/^[s]/"
+                           })
+           ])
+        )
+    def test_multilinelog_with_multiple_paths(data)
+      files = ["#{@tmp_dir}/tail1.txt", "#{@tmp_dir}/tail2.txt"]
+      files.each { |file| Fluent::FileWrapper.open(file, "wb") { |f| } }
+
+      config = data + config_element("", "", {
+                                       "path" => "#{files[0]},#{files[1]}",
+                                       "tag" => "t1",
+                                     })
+      d = create_driver(config, false)
+      d.run(expect_emits: 2) do
+        files.each do |file|
+          Fluent::FileWrapper.open(file, 'ab') { |f|
+            f.puts "f #{file} line should be ignored"
+            f.puts "s test1"
+            f.puts "f test2"
+            f.puts "f test3"
+            f.puts "s test4"
+          }
+        end
+      end
+
+      events = d.events
+      assert_equal({"message" => "test1\nf test2\nf test3"}, events[0][2])
+      assert_equal({"message" => "test1\nf test2\nf test3"}, events[1][2])
+      # "test4" events are here because these events are flushed at shutdown phase
+      assert_equal({"message" => "test4"}, events[2][2])
+      assert_equal({"message" => "test4"}, events[3][2])
+    end
+
+    data(flat: config_element("", "", {
+                                "format" => "multiline",
+                                "format1" => "/(?<var1>foo \\d)\\n/",
+                                "format2" => "/(?<var2>bar \\d)\\n/",
+                                "format3" => "/(?<var3>baz \\d)/"
+                              }),
+         parse: config_element(
+           "", "", {},
+           [config_element("parse", "", {
+                             "@type" => "multiline",
+                             "format1" => "/(?<var1>foo \\d)\\n/",
+                             "format2" => "/(?<var2>bar \\d)\\n/",
+                             "format3" => "/(?<var3>baz \\d)/"
+                           })
+           ])
+        )
+    def test_multiline_without_firstline(data)
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f| }
+
+      config = data
+      d = create_driver(config)
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") { |f|
+          f.puts "foo 1"
+          f.puts "bar 1"
+          f.puts "baz 1"
+          f.puts "foo 2"
+          f.puts "bar 2"
+          f.puts "baz 2"
+        }
+      end
+
+      events = d.events
+      assert_equal(2, events.length)
+      assert_equal({"var1" => "foo 1", "var2" => "bar 1", "var3" => "baz 1"}, events[0][2])
+      assert_equal({"var1" => "foo 2", "var2" => "bar 2", "var3" => "baz 2"}, events[1][2])
+    end
+  end
+
+  sub_test_case "path" do
+    # * path test
+    # TODO: Clean up tests
+    def test_expand_paths
+      ex_paths = [
+        create_target_info('test/plugin/data/2010/01/20100102-030405.log'),
+        create_target_info('test/plugin/data/log/foo/bar.log'),
+        create_target_info('test/plugin/data/log/test.log')
+      ]
+      plugin = create_driver(ex_config, false).instance
+      flexstub(Time) do |timeclass|
+        timeclass.should_receive(:now).with_no_args.and_return(Time.new(2010, 1, 2, 3, 4, 5))
+        assert_equal(ex_paths, plugin.expand_paths.values.sort_by { |path_ino| path_ino.path })
+      end
+
+      # Test exclusion
+      exclude_config = ex_config + config_element("", "", { "exclude_path" => %Q(["#{ex_paths.last.path}"]) })
+      plugin = create_driver(exclude_config, false).instance
+      assert_equal(ex_paths - [ex_paths.last], plugin.expand_paths.values.sort_by { |path_ino| path_ino.path })
+    end
+
+    sub_test_case "expand_paths with glob" do |data|
+      sub_test_case "extended_glob" do
+        data("curly braces"          => [true, "always", "test/plugin/data/log_numeric/{0,1}*.log"],
+             "square brackets"       => [true, "always", "test/plugin/data/log_numeric/[0-1][2-4].log"],
+             "asterisk"              => [true, "always", "test/plugin/data/log/*.log"],
+             "one character matcher" => [true, "always", "test/plugin/data/log/tes?.log"],
+            )
+        def test_expand_paths_with_use_glob_p_and_almost_set_of_patterns
+          result, option, path = data
+          config = config_element("", "", {
+                                    "tag" => "tail",
+                                    "path" => path,
+                                    "format" => "none",
+                                    "pos_file" => "#{@tmp_dir}/tail.pos",
+                                    "read_from_head" => true,
+                                    "refresh_interval" => 30,
+                                    "glob_policy" => option,
+                                    "path_delimiter" => "|",
+                                    "rotate_wait" => "#{EX_ROTATE_WAIT}s",
+                                    "follow_inodes" => "#{EX_FOLLOW_INODES}",
+                                  })
+          plugin = create_driver(config, false).instance
+          assert_equal(result, !!plugin.use_glob?(path))
+        end
+
+        data("curly braces"          => [true, false, "extended", "test/plugin/data/log_numeric/{0,1}*.log"],
+             "square brackets"       => [false, true, "extended", "test/plugin/data/log_numeric/[0-1][2-4].log"],
+             "asterisk"              => [false, true, "extended", "test/plugin/data/log/*.log"],
+             "one character matcher" => [false, true, "extended", "test/plugin/data/log/tes?.log"],
+            )
+        def test_expand_paths_with_use_glob_p
+          emit_exception_p, result, option, path = data
+          config = config_element("", "", {
+                                    "tag" => "tail",
+                                    "path" => path,
+                                    "format" => "none",
+                                    "pos_file" => "#{@tmp_dir}/tail.pos",
+                                    "read_from_head" => true,
+                                    "refresh_interval" => 30,
+                                    "glob_policy" => option,
+                                    "rotate_wait" => "#{EX_ROTATE_WAIT}s",
+                                    "follow_inodes" => "#{EX_FOLLOW_INODES}",
+                                  })
+          if emit_exception_p
+            assert_raise(Fluent::ConfigError) do
+              plugin = create_driver(config, false).instance
+            end
+          else
+            plugin = create_driver(config, false).instance
+            assert_equal(result, !!plugin.use_glob?(path))
+          end
+        end
+      end
+
+      sub_test_case "only_use_backward_compatible" do
+        data("square brackets"       => [false, "backward_compatible", "test/plugin/data/log_numeric/[0-1][2-4].log"],
+             "asterisk"              => [true,  "backward_compatible", "test/plugin/data/log/*.log"],
+             "one character matcher" => [false, "backward_compatible", "test/plugin/data/log/tes?.log"],
+            )
+        def test_expand_paths_with_use_glob_p
+          result, option, path = data
+          config = config_element("", "", {
+                                    "tag" => "tail",
+                                    "path" => path,
+                                    "format" => "none",
+                                    "pos_file" => "#{@tmp_dir}/tail.pos",
+                                    "read_from_head" => true,
+                                    "refresh_interval" => 30,
+                                    "glob_policy" => option,
+                                    "rotate_wait" => "#{EX_ROTATE_WAIT}s",
+                                    "follow_inodes" => "#{EX_FOLLOW_INODES}",
+                                  })
+          plugin = create_driver(config, false).instance
+          assert_equal(result, !!plugin.use_glob?(path))
+        end
+      end
+    end
+
+    def ex_config_with_brackets
+      config_element("", "", {
+                     "tag" => "tail",
+                     "path" => "test/plugin/data/log_numeric/[0-1][2-4].log",
+                     "format" => "none",
+                     "pos_file" => "#{@tmp_dir}/tail.pos",
+                     "read_from_head" => true,
+                     "refresh_interval" => 30,
+                     "glob_policy" => "extended",
+                     "rotate_wait" => "#{EX_ROTATE_WAIT}s",
+                     "follow_inodes" => "#{EX_FOLLOW_INODES}",
+                   })
+    end
+
+    def test_config_with_always_with_default_delimiter
+      assert_raise(Fluent::ConfigError) do
+        config = config_element("", "", {
+                         "tag" => "tail",
+                         "path" => "test/plugin/data/log_numeric/[0-1][2-4].log",
+                         "format" => "none",
+                         "pos_file" => "#{@tmp_dir}/tail.pos",
+                         "read_from_head" => true,
+                         "refresh_interval" => 30,
+                         "glob_policy" => "always",
+                         "rotate_wait" => "#{EX_ROTATE_WAIT}s",
+                         "follow_inodes" => "#{EX_FOLLOW_INODES}",
+                       })
+
+        create_driver(config, false).instance
+      end
+    end
+
+    def test_config_with_always_with_custom_delimiter
+      assert_nothing_raised do
+        config = config_element("", "", {
+                         "tag" => "tail",
+                         "path" => "test/plugin/data/log_numeric/[0-1][2-4].log",
+                         "format" => "none",
+                         "pos_file" => "#{@tmp_dir}/tail.pos",
+                         "read_from_head" => true,
+                         "refresh_interval" => 30,
+                         "glob_policy" => "always",
+                         "path_delimiter" => "|",
+                         "rotate_wait" => "#{EX_ROTATE_WAIT}s",
+                         "follow_inodes" => "#{EX_FOLLOW_INODES}",
+                       })
+
+        create_driver(config, false).instance
+      end
+    end
+
+    def test_expand_paths_with_brackets
+      expanded_paths = [
+        create_target_info('test/plugin/data/log_numeric/01.log'),
+        create_target_info('test/plugin/data/log_numeric/02.log'),
+        create_target_info('test/plugin/data/log_numeric/12.log'),
+        create_target_info('test/plugin/data/log_numeric/14.log'),
+      ]
+
+      plugin = create_driver(ex_config_with_brackets, false).instance
+      assert_equal(expanded_paths - [expanded_paths.first], plugin.expand_paths.values.sort_by { |path_ino| path_ino.path })
+    end
+
+    def test_expand_paths_with_duplicate_configuration
+      expanded_paths = [
+        create_target_info('test/plugin/data/log/foo/bar.log'),
+        create_target_info('test/plugin/data/log/test.log')
+      ]
+      duplicate_config = ex_config.dup
+      duplicate_config["path"]="test/plugin/data/log/**/*.log, test/plugin/data/log/**/*.log"
+      plugin = create_driver(ex_config, false).instance
+      assert_equal(expanded_paths, plugin.expand_paths.values.sort_by { |path_ino| path_ino.path })
+    end
+
+    def test_expand_paths_with_timezone
+      ex_paths = [
+        create_target_info('test/plugin/data/2010/01/20100102-030405.log'),
+        create_target_info('test/plugin/data/log/foo/bar.log'),
+        create_target_info('test/plugin/data/log/test.log')
+      ]
+      ['Asia/Taipei', '+08'].each do |tz_type|
+        taipei_config = ex_config + config_element("", "", {"path_timezone" => tz_type})
+        plugin = create_driver(taipei_config, false).instance
+
+        # Test exclude
+        exclude_config = taipei_config + config_element("", "", { "exclude_path" => %Q(["test/plugin/**/%Y%m%d-%H%M%S.log"]) })
+        exclude_plugin = create_driver(exclude_config, false).instance
+
+        with_timezone('utc') do
+          flexstub(Time) do |timeclass|
+            # env : 2010-01-01 19:04:05 (UTC), tail path : 2010-01-02 03:04:05 (Asia/Taipei)
+            timeclass.should_receive(:now).with_no_args.and_return(Time.new(2010, 1, 1, 19, 4, 5))
+
+            assert_equal(ex_paths, plugin.expand_paths.values.sort_by { |path_ino| path_ino.path })
+            assert_equal(ex_paths - [ex_paths.first], exclude_plugin.expand_paths.values.sort_by { |path_ino| path_ino.path })
+          end
+        end
+      end
+    end
+
+    def test_log_file_without_extension
+      expected_files = [
+        create_target_info('test/plugin/data/log/bar'),
+        create_target_info('test/plugin/data/log/foo/bar.log'),
+        create_target_info('test/plugin/data/log/foo/bar2'),
+        create_target_info('test/plugin/data/log/test.log')
+      ]
+
+      config = config_element("", "", {
+        "tag" => "tail",
+        "path" => "test/plugin/data/log/**/*",
+        "format" => "none",
+        "pos_file" => "#{@tmp_dir}/tail.pos"
+      })
+
+      plugin = create_driver(config, false).instance
+      assert_equal(expected_files, plugin.expand_paths.values.sort_by { |path_ino| path_ino.path })
+    end
+
+    def test_unwatched_files_should_be_removed
+      config = config_element("", "", {
+                                "tag" => "tail",
+                                "path" => "#{@tmp_dir}/*.txt",
+                                "format" => "none",
+                                "pos_file" => "#{@tmp_dir}/tail.pos",
+                                "read_from_head" => true,
+                                "refresh_interval" => 1,
+                              })
+      d = create_driver(config, false)
+      d.end_if { d.instance.instance_variable_get(:@tails).keys.size >= 1 }
+      d.run(expect_emits: 1, shutdown: false) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") { |f| f.puts "test3\n" }
+      end
+
+      cleanup_file("#{@tmp_dir}/tail.txt")
+      waiting(20) { sleep 0.1 until Dir.glob("#{@tmp_dir}/*.txt").size == 0 } # Ensure file is deleted on Windows
+      waiting(5) { sleep 0.1 until d.logs.last.include?("detected rotation") }
+      monitor = d.instance.instance_variable_get(:@watcher_refresh_monitor)
+      waiting(5) { sleep 0.1 until monitor.synchronize { d.instance.instance_variable_get(:@tails).keys.size <= 0 } }
+
+      assert_equal(
+        {
+          files: [],
+          tails: []
+        },
+        {
+          files: Dir.glob("#{@tmp_dir}/*.txt"),
+          tails: d.instance.instance_variable_get(:@tails).keys
+        }
+      )
+    ensure
+      d.instance_shutdown if d&.instance
+      cleanup_directory(@tmp_dir)
+    end
+
+    def count_timer_object
+      num = 0
+      ObjectSpace.each_object(Fluent::PluginHelper::Timer::TimerWatcher) { |obj|
+        num += 1
+      }
+      num
+    end
+  end
+
+  sub_test_case "path w/ Linux capability" do
+    def capability_enabled?
+      if Fluent.linux?
+        begin
+          require 'capng'
+          true
+        rescue LoadError
+          false
+        end
+      else
+        false
+      end
+    end
+
+    setup do
+      omit "This environment is not enabled Linux capability handling feature" unless capability_enabled?
+
+      @capng = CapNG.new(:current_process)
+      flexstub(Fluent::Capability) do |klass|
+        klass.should_receive(:new).with(:current_process).and_return(@capng)
+      end
+    end
+
+    data("dac_read_search" => [:dac_read_search, true,  1],
+         "dac_override"    => [:dac_override,    true,  1],
+         "chown"           => [:chown,           false, 0],
+        )
+    test "with partially elevated privileges" do |data|
+      cap, result, readable_paths = data
+      @capng.update(:add, :effective, cap)
+
+      d = create_driver(
+        config_element("ROOT", "", {
+                            "path" => "/var/log/ker*.log", # Use /var/log/kern.log
+                            "tag" => "t1",
+                            "rotate_wait" => "2s"
+                       }) + PARSE_SINGLE_LINE_CONFIG, false)
+
+      assert_equal(readable_paths, d.instance.expand_paths.length)
+      assert_equal(result, d.instance.have_read_capability?)
+    end
+  end
+
+  def test_pos_file_dir_creation
+    config = config_element("", "", {
+      "tag" => "tail",
+      "path" => "#{@tmp_dir}/*.txt",
+      "format" => "none",
+      "pos_file" => "#{@tmp_dir}/pos/tail.pos",
+      "read_from_head" => true,
+      "refresh_interval" => 1
+    })
+
+    assert_path_not_exist("#{@tmp_dir}/pos")
+    d = create_driver(config, false)
+    d.run
+    assert_path_exist("#{@tmp_dir}/pos")
+    assert_equal('755', File.stat("#{@tmp_dir}/pos").mode.to_s(8)[-3, 3])
+  ensure
+    cleanup_directory(@tmp_dir)
+  end
+
+  def test_pos_file_dir_creation_with_system_dir_permission
+    config = config_element("", "", {
+      "tag" => "tail",
+      "path" => "#{@tmp_dir}/*.txt",
+      "format" => "none",
+      "pos_file" => "#{@tmp_dir}/pos/tail.pos",
+      "read_from_head" => true,
+      "refresh_interval" => 1
+    })
+
+    assert_path_not_exist("#{@tmp_dir}/pos")
+
+    Fluent::SystemConfig.overwrite_system_config({ "dir_permission" => "744" }) do
+      d = create_driver(config, false)
+      d.run
+    end
+
+    assert_path_exist("#{@tmp_dir}/pos")
+    if Fluent.windows?
+      assert_equal('755', File.stat("#{@tmp_dir}/pos").mode.to_s(8)[-3, 3])
+    else
+      assert_equal('744', File.stat("#{@tmp_dir}/pos").mode.to_s(8)[-3, 3])
+    end
+  ensure
+    cleanup_directory(@tmp_dir)
+  end
+
+  def test_z_refresh_watchers
+    ex_paths = [
+      create_target_info('test/plugin/data/2010/01/20100102-030405.log'),
+      create_target_info('test/plugin/data/log/foo/bar.log'),
+      create_target_info('test/plugin/data/log/test.log'),
+    ]
+    plugin = create_driver(ex_config, false).instance
+    sio = StringIO.new
+    plugin.instance_eval do
+      @pf = Fluent::Plugin::TailInput::PositionFile.load(sio, EX_FOLLOW_INODES, {}, logger: $log)
+      @loop = Coolio::Loop.new
+    end
+
+    Timecop.freeze(2010, 1, 2, 3, 4, 5) do
+      ex_paths.each do |target_info|
+        mock.proxy(Fluent::Plugin::TailInput::TailWatcher).new(target_info, anything, anything, true, false, anything, anything, anything, anything).once
+      end
+
+      plugin.refresh_watchers
+    end
+
+    path = 'test/plugin/data/2010/01/20100102-030405.log'
+    mock.proxy(plugin).detach_watcher_after_rotate_wait(plugin.instance_variable_get(:@tails)[path], Fluent::FileWrapper.stat(path).ino)
+
+    Timecop.freeze(2010, 1, 2, 3, 4, 6) do
+      path = "test/plugin/data/2010/01/20100102-030406.log"
+      inode = Fluent::FileWrapper.stat(path).ino
+      target_info = Fluent::Plugin::TailInput::TargetInfo.new(path, inode)
+      mock.proxy(Fluent::Plugin::TailInput::TailWatcher).new(target_info, anything, anything, true, false, anything, anything, anything, anything).once
+      plugin.refresh_watchers
+
+      flexstub(Fluent::Plugin::TailInput::TailWatcher) do |watcherclass|
+        watcherclass.should_receive(:new).never
+        plugin.refresh_watchers
+      end
+    end
+  end
+
+  sub_test_case "refresh of pos file" do
+    test 'type of pos_file_compaction_interval is time' do
+      tail = {
+        "tag" => "tail",
+        "path" => "#{@tmp_dir}/*.txt",
+        "format" => "none",
+        "pos_file" => "#{@tmp_dir}/pos/tail.pos",
+        "refresh_interval" => 1,
+        "read_from_head" => true,
+        'pos_file_compaction_interval' => '24h',
+      }
+      config = config_element("", "", tail)
+      d = create_driver(config, false)
+      mock(d.instance).timer_execute(:in_tail_refresh_watchers, 1.0).once
+      mock(d.instance).timer_execute(:in_tail_refresh_compact_pos_file, 60 * 60 * 24).once
+      d.run                     # call start
+    end
+  end
+
+  # Ensure that no fatal exception is raised when a file is missing and that
+  # files that do exist are still tailed as expected.
+  def test_missing_file
+    Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+      f.puts "test1"
+      f.puts "test2"
+    }
+
+    # Try two different configs - one with read_from_head and one without,
+    # since their interactions with the filesystem differ.
+    config1 = config_element("", "", {
+                               "tag" => "t1",
+                               "path" => "#{@tmp_dir}/non_existent_file.txt,#{@tmp_dir}/tail.txt",
+                               "format" => "none",
+                               "rotate_wait" => "2s",
+                               "pos_file" => "#{@tmp_dir}/tail.pos"
+                             })
+    config2 = config1 + config_element("", "", { "read_from_head" => true })
+    [config1, config2].each do |config|
+      d = create_driver(config, false)
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+          f.puts "test3"
+          f.puts "test4"
+        }
+      end
+      # This test sometimes fails and it shows a potential bug of in_tail
+      # https://github.com/fluent/fluentd/issues/1434
+      events = d.events
+      assert_equal(2, events.length)
+      assert_equal({"message" => "test3"}, events[0][2])
+      assert_equal({"message" => "test4"}, events[1][2])
+    end
+  end
+
+  sub_test_case 'inode_processing' do
+    def test_should_delete_file_pos_entry_for_non_existing_file_with_follow_inodes
+      config = common_follow_inode_config
+
+      path = "#{@tmp_dir}/tail.txt"
+      ino = 1
+      pos = 1234
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "wb") {|f|
+        f.puts ("%s\t%016x\t%016x\n" % [path, pos, ino])
+      }
+
+      d = create_driver(config, false)
+      d.run
+
+      pos_file = Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r")
+      pos_file.pos = 0
+
+      assert_raise(EOFError) do
+        pos_file.readline
+      end
+    end
+
+    # When `follow_inodes` is enabled, position entries are keyed by inode.
+    # The inode of a rotated file disappears from `@tails` when its TailWatcher
+    # is detached by `update_watcher`, so `detach_watcher` must unwatch that
+    # entry even if the same path is still followed by a new watcher.
+    # Otherwise the entry of the rotated inode is left in the position file.
+    def test_detach_watcher_unwatches_pos_entry_of_rotated_inode_with_follow_inodes
+      config = config_element("ROOT", "", {
+          "path" => "#{@tmp_dir}/tail.txt*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          "rotate_wait" => "1s",
+          # In order to reproduce the same condition stably, ensure that
+          # `refresh_watchers` is not called by a timer.
+          "refresh_interval" => "1h",
+          # stat_watcher often calls `TailWatcher::on_notify` unexpectedly,
+          # so disable it in order to reproduce the same condition stably.
+          "enable_stat_watcher" => "false",
+        })
+
+      path = "#{@tmp_dir}/tail.txt"
+      Fluent::FileWrapper.open(path, "wb") {|f| f.puts "log1" }
+
+      d = create_driver(config, false)
+      d.run(shutdown: false) do
+        plugin = d.instance
+        pf = plugin.instance_variable_get(:@pf)
+        tails = plugin.instance_variable_get(:@tails)
+
+        current_tw = tails[path]
+        assert_not_nil(current_tw)
+
+        # The state right after a rotation: the position entry of the rotated
+        # inode is still in the position file, and the path is followed by a
+        # new watcher which has a different inode.
+        rotated_ino = 0xffffffffffffff01
+        rotated_target_info = Fluent::Plugin::TailInput::TargetInfo.new(path, rotated_ino)
+        rotated_pe = pf[rotated_target_info]
+        rotated_tw = Fluent::Plugin::TailInput::TailWatcher.new(
+          rotated_target_info, rotated_pe, $log, true, true, nil, nil, nil, nil
+        )
+        rotated_tw.unwatched = true
+
+        plugin.detach_watcher(rotated_tw, rotated_ino)
+
+        assert_equal(
+          {
+            map_keys: [current_tw.ino],
+            unwatched_pe_pos: Fluent::Plugin::TailInput::PositionFile::UNWATCHED_POSITION,
+          },
+          {
+            map_keys: pf.instance_variable_get(:@map).keys,
+            unwatched_pe_pos: rotated_pe.read_pos,
+          }
+        )
+      end
+
+      d.instance_shutdown
+    end
+
+    def test_detach_worker_waiting_watcher_defers_close_and_position_unwatch
+      config = config_element("ROOT", "", {
+          "path" => "#{@tmp_dir}/not-created*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "/(?<message>.*)/",
+          "num_threads" => 2,
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          "enable_stat_watcher" => "false",
+        })
+      d = create_driver(config, false)
+      d.run(shutdown: false) do
+        plugin = d.instance
+        pf = plugin.instance_variable_get(:@pf)
+        ino = 0xffffffffffffff02
+        target_info = Fluent::Plugin::TailInput::TargetInfo.new("#{@tmp_dir}/rotated.txt", ino)
+        pe = pf[target_info]
+        pe.update(ino, 12)
+        metrics = plugin.instance_variable_get(:@metrics)
+        tw = Fluent::Plugin::TailInput::TailWatcher.new(
+          target_info, pe, $log, true, true, nil, nil, nil, metrics
+        )
+        tw.unwatched = true
+
+        closed = false
+        at_eof = false
+        io_handler = Object.new
+        io_handler.define_singleton_method(:pending?) { false }
+        io_handler.define_singleton_method(:eof?) { at_eof }
+        io_handler.define_singleton_method(:drained?) { at_eof }
+        io_handler.define_singleton_method(:ready_to_shutdown) { |_shutdown_start_time| }
+        io_handler.define_singleton_method(:on_notify) {}
+        io_handler.define_singleton_method(:close) { closed = true }
+        tw.instance_variable_set(:@io_handler, io_handler)
+        plugin.instance_variable_get(:@worker_waiting_watchers) << tw
+
+        plugin.detach_watcher(tw, ino)
+
+        assert_false closed
+        assert_equal 12, pe.read_pos
+        assert_false tw.eof?
+
+        at_eof = true
+        plugin.send(:process_worker_completions)
+
+        assert_true closed
+        assert_true tw.eof?
+        assert_equal Fluent::Plugin::TailInput::PositionFile::UNWATCHED_POSITION, pe.read_pos
+        assert_false pf.instance_variable_get(:@map).key?(ino)
+      end
+
+      d.instance_shutdown
+    end
+
+    # With `follow_inodes false`, position entries are keyed by path, so the
+    # entry must not be unwatched while the path is still followed by a watcher.
+    # (See https://github.com/fluent/fluentd/pull/4327)
+    def test_detach_watcher_keeps_pos_entry_of_still_watched_path_without_follow_inodes
+      config = config_element("ROOT", "", {
+          "path" => "#{@tmp_dir}/tail.txt*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "false",
+          "rotate_wait" => "1s",
+          # In order to reproduce the same condition stably, ensure that
+          # `refresh_watchers` is not called by a timer.
+          "refresh_interval" => "1h",
+          "enable_stat_watcher" => "false",
+        })
+
+      path = "#{@tmp_dir}/tail.txt"
+      Fluent::FileWrapper.open(path, "wb") {|f| f.puts "log1" }
+
+      d = create_driver(config, false)
+      d.run(shutdown: false) do
+        plugin = d.instance
+        pf = plugin.instance_variable_get(:@pf)
+        tails = plugin.instance_variable_get(:@tails)
+
+        current_tw = tails[path]
+        assert_not_nil(current_tw)
+
+        # A watcher which was following the same path with a different inode.
+        # Since the path is still followed by `current_tw`, the position entry
+        # of that path must be kept.
+        old_ino = 0xffffffffffffff01
+        old_target_info = Fluent::Plugin::TailInput::TargetInfo.new(path, old_ino)
+        old_pe = pf[old_target_info]
+        old_tw = Fluent::Plugin::TailInput::TailWatcher.new(
+          old_target_info, old_pe, $log, true, false, nil, nil, nil, nil
+        )
+        old_tw.unwatched = true
+
+        plugin.detach_watcher(old_tw, old_ino)
+
+        assert_equal([path], pf.instance_variable_get(:@map).keys)
+        assert_not_equal(Fluent::Plugin::TailInput::PositionFile::UNWATCHED_POSITION, old_pe.read_pos)
+      end
+
+      d.instance_shutdown
+    end
+
+    def test_should_write_latest_offset_after_rotate_wait
+      config = common_follow_inode_config
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+
+      d = create_driver(config, false)
+      d.run(expect_emits: 2, shutdown: false) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "test3\n"}
+        FileUtils.move("#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt" + "1")
+        sleep 1
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt" + "1", "ab") {|f| f.puts "test4\n"}
+      end
+
+      pos_file = Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r")
+      pos_file.pos = 0
+      line_parts = /^([^\t]+)\t([0-9a-fA-F]+)\t([0-9a-fA-F]+)/.match(pos_file.readline)
+      waiting(5) {
+        while line_parts[2].to_i(16) != 24
+          sleep(0.1)
+          pos_file.pos = 0
+          line_parts = /^([^\t]+)\t([0-9a-fA-F]+)\t([0-9a-fA-F]+)/.match(pos_file.readline)
+        end
+      }
+      assert_equal(24, line_parts[2].to_i(16))
+      d.instance_shutdown
+    end
+
+    def test_should_remove_deleted_file
+      config = config_element("", "", {"format" => "none"})
+
+      path = "#{@tmp_dir}/tail.txt"
+      ino = 1
+      pos = 1234
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "wb") {|f|
+        f.puts ("%s\t%016x\t%016x\n" % [path, pos, ino])
+      }
+
+      d = create_driver(config)
+      d.run do
+        pos_file = Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r")
+        pos_file.pos = 0
+        assert_equal([], pos_file.readlines)
+      end
+    end
+
+    def test_should_mark_file_unwatched_after_limit_recently_modified_and_rotate_wait
+      config = config_element("ROOT", "", {
+          "path" => "#{@tmp_dir}/tail.txt*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "rotate_wait" => "1s",
+          "refresh_interval" => "1s",
+          "limit_recently_modified" => "1s",
+          "read_from_head" => "true",
+          "format" => "none",
+          "follow_inodes" => "true",
+      })
+
+      d = create_driver(config, false)
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+      target_info = create_target_info("#{@tmp_dir}/tail.txt")
+
+      d.run(expect_emits: 1, shutdown: false) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "test3\n"}
+      end
+
+
+      Timecop.travel(Time.now + 10) do
+        waiting(5) {
+          # @pos will be reset as 0 when UNWATCHED_POSITION is specified.
+          sleep 0.1 until d.instance.instance_variable_get(:@pf)[target_info].read_pos == 0
+        }
+      end
+
+      assert_equal(0, d.instance.instance_variable_get(:@pf)[target_info].read_pos)
+
+      d.instance_shutdown
+    end
+
+    def test_should_read_from_head_on_file_renaming_with_star_in_pattern
+      config = config_element("ROOT", "", {
+          "path" => "#{@tmp_dir}/tail.txt*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "rotate_wait" => "10s",
+          "refresh_interval" => "1s",
+          "limit_recently_modified" => "60s",
+          "read_from_head" => "true",
+          "format" => "none",
+          "follow_inodes" => "true"
+      })
+
+      d = create_driver(config, false)
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+
+      d.run(expect_emits: 2, shutdown: false) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "test3\n"}
+        FileUtils.move("#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt1")
+      end
+
+      events = d.events
+      assert_equal(3, events.length)
+      d.instance_shutdown
+    end
+
+    def test_should_not_read_from_head_on_rotation_when_watching_inodes
+      config = common_follow_inode_config
+
+      d = create_driver(config, false)
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+
+      d.run(expect_emits: 1, shutdown: false) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "test3\n"}
+      end
+
+      FileUtils.move("#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt1")
+      Timecop.travel(Time.now + 10) do
+        sleep 2
+        events = d.events
+        assert_equal(3, events.length)
+      end
+
+      d.instance_shutdown
+    end
+
+    def test_should_mark_file_unwatched_if_same_name_file_created_with_different_inode
+      config = common_follow_inode_config
+
+      d = create_driver(config, false)
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+      target_info = create_target_info("#{@tmp_dir}/tail.txt")
+
+      d.run(expect_emits: 2, shutdown: false) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "test3\n"}
+        cleanup_file("#{@tmp_dir}/tail.txt")
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| f.puts "test4\n"}
+      end
+
+      new_target_info = create_target_info("#{@tmp_dir}/tail.txt")
+
+      pos_file = d.instance.instance_variable_get(:@pf)
+
+      waiting(10) {
+        # @pos will be reset as 0 when UNWATCHED_POSITION is specified.
+        sleep 0.1 until pos_file[target_info].read_pos == 0
+      }
+      new_position = pos_file[new_target_info].read_pos
+      assert_equal(6, new_position)
+
+      d.instance_shutdown
+    end
+
+    def test_should_close_watcher_after_rotate_wait
+      now = Time.now
+      config = common_follow_inode_config + config_element('', '', {"rotate_wait" => "1s", "limit_recently_modified" => "1s"})
+
+      d = create_driver(config, false)
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+      target_info = create_target_info("#{@tmp_dir}/tail.txt")
+      mock.proxy(Fluent::Plugin::TailInput::TailWatcher).new(target_info, anything, anything, true, true, anything, anything, anything, anything).once
+      d.run(shutdown: false)
+      assert d.instance.instance_variable_get(:@tails)[target_info.path]
+
+      Timecop.travel(now + 10) do
+        d.instance.instance_eval do
+          sleep 0.1 until @tails[target_info.path] == nil
+        end
+        assert_nil d.instance.instance_variable_get(:@tails)[target_info.path]
+      end
+      d.instance_shutdown
+    end
+
+    def test_should_create_new_watcher_for_new_file_with_same_name
+      now = Time.now
+      config = common_follow_inode_config + config_element('', '', {"limit_recently_modified" => "2s"})
+
+      d = create_driver(config, false)
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+      path_ino = create_target_info("#{@tmp_dir}/tail.txt")
+
+      d.run(expect_emits: 1, shutdown: false) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "test3\n"}
+      end
+
+      cleanup_file("#{@tmp_dir}/tail.txt")
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test3"
+        f.puts "test4"
+      }
+      new_path_ino = create_target_info("#{@tmp_dir}/tail.txt")
+
+      Timecop.travel(now + 10) do
+        sleep 3
+        d.instance.instance_eval do
+          @tails[path_ino.path] == nil
+          @tails[new_path_ino.path] != nil
+        end
+      end
+
+      events = d.events
+
+      assert_equal(5, events.length)
+
+      d.instance_shutdown
+    end
+
+    def test_truncate_file_with_follow_inodes
+      config = common_follow_inode_config
+
+      d = create_driver(config, false)
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+
+      d.run(expect_emits: 3, shutdown: false) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "test3\n"}
+        sleep 2
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "w+b") {|f| f.puts "test4\n"}
+      end
+
+      events = d.events
+      assert_equal(4, events.length)
+      assert_equal({"message" => "test1"}, events[0][2])
+      assert_equal({"message" => "test2"}, events[1][2])
+      assert_equal({"message" => "test3"}, events[2][2])
+      assert_equal({"message" => "test4"}, events[3][2])
+      d.instance_shutdown
+    end
+
+    # issue #3464
+    def test_should_replace_target_info
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1\n"
+      }
+      target_info = create_target_info("#{@tmp_dir}/tail.txt")
+      inodes = []
+
+      config = config_element("ROOT", "", {
+                                "path" => "#{@tmp_dir}/tail.txt*",
+                                "pos_file" => "#{@tmp_dir}/tail.pos",
+                                "tag" => "t1",
+                                "refresh_interval" => "60s",
+                                "read_from_head" => "true",
+                                "format" => "none",
+                                "rotate_wait" => "1s",
+                                "follow_inodes" => "true"
+                              })
+      d = create_driver(config, false)
+      d.run(timeout: 5) do
+        while d.events.size < 1 do
+          sleep 0.1
+        end
+        inodes = d.instance.instance_variable_get(:@tails).values.collect do |tw|
+          tw.ino
+        end
+        assert_equal([target_info.ino], inodes)
+
+        cleanup_file("#{@tmp_dir}/tail.txt")
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| f.puts "test2\n"}
+
+        while d.events.size < 2 do
+          sleep 0.1
+        end
+        inodes = d.instance.instance_variable_get(:@tails).values.collect do |tw|
+          tw.ino
+        end
+        new_target_info = create_target_info("#{@tmp_dir}/tail.txt")
+        assert_not_equal(target_info.ino, new_target_info.ino)
+        assert_equal([new_target_info.ino], inodes)
+      end
+    end
+  end
+
+  sub_test_case "tail_path" do
+    def test_tail_path_with_singleline
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
+        f.puts "test1"
+        f.puts "test2"
+      }
+
+      d = create_driver(SINGLE_LINE_CONFIG + config_element("", "", { "path_key" => "path" }))
+
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f|
+          f.puts "test3"
+          f.puts "test4"
+        }
+      end
+
+      events = d.events
+      assert_equal(true, events.length > 0)
+      events.each do |emit|
+        assert_equal("#{@tmp_dir}/tail.txt", emit[2]["path"])
+      end
+    end
+
+    def test_tail_path_with_multiline_with_firstline
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f| }
+
+      config = config_element("", "", {
+                                "path_key" => "path",
+                                "format" => "multiline",
+                                "format1" => "/^s (?<message1>[^\\n]+)(\\nf (?<message2>[^\\n]+))?(\\nf (?<message3>.*))?/",
+                                "format_firstline" => "/^[s]/"
+                              })
+      d = create_driver(config)
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") { |f|
+          f.puts "f test1"
+          f.puts "s test2"
+          f.puts "f test3"
+          f.puts "f test4"
+          f.puts "s test5"
+          f.puts "s test6"
+          f.puts "f test7"
+          f.puts "s test8"
+        }
+      end
+
+      events = d.events
+      assert_equal(4, events.length)
+      events.each do |emit|
+        assert_equal("#{@tmp_dir}/tail.txt", emit[2]["path"])
+      end
+    end
+
+    def test_tail_path_with_multiline_without_firstline
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f| }
+
+      config = config_element("", "", {
+                                "path_key" => "path",
+                                "format" => "multiline",
+                                "format1" => "/(?<var1>foo \\d)\\n/",
+                                "format2" => "/(?<var2>bar \\d)\\n/",
+                                "format3" => "/(?<var3>baz \\d)/",
+                              })
+      d = create_driver(config)
+      d.run(expect_emits: 1) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") { |f|
+          f.puts "foo 1"
+          f.puts "bar 1"
+          f.puts "baz 1"
+        }
+      end
+
+      events = d.events
+      assert(events.length > 0)
+      events.each do |emit|
+        assert_equal("#{@tmp_dir}/tail.txt", emit[2]["path"])
+      end
+    end
+
+    def test_tail_path_with_multiline_with_multiple_paths
+      files = ["#{@tmp_dir}/tail1.txt", "#{@tmp_dir}/tail2.txt"]
+      files.each { |file| Fluent::FileWrapper.open(file, "wb") { |f| } }
+
+      config = config_element("", "", {
+                                "path" => "#{files[0]},#{files[1]}",
+                                "path_key" => "path",
+                                "tag" => "t1",
+                                "format" => "multiline",
+                                "format1" => "/^[s|f] (?<message>.*)/",
+                                "format_firstline" => "/^[s]/"
+                              })
+      d = create_driver(config, false)
+      d.run(expect_emits: 2) do
+        files.each do |file|
+          Fluent::FileWrapper.open(file, 'ab') { |f|
+            f.puts "f #{file} line should be ignored"
+            f.puts "s test1"
+            f.puts "f test2"
+            f.puts "f test3"
+            f.puts "s test4"
+          }
+        end
+      end
+
+      events = d.events
+      assert_equal(4, events.length)
+      assert_equal(files, [events[0][2]["path"], events[1][2]["path"]].sort)
+      # "test4" events are here because these events are flushed at shutdown phase
+      assert_equal(files, [events[2][2]["path"], events[3][2]["path"]].sort)
+    end
+  end
+
+  def test_limit_recently_modified
+    now = Time.new(2010, 1, 2, 3, 4, 5)
+    FileUtils.touch("#{@tmp_dir}/tail_unwatch.txt", mtime: (now - 3601))
+    FileUtils.touch("#{@tmp_dir}/tail_watch1.txt", mtime: (now - 3600))
+    FileUtils.touch("#{@tmp_dir}/tail_watch2.txt", mtime: now)
+
+    config = config_element('', '', {
+      'tag' => 'tail',
+      'path' => "#{@tmp_dir}/*.txt",
+      'format' => 'none',
+      'limit_recently_modified' => '3600s'
+    })
+
+    expected_files = [
+      create_target_info("#{@tmp_dir}/tail_watch1.txt"),
+      create_target_info("#{@tmp_dir}/tail_watch2.txt")
+    ]
+
+    Timecop.freeze(now) do
+      plugin = create_driver(config, false).instance
+      assert_equal(expected_files, plugin.expand_paths.values.sort_by { |path_ino| path_ino.path })
+    end
+  end
+
+  def test_skip_refresh_on_startup
+    FileUtils.touch("#{@tmp_dir}/tail.txt")
+    config = config_element('', '', {
+                              'format' => 'none',
+                              'refresh_interval' => 1,
+                              'skip_refresh_on_startup' => true
+                            })
+    d = create_driver(config)
+    d.run(shutdown: false) {}
+    assert_equal(0, d.instance.instance_variable_get(:@tails).keys.size)
+    # detect a file at first execution of in_tail_refresh_watchers timer
+    waiting(5) { sleep 0.1 until d.instance.instance_variable_get(:@tails).keys.size == 1 }
+    d.instance_shutdown
+  end
+
+  sub_test_case 'dir_watcher' do
+    def dir_watchers(d)
+      d.instance.instance_variable_get(:@dir_watchers)
+    end
+
+    # The watched directories are the directories of the expanded path patterns
+    # as the file system names them, so the real path of @tmp_dir is compared
+    # instead of @tmp_dir itself.
+    def expanded_tmp_dir
+      File.realpath(@tmp_dir)
+    end
+
+    # libev's ev_stat compares second-resolution timestamps as well as other
+    # stat fields. Wait for a later second so the next directory change is
+    # detectable even if fields such as size and nlink stay unchanged, rather
+    # than relying on refresh_interval to make the test progress.
+    def wait_until_dir_stat_can_change(dir)
+      deadline = File.mtime(dir).to_i + 1
+      # Linux filesystem timestamps use the coarse realtime clock, which can
+      # still be in the previous second just after CLOCK_REALTIME rolls over.
+      if Fluent.linux? && Process.const_defined?(:CLOCK_REALTIME_COARSE)
+        clock = Process::CLOCK_REALTIME_COARSE
+      else
+        clock = Process::CLOCK_REALTIME
+        deadline += 0.1 # Avoid the boundary when the clock may not match file system timestamps.
+      end
+      sleep(0.05) while Process.clock_gettime(clock) < deadline
+    end
+
+    data('coarse clock' => [true, true, true],
+         'realtime fallback' => [true, false, false],
+         'coarse clock defined on another platform' => [false, true, false])
+    test 'waits for the filesystem clock to pass the directory timestamp second' do |(linux, coarse_defined, coarse)|
+      omit 'Coarse realtime clock is unavailable' if coarse && !Process.const_defined?(:CLOCK_REALTIME_COARSE)
+      stub(Fluent).linux?.returns(linux)
+      stub(Process).const_defined?(:CLOCK_REALTIME_COARSE).returns(coarse_defined)
+      stub(File).mtime(@tmp_dir).returns(Time.at(100))
+      clock = coarse ? Process::CLOCK_REALTIME_COARSE : Process::CLOCK_REALTIME
+      ticks = [100.999, 101.0, 101.05, 101.1]
+      stub(Process).clock_gettime(clock) { ticks.shift || raise('Clock sequence exhausted') }
+      sleeper = mock(self).sleep(0.05)
+      coarse ? sleeper.once : sleeper.times(3)
+      assert_nothing_raised { wait_until_dir_stat_can_change(@tmp_dir) }
+    end
+
+    test 'expand_watch_dirs returns the directories which have to be watched' do
+      FileUtils.mkdir_p("#{@tmp_dir}/sub/deep")
+      FileUtils.touch("#{@tmp_dir}/tail.txt")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/tail.txt,#{@tmp_dir}/*.log,#{@tmp_dir}/sub/**/*.log",
+                             })
+      plugin = create_driver(config, false).instance
+      base = expanded_tmp_dir
+      # A static path, a pattern which matches nothing yet and a '**' pattern
+      # are handled without duplicating the same directory.
+      assert_equal([base, "#{base}/sub", "#{base}/sub/deep"].sort, plugin.expand_watch_dirs.sort)
+    end
+
+    test 'expand_watch_dirs returns the closest existing directory of a not yet created directory' do
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/not_yet_created/app.log",
+                             })
+      plugin = create_driver(config, false).instance
+      assert_equal([expanded_tmp_dir], plugin.expand_watch_dirs)
+    end
+
+    # The directory of a path directly in a root directory is that root
+    # directory, and its path gives no component to walk below it.
+    test 'expand_watch_dirs returns the root directory of a path directly in it' do
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => '/review.log',
+                             })
+      plugin = create_driver(config, false).instance
+      assert_equal([File.dirname(File.expand_path('/review.log'))], plugin.expand_watch_dirs)
+    end
+
+    # A pattern may have a wildcard before the directory of the files. The
+    # existing directories matching it have to be watched too, because the
+    # directory of the files is created inside one of them: watching only the
+    # part before the first wildcard doesn't notice it.
+    test 'expand_watch_dirs returns the directories of a not yet created directory after a wildcard' do
+      FileUtils.mkdir_p("#{@tmp_dir}/tenant")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*/logs/*.log",
+                             })
+      plugin = create_driver(config, false).instance
+      base = expanded_tmp_dir
+      # `tenant' is watched to notice the creation of `logs', and the directory
+      # of the pattern to notice a new directory matching `*'.
+      assert_equal([base, "#{base}/tenant"].sort, plugin.expand_watch_dirs.sort)
+    end
+
+    # A pattern may have a branch whose directory is not created while another
+    # branch has it. The branches have to be taken each on its own: whether
+    # another branch has that directory says nothing about this one, and the
+    # missing directory is created inside the parent which doesn't have it.
+    test 'expand_watch_dirs returns the directory of each branch whose directory is not created yet' do
+      FileUtils.mkdir_p("#{@tmp_dir}/one/logs")
+      FileUtils.mkdir_p("#{@tmp_dir}/two")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*/logs/*.log",
+                             })
+      plugin = create_driver(config, false).instance
+      base = expanded_tmp_dir
+      # `two' is watched to notice the creation of its own `logs', and the
+      # directory of the files of `one' is watched for the files themselves.
+      assert_equal([base, "#{base}/one/logs", "#{base}/two"].sort, plugin.expand_watch_dirs.sort)
+    end
+
+    test 'expand_watch_dirs returns the directories of each level of a multi level wildcard' do
+      FileUtils.mkdir_p("#{@tmp_dir}/tenant/level1")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*/*/app.log",
+                             })
+      plugin = create_driver(config, false).instance
+      base = expanded_tmp_dir
+      # The directory of the files is created inside a directory matching the
+      # second `*', which is created inside a directory matching the first one.
+      assert_equal([base, "#{base}/tenant", "#{base}/tenant/level1"].sort, plugin.expand_watch_dirs.sort)
+    end
+
+    # `**' stands for no directory or for directories at any depth, so the files
+    # may be created in any of the existing directories below it. Dir.glob takes
+    # `dir/**' as `dir/*', so the recursion has to be asked with `dir/**/'.
+    test 'expand_watch_dirs returns the existing directories of a ** pattern at every depth' do
+      FileUtils.mkdir_p("#{@tmp_dir}/deep/a/b")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/deep/**/*.log",
+                             })
+      plugin = create_driver(config, false).instance
+      base = expanded_tmp_dir
+      assert_equal(["#{base}/deep", "#{base}/deep/a", "#{base}/deep/a/b"].sort, plugin.expand_watch_dirs.sort)
+    end
+
+    # A directory matched by a wildcard may have glob characters in its own
+    # name. They are parts of that name, so taking them as wildcards again at
+    # the next level would look into another directory than the path has.
+    test 'expand_watch_dirs takes the glob characters of an existing directory name as parts of it' do
+      FileUtils.mkdir_p("#{@tmp_dir}/[x]/logs")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*/*/app.log",
+                             })
+      plugin = create_driver(config, false).instance
+      base = expanded_tmp_dir
+      assert_equal([base, "#{base}/[x]", "#{base}/[x]/logs"].sort, plugin.expand_watch_dirs.sort)
+    end
+
+    test 'expand_watch_dirs does not include regular files matched by a directory wildcard' do
+      FileUtils.mkdir_p("#{@tmp_dir}/tenant/logs")
+      FileUtils.touch("#{@tmp_dir}/not_a_directory")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*/logs/*.log",
+                             })
+      plugin = create_driver(config, false).instance
+      base = expanded_tmp_dir
+      assert_equal([base, "#{base}/tenant/logs"].sort, plugin.expand_watch_dirs.sort)
+    end
+
+    test 'expand_watch_dirs interprets escapes in components without wildcards' do
+      omit 'Backslashes are path separators on Windows' if Fluent.windows?
+      FileUtils.mkdir_p("#{@tmp_dir}/literal")
+      FileUtils.touch("#{@tmp_dir}/literal/app.log")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/\\literal/*.log",
+                             })
+      plugin = create_driver(config, false).instance
+      assert_equal(["#{@tmp_dir}/literal/app.log"], plugin.expand_paths_raw)
+      assert_equal(["#{expanded_tmp_dir}/literal"], plugin.expand_watch_dirs)
+    end
+
+    test 'dir_path_parts preserves a Windows UNC share as the root' do
+      omit 'UNC paths require Windows' unless Fluent.windows?
+      plugin = create_driver(base_config + SINGLE_LINE_CONFIG, false).instance
+      assert_equal(['//server/share/', ['logs']], plugin.dir_path_parts('//server/share/logs'))
+      assert_equal(['//server/share/', []], plugin.dir_path_parts('//server/share/'))
+    end
+
+    # The glob characters of a path are expanded by Dir.glob whenever the path
+    # is taken as a glob, whatever they are by the glob policy. The directories
+    # have to be derived the same way, or `/base/[a]/*.log' would be taken as
+    # the literal directory `/base/[a]' while #expand_paths_raw matches
+    # `/base/a/app.log'.
+    test 'expand_watch_dirs expands the glob characters which the glob policy does not take as wildcards' do
+      FileUtils.mkdir_p("#{@tmp_dir}/a")
+      FileUtils.touch("#{@tmp_dir}/a/app.log")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/[a]/*.log",
+                             })
+      plugin = create_driver(config, false).instance
+      base = expanded_tmp_dir
+      assert_equal(["#{@tmp_dir}/a/app.log"], plugin.expand_paths_raw)
+      assert_equal([base, "#{base}/a"].sort, plugin.expand_watch_dirs.sort)
+    end
+
+    # File.dirname cuts a path at the separator inside a brace group, so the
+    # directories of `/base/{a/app.log,b/app.log}' have to be derived from the
+    # paths the group stands for.
+    test 'expand_watch_dirs returns the directories of a brace pattern which contains a separator' do
+      FileUtils.mkdir_p("#{@tmp_dir}/a")
+      FileUtils.mkdir_p("#{@tmp_dir}/b")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/{a/app.log,b/app.log}",
+                               'glob_policy' => 'always',
+                               'path_delimiter' => '|',
+                             })
+      plugin = create_driver(config, false).instance
+      base = expanded_tmp_dir
+      assert_equal(["#{base}/a", "#{base}/b"].sort, plugin.expand_watch_dirs.sort)
+    end
+
+    test 'expand_watch_dirs returns the directories of nested brace groups' do
+      FileUtils.mkdir_p("#{@tmp_dir}/a/c")
+      FileUtils.mkdir_p("#{@tmp_dir}/b")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/{a/{c,d},b}/app.log",
+                               'glob_policy' => 'always',
+                               'path_delimiter' => '|',
+                             })
+      plugin = create_driver(config, false).instance
+      base = expanded_tmp_dir
+      # `d' is not created yet, so its parent is watched instead of it.
+      assert_equal(["#{base}/a", "#{base}/a/c", "#{base}/b"].sort, plugin.expand_watch_dirs.sort)
+    end
+
+    data('below limit' => 99, 'exact limit' => 100, 'over limit' => 101)
+    test 'warns about brace expansion only when paths are actually omitted' do |count|
+      d = create_driver(base_config + config_element('', '', { 'format' => 'none' }), false)
+      alternatives = Array.new(count) { |i| "dir#{i}" }
+      pattern = "/logs/{#{alternatives.join(',')}}/app.log"
+
+      assert_equal(alternatives.first(100).map { |dir| "/logs/#{dir}/app.log" }, d.instance.expand_brace_patterns(pattern))
+      warnings = d.logs.grep(/Too many paths expanded/)
+      assert_equal(count > 100 ? 1 : 0, warnings.size)
+      if count > 100
+        assert_match(/Only the first 100 paths are considered/, warnings.first)
+        assert_match(/remaining paths rely on refresh_interval/, warnings.first)
+      end
+    end
+
+    data('exact limit' => 10, 'over limit' => 11)
+    test 'bounds nested brace expansion including the overflow probe' do |inner_count|
+      d = create_driver(base_config + config_element('', '', { 'format' => 'none' }), false)
+      outer = Array.new(10) { |i| "a#{i}" }
+      inner = Array.new(inner_count) { |i| "b#{i}" }
+      pattern = "/logs/{#{outer.join(',')}}/{#{inner.join(',')}}/app.log"
+      expected = outer.product(inner).first(100).map { |a, b| "/logs/#{a}/#{b}/app.log" }
+      assert_equal(expected, d.instance.expand_brace_patterns(pattern))
+      assert_equal(inner_count > 10 ? 1 : 0, d.logs.grep(/Too many paths expanded/).size)
+    end
+
+    test 'warns once per configured brace pattern until expansion fits again' do
+      d = create_driver(base_config + config_element('', '', { 'format' => 'none' }), false)
+      alternatives = Array.new(101) { |i| "dir#{i}" }
+      pattern = "/logs/{#{alternatives.join(',')}}/app.log"
+      key = '/logs/%Y/configured-pattern'
+      2.times { d.instance.expand_brace_patterns(pattern, warning_key: key) }
+      d.instance.expand_brace_patterns("/next-year#{pattern}", warning_key: key)
+      assert_equal(1, d.logs.grep(/Too many paths expanded/).size)
+      assert_equal([key], d.instance.instance_variable_get(:@truncated_dir_patterns).keys)
+
+      d.instance.expand_brace_patterns(pattern, warning_key: 'another configured pattern')
+      assert_equal(2, d.logs.grep(/Too many paths expanded/).size)
+      d.instance.expand_brace_patterns('/logs/app.log', warning_key: key)
+      d.instance.expand_brace_patterns(pattern, warning_key: key)
+      assert_equal(3, d.logs.grep(/Too many paths expanded/).size)
+    end
+
+    test 'expand_watch_dirs watches time dependent parents in brace alternatives of different depths' do
+      Timecop.freeze do
+        year = Time.now.strftime('%Y')
+        FileUtils.mkdir_p("#{@tmp_dir}/a/b/#{year}")
+        FileUtils.mkdir_p("#{@tmp_dir}/c/#{year}")
+        config = config_element('', '', {
+                                 'tag' => 't1',
+                                 'format' => 'none',
+                                 'path' => "#{@tmp_dir}/{a/b,c}/%Y/app.log",
+                                 'glob_policy' => 'always',
+                                 'path_delimiter' => '|',
+                               })
+        plugin = create_driver(config, false).instance
+        base = expanded_tmp_dir
+        assert_equal(["#{base}/a/b", "#{base}/a/b/#{year}", "#{base}/c", "#{base}/c/#{year}"].sort,
+                     plugin.expand_watch_dirs.sort)
+      end
+    end
+
+    # Unix resolves the link before '..'; Windows normalizes 'alias/..' first.
+    # Both sides exist so a mismatch cannot hide behind an empty glob result.
+    data('glob' => true, 'literal' => false)
+    test 'expand_watch_dirs takes .. of a path after a symbolic link as file lookup does' do |glob|
+      FileUtils.mkdir_p("#{@tmp_dir}/actual/child")
+      FileUtils.mkdir_p("#{@tmp_dir}/actual/logs")
+      FileUtils.mkdir_p("#{@tmp_dir}/logs")
+      FileUtils.touch("#{@tmp_dir}/actual/logs/unix.log")
+      FileUtils.touch("#{@tmp_dir}/logs/windows.log")
+      # Use an absolute target rather than resolving @tmp_dir relative to alias.
+      File.symlink(File.expand_path("#{@tmp_dir}/actual/child"), "#{@tmp_dir}/alias")
+      name = Fluent.windows? ? 'windows.log' : 'unix.log'
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/alias/../logs/#{glob ? '*.log' : name}",
+                             })
+      plugin = create_driver(config, false).instance
+      directory = Fluent.windows? ? "#{@tmp_dir}/logs" : "#{@tmp_dir}/actual/logs"
+      # Do not resolve alias before the next component ('..') is looked up.
+      assert_equal(["#{expanded_tmp_dir}/alias"], plugin.existing_dirs(expanded_tmp_dir, 'alias', glob))
+      assert_equal(["#{@tmp_dir}/alias/../logs/#{name}"], plugin.expand_paths_raw)
+      assert_equal([expanded_tmp_dir, File.realpath(directory)].sort, plugin.expand_watch_dirs.sort)
+    end
+
+    test 'detects files after a directory symbolic link is replaced' do
+      FileUtils.mkdir_p("#{@tmp_dir}/first/logs")
+      FileUtils.mkdir_p("#{@tmp_dir}/second/logs")
+      File.symlink(File.expand_path("#{@tmp_dir}/first"), "#{@tmp_dir}/alias")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/alias/logs/*.log",
+                               'refresh_interval' => 1000,
+                               'read_from_head' => 'true',
+                               'enable_dir_watcher' => 'true',
+                             })
+      d = create_driver(config, false)
+      base = expanded_tmp_dir
+      d.run(shutdown: false) do
+        assert_includes(dir_watchers(d).keys, base)
+        wait_until_dir_stat_can_change(@tmp_dir)
+        File.unlink("#{@tmp_dir}/alias")
+        File.symlink(File.expand_path("#{@tmp_dir}/second"), "#{@tmp_dir}/alias")
+        waiting(20, plugin: d.instance) { sleep 0.1 until dir_watchers(d).key?("#{base}/second/logs") }
+        wait_until_dir_stat_can_change("#{@tmp_dir}/second/logs")
+        File.open("#{@tmp_dir}/second/logs/app.log", 'w') { |f| f.puts 'hello' }
+        waiting(20, plugin: d.instance) { sleep 0.1 until d.events.size == 1 }
+      end
+      assert_equal(['hello'], d.events.map { |e| e[2]['message'] })
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+
+    test 'does not watch directories by default' do
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*.txt",
+                               'refresh_interval' => 1000,
+                             })
+      d = create_driver(config, false)
+      d.run(shutdown: false) {}
+      assert_equal({}, dir_watchers(d))
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+
+    data('initial refresh' => false, 'skip initial refresh' => true)
+    test 'watches the directories when enable_dir_watcher is true' do |skip_initial_refresh|
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*.txt",
+                               'refresh_interval' => 1000,
+                               'enable_dir_watcher' => 'true',
+                               'skip_refresh_on_startup' => skip_initial_refresh,
+                             })
+      d = create_driver(config, false)
+      d.run(shutdown: false) {}
+      assert_equal([expanded_tmp_dir], dir_watchers(d).keys)
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+
+    data('startup' => false, 'rotated directory window' => true)
+    test 'detects a file created after the snapshot in a newly watched directory' do |rotate|
+      directories = %w[first second].map { |name| "#{@tmp_dir}/#{name}" }
+      directories.each { |dir| FileUtils.mkdir_p(dir) }
+      target_dir = directories[rotate ? 1 : 0]
+      path = "#{target_dir}/late.log"
+      config = config_element('', '', {
+                               'tag' => 't1', 'format' => 'none',
+                               'path' => directories.map { |dir| "#{dir}/*.log" }.join('|'),
+                               'path_delimiter' => '|', 'refresh_interval' => 1000,
+                               'read_from_head' => 'true',
+                               'enable_dir_watcher' => 'true', 'dir_watcher_limit' => 1,
+                             })
+      d = create_driver(config, false)
+      inject = !rotate
+      injected = false
+      after_snapshot = ->(paths) do
+        next unless inject && !injected
+        injected = true
+        assert_not_include(paths.keys, path)
+        # The new file must not become part of a watcher's initial baseline.
+        assert_equal([File.realpath(target_dir)], dir_watchers(d).keys)
+        wait_until_dir_stat_can_change(target_dir)
+        File.open(path, 'w') { |f| f.puts 'late' }
+      end
+      d.instance.define_singleton_method(:expand_paths) do
+        paths = super()
+        after_snapshot.call(paths)
+        paths
+      end
+
+      d.run(shutdown: false) do
+        if rotate
+          assert_equal([File.realpath(directories.first)], dir_watchers(d).keys)
+          inject = true
+          # Select the previously unwatched directory without waiting 1000s.
+          d.instance.refresh_watchers_on_timer
+        end
+        # No further file changes or periodic refreshes should be necessary.
+        waiting(20, plugin: d.instance) { sleep 0.1 until d.events.size == 1 }
+        assert(injected)
+      end
+      assert_equal(['late'], d.events.map { |e| e[2]['message'] })
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+
+    # refresh_interval is long enough to be never reached in this test, so the
+    # file is detected only when the change of the directory is noticed.
+    data('file stat watchers enabled' => true, 'file stat watchers disabled' => false)
+    test 'detects a file created after startup of a wildcard path' do |file_stat|
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*.txt",
+                               'refresh_interval' => 1000,
+                               'read_from_head' => 'true',
+                               'enable_dir_watcher' => 'true',
+                               'enable_stat_watcher' => file_stat,
+                             })
+      d = create_driver(config, false)
+      d.run(shutdown: false) do
+        waiting(20, plugin: d.instance) { sleep 0.1 until dir_watchers(d).key?(expanded_tmp_dir) }
+        wait_until_dir_stat_can_change(@tmp_dir)
+        File.open("#{@tmp_dir}/tail.txt", 'w') { |f| f.puts 'hello' }
+        waiting(20, plugin: d.instance) { sleep 0.1 until d.events.size == 1 }
+      end
+      assert_equal([{ 'message' => 'hello' }], d.events.map { |e| e[2] })
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+
+    test 'detects a file of a static path created after startup' do
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/tail.txt",
+                               'refresh_interval' => 1000,
+                               'read_from_head' => 'true',
+                               'enable_dir_watcher' => 'true',
+                             })
+      d = create_driver(config, false)
+      d.run(shutdown: false) do
+        wait_until_dir_stat_can_change(@tmp_dir)
+        File.open("#{@tmp_dir}/tail.txt", 'w') { |f| f.puts 'hello' }
+        waiting(20, plugin: d.instance) { sleep 0.1 until d.events.size == 1 }
+      end
+      assert_equal([{ 'message' => 'hello' }], d.events.map { |e| e[2] })
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+
+    # A file created after the first change has to be detected too: the one shot
+    # timer of the previous change must be armed again when it is triggered.
+    test 'detects the files created one after another' do
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*.txt",
+                               'refresh_interval' => 1000,
+                               'read_from_head' => 'true',
+                               'enable_dir_watcher' => 'true',
+                             })
+      d = create_driver(config, false)
+      d.run(shutdown: false) do
+        waiting(20, plugin: d.instance) { sleep 0.1 until dir_watchers(d).key?(expanded_tmp_dir) }
+        wait_until_dir_stat_can_change(@tmp_dir)
+        File.open("#{@tmp_dir}/tail1.txt", 'w') { |f| f.puts 'first' }
+        waiting(20, plugin: d.instance) { sleep 0.1 until d.events.size == 1 }
+        wait_until_dir_stat_can_change(@tmp_dir)
+        File.open("#{@tmp_dir}/tail2.txt", 'w') { |f| f.puts 'second' }
+        waiting(20, plugin: d.instance) { sleep 0.1 until d.events.size == 2 }
+      end
+      assert_equal(%w[first second], d.events.map { |e| e[2]['message'] })
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+
+    # Requests arriving while a refresh is pending must be merged.
+    test 'a burst of directory changes causes only one refresh' do
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*.txt",
+                               'refresh_interval' => 1000,
+                               'enable_dir_watcher' => 'true',
+                             })
+      d = create_driver(config, false)
+      refreshed = Queue.new
+      d.run(shutdown: false) do
+        waiting(20, plugin: d.instance) { sleep 0.1 until dir_watchers(d).key?(expanded_tmp_dir) }
+        # Count the refreshes after the initial one of #start.
+        d.instance.define_singleton_method(:refresh_watchers) { refreshed << true }
+        3.times { |i| d.instance.on_dir_changed("#{@tmp_dir}/dir#{i}") }
+        waiting(20, plugin: d.instance) { sleep 0.1 until refreshed.size == 1 }
+        # The requests of the same burst are merged into the scheduled refresh.
+        sleep(Fluent::Plugin::TailInput::DIR_WATCH_DEBOUNCE_INTERVAL + 1)
+        assert_equal(1, refreshed.size)
+        # And the changes of the next burst are noticed again.
+        d.instance.on_dir_changed("#{@tmp_dir}/dir3")
+        waiting(20, plugin: d.instance) { sleep 0.1 until refreshed.size == 2 }
+      end
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+
+    data('before_shutdown' => :before_shutdown, 'shutdown' => :shutdown)
+    test 'does not request or execute a refresh once shutdown begins' do |phase|
+      plugin = create_driver(config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*.txt",
+                             }), false).instance
+      attached = []
+      refreshed = []
+      plugin.define_singleton_method(:event_loop_attach) { |watcher| attached << watcher }
+      plugin.define_singleton_method(:refresh_watchers_raw) { refreshed << true }
+      plugin.request_refresh_watchers(:directory, delay: 1000)
+      timer = plugin.instance_variable_get(:@refresh_timer)
+      assert_equal(1, attached.size)
+
+      if phase == :before_shutdown
+        plugin.before_shutdown
+      else
+        plugin.instance_variable_set(:@shutdown_start_time, Fluent::Clock.now)
+      end
+      plugin.detach_refresh_timer
+      # A callback already dispatched before detach must not refresh or rearm.
+      timer.on_timer
+      plugin.on_dir_changed(@tmp_dir)
+      plugin.request_refresh_watchers(:refresh_interval)
+      plugin.refresh_watchers
+      assert_nil(plugin.instance_variable_get(:@refresh_timer))
+      assert_equal(1, attached.size)
+      assert_empty(refreshed)
+    end
+
+    data('before_shutdown' => :before_shutdown, 'shutdown' => :shutdown)
+    test 'does not reattach directories when shutdown occurs during path expansion' do |phase|
+      plugin = create_driver(config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*.txt",
+                               'enable_dir_watcher' => 'true',
+                             }), false).instance
+      expanding = Queue.new
+      resume = Queue.new
+      dirs = [expanded_tmp_dir]
+      plugin.define_singleton_method(:expand_watch_dirs) do
+        expanding << true
+        resume.pop
+        dirs
+      end
+      worker = Thread.new { plugin.update_dir_watchers }
+      Timeout.timeout(5) { expanding.pop }
+      if phase == :before_shutdown
+        plugin.before_shutdown
+      else
+        plugin.instance_variable_set(:@shutdown_start_time, Fluent::Clock.now)
+      end
+      plugin.detach_dir_watchers
+      resume << true
+      Timeout.timeout(5) { worker.value }
+      assert_empty(plugin.instance_variable_get(:@dir_watchers))
+    ensure
+      resume << true if resume
+      worker&.join(5)
+      worker&.kill if worker&.alive?
+      plugin&.detach_dir_watchers
+    end
+
+    test 'stops watching a removed directory and watches its parent instead' do
+      FileUtils.mkdir_p("#{@tmp_dir}/sub")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/sub/*.txt",
+                               'refresh_interval' => 1000,
+                               'enable_dir_watcher' => 'true',
+                             })
+      d = create_driver(config, false)
+      base = expanded_tmp_dir
+      d.run(shutdown: false) do
+        waiting(20, plugin: d.instance) { sleep 0.1 until dir_watchers(d).key?("#{base}/sub") }
+        FileUtils.remove_entry_secure("#{@tmp_dir}/sub")
+        waiting(20, plugin: d.instance) { sleep 0.1 until dir_watchers(d).keys == [base] }
+      end
+      assert_equal([base], dir_watchers(d).keys)
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+
+    # The directory of the files may be created after the directory matched by a
+    # wildcard of the path, and creating it changes nothing of the directories
+    # before the wildcard. refresh_interval is long enough to be never reached in
+    # this test, so the file is detected only when the directory matched by the
+    # wildcard is watched.
+    test 'detects a file created in a directory created after startup of a wildcard path' do
+      FileUtils.mkdir_p("#{@tmp_dir}/tenant")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*/logs/*.log",
+                               'refresh_interval' => 1000,
+                               'read_from_head' => 'true',
+                               'enable_dir_watcher' => 'true',
+                             })
+      d = create_driver(config, false)
+      base = expanded_tmp_dir
+      d.run(shutdown: false) do
+        waiting(20, plugin: d.instance) { sleep 0.1 until dir_watchers(d).key?("#{base}/tenant") }
+        wait_until_dir_stat_can_change("#{@tmp_dir}/tenant")
+        FileUtils.mkdir_p("#{@tmp_dir}/tenant/logs")
+        waiting(20, plugin: d.instance) { sleep 0.1 until dir_watchers(d).key?("#{base}/tenant/logs") }
+        wait_until_dir_stat_can_change("#{@tmp_dir}/tenant/logs")
+        File.open("#{@tmp_dir}/tenant/logs/app.log", 'w') { |f| f.puts 'hello' }
+        waiting(20, plugin: d.instance) { sleep 0.1 until d.events.size == 1 }
+      end
+      assert_equal(['hello'], d.events.map { |e| e[2]['message'] })
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+
+    # A branch of a wildcard whose directory is not created at startup has to be
+    # watched on its own: whether the other branches have the directory of the
+    # files says nothing about it, and creating it changes that branch only.
+    test 'detects a file of a branch whose directory was not created at startup' do
+      FileUtils.mkdir_p("#{@tmp_dir}/one/logs")
+      FileUtils.mkdir_p("#{@tmp_dir}/two")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/*/logs/*.log",
+                               'refresh_interval' => 1000,
+                               'read_from_head' => 'true',
+                               'enable_dir_watcher' => 'true',
+                             })
+      d = create_driver(config, false)
+      base = expanded_tmp_dir
+      d.run(shutdown: false) do
+        waiting(20, plugin: d.instance) { sleep 0.1 until dir_watchers(d).key?("#{base}/two") }
+        wait_until_dir_stat_can_change("#{@tmp_dir}/two")
+        FileUtils.mkdir_p("#{@tmp_dir}/two/logs")
+        waiting(20, plugin: d.instance) { sleep 0.1 until dir_watchers(d).key?("#{base}/two/logs") }
+        wait_until_dir_stat_can_change("#{@tmp_dir}/two/logs")
+        File.open("#{@tmp_dir}/two/logs/app.log", 'w') { |f| f.puts 'branch' }
+        waiting(20, plugin: d.instance) { sleep 0.1 until d.events.size == 1 }
+      end
+      assert_equal(['branch'], d.events.map { |e| e[2]['message'] })
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+
+    # The directory named by a strftime directive names another directory when the
+    # time comes to the next period, and that directory is created above it.
+    test 'expand_watch_dirs watches the directories above a path whose directory depends on the current time' do
+      Timecop.freeze do
+        month = Time.now.strftime('%Y%m')
+        FileUtils.mkdir_p("#{@tmp_dir}/#{month}")
+        config = config_element('', '', {
+                                 'tag' => 't1',
+                                 'format' => 'none',
+                                 'path' => "#{@tmp_dir}/%Y%m/app.log",
+                               })
+        plugin = create_driver(config, false).instance
+        base = expanded_tmp_dir
+        assert_equal([base, "#{base}/#{month}"].sort, plugin.expand_watch_dirs.sort)
+      end
+    end
+
+    test 'watches at most dir_watcher_limit directories' do
+      max = 3
+      (max + 1).times { |i| FileUtils.mkdir_p("#{@tmp_dir}/dir#{format('%03d', i)}") }
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/**/*.txt",
+                               'refresh_interval' => 1000,
+                               'enable_dir_watcher' => 'true',
+                               'dir_watcher_limit' => max,
+                             })
+      d = create_driver(config, false)
+      d.run(shutdown: false) {}
+      assert_equal(max, dir_watchers(d).size)
+      assert(d.logs.any? { |log| log.include?('Too many directories to watch') }, d.logs.join)
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+
+    # Interleave paths before limiting so a large glob does not consume the
+    # entire initial window. Later windows may also leave static paths out.
+    test 'watches the directories of each path when a wildcard matches too many directories' do
+      max = 3
+      max.times { |i|
+        FileUtils.mkdir_p("#{@tmp_dir}/many/dir#{format('%03d', i)}")
+      }
+      FileUtils.mkdir_p("#{@tmp_dir}/static")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/many/**/*.log|#{@tmp_dir}/static/app.log",
+                               'path_delimiter' => '|',
+                               'refresh_interval' => 1000,
+                               'enable_dir_watcher' => 'true',
+                               'dir_watcher_limit' => max,
+                             })
+      d = create_driver(config, false)
+      base = expanded_tmp_dir
+      d.run(shutdown: false) {}
+      watchers = dir_watchers(d)
+      assert_equal(max, watchers.size)
+      assert_includes(watchers.keys, "#{base}/static")
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+
+    test 'prioritizes a static directory also matched late by a large wildcard in the initial window' do
+      max = 3
+      max.times { |i| FileUtils.mkdir_p("#{@tmp_dir}/dir#{format('%03d', i)}") }
+      FileUtils.mkdir_p("#{@tmp_dir}/zz_static")
+      config = config_element('', '', {
+                               'tag' => 't1',
+                               'format' => 'none',
+                               'path' => "#{@tmp_dir}/**/*.log|#{@tmp_dir}/zz_static/app.log",
+                               'path_delimiter' => '|',
+                             })
+      plugin = create_driver(config, false).instance
+      assert_includes(plugin.expand_watch_dirs.first(max), "#{expanded_tmp_dir}/zz_static")
+    end
+
+    test 'warns only when directory candidates cross the watcher limit' do
+      d = create_driver(base_config + config_element('', '', {
+                        'format' => 'none', 'enable_dir_watcher' => true, 'dir_watcher_limit' => 2,
+                      }), false)
+      candidates = %w[a b c]
+      d.instance.define_singleton_method(:expand_watch_dirs) { candidates.dup }
+      d.instance.define_singleton_method(:attach_dir_watcher) { |_dir| }
+      2.times { d.instance.update_dir_watchers }
+      candidates << 'd'
+      d.instance.update_dir_watchers
+      assert_equal(1, d.logs.grep(/Too many directories to watch/).size)
+
+      candidates.replace(%w[a b])
+      d.instance.update_dir_watchers
+      assert_equal(1, d.logs.grep(/Too many directories to watch/).size)
+      candidates << 'c'
+      d.instance.update_dir_watchers
+      assert_equal(2, d.logs.grep(/Too many directories to watch/).size)
+    end
+
+    data('both enabled' => [true, true], 'directories only' => [true, false],
+         'files only' => [false, true], 'both disabled' => [false, false])
+    test 'logs directory inotify information only when file stat watchers are disabled' do |(directories, files)|
+      d = create_driver(base_config + config_element('', '', {
+                        'format' => 'none', 'enable_dir_watcher' => directories, 'enable_stat_watcher' => files,
+                      }), false)
+      notifications = d.logs.grep(/enable_dir_watcher still uses directory stat watchers and may use inotify/)
+      assert_equal(directories && !files ? 1 : 0, notifications.size)
+      notifications.each { |notification| assert_match(/\[info\]/, notification) }
+    end
+
+    test 'defaults dir_watcher_limit to 100 and allows a higher limit' do
+      plugin = create_driver(base_config + config_element('', '', { 'format' => 'none' }), false).instance
+      assert_equal(100, plugin.dir_watcher_limit)
+      plugin = create_driver(base_config + config_element('', '', {
+                               'format' => 'none', 'dir_watcher_limit' => 101,
+                             }), false).instance
+      assert_equal(101, plugin.dir_watcher_limit)
+    end
+
+    data('zero' => 0, 'negative' => -1)
+    test 'rejects a nonpositive dir_watcher_limit' do |limit|
+      assert_raise(Fluent::ConfigError) do
+        create_driver(base_config + config_element('', '', {
+                        'format' => 'none', 'dir_watcher_limit' => limit,
+                      }), false)
+      end
+    end
+
+    data('one slot' => [5, 1], 'partial last window' => [5, 2],
+         'overlapping windows' => [4, 3], 'exact windows' => [4, 2],
+         'below limit' => [2, 3], 'empty' => [0, 2])
+    test 'rotates through all candidates within the configured limit' do |(count, limit)|
+      plugin = create_driver(base_config + config_element('', '', {
+                               'format' => 'none', 'dir_watcher_limit' => limit,
+                             }), false).instance
+      candidates = Array.new(count) { |i| "dir#{i}" }
+      initial = plugin.limit_dir_watchers(candidates, rotate: false)
+      assert_equal(candidates.first(limit), initial)
+      seen = initial.dup
+      [count, 1].max.times do
+        selected = plugin.limit_dir_watchers(candidates, rotate: true)
+        assert_equal([limit, count].min, selected.size)
+        assert_equal(selected.uniq, selected)
+        assert_equal(selected, plugin.limit_dir_watchers(candidates, rotate: false))
+        seen.concat(selected)
+      end
+      assert_equal(candidates.sort, seen.uniq.sort)
+    end
+
+    test 'keeps the window anchor when candidates change and resets when all fit' do
+      plugin = create_driver(base_config + config_element('', '', {
+                               'format' => 'none', 'dir_watcher_limit' => 2,
+                             }), false).instance
+      assert_equal(%w[a b], plugin.limit_dir_watchers(%w[a b c d e], rotate: false))
+      assert_equal(%w[c d], plugin.limit_dir_watchers(%w[a b c d e], rotate: true))
+      assert_equal(%w[c d], plugin.limit_dir_watchers(%w[x a b c d e], rotate: false))
+      # A removed anchor falls back to the last starting index and wraps safely.
+      assert_equal(%w[d e], plugin.limit_dir_watchers(%w[x a b d e], rotate: false))
+      assert_equal(%w[x a], plugin.limit_dir_watchers(%w[x a], rotate: true))
+      assert_equal([], plugin.limit_dir_watchers([], rotate: true))
+      assert_equal(%w[a b], plugin.limit_dir_watchers(%w[a b c], rotate: false))
+    end
+
+    data('disabled' => false, 'enabled' => true)
+    test 'routes periodic refresh through scheduling only when directory watching is enabled' do |enabled|
+      plugin = create_driver(base_config + config_element('', '', {
+                               'format' => 'none', 'enable_dir_watcher' => enabled.to_s,
+                             }), false).instance
+      calls = []
+      plugin.define_singleton_method(:refresh_watchers) { calls << :refresh }
+      plugin.define_singleton_method(:request_refresh_watchers) { |trigger| calls << trigger }
+
+      plugin.refresh_watchers_on_timer
+
+      assert_equal([enabled ? :refresh_interval : :refresh], calls)
+    end
+
+    test 'ordinary refresh does not lock directory refresh scheduling state' do
+      plugin = create_driver(base_config + config_element('', '', { 'format' => 'none' }), false).instance
+      refreshed = []
+      plugin.define_singleton_method(:refresh_watchers_raw) { refreshed << true }
+      plugin.instance_variable_get(:@refresh_request_mutex).define_singleton_method(:synchronize) do
+        raise 'directory scheduling lock used while directory watching is disabled'
+      end
+
+      plugin.refresh_watchers_on_timer
+
+      assert_equal([true], refreshed)
+      assert_nil(plugin.instance_variable_get(:@refresh_timer))
+      assert_equal(false, plugin.instance_variable_get(:@rotate_dir_watchers))
+    end
+
+    test 'retains a periodic rotation request merged into a directory refresh' do
+      plugin = create_driver(base_config + config_element('', '', {
+                               'format' => 'none', 'enable_dir_watcher' => 'true',
+                             }), false).instance
+      rotations = []
+      plugin.define_singleton_method(:event_loop_attach) { |watcher| watcher }
+      plugin.define_singleton_method(:refresh_watchers_raw) {}
+      plugin.define_singleton_method(:update_dir_watchers) { |rotate: false| rotations << rotate }
+      plugin.request_refresh_watchers(:directory, delay: 1000)
+      timer = plugin.instance_variable_get(:@refresh_timer)
+      plugin.request_refresh_watchers(:refresh_interval)
+      assert_same(timer, plugin.instance_variable_get(:@refresh_timer))
+      timer.on_timer
+      assert_equal([true], rotations)
+      plugin.request_refresh_watchers(:directory, delay: 1000)
+      plugin.instance_variable_get(:@refresh_timer).on_timer
+      assert_equal([true, false], rotations)
+      plugin.request_refresh_watchers(:refresh_interval)
+      assert_equal([true, false, true], rotations)
+    end
+
+    test 'periodic refresh rotates attached watchers and eventually covers all candidates' do
+      4.times { |i| FileUtils.mkdir_p("#{@tmp_dir}/dir#{i}") }
+      d = create_driver(config_element('', '', {
+                          'tag' => 't1', 'format' => 'none',
+                          'path' => "#{@tmp_dir}/*/*.txt",
+                          'enable_dir_watcher' => 'true', 'dir_watcher_limit' => 2,
+                          'refresh_interval' => 0.2,
+                        }), false)
+      observed = Queue.new
+      sizes = Queue.new
+      d.instance.define_singleton_method(:attach_dir_watcher) do |dir|
+        super(dir)
+        sizes << @dir_watchers.size
+      end
+      d.instance.define_singleton_method(:update_dir_watchers) do |rotate: false|
+        super(rotate: rotate)
+        observed << [rotate, @dir_watchers.dup]
+      end
+      candidates = d.instance.expand_watch_dirs
+      snapshots = []
+      d.run(shutdown: false) do
+        Timeout.timeout(10) do
+          snapshots << observed.pop until snapshots.count { |rotate, _| rotate } == 3
+        end
+      end
+      initial = snapshots.first[1]
+      assert_equal(candidates.first(2), initial.keys)
+      periodic = snapshots.select { |rotate, _| rotate }.map(&:last)
+      assert_equal(candidates.rotate(2).first(2), periodic.first.keys)
+      assert_equal(candidates.sort, (initial.keys + periodic.flat_map(&:keys)).uniq.sort)
+      assert(snapshots.all? { |_, watchers| watchers.size == 2 })
+      assert_operator(sizes.size, :>, 2)
+      assert(sizes.pop <= 2) until sizes.empty?
+      initial.each do |dir, watcher|
+        assert_false(watcher.attached?) unless periodic.last.key?(dir)
+      end
+    ensure
+      d.instance_shutdown if d&.instance
+    end
+  end
+
+  def test_ENOENT_error_after_setup_watcher
+    path = "#{@tmp_dir}/tail.txt"
+    FileUtils.touch(path)
+    config = config_element('', '', {
+                              'format' => 'none',
+                            })
+    d = create_driver(config)
+    file_deleted = false
+    mock.proxy(d.instance).existence_path do |hash|
+      unless file_deleted
+        cleanup_file(path)
+        file_deleted = true
+      end
+      hash
+    end.twice
+    assert_nothing_raised do
+      d.run(shutdown: false) {}
+    end
+    assert(d.logs.any?{|log| log.include?("stat() for #{path} failed. Continuing without tailing it.\n") },
+           d.logs.join("\n"))
+  ensure
+    d.instance_shutdown if d&.instance
+  end
+
+  def test_EACCES_error_after_setup_watcher
+    omit "Cannot test with root user" if Process::UID.eid == 0
+    path = "#{@tmp_dir}/noaccess/tail.txt"
+    begin
+      FileUtils.mkdir_p("#{@tmp_dir}/noaccess")
+      FileUtils.chmod(0755, "#{@tmp_dir}/noaccess")
+      FileUtils.touch(path)
+      config = config_element('', '', {
+                                'tag' => "tail",
+                                'path' => path,
+                                'format' => 'none',
+                              })
+      d = create_driver(config, false)
+      mock.proxy(d.instance).existence_path do |hash|
+        FileUtils.chmod(0000, "#{@tmp_dir}/noaccess")
+        hash
+      end.twice
+      assert_nothing_raised do
+        d.run(shutdown: false) {}
+      end
+      assert(d.logs.any?{|log| log.include?("stat() for #{path} failed. Continuing without tailing it.\n") },
+             d.logs.join("\n"))
+    end
+  ensure
+    d.instance_shutdown if d&.instance
+    if File.exist?("#{@tmp_dir}/noaccess")
+      FileUtils.chmod(0755, "#{@tmp_dir}/noaccess")
+      FileUtils.rm_rf("#{@tmp_dir}/noaccess")
+    end
+  end unless Fluent.windows?
+
+  def test_EACCES
+    path = "#{@tmp_dir}/tail.txt"
+    FileUtils.touch(path)
+    config = config_element('', '', {
+                              'format' => 'none',
+                            })
+    d = create_driver(config)
+    mock.proxy(Fluent::FileWrapper).stat(path) do |stat|
+      raise Errno::EACCES
+    end.at_least(1)
+    assert_nothing_raised do
+      d.run(shutdown: false) {}
+    end
+    assert(d.logs.any?{|log| log.include?("expand_paths: stat() for #{path} failed with Errno::EACCES. Skip file.\n") })
+  ensure
+    d.instance_shutdown if d&.instance
+  end
+
+  def test_warn_without_directory_permission
+    omit "Cannot test with root user" if Process::UID.eid == 0
+    omit "NTFS doesn't support UNIX like permissions" if Fluent.windows?
+    path = "#{@tmp_dir}/noaccess/tail.txt"
+    begin
+      FileUtils.mkdir_p("#{@tmp_dir}/noaccess")
+      FileUtils.touch(path)
+      FileUtils.chmod(0400, path)
+      FileUtils.chmod(0600, "#{@tmp_dir}/noaccess")
+      config = config_element('', '', {
+                                'tag' => "tail",
+                                'path' => path,
+                                'format' => 'none',
+                                "pos_file" => "#{@tmp_dir}/tail.pos",
+                              })
+      d = create_driver(config, false)
+      fname = File.expand_path("#{@tmp_dir}/noaccess")
+      assert(d.logs.any?{|log| log.include?("Skip #{path} because '#{fname}' lacks execute permission.\n") })
+    end
+  end
+
+  def test_no_warn_with_directory_permission
+    omit "Cannot test with root user" if Process::UID.eid == 0
+    omit "NTFS doesn't support UNIX like permissions" if Fluent.windows?
+    path = "#{@tmp_dir}/noaccess/tail.txt"
+    begin
+      FileUtils.mkdir_p("#{@tmp_dir}/noaccess")
+      FileUtils.chmod(0100, "#{@tmp_dir}/noaccess")
+      config = config_element('', '', {
+                                'tag' => "tail",
+                                'path' => path,
+                                'format' => 'none',
+                                "pos_file" => "#{@tmp_dir}/tail.pos",
+                              })
+      d = create_driver(config, false)
+      fname = File.expand_path("#{@tmp_dir}/noaccess")
+      assert(d.logs.all?{|log| !log.include?("Skip #{path} because '#{fname}' lacks execute permission.\n") })
+    end
+  end
+
+  def test_other_user_owned_files
+    # https://github.com/fluent/fluentd/issues/5141
+    omit "Cannot test with root user" if Process::UID.eid == 0
+    omit "NTFS doesn't support UNIX like permissions" if Fluent.windows?
+
+    config = config_element('', '', {
+      'tag' => "tail",
+      'path' => "/var/log/*.log",
+      'format' => 'none',
+      "pos_file" => "#{@tmp_dir}/tail.pos",
+    })
+    assert_nothing_raised do
+      create_driver(config, false)
+    end
+  end
+
+  test 'shutdown waits for an ongoing refresh before closing the position file' do
+    plugin = create_driver(config_element('', '', {
+                             'tag' => 't1', 'format' => 'none',
+                             'path' => "#{@tmp_dir}/*.txt",
+                           }), false).instance
+    position_file = File.open("#{@tmp_dir}/refresh.pos", 'w')
+    plugin.instance_variable_set(:@pf_file, position_file)
+    expanding = Queue.new
+    resume = Queue.new
+    plugin.define_singleton_method(:refresh_watchers_raw) do
+      expanding << true
+      resume.pop
+      position_file.write('refreshed')
+    end
+    refresh = Thread.new { plugin.refresh_watchers }
+    Timeout.timeout(5) { expanding.pop }
+    shutdown = Thread.new { plugin.shutdown }
+    waiting(5) { sleep 0.01 until shutdown.status == 'sleep' }
+    assert_false(position_file.closed?)
+    resume << true
+    Timeout.timeout(5) { refresh.value; shutdown.value }
+    assert_true(position_file.closed?)
+    assert_equal('refreshed', File.read("#{@tmp_dir}/refresh.pos"))
+  ensure
+    resume << true if resume
+    [refresh, shutdown].compact.each do |thread|
+      thread.join(5)
+      thread.kill if thread.alive?
+    end
+    position_file.close if position_file && !position_file.closed?
+  end
+
+  sub_test_case 'rotation during shutdown' do
+    def start_and_rotate(follow_inodes)
+      path = "#{@tmp_dir}/tail.txt"
+      Fluent::FileWrapper.open(path, 'wb') { |f| f.puts 'old' }
+      d = create_driver(config_element('', '', {
+                          'tag' => 't1', 'format' => 'none', 'path' => path,
+                          'pos_file' => "#{@tmp_dir}/tail.pos",
+                          'follow_inodes' => follow_inodes.to_s,
+                          'enable_stat_watcher' => 'false',
+                        }), false)
+      yield d.instance
+      d.instance_start
+      FileUtils.move(path, "#{path}1")
+      Fluent::FileWrapper.open(path, 'wb') { |f| f.puts 'new' }
+      d
+    end
+
+    data('follow_inodes false' => false, 'follow_inodes true' => true)
+    test 'shutdown waits for an ongoing rotation before closing the position file' do |follow_inodes|
+      rotating = Queue.new
+      resume = Queue.new
+      d = start_and_rotate(follow_inodes) do |plugin|
+        plugin.define_singleton_method(:update_watcher_raw) do |*args|
+          rotating << true
+          resume.pop
+          super(*args)
+        end
+      end
+      Timeout.timeout(5) { rotating.pop }
+      position_file = d.instance.instance_variable_get(:@pf_file)
+      shutdown = Thread.new { d.instance.stop; d.instance.before_shutdown; d.instance.shutdown }
+      waiting(5) { sleep 0.01 until shutdown.status == 'sleep' || !shutdown.alive? }
+      assert_false(position_file.closed?)
+      resume << true
+      Timeout.timeout(5) { shutdown.value }
+      assert_true(position_file.closed?)
+      d.instance_shutdown
+      assert_equal([], d.logs.grep(/closed stream/))
+      assert_equal(['new'], d.events.map { |e| e[2]['message'] })
+    ensure
+      resume << true if resume
+      if shutdown
+        shutdown.join(5)
+        shutdown.kill if shutdown.alive?
+      end
+      d.instance_shutdown if d && !d.instance.terminated?
+    end
+
+    data('follow_inodes false' => false, 'follow_inodes true' => true)
+    test 'rotation detected after shutdown has started does not touch the position file' do |follow_inodes|
+      rotating = Queue.new
+      resume = Queue.new
+      d = start_and_rotate(follow_inodes) do |plugin|
+        plugin.define_singleton_method(:update_watcher) do |*args|
+          rotating << true
+          resume.pop
+          super(*args)
+        end
+      end
+      Timeout.timeout(5) { rotating.pop }
+      d.instance.stop
+      d.instance.before_shutdown
+      d.instance.shutdown
+      assert_true(d.instance.instance_variable_get(:@pf_file).closed?)
+      resume << true
+      d.instance_shutdown
+      assert_equal([], d.logs.grep(/closed stream/))
+      assert_equal([], d.events)
+    ensure
+      resume << true if resume
+      d.instance_shutdown if d && !d.instance.terminated?
+    end
+  end
+
+  sub_test_case 'rotation during refresh' do
+    data('follow_inodes false' => false, 'follow_inodes true' => true)
+    test 'refresh handles a rotation noticed by its own notification' do |follow_inodes|
+      path = "#{@tmp_dir}/tail.txt"
+      Fluent::FileWrapper.open(path, 'wb') { |f| f.puts 'old' }
+      d = create_driver(config_element('', '', {
+                          'tag' => 't1', 'format' => 'none', 'path' => path,
+                          'pos_file' => "#{@tmp_dir}/tail.pos",
+                          'follow_inodes' => follow_inodes.to_s,
+                          'enable_stat_watcher' => 'false',
+                          'skip_refresh_on_startup' => 'true',
+                        }), false)
+      plugin = d.instance
+      rotated = false
+      plugin.define_singleton_method(:setup_watcher) do |*args|
+        tw = super(*args)
+        unless rotated
+          rotated = true
+          tw.on_notify
+          FileUtils.move(path, "#{path}1")
+          Fluent::FileWrapper.open(path, 'wb') { |f| f.puts 'new' }
+        end
+        tw
+      end
+      d.instance_start
+      plugin.refresh_watchers
+      assert_equal([], d.logs.grep(/recursive locking/))
+      target_info = create_target_info(path)
+      assert_equal(target_info.ino, plugin.instance_variable_get(:@pf)[target_info].read_inode)
+      FileUtils.move(path, "#{path}2")
+      Fluent::FileWrapper.open(path, 'wb') { |f| f.puts 'newer' }
+      waiting(10) { sleep 0.1 until d.events.any? { |e| e[2]['message'] == 'newer' } }
+    ensure
+      d.instance_shutdown if d && !d.instance.terminated?
+    end
+  end
+
+  def test_shutdown_timeout
+    Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") do |f|
+      # Should be large enough to take too long time to consume
+      (1024 * 1024 * 5).times do
+        f.puts "{\"test\":\"fizzbuzz\"}"
+      end
+    end
+
+    config =
+      CONFIG_READ_FROM_HEAD +
+      config_element('', '', {
+                              'format' => 'json',
+                              'skip_refresh_on_startup' => true,
+                            })
+    shutdown_start_time = nil
+
+    d = create_driver(config)
+    mock.proxy(d.instance).io_handler(anything, anything) do |io_handler|
+      mock.proxy(io_handler).ready_to_shutdown(anything) do
+        shutdown_start_time ||= Fluent::Clock.now
+      end.at_least(1)
+      io_handler.shutdown_timeout = 0.5
+      io_handler
+    end
+
+    assert_nothing_raised do
+      d.run(expect_emits: 1)
+    end
+
+    elapsed = Fluent::Clock.now - shutdown_start_time
+    assert_true(elapsed > 0.5 && elapsed < 2.0,
+                "elapsed time: #{elapsed}")
+  end
+
+  sub_test_case "throttling logs at in_tail level" do
+    data("file test1.log no_limit 5120 text: msg" => ["test1.log", 5120, "msg"],
+         "file test2.log no_limit 1024 text: test" => ["test2.log", 1024, "test"])
+    def test_lines_collected_with_no_throttling(data)
+      file, num_lines, msg = data
+
+      pattern = "/^#{@tmp_dir}\/(?<file>.+)\.log$/"
+      rule = create_rule_directive({
+        "file" => "/test.*/",
+      }, -1)
+      group = create_group_directive(pattern, "1s", rule)
+      path_element = create_path_element(file)
+
+      conf = ROOT_CONFIG + group + path_element + CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/#{file}", 'wb') do |f|
+        num_lines.times do
+          f.puts "#{msg}\n"
+        end
+      end
+
+
+      d = create_driver(conf, false)
+      d.run(timeout: 3) do
+        start_time = Fluent::Clock.now
+
+        assert_equal(num_lines, d.record_count)
+        assert_equal({ "message" => msg }, d.events[0][2])
+
+        prev_count = d.record_count
+        sleep(0.1) while d.emit_count < 1
+        assert_true(Fluent::Clock.now - start_time < 2)
+        ## after waiting for 1 (+ jitter) secs, limit will reset
+        ## Plugin will start reading but it will encounter EOF Error
+        ## since no logs are left to be read
+        ## Hence, d.record_count = prev_count
+        tail_watcher_interval = 1.0 # hard coded value in in_tail
+        safety_ratio = 1.2
+        jitter = tail_watcher_interval * safety_ratio
+        sleep(1.0 + jitter)
+        assert_equal(0, d.record_count - prev_count)
+      end
+    end
+
+    test "watcher waiting rotate_wait keeps reading a group limited file until EOF" do
+      file = "test1.log"
+      pattern = "/^#{@tmp_dir}\/(?<file>.+)\.log$/"
+      rule = create_rule_directive({ "file" => "/test.*/" }, 1)
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/*.log",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          "limit_recently_modified" => "10s",
+          "rotate_wait" => "1s",
+          "refresh_interval" => "1h",
+          "enable_stat_watcher" => "false",
+        }
+      ) + create_group_directive(pattern, "1s", rule)
+
+      # Large enough to need several reads, so the watcher is throttled before reaching EOF.
+      Fluent::FileWrapper.open("#{@tmp_dir}/#{file}", "wb") { |f| 32000.times { f.puts "initial" } }
+
+      d = create_driver(config, false)
+      d.run(timeout: 30) do
+        tw = d.instance.instance_variable_get(:@tails)["#{@tmp_dir}/#{file}"]
+        waiting(5) { sleep 0.1 until d.events.size > 0 }
+        assert_false(tw.eof?)
+
+        File.utime(Time.now - 20, Time.now - 20, "#{@tmp_dir}/#{file}")
+        d.instance.refresh_watchers
+        assert_equal(1, d.instance.instance_variable_get(:@tails_rotate_wait).size)
+
+        waiting(15) { sleep 0.1 until d.instance.instance_variable_get(:@tails_rotate_wait).empty? }
+        assert_true(tw.eof?)
+      end
+      assert_equal(32000, d.events.size)
+    end
+
+    test "refresh keeps discovering files while a stopped watcher in the same group drains" do
+      pattern = "/^#{@tmp_dir}\/(?<file>.+)\.log$/"
+      rule = create_rule_directive({ "file" => "/.*/" }, 1)
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/*.log",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          "limit_recently_modified" => "10s",
+          "rotate_wait" => "1s",
+          "refresh_interval" => "0.5s",
+          "enable_stat_watcher" => "false",
+        }
+      ) + create_group_directive(pattern, "1s", rule)
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/old.log", "wb") { |f| 40000.times { f.puts "old" } }
+
+      d = create_driver(config, false)
+      d.run(timeout: 40) do
+        old_tw = d.instance.instance_variable_get(:@tails)["#{@tmp_dir}/old.log"]
+        waiting(5) { sleep 0.1 until d.events.size > 0 }
+
+        File.utime(Time.now - 20, Time.now - 20, "#{@tmp_dir}/old.log")
+        Fluent::FileWrapper.open("#{@tmp_dir}/new.log", "wb") { |f| f.puts "new" }
+        waiting(10) { sleep 0.1 until d.events.any? { |e| e[2]["message"] == "new" } }
+
+        File.utime(Time.now - 20, Time.now - 20, "#{@tmp_dir}/new.log")
+        Fluent::FileWrapper.open("#{@tmp_dir}/later.log", "wb") { |f| f.puts "later" }
+        waiting(10) { sleep 0.1 until d.events.any? { |e| e[2]["message"] == "later" } }
+
+        waiting(15) { sleep 0.1 until d.instance.instance_variable_get(:@tails_rotate_wait).empty? }
+        assert_true(old_tw.eof?)
+        assert_false(old_tw.group_watcher.include?("#{@tmp_dir}/old.log"))
+      end
+      assert_equal([], d.logs.grep(/Stopping the timer/))
+    end
+
+    test "position of other files survives compaction while a stopped watcher drains" do
+      pattern = "/^#{@tmp_dir}\/(?<file>.+)\.log$/"
+      rule = create_rule_directive({ "file" => "/.*/" }, 1)
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/*.log",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          "limit_recently_modified" => "10s",
+          "rotate_wait" => "1s",
+          "refresh_interval" => "1h",
+          "enable_stat_watcher" => "false",
+        }
+      ) + create_group_directive(pattern, "1s", rule)
+
+      a_log_lines = 60000
+      Fluent::FileWrapper.open("#{@tmp_dir}/a.log", "wb") { |f| a_log_lines.times { f.puts "old" } }
+      Fluent::FileWrapper.open("#{@tmp_dir}/b.log", "wb") { |f| f.puts "new" }
+
+      d = create_driver(config, false)
+      d.run(timeout: 30) do
+        tw = d.instance.instance_variable_get(:@tails)["#{@tmp_dir}/a.log"]
+        waiting(5) { sleep 0.1 until d.events.size > 0 }
+        assert_false(tw.eof?)
+
+        File.utime(Time.now - 20, Time.now - 20, "#{@tmp_dir}/a.log")
+        d.instance.refresh_watchers
+        d.instance.instance_variable_get(:@pf).try_compact
+
+        waiting(15) { sleep 0.1 until d.instance.instance_variable_get(:@tails_rotate_wait).empty? }
+      end
+
+      position_entries = {}
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r") do |f|
+        f.readlines(chomp: true).each do |line|
+          values = line.split("\t")
+          position_entries[values[0]] = values[1].to_i(16)
+        end
+      end
+      assert_equal(
+        {
+          "#{@tmp_dir}/a.log" => "old\n".bytesize * a_log_lines,
+          "#{@tmp_dir}/b.log" => "new\n".bytesize,
+        },
+        position_entries,
+      )
+    end
+
+    test "a group limited file updated while its stopped watcher drains is not read twice" do
+      pattern = "/^#{@tmp_dir}\/(?<file>.+)\.log$/"
+      rule = create_rule_directive({ "file" => "/.*/" }, 1)
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/*.log",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          "limit_recently_modified" => "60s",
+          "rotate_wait" => "1s",
+          "refresh_interval" => "1h",
+          "enable_stat_watcher" => "false",
+        }
+      ) + create_group_directive(pattern, "1s", rule)
+
+      # Needs several reads of BYTES_TO_READ, so the group limit stops the watcher before EOF.
+      lines = Fluent::Plugin::TailInput::TailWatcher::IOHandler::BYTES_TO_READ * 4 / "initial\n".bytesize
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.log", "wb") { |f| lines.times { f.puts "initial" } }
+
+      d = create_driver(config, false)
+      d.run(timeout: 30) do
+        tw = d.instance.instance_variable_get(:@tails)["#{@tmp_dir}/tail.log"]
+        waiting(5) { sleep 0.1 until d.events.size > 0 }
+        assert_false(tw.eof?)
+
+        File.utime(Time.now - 120, Time.now - 120, "#{@tmp_dir}/tail.log")
+        d.instance.refresh_watchers
+
+        # The file becomes a target again while the stopped watcher is still draining it.
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.log", "ab") { |f| f.puts "resumed" }
+        d.instance.refresh_watchers
+        assert_equal(0, d.instance.instance_variable_get(:@tails).size)
+
+        waiting(15) { sleep 0.1 until d.instance.instance_variable_get(:@tails_rotate_wait).empty? }
+        d.instance.refresh_watchers
+        assert_equal(1, d.instance.instance_variable_get(:@tails).size)
+      end
+      assert_equal(["resumed"], d.events.map { |e| e[2]["message"] }.reject { |m| m == "initial" })
+      assert_equal(lines + 1, d.events.size)
+    end
+
+    test "a rotated file keeps being read under a group limit without the watch timer" do
+      omit "need file change notifications" unless Fluent.linux? || Fluent.windows?
+      pattern = "/^#{@tmp_dir}\/(?<file>.+)\.log.*$/"
+      rule = create_rule_directive({ "file" => "/.*/" }, 1)
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/tail.log*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          "rotate_wait" => "1s",
+          "refresh_interval" => "1h",
+          "enable_watch_timer" => "false",
+        }
+      ) + create_group_directive(pattern, "1s", rule)
+
+      # Needs several reads of BYTES_TO_READ, so the group limit stops the watcher before EOF.
+      lines = Fluent::Plugin::TailInput::TailWatcher::IOHandler::BYTES_TO_READ * 4 / "initial\n".bytesize
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.log", "wb") { |f| lines.times { f.puts "initial" } }
+
+      d = create_driver(config, false)
+      d.run(timeout: 30) do
+        tw = d.instance.instance_variable_get(:@tails)["#{@tmp_dir}/tail.log"]
+        waiting(5) { sleep 0.1 until d.events.size > 0 }
+        assert_false(tw.eof?)
+
+        # Only the stat watcher notices the rotation, and it watches the old path, so the stat watcher never fires again.
+        FileUtils.move("#{@tmp_dir}/tail.log", "#{@tmp_dir}/tail.log.1")
+        waiting(5) { sleep 0.1 until d.instance.instance_variable_get(:@tails_rotate_wait).size == 1 }
+
+        waiting(15) { sleep 0.1 until d.instance.instance_variable_get(:@tails_rotate_wait).empty? }
+      end
+      assert_equal(lines, d.events.size)
+    end
+
+    test "a transient emit error does not stop draining a rotated file without the watch timer" do
+      omit "need file change notifications" unless Fluent.linux? || Fluent.windows?
+      pattern = "/^#{@tmp_dir}\/(?<file>.+)\.log.*$/"
+      rule = create_rule_directive({ "file" => "/.*/" }, 1)
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/tail.log*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          "rotate_wait" => "1s",
+          "refresh_interval" => "1h",
+          "enable_watch_timer" => "false",
+          "multiline_flush_interval" => "1s",
+        },
+        [config_element("parse", "", { "@type" => "multiline", "format_firstline" => "/^s /", "format1" => "/^s (?<message>.*)/" })]
+      ) + create_group_directive(pattern, "3s", rule)
+
+      # Needs two reads of BYTES_TO_READ, so the group limit stops the watcher before EOF.
+      lines = Fluent::Plugin::TailInput::TailWatcher::IOHandler::BYTES_TO_READ * 2 / "s initial\n".bytesize
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.log", "wb") { |f| lines.times { f.puts "s initial" }; f.puts "s last" }
+
+      d = create_driver(config, false)
+      raised = false
+      d.run(timeout: 40) do
+        tw = d.instance.instance_variable_get(:@tails)["#{@tmp_dir}/tail.log"]
+        waiting(5) { sleep 0.1 until d.events.size > 0 }
+        assert_false(tw.eof?)
+
+        # The multiline flush fails once, as if the output buffer were full.
+        file_feed = tw.file_feed
+        flush_handler = file_feed.instance_variable_get(:@flush_handler)
+        file_feed.instance_variable_set(:@flush_handler, lambda { |watcher, buf|
+          unless raised
+            raised = true
+            raise Fluent::Plugin::Buffer::BufferOverflowError, "test"
+          end
+          flush_handler.call(watcher, buf)
+        })
+
+        FileUtils.move("#{@tmp_dir}/tail.log", "#{@tmp_dir}/tail.log.1")
+        waiting(5) { sleep 0.1 until d.instance.instance_variable_get(:@tails_rotate_wait).size == 1 }
+        waiting(20) { sleep 0.1 until d.instance.instance_variable_get(:@tails_rotate_wait).empty? }
+      end
+      assert_true(raised)
+      assert_equal([], d.logs.grep(/Stopping the timer/))
+      assert_equal(lines + 1, d.events.size)
+      assert_equal("last", d.events.last[2]["message"])
+    end
+
+    test "lines collected with throttling" do
+      file = "podname1_namespace12_container-123456.log"
+      limit = 1000
+      rate_period = 2
+      num_lines = 3000
+      msg = "a" * 8190 # Total size = 8190 bytes + 2 (\n) bytes
+
+      rule = create_rule_directive({
+        "namespace"=> "/namespace.+/",
+        "podname"=> "/podname.+/",
+      }, limit)
+      path_element = create_path_element(file)
+      conf = ROOT_CONFIG + create_group_directive(tailing_group_pattern, "#{rate_period}s", rule) + path_element + SINGLE_LINE_CONFIG + CONFIG_READ_FROM_HEAD
+
+      d = create_driver(conf, false)
+      file_path = "#{@tmp_dir}/#{file}"
+
+      Fluent::FileWrapper.open(file_path, 'wb') do |f|
+        num_lines.times do
+          f.puts msg
+        end
+      end
+
+      d.run(timeout: 15) do
+        sleep_interval = 0.1
+        tail_watcher_interval = 1.0 # hard coded value in in_tail
+        safety_ratio = 1.2
+        # The throttling guarantees that consecutive *read starts* are at least
+        # rate_period apart. However, this test measures the interval between
+        # *emit* events, and an emit happens after a whole batch (= `limit` lines,
+        # ~8MB here) has been read, i.e. at `read_start + read_duration`. Since the
+        # read duration varies per batch (especially the first batch right after
+        # the file is opened), the measured emit interval can deviate from
+        # rate_period in either direction by roughly the same magnitude as the
+        # watcher scheduling delay. Use a symmetric jitter so the lower bound also
+        # tolerates this read/observation latency.
+        #
+        # In addition, the throttling state is re-checked only when the watcher
+        # is notified. Once the file has been fully written, no further stat
+        # change is expected, so retries depend mainly on the timer notification
+        # (every tail_watcher_interval). Whether the tick that lands exactly
+        # rate_period after the previous read start already satisfies
+        # `time_spent >= rate_period` depends on sub-millisecond scheduling
+        # differences, so the next read can start one tick later, i.e.
+        # rate_period + tail_watcher_interval after the previous one. The jitter
+        # above already contains one tail_watcher_interval, but that allowance is
+        # shared with the read/observation latency. When the extra tick and a
+        # slow batch coincide, the sum exceeds it, so add one tick explicitly.
+        jitter = (tail_watcher_interval + sleep_interval) * safety_ratio
+        lower_interval = rate_period - jitter
+        upper_interval = rate_period + tail_watcher_interval + jitter
+
+        emit_count = 0
+        prev_count = 0
+        start_time = Fluent::Clock.now
+
+        while emit_count < 3 do
+          sleep(sleep_interval) while d.emit_count <= emit_count
+          elapsed_seconds = Fluent::Clock.now - start_time
+          if emit_count > 0
+            assert_true(elapsed_seconds > lower_interval && elapsed_seconds < upper_interval,
+                        "elapsed_seconds #{elapsed_seconds} is out of allowed range:\n" +
+                        "  lower: #{lower_interval} [sec]\n" +
+                        "  upper: #{upper_interval} [sec]")
+          end
+          assert_equal(limit, d.record_count - prev_count)
+          emit_count = d.emit_count
+          prev_count = d.record_count
+          start_time = Fluent::Clock.now
+        end
+
+        ## When all the lines are read and rate_period seconds are over
+        ## limit will reset and since there are no more logs to be read,
+        ## number_lines_read will be 0
+        sleep upper_interval
+        gw = d.instance.find_group_from_metadata(file_path)
+        assert_equal(0, gw.current_paths[file_path].number_lines_read)
+      end
+    end
+  end
+
+  sub_test_case "Update watchers for rotation with follow_inodes" do
+    def test_updateTW_before_refreshTW_and_detach_before_refreshTW
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/tail.txt*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          # In order to detach the old watcher quickly.
+          "rotate_wait" => "1s",
+          # In order to reproduce the same condition stably, ensure that `refresh_watchers` is not
+          # called by a timer.
+          "refresh_interval" => "1h",
+          # stat_watcher often calls `TailWatcher::on_notify` faster than creating a new log file,
+          # so disable it in order to reproduce the same condition stably.
+          "enable_stat_watcher" => "false",
+        }
+      )
+      d = create_driver(config, false)
+
+      tail_watchers = []
+      stub.proxy(d.instance).setup_watcher do |tw|
+        tail_watchers.append(tw)
+        tw
+      end
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| f.puts "file1 log1"}
+
+      d.run(expect_records: 4, timeout: 10) do
+        # Rotate (If the timing is bad, `TailWatcher::on_notify` might be called between mv and new-file-creation)
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "file1 log2"}
+        FileUtils.move("#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt" + "1")
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| f.puts "file2 log1"}
+
+        # `watch_timer` calls `TailWatcher::on_notify`, and then `update_watcher` updates the TailWatcher:
+        #     TailWatcher(path: "tail.txt", inode: inode_0) => TailWatcher(path: "tail.txt", inode: inode_1)
+        # The old TailWatcher is detached here since `rotate_wait` is just `1s`.
+        sleep 3
+
+        # This reproduces the following situation:
+        #     Rotation => update_watcher => refresh_watchers
+        # This adds a new TailWatcher: TailWatcher(path: "tail.txt1", inode: inode_0)
+        d.instance.refresh_watchers
+
+        # Append to the new current log file.
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "file2 log2"}
+      end
+
+      inode_0 = tail_watchers[0].ino
+      inode_1 = tail_watchers[1].ino
+      record_values = d.events.collect { |event| event[2]["message"] }.sort
+      position_entries = []
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r") do |f|
+        f.readlines(chomp: true).each do |line|
+          values = line.split("\t")
+          position_entries.append([values[0], values[1], values[2].to_i(16)])
+        end
+      end
+
+      assert_equal(
+        {
+          record_values: ["file1 log1", "file1 log2", "file2 log1", "file2 log2"],
+          tail_watcher_paths: ["#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt1"],
+          tail_watcher_inodes: [inode_0, inode_1, inode_0],
+          tail_watcher_io_handler_opened_statuses: [false, false, false],
+          position_entries: [
+            ["#{@tmp_dir}/tail.txt", "0000000000000016", inode_0],
+            ["#{@tmp_dir}/tail.txt", "0000000000000016", inode_1],
+          ],
+        },
+        {
+          record_values: record_values,
+          tail_watcher_paths: tail_watchers.collect { |tw| tw.path },
+          tail_watcher_inodes: tail_watchers.collect { |tw| tw.ino },
+          tail_watcher_io_handler_opened_statuses: tail_watchers.collect { |tw| tw.instance_variable_get(:@io_handler)&.opened? || false },
+          position_entries: position_entries
+        },
+      )
+    end
+
+    def test_updateTW_before_refreshTW_and_detach_after_refreshTW
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/tail.txt*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          # In order to detach the old watcher after refresh_watchers.
+          "rotate_wait" => "4s",
+          # In order to reproduce the same condition stably, ensure that `refresh_watchers` is not
+          # called by a timer.
+          "refresh_interval" => "1h",
+          # stat_watcher often calls `TailWatcher::on_notify` faster than creating a new log file,
+          # so disable it in order to reproduce the same condition stably.
+          "enable_stat_watcher" => "false",
+        }
+      )
+      d = create_driver(config, false)
+
+      tail_watchers = []
+      stub.proxy(d.instance).setup_watcher do |tw|
+        tail_watchers.append(tw)
+        tw
+      end
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| f.puts "file1 log1"}
+
+      tail_watcher_count_after_first_refresh = nil
+      d.run(expect_records: 4, timeout: 10) do
+        # Rotate (If the timing is bad, `TailWatcher::on_notify` might be called between mv and new-file-creation)
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "file1 log2"}
+        FileUtils.move("#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt" + "1")
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| f.puts "file2 log1"}
+
+        # `watch_timer` calls `TailWatcher::on_notify`, and then `update_watcher` updates the TailWatcher:
+        #     TailWatcher(path: "tail.txt", inode: inode_0) => TailWatcher(path: "tail.txt", inode: inode_1)
+        sleep 2
+
+        # This reproduces the following situation:
+        #     Rotation => update_watcher => refresh_watchers
+        # This does NOT add TailWatcher(path: "tail.txt1", inode: inode_0) because the old
+        # TailWatcher waiting `rotate_wait` still reads inode_0.
+        d.instance.refresh_watchers
+        tail_watcher_count_after_first_refresh = tail_watchers.size
+
+        # The old TailWatcher is detached and closed after `rotate_wait` (`4s`).
+        waiting(10) { sleep 0.1 until tail_watchers[0].instance_variable_get(:@io_handler).nil? }
+
+        # This adds a new TailWatcher: TailWatcher(path: "tail.txt1", inode: inode_0)
+        d.instance.refresh_watchers
+
+        # Append to the new current log file.
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "file2 log2"}
+      end
+
+      inode_0 = tail_watchers[0].ino
+      inode_1 = tail_watchers[1].ino
+      record_values = d.events.collect { |event| event[2]["message"] }.sort
+      position_entries = []
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r") do |f|
+        f.readlines(chomp: true).each do |line|
+          values = line.split("\t")
+          position_entries.append([values[0], values[1], values[2].to_i(16)])
+        end
+      end
+
+      assert_equal(
+        {
+          record_values: ["file1 log1", "file1 log2", "file2 log1", "file2 log2"],
+          tail_watcher_count_after_first_refresh: 2,
+          tail_watcher_paths: ["#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt1"],
+          tail_watcher_inodes: [inode_0, inode_1, inode_0],
+          tail_watcher_io_handler_opened_statuses: [false, false, false],
+          position_entries: [
+            # The recorded path is old, but it is no problem. The path is not used when using follow_inodes.
+            ["#{@tmp_dir}/tail.txt", "0000000000000016", inode_0],
+            ["#{@tmp_dir}/tail.txt", "0000000000000016", inode_1],
+          ],
+        },
+        {
+          record_values: record_values,
+          tail_watcher_count_after_first_refresh: tail_watcher_count_after_first_refresh,
+          tail_watcher_paths: tail_watchers.collect { |tw| tw.path },
+          tail_watcher_inodes: tail_watchers.collect { |tw| tw.ino },
+          tail_watcher_io_handler_opened_statuses: tail_watchers.collect { |tw| tw.instance_variable_get(:@io_handler)&.opened? || false },
+          position_entries: position_entries
+        },
+      )
+    end
+
+    # The scenario where in_tail wrongly detaches TailWatcher.
+    # This is reported in https://github.com/fluent/fluentd/issues/4190.
+    def test_updateTW_after_refreshTW
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/tail.txt*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          # In order to detach the old watcher quickly.
+          "rotate_wait" => "1s",
+          # In order to reproduce the same condition stably, ensure that `refresh_watchers` is not
+          # called by a timer.
+          "refresh_interval" => "1h",
+          # stat_watcher often calls `TailWatcher::on_notify` faster than creating a new log file,
+          # so disable it in order to reproduce the same condition stably.
+          "enable_stat_watcher" => "false",
+        }
+      )
+      d = create_driver(config, false)
+
+      tail_watchers = []
+      stub.proxy(d.instance).setup_watcher do |tw|
+        tail_watchers.append(tw)
+        tw
+      end
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| f.puts "file1 log1"}
+
+      d.run(expect_records: 4, timeout: 10) do
+        # Rotate (If the timing is bad, `TailWatcher::on_notify` might be called between mv and new-file-creation)
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "file1 log2"}
+        FileUtils.move("#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt" + "1")
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| f.puts "file2 log1"}
+
+        # This reproduces the following situation:
+        #     Rotation => refresh_watchers => update_watcher
+        # This add a new TailWatcher: TailWatcher(path: "tail.txt", inode: inode_1)
+        #     This overwrites `@tails["tail.txt"]`
+        d.instance.refresh_watchers
+
+        # `watch_timer` calls `TailWatcher::on_notify`, and then `update_watcher` trys to update the TailWatcher:
+        #     TailWatcher(path: "tail.txt", inode: inode_0) => TailWatcher(path: "tail.txt", inode: inode_1)
+        # However, it is already added in `refresh_watcher`, so `update_watcher` doesn't create the new TailWatcher.
+        # The old TailWatcher is detached here since `rotate_wait` is just `1s`.
+        sleep 3
+
+        # This adds a new TailWatcher: TailWatcher(path: "tail.txt1", inode: inode_0)
+        d.instance.refresh_watchers
+
+        # Append to the new current log file.
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "file2 log2"}
+      end
+
+      inode_0 = tail_watchers[0].ino
+      inode_1 = tail_watchers[1].ino
+      record_values = d.events.collect { |event| event[2]["message"] }.sort
+      position_entries = []
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r") do |f|
+        f.readlines(chomp: true).each do |line|
+          values = line.split("\t")
+          position_entries.append([values[0], values[1], values[2].to_i(16)])
+        end
+      end
+
+      assert_equal(
+        {
+          record_values: ["file1 log1", "file1 log2", "file2 log1", "file2 log2"],
+          tail_watcher_paths: ["#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt1"],
+          tail_watcher_inodes: [inode_0, inode_1, inode_0],
+          tail_watcher_io_handler_opened_statuses: [false, false, false],
+          position_entries: [
+            # The recorded path is old, but it is no problem. The path is not used when using follow_inodes.
+            ["#{@tmp_dir}/tail.txt", "0000000000000016", inode_0],
+            ["#{@tmp_dir}/tail.txt", "0000000000000016", inode_1],
+          ],
+        },
+        {
+          record_values: record_values,
+          tail_watcher_paths: tail_watchers.collect { |tw| tw.path },
+          tail_watcher_inodes: tail_watchers.collect { |tw| tw.ino },
+          tail_watcher_io_handler_opened_statuses: tail_watchers.collect { |tw| tw.instance_variable_get(:@io_handler)&.opened? || false },
+          position_entries: position_entries
+        },
+      )
+    end
+
+    def test_path_resurrection
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/tail.txt*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          # In order to reproduce the same condition stably, ensure that `refresh_watchers` is not
+          # called by a timer.
+          "refresh_interval" => "1h",
+          # In order to keep the first TailWatcher reading the rotated file until the end of the test.
+          "rotate_wait" => "10s",
+        }
+      )
+      d = create_driver(config, false)
+
+      tail_watchers = []
+      stub.proxy(d.instance).setup_watcher do |tw|
+        tail_watchers.append(tw)
+        tw
+      end
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| f.puts "file1 log1"}
+
+      d.run(expect_records: 5, timeout: 10) do
+        # Rotate
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "file1 log2"}
+        FileUtils.move("#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt" + "1")
+        # TailWatcher(path: "tail.txt", inode: inode_0) detects `tail.txt` disappeared.
+        #     Call `update_watcher` to stop and discard self.
+        # If not discarding, then it will be a orphan and cause leak and log duplication.
+        #
+        # This reproduces the case where the notify to TailWatcher comes before the new file for the path
+        # is created during rotation.
+        # (stat_watcher notifies faster than a new file is created)
+        # Overall, this is a rotation operation, but from the TailWatcher, it appears as if the file
+        # was resurrected once it disappeared.
+        sleep 2 # Allow TimeTrigger to detect the rotation on platforms without file change notifications.
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| f.puts "file2 log1"}
+
+        # Add a new TailWatcher
+        #     tail.txt: TailWatcher(path: "tail.txt", inode: inode_1)
+        # TailWatcher(path: "tail.txt1", inode: inode_0) is not added because the first TailWatcher
+        # waiting `rotate_wait` still reads inode_0.
+        # NOTE: If not discarding the first TailWatcher on notify, this makes it a orphan because
+        # this overwrites the `@tails[tail.txt]` by adding TailWatcher(path: "tail.txt", inode: inode_1)
+        d.instance.refresh_watchers
+
+        # This does nothing.
+        # NOTE: If not discarding the first TailWatcher on notify, this add
+        #     tail.txt1: TailWatcher(path: "tail.txt1", inode: inode_0)
+        # because the previous refresh_watcher overwrites `@tails[tail.txt]` and the inode_0 is lost.
+        # This would cause log duplication.
+        d.instance.refresh_watchers
+
+        # Append to the old file
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt1", "ab") {|f| f.puts "file1 log3"}
+
+        # Append to the new current log file.
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "file2 log2"}
+      end
+
+      inode_0 = Fluent::FileWrapper.stat("#{@tmp_dir}/tail.txt1").ino
+      inode_1 = Fluent::FileWrapper.stat("#{@tmp_dir}/tail.txt").ino
+      record_values = d.events.collect { |event| event[2]["message"] }.sort
+      position_entries = []
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r") do |f|
+        f.readlines(chomp: true).each do |line|
+          values = line.split("\t")
+          position_entries.append([values[0], values[1], values[2].to_i(16)])
+        end
+      end
+
+      assert_equal(
+        {
+          record_values: ["file1 log1", "file1 log2", "file1 log3", "file2 log1", "file2 log2"],
+          tail_watcher_set: Set[
+            {
+              path: "#{@tmp_dir}/tail.txt",
+              inode: inode_0,
+              io_handler_opened_status: false,
+            },
+            {
+              path: "#{@tmp_dir}/tail.txt",
+              inode: inode_1,
+              io_handler_opened_status: false,
+            },
+          ],
+          position_entries: [
+            ["#{@tmp_dir}/tail.txt", "0000000000000021", inode_0],
+            ["#{@tmp_dir}/tail.txt", "0000000000000016", inode_1],
+          ],
+        },
+        {
+          record_values: record_values,
+          tail_watcher_set: Set.new(tail_watchers.collect { |tw|
+            {
+              path: tw.path,
+              inode: tw.ino,
+              io_handler_opened_status: tw.instance_variable_get(:@io_handler)&.opened? || false,
+            }
+          }),
+          position_entries: position_entries,
+        },
+      )
+    end
+
+    # https://github.com/fluent/fluentd/issues/4243
+    def test_no_duplication_when_appending_to_rotated_file_during_rotate_wait
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/tail.txt*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          # In order to keep the old watcher alive while `refresh_watchers` runs.
+          "rotate_wait" => "4s",
+          # In order to reproduce the same condition stably, ensure that `refresh_watchers` is not
+          # called by a timer.
+          "refresh_interval" => "1h",
+          # stat_watcher often calls `TailWatcher::on_notify` faster than creating a new log file,
+          # so disable it in order to reproduce the same condition stably.
+          "enable_stat_watcher" => "false",
+        }
+      )
+      d = create_driver(config, false)
+
+      tail_watchers = []
+      stub.proxy(d.instance).setup_watcher do |tw|
+        tail_watchers.append(tw)
+        tw
+      end
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| f.puts "file1 log1"}
+
+      d.run(expect_records: 6, timeout: 15) do
+        # Rotate
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "file1 log2"}
+        FileUtils.move("#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt" + "1")
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f| f.puts "file2 log1"}
+
+        # `watch_timer` calls `TailWatcher::on_notify`, and then `update_watcher` updates the TailWatcher:
+        #     TailWatcher(path: "tail.txt", inode: inode_0) => TailWatcher(path: "tail.txt", inode: inode_1)
+        # The old TailWatcher keeps reading inode_0 during `rotate_wait`.
+        waiting(5) { sleep 0.1 until d.instance.instance_variable_get(:@tails_rotate_wait).size == 1 }
+
+        # `refresh_watchers` must not add another TailWatcher for inode_0 while the old one is
+        # still reading it. Otherwise the following append is collected twice.
+        d.instance.refresh_watchers
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt1", "ab") {|f| f.puts "file1 log3"}
+
+        # The old TailWatcher is detached and closed after `rotate_wait` (`4s`).
+        waiting(10) { sleep 0.1 until tail_watchers[0].instance_variable_get(:@io_handler).nil? }
+
+        # Now the rotated file is followed again from the recorded position.
+        #     TailWatcher(path: "tail.txt1", inode: inode_0)
+        d.instance.refresh_watchers
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt1", "ab") {|f| f.puts "file1 log4"}
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "ab") {|f| f.puts "file2 log2"}
+      end
+
+      inode_0 = tail_watchers[0].ino
+      inode_1 = tail_watchers[1].ino
+      record_values = d.events.collect { |event| event[2]["message"] }.sort
+      position_entries = []
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r") do |f|
+        f.readlines(chomp: true).each do |line|
+          values = line.split("\t")
+          position_entries.append([values[0], values[1], values[2].to_i(16)])
+        end
+      end
+
+      assert_equal(
+        {
+          record_values: ["file1 log1", "file1 log2", "file1 log3", "file1 log4", "file2 log1", "file2 log2"],
+          tail_watcher_paths: ["#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt", "#{@tmp_dir}/tail.txt1"],
+          tail_watcher_inodes: [inode_0, inode_1, inode_0],
+          position_entries: [
+            ["#{@tmp_dir}/tail.txt", "000000000000002c", inode_0],
+            ["#{@tmp_dir}/tail.txt", "0000000000000016", inode_1],
+          ],
+        },
+        {
+          record_values: record_values,
+          tail_watcher_paths: tail_watchers.collect { |tw| tw.path },
+          tail_watcher_inodes: tail_watchers.collect { |tw| tw.ino },
+          position_entries: position_entries
+        },
+      )
+    end
+
+    def test_next_rotation_occurs_very_fast_while_old_TW_still_waiting_rotate_wait
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/tail.txt*",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "follow_inodes" => "true",
+          "rotate_wait" => "3s",
+          "refresh_interval" => "1h",
+          # stat_watcher often calls `TailWatcher::on_notify` faster than creating a new log file,
+          # so disable it in order to reproduce the same condition stably.
+          "enable_stat_watcher" => "false",
+        }
+      )
+      d = create_driver(config, false)
+
+      tail_watchers = []
+      stub.proxy(d.instance).setup_watcher do |tw|
+        tail_watchers.append(tw)
+        mock.proxy(tw).close.once # Note: Currently, there is no harm in duplicate calls.
+        tw
+      end
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file1 log1"}
+
+      d.run(expect_records: 6, timeout: 15) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file1 log2"}
+
+        sleep 1.5 # Need to be larger than 1s (the interval of watch_timer)
+
+        FileUtils.move("#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt" + "1")
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file2 log1"}
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file2 log2"}
+
+        sleep 1.5 # Need to be larger than 1s (the interval of watch_timer)
+
+        # Rotate again (Old TailWatcher waiting rotate_wait also calls update_watcher)
+        [1, 0].each do |i|
+          FileUtils.move("#{@tmp_dir}/tail.txt#{i}", "#{@tmp_dir}/tail.txt#{i + 1}")
+        end
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file3 log1"}
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file3 log2"}
+
+        # Wait rotate_wait to confirm that TailWatcher.close is not called in duplicate.
+        # (Note: Currently, there is no harm in duplicate calls)
+        sleep 4
+      end
+
+      inode_0 = tail_watchers[0]&.ino
+      inode_1 = tail_watchers[1]&.ino
+      inode_2 = tail_watchers[2]&.ino
+      record_values = d.events.collect { |event| event[2]["message"] }.sort
+      position_entries = []
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r") do |f|
+        f.readlines(chomp: true).each do |line|
+          values = line.split("\t")
+          position_entries.append([values[0], values[1], values[2].to_i(16)])
+        end
+      end
+
+      assert_equal(
+        {
+          record_values: ["file1 log1", "file1 log2", "file2 log1", "file2 log2", "file3 log1", "file3 log2"],
+          tail_watcher_paths: ["#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt0"],
+          tail_watcher_inodes: [inode_0, inode_1, inode_2],
+          tail_watcher_io_handler_opened_statuses: [false, false, false],
+          position_entries: [
+            ["#{@tmp_dir}/tail.txt0", "0000000000000016", inode_0],
+            ["#{@tmp_dir}/tail.txt0", "0000000000000016", inode_1],
+            ["#{@tmp_dir}/tail.txt0", "0000000000000016", inode_2],
+          ],
+        },
+        {
+          record_values: record_values,
+          tail_watcher_paths: tail_watchers.collect { |tw| tw.path },
+          tail_watcher_inodes: tail_watchers.collect { |tw| tw.ino },
+          tail_watcher_io_handler_opened_statuses: tail_watchers.collect { |tw| tw.instance_variable_get(:@io_handler)&.opened? || false },
+          position_entries: position_entries
+        },
+      )
+    end
+  end
+
+  sub_test_case "Update watchers for rotation without follow_inodes" do
+    # The scenario where in_tail wrongly unwatches the PositionEntry.
+    # This is reported in https://github.com/fluent/fluentd/issues/3614.
+    def test_refreshTW_during_rotation
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/tail.txt0",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          # In order to detach the old watcher quickly.
+          "rotate_wait" => "3s",
+          # In order to reproduce the same condition stably, ensure that `refresh_watchers` is not
+          # called by a timer.
+          "refresh_interval" => "1h",
+          # stat_watcher often calls `TailWatcher::on_notify` faster than creating a new log file,
+          # so disable it in order to reproduce the same condition stably.
+          "enable_stat_watcher" => "false",
+        }
+      )
+      d = create_driver(config, false)
+
+      tail_watchers = []
+      stub.proxy(d.instance).setup_watcher do |tw|
+        tail_watchers.append(tw)
+        tw
+      end
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file1 log1"}
+
+      d.run(expect_records: 6, timeout: 15) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file1 log2"}
+        FileUtils.move("#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt" + "1")
+
+        # This reproduces the following situation:
+        #     `refresh_watchers` is called during the rotation process and it detects the current file being lost.
+        #     Then it stops and unwatches the TailWatcher.
+        d.instance.refresh_watchers
+
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file2 log1"}
+
+        # `watch_timer` calls `TailWatcher::on_notify`, and then `update_watcher` trys to add the new TailWatcher.
+        # After `rotate_wait` interval, the PositionEntry is unwatched.
+        # HOWEVER, the new TailWatcher is still using that PositionEntry, so this breaks the PositionFile!!
+        # That PositionEntry is removed from `PositionFile::map`, but it is still working and remaining in the real pos file.
+        sleep 5
+
+        # Append to the new current log file.
+        # The PositionEntry is updated although it does not exist in `PositionFile::map`.
+        #     `PositionFile::map`: empty
+        #     Real pos file: `.../tail.txt 0000000000000016 (inode)`
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file2 log2"}
+
+        # Rotate again
+        [1, 0].each do |i|
+          FileUtils.move("#{@tmp_dir}/tail.txt#{i}", "#{@tmp_dir}/tail.txt#{i + 1}")
+        end
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file3 log1"}
+
+        # `watch_timer` calls `TailWatcher::on_notify`, and then `update_watcher` trys to update the TailWatcher.
+        sleep 3
+
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file3 log2"}
+      end
+
+      pos_file_inode = tail_watchers[2].pe.read_inode
+      record_values = d.events.collect { |event| event[2]["message"] }.sort
+      position_entries = []
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r") do |f|
+        f.readlines(chomp: true).each do |line|
+          values = line.split("\t")
+          position_entries.append([values[0], values[1], values[2].to_i(16)])
+        end
+      end
+
+      assert_equal(
+        {
+          record_values: ["file1 log1", "file1 log2", "file2 log1", "file2 log2", "file3 log1", "file3 log2"],
+          tail_watcher_paths: ["#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt0"],
+          tail_watcher_io_handler_opened_statuses: [false, false, false],
+          position_entries: [
+            # The recorded path is old, but it is no problem. The path is not used when using follow_inodes.
+            ["#{@tmp_dir}/tail.txt0", "0000000000000016", pos_file_inode],
+          ],
+        },
+        {
+          record_values: record_values,
+          tail_watcher_paths: tail_watchers.collect { |tw| tw.path },
+          tail_watcher_io_handler_opened_statuses: tail_watchers.collect { |tw| tw.instance_variable_get(:@io_handler)&.opened? || false },
+          position_entries: position_entries
+        },
+      )
+    end
+
+    def test_next_rotation_occurs_very_fast_while_old_TW_still_waiting_rotate_wait
+      config = config_element(
+        "ROOT",
+        "",
+        {
+          "path" => "#{@tmp_dir}/tail.txt0",
+          "pos_file" => "#{@tmp_dir}/tail.pos",
+          "tag" => "t1",
+          "format" => "none",
+          "read_from_head" => "true",
+          "rotate_wait" => "3s",
+          "refresh_interval" => "1h",
+        }
+      )
+      d = create_driver(config, false)
+
+      tail_watchers = []
+      stub.proxy(d.instance).setup_watcher do |tw|
+        tail_watchers.append(tw)
+        mock.proxy(tw).close.once # Note: Currently, there is no harm in duplicate calls.
+        tw
+      end
+
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file1 log1"}
+
+      d.run(expect_records: 6, timeout: 15) do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file1 log2"}
+
+        sleep 1.5 # Need to be larger than 1s (the interval of watch_timer)
+
+        FileUtils.move("#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt" + "1")
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file2 log1"}
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file2 log2"}
+
+        sleep 1.5 # Need to be larger than 1s (the interval of watch_timer)
+
+        # Rotate again (Old TailWatcher waiting rotate_wait also calls update_watcher)
+        [1, 0].each do |i|
+          FileUtils.move("#{@tmp_dir}/tail.txt#{i}", "#{@tmp_dir}/tail.txt#{i + 1}")
+        end
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "wb") {|f| f.puts "file3 log1"}
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt0", "ab") {|f| f.puts "file3 log2"}
+
+        # Wait rotate_wait to confirm that TailWatcher.close is not called in duplicate.
+        # (Note: Currently, there is no harm in duplicate calls)
+        sleep 4
+      end
+
+      pos_file_inode = tail_watchers[2].pe.read_inode
+      record_values = d.events.collect { |event| event[2]["message"] }.sort
+      position_entries = []
+      Fluent::FileWrapper.open("#{@tmp_dir}/tail.pos", "r") do |f|
+        f.readlines(chomp: true).each do |line|
+          values = line.split("\t")
+          position_entries.append([values[0], values[1], values[2].to_i(16)])
+        end
+      end
+
+      assert_equal(
+        {
+          record_values: ["file1 log1", "file1 log2", "file2 log1", "file2 log2", "file3 log1", "file3 log2"],
+          tail_watcher_paths: ["#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt0", "#{@tmp_dir}/tail.txt0"],
+          tail_watcher_io_handler_opened_statuses: [false, false, false],
+          position_entries: [
+            ["#{@tmp_dir}/tail.txt0", "0000000000000016", pos_file_inode],
+          ],
+        },
+        {
+          record_values: record_values,
+          tail_watcher_paths: tail_watchers.collect { |tw| tw.path },
+          tail_watcher_io_handler_opened_statuses: tail_watchers.collect { |tw| tw.instance_variable_get(:@io_handler)&.opened? || false },
+          position_entries: position_entries
+        },
+      )
+    end
+  end
+
+  data(
+    small: ["128", 128],
+    KiB: ["1k", 1024]
+  )
+  test 'max_line_size' do |(label, size)|
+    config = config_element("", "", {
+                              "tag" => "max_line_size",
+                              "path" => "#{@tmp_dir}/with_long_lines.txt",
+                              "format" => "none",
+                              "read_from_head" => true,
+                              "max_line_size" => label,
+                              "log_level" => "debug"
+                            })
+    Fluent::FileWrapper.open("#{@tmp_dir}/with_long_lines.txt", "w+") do |f|
+      f.puts "foo"
+      f.puts "x" * size # 'x' * size + \n > @max_line_size
+      f.puts "bar"
+    end
+    d = create_driver(config, false)
+    timestamp = Time.parse("Mon Nov 29 11:22:33 UTC 2021")
+    Timecop.freeze(timestamp)
+    d.run(expect_records: 2)
+    assert_equal([
+                    [{"message" => "foo"},{"message" => "bar"}],
+                    [
+                      "2021-11-29 11:22:33 +0000 [warn]: received line length is longer than #{size}\n",
+                      "2021-11-29 11:22:33 +0000 [debug]: skipped line: #{'x' * size}\n"
+                    ]
+                  ],
+                  [
+                    d.events.collect { |event| event.last },
+                    d.logs[-2..]
+                  ])
+  end
+
+  test 'statistics' do
+    config = config_element("", "", {
+      "tag" => "statistics",
+      "path" => "#{@tmp_dir}/statistics*.txt",
+      "format" => "none",
+      "read_from_head" => true,
+    })
+    Fluent::FileWrapper.open("#{@tmp_dir}/statistics1.txt", "w+") do |f|
+      f.puts "foo"
+    end
+
+    d = create_driver(config, false)
+    d.run(expect_records: 1, shutdown: false)
+
+    assert_equal({
+                   "emit_records" => 0,
+                   "emit_size" => 0,
+                   "opened_file_count" => 1,
+                   "closed_file_count" => 0,
+                   "rotated_file_count" => 0,
+                   "throttled_log_count" =>0,
+                   "tracked_file_count" => 1,
+                 },
+                 d.instance.statistics["input"])
+
+    d.instance_shutdown
+  end
+end

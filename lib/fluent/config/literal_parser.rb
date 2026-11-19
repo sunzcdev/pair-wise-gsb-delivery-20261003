@@ -1,0 +1,305 @@
+#
+# Fluentd
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+#
+
+require 'stringio'
+
+require 'json'
+require 'socket'
+require 'ripper'
+
+require 'fluent/env'
+require 'fluent/config/basic_parser'
+
+module Fluent
+  module Config
+    class LiteralParser < BasicParser
+      # A physical line break (LF, CR, or CRLF) inside a quoted string.
+      # CRLF is normalized to LF so that the same config text does not produce a
+      # different value depending on whether the file was saved with LF or CRLF.
+      # A lone CR is kept as-is, and an escaped "\r\n" still produces CRLF.
+      LINE_BREAK = /\r\n|[\r\n]/
+      # A backslash immediately followed by a physical line break.
+      # It works as a line continuation, so both are stripped from the value.
+      LINE_CONTINUATION = /\\#{LINE_BREAK}/o
+
+      def self.unescape_char(c)
+        case c
+        when '"'
+          '\"'
+        when "'"
+          "\\'"
+        when '\\'
+          '\\\\'
+        when "\r"
+          '\r'
+        when "\n"
+          '\n'
+        when "\t"
+          '\t'
+        when "\f"
+          '\f'
+        when "\b"
+          '\b'
+        else
+          c
+        end
+      end
+
+      def initialize(strscan, eval_context)
+        super(strscan)
+        @eval_context = eval_context
+        unless @eval_context.respond_to?(:use_nil)
+          def @eval_context.use_nil
+            raise SetNil
+          end
+        end
+        unless @eval_context.respond_to?(:use_default)
+          def @eval_context.use_default
+            raise SetDefault
+          end
+        end
+      end
+
+      def parse_literal(string_boundary_charset = LINE_END)
+        spacing_without_comment
+
+        value = if skip(/\[/)
+                  scan_json(true)
+                elsif skip(/\{/)
+                  scan_json(false)
+                else
+                  scan_string(string_boundary_charset)
+                end
+        value
+      end
+
+      def scan_string(string_boundary_charset = LINE_END)
+        if skip(/\"/)
+          return scan_double_quoted_string
+        elsif skip(/\'/)
+          return scan_single_quoted_string
+        else
+          return scan_nonquoted_string(string_boundary_charset)
+        end
+      end
+
+      def scan_double_quoted_string
+        string = []
+        while true
+          if skip(/\"/)
+            if string.include?(nil)
+              return nil
+            elsif string.include?(:default)
+              return :default
+            else
+              return string.join
+            end
+          elsif skip(LINE_CONTINUATION)
+            next
+          elsif s = scan(LINE_BREAK)
+            string << (s == "\r\n" ? "\n" : s)
+          elsif s = scan(/\\./)
+            string << eval_escape_char(s[1,1])
+          elsif skip(/\#\{/)
+            string << eval_embedded_code(scan_embedded_code)
+            skip(/\}/)
+          elsif s = scan(/./)
+            string << s
+          else
+            parse_error! "unexpected end of file in a double quoted string"
+          end
+        end
+      end
+
+      def scan_single_quoted_string
+        string = []
+        while true
+          if skip(/\'/)
+            return string.join
+          elsif s = scan(/\\'/)
+            string << "'"
+          elsif s = scan(/\\\\/)
+            string << "\\"
+          elsif s = scan(LINE_BREAK)
+            string << (s == "\r\n" ? "\n" : s)
+          elsif s = scan(/./)
+            string << s
+          else
+            parse_error! "unexpected end of file in a single quoted string"
+          end
+        end
+      end
+
+      def scan_nonquoted_string(boundary_charset = LINE_END)
+        charset = /(?!#{boundary_charset})./
+
+        string = []
+        while true
+          if s = scan(/\#/)
+            string << '#'
+          elsif s = scan(charset)
+            string << s
+          else
+            break
+          end
+        end
+
+        if string.empty?
+          return nil
+        end
+
+        string.join
+      end
+
+      def scan_embedded_code
+        src = '"#{'+@ss.rest+"\n=begin\n=end\n}"
+
+        seek = -1
+        while (seek = src.index('}', seek + 1))
+          unless Ripper.sexp(src[0..seek] + '"').nil? # eager parsing until valid expression
+            break
+          end
+        end
+
+        unless seek
+          raise Fluent::ConfigParseError, @ss.rest
+        end
+
+        code = src[3, seek-3]
+
+        if @ss.rest.length < code.length
+          @ss.pos += @ss.rest.length
+          parse_error! "expected end of embedded code but $end"
+        end
+
+        @ss.pos += code.length
+
+        '"#{' + code + '}"'
+      end
+
+      def eval_embedded_code(code)
+        if @eval_context.nil?
+          parse_error! "embedded code is not allowed in this file"
+        end
+        # Add hostname and worker_id to code for preventing unused warnings
+        code = <<EOM + code
+hostname = Socket.gethostname
+worker_id = ENV['SERVERENGINE_WORKER_ID'] || ''
+EOM
+        begin
+          @eval_context.instance_eval(code)
+        rescue SetNil
+          nil
+        rescue SetDefault
+          :default
+        end
+      end
+
+      def eval_escape_char(c)
+        case c
+        when '"'
+          '"'
+        when "'"
+          "'"
+        when "r"
+          "\r"
+        when "n"
+          "\n"
+        when "t"
+          "\t"
+        when "f"
+          "\f"
+        when "b"
+          "\b"
+        when "0"
+          "\0"
+        when /[a-zA-Z0-9]/
+          parse_error! "unexpected back-slash escape character '#{c}'"
+        else  # symbols
+          c
+        end
+      end
+
+      def scan_json(is_array)
+        result = nil
+        # scan_json detects the end of a JSON literal by repeatedly attempting
+        # to parse the buffer and treating a successful parse as completion.
+        # This requires a parser that raises JSON::ParserError for incomplete
+        # input like '[1', '{"h"', '{"h":' or '{"h1":1'.
+
+        buffer = (is_array ? "[" : "{")
+        line_buffer = ""
+
+        until result
+          char = getch
+
+          break if char.nil?
+
+          if char == "#"
+            # If this is out of json string literals, this object can be parsed correctly
+            # '{"foo":"bar", #' -> '{"foo":"bar"}' (to check)
+            parsed = nil
+            begin
+              parsed = JSON.parse(buffer + line_buffer.rstrip.sub(/,$/, '') + (is_array ? "]" : "}"), **Fluent::DEFAULT_JSON_PARSE_OPTIONS)
+            rescue JSON::ParserError
+              # This '#' is in json string literals
+            end
+
+            if parsed
+              # ignore chars as comment before newline
+              while (char = getch) != "\n"
+                # ignore comment char
+              end
+              buffer << line_buffer + "\n"
+              line_buffer = ""
+            else
+              if @ss.exist?(/^\{[^}]+\}/)
+                # if it's interpolated string
+                skip(/\{/)
+                line_buffer << eval_embedded_code(scan_embedded_code)
+                skip(/\}/)
+              else
+                # '#' is a char in json string
+                line_buffer << char
+              end
+            end
+
+            next # This char '#' MUST NOT terminate json object.
+          end
+
+          if char == "\n"
+            buffer << line_buffer + "\n"
+            line_buffer = ""
+            next
+          end
+
+          line_buffer << char
+          begin
+            result = JSON.parse(buffer + line_buffer, **Fluent::DEFAULT_JSON_PARSE_OPTIONS)
+          rescue JSON::ParserError
+            # Incomplete json string yet
+          end
+        end
+
+        unless result
+          parse_error! "got incomplete JSON #{is_array ? 'array' : 'hash'} configuration"
+        end
+
+        JSON.dump(result)
+      end
+    end
+  end
+end

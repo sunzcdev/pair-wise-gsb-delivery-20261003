@@ -1,0 +1,40 @@
+name: RuboCop Security & Performance Check
+
+on:
+  push:
+    paths-ignore:
+      - '*.md'
+      - 'lib/fluent/version.rb'
+  pull_request:
+    paths-ignore:
+      - '*.md'
+      - 'lib/fluent/version.rb'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  rubocop:
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby-version: ['4.0']
+    name: Ruby ${{ matrix.ruby-version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+        with:
+          ruby-version: ${{ matrix.ruby-version }}
+      - name: Install dependencies
+        run: |
+          bundle install
+          gem install rubocop-performance
+      - name: Run RuboCop
+        run: rubocop

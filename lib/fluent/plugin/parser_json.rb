@@ -1,0 +1,115 @@
+#
+# Fluentd
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+#
+
+require 'fluent/env'
+require 'fluent/plugin/parser'
+require 'fluent/time'
+require 'fluent/oj_options'
+
+require 'json'
+
+module Fluent
+  module Plugin
+    class JSONParser < Parser
+      Plugin.register_parser('json', self)
+
+      config_set_default :time_key, 'time'
+      desc 'Set JSON parser'
+      # NOTE: Contains yajl for backward compatibility
+      config_param :json_parser, :enum, list: [:oj, :yajl, :json], default: :oj
+
+      desc 'Set the buffer size that JSON parser will use when parsing streaming input'
+      config_param :stream_buffer_size, :integer, default: 8192
+
+      config_set_default :time_type, :float
+
+      # Use a shared proc rather than a per-call lambda so that
+      # configure_json_parser returns the same object every time.
+      JSON_PARSE_PROC = ->(text) { JSON.parse(text, **Fluent::DEFAULT_JSON_PARSE_OPTIONS) }
+
+      def configure(conf)
+        if conf.has_key?('time_format')
+          conf['time_type'] ||= 'string'
+        end
+
+        super
+        @load_proc, @error_class = configure_json_parser(@json_parser)
+      end
+
+      def configure_json_parser(name)
+        case name
+        when :oj
+          return [Oj.method(:load), Oj::ParseError] if Fluent::OjOptions.available?
+
+          log&.info "Oj is not installed, and failing back to JSON for json parser"
+          configure_json_parser(:json)
+        when :yajl, :json # NOTE: Fallback yajl to json for backward compatibility
+          [JSON_PARSE_PROC, JSON::ParserError]
+        else
+          raise "BUG: unknown json parser specified: #{name}"
+        end
+      end
+
+      def parse(text)
+        parsed_json = @load_proc.call(text)
+
+        if parsed_json.is_a?(Hash)
+          time = parse_time(parsed_json)
+          time, parsed_json = convert_values(time, parsed_json) if @execute_convert_values
+          yield time, parsed_json
+        elsif parsed_json.is_a?(Array)
+          parsed_json.each do |record|
+            unless record.is_a?(Hash)
+              yield nil, nil
+              next
+            end
+            time = parse_time(record)
+            time, record = convert_values(time, record) if @execute_convert_values
+            yield time, record
+          end
+        else
+          yield nil, nil
+        end
+
+      rescue @error_class, EncodingError # EncodingError is for oj 3.x or later
+        yield nil, nil
+      end
+
+      def parser_type
+        :text
+      end
+
+      def parse_io(io, &block)
+        parser = JSON::ResumableParser.new(**Fluent::DEFAULT_JSON_PARSE_OPTIONS)
+        begin
+          chunk = +"".b
+          while io.readpartial(@stream_buffer_size, chunk)
+            parser << chunk
+            while parser.parse
+              record = parser.value
+              block.call(parse_time(record), record)
+            end
+          end
+        rescue EOFError
+          unless parser.empty?
+            log&.warn "JSON stream ended in the middle of a document; " \
+                      "discarding incomplete data"
+          end
+        end
+      end
+    end
+  end
+end

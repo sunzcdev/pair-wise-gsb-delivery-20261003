@@ -1,0 +1,1513 @@
+require_relative '../helper'
+require 'fluent/test/driver/input'
+require 'fluent/plugin/in_http'
+require 'net/http'
+require 'timecop'
+
+class HttpInputTest < Test::Unit::TestCase
+  class << self
+    def startup
+      @server = ServerEngine::SocketManager::Server.open
+      ENV['SERVERENGINE_SOCKETMANAGER_PATH'] = @server.path.to_s
+    end
+
+    def shutdown
+      @server.close
+    end
+  end
+
+  def setup
+    Fluent::Test.setup
+    @port = unused_port(protocol: :tcp)
+  end
+
+  def teardown
+    Timecop.return
+    @port = nil
+  end
+
+  def config
+    %[
+      port #{@port}
+      bind "127.0.0.1"
+      body_size_limit 10m
+      decompression_size_limit 128m
+      keepalive_timeout 5
+      respond_with_empty_img true
+     use_204_response false
+    ]
+  end
+
+  def create_driver(conf=config)
+    Fluent::Test::Driver::Input.new(Fluent::Plugin::HttpInput).configure(conf)
+  end
+
+  def test_configure
+    d = create_driver
+    assert_equal @port, d.instance.port
+    assert_equal '127.0.0.1', d.instance.bind
+    assert_equal 10*1024*1024, d.instance.body_size_limit
+    assert_equal 128*1024*1024, d.instance.decompression_size_limit
+    assert_equal 5, d.instance.keepalive_timeout
+    assert_equal false, d.instance.add_http_headers
+    assert_equal false, d.instance.add_query_params
+  end
+
+  def security_config(body, base = config)
+    base + %[
+      <security>
+      #{body}
+      </security>
+    ]
+  end
+
+  def test_configure_security_client_without_network
+    assert_raise(Fluent::ConfigError) do
+      create_driver(security_config("<client>\n</client>"))
+    end
+  end
+
+  def test_configure_security_with_invalid_network
+    assert_raise(Fluent::ConfigError) do
+      create_driver(security_config("<client>\n  network 300.0.0.0/8\n</client>"))
+    end
+  end
+
+  def test_allowed_client_is_accepted
+    d = create_driver(security_config("<client>\n  network 127.0.0.0/8\n</client>"))
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+
+    d.run(expect_records: 1) do
+      res = post("/tag1", {"json" => {"a" => 1}.to_json, "time" => time_i.to_s})
+      assert_equal "200", res.code
+    end
+
+    assert_equal [["tag1", time, {"a" => 1}]], d.events
+  end
+
+  def test_disallowed_client_is_disconnected
+    d = create_driver(security_config("<client>\n  network 10.0.0.0/8\n</client>"))
+
+    d.run(expect_records: 0, timeout: 5) do
+      assert_raise(EOFError, Errno::ECONNRESET, Errno::EPIPE) do
+        post("/tag1", {"json" => {"a" => 1}.to_json})
+      end
+    end
+
+    assert_equal [], d.events
+  end
+
+  def test_disallowed_client_cannot_spoof_with_x_forwarded_for
+    d = create_driver(security_config("<client>\n  network 10.0.0.0/8\n</client>"))
+
+    d.run(expect_records: 0, timeout: 5) do
+      assert_raise(EOFError, Errno::ECONNRESET, Errno::EPIPE) do
+        post("/tag1", {"json" => {"a" => 1}.to_json}, {"X-Forwarded-For" => "10.0.0.1"})
+      end
+    end
+
+    assert_equal [], d.events
+  end
+
+  def test_allowed_client_matches_ipv4_and_ipv6_entries
+    d = create_driver(security_config(%[
+      <client>
+        network 10.0.0.0/8
+      </client>
+      <client>
+        network 2001:db8::/32
+      </client>
+    ]))
+    instance = d.instance
+
+    assert_true(instance.send(:allowed_client?, "10.1.2.3"))
+    assert_true(instance.send(:allowed_client?, "2001:db8::1"))
+    assert_false(instance.send(:allowed_client?, "11.1.2.3"))
+    assert_false(instance.send(:allowed_client?, "2001:db9::1"))
+    assert_false(instance.send(:allowed_client?, "not an address"))
+  end
+
+  def test_security_without_client_accepts_any_peer
+    d = create_driver(security_config(""))
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+
+    d.run(expect_records: 1) do
+      res = post("/tag1", {"json" => {"a" => 1}.to_json, "time" => time_i.to_s})
+      assert_equal "200", res.code
+    end
+
+    assert_equal [["tag1", time, {"a" => 1}]], d.events
+  end
+
+  def auth_config(base = config)
+    base + %[
+      <auth>
+        method basic
+        username fluentd
+        password s3cret
+      </auth>
+    ]
+  end
+
+  def basic_credentials(username = "fluentd", password = "s3cret")
+    "Basic " + ["#{username}:#{password}"].pack('m0')
+  end
+
+  def test_configure_auth_without_username
+    assert_raise(Fluent::ConfigError) do
+      create_driver(config + %[
+        <auth>
+          method basic
+          password s3cret
+        </auth>
+      ])
+    end
+  end
+
+  def read_http_response(sock)
+    status = sock.readline.split(' ')[1]
+    length = 0
+    while (line = sock.readline) != "\r\n"
+      length = line.split(':', 2)[1].strip.to_i if /\AContent-Length:/i.match?(line)
+    end
+    sock.read(length) if length > 0
+    status
+  end
+
+  def test_basic_auth_accepts_valid_credentials
+    d = create_driver(auth_config)
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+
+    d.run(expect_records: 1) do
+      res = post("/tag1", {"json" => {"a" => 1}.to_json, "time" => time_i.to_s},
+                 {"Authorization" => basic_credentials})
+      assert_equal "200", res.code
+    end
+
+    assert_equal [["tag1", time, {"a" => 1}]], d.events
+  end
+
+  def test_basic_auth_rejects_wrong_and_missing_credentials
+    d = create_driver(auth_config)
+    codes = []
+
+    d.end_if { codes.size == 4 }
+    d.run(expect_records: 0, timeout: 5) do
+      codes << post("/tag1", {"json" => "{}"}, {"Authorization" => basic_credentials("fluentd", "wrong")}).code
+      codes << post("/tag1", {"json" => "{}"}, {"Authorization" => basic_credentials("nobody", "s3cret")}).code
+      codes << post("/tag1", {"json" => "{}"}).code
+      codes << post("/tag1", {"json" => "{}"}, {"Authorization" => "Bearer s3cret"}).code
+    end
+
+    assert_equal ["401", "401", "401", "401"], codes
+    assert_equal [], d.events
+  end
+
+  class FakeIO
+    attr_reader :written
+
+    def initialize
+      @written = +''
+    end
+
+    def remote_addr
+      "127.0.0.1"
+    end
+
+    def remote_port
+      12345
+    end
+
+    def write(data)
+      @written << data
+    end
+
+    def close
+    end
+  end
+
+  def build_handler(instance, io)
+    Fluent::Plugin::HttpInput::Handler.new(
+      io,
+      Fluent::Plugin::HttpInput::KeepaliveManager.new(10),
+      ->(_path, _params) { ["200 OK", {}, ""] },
+      instance.body_size_limit,
+      instance.decompression_size_limit,
+      "default",
+      $log,
+      nil,
+      false,
+      false,
+      instance.auth
+    )
+  end
+
+  def feed_request(handler, authorization)
+    body = "x" * 65536
+    header = +"POST /tag1 HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+    header << "Authorization: #{authorization}\r\n" if authorization
+    header << "Content-Type: application/json\r\nContent-Length: #{body.bytesize}\r\n\r\n"
+    handler.on_read(header)
+    handler.on_read(body)
+    handler.instance_variable_get(:@body).bytesize
+  end
+
+  def test_unauthorized_request_body_is_not_buffered
+    d = create_driver(auth_config)
+
+    rejected_io = FakeIO.new
+    rejected = feed_request(build_handler(d.instance, rejected_io), nil)
+
+    accepted = feed_request(build_handler(d.instance, FakeIO.new), basic_credentials)
+
+    assert_true(rejected_io.written.start_with?("HTTP/1.1 401 Unauthorized"))
+    assert_equal(0, rejected)
+    assert_equal(65536, accepted)
+  end
+
+  def test_authorization_header_is_kept_out_of_records
+    d = create_driver(auth_config(config + "add_http_headers true"))
+    time_i = event_time("2011-01-02 13:14:15 UTC").to_i
+
+    d.run(expect_records: 1) do
+      res = post("/tag1", {"json" => {"a" => 1}.to_json, "time" => time_i.to_s},
+                 {"Authorization" => basic_credentials})
+      assert_equal "200", res.code
+    end
+
+    record = d.events[0][2]
+    assert_false(record.key?("HTTP_AUTHORIZATION"))
+    assert_equal(1, record["a"])
+  end
+
+  def test_cors_preflight_is_exempt_from_authentication
+    d = create_driver(auth_config(config + %[cors_allow_origins ["http://example.com"]]))
+    codes = []
+
+    d.end_if { codes.size == 1 }
+    d.run(expect_records: 0, timeout: 5) do
+      codes << options("/tag1", {}, {"Origin" => "http://example.com",
+                                     "Access-Control-Request-Method" => "POST"}).code
+    end
+
+    assert_equal ["200"], codes
+  end
+
+  def test_authorization_is_not_carried_over_a_keepalive_connection
+    d = create_driver(auth_config)
+    codes = []
+    body = {"a" => 1}.to_json
+
+    d.end_if { codes.size == 2 }
+    d.run(expect_records: 1, timeout: 5) do
+      TCPSocket.open("127.0.0.1", @port) do |sock|
+        sock.write("POST /tag1 HTTP/1.1\r\nHost: 127.0.0.1\r\n" \
+                   "Authorization: #{basic_credentials}\r\n" \
+                   "Content-Type: application/json\r\nContent-Length: #{body.bytesize}\r\n\r\n#{body}")
+        codes << read_http_response(sock)
+
+        sock.write("POST /tag1 HTTP/1.1\r\nHost: 127.0.0.1\r\n" \
+                   "Content-Type: application/json\r\nContent-Length: #{body.bytesize}\r\n\r\n#{body}")
+        codes << read_http_response(sock)
+      end
+    end
+
+    assert_equal ["200", "401"], codes
+    assert_equal 1, d.events.size
+  end
+
+  def test_time
+    d = create_driver
+    time = event_time("2011-01-02 13:14:15.123 UTC")
+    Timecop.freeze(Time.at(time))
+
+    events = [
+      ["tag1", time, {"a" => 1}],
+      ["tag2", time, {"a" => 2}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 2) do
+      events.each do |tag, _time, record|
+        res = post("/#{tag}", {"json"=>record.to_json})
+        res_codes << res.code
+      end
+    end
+
+    assert_equal ["200", "200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_time_as_float
+    d = create_driver
+    time = event_time("2011-01-02 13:14:15.123 UTC")
+    float_time = time.to_f
+
+    events = [
+      ["tag1", time, {"a"=>1}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 1) do
+      events.each do |tag, t, record|
+        res = post("/#{tag}", {"json"=>record.to_json, "time"=>float_time.to_s})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+  end
+
+  def test_json
+    d = create_driver
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+
+    events = [
+      ["tag1", time_i, {"a"=>1}],
+      ["tag2", time_i, {"a"=>2}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 2) do
+      events.each do |tag, t, record|
+        res = post("/#{tag}", {"json"=>record.to_json, "time"=>t.to_s})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  data('json' => ['json', :to_json],
+       'msgpack' => ['msgpack', :to_msgpack])
+  def test_default_with_time_format(data)
+    param, method_name = data
+    d = create_driver(config + %[
+      <parse>
+        keep_time_key
+        time_format %iso8601
+      </parse>
+    ])
+
+    time = event_time("2020-06-10T01:14:27+00:00")
+    events = [
+      ["tag1", time, {"a" => 1, "time" => '2020-06-10T01:14:27+00:00'}],
+      ["tag2", time, {"a" => 2, "time" => '2020-06-10T01:14:27+00:00'}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 2) do
+      events.each do |tag, t, record|
+        res = post("/#{tag}", {param => record.__send__(method_name)})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_multi_json
+    d = create_driver
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+
+    records = [{"a"=>1},{"a"=>2}]
+    events = [
+      ["tag1", time_i, records[0]],
+      ["tag1", time_i, records[1]],
+    ]
+    tag = "tag1"
+    res_codes = []
+    d.run(expect_records: 2, timeout: 5) do
+      res = post("/#{tag}", {"json"=>records.to_json, "time"=>time_i.to_s})
+      res_codes << res.code
+    end
+    assert_equal ["200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_multi_json_with_time_field
+    d = create_driver
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    time_f = time.to_f
+
+    records = [{"a" => 1, 'time' => time_i},{"a" => 2, 'time' => time_f}]
+    events = [
+      ["tag1", time, {'a' => 1}],
+      ["tag1", time, {'a' => 2}],
+    ]
+    tag = "tag1"
+    res_codes = []
+    d.run(expect_records: 2, timeout: 5) do
+      res = post("/#{tag}", {"json" => records.to_json})
+      res_codes << res.code
+    end
+    assert_equal ["200"], res_codes
+    assert_equal events, d.events
+    assert_instance_of Fluent::EventTime, d.events[0][1]
+    assert_instance_of Fluent::EventTime, d.events[1][1]
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  data('json' => ['json', :to_json],
+       'msgpack' => ['msgpack', :to_msgpack])
+  def test_default_multi_with_time_format(data)
+    param, method_name = data
+    d = create_driver(config + %[
+      <parse>
+        keep_time_key
+        time_format %iso8601
+      </parse>
+    ])
+    time = event_time("2020-06-10T01:14:27+00:00")
+    events = [
+      ["tag1", time, {'a' => 1, 'time' => "2020-06-10T01:14:27+00:00"}],
+      ["tag1", time, {'a' => 2, 'time' => "2020-06-10T01:14:27+00:00"}],
+    ]
+    tag = "tag1"
+    res_codes = []
+    d.run(expect_records: 2, timeout: 5) do
+      res = post("/#{tag}", {param => events.map { |e| e[2] }.__send__(method_name)})
+      res_codes << res.code
+    end
+    assert_equal ["200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_multi_json_with_nonexistent_time_key
+    d = create_driver(config + %[
+      <parse>
+        time_key missing
+      </parse>
+    ])
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    time_f = time.to_f
+
+    records = [{"a" => 1, 'time' => time_i},{"a" => 2, 'time' => time_f}]
+    tag = "tag1"
+    res_codes = []
+    d.run(expect_records: 2, timeout: 5) do
+      res = post("/#{tag}", {"json" => records.to_json})
+      res_codes << res.code
+    end
+    assert_equal ["200"], res_codes
+    assert_equal 2, d.events.size
+    assert_not_equal time_i, d.events[0][1].sec # current time is used because "missing" field doesn't exist
+    assert_not_equal time_i, d.events[1][1].sec
+  end
+
+  def test_json_with_add_remote_addr
+    d = create_driver(config + "add_remote_addr true")
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+
+    events = [
+      ["tag1", time, {"REMOTE_ADDR"=>"127.0.0.1", "a"=>1}],
+      ["tag2", time, {"REMOTE_ADDR"=>"127.0.0.1", "a"=>2}],
+    ]
+    res_codes = []
+    d.run(expect_records: 2) do
+      events.each do |tag, _t, record|
+        res = post("/#{tag}", {"json"=>record.to_json, "time"=>time_i.to_s})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_exact_match_for_expect
+    d = create_driver(config)
+    records = [{ "a" => 1}, { "a" => 2 }]
+    tag = "tag1"
+    res_codes = []
+
+    d.run(expect_records: 0, timeout: 5) do
+      res = post("/#{tag}", { "json" => records.to_json }, { 'Expect' => 'something' })
+      res_codes << res.code
+    end
+    assert_equal ["417"], res_codes
+  end
+
+  def test_exact_match_for_expect_with_other_header
+    d = create_driver(config)
+
+    records = [{ "a" => 1}, { "a" => 2 }]
+    tag = "tag1"
+    res_codes = []
+
+    d.run(expect_records: 2, timeout: 5) do
+      res = post("/#{tag}", { "json" => records.to_json, 'x-envoy-expected-rq-timeout-ms' => 4 })
+      res_codes << res.code
+    end
+    assert_equal ["200"], res_codes
+
+    assert_equal "tag1", d.events[0][0]
+    assert_equal 1, d.events[0][2]["a"]
+    assert_equal "tag1", d.events[1][0]
+    assert_equal 2, d.events[1][2]["a"]
+  end
+
+  def test_multi_json_with_add_remote_addr
+    d = create_driver(config + "add_remote_addr true")
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+
+    records = [{"a"=>1},{"a"=>2}]
+    tag = "tag1"
+    res_codes = []
+
+    d.run(expect_records: 2, timeout: 5) do
+      res = post("/#{tag}", {"json"=>records.to_json, "time"=>time_i.to_s})
+      res_codes << res.code
+    end
+    assert_equal ["200"], res_codes
+
+    assert_equal "tag1", d.events[0][0]
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal 1, d.events[0][2]["a"]
+    assert{ d.events[0][2].has_key?("REMOTE_ADDR") && d.events[0][2]["REMOTE_ADDR"] =~ /^\d{1,4}(\.\d{1,4}){3}$/ }
+
+    assert_equal "tag1", d.events[1][0]
+    assert_equal_event_time time, d.events[1][1]
+    assert_equal 2, d.events[1][2]["a"]
+  end
+
+  def test_json_with_add_remote_addr_given_x_forwarded_for
+    d = create_driver(config + "add_remote_addr true")
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+
+    events = [
+      ["tag1", time, {"a"=>1}],
+      ["tag2", time, {"a"=>2}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 2) do
+      events.each do |tag, _t, record|
+        res = post("/#{tag}", {"json"=>record.to_json, "time"=>time_i.to_s}, {"X-Forwarded-For"=>"129.78.138.66, 127.0.0.1"})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+
+    assert_equal "tag1", d.events[0][0]
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal({"REMOTE_ADDR"=>"129.78.138.66", "a"=>1}, d.events[0][2])
+
+    assert_equal "tag2", d.events[1][0]
+    assert_equal_event_time time, d.events[1][1]
+    assert_equal({"REMOTE_ADDR"=>"129.78.138.66", "a"=>2}, d.events[1][2])
+  end
+
+  def test_multi_json_with_add_remote_addr_given_x_forwarded_for
+    d = create_driver(config + "add_remote_addr true")
+
+    tag = "tag1"
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    records = [{"a"=>1},{"a"=>2}]
+    events = [
+      [tag, time, {"REMOTE_ADDR"=>"129.78.138.66", "a"=>1}],
+      [tag, time, {"REMOTE_ADDR"=>"129.78.138.66", "a"=>2}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 2, timeout: 5) do
+      res = post("/#{tag}", {"json"=>records.to_json, "time"=>time_i.to_s}, {"X-Forwarded-For"=>"129.78.138.66, 127.0.0.1"})
+      res_codes << res.code
+    end
+    assert_equal ["200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_add_remote_addr_given_multi_x_forwarded_for
+    d = create_driver(config + "add_remote_addr true")
+
+    tag = "tag1"
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    record = {"a" => 1}
+    event = ["tag1", time, {"REMOTE_ADDR" => "129.78.138.66", "a" => 1}]
+    res_code = nil
+
+    d.run(expect_records: 1, timeout: 5) do
+      res = post("/#{tag}", {"json" => record.to_json, "time" => time_i.to_s}) { |http, req|
+        # net/http can't send multiple headers so overwrite it.
+        def req.each_capitalized
+          block_given? or return enum_for(__method__) { @header.size }
+          @header.each do |k, vs|
+            vs.each { |v|
+              yield capitalize(k), v
+            }
+          end
+        end
+        req.add_field("X-Forwarded-For", "129.78.138.66, 127.0.0.1")
+        req.add_field("X-Forwarded-For", "8.8.8.8")
+      }
+      res_code = res.code
+    end
+    assert_equal "200", res_code
+    assert_equal event, d.events.first
+    assert_equal_event_time time, d.events.first[1]
+  end
+
+  def test_multi_json_with_add_http_headers
+    d = create_driver(config + "add_http_headers true")
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    records = [{"a"=>1},{"a"=>2}]
+    tag = "tag1"
+    res_codes = []
+
+    d.run(expect_records: 2, timeout: 5) do
+      res = post("/#{tag}", {"json"=>records.to_json, "time"=>time_i.to_s})
+      res_codes << res.code
+    end
+    assert_equal ["200"], res_codes
+
+    assert_equal "tag1", d.events[0][0]
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal 1, d.events[0][2]["a"]
+
+    assert_equal "tag1", d.events[1][0]
+    assert_equal_event_time time, d.events[1][1]
+    assert_equal 2, d.events[1][2]["a"]
+
+    assert include_http_header?(d.events[0][2])
+    assert include_http_header?(d.events[1][2])
+  end
+
+  def test_json_with_add_http_headers
+    d = create_driver(config + "add_http_headers true")
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    events = [
+      ["tag1", time, {"a"=>1}],
+      ["tag2", time, {"a"=>2}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 2) do
+      events.each do |tag, t, record|
+        res = post("/#{tag}", {"json"=>record.to_json, "time"=>time_i.to_s})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+
+    assert_equal "tag1", d.events[0][0]
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal 1, d.events[0][2]["a"]
+
+    assert_equal "tag2", d.events[1][0]
+    assert_equal_event_time time, d.events[1][1]
+    assert_equal 2, d.events[1][2]["a"]
+
+    assert include_http_header?(d.events[0][2])
+    assert include_http_header?(d.events[1][2])
+  end
+
+  def test_multi_json_with_custom_parser
+    d = create_driver(config + %[
+        <parse>
+          @type json
+          keep_time_key true
+          time_key foo
+          time_format %iso8601
+        </parse>
+    ])
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_s = Time.at(time).iso8601
+
+    records = [{"foo"=>time_s,"bar"=>"test1"},{"foo"=>time_s,"bar"=>"test2"}]
+    tag = "tag1"
+    res_codes = []
+
+    d.run(expect_records: 2, timeout: 5) do
+      res = post("/#{tag}", records.to_json, {"Content-Type"=>"application/octet-stream"})
+      res_codes << res.code
+    end
+    assert_equal ["200"], res_codes
+
+    assert_equal "tag1", d.events[0][0]
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal d.events[0][2], records[0]
+
+    assert_equal "tag1", d.events[1][0]
+    assert_equal_event_time time, d.events[1][1]
+    assert_equal d.events[1][2], records[1]
+  end
+
+  def test_application_json
+    d = create_driver
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    events = [
+      ["tag1", time, {"a"=>1}],
+      ["tag2", time, {"a"=>2}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 2) do
+      events.each do |tag, t, record|
+        res = post("/#{tag}?time=#{time_i.to_s}", record.to_json, {"Content-Type"=>"application/json; charset=utf-8"})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_csp_report
+    d = create_driver
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    events = [
+      ["tag1", time, {"a"=>1}],
+      ["tag2", time, {"a"=>2}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 2) do
+      events.each do |tag, t, record|
+        res = post("/#{tag}?time=#{time_i.to_s}", record.to_json, {"Content-Type"=>"application/csp-report; charset=utf-8"})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_application_msgpack
+    d = create_driver
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    events = [
+      ["tag1", time, {"a"=>1}],
+      ["tag2", time, {"a"=>2}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 2) do
+      events.each do |tag, t, record|
+        res = post("/#{tag}?time=#{time_i.to_s}", record.to_msgpack, {"Content-Type"=>"application/msgpack"})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_application_ndjson
+    d = create_driver
+    events = [
+        ["tag1", 1643935663, "{\"a\":1}\n{\"b\":2}"],
+        ["tag2", 1643935664, "{\"a\":3}\r\n{\"b\":4}"]
+    ]
+
+    expected = [
+        ["tag1", 1643935663, {"a"=>1}],
+        ["tag1", 1643935663, {"b"=>2}],
+        ["tag2", 1643935664, {"a"=>3}],
+        ["tag2", 1643935664, {"b"=>4}]
+    ]
+
+    d.run(expect_records: 1) do
+      events.each do |tag, time, record|
+        res = post("/#{tag}?time=#{time}", record, {"Content-Type"=>"application/x-ndjson"})
+        assert_equal("200", res.code)
+      end
+    end
+    assert_equal(expected, d.events)
+  end
+
+  def test_multipart_formdata
+    tag = "tag"
+    time = event_time_without_nsec
+    event = [tag, time, {"key" => 0}]
+    body = "--TESTBOUNDARY\r\n" +
+           "Content-Disposition: form-data; name=\"json\"\r\n" +
+           "\r\n" +
+           %[{"key":0}\r\n] +
+           "--TESTBOUNDARY\r\n"
+
+    d = create_driver
+    res = nil
+    d.run(expect_records: 1) do
+      res = post("/#{tag}?time=#{time.to_s}", body, {"Content-Type"=>"multipart/form-data; boundary=TESTBOUNDARY"})
+    end
+
+    assert_equal(
+      ["200", [event]],
+      [res.code, d.events],
+    )
+  end
+
+  def test_msgpack
+    d = create_driver
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+
+    events = [
+      ["tag1", time, {"a"=>1}],
+      ["tag2", time, {"a"=>2}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 2) do
+      events.each do |tag, t, record|
+        res = post("/#{tag}", {"msgpack"=>record.to_msgpack, "time"=>time_i.to_s})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_multi_msgpack
+    d = create_driver
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+
+    records = [{"a"=>1},{"a"=>2}]
+    events = [
+      ["tag1", time, records[0]],
+      ["tag1", time, records[1]],
+    ]
+    tag = "tag1"
+    res_codes = []
+    d.run(expect_records: 2) do
+      res = post("/#{tag}", {"msgpack"=>records.to_msgpack, "time"=>time_i.to_s})
+      res_codes << res.code
+    end
+    assert_equal ["200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_with_regexp
+    d = create_driver(config + %[
+      format /^(?<field_1>\\d+):(?<field_2>\\w+)$/
+      types field_1:integer
+    ])
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    events = [
+      ["tag1", time, {"field_1" => 1, "field_2" => 'str'}],
+      ["tag2", time, {"field_1" => 2, "field_2" => 'str'}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 2) do
+      events.each do |tag, t, record|
+        body = record.map { |k, v|
+          v.to_s
+        }.join(':')
+        res = post("/#{tag}?time=#{time_i.to_s}", body, {'Content-Type' => 'application/octet-stream'})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_with_csv
+    require 'csv'
+
+    d = create_driver(config + %[
+      format csv
+      keys foo,bar
+    ])
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    events = [
+      ["tag1", time, {"foo" => "1", "bar" => 'st"r'}],
+      ["tag2", time, {"foo" => "2", "bar" => 'str'}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 2) do
+      events.each do |tag, t, record|
+        body = record.map { |k, v| v }.to_csv
+        res = post("/#{tag}?time=#{time_i.to_s}", body, {'Content-Type' => 'text/comma-separated-values'})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_response_with_empty_img
+    d = create_driver(config)
+    assert_equal true, d.instance.respond_with_empty_img
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    events = [
+      ["tag1", time, {"a"=>1}],
+      ["tag2", time, {"a"=>2}],
+    ]
+    res_codes = []
+    res_bodies = []
+
+    d.run do
+      events.each do |tag, _t, record|
+        res = post("/#{tag}", {"json"=>record.to_json, "time"=>time_i.to_s})
+        res_codes << res.code
+        # Ruby returns ASCII-8 encoded string for GIF.
+        res_bodies << res.body.force_encoding("UTF-8")
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal [Fluent::Plugin::HttpInput::EMPTY_GIF_IMAGE, Fluent::Plugin::HttpInput::EMPTY_GIF_IMAGE], res_bodies
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_response_without_empty_img
+    d = create_driver(config + "respond_with_empty_img false")
+    assert_equal false, d.instance.respond_with_empty_img
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    events = [
+      ["tag1", time, {"a"=>1}],
+      ["tag2", time, {"a"=>2}],
+    ]
+    res_codes = []
+    res_bodies = []
+
+    d.run do
+      events.each do |tag, _t, record|
+        res = post("/#{tag}", {"json"=>record.to_json, "time"=>time_i.to_s})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal [], res_bodies
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_response_use_204_response
+    d = create_driver(config + %[
+          respond_with_empty_img false
+          use_204_response true
+        ])
+    assert_equal true, d.instance.use_204_response
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    events = [
+      ["tag1", time, {"a"=>1}],
+      ["tag2", time, {"a"=>2}],
+    ]
+    res_codes = []
+    res_bodies = []
+
+    d.run do
+      events.each do |tag, _t, record|
+        res = post("/#{tag}", {"json"=>record.to_json, "time"=>time_i.to_s})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["204", "204"], res_codes
+    assert_equal [], res_bodies
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_cors_allowed
+    d = create_driver(config + "cors_allow_origins [\"http://foo.com\"]")
+    assert_equal ["http://foo.com"], d.instance.cors_allow_origins
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    events = [
+      ["tag1", time, {"a"=>1}],
+      ["tag2", time, {"a"=>2}],
+    ]
+    res_codes = []
+    res_headers = []
+
+    d.run do
+      events.each do |tag, _t, record|
+        res = post("/#{tag}", {"json"=>record.to_json, "time"=>time_i.to_s}, {"Origin"=>"http://foo.com"})
+        res_codes << res.code
+        res_headers << res["Access-Control-Allow-Origin"]
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal ["http://foo.com", "http://foo.com"], res_headers
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_cors_allowed_wildcard
+    d = create_driver(config + 'cors_allow_origins ["*"]')
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    events = [
+      ["tag1", time, {"a"=>1}],
+    ]
+
+    d.run do
+      events.each do |tag, time, record|
+        headers = {"Origin" => "http://foo.com"}
+
+        res = post("/#{tag}", {"json" => record.to_json, "time" => time.to_i}, headers)
+
+        assert_equal "200", res.code
+        assert_equal "*", res["Access-Control-Allow-Origin"]
+      end
+    end
+  end
+
+  def test_get_request
+    d = create_driver(config)
+
+    d.run do
+      res = get("/cors.test", {}, {})
+      assert_equal "200", res.code
+    end
+  end
+
+  def test_cors_preflight
+    d = create_driver(config + 'cors_allow_origins ["*"]')
+
+    d.run do
+      header = {
+        "Origin" => "http://foo.com",
+        "Access-Control-Request-Method" => "POST",
+        "Access-Control-Request-Headers" => "Content-Type",
+      }
+      res = options("/cors.test", {}, header)
+
+      assert_equal "200", res.code
+      assert_equal "*", res["Access-Control-Allow-Origin"]
+      assert_equal "POST", res["Access-Control-Allow-Methods"]
+    end
+  end
+
+  def test_cors_allowed_wildcard_for_subdomain
+    d = create_driver(config + 'cors_allow_origins ["http://*.foo.com"]')
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    events = [
+      ["tag1", time, {"a"=>1}],
+    ]
+
+    d.run do
+      events.each do |tag, time, record|
+        headers = {"Origin" => "http://subdomain.foo.com"}
+
+        res = post("/#{tag}", {"json" => record.to_json, "time" => time.to_i}, headers)
+
+        assert_equal "200", res.code
+        assert_equal "http://subdomain.foo.com", res["Access-Control-Allow-Origin"]
+      end
+    end
+  end
+
+  def test_cors_allowed_exclude_empty_string
+    d = create_driver(config + 'cors_allow_origins ["", "http://*.foo.com"]')
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    events = [
+      ["tag1", time, {"a"=>1}],
+    ]
+
+    d.run do
+      events.each do |tag, time, record|
+        headers = {"Origin" => "http://subdomain.foo.com"}
+
+        res = post("/#{tag}", {"json" => record.to_json, "time" => time.to_i}, headers)
+
+        assert_equal "200", res.code
+        assert_equal "http://subdomain.foo.com", res["Access-Control-Allow-Origin"]
+      end
+    end
+  end
+
+  def test_cors_allowed_wildcard_preflight_for_subdomain
+    d = create_driver(config + 'cors_allow_origins ["http://*.foo.com"]')
+
+    d.run do
+      header = {
+        "Origin" => "http://subdomain.foo.com",
+        "Access-Control-Request-Method" => "POST",
+        "Access-Control-Request-Headers" => "Content-Type",
+      }
+      res = options("/cors.test", {}, header)
+
+      assert_equal "200", res.code
+      assert_equal "http://subdomain.foo.com", res["Access-Control-Allow-Origin"]
+      assert_equal "POST", res["Access-Control-Allow-Methods"]
+    end
+  end
+
+  def test_cors_allow_credentials
+    d = create_driver(config + %[
+          cors_allow_origins ["http://foo.com"]
+          cors_allow_credentials
+        ])
+    assert_equal true, d.instance.cors_allow_credentials
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    event = ["tag1", time, {"a"=>1}]
+    res_code = nil
+    res_header = nil
+
+    d.run do
+      res = post("/#{event[0]}", {"json"=>event[2].to_json, "time"=>time.to_i.to_s}, {"Origin"=>"http://foo.com"})
+      res_code = res.code
+      res_header = res["Access-Control-Allow-Credentials"]
+    end
+    assert_equal(
+      {
+        response_code: "200",
+        allow_credentials_header: "true",
+        events: [event]
+      },
+      {
+        response_code: res_code,
+        allow_credentials_header: res_header,
+        events: d.events
+      }
+    )
+  end
+
+  def test_cors_allow_credentials_for_wildcard_origins
+    assert_raise(Fluent::ConfigError) do
+      create_driver(config + %[
+        cors_allow_origins ["*"]
+        cors_allow_credentials
+      ])
+    end
+  end
+
+  def test_cors_with_nil_origin
+    d = create_driver(config + %[
+      cors_allow_origins ["http://foo.com"]
+    ])
+    assert_equal ["http://foo.com"], d.instance.cors_allow_origins
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    event = ["tag1", time, {"a"=>1}]
+    res_code = nil
+
+    d.run do
+      res = post("/#{event[0]}", {"json"=>event[2].to_json, "time"=>time.to_i.to_s})
+      res_code = res.code
+    end
+
+    assert_equal "200", res_code
+    assert_equal [event], d.events
+    assert_equal_event_time time, d.events[0][1]
+  end
+
+  def test_content_encoding_gzip
+    d = create_driver
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    events = [
+      ["tag1", time, {"a"=>1}],
+      ["tag2", time, {"a"=>2}],
+    ]
+    res_codes = []
+
+    d.run do
+      events.each do |tag, time, record|
+        header = {'Content-Type'=>'application/json', 'Content-Encoding'=>'gzip'}
+        res = post("/#{tag}?time=#{time}", compress_gzip(record.to_json), header)
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_content_encoding_gzip_size_error
+    d = create_driver(%[
+      port #{@port}
+      bind "127.0.0.1"
+      decompression_size_limit 512k
+    ])
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    events = [
+      ["tag1", time, {"msg"=>"a" * 1024 * 1024}],
+    ]
+    res_codes = []
+
+    d.run do
+      events.each do |tag, time, record|
+        header = {'Content-Type'=>'application/json', 'Content-Encoding'=>'gzip'}
+        res = post("/#{tag}?time=#{time}", compress_gzip(record.to_json), header)
+        res_codes << res.code
+      end
+    end
+
+    assert_equal ["400"], res_codes
+    assert_true d.events.empty?
+
+    log = d.logs.first
+    assert_true log.include?("fails to decode payload") && log.include?("Decompressed data exceeds limit of #{512*1024} bytes")
+  end
+
+  def test_content_encoding_deflate
+    d = create_driver
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    events = [
+      ["tag1", time, {"a"=>1}],
+      ["tag2", time, {"a"=>2}],
+    ]
+    res_codes = []
+
+    d.run do
+      events.each do |tag, time, record|
+        header = {'Content-Type'=>'application/msgpack', 'Content-Encoding'=>'deflate'}
+        res = post("/#{tag}?time=#{time}", Zlib.deflate(record.to_msgpack), header)
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal events, d.events
+    assert_equal_event_time time, d.events[0][1]
+    assert_equal_event_time time, d.events[1][1]
+  end
+
+  def test_content_encoding_deflate_size_error
+    d = create_driver(%[
+      port #{@port}
+      bind "127.0.0.1"
+      decompression_size_limit 512k
+    ])
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    events = [
+      ["tag1", time, {"msg"=>"a" * 1024 * 1024}],
+    ]
+    res_codes = []
+
+    d.run do
+      events.each do |tag, time, record|
+        header = {'Content-Type'=>'application/msgpack', 'Content-Encoding'=>'deflate'}
+        res = post("/#{tag}?time=#{time}", Zlib.deflate(record.to_msgpack), header)
+        res_codes << res.code
+      end
+    end
+
+    assert_equal ["400"], res_codes
+    assert_true d.events.empty?
+
+    log = d.logs.first
+    assert_true log.include?("fails to decode payload") && log.include?("Decompressed data exceeds limit of #{512*1024} bytes")
+  end
+
+  def test_cors_disallowed
+    d = create_driver(config + "cors_allow_origins [\"http://foo.com\"]")
+    assert_equal ["http://foo.com"], d.instance.cors_allow_origins
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    res_codes = []
+
+    d.end_if{ res_codes.size == 2 }
+    d.run do
+      res = post("/tag1", {"json"=>{"a"=>1}.to_json, "time"=>time_i.to_s}, {"Origin"=>"http://bar.com"})
+      res_codes << res.code
+      res = post("/tag2", {"json"=>{"a"=>1}.to_json, "time"=>time_i.to_s}, {"Origin"=>"http://bar.com"})
+      res_codes << res.code
+    end
+    assert_equal ["403", "403"], res_codes
+  end
+
+  def test_add_query_params
+    d = create_driver(config + "add_query_params true")
+    assert_equal true, d.instance.add_query_params
+
+    time = event_time("2011-01-02 13:14:15 UTC")
+    time_i = time.to_i
+    events = [
+      ["tag1", time, {"a"=>1, "QUERY_A"=>"b"}],
+      ["tag2", time, {"a"=>2, "QUERY_A"=>"b"}],
+    ]
+    res_codes = []
+    res_bodies = []
+
+    d.run do
+      events.each do |tag, _t, record|
+        res = post("/#{tag}?a=b", {"json"=>record.to_json, "time"=>time_i.to_s})
+        res_codes << res.code
+      end
+    end
+    assert_equal ["200", "200"], res_codes
+    assert_equal [], res_bodies
+    assert_equal events, d.events
+  end
+
+  def test_add_tag_prefix
+    d = create_driver(config + "add_tag_prefix test")
+    assert_equal "test", d.instance.add_tag_prefix
+
+    time = event_time("2011-01-02 13:14:15.123 UTC")
+    float_time = time.to_f
+
+    events = [
+      ["tag1", time, {"a"=>1}],
+    ]
+    res_codes = []
+
+    d.run(expect_records: 1) do
+      events.each do |tag, t, record|
+        res = post("/#{tag}", {"json"=>record.to_json, "time"=>float_time.to_s})
+        res_codes << res.code
+      end
+    end
+
+    assert_equal ["200"], res_codes
+    assert_equal [["test.tag1", time, {"a"=>1}]], d.events
+  end
+
+  $test_in_http_connection_object_ids = []
+  $test_in_http_content_types = []
+  $test_in_http_content_types_flag = false
+  module ContentTypeHook
+    def initialize(*args)
+      @io_handler = nil
+      super
+    end
+    def on_headers_complete(headers)
+      super
+      if $test_in_http_content_types_flag
+        $test_in_http_content_types << self.content_type
+      end
+    end
+
+    def on_message_begin
+      super
+      if $test_in_http_content_types_flag
+        $test_in_http_connection_object_ids << @io_handler.object_id
+      end
+    end
+  end
+
+  class Fluent::Plugin::HttpInput::Handler
+    prepend ContentTypeHook
+  end
+
+  def test_if_content_type_is_initialized_properly
+    # This test is to check if Fluent::HttpInput::Handler's @content_type is initialized properly.
+    # Especially when in Keep-Alive and the second request has no 'Content-Type'.
+
+    begin
+      d = create_driver
+
+      $test_in_http_content_types_flag = true
+      d.run do
+        # Send two requests the second one has no Content-Type in Keep-Alive
+        Net::HTTP.start("127.0.0.1", @port) do |http|
+          req = Net::HTTP::Post.new("/foodb/bartbl", {"connection" => "keepalive", "Content-Type" => "application/json"})
+          http.request(req)
+          req = Net::HTTP::Get.new("/foodb/bartbl", {"connection" => "keepalive"})
+          http.request(req)
+        end
+
+      end
+    ensure
+      $test_in_http_content_types_flag = false
+    end
+    assert_equal(['application/json', ''], $test_in_http_content_types)
+    # Asserting keepalive
+    assert_equal $test_in_http_connection_object_ids[0], $test_in_http_connection_object_ids[1]
+  end
+
+  def get(path, params, header = {})
+    http = Net::HTTP.new("127.0.0.1", @port)
+    req = Net::HTTP::Get.new(path, header)
+    http.request(req)
+  end
+
+  def options(path, params, header = {})
+    http = Net::HTTP.new("127.0.0.1", @port)
+    req = Net::HTTP::Options.new(path, header)
+    http.request(req)
+  end
+
+  def post(path, params, header = {})
+    http = Net::HTTP.new("127.0.0.1", @port)
+    req = Net::HTTP::Post.new(path, header)
+    yield http, req if block_given?
+    if params.is_a?(String)
+      unless header.has_key?('Content-Type')
+        header['Content-Type'] = 'application/octet-stream'
+      end
+      req.body = params
+    else
+      unless header.has_key?('Content-Type')
+        header['Content-Type'] = 'application/x-www-form-urlencoded'
+      end
+      req.set_form_data(params)
+    end
+    http.request(req)
+  end
+
+  def compress_gzip(data)
+    io = StringIO.new
+    io.binmode
+    Zlib::GzipWriter.wrap(io) { |gz| gz.write data }
+    return io.string
+  end
+
+  def include_http_header?(record)
+    record.keys.find { |header| header.start_with?('HTTP_') }
+  end
+end

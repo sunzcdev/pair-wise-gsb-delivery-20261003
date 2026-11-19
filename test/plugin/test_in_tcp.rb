@@ -1,0 +1,617 @@
+require_relative '../helper'
+require 'fluent/test/driver/input'
+require 'fluent/plugin/in_tcp'
+
+class TcpInputTest < Test::Unit::TestCase
+  def setup
+    Fluent::Test.setup
+    @port = unused_port(protocol: :tcp)
+  end
+
+  def teardown
+    @port = nil
+  end
+
+  def base_config
+    %[
+      port #{@port}
+      tag tcp
+    ]
+  end
+
+  def ipv4_config
+    base_config + %[
+      bind 127.0.0.1
+      format none
+    ]
+  end
+
+  def ipv6_config
+    base_config + %[
+      bind ::1
+      format none
+    ]
+  end
+
+  def create_driver(conf)
+    Fluent::Test::Driver::Input.new(Fluent::Plugin::TcpInput).configure(conf)
+  end
+
+  def create_tcp_socket(host, port, &block)
+    if block_given?
+      TCPSocket.open(host, port, &block)
+    else
+      TCPSocket.open(host, port)
+    end
+  end
+
+
+  data(
+    'ipv4' => ['127.0.0.1', :ipv4],
+    'ipv6' => ['::1', :ipv6],
+  )
+  test 'configure' do |data|
+    bind, protocol = data
+    conf = send("#{protocol}_config")
+    omit "IPv6 is not supported on this environment" if protocol == :ipv6 && !ipv6_enabled?
+
+    d = create_driver(conf)
+    assert_equal @port, d.instance.port
+    assert_equal bind, d.instance.bind
+    assert_equal "\n", d.instance.delimiter
+  end
+
+  test ' configure w/o parse section' do
+    assert_raise(Fluent::ConfigError.new("<parse> section is required.")) {
+      create_driver(base_config)
+    }
+  end
+
+  test 'configure with an empty delimiter' do
+    assert_raise(Fluent::ConfigError.new("'delimiter' parameter must not be empty")) {
+      create_driver(ipv4_config + 'delimiter ""')
+    }
+  end
+
+  test_case_data = {
+    'none' => {
+      'format' => 'none',
+      'payloads' => [ "tcptest1\n", "tcptest2\n" ],
+      'expecteds' => [
+        {'message' => 'tcptest1'},
+        {'message' => 'tcptest2'},
+      ],
+    },
+    'json' => {
+      'format' => 'json',
+      'payloads' => [
+        {'k' => 123, 'message' => 'tcptest1'}.to_json + "\n",
+        {'k' => 'tcptest2', 'message' => 456}.to_json + "\n",
+      ],
+      'expecteds' => [
+        {'k' => 123, 'message' => 'tcptest1'},
+        {'k' => 'tcptest2', 'message' => 456}
+      ],
+    },
+  }
+
+  data(test_case_data)
+  test 'test_msg_size' do |data|
+    format = data['format']
+    payloads = data['payloads']
+    expecteds = data['expecteds']
+
+    d = create_driver(base_config + "format #{format}")
+    d.run(expect_records: 2) do
+      payloads.each do |payload|
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          sock.send(payload, 0)
+        end
+      end
+    end
+
+    assert_equal 2, d.events.size
+    expecteds.each_with_index do |expected_record, i|
+      assert_equal "tcp", d.events[i][0]
+      assert d.events[i][1].is_a?(Fluent::EventTime)
+      assert_equal expected_record, d.events[i][2]
+    end
+  end
+
+  data(test_case_data)
+  test 'test data in a connection' do |data|
+    format = data['format']
+    payloads = data['payloads']
+    expecteds = data['expecteds']
+
+    d = create_driver(base_config + "format #{format}")
+    d.run(expect_records: 2) do
+      create_tcp_socket('127.0.0.1', @port) do |sock|
+        payloads.each do |payload|
+          sock.send(payload, 0)
+        end
+      end
+    end
+
+    assert_equal 2, d.events.size
+    expecteds.each_with_index do |expected_record, i|
+      assert_equal "tcp", d.events[i][0]
+      assert d.events[i][1].is_a?(Fluent::EventTime)
+      assert_equal expected_record, d.events[i][2]
+    end
+  end
+
+  test 'source_hostname_key' do
+    d = create_driver(base_config + %!
+      format none
+      source_hostname_key host
+    !)
+    hostname = nil
+    d.run(expect_records: 1) do
+      create_tcp_socket('127.0.0.1', @port) do |sock|
+        sock.do_not_reverse_lookup = false
+        hostname = sock.peeraddr[2]
+        sock.send("test\n", 0)
+      end
+    end
+
+    assert_equal 1, d.events.size
+    event = d.events[0]
+    assert_equal "tcp", event[0]
+    assert event[1].is_a?(Fluent::EventTime)
+    assert_equal hostname, event[2]['host']
+  end
+
+  test "send_keepalive_packet_can_be_enabled" do
+    d = create_driver(base_config + %!
+      format none
+      send_keepalive_packet true
+    !)
+    assert_true d.instance.send_keepalive_packet
+
+    d = create_driver(base_config + %!
+      format none
+    !)
+    assert_false d.instance.send_keepalive_packet
+  end
+
+  test 'source_address_key' do
+    d = create_driver(base_config + %!
+      format none
+      source_address_key addr
+    !)
+    address = nil
+    d.run(expect_records: 1) do
+      create_tcp_socket('127.0.0.1', @port) do |sock|
+        address = sock.peeraddr[3]
+        sock.send("test\n", 0)
+      end
+    end
+
+    assert_equal 1, d.events.size
+    event = d.events[0]
+    assert_equal "tcp", event[0]
+    assert event[1].is_a?(Fluent::EventTime)
+    assert_equal address, event[2]['addr']
+  end
+
+  sub_test_case '<security>' do
+    test 'accept from allowed client' do
+      d = create_driver(ipv4_config + %!
+        <security>
+          <client>
+            network 127.0.0.1
+          </client>
+        </security>
+      !)
+      d.run(expect_records: 1) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          sock.send("hello\n", 0)
+        end
+      end
+
+      assert_equal 1, d.events.size
+      event = d.events[0]
+      assert_equal 'tcp', event[0]
+      assert_equal 'hello', event[2]['message']
+    end
+
+    test 'deny from disallowed client' do
+      d = create_driver(ipv4_config + %!
+        <security>
+          <client>
+            network 200.0.0.0
+          </client>
+        </security>
+      !)
+      d.run(expect_records: 1, timeout: 2) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          sock.send("hello\n", 0)
+        end
+      end
+
+      assert_equal 1, d.logs.count { |l| l =~ /anonymous client/ }
+      assert_equal 0, d.events.size
+    end
+  end
+
+  sub_test_case '<extract>' do
+    test 'extract tag from record field' do
+      d = create_driver(base_config + %!
+        <parse>
+          @type json
+        </parse>
+        <extract>
+          tag_key tag
+        </extract>
+      !)
+      d.run(expect_records: 1) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          data = {'msg' => 'hello', 'tag' => 'helper_test'}
+          sock.send("#{data.to_json}\n", 0)
+        end
+      end
+
+      assert_equal 1, d.events.size
+      event = d.events[0]
+      assert_equal 'helper_test', event[0]
+      assert event[1].is_a?(Fluent::EventTime)
+      assert_equal 'hello', event[2]['msg']
+    end
+  end
+
+  sub_test_case "delimiter" do
+    data("batch_emit", { extract: "" }, keep: true)
+    data("single_emit", { extract: "<extract>\ntag_key tag\n</extract>\n" }, keep: true)
+    test "find the delimiter split across reads" do |data|
+      d = create_driver(base_config + %!
+        delimiter "\\r\\n"
+        <parse>
+          @type none
+        </parse>
+        #{data[:extract]}
+      !)
+      d.run(expect_records: 2, timeout: 10) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          sock.send("hello\r", 0)
+          sleep 1
+          sock.send("\nworld\r\n", 0)
+        end
+      end
+
+      assert_equal(["hello", "world"], d.events.collect { |event| event[2]["message"] })
+    end
+
+    test "split by a non-ASCII delimiter" do |data|
+      d = create_driver(base_config + %!
+        delimiter "§"
+        <parse>
+          @type none
+        </parse>
+        #{data[:extract]}
+      !)
+      d.run(expect_records: 2, timeout: 10) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          # Split the 2-byte delimiter across reads.
+          payload = "hello§world§".b
+          sock.send(payload[0, 6], 0)
+          sleep 1
+          sock.send(payload[6..], 0)
+        end
+      end
+
+      assert_equal(["hello", "world"], d.events.collect { |event| event[2]["message"] })
+    end
+
+    test "do not emit an empty event stream for a read without a complete message" do |data|
+      d = create_driver(base_config + %!
+        <parse>
+          @type none
+        </parse>
+        #{data[:extract]}
+      !)
+      d.run(expect_records: 1, timeout: 10) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          sock.send("hel", 0)
+          sleep 1
+          sock.send("lo\n", 0)
+        end
+      end
+
+      assert_equal(["hello"], d.events.collect { |event| event[2]["message"] })
+      assert_equal(1, d.emit_count)
+    end
+  end
+
+  sub_test_case "message_length_limit" do
+    data("batch_emit", { extract: "" }, keep: true)
+    data("single_emit", { extract: "<extract>\ntag_key tag\n</extract>\n" }, keep: true)
+    test "drop records exceeding limit" do |data|
+      message_length_limit = 10
+      d = create_driver(base_config + %!
+        message_length_limit #{message_length_limit}
+        <parse>
+          @type none
+        </parse>
+        #{data[:extract]}
+      !)
+      d.run(expect_records: 2, timeout: 10) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          sock.send("a" * message_length_limit + "\n", 0)
+          sock.send("b" * (message_length_limit + 1) + "\n", 0)
+          sock.send("c" * (message_length_limit - 1) + "\n", 0)
+        end
+      end
+
+      expected_records = [
+        "a" * message_length_limit,
+        "c" * (message_length_limit - 1)
+      ]
+      actual_records = d.events.collect do |event|
+        event[2]["message"]
+      end
+
+      assert_equal expected_records, actual_records
+    end
+
+    test "clear buffer and discard the subsequent data until the next delimiter" do |data|
+      message_length_limit = 12
+      d = create_driver(base_config + %!
+        message_length_limit #{message_length_limit}
+        delimiter ";"
+        <parse>
+          @type json
+        </parse>
+        #{data[:extract]}
+      !)
+      d.run(expect_records: 1, timeout: 10) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          sock.send('{"message":', 0)
+          sock.send('"hello', 0)
+          sleep 1 # To make the server read data and clear the buffer here.
+          sock.send('world!"};', 0) # This subsequent data must be discarded so that a parsing failure doesn't occur.
+          sock.send('{"k":"v"};', 0) # This will succeed to parse.
+        end
+      end
+
+      logs = d.logs.collect do |log|
+        log.gsub(/\A\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [-+]\d{4} /, "")
+      end
+      actual_records = d.events.collect do |event|
+        event[2]
+      end
+
+      assert_equal(
+        {
+          # Asserting that '[warn]: pattern not matched message="world!\"}"' warning does not occur.
+          logs: ['[info]: The buffer size exceeds \'message_length_limit\', cleared: limit=12 size=17' + "\n"],
+          records: [{"k" => "v"}],
+        },
+        {
+          logs: logs[1..],
+          records: actual_records,
+        }
+      )
+    end
+
+    test "log the clear only once for one long message" do |data|
+      message_length_limit = 12
+      d = create_driver(base_config + %!
+        message_length_limit #{message_length_limit}
+        delimiter ";"
+        <parse>
+          @type json
+        </parse>
+        #{data[:extract]}
+      !)
+      d.run(expect_records: 1, timeout: 10) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          sock.send("a" * (message_length_limit + 1), 0)
+          waiting(10) { sleep 0.1 until d.logs.any? { |log| log.include?("cleared:") } }
+          2.times do
+            sock.send("a" * (message_length_limit + 1), 0)
+            sleep 1 # To make the server read data and clear the buffer each time.
+          end
+          sock.send(';{"k":"v"};', 0)
+        end
+      end
+
+      logs = d.logs.collect do |log|
+        log.gsub(/\A\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [-+]\d{4} /, "")
+      end
+      actual_records = d.events.collect do |event|
+        event[2]
+      end
+
+      assert_equal(
+        {
+          logs: ['[info]: The buffer size exceeds \'message_length_limit\', cleared: limit=12 size=13' + "\n"],
+          records: [{"k" => "v"}],
+        },
+        {
+          logs: logs[1..],
+          records: actual_records,
+        }
+      )
+    end
+
+    test "keep the discard state for each connection" do |data|
+      message_length_limit = 12
+      d = create_driver(base_config + %!
+        message_length_limit #{message_length_limit}
+        delimiter ";"
+        <parse>
+          @type json
+        </parse>
+        #{data[:extract]}
+      !)
+      cleared = "[info]: The buffer size exceeds 'message_length_limit', cleared:"
+      d.run(expect_records: 2, timeout: 10) do
+        create_tcp_socket('127.0.0.1', @port) do |sock_a|
+          create_tcp_socket('127.0.0.1', @port) do |sock_b|
+            sock_a.send("a" * (message_length_limit + 1), 0)
+            waiting(10) { sleep 0.1 until d.logs.count { |log| log.include?(cleared) } >= 1 }
+            sock_b.send("b" * (message_length_limit + 1), 0)
+            waiting(10) { sleep 0.1 until d.logs.count { |log| log.include?(cleared) } >= 2 }
+            # A's long message is not finished, so B's next message must not be dropped.
+            sock_b.send(';{"k":"b"};', 0)
+            waiting(10) { sleep 0.1 until d.events.size >= 1 }
+            sock_a.send(';{"k":"a"};', 0)
+          end
+        end
+      end
+
+      assert_equal(
+        {
+          logs: 2,
+          records: [{"k" => "b"}, {"k" => "a"}],
+        },
+        {
+          logs: d.logs.count { |log| log.include?(cleared) },
+          records: d.events.collect { |event| event[2] },
+        }
+      )
+    end
+
+    test "do not cut a multi-byte delimiter when clearing the buffer" do |data|
+      message_length_limit = 12
+      d = create_driver(base_config + %!
+        message_length_limit #{message_length_limit}
+        delimiter "\\r\\n"
+        <parse>
+          @type json
+        </parse>
+        #{data[:extract]}
+      !)
+      cleared = "[info]: The buffer size exceeds 'message_length_limit', cleared:"
+      d.run(expect_records: 1, timeout: 20) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          3.times do |i|
+            sock.send((i.zero? ? "" : "\n") + "a" * (message_length_limit + 1) + "\r", 0)
+            waiting(10) { sleep 0.1 until d.logs.count { |log| log.include?(cleared) } >= i + 1 }
+          end
+          sock.send(%!\n{"k":"v"}\r\n!, 0)
+        end
+      end
+
+      assert_equal(
+        {
+          logs: 3,
+          records: [{"k" => "v"}],
+        },
+        {
+          logs: d.logs.count { |log| log.include?(cleared) },
+          records: d.events.collect { |event| event[2] },
+        }
+      )
+    end
+  end
+
+  sub_test_case "head of the data in logs" do
+    dropped = "The received data is larger than 'message_length_limit'"
+    cleared = "The buffer size exceeds 'message_length_limit'"
+    single_emit = "<extract>\ntag_key tag\n</extract>\n"
+    data(
+      "dropped (batch_emit)" => ["\xff" * 13 + ";", dropped, ""],
+      "dropped (single_emit)" => ["\xff" * 13 + ";", dropped, single_emit],
+      "cleared (batch_emit)" => ["\xff" * 13, cleared, ""],
+      "cleared (single_emit)" => ["\xff" * 13, cleared, single_emit],
+    )
+    test "log the head as an escaped string only at debug level" do |data|
+      payload, message, extract = data
+      d = create_driver(base_config + %!
+        @log_level debug
+        message_length_limit 12
+        delimiter ";"
+        <parse>
+          @type none
+        </parse>
+        #{extract}
+      !)
+      d.run(timeout: 10) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          sock.send(payload.b, 0)
+          waiting(10) { sleep 0.1 until d.logs.any? { |log| log.include?("[info]: #{message}") } }
+        end
+      end
+
+      head = ("\xff" * 13).b.dump
+      assert_equal(
+        {
+          debug: 1,
+          info_with_head: 0,
+        },
+        {
+          debug: d.logs.count { |log| log.include?("[debug]: #{message}: head=#{head.dump}") },
+          info_with_head: d.logs.count { |log| log.include?("[info]:") && log.include?("head=") },
+        }
+      )
+    end
+  end
+
+  sub_test_case "pattern not matched" do
+    data("batch_emit", { extract: "" }, keep: true)
+    data("single_emit", { extract: "<extract>\ntag_key tag\n</extract>\n" }, keep: true)
+    test "log the whole message when it is short" do |data|
+      d = create_driver(base_config + %!
+        <parse>
+          @type json
+        </parse>
+        #{data[:extract]}
+      !)
+      d.run(expect_records: 1, timeout: 10) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          sock.send("hello\n", 0)
+          sock.send('{"k":"v"}' + "\n", 0)
+        end
+      end
+
+      logs = d.logs.collect do |log|
+        log.gsub(/\A\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [-+]\d{4} /, "")
+      end
+      assert_equal(['[warn]: pattern not matched message="hello"' + "\n"], logs[1..])
+    end
+
+    test "log the whole message when its length is the limit" do |data|
+      max = Fluent::Plugin::TcpInput::MAX_LOGGED_MESSAGE_LENGTH
+      d = create_driver(base_config + %!
+        <parse>
+          @type json
+        </parse>
+        #{data[:extract]}
+      !)
+      d.run(expect_records: 1, timeout: 10) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          sock.send("a" * max + "\n", 0)
+          sock.send('{"k":"v"}' + "\n", 0)
+        end
+      end
+
+      logs = d.logs.collect do |log|
+        log.gsub(/\A\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [-+]\d{4} /, "")
+      end
+      assert_equal(["[warn]: pattern not matched message=\"#{"a" * max}\"\n"], logs[1..])
+    end
+
+    test "log only the head of the message when it is long" do |data|
+      max = Fluent::Plugin::TcpInput::MAX_LOGGED_MESSAGE_LENGTH
+      d = create_driver(base_config + %!
+        <parse>
+          @type json
+        </parse>
+        #{data[:extract]}
+      !)
+      d.run(expect_records: 1, timeout: 10) do
+        create_tcp_socket('127.0.0.1', @port) do |sock|
+          sock.send("a" * (max + 1) + "\n", 0)
+          sock.send('{"k":"v"}' + "\n", 0)
+        end
+      end
+
+      logs = d.logs.collect do |log|
+        log.gsub(/\A\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [-+]\d{4} /, "")
+      end
+      assert_equal(["[warn]: pattern not matched message=\"#{"a" * max}\" size=#{max + 1}\n"], logs[1..])
+    end
+  end
+end

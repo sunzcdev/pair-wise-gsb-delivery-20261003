@@ -1,0 +1,34 @@
+name: Test with Ruby head
+
+on:
+  schedule:
+    - cron: '11 14 * * 0'
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    continue-on-error: false
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ['ubuntu-latest', 'macos-latest', 'windows-latest', 'windows-11-arm']
+        ruby-version: ['head']
+    env:
+      RUBYOPT: "--disable-frozen_string_literal"
+    name: Ruby ${{ matrix.ruby-version }} on ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+        with:
+          ruby-version: ${{ matrix.ruby-version }}
+      - name: Install addons
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: sudo apt-get install libgmp3-dev libcap-ng-dev
+      - name: Install dependencies
+        run: bundle install
+      - name: Run tests
+        run: bundle exec rake test TESTOPTS="-v --report-slow-tests --no-show-detail-immediately"
