@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from fsspec import filesystem
 from fsspec.asyn import _run_coros_in_chunks
 from fsspec.callbacks import DEFAULT_CALLBACK
+from fsspec.caching import BlockManifest
 from fsspec.compression import compr
 from fsspec.core import BaseCache, MMapCache
 from fsspec.exceptions import BlocksizeMismatchError
@@ -216,6 +217,8 @@ class CachingFileSystem(ChainedFileSystem):
         # recalculated the next time cache_size() is called. On writes to the
         # cache this is reset to None.
         self._cache_size = None
+        # outcomes of verifying a "complete" cached file, keyed by file stamp
+        self._complete_confirmed = {}
 
         if same_names is not None and cache_mapper is not None:
             raise ValueError(
@@ -336,14 +339,19 @@ class CachingFileSystem(ChainedFileSystem):
 
         expired_files, writable_cache_empty = self._metadata.clear_expired(expiry_time)
         for fn in expired_files:
-            if os.path.exists(fn):
-                os.remove(fn)
+            self._remove_cached_file(fn)
 
         if writable_cache_empty:
             rmtree(self.storage[-1])
             self.load_cache()
 
         self._cache_size = None
+
+    def _remove_cached_file(self, fn):
+        """Remove a cached file together with the manifest that describes it"""
+        for name in (fn, fn + BlockManifest.suffix):
+            with suppress(FileNotFoundError):
+                os.remove(name)
 
     def pop_from_cache(self, path):
         """Remove cached version of given file
@@ -355,7 +363,7 @@ class CachingFileSystem(ChainedFileSystem):
         path = self._strip_protocol(path)
         fn = self._metadata.pop_file(path)
         if fn is not None:
-            os.remove(fn)
+            self._remove_cached_file(fn)
         self._cache_size = None
 
     def _open(
@@ -396,12 +404,16 @@ class CachingFileSystem(ChainedFileSystem):
             # file is in cache
             detail, fn = detail
             hash, blocks = detail["fn"], detail["blocks"]
-            if blocks is True:
-                # stored file is complete
+            if blocks is True and self._complete_file_confirmed(path, fn, detail):
+                # stored file is complete, and every block confirmed
                 logger.debug("Opening local copy of %s", path)
                 return open(fn, mode)
             # TODO: action where partial file exists in read-only cache
             logger.debug("Opening partially cached copy of %s", path)
+            if blocks is True:
+                # "complete" is not confirmed by the manifest, so the blocks
+                # must be checked again one by one
+                blocks = set()
         else:
             hash = self._mapper(path)
             fn = os.path.join(self.storage[-1], hash)
@@ -464,14 +476,98 @@ class CachingFileSystem(ChainedFileSystem):
                 **kwargs,
             )
 
+        # The metadata block set is a hint only. What may actually be reused
+        # after an interruption is decided by the on-disk manifest, which only
+        # records blocks whose bytes were written and checked (see MMapCache).
+        # Without compression the file size is known, so a manifest can be kept;
+        # note that a compressed cache stores different bytes from the source.
+        manifest = None
+        if not self.compression and f.size is not None:
+            manifest = BlockManifest.for_blockfile(
+                fn, f.size, f.blocksize, source=self._source_version(path, detail)
+            )
+            # A fresh set, not the one already in the metadata: `save` merges
+            # metadata entries, and a stale on-disk block list must not be
+            # merged back into the blocks that recovery just discarded.
+            blocks = set()
+
         multi_fetcher = None if self.compression else _fetch_ranges
         f.cache = MMapCache(
-            f.blocksize, f._fetch_range, f.size, fn, blocks, multi_fetcher=multi_fetcher
+            f.blocksize,
+            f._fetch_range,
+            f.size,
+            fn,
+            blocks,
+            multi_fetcher=multi_fetcher,
+            manifest=manifest,
         )
+        if manifest is not None:
+            # the manifest is authoritative: mirror the confirmed blocks into
+            # the metadata document so other processes see the same state
+            detail["blocks"] = f.cache.blocks
+            detail["manifest"] = True
+            self._metadata.update_file(path, detail)
         close = f.close
         f.close = lambda: self.close_and_update(f, close)
         self.save_cache()
         return f
+
+    def _complete_file_confirmed(self, path, fn, detail) -> bool:
+        """Whether a metadata "complete" entry is backed by the manifest
+
+        A complete entry without a manifest (e.g. written with a different
+        blocksize, or with compression) predates this bookkeeping and is
+        treated as trustworthy, exactly as before.
+        """
+        if self.compression or detail.get("blocksize") is None:
+            return True
+        size = detail.get("size")
+        if size is None:
+            return True
+        key = (fn, self._cache_stamp(fn))
+        if key in self._complete_confirmed:
+            return self._complete_confirmed[key]
+        manifest = BlockManifest.for_blockfile(
+            fn, size, detail["blocksize"], source=self._source_version(path, detail)
+        )
+        if manifest.covers(fn):
+            self._complete_confirmed[key] = True
+            return True
+        logger.info(
+            "Cached file %s is marked complete but its blocks are not all "
+            "confirmed; reading it back block by block",
+            fn,
+        )
+        self._complete_confirmed[key] = False
+        return False
+
+    def _cache_stamp(self, fn):
+        """Cheap fingerprint of a cached file and its manifest
+
+        The verification of a complete file reads all of it, so remember the
+        outcome until either file changes on disk.
+        """
+        try:
+            return (os.path.getmtime(fn), os.path.getsize(fn))
+        except OSError:
+            return None
+
+    def _source_version(self, path, detail):
+        """Identifier of the source version that confirmed blocks belong to
+
+        Blocks cached from a different version of the file must not be mixed
+        with newly fetched ones, so the manifest records this value. It is
+        only computed when ``check_files`` asks for version checking, since
+        the lookup costs a metadata request.
+        """
+        if not self.check_files:
+            return None
+        try:
+            return self.fs.ukey(path)
+        except Exception:
+            # an unreadable ukey means the version cannot be pinned: the
+            # manifest then only protects against an interrupted write
+            return None
 
     def _parent(self, path):
         return self.fs._parent(path)
@@ -535,6 +631,10 @@ class CachingFileSystem(ChainedFileSystem):
             "_check_cache",
             "_makedirs",
             "_mkcache",
+            "_source_version",
+            "_complete_file_confirmed",
+            "_cache_stamp",
+            "_remove_cached_file",
             "clear_cache",
             "clear_expired_cache",
             "pop_from_cache",

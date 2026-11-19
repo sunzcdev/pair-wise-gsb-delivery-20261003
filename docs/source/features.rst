@@ -302,6 +302,17 @@ With the "blockcache" variant, data is downloaded block-wise: only the specific 
 which are accessed. This means that the local copy of the file might end up being much smaller than the
 remote one, if only certain parts of it are required.
 
+A block-cache file is sparse, so its presence - and even its full length - does not mean that any
+particular block holds data. Next to each cached file, "blockcache" keeps a ``*.manifest`` document
+listing the blocks that have been written, flushed and read back to match a checksum of the fetched
+bytes. A block is added to the manifest only after that check, so an interrupted process never causes
+allocated-but-unwritten space to be treated as valid data. When the cache is reopened, only the blocks
+in the manifest are reused; any other block is fetched again, individually, when it is next read - the
+whole file is never downloaded to recover. A manifest that cannot be parsed is ignored (and the cache
+refetched on demand); one written for a different file size, block size or, when ``check_files=True``,
+a different source version, is discarded rather than mixed with new data. The last block may be shorter
+than the block size and is recorded as such.
+
 Whereas "filecache" works for all file system implementations, and provides a real local file for other
 libraries to use, "blockcache" has restrictions: that you have a storage/OS combination which supports
 sparse files, that the backend implementation uses files which derive ``from AbstractBufferedFile``,

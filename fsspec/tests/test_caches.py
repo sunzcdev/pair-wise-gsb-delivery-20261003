@@ -1,3 +1,4 @@
+import json
 import pickle
 import string
 
@@ -6,6 +7,7 @@ import pytest
 from fsspec.caching import (
     BackgroundBlockCache,
     BlockCache,
+    BlockManifest,
     BytesCache,
     FirstChunkCache,
     MMapCache,
@@ -465,6 +467,315 @@ def test_mmap_cache_retries_failed_ranges(use_multi_fetcher, failed_start, short
         calls.clear()
         assert cache._fetch(0, 11) == data[:11]
         assert calls == []
+    finally:
+        cache.cache.close()
+
+
+def _blockfile(tmp_path, payload):
+    path = tmp_path / "cached"
+    path.write_bytes(payload)
+    return str(path)
+
+
+def _fetch_recorder(data):
+    calls = []
+
+    def fetcher(start, end):
+        calls.append((start, end))
+        return data[start:end]
+
+    return fetcher, calls
+
+
+@pytest.mark.parametrize("blocksize", [1, 5, 100])
+def test_block_manifest_all_blocks_including_short_last(tmp_path, blocksize):
+    data = b"0123456789"
+    location = _blockfile(tmp_path, data)
+    fetcher, calls = _fetch_recorder(data)
+    manifest = BlockManifest.for_blockfile(location, len(data), blocksize, "v1")
+    cache = MMapCache(
+        blocksize, fetcher, len(data), location, set(), manifest=manifest
+    )
+    try:
+        assert cache._fetch(0, len(data) - 1) == data[:-1]
+        assert cache._fetch(len(data) - 1, len(data)) == data[-1:]
+        # every real block is confirmed, and nothing else is published
+        assert set(manifest.entries) == manifest.all_blocks()
+        assert manifest.all_blocks() <= cache.blocks
+        # the last block may be shorter than blocksize, and is still confirmed
+        last = max(manifest.all_blocks())
+        start, stop = manifest.block_slice(last)
+        assert stop - start <= blocksize
+        stored = manifest.entries[last]
+        assert stored["length"] == stop - start
+        assert manifest.covers(location)
+    finally:
+        cache.cache.close()
+
+
+def test_block_manifest_recovers_only_published_blocks(tmp_path):
+    data = bytes(range(20))
+    location = _blockfile(tmp_path, data)
+    fetcher, calls = _fetch_recorder(data)
+    manifest = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+    cache = MMapCache(5, fetcher, len(data), location, set(), manifest=manifest)
+    try:
+        assert cache._fetch(0, 7) == data[:7]
+        assert calls == [(0, 10)]
+        assert manifest.recover(location) == {0, 1}
+    finally:
+        cache.cache.close()
+
+    # A new process reuses the confirmed blocks and fetches only the rest;
+    # the whole file is never downloaded again.
+    fetcher2, calls2 = _fetch_recorder(data)
+    manifest2 = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+    cache2 = MMapCache(5, fetcher2, len(data), location, {0, 1}, manifest=manifest2)
+    try:
+        assert cache2.blocks == {0, 1}
+        assert cache2._fetch(0, 18) == data[:18]
+        assert calls2 == [(10, 20)]
+    finally:
+        cache2.cache.close()
+
+
+def test_block_manifest_in_memory_blocks_without_manifest_are_ignored(tmp_path):
+    # blocks handed in from the metadata, but never published, are not reused
+    data = bytes(range(10))
+    location = _blockfile(tmp_path, data)
+    manifest = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+    fetcher, calls = _fetch_recorder(data)
+    cache = MMapCache(5, fetcher, len(data), location, {0, 1}, manifest=manifest)
+    try:
+        assert cache.blocks == set()
+        assert cache._fetch(0, 9) == data[:9]
+        assert calls == [(0, 10)]
+    finally:
+        cache.cache.close()
+
+
+def test_block_manifest_allocated_space_is_not_a_hit(tmp_path):
+    # A sparse file carries its full length as soon as one byte is written, so
+    # existence (or size) says nothing about the blocks' contents.
+    data = b"0123456789"
+    location = tmp_path / "cached"
+    with open(location, "wb") as f:
+        f.seek(len(data) - 1)
+        f.write(b"1")
+    fetcher, calls = _fetch_recorder(data)
+    manifest = BlockManifest.for_blockfile(str(location), len(data), 5, "v1")
+    cache = MMapCache(5, fetcher, len(data), str(location), set(), manifest=manifest)
+    try:
+        assert cache.blocks == set()
+        assert cache._fetch(0, len(data)) == data
+        assert calls == [(0, 10)]
+    finally:
+        cache.cache.close()
+
+
+def test_block_manifest_corrupt_document(tmp_path):
+    data = b"0123456789"
+    location = _blockfile(tmp_path, data)
+    manifest = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+    with open(manifest.path, "w") as f:
+        f.write("{not json")
+    fetcher, calls = _fetch_recorder(data)
+    cache = MMapCache(5, fetcher, len(data), location, set(), manifest=manifest)
+    try:
+        assert cache.blocks == set()
+        assert cache._fetch(0, len(data)) == data
+        assert calls == [(0, 10)]
+        # the unusable document was replaced by a valid one
+        assert manifest.covers(location)
+    finally:
+        cache.cache.close()
+
+
+def test_block_manifest_rejects_bad_entries(tmp_path):
+    data = b"0123456789"
+    location = _blockfile(tmp_path, data)
+    manifest = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+    with open(manifest.path, "w") as f:
+        json.dump(
+            {
+                "version": BlockManifest.schema,
+                "size": len(data),
+                "blocksize": 5,
+                "source": "v1",
+                "blocks": {"0": {"offset": 0, "length": 5}},
+            },
+            f,
+        )
+    fetcher, calls = _fetch_recorder(data)
+    cache = MMapCache(5, fetcher, len(data), location, set(), manifest=manifest)
+    try:
+        # an entry without a checksum makes the whole document unusable
+        assert cache.blocks == set()
+        assert not cache._trusted
+    finally:
+        cache.cache.close()
+
+
+def test_block_manifest_detects_altered_bytes(tmp_path):
+    data = b"0123456789"
+    location = _blockfile(tmp_path, data)
+    fetcher, calls = _fetch_recorder(data)
+    manifest = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+    cache = MMapCache(5, fetcher, len(data), location, set(), manifest=manifest)
+    try:
+        assert cache._fetch(0, len(data)) == data
+    finally:
+        cache.cache.close()
+
+    # bytes on disk changed behind our back: the block is no longer confirmed
+    with open(location, "r+b") as f:
+        f.seek(5)
+        f.write(b"XXXXX")
+    fetcher2, calls2 = _fetch_recorder(data)
+    manifest2 = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+    cache2 = MMapCache(5, fetcher2, len(data), location, set(), manifest=manifest2)
+    try:
+        # both blocks are structurally confirmed, but block 1 fails its check
+        # when it is first handed out, and is fetched again
+        assert cache2.blocks == {0, 1}
+        assert cache2._fetch(0, len(data)) == data
+        assert calls2 == [(5, 10)]
+        assert cache2.blocks == {0, 1}
+        assert 1 in manifest2.entries  # refetched and published again
+    finally:
+        cache2.cache.close()
+
+
+def test_block_manifest_source_mismatch_discards_blocks(tmp_path):
+    data = b"0123456789"
+    new_data = b"abcdefghij"
+    location = _blockfile(tmp_path, data)
+    fetcher, calls = _fetch_recorder(data)
+    manifest = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+    cache = MMapCache(5, fetcher, len(data), location, set(), manifest=manifest)
+    try:
+        assert cache._fetch(0, len(data)) == data
+    finally:
+        cache.cache.close()
+
+    with open(location, "wb") as f:
+        f.write(new_data)
+    fetcher2, calls2 = _fetch_recorder(new_data)
+    manifest2 = BlockManifest.for_blockfile(location, len(new_data), 5, "v2")
+    cache2 = MMapCache(5, fetcher2, len(new_data), location, {0, 1}, manifest=manifest2)
+    try:
+        assert cache2.blocks == set()
+        assert manifest2.status == "stale"
+        assert cache2._fetch(0, len(new_data)) == new_data
+        assert calls2 == [(0, 10)]
+    finally:
+        cache2.cache.close()
+
+
+def test_block_manifest_partial_file_is_discarded(tmp_path):
+    data = b"0123456789"
+    location = _blockfile(tmp_path, data)
+    fetcher, calls = _fetch_recorder(data)
+    manifest = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+    cache = MMapCache(5, fetcher, len(data), location, set(), manifest=manifest)
+    try:
+        assert cache._fetch(0, len(data)) == data
+    finally:
+        cache.cache.close()
+
+    # an interrupted allocation leaves fewer bytes than the source length
+    with open(location, "r+b") as f:
+        f.truncate(5)
+    manifest2 = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+    assert not manifest2.covers(location)
+    fetcher2, calls2 = _fetch_recorder(data)
+    cache2 = MMapCache(5, fetcher2, len(data), location, set(), manifest=manifest2)
+    try:
+        assert cache2.blocks == set()
+        assert cache2._fetch(0, len(data)) == data
+        assert calls2 == [(0, 10)]
+    finally:
+        cache2.cache.close()
+
+
+def test_block_manifest_unwritten_block_failure_is_not_published(tmp_path):
+    # a block that does not round-trip must not be recorded as cached
+    data = b"0123456789"
+    location = _blockfile(tmp_path, data)
+    manifest = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+
+    def fetcher(start, end):
+        return b"" if start == 5 else data[start:end]
+
+    cache = MMapCache(5, fetcher, len(data), location, set(), manifest=manifest)
+    try:
+        with pytest.raises(IndexError):
+            cache._fetch(5, 10)
+        assert 1 not in manifest.entries
+        assert 1 not in cache.blocks
+    finally:
+        cache.cache.close()
+
+
+def test_block_manifest_shared_between_instances(tmp_path):
+    data = b"0123456789"
+    location = _blockfile(tmp_path, data)
+    # two caches over the same file, each confirming a different block
+    m1 = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+    f1, calls1 = _fetch_recorder(data)
+    c1 = MMapCache(5, f1, len(data), location, set(), manifest=m1)
+    m2 = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+    f2, calls2 = _fetch_recorder(data)
+    c2 = MMapCache(5, f2, len(data), location, set(), manifest=m2)
+    try:
+        assert c1._fetch(0, 5) == data[:5]
+        assert c2._fetch(5, 10) == data[5:10]
+        # the second publish kept the first process's block
+        merged = BlockManifest.for_blockfile(location, len(data), 5, "v1")
+        assert merged.recover(location) == {0, 1}
+    finally:
+        c1.cache.close()
+        c2.cache.close()
+
+
+def test_block_manifest_requires_matching_layout(tmp_path):
+    location = _blockfile(tmp_path, b"0123456789")
+    manifest = BlockManifest.for_blockfile(location, 10, 5)
+    with pytest.raises(ValueError, match="does not describe this cache"):
+        MMapCache(4, letters_fetcher, 10, location, set(), manifest=manifest)
+
+
+def test_block_manifest_survives_pickling(tmp_path):
+    location = _blockfile(tmp_path, string.ascii_letters[:10].encode())
+    manifest = BlockManifest.for_blockfile(location, 10, 5, "v1")
+    cache = MMapCache(
+        5, letters_fetcher, 10, location, set(), manifest=manifest
+    )
+    try:
+        assert cache._fetch(0, 5) == b"abcde"
+        payload = pickle.dumps(cache)
+    finally:
+        cache.cache.close()
+    restored = pickle.loads(payload)
+    try:
+        assert restored._fetch(0, 10) == b"abcdefghij"
+        assert restored.blocks == {0, 1}
+    finally:
+        restored.cache.close()
+
+
+def test_mmap_cache_without_manifest_is_unchanged(tmp_path):
+    # no manifest: blocks are tracked in memory only, as they always were
+    location = _blockfile(tmp_path, b"0123456789")
+    fetcher, calls = _fetch_recorder(b"0123456789")
+    cache = MMapCache(5, fetcher, 10, location, {0})
+    try:
+        assert cache.manifest is None
+        assert cache._fetch(0, 10) == b"0123456789"
+        # blocks 0 and 1 cover the whole file; no empty trailing block is
+        # recorded or requested
+        assert cache.blocks == {0, 1}
+        assert calls == [(5, 10)]
     finally:
         cache.cache.close()
 

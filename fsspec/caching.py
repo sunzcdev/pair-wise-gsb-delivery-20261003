@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import functools
+import json
 import logging
 import math
 import os
+import tempfile
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from hashlib import sha256
 from itertools import groupby
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, NamedTuple, TypeVar
@@ -95,6 +99,313 @@ class BaseCache:
         """
 
 
+class BlockManifest:
+    """Durable record of which blocks of a block-cache file are confirmed.
+
+    A block-cache file is sparse: its size is allocated up front, so the mere
+    existence of a file (or of a region within it) says nothing about whether
+    the bytes were ever written. This manifest is the only source of truth for
+    which blocks may be reused after a process was interrupted.
+
+    A block is published only after its bytes have been written to the
+    backing file, flushed to disk, and read back to match the checksum taken
+    from the fetched data. Recovery therefore reuses only those blocks, and
+    never downloads the whole file again: any block missing from the manifest
+    is fetched individually by the caller when it is next needed.
+
+    The manifest document records the layout (``size`` and ``blocksize``) and
+    the source version (``source``, normally the filesystem's ``ukey``), so a
+    file that has since changed, or a cache written with different parameters,
+    is detected instead of silently mixing blocks from different versions.
+
+    Parameters
+    ----------
+    path: str
+        Location of the manifest document itself (next to the cached file).
+    size: int
+        Length of the cached file.
+    blocksize: int
+        Block size used for the cached file.
+    source: str or None
+        Identifier of the source version the blocks belong to.
+    """
+
+    suffix = ".manifest"
+    schema = 1
+
+    def __init__(self, path: str, size: int, blocksize: int, source: str | None = None):
+        self.path = path
+        self.size = size
+        self.blocksize = blocksize
+        self.source = source
+        #: "ok", "missing" (no document), "corrupt", "stale" (another source
+        #: version or layout) or "partial" (backing file not fully allocated)
+        self.status = "missing"
+        self.entries: dict[int, dict[str, Any]] = {}
+        self._layout: dict[str, Any] | None = None
+
+    @classmethod
+    def for_blockfile(
+        cls, blockfile: str, size: int, blocksize: int, source: str | None = None
+    ) -> BlockManifest:
+        """Manifest belonging to the block-cache file ``blockfile``"""
+        return cls(os.fspath(blockfile) + cls.suffix, size, blocksize, source)
+
+    def _stored_layout(self) -> dict[str, Any]:
+        return {
+            "size": self.size,
+            "blocksize": self.blocksize,
+            "source": self.source,
+        }
+
+    def block_slice(self, block: int) -> tuple[int, int]:
+        """Start and stop offsets of ``block``; the last one may be short"""
+        start = block * self.blocksize
+        return start, min(start + self.blocksize, self.size)
+
+    def all_blocks(self) -> set[int]:
+        """Indices of every block a complete file consists of"""
+        if not self.blocksize or not self.size or self.size < 0:
+            return set()
+        return set(range((self.size + self.blocksize - 1) // self.blocksize))
+
+    def read(self) -> None:
+        """Load and structurally validate the manifest document"""
+        self.entries = {}
+        self._layout = None
+        try:
+            with open(self.path) as f:
+                document = json.load(f)
+        except FileNotFoundError:
+            self.status = "missing"
+            return
+        except (OSError, ValueError) as e:
+            self.status = "corrupt"
+            logger.warning("Ignoring unreadable block manifest %s: %s", self.path, e)
+            return
+        if (
+            not isinstance(document, dict)
+            or document.get("version") != self.schema
+            or not isinstance(document.get("size"), int)
+            or not isinstance(document.get("blocksize"), int)
+            or not isinstance(document.get("blocks"), dict)
+        ):
+            self.status = "corrupt"
+            logger.warning("Ignoring malformed block manifest %s", self.path)
+            return
+        blocks: dict[int, dict[str, Any]] = {}
+        for key, entry in document["blocks"].items():
+            try:
+                block = int(key)
+            except (TypeError, ValueError):
+                self.status = "corrupt"
+                logger.warning("Ignoring malformed block manifest %s", self.path)
+                return
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("offset"), int)
+                or not isinstance(entry.get("length"), int)
+                or not isinstance(entry.get("sha256"), str)
+            ):
+                self.status = "corrupt"
+                logger.warning("Ignoring malformed block manifest %s", self.path)
+                return
+            blocks[block] = entry
+        self.status = "ok"
+        self.entries = blocks
+        self._layout = {
+            "size": document["size"],
+            "blocksize": document["blocksize"],
+            "source": document.get("source"),
+        }
+
+    def recover(self, location: str) -> set[int]:
+        """Blocks that may be trusted for the current layout and source version
+
+        The manifest is read and checked against the backing file. A document
+        that cannot be parsed, that belongs to another source version or
+        layout, or whose backing file is not the expected length leaves no
+        confirmed blocks behind; the caller refetches on demand.
+
+        ``status`` reports what was found: ``"missing"``, ``"corrupt"``,
+        ``"stale"`` (another source version or layout) or ``"partial"`` (the
+        backing file is not the expected length).
+
+        Only the structure is checked here, in time proportional to the number
+        of entries. The block bytes are checked by :meth:`verify` before any
+        confirmed block is handed out, so that cost is paid per block read, not
+        on every open.
+        """
+        self.read()
+        if self.status == "corrupt":
+            self.forget()
+            return set()
+        if self.status != "ok":
+            return set()
+        if self._layout != self._stored_layout():
+            logger.info(
+                "Block manifest %s belongs to another source version or layout; "
+                "previously cached blocks will be refetched",
+                self.path,
+            )
+            self.forget()
+            self.status = "stale"
+            return set()
+        try:
+            on_disk = os.path.getsize(location)
+        except OSError:
+            self.forget()
+            self.status = "missing"
+            self.entries = {}
+            return set()
+        if on_disk != self.size:
+            # allocated but not the expected length: nothing can be trusted
+            logger.warning(
+                "Cached file %s is incomplete (%s of %s bytes); cached blocks "
+                "will be refetched",
+                location,
+                on_disk,
+                self.size,
+            )
+            self.forget()
+            self.status = "partial"
+            return set()
+        confirmed = {}
+        for block, entry in self.entries.items():
+            start, stop = self.block_slice(block)
+            if entry["offset"] == start and entry["length"] == stop - start:
+                confirmed[block] = entry
+        self.entries = confirmed
+        return set(confirmed)
+
+    def verify(self, block: int, payload: bytes) -> bool:
+        """Whether ``payload`` is the block content that was published
+
+        A mismatch means the backing file no longer holds what was recorded,
+        e.g. because it was truncated, overwritten or only partially written.
+        The entry is then dropped, so the block is fetched again.
+        """
+        entry = self.entries.get(block)
+        if entry is None:
+            return False
+        expected = self.block_slice(block)
+        if entry["offset"] != expected[0] or entry["length"] != len(payload):
+            self.discard(block)
+            return False
+        if sha256(payload).hexdigest() != entry["sha256"]:
+            logger.warning(
+                "Cached block %s of %s does not match its recorded checksum; "
+                "refetching it",
+                block,
+                self.path,
+            )
+            self.discard(block)
+            return False
+        return True
+
+    def covers(self, location: str) -> bool:
+        """Whether every block of the file is confirmed and matches its bytes
+
+        Used before handing out a cached file as complete, a decision made once
+        per open, so reading the whole file here is acceptable: a "complete"
+        entry that is not backed by confirmed, unmodified blocks must not be
+        served directly.
+        """
+        confirmed = self.recover(location)
+        if self.status != "ok" or not self.all_blocks() <= confirmed:
+            return False
+        try:
+            with open(location, "rb") as f:
+                for block in sorted(confirmed):
+                    start, stop = self.block_slice(block)
+                    f.seek(start)
+                    if not self.verify(block, f.read(stop - start)):
+                        return False
+        except OSError:
+            return False
+        return True
+
+    def publish(self, entries: dict[int, dict[str, Any]]) -> None:
+        """Atomically record freshly verified blocks
+
+        The caller is responsible for having flushed the block bytes to the
+        backing file first: an entry is only written after its content is
+        known to be durable, so a crash can never leave a manifest claiming
+        data that was never written.
+
+        Entries confirmed by another process since this one last read the
+        document are preserved, so two processes filling different blocks of
+        the same file do not erase each other's work.
+        """
+        if not entries:
+            return
+        self._merge_disk_entries()
+        self.entries.update(entries)
+        self.write()
+
+    def _merge_disk_entries(self) -> None:
+        """Pick up blocks another process published for the same version"""
+        current = BlockManifest(self.path, self.size, self.blocksize, self.source)
+        current.read()
+        if current.status != "ok" or current._layout != self._stored_layout():
+            return
+        for block, entry in current.entries.items():
+            start, stop = self.block_slice(block)
+            if entry["offset"] == start and entry["length"] == stop - start:
+                self.entries.setdefault(block, entry)
+
+    def discard(self, block: int) -> None:
+        """Forget a confirmed block, e.g. after its bytes failed a check"""
+        if self.entries.pop(block, None) is not None and self.status == "ok":
+            # best effort: a read-only cache location cannot be repaired here,
+            # and the block is still dropped from this process's view
+            with contextlib.suppress(OSError):
+                self.write()
+
+    def forget(self) -> None:
+        """Drop all entries and remove the manifest document"""
+        self.entries = {}
+        self._layout = None
+        self.status = "missing"
+        try:
+            os.remove(self.path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            # The document could not be removed. Its entries must not be used
+            # again, but it would still be read by another process, so make it
+            # explicitly empty when possible.
+            logger.warning("Could not remove block manifest %s: %s", self.path, e)
+            with contextlib.suppress(OSError):
+                self.write()
+
+    def write(self) -> None:
+        """Write the manifest atomically, syncing its contents first"""
+        document = {
+            "version": self.schema,
+            "size": self.size,
+            "blocksize": self.blocksize,
+            "source": self.source,
+            "blocks": {str(k): self.entries[k] for k in sorted(self.entries)},
+        }
+        directory = os.path.dirname(self.path) or "."
+        fd, tmp = tempfile.mkstemp(
+            dir=directory, prefix=os.path.basename(self.path) + "-"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(document, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
+        self._layout = self._stored_layout()
+        self.status = "ok"
+
+
 class MMapCache(BaseCache):
     """memory-mapped sparse file cache
 
@@ -122,6 +433,12 @@ class MMapCache(BaseCache):
         Function of the form f([(start, end)]) which gets bytes from remote
         as specified. This function is used to fetch multiple blocks at once.
         If not specified, the fetcher function is used instead.
+    manifest: BlockManifest
+        Durable record of the blocks whose contents are confirmed. When given,
+        it is the only authority on which blocks may be reused: recovery keeps
+        only the confirmed blocks, and a block is added to ``blocks`` only
+        after its bytes have been written, flushed, read back and checked. If
+        None (the default), blocks are tracked in memory only, as before.
     """
 
     name = "mmap"
@@ -134,12 +451,27 @@ class MMapCache(BaseCache):
         location: str | None = None,
         blocks: set[int] | None = None,
         multi_fetcher: MultiFetcher | None = None,
+        manifest: BlockManifest | None = None,
     ) -> None:
         super().__init__(blocksize, fetcher, size)
         self.blocks = set() if blocks is None else blocks
         self.location = location
         self.multi_fetcher = multi_fetcher
+        self.manifest = manifest if location is not None else None
+        if self.manifest is not None and (
+            self.manifest.size != size or self.manifest.blocksize != blocksize
+        ):
+            raise ValueError(
+                "Block manifest does not describe this cache: "
+                f"manifest size/blocksize {self.manifest.size}/"
+                f"{self.manifest.blocksize}, cache {size}/{blocksize}"
+            )
+        self._fresh_file = False
+        # blocks whose bytes this process has seen verified: either written and
+        # checked just now, or checked against the manifest on first reuse
+        self._trusted: set[int] = set()
         self.cache = self._makefile()
+        self._recover_blocks()
 
     def _makefile(self) -> mmap.mmap | bytearray:
         import mmap
@@ -149,8 +481,17 @@ class MMapCache(BaseCache):
             return bytearray()
 
         # posix version
-        if self.location is None or not os.path.exists(self.location):
+        reuse = False
+        if self.location is not None and os.path.exists(self.location):
+            try:
+                reuse = os.path.getsize(self.location) == self.size
+            except OSError:
+                reuse = False
+        if not reuse:
+            # A new, or wrongly sized, file: nothing in it can be trusted, and
+            # neither can a manifest that describes a different file.
             self.blocks.clear()
+            self._fresh_file = True
             if self.location is None:
                 fd = tempfile.TemporaryFile()
             else:
@@ -163,6 +504,104 @@ class MMapCache(BaseCache):
 
         return mmap.mmap(fd.fileno(), self.size)
 
+    def _recover_blocks(self) -> None:
+        """Replace ``blocks`` with the blocks confirmed by the manifest"""
+        if self.manifest is None:
+            return
+        if self._fresh_file:
+            # any manifest belongs to the file that was just replaced
+            self.manifest.forget()
+            self.blocks.clear()
+            return
+        confirmed = self.manifest.recover(self.location)
+        # Reuse exactly the confirmed blocks: anything else was allocated by a
+        # previous run but was never proven to hold the source bytes.
+        self.blocks.clear()
+        self.blocks.update(confirmed)
+
+    def _confirm(
+        self, sstart: int, send: int, payload: bytes, blocks: tuple
+    ) -> dict[int, dict[str, Any]]:
+        """Check freshly written bytes and describe them for the manifest"""
+        if hasattr(self.cache, "flush"):
+            self.cache.flush()
+        with open(self.location, "r+b") as f:
+            # make the block bytes durable before they can be published
+            os.fsync(f.fileno())
+            f.seek(sstart)
+            on_disk = f.read(send - sstart)
+        if on_disk != payload:
+            raise OSError(
+                f"Block cache write to {self.location} ({sstart}-{send}) did "
+                "not round-trip; the block will not be recorded as cached"
+            )
+        entries = {}
+        for block in blocks:
+            bstart, bstop = self.manifest.block_slice(block)
+            length = bstop - bstart
+            if length <= 0:
+                # a block that lies wholly past the end holds no data
+                continue
+            chunk = payload[bstart - sstart : bstop - sstart]
+            if len(chunk) != length:
+                raise OSError(
+                    f"Block {block} of {self.location} is short: expected "
+                    f"{length} bytes, got {len(chunk)}"
+                )
+            entries[block] = {
+                "offset": bstart,
+                "length": length,
+                "sha256": sha256(chunk).hexdigest(),
+            }
+        return entries
+
+    def _store(self, sstart: int, send: int, payload: bytes, blocks: tuple) -> None:
+        self.cache[sstart:send] = payload
+        if self.manifest is not None:
+            try:
+                entries = self._confirm(sstart, send, payload, blocks)
+            except OSError as e:
+                # the data is usable, but cannot be recorded for recovery; keep
+                # serving it and stop trying to persist this run
+                logger.warning("Could not record cached blocks: %s", e)
+                self.manifest = None
+            else:
+                if entries:
+                    self.manifest.publish(entries)
+                # only confirmed blocks may count as cached, so that a later
+                # recovery reuses exactly what was written and checked
+                self.blocks.update(entries)
+                self._trusted.update(entries)
+                # a block that begins at or past the end holds no data: record
+                # it in memory only, so an empty range is not requested again
+                self.blocks.update(blocks)
+                return
+        self.blocks.update(blocks)
+        self._trusted.update(blocks)
+
+    def _check_reused(self, block_range) -> None:
+        """Drop reused blocks that no longer match their recorded checksum
+
+        A block recovered from the manifest was written by an earlier process;
+        its bytes are checked the first time this process reads it, so a file
+        damaged since then (truncated, overwritten, half-written) is refetched
+        rather than returned as valid data.
+        """
+        if self.manifest is None:
+            return
+        for block in block_range:
+            if block not in self.blocks or block in self._trusted:
+                continue
+            start, stop = self.manifest.block_slice(block)
+            if stop <= start:
+                self._trusted.add(block)
+                continue
+            payload = bytes(self.cache[start:stop])
+            if self.manifest.verify(block, payload):
+                self._trusted.add(block)
+            else:
+                self.blocks.discard(block)
+
     def _fetch(self, start: int | None, end: int | None) -> bytes:
         logger.debug(f"MMap cache fetching {start}-{end}")
         if start is None:
@@ -173,7 +612,13 @@ class MMapCache(BaseCache):
             return b""
         start_block = start // self.blocksize
         end_block = end // self.blocksize
-        block_range = range(start_block, end_block + 1)
+        # a read that ends exactly on a block boundary must not ask for the
+        # block after it: that block is wholly past the data it covers
+        last_block = (self.size - 1) // self.blocksize
+        block_range = range(start_block, min(end_block, last_block) + 1)
+        # A reused block is only data once its bytes have been checked against
+        # the manifest; a block that fails is treated as missing below.
+        self._check_reused(block_range)
         # Determine which blocks need to be fetched. This sequence is sorted by construction.
         need = (i for i in block_range if i not in self.blocks)
         # Count the number of blocks already cached
@@ -216,13 +661,11 @@ class MMapCache(BaseCache):
             for idx, r in enumerate(self.multi_fetcher(ranges)):
                 sstart, send = ranges[idx]
                 logger.debug(f"MMap copy block ({sstart}-{send}")
-                self.cache[sstart:send] = r
-                self.blocks.update(block_groups[idx])
+                self._store(sstart, send, r, block_groups[idx])
         else:
             for idx, (sstart, send) in enumerate(ranges):
                 logger.debug(f"MMap get block ({sstart}-{send}")
-                self.cache[sstart:send] = self.fetcher(sstart, send)
-                self.blocks.update(block_groups[idx])
+                self._store(sstart, send, self.fetcher(sstart, send), block_groups[idx])
 
         return self.cache[start:end]
 
@@ -240,6 +683,7 @@ class MMapCache(BaseCache):
         # Restore instance attributes
         self.__dict__.update(state)
         self.cache = self._makefile()
+        self._recover_blocks()
 
 
 class ReadAheadCache(BaseCache):

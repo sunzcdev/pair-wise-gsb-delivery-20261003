@@ -9,6 +9,11 @@ Enhancements
 - List TAR archive descendants from the existing directory cache without
   rescanning the full archive for each directory.
 
+- Persist a verified block manifest for ``blockcache`` entries: a block is only
+  reused after its bytes were written, flushed and checked, so space allocated
+  by an interrupted process is never treated as valid data, and recovery
+  refetches only the unconfirmed blocks rather than the whole file.
+
 - Avoid traversing excluded deep ancestors in shallow memory filesystem searches.
 
 - Accept a ``callback=`` on the caching filesystems and pass it to the ``get``
@@ -18,6 +23,9 @@ Enhancements
 Fixes
 
 - Avoid empty backend range requests at EOF with the first-chunk cache.
+
+- Do not record an empty block past the end of a memory-mapped cache file, or
+  request its (zero-length) range from the backend.
 
 - Forward per-call reference ``cat_file`` options to the target filesystem.
 

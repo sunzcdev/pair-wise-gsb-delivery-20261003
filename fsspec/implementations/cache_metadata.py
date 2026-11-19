@@ -189,6 +189,15 @@ class CacheMetadata:
                 cached_files = self._load(fn)
                 for k, c in cached_files.items():
                     if k in cache:
+                        if c.get("manifest") or cache[k].get("manifest"):
+                            # The block manifest owns this entry's block list.
+                            # Merging the document's list back in could
+                            # resurrect blocks that recovery rejected for the
+                            # current source version, so the in-memory state
+                            # is written as it stands.
+                            c.clear()
+                            c.update(cache[k])
+                            continue
                         if c["blocks"] is True or cache[k]["blocks"] is True:
                             c["blocks"] = True
                         else:

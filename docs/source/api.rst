@@ -333,6 +333,9 @@ Read Buffering
 .. autoclass:: fsspec.caching.BackgroundBlockCache
    :members:
 
+.. autoclass:: fsspec.caching.BlockManifest
+   :members: recover, verify, covers, publish, discard
+
 Utilities
 ---------
 

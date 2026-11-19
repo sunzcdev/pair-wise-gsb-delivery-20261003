@@ -2159,3 +2159,324 @@ def test_callback_reports_download_async(tmp_path, protocol):
         assert callback.sizes == []
 
     asyncio.run(run())
+
+
+class _RangedSource(fsspec.AbstractFileSystem):
+    """A block-readable source that records every range it is asked for"""
+
+    protocol = "ranged"
+    root_marker = "/"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.store = {}
+        self.version = "v1"
+        self.fail_ranges = set()
+        self.ranges = []
+        self.cat_ranges_calls = []
+
+    def _open(self, path, mode="rb", block_size=None, **kwargs):
+        return self._File(self, path, mode=mode, block_size=5)
+
+    class _File(fsspec.spec.AbstractBufferedFile):
+        def _fetch_range(self, start, end):
+            return self.fs._read(self.path, start, end)
+
+        def __init__(self, fs, path, mode="rb", block_size=5):
+            super().__init__(fs, path, mode=mode, block_size=block_size)
+
+    def _read(self, path, start, end):
+        self.ranges.append((start, end))
+        if start in self.fail_ranges:
+            raise OSError(f"injected failure for {start}-{end}")
+        return self.store[path][start:end]
+
+    def info(self, path, **kwargs):
+        return {
+            "name": path,
+            "size": len(self.store[path]),
+            "type": "file",
+            "mtime": 1.0,
+        }
+
+    def ukey(self, path):
+        return self.version
+
+    def cat_file(self, path, start=None, end=None, **kwargs):
+        return self.store[path][start:end]
+
+    def cat_ranges(self, paths, starts, ends, max_gap=None, on_error="return", **kw):
+        self.cat_ranges_calls.append(list(zip(starts, ends)))
+        return [self._read(p, s, e) for p, s, e in zip(paths, starts, ends)]
+
+    def exists(self, path, **kwargs):
+        return path in self.store
+
+    @classmethod
+    def _parent(cls, path):
+        return "/"
+
+
+@pytest.fixture
+def ranged_source():
+    return _RangedSource(skip_instance_cache=True)
+
+
+def _blockcache(tmp_path, source, **kwargs):
+    return fsspec.filesystem(
+        "blockcache",
+        fs=source,
+        cache_storage=str(tmp_path),
+        skip_instance_cache=True,
+        **kwargs,
+    )
+
+
+def test_blockcache_manifest_recovery_only_refetches_unconfirmed(
+    tmp_path, ranged_source
+):
+    data = bytes(range(20))
+    ranged_source.store["/big"] = data
+    fs = _blockcache(tmp_path, ranged_source)
+    with fs.open("/big", block_size=5) as f:
+        assert f.read(7) == data[:7]
+    assert ranged_source.ranges == [(0, 10)]
+    assert any(name.endswith(".manifest") for name in os.listdir(tmp_path))
+
+    # A fresh instance over the same cache storage: blocks 0 and 1 are reused,
+    # and the remaining blocks are requested individually, not the whole file.
+    ranged_source.ranges.clear()
+    fs2 = _blockcache(tmp_path, ranged_source)
+    with fs2.open("/big", block_size=5) as f:
+        assert f.read() == data
+    assert ranged_source.ranges == [(10, 20)]
+
+
+def test_blockcache_manifest_published_after_read(tmp_path, ranged_source):
+    # each block is recorded as soon as it has been written and verified, even
+    # while the file is still open
+    data = bytes(range(20))
+    ranged_source.store["/big"] = data
+    fs = _blockcache(tmp_path, ranged_source)
+    with fs.open("/big", block_size=5) as f:
+        assert f.read(3) == data[:3]
+        manifests = [n for n in os.listdir(tmp_path) if n.endswith(".manifest")]
+        assert len(manifests) == 1
+        with open(tmp_path / manifests[0]) as mf:
+            assert list(json.load(mf)["blocks"]) == ["0"]
+
+
+def test_blockcache_interrupted_write_is_not_complete(tmp_path, ranged_source):
+    # The sparse cache file exists (and is fully allocated) after a single
+    # block, but only that block may be treated as valid data.
+    data = bytes(range(20))
+    ranged_source.store["/big"] = data
+    fs = _blockcache(tmp_path, ranged_source)
+    with fs.open("/big", block_size=5) as f:
+        assert f.read(3) == data[:3]
+    cached = [n for n in os.listdir(tmp_path) if n != "cache" and "." not in n]
+    fn = tmp_path / cached[0]
+    assert fn.stat().st_size == len(data)  # allocated, but mostly unwritten
+
+    ranged_source.ranges.clear()
+    fs2 = _blockcache(tmp_path, ranged_source)
+    with fs2.open("/big", block_size=5) as f:
+        assert f.read() == data
+    assert ranged_source.ranges == [(5, 20)]
+
+
+def test_blockcache_corrupt_manifest_falls_back_to_refetch(
+    tmp_path, ranged_source
+):
+    data = bytes(range(20))
+    ranged_source.store["/big"] = data
+    fs = _blockcache(tmp_path, ranged_source)
+    with fs.open("/big", block_size=5) as f:
+        assert f.read(10) == data[:10]
+
+    manifest = next(n for n in os.listdir(tmp_path) if n.endswith(".manifest"))
+    with open(tmp_path / manifest, "w") as f:
+        f.write("{ truncated")
+
+    ranged_source.ranges.clear()
+    fs2 = _blockcache(tmp_path, ranged_source)
+    with fs2.open("/big", block_size=5) as f:
+        assert f.read() == data
+    assert ranged_source.ranges == [(0, 20)]
+
+
+def test_blockcache_partial_manifest_drops_bad_entries(tmp_path, ranged_source):
+    # One published entry is edited to no longer match its bytes: only that
+    # block is refetched, the rest is still reused.
+    data = bytes(range(20))
+    ranged_source.store["/big"] = data
+    fs = _blockcache(tmp_path, ranged_source)
+    with fs.open("/big", block_size=5) as f:
+        assert f.read(20) == data
+
+    manifest = next(n for n in os.listdir(tmp_path) if n.endswith(".manifest"))
+    path = tmp_path / manifest
+    with open(path) as f:
+        document = json.load(f)
+    document["blocks"]["1"]["sha256"] = "0" * 64
+    with open(path, "w") as f:
+        json.dump(document, f)
+
+    ranged_source.ranges.clear()
+    fs2 = _blockcache(tmp_path, ranged_source)
+    f = fs2.open("/big", block_size=5)
+    try:
+        # recovery kept everything but the entry that no longer matched
+        with open(path) as mf:
+            assert "1" not in json.load(mf)["blocks"]
+        assert f.read() == data
+        assert ranged_source.ranges == [(5, 10)]
+    finally:
+        f.close()
+
+
+def test_blockcache_manifest_source_version_mismatch(tmp_path, ranged_source):
+    data = bytes(range(20))
+    ranged_source.store["/big"] = data
+    fs = _blockcache(tmp_path, ranged_source, check_files=True)
+    with fs.open("/big", block_size=5) as f:
+        assert f.read(10) == data[:10]
+
+    # the remote file changes; none of the old blocks may be reused
+    new_data = bytes(range(100, 120))
+    ranged_source.store["/big"] = new_data
+    ranged_source.version = "v2"
+    ranged_source.ranges.clear()
+    fs2 = _blockcache(tmp_path, ranged_source, check_files=True)
+    with fs2.open("/big", block_size=5) as f:
+        assert f.read() == new_data
+    assert ranged_source.ranges == [(0, 20)]
+
+
+def test_blockcache_lost_manifest_refetches_on_demand(tmp_path, ranged_source):
+    data = bytes(range(20))
+    ranged_source.store["/big"] = data
+    fs = _blockcache(tmp_path, ranged_source)
+    with fs.open("/big", block_size=5) as f:
+        assert f.read(10) == data[:10]
+
+    for name in os.listdir(tmp_path):
+        if name.endswith(".manifest"):
+            os.remove(tmp_path / name)
+
+    ranged_source.ranges.clear()
+    fs2 = _blockcache(tmp_path, ranged_source)
+    with fs2.open("/big", block_size=5) as f:
+        assert f.read(5) == data[:5]
+    # the whole file was not downloaded: only the block actually read
+    assert ranged_source.ranges == [(0, 10)]
+
+
+def test_blockcache_failed_block_is_retried_on_next_read(tmp_path, ranged_source):
+    data = bytes(range(20))
+    ranged_source.store["/big"] = data
+    fs = _blockcache(tmp_path, ranged_source)
+    with fs.open("/big", block_size=5) as f:
+        assert f.read(3) == data[:3]
+        ranged_source.fail_ranges.add(5)
+        with pytest.raises(OSError, match="injected failure"):
+            f.read(10)
+        # the failed block was never recorded
+        ranged_source.fail_ranges.clear()
+        f.seek(5)
+        assert f.read(5) == data[5:10]
+
+    ranged_source.ranges.clear()
+    fs2 = _blockcache(tmp_path, ranged_source)
+    with fs2.open("/big", block_size=5) as f:
+        assert f.read(10) == data[:10]
+    assert ranged_source.ranges == []
+
+
+def test_blockcache_pop_removes_manifest(tmp_path, ranged_source):
+    ranged_source.store["/big"] = bytes(range(20))
+    fs = _blockcache(tmp_path, ranged_source)
+    with fs.open("/big", block_size=5) as f:
+        assert f.read(10)
+    assert any(n.endswith(".manifest") for n in os.listdir(tmp_path))
+
+    fs.pop_from_cache("/big")
+    assert not any(n.endswith(".manifest") for n in os.listdir(tmp_path))
+
+
+def test_blockcache_clear_expired_removes_manifest(tmp_path, ranged_source):
+    ranged_source.store["/big"] = bytes(range(20))
+    fs = _blockcache(tmp_path, ranged_source)
+    with fs.open("/big", block_size=5) as f:
+        assert f.read(10)
+    for detail in fs._metadata.cached_files[-1].values():
+        detail["time"] -= 100
+
+    fs.clear_expired_cache(expiry_time=1)
+    assert not any(n.endswith(".manifest") for n in os.listdir(tmp_path))
+
+
+def test_blockcache_metadata_does_not_override_manifest(tmp_path, ranged_source):
+    # A stale metadata block list must not resurrect blocks that recovery
+    # rejected: the metadata is only a hint, the manifest decides.
+    data = bytes(range(20))
+    ranged_source.store["/big"] = data
+    fs = _blockcache(tmp_path, ranged_source)
+    with fs.open("/big", block_size=5) as f:
+        assert f.read(3) == data[:3]
+    # pretend an earlier run had recorded more blocks than were confirmed
+    metadata_file = tmp_path / "cache"
+    with open(metadata_file) as f:
+        document = json.load(f)
+    for detail in document.values():
+        detail["blocks"] = [0, 1, 2, 3]
+    with open(metadata_file, "w") as f:
+        json.dump(document, f)
+
+    ranged_source.ranges.clear()
+    fs2 = _blockcache(tmp_path, ranged_source)
+    with fs2.open("/big", block_size=5) as f:
+        assert f.read(10) == data[:10]
+    # block 0 came from the manifest; blocks 1 and 2 had to be fetched
+    assert ranged_source.ranges == [(5, 15)]
+
+
+def test_blockcache_damaged_complete_file_is_verified(tmp_path, ranged_source):
+    # A complete entry is not served straight from disk: the blocks are
+    # checked against the manifest, and a damaged one is fetched again.
+    data = bytes(range(20))
+    ranged_source.store["/big"] = data
+    fs = _blockcache(tmp_path, ranged_source)
+    with fs.open("/big", block_size=5) as f:
+        assert f.read() == data
+    assert fs._metadata.cached_files[-1]["/big"]["blocks"] is True
+
+    cached = [n for n in os.listdir(tmp_path) if n != "cache" and "." not in n]
+    fn = tmp_path / cached[0]
+    with open(fn, "r+b") as f:
+        # damage only block 2 (offsets 10-14)
+        f.seek(12)
+        f.write(b"XX")
+
+    ranged_source.ranges.clear()
+    fs2 = _blockcache(tmp_path, ranged_source)
+    with fs2.open("/big", block_size=5) as f:
+        assert f.read() == data
+    # only the damaged block is fetched again
+    assert ranged_source.ranges == [(10, 15)]
+
+
+def test_blockcache_complete_file_reused_without_refetch(tmp_path, ranged_source):
+    data = bytes(range(20))
+    ranged_source.store["/big"] = data
+    fs = _blockcache(tmp_path, ranged_source)
+    with fs.open("/big", block_size=5) as f:
+        assert f.read() == data
+
+    ranged_source.ranges.clear()
+    fs2 = _blockcache(tmp_path, ranged_source)
+    for _ in range(2):
+        with fs2.open("/big", block_size=5) as f:
+            assert f.read() == data
+    assert ranged_source.ranges == []
+
