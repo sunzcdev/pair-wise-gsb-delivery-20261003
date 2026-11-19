@@ -147,12 +147,26 @@ class Server:
                 return fromshare(sock_data)
 
             self.servers: list[asyncio.base_events.Server] = []
-            for sock in sockets:
+            # Index of every borrowed handle paired with the server created on it.
+            started: list[tuple[int, asyncio.base_events.Server]] = []
+            for index, sock in enumerate(sockets):
                 is_windows = platform.system() == "Windows"
                 if config.workers > 1 and is_windows:  # pragma: py-not-win32
+                    # The shared copy is created and owned by this process; the
+                    # original entry in ``sockets`` stays the borrowed handle.
                     sock = _share_socket(sock)  # type: ignore[assignment]
-                server = await loop.create_server(create_protocol, sock=sock, ssl=config.ssl, backlog=config.backlog)
+                try:
+                    server = await loop.create_server(
+                        create_protocol, sock=sock, ssl=config.ssl, backlog=config.backlog
+                    )
+                except OSError:
+                    # A later listener failed to initialise. Roll back every listener
+                    # that already came up so no half-started server keeps accepting,
+                    # and run the lifespan shutdown for the startup that did happen.
+                    await self._rollback_borrowed_sockets(sockets, started)
+                    raise
                 self.servers.append(server)
+                started.append((index, server))
             listeners = sockets
 
         elif config.fd is not None:  # pragma: py-win32
@@ -203,6 +217,45 @@ class Server:
             pass  # pragma: full coverage
 
         self.started = True
+
+    async def _rollback_borrowed_sockets(
+        self,
+        sockets: list[socket.socket],
+        started: list[tuple[int, asyncio.base_events.Server]],
+    ) -> None:
+        """Roll back a failed multi-listener startup.
+
+        ``sockets`` are borrowed handles (e.g. handed down by the Gunicorn /
+        multiprocess parent); ``started`` pairs their positions with the
+        ``asyncio.Server`` objects this process created on top of them. This
+        process never owned the handles, so it only tears down the servers it
+        created, then makes sure the borrowed handles are usable by their owner
+        again and runs the matching lifespan shutdown. The owner alone decides
+        when to close the handles.
+        """
+        # Stop accepting on every listener that already came up. On some loops
+        # ``Server.close()`` also closes the underlying socket, so capture each
+        # address before closing and, where needed, re-establish a listening
+        # handle at the same address and put it back in the list the owner keeps.
+        to_roll_back = [(index, server, sockets[index], sockets[index].getsockname()) for index, server in started]
+
+        for index, server, borrowed, address in to_roll_back:
+            server.close()
+            await server.wait_closed()
+
+            if borrowed.fileno() == -1:
+                restored = socket.socket(borrowed.family, borrowed.type, borrowed.proto)
+                restored.bind(address)
+                restored.listen()
+                sockets[index] = restored
+            else:
+                # The loop only stopped serving and kept the handle open. Make
+                # sure it is still listening for its owner to accept on.
+                borrowed.listen()
+
+        # The lifespan startup already completed, so give the application a
+        # matching shutdown instead of leaving it running.
+        await self.lifespan.shutdown()
 
     def _log_started_message(self, listeners: Sequence[socket.SocketType]) -> None:
         config = self.config

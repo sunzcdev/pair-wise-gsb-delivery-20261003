@@ -6,9 +6,11 @@ import contextvars
 import json
 import logging
 import signal
+import socket
 import sys
 from collections.abc import Callable, Generator
 from contextlib import AbstractContextManager
+from typing import cast
 
 import httpx2
 import pytest
@@ -276,3 +278,146 @@ async def test_reset_contextvars_asyncio(
     ) as extract_json_body:
         assert await extract_json_body(large_request) == {}
         assert await extract_json_body(SIMPLE_GET_REQUEST) == {}
+
+
+def _bound_listening_socket() -> socket.socket:
+    """A bound, listening TCP socket whose owner is the caller (a "parent process")."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen()
+    return sock
+
+
+def _connection_refused(address: tuple[str, int]) -> bool:
+    """True when nothing is accepting TCP connections at ``address``.
+
+    Uses a blocking socket on purpose: an asyncio client that fails to connect
+    leaves an unclosed stream transport behind, which the test suite treats as
+    an error.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(2)
+    try:
+        probe.connect(address)
+    except OSError:
+        return True
+    else:  # pragma: no cover - only reached if an entry point was left behind
+        return False
+    finally:
+        probe.close()
+
+
+async def test_multi_listener_rollback_keeps_borrowed_sockets_usable():
+    """First listener starts, second fails to initialise: roll back cleanly.
+
+    The borrowed sockets are owned by the caller (modelled parent process).
+    On rollback the server this process created must stop accepting, the
+    lifespan must be shut down, and the parent must still own usable,
+    connectable handles -- the server never closes them.
+    """
+    parent_sockets = [_bound_listening_socket(), _bound_listening_socket()]
+    first_addr = parent_sockets[0].getsockname()
+    second_addr = parent_sockets[1].getsockname()
+
+    # Simulate the second listener failing to initialise: its handle is dead.
+    parent_sockets[1].close()
+
+    lifespan_events: list[str] = []
+
+    async def lifespan_app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        if scope["type"] != "lifespan":  # pragma: no cover
+            return
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                lifespan_events.append("startup")
+                await send({"type": "lifespan.startup.complete"})
+            elif message["type"] == "lifespan.shutdown":
+                lifespan_events.append("shutdown")
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+    config = Config(app=lifespan_app, lifespan="on", loop="asyncio")
+    server = Server(config=config)
+
+    with pytest.raises(OSError):
+        await server.serve(sockets=parent_sockets)
+
+    # The failed startup never flipped the "started" flag, so _serve did not
+    # run the normal shutdown path either.
+    assert server.started is False
+
+    # The already-started lifespan got a matching shutdown event.
+    assert lifespan_events == ["startup", "shutdown"]
+
+    # The server this process created on the first listener stopped accepting.
+    assert all(not created.is_serving() for created in server.servers)
+
+    # The borrowed first handle is still owned by the parent and usable: the
+    # parent can accept a connection on it itself. The rollback never closed
+    # it; on loops where asyncio closed the underlying fd, a fresh listening
+    # handle at the same address was put back in the parent's list.
+    first_handle = parent_sockets[0]
+    assert first_handle.fileno() != -1
+    first_handle.settimeout(2)
+    client = socket.create_connection(first_addr, timeout=2)
+    accepted, _ = first_handle.accept()
+    accepted.close()
+    client.close()
+
+    # The failed second handle stays dead; nothing re-opened a listener there.
+    assert parent_sockets[1].fileno() == -1
+    assert _connection_refused(second_addr)
+
+    first_handle.close()
+
+
+class _NonClosingServer:
+    """Stand-in for an asyncio.Server whose loop only stops serving, keeping the fd open."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+async def test_rollback_preserves_handle_when_loop_keeps_fd_open():
+    """When the loop keeps the listening fd open, the borrowed object is left in place.
+
+    The process-created server is still told to stop accepting, but the borrowed
+    handle and its file descriptor are preserved (not replaced) and remain usable
+    by the owner, since this process never owned the handle.
+    """
+    borrowed = _bound_listening_socket()
+    address = borrowed.getsockname()
+    original_fd = borrowed.fileno()
+    sockets = [borrowed]
+
+    config = Config(app=dummy_app, lifespan="off", loop="asyncio")
+    config.load()
+    server = Server(config=config)
+    server.lifespan = config.lifespan_class(config)
+
+    fake_server = _NonClosingServer()
+    await server._rollback_borrowed_sockets(
+        sockets, [(0, cast(asyncio.base_events.Server, fake_server))]
+    )
+
+    # The process-created server was asked to stop accepting...
+    assert fake_server.closed
+    # ...while the borrowed handle and its fd were preserved, not replaced.
+    assert sockets[0] is borrowed
+    assert borrowed.fileno() == original_fd
+
+    # And the owner can still accept connections on it itself.
+    borrowed.settimeout(2)
+    client = socket.create_connection(address, timeout=2)
+    accepted, _ = borrowed.accept()
+    accepted.close()
+    client.close()
+    borrowed.close()
+
