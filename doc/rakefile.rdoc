@@ -373,6 +373,36 @@ Use the <tt>--rules</tt> command line option to trace how rules are
 resolved when searching for tasks; note that creation of implicit file
 tasks is not traced.
 
+=== Bounded Rule Search
+
+Rules may refer to each other, so resolving one implicit task can require
+resolving another.  Rake bounds that search with a Rake::RuleSearchBudget:
+
+  Rake.application.rule_search_budget =
+    Rake::RuleSearchBudget.new(max_depth: 16, max_candidates: 10_000)
+
++max_depth+ limits how many rule levels may be nested.  +max_candidates+
+limits how many candidate sources the whole lookup may examine.  Candidates
+come only from the dependent lists of matching rules; Rake never scans the
+directory to find them, and resolution never runs task actions.
+
+Each lookup produces a Rake::RuleSearchReport listing every candidate that
+was tried and why it was rejected:
+
+  Rake.application.last_rule_search_report
+
+When the depth or candidate budget runs out, or when the rule chain loops
+back to a file that is already on the search path, the plan is
+<em>undetermined</em>: Rake raises Rake::RuleRecursionOverflowError (of which
+Rake::RuleSearchBudgetExceeded and Rake::RuleCycleError are subclasses) and
+reports the attempted rules instead of claiming the target file is missing.
+An existing target file is reported through the error's
++target_file_exists+ flag.
+
+A report is tied to the rules revision that produced it.  Adding or clearing
+rules invalidates the report, so a result produced under one rule
+configuration is never reused under another.
+
 == Importing Dependencies
 
 Any ruby file (including other rakefiles) can be included with a

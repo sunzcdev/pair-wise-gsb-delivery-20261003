@@ -79,6 +79,7 @@ Gem::Specification.new do |s|
     "lib/rake/rake_module.rb",
     "lib/rake/rake_test_loader.rb",
     "lib/rake/rule_recursion_overflow_error.rb",
+    "lib/rake/rule_search.rb",
     "lib/rake/scope.rb",
     "lib/rake/task.rb",
     "lib/rake/task_argument_error.rb",

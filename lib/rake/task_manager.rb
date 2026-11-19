@@ -1,4 +1,6 @@
 # frozen_string_literal: true
+require_relative "rule_search"
+
 module Rake
 
   # The TaskManager module is a mixin for managing tasks.
@@ -10,14 +12,76 @@ module Rake
       super
       @tasks = Hash.new
       @rules = Array.new
+      @rules_revision = 0
       @scope = Scope.make
       @last_description = nil
+      @rule_search_budget = RuleSearchBudget.new
+      self.last_rule_search_report = nil
+    end
+
+    # Budget applied when resolving an implicit task through rules.
+    #
+    # The default allows up to RuleSearchBudget::DEFAULT_MAX_DEPTH nested
+    # rule levels and RuleSearchBudget::DEFAULT_MAX_CANDIDATES candidate
+    # sources per lookup.  Assign a Rake::RuleSearchBudget instance (or a
+    # hash of its parameters) to tighten or widen the search.
+    attr_reader :rule_search_budget
+
+    def rule_search_budget=(budget)
+      @rule_search_budget =
+        case budget
+        when RuleSearchBudget
+          budget
+        when Hash
+          RuleSearchBudget.new(**budget)
+        else
+          fail ArgumentError, "rule_search_budget must be a Rake::RuleSearchBudget or Hash"
+        end
+      # A report carries the budget it was produced under; do not expose it
+      # after the budget has been reconfigured.
+      self.last_rule_search_report = nil
+    end
+
+    # The report produced by the most recent implicit rule lookup on this
+    # thread.
+    #
+    # Returns nil when no lookup ran, and nil when the rules have changed
+    # since the report was produced.  The report is read-only diagnostic
+    # data; it is never consulted to resolve a later lookup, so a plan
+    # produced under one rule configuration cannot be reused under another.
+    def last_rule_search_report
+      report = thread_last_report
+      return nil if report && report.stale?(rules_revision)
+      report
+    end
+
+    def last_rule_search_report=(report) # :nodoc:
+      Thread.current[thread_last_report_key] = report
+    end
+
+    # Number of rule configuration changes applied to this task manager.
+    # Every create_rule and clear bumps the revision.
+    def rules_revision
+      @rules_revision
+    end
+
+    # The rule search report currently in flight on this thread, if any.
+    # This is separate from #last_rule_search_report, which is the published
+    # result of the most recent completed lookup.
+    def current_rule_search_report # :nodoc:
+      Thread.current[thread_search_report_key]
+    end
+
+    def current_rule_search_report=(report) # :nodoc:
+      Thread.current[thread_search_report_key] = report
     end
 
     def create_rule(*args, &block) # :nodoc:
       pattern, args, deps, order_only = resolve_args(args)
       pattern = Regexp.new(Regexp.quote(pattern) + "$") if String === pattern
       @rules << [pattern, args, deps, order_only, block]
+      @rules_revision += 1
+      self.last_rule_search_report = nil
     end
 
     def define_task(task_class, *args, &block) # :nodoc:
@@ -51,12 +115,62 @@ module Rake
     end
 
     # Find a matching task for +task_name+.
+    #
+    # Resolution tries, in order: an already defined task, a task
+    # synthesized from the rules, and finally an existing file with that
+    # name.  If a rule search stops because it exhausted its depth or
+    # candidate budget, the plan is undetermined.  The target is only
+    # reported as missing when that search finished without a match and no
+    # file with the target name exists.
     def [](task_name, scopes=nil)
       task_name = task_name.to_s
-      self.lookup(task_name, scopes) or
-        enhance_with_matching_rule(task_name) or
-        synthesize_file_task(task_name) or
+
+      # A rule dependent may be a proc that itself looks up a task.  A nested
+      # lookup shares the in-flight report so the budget, cycle chain and
+      # depth count cannot be reset from inside a rule.  The report is kept
+      # per thread because prerequisites may be resolved concurrently.
+      active_report = current_rule_search_report
+      if active_report
+        task = lookup(task_name, scopes)
+        return task if task
+        task = enhance_with_matching_rule(task_name, active_report.current_level, active_report)
+        return task if task
+        task = synthesize_file_task(task_name)
+        return task if task
         fail generate_message_for_undefined_task(task_name)
+      end
+
+      # Each top level lookup starts with no rule report, so the report always
+      # describes the lookup that just ran rather than an earlier one.
+      self.last_rule_search_report = nil
+      task = lookup(task_name, scopes)
+      return task if task
+
+      begin
+        task = enhance_with_matching_rule(task_name)
+        return task if task
+      rescue Rake::RuleRecursionOverflowError => ex
+        # Budget exhaustion, the depth limit and a rule cycle all leave the
+        # plan undetermined.  None of them proves the target file is missing,
+        # so they are reported through this dedicated error instead of
+        # falling through to "Don't know how to build task".  The error
+        # records whether the target file happens to exist on disk.
+        ex.target_file_exists = File.exist?(task_name)
+        ex.report.target_file_exists = ex.target_file_exists if ex.report
+        fail ex
+      end
+
+      task = synthesize_file_task(task_name)
+      if task
+        # The rules did not match, but a file with the target name exists.
+        # Record the resolution so the report does not read as a missing
+        # target.  The rules themselves were already fully explored.
+        report = self.last_rule_search_report
+        report.resolved_by_file! if report
+        return task
+      end
+
+      fail generate_message_for_undefined_task(task_name)
     end
 
     def generate_message_for_undefined_task(task_name)
@@ -147,18 +261,61 @@ module Rake
     # If a rule can be found that matches the task name, enhance the
     # task with the prerequisites and actions from the rule.  Set the
     # source attribute of the task appropriately for the rule.  Return
-    # the enhanced task or nil of no rule was found.
-    def enhance_with_matching_rule(task_name, level=0)
-      fail Rake::RuleRecursionOverflowError,
-        "Rule Recursion Too Deep" if level >= 16
-      @rules.each do |pattern, args, extensions, order_only, block|
-        if pattern && pattern.match(task_name)
-          task = attempt_rule(task_name, pattern, args, extensions, block, level)
-          task | order_only unless order_only.nil?
-          return task if task
-        end
+    # the enhanced task or nil if no rule was found.
+    #
+    # +report+ carries the bounded search state for the whole lookup.  A
+    # nested resolution reuses the same report so that candidate counting,
+    # cycle detection and depth control apply to the complete search rather
+    # than to one recursion level.  +incoming_rule+ is the rule edge that
+    # introduced +task_name+ (nil at the top level).  No task action is
+    # executed here; only task objects and their dependency edges are
+    # created.
+    def enhance_with_matching_rule(task_name, level=0, report=nil, incoming_rule=nil)
+      top_level = report.nil?
+      report ||= begin
+        new_report =
+          RuleSearchReport.new(task_name, rule_search_budget,
+                               rules_revision: rules_revision)
+        self.last_rule_search_report = new_report
+        new_report
       end
-      nil
+
+      # Share the in-flight report with any lookup performed by a rule
+      # dependent, so a proc cannot start a parallel search with a fresh
+      # budget.
+      previous_active = current_rule_search_report
+      self.current_rule_search_report = report
+      begin
+        if level >= report.budget.max_depth
+          report.mark_depth_exceeded!(task_name, incoming_rule)
+          error = RuleRecursionOverflowError.new("Rule Recursion Too Deep")
+          error.report = report
+          fail error
+        end
+
+        report.enter(task_name, incoming_rule) do
+          @rules.each do |pattern, args, extensions, order_only, block|
+            next unless pattern && pattern.match(task_name)
+            task = attempt_rule(task_name, pattern, args, extensions, block, level, report)
+            task | order_only unless order_only.nil?
+            if task
+              report.resolved!(:rule) if top_level
+              return task
+            end
+          end
+        end
+
+        if top_level
+          if report.cycle?
+            report.mark_cycle!
+            fail RuleCycleError.new(report, task_name)
+          end
+          report.not_found!
+        end
+        nil
+      ensure
+        self.current_rule_search_report = previous_active
+      end
     rescue Rake::RuleRecursionOverflowError => ex
       ex.add_target(task_name)
       fail ex
@@ -182,6 +339,8 @@ module Rake
     def clear
       @tasks.clear
       @rules.clear
+      @rules_revision += 1
+      self.last_rule_search_report = nil
     end
 
     # Lookup a task, using scope and the scope hints in the task name.
@@ -237,6 +396,20 @@ module Rake
 
     private
 
+    # Per-thread slot for the in-flight rule search report.
+    def thread_search_report_key
+      @thread_search_report_key ||= :"rake_rule_search_report_#{object_id}"
+    end
+
+    # Per-thread slot for the most recently published report.
+    def thread_last_report
+      Thread.current[thread_last_report_key]
+    end
+
+    def thread_last_report_key
+      @thread_last_report_key ||= :"rake_last_rule_search_report_#{object_id}"
+    end
+
     # Add a location to the locations field of the given task.
     def add_location(task)
       loc = find_location
@@ -268,18 +441,45 @@ module Rake
     end
 
     # Attempt to create a rule given the list of prerequisites.
-    def attempt_rule(task_name, task_pattern, args, extensions, block, level)
+    #
+    # Every candidate source produced by the rule is accounted for in
+    # +report+.  A candidate that exists on disk or as a task is accepted; a
+    # candidate that can be expanded by another rule is accepted through the
+    # nested lookup; anything else rejects this rule and lets the caller try
+    # the next matching rule.  Candidates come only from the rule's own
+    # dependent list (extensions, pathmaps and procs), never from scanning
+    # the filesystem.
+    def attempt_rule(task_name, task_pattern, args, extensions, block, level, report)
       sources = make_sources(task_name, task_pattern, extensions)
       prereqs = sources.map { |source|
+        report.consume_candidate!(task_name, task_pattern, source, level)
         trace_rule level, "Attempting Rule #{task_name} => #{source}"
-        if File.exist?(source) || Rake::Task.task_defined?(source)
+        if File.exist?(source)
           trace_rule level, "(#{task_name} => #{source} ... EXIST)"
+          report.record_attempt(task_name, task_pattern, source, level,
+                                :accepted, :existing_file)
           source
-        elsif parent = enhance_with_matching_rule(source, level + 1)
+        elsif Rake::Task.task_defined?(source)
+          trace_rule level, "(#{task_name} => #{source} ... EXIST)"
+          report.record_attempt(task_name, task_pattern, source, level,
+                                :accepted, :defined_task)
+          source
+        elsif report.cycle_target?(source)
+          # Not a file and not a task, yet already on the search path: this
+          # branch is a genuine rule cycle.  Reject it so a sibling rule can
+          # still resolve the target, and remember the chain for the report.
+          trace_rule level, "(#{task_name} => #{source} ... CYCLE)"
+          report.note_cycle!(source, task_pattern)
+          return nil
+        elsif parent = enhance_with_matching_rule(source, level + 1, report, task_pattern)
           trace_rule level, "(#{task_name} => #{source} ... ENHANCE)"
+          report.record_attempt(task_name, task_pattern, source, level,
+                                :accepted, :synthesized_rule)
           parent.name
         else
           trace_rule level, "(#{task_name} => #{source} ... FAIL)"
+          report.record_attempt(task_name, task_pattern, source, level,
+                                :rejected, :missing_candidate)
           return nil
         end
       }
