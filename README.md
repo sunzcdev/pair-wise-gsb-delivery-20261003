@@ -25,7 +25,7 @@ needs for you, including RabbitMQ extensions to AMQP 0.9.1.
 
 ## Development
 
-Make sure you have Python, pip and the mako templating package installed:
+Make sure you have Python 3, pip and the mako templating package installed:
 
     pip install mako
 
@@ -36,12 +36,30 @@ To regenerate `lib/amq/protocol/client.rb` from the source (`codegen/*` files), 
 
     ./generate.rb
 
+The generator runs `python3` by default; set `PYTHON` to use a different interpreter.
 To make changes, **do not edit client.rb directly**. Instead, edit the `codegen/protocol.rb.pytemplate` and regenerate.
 
 To run tests, use
 
     bundle install --binstubs
     ./bin/rspec -c spec spec
+
+## Strict Parameter Mode
+
+Method encoding is permissive by default and uses Ruby truthiness for `bit`
+arguments, as in previous releases. Opt into strict parameter mode to validate
+every argument against the AMQP method description before serialization:
+
+```ruby
+AMQ::Protocol::Method.enable_strict_parameters!
+# later, if needed
+AMQ::Protocol::Method.disable_strict_parameters!
+```
+
+In strict mode a `bit` argument only accepts `true`, `false` or `nil` (an
+omitted optional bit, encoded as the default `false`); any other truthy object
+raises `AMQ::Protocol::InvalidParameterError`. Scalar arguments are type and
+range checked, and required arguments reject `nil`.
 
 
 ## Maintainer Information

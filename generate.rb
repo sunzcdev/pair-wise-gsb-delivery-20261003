@@ -1,9 +1,10 @@
 #!/usr/bin/env ruby
 # encoding: utf-8
 
-# rabbitmq-codegen is Python 3 compatible and so is
-# the code in this repo but Mako still fails with 3.6 as of May 2017 :( MK.
-python = ENV.fetch("PYTHON", "python2")
+# The code generator targets Python 3 (Mako is required, e.g.
+# `python -m pip install mako`). Override with the PYTHON environment
+# variable when the interpreter has a different name.
+python = ENV.fetch("PYTHON", "python3")
 
 def sh(*args)
   system(*args)
@@ -20,5 +21,10 @@ path = "lib/amq/protocol/client.rb"
 puts "Running '#{python} ./codegen/codegen.py client #{spec} #{extensions.join(' ')} #{path}'"
 sh "#{python} ./codegen/codegen.py client #{spec} #{extensions.join(' ')} #{path}"
 if File.file?(path)
+  # Python writes through text mode, which turns line endings into CRLF on
+  # Windows. Normalize back to LF so the generated file is byte-stable and
+  # matches the LF line endings stored in git.
+  content = File.binread(path)
+  File.binwrite(path, content.gsub("\r\n", "\n"))
   sh "ruby -c #{path}"
 end

@@ -12,6 +12,7 @@ require "amq/protocol/frame"
 
 require "amq/protocol/constants"
 require "amq/protocol/exceptions"
+require "amq/protocol/strict_parameters"
 
 module AMQ
   module Protocol
@@ -148,6 +149,21 @@ module AMQ
         @methods
       end
 
+      # Strict parameter mode validates every encode argument against the
+      # AMQP method description before serialization. It is off by default so
+      # legacy callers keep their permissive, truthiness-based behavior.
+      def self.strict?
+        StrictParameters.enabled?
+      end
+
+      def self.enable_strict_parameters!
+        StrictParameters.enable!
+      end
+
+      def self.disable_strict_parameters!
+        StrictParameters.disable!
+      end
+
       def self.split_headers(user_headers)
         properties, headers = {}, {}
         user_headers.each do |key, value|
@@ -173,6 +189,8 @@ module AMQ
         limit        = frame_size - 8
         return [BodyFrame.new(body, channel)] if body.bytesize < limit
 
+        # Otherwise String#slice operates on code points for non-binary
+        # strings, and we need bytes.
         body.force_encoding("ASCII-8BIT") if body.encoding != Encoding::BINARY
 
         array = Array.new
@@ -200,24 +218,32 @@ module AMQ
         @method_id = 10
         @index = 0x000A000A # 10, 10, 655370
         @packed_indexes = [10, 10].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:version_major, :octet, false],
+          [:version_minor, :octet, true],
+          [:server_properties, :table, false],
+          [:mechanisms, :longstr, true],
+          [:locales, :longstr, true],
+        ].freeze
+        ARGUMENT_NAMES = [:version_major, :version_minor, :server_properties, :mechanisms, :locales].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          version_major = data[offset, 1].unpack(PACK_CHAR).first
+          version_major = data.getbyte(offset)
           offset += 1
-          version_minor = data[offset, 1].unpack(PACK_CHAR).first
+          version_minor = data.getbyte(offset)
           offset += 1
-          table_length = Table.length(data[offset, 4])
-          server_properties = Table.decode(data[offset, table_length + 4])
+          table_length = Table.length(data.byteslice(offset, 4))
+          server_properties = Table.decode(data.byteslice(offset, table_length + 4))
           offset += table_length + 4
-          length = data[offset, 4].unpack(PACK_UINT32).first
+          length = data.byteslice(offset, 4).unpack1(PACK_UINT32)
           offset += 4
-          mechanisms = data[offset, length]
+          mechanisms = data.byteslice(offset, length)
           offset += length
-          length = data[offset, 4].unpack(PACK_UINT32).first
+          length = data.byteslice(offset, 4).unpack1(PACK_UINT32)
           offset += 4
-          locales = data[offset, length]
+          locales = data.byteslice(offset, length)
           offset += length
           self.new(version_major, version_minor, server_properties, mechanisms, locales)
         end
@@ -243,6 +269,13 @@ module AMQ
         @method_id = 11
         @index = 0x000A000B # 10, 11, 655371
         @packed_indexes = [10, 11].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:client_properties, :table, false],
+          [:mechanism, :shortstr, true],
+          [:response, :longstr, false],
+          [:locale, :shortstr, true],
+        ].freeze
+        ARGUMENT_NAMES = [:client_properties, :mechanism, :response, :locale].freeze
 
 
         def self.has_content?
@@ -250,9 +283,10 @@ module AMQ
         end
 
         # @return
-        # [u'client_properties = nil', u"mechanism = u'PLAIN'", u'response = nil', u"locale = u'en_US'"]
+        # ['client_properties = nil', "mechanism = 'PLAIN'", 'response = nil', "locale = 'en_US'"]
         def self.encode(client_properties, mechanism, response, locale)
           channel = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:client_properties => client_properties, :mechanism => mechanism, :response => response, :locale => locale})
           buffer = @packed_indexes.dup
           buffer << AMQ::Protocol::Table.encode(client_properties)
           buffer << mechanism.to_s.bytesize.chr
@@ -271,13 +305,17 @@ module AMQ
         @method_id = 20
         @index = 0x000A0014 # 10, 20, 655380
         @packed_indexes = [10, 20].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:challenge, :longstr, false],
+        ].freeze
+        ARGUMENT_NAMES = [:challenge].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          length = data[offset, 4].unpack(PACK_UINT32).first
+          length = data.byteslice(offset, 4).unpack1(PACK_UINT32)
           offset += 4
-          challenge = data[offset, length]
+          challenge = data.byteslice(offset, length)
           offset += length
           self.new(challenge)
         end
@@ -299,6 +337,10 @@ module AMQ
         @method_id = 21
         @index = 0x000A0015 # 10, 21, 655381
         @packed_indexes = [10, 21].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:response, :longstr, false],
+        ].freeze
+        ARGUMENT_NAMES = [:response].freeze
 
 
         def self.has_content?
@@ -306,9 +348,10 @@ module AMQ
         end
 
         # @return
-        # [u'response = nil']
+        # ['response = nil']
         def self.encode(response)
           channel = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:response => response})
           buffer = @packed_indexes.dup
           buffer << [response.to_s.bytesize].pack(PACK_UINT32)
           buffer << response.to_s
@@ -322,15 +365,21 @@ module AMQ
         @method_id = 30
         @index = 0x000A001E # 10, 30, 655390
         @packed_indexes = [10, 30].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:channel_max, :short, false],
+          [:frame_max, :long, false],
+          [:heartbeat, :short, false],
+        ].freeze
+        ARGUMENT_NAMES = [:channel_max, :frame_max, :heartbeat].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          channel_max = data[offset, 2].unpack(PACK_UINT16).first
+          channel_max = data.byteslice(offset, 2).unpack1(PACK_UINT16)
           offset += 2
-          frame_max = data[offset, 4].unpack(PACK_UINT32).first
+          frame_max = data.byteslice(offset, 4).unpack1(PACK_UINT32)
           offset += 4
-          heartbeat = data[offset, 2].unpack(PACK_UINT16).first
+          heartbeat = data.byteslice(offset, 2).unpack1(PACK_UINT16)
           offset += 2
           self.new(channel_max, frame_max, heartbeat)
         end
@@ -354,6 +403,12 @@ module AMQ
         @method_id = 31
         @index = 0x000A001F # 10, 31, 655391
         @packed_indexes = [10, 31].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:channel_max, :short, false],
+          [:frame_max, :long, false],
+          [:heartbeat, :short, false],
+        ].freeze
+        ARGUMENT_NAMES = [:channel_max, :frame_max, :heartbeat].freeze
 
 
         def self.has_content?
@@ -361,9 +416,10 @@ module AMQ
         end
 
         # @return
-        # [u'channel_max = false', u'frame_max = false', u'heartbeat = false']
+        # ['channel_max = false', 'frame_max = false', 'heartbeat = false']
         def self.encode(channel_max, frame_max, heartbeat)
           channel = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:channel_max => channel_max, :frame_max => frame_max, :heartbeat => heartbeat})
           buffer = @packed_indexes.dup
           buffer << [channel_max].pack(PACK_UINT16)
           buffer << [frame_max].pack(PACK_UINT32)
@@ -378,6 +434,10 @@ module AMQ
         @method_id = 40
         @index = 0x000A0028 # 10, 40, 655400
         @packed_indexes = [10, 40].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:virtual_host, :shortstr, true],
+        ].freeze
+        ARGUMENT_NAMES = [:virtual_host].freeze
 
 
         def self.has_content?
@@ -385,18 +445,22 @@ module AMQ
         end
 
         # @return
-        # [u"virtual_host = u'/'", u'capabilities = EMPTY_STRING', u'insist = false']
+        # ["virtual_host = '/'", 'capabilities = EMPTY_STRING', 'insist = false']
         def self.encode(virtual_host)
           capabilities = EMPTY_STRING
           insist = false
           channel = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:virtual_host => virtual_host})
           buffer = @packed_indexes.dup
           buffer << virtual_host.to_s.bytesize.chr
           buffer << virtual_host.to_s
           buffer << capabilities.to_s.bytesize.chr
           buffer << capabilities.to_s
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if insist
+          if StrictParameters.enabled? && !insist.nil? && !insist.equal?(true) && !insist.equal?(false)
+            raise InvalidParameterError.new(@name, :insist, "true, false or nil", insist)
+          end
+          bit_buffer |= ((insist ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -408,13 +472,17 @@ module AMQ
         @method_id = 41
         @index = 0x000A0029 # 10, 41, 655401
         @packed_indexes = [10, 41].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:known_hosts, :shortstr, false],
+        ].freeze
+        ARGUMENT_NAMES = [:known_hosts].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          known_hosts = data[offset, length]
+          known_hosts = data.byteslice(offset, length)
           offset += length
           self.new(known_hosts)
         end
@@ -436,19 +504,26 @@ module AMQ
         @method_id = 50
         @index = 0x000A0032 # 10, 50, 655410
         @packed_indexes = [10, 50].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:reply_code, :short, false],
+          [:reply_text, :shortstr, false],
+          [:class_id, :short, false],
+          [:method_id, :short, false],
+        ].freeze
+        ARGUMENT_NAMES = [:reply_code, :reply_text, :class_id, :method_id].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          reply_code = data[offset, 2].unpack(PACK_UINT16).first
+          reply_code = data.byteslice(offset, 2).unpack1(PACK_UINT16)
           offset += 2
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          reply_text = data[offset, length]
+          reply_text = data.byteslice(offset, length)
           offset += length
-          class_id = data[offset, 2].unpack(PACK_UINT16).first
+          class_id = data.byteslice(offset, 2).unpack1(PACK_UINT16)
           offset += 2
-          method_id = data[offset, 2].unpack(PACK_UINT16).first
+          method_id = data.byteslice(offset, 2).unpack1(PACK_UINT16)
           offset += 2
           self.new(reply_code, reply_text, class_id, method_id)
         end
@@ -466,9 +541,10 @@ module AMQ
         end
 
         # @return
-        # [u'reply_code = nil', u'reply_text = EMPTY_STRING', u'class_id = nil', u'method_id = nil']
+        # ['reply_code = nil', 'reply_text = EMPTY_STRING', 'class_id = nil', 'method_id = nil']
         def self.encode(reply_code, reply_text, class_id, method_id)
           channel = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:reply_code => reply_code, :reply_text => reply_text, :class_id => class_id, :method_id => method_id})
           buffer = @packed_indexes.dup
           buffer << [reply_code].pack(PACK_UINT16)
           buffer << reply_text.to_s.bytesize.chr
@@ -485,6 +561,9 @@ module AMQ
         @method_id = 51
         @index = 0x000A0033 # 10, 51, 655411
         @packed_indexes = [10, 51].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -503,6 +582,7 @@ module AMQ
         # []
         def self.encode()
           channel = 0
+          StrictParameters.validate!(@name, PARAMETERS, {})
           buffer = @packed_indexes.dup
           MethodFrame.new(buffer, channel)
         end
@@ -514,13 +594,17 @@ module AMQ
         @method_id = 60
         @index = 0x000A003C # 10, 60, 655420
         @packed_indexes = [10, 60].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:reason, :shortstr, false],
+        ].freeze
+        ARGUMENT_NAMES = [:reason].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          reason = data[offset, length]
+          reason = data.byteslice(offset, length)
           offset += length
           self.new(reason)
         end
@@ -535,9 +619,10 @@ module AMQ
         end
 
         # @return
-        # [u'reason = EMPTY_STRING']
+        # ['reason = EMPTY_STRING']
         def self.encode(reason)
           channel = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:reason => reason})
           buffer = @packed_indexes.dup
           buffer << reason.to_s.bytesize.chr
           buffer << reason.to_s
@@ -551,6 +636,9 @@ module AMQ
         @method_id = 61
         @index = 0x000A003D # 10, 61, 655421
         @packed_indexes = [10, 61].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -569,6 +657,7 @@ module AMQ
         # []
         def self.encode()
           channel = 0
+          StrictParameters.validate!(@name, PARAMETERS, {})
           buffer = @packed_indexes.dup
           MethodFrame.new(buffer, channel)
         end
@@ -580,17 +669,22 @@ module AMQ
         @method_id = 70
         @index = 0x000A0046 # 10, 70, 655430
         @packed_indexes = [10, 70].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:new_secret, :longstr, false],
+          [:reason, :shortstr, false],
+        ].freeze
+        ARGUMENT_NAMES = [:new_secret, :reason].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          length = data[offset, 4].unpack(PACK_UINT32).first
+          length = data.byteslice(offset, 4).unpack1(PACK_UINT32)
           offset += 4
-          new_secret = data[offset, length]
+          new_secret = data.byteslice(offset, length)
           offset += length
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          reason = data[offset, length]
+          reason = data.byteslice(offset, length)
           offset += length
           self.new(new_secret, reason)
         end
@@ -606,9 +700,10 @@ module AMQ
         end
 
         # @return
-        # [u'new_secret = nil', u'reason = nil']
+        # ['new_secret = nil', 'reason = nil']
         def self.encode(new_secret, reason)
           channel = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:new_secret => new_secret, :reason => reason})
           buffer = @packed_indexes.dup
           buffer << [new_secret.to_s.bytesize].pack(PACK_UINT32)
           buffer << new_secret.to_s
@@ -624,6 +719,9 @@ module AMQ
         @method_id = 71
         @index = 0x000A0047 # 10, 71, 655431
         @packed_indexes = [10, 71].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -642,6 +740,7 @@ module AMQ
         # []
         def self.encode()
           channel = 0
+          StrictParameters.validate!(@name, PARAMETERS, {})
           buffer = @packed_indexes.dup
           MethodFrame.new(buffer, channel)
         end
@@ -661,6 +760,10 @@ module AMQ
         @method_id = 10
         @index = 0x0014000A # 20, 10, 1310730
         @packed_indexes = [20, 10].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:out_of_band, :shortstr, false],
+        ].freeze
+        ARGUMENT_NAMES = [:out_of_band].freeze
 
 
         def self.has_content?
@@ -668,8 +771,9 @@ module AMQ
         end
 
         # @return
-        # [u'out_of_band = EMPTY_STRING']
+        # ['out_of_band = EMPTY_STRING']
         def self.encode(channel, out_of_band)
+          StrictParameters.validate!(@name, PARAMETERS, {:out_of_band => out_of_band})
           buffer = @packed_indexes.dup
           buffer << out_of_band.to_s.bytesize.chr
           buffer << out_of_band.to_s
@@ -683,13 +787,17 @@ module AMQ
         @method_id = 11
         @index = 0x0014000B # 20, 11, 1310731
         @packed_indexes = [20, 11].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:channel_id, :longstr, false],
+        ].freeze
+        ARGUMENT_NAMES = [:channel_id].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          length = data[offset, 4].unpack(PACK_UINT32).first
+          length = data.byteslice(offset, 4).unpack1(PACK_UINT32)
           offset += 4
-          channel_id = data[offset, length]
+          channel_id = data.byteslice(offset, length)
           offset += length
           self.new(channel_id)
         end
@@ -711,11 +819,15 @@ module AMQ
         @method_id = 20
         @index = 0x00140014 # 20, 20, 1310740
         @packed_indexes = [20, 20].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:active, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:active].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          bit_buffer = data[offset, 1].unpack(PACK_CHAR).first
+          bit_buffer = data.getbyte(offset)
           offset += 1
           active = (bit_buffer & (1 << 0)) != 0
           self.new(active)
@@ -731,11 +843,15 @@ module AMQ
         end
 
         # @return
-        # [u'active = nil']
+        # ['active = nil']
         def self.encode(channel, active)
+          StrictParameters.validate!(@name, PARAMETERS, {:active => active})
           buffer = @packed_indexes.dup
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if active
+          if StrictParameters.enabled? && !active.nil? && !active.equal?(true) && !active.equal?(false)
+            raise InvalidParameterError.new(@name, :active, "true, false or nil", active)
+          end
+          bit_buffer |= ((active ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -747,11 +863,15 @@ module AMQ
         @method_id = 21
         @index = 0x00140015 # 20, 21, 1310741
         @packed_indexes = [20, 21].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:active, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:active].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          bit_buffer = data[offset, 1].unpack(PACK_CHAR).first
+          bit_buffer = data.getbyte(offset)
           offset += 1
           active = (bit_buffer & (1 << 0)) != 0
           self.new(active)
@@ -767,11 +887,15 @@ module AMQ
         end
 
         # @return
-        # [u'active = nil']
+        # ['active = nil']
         def self.encode(channel, active)
+          StrictParameters.validate!(@name, PARAMETERS, {:active => active})
           buffer = @packed_indexes.dup
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if active
+          if StrictParameters.enabled? && !active.nil? && !active.equal?(true) && !active.equal?(false)
+            raise InvalidParameterError.new(@name, :active, "true, false or nil", active)
+          end
+          bit_buffer |= ((active ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -783,19 +907,26 @@ module AMQ
         @method_id = 40
         @index = 0x00140028 # 20, 40, 1310760
         @packed_indexes = [20, 40].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:reply_code, :short, false],
+          [:reply_text, :shortstr, false],
+          [:class_id, :short, false],
+          [:method_id, :short, false],
+        ].freeze
+        ARGUMENT_NAMES = [:reply_code, :reply_text, :class_id, :method_id].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          reply_code = data[offset, 2].unpack(PACK_UINT16).first
+          reply_code = data.byteslice(offset, 2).unpack1(PACK_UINT16)
           offset += 2
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          reply_text = data[offset, length]
+          reply_text = data.byteslice(offset, length)
           offset += length
-          class_id = data[offset, 2].unpack(PACK_UINT16).first
+          class_id = data.byteslice(offset, 2).unpack1(PACK_UINT16)
           offset += 2
-          method_id = data[offset, 2].unpack(PACK_UINT16).first
+          method_id = data.byteslice(offset, 2).unpack1(PACK_UINT16)
           offset += 2
           self.new(reply_code, reply_text, class_id, method_id)
         end
@@ -813,8 +944,9 @@ module AMQ
         end
 
         # @return
-        # [u'reply_code = nil', u'reply_text = EMPTY_STRING', u'class_id = nil', u'method_id = nil']
+        # ['reply_code = nil', 'reply_text = EMPTY_STRING', 'class_id = nil', 'method_id = nil']
         def self.encode(channel, reply_code, reply_text, class_id, method_id)
+          StrictParameters.validate!(@name, PARAMETERS, {:reply_code => reply_code, :reply_text => reply_text, :class_id => class_id, :method_id => method_id})
           buffer = @packed_indexes.dup
           buffer << [reply_code].pack(PACK_UINT16)
           buffer << reply_text.to_s.bytesize.chr
@@ -831,6 +963,9 @@ module AMQ
         @method_id = 41
         @index = 0x00140029 # 20, 41, 1310761
         @packed_indexes = [20, 41].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -848,6 +983,7 @@ module AMQ
         # @return
         # []
         def self.encode(channel)
+          StrictParameters.validate!(@name, PARAMETERS, {})
           buffer = @packed_indexes.dup
           MethodFrame.new(buffer, channel)
         end
@@ -867,6 +1003,17 @@ module AMQ
         @method_id = 10
         @index = 0x0028000A # 40, 10, 2621450
         @packed_indexes = [40, 10].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:exchange, :shortstr, false],
+          [:type, :shortstr, true],
+          [:passive, :bit, true],
+          [:durable, :bit, true],
+          [:auto_delete, :bit, true],
+          [:internal, :bit, true],
+          [:nowait, :bit, true],
+          [:arguments, :table, true],
+        ].freeze
+        ARGUMENT_NAMES = [:exchange, :type, :passive, :durable, :auto_delete, :internal, :nowait, :arguments].freeze
 
 
         def self.has_content?
@@ -874,9 +1021,10 @@ module AMQ
         end
 
         # @return
-        # [u'ticket = 0', u'exchange = nil', u"type = u'direct'", u'passive = false', u'durable = false', u'auto_delete = false', u'internal = false', u'nowait = false', u'arguments = {}']
+        # ['ticket = 0', 'exchange = nil', "type = 'direct'", 'passive = false', 'durable = false', 'auto_delete = false', 'internal = false', 'nowait = false', 'arguments = {}']
         def self.encode(channel, exchange, type, passive, durable, auto_delete, internal, nowait, arguments)
           ticket = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:exchange => exchange, :type => type, :passive => passive, :durable => durable, :auto_delete => auto_delete, :internal => internal, :nowait => nowait, :arguments => arguments})
           buffer = @packed_indexes.dup
           buffer << [ticket].pack(PACK_UINT16)
           buffer << exchange.to_s.bytesize.chr
@@ -884,11 +1032,26 @@ module AMQ
           buffer << type.to_s.bytesize.chr
           buffer << type.to_s
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if passive
-          bit_buffer = bit_buffer | (1 << 1) if durable
-          bit_buffer = bit_buffer | (1 << 2) if auto_delete
-          bit_buffer = bit_buffer | (1 << 3) if internal
-          bit_buffer = bit_buffer | (1 << 4) if nowait
+          if StrictParameters.enabled? && !passive.nil? && !passive.equal?(true) && !passive.equal?(false)
+            raise InvalidParameterError.new(@name, :passive, "true, false or nil", passive)
+          end
+          bit_buffer |= ((passive ? 1 : 0) << 0)
+          if StrictParameters.enabled? && !durable.nil? && !durable.equal?(true) && !durable.equal?(false)
+            raise InvalidParameterError.new(@name, :durable, "true, false or nil", durable)
+          end
+          bit_buffer |= ((durable ? 1 : 0) << 1)
+          if StrictParameters.enabled? && !auto_delete.nil? && !auto_delete.equal?(true) && !auto_delete.equal?(false)
+            raise InvalidParameterError.new(@name, :auto_delete, "true, false or nil", auto_delete)
+          end
+          bit_buffer |= ((auto_delete ? 1 : 0) << 2)
+          if StrictParameters.enabled? && !internal.nil? && !internal.equal?(true) && !internal.equal?(false)
+            raise InvalidParameterError.new(@name, :internal, "true, false or nil", internal)
+          end
+          bit_buffer |= ((internal ? 1 : 0) << 3)
+          if StrictParameters.enabled? && !nowait.nil? && !nowait.equal?(true) && !nowait.equal?(false)
+            raise InvalidParameterError.new(@name, :nowait, "true, false or nil", nowait)
+          end
+          bit_buffer |= ((nowait ? 1 : 0) << 4)
           buffer << [bit_buffer].pack(PACK_CHAR)
           buffer << AMQ::Protocol::Table.encode(arguments)
           MethodFrame.new(buffer, channel)
@@ -901,6 +1064,9 @@ module AMQ
         @method_id = 11
         @index = 0x0028000B # 40, 11, 2621451
         @packed_indexes = [40, 11].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -923,6 +1089,12 @@ module AMQ
         @method_id = 20
         @index = 0x00280014 # 40, 20, 2621460
         @packed_indexes = [40, 20].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:exchange, :shortstr, false],
+          [:if_unused, :bit, true],
+          [:nowait, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:exchange, :if_unused, :nowait].freeze
 
 
         def self.has_content?
@@ -930,16 +1102,23 @@ module AMQ
         end
 
         # @return
-        # [u'ticket = 0', u'exchange = nil', u'if_unused = false', u'nowait = false']
+        # ['ticket = 0', 'exchange = nil', 'if_unused = false', 'nowait = false']
         def self.encode(channel, exchange, if_unused, nowait)
           ticket = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:exchange => exchange, :if_unused => if_unused, :nowait => nowait})
           buffer = @packed_indexes.dup
           buffer << [ticket].pack(PACK_UINT16)
           buffer << exchange.to_s.bytesize.chr
           buffer << exchange.to_s
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if if_unused
-          bit_buffer = bit_buffer | (1 << 1) if nowait
+          if StrictParameters.enabled? && !if_unused.nil? && !if_unused.equal?(true) && !if_unused.equal?(false)
+            raise InvalidParameterError.new(@name, :if_unused, "true, false or nil", if_unused)
+          end
+          bit_buffer |= ((if_unused ? 1 : 0) << 0)
+          if StrictParameters.enabled? && !nowait.nil? && !nowait.equal?(true) && !nowait.equal?(false)
+            raise InvalidParameterError.new(@name, :nowait, "true, false or nil", nowait)
+          end
+          bit_buffer |= ((nowait ? 1 : 0) << 1)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -951,6 +1130,9 @@ module AMQ
         @method_id = 21
         @index = 0x00280015 # 40, 21, 2621461
         @packed_indexes = [40, 21].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -973,6 +1155,14 @@ module AMQ
         @method_id = 30
         @index = 0x0028001E # 40, 30, 2621470
         @packed_indexes = [40, 30].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:destination, :shortstr, false],
+          [:source, :shortstr, false],
+          [:routing_key, :shortstr, false],
+          [:nowait, :bit, true],
+          [:arguments, :table, true],
+        ].freeze
+        ARGUMENT_NAMES = [:destination, :source, :routing_key, :nowait, :arguments].freeze
 
 
         def self.has_content?
@@ -980,9 +1170,10 @@ module AMQ
         end
 
         # @return
-        # [u'ticket = 0', u'destination = nil', u'source = nil', u'routing_key = EMPTY_STRING', u'nowait = false', u'arguments = {}']
+        # ['ticket = 0', 'destination = nil', 'source = nil', 'routing_key = EMPTY_STRING', 'nowait = false', 'arguments = {}']
         def self.encode(channel, destination, source, routing_key, nowait, arguments)
           ticket = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:destination => destination, :source => source, :routing_key => routing_key, :nowait => nowait, :arguments => arguments})
           buffer = @packed_indexes.dup
           buffer << [ticket].pack(PACK_UINT16)
           buffer << destination.to_s.bytesize.chr
@@ -992,7 +1183,10 @@ module AMQ
           buffer << routing_key.to_s.bytesize.chr
           buffer << routing_key.to_s
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if nowait
+          if StrictParameters.enabled? && !nowait.nil? && !nowait.equal?(true) && !nowait.equal?(false)
+            raise InvalidParameterError.new(@name, :nowait, "true, false or nil", nowait)
+          end
+          bit_buffer |= ((nowait ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           buffer << AMQ::Protocol::Table.encode(arguments)
           MethodFrame.new(buffer, channel)
@@ -1005,6 +1199,9 @@ module AMQ
         @method_id = 31
         @index = 0x0028001F # 40, 31, 2621471
         @packed_indexes = [40, 31].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -1027,6 +1224,14 @@ module AMQ
         @method_id = 40
         @index = 0x00280028 # 40, 40, 2621480
         @packed_indexes = [40, 40].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:destination, :shortstr, false],
+          [:source, :shortstr, false],
+          [:routing_key, :shortstr, false],
+          [:nowait, :bit, true],
+          [:arguments, :table, true],
+        ].freeze
+        ARGUMENT_NAMES = [:destination, :source, :routing_key, :nowait, :arguments].freeze
 
 
         def self.has_content?
@@ -1034,9 +1239,10 @@ module AMQ
         end
 
         # @return
-        # [u'ticket = 0', u'destination = nil', u'source = nil', u'routing_key = EMPTY_STRING', u'nowait = false', u'arguments = {}']
+        # ['ticket = 0', 'destination = nil', 'source = nil', 'routing_key = EMPTY_STRING', 'nowait = false', 'arguments = {}']
         def self.encode(channel, destination, source, routing_key, nowait, arguments)
           ticket = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:destination => destination, :source => source, :routing_key => routing_key, :nowait => nowait, :arguments => arguments})
           buffer = @packed_indexes.dup
           buffer << [ticket].pack(PACK_UINT16)
           buffer << destination.to_s.bytesize.chr
@@ -1046,7 +1252,10 @@ module AMQ
           buffer << routing_key.to_s.bytesize.chr
           buffer << routing_key.to_s
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if nowait
+          if StrictParameters.enabled? && !nowait.nil? && !nowait.equal?(true) && !nowait.equal?(false)
+            raise InvalidParameterError.new(@name, :nowait, "true, false or nil", nowait)
+          end
+          bit_buffer |= ((nowait ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           buffer << AMQ::Protocol::Table.encode(arguments)
           MethodFrame.new(buffer, channel)
@@ -1059,6 +1268,9 @@ module AMQ
         @method_id = 51
         @index = 0x00280033 # 40, 51, 2621491
         @packed_indexes = [40, 51].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -1089,6 +1301,16 @@ module AMQ
         @method_id = 10
         @index = 0x0032000A # 50, 10, 3276810
         @packed_indexes = [50, 10].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:queue, :shortstr, false],
+          [:passive, :bit, true],
+          [:durable, :bit, true],
+          [:exclusive, :bit, true],
+          [:auto_delete, :bit, true],
+          [:nowait, :bit, true],
+          [:arguments, :table, true],
+        ].freeze
+        ARGUMENT_NAMES = [:queue, :passive, :durable, :exclusive, :auto_delete, :nowait, :arguments].freeze
 
 
         def self.has_content?
@@ -1096,19 +1318,35 @@ module AMQ
         end
 
         # @return
-        # [u'ticket = 0', u'queue = EMPTY_STRING', u'passive = false', u'durable = false', u'exclusive = false', u'auto_delete = false', u'nowait = false', u'arguments = {}']
+        # ['ticket = 0', 'queue = EMPTY_STRING', 'passive = false', 'durable = false', 'exclusive = false', 'auto_delete = false', 'nowait = false', 'arguments = {}']
         def self.encode(channel, queue, passive, durable, exclusive, auto_delete, nowait, arguments)
           ticket = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:queue => queue, :passive => passive, :durable => durable, :exclusive => exclusive, :auto_delete => auto_delete, :nowait => nowait, :arguments => arguments})
           buffer = @packed_indexes.dup
           buffer << [ticket].pack(PACK_UINT16)
           buffer << queue.to_s.bytesize.chr
           buffer << queue.to_s
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if passive
-          bit_buffer = bit_buffer | (1 << 1) if durable
-          bit_buffer = bit_buffer | (1 << 2) if exclusive
-          bit_buffer = bit_buffer | (1 << 3) if auto_delete
-          bit_buffer = bit_buffer | (1 << 4) if nowait
+          if StrictParameters.enabled? && !passive.nil? && !passive.equal?(true) && !passive.equal?(false)
+            raise InvalidParameterError.new(@name, :passive, "true, false or nil", passive)
+          end
+          bit_buffer |= ((passive ? 1 : 0) << 0)
+          if StrictParameters.enabled? && !durable.nil? && !durable.equal?(true) && !durable.equal?(false)
+            raise InvalidParameterError.new(@name, :durable, "true, false or nil", durable)
+          end
+          bit_buffer |= ((durable ? 1 : 0) << 1)
+          if StrictParameters.enabled? && !exclusive.nil? && !exclusive.equal?(true) && !exclusive.equal?(false)
+            raise InvalidParameterError.new(@name, :exclusive, "true, false or nil", exclusive)
+          end
+          bit_buffer |= ((exclusive ? 1 : 0) << 2)
+          if StrictParameters.enabled? && !auto_delete.nil? && !auto_delete.equal?(true) && !auto_delete.equal?(false)
+            raise InvalidParameterError.new(@name, :auto_delete, "true, false or nil", auto_delete)
+          end
+          bit_buffer |= ((auto_delete ? 1 : 0) << 3)
+          if StrictParameters.enabled? && !nowait.nil? && !nowait.equal?(true) && !nowait.equal?(false)
+            raise InvalidParameterError.new(@name, :nowait, "true, false or nil", nowait)
+          end
+          bit_buffer |= ((nowait ? 1 : 0) << 4)
           buffer << [bit_buffer].pack(PACK_CHAR)
           buffer << AMQ::Protocol::Table.encode(arguments)
           MethodFrame.new(buffer, channel)
@@ -1121,17 +1359,23 @@ module AMQ
         @method_id = 11
         @index = 0x0032000B # 50, 11, 3276811
         @packed_indexes = [50, 11].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:queue, :shortstr, false],
+          [:message_count, :long, false],
+          [:consumer_count, :long, false],
+        ].freeze
+        ARGUMENT_NAMES = [:queue, :message_count, :consumer_count].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          queue = data[offset, length]
+          queue = data.byteslice(offset, length)
           offset += length
-          message_count = data[offset, 4].unpack(PACK_UINT32).first
+          message_count = data.byteslice(offset, 4).unpack1(PACK_UINT32)
           offset += 4
-          consumer_count = data[offset, 4].unpack(PACK_UINT32).first
+          consumer_count = data.byteslice(offset, 4).unpack1(PACK_UINT32)
           offset += 4
           self.new(queue, message_count, consumer_count)
         end
@@ -1155,6 +1399,14 @@ module AMQ
         @method_id = 20
         @index = 0x00320014 # 50, 20, 3276820
         @packed_indexes = [50, 20].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:queue, :shortstr, false],
+          [:exchange, :shortstr, false],
+          [:routing_key, :shortstr, false],
+          [:nowait, :bit, true],
+          [:arguments, :table, true],
+        ].freeze
+        ARGUMENT_NAMES = [:queue, :exchange, :routing_key, :nowait, :arguments].freeze
 
 
         def self.has_content?
@@ -1162,9 +1414,10 @@ module AMQ
         end
 
         # @return
-        # [u'ticket = 0', u'queue = EMPTY_STRING', u'exchange = nil', u'routing_key = EMPTY_STRING', u'nowait = false', u'arguments = {}']
+        # ['ticket = 0', 'queue = EMPTY_STRING', 'exchange = nil', 'routing_key = EMPTY_STRING', 'nowait = false', 'arguments = {}']
         def self.encode(channel, queue, exchange, routing_key, nowait, arguments)
           ticket = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:queue => queue, :exchange => exchange, :routing_key => routing_key, :nowait => nowait, :arguments => arguments})
           buffer = @packed_indexes.dup
           buffer << [ticket].pack(PACK_UINT16)
           buffer << queue.to_s.bytesize.chr
@@ -1174,7 +1427,10 @@ module AMQ
           buffer << routing_key.to_s.bytesize.chr
           buffer << routing_key.to_s
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if nowait
+          if StrictParameters.enabled? && !nowait.nil? && !nowait.equal?(true) && !nowait.equal?(false)
+            raise InvalidParameterError.new(@name, :nowait, "true, false or nil", nowait)
+          end
+          bit_buffer |= ((nowait ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           buffer << AMQ::Protocol::Table.encode(arguments)
           MethodFrame.new(buffer, channel)
@@ -1187,6 +1443,9 @@ module AMQ
         @method_id = 21
         @index = 0x00320015 # 50, 21, 3276821
         @packed_indexes = [50, 21].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -1209,6 +1468,11 @@ module AMQ
         @method_id = 30
         @index = 0x0032001E # 50, 30, 3276830
         @packed_indexes = [50, 30].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:queue, :shortstr, false],
+          [:nowait, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:queue, :nowait].freeze
 
 
         def self.has_content?
@@ -1216,15 +1480,19 @@ module AMQ
         end
 
         # @return
-        # [u'ticket = 0', u'queue = EMPTY_STRING', u'nowait = false']
+        # ['ticket = 0', 'queue = EMPTY_STRING', 'nowait = false']
         def self.encode(channel, queue, nowait)
           ticket = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:queue => queue, :nowait => nowait})
           buffer = @packed_indexes.dup
           buffer << [ticket].pack(PACK_UINT16)
           buffer << queue.to_s.bytesize.chr
           buffer << queue.to_s
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if nowait
+          if StrictParameters.enabled? && !nowait.nil? && !nowait.equal?(true) && !nowait.equal?(false)
+            raise InvalidParameterError.new(@name, :nowait, "true, false or nil", nowait)
+          end
+          bit_buffer |= ((nowait ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -1236,11 +1504,15 @@ module AMQ
         @method_id = 31
         @index = 0x0032001F # 50, 31, 3276831
         @packed_indexes = [50, 31].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:message_count, :long, false],
+        ].freeze
+        ARGUMENT_NAMES = [:message_count].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          message_count = data[offset, 4].unpack(PACK_UINT32).first
+          message_count = data.byteslice(offset, 4).unpack1(PACK_UINT32)
           offset += 4
           self.new(message_count)
         end
@@ -1262,6 +1534,13 @@ module AMQ
         @method_id = 40
         @index = 0x00320028 # 50, 40, 3276840
         @packed_indexes = [50, 40].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:queue, :shortstr, false],
+          [:if_unused, :bit, true],
+          [:if_empty, :bit, true],
+          [:nowait, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:queue, :if_unused, :if_empty, :nowait].freeze
 
 
         def self.has_content?
@@ -1269,17 +1548,27 @@ module AMQ
         end
 
         # @return
-        # [u'ticket = 0', u'queue = EMPTY_STRING', u'if_unused = false', u'if_empty = false', u'nowait = false']
+        # ['ticket = 0', 'queue = EMPTY_STRING', 'if_unused = false', 'if_empty = false', 'nowait = false']
         def self.encode(channel, queue, if_unused, if_empty, nowait)
           ticket = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:queue => queue, :if_unused => if_unused, :if_empty => if_empty, :nowait => nowait})
           buffer = @packed_indexes.dup
           buffer << [ticket].pack(PACK_UINT16)
           buffer << queue.to_s.bytesize.chr
           buffer << queue.to_s
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if if_unused
-          bit_buffer = bit_buffer | (1 << 1) if if_empty
-          bit_buffer = bit_buffer | (1 << 2) if nowait
+          if StrictParameters.enabled? && !if_unused.nil? && !if_unused.equal?(true) && !if_unused.equal?(false)
+            raise InvalidParameterError.new(@name, :if_unused, "true, false or nil", if_unused)
+          end
+          bit_buffer |= ((if_unused ? 1 : 0) << 0)
+          if StrictParameters.enabled? && !if_empty.nil? && !if_empty.equal?(true) && !if_empty.equal?(false)
+            raise InvalidParameterError.new(@name, :if_empty, "true, false or nil", if_empty)
+          end
+          bit_buffer |= ((if_empty ? 1 : 0) << 1)
+          if StrictParameters.enabled? && !nowait.nil? && !nowait.equal?(true) && !nowait.equal?(false)
+            raise InvalidParameterError.new(@name, :nowait, "true, false or nil", nowait)
+          end
+          bit_buffer |= ((nowait ? 1 : 0) << 2)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -1291,11 +1580,15 @@ module AMQ
         @method_id = 41
         @index = 0x00320029 # 50, 41, 3276841
         @packed_indexes = [50, 41].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:message_count, :long, false],
+        ].freeze
+        ARGUMENT_NAMES = [:message_count].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          message_count = data[offset, 4].unpack(PACK_UINT32).first
+          message_count = data.byteslice(offset, 4).unpack1(PACK_UINT32)
           offset += 4
           self.new(message_count)
         end
@@ -1317,6 +1610,13 @@ module AMQ
         @method_id = 50
         @index = 0x00320032 # 50, 50, 3276850
         @packed_indexes = [50, 50].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:queue, :shortstr, false],
+          [:exchange, :shortstr, false],
+          [:routing_key, :shortstr, false],
+          [:arguments, :table, true],
+        ].freeze
+        ARGUMENT_NAMES = [:queue, :exchange, :routing_key, :arguments].freeze
 
 
         def self.has_content?
@@ -1324,9 +1624,10 @@ module AMQ
         end
 
         # @return
-        # [u'ticket = 0', u'queue = EMPTY_STRING', u'exchange = nil', u'routing_key = EMPTY_STRING', u'arguments = {}']
+        # ['ticket = 0', 'queue = EMPTY_STRING', 'exchange = nil', 'routing_key = EMPTY_STRING', 'arguments = {}']
         def self.encode(channel, queue, exchange, routing_key, arguments)
           ticket = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:queue => queue, :exchange => exchange, :routing_key => routing_key, :arguments => arguments})
           buffer = @packed_indexes.dup
           buffer << [ticket].pack(PACK_UINT16)
           buffer << queue.to_s.bytesize.chr
@@ -1346,6 +1647,9 @@ module AMQ
         @method_id = 51
         @index = 0x00320033 # 50, 51, 3276851
         @packed_indexes = [50, 51].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -1567,7 +1871,6 @@ module AMQ
         0x0004,
       ]
 
-      # Optimized decode_properties using getbyte and unpack1
       def self.decode_properties(data)
         offset, data_length, properties = 0, data.bytesize, {}
 
@@ -1588,7 +1891,7 @@ module AMQ
               result = data.getbyte(offset)
             when :timestamp
               size = 8
-              result = Time.at(data.byteslice(offset, 8).unpack1(PACK_UINT64_BE))
+              result = Time.at(data.byteslice(offset, size).unpack1(PACK_UINT64_BE))
             when :table
               size = 4 + data.byteslice(offset, 4).unpack1(PACK_UINT32)
               result = Table.decode(data.byteslice(offset, size))
@@ -1606,6 +1909,12 @@ module AMQ
         @method_id = 10
         @index = 0x003C000A # 60, 10, 3932170
         @packed_indexes = [60, 10].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:prefetch_size, :long, false],
+          [:prefetch_count, :short, false],
+          [:global, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:prefetch_size, :prefetch_count, :global].freeze
 
 
         def self.has_content?
@@ -1613,13 +1922,17 @@ module AMQ
         end
 
         # @return
-        # [u'prefetch_size = false', u'prefetch_count = false', u'global = false']
+        # ['prefetch_size = false', 'prefetch_count = false', 'global = false']
         def self.encode(channel, prefetch_size, prefetch_count, global)
+          StrictParameters.validate!(@name, PARAMETERS, {:prefetch_size => prefetch_size, :prefetch_count => prefetch_count, :global => global})
           buffer = @packed_indexes.dup
           buffer << [prefetch_size].pack(PACK_UINT32)
           buffer << [prefetch_count].pack(PACK_UINT16)
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if global
+          if StrictParameters.enabled? && !global.nil? && !global.equal?(true) && !global.equal?(false)
+            raise InvalidParameterError.new(@name, :global, "true, false or nil", global)
+          end
+          bit_buffer |= ((global ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -1631,6 +1944,9 @@ module AMQ
         @method_id = 11
         @index = 0x003C000B # 60, 11, 3932171
         @packed_indexes = [60, 11].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -1653,6 +1969,16 @@ module AMQ
         @method_id = 20
         @index = 0x003C0014 # 60, 20, 3932180
         @packed_indexes = [60, 20].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:queue, :shortstr, false],
+          [:consumer_tag, :shortstr, false],
+          [:no_local, :bit, true],
+          [:no_ack, :bit, true],
+          [:exclusive, :bit, true],
+          [:nowait, :bit, true],
+          [:arguments, :table, true],
+        ].freeze
+        ARGUMENT_NAMES = [:queue, :consumer_tag, :no_local, :no_ack, :exclusive, :nowait, :arguments].freeze
 
 
         def self.has_content?
@@ -1660,9 +1986,10 @@ module AMQ
         end
 
         # @return
-        # [u'ticket = 0', u'queue = EMPTY_STRING', u'consumer_tag = EMPTY_STRING', u'no_local = false', u'no_ack = false', u'exclusive = false', u'nowait = false', u'arguments = {}']
+        # ['ticket = 0', 'queue = EMPTY_STRING', 'consumer_tag = EMPTY_STRING', 'no_local = false', 'no_ack = false', 'exclusive = false', 'nowait = false', 'arguments = {}']
         def self.encode(channel, queue, consumer_tag, no_local, no_ack, exclusive, nowait, arguments)
           ticket = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:queue => queue, :consumer_tag => consumer_tag, :no_local => no_local, :no_ack => no_ack, :exclusive => exclusive, :nowait => nowait, :arguments => arguments})
           buffer = @packed_indexes.dup
           buffer << [ticket].pack(PACK_UINT16)
           buffer << queue.to_s.bytesize.chr
@@ -1670,10 +1997,22 @@ module AMQ
           buffer << consumer_tag.to_s.bytesize.chr
           buffer << consumer_tag.to_s
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if no_local
-          bit_buffer = bit_buffer | (1 << 1) if no_ack
-          bit_buffer = bit_buffer | (1 << 2) if exclusive
-          bit_buffer = bit_buffer | (1 << 3) if nowait
+          if StrictParameters.enabled? && !no_local.nil? && !no_local.equal?(true) && !no_local.equal?(false)
+            raise InvalidParameterError.new(@name, :no_local, "true, false or nil", no_local)
+          end
+          bit_buffer |= ((no_local ? 1 : 0) << 0)
+          if StrictParameters.enabled? && !no_ack.nil? && !no_ack.equal?(true) && !no_ack.equal?(false)
+            raise InvalidParameterError.new(@name, :no_ack, "true, false or nil", no_ack)
+          end
+          bit_buffer |= ((no_ack ? 1 : 0) << 1)
+          if StrictParameters.enabled? && !exclusive.nil? && !exclusive.equal?(true) && !exclusive.equal?(false)
+            raise InvalidParameterError.new(@name, :exclusive, "true, false or nil", exclusive)
+          end
+          bit_buffer |= ((exclusive ? 1 : 0) << 2)
+          if StrictParameters.enabled? && !nowait.nil? && !nowait.equal?(true) && !nowait.equal?(false)
+            raise InvalidParameterError.new(@name, :nowait, "true, false or nil", nowait)
+          end
+          bit_buffer |= ((nowait ? 1 : 0) << 3)
           buffer << [bit_buffer].pack(PACK_CHAR)
           buffer << AMQ::Protocol::Table.encode(arguments)
           MethodFrame.new(buffer, channel)
@@ -1686,12 +2025,18 @@ module AMQ
         @method_id = 21
         @index = 0x003C0015 # 60, 21, 3932181
         @packed_indexes = [60, 21].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:consumer_tag, :shortstr, false],
+        ].freeze
+        ARGUMENT_NAMES = [:consumer_tag].freeze
 
-        # Optimized decode using getbyte
         # @return
         def self.decode(data)
-          length = data.getbyte(0)
-          consumer_tag = data.byteslice(1, length)
+          offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
+          length = data.getbyte(offset)
+          offset += 1
+          consumer_tag = data.byteslice(offset, length)
+          offset += length
           self.new(consumer_tag)
         end
 
@@ -1712,15 +2057,20 @@ module AMQ
         @method_id = 30
         @index = 0x003C001E # 60, 30, 3932190
         @packed_indexes = [60, 30].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:consumer_tag, :shortstr, false],
+          [:nowait, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:consumer_tag, :nowait].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          consumer_tag = data[offset, length]
+          consumer_tag = data.byteslice(offset, length)
           offset += length
-          bit_buffer = data[offset, 1].unpack(PACK_CHAR).first
+          bit_buffer = data.getbyte(offset)
           offset += 1
           nowait = (bit_buffer & (1 << 0)) != 0
           self.new(consumer_tag, nowait)
@@ -1737,13 +2087,17 @@ module AMQ
         end
 
         # @return
-        # [u'consumer_tag = nil', u'nowait = false']
+        # ['consumer_tag = nil', 'nowait = false']
         def self.encode(channel, consumer_tag, nowait)
+          StrictParameters.validate!(@name, PARAMETERS, {:consumer_tag => consumer_tag, :nowait => nowait})
           buffer = @packed_indexes.dup
           buffer << consumer_tag.to_s.bytesize.chr
           buffer << consumer_tag.to_s
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if nowait
+          if StrictParameters.enabled? && !nowait.nil? && !nowait.equal?(true) && !nowait.equal?(false)
+            raise InvalidParameterError.new(@name, :nowait, "true, false or nil", nowait)
+          end
+          bit_buffer |= ((nowait ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -1755,13 +2109,17 @@ module AMQ
         @method_id = 31
         @index = 0x003C001F # 60, 31, 3932191
         @packed_indexes = [60, 31].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:consumer_tag, :shortstr, false],
+        ].freeze
+        ARGUMENT_NAMES = [:consumer_tag].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          consumer_tag = data[offset, length]
+          consumer_tag = data.byteslice(offset, length)
           offset += length
           self.new(consumer_tag)
         end
@@ -1783,6 +2141,13 @@ module AMQ
         @method_id = 40
         @index = 0x003C0028 # 60, 40, 3932200
         @packed_indexes = [60, 40].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:exchange, :shortstr, false],
+          [:routing_key, :shortstr, false],
+          [:mandatory, :bit, true],
+          [:immediate, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:exchange, :routing_key, :mandatory, :immediate].freeze
 
 
         def self.has_content?
@@ -1790,9 +2155,10 @@ module AMQ
         end
 
         # @return
-        # [u'ticket = 0', u'exchange = EMPTY_STRING', u'routing_key = EMPTY_STRING', u'mandatory = false', u'immediate = false', 'user_headers = nil', 'payload = ""', 'frame_size = nil']
+        # ['ticket = 0', 'exchange = EMPTY_STRING', 'routing_key = EMPTY_STRING', 'mandatory = false', 'immediate = false', 'user_headers = nil', 'payload = ""', 'frame_size = nil']
         def self.encode(channel, payload, user_headers, exchange, routing_key, mandatory, immediate, frame_size)
           ticket = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:exchange => exchange, :routing_key => routing_key, :mandatory => mandatory, :immediate => immediate})
           buffer = @packed_indexes.dup
           buffer << [ticket].pack(PACK_UINT16)
           buffer << exchange.to_s.bytesize.chr
@@ -1800,8 +2166,14 @@ module AMQ
           buffer << routing_key.to_s.bytesize.chr
           buffer << routing_key.to_s
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if mandatory
-          bit_buffer = bit_buffer | (1 << 1) if immediate
+          if StrictParameters.enabled? && !mandatory.nil? && !mandatory.equal?(true) && !mandatory.equal?(false)
+            raise InvalidParameterError.new(@name, :mandatory, "true, false or nil", mandatory)
+          end
+          bit_buffer |= ((mandatory ? 1 : 0) << 0)
+          if StrictParameters.enabled? && !immediate.nil? && !immediate.equal?(true) && !immediate.equal?(false)
+            raise InvalidParameterError.new(@name, :immediate, "true, false or nil", immediate)
+          end
+          bit_buffer |= ((immediate ? 1 : 0) << 1)
           buffer << [bit_buffer].pack(PACK_CHAR)
           frames = [MethodFrame.new(buffer, channel)]
           properties, _headers = self.split_headers(user_headers)
@@ -1821,23 +2193,30 @@ module AMQ
         @method_id = 50
         @index = 0x003C0032 # 60, 50, 3932210
         @packed_indexes = [60, 50].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:reply_code, :short, false],
+          [:reply_text, :shortstr, false],
+          [:exchange, :shortstr, false],
+          [:routing_key, :shortstr, false],
+        ].freeze
+        ARGUMENT_NAMES = [:reply_code, :reply_text, :exchange, :routing_key].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          reply_code = data[offset, 2].unpack(PACK_UINT16).first
+          reply_code = data.byteslice(offset, 2).unpack1(PACK_UINT16)
           offset += 2
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          reply_text = data[offset, length]
+          reply_text = data.byteslice(offset, length)
           offset += length
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          exchange = data[offset, length]
+          exchange = data.byteslice(offset, length)
           offset += length
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          routing_key = data[offset, length]
+          routing_key = data.byteslice(offset, length)
           offset += length
           self.new(reply_code, reply_text, exchange, routing_key)
         end
@@ -1862,19 +2241,27 @@ module AMQ
         @method_id = 60
         @index = 0x003C003C # 60, 60, 3932220
         @packed_indexes = [60, 60].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:consumer_tag, :shortstr, false],
+          [:delivery_tag, :longlong, false],
+          [:redelivered, :bit, true],
+          [:exchange, :shortstr, false],
+          [:routing_key, :shortstr, false],
+        ].freeze
+        ARGUMENT_NAMES = [:consumer_tag, :delivery_tag, :redelivered, :exchange, :routing_key].freeze
 
-        # Optimized decode using getbyte and unpack1 for better performance
         # @return
         def self.decode(data)
-          offset = 0
+          offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
           length = data.getbyte(offset)
           offset += 1
           consumer_tag = data.byteslice(offset, length)
           offset += length
           delivery_tag = data.byteslice(offset, 8).unpack1(PACK_UINT64_BE)
           offset += 8
-          redelivered = (data.getbyte(offset) & 1) != 0
+          bit_buffer = data.getbyte(offset)
           offset += 1
+          redelivered = (bit_buffer & (1 << 0)) != 0
           length = data.getbyte(offset)
           offset += 1
           exchange = data.byteslice(offset, length)
@@ -1882,6 +2269,7 @@ module AMQ
           length = data.getbyte(offset)
           offset += 1
           routing_key = data.byteslice(offset, length)
+          offset += length
           self.new(consumer_tag, delivery_tag, redelivered, exchange, routing_key)
         end
 
@@ -1906,6 +2294,11 @@ module AMQ
         @method_id = 70
         @index = 0x003C0046 # 60, 70, 3932230
         @packed_indexes = [60, 70].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:queue, :shortstr, false],
+          [:no_ack, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:queue, :no_ack].freeze
 
 
         def self.has_content?
@@ -1913,15 +2306,19 @@ module AMQ
         end
 
         # @return
-        # [u'ticket = 0', u'queue = EMPTY_STRING', u'no_ack = false']
+        # ['ticket = 0', 'queue = EMPTY_STRING', 'no_ack = false']
         def self.encode(channel, queue, no_ack)
           ticket = 0
+          StrictParameters.validate!(@name, PARAMETERS, {:queue => queue, :no_ack => no_ack})
           buffer = @packed_indexes.dup
           buffer << [ticket].pack(PACK_UINT16)
           buffer << queue.to_s.bytesize.chr
           buffer << queue.to_s
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if no_ack
+          if StrictParameters.enabled? && !no_ack.nil? && !no_ack.equal?(true) && !no_ack.equal?(false)
+            raise InvalidParameterError.new(@name, :no_ack, "true, false or nil", no_ack)
+          end
+          bit_buffer |= ((no_ack ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -1933,24 +2330,32 @@ module AMQ
         @method_id = 71
         @index = 0x003C0047 # 60, 71, 3932231
         @packed_indexes = [60, 71].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:delivery_tag, :longlong, false],
+          [:redelivered, :bit, true],
+          [:exchange, :shortstr, false],
+          [:routing_key, :shortstr, false],
+          [:message_count, :long, false],
+        ].freeze
+        ARGUMENT_NAMES = [:delivery_tag, :redelivered, :exchange, :routing_key, :message_count].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          delivery_tag = AMQ::Pack.unpack_uint64_big_endian(data[offset, 8]).first
+          delivery_tag = data.byteslice(offset, 8).unpack1(PACK_UINT64_BE)
           offset += 8
-          bit_buffer = data[offset, 1].unpack(PACK_CHAR).first
+          bit_buffer = data.getbyte(offset)
           offset += 1
           redelivered = (bit_buffer & (1 << 0)) != 0
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          exchange = data[offset, length]
+          exchange = data.byteslice(offset, length)
           offset += length
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          routing_key = data[offset, length]
+          routing_key = data.byteslice(offset, length)
           offset += length
-          message_count = data[offset, 4].unpack(PACK_UINT32).first
+          message_count = data.byteslice(offset, 4).unpack1(PACK_UINT32)
           offset += 4
           self.new(delivery_tag, redelivered, exchange, routing_key, message_count)
         end
@@ -1976,13 +2381,17 @@ module AMQ
         @method_id = 72
         @index = 0x003C0048 # 60, 72, 3932232
         @packed_indexes = [60, 72].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:cluster_id, :shortstr, false],
+        ].freeze
+        ARGUMENT_NAMES = [:cluster_id].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          length = data[offset, 1].unpack(PACK_CHAR).first
+          length = data.getbyte(offset)
           offset += 1
-          cluster_id = data[offset, length]
+          cluster_id = data.byteslice(offset, length)
           offset += length
           self.new(cluster_id)
         end
@@ -2004,12 +2413,20 @@ module AMQ
         @method_id = 80
         @index = 0x003C0050 # 60, 80, 3932240
         @packed_indexes = [60, 80].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:delivery_tag, :longlong, false],
+          [:multiple, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:delivery_tag, :multiple].freeze
 
-        # Optimized decode using unpack1 and getbyte
         # @return
         def self.decode(data)
-          delivery_tag = data.byteslice(0, 8).unpack1(PACK_UINT64_BE)
-          multiple = (data.getbyte(8) & 1) != 0
+          offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
+          delivery_tag = data.byteslice(offset, 8).unpack1(PACK_UINT64_BE)
+          offset += 8
+          bit_buffer = data.getbyte(offset)
+          offset += 1
+          multiple = (bit_buffer & (1 << 0)) != 0
           self.new(delivery_tag, multiple)
         end
 
@@ -2024,12 +2441,16 @@ module AMQ
         end
 
         # @return
-        # [u'delivery_tag = false', u'multiple = false']
+        # ['delivery_tag = false', 'multiple = false']
         def self.encode(channel, delivery_tag, multiple)
+          StrictParameters.validate!(@name, PARAMETERS, {:delivery_tag => delivery_tag, :multiple => multiple})
           buffer = @packed_indexes.dup
           buffer << AMQ::Pack.pack_uint64_big_endian(delivery_tag)
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if multiple
+          if StrictParameters.enabled? && !multiple.nil? && !multiple.equal?(true) && !multiple.equal?(false)
+            raise InvalidParameterError.new(@name, :multiple, "true, false or nil", multiple)
+          end
+          bit_buffer |= ((multiple ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -2041,6 +2462,11 @@ module AMQ
         @method_id = 90
         @index = 0x003C005A # 60, 90, 3932250
         @packed_indexes = [60, 90].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:delivery_tag, :longlong, false],
+          [:requeue, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:delivery_tag, :requeue].freeze
 
 
         def self.has_content?
@@ -2048,12 +2474,16 @@ module AMQ
         end
 
         # @return
-        # [u'delivery_tag = nil', u'requeue = true']
+        # ['delivery_tag = nil', 'requeue = true']
         def self.encode(channel, delivery_tag, requeue)
+          StrictParameters.validate!(@name, PARAMETERS, {:delivery_tag => delivery_tag, :requeue => requeue})
           buffer = @packed_indexes.dup
           buffer << AMQ::Pack.pack_uint64_big_endian(delivery_tag)
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if requeue
+          if StrictParameters.enabled? && !requeue.nil? && !requeue.equal?(true) && !requeue.equal?(false)
+            raise InvalidParameterError.new(@name, :requeue, "true, false or nil", requeue)
+          end
+          bit_buffer |= ((requeue ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -2065,6 +2495,10 @@ module AMQ
         @method_id = 100
         @index = 0x003C0064 # 60, 100, 3932260
         @packed_indexes = [60, 100].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:requeue, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:requeue].freeze
 
 
         def self.has_content?
@@ -2072,11 +2506,15 @@ module AMQ
         end
 
         # @return
-        # [u'requeue = false']
+        # ['requeue = false']
         def self.encode(channel, requeue)
+          StrictParameters.validate!(@name, PARAMETERS, {:requeue => requeue})
           buffer = @packed_indexes.dup
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if requeue
+          if StrictParameters.enabled? && !requeue.nil? && !requeue.equal?(true) && !requeue.equal?(false)
+            raise InvalidParameterError.new(@name, :requeue, "true, false or nil", requeue)
+          end
+          bit_buffer |= ((requeue ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -2088,6 +2526,10 @@ module AMQ
         @method_id = 110
         @index = 0x003C006E # 60, 110, 3932270
         @packed_indexes = [60, 110].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:requeue, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:requeue].freeze
 
 
         def self.has_content?
@@ -2095,11 +2537,15 @@ module AMQ
         end
 
         # @return
-        # [u'requeue = false']
+        # ['requeue = false']
         def self.encode(channel, requeue)
+          StrictParameters.validate!(@name, PARAMETERS, {:requeue => requeue})
           buffer = @packed_indexes.dup
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if requeue
+          if StrictParameters.enabled? && !requeue.nil? && !requeue.equal?(true) && !requeue.equal?(false)
+            raise InvalidParameterError.new(@name, :requeue, "true, false or nil", requeue)
+          end
+          bit_buffer |= ((requeue ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -2111,6 +2557,9 @@ module AMQ
         @method_id = 111
         @index = 0x003C006F # 60, 111, 3932271
         @packed_indexes = [60, 111].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -2133,14 +2582,22 @@ module AMQ
         @method_id = 120
         @index = 0x003C0078 # 60, 120, 3932280
         @packed_indexes = [60, 120].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:delivery_tag, :longlong, false],
+          [:multiple, :bit, true],
+          [:requeue, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:delivery_tag, :multiple, :requeue].freeze
 
-        # Optimized decode using unpack1 and getbyte
         # @return
         def self.decode(data)
-          delivery_tag = data.byteslice(0, 8).unpack1(PACK_UINT64_BE)
-          bit_buffer = data.getbyte(8)
-          multiple = (bit_buffer & 1) != 0
-          requeue = (bit_buffer & 2) != 0
+          offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
+          delivery_tag = data.byteslice(offset, 8).unpack1(PACK_UINT64_BE)
+          offset += 8
+          bit_buffer = data.getbyte(offset)
+          offset += 1
+          multiple = (bit_buffer & (1 << 0)) != 0
+          requeue = (bit_buffer & (1 << 1)) != 0
           self.new(delivery_tag, multiple, requeue)
         end
 
@@ -2156,13 +2613,20 @@ module AMQ
         end
 
         # @return
-        # [u'delivery_tag = false', u'multiple = false', u'requeue = true']
+        # ['delivery_tag = false', 'multiple = false', 'requeue = true']
         def self.encode(channel, delivery_tag, multiple, requeue)
+          StrictParameters.validate!(@name, PARAMETERS, {:delivery_tag => delivery_tag, :multiple => multiple, :requeue => requeue})
           buffer = @packed_indexes.dup
           buffer << AMQ::Pack.pack_uint64_big_endian(delivery_tag)
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if multiple
-          bit_buffer = bit_buffer | (1 << 1) if requeue
+          if StrictParameters.enabled? && !multiple.nil? && !multiple.equal?(true) && !multiple.equal?(false)
+            raise InvalidParameterError.new(@name, :multiple, "true, false or nil", multiple)
+          end
+          bit_buffer |= ((multiple ? 1 : 0) << 0)
+          if StrictParameters.enabled? && !requeue.nil? && !requeue.equal?(true) && !requeue.equal?(false)
+            raise InvalidParameterError.new(@name, :requeue, "true, false or nil", requeue)
+          end
+          bit_buffer |= ((requeue ? 1 : 0) << 1)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -2182,6 +2646,9 @@ module AMQ
         @method_id = 10
         @index = 0x005A000A # 90, 10, 5898250
         @packed_indexes = [90, 10].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
 
         def self.has_content?
@@ -2191,6 +2658,7 @@ module AMQ
         # @return
         # []
         def self.encode(channel)
+          StrictParameters.validate!(@name, PARAMETERS, {})
           buffer = @packed_indexes.dup
           MethodFrame.new(buffer, channel)
         end
@@ -2202,6 +2670,9 @@ module AMQ
         @method_id = 11
         @index = 0x005A000B # 90, 11, 5898251
         @packed_indexes = [90, 11].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -2224,6 +2695,9 @@ module AMQ
         @method_id = 20
         @index = 0x005A0014 # 90, 20, 5898260
         @packed_indexes = [90, 20].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
 
         def self.has_content?
@@ -2233,6 +2707,7 @@ module AMQ
         # @return
         # []
         def self.encode(channel)
+          StrictParameters.validate!(@name, PARAMETERS, {})
           buffer = @packed_indexes.dup
           MethodFrame.new(buffer, channel)
         end
@@ -2244,6 +2719,9 @@ module AMQ
         @method_id = 21
         @index = 0x005A0015 # 90, 21, 5898261
         @packed_indexes = [90, 21].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -2266,6 +2744,9 @@ module AMQ
         @method_id = 30
         @index = 0x005A001E # 90, 30, 5898270
         @packed_indexes = [90, 30].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
 
         def self.has_content?
@@ -2275,6 +2756,7 @@ module AMQ
         # @return
         # []
         def self.encode(channel)
+          StrictParameters.validate!(@name, PARAMETERS, {})
           buffer = @packed_indexes.dup
           MethodFrame.new(buffer, channel)
         end
@@ -2286,6 +2768,9 @@ module AMQ
         @method_id = 31
         @index = 0x005A001F # 90, 31, 5898271
         @packed_indexes = [90, 31].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -2316,11 +2801,15 @@ module AMQ
         @method_id = 10
         @index = 0x0055000A # 85, 10, 5570570
         @packed_indexes = [85, 10].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+          [:nowait, :bit, true],
+        ].freeze
+        ARGUMENT_NAMES = [:nowait].freeze
 
         # @return
         def self.decode(data)
           offset = offset = 0 # self-assigning offset to eliminate "assigned but unused variable" warning even if offset is not used in this method
-          bit_buffer = data[offset, 1].unpack(PACK_CHAR).first
+          bit_buffer = data.getbyte(offset)
           offset += 1
           nowait = (bit_buffer & (1 << 0)) != 0
           self.new(nowait)
@@ -2336,11 +2825,15 @@ module AMQ
         end
 
         # @return
-        # [u'nowait = false']
+        # ['nowait = false']
         def self.encode(channel, nowait)
+          StrictParameters.validate!(@name, PARAMETERS, {:nowait => nowait})
           buffer = @packed_indexes.dup
           bit_buffer = 0
-          bit_buffer = bit_buffer | (1 << 0) if nowait
+          if StrictParameters.enabled? && !nowait.nil? && !nowait.equal?(true) && !nowait.equal?(false)
+            raise InvalidParameterError.new(@name, :nowait, "true, false or nil", nowait)
+          end
+          bit_buffer |= ((nowait ? 1 : 0) << 0)
           buffer << [bit_buffer].pack(PACK_CHAR)
           MethodFrame.new(buffer, channel)
         end
@@ -2352,6 +2845,9 @@ module AMQ
         @method_id = 11
         @index = 0x0055000B # 85, 11, 5570571
         @packed_indexes = [85, 11].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        ].freeze
+        ARGUMENT_NAMES = [].freeze
 
         # @return
         def self.decode(data)
@@ -2369,6 +2865,7 @@ module AMQ
         # @return
         # []
         def self.encode(channel)
+          StrictParameters.validate!(@name, PARAMETERS, {})
           buffer = @packed_indexes.dup
           MethodFrame.new(buffer, channel)
         end

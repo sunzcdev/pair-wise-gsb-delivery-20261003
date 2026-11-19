@@ -22,11 +22,11 @@ def genSingleEncode(spec, cValue, unresolved_domain):
     elif type == 'timestamp':
         buffer.append("buffer << AMQ::Pack.pack_uint64_big_endian(%s)" % (cValue,))
     elif type == 'bit':
-        raise "Can't encode bit in genSingleEncode"
+        raise ValueError("Can't encode bit in genSingleEncode")
     elif type == 'table':
         buffer.append("buffer << AMQ::Protocol::Table.encode(%s)" % (cValue,))
     else:
-        raise "Illegal domain in genSingleEncode: {0}".format(type)
+        raise ValueError("Illegal domain in genSingleEncode: {0}".format(type))
 
     return buffer
 
@@ -34,45 +34,41 @@ def genSingleDecode(spec, field):
     cLvalue = field.ruby_name
     unresolved_domain = field.domain
 
-    if cLvalue == "known_hosts":
-        import sys
-        print(field, field.ignored, file = sys.stderr)
-
     type = spec.resolveDomain(unresolved_domain)
     buffer = []
     if type == 'shortstr':
-        buffer.append("length = data[offset, 1].unpack(PACK_CHAR).first")
+        buffer.append("length = data.getbyte(offset)")
         buffer.append("offset += 1")
-        buffer.append("%s = data[offset, length]" % (cLvalue,))
+        buffer.append("%s = data.byteslice(offset, length)" % (cLvalue,))
         buffer.append("offset += length")
     elif type == 'longstr':
-        buffer.append("length = data[offset, 4].unpack(PACK_UINT32).first")
+        buffer.append("length = data.byteslice(offset, 4).unpack1(PACK_UINT32)")
         buffer.append("offset += 4")
-        buffer.append("%s = data[offset, length]" % (cLvalue,))
+        buffer.append("%s = data.byteslice(offset, length)" % (cLvalue,))
         buffer.append("offset += length")
     elif type == 'octet':
-        buffer.append("%s = data[offset, 1].unpack(PACK_CHAR).first" % (cLvalue,))
+        buffer.append("%s = data.getbyte(offset)" % (cLvalue,))
         buffer.append("offset += 1")
     elif type == 'short':
-        buffer.append("%s = data[offset, 2].unpack(PACK_UINT16).first" % (cLvalue,))
+        buffer.append("%s = data.byteslice(offset, 2).unpack1(PACK_UINT16)" % (cLvalue,))
         buffer.append("offset += 2")
     elif type == 'long':
-        buffer.append("%s = data[offset, 4].unpack(PACK_UINT32).first" % (cLvalue,))
+        buffer.append("%s = data.byteslice(offset, 4).unpack1(PACK_UINT32)" % (cLvalue,))
         buffer.append("offset += 4")
     elif type == 'longlong':
-        buffer.append("%s = AMQ::Pack.unpack_uint64_big_endian(data[offset, 8]).first" % (cLvalue,))
+        buffer.append("%s = data.byteslice(offset, 8).unpack1(PACK_UINT64_BE)" % (cLvalue,))
         buffer.append("offset += 8")
     elif type == 'timestamp':
-        buffer.append("%s = data[offset, 8].unpack(PACK_UINT64_BE).first" % (cLvalue,))
+        buffer.append("%s = Time.at(data.byteslice(offset, 8).unpack1(PACK_UINT64_BE))" % (cLvalue,))
         buffer.append("offset += 8")
     elif type == 'bit':
-        raise "Can't decode bit in genSingleDecode"
+        raise ValueError("Can't decode bit in genSingleDecode")
     elif type == 'table':
-        buffer.append("table_length = Table.length(data[offset, 4])")
-        buffer.append("%s = Table.decode(data[offset, table_length + 4])" % (cLvalue,))
+        buffer.append("table_length = Table.length(data.byteslice(offset, 4))")
+        buffer.append("%s = Table.decode(data.byteslice(offset, table_length + 4))" % (cLvalue,))
         buffer.append("offset += table_length + 4")
     else:
-        raise StandardError("Illegal domain '{0}' in genSingleDecode".format(type))
+        raise ValueError("Illegal domain '{0}' in genSingleDecode".format(type))
 
     return buffer
 
@@ -81,10 +77,6 @@ def genSingleDecode(spec, field):
 def genSingleSimpleDecode(spec, field):
     cLvalue = field.ruby_name
     unresolved_domain = field.domain
-
-    if cLvalue == "known_hosts":
-        import sys
-        print >> sys.stderr, field, field.ignored
 
     type = spec.resolveDomain(unresolved_domain)
     buffer = []
@@ -103,17 +95,20 @@ def genSingleSimpleDecode(spec, field):
     elif type == 'timestamp':
         buffer.append("Time.at(data.unpack(PACK_UINT64_BE).last)")
     elif type == 'bit':
-        raise "Can't decode bit in genSingleDecode"
+        raise ValueError("Can't decode bit in genSingleDecode")
     elif type == 'table':
         buffer.append("Table.decode(data)")
     else:
-        raise StandardError("Illegal domain '" + type + "' in genSingleSimpleDecode")
+        raise ValueError("Illegal domain '" + type + "' in genSingleSimpleDecode")
 
     return buffer
 
 
 def genEncodeMethodDefinition(spec, m):
-    def finishBits():
+    # Adjacent bit arguments share one byte. A non-bit field always flushes
+    # the current bit group, so a later group starts at bit offset 0 of a new
+    # byte instead of reusing the previous group's offset.
+    def flush_bits():
         if bit_index is not None:
             buffer.append("buffer << [bit_buffer].pack(PACK_CHAR)")
 
@@ -125,38 +120,44 @@ def genEncodeMethodDefinition(spec, m):
             if bit_index is None:
                 bit_index = 0
                 buffer.append("bit_buffer = 0")
-            if bit_index >= 8:
-                finishBits()
+            elif bit_index >= 8:
+                flush_bits()
                 buffer.append("bit_buffer = 0")
                 bit_index = 0
-            buffer.append("bit_buffer = bit_buffer | (1 << %d) if %s" % (bit_index, f.ruby_name))
+            # Inline branch keeps the legacy truthiness fast path free of
+            # method calls; strict mode only accepts real booleans and nil
+            # (an omitted optional bit).
+            buffer.append("if StrictParameters.enabled? && !%s.nil? && !%s.equal?(true) && !%s.equal?(false)" % (f.ruby_name, f.ruby_name, f.ruby_name))
+            buffer.append("  raise InvalidParameterError.new(@name, :%s, \"true, false or nil\", %s)" % (f.ruby_name, f.ruby_name))
+            buffer.append("end")
+            buffer.append("bit_buffer |= ((%s ? 1 : 0) << %d)" % (f.ruby_name, bit_index))
             bit_index = bit_index + 1
         else:
-            finishBits()
+            flush_bits()
             bit_index = None
             buffer += genSingleEncode(spec, f.ruby_name, f.domain)
 
-    finishBits()
+    flush_bits()
     return buffer
 
 def genDecodeMethodDefinition(spec, m):
+    # Every bit group occupies its own byte, even when fewer than 8 bits are
+    # used. A non-bit field between two bit groups forces a fresh byte read.
     buffer = []
-    bitindex = None
+    bit_index = None
     for f in m.arguments:
         if spec.resolveDomain(f.domain) == 'bit':
-            if bitindex is None:
-                bitindex = 0
-            if bitindex >= 8:
-                bitindex = 0
-            if bitindex == 0:
-                buffer.append("bit_buffer = data[offset, 1].unpack(PACK_CHAR).first")
+            if bit_index is None:
+                bit_index = 0
+                buffer.append("bit_buffer = data.getbyte(offset)")
                 buffer.append("offset += 1")
-                buffer.append("%s = (bit_buffer & (1 << %d)) != 0" % (f.ruby_name, bitindex))
-                #### TODO: ADD bitindex TO THE buffer
-            else:
-                buffer.append("%s = (bit_buffer & (1 << %d)) != 0" % (f.ruby_name, bitindex))
-            bitindex = bitindex + 1
+            elif bit_index >= 8:
+                buffer.append("bit_buffer = data.getbyte(offset)")
+                buffer.append("offset += 1")
+                bit_index = 0
+            buffer.append("%s = (bit_buffer & (1 << %d)) != 0" % (f.ruby_name, bit_index))
+            bit_index = bit_index + 1
         else:
-            bitindex = None
+            bit_index = None
             buffer += genSingleDecode(spec, f)
     return buffer

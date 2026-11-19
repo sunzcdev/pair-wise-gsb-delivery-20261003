@@ -13,6 +13,7 @@ require "amq/protocol/frame"
 
 require "amq/protocol/constants"
 require "amq/protocol/exceptions"
+require "amq/protocol/strict_parameters"
 
 module AMQ
   module Protocol
@@ -85,6 +86,21 @@ module AMQ
         @methods
       end
 
+      # Strict parameter mode validates every encode argument against the
+      # AMQP method description before serialization. It is off by default so
+      # legacy callers keep their permissive, truthiness-based behavior.
+      def self.strict?
+        StrictParameters.enabled?
+      end
+
+      def self.enable_strict_parameters!
+        StrictParameters.enable!
+      end
+
+      def self.disable_strict_parameters!
+        StrictParameters.disable!
+      end
+
       def self.split_headers(user_headers)
         properties, headers = {}, {}
         user_headers.each do |key, value|
@@ -110,9 +126,9 @@ module AMQ
         limit        = frame_size - 8
         return [BodyFrame.new(body, channel)] if body.bytesize < limit
 
-        # Otherwise String#slice on 1.9 will operate with code points,
-        # and we need bytes. MK.
-        body.force_encoding("ASCII-8BIT") if RUBY_VERSION.to_f >= 1.9
+        # Otherwise String#slice operates on code points for non-binary
+        # strings, and we need bytes.
+        body.force_encoding("ASCII-8BIT") if body.encoding != Encoding::BINARY
 
         array = Array.new
         while body && !body.empty?
@@ -196,27 +212,27 @@ module AMQ
       def self.decode_properties(data)
         offset, data_length, properties = 0, data.bytesize, {}
 
-        compressed_index = data[offset, 2].unpack(PACK_UINT16)[0]
+        compressed_index = data.byteslice(offset, 2).unpack1(PACK_UINT16)
         offset += 2
         while data_length > offset
           DECODE_PROPERTIES_KEYS.each do |key|
             next unless compressed_index >= key
             compressed_index -= key
-            name = DECODE_PROPERTIES[key] || raise(RuntimeError.new("No property found for index #{index.inspect}!"))
+            name = DECODE_PROPERTIES[key] || raise(RuntimeError.new("No property found for index #{key.inspect}!"))
             case DECODE_PROPERTIES_TYPE[key]
             when :shortstr
-              size = data[offset, 1].unpack(PACK_CHAR)[0]
+              size = data.getbyte(offset)
               offset += 1
-              result = data[offset, size]
+              result = data.byteslice(offset, size)
             when :octet
               size = 1
-              result = data[offset, size].unpack(PACK_CHAR).first
+              result = data.getbyte(offset)
             when :timestamp
               size = 8
-              result = Time.at(data[offset, size].unpack(PACK_UINT64_BE).last)
+              result = Time.at(data.byteslice(offset, size).unpack1(PACK_UINT64_BE))
             when :table
-              size = 4 + data[offset, 4].unpack(PACK_UINT32)[0]
-              result = Table.decode(data[offset, size])
+              size = 4 + data.byteslice(offset, 4).unpack1(PACK_UINT32)
+              result = Table.decode(data.byteslice(offset, size))
             end
             properties[name] = result
             offset += size
@@ -233,6 +249,12 @@ module AMQ
         @method_id = ${method.index}
         @index = ${method.binary()}
         @packed_indexes = [${klass.index}, ${method.index}].pack(PACK_UINT16_X2).freeze
+        PARAMETERS = [
+        % for (ruby_name, resolved_type, optional) in method.parameter_entries(spec):
+          [:${ruby_name}, :${resolved_type}, ${str(optional).lower()}],
+        % endfor
+        ].freeze
+        ARGUMENT_NAMES = [${', '.join([":" + f.ruby_name for f in method.active_arguments()])}].freeze
 
         % if (spec.type == "client" and method.accepted_by("client")) or (spec.type == "server" and method.accepted_by("server") or spec.type == "all"):
         # @return
@@ -280,6 +302,7 @@ module AMQ
           % if klass.name == "connection":
           channel = 0
           % endif
+          StrictParameters.validate!(@name, PARAMETERS, {${', '.join([":" + f.ruby_name + " => " + f.ruby_name for f in method.active_arguments()])}})
           buffer = @packed_indexes.dup
           % for line in helpers.genEncodeMethodDefinition(spec, method):
           ${line}

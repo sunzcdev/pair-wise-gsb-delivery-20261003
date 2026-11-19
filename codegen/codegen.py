@@ -44,7 +44,7 @@ class AmqpSpecObject(AmqpSpec):
                 for field in method.arguments:
                     extend_field(field)
 
-        self.classes = filter(lambda klass: not klass.ignored, self.classes)
+        self.classes = list(filter(lambda klass: not klass.ignored, self.classes))
 
 original_init = AmqpEntity.__init__
 def new_init(self, arg):
@@ -57,7 +57,7 @@ AmqpEntity.__init__ = new_init
 
 # method.accepted_by("server")
 # method.accepted_by("client", "server")
-accepted_by_update = json.loads(open("codegen/amqp_0.9.1_changes.json").read())
+accepted_by_update = json.loads(open("codegen/amqp_0.9.1_changes.json", encoding="utf-8").read())
 
 def accepted_by(self, *receivers):
     def get_accepted_by(self):
@@ -88,14 +88,14 @@ def convert_to_ruby(field):
 
 def not_ignored_args(self):
     if self.hasContent:
-        return ["payload", "user_headers"] + map(lambda argument: argument.ruby_name, filter(lambda argument: not argument.ignored, self.arguments)) + ["frame_size"]
+        return ["payload", "user_headers"] + list(map(lambda argument: argument.ruby_name, filter(lambda argument: not argument.ignored, self.arguments))) + ["frame_size"]
     else:
-        return map(lambda argument: argument.ruby_name, filter(lambda argument: not argument.ignored, self.arguments))
+        return list(map(lambda argument: argument.ruby_name, filter(lambda argument: not argument.ignored, self.arguments)))
 
 AmqpMethod.not_ignored_args = not_ignored_args
 
 def ignored_args(self):
-    return filter(lambda argument: argument.ignored, self.arguments)
+    return list(filter(lambda argument: argument.ignored, self.arguments))
 
 AmqpMethod.ignored_args = ignored_args
 
@@ -123,9 +123,37 @@ def params(self):
 AmqpMethod.params = params
 
 def args(self):
-    return map(lambda item: item.split(" ")[0], self.params())
+    return list(map(lambda item: item.split(" ")[0], self.params()))
 
 AmqpMethod.args = args
+
+# Fields dropped from the wire (deprecated AMQP 0-9-1 fields). The generated
+# encode methods assign these locally but they must never be validated as
+# protocol arguments and never appear in the PARAMETERS metadata.
+def active_arguments(self):
+    return list(filter(lambda argument: not argument.ignored, self.arguments))
+
+AmqpMethod.active_arguments = active_arguments
+
+# [[:name, :type, true/false], ...] metadata consumed by StrictParameters.
+# Bit arguments are always optional: an omitted bit encodes the default
+# false. Other arguments are optional when the spec gives a non-blank
+# default (e.g. mechanism = "PLAIN"); zero/empty/false defaults describe
+# the value callers pass, so nil is rejected for those arguments.
+def parameter_entries(self, spec):
+    blank_defaults = (None, 0, False, "")
+    entries = []
+    for argument in self.active_arguments():
+        resolved_type = spec.resolveDomain(argument.domain)
+        if resolved_type == "bit":
+            optional = True
+        else:
+            default = argument.element.get("default-value")
+            optional = default not in blank_defaults
+        entries.append((argument.ruby_name, resolved_type, optional))
+    return entries
+
+AmqpMethod.parameter_entries = parameter_entries
 
 def binary(self):
     method_id = self.klass.index << 16 | self.index
@@ -135,8 +163,8 @@ AmqpMethod.binary = binary
 
 # helpers
 def render(path, **context):
-    file = open(path)
-    template = Template(file.read())
+    with open(path, encoding="utf-8") as file:
+        template = Template(file.read())
     return template.render(**context)
 
 def generateMain(type):

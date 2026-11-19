@@ -1,6 +1,27 @@
 ## Changes between 2.10.0 and 2.11.0 (unreleased)
 
-No changes yet.
+### Strict Parameter Mode and Correct Bit-Group Encoding
+
+Adjacent `bit` method arguments share one wire byte. A non-bit field now always
+flushes the current bit group, so a later group starts at bit offset 0 of a new
+byte instead of reusing the previous group's offset. This keeps cross-byte bit
+groups and bit groups separated by strings correct on both encode and decode,
+and decoded arguments keep their protocol order
+
+`AMQ::Protocol::Method.enable_strict_parameters!` opts into strict parameter
+mode, where every `encode` argument is validated against the AMQP method
+description before serialization. Bit arguments only accept `true`, `false` or
+`nil`; an arbitrary truthy object (such as `1` or a string) is rejected with
+`AMQ::Protocol::InvalidParameterError` instead of being treated as a boolean.
+An omitted optional value (`nil`) is accepted and encodes like the default
+`false`, while scalar arguments with blank defaults still reject `nil`
+Strict mode is off by default, so legacy callers keep their truthiness
+behavior. Generated method classes now carry `PARAMETERS` and `ARGUMENT_NAMES`
+metadata describing their arguments
+
+The code generator (`generate.rb` and `codegen/`) now runs on Python 3 and the
+generated `lib/amq/protocol/client.rb` is byte-stable across regenerations, so
+method classes no longer need hand-edited patches
 
 
 ## Changes between 2.9.0 and 2.10.0 (Nov 2, 2026)
