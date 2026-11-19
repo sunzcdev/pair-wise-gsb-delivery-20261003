@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 require File.expand_path("../helper", __FILE__)
+require "json"
 
 class TestRakeFunctional < Rake::TestCase # :nodoc:
   include RubyRunner
@@ -505,6 +506,45 @@ class TestRakeFunctional < Rake::TestCase # :nodoc:
 
     assert_match(/^stand_alone_filelist\.rb$/, @out)
     assert_equal 0, @exit.exitstatus unless uncertain_exit_status?
+  end
+
+  def test_plan_option_does_not_run_actions
+    rakefile <<~PLAN
+      task :default => :build
+
+      task :build => [:compile], order_only: [:setup]
+      task :compile do
+        puts "COMPILED"
+      end
+      task :setup
+    PLAN
+
+    rake "--plan"
+
+    assert_match(/^Execution plan \(no task actions run\)$/, @out)
+    assert_match(/build \[task\]/, @out)
+    assert_match(/prerequisites: compile/, @out)
+    assert_match(/order-only: setup/, @out)
+    refute_match(/COMPILED/, @out)
+  end
+
+  def test_plan_json_option_is_machine_readable
+    rakefile <<~PLAN
+      task :default => :build
+      task :build => [:compile]
+      task :compile do
+        puts "COMPILED"
+      end
+    PLAN
+
+    rake "--plan-json"
+
+    refute_match(/COMPILED/, @out)
+    plan = JSON.parse(@out)
+    assert_equal "ok", plan["status"]
+    assert_equal %w[compile build], plan["nodes"].first(2).map { |node| node["name"] }
+    assert_equal ["compile"], plan["nodes"][1]["prerequisites"]
+    refute_empty plan["limitations"]
   end
 
   private

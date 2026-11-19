@@ -373,6 +373,37 @@ Use the <tt>--rules</tt> command line option to trace how rules are
 resolved when searching for tasks; note that creation of implicit file
 tasks is not traced.
 
+=== Previewing an Execution Plan
+
+Use <tt>rake --plan</tt> (or <tt>rake --plan-json</tt>) to inspect the
+graph Rake would walk for the requested targets before running
+anything.  The plan is built with the normal name resolution, so
+namespace lookups, scope hints such as <tt>rake:name</tt> and
+<tt>^name</tt>, implicit rules and existing-file tasks resolve exactly
+the way they do during a real invocation.
+
+  $ rake --plan package
+
+Each node reports its task type, the number of actions attached, its
+real prerequisites by task identity, its order-only prerequisites, and
+the rule or existing file that produced it.  Two spellings that resolve
+to the same task appear once as an edge; the extra spellings are listed
+as duplicates.  Circular dependencies are reported as a readable path
+such as <tt>a =&gt; b =&gt; a</tt>.
+
+Implicit rules with constant sources are expanded completely.  A rule
+whose sources come from a Proc or Method is arbitrary Ruby, so it is
+never evaluated while planning: the affected task is marked unknown and
+the plan records why.  For the same reason, tasks that arbitrary Ruby
+code creates later (inside an action, for example) are not predicted.
+
+Building a plan does not run any task action, does not mark a task as
+invoked, and does not clear or replace a previously recorded failure,
+so <tt>already_invoked</tt> and failure state are unchanged afterwards.
+Programmatically, <tt>Rake.application.execution_plan(names)</tt>
+returns a <tt>Rake::ExecutionPlan</tt> whose <tt>to_h</tt> is suitable
+for JSON output.
+
 == Importing Dependencies
 
 Any ruby file (including other rakefiles) can be included with a

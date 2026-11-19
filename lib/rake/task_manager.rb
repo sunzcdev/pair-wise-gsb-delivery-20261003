@@ -10,8 +10,17 @@ module Rake
       super
       @tasks = Hash.new
       @rules = Array.new
+      @rule_derivations = Hash.new
       @scope = Scope.make
       @last_description = nil
+    end
+
+    # Derivation records for tasks synthesized from an implicit rule or from
+    # an existing file.  Keyed by task name.  Explicitly defined tasks have no
+    # entry.  Each record is a Hash with +:kind+ (:rule or :existing_file) and,
+    # for rules, the +:pattern+ and +:extensions+ that produced the task.
+    def rule_derivations
+      @rule_derivations ||= Hash.new
     end
 
     def create_rule(*args, &block) # :nodoc:
@@ -50,6 +59,16 @@ module Rake
       @tasks[task_name.to_s] ||= task_class.new(task_name, self)
     end
 
+    # Build a read-only execution plan for +task_names+ without invoking any
+    # task action.  Names are resolved with the same [+][] lookup used for a
+    # real invocation, so namespaces, implicit rules and synthesized file
+    # tasks behave identically.  The plan never changes +already_invoked+ and
+    # never clears a previously recorded invocation failure.
+    def execution_plan(task_names)
+      Rake::ExecutionPlan.build(self, task_names)
+    end
+    alias build_plan execution_plan
+
     # Find a matching task for +task_name+.
     def [](task_name, scopes=nil)
       task_name = task_name.to_s
@@ -80,7 +99,9 @@ module Rake
 
     def synthesize_file_task(task_name) # :nodoc:
       return nil unless File.exist?(task_name)
-      define_task(Rake::FileTask, task_name)
+      task = define_task(Rake::FileTask, task_name)
+      @rule_derivations[task.name] ||= { kind: :existing_file }
+      task
     end
 
     # Resolve the arguments for a task/rule.  Returns a tuple of
@@ -154,8 +175,10 @@ module Rake
       @rules.each do |pattern, args, extensions, order_only, block|
         if pattern && pattern.match(task_name)
           task = attempt_rule(task_name, pattern, args, extensions, block, level)
+          next unless task
           task | order_only unless order_only.nil?
-          return task if task
+          record_rule_derivation(task, pattern, extensions)
+          return task
         end
       end
       nil
@@ -182,6 +205,7 @@ module Rake
     def clear
       @tasks.clear
       @rules.clear
+      @rule_derivations.clear
     end
 
     # Lookup a task, using scope and the scope hints in the task name.
@@ -266,6 +290,84 @@ module Rake
       options.trace_output.puts "#{"    " * level}#{message}" if
         Rake.application.options.trace_rules
     end
+
+    # Read-only preview of the rule that would be applied when a task with no
+    # actions is executed.  Unlike a real lookup this never defines or
+    # enhances a task, so an execution plan can report the rule without
+    # changing the graph.  User supplied dependents (Proc/Method) are never
+    # called here: they are reported as dynamic and left unresolved.
+    # Returns nil when no rule applies, otherwise a Hash with +:pattern+,
+    # +:sources+, +:order_only+, +:dynamic+ and optionally +:error+.
+    def preview_rule(task_name, level=0) # :nodoc:
+      return nil if level >= 16
+      @rules.each do |pattern, _args, extensions, rule_order_only, _block|
+        next unless pattern && pattern.match(task_name)
+        order_only = Rake::Task.format_deps(rule_order_only || [])
+        if extensions.any? { |ext| ext.is_a?(Proc) || ext.is_a?(Method) }
+          return {
+            pattern: pattern.inspect,
+            sources: [],
+            order_only: order_only,
+            dynamic: true,
+            error: "dependent computed by Ruby code",
+          }
+        end
+        begin
+          sources = make_sources(task_name, pattern, extensions)
+        rescue StandardError => ex
+          return {
+            pattern: pattern.inspect,
+            sources: [],
+            order_only: order_only,
+            dynamic: true,
+            error: ex.message,
+          }
+        end
+        next unless sources.all? { |source|
+          File.exist?(source) || lookup(source) || preview_rule(source, level + 1)
+        }
+        dynamic_sources = sources.select do |source|
+          next false if File.exist?(source) || lookup(source)
+          nested = preview_rule(source, level + 1)
+          nested && nested[:dynamic]
+        end
+        result = {
+          pattern: pattern.inspect,
+          sources: sources.map { |source| Rake.from_pathname(source).to_s },
+          order_only: order_only,
+          dynamic: !dynamic_sources.empty?,
+        }
+        result[:error] = "source resolved by Ruby code" unless dynamic_sources.empty?
+        return result
+      end
+      nil
+    end
+    public :preview_rule
+
+    # Remember how the task was synthesized so a later execution plan can
+    # report the rule (or existing file) that produced it.
+    def record_rule_derivation(task, pattern, extensions) # :nodoc:
+      @rule_derivations[task.name] = {
+        kind: :rule,
+        pattern: pattern.inspect,
+        extensions: extensions.map { |ext| describe_rule_dependent(ext) },
+        dynamic: extensions.any? { |ext| ext.is_a?(Proc) || ext.is_a?(Method) },
+      }
+    end
+    private :record_rule_derivation
+
+    # A JSON friendly description of a rule dependent.
+    def describe_rule_dependent(ext) # :nodoc:
+      case ext
+      when Proc
+        "#<Proc>"
+      when Method
+        "#<Method #{ext.name}>"
+      else
+        Rake.from_pathname(ext).to_s
+      end
+    end
+    private :describe_rule_dependent
 
     # Attempt to create a rule given the list of prerequisites.
     def attempt_rule(task_name, task_pattern, args, extensions, block, level)

@@ -32,6 +32,8 @@ class TestRakeApplicationOptions < Rake::TestCase # :nodoc:
     assert_equal false, opts.nosearch
     assert_equal ["rakelib"], opts.rakelib
     assert_equal false, opts.show_prereqs
+    assert_equal false, opts.show_plan
+    assert_equal false, opts.show_plan_json
     assert_nil opts.show_task_pattern
     assert_nil opts.show_tasks
     assert_equal false, opts.silent
@@ -55,6 +57,20 @@ class TestRakeApplicationOptions < Rake::TestCase # :nodoc:
     flags("--describe") do |opts|
       assert_equal :describe, opts.show_tasks
       assert_equal(//.to_s, opts.show_task_pattern.to_s)
+    end
+  end
+
+  def test_plan
+    flags("--plan") do |opts|
+      assert opts.show_plan
+      refute opts.show_plan_json
+    end
+  end
+
+  def test_plan_json
+    flags("--plan-json") do |opts|
+      assert opts.show_plan
+      assert opts.show_plan_json
     end
   end
 

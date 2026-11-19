@@ -1,5 +1,9 @@
 === 13.2.1
 
+* Added `rake --plan` / `rake --plan-json` and
+  `Rake::Application#execution_plan`, a read-only task graph preview that
+  reports resolved prerequisites, order-only edges, rule/file derivations,
+  duplicates and cycles without running any task action.
 * Suppressed "internal:array:52:in 'Array#each'" from backtrace by @hsbt in #554
 * Bump actions/configure-pages from 4 to 5 by @dependabot in #553
 

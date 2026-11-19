@@ -4,6 +4,7 @@ require "optparse"
 require_relative "options"
 require_relative "task_manager"
 require_relative "file_list"
+require_relative "execution_plan"
 require_relative "thread_pool"
 require_relative "thread_history_display"
 require_relative "trace_output"
@@ -131,7 +132,9 @@ module Rake
     # Run the top level tasks of a Rake application.
     def top_level
       run_with_threads do
-        if options.show_tasks
+        if options.show_plan
+          display_execution_plan
+        elsif options.show_tasks
           display_tasks_and_comments
         elsif options.show_prereqs
           display_prerequisites
@@ -410,6 +413,19 @@ module Rake
       end
     end
 
+    # Display the execution plan for the top level tasks without running any
+    # task action.  See Rake::ExecutionPlan.
+    def display_execution_plan # :nodoc:
+      plan = execution_plan(top_level_tasks)
+      if options.show_plan_json
+        require "json"
+        puts JSON.generate(plan.to_h)
+      else
+        puts plan.to_s
+      end
+      plan
+    end
+
     def trace(*strings) # :nodoc:
       options.trace_output ||= $stderr
       trace_on(options.trace_output, *strings)
@@ -534,6 +550,19 @@ module Rake
           ["--prereqs", "-P",
             "Display the tasks and dependencies, then exit.",
             lambda { |value| options.show_prereqs = true }
+          ],
+          ["--plan",
+            "Display the execution plan for the targets (tasks, dependencies, " +
+            "order-only edges and rule derivations) without running any task " +
+            "action, then exit.",
+            lambda { |value| options.show_plan = true }
+          ],
+          ["--plan-json",
+            "Like --plan, but print the execution plan as JSON.",
+            lambda { |value|
+              options.show_plan = true
+              options.show_plan_json = true
+            }
           ],
           ["--quiet", "-q",
             "Do not log messages to standard output.",
@@ -832,6 +861,8 @@ module Rake
       options.nosearch                   = false
       options.rakelib                    = %w[rakelib]
       options.show_all_tasks             = false
+      options.show_plan                  = false
+      options.show_plan_json             = false
       options.show_prereqs               = false
       options.show_task_pattern          = nil
       options.show_tasks                 = nil

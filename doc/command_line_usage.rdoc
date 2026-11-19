@@ -84,6 +84,23 @@ Options are:
 [<tt>--nosearch</tt>  (-N)]
     Do not search for a Rakefile in parent directories.
 
+[<tt>--plan</tt>]
+    Display the execution plan for the requested targets, then exit
+    without running any task action.  The plan lists every reachable
+    task, its real prerequisites (resolved through normal namespace and
+    scope lookup), its order-only prerequisites, and the implicit rule or
+    existing file that produced each task.  Dependencies that resolve to
+    the same task are collapsed into a single edge.  Circular
+    dependencies are reported as a readable path such as
+    <tt>a => b => a</tt>.  Rules with constant sources are expanded
+    completely; rules whose sources come from a Proc or Method are
+    reported as unknown because they depend on arbitrary Ruby code.
+    Building a plan never marks a task as invoked and never clears a
+    previously recorded failure.
+
+[<tt>--plan-json</tt>]
+    Like <tt>--plan</tt>, but print the plan as a JSON document.
+
 [<tt>--prereqs</tt>  (-P)]
     Display a list of all tasks and their immediate prerequisites.
 

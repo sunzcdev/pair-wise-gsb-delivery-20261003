@@ -17,6 +17,8 @@ module Rake
     attr_accessor :nosearch
     attr_accessor :rakelib
     attr_accessor :show_all_tasks
+    attr_accessor :show_plan
+    attr_accessor :show_plan_json
     attr_accessor :show_prereqs
     attr_accessor :show_task_pattern
     attr_accessor :show_tasks
