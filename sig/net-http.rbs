@@ -1145,6 +1145,12 @@ module Net
     #
     attr_accessor proxy_pass: String?
 
+    # <!-- rdoc-file=lib/net/http.rb -->
+    # Sets the Net::HTTP::ProxyCredentialStore used to obtain rotatable proxy
+    # credentials for this connection.
+    #
+    attr_writer proxy_credential_store: Net::HTTP::ProxyCredentialStore?
+
     # <!--
     #   rdoc-file=lib/net/http.rb
     #   - ipaddr()
@@ -1542,6 +1548,23 @@ module Net
     # otherwise; see [Proxy Server](rdoc-ref:Net::HTTP@Proxy+Server).
     #
     def proxy_from_env?: () -> bool
+
+    # <!-- rdoc-file=lib/net/http.rb -->
+    # Returns the Net::HTTP::ProxyCredentialStore for this connection, or `nil`
+    # if none has been installed; see #proxy_credential_store=.
+    #
+    attr_reader proxy_credential_store: Net::HTTP::ProxyCredentialStore?
+
+    # <!-- rdoc-file=lib/net/http.rb -->
+    # Returns the generation identifier of the proxy credential snapshot this
+    # connection has actually used, or `nil` if it has not used one yet.
+    #
+    attr_reader proxy_credential_generation: Integer?
+
+    # <!-- rdoc-file=lib/net/http.rb -->
+    # Returns a hash of proxy credential diagnostics for this connection.
+    #
+    def proxy_credential_diagnostics: () -> { published_generation: Integer?, in_use_generation: Integer? }
 
     def proxy_uri: () -> (nil | URI::Generic)
 
@@ -5631,5 +5654,59 @@ module Net
 
   class HTTPFatalError < ProtoFatalError
     include Net::HTTPExceptions
+  end
+
+  class HTTP
+    # <!-- rdoc-file=lib/net/http/proxy_credentials.rb -->
+    # Raised when a credential set cannot be published to a
+    # Net::HTTP::ProxyCredentialStore.  The store keeps the previously
+    # published snapshot, so a failed rotation never leaves a connection
+    # without usable (older) credentials.
+    #
+    class ProxyCredentialError < ArgumentError
+    end
+
+    # <!-- rdoc-file=lib/net/http/proxy_credentials.rb -->
+    # Raised when the proxy server rejects the credentials offered in a CONNECT
+    # handshake, i.e. the handshake ends with a 407 (Proxy Authentication
+    # Required) response.
+    #
+    class ProxyAuthenticationError < ProtoServerError
+      include Net::HTTPExceptions
+
+      attr_reader generation: Integer?
+
+      def initialize: (untyped msg, untyped response, ?Integer? generation) -> void
+    end
+
+    # <!-- rdoc-file=lib/net/http/proxy_credentials.rb -->
+    # Net::HTTP::ProxyCredentialStore holds proxy credentials as a sequence of
+    # immutable, generation-tagged snapshots, so that a platform can rotate proxy
+    # credentials while Net::HTTP objects are in use.
+    #
+    class ProxyCredentialStore
+      def initialize: (?String? user, ?String? pass) -> void
+
+      def publish: (String user, String pass) -> Integer
+
+      def current: () -> Net::HTTP::ProxyCredentialStore::Snapshot?
+
+      def published_generation: () -> Integer?
+
+      def diagnostics: () -> { published_generation: Integer? }
+    end
+
+    # <!-- rdoc-file=lib/net/http/proxy_credentials.rb -->
+    # An immutable view of one published credential set.
+    #
+    class ProxyCredentialStore::Snapshot
+      attr_reader user: String?
+
+      attr_reader pass: String?
+
+      attr_reader generation: Integer?
+
+      attr_reader authorization: String
+    end
   end
 end

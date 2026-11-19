@@ -431,6 +431,37 @@ module Net   #:nodoc:
   #     http = Net::HTTP.new('example.com', nil, 'my.proxy', 8000, 'pname', 'ppass', 'my.proxy,proxy.example:8000')
   #     http.proxy_address # => nil
   #
+  # === Rotating Proxy Credentials
+  #
+  # A platform that rotates proxy credentials can install a
+  # Net::HTTP::ProxyCredentialStore on a connection instead of the static
+  # +proxy_user+/+proxy_pass+ pair:
+  #
+  #   store = Net::HTTP::ProxyCredentialStore.new('user1', 'secret1') # generation 1
+  #   http = Net::HTTP.new('example.com', 443, 'proxy.example', 8080)
+  #   http.proxy_credential_store = store
+  #
+  #   store.publish('user2', 'secret2') # => 2
+  #   http.proxy_credential_diagnostics
+  #   # => {published_generation: 2, in_use_generation: nil}
+  #
+  # Generation semantics:
+  #
+  # - Each request and each new connection uses the most recently
+  #   published snapshot.
+  # - A CONNECT handshake pins the snapshot current when it starts, and a
+  #   407 round-trip inside that handshake reuses the same snapshot.  One
+  #   handshake therefore never mixes two credential identities, even if
+  #   the platform publishes new credentials midway.
+  # - A rejected publication (Net::HTTP::ProxyCredentialError) leaves the
+  #   previously published snapshot in place.
+  # - Proxy-Authorization is never copied into the requests that travel
+  #   inside a CONNECT tunnel, and neither the diagnostics nor the debug
+  #   log contain a credential: they report generation identifiers only.
+  # - A CONNECT handshake that is answered with 407 raises
+  #   Net::HTTP::ProxyAuthenticationError; failures of the target service
+  #   behind the proxy keep raising the usual Net::HTTPResponse exception.
+  #
   # == Compression and Decompression
   #
   # \Net::HTTP does not compress the body of a request before sending.
@@ -606,6 +637,14 @@ module Net   #:nodoc:
   #   Returns whether +self+ has a proxy.
   # - {#proxy_address}[rdoc-ref:Net::HTTP#proxy_address]:
   #   Returns the proxy address.
+  # - {#proxy_credential_diagnostics}[rdoc-ref:Net::HTTP#proxy_credential_diagnostics]:
+  #   Returns published and in-use credential generations.
+  # - {#proxy_credential_generation}[rdoc-ref:Net::HTTP#proxy_credential_generation]:
+  #   Returns the credential generation this connection has used.
+  # - {:proxy_credential_store}[rdoc-ref:Net::HTTP#proxy_credential_store]:
+  #   Returns the rotatable proxy credential store.
+  # - {:proxy_credential_store=}[rdoc-ref:Net::HTTP#proxy_credential_store=]:
+  #   Sets the rotatable proxy credential store.
   # - {#proxy_from_env?}[rdoc-ref:Net::HTTP#proxy_from_env?]:
   #   Returns whether the proxy is taken from an environment variable.
   # - {:proxy_from_env=}[rdoc-ref:Net::HTTP#proxy_from_env=]:
@@ -1192,6 +1231,9 @@ module Net   #:nodoc:
       @proxy_pass     = nil
       @proxy_use_ssl  = nil
 
+      @proxy_credential_store      = nil
+      @proxy_credential_generation = nil
+
       @use_ssl = false
       @ssl_context = nil
       @ssl_session = nil
@@ -1329,6 +1371,22 @@ module Net   #:nodoc:
     # Sets whether the proxy uses SSL;
     # see {Proxy Server}[rdoc-ref:Net::HTTP@Proxy+Server].
     attr_writer :proxy_use_ssl
+
+    # Sets the Net::HTTP::ProxyCredentialStore used to obtain rotatable
+    # proxy credentials for this connection.
+    #
+    # When a store is installed, it takes precedence over the static
+    # +proxy_user+/+proxy_pass+ attributes: a new connection (and a new
+    # non-tunneled request) uses the store's latest published snapshot,
+    # while a CONNECT handshake that is already in progress keeps using
+    # the snapshot (generation) it started with.
+    #
+    #   store = Net::HTTP::ProxyCredentialStore.new('user1', 'secret1')
+    #   http = Net::HTTP.new('example.com', 443, 'proxy.example', 8080)
+    #   http.proxy_credential_store = store
+    #
+    # See Net::HTTP::ProxyCredentialStore.
+    attr_writer :proxy_credential_store
 
     # Returns the IP address for the connection.
     #
@@ -1728,15 +1786,7 @@ module Net   #:nodoc:
           if /[\r\n]/.match?(@address)
             raise ArgumentError, "address cannot include CR/LF"
           end
-          buf = +"CONNECT #{conn_address}:#{@port} HTTP/#{HTTPVersion}\r\n" \
-            "Host: #{@address}:#{@port}\r\n"
-          if proxy_user
-            credential = ["#{proxy_user}:#{proxy_pass}"].pack('m0')
-            buf << "Proxy-Authorization: Basic #{credential}\r\n"
-          end
-          buf << "\r\n"
-          proxy_sock.write(buf)
-          HTTPResponse.read_new(proxy_sock).value
+          proxy_connect(proxy_sock)
           # assuming nothing left in buffers after successful CONNECT response
         end
 
@@ -1831,10 +1881,185 @@ module Net   #:nodoc:
     end
     private :on_connect
 
+    # Performs the CONNECT handshake with the proxy server.
+    #
+    # The credential snapshot is pinned when the handshake begins: the
+    # initial CONNECT and a possible 407 retry round-trip always use the
+    # same generation, even if the platform publishes new credentials while
+    # the handshake is in progress.  Only a new connection picks up the
+    # newly published snapshot.
+    #
+    # A handshake that ends with a 407 raises ProxyAuthenticationError; any
+    # other unsuccessful response is a failure of the proxy/target service
+    # and keeps raising the regular Net::HTTPResponse exception (for
+    # example Net::HTTPFatalError for a 502).
+    def proxy_connect(proxy_sock)
+      credential = proxy_credential_snapshot
+      label = proxy_credential_label(credential)
+      debug "proxy CONNECT with credential generation #{label}"
+      attempts = credential ? 2 : 1
+      res = nil
+      attempt = 0
+      while attempt < attempts
+        attempt += 1
+        write_proxy_connect(proxy_sock, credential)
+        # The pinned generation is the identity that went on the wire for
+        # this handshake, whether or not the handshake succeeds.
+        @proxy_credential_generation = credential&.generation
+        res = HTTPResponse.read_new(proxy_sock)
+        break unless res.kind_of?(HTTPProxyAuthenticationRequired)
+        break if attempt >= attempts
+        # This 407 belongs to the handshake that started with this
+        # generation: the retry reuses the pinned snapshot and never a
+        # newer published one, so one handshake never mixes identities.
+        discard_proxy_response_body(res, proxy_sock)
+        if res.connection_close? || proxy_connection_closed?(proxy_sock)
+          debug "proxy closed the connection after 407 (credential generation #{label})"
+          break
+        end
+        debug "proxy authentication required; retrying CONNECT with credential generation #{label}"
+      end
+      if res.kind_of?(HTTPProxyAuthenticationRequired)
+        raise ProxyAuthenticationError.new(
+          "proxy authentication failed (credential generation #{label})",
+          res, credential&.generation)
+      end
+      res.value
+      nil
+    end
+    private :proxy_connect
+
+    # Writes one CONNECT request to the proxy.
+    #
+    # The request line, Host field and the terminating empty line go through
+    # the socket normally, but the Proxy-Authorization field is written with
+    # the socket's debug output suspended: credentials must never reach a
+    # debug log.  The generation identifier is logged by #proxy_connect
+    # instead.
+    def write_proxy_connect(proxy_sock, credential)
+      proxy_sock.write(
+        "CONNECT #{conn_address}:#{@port} HTTP/#{HTTPVersion}\r\n" \
+        "Host: #{@address}:#{@port}\r\n")
+      if credential
+        with_debug_output_disabled(proxy_sock) do
+          proxy_sock.write("Proxy-Authorization: #{credential.authorization}\r\n")
+        end
+      end
+      proxy_sock.write("\r\n")
+      nil
+    end
+    private :write_proxy_connect
+
+    # Suspends the socket's debug output for the duration of the block.
+    def with_debug_output_disabled(sock)
+      unless sock.respond_to?(:debug_output) && sock.respond_to?(:debug_output=)
+        return yield
+      end
+      saved = sock.debug_output
+      begin
+        sock.debug_output = nil
+        yield
+      ensure
+        sock.debug_output = saved
+      end
+    end
+    private :with_debug_output_disabled
+
+    # Discards the body of an interim proxy response so that a retried
+    # CONNECT starts on a clean stream.  Only reads when the response
+    # framing is self-delimiting, to avoid blocking on a persistent proxy
+    # connection.
+    def discard_proxy_response_body(res, proxy_sock)
+      if res.chunked? || res['content-length']
+        res.reading_body(proxy_sock, true) {}
+      end
+    rescue IOError, EOFError, SystemCallError, *proxy_socket_error_classes
+      # The proxy closed the connection; this handshake is over.
+    end
+    private :discard_proxy_response_body
+
+    # Returns whether the proxy connection appears to have been closed.
+    def proxy_connection_closed?(proxy_sock)
+      return true if proxy_sock.closed?
+      io = proxy_sock.respond_to?(:io) ? proxy_sock.io : proxy_sock
+      io = io.to_io if io.respond_to?(:to_io)
+      return false unless io.wait_readable(0)
+      proxy_sock.eof?
+    rescue IOError, EOFError, SystemCallError, *proxy_socket_error_classes
+      true
+    end
+    private :proxy_connection_closed?
+
+    # Error classes a proxy socket may raise once the connection is gone.
+    # OpenSSL is only referenced when it has already been loaded (which is
+    # the case for a proxied HTTPS connection).
+    def proxy_socket_error_classes
+      defined?(OpenSSL::SSL::SSLError) ? [OpenSSL::SSL::SSLError] : []
+    end
+    private :proxy_socket_error_classes
+
+    # Returns the credential snapshot to use for proxy authentication: the
+    # latest published snapshot when a credential store is installed,
+    # otherwise a generation-less snapshot wrapping the static
+    # +proxy_user+/+proxy_pass+ attributes.  Returns +nil+ when no proxy
+    # credentials are configured.
+    #
+    # A store that has not published anything yet falls back to the static
+    # attributes, so installing an empty store never disables credentials
+    # that are already configured.
+    def proxy_credential_snapshot
+      if @proxy_credential_store && (snapshot = @proxy_credential_store.current)
+        snapshot
+      elsif proxy_user
+        ProxyCredentialStore::Snapshot.new(proxy_user, proxy_pass, nil)
+      end
+    end
+    private :proxy_credential_snapshot
+
+    # Returns a loggable representation of +credential+: its generation
+    # identifier only, or 'static'/'none'.  Credentials are never logged.
+    def proxy_credential_label(credential)
+      return 'none' if credential.nil?
+      credential.generation || 'static'
+    end
+    private :proxy_credential_label
+
+    # Sets the proxy credentials on +req+.
+    #
+    # - Inside a CONNECT tunnel the request is an origin request, so any
+    #   Proxy-Authorization field is removed: proxy credentials must never
+    #   be copied to the target request.
+    # - A plain (tunnel-less) proxy request authenticates with the latest
+    #   published snapshot, so a request started after a rotation uses the
+    #   new credentials.
+    # - Without a credential store the static +proxy_user+/+proxy_pass+
+    #   attributes are used exactly as before.
+    def apply_proxy_authentication(req)
+      if use_ssl?
+        req.delete('Proxy-Authorization') if proxy?
+        return
+      end
+      if @proxy_credential_store && proxy?
+        credential = proxy_credential_snapshot
+        if credential
+          req['Proxy-Authorization'] = credential.authorization
+          @proxy_credential_generation = credential.generation
+          debug "proxy request with credential generation #{proxy_credential_label(credential)}"
+        else
+          @proxy_credential_generation = nil
+        end
+      elsif proxy_user
+        req.proxy_basic_auth proxy_user, proxy_pass
+        @proxy_credential_generation = nil
+      end
+    end
+    private :apply_proxy_authentication
+
     def do_finish
       @started = false
       @socket.close if @socket
       @socket = nil
+      @proxy_credential_generation = nil
     end
     private :do_finish
 
@@ -1919,6 +2144,41 @@ module Net   #:nodoc:
     # see {Proxy Server}[rdoc-ref:Net::HTTP@Proxy+Server].
     def proxy_from_env?
       @proxy_from_env
+    end
+
+    # Returns the Net::HTTP::ProxyCredentialStore for this connection, or
+    # +nil+ if none has been installed;
+    # see #proxy_credential_store=.
+    attr_reader :proxy_credential_store
+
+    # Returns the generation identifier of the proxy credential snapshot
+    # this connection has actually used, or +nil+ if it has not used one
+    # yet.
+    #
+    # For a tunneled (CONNECT) connection this is the generation pinned by
+    # the handshake; for a plain proxy connection it is the generation of
+    # the snapshot used by the most recent request.  Compare it with
+    # Net::HTTP::ProxyCredentialStore#published_generation to see whether
+    # this connection has already picked up a rotation.
+    attr_reader :proxy_credential_generation
+
+    # Returns a hash of proxy credential diagnostics for this connection:
+    #
+    #   http.proxy_credential_diagnostics
+    #   # => {published_generation: 2, in_use_generation: 1}
+    #
+    # +:published_generation+ is the generation most recently published to
+    # the credential store (whether or not this connection has used it
+    # yet), and +:in_use_generation+ is the generation this connection has
+    # actually used, as reported by #proxy_credential_generation.
+    #
+    # Only generation identifiers are reported; credentials are never
+    # exposed here or in the debug log.
+    def proxy_credential_diagnostics
+      {
+        published_generation: @proxy_credential_store&.published_generation,
+        in_use_generation: @proxy_credential_generation,
+      }
     end
 
     # The proxy URI determined from the environment for this connection.
@@ -2484,9 +2744,7 @@ module Net   #:nodoc:
           return request(req, body, &block)
         }
       end
-      if proxy_user()
-        req.proxy_basic_auth proxy_user(), proxy_pass() unless use_ssl?
-      end
+      apply_proxy_authentication(req)
       req.set_body_internal body
       res = transport_request(req, &block)
       if sspi_auth?(res)
@@ -2693,3 +2951,5 @@ require_relative 'http/response'
 require_relative 'http/responses'
 
 require_relative 'http/proxy_delta'
+
+require_relative 'http/proxy_credentials'
