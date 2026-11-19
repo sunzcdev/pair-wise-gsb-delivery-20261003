@@ -414,4 +414,436 @@ class RedisClient
       hash.to_a.flatten(1)
     end
   end
+
+  # Exercises role verification and connection replacement without a real
+  # cluster: Sentinels and Redis nodes are stand-ins whose roles and
+  # reachability can be flipped between switches.
+  class SentinelDiscoveryTest < RedisClientTestCase
+    # A node stand-in. It answers ROLE and simple commands, tracks how many
+    # connections were opened/closed, and can be taken down to simulate a node
+    # that has been demoted but still accepts Sentinel traffic.
+    class NodeDouble
+      attr_reader :name, :host, :port, :opens, :closes, :commands
+      attr_accessor :role
+
+      def initialize(name, host, port, role)
+        @name = name
+        @host = host
+        @port = port
+        @role = role
+        @opens = 0
+        @closes = 0
+        @commands = []
+        @up = true
+      end
+
+      def up!
+        @up = true
+      end
+
+      def down!
+        @up = false
+      end
+
+      def up?
+        @up
+      end
+
+      def address
+        "#{host}:#{port}"
+      end
+
+      def server_key
+        [nil, host, port].freeze
+      end
+    end
+
+    # Raw connection bound to a NodeDouble.
+    class NodeConnection
+      include ConnectionMixin
+
+      attr_accessor :read_timeout, :write_timeout, :lose_reply_after
+
+      def initialize(config, node)
+        super(config)
+        @node = node
+        @written = []
+        @server_key = node.server_key
+        @lose_reply_after = nil
+        node.instance_variable_set(:@opens, node.opens + 1)
+      end
+
+      def connect
+        @server_key = @node.server_key
+        true
+      end
+
+      def connected?
+        @node.up?
+      end
+
+      def close
+        @node.instance_variable_set(:@closes, @node.closes + 1)
+        super
+      end
+
+      def write(command)
+        raise connection_error("#{@node.name} is down") unless @node.up?
+
+        @written << command
+        @node.commands << command
+      end
+
+      def write_multi(commands)
+        commands.each { |command| write(command) }
+      end
+
+      def read(_timeout = nil)
+        raise connection_error("#{@node.name} is down") unless @node.up?
+
+        command = @written.shift
+        if @lose_reply_after
+          if @lose_reply_after <= 0
+            @lose_reply_after = nil
+            raise connection_error("reply lost on #{@node.name}")
+          end
+          @lose_reply_after -= 1
+        end
+
+        case command.first
+        when "ROLE" then [@node.role, 0, []]
+        when "PING" then "PONG"
+        when "GET" then "value"
+        else "OK"
+        end
+      end
+
+      def measure_round_trip_delay
+        0.0
+      end
+    end
+
+    # Driver resolving host:port to a NodeDouble.
+    class NodeDriver < NodeConnection
+      class << self
+        attr_accessor :registry
+      end
+
+      self.registry = {}
+
+      def self.register(node)
+        registry[node.address] = node
+      end
+
+      def self.ssl_context(_params)
+        nil
+      end
+
+      def initialize(config, connect_timeout:, read_timeout:, write_timeout:)
+        node = self.class.registry.fetch("#{config.host}:#{config.port}")
+        super(config, node)
+        self.read_timeout = read_timeout
+        self.write_timeout = write_timeout
+      end
+    end
+
+    # A Sentinel stand-in with a swappable master and per-call close tracking.
+    class SentinelDouble
+      attr_accessor :master, :replicas, :error
+
+      def initialize(master: nil, replicas: [], error: nil)
+        @master = master
+        @replicas = replicas
+        @error = error
+      end
+
+      def call_v(command)
+        raise error if error
+
+        case command[1]
+        when "get-master-addr-by-name"
+          master && [master.host, master.port.to_s]
+        when "replicas"
+          replicas.map { |node| { "ip" => node.host, "port" => node.port.to_s, "flags" => "slave" } }
+        when "sentinels"
+          []
+        else
+          raise "unexpected #{command.inspect}"
+        end
+      end
+
+      def close
+        nil
+      end
+    end
+
+    def setup
+      super
+      @previous_registry = NodeDriver.registry
+      NodeDriver.registry = {}
+      @master = register(NodeDouble.new("master", "10.0.1.1", 6379, "master"))
+      @replica = register(NodeDouble.new("replica", "10.0.1.2", 6379, "slave"))
+    end
+
+    def teardown
+      NodeDriver.registry = @previous_registry
+      super
+    end
+
+    def test_stale_master_answer_is_rejected_by_role_probe
+      sentinel = SentinelDouble.new(master: @replica)
+      config = new_config(sentinels: [{ host: "s1", port: 26379, client: sentinel }])
+
+      snapshot = config.discover
+      candidate = snapshot.candidates.first
+
+      assert_equal @replica.address, candidate.address
+      assert_equal "s1:26379", candidate.sentinel_address
+      assert_equal "slave", candidate.role
+      assert_predicate candidate, :rejected?
+      assert_instance_of FailoverError, candidate.error
+      assert_nil snapshot.selected
+
+      error = assert_raises SentinelUnavailableError do
+        config.resolve!
+      end
+      refute_nil error.discovery
+      assert_predicate error.discovery.candidates.first, :rejected?
+      refute_predicate config, :resolved?
+    end
+
+    def test_confirmed_master_is_published
+      sentinel = SentinelDouble.new(master: @master)
+      config = new_config(sentinels: [{ host: "s1", port: 26379, client: sentinel }])
+
+      snapshot = config.discover
+      candidate = snapshot.candidates.first
+
+      assert_equal "master", candidate.role
+      assert_predicate candidate, :confirmed?
+      assert_equal @master.address, snapshot.selected.address
+
+      config.resolve!
+      assert_equal @master.host, config.host
+      assert_equal @master.port, config.port
+    end
+
+    def test_disagreeing_sentinels_without_a_majority_are_reported
+      @replica.role = "master"
+      s1 = SentinelDouble.new(master: @master)
+      s2 = SentinelDouble.new(master: @replica)
+      config = new_config(
+        sentinels: [
+          { host: "s1", port: 26379, client: s1 },
+          { host: "s2", port: 26380, client: s2 },
+        ],
+        consensus: true
+      )
+
+      snapshot = config.discover
+      assert_predicate snapshot, :disagreement?
+      assert_equal ["s1:26379", "s2:26380"], snapshot.candidates.map(&:sentinel_address).sort
+
+      error = assert_raises SentinelDisagreementError do
+        config.resolve!
+      end
+      assert_includes error.message, @master.address
+      assert_includes error.message, @replica.address
+      refute_predicate config, :resolved?
+    end
+
+    def test_all_sentinels_failing_lists_each_source
+      s1 = SentinelDouble.new(error: ConnectionError.new("first sentinel down"))
+      s2 = SentinelDouble.new(error: ConnectionError.new("second sentinel down"))
+      config = new_config(
+        sentinels: [
+          { host: "s1", port: 26379, client: s1 },
+          { host: "s2", port: 26380, client: s2 },
+        ]
+      )
+
+      snapshot = config.discover
+      assert_predicate snapshot, :all_failed?
+      assert_equal 2, snapshot.failures.size
+
+      error = assert_raises SentinelUnavailableError do
+        config.resolve!
+      end
+      assert_includes error.message, "s1:26379"
+      assert_includes error.message, "s2:26380"
+      assert_includes error.message, "first sentinel down"
+    end
+
+    def test_role_mismatch_evicts_only_the_rejected_candidate
+      sentinel = SentinelDouble.new(master: @replica)
+      config = new_config(sentinels: [{ host: "s1", port: 26379, client: sentinel }])
+
+      # The lazy path publishes the Sentinel answer immediately; the connection
+      # prelude then verifies the role before the connection is handed out.
+      assert_equal @replica.host, config.host
+      refute_predicate config, :confirmed?
+
+      assert_raises FailoverError do
+        config.check_role!("slave")
+      end
+
+      refute_predicate config, :resolved?
+      assert_nil config.selected_candidate
+      assert_predicate config.discovery.candidates.first, :rejected?
+    end
+
+    def test_in_flight_write_is_not_migrated
+      sentinel = SentinelDouble.new(master: @master)
+      config = new_config(
+        sentinels: [{ host: "s1", port: 26379, client: sentinel }],
+        reconnect_attempts: 2
+      )
+      client = config.new_client
+      assert_equal "PONG", client.call("PING")
+
+      raw = client.instance_variable_get(:@raw_connection)
+      raw.lose_reply_after = 0
+
+      error = assert_raises(ConnectionError) do
+        client.call("SET", "counter", "1")
+      end
+
+      assert_predicate error, :unknown_outcome?
+      refute_predicate error, :replayable?
+      assert_equal [["SET", "counter", "1"]], error.in_flight_commands
+
+      # The write was sent once and never replayed on another node.
+      assert_equal 1, @master.commands.count { |command| command.first == "SET" }
+      assert_equal 0, @replica.commands.count { |command| command.first == "SET" }
+    end
+
+    def test_in_flight_read_is_replayable
+      sentinel = SentinelDouble.new(master: @master)
+      config = new_config(
+        sentinels: [{ host: "s1", port: 26379, client: sentinel }],
+        reconnect_attempts: 1
+      )
+      client = config.new_client
+      client.call("PING")
+
+      client.instance_variable_get(:@raw_connection).lose_reply_after = 0
+      assert_equal "value", client.call("GET", "key")
+    end
+
+    def test_pipeline_preserves_acked_prefix_and_drops_the_rest
+      sentinel = SentinelDouble.new(master: @master)
+      config = new_config(
+        sentinels: [{ host: "s1", port: 26379, client: sentinel }],
+        reconnect_attempts: 1
+      )
+      client = config.new_client
+      client.call("PING")
+
+      client.instance_variable_get(:@raw_connection).lose_reply_after = 1
+
+      error = assert_raises(ConnectionError) do
+        client.pipelined do |pipeline|
+          pipeline.call("GET", "a")
+          pipeline.call("SET", "b", "2")
+          pipeline.call("SET", "c", "3")
+        end
+      end
+
+      assert_equal ["value"], error.partial_results
+      assert_equal [["SET", "b", "2"], ["SET", "c", "3"]], error.in_flight_commands
+      refute_predicate error, :replayable?
+      assert_equal 1, @master.commands.count { |command| command.first == "SET" && command[1] == "b" }
+      assert_equal 0, @replica.commands.count { |command| command.first == "SET" }
+    end
+
+    def test_two_switches_are_attributed_to_their_generation
+      s1 = SentinelDouble.new(master: @master)
+      s2 = SentinelDouble.new(master: @master)
+      config = new_config(
+        sentinels: [
+          { host: "s1", port: 26379, client: s1 },
+          { host: "s2", port: 26380, client: s2 },
+        ],
+        reconnect_attempts: 1
+      )
+      client = config.new_client
+      client.call("PING")
+      client.call("PING")
+
+      # First switch: the old master is demoted and stops answering.
+      s1.master = s2.master = @replica
+      @master.role = "slave"
+      @replica.role = "master"
+      @master.down!
+      assert_equal "PONG", client.call("PING")
+      assert_equal @replica.host, config.host
+      assert_equal 1, config.generation
+
+      # Second switch: back to the original master.
+      s1.master = s2.master = @master
+      @replica.role = "slave"
+      @master.role = "master"
+      @replica.down!
+      @master.up!
+      assert_equal "PONG", client.call("PING")
+      assert_equal @master.host, config.host
+      assert_equal 2, config.generation
+
+      events = config.connection_events
+      exit_old_master = events.find { |event| event.exit? && event.address == @master.address }
+      exit_replica = events.find { |event| event.exit? && event.address == @replica.address }
+      establish_replica = events.find { |event| event.establish? && event.address == @replica.address }
+      establish_master = events.reverse.find { |event| event.establish? && event.address == @master.address }
+
+      refute_nil exit_old_master
+      refute_nil exit_replica
+      refute_nil establish_replica
+      refute_nil establish_master
+
+      # The old connection's exit belongs to the previous generation; the new
+      # connection's establishment belongs to the generation it created.
+      assert_equal 0, exit_old_master.generation
+      assert_equal 1, exit_replica.generation
+      assert_equal 1, establish_replica.generation
+      assert_equal 2, establish_master.generation
+    end
+
+    def test_legacy_lazy_lookup_keeps_first_answer
+      sentinel = SentinelDouble.new(master: @master)
+      config = new_config(sentinels: [{ host: "s1", port: 26379, client: sentinel }])
+
+      assert_equal @master.host, config.host
+      assert_empty @master.commands
+      assert_empty @replica.commands
+      assert_predicate config, :resolved?
+      refute_predicate config, :confirmed?
+    end
+
+    private
+
+    def register(node)
+      NodeDriver.register(node)
+      node
+    end
+
+    def new_config(**kwargs)
+      entries = kwargs.fetch(:sentinels)
+      doubles = {}
+      sentinels = entries.map do |entry|
+        doubles["#{entry[:host]}:#{entry[:port]}"] = entry.fetch(:client)
+        entry.slice(:host, :port)
+      end
+
+      config = RedisClient.sentinel(
+        name: "cache",
+        timeout: 0.05,
+        driver: NodeDriver,
+        **kwargs.merge(sentinels: sentinels)
+      )
+      config.define_singleton_method(:sentinel_client) do |sentinel_config|
+        doubles.fetch("#{sentinel_config.host}:#{sentinel_config.port}")
+      end
+      config
+    end
+  end
 end

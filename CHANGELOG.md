@@ -1,5 +1,23 @@
 # Unreleased
 
+- Sentinel: a Sentinel answer is no longer treated as proof of a node's role. Added
+  `RedisClient::SentinelConfig#discover`, which asks every Sentinel (recording which
+  one advertised each address) and probes each candidate with `ROLE`. The returned
+  `RedisClient::SentinelConfig::Discovery` keeps every candidate, its source
+  Sentinel, the confirmed role, and any rejection, and reports Sentinel
+  disagreements and total failures separately
+  (`RedisClient::SentinelDisagreementError`, `RedisClient::SentinelUnavailableError`).
+  `#resolve!` publishes only a role-confirmed candidate; a rejected candidate is
+  evicted from the reusable main-connection cache. `#generation` and
+  `#connection_events` attribute each connection's establishment and exit to a
+  specific switch.
+- Sentinel: connection errors now record the commands whose reply was not observed
+  (`RedisClient::Error#in_flight_commands`), whether their outcome is unknown
+  (`#unknown_outcome?`) and whether they are safe to replay (`#replayable?`).
+  A pipeline keeps its acknowledged prefix in `#partial_results`. A write with an
+  unknown outcome is never automatically migrated to a new primary; reads are
+  still retried.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.

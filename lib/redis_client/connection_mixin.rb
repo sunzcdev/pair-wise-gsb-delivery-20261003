@@ -10,6 +10,8 @@ class RedisClient
       @retry_attempt = nil
       @config = config
       @server_key = nil
+      @established = false
+      @exit_recorded = false
     end
 
     def reconnect
@@ -17,9 +19,42 @@ class RedisClient
       connect
     end
 
+    # The server key this connection was last opened against. Used to attribute
+    # a close to the generation it actually belonged to, even when the published
+    # address has moved on since.
+    def _connected_server_key
+      @server_key
+    end
+
+    # Marks this connection as having completed its prelude/role check. Only
+    # established connections produce an exit event; a half-open attempt that
+    # failed during connect does not.
+    def _mark_established
+      @established = true
+      @exit_recorded = false
+    end
+
+    def _established?
+      !!@established
+    end
+
     def close
+      record_exit
       @pending_reads = 0
       nil
+    end
+
+    # Records this connection's exit against the Sentinel config, once, and only
+    # if the connection was actually established. The address is the one this
+    # connection was opened against, so a connection retired by a failover is
+    # attributed to the generation it belonged to rather than to its successor.
+    def record_exit
+      return unless @established
+      return unless @exit_recorded == false
+      return unless config.respond_to?(:record_connection_closed)
+
+      @exit_recorded = true
+      config.record_connection_closed(@server_key) if config.sentinel?
     end
 
     def revalidate
@@ -33,9 +68,20 @@ class RedisClient
 
     def call(command, timeout)
       @pending_reads += 1
-      write(command)
-      result = read(connection_timeout(timeout))
-      @pending_reads -= 1
+      begin
+        write(command)
+        result = read(connection_timeout(timeout))
+        @pending_reads -= 1
+      rescue ConnectionError, ProtocolError => error
+        # The command was handed to the socket but no reply was observed, so the
+        # server may or may not have applied it. `@pending_reads` deliberately
+        # stays positive so the connection is discarded rather than reused with
+        # a reply still in flight, and the command is recorded so unsafe writes
+        # are not replayed on another node.
+        mark_in_flight(error, [command], [])
+        raise error
+      end
+
       if result.is_a?(Error)
         result._set_command(command)
         result._set_config(config)
@@ -52,30 +98,40 @@ class RedisClient
       size = commands.size
       results = Array.new(commands.size)
       @pending_reads += size
-      write_multi(commands)
+      index = 0
+      begin
+        write_multi(commands)
 
-      size.times do |index|
-        timeout = timeouts && timeouts[index]
-        result = read(connection_timeout(timeout))
-        @pending_reads -= 1
+        while index < size
+          timeout = timeouts && timeouts[index]
+          result = read(connection_timeout(timeout))
+          @pending_reads -= 1
 
-        # A multi/exec command can return an array of results.
-        # An error from a multi/exec command is handled in Multi#_coerce!.
-        if result.is_a?(Array)
-          result.each do |res|
-            res._set_config(config) if res.is_a?(Error)
+          # A multi/exec command can return an array of results.
+          # An error from a multi/exec command is handled in Multi#_coerce!.
+          if result.is_a?(Array)
+            result.each do |res|
+              res._set_config(config) if res.is_a?(Error)
+            end
+          elsif result.is_a?(Error)
+            result._set_command(commands[index])
+            result._set_config(config)
+            result._set_retry_attempt(@retry_attempt)
+
+            last_error&._set_next_error(result)
+            first_error ||= result
+            last_error = result
           end
-        elsif result.is_a?(Error)
-          result._set_command(commands[index])
-          result._set_config(config)
-          result._set_retry_attempt(@retry_attempt)
 
-          last_error&._set_next_error(result)
-          first_error ||= result
-          last_error = result
+          results[index] = result
+          index += 1
         end
-
-        results[index] = result
+      rescue ConnectionError, ProtocolError => error
+        # Replies already read are real results and are preserved on the error.
+        # The commands whose replies were not observed are the ones whose
+        # outcome is unknown.
+        mark_in_flight(error, commands[index..-1], results[0...index])
+        raise error
       end
 
       if first_error && exception
@@ -103,6 +159,20 @@ class RedisClient
     def connection_error(message)
       error = ConnectionError.with_config(message, config)
       error._set_retry_attempt(@retry_attempt)
+      error
+    end
+
+    private
+
+    # Attach the facts a caller needs to decide whether a retry is safe:
+    # which commands have an unknown outcome, which results are already real,
+    # and which node those commands went to.
+    def mark_in_flight(error, unknown_commands, known_results)
+      error._set_config(config)
+      error._set_retry_attempt(@retry_attempt)
+      error._set_in_flight_commands(unknown_commands) if unknown_commands
+      error._set_in_flight_server_key(@server_key)
+      error._set_partial_results(known_results) if known_results
       error
     end
   end

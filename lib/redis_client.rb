@@ -53,6 +53,32 @@ class RedisClient
     def now_ms
       Process.clock_gettime(Process::CLOCK_MONOTONIC, :float_millisecond)
     end
+
+    # Commands that are known to be safe to replay: they never mutate the
+    # dataset, so re-issuing them after a lost reply can't duplicate a write.
+    #
+    # Anything that isn't listed here is treated as a write. That is
+    # deliberately conservative: a command whose reply was lost must not be
+    # migrated to the new primary unless we can prove it was a read.
+    READ_ONLY_COMMANDS = %w[
+      BITCOUNT BITPOS DBSIZE DUMP ECHO EXISTS EXPIRETIME GET GETBIT GETRANGE
+      HEXISTS HGET HGETALL HKEYS HLEN HMGET HRANDFIELD HSCAN HSTRLEN HVALS
+      INFO KEYS LASTSAVE LCS LINDEX LLEN LPOS LRANGE MEMORY MGET OBJECT
+      PEXPIRETIME PFCOUNT PING PTTL RANDOMKEY ROLE SCAN SCARD SDIFF SINTER
+      SISMEMBER SMEMBERS SMISMEMBER SRANDMEMBER SSCAN STRLEN SUBSTR SUNION
+      TIME TTL TYPE
+      XINFO XLEN XPENDING XRANGE XREAD XREVRANGE
+      ZCARD ZCOUNT ZDIFF ZINTER ZLEXCOUNT ZMSCORE ZRANDMEMBER ZRANGE
+      ZRANGEBYLEX ZRANGEBYSCORE ZRANK ZREVRANGE ZREVRANGEBYLEX
+      ZREVRANGEBYSCORE ZREVRANK ZSCAN ZSCORE ZUNION
+    ].freeze
+
+    def read_only_command?(command)
+      return false if command.nil? || command.empty?
+
+      token = command.is_a?(String) ? command : command.first
+      READ_ONLY_COMMANDS.include?(token.to_s.upcase)
+    end
   end
 
   register_driver :ruby do
@@ -148,6 +174,9 @@ class RedisClient
     include HasConfig
     include Retriable
 
+    EMPTY_COMMANDS = [].freeze
+    private_constant :EMPTY_COMMANDS
+
     attr_reader :next_error
 
     def self.with_config(message, config = nil)
@@ -159,6 +188,55 @@ class RedisClient
     def _set_next_error(error) # :nodoc:
       @next_error = error
     end
+
+    # Records the commands that were written to the socket but whose replies
+    # were never read. When this is non-empty the outcome of those commands is
+    # unknown: the server may or may not have applied them.
+    def _set_in_flight_commands(commands) # :nodoc:
+      @in_flight_commands = commands.frozen? ? commands : commands.dup.freeze
+      self
+    end
+
+    # The server key the in-flight commands were sent to, for diagnostics. The
+    # retry decision itself only needs to know whether the error is a timeout
+    # (same node, same generation) or a failover (a possibly different node).
+    def _set_in_flight_server_key(server_key) # :nodoc:
+      @in_flight_server_key = server_key
+      self
+    end
+
+    def in_flight_server_key
+      @in_flight_server_key
+    end
+
+    def in_flight_commands
+      @in_flight_commands || EMPTY_COMMANDS
+    end
+
+    def _set_partial_results(results) # :nodoc:
+      @partial_results = results.frozen? ? results : results.dup.freeze
+      self
+    end
+
+    # Results that were already read before the connection failed. For a
+    # pipeline this is the confirmed prefix; the remaining commands are listed
+    # in `in_flight_commands`.
+    def partial_results
+      @partial_results || EMPTY_COMMANDS
+    end
+
+    # True when a command was sent but no reply was observed, which means a
+    # write may already have been applied. Such a command must not be replayed
+    # automatically.
+    def unknown_outcome?
+      !in_flight_commands.empty?
+    end
+
+    # A command may only be re-sent on a different connection when every command
+    # whose outcome is unknown is safe to replay.
+    def replayable?
+      in_flight_commands.all? { |command| RedisClient.read_only_command?(command) }
+    end
   end
 
   ProtocolError = Class.new(Error)
@@ -168,6 +246,18 @@ class RedisClient
   CannotConnectError = Class.new(ConnectionError)
 
   FailoverError = Class.new(ConnectionError)
+
+  # Raised when the configured Sentinels could not be reached at all, or when
+  # none of them produced a usable candidate. Every Sentinel-level error is
+  # listed so the failure can be attributed, and the discovery snapshot that
+  # led to it is kept on the error.
+  SentinelUnavailableError = Class.new(ConnectionError)
+  SentinelUnavailableError.include(SentinelConfig::HasDiscovery)
+
+  # Raised when reachable Sentinels disagree about the address of the master
+  # and no address holds a majority, so publishing one would be a guess.
+  SentinelDisagreementError = Class.new(ConnectionError)
+  SentinelDisagreementError.include(SentinelConfig::HasDiscovery)
 
   TimeoutError = Class.new(ConnectionError)
   ReadTimeoutError = Class.new(TimeoutError)
@@ -499,6 +589,8 @@ class RedisClient
   end
 
   def close
+    # The raw connection records its own exit (it knows which address it was
+    # opened against), including when it is closed internally by `revalidate`.
     @raw_connection&.close
     self
   end
@@ -800,6 +892,15 @@ class RedisClient
           preferred_error = error
         end
 
+        # With Sentinel, a non-timeout connection error re-resolves the master
+        # and may land on a different node. A command whose reply was never
+        # observed may already have been applied on the old one, so an unsafe
+        # write is never migrated and re-sent. (A timeout reconnects to the same
+        # resolved node and keeps the documented `reconnect_attempts` behaviour.)
+        if config.sentinel? && !error.is_a?(TimeoutError) && error.unknown_outcome? && !error.replayable?
+          raise preferred_error
+        end
+
         if !@disable_reconnection && config.retry_connecting?(tries, error)
           tries += 1
           retry
@@ -851,6 +952,10 @@ class RedisClient
         @raw_connection.reconnect
       end
     else
+      # The previous connection can't be reused (dead socket or a different
+      # address). Close it before replacing it so its exit is attributed to the
+      # address and generation it actually belonged to.
+      @raw_connection&.close
       @raw_connection = @middlewares.connect(config) do
         config.driver.new(
           config,
@@ -888,9 +993,16 @@ class RedisClient
 
       if config.sentinel?
         config.check_role!(results.last.first)
+        # Mark the connection as established only after the role check passed, so
+        # a candidate rejected mid-connect is never reported as established.
+        @raw_connection._mark_established
+        config.record_connection_established(@raw_connection._connected_server_key)
       end
     end
-  rescue FailoverError, CannotConnectError => error
+  rescue FailoverError, CannotConnectError, SentinelUnavailableError, SentinelDisagreementError => error
+    # These already carry the config (and, for the Sentinel errors, the discovery
+    # snapshot that explains the failure), so re-wrap as ConnectionError would
+    # lose that detail.
     @raw_connection&.close
     error._set_config(config)
     raise error

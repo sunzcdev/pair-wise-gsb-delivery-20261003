@@ -168,6 +168,66 @@ Also the `name`, `password`, `username` and `db` for Redis instance can be passe
 redis_config = RedisClient.sentinel(url: "redis://appuser:mysecret@mymaster/10", sentinels: SENTINELS, role: :master)
 ```
 
+#### Role verification and discovery state
+
+A Sentinel can keep advertising an address that has since been demoted to a
+replica (for example while a failover is still converging). The client never
+treats a Sentinel answer as proof of role:
+
+* Before a resolved connection is handed to the caller, the connection prelude
+  issues `ROLE` and `RedisClient::SentinelConfig#check_role!` is called. On a
+  mismatch the address is rejected, the reusable main-connection cache is
+  cleared *if it still points at that address*, and a `RedisClient::FailoverError`
+  is raised (as before).
+* `RedisClient::SentinelConfig#discover` queries every known Sentinel and, by
+  default, asks each distinct candidate for its own `ROLE`. It never publishes
+  anything and never raises for Sentinel trouble; the outcome is returned as a
+  `RedisClient::SentinelConfig::Discovery` snapshot.
+* `RedisClient::SentinelConfig#resolve!` does the same but publishes the result,
+  raising `RedisClient::SentinelUnavailableError` when every Sentinel or every
+  candidate failed, and `RedisClient::SentinelDisagreementError` when Sentinels
+  disagree without a majority (pass `consensus: true` to make a majority
+  mandatory; the default keeps the historical "first answer wins" behaviour).
+
+A `Discovery` snapshot keeps, for every candidate, the address, **which Sentinel
+advertised it** (`sentinel_address`), the role the node reported, and the
+rejection error if any. Sentinel-level failures are kept separately, so a
+disagreement and a total failure are reported differently:
+
+```ruby
+snapshot = redis_config.discover
+snapshot.candidates.each do |candidate|
+  puts "#{candidate.address} via #{candidate.sentinel_address}: #{candidate.role || candidate.error.inspect}"
+end
+snapshot.failures # => [{ sentinel: ..., reason: ..., error: ... }]
+snapshot.disagreement? # true when confirmed Sentinels report different addresses
+```
+
+Each successful published address bumps `RedisClient::SentinelConfig#generation`.
+`#connection_events` records each connection's establishment and exit together
+with the address and generation it belongs to, so the closing of the previous
+connection can't be confused with the establishment of the new one across two
+consecutive switches.
+
+#### In-flight commands during a switch
+
+When a connection error happens after a command was written but before its reply
+was read, the outcome of that command is unknown. The error carries the facts
+needed to decide what is safe:
+
+* `RedisClient::Error#in_flight_commands`: the commands whose reply was not seen.
+* `RedisClient::Error#partial_results`: for pipelines, the replies already read
+  (the confirmed prefix). These are real results and are preserved.
+* `RedisClient::Error#unknown_outcome?`: true when at least one command's outcome
+  is unknown.
+* `RedisClient::Error#replayable?`: true only when every such command is a known
+  read.
+
+A write with an unknown outcome is **never** migrated to a new primary
+automatically. With Sentinel configured, a non-timeout connection error will not
+be retried when it would re-send an unsafe write on a different node, even if
+`reconnect_attempts` is set. Reads are still retried.
+
 ### Consistent Hashing
 
 To horizontally shard keys across multiple servers without relying on clustering, a `RedisClient::HashRing` class is provided:
