@@ -34,12 +34,17 @@ dns.name Exceptions
 .. autoexception:: dns.name.BadLabelType
 .. autoexception:: dns.name.BadPointer
 .. autoexception:: dns.name.EmptyLabel
+.. autoexception:: dns.name.ForwardPointer
 .. autoexception:: dns.name.IDNAException
 .. autoexception:: dns.name.LabelTooLong
 .. autoexception:: dns.name.NameTooLong
 .. autoexception:: dns.name.NeedAbsoluteNameOrOrigin
 .. autoexception:: dns.name.NoIDNA2008
 .. autoexception:: dns.name.NoParent
+.. autoexception:: dns.name.PointerCycle
+.. autoexception:: dns.name.PointerChainTooLong
+.. autoexception:: dns.name.PointerInsideLabel
+.. autoexception:: dns.name.PointerOutOfBounds
 
 dns.opcode Exceptions
 ---------------------

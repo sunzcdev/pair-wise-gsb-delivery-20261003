@@ -83,6 +83,40 @@ NAMERELN_EQUAL = NameRelation.EQUAL
 NAMERELN_COMMONANCESTOR = NameRelation.COMMONANCESTOR
 
 
+class PointerProblem(dns.enum.IntEnum):
+    """The kind of problem found with a compression pointer in strict
+    diagnostic mode.
+
+    Each value names the exact boundary the offending pointer crossed:
+
+    * ``CYCLE`` -- following the pointer chain revisited an offset, so the
+      chain looped instead of terminating.
+    * ``FORWARD`` -- the pointer did not point strictly backwards in the
+      message (it targeted its own location or a later one).
+    * ``INSIDE_LABEL`` -- the pointer landed in the middle of an existing
+      label rather than at a label boundary.
+    * ``OUT_OF_BOUNDS`` -- the pointer targeted an offset outside the
+      message (or outside the region available to the name).
+    """
+
+    #: The compression pointer chain contained a cycle.
+    CYCLE = 0
+    #: The compression pointer pointed forward (or to itself).
+    FORWARD = 1
+    #: The compression pointer landed inside a label.
+    INSIDE_LABEL = 2
+    #: The compression pointer target was outside the message.
+    OUT_OF_BOUNDS = 3
+
+    @classmethod
+    def _maximum(cls):
+        return cls.OUT_OF_BOUNDS  # pragma: no cover
+
+    @classmethod
+    def _short_name(cls):
+        return cls.__name__  # pragma: no cover
+
+
 class EmptyLabel(dns.exception.SyntaxError):
     """A DNS label is empty."""
 
@@ -92,7 +126,23 @@ class BadEscape(dns.exception.SyntaxError):
 
 
 class BadPointer(dns.exception.FormError):
-    """A DNS compression pointer points forward instead of backward."""
+    """A DNS compression pointer did not point backwards in the message."""
+
+
+class PointerCycle(BadPointer):
+    """A DNS compression pointer chain contained a cycle."""
+
+
+class ForwardPointer(BadPointer):
+    """A DNS compression pointer pointed forward instead of backward."""
+
+
+class PointerInsideLabel(BadPointer):
+    """A DNS compression pointer landed in the middle of a label."""
+
+
+class PointerOutOfBounds(BadPointer):
+    """A DNS compression pointer pointed outside of the message."""
 
 
 class PointerChainTooLong(dns.exception.FormError):
@@ -1183,6 +1233,12 @@ MAX_COMPRESSION_POINTER_CHAIN = 16
 def from_wire_parser(parser: dns.wirebase.Parser, decompress: bool = True) -> Name:
     """Convert possibly compressed wire format into a :py:class:`dns.name.Name`.
 
+    This is the ordinary, backwards-compatible parsing entry point.  It does
+    not perform the additional classification done by
+    :py:func:`from_wire_parser_strict`; malformed compression pointers raise
+    the generic :py:class:`dns.name.BadPointer` exception without any detailed
+    diagnostics attached.
+
     :param parser: The wire format parser.
     :type parser: :py:class:`dns.wirebase.Parser`
     :param decompress: Is decompression allowed?
@@ -1228,8 +1284,327 @@ def from_wire_parser(parser: dns.wirebase.Parser, decompress: bool = True) -> Na
     return Name(labels)
 
 
+# Maps each strict diagnostic problem to the backwards-compatible exception
+# raised for it.  Every problem class is a subclass of dns.name.BadPointer, so
+# existing callers catching BadPointer keep working unchanged.
+_POINTER_PROBLEM_EXCEPTIONS = {
+    PointerProblem.CYCLE: PointerCycle,
+    PointerProblem.FORWARD: ForwardPointer,
+    PointerProblem.INSIDE_LABEL: PointerInsideLabel,
+    PointerProblem.OUT_OF_BOUNDS: PointerOutOfBounds,
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class NameDiagnostics:
+    """Detailed diagnostics for a name parsed from DNS wire format.
+
+    Instances are only produced by the strict parsing entry points
+    (:py:func:`from_wire_parser_strict` and :py:func:`from_wire_strict`).
+    All offsets are relative to the start of the wire data given to the
+    parser, i.e. they are message offsets.  They are never remapped while a
+    compression pointer chain is followed; in particular ``start_offset``
+    stays at the original beginning of the name even though the parser itself
+    is redirected to earlier offsets.
+
+    :ivar int start_offset: The message offset where parsing of the name
+        originally began.
+    :ivar int pointer_offsets: The message offsets of every compression
+        pointer encountered while parsing the name, in the order in which
+        they were followed.
+    :ivar int label_boundaries: Every message offset known to be the start
+        of a label (or the root label) of the parsed name, in ascending
+        order.
+    """
+
+    start_offset: int
+    pointer_offsets: tuple[int, ...] = ()
+    label_boundaries: tuple[int, ...] = ()
+
+
+def _strict_pointer_error(
+    problem: PointerProblem,
+    diagnostics: NameDiagnostics,
+    pointer_offset: int,
+    target_offset: int,
+) -> BadPointer:
+    """Build the classified exception for a bad compression pointer.
+
+    The original message offset of both the offending pointer and its target
+    is preserved on the exception, alongside the accumulated diagnostics.
+    """
+
+    exception_class = _POINTER_PROBLEM_EXCEPTIONS[problem]
+    exception = exception_class()
+    exception.problem = problem
+    exception.diagnostics = diagnostics
+    # The offset of the two-byte pointer itself within the message.
+    exception.offset = pointer_offset
+    # The offset the pointer claimed to point at within the message.
+    exception.target_offset = target_offset
+    return exception
+
+
+def _collect_label_boundaries(
+    wire: bytes,
+    region_end: int,
+    boundaries: set[int],
+) -> None:
+    """Scan the message region and record every label boundary.
+
+    Each offset is processed at most once, so the scan is linear in
+    *region_end*.  From every offset that looks like the start of a label
+    run, the run is walked to its end; ordinary label starts, root labels and
+    compression pointers encountered along valid runs are recorded as
+    boundaries.  Only bytes in ``wire[0:region_end]`` are ever indexed, so
+    nothing outside the message (or the region available to the name) is
+    read.  Walking a run is iterative, with compression-pointer hops bounded
+    by :py:data:`MAX_COMPRESSION_POINTER_CHAIN`, so malformed input cannot
+    cause unbounded recursion or iteration.  Malformed or un-walkable runs
+    simply contribute no further boundaries.
+    """
+
+    # Offsets already processed as the head of a walk.
+    processed: set[int] = set()
+    for origin in range(region_end):
+        if origin in processed or origin in boundaries:
+            continue
+        processed.add(origin)
+        position = origin
+        run: list[int] = []
+        seen: set[int] = set()
+        pointer_hops = 0
+        valid = True
+        while 0 <= position < region_end:
+            if position in seen:
+                # A cycle within this run.
+                valid = False
+                break
+            seen.add(position)
+            kind = wire[position]
+            if kind == 0:
+                # Root label terminates a valid run.
+                run.append(position)
+                break
+            if kind >= 192:
+                # Compression pointer: record its start and follow it.
+                if position + 1 >= region_end:
+                    valid = False
+                    break
+                run.append(position)
+                pointer_hops += 1
+                if pointer_hops > MAX_COMPRESSION_POINTER_CHAIN:
+                    valid = False
+                    break
+                position = (kind & 0x3F) * 256 + wire[position + 1]
+                continue
+            if kind >= 64:
+                # Extended/unknown label type: not a walkable label start.
+                valid = False
+                break
+            # Ordinary label beginning at position.
+            next_position = position + 1 + kind
+            if next_position > region_end:
+                valid = False
+                break
+            run.append(position)
+            position = next_position
+        else:
+            # Walked out of the region without a terminating root label.
+            valid = False
+        if valid:
+            boundaries.update(run)
+            processed.update(run)
+
+
+def from_wire_parser_strict(
+    parser: dns.wirebase.Parser, decompress: bool = True
+) -> tuple[Name, NameDiagnostics]:
+    """Convert possibly compressed wire format into a :py:class:`dns.name.Name`,
+    with strict diagnostics for malformed compression pointers.
+
+    This is the strict diagnostic companion to
+    :py:func:`from_wire_parser`.  On success it returns both the name and a
+    :py:class:`dns.name.NameDiagnostics` object describing the compression
+    pointers that were followed.  A name reached through any number of legal
+    backwards pointers parses exactly as it does through the ordinary entry
+    point.
+
+    When a compression pointer is malformed, a specific subclass of
+    :py:class:`dns.name.BadPointer` is raised, distinguishing a pointer
+    chain cycle (:py:class:`dns.name.PointerCycle`), an illegal forward or
+    self reference (:py:class:`dns.name.ForwardPointer`), a pointer landing
+    in the middle of a label rather than at a label boundary
+    (:py:class:`dns.name.PointerInsideLabel`), and a pointer targeting an
+    offset outside the message
+    (:py:class:`dns.name.PointerOutOfBounds`).  Each exception carries the
+    original message offset of the pointer and its target, plus the
+    :py:class:`dns.name.NameDiagnostics` gathered so far.
+
+    Only bytes within the parser's current message region are ever read,
+    and the pointer chain is walked iteratively with a visited-offset set,
+    so malformed input can neither cause reads outside the message nor
+    unbounded recursion.
+
+    :param parser: The wire format parser.
+    :type parser: :py:class:`dns.wirebase.Parser`
+    :param decompress: Is decompression allowed?
+    :type decompress: bool
+    :raises dns.name.PointerCycle: if following the compression pointers
+        revisits an offset already seen in the chain.
+    :raises dns.name.ForwardPointer: if a compression pointer does not
+        point strictly backwards in the message.
+    :raises dns.name.PointerInsideLabel: if a compression pointer targets
+        an offset in the middle of a label rather than at a label boundary.
+    :raises dns.name.PointerOutOfBounds: if a compression pointer targets
+        an offset outside the message or the region available to the name.
+    :raises dns.name.PointerChainTooLong: if the compression pointer chain
+        is longer than :py:data:`dns.name.MAX_COMPRESSION_POINTER_CHAIN`.
+    :raises dns.name.BadLabelType: if an invalid (e.g. extended) label type
+        was encountered; extended label types are never treated as ordinary
+        text labels.
+    :raises dns.name.DecompressionForbidden: if a name needs decompression
+        but it is not allowed.
+    :rtype: tuple[:py:class:`dns.name.Name`,
+        :py:class:`dns.name.NameDiagnostics`]
+    """
+
+    labels: list[bytes] = []
+    # Offsets visited as chain targets (the initial offset is visited too),
+    # used to detect cycles in O(1) without recursion.
+    visited: set[int] = set()
+    pointer_offsets: list[int] = []
+    # Message offsets that begin a label of THIS name (including its root
+    # label and every compression target it follows).  A set gives O(1)
+    # membership tests; a sorted list is produced for the diagnostics.
+    boundary_set: set[int] = set()
+    # Lazily computed, message-wide set of label boundaries used to decide
+    # whether a pointer lands inside a label.  It is kept separate from
+    # boundary_set so diagnostics report only this name's own boundaries, and
+    # the (bounded) scan runs at most once per parse.
+    scanned_boundaries: set[int] | None = None
+
+    def add_boundary(offset: int) -> None:
+        boundary_set.add(offset)
+
+    def is_message_label_boundary(target: int) -> bool:
+        nonlocal scanned_boundaries
+        if target in boundary_set:
+            return True
+        if scanned_boundaries is None:
+            scanned_boundaries = set(boundary_set)
+            _collect_label_boundaries(parser.wire, parser.end, scanned_boundaries)
+        return target in scanned_boundaries
+
+    hops = 0
+    with parser.restore_furthest():
+        # The original message offset where parsing of this name began; it is
+        # preserved unchanged even when compression pointers redirect the
+        # parser to earlier offsets.
+        name_start = parser.current
+        start = name_start
+        diagnostics = NameDiagnostics(name_start, (), ())
+        visited.add(start)
+        add_boundary(start)
+        # The offset of the octet about to be read by the loop's get_uint8();
+        # tracked explicitly so a compression pointer reports its own message
+        # offset rather than that of its second byte.
+        octet_offset = start
+        count = parser.get_uint8()
+        while count != 0:
+            if count < 64:
+                # An ordinary text label.
+                labels.append(parser.get_bytes(count))
+                # The byte immediately after the label is the next label's
+                # boundary.
+                add_boundary(parser.current)
+                octet_offset = parser.current
+            elif count >= 192:
+                # A compression pointer.  octet_offset is the absolute message
+                # offset of the pointer's first byte.
+                if not decompress:
+                    raise DecompressionForbidden
+                pointer_offset = octet_offset
+                target = (count & 0x3F) * 256 + parser.get_uint8()
+                pointer_offsets.append(pointer_offset)
+                diagnostics = NameDiagnostics(
+                    name_start,
+                    tuple(pointer_offsets),
+                    tuple(sorted(boundary_set)),
+                )
+                # 1. The target must lie within the message region the name
+                #    is allowed to read.  This check never reads memory.
+                if target < 0 or target >= parser.end:
+                    raise _strict_pointer_error(
+                        PointerProblem.OUT_OF_BOUNDS,
+                        diagnostics,
+                        pointer_offset,
+                        target,
+                    )
+                # 2. Pointers must point strictly backwards relative to the
+                #    start of the segment they occur in, so a chain can never
+                #    move forward through the message.
+                if target >= start:
+                    raise _strict_pointer_error(
+                        PointerProblem.FORWARD,
+                        diagnostics,
+                        pointer_offset,
+                        target,
+                    )
+                # 3. A chain that revisits an offset would loop forever.
+                if target in visited:
+                    raise _strict_pointer_error(
+                        PointerProblem.CYCLE,
+                        diagnostics,
+                        pointer_offset,
+                        target,
+                    )
+                hops += 1
+                if hops > MAX_COMPRESSION_POINTER_CHAIN:
+                    raise PointerChainTooLong
+                # 4. The target must be the start of a label in the message,
+                #    not the interior of one.  The check only indexes in-bounds
+                #    bytes and iterates (never recurses); the underlying scan
+                #    runs at most once per parse.
+                if not is_message_label_boundary(target):
+                    raise _strict_pointer_error(
+                        PointerProblem.INSIDE_LABEL,
+                        diagnostics,
+                        pointer_offset,
+                        target,
+                    )
+                # The entire compression target must not overlap with any part
+                # of this name, matching the ordinary parser's restriction.
+                parser.restrict_end(start)
+                visited.add(target)
+                add_boundary(target)
+                parser.seek(target)
+                start = target
+                octet_offset = target
+            else:
+                # The 0x40 and 0x80 label types are extended label types;
+                # they must never be silently parsed as ordinary text.
+                raise BadLabelType
+            octet_offset = parser.current
+            count = parser.get_uint8()
+        # The root label's zero octet is itself a label boundary.
+        add_boundary(parser.current)
+        labels.append(b"")
+    diagnostics = NameDiagnostics(
+        name_start,
+        tuple(pointer_offsets),
+        tuple(sorted(boundary_set)),
+    )
+    return Name(labels), diagnostics
+
+
 def from_wire(message: bytes, current: int) -> tuple[Name, int]:
     """Convert possibly compressed wire format into a :py:class:`dns.name.Name`.
+
+    This is the ordinary, backwards-compatible parsing entry point and does
+    not attach detailed compression-pointer diagnostics.  Use
+    :py:func:`from_wire_strict` when the exact boundary crossed by a bad
+    compression pointer must be classified.
 
     :param bytes message: A ``bytes`` containing an entire DNS message in DNS
         wire form.
@@ -1246,6 +1621,38 @@ def from_wire(message: bytes, current: int) -> tuple[Name, int]:
     parser = dns.wirebase.Parser(message, current)
     name = from_wire_parser(parser)
     return (name, parser.current - current)
+
+
+def from_wire_strict(
+    message: bytes, current: int
+) -> tuple[Name, int, NameDiagnostics]:
+    """Convert possibly compressed wire format into a :py:class:`dns.name.Name`,
+    with strict compression-pointer diagnostics.
+
+    This is the strict diagnostic companion to :py:func:`from_wire`.  It
+    returns the name, the number of wire bytes consumed, and a
+    :py:class:`dns.name.NameDiagnostics` object.  Malformed compression
+    pointers raise the classified exceptions documented on
+    :py:func:`from_wire_parser_strict`, each preserving the original message
+    offset of the offending pointer and its target.
+
+    :param bytes message: A ``bytes`` containing an entire DNS message in DNS
+        wire form.
+    :param int current: The offset of the beginning of the name from the
+        start of the message.
+    :raises dns.name.BadPointer: (or one of its classified subclasses) if a
+        compression pointer is malformed.
+    :raises dns.name.BadLabelType: if an invalid label type was encountered.
+    :returns: A tuple of the name that was read, the number of bytes of the
+        wire format message which were consumed reading it, and the
+        diagnostics.
+    :rtype: tuple[:py:class:`dns.name.Name`, int,
+        :py:class:`dns.name.NameDiagnostics`]
+    """
+
+    parser = dns.wirebase.Parser(message, current)
+    name, diagnostics = from_wire_parser_strict(parser)
+    return (name, parser.current - current, diagnostics)
 
 
 # RFC 4471 Support

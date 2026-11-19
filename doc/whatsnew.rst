@@ -38,6 +38,23 @@ What's New in dnspython
   attribute of the result, may now need an ``isinstance()`` check or a cast to
   satisfy a type checker.
 
+* DNS name wire parsing now has an opt-in strict diagnostic mode.
+  ``dns.name.from_wire_parser_strict()`` and ``dns.name.from_wire_strict()``
+  classify a malformed compression pointer into one of four
+  ``dns.name.PointerProblem`` kinds -- a pointer chain cycle
+  (``dns.name.PointerCycle``), an illegal forward or self reference
+  (``dns.name.ForwardPointer``), a pointer landing in the middle of a label
+  (``dns.name.PointerInsideLabel``), and a pointer outside the message
+  (``dns.name.PointerOutOfBounds``) -- and return a
+  ``dns.name.NameDiagnostics`` object that preserves the original message
+  offsets of the name, the pointers followed, and the label boundaries.  The
+  classified exceptions are subclasses of the existing
+  ``dns.name.BadPointer``, and the ordinary ``from_wire()`` and
+  ``from_wire_parser()`` entry points are unchanged and do not attach
+  diagnostics.  Extended label types are rejected with
+  ``dns.name.BadLabelType`` as before, and parsing never reads outside the
+  message or recurses.
+
 2.9.2
 -----
 

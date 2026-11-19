@@ -27,6 +27,7 @@ import dns.e164
 import dns.exception
 import dns.name
 import dns.reversename
+import dns.wirebase
 
 # pylint: disable=line-too-long,unsupported-assignment-operation
 
@@ -794,6 +795,198 @@ class NameTestCase(unittest.TestCase):
 
         self.assertEqual(dns.name.from_wire(w, 32)[0], dns.name.from_text("."))
         self.assertRaises(dns.name.PointerChainTooLong, bad)
+
+    def testStrictFromWireLegalMultipleBackPointers(self):
+        # The same name reached through any number of legal backwards
+        # references parses correctly, and the diagnostics remember every
+        # pointer followed (in order) using original message offsets.
+        w = b"\x03foo\x00\x01a\xc0\x00\x01b\xc0\x05"
+        n1, c1, d1 = dns.name.from_wire_strict(w, 0)
+        n2, c2, d2 = dns.name.from_wire_strict(w, c1)
+        n3, c3, d3 = dns.name.from_wire_strict(w, c1 + c2)
+        self.assertEqual(n1, dns.name.from_text("foo."))
+        self.assertEqual(n2, dns.name.from_text("a.foo."))
+        self.assertEqual(n3, dns.name.from_text("b.a.foo."))
+        self.assertEqual((c1, c2, c3), (5, 4, 4))
+        self.assertEqual(d1.start_offset, 0)
+        self.assertEqual(d1.pointer_offsets, ())
+        self.assertEqual(d2.pointer_offsets, (7,))
+        # n3 follows the pointer at 11, then the pointer at 7, then root.
+        self.assertEqual(d3.pointer_offsets, (11, 7))
+        # Diagnostics only expose this name's own label boundaries.
+        self.assertEqual(d2.label_boundaries, (0, 4, 5, 7))
+        self.assertEqual(d3.label_boundaries, (0, 4, 5, 7, 9, 11))
+
+    def testStrictFromWireAgreesWithOrdinary(self):
+        w = b"\x03foo\x00\x01a\xc0\x00"
+        ordinary = dns.name.from_wire_parser(dns.wirebase.Parser(w, 5))
+        strict, diagnostics = dns.name.from_wire_parser_strict(
+            dns.wirebase.Parser(w, 5)
+        )
+        self.assertEqual(ordinary, strict)
+        self.assertEqual(diagnostics.pointer_offsets, (7,))
+
+    def testStrictForwardPointerSelf(self):
+        w = b"\x03foo\xc0\x04"
+        with self.assertRaises(dns.name.ForwardPointer) as cm:
+            dns.name.from_wire_strict(w, 0)
+        e = cm.exception
+        self.assertEqual(e.problem, dns.name.PointerProblem.FORWARD)
+        self.assertEqual(e.offset, 4)
+        self.assertEqual(e.target_offset, 4)
+        self.assertIsInstance(e, dns.name.BadPointer)
+        self.assertIsInstance(e.diagnostics, dns.name.NameDiagnostics)
+
+    def testStrictForwardPointerLater(self):
+        w = b"\x03foo\xc0\x05"
+        with self.assertRaises(dns.name.ForwardPointer) as cm:
+            dns.name.from_wire_strict(w, 0)
+        self.assertEqual(cm.exception.problem, dns.name.PointerProblem.FORWARD)
+        self.assertEqual(cm.exception.offset, 4)
+        self.assertEqual(cm.exception.target_offset, 5)
+
+    def testStrictPointerOutOfBounds(self):
+        w = b"\x03foo\xc0\x20"
+        with self.assertRaises(dns.name.PointerOutOfBounds) as cm:
+            dns.name.from_wire_strict(w, 0)
+        self.assertEqual(
+            cm.exception.problem, dns.name.PointerProblem.OUT_OF_BOUNDS
+        )
+        self.assertEqual(cm.exception.offset, 4)
+        self.assertEqual(cm.exception.target_offset, 32)
+
+    def testStrictPointerInsideEarlierLabel(self):
+        # A later name points into the middle of an earlier "foo" label
+        # (offset 2 is a content byte, not a label boundary).
+        w = b"\x03foo\x00\xc0\x02"
+        with self.assertRaises(dns.name.PointerInsideLabel) as cm:
+            dns.name.from_wire_strict(w, 5)
+        self.assertEqual(
+            cm.exception.problem, dns.name.PointerProblem.INSIDE_LABEL
+        )
+        self.assertEqual(cm.exception.offset, 5)
+        self.assertEqual(cm.exception.target_offset, 2)
+
+    def testStrictPointerInsideOwnLabel(self):
+        # A backwards pointer from later in the name landing inside one of the
+        # name's own labels.
+        w = b"\x03abc\x01x\xc0\x02"
+        with self.assertRaises(dns.name.PointerInsideLabel) as cm:
+            dns.name.from_wire_strict(w, 4)
+        self.assertEqual(
+            cm.exception.problem, dns.name.PointerProblem.INSIDE_LABEL
+        )
+        self.assertEqual(cm.exception.offset, 6)
+        self.assertEqual(cm.exception.target_offset, 2)
+
+    def testStrictPointerOnBoundaryIsLegal(self):
+        w = b"\x03foo\x00\xc0\x00"
+        n, consumed, diagnostics = dns.name.from_wire_strict(w, 5)
+        self.assertEqual(n, dns.name.from_text("foo."))
+        self.assertEqual(consumed, 2)
+        self.assertEqual(diagnostics.pointer_offsets, (5,))
+
+    def testStrictPointerCycleClassification(self):
+        # All four problem classes exist and map onto the PointerProblem enum.
+        self.assertTrue(issubclass(dns.name.PointerCycle, dns.name.BadPointer))
+        self.assertTrue(issubclass(dns.name.ForwardPointer, dns.name.BadPointer))
+        self.assertTrue(
+            issubclass(dns.name.PointerInsideLabel, dns.name.BadPointer)
+        )
+        self.assertTrue(
+            issubclass(dns.name.PointerOutOfBounds, dns.name.BadPointer)
+        )
+        self.assertEqual(
+            {p.name for p in dns.name.PointerProblem},
+            {"CYCLE", "FORWARD", "INSIDE_LABEL", "OUT_OF_BOUNDS"},
+        )
+        # A self-referencing pointer is a forward reference (it cannot point
+        # strictly backwards), so it is classified FORWARD rather than looping.
+        with self.assertRaises(dns.name.ForwardPointer):
+            dns.name.from_wire_strict(b"\xc0\x00", 0)
+
+    def testStrictExtendedLabelTypeRejected(self):
+        # Extended label types must never be silently treated as text.
+        for octet in (0x40, 0x80, 0xBF):
+            with self.assertRaises(dns.name.BadLabelType):
+                dns.name.from_wire_strict(bytes([octet]) + b"foo", 0)
+
+    def testStrictDecompressionForbidden(self):
+        with self.assertRaises(dns.name.DecompressionForbidden):
+            dns.name.from_wire_parser_strict(
+                dns.wirebase.Parser(b"\xc0\x00"), decompress=False
+            )
+
+    def testStrictChainTooLong(self):
+        w = (
+            b"\x00\x00\xc0\x00\xc0\x02\xc0\x04\xc0\x06\xc0\x08\xc0\x0a"
+            b"\xc0\x0c\xc0\x0e\xc0\x10\xc0\x12\xc0\x14\xc0\x16\xc0\x18"
+            b"\xc0\x1a\xc0\x1c\xc0\x1e\xc0\x20"
+        )
+        with self.assertRaises(dns.name.PointerChainTooLong):
+            dns.name.from_wire_strict(w, 34)
+
+    def testStrictTruncatedPointerDoesNotReadOutOfBounds(self):
+        # The second byte of a pointer is missing; parsing fails cleanly with
+        # a FormError rather than indexing outside the message.
+        with self.assertRaises(dns.exception.FormError):
+            dns.name.from_wire_strict(b"\x03foo\xc0", 0)
+
+    def testStrictRobustToCyclesElsewhereInMessage(self):
+        # A pointer cycle present elsewhere in the message must not hang the
+        # boundary scan or confuse parsing of a legal name.
+        w = b"\x03foo\x00" + b"\xc0\x07\xc0\x05"
+        n, consumed, _ = dns.name.from_wire_strict(w, 0)
+        self.assertEqual(n, dns.name.from_text("foo."))
+        self.assertEqual(consumed, 5)
+        # A legal pointer into the same message still resolves.
+        n, _, _ = dns.name.from_wire_strict(b"\x03foo\x00\xc0\x00", 5)
+        self.assertEqual(n, dns.name.from_text("foo."))
+
+    def testStrictPointerIntoExtendedLabelIsInsideLabel(self):
+        # The target offset holds an extended-label type, so it is not a label
+        # boundary and must be classified as landing inside a label.
+        w = b"\x40zz\x03foo\x00\xc0\x00"
+        with self.assertRaises(dns.name.PointerInsideLabel) as cm:
+            dns.name.from_wire_strict(w, 8)
+        self.assertEqual(cm.exception.target_offset, 0)
+
+    def testStrictExtendedLabelElsewhereDoesNotBreakLegalPointer(self):
+        # Extended-label bytes elsewhere in the region do not prevent a legal
+        # pointer to a genuine label boundary from resolving.
+        w = b"\x03foo\x00\x40zz\xc0\x00"
+        n, _, _ = dns.name.from_wire_strict(w, 8)
+        self.assertEqual(n, dns.name.from_text("foo."))
+
+    def testStrictPreservesOffsetsAcrossHops(self):
+        # root at 0; pointer 1 -> 0; name at 3 = label "a" then pointer -> 1.
+        w = b"\x00\xc0\x00\x01a\xc0\x01"
+        n, consumed, diagnostics = dns.name.from_wire_strict(w, 3)
+        self.assertEqual(n, dns.name.from_text("a."))
+        self.assertEqual(consumed, 4)
+        # start_offset is the original name start, not the redirect target.
+        self.assertEqual(diagnostics.start_offset, 3)
+        self.assertEqual(diagnostics.pointer_offsets, (5, 1))
+        self.assertEqual(diagnostics.label_boundaries, (0, 1, 3, 5))
+
+    def testStrictSimpleNameDiagnostics(self):
+        n, consumed, diagnostics = dns.name.from_wire_strict(b"\x03foo\x00", 0)
+        self.assertEqual(n, dns.name.from_text("foo."))
+        self.assertEqual(consumed, 5)
+        self.assertEqual(diagnostics.start_offset, 0)
+        self.assertEqual(diagnostics.pointer_offsets, ())
+        self.assertEqual(diagnostics.label_boundaries, (0, 4, 5))
+
+    def testOrdinaryEntryHasNoDiagnostics(self):
+        # The backwards-compatible entry point must not attach detailed
+        # diagnostics to its exceptions.
+        with self.assertRaises(dns.name.BadPointer) as cm:
+            dns.name.from_wire(b"\x03foo\xc0\x04", 0)
+        self.assertFalse(hasattr(cm.exception, "problem"))
+        self.assertFalse(hasattr(cm.exception, "diagnostics"))
+        # And it still returns the plain two-tuple.
+        result = dns.name.from_wire(b"\x03foo\x00", 0)
+        self.assertEqual(len(result), 2)
 
     def testParent1(self):
         n = dns.name.from_text("foo.bar.")
