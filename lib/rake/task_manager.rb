@@ -21,6 +21,7 @@ module Rake
     end
 
     def define_task(task_class, *args, &block) # :nodoc:
+      resources = extract_resources!(args)
       task_name, arg_names, deps, order_only = resolve_args(args)
 
       original_scope = @scope
@@ -33,6 +34,7 @@ module Rake
       task_name = task_class.scope_name(@scope, task_name)
       task = intern(task_class, task_name)
       task.set_arg_names(arg_names) unless arg_names.empty?
+      task.resources = resources if resources
       if Rake::TaskManager.record_task_metadata
         add_location(task)
         task.add_description(get_description)
@@ -43,6 +45,21 @@ module Rake
     ensure
       @scope = original_scope
     end
+
+    # Extract an optional :resources declaration from the trailing hash
+    # of a task definition, e.g.
+    #
+    #   task :a => [:b], resources: { compiler: 1 }
+    #
+    # Returns the declared requirements, or nil if none were declared.
+    def extract_resources!(args) # :nodoc:
+      hash = args.last
+      return nil unless hash.is_a?(Hash) && hash.key?(:resources)
+      resources = hash.delete(:resources)
+      args.pop if hash.empty?
+      resources
+    end
+    private :extract_resources!
 
     # Lookup a task.  Return an existing task if found, otherwise
     # create a task of the current type.

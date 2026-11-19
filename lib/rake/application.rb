@@ -5,6 +5,7 @@ require_relative "options"
 require_relative "task_manager"
 require_relative "file_list"
 require_relative "thread_pool"
+require_relative "resource_manager"
 require_relative "thread_history_display"
 require_relative "trace_output"
 require_relative "win32"
@@ -172,6 +173,13 @@ module Rake
     # Return the thread pool used for multithreaded processing.
     def thread_pool             # :nodoc:
       @thread_pool ||= ThreadPool.new(options.thread_pool_size || Rake.suggested_thread_count-1)
+    end
+
+    # Return the resource manager used to allocate finite build
+    # resources (compilers, linkers, ...) to tasks that declare resource
+    # requirements.
+    def resource_manager        # :nodoc:
+      @resource_manager ||= ResourceManager.new
     end
 
     # internal ----------------------------------------------------------------

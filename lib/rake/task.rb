@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 require_relative "invocation_exception_mixin"
+require_relative "resource_manager"
 
 module Rake
 
@@ -37,6 +38,12 @@ module Rake
     # Has this task already been invoked?  Already invoked tasks
     # will be skipped unless you reenable them.
     attr_reader :already_invoked
+
+    # Resource requirements of this task: a hash of resource name =>
+    # amount.  All declared quotas are acquired atomically after the
+    # prerequisites have finished and before the actions execute, and
+    # are returned when the actions complete, fail, or are cancelled.
+    attr_reader :resources
 
     # Return task name
     def to_s
@@ -109,6 +116,13 @@ module Rake
       @locations       = []
       @invocation_exception = nil
       @order_only_prerequisites = []
+      @resources       = {}
+    end
+
+    # Declare the resources (resource name => amount) this task needs
+    # while its actions execute.  See the resources attribute.
+    def resources=(requirements)
+      @resources = ResourceManager.normalize(requirements)
     end
 
     # Enhance a task with prerequisites or actions.  Returns self.
@@ -215,8 +229,11 @@ module Rake
 
           @already_invoked = true
 
+          # Reject illegal resource requirements before anything runs.
+          requirements = application.resource_manager.validate!(@resources)
+
           invoke_prerequisites(task_args, new_chain)
-          execute(task_args) if needed?
+          execute_with_resources(task_args, requirements)
         rescue Exception => ex
           add_chain_to(ex, new_chain)
           @invocation_exception = ex
@@ -232,6 +249,22 @@ module Rake
       exception.chain = new_chain if exception.chain.nil?
     end
     private :add_chain_to
+
+    # Execute the task's actions, first acquiring the whole declared
+    # resource requirement (if any) in a single atomic step.  The quotas
+    # are held only while the actions run and are always returned, even
+    # if the actions fail or the worker thread is cancelled.
+    def execute_with_resources(task_args, requirements) # :nodoc:
+      return unless needed?
+      if requirements.empty?
+        execute(task_args)
+      else
+        application.resource_manager.with_resources(requirements) do
+          execute(task_args)
+        end
+      end
+    end
+    private :execute_with_resources
 
     # Invoke all the prerequisites of a task.
     def invoke_prerequisites(task_args, invocation_chain) # :nodoc:

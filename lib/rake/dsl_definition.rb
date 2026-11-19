@@ -114,6 +114,24 @@ module Rake
       Rake::MultiTask.define_task(*args, &block)
     end
 
+    # Declare a finite build resource (such as a compiler or a linker)
+    # with the given total +capacity+.  Tasks declare how much of a
+    # resource they need with the <tt>:resources</tt> option; the whole
+    # declared amount is acquired atomically once the task's
+    # prerequisites are ready, and is returned when the task's actions
+    # complete, fail, or are cancelled.
+    #
+    # Example:
+    #   resource_limit :compiler, 2
+    #
+    #   task :foo => [:bar], resources: { compiler: 1 } do
+    #     # ... runs only while holding one compiler quota ...
+    #   end
+    #
+    def resource_limit(name, capacity) # :doc:
+      Rake.application.resource_manager.declare(name, capacity)
+    end
+
     # Create a new rake namespace and use it for evaluating the given
     # block.  Returns a NameSpace object that can be used to lookup
     # tasks defined in the namespace.
