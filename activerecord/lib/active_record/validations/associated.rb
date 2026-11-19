@@ -1,0 +1,67 @@
+# frozen_string_literal: true
+
+module ActiveRecord
+  module Validations
+    class AssociatedValidator < ActiveModel::EachValidator # :nodoc:
+      def validate_each(record, attribute, value)
+        context = record_validation_context_for_association(record)
+
+        if Array(value).reject { |association| valid_object?(association, context) }.any?
+          record.errors.add(attribute, :invalid, **options, value: value)
+        end
+      end
+
+      private
+        def valid_object?(record, context)
+          (record.respond_to?(:marked_for_destruction?) && record.marked_for_destruction?) || record.valid?(context)
+        end
+
+        def record_validation_context_for_association(record)
+          record.custom_validation_context? ? record.validation_context : nil
+        end
+    end
+
+    module ClassMethods
+      # Validates whether the associated object or objects are all valid.
+      # Works with any kind of association.
+      #
+      # ```
+      # class Book < ActiveRecord::Base
+      #   has_many :pages
+      #   belongs_to :library
+      #
+      #   validates_associated :pages, :library
+      # end
+      # ```
+      #
+      # WARNING: This validation must not be used on both ends of an association.
+      # Doing so will lead to a circular dependency and cause infinite recursion.
+      #
+      # NOTE: This validation will not fail if the association hasn't been
+      # assigned. If you want to ensure that the association is both present and
+      # guaranteed to be valid, you also need to use
+      # [validates_presence_of](rdoc-ref:Validations::ClassMethods#validates_presence_of).
+      #
+      # Configuration options:
+      #
+      # * `:message` - A custom error message (default is: "is invalid").
+      # * `:on` - Specifies the contexts where this validation is active.
+      #   Runs in all validation contexts by default `nil`. You can pass a symbol
+      #   or an array of symbols. (e.g. `on: :create` or
+      #   `on: :custom_validation_context` or
+      #   `on: [:create, :custom_validation_context]`)
+      # * `:if` - Specifies a method, proc, or lambda to call to determine
+      #   if the validation should occur (e.g. `if: :allow_validation`,
+      #   or `if: Proc.new { |user| user.signup_step > 2 }`). The method,
+      #   proc or lambda should return or evaluate to a `true` or `false` value.
+      # * `:unless` - Specifies a method, proc, or lambda to call to
+      #   determine if the validation should not occur (e.g. `unless: :skip_validation`,
+      #   or `unless: Proc.new { |user| user.signup_step <= 2 }`). The
+      #   method, proc, or lambda should return or evaluate to a `true` or `false`
+      #   value.
+      def validates_associated(*attr_names)
+        validates_with AssociatedValidator, _merge_attributes(attr_names)
+      end
+    end
+  end
+end

@@ -1,0 +1,55 @@
+# frozen_string_literal: true
+
+require "active_storage/vips"
+
+module ActiveStorage
+  # This analyzer relies on the third-party [ruby-vips](https://github.com/libvips/ruby-vips) gem. Ruby-vips requires
+  # the [libvips](https://libvips.github.io/libvips/) system library.
+  class Analyzer::ImageAnalyzer::Vips < Analyzer::ImageAnalyzer
+    def self.accept?(blob)
+      super && ActiveStorage.variant_processor == :vips
+    end
+
+    private
+      def read_image
+        unless VIPS_AVAILABLE
+          logger.error "Skipping image analysis because the ruby-vips gem isn't installed"
+          return {}
+        end
+
+        ActiveStorage.require_securable_vips!
+
+        download_blob_to_tempfile do |file|
+          image = instrument("vips") do
+            # ruby-vips will raise Vips::Error if it can't find an appropriate loader for the file
+            ::Vips::Image.new_from_file(file.path, access: :sequential)
+          rescue ::Vips::Error
+            logger.info "Skipping image analysis because Vips doesn't support the file"
+            nil
+          end
+
+          if image
+            yield image
+          else
+            {}
+          end
+        rescue ::Vips::Error => error
+          logger.error "Skipping image analysis due to a Vips error: #{error.message}"
+          {}
+        end
+      rescue ::Vips::Error => error
+        logger.error "Skipping image analysis due to a Vips error: #{error.message}"
+        {}
+      end
+
+
+      # Orientations 5 to 8 involve a 90 or 270 degree rotation, so the stored width and height are
+      # transposed. This is the same libvips field that `autorot` reads when generating variants.
+      AXIS_SWAPPING_ORIENTATIONS = 5..8
+      def rotated_image?(image)
+        AXIS_SWAPPING_ORIENTATIONS.cover?(image.get("orientation"))
+      rescue ::Vips::Error
+        false
+      end
+  end
+end

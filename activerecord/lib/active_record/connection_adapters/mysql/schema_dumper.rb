@@ -1,0 +1,103 @@
+# frozen_string_literal: true
+
+module ActiveRecord
+  module ConnectionAdapters
+    module MySQL
+      class SchemaDumper < ConnectionAdapters::SchemaDumper # :nodoc:
+        private
+          def read_schema_metadata(tables)
+            super
+            @table_collations = @connection.table_collation(tables)
+          end
+
+          def add_index_column_parts!(index_parts, index)
+            index_parts << "length: #{format_index_parts(index.lengths)}" if index.lengths.present?
+            super
+          end
+
+          def add_index_option_parts!(index_parts, index)
+            index_parts << "type: #{index.type.inspect}" if index.type
+            super
+            index_parts << "enabled: #{index.enabled.inspect}" if @connection.supports_disabling_indexes? && index.disabled?
+            index_parts
+          end
+
+          def prepare_column_options(column)
+            spec = super
+            spec[:unsigned] = "true" if column.unsigned?
+            spec[:auto_increment] = "true" if column.auto_increment?
+
+            if /\A(?<size>tiny|medium|long)(?:text|blob)/ =~ column.sql_type
+              spec = { size: size.to_sym.inspect }.merge!(spec)
+            end
+
+            if @connection.supports_virtual_columns? && column.virtual?
+              spec[:as] = extract_expression_for_virtual_column(column)
+              spec[:stored] = "true" if /\b(?:STORED|PERSISTENT)\b/.match?(column.extra)
+              spec = { type: schema_type(column).inspect }.merge!(spec)
+            end
+
+            spec
+          end
+
+          def column_spec_for_primary_key(column)
+            spec = super
+            spec.delete(:auto_increment) if column.type == :integer && column.auto_increment?
+            spec
+          end
+
+          def default_primary_key?(column)
+            super && column.auto_increment? && !column.unsigned?
+          end
+
+          def explicit_primary_key_default?(column)
+            column.type == :integer && !column.auto_increment?
+          end
+
+          def schema_type(column)
+            case column.sql_type
+            when /\Atimestamp\b/
+              :timestamp
+            when /\A(?:enum|set)\b/
+              column.sql_type
+            else
+              super
+            end
+          end
+
+          def schema_limit(column)
+            super unless /\A(?:tiny|medium|long)?(?:text|blob)\b/.match?(column.sql_type)
+          end
+
+          def schema_precision(column)
+            if /\Atime(?:stamp)?\b/.match?(column.sql_type) && column.precision == 0
+              nil
+            elsif column.type == :datetime
+              column.precision == 0 ? "nil" : super
+            else
+              super
+            end
+          end
+
+          def schema_collation(column)
+            return unless column.collation
+
+            column.collation.inspect if column.collation != @table_collations[table_name]
+          end
+
+          def extract_expression_for_virtual_column(column)
+            scope = @connection.send(:quoted_scope, table_name)
+            column_name = @connection.quote(column.name)
+            sql = "SELECT generation_expression FROM information_schema.columns" \
+                  " WHERE table_schema = #{scope[:schema]}" \
+                  "   AND table_name = #{scope[:name]}" \
+                  "   AND column_name = #{column_name}"
+            # Calling .inspect leads into issues with the query result
+            # which already returns escaped quotes.
+            # We remove the escape sequence from the result in order to deal with double escaping issues.
+            @connection.query_value(sql).gsub("\\'", "'").inspect
+          end
+      end
+    end
+  end
+end

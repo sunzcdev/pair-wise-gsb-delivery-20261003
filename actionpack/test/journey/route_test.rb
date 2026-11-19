@@ -1,0 +1,174 @@
+# frozen_string_literal: true
+
+require "abstract_unit"
+require "support/path_helper"
+
+module ActionDispatch
+  module Journey
+    class TestRoute < ActiveSupport::TestCase
+      include PathHelper
+
+      def test_initialize
+        app      = Object.new
+        path     = path_from_string "/:controller(/:action(/:id(.:format)))"
+        defaults = {}
+        route    = Route.new(name: "name", app: app, path: path, defaults: defaults)
+
+        assert_equal app, route.app
+        assert_equal path, route.path
+        assert_same  defaults, route.defaults
+      end
+
+      def test_verb_matchers
+        verbs = Route::VerbMatchers::VERBS
+
+        verbs.each_with_index do |verb, index|
+          matcher = Route::VerbMatchers.const_get(verb)
+          request_class = verb == "QUERY" ? ActionDispatch::Request : Rack::Request
+          request = request_class.new("REQUEST_METHOD" => verb)
+          other_verb = verbs[(index + 1) % verbs.size]
+          other_request = request_class.new("REQUEST_METHOD" => other_verb)
+
+          assert_equal verb, matcher.verb
+          assert matcher.call(request)
+          assert_not matcher.call(other_request)
+        end
+      end
+
+      def test_route_adds_itself_as_memo
+        app   = Object.new
+        path  = path_from_string "/:controller(/:action(/:id(.:format)))"
+        route = Route.new(name: "name", app: app, path: path)
+
+        route.ast.grep(Nodes::Terminal).each do |node|
+          assert_equal route, node.memo
+        end
+      end
+
+      def test_path_requirements_override_defaults
+        path     = build_path(":name", { name: /love/ }, "/", true)
+        defaults = { name: "tender" }
+        route    = Route.new(name: "name", path: path, defaults: defaults)
+        assert_equal(/love/, route.requirements[:name])
+      end
+
+      def test_ip_address
+        path  = path_from_string "/messages/:id(.:format)"
+        route = Route.new(name: "name", path: path, constraints: { ip: "192.168.1.1" },
+                          defaults: { controller: "foo", action: "bar" })
+        assert_equal "192.168.1.1", route.ip
+      end
+
+      def test_default_ip
+        path  = path_from_string "/messages/:id(.:format)"
+        route = Route.new(name: "name", path: path,
+                          defaults: { controller: "foo", action: "bar" })
+        assert_equal(//, route.ip)
+      end
+
+      def test_format_with_star
+        path  = path_from_string "/:controller/*extra"
+        route = Route.new(name: "name", path: path,
+                          defaults: { controller: "foo", action: "bar" })
+        assert_equal "/foo/himom", route.format(
+          controller: "foo",
+          extra: "himom")
+      end
+
+      def test_connects_all_match
+        path  = path_from_string "/:controller(/:action(/:id(.:format)))"
+        route = Route.new(name: "name", path: path, constraints: { action: "bar" },
+                          defaults: { controller: "foo" })
+
+        assert_equal "/foo/bar/10", route.format(
+          controller: "foo",
+          action: "bar",
+          id: 10)
+      end
+
+      def test_extras_are_not_included_if_optional
+        path  = path_from_string "/page/:id(/:action)"
+        route = Route.new(name: "name", path: path, defaults: { action: "show" })
+
+        assert_equal "/page/10", route.format(id: 10)
+      end
+
+      def test_extras_are_not_included_if_optional_with_parameter
+        path  = path_from_string "(/sections/:section)/pages/:id"
+        route = Route.new(name: "name", path: path, defaults: { action: "show" })
+
+        assert_equal "/pages/10", route.format(id: 10)
+      end
+
+      def test_extras_are_not_included_if_optional_parameter_is_nil
+        path  = path_from_string "(/sections/:section)/pages/:id"
+        route = Route.new(name: "name", path: path, defaults: { action: "show" })
+
+        assert_equal "/pages/10", route.format(id: 10, section: nil)
+      end
+
+      def test_format_with_literals_around_parameters_and_nested_groups
+        path  = path_from_string "/blog/posts/:id/comments(/page/:page(.:format))"
+        route = Route.new(name: "name", path: path, defaults: { controller: "comments", action: "index" })
+
+        assert_equal "/blog/posts/1/comments", route.format(id: 1)
+        assert_equal "/blog/posts/1/comments", route.format(id: 1, format: "json")
+        assert_equal "/blog/posts/1/comments/page/2", route.format(id: 1, page: 2)
+        assert_equal "/blog/posts/1/comments/page/2.json", route.format(id: 1, page: 2, format: "json")
+      end
+
+      def test_format_with_star_between_literals
+        path  = path_from_string "/files/*path/raw"
+        route = Route.new(name: "name", path: path, defaults: { controller: "files", action: "show" })
+
+        assert_equal "/files/a/b/raw", route.format(path: "a/b")
+      end
+
+      def test_format_with_non_ascii_literals_returns_a_new_string_each_time
+        path  = path_from_string "/café/menü/:id"
+        route = Route.new(name: "name", path: path, defaults: { controller: "menus", action: "show" })
+
+        first = route.format(id: 1)
+        assert_equal "/café/menü/1", first
+        assert_equal Encoding::UTF_8, first.encoding
+
+        first << "/changed"
+        assert_equal "/café/menü/1", route.format(id: 1)
+      end
+
+      def test_score
+        defaults = { controller: "pages", action: "show" }
+
+        path = path_from_string "/page/:id(/:action)(.:format)"
+        specific = Route.new name: "name", path: path, required_defaults: [:controller, :action], defaults: defaults
+
+        path = path_from_string "/:controller(/:action(/:id))(.:format)"
+        generic = Route.new name: "name", path: path
+
+        knowledge = { "id" => true, "controller" => true, "action" => true }
+
+        routes = [specific, generic]
+
+        assert_not_equal specific.score(knowledge), generic.score(knowledge)
+
+        found = routes.sort_by { |r| r.score(knowledge) }.last
+
+        assert_equal specific, found
+      end
+
+      if RUBY_VERSION >= "4.0"
+        def test_route_instance_is_ractor_shareable
+          path  = path_from_string "/messages/:id(.:format)"
+          route = Route.new(name: "name", path: path, defaults: { controller: "messages", action: "show" })
+
+          assert_nothing_raised { Ractor.make_shareable(route) }
+          assert Ractor.shareable?(route)
+
+          assert_equal "/messages/1", route.format(id: 1)
+          assert_equal [:id], route.required_parts
+          assert_nothing_raised { route.eager_load! }
+        end
+      end
+    end
+  end
+end

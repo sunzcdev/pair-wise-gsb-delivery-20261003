@@ -1,0 +1,236 @@
+# frozen_string_literal: true
+
+module ActiveRecord
+  module Associations
+    class Preloader
+      class ThroughAssociation < Association # :nodoc:
+        EMPTY_FIXED_VALUES = {}.freeze
+        private_constant :EMPTY_FIXED_VALUES
+
+        SOURCE_REUSING_SCOPE_VALUES = [:includes, :preload, :references, :extending, :optimizer_hints, :annotate, :distinct, :create_with].freeze
+        private_constant :SOURCE_REUSING_SCOPE_VALUES
+
+        def self.association_route_for(*)
+        end
+
+        def associate_records_from_unscoped(*)
+        end
+
+        def preloaded_records
+          @preloaded_records ||= owners.flat_map { |owner| records_by_owner[owner] }.uniq(&:__id__)
+        end
+
+        def records_by_owner
+          # Distinct objects for the same row are different owners, as in Association#load_records.
+          @records_by_owner ||= owners.each_with_object({}.compare_by_identity) do |owner, result|
+            if loaded?(owner)
+              result[owner] = target_for(owner)
+              next
+            end
+
+            through_records = filter_by_source_type(through_records_by_owner[owner] || [])
+
+            records = through_records.flat_map do |record|
+              source_records_by_owner[record]
+            end
+
+            records.compact!
+            if source_order_applies?
+              # A reused loaded target can hold records missing from the index,
+              # such as new ones: keep them last, in their loaded order.
+              unranked = records_in_query_order.size
+              records.sort_by! { |rhs| preload_index.fetch(rhs) { unranked += 1 } }
+            end
+            records.uniq! if scope.distinct_value
+            result[owner] = records
+          end
+        end
+
+        def runnable_loaders
+          if data_available?
+            [self]
+          elsif through_preloaders.all?(&:run?)
+            source_preloaders.flat_map(&:runnable_loaders)
+          else
+            through_preloaders.flat_map(&:runnable_loaders)
+          end
+        end
+
+        def future_classes
+          if run?
+            []
+          elsif through_preloaders.all?(&:run?)
+            source_preloaders.flat_map(&:future_classes).uniq
+          else
+            through_classes = through_preloaders.flat_map(&:future_classes)
+            source_classes = source_reflection.
+              chain.
+              reject { |reflection| reflection.respond_to?(:polymorphic?) && reflection.polymorphic? }.
+              map(&:klass)
+            (through_classes + source_classes).uniq
+          end
+        end
+
+        protected
+          # The source records in the order their queries returned them, which
+          # sorts each owner's records when the source order applies.
+          def records_in_query_order
+            @records_in_query_order ||= source_preloaders.flat_map do |loader|
+              loader.is_a?(ThroughAssociation) ? loader.records_in_query_order : loader.preloaded_records
+            end
+          end
+
+          def through_scope_filters_source?
+            !reflection.options[:disable_joins] &&
+              through_reflection.klass.table_name != klass.table_name &&
+              !reflection_scope.where_clause.empty?
+          end
+
+        private
+          def destination_fixed_values
+            EMPTY_FIXED_VALUES
+          end
+
+          def data_available?
+            owners.all? { |owner| loaded?(owner) } ||
+              through_preloaders.all?(&:run?) && source_preloaders.all?(&:run?)
+          end
+
+          def source_preloaders
+            @source_preloaders ||= ActiveRecord::Associations::Preloader.new(records: middle_records, associations: source_reflection.name, scope: scope, associate_by_default: false).loaders.tap do |loaders|
+              loaders.each(&:ignore_loaded_target!) if source_scope_filters_source? || through_scope_skipped?
+            end
+          end
+
+          def middle_records
+            filter_by_source_type(through_records_by_owner.values.flatten)
+          end
+
+          # Already loaded through records aren't filtered by `source_type`.
+          def filter_by_source_type(through_records)
+            if source_type = reflection.options[:source_type]
+              source_type = source_type.to_s
+              through_records.select do |record|
+                record.read_attr(reflection.foreign_type) == source_type
+              end
+            else
+              through_records
+            end
+          end
+
+          def through_preloaders
+            @through_preloaders ||= ActiveRecord::Associations::Preloader.new(records: owners, associations: through_reflection.name, scope: through_scope, associate_by_default: false).loaders.tap do |loaders|
+              loaders.each(&:ignore_loaded_target!) if through_scope_filters_source?
+            end
+          end
+
+          def through_reflection
+            reflection.through_reflection
+          end
+
+          def source_reflection
+            reflection.source_reflection
+          end
+
+          def source_records_by_owner
+            @source_records_by_owner ||= source_preloaders.map(&:records_by_owner).reduce(:merge)
+          end
+
+          def through_records_by_owner
+            @through_records_by_owner ||= through_preloaders.map(&:records_by_owner).reduce(:merge)
+          end
+
+          def preload_index
+            @preload_index ||= records_in_query_order.each_with_object({}).with_index do |(record, result), index|
+              result[record] = index
+            end
+          end
+
+          # When the through scope doesn't eager load the source records, already
+          # loaded ones are reused only if the scope can't change which records
+          # come back or how they're built, and never by a nested through
+          # association whose loaded targets are ignored: the source records
+          # loaded on its middle records don't reflect the scope passed down to it.
+          def source_scope_filters_source?
+            !through_scope_filters_source? &&
+              (!@reuse_loaded_target || !reflection_scope.values.except(*SOURCE_REUSING_SCOPE_VALUES).empty?)
+          end
+
+          # A nested through association filtered on its own through table loads
+          # its source records with its own query, without the through scope
+          # passed down to it, so what they have loaded isn't filtered by ours.
+          def through_scope_skipped?
+            through_scope_filters_source? &&
+              through_preloaders.any? { |loader| loader.is_a?(ThroughAssociation) && loader.through_scope_filters_source? }
+          end
+
+          # As in SQL, an explicit order on the through association beats the
+          # default order of the source.
+          def source_order_applies?
+            return @source_order_applies if defined?(@source_order_applies)
+
+            @source_order_applies = scope.order_values.any? ||
+              (!scope.effective_order_values.empty? &&
+                through_preloaders.none? { |loader| loader.scope.order_values.any? })
+          end
+
+          def through_scope
+            scope = through_reflection.klass.unscoped
+            options = reflection.options
+
+            return scope if options[:disable_joins]
+
+            values = reflection_scope.values
+            if annotations = values[:annotate]
+              scope.annotate!(*annotations)
+            end
+
+            if options[:source_type]
+              scope.where! reflection.foreign_type => options[:source_type]
+            end
+
+            if through_scope_filters_source?
+              scope.where_clause += reflection_scope.where_clause
+
+              includes = [*values[:includes], *values[:eager_load]].presence
+
+              # The class fixed by `source_type` can't be preloaded, only eager loaded.
+              if source_type_reflection = reflection.source_type_reflection
+                source = source_type_reflection
+                scope.eager_load!(includes ? { source => includes } : source)
+              else
+                source = source_reflection.name
+                scope.includes!(includes ? { source => includes } : source)
+              end
+
+              if values[:references] && !values[:references].empty?
+                scope.references_values |= values[:references]
+              else
+                scope.references!((source_type_reflection || source_reflection).table_name)
+              end
+
+              if preload = values[:preload]
+                scope.preload!(source_reflection.name => preload)
+              end
+
+              if joins = values[:joins]
+                scope.joins!(source => joins)
+              end
+
+              if left_outer_joins = values[:left_outer_joins]
+                scope.left_outer_joins!(source => left_outer_joins)
+              end
+
+              # Both are kept so that `effective_order_values` picks one as for the source.
+              if scope.eager_loading?
+                scope.order_values = reflection_scope.order_values
+                scope.default_order_values = reflection_scope.default_order_values
+              end
+            end
+
+            cascade_strict_loading(scope)
+          end
+      end
+    end
+  end
+end

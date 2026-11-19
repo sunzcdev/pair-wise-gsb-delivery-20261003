@@ -1,0 +1,146 @@
+# frozen_string_literal: true
+
+module ActionView
+  module Helpers
+    module Tags # :nodoc:
+      class Base # :nodoc:
+        include Helpers::ActiveModelInstanceTag, Helpers::TagHelper, Helpers::FormTagHelper
+
+        attr_reader :object
+
+        def initialize(object_name, method_name, template_object, options = {})
+          @object_name = object_name.is_a?(Symbol) ? object_name.name : object_name.to_s
+          @method_name = method_name.is_a?(Symbol) ? method_name.name : method_name.to_s
+          @template_object = template_object
+
+          if @object_name.include?("[]")
+            @object_name = @object_name.dup
+            @object_name.sub!(/\[\]$/, "") || @object_name.sub!(/\[\]\]$/, "]")
+          end
+          @object = retrieve_object(options.delete(:object))
+          @skip_default_ids = options.delete(:skip_default_ids)
+          @allow_method_names_outside_object = options.delete(:allow_method_names_outside_object)
+          @options = options
+
+          if Regexp.last_match
+            @generate_indexed_names = true
+            @auto_index = retrieve_autoindex(Regexp.last_match.pre_match)
+          else
+            @generate_indexed_names = false
+            @auto_index = nil
+          end
+        end
+
+        # This is what child classes implement.
+        def render
+          raise NotImplementedError, "Subclasses must implement a render method"
+        end
+
+        private
+          def value
+            return unless object
+
+            if @allow_method_names_outside_object
+              object.public_send @method_name if object.respond_to?(@method_name)
+            else
+              object.public_send @method_name
+            end
+          end
+
+          def value_before_type_cast
+            return unless object
+
+            method_before_type_cast = @method_name + "_before_type_cast"
+
+            if value_came_from_user? && object.respond_to?(method_before_type_cast)
+              object.public_send(method_before_type_cast)
+            else
+              value
+            end
+          end
+
+          def value_came_from_user?
+            method_name = "#{@method_name}_came_from_user?"
+            !object.respond_to?(method_name) || object.public_send(method_name)
+          end
+
+          def retrieve_object(object)
+            if object
+              object
+            elsif @object_name.empty? || @object_name.include?("[")
+              # Model-less forms (form_with url: ...) and the nested syntax (item[subobject])
+              # can't name an instance variable, so skip the lookup instead of rescuing.
+              nil
+            else
+              ivar = "@#{@object_name}"
+              @template_object.instance_variable_get(ivar) if @template_object.instance_variable_defined?(ivar)
+            end
+          rescue NameError
+            # Any other name that isn't a valid instance variable name falls back to nil.
+            nil
+          end
+
+          def retrieve_autoindex(pre_match)
+            object = self.object || @template_object.instance_variable_get("@#{pre_match}")
+            if object && object.respond_to?(:to_param)
+              object.to_param
+            else
+              raise ArgumentError, "object[] naming but object param and @object var don't exist or don't respond to to_param: #{object.inspect}"
+            end
+          end
+
+          def add_default_name_and_field_for_value(tag_value, options, field = "id")
+            specified_field = options[field]
+            add_default_name_and_field(options, field)
+            sanitized = sanitized_value(tag_value)
+
+            if !sanitized.empty? && specified_field.blank? && options[field].present?
+              options[field] += "_#{sanitized}"
+            end
+          end
+          alias_method :add_default_name_and_id_for_value, :add_default_name_and_field_for_value
+
+          def add_default_name_and_field(options, field = "id")
+            index = name_and_id_index(options)
+            options["name"] = options.fetch("name") { tag_name(options["multiple"], index) }
+
+            if generate_ids?
+              options[field] = options.fetch(field) { tag_id(index, options.delete("namespace")) }
+              if namespace = options.delete("namespace")
+                options[field] = options[field] ? "#{namespace}_#{options[field]}" : namespace
+              end
+            end
+          end
+          alias_method :add_default_name_and_id, :add_default_name_and_field
+
+          def tag_name(multiple = false, index = nil)
+            @template_object.field_name(@object_name, sanitized_method_name, multiple: multiple, index: index)
+          end
+
+          def tag_id(index = nil, namespace = nil)
+            @template_object.field_id(@object_name, @method_name, index: index, namespace: namespace)
+          end
+
+          def sanitized_method_name
+            @sanitized_method_name ||= @method_name.delete_suffix("?")
+          end
+
+          def sanitized_value(value)
+            value.to_s.gsub(/[\s.]/, "_").gsub(/[^-[[:word:]]]/, "").downcase
+          end
+
+          def name_and_id_index(options)
+            if options.key?("index")
+              options.delete("index") || ""
+            elsif @generate_indexed_names
+              @auto_index || ""
+            end
+          end
+
+          def generate_ids?
+            !@skip_default_ids
+          end
+      end
+    end
+  end
+end

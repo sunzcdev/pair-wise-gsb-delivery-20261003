@@ -1,0 +1,44 @@
+# frozen_string_literal: true
+
+require "action_view/helpers/tags/placeholderable"
+
+module ActionView
+  module Helpers
+    module Tags # :nodoc:
+      class TextField < Base # :nodoc:
+        include Placeholderable
+
+        def render
+          options = @options.stringify_keys
+          options["size"] = options["maxlength"] unless options.key?("size")
+          options["type"] ||= field_type
+          options["value"] = options.fetch("value") { fallback_value } unless field_type == "file"
+          add_default_name_and_field(options)
+          tag("input", options)
+        end
+
+        class << self
+          def field_type
+            @field_type ||= name.split("::").last.sub("Field", "").downcase.dedup
+          end
+
+          def inherited(subclass)
+            super
+            subclass.field_type if subclass.name
+          end
+        end
+
+        field_type
+
+        private
+          def field_type
+            self.class.field_type
+          end
+
+          def fallback_value
+            value_before_type_cast
+          end
+      end
+    end
+  end
+end

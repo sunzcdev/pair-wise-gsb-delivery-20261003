@@ -1,0 +1,168 @@
+# frozen_string_literal: true
+
+require "abstract_unit"
+require "active_support/testing/ractors_assertions"
+
+module MiddlewareTest
+  class MyMiddleware
+    def initialize(app, kw: nil)
+      @app = app
+    end
+
+    def call(env)
+      result = @app.call(env)
+      result[1]["Middleware-Test"] = "Success"
+      result[1]["Middleware-Order"] = "First"
+      result
+    end
+  end
+
+  class ExclaimerMiddleware
+    def initialize(app, kw: nil)
+      @app = app
+    end
+
+    def call(env)
+      result = @app.call(env)
+      result[1]["Middleware-Order"] += "!"
+      result
+    end
+  end
+
+  class BlockMiddleware
+    attr_accessor :configurable_message
+    def initialize(app, &block)
+      @app = app
+      yield(self) if block_given?
+    end
+
+    def call(env)
+      result = @app.call(env)
+      result[1]["Configurable-Message"] = configurable_message
+      result
+    end
+  end
+
+  class MyController < ActionController::Metal
+    use BlockMiddleware do |config|
+      config.configurable_message = "Configured by block."
+    end
+    use MyMiddleware, kw: 1
+    middleware.insert_before MyMiddleware, ExclaimerMiddleware, kw: 1
+
+    def index
+      self.response_body = "Hello World"
+    end
+  end
+
+  class InheritedController < MyController
+  end
+
+  class ActionsController < ActionController::Metal
+    use MyMiddleware, only: :show, kw: 1
+    middleware.insert_before MyMiddleware, ExclaimerMiddleware, except: :index, kw: 1
+
+    def index
+      self.response_body = "index"
+    end
+
+    def show
+      self.response_body = "show"
+    end
+  end
+
+  class RactorController < ActionController::Metal
+  end
+
+  class TestMiddleware < ActiveSupport::TestCase
+    include ActiveSupport::Testing::RactorsAssertions
+
+    def setup
+      @app = MyController.action(:index)
+    end
+
+    test "middleware that is 'use'd is called as part of the Rack application" do
+      result = @app.call(env_for("/"))
+      assert_equal ["Hello World"], [].tap { |a| result[2].each { |x| a << x } }
+      assert_equal "Success", result[1]["Middleware-Test"]
+    end
+
+    test "the middleware stack is exposed as 'middleware' in the controller" do
+      result = @app.call(env_for("/"))
+      assert_equal "First!", result[1]["Middleware-Order"]
+    end
+
+    test "middleware stack accepts block arguments" do
+      result = @app.call(env_for("/"))
+      assert_equal "Configured by block.", result[1]["Configurable-Message"]
+    end
+
+    test "middleware stack accepts only and except as options" do
+      result = ActionsController.action(:show).call(env_for("/"))
+      assert_equal "First!", result[1]["Middleware-Order"]
+
+      result = ActionsController.action(:index).call(env_for("/"))
+      assert_nil result[1]["Middleware-Order"]
+    end
+
+    test "the middleware proxy reads the stack it has mutated" do
+      middleware = Class.new(ActionController::Metal).middleware
+
+      middleware.use MyMiddleware
+
+      assert_equal 1, middleware.size
+      assert_equal [MyMiddleware], middleware.map(&:klass)
+    end
+
+    test "deleting a middleware that is not in the stack returns nil" do
+      middleware = Class.new(ActionController::Metal).middleware
+      middleware.use MyMiddleware
+
+      assert_nil middleware.delete(BlockMiddleware)
+      assert_equal 1, middleware.size
+    end
+
+    test "assigning middlewares refreezes the stack" do
+      old = ActiveSupport::Ractors.unshareable_proc_action
+      ActiveSupport::Ractors.unshareable_proc_action = :raise
+      controller = Class.new(ActionController::Metal)
+
+      controller.middleware.middlewares = []
+
+      assert_ractor_shareable(controller.middleware_stack)
+    ensure
+      ActiveSupport::Ractors.unshareable_proc_action = old
+    end
+
+    test "middleware stack is frozen" do
+      old = ActiveSupport::Ractors.unshareable_proc_action
+      ActiveSupport::Ractors.unshareable_proc_action = :raise
+
+      RactorController.use(ExclaimerMiddleware)
+      RactorController.middleware.unshift(BlockMiddleware)
+      RactorController.middleware.insert(0, ExclaimerMiddleware)
+      RactorController.middleware.swap(ExclaimerMiddleware, MyMiddleware)
+      RactorController.middleware.insert_before(MyMiddleware, BlockMiddleware)
+      RactorController.middleware.insert_after(MyMiddleware, ExclaimerMiddleware)
+      RactorController.middleware.move(0, MyMiddleware)
+      RactorController.middleware.move_before(ExclaimerMiddleware, MyMiddleware)
+      RactorController.middleware.move_after(ExclaimerMiddleware, MyMiddleware)
+      RactorController.middleware.delete(MyMiddleware)
+      RactorController.middleware.delete!(BlockMiddleware)
+
+      assert_ractor_shareable(RactorController.middleware_stack)
+    ensure
+      ActiveSupport::Ractors.unshareable_proc_action = old
+    end
+
+    def env_for(url)
+      Rack::MockRequest.env_for(url)
+    end
+  end
+
+  class TestInheritedMiddleware < TestMiddleware
+    def setup
+      @app = InheritedController.action(:index)
+    end
+  end
+end

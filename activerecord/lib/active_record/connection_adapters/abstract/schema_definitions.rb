@@ -1,0 +1,1184 @@
+# frozen_string_literal: true
+
+module ActiveRecord
+  module ConnectionAdapters # :nodoc:
+    # Abstract representation of an index definition on a table. Instances of
+    # this type are typically created and returned by methods in database
+    # adapters. e.g. ActiveRecord::ConnectionAdapters::MySQL::SchemaStatements#indexes
+    class IndexDefinition # :nodoc:
+      attr_reader :table, :name, :unique, :columns, :orders, :where, :using, :comment, :valid
+
+      def initialize(
+        table, name,
+        unique = false,
+        columns = [],
+        orders: {},
+        where: nil,
+        using: nil,
+        comment: nil,
+        valid: true
+      )
+        @table = table
+        @name = name
+        @unique = unique
+        @columns = columns
+        @orders = concise_options(orders)
+        @where = where
+        @using = using
+        @comment = comment
+        @valid = valid
+      end
+
+      def valid?
+        @valid
+      end
+
+      def column_options
+        { order: orders }
+      end
+
+      def defined_for?(columns = nil, name: nil, unique: nil, valid: nil, **options)
+        columns = options[:column] if columns.blank?
+        (columns.nil? || Array(self.columns) == Array(columns).map(&:to_s)) &&
+          (name.nil? || self.name == name.to_s) &&
+          (unique.nil? || self.unique == unique) &&
+          (valid.nil? || self.valid == valid)
+      end
+
+      def as_schema_json
+        {
+          "table" => @table,
+          "name" => @name,
+          "unique" => @unique || nil,
+          "columns" => @columns,
+          "orders" => @orders.presence,
+          "where" => @where,
+          "using" => @using,
+          "comment" => @comment,
+          "invalid" => !@valid || nil
+        }
+      end
+
+      def init_from_schema_json(coder, references)
+        @table = coder["table"]
+        @name = coder["name"]
+        @unique = coder["unique"] || false
+        @columns = coder["columns"]
+        @orders = symbolize_concise_options(coder["orders"])
+        @where = coder["where"]
+        @using = coder["using"]&.to_sym
+        @comment = coder["comment"]
+        @valid = !coder["invalid"]
+      end
+
+      private
+        def symbolize_concise_options(options)
+          case options
+          when String then options.to_sym
+          when Hash then options.transform_values(&:to_sym)
+          else {}
+          end
+        end
+
+        def concise_options(options)
+          if columns.size == options.size && options.values.uniq.size == 1
+            options.values.first
+          else
+            options
+          end
+        end
+    end
+
+    # Abstract representation of a column definition. Instances of this type
+    # are typically created by methods in TableDefinition, and added to the
+    # `columns` attribute of said TableDefinition object, in order to be used
+    # for generating a number of table creation or table changing SQL statements.
+    ColumnDefinition = Struct.new(:name, :type, :options, :sql_type, :cast_type) do # :nodoc:
+      self::OPTION_NAMES = [
+        :limit,
+        :precision,
+        :scale,
+        :default,
+        :null,
+        :collation,
+        :comment,
+        :primary_key,
+        :if_exists,
+        :if_not_exists
+      ].freeze
+
+      def primary_key?
+        options[:primary_key]
+      end
+
+      def limit = options[:limit]
+      def limit=(value)
+        options[:limit] = value
+      end
+
+      def precision = options[:precision]
+      def precision=(value)
+        options[:precision] = value
+      end
+
+      def scale = options[:scale]
+      def scale=(value)
+        options[:scale] = value
+      end
+
+      def default = options[:default]
+      def default=(value)
+        options[:default] = value
+      end
+
+      def null = options[:null]
+      def null=(value)
+        options[:null] = value
+      end
+
+      def collation = options[:collation]
+      def collation=(value)
+        options[:collation] = value
+      end
+
+      def comment = options[:comment]
+      def comment=(value)
+        options[:comment] = value
+      end
+
+      def if_exists = options[:if_exists]
+      def if_exists=(value)
+        options[:if_exists] = value
+      end
+
+      def if_not_exists = options[:if_not_exists]
+      def if_not_exists=(value)
+        options[:if_not_exists] = value
+      end
+
+      deprecate(
+        limit: "use options[:limit] instead",
+        "limit=": "use options[:limit]= instead",
+        precision: "use options[:precision] instead",
+        "precision=": "use options[:precision]= instead",
+        scale: "use options[:scale] instead",
+        "scale=": "use options[:scale]= instead",
+        default: "use options[:default] instead",
+        "default=": "use options[:default]= instead",
+        null: "use options[:null] instead",
+        "null=": "use options[:null]= instead",
+        collation: "use options[:collation] instead",
+        "collation=": "use options[:collation]= instead",
+        comment: "use options[:comment] instead",
+        "comment=": "use options[:comment]= instead",
+        if_exists: "use options[:if_exists] instead",
+        "if_exists=": "use options[:if_exists]= instead",
+        if_not_exists: "use options[:if_not_exists] instead",
+        "if_not_exists=": "use options[:if_not_exists]= instead",
+        deprecator: ActiveRecord.deprecator
+      )
+
+      def aliased_types(name, fallback)
+        "timestamp" == name ? :datetime : fallback
+      end
+    end
+
+    AddColumnDefinition = Struct.new(:column) # :nodoc:
+
+    ChangeColumnDefinition = Struct.new(:column, :name) # :nodoc:
+
+    ChangeColumnDefaultDefinition = Struct.new(:column, :default) # :nodoc:
+
+    AddForeignKey = Data.define(:foreign_key) # :nodoc:
+    DropForeignKey = Data.define(:name) # :nodoc:
+    AddCheckConstraint = Data.define(:check_constraint) # :nodoc:
+    DropCheckConstraint = Data.define(:name) # :nodoc:
+    DropConstraint = Data.define(:name) # :nodoc:
+    DropColumn = Data.define(:name) # :nodoc:
+    RenameColumn = Data.define(:from_name, :to_name) # :nodoc:
+    ChangeColumnNull = Data.define(:name, :null) # :nodoc:
+
+    CreateIndexDefinition = Struct.new(:index, :algorithm, :if_not_exists, :lock) # :nodoc:
+
+    PrimaryKeyDefinition = Struct.new(:name) # :nodoc:
+
+    ForeignKeyDefinition = Struct.new(:from_table, :to_table, :options) do # :nodoc:
+      def name
+        options[:name]
+      end
+
+      def column
+        options[:column]
+      end
+
+      def primary_key
+        options[:primary_key] || default_primary_key
+      end
+
+      def on_delete
+        options[:on_delete]
+      end
+
+      def on_update
+        options[:on_update]
+      end
+
+      def deferrable
+        options[:deferrable]
+      end
+
+      def custom_primary_key?
+        options[:primary_key] != default_primary_key
+      end
+
+      def validate?
+        options.fetch(:validate, true)
+      end
+      alias validated? validate?
+
+      def enforced?
+        options.fetch(:enforced, true)
+      end
+
+      def export_name_on_schema_dump?
+        !ActiveRecord::SchemaDumper.fk_ignore_pattern.match?(name) if name
+      end
+
+      def defined_for?(to_table: nil, validate: nil, **options)
+        options = options.slice(*self.options.keys)
+
+        (to_table.nil? || to_table.to_s == self.to_table) &&
+          (validate.nil? || validate == self.options.fetch(:validate, validate)) &&
+          options.all? { |k, v| Array(self.options[k]).map(&:to_s) == Array(v).map(&:to_s) }
+      end
+
+      private
+        def default_primary_key
+          "id"
+        end
+    end
+
+    CheckConstraintDefinition = Struct.new(:table_name, :expression, :options) do
+      def name
+        options[:name]
+      end
+
+      def validate?
+        options.fetch(:validate, true)
+      end
+      alias validated? validate?
+
+      def export_name_on_schema_dump?
+        !ActiveRecord::SchemaDumper.chk_ignore_pattern.match?(name) if name
+      end
+
+      def defined_for?(name:, expression: nil, validate: nil, **options)
+        options = options.slice(*self.options.keys)
+
+        self.name == name.to_s &&
+          (validate.nil? || validate == self.options.fetch(:validate, validate)) &&
+          options.all? { |k, v| self.options[k].to_s == v.to_s }
+      end
+    end
+
+    class ReferenceDefinition # :nodoc:
+      def initialize(
+        name,
+        polymorphic: false,
+        index: true,
+        foreign_key: false,
+        type: :bigint,
+        **options
+      )
+        @name = name
+        @polymorphic = polymorphic
+        @index = index
+        @foreign_key = foreign_key
+        @type = type
+        @options = options
+
+        if polymorphic && foreign_key
+          raise ArgumentError, "Cannot add a foreign key to a polymorphic relation"
+        end
+      end
+
+      def add(table_name, connection)
+        columns.each do |name, type, options|
+          connection.add_column(table_name, name, type, **options)
+        end
+
+        if index
+          connection.add_index(table_name, column_names, **index_options(table_name))
+        end
+
+        if foreign_key
+          connection.add_foreign_key(table_name, foreign_table_name, **foreign_key_options)
+        end
+      end
+
+      def add_to(table)
+        columns.each do |name, type, options|
+          table.column(name, type, **options)
+        end
+
+        if index
+          table.index(column_names, **index_options(table.name))
+        end
+
+        if foreign_key
+          table.foreign_key(foreign_table_name, **foreign_key_options)
+        end
+      end
+
+      private
+        attr_reader :name, :polymorphic, :index, :foreign_key, :type, :options
+
+        def as_options(value)
+          value.is_a?(Hash) ? value : {}
+        end
+
+        def conditional_options
+          options.slice(:if_exists, :if_not_exists)
+        end
+
+        def polymorphic_options
+          as_options(polymorphic).merge(conditional_options).merge(options.slice(:null, :first, :after))
+        end
+
+        def polymorphic_index_name(table_name)
+          "index_#{table_name}_on_#{name}"
+        end
+
+        def index_options(table_name)
+          index_options = as_options(index).merge(conditional_options)
+
+          # legacy reference index names are used on versions 6.0 and earlier
+          return index_options if options[:_uses_legacy_reference_index_name]
+
+          index_options[:name] ||= polymorphic_index_name(table_name) if polymorphic
+          index_options
+        end
+
+        def foreign_key_options
+          as_options(foreign_key).merge(column: column_name, **conditional_options)
+        end
+
+        def columns
+          result = [[column_name, type, options]]
+          if polymorphic
+            result.unshift(["#{name}_type", :string, polymorphic_options])
+          end
+          result
+        end
+
+        def column_name
+          "#{name}_id"
+        end
+
+        def column_names
+          columns.map(&:first)
+        end
+
+        def foreign_table_name
+          foreign_key_options.fetch(:to_table) do
+            Base.pluralize_table_names ? name.to_s.pluralize : name
+          end
+        end
+    end
+
+    module ColumnMethods
+      extend ActiveSupport::Concern
+
+      class_methods do
+        private
+          def define_column_methods(*column_types) # :nodoc:
+            column_types.each do |column_type|
+              module_eval <<-RUBY, __FILE__, __LINE__ + 1
+              def #{column_type}(*names, **options)
+                raise ArgumentError, "Missing column name(s) for #{column_type}" if names.empty?
+                names.each { |name| column(name, :#{column_type}, **options) }
+              end
+              RUBY
+            end
+          end
+      end
+      extend ClassMethods
+
+      # Appends a primary key definition to the table definition.
+      # Can be called multiple times, but this is probably not a good idea.
+      def primary_key(name, type = :primary_key, **options)
+        column(name, type, **options, primary_key: true)
+      end
+
+      define_column_methods :bigint, :binary, :boolean, :date, :datetime, :decimal,
+        :float, :integer, :json, :string, :text, :time, :timestamp, :virtual
+
+      alias :blob :binary
+      alias :numeric :decimal
+    end
+
+    # Active Record Connection Adapters \Table \Definition
+    # ====================================================
+    #
+    # Represents the schema of an SQL table in an abstract way. This class
+    # provides methods for manipulating the schema representation.
+    #
+    # Inside migration files, the `t` object in [create_table](rdoc-ref:SchemaStatements#create_table)
+    # is actually of this type:
+    #
+    # ```
+    # class SomeMigration < ActiveRecord::Migration[8.1]
+    #   def up
+    #     create_table :foo do |t|
+    #       puts t.class  # => "ActiveRecord::ConnectionAdapters::TableDefinition"
+    #     end
+    #   end
+    #
+    #   def down
+    #     ...
+    #   end
+    # end
+    # ```
+    #
+    class TableDefinition
+      include ColumnMethods
+
+      attr_reader :name, :temporary, :if_not_exists, :options, :as, :comment, :indexes, :foreign_keys, :check_constraints, :conn
+
+      def initialize(
+        conn,
+        name,
+        temporary: false,
+        if_not_exists: false,
+        options: nil,
+        as: nil,
+        comment: nil,
+        **
+      )
+        @conn = conn
+        @columns_hash = {}
+        @indexes = []
+        @foreign_keys = []
+        @primary_keys = nil
+        @check_constraints = []
+        @temporary = temporary
+        @if_not_exists = if_not_exists
+        @options = options
+        @as = as
+        @name = name
+        @comment = comment
+      end
+
+      def set_primary_key(table_name, id, primary_key, **options)
+        if id && !as
+          pk = primary_key || Base.primary_key_from_prefix(table_name.to_s.singularize) || "id"
+
+          if id.is_a?(Hash)
+            options.merge!(id.except(:type))
+            id = id.fetch(:type, :primary_key)
+          end
+
+          if pk.is_a?(Array)
+            primary_keys(pk)
+          else
+            primary_key(pk, id, **options)
+          end
+        end
+      end
+
+      def primary_keys(name = nil) # :nodoc:
+        @primary_keys = PrimaryKeyDefinition.new(name) if name
+        @primary_keys
+      end
+
+      # Returns an array of ColumnDefinition objects for the columns of the table.
+      def columns; @columns_hash.values; end
+
+      # Returns a ColumnDefinition for the column with name `name`.
+      def [](name)
+        @columns_hash[name.to_s]
+      end
+
+      # Instantiates a new column for the table.
+      # See [connection.add_column](rdoc-ref:ConnectionAdapters::SchemaStatements#add_column)
+      # for available options.
+      #
+      # Additional options are:
+      #
+      # * `:index` -
+      #   Create an index for the column. Can be either `true` or an options hash.
+      #
+      # This method returns `self`.
+      #
+      # Examples
+      # --------
+      #
+      # ```
+      # # Assuming `td` is an instance of TableDefinition
+      # td.column(:granted, :boolean, index: true)
+      # ```
+      #
+      # Short-hand examples
+      # -------------------
+      #
+      # Instead of calling #column directly, you can also work with the short-hand definitions for the default types.
+      # They use the type as the method name instead of as a parameter and allow for multiple columns to be defined
+      # in a single statement.
+      #
+      # What can be written like this with the regular calls to column:
+      #
+      # ```
+      # create_table :products do |t|
+      #   t.column :shop_id,     :integer
+      #   t.column :creator_id,  :integer
+      #   t.column :item_number, :string
+      #   t.column :name,        :string, default: "Untitled"
+      #   t.column :value,       :string, default: "Untitled"
+      #   t.column :created_at,  :datetime
+      #   t.column :updated_at,  :datetime
+      # end
+      # add_index :products, :item_number
+      # ```
+      #
+      # can also be written as follows using the short-hand:
+      #
+      # ```
+      # create_table :products do |t|
+      #   t.integer :shop_id, :creator_id
+      #   t.string  :item_number, index: true
+      #   t.string  :name, :value, default: "Untitled"
+      #   t.timestamps null: false
+      # end
+      # ```
+      #
+      # There's a short-hand method for each of the type values declared at the top. And then there's
+      # TableDefinition#timestamps that'll add `created_at` and `updated_at` as datetimes.
+      #
+      # TableDefinition#references will add an appropriately-named \_id column, plus a corresponding \_type
+      # column if the `:polymorphic` option is supplied. If `:polymorphic` is a hash of
+      # options, these will be used when creating the `_type` column. The `:index` option
+      # will also create an index, similar to calling [add_index](rdoc-ref:ConnectionAdapters::SchemaStatements#add_index).
+      # So what can be written like this:
+      #
+      # ```
+      # create_table :taggings do |t|
+      #   t.integer :tag_id, :tagger_id, :taggable_id
+      #   t.string  :tagger_type
+      #   t.string  :taggable_type, default: 'Photo'
+      # end
+      # add_index :taggings, :tag_id, name: 'index_taggings_on_tag_id'
+      # add_index :taggings, [:tagger_id, :tagger_type]
+      # ```
+      #
+      # Can also be written as follows using references:
+      #
+      # ```
+      # create_table :taggings do |t|
+      #   t.references :tag, index: { name: 'index_taggings_on_tag_id' }
+      #   t.references :tagger, polymorphic: true
+      #   t.references :taggable, polymorphic: { default: 'Photo' }, index: false
+      # end
+      # ```
+      def column(name, type, index: nil, **options)
+        name = name.to_s
+        type = type.to_sym if type
+
+        raise_on_duplicate_column(name)
+        @columns_hash[name] = new_column_definition(name, type, **options)
+
+        if index
+          index_options = index.is_a?(Hash) ? index : {}
+          index(name, **index_options)
+        end
+
+        self
+      end
+
+      # remove the column `name` from the table.
+      #
+      # ```
+      # remove_column(:account_id)
+      # ```
+      def remove_column(name)
+        @columns_hash.delete name.to_s
+      end
+
+      # Adds index options to the indexes hash, keyed by column name
+      # This is primarily used to track indexes that need to be created after the table
+      #
+      # ```
+      # index(:account_id, name: 'index_projects_on_account_id')
+      # ```
+      def index(column_name, **options)
+        indexes << [column_name, options]
+      end
+
+      def foreign_key(to_table, **options)
+        foreign_keys << new_foreign_key_definition(to_table, options)
+      end
+
+      def check_constraint(expression, **options)
+        check_constraints << new_check_constraint_definition(expression, options)
+      end
+
+      # Appends `:datetime` columns `:created_at` and
+      # `:updated_at` to the table. See [connection.add_timestamps](rdoc-ref:SchemaStatements#add_timestamps)
+      #
+      # ```
+      # t.timestamps null: false
+      # ```
+      def timestamps(**options)
+        options[:null] = false if options[:null].nil?
+
+        options[:precision] = 6 unless options.key?(:precision)
+
+        column(:created_at, :datetime, **options)
+        column(:updated_at, :datetime, **options)
+      end
+
+      # Adds a reference.
+      #
+      # ```
+      # t.references(:user)
+      # t.belongs_to(:supplier, foreign_key: true)
+      # t.belongs_to(:supplier, foreign_key: true, type: :integer)
+      # ```
+      #
+      # See [connection.add_reference](rdoc-ref:SchemaStatements#add_reference) for details of the options you can use.
+      def references(*args, **options)
+        args.each do |ref_name|
+          ReferenceDefinition.new(ref_name, **options).add_to(self)
+        end
+      end
+      alias :belongs_to :references
+
+      def new_column_definition(name, type, **options) # :nodoc:
+        if integer_like_primary_key?(type, options)
+          type = integer_like_primary_key_type(type, options)
+        end
+        type = aliased_types(type.to_s, type)
+
+        if type == :datetime && !options.key?(:precision)
+          options[:precision] = 6
+        end
+
+        options[:primary_key] ||= type == :primary_key
+
+        if options[:primary_key]
+          if options[:null]
+            raise ArgumentError, "primary keys cannot be NULL"
+          end
+          options[:null] = false
+        end
+
+        create_column_definition(name, type, options)
+      end
+
+      def new_foreign_key_definition(to_table, options) # :nodoc:
+        prefix = ActiveRecord::Base.table_name_prefix
+        suffix = ActiveRecord::Base.table_name_suffix
+        to_table = "#{prefix}#{to_table}#{suffix}"
+        options = @conn.foreign_key_options(name, to_table, options)
+        ForeignKeyDefinition.new(name, to_table, options)
+      end
+
+      def new_check_constraint_definition(expression, options) # :nodoc:
+        options = @conn.check_constraint_options(name, expression, options)
+        CheckConstraintDefinition.new(name, expression, options)
+      end
+
+      private
+        def valid_column_definition_options
+          @conn.valid_column_definition_options
+        end
+
+        def create_column_definition(name, type, options)
+          unless options[:_skip_validate_options]
+            options.except(:_uses_legacy_reference_index_name, :_skip_validate_options).assert_valid_keys(valid_column_definition_options)
+          end
+
+          ColumnDefinition.new(name, type, options)
+        end
+
+        def aliased_types(name, fallback)
+          "timestamp" == name ? :datetime : fallback
+        end
+
+        def integer_like_primary_key?(type, options)
+          options[:primary_key] && [:integer, :bigint].include?(type) && !options.key?(:default)
+        end
+
+        def integer_like_primary_key_type(type, options)
+          type
+        end
+
+        def raise_on_duplicate_column(name)
+          if @columns_hash[name]
+            if @columns_hash[name].primary_key?
+              raise ArgumentError, "you can't redefine the primary key column '#{name}' on '#{@name}'. To define a custom primary key, pass { id: false } to create_table."
+            else
+              raise ArgumentError, "you can't define an already defined column '#{name}' on '#{@name}'."
+            end
+          end
+        end
+    end
+
+    class AlterTable # :nodoc:
+      # Commands from CommandRecorder that can be dispatched directly to AlterTable
+      # methods (combinable into a single ALTER TABLE statement). Subclasses may extend.
+      COMBINABLE_COMMANDS = %i[
+        add_column
+        remove_column
+        remove_columns
+        change_column_default
+        add_timestamps
+        remove_timestamps
+        add_foreign_key
+        remove_foreign_key
+        add_check_constraint
+        remove_check_constraint
+      ].freeze
+
+      attr_reader :operations, :deferred_operations
+
+      def initialize(td)
+        @td = td
+        @operations = []
+        @deferred_operations = []
+      end
+
+      def name; @td.name; end
+
+      def add_column(column_name, type, **options)
+        column_name = column_name.to_s
+        type = type.to_sym
+        @operations << AddColumnDefinition.new(@td.new_column_definition(column_name, type, **options))
+      end
+
+      def remove_column(column_name, _type = nil, **)
+        @operations << DropColumn.new(column_name)
+      end
+
+      def remove_columns(*column_names, **)
+        column_names.each { |column_name| remove_column(column_name) }
+      end
+
+      def change_column_default(column_name, default_or_changes)
+        conn = @td.conn
+        column = conn.send(:column_for, name, column_name)
+        return unless column
+        default = conn.send(:extract_new_default_value, default_or_changes)
+        @operations << ChangeColumnDefaultDefinition.new(column, default)
+      end
+
+      def rename_column(from_name, to_name)
+        @operations << RenameColumn.new(from_name, to_name)
+      end
+
+      def change_column_null(name, null)
+        @operations << ChangeColumnNull.new(name, null)
+      end
+
+      def add_timestamps(**options)
+        options[:null] = false if options[:null].nil?
+        add_column(:created_at, :datetime, **options)
+        add_column(:updated_at, :datetime, **options)
+      end
+
+      def remove_timestamps(**)
+        remove_column(:updated_at)
+        remove_column(:created_at)
+      end
+
+      def add_foreign_key(to_table, **options)
+        conn = @td.conn
+        return unless conn.use_foreign_keys?
+        options = conn.foreign_key_options(name, to_table, options)
+        @operations << AddForeignKey.new(@td.new_foreign_key_definition(to_table, options))
+      end
+
+      def remove_foreign_key(to_table = nil, **options)
+        conn = @td.conn
+        return unless conn.use_foreign_keys?
+        to_table ||= options[:to_table]
+        drop_foreign_key(conn.send(:foreign_key_for!, name, to_table: to_table, **options).name)
+      end
+
+      def drop_foreign_key(name)
+        @operations << DropForeignKey.new(name)
+      end
+
+      def add_check_constraint(expression, **options)
+        return unless @td.conn.supports_check_constraints?
+        @operations << AddCheckConstraint.new(@td.new_check_constraint_definition(expression, options))
+      end
+
+      def remove_check_constraint(expression = nil, **options)
+        conn = @td.conn
+        return unless conn.supports_check_constraints?
+        drop_check_constraint(conn.send(:check_constraint_for!, name, expression: expression, **options).name)
+      end
+
+      def drop_check_constraint(constraint_name)
+        @operations << DropCheckConstraint.new(constraint_name)
+      end
+
+      def drop_constraint(constraint_name)
+        @operations << DropConstraint.new(constraint_name)
+      end
+
+      def empty?
+        @operations.empty?
+      end
+    end
+
+    # Active Record Connection Adapters \Table
+    # ========================================
+    #
+    # Represents an SQL table in an abstract way for updating a table.
+    # Also see TableDefinition and [connection.create_table](rdoc-ref:SchemaStatements#create_table)
+    #
+    # Available transformations are:
+    #
+    # ```
+    # change_table :table do |t|
+    #   t.primary_key
+    #   t.column
+    #   t.index
+    #   t.rename_index
+    #   t.timestamps
+    #   t.change
+    #   t.change_default
+    #   t.change_null
+    #   t.rename
+    #   t.references
+    #   t.belongs_to
+    #   t.check_constraint
+    #   t.string
+    #   t.text
+    #   t.integer
+    #   t.bigint
+    #   t.float
+    #   t.decimal
+    #   t.numeric
+    #   t.datetime
+    #   t.timestamp
+    #   t.time
+    #   t.date
+    #   t.binary
+    #   t.blob
+    #   t.boolean
+    #   t.foreign_key
+    #   t.json
+    #   t.virtual
+    #   t.remove
+    #   t.remove_foreign_key
+    #   t.remove_references
+    #   t.remove_belongs_to
+    #   t.remove_index
+    #   t.remove_check_constraint
+    #   t.remove_timestamps
+    # end
+    # ```
+    #
+    class Table
+      include ColumnMethods
+
+      attr_reader :name
+
+      def initialize(table_name, base)
+        @name = table_name
+        @base = base
+      end
+
+      # Adds a new column to the named table.
+      #
+      # ```
+      # t.column(:name, :string)
+      # ```
+      #
+      # See TableDefinition#column for details of the options you can use.
+      def column(column_name, type, index: nil, **options)
+        raise_on_if_exist_options(options)
+        @base.add_column(name, column_name, type, **options)
+        if index
+          index_options = index.is_a?(Hash) ? index : {}
+          index(column_name, **index_options)
+        end
+      end
+
+      # Checks to see if a column exists.
+      #
+      # ```
+      # t.string(:name) unless t.column_exists?(:name, :string)
+      # ```
+      #
+      # See [connection.column_exists?](rdoc-ref:SchemaStatements#column_exists?)
+      def column_exists?(column_name, type = nil, **options)
+        @base.column_exists?(name, column_name, type, **options)
+      end
+
+      # Adds a new index to the table. `column_name` can be a single Symbol, or
+      # an Array of Symbols.
+      #
+      # ```
+      # t.index(:name)
+      # t.index([:branch_id, :party_id], unique: true)
+      # t.index([:branch_id, :party_id], unique: true, name: 'by_branch_party')
+      # ```
+      #
+      # See [connection.add_index](rdoc-ref:SchemaStatements#add_index) for details of the options you can use.
+      def index(column_name, **options)
+        raise_on_if_exist_options(options)
+        @base.add_index(name, column_name, **options)
+      end
+
+      # Checks to see if an index exists.
+      #
+      # ```
+      # unless t.index_exists?(:branch_id)
+      #   t.index(:branch_id)
+      # end
+      # ```
+      #
+      # See [connection.index_exists?](rdoc-ref:SchemaStatements#index_exists?)
+      def index_exists?(column_name = nil, **options)
+        @base.index_exists?(name, column_name, **options)
+      end
+
+      # Renames the given index on the table.
+      #
+      # ```
+      # t.rename_index(:user_id, :account_id)
+      # ```
+      #
+      # See [connection.rename_index](rdoc-ref:SchemaStatements#rename_index)
+      def rename_index(index_name, new_index_name)
+        @base.rename_index(name, index_name, new_index_name)
+      end
+
+      # Adds timestamps (`created_at` and `updated_at`) columns to the table.
+      #
+      # ```
+      # t.timestamps(null: false)
+      # ```
+      #
+      # See [connection.add_timestamps](rdoc-ref:SchemaStatements#add_timestamps)
+      def timestamps(**options)
+        raise_on_if_exist_options(options)
+        @base.add_timestamps(name, **options)
+      end
+
+      # Changes the column's definition according to the new options.
+      #
+      # ```
+      # t.change(:name, :string, limit: 80)
+      # t.change(:description, :text)
+      # ```
+      #
+      # See TableDefinition#column for details of the options you can use.
+      def change(column_name, type, **options)
+        raise_on_if_exist_options(options)
+        @base.change_column(name, column_name, type, **options)
+      end
+
+      # Sets a new default value for a column.
+      #
+      # ```
+      # t.change_default(:qualification, 'new')
+      # t.change_default(:authorized, 1)
+      # t.change_default(:status, from: nil, to: "draft")
+      # ```
+      #
+      # See [connection.change_column_default](rdoc-ref:SchemaStatements#change_column_default)
+      def change_default(column_name, default_or_changes)
+        @base.change_column_default(name, column_name, default_or_changes)
+      end
+
+      # Sets or removes a NOT NULL constraint on a column.
+      #
+      # ```
+      # t.change_null(:qualification, true)
+      # t.change_null(:qualification, false, 0)
+      # ```
+      #
+      # See [connection.change_column_null](rdoc-ref:SchemaStatements#change_column_null)
+      def change_null(column_name, null, default = nil)
+        @base.change_column_null(name, column_name, null, default)
+      end
+
+      # Removes the column(s) from the table definition.
+      #
+      # ```
+      # t.remove(:qualification)
+      # t.remove(:qualification, :experience)
+      # ```
+      #
+      # See [connection.remove_columns](rdoc-ref:SchemaStatements#remove_columns)
+      def remove(*column_names, **options)
+        raise_on_if_exist_options(options)
+        @base.remove_columns(name, *column_names, **options)
+      end
+
+      # Removes the given index from the table.
+      #
+      # ```
+      # t.remove_index(:branch_id)
+      # t.remove_index(column: [:branch_id, :party_id])
+      # t.remove_index(name: :by_branch_party)
+      # t.remove_index(:branch_id, name: :by_branch_party)
+      # ```
+      #
+      # See [connection.remove_index](rdoc-ref:SchemaStatements#remove_index)
+      def remove_index(column_name = nil, **options)
+        raise_on_if_exist_options(options)
+        @base.remove_index(name, column_name, **options)
+      end
+
+      # Removes the timestamp columns (`created_at` and `updated_at`) from the table.
+      #
+      # ```
+      # t.remove_timestamps
+      # ```
+      #
+      # See [connection.remove_timestamps](rdoc-ref:SchemaStatements#remove_timestamps)
+      def remove_timestamps(**options)
+        raise_on_if_exist_options(options)
+        @base.remove_timestamps(name, **options)
+      end
+
+      # Renames a column.
+      #
+      # ```
+      # t.rename(:description, :name)
+      # ```
+      #
+      # See [connection.rename_column](rdoc-ref:SchemaStatements#rename_column)
+      def rename(column_name, new_column_name)
+        @base.rename_column(name, column_name, new_column_name)
+      end
+
+      # Adds a reference.
+      #
+      # ```
+      # t.references(:user)
+      # t.belongs_to(:supplier, foreign_key: true)
+      # ```
+      #
+      # See [connection.add_reference](rdoc-ref:SchemaStatements#add_reference) for details of the options you can use.
+      def references(*args, **options)
+        raise_on_if_exist_options(options)
+        args.each do |ref_name|
+          @base.add_reference(name, ref_name, **options)
+        end
+      end
+      alias :belongs_to :references
+
+      # Removes a reference. Optionally removes a `type` column.
+      #
+      # ```
+      # t.remove_references(:user)
+      # t.remove_belongs_to(:supplier, polymorphic: true)
+      # ```
+      #
+      # See [connection.remove_reference](rdoc-ref:SchemaStatements#remove_reference)
+      def remove_references(*args, **options)
+        raise_on_if_exist_options(options)
+        args.each do |ref_name|
+          @base.remove_reference(name, ref_name, **options)
+        end
+      end
+      alias :remove_belongs_to :remove_references
+
+      # Adds a foreign key to the table using a supplied table name.
+      #
+      # ```
+      # t.foreign_key(:authors)
+      # t.foreign_key(:authors, column: :author_id, primary_key: "id")
+      # ```
+      #
+      # See [connection.add_foreign_key](rdoc-ref:SchemaStatements#add_foreign_key)
+      def foreign_key(*args, **options)
+        raise_on_if_exist_options(options)
+        @base.add_foreign_key(name, *args, **options)
+      end
+
+      # Removes the given foreign key from the table.
+      #
+      # ```
+      # t.remove_foreign_key(:authors)
+      # t.remove_foreign_key(column: :author_id)
+      # ```
+      #
+      # See [connection.remove_foreign_key](rdoc-ref:SchemaStatements#remove_foreign_key)
+      def remove_foreign_key(*args, **options)
+        raise_on_if_exist_options(options)
+        @base.remove_foreign_key(name, *args, **options)
+      end
+
+      # Checks to see if a foreign key exists.
+      #
+      # ```
+      # t.foreign_key(:authors) unless t.foreign_key_exists?(:authors)
+      # ```
+      #
+      # See [connection.foreign_key_exists?](rdoc-ref:SchemaStatements#foreign_key_exists?)
+      def foreign_key_exists?(*args, **options)
+        @base.foreign_key_exists?(name, *args, **options)
+      end
+
+      # Adds a check constraint.
+      #
+      # ```
+      # t.check_constraint("price > 0", name: "price_check")
+      # ```
+      #
+      # See [connection.add_check_constraint](rdoc-ref:SchemaStatements#add_check_constraint)
+      def check_constraint(*args, **options)
+        raise_on_if_exist_options(options)
+        @base.add_check_constraint(name, *args, **options)
+      end
+
+      # Removes the given check constraint from the table.
+      #
+      # ```
+      # t.remove_check_constraint(name: "price_check")
+      # ```
+      #
+      # See [connection.remove_check_constraint](rdoc-ref:SchemaStatements#remove_check_constraint)
+      def remove_check_constraint(*args, **options)
+        raise_on_if_exist_options(options)
+        @base.remove_check_constraint(name, *args, **options)
+      end
+
+      # Checks if a check_constraint exists on a table.
+      #
+      # ```
+      # unless t.check_constraint_exists?(name: "price_check")
+      #   t.check_constraint("price > 0", name: "price_check")
+      # end
+      # ```
+      #
+      # See [connection.check_constraint_exists?](rdoc-ref:SchemaStatements#check_constraint_exists?)
+      def check_constraint_exists?(*args, **options)
+        @base.check_constraint_exists?(name, *args, **options)
+      end
+
+      private
+        def raise_on_if_exist_options(options)
+          unrecognized_option = options.keys.find do |key|
+            key == :if_exists || key == :if_not_exists
+          end
+          if unrecognized_option
+            conditional = unrecognized_option == :if_exists ? "if" : "unless"
+            message = <<~TXT
+              Option #{unrecognized_option} will be ignored. If you are calling an expression like
+              `t.column(.., #{unrecognized_option}: true)` from inside a change_table block, try a
+              conditional clause instead, as in `t.column(..) #{conditional} t.column_exists?(..)`
+            TXT
+            raise ArgumentError.new(message)
+          end
+        end
+    end
+  end
+end

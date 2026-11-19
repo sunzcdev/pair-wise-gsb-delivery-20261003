@@ -1,0 +1,84 @@
+# frozen_string_literal: true
+
+require "helper"
+require "jobs/configuration_job"
+require "jobs/hello_job"
+require "active_support/testing/ractors_assertions"
+
+class QueuePriorityTest < ActiveSupport::TestCase
+  setup do
+    JobBuffer.clear
+  end
+
+  test "priority unset by default" do
+    assert_nil HelloJob.new.priority
+  end
+
+  test "using a custom default_priority" do
+    original_default_priority = ActiveJob::Base.default_priority
+
+    begin
+      ActiveJob::Base.default_priority = 8
+
+      assert_equal 8, HelloJob.new.priority
+    ensure
+      ActiveJob::Base.default_priority = original_default_priority
+    end
+  end
+
+  test "uses given priority" do
+    original_priority = HelloJob.priority
+
+    begin
+      HelloJob.queue_with_priority 90
+      assert_equal 90, HelloJob.new.priority
+    ensure
+      HelloJob.priority = original_priority
+    end
+  end
+
+  test "evals block given to priority to determine priority" do
+    original_priority = HelloJob.priority
+
+    begin
+      HelloJob.queue_with_priority { 25 }
+      assert_equal 25, HelloJob.new.priority
+    ensure
+      HelloJob.priority = original_priority
+    end
+  end
+
+  test "can use arguments to determine priority in priority block" do
+    original_priority = HelloJob.priority
+
+    begin
+      HelloJob.queue_with_priority { arguments.first == "1" ? 99 : 11 }
+      assert_equal 99, HelloJob.new("1").priority
+      assert_equal 11, HelloJob.new("3").priority
+    ensure
+      HelloJob.priority = original_priority
+    end
+  end
+
+  test "is assigned when perform_now" do
+    ConfigurationJob.set(priority: 123).perform_now
+    job = JobBuffer.last_value
+    assert_equal 123, job.priority
+  end
+
+  test "is assigned when perform_later" do
+    ConfigurationJob.set(priority: 123).perform_later
+    job = JobBuffer.last_value
+    assert_equal 123, job.priority
+  end
+end
+
+class QueuePriorityRactorTest < ActiveSupport::TestCase
+  include ActiveSupport::Testing::Isolation
+  include ActiveSupport::Testing::RactorsAssertions
+
+  test "priority resolves from a non-main Ractor" do
+    assert_nil on_ractor { HelloJob.new.priority }
+    assert_nil on_ractor { HelloJob.default_priority }
+  end
+end

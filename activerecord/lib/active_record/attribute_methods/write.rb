@@ -1,0 +1,60 @@
+# frozen_string_literal: true
+
+module ActiveRecord
+  module AttributeMethods
+    # Active Record Attribute Methods \Write
+    # ======================================
+    module Write
+      extend ActiveSupport::Concern
+
+      included do
+        attribute_method_suffix "=", parameters: "value"
+      end
+
+      module ClassMethods # :nodoc:
+        private
+          def define_method_attribute=(canonical_name, owner:, as: canonical_name)
+            ActiveModel::AttributeMethods::AttrNames.define_attribute_accessor_method(
+              canonical_name, writer: true,
+            ) do |temp_method_name, attr_name_expr|
+              owner.define_cached_method(temp_method_name, as: "#{as}=", namespace: :active_record) do |batch|
+                batch <<
+                  "def #{temp_method_name}(value)" <<
+                  "  @attributes.write_from_user(#{attr_name_expr}, value)" <<
+                  "end"
+              end
+            end
+          end
+      end
+
+      # Updates the attribute identified by `attr_name` using the specified
+      # `value`. The attribute value will be type cast upon being read.
+      def write_attribute(attr_name, value)
+        name = resolve_alias(attr_name.is_a?(Symbol) ? attr_name.name : attr_name.to_s)
+
+        return @attributes.write_from_user(name, value) unless name == "id" && @primary_key
+
+        if primary_key_is_composite?
+          @attributes.write_from_user("id", value)
+        else
+          if @primary_key != "id"
+            ActiveRecord.deprecator.warn(<<-MSG.squish)
+              Using write_attribute(:id, value) to write the primary key value is deprecated
+              and will be removed in Rails 9.0. Use #id= instead.
+            MSG
+          end
+          @attributes.write_from_user(@primary_key, value)
+        end
+      end
+
+      # This method exists to avoid the expensive primary_key check internally, without
+      # breaking compatibility with the write_attribute API
+      def _write_attribute(attr_name, value) # :nodoc:
+        @attributes.write_from_user(attr_name, value)
+      end
+
+      alias :attribute= :_write_attribute
+      private :attribute=
+    end
+  end
+end

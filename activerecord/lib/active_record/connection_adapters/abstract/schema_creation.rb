@@ -1,0 +1,199 @@
+# frozen_string_literal: true
+
+module ActiveRecord
+  module ConnectionAdapters
+    class SchemaCreation # :nodoc:
+      def initialize(conn)
+        @conn = conn
+        @cache = {}
+      end
+
+      def accept(o)
+        m = @cache[o.class] ||= "visit_#{o.class.name.split('::').last}"
+        send m, o
+      end
+
+      delegate :quote_column_name, :quote_table_name, :quote_default_expression, :type_to_sql,
+        :options_include_default?, :supports_indexes_in_create?, :use_foreign_keys?,
+        :quoted_columns_for_index, :supports_partial_index?, :supports_check_constraints?,
+        :lookup_cast_type,
+        to: :@conn, private: true
+
+      private
+        def visit_AlterTable(o)
+          "ALTER TABLE #{quote_table_name(o.name)} #{o.operations.map { |op| accept(op) }.join(', ')}"
+        end
+
+        def visit_DropColumn(o)
+          "DROP COLUMN #{quote_column_name(o.name)}"
+        end
+
+        def visit_RenameColumn(o)
+          "RENAME COLUMN #{quote_column_name(o.from_name)} TO #{quote_column_name(o.to_name)}"
+        end
+
+        def visit_ChangeColumnNull(o)
+          "ALTER COLUMN #{quote_column_name(o.name)} #{o.null ? 'DROP' : 'SET'} NOT NULL"
+        end
+
+        def visit_ColumnDefinition(o)
+          o.sql_type = type_to_sql(o.type, **o.options)
+          column_sql = +"#{quote_column_name(o.name)} #{o.sql_type}"
+          add_column_options!(column_sql, column_options(o)) unless o.type == :primary_key
+          column_sql
+        end
+
+        def visit_AddColumnDefinition(o)
+          +"ADD #{accept(o.column)}"
+        end
+
+        def visit_TableDefinition(o)
+          create_sql = +"CREATE#{table_modifier_in_create(o)} TABLE "
+          create_sql << "IF NOT EXISTS " if o.if_not_exists
+          create_sql << "#{quote_table_name(o.name)} "
+
+          statements = o.columns.map { |c| accept c }
+          statements << accept(o.primary_keys) if o.primary_keys
+
+          if supports_indexes_in_create?
+            statements.concat(o.indexes.map { |column_name, options| index_in_create(o.name, column_name, options) })
+          end
+
+          add_table_constraints!(statements, o)
+
+          create_sql << "(#{statements.join(', ')})" if statements.present?
+          add_table_options!(create_sql, o)
+          create_sql << " AS #{to_sql(o.as)}" if o.as
+          create_sql
+        end
+
+        def visit_PrimaryKeyDefinition(o)
+          "PRIMARY KEY (#{o.name.map { |name| quote_column_name(name) }.join(', ')})"
+        end
+
+        def visit_ForeignKeyDefinition(o)
+          quoted_columns = Array(o.column).map { |c| quote_column_name(c) }
+          quoted_primary_keys = Array(o.primary_key).map { |c| quote_column_name(c) }
+          sql = +<<~SQL
+            CONSTRAINT #{quote_column_name(o.name)}
+            FOREIGN KEY (#{quoted_columns.join(", ")})
+              REFERENCES #{quote_table_name(o.to_table)} (#{quoted_primary_keys.join(", ")})
+          SQL
+          sql << " #{action_sql('DELETE', o.on_delete)}" if o.on_delete
+          sql << " #{action_sql('UPDATE', o.on_update)}" if o.on_update
+          sql
+        end
+
+        def visit_AddForeignKey(o)
+          "ADD #{accept(o.foreign_key)}"
+        end
+
+        def visit_DropConstraint(o)
+          "DROP CONSTRAINT #{quote_column_name(o.name)}"
+        end
+        alias :visit_DropForeignKey :visit_DropConstraint
+        alias :visit_DropCheckConstraint :visit_DropConstraint
+
+        def visit_CreateIndexDefinition(o)
+          index = o.index
+
+          sql = ["CREATE"]
+          sql << "UNIQUE" if index.unique
+          sql << "INDEX"
+          sql << o.algorithm if o.algorithm
+          sql << "IF NOT EXISTS" if o.if_not_exists
+          sql << "#{quote_column_name(index.name)} ON #{quote_table_name(index.table)}"
+          sql << "USING #{index.using}" if supports_index_using? && index.using
+          sql << "(#{quoted_columns(index)})"
+          add_index_options!(sql, index)
+
+          sql.join(" ")
+        end
+
+        def visit_CheckConstraintDefinition(o)
+          "CONSTRAINT #{o.name} CHECK (#{o.expression})"
+        end
+
+        def visit_AddCheckConstraint(o)
+          "ADD #{accept(o.check_constraint)}"
+        end
+
+        def quoted_columns(o)
+          String === o.columns ? o.columns : quoted_columns_for_index(o.columns, o.column_options)
+        end
+
+        def supports_index_using?
+          true
+        end
+
+        def add_table_constraints!(statements, o)
+          if use_foreign_keys?
+            statements.concat(o.foreign_keys.map { |fk| accept fk })
+          end
+
+          if supports_check_constraints?
+            statements.concat(o.check_constraints.map { |chk| accept chk })
+          end
+
+          statements
+        end
+
+        def add_index_options!(sql, index)
+          sql << "WHERE #{index.where}" if supports_partial_index? && index.where
+          sql
+        end
+
+        def add_table_options!(create_sql, o)
+          create_sql << " #{o.options}" if o.options
+          create_sql
+        end
+
+        def column_options(o)
+          o.options.merge(column: o)
+        end
+
+        def add_column_options!(sql, options)
+          sql << " DEFAULT #{quote_default_expression_for_column_definition(options[:default], options[:column])}" if options_include_default?(options)
+          # must explicitly check for :null to allow change_column to work on migrations
+          if options[:null] == false
+            sql << " NOT NULL"
+          end
+          if options[:auto_increment] == true
+            sql << " AUTO_INCREMENT"
+          end
+          if options[:primary_key] == true
+            sql << " PRIMARY KEY"
+          end
+          sql
+        end
+
+        def quote_default_expression_for_column_definition(default, column_definition)
+          column_definition.cast_type = lookup_cast_type(column_definition.sql_type)
+          quote_default_expression(default, column_definition)
+        end
+
+        def to_sql(sql)
+          sql = sql.to_sql if sql.respond_to?(:to_sql)
+          sql
+        end
+
+        # Returns any SQL string to go between CREATE and TABLE. May be nil.
+        def table_modifier_in_create(o)
+          " TEMPORARY" if o.temporary
+        end
+
+        def action_sql(action, dependency)
+          case dependency
+          when :nullify then "ON #{action} SET NULL"
+          when :cascade  then "ON #{action} CASCADE"
+          when :restrict then "ON #{action} RESTRICT"
+          else
+            raise ArgumentError, <<~MSG
+              '#{dependency}' is not supported for :on_update or :on_delete.
+              Supported values are: :nullify, :cascade, :restrict
+            MSG
+          end
+        end
+    end
+  end
+end

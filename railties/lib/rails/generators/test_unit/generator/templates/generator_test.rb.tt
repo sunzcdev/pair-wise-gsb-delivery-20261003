@@ -1,0 +1,18 @@
+require "test_helper"
+require "<%= generator_path %>"
+
+<% module_namespacing do -%>
+class <%= class_name %>GeneratorTest < Rails::Generators::TestCase
+  tests <%= class_name %>Generator
+  setup do
+    self.class.destination Dir.mktmpdir("generators", Rails.root.join("tmp").to_s)
+  end
+  teardown { FileUtils.remove_entry(destination_root) }
+
+  # test "generator runs without errors" do
+  #   assert_nothing_raised do
+  #     run_generator ["arguments"]
+  #   end
+  # end
+end
+<% end -%>

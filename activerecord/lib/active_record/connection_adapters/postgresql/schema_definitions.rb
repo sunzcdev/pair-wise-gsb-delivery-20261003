@@ -1,0 +1,503 @@
+# frozen_string_literal: true
+
+module ActiveRecord
+  module ConnectionAdapters
+    module PostgreSQL
+      module ColumnMethods
+        extend ActiveSupport::Concern
+        extend ConnectionAdapters::ColumnMethods::ClassMethods
+
+        # Defines the primary key field.
+        # Use of the native PostgreSQL UUID type is supported, and can be used
+        # by defining your tables as such:
+        #
+        # ```
+        # create_table :stuffs, id: :uuid do |t|
+        #   t.string :content
+        #   t.timestamps
+        # end
+        # ```
+        #
+        # By default, this will use the `gen_random_uuid()` function.
+        #
+        # To use a UUID primary key without any defaults, set the `:default`
+        # option to `nil`:
+        #
+        # ```
+        # create_table :stuffs, id: false do |t|
+        #   t.primary_key :id, :uuid, default: nil
+        #   t.uuid :foo_id
+        #   t.timestamps
+        # end
+        # ```
+        #
+        # You may also pass a custom stored procedure that returns a UUID or use a
+        # different UUID generation function from another library.
+        #
+        # Note that setting the UUID primary key default value to `nil` will
+        # require you to assure that you always provide a UUID value before saving
+        # a record (as primary keys cannot be `nil`). This might be done via the
+        # `SecureRandom.uuid` method and a `before_save` callback, for instance.
+        def primary_key(name, type = :primary_key, **options)
+          if type == :uuid
+            options[:default] = options.fetch(:default, "gen_random_uuid()")
+          end
+
+          super
+        end
+
+        ##
+        # :method: bigserial
+        # :call-seq: bigserial(*names, **options)
+
+        ##
+        # :method: bit
+        # :call-seq: bit(*names, **options)
+
+        ##
+        # :method: bit_varying
+        # :call-seq: bit_varying(*names, **options)
+
+        ##
+        # :method: cidr
+        # :call-seq: cidr(*names, **options)
+
+        ##
+        # :method: citext
+        # :call-seq: citext(*names, **options)
+
+        ##
+        # :method: daterange
+        # :call-seq: daterange(*names, **options)
+
+        ##
+        # :method: hstore
+        # :call-seq: hstore(*names, **options)
+
+        ##
+        # :method: inet
+        # :call-seq: inet(*names, **options)
+
+        ##
+        # :method: interval
+        # :call-seq: interval(*names, **options)
+
+        ##
+        # :method: int4range
+        # :call-seq: int4range(*names, **options)
+
+        ##
+        # :method: int8range
+        # :call-seq: int8range(*names, **options)
+
+        ##
+        # :method: jsonb
+        # :call-seq: jsonb(*names, **options)
+
+        ##
+        # :method: ltree
+        # :call-seq: ltree(*names, **options)
+
+        ##
+        # :method: macaddr
+        # :call-seq: macaddr(*names, **options)
+
+        ##
+        # :method: money
+        # :call-seq: money(*names, **options)
+
+        ##
+        # :method: numrange
+        # :call-seq: numrange(*names, **options)
+
+        ##
+        # :method: oid
+        # :call-seq: oid(*names, **options)
+
+        ##
+        # :method: point
+        # :call-seq: point(*names, **options)
+
+        ##
+        # :method: line
+        # :call-seq: line(*names, **options)
+
+        ##
+        # :method: lseg
+        # :call-seq: lseg(*names, **options)
+
+        ##
+        # :method: box
+        # :call-seq: box(*names, **options)
+
+        ##
+        # :method: path
+        # :call-seq: path(*names, **options)
+
+        ##
+        # :method: polygon
+        # :call-seq: polygon(*names, **options)
+
+        ##
+        # :method: circle
+        # :call-seq: circle(*names, **options)
+
+        ##
+        # :method: serial
+        # :call-seq: serial(*names, **options)
+
+        ##
+        # :method: tsrange
+        # :call-seq: tsrange(*names, **options)
+
+        ##
+        # :method: tstzrange
+        # :call-seq: tstzrange(*names, **options)
+
+        ##
+        # :method: tsvector
+        # :call-seq: tsvector(*names, **options)
+
+        ##
+        # :method: uuid
+        # :call-seq: uuid(*names, **options)
+
+        ##
+        # :method: xml
+        # :call-seq: xml(*names, **options)
+
+        ##
+        # :method: timestamptz
+        # :call-seq: timestamptz(*names, **options)
+
+        ##
+        # :method: enum
+        # :call-seq: enum(*names, **options)
+
+        define_column_methods :bigserial, :bit, :bit_varying, :cidr, :citext, :daterange,
+          :hstore, :inet, :interval, :int4range, :int8range, :jsonb, :ltree, :macaddr,
+          :money, :numrange, :oid, :point, :line, :lseg, :box, :path, :polygon, :circle,
+          :serial, :tsrange, :tstzrange, :tsvector, :uuid, :xml, :timestamptz, :enum
+      end
+
+      ExclusionConstraintDefinition = Struct.new(:table_name, :expression, :options) do
+        def name
+          options[:name]
+        end
+
+        def using
+          options[:using]
+        end
+
+        def where
+          options[:where]
+        end
+
+        def deferrable
+          options[:deferrable]
+        end
+
+        def export_name_on_schema_dump?
+          !ActiveRecord::SchemaDumper.excl_ignore_pattern.match?(name) if name
+        end
+
+        def defined_for?(name:, expression: nil, **options)
+          self.name == name.to_s &&
+            options.all? { |k, v| self.options[k].to_s == v.to_s }
+        end
+      end
+
+      UniqueConstraintDefinition = Struct.new(:table_name, :column, :options) do
+        def name
+          options[:name]
+        end
+
+        def deferrable
+          options[:deferrable]
+        end
+
+        def using_index
+          options[:using_index]
+        end
+
+        def nulls_not_distinct
+          options[:nulls_not_distinct]
+        end
+
+        def export_name_on_schema_dump?
+          !ActiveRecord::SchemaDumper.unique_ignore_pattern.match?(name) if name
+        end
+
+        def defined_for?(name: nil, column: nil, **options)
+          options = options.slice(*self.options.keys)
+
+          (name.nil? || self.name == name.to_s) &&
+            (column.nil? || Array(self.column) == Array(column).map(&:to_s)) &&
+            options.all? { |k, v| self.options[k].to_s == v.to_s }
+        end
+      end
+
+      # Active Record PostgreSQL Adapter \Index Definition
+      # ==================================================
+      class IndexDefinition < ActiveRecord::ConnectionAdapters::IndexDefinition # :nodoc:
+        attr_reader :opclasses, :include, :nulls_not_distinct
+
+        def initialize(*args, opclasses: {}, include: nil, nulls_not_distinct: nil, **kwargs)
+          super(*args, **kwargs)
+          @opclasses = concise_options(opclasses)
+          @include = include
+          @nulls_not_distinct = nulls_not_distinct
+        end
+
+        def column_options
+          super.merge!(opclass: opclasses)
+        end
+
+        def defined_for?(columns = nil, include: nil, nulls_not_distinct: nil, **options)
+          super(columns, **options) &&
+            (include.nil? || Array(self.include) == Array(include).map(&:to_s)) &&
+            (nulls_not_distinct.nil? || self.nulls_not_distinct == nulls_not_distinct)
+        end
+
+        def as_schema_json
+          json = super
+          json["opclasses"] = @opclasses.presence
+          json["include"] = @include
+          json["nulls_not_distinct"] = @nulls_not_distinct
+          json
+        end
+
+        def init_from_schema_json(coder, references)
+          super
+          @opclasses = symbolize_concise_options(coder["opclasses"])
+          @include = coder["include"]
+          @nulls_not_distinct = coder["nulls_not_distinct"]
+        end
+      end
+
+      ValidateConstraint = Data.define(:name) # :nodoc:
+      AddExclusionConstraint = Data.define(:exclusion_constraint) # :nodoc:
+      AddUniqueConstraint = Data.define(:unique_constraint) # :nodoc:
+
+      # Active Record PostgreSQL Adapter \Table Definition
+      # ==================================================
+      class TableDefinition < ActiveRecord::ConnectionAdapters::TableDefinition
+        include ColumnMethods
+
+        attr_reader :exclusion_constraints, :unique_constraints, :unlogged
+
+        def initialize(*, **)
+          super
+          @exclusion_constraints = []
+          @unique_constraints = []
+          @unlogged = ActiveRecord::ConnectionAdapters::PostgreSQLAdapter.create_unlogged_tables
+        end
+
+        def exclusion_constraint(expression, **options)
+          exclusion_constraints << new_exclusion_constraint_definition(expression, options)
+        end
+
+        def unique_constraint(column_name, **options)
+          unique_constraints << new_unique_constraint_definition(column_name, options)
+        end
+
+        def new_exclusion_constraint_definition(expression, options) # :nodoc:
+          options = @conn.exclusion_constraint_options(name, expression, options)
+          ExclusionConstraintDefinition.new(name, expression, options)
+        end
+
+        def new_unique_constraint_definition(column_name, options) # :nodoc:
+          options = @conn.unique_constraint_options(name, column_name, options)
+          UniqueConstraintDefinition.new(name, column_name, options)
+        end
+
+        def new_column_definition(name, type, **options) # :nodoc:
+          case type
+          when :virtual
+            type = options[:type]
+          end
+
+          super
+        end
+
+        private
+          def valid_column_definition_options
+            super + [:array, :using, :cast_as, :as, :type, :enum_type, :stored]
+          end
+
+          def aliased_types(name, fallback)
+            fallback
+          end
+
+          def integer_like_primary_key_type(type, options)
+            if type == :bigint || options[:limit] == 8
+              :bigserial
+            else
+              :serial
+            end
+          end
+      end
+
+      # Active Record PostgreSQL Adapter \Table
+      # =======================================
+      class Table < ActiveRecord::ConnectionAdapters::Table
+        include ColumnMethods
+
+        # Adds an exclusion constraint.
+        #
+        # ```
+        # t.exclusion_constraint("price WITH =, availability_range WITH &&", using: :gist, name: "price_check")
+        # ```
+        #
+        # See [connection.add_exclusion_constraint](rdoc-ref:SchemaStatements#add_exclusion_constraint)
+        def exclusion_constraint(...)
+          @base.add_exclusion_constraint(name, ...)
+        end
+
+        # Removes the given exclusion constraint from the table.
+        #
+        # ```
+        # t.remove_exclusion_constraint(name: "price_check")
+        # ```
+        #
+        # See [connection.remove_exclusion_constraint](rdoc-ref:SchemaStatements#remove_exclusion_constraint)
+        def remove_exclusion_constraint(...)
+          @base.remove_exclusion_constraint(name, ...)
+        end
+
+        # Checks if an exclusion constraint exists on a table.
+        #
+        # ```
+        # unless t.exclusion_constraint_exists?(name: "invoices_date_overlap")
+        #   t.exclusion_constraint("daterange(start_date, end_date) WITH &&", using: :gist, name: "invoices_date_overlap")
+        # end
+        # ```
+        #
+        # See [connection.exclusion_constraint_exists?](rdoc-ref:SchemaStatements#exclusion_constraint_exists?)
+        def exclusion_constraint_exists?(*args, **options)
+          @base.exclusion_constraint_exists?(name, *args, **options)
+        end
+
+        # Adds a unique constraint.
+        #
+        # ```
+        # t.unique_constraint(:position, name: 'unique_position', deferrable: :deferred, nulls_not_distinct: true)
+        # ```
+        #
+        # See [connection.add_unique_constraint](rdoc-ref:SchemaStatements#add_unique_constraint)
+        def unique_constraint(...)
+          @base.add_unique_constraint(name, ...)
+        end
+
+        # Removes the given unique constraint from the table.
+        #
+        # ```
+        # t.remove_unique_constraint(name: "unique_position")
+        # ```
+        #
+        # See [connection.remove_unique_constraint](rdoc-ref:SchemaStatements#remove_unique_constraint)
+        def remove_unique_constraint(...)
+          @base.remove_unique_constraint(name, ...)
+        end
+
+        # Validates the given constraint on the table.
+        #
+        # ```
+        # t.check_constraint("price > 0", name: "price_check", validate: false)
+        # t.validate_constraint "price_check"
+        # ```
+        #
+        # See [connection.validate_constraint](rdoc-ref:SchemaStatements#validate_constraint)
+        def validate_constraint(...)
+          @base.validate_constraint(name, ...)
+        end
+
+        # Validates the given check constraint on the table
+        #
+        # ```
+        # t.check_constraint("price > 0", name: "price_check", validate: false)
+        # t.validate_check_constraint name: "price_check"
+        # ```
+        #
+        # See [connection.validate_check_constraint](rdoc-ref:SchemaStatements#validate_check_constraint)
+        def validate_check_constraint(...)
+          @base.validate_check_constraint(name, ...)
+        end
+
+        # Checks if a unique constraint exists on a table.
+        #
+        # ```
+        # unless t.unique_constraint_exists?(name: "unique_position")
+        #   t.unique_constraint(:position, name: "unique_position", deferrable: :deferred)
+        # end
+        # ```
+        #
+        # See [connection.unique_constraint_exists?](rdoc-ref:SchemaStatements#unique_constraint_exists?)
+        def unique_constraint_exists?(*args, **options)
+          @base.unique_constraint_exists?(name, *args, **options)
+        end
+      end
+
+      # Active Record PostgreSQL Adapter Alter \Table
+      # =============================================
+      class AlterTable < ActiveRecord::ConnectionAdapters::AlterTable # :nodoc:
+        COMBINABLE_COMMANDS = (superclass::COMBINABLE_COMMANDS + %i[
+          change_column
+          change_column_null
+          add_exclusion_constraint
+          remove_exclusion_constraint
+          add_unique_constraint
+          remove_unique_constraint
+        ]).freeze
+
+        def add_column(column_name, type, **options)
+          super
+          defer_comment(column_name, options[:comment]) if options.key?(:comment)
+        end
+
+        def change_column(column_name, type, **options)
+          cd = @td.new_column_definition(column_name, type, **options)
+          @operations << ChangeColumnDefinition.new(cd, column_name)
+          defer_comment(column_name, options[:comment]) if options.key?(:comment)
+        end
+
+        def change_column_null(column_name, null, default = nil)
+          if default.nil?
+            super(column_name, null)
+          else
+            conn = @td.conn
+            table_name = name
+            @deferred_operations << -> { conn.change_column_null(table_name, column_name, null, default) }
+          end
+        end
+
+        def validate_constraint(name)
+          @operations << ValidateConstraint.new(name)
+        end
+
+        def add_exclusion_constraint(expression, **options)
+          @operations << AddExclusionConstraint.new(@td.new_exclusion_constraint_definition(expression, options))
+        end
+
+        def remove_exclusion_constraint(expression = nil, **options)
+          drop_constraint(@td.conn.send(:exclusion_constraint_for!, name, expression: expression, **options).name)
+        end
+
+        def add_unique_constraint(column_name = nil, **options)
+          @operations << AddUniqueConstraint.new(@td.new_unique_constraint_definition(column_name, options))
+        end
+
+        def remove_unique_constraint(column_name = nil, **options)
+          drop_constraint(@td.conn.send(:unique_constraint_for!, name, column: column_name, **options).name)
+        end
+
+        private
+          def defer_comment(column_name, comment)
+            conn = @td.conn
+            table_name = name
+            @deferred_operations << -> { conn.change_column_comment(table_name, column_name, comment) }
+          end
+      end
+    end
+  end
+end

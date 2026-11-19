@@ -1,0 +1,406 @@
+# frozen_string_literal: true
+
+require "cases/helper"
+require "active_support/testing/ractors_assertions"
+require "active_support/core_ext/object/with"
+require "models/person"
+require "models/topic"
+require "pp"
+require "models/cpk"
+
+class NonExistentTable < ActiveRecord::Base; end
+
+class CoreTest < ActiveRecord::TestCase
+  fixtures :topics
+
+  def test_inspect_class
+    assert_equal "ActiveRecord::Base", ActiveRecord::Base.inspect
+    assert_equal "LoosePerson(abstract)", LoosePerson.inspect
+    assert_match(/^Topic\(id: integer, title: string/, Topic.inspect)
+  end
+
+  def test_inspect_instance
+    topic = topics(:first)
+    assert_equal %(#<Topic id: 1, title: "The First Topic", author_name: "David", author_email_address: "david@loudthinking.com", written_on: "#{topic.written_on.to_fs(:inspect)}", bonus_time: "#{topic.bonus_time.to_fs(:inspect)}", last_read: "#{topic.last_read.to_fs(:inspect)}", content: "Have a nice day", important: nil, binary_content: nil, approved: false, replies_count: 1, unique_replies_count: 0, parent_id: nil, parent_title: nil, type: nil, group: nil, created_at: "#{topic.created_at.to_fs(:inspect)}", updated_at: "#{topic.updated_at.to_fs(:inspect)}">), topic.inspect
+  end
+
+  def test_inspect_includes_attributes_from_attributes_for_inspect
+    Topic.stub(:attributes_for_inspect, [:id, :title, :author_name]) do
+      topic = topics(:first)
+
+      assert_equal %(#<Topic id: 1, title: "The First Topic", author_name: "David">), topic.inspect
+    end
+  end
+
+  def test_inspect_instance_with_lambda_date_formatter
+    Topic.stub(:attributes_for_inspect, [:id, :last_read]) do
+      ActiveSupport::TimeFormats.stub(:lookup, ->(format) { { inspect: ->(date) { "my_format" } }[format] }) do
+        topic = topics(:first)
+
+        assert_equal %(#<Topic id: 1, last_read: "2004-04-15">), topic.inspect
+      end
+    end
+  end
+
+  def test_inspect_new_instance
+    assert_match(/Topic id: nil/, Topic.new.inspect)
+  end
+
+  def test_inspect_singleton_instance
+    assert_match(/#<Class:#<Topic:\w+>>/, Topic.new.singleton_class.inspect)
+  end
+
+  def test_inspect_limited_select_instance
+    Topic.stub(:attributes_for_inspect, [:id, :title]) do
+      assert_equal %(#<Topic id: 1>), Topic.all.merge!(select: "id", where: "id = 1").first.inspect
+      assert_equal %(#<Topic id: 1, title: "The First Topic">), Topic.all.merge!(select: "id, title", where: "id = 1").first.inspect
+    end
+  end
+
+  def test_inspect_instance_with_non_primary_key_id_attribute
+    topic = topics(:first).becomes(TitlePrimaryKeyTopic)
+    assert_match(/id: 1/, topic.inspect)
+  end
+
+  def test_inspect_class_without_table
+    assert_equal "NonExistentTable(Table doesn't exist)", NonExistentTable.inspect
+  end
+
+  def test_inspect_with_attributes_for_inspect_all_lists_all_attributes
+    Topic.stub(:attributes_for_inspect, :all) do
+      topic = topics(:first)
+
+      assert_equal <<~STRING.squish, topic.inspect
+        #<Topic id: 1, title: "The First Topic", author_name: "David", author_email_address: "david@loudthinking.com", written_on: "#{topic.written_on.to_fs(:inspect)}", bonus_time: "#{topic.bonus_time.to_fs(:inspect)}", last_read: "#{topic.last_read.to_fs(:inspect)}", content: "Have a nice day", important: nil, binary_content: nil, approved: false, replies_count: 1, unique_replies_count: 0, parent_id: nil, parent_title: nil, type: nil, group: nil, created_at: "#{topic.created_at.to_fs(:inspect)}", updated_at: "#{topic.updated_at.to_fs(:inspect)}">
+      STRING
+    end
+  end
+
+  def test_inspect_relation_with_virtual_field
+    relation = Topic.limit(1).select("1 as virtual_field")
+    assert_match(/virtual_field: 1/, relation.first.full_inspect)
+  end
+
+  def test_inspect_with_overridden_attribute_for_inspect
+    topic = topics(:first)
+
+    topic.instance_eval do
+      def attribute_for_inspect(attr_name)
+        if attr_name == "title"
+          title.upcase.inspect
+        else
+          super
+        end
+      end
+    end
+
+    assert_match(/title: "THE FIRST TOPIC"/, topic.full_inspect)
+  end
+
+  def test_full_inspect_lists_all_attributes
+    topic = topics(:first)
+
+    assert_equal <<~STRING.squish, topic.full_inspect
+      #<Topic id: 1, title: "The First Topic", author_name: "David", author_email_address: "david@loudthinking.com", written_on: "#{topic.written_on.to_fs(:inspect)}", bonus_time: "#{topic.bonus_time.to_fs(:inspect)}", last_read: "#{topic.last_read.to_fs(:inspect)}", content: "Have a nice day", important: nil, binary_content: nil, approved: false, replies_count: 1, unique_replies_count: 0, parent_id: nil, parent_title: nil, type: nil, group: nil, created_at: "#{topic.created_at.to_fs(:inspect)}", updated_at: "#{topic.updated_at.to_fs(:inspect)}">
+    STRING
+  end
+
+  def test_pretty_print_new
+    topic = Topic.new
+    actual = +""
+    PP.pp(topic, StringIO.new(actual))
+    expected = <<~PRETTY
+      #<Topic:0xXXXXXX
+       id: nil,
+       title: nil,
+       author_name: nil,
+       author_email_address: "test@test.com",
+       written_on: nil,
+       bonus_time: nil,
+       last_read: nil,
+       content: nil,
+       important: nil,
+       binary_content: nil,
+       approved: true,
+       replies_count: 0,
+       unique_replies_count: 0,
+       parent_id: nil,
+       parent_title: nil,
+       type: nil,
+       group: nil,
+       created_at: nil,
+       updated_at: nil>
+    PRETTY
+    assert actual.start_with?(expected.split("XXXXXX").first)
+    assert actual.end_with?(expected.split("XXXXXX").last)
+  end
+
+  def test_pretty_print_persisted
+    topic = topics(:first)
+    actual = +""
+    PP.pp(topic, StringIO.new(actual))
+    expected = <<~PRETTY
+      #<Topic:0x\\w+
+       id: 1,
+       title: "The First Topic",
+       author_name: "David",
+       author_email_address: "david@loudthinking.com",
+       written_on: "2003-07-16 14:28:11\\.223300000 \\+0000",
+       bonus_time: "2000-01-01 14:28:00\\.000000000 \\+0000",
+       last_read: "2004-04-15",
+       content: "Have a nice day",
+       important: nil,
+       binary_content: nil,
+       approved: false,
+       replies_count: 1,
+       unique_replies_count: 0,
+       parent_id: nil,
+       parent_title: nil,
+       type: nil,
+       group: nil,
+       created_at: [^,]+,
+       updated_at: [^,>]+>
+    PRETTY
+    assert_match(/\A#{expected}\z/, actual)
+  end
+
+  def test_pretty_print_full
+    Topic.stub(:attributes_for_inspect, :all) do
+      topic = topics(:first)
+      actual = +""
+      PP.pp(topic, StringIO.new(actual))
+      expected = <<~PRETTY
+        #<Topic:0x\\w+
+         id: 1,
+         title: "The First Topic",
+         author_name: "David",
+         author_email_address: "david@loudthinking.com",
+         written_on: "2003-07-16 14:28:11\\.223300000 \\+0000",
+         bonus_time: "2000-01-01 14:28:00\\.000000000 \\+0000",
+         last_read: "2004-04-15",
+         content: "Have a nice day",
+         important: nil,
+         binary_content: nil,
+         approved: false,
+         replies_count: 1,
+         unique_replies_count: 0,
+         parent_id: nil,
+         parent_title: nil,
+         type: nil,
+         group: nil,
+         created_at: [^,]+,
+         updated_at: [^,>]+>
+      PRETTY
+      assert_match(/\A#{expected}\z/, actual)
+    end
+  end
+
+  def test_pretty_print_uninitialized
+    topic = Topic.allocate
+    actual = +""
+    PP.pp(topic, StringIO.new(actual))
+    expected = "#<Topic:XXXXXX not initialized>\n"
+    assert actual.start_with?(expected.split("XXXXXX").first)
+    assert actual.end_with?(expected.split("XXXXXX").last)
+  end
+
+  def test_pretty_print_overridden_by_inspect
+    subtopic = Class.new(Topic) do
+      def inspect
+        "inspecting topic"
+      end
+    end
+    actual = +""
+    PP.pp(subtopic.new, StringIO.new(actual))
+    assert_equal "inspecting topic\n", actual
+  end
+
+  def test_pretty_print_with_non_primary_key_id_attribute
+    topic = topics(:first).becomes(TitlePrimaryKeyTopic)
+    actual = +""
+    PP.pp(topic, StringIO.new(actual))
+    assert_match(/id: 1/, actual)
+  end
+
+  def test_pretty_print_with_overridden_attribute_for_inspect
+    topic = topics(:first)
+
+    topic.instance_eval do
+      def attribute_for_inspect(attr_name)
+        if attr_name == "title"
+          title.upcase.inspect
+        else
+          super
+        end
+      end
+    end
+
+    Topic.stub(:attributes_for_inspect, :all) do
+      actual = +""
+      PP.pp(topic, StringIO.new(actual))
+      assert_match(/title: "THE FIRST TOPIC"/, actual)
+    end
+  end
+
+  def test_find_by_cache_does_not_duplicate_entries
+    Topic.initialize_find_by_cache
+    using_prepared_statements = Topic.lease_connection.prepared_statements
+    topic_find_by_cache = Topic.schema_context.find_by_statement_cache[using_prepared_statements]
+
+    assert_difference -> { topic_find_by_cache.size }, +1 do
+      Topic.find(1)
+    end
+    assert_no_difference -> { topic_find_by_cache.size } do
+      Topic.find_by(id: 1)
+    end
+  end
+
+  def test_composite_pk_models_added_to_a_set
+    library = Set.new
+    # with primary key present
+    library << Cpk::Book.new(id: [1, 2])
+
+    # duplicate
+    library << Cpk::Book.new(id: [1, 3])
+    library << Cpk::Book.new(id: [1, 3])
+
+    # without primary key being set
+    library << Cpk::Book.new(title: "Book A")
+    library << Cpk::Book.new(title: "Book B")
+
+    assert_equal 4, library.size
+  end
+
+  def test_composite_pk_models_equality
+    assert Cpk::Book.new(id: [1, 2]) == Cpk::Book.new(id: [1, 2])
+
+    assert_not Cpk::Book.new(id: [1, 2]) == Cpk::Book.new(id: [1, 3])
+    assert_not Cpk::Book.new == Cpk::Book.new
+    assert_not Cpk::Book.new(title: "Book A") == Cpk::Book.new(title: "Book B")
+    assert_not Cpk::Book.new(author_id: 1) == Cpk::Book.new(author_id: 1)
+    assert_not Cpk::Book.new(author_id: 1, title: "Same title") == Cpk::Book.new(author_id: 1, title: "Same title")
+  end
+
+  def test_composite_pk_models_hash
+    assert_equal Cpk::Book.new(id: [1, 2]).hash, Cpk::Book.new(id: [1, 2]).hash
+
+    assert_not_equal Cpk::Book.new(id: [1, 2]).hash, Cpk::Book.new(id: [1, 3]).hash
+    assert_not_equal Cpk::Book.new.hash, Cpk::Book.new.hash
+    assert_not_equal Cpk::Book.new(title: "Book A").hash, Cpk::Book.new(title: "Book B").hash
+    assert_not_equal Cpk::Book.new(author_id: 1).hash, Cpk::Book.new(author_id: 1).hash
+    assert_not_equal Cpk::Book.new(author_id: 1, title: "Same title").hash, Cpk::Book.new(author_id: 1, title: "Same title").hash
+  end
+
+  if RUBY_VERSION >= "4.0" && !in_memory_db?
+    class RactorTest < ActiveRecord::TestCase
+      include ActiveSupport::Testing::Isolation
+      include ActiveSupport::Testing::RactorsAssertions
+
+      def test_schema_context_is_ractor_shareable_and_accessible_on_a_non_main_ractor
+        model = Class.new(ActiveRecord::Base) do
+          def self.name = "ractor_safe_schema_context"
+          self.table_name = "topics"
+        end
+        context = model.schema_context
+
+        assert_ractor_shareable context
+        assert_same context, on_ractor { model.schema_context }
+        assert_not_predicate context, :schema_loaded?
+      end
+
+      def test_schema_context_loads_its_columns_on_a_non_main_ractor
+        model = Class.new(ActiveRecord::Base) do
+          def self.name = "ractor_shared_schema_context_columns"
+          self.table_name = "topics"
+        end
+        context = model.schema_context
+
+        column_names, attributes = ActiveSupport::Ractors.with(unshareable_proc_action: :raise) do
+          on_ractor { [model.column_names, context.attributes] }
+        end
+
+        assert_predicate context, :schema_loaded?
+        assert_same column_names, context.mapped_table.column_names
+        assert_same attributes, context.attributes
+      end
+
+      def test_schema_context_shares_columns_but_keeps_unshareable_attributes_ractor_local
+        model = Class.new(ActiveRecord::Base) do
+          def self.name = "ractor_schema_context_local_attributes"
+          self.table_name = "topics"
+          attribute :approved, default: true
+        end
+        context = model.schema_context
+
+        columns_hash, attributes_id, stable_attributes = ActiveSupport::Ractors.with(unshareable_proc_action: :raise) do
+          on_ractor do
+            attributes = model.schema_context.attributes
+            [model.schema_context.mapped_table.columns_hash, attributes.object_id, attributes.equal?(model.schema_context.attributes)]
+          end
+        end
+
+        assert_same context.mapped_table.columns_hash, columns_hash
+        assert_not_equal context.attributes.object_id, attributes_id
+        assert stable_attributes
+      end
+
+      def test_find_by_statement_cache_is_ractor_local
+        model = Class.new(ActiveRecord::Base) do
+          def self.name = "ractor_safe_find_by_cache"
+          self.table_name = "topics"
+        end
+        model.load_schema
+
+        worker_marker, worker_stable = on_ractor do
+          cache = model.schema_context.find_by_statement_cache
+          cache[true][:ractor_marker] = :from_worker
+          [cache[true][:ractor_marker], model.schema_context.find_by_statement_cache.equal?(cache)]
+        end
+
+        assert_equal :from_worker, worker_marker
+        assert worker_stable
+        assert_nil model.schema_context.find_by_statement_cache[true][:ractor_marker]
+      end
+
+      def test_pending_attribute_modifications_are_shareable_and_applied_on_a_non_main_ractor
+        model = Class.new(ActiveRecord::Base) do
+          def self.name = "ractor_safe_pending_modifications"
+          self.table_name = "topics"
+          attribute :approved, default: true
+          attribute :title, :string, default: -> { "title-#{rand}" }
+        end
+        ActiveSupport::Ractors.with(unshareable_proc_action: :raise) do
+          model.load_schema
+        end
+
+        assert_ractor_shareable model.send(:pending_attribute_modifications)
+
+        approved_default, title_a, title_b = on_ractor do
+          defaults = model.schema_context.attributes.defaults
+          [
+            defaults["approved"].value,
+            defaults.deep_dup.fetch_value("title"),
+            defaults.deep_dup.fetch_value("title"),
+          ]
+        end
+
+        assert_equal true, approved_default
+        assert_match(/\Atitle-/, title_a)
+        assert_not_equal title_a, title_b
+      end
+
+      def test_unshareable_pending_attribute_modifications_do_not_break_schema_load
+        unshareable = +"local default"
+        model = Class.new(ActiveRecord::Base) do
+          def self.name = "ractor_unsafe_pending_modifications"
+          self.table_name = "topics"
+          attribute :title, :string, default: -> { unshareable }
+        end
+
+        assert_nothing_raised { model.load_schema }
+        assert_not_ractor_shareable model.send(:pending_attribute_modifications)
+        assert_equal "local default", model.new.title
+      end
+    end
+  end
+end

@@ -1,0 +1,20 @@
+# frozen_string_literal: true
+
+class Tag < ActiveRecord::Base
+  has_many :taggings
+  has_many :taggables, through: :taggings
+  has_one  :tagging
+
+  has_many :tagged_posts, through: :taggings, source: "taggable", source_type: "Post"
+  has_many :tagged_posts_by_bob, -> { joins(:author).where(authors: { name: "Bob" }) }, through: :taggings, source: "taggable", source_type: "Post"
+  has_many :second_tagged_posts, -> { where(taggings: { comment: "second" }) }, through: :taggings, source: "taggable", source_type: "Post"
+  has_many :second_tagged_posts_with_taggings, -> { preload(taggings: :taggable).where(taggings: { comment: "second" }) }, through: :taggings, source: "taggable", source_type: "Post"
+  has_many :first_tagged_posts_by_bob, -> { joins(:author).where(taggings: { comment: "first" }, authors: { name: "Bob" }) }, through: :taggings, source: "taggable", source_type: "Post"
+end
+
+class OrderedTag < Tag
+  self.table_name = "tags"
+
+  has_many :ordered_taggings, -> { order("taggings.id DESC") }, foreign_key: "tag_id", class_name: "Tagging"
+  has_many :tagged_posts, through: :ordered_taggings, source: "taggable", source_type: "Post"
+end

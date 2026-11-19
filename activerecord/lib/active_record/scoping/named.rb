@@ -1,0 +1,260 @@
+# frozen_string_literal: true
+
+module ActiveRecord
+  # Active Record \Named \Scopes
+  # ============================
+  module Scoping
+    module Named
+      extend ActiveSupport::Concern
+
+      module ClassMethods
+        # Returns an ActiveRecord::Relation scope object.
+        #
+        # ```
+        # posts = Post.all
+        # posts.size # Fires "select count(*) from  posts" and returns the count
+        # posts.each {|p| puts p.name } # Fires "select * from posts" and loads post objects
+        #
+        # fruits = Fruit.all
+        # fruits = fruits.where(color: 'red') if options[:red_only]
+        # fruits = fruits.limit(10) if limited?
+        # ```
+        #
+        # You can define a scope that applies to all finders using
+        # [default_scope](rdoc-ref:Scoping::Default::ClassMethods#default_scope).
+        def all(all_queries: (all_queries_not_set = true))
+          if all_queries_not_set
+            all_queries = nil
+          else
+            ActiveRecord.deprecator.warn(
+              "The `all_queries` keyword argument to `ActiveRecord::Base.all` is deprecated and will be removed in Rails 9.0."
+            )
+          end
+
+          return all_queries_scope if all_queries
+
+          scope = current_scope
+
+          if scope
+            if self == scope.model
+              scope.clone
+            else
+              relation.merge!(scope)
+            end
+          else
+            default_scoped(all_queries: all_queries)
+          end
+        end
+
+        def scope_for_association(scope = relation) # :nodoc:
+          if current_scope&.empty_scope?
+            scope
+          else
+            default_scoped(scope)
+          end
+        end
+
+        # Returns a scope for the model with default scopes.
+        def default_scoped(scope = relation, all_queries: nil)
+          build_default_scope(scope, all_queries: all_queries) || scope
+        end
+
+        def all_queries_scope # :nodoc:
+          scope = if default_scopes?(all_queries: true)
+            default_scoped(all_queries: true)
+          else
+            relation
+          end
+
+          if current_scope = global_current_scope
+            scope = scope.merge!(current_scope)
+          end
+
+          scope
+        end
+
+        def default_extensions # :nodoc:
+          return Relation::FROZEN_EMPTY_ARRAY unless has_default_scope?
+
+          if scope = scope_for_association || build_default_scope
+            scope.extensions
+          else
+            Relation::FROZEN_EMPTY_ARRAY
+          end
+        end
+
+        # Adds a class method for retrieving and querying objects.
+        # The method is intended to return an ActiveRecord::Relation
+        # object, which is composable with other scopes.
+        # If it returns `nil` or `false`, an
+        # [all](rdoc-ref:Scoping::Named::ClassMethods#all) scope is returned instead.
+        #
+        # A \scope represents a narrowing of a database query, such as
+        # `where(color: :red).select('shirts.*').includes(:washing_instructions)`.
+        #
+        # ```
+        # class Shirt < ActiveRecord::Base
+        #   scope :red, -> { where(color: 'red') }
+        #   scope :dry_clean_only, -> { joins(:washing_instructions).where('washing_instructions.dry_clean_only = ?', true) }
+        # end
+        # ```
+        #
+        # The above calls to #scope define class methods `Shirt.red` and
+        # `Shirt.dry_clean_only`. `Shirt.red`, in effect,
+        # represents the query `Shirt.where(color: 'red')`.
+        #
+        # Note that this is simply 'syntactic sugar' for defining an actual
+        # class method:
+        #
+        # ```
+        # class Shirt < ActiveRecord::Base
+        #   def self.red
+        #     where(color: 'red')
+        #   end
+        # end
+        # ```
+        #
+        # Unlike `Shirt.find(...)`, however, the object returned by
+        # `Shirt.red` is not an Array but an ActiveRecord::Relation,
+        # which is composable with other scopes; it resembles the association object
+        # constructed by a [has_many](rdoc-ref:Associations::ClassMethods#has_many)
+        # declaration. For instance, you can invoke `Shirt.red.first`, `Shirt.red.count`,
+        # `Shirt.red.where(size: 'small')`. Also, just as with the
+        # association objects, named \scopes act like an Array, implementing
+        # Enumerable; `Shirt.red.each(&block)`, `Shirt.red.first`,
+        # and `Shirt.red.inject(memo, &block)` all behave as if
+        # `Shirt.red` really was an array.
+        #
+        # These named \scopes are composable. For instance,
+        # `Shirt.red.dry_clean_only` will produce all shirts that are
+        # both red and dry clean only. Nested finds and calculations also work
+        # with these compositions: `Shirt.red.dry_clean_only.count`
+        # returns the number of garments for which these criteria obtain.
+        # Similarly with `Shirt.red.dry_clean_only.average(:thread_count)`.
+        #
+        # All scopes are available as class methods on the ActiveRecord::Base
+        # descendant upon which the \scopes were defined. But they are also
+        # available to [has_many](rdoc-ref:Associations::ClassMethods#has_many)
+        # associations. If,
+        #
+        # ```
+        # class Person < ActiveRecord::Base
+        #   has_many :shirts
+        # end
+        # ```
+        #
+        # then `elton.shirts.red.dry_clean_only` will return all of
+        # Elton's red, dry clean only shirts.
+        #
+        # \Named scopes can also have extensions, just as with
+        # [has_many](rdoc-ref:Associations::ClassMethods#has_many) declarations:
+        #
+        # ```
+        # class Shirt < ActiveRecord::Base
+        #   scope :red, -> { where(color: 'red') } do
+        #     def dom_id
+        #       'red_shirts'
+        #     end
+        #   end
+        # end
+        # ```
+        #
+        # Scopes can also be used while creating/building a record.
+        #
+        # ```
+        # class Article < ActiveRecord::Base
+        #   scope :published, -> { where(published: true) }
+        # end
+        #
+        # Article.published.new.published    # => true
+        # Article.published.create.published # => true
+        # ```
+        #
+        # \Class methods on your model are automatically available
+        # on scopes. Assuming the following setup:
+        #
+        # ```
+        # class Article < ActiveRecord::Base
+        #   scope :published, -> { where(published: true) }
+        #   scope :featured, -> { where(featured: true) }
+        #
+        #   def self.latest_article
+        #     order('published_at desc').first
+        #   end
+        #
+        #   def self.titles
+        #     pluck(:title)
+        #   end
+        # end
+        # ```
+        #
+        # We are able to call the methods like this:
+        #
+        # ```
+        # Article.published.featured.latest_article
+        # Article.featured.titles
+        # ```
+        def scope(name, body, &block)
+          unless body.respond_to?(:call)
+            raise ArgumentError, "The scope body needs to be callable."
+          end
+
+          if dangerous_class_method?(name)
+            raise ArgumentError, "You tried to define a scope named \"#{name}\" " \
+              "on the model \"#{self.name}\", but Active Record already defined " \
+              "a class method with the same name."
+          end
+
+          if method_defined_within?(name, Relation)
+            raise ArgumentError, "You tried to define a scope named \"#{name}\" " \
+              "on the model \"#{self.name}\", but ActiveRecord::Relation already defined " \
+              "an instance method with the same name."
+          end
+
+          extension = Module.new(&block).freeze if block
+          scope_method =
+            if body.respond_to?(:to_proc)
+              scope_body = ActiveSupport::Ractors.try_shareable_proc(&body)
+              if scope_body.lambda? && scope_body.parameters.empty?
+                # A lambda without parameters raises ArgumentError for any
+                # argument, so the method can take none and skip allocating
+                # an empty rest Array and kwrest Hash per call.
+                proc do
+                  scope = all._exec_scope(&scope_body)
+                  scope = scope.extending(extension) if extension
+                  scope
+                end
+              else
+                proc do |*args, **kwargs|
+                  scope = all._exec_scope(*args, **kwargs, &scope_body)
+                  scope = scope.extending(extension) if extension
+                  scope
+                end
+              end
+            else
+              callable = body
+              proc do |*args, **kwargs|
+                scope = callable.call(*args, **kwargs) || all
+                scope = scope.extending(extension) if extension
+                scope
+              end
+            end
+          scope_method = ActiveSupport::Ractors.try_shareable_proc(&scope_method)
+
+          singleton_class.define_method(name, &scope_method)
+
+          generate_relation_method(name)
+        end
+
+        private
+          def singleton_method_added(name)
+            super
+            # Most Kernel extends are both singleton and instance methods so
+            # respond_to is a fast check, but we don't want to define methods
+            # only on the module (ex. Module#name)
+            generate_relation_method(name) if Kernel.respond_to?(name) && (Kernel.method_defined?(name) || Kernel.private_method_defined?(name)) && !ActiveRecord::Relation.method_defined?(name)
+          end
+      end
+    end
+  end
+end

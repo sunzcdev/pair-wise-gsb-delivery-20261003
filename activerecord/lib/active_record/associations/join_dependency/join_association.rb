@@ -1,0 +1,118 @@
+# frozen_string_literal: true
+
+require "active_record/associations/join_dependency/join_part"
+require "active_support/core_ext/array/extract"
+
+module ActiveRecord
+  module Associations
+    class JoinDependency # :nodoc:
+      class JoinAssociation < JoinPart # :nodoc:
+        attr_reader :reflection, :tables
+        attr_accessor :table
+
+        def initialize(reflection, children)
+          super(reflection.klass, children)
+
+          @reflection = reflection
+        end
+
+        def match?(other)
+          return true if self == other
+          super && reflection == other.reflection
+        end
+
+        def join_constraints(foreign_table, foreign_klass, join_type, alias_tracker)
+          joins = []
+          chain = []
+
+          reflection_chain = reflection.chain
+          reflection_chain.each_with_index do |reflection, index|
+            table, terminated = yield reflection, reflection_chain.drop(index)
+            @table ||= table
+
+            if terminated
+              foreign_table, foreign_klass = table, reflection.klass
+              break
+            end
+
+            chain << [reflection, table]
+          end
+
+          # The chain starts with the target table, but we want to end with it here (makes
+          # more sense in this context), so we reverse
+          chain.reverse_each do |reflection, table|
+            klass = reflection.klass
+
+            scope = reflection.join_scope(table, foreign_table, foreign_klass)
+
+            unless scope.references_values.empty?
+              associations = scope.eager_load_values | scope.includes_values
+
+              unless associations.empty?
+                scope.joins! scope.construct_join_dependency(associations, Arel::Nodes::OuterJoin)
+              end
+            end
+
+            # Build the scope with a copy of the aliases, and keep the copy only
+            # if its joins are used below. Otherwise the tables of the unused
+            # joins would make later joins of the same tables use an alias.
+            aliases = alias_tracker.aliases
+            unless scope.joins_values.empty? && scope.left_outer_joins_values.empty?
+              aliases = aliases.dup
+            end
+            arel = scope.arel(aliases)
+            nodes = arel.constraints.first
+
+            if nodes.is_a?(Arel::Nodes::And)
+              others = nodes.children.extract! do |node|
+                !Arel.fetch_attribute(node) { |attr| attr.relation.name == table.name }
+              end
+            end
+
+            joins << join_type.new(table, Arel::Nodes::On.new(nodes))
+
+            if others && !others.empty?
+              joins.concat arel.join_sources
+              append_constraints(joins.last, others)
+              alias_tracker.aliases.replace(aliases) unless aliases.equal?(alias_tracker.aliases)
+            end
+
+            # The current table in this iteration becomes the foreign table in the next
+            foreign_table, foreign_klass = table, klass
+          end
+
+          joins
+        end
+
+        # Columns on the associated table used to detect a match in an outer join.
+        def destination_key(parent_klass)
+          first, adjacent = reflection.chain
+          first.association_route_for_join(adjacent&.klass || parent_klass, destination_class: base_klass).destination_key
+        end
+
+        def readonly?
+          return @readonly if defined?(@readonly)
+
+          @readonly = reflection.scope && reflection.scope_for(base_klass.unscoped).readonly_value
+        end
+
+        def strict_loading?
+          return @strict_loading if defined?(@strict_loading)
+
+          @strict_loading = reflection.scope && reflection.scope_for(base_klass.unscoped).strict_loading_value
+        end
+
+        private
+          def append_constraints(join, constraints)
+            if join.is_a?(Arel::Nodes::StringJoin)
+              join_string = Arel::Nodes::And.new(constraints.unshift join.left)
+              join.left = join_string
+            else
+              right = join.right
+              right.expr = Arel::Nodes::And.new(constraints.unshift right.expr)
+            end
+          end
+      end
+    end
+  end
+end

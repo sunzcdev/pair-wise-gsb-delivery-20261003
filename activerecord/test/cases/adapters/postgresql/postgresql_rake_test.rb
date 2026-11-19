@@ -1,0 +1,767 @@
+# frozen_string_literal: true
+
+require "cases/helper"
+require "active_record/tasks/database_tasks"
+
+module ActiveRecord
+  class PostgreSQLDBCreateTest < ActiveRecord::TestCase
+    def setup
+      @connection    = Class.new { def create_database(*); end }.new
+      @configuration = {
+        "adapter"  => "postgresql",
+        "database" => "my-app-db"
+      }
+      $stdout, @original_stdout = StringIO.new, $stdout
+      $stderr, @original_stderr = StringIO.new, $stderr
+    end
+
+    def teardown
+      $stdout, $stderr = @original_stdout, @original_stderr
+    end
+
+    def test_establishes_connection_to_postgresql_database
+      db_config = ActiveRecord::DatabaseConfigurations::HashConfig.new("default_env", "primary", @configuration)
+
+      mock = Minitest::Mock.new
+      mock.expect(:call, nil, [{ adapter: "postgresql", database: "postgres", schema_search_path: "public" }])
+      mock.expect(:call, nil, [db_config])
+
+      ActiveRecord::Base.stub(:lease_connection, @connection) do
+        ActiveRecord::Base.stub(:establish_connection, mock) do
+          ActiveRecord::Tasks::DatabaseTasks.create(db_config)
+        end
+      end
+
+      assert_mock(mock)
+    end
+
+    def test_establishes_connection_to_maintenance_database
+      db_config = ActiveRecord::DatabaseConfigurations::HashConfig.new("default_env", "primary", @configuration.merge("maintenance_database" => "defaultdb"))
+
+      mock = Minitest::Mock.new
+      mock.expect(:call, nil, [{ adapter: "postgresql", database: "defaultdb", schema_search_path: "public" }])
+      mock.expect(:call, nil, [db_config])
+
+      ActiveRecord::Base.stub(:lease_connection, @connection) do
+        ActiveRecord::Base.stub(:establish_connection, mock) do
+          ActiveRecord::Tasks::DatabaseTasks.create(db_config)
+        end
+      end
+
+      assert_mock(mock)
+    end
+
+    def test_create_raises_connection_not_established_when_maintenance_database_does_not_exist
+      connection = Class.new do
+        def create_database(*)
+          raise PG::ConnectionBad, 'FATAL:  database "defaultdb" does not exist'
+        rescue PG::ConnectionBad
+          raise ActiveRecord::NoDatabaseError
+        end
+      end.new
+
+      ActiveRecord::Base.stub(:lease_connection, connection) do
+        ActiveRecord::Base.stub(:establish_connection, nil) do
+          error = assert_raises(ActiveRecord::ConnectionNotEstablished) do
+            ActiveRecord::Tasks::DatabaseTasks.create @configuration.merge("maintenance_database" => "defaultdb")
+          end
+          assert_equal 'FATAL:  database "defaultdb" does not exist', error.message
+        end
+      end
+    end
+
+    def test_creates_database_with_default_encoding
+      with_stubbed_connection_establish_connection do
+        assert_called_with(
+          @connection,
+          :create_database,
+          ["my-app-db", @configuration.symbolize_keys.merge(encoding: "utf8")]
+        ) do
+          ActiveRecord::Tasks::DatabaseTasks.create @configuration
+        end
+      end
+    end
+
+    def test_creates_database_with_given_encoding
+      with_stubbed_connection_establish_connection do
+        assert_called_with(
+          @connection,
+          :create_database,
+          ["my-app-db", @configuration.symbolize_keys.merge(encoding: "latin")]
+        ) do
+          ActiveRecord::Tasks::DatabaseTasks.create @configuration.
+            merge("encoding" => "latin")
+        end
+      end
+    end
+
+    def test_creates_database_with_given_collation_and_ctype
+      with_stubbed_connection_establish_connection do
+        assert_called_with(
+          @connection,
+          :create_database,
+          [
+            "my-app-db",
+            @configuration.symbolize_keys.merge(
+              encoding: "utf8",
+              collation: "ja_JP.UTF8",
+              ctype: "ja_JP.UTF8"
+            )
+          ]
+        ) do
+          ActiveRecord::Tasks::DatabaseTasks.create @configuration.
+            merge("collation" => "ja_JP.UTF8", "ctype" => "ja_JP.UTF8")
+        end
+      end
+    end
+
+    def test_establishes_connection_to_new_database
+      db_config = ActiveRecord::DatabaseConfigurations::HashConfig.new("default_env", "primary", @configuration)
+
+      mock = Minitest::Mock.new
+      mock.expect(:call, nil, [{ adapter: "postgresql", database: "postgres", schema_search_path: "public" }])
+      mock.expect(:call, nil, [db_config])
+
+      ActiveRecord::Base.stub(:lease_connection, @connection) do
+        ActiveRecord::Base.stub(:establish_connection, mock) do
+          ActiveRecord::Tasks::DatabaseTasks.create(db_config)
+        end
+      end
+
+      assert_mock(mock)
+    end
+
+    def test_db_create_with_error_prints_message
+      ActiveRecord::Base.stub(:lease_connection, @connection) do
+        ActiveRecord::Base.stub(:establish_connection, -> * { raise Exception }) do
+          assert_raises(Exception) { ActiveRecord::Tasks::DatabaseTasks.create @configuration }
+          assert_match "Couldn't create '#{@configuration['database']}' database. Please check your configuration.", $stderr.string
+        end
+      end
+    end
+
+    def test_when_database_created_successfully_outputs_info_to_stdout
+      with_stubbed_connection_establish_connection do
+        ActiveRecord::Tasks::DatabaseTasks.create @configuration
+
+        assert_equal "Created database 'my-app-db'\n", $stdout.string
+      end
+    end
+
+    def test_create_when_database_exists_outputs_info_to_stderr
+      with_stubbed_connection_establish_connection do
+        ActiveRecord::Base.lease_connection.stub(
+          :create_database,
+          proc { raise ActiveRecord::DatabaseAlreadyExists }
+        ) do
+          ActiveRecord::Tasks::DatabaseTasks.create @configuration
+
+          assert_equal "Database 'my-app-db' already exists\n", $stderr.string
+        end
+      end
+    end
+
+    private
+      def with_stubbed_connection_establish_connection(&block)
+        ActiveRecord::Base.stub(:lease_connection, @connection) do
+          ActiveRecord::Base.stub(:establish_connection, nil, &block)
+        end
+      end
+  end
+
+  class PostgreSQLDBDropTest < ActiveRecord::TestCase
+    def setup
+      @connection    = Class.new { def drop_database(*); end }.new
+      @configuration = {
+        "adapter"  => "postgresql",
+        "database" => "my-app-db"
+      }
+      $stdout, @original_stdout = StringIO.new, $stdout
+      $stderr, @original_stderr = StringIO.new, $stderr
+    end
+
+    def teardown
+      $stdout, $stderr = @original_stdout, @original_stderr
+    end
+
+    def test_establishes_connection_to_postgresql_database
+      ActiveRecord::Base.stub(:lease_connection, @connection) do
+        assert_called_with(
+          ActiveRecord::Base,
+          :establish_connection,
+          [
+            adapter: "postgresql",
+            database: "postgres",
+            schema_search_path: "public"
+          ]
+        ) do
+          ActiveRecord::Tasks::DatabaseTasks.drop @configuration
+        end
+      end
+    end
+
+    def test_establishes_connection_to_maintenance_database
+      ActiveRecord::Base.stub(:lease_connection, @connection) do
+        assert_called_with(
+          ActiveRecord::Base,
+          :establish_connection,
+          [
+            adapter: "postgresql",
+            database: "defaultdb",
+            schema_search_path: "public"
+          ]
+        ) do
+          ActiveRecord::Tasks::DatabaseTasks.drop @configuration.merge("maintenance_database" => "defaultdb")
+        end
+      end
+    end
+
+    def test_drop_raises_connection_not_established_when_maintenance_database_does_not_exist
+      connection = Class.new do
+        def drop_database(*)
+          raise PG::ConnectionBad, 'FATAL:  database "defaultdb" does not exist'
+        rescue PG::ConnectionBad
+          raise ActiveRecord::NoDatabaseError
+        end
+      end.new
+
+      ActiveRecord::Base.stub(:lease_connection, connection) do
+        ActiveRecord::Base.stub(:establish_connection, nil) do
+          error = assert_raises(ActiveRecord::ConnectionNotEstablished) do
+            ActiveRecord::Tasks::DatabaseTasks.drop @configuration.merge("maintenance_database" => "defaultdb")
+          end
+          assert_equal 'FATAL:  database "defaultdb" does not exist', error.message
+        end
+      end
+    end
+
+    def test_drops_database
+      with_stubbed_connection_establish_connection do
+        assert_called_with(
+          @connection,
+          :drop_database,
+          ["my-app-db"]
+        ) do
+          ActiveRecord::Tasks::DatabaseTasks.drop @configuration
+        end
+      end
+    end
+
+    def test_when_database_dropped_successfully_outputs_info_to_stdout
+      with_stubbed_connection_establish_connection do
+        ActiveRecord::Tasks::DatabaseTasks.drop @configuration
+
+        assert_equal "Dropped database 'my-app-db'\n", $stdout.string
+      end
+    end
+
+    private
+      def with_stubbed_connection_establish_connection(&block)
+        ActiveRecord::Base.stub(:lease_connection, @connection) do
+          ActiveRecord::Base.stub(:establish_connection, nil, &block)
+        end
+      end
+  end
+
+  class PostgreSQLPurgeTest < ActiveRecord::TestCase
+    def setup
+      @connection = Class.new do
+        def create_database(*); end
+        def drop_database(*); end
+      end.new
+      @configuration = {
+        "adapter"  => "postgresql",
+        "database" => "my-app-db"
+      }
+    end
+
+    def test_clears_active_connections
+      with_stubbed_connection do
+        ActiveRecord::Base.connection_handler.stub(:establish_connection, nil) do
+          assert_called(ActiveRecord::Base.connection_handler, :clear_active_connections!) do
+            ActiveRecord::Tasks::DatabaseTasks.purge @configuration
+          end
+        end
+      end
+    end
+
+    def test_establishes_connection_to_postgresql_database
+      db_config = ActiveRecord::DatabaseConfigurations::HashConfig.new("default_env", "primary", @configuration)
+
+      mock = Minitest::Mock.new
+      mock.expect(:call, nil, [{ adapter: "postgresql", database: "postgres", schema_search_path: "public" }])
+      mock.expect(:call, nil, [db_config])
+
+      with_stubbed_connection do
+        ActiveRecord::Base.stub(:establish_connection, mock) do
+          ActiveRecord::Tasks::DatabaseTasks.purge(db_config)
+        end
+      end
+
+      assert_mock(mock)
+    end
+
+    def test_drops_database
+      with_stubbed_connection do
+        ActiveRecord::Base.stub(:establish_connection, nil) do
+          assert_called_with(@connection, :drop_database, ["my-app-db"]) do
+            ActiveRecord::Tasks::DatabaseTasks.purge @configuration
+          end
+        end
+      end
+    end
+
+    def test_creates_database
+      with_stubbed_connection do
+        ActiveRecord::Base.stub(:establish_connection, nil) do
+          assert_called_with(
+            @connection,
+            :create_database,
+            ["my-app-db", @configuration.symbolize_keys.merge(encoding: "utf8")]
+          ) do
+            ActiveRecord::Tasks::DatabaseTasks.purge @configuration
+          end
+        end
+      end
+    end
+
+    def test_establishes_connection
+      db_config = ActiveRecord::DatabaseConfigurations::HashConfig.new("default_env", "primary", @configuration)
+
+      mock = Minitest::Mock.new
+      mock.expect(:call, nil, [{ adapter: "postgresql", database: "postgres", schema_search_path: "public" }])
+      mock.expect(:call, nil, [db_config])
+
+      with_stubbed_connection do
+        ActiveRecord::Base.stub(:establish_connection, mock) do
+          ActiveRecord::Tasks::DatabaseTasks.purge(db_config)
+        end
+      end
+
+      assert_mock(mock)
+    end
+
+    private
+      def with_stubbed_connection(&block)
+        ActiveRecord::Base.stub(:lease_connection, @connection, &block)
+      end
+  end
+
+  class PostgreSQLDBCharsetTest < ActiveRecord::TestCase
+    def setup
+      @connection = Class.new do
+        def create_database(*); end
+        def encoding; end
+      end.new
+      @configuration = {
+        "adapter"  => "postgresql",
+        "database" => "my-app-db"
+      }
+    end
+
+    def test_db_retrieves_charset
+      ActiveRecord::Base.stub(:lease_connection, @connection) do
+        assert_called(@connection, :encoding) do
+          ActiveRecord::Tasks::DatabaseTasks.charset @configuration
+        end
+      end
+    end
+  end
+
+  class PostgreSQLDBCollationTest < ActiveRecord::TestCase
+    def setup
+      @connection    = Class.new { def collation; end }.new
+      @configuration = {
+        "adapter"  => "postgresql",
+        "database" => "my-app-db"
+      }
+    end
+
+    def test_db_retrieves_collation
+      ActiveRecord::Base.stub(:lease_connection, @connection) do
+        assert_called(@connection, :collation) do
+          ActiveRecord::Tasks::DatabaseTasks.collation @configuration
+        end
+      end
+    end
+  end
+
+  class PostgreSQLStructureDumpTest < ActiveRecord::TestCase
+    FakeDumpedConnection = Struct.new(:data_sources, :schema_search_path) do
+      def disconnect!
+        @disconnected = true
+      end
+
+      def disconnected?
+        @disconnected
+      end
+    end
+
+    def setup
+      @configuration = {
+        "adapter"  => "postgresql",
+        "database" => "my-app-db"
+      }
+      @tmpdir = Dir.mktmpdir
+      @filename = File.join(@tmpdir, "awesome-file.sql")
+      FileUtils.touch(@filename)
+    end
+
+    def teardown
+      FileUtils.rm_rf(@tmpdir)
+    end
+
+    # This test actually runs a dump so we can ensure all the arguments are parsed correctly.
+    # All other tests in this class just mock the call (using assert_called_with) to make the tests quicker.
+    def test_structure_dump
+      assert_equal "", File.read(@filename)
+
+      config = @configuration.dup
+      config["database"] = ARTest.config["connections"]["postgresql"]["arunit"]["database"]
+
+      ActiveRecord::Tasks::DatabaseTasks.structure_dump(config, @filename)
+
+      assert File.read(@filename).include?("PostgreSQL database dump complete")
+    end
+
+    def test_structure_dump_header_comments_removed
+      stub_dumped_database_connection do
+        Kernel.stub(:system, true) do
+          raw_dump_sql = <<~SQL
+            -- header comment
+
+            -- more header comment
+            statement
+            -- lower comment
+          SQL
+          expected_dump_sql = <<~SQL
+            statement
+            -- lower comment
+          SQL
+          File.write(@filename, raw_dump_sql)
+          ActiveRecord::Tasks::DatabaseTasks.structure_dump(@configuration, @filename)
+          assert_equal expected_dump_sql, File.readlines(@filename).first(2).join
+        end
+      end
+    end
+
+    def test_structure_dump_header_comments_with_restrict_commands_removed
+      stub_dumped_database_connection do
+        Kernel.stub(:system, true) do
+          raw_dump_sql = <<~SQL
+            \\restrict pbgv1pF8SxQK6cuT7hwDi21uDYr8wpxKJ3wlLa9Zk5EIO1xBiu84SJQU8fL22PT
+
+            -- header comment
+
+            -- more header comment
+            statement
+            -- lower comment
+            \\unrestrict pbgv1pF8SxQK6cuT7hwDi21uDYr8wpxKJ3wlLa9Zk5EIO1xBiu84SJQU8fL22PT
+
+            other_statement
+          SQL
+          expected_dump_sql = <<~SQL
+            statement
+            -- lower comment
+            other_statement
+          SQL
+          File.write(@filename, raw_dump_sql)
+          ActiveRecord::Tasks::DatabaseTasks.structure_dump(@configuration, @filename)
+          assert_equal expected_dump_sql, File.readlines(@filename).first(3).join
+        end
+      end
+    end
+
+    def test_structure_dump_with_env
+      stub_dumped_database_connection do
+        expected_env = { "PGHOST" => "my.server.tld", "PGPORT" => "2345", "PGUSER" => "jane", "PGPASSWORD" => "s3cr3t" }
+        expected_command = [expected_env, "pg_dump", "--schema-only", "--no-privileges", "--no-owner", "--file", @filename, "my-app-db"]
+
+        assert_called_with(Kernel, :system, expected_command, returns: true) do
+          ActiveRecord::Tasks::DatabaseTasks.structure_dump(
+            @configuration.merge(host: "my.server.tld", port: 2345, username: "jane", password: "s3cr3t"),
+            @filename
+          )
+        end
+      end
+    end
+
+    def test_structure_dump_with_ssl_env
+      stub_dumped_database_connection do
+        expected_env = { "PGSSLMODE" => "verify-full", "PGSSLCERT" => "client.crt", "PGSSLKEY" => "client.key", "PGSSLROOTCERT" => "root.crt" }
+        expected_command = [expected_env, "pg_dump", "--schema-only", "--no-privileges", "--no-owner", "--file", @filename, "my-app-db"]
+
+        assert_called_with(Kernel, :system, expected_command, returns: true) do
+          ActiveRecord::Tasks::DatabaseTasks.structure_dump(
+            @configuration.merge(sslmode: "verify-full", sslcert: "client.crt", sslkey: "client.key", sslrootcert: "root.crt"),
+            @filename
+          )
+        end
+      end
+    end
+
+    def test_structure_dump_with_extra_flags
+      stub_dumped_database_connection do
+        expected_command = [{}, "pg_dump", "--schema-only", "--no-privileges", "--no-owner", "--file", @filename, "--noop", "my-app-db"]
+
+        assert_called_with(Kernel, :system, expected_command, returns: true) do
+          with_structure_dump_flags(["--noop"]) do
+            ActiveRecord::Tasks::DatabaseTasks.structure_dump(@configuration, @filename)
+          end
+        end
+      end
+    end
+
+    def test_structure_dump_with_hash_extra_flags_for_a_different_driver
+      stub_dumped_database_connection do
+        expected_command = [{}, "pg_dump", "--schema-only", "--no-privileges", "--no-owner", "--file", @filename, "my-app-db"]
+
+        assert_called_with(Kernel, :system, expected_command, returns: true) do
+          with_structure_dump_flags({ mysql2: ["--noop"] }) do
+            ActiveRecord::Tasks::DatabaseTasks.structure_dump(@configuration, @filename)
+          end
+        end
+      end
+    end
+
+    def test_structure_dump_with_hash_extra_flags_for_the_correct_driver
+      stub_dumped_database_connection do
+        expected_command = [{}, "pg_dump", "--schema-only", "--no-privileges", "--no-owner", "--file", @filename, "--noop", "my-app-db"]
+
+        assert_called_with(Kernel, :system, expected_command, returns: true) do
+          with_structure_dump_flags({ postgresql: ["--noop"] }) do
+            ActiveRecord::Tasks::DatabaseTasks.structure_dump(@configuration, @filename)
+          end
+        end
+      end
+    end
+
+    def test_structure_dump_with_ignore_tables
+      stub_dumped_database_connection(data_sources: ["foo", "bar", "prefix_foo", "ignored_foo"]) do
+        ActiveRecord.stub(:schema_ignored_tables, [/^prefix_/, "ignored_foo"]) do
+          assert_called_with(
+            Kernel,
+            :system,
+            [{}, "pg_dump", "--schema-only", "--no-privileges", "--no-owner", "--file", @filename, "-T", "prefix_foo", "-T", "ignored_foo", "my-app-db"],
+            returns: true
+          ) do
+            ActiveRecord::Tasks::DatabaseTasks.structure_dump(@configuration, @filename)
+          end
+        end
+      end
+    end
+
+    def test_structure_dump_with_schema_search_path
+      stub_dumped_database_connection do
+        @configuration["schema_search_path"] = "foo,bar"
+
+        assert_called_with(
+          Kernel,
+          :system,
+          [{}, "pg_dump", "--schema-only", "--no-privileges", "--no-owner", "--file", @filename, "--schema=foo", "--schema=bar", "my-app-db"],
+          returns: true
+        ) do
+          ActiveRecord::Tasks::DatabaseTasks.structure_dump(@configuration, @filename)
+        end
+      end
+    end
+
+    def test_structure_dump_with_schema_search_path_and_dump_schemas_all
+      stub_dumped_database_connection do
+        @configuration["schema_search_path"] = "foo,bar"
+
+        assert_called_with(
+          Kernel,
+          :system,
+          [{}, "pg_dump", "--schema-only", "--no-privileges", "--no-owner", "--file", @filename,  "my-app-db"],
+          returns: true
+        ) do
+          with_dump_schemas(:all) do
+            ActiveRecord::Tasks::DatabaseTasks.structure_dump(@configuration, @filename)
+          end
+        end
+      end
+    end
+
+    def test_structure_dump_with_dump_schemas_string
+      stub_dumped_database_connection do
+        assert_called_with(
+          Kernel,
+          :system,
+          [{}, "pg_dump", "--schema-only", "--no-privileges", "--no-owner", "--file", @filename, "--schema=foo", "--schema=bar", "my-app-db"],
+          returns: true
+        ) do
+          with_dump_schemas("foo,bar") do
+            ActiveRecord::Tasks::DatabaseTasks.structure_dump(@configuration, @filename)
+          end
+        end
+      end
+    end
+
+    def test_structure_dump_execution_fails
+      stub_dumped_database_connection do
+        filename = "awesome-file.sql"
+        assert_called_with(
+          Kernel,
+          :system,
+          [{}, "pg_dump", "--schema-only", "--no-privileges", "--no-owner", "--file", filename, "my-app-db"],
+          returns: nil
+        ) do
+          e = assert_raise(RuntimeError) do
+            ActiveRecord::Tasks::DatabaseTasks.structure_dump(@configuration, filename)
+          end
+          assert_match("failed to execute:", e.message)
+        end
+      end
+    end
+
+    def test_structure_dump_writes_the_search_path_of_the_database_being_dumped
+      dumped_config = nil
+      connection = FakeDumpedConnection.new([], "dumped_schema")
+
+      # The search path of whichever database ActiveRecord::Base happens to be
+      # connected to must not be the one written to the dump.
+      ActiveRecord::Base.lease_connection.stub(:schema_search_path, "ambient_schema") do
+        ActiveRecord::ConnectionAdapters::PostgreSQLAdapter.stub(:new, ->(config) { dumped_config = config; connection }) do
+          Kernel.stub(:system, true) do
+            File.write(@filename, "statement\n")
+            ActiveRecord::Tasks::DatabaseTasks.structure_dump(@configuration, @filename)
+          end
+        end
+      end
+
+      assert_includes File.read(@filename), "SET search_path TO dumped_schema;"
+      assert_not_includes File.read(@filename), "ambient_schema"
+      assert_equal "my-app-db", dumped_config[:database]
+      assert_predicate connection, :disconnected?
+    end
+
+    private
+      def stub_dumped_database_connection(data_sources: [], schema_search_path: "public", &block)
+        connection = FakeDumpedConnection.new(data_sources, schema_search_path)
+        ActiveRecord::ConnectionAdapters::PostgreSQLAdapter.stub(:new, connection, &block)
+        assert_predicate connection, :disconnected?
+      end
+
+      def with_dump_schemas(value, &block)
+        old_dump_schemas = ActiveRecord.dump_schemas
+        ActiveRecord.dump_schemas = value
+        yield
+      ensure
+        ActiveRecord.dump_schemas = old_dump_schemas
+      end
+
+      def with_structure_dump_flags(flags)
+        old = ActiveRecord::Tasks::DatabaseTasks.structure_dump_flags
+        ActiveRecord::Tasks::DatabaseTasks.structure_dump_flags = flags
+        yield
+      ensure
+        ActiveRecord::Tasks::DatabaseTasks.structure_dump_flags = old
+      end
+  end
+
+  class PostgreSQLStructureLoadTest < ActiveRecord::TestCase
+    def setup
+      @configuration = {
+        "adapter"  => "postgresql",
+        "database" => "my-app-db"
+      }
+    end
+
+    def test_structure_load
+      filename = "awesome-file.sql"
+      assert_called_with(
+        Kernel,
+        :system,
+        [{}, "psql", "--set", "ON_ERROR_STOP=1", "--quiet", "--no-psqlrc", "--output", File::NULL, "--file", filename, @configuration["database"]],
+        returns: true
+      ) do
+        ActiveRecord::Tasks::DatabaseTasks.structure_load(@configuration, filename)
+      end
+    end
+
+    def test_structure_load_with_extra_flags
+      filename = "awesome-file.sql"
+      expected_command = [{}, "psql", "--set", "ON_ERROR_STOP=1", "--quiet", "--no-psqlrc", "--output", File::NULL, "--noop", "--file", filename, @configuration["database"]]
+
+      assert_called_with(Kernel, :system, expected_command, returns: true) do
+        with_structure_load_flags(["--noop"]) do
+          ActiveRecord::Tasks::DatabaseTasks.structure_load(@configuration, filename)
+        end
+      end
+    end
+
+    def test_structure_load_with_env
+      filename = "awesome-file.sql"
+      expected_env = { "PGHOST" => "my.server.tld", "PGPORT" => "2345", "PGUSER" => "jane", "PGPASSWORD" => "s3cr3t" }
+      expected_command = [expected_env, "psql", "--set", "ON_ERROR_STOP=1", "--quiet", "--no-psqlrc", "--output", File::NULL, "--noop", "--file", filename, @configuration["database"]]
+
+      assert_called_with(Kernel, :system, expected_command, returns: true) do
+        with_structure_load_flags(["--noop"]) do
+          ActiveRecord::Tasks::DatabaseTasks.structure_load(
+            @configuration.merge(host: "my.server.tld", port: 2345, username: "jane", password: "s3cr3t"),
+            filename
+          )
+        end
+      end
+    end
+
+    def test_structure_load_with_ssl_env
+      filename = "awesome-file.sql"
+      expected_env = { "PGSSLMODE" => "verify-full", "PGSSLCERT" => "client.crt", "PGSSLKEY" => "client.key", "PGSSLROOTCERT" => "root.crt" }
+      expected_command = [expected_env, "psql", "--set", "ON_ERROR_STOP=1", "--quiet", "--no-psqlrc", "--output", File::NULL, "--noop", "--file", filename, @configuration["database"]]
+
+      assert_called_with(Kernel, :system, expected_command, returns: true) do
+        with_structure_load_flags(["--noop"]) do
+          ActiveRecord::Tasks::DatabaseTasks.structure_load(
+            @configuration.merge(sslmode: "verify-full", sslcert: "client.crt", sslkey: "client.key", sslrootcert: "root.crt"),
+            filename
+          )
+        end
+      end
+    end
+
+    def test_structure_load_with_hash_extra_flags_for_a_different_driver
+      filename = "awesome-file.sql"
+      expected_command = [{}, "psql", "--set", "ON_ERROR_STOP=1", "--quiet", "--no-psqlrc", "--output", File::NULL, "--file", filename, @configuration["database"]]
+
+      assert_called_with(Kernel, :system, expected_command, returns: true) do
+        with_structure_load_flags({ mysql2: ["--noop"] }) do
+          ActiveRecord::Tasks::DatabaseTasks.structure_load(@configuration, filename)
+        end
+      end
+    end
+
+    def test_structure_load_with_hash_extra_flags_for_the_correct_driver
+      filename = "awesome-file.sql"
+      expected_command = [{}, "psql", "--set", "ON_ERROR_STOP=1", "--quiet", "--no-psqlrc", "--output", File::NULL, "--noop", "--file", filename, @configuration["database"]]
+
+      assert_called_with(Kernel, :system, expected_command, returns: true) do
+        with_structure_load_flags({ postgresql: ["--noop"] }) do
+          ActiveRecord::Tasks::DatabaseTasks.structure_load(@configuration, filename)
+        end
+      end
+    end
+
+    def test_structure_load_accepts_path_with_spaces
+      filename = "awesome file.sql"
+      assert_called_with(
+        Kernel,
+        :system,
+        [{}, "psql", "--set", "ON_ERROR_STOP=1", "--quiet", "--no-psqlrc", "--output", File::NULL, "--file", filename, @configuration["database"]],
+        returns: true
+      ) do
+        ActiveRecord::Tasks::DatabaseTasks.structure_load(@configuration, filename)
+      end
+    end
+
+    private
+      def with_structure_load_flags(flags)
+        old = ActiveRecord::Tasks::DatabaseTasks.structure_load_flags
+        ActiveRecord::Tasks::DatabaseTasks.structure_load_flags = flags
+        yield
+      ensure
+        ActiveRecord::Tasks::DatabaseTasks.structure_load_flags = old
+      end
+  end
+end

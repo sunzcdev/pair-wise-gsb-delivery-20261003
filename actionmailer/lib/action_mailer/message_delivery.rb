@@ -1,0 +1,175 @@
+# frozen_string_literal: true
+
+require "delegate"
+
+module ActionMailer
+  # Action Mailer \MessageDelivery
+  # ==============================
+  #
+  # The `ActionMailer::MessageDelivery` class is used by
+  # ActionMailer::Base when creating a new mailer.
+  # `MessageDelivery` is a wrapper (`Delegator` subclass) around a lazy
+  # created `Mail::Message`. You can get direct access to the
+  # `Mail::Message`, deliver the email or schedule the email to be sent
+  # through Active Job.
+  #
+  # ```
+  # Notifier.welcome(User.first)               # an ActionMailer::MessageDelivery object
+  # Notifier.welcome(User.first).deliver_now   # sends the email
+  # Notifier.welcome(User.first).deliver_later # enqueue email delivery as a job through Active Job
+  # Notifier.welcome(User.first).message       # a Mail::Message object
+  # ```
+  class MessageDelivery < Delegator
+    attr_reader :mailer_class, :action, :params, :args # :nodoc:
+
+    def initialize(mailer_class, action, *args, **kwargs) # :nodoc:
+      args << Hash.ruby2_keywords_hash(kwargs) unless kwargs.empty?
+      @mailer_class, @action, @args = mailer_class, action, args
+
+      # The mail is only processed if we try to call any methods on it.
+      # Typical usage will leave it unloaded and call deliver_later.
+      @processed_mailer = nil
+      @mail_message = nil
+    end
+
+    # Method calls are delegated to the Mail::Message that's ready to deliver.
+    def __getobj__(&) # :nodoc:
+      @mail_message ||= processed_mailer.message
+    end
+
+    # Unused except for delegator internals (dup, marshalling).
+    def __setobj__(mail_message) # :nodoc:
+      @mail_message = mail_message
+    end
+
+    # Returns the resulting Mail::Message
+    def message
+      __getobj__
+    end
+
+    ALREADY_PROCESSED_MESSAGE = "You've accessed the message before asking to " \
+      "deliver it later, so you may have made local changes that would " \
+      "be silently lost if we enqueued a job to deliver it. Why? Only " \
+      "the mailer method *arguments* are passed with the delivery job! " \
+      "Do not access the message in any way if you mean to deliver it " \
+      "later. Workarounds: 1. don't touch the message before calling " \
+      "#deliver_later, 2. only touch the message *within your mailer " \
+      "method*, or 3. use a custom Active Job instead of #deliver_later." # :nodoc:
+
+    # Was the delegate loaded, causing the mailer action to be processed?
+    def processed?
+      @processed_mailer || @mail_message
+    end
+
+    # Enqueues the email to be delivered through Active Job. When the
+    # job runs it will send the email using `deliver_now!`. That means
+    # that the message will be sent bypassing checking `perform_deliveries`
+    # and `raise_delivery_errors`, so use with caution.
+    #
+    # ```
+    # Notifier.welcome(User.first).deliver_later!
+    # Notifier.welcome(User.first).deliver_later!(wait: 1.hour)
+    # Notifier.welcome(User.first).deliver_later!(wait_until: 10.hours.from_now)
+    # Notifier.welcome(User.first).deliver_later!(priority: 10)
+    # ```
+    #
+    # Options:
+    #
+    # * `:wait` - Enqueue the email to be delivered with a delay
+    # * `:wait_until` - Enqueue the email to be delivered at (after) a specific date / time
+    # * `:queue` - Enqueue the email on the specified queue
+    # * `:priority` - Enqueues the email with the specified priority
+    #
+    # By default, the email will be enqueued using ActionMailer::MailDeliveryJob on
+    # the default queue. Mailer classes can customize the queue name used for the default
+    # job by assigning a `deliver_later_queue_name` class variable, or provide a custom job
+    # by assigning a `delivery_job`. When a custom job is used, it controls the queue name.
+    #
+    # ```
+    # class AccountRegistrationMailer < ApplicationMailer
+    #   self.delivery_job = RegistrationDeliveryJob
+    # end
+    # ```
+    def deliver_later!(options = {})
+      enqueue_delivery :deliver_now!, options
+    end
+
+    # Enqueues the email to be delivered through Active Job. When the
+    # job runs it will send the email using `deliver_now`.
+    #
+    # ```
+    # Notifier.welcome(User.first).deliver_later
+    # Notifier.welcome(User.first).deliver_later(wait: 1.hour)
+    # Notifier.welcome(User.first).deliver_later(wait_until: 10.hours.from_now)
+    # Notifier.welcome(User.first).deliver_later(priority: 10)
+    # ```
+    #
+    # Options:
+    #
+    # * `:wait` - Enqueue the email to be delivered with a delay.
+    # * `:wait_until` - Enqueue the email to be delivered at (after) a specific date / time.
+    # * `:queue` - Enqueue the email on the specified queue.
+    # * `:priority` - Enqueues the email with the specified priority
+    #
+    # By default, the email will be enqueued using ActionMailer::MailDeliveryJob on
+    # the default queue. Mailer classes can customize the queue name used for the default
+    # job by assigning a `deliver_later_queue_name` class variable, or provide a custom job
+    # by assigning a `delivery_job`. When a custom job is used, it controls the queue name.
+    #
+    # ```
+    # class AccountRegistrationMailer < ApplicationMailer
+    #   self.delivery_job = RegistrationDeliveryJob
+    # end
+    # ```
+    def deliver_later(options = {})
+      enqueue_delivery :deliver_now, options
+    end
+
+    # Delivers an email without checking `perform_deliveries` and `raise_delivery_errors`,
+    # so use with caution.
+    #
+    # ```
+    # Notifier.welcome(User.first).deliver_now!
+    # ```
+    #
+    def deliver_now!
+      processed_mailer.handle_exceptions do
+        processed_mailer.run_callbacks(:deliver) do
+          message.deliver!
+        end
+      end
+    end
+
+    # Delivers an email:
+    #
+    # ```
+    # Notifier.welcome(User.first).deliver_now
+    # ```
+    #
+    def deliver_now
+      processed_mailer.handle_exceptions do
+        processed_mailer.run_callbacks(:deliver) do
+          message.deliver
+        end
+      end
+    end
+
+    private
+      # Returns the processed Mailer instance. We keep this instance
+      # on hand so we can run callbacks and delegate exception handling to it.
+      def processed_mailer
+        @processed_mailer ||= @mailer_class.new.tap do |mailer|
+          mailer.process @action, *@args
+        end
+      end
+
+      def enqueue_delivery(delivery_method, options = {})
+        if processed?
+          ::Kernel.raise ALREADY_PROCESSED_MESSAGE
+        else
+          @mailer_class.delivery_job.set(options).perform_later(
+            @mailer_class.name, @action.to_s, delivery_method.to_s, args: @args)
+        end
+      end
+  end
+end
