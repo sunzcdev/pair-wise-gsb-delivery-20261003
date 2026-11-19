@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import threading
@@ -78,6 +79,23 @@ async def dummy_async_job(delay: float = 0, fail: bool = False) -> str:
         raise RuntimeError("failing as requested")
     else:
         return "returnvalue"
+
+
+async def record_start_time(
+    starts: list[tuple[float, datetime]], clock: type[datetime]
+) -> None:
+    """Record the monotonic and wall clock times at which the job started."""
+    starts.append((time.monotonic(), clock.now(UTC)))
+
+
+class FakeWallClock(datetime):
+    """A datetime stand-in whose "now" can be shifted to simulate clock jumps."""
+
+    offset: timedelta = timedelta(0)
+
+    @classmethod
+    def now(cls, tz=None) -> datetime:
+        return datetime.now(tz) + cls.offset
 
 
 def dummy_sync_job(delay: float = 0, fail: bool = False) -> str:
@@ -1263,6 +1281,231 @@ class TestAsyncScheduler:
             # Check that the job outcome was set to "cancelled"
             result = await scheduler.get_job_result(job_id)
             assert result.outcome is JobOutcome.cancelled
+
+
+class TestClockCalibration:
+    """
+    Acceptance tests for the clock calibration of the scheduler's wait loop.
+
+    The wall clock and the monotonic clock are jumped independently, and the
+    actual next start time of the scheduled job along with the number of
+    intermediate wake-ups are recorded.
+    """
+
+    @pytest.fixture
+    def wall_clock(self, monkeypatch: MonkeyPatch) -> type[FakeWallClock]:
+        """Replace the wall clock of the scheduler and the data store."""
+        FakeWallClock.offset = timedelta(0)
+        monkeypatch.setattr("apscheduler._schedulers.async_.datetime", FakeWallClock)
+        monkeypatch.setattr("apscheduler.datastores.memory.datetime", FakeWallClock)
+        return FakeWallClock
+
+    @pytest.fixture
+    def wake_counter(self, monkeypatch: MonkeyPatch) -> Callable[[], int]:
+        """Count the monotonic wait chunks made by the schedule processing loop."""
+        count = 0
+        real_move_on_after = anyio.move_on_after
+
+        def counting_move_on_after(delay, shield=False):
+            nonlocal count
+            if not shield:
+                count += 1
+
+            return real_move_on_after(delay, shield)
+
+        monkeypatch.setattr(
+            "apscheduler._schedulers.async_.move_on_after", counting_move_on_after
+        )
+        return lambda: count
+
+    async def test_wall_clock_forward_jump(
+        self, wall_clock: type[FakeWallClock], wake_counter: Callable[[], int]
+    ) -> None:
+        """
+        Jump the wall clock forward past the fire time: the expired schedule must
+        be discovered within a bounded time (a few calibration intervals), not
+        after the originally computed wait.
+        """
+        calibration = 0.2
+        jump = timedelta(hours=1)
+        starts: list[tuple[float, datetime]] = []
+
+        async with AsyncScheduler(
+            data_store=MemoryDataStore(),
+            clock_calibration_interval=calibration,
+        ) as scheduler:
+            await scheduler.start_in_background()
+            run_time = wall_clock.now(UTC) + jump
+            await scheduler.add_schedule(
+                record_start_time, DateTrigger(run_time), args=[starts, wall_clock]
+            )
+            wakes_0 = wake_counter()
+            await sleep(1)  # let the scheduler settle into its calibrated wait
+            assert not starts
+
+            # Simulate the system clock jumping forward past the fire time
+            wall_clock.offset += jump
+            jumped_at = time.monotonic()
+            with fail_after(10):
+                while not starts:
+                    await sleep(0.01)
+
+        start_mono, start_wall = starts[0]
+        detection_delay = start_mono - jumped_at
+        intermediate_wakes = wake_counter() - wakes_0
+        print(
+            f"\nforward wall clock jump: next start {detection_delay:.3f}s after "
+            f"the jump, {intermediate_wakes} intermediate wake(s)"
+        )
+        assert start_wall >= run_time
+        assert detection_delay < 5 * calibration
+        assert intermediate_wakes >= 2
+
+    async def test_wall_clock_backward_jump(
+        self, wall_clock: type[FakeWallClock], wake_counter: Callable[[], int]
+    ) -> None:
+        """
+        Jump the wall clock backward: the remaining wait must be extended
+        accordingly so the job does not start before its wall clock fire time.
+        """
+        calibration = 0.2
+        fire_delay = 1.0
+        jump_back = timedelta(seconds=0.6)
+        starts: list[tuple[float, datetime]] = []
+
+        async with AsyncScheduler(
+            data_store=MemoryDataStore(),
+            clock_calibration_interval=calibration,
+        ) as scheduler:
+            await scheduler.start_in_background()
+            run_time = wall_clock.now(UTC) + timedelta(seconds=fire_delay)
+            await scheduler.add_schedule(
+                record_start_time, DateTrigger(run_time), args=[starts, wall_clock]
+            )
+            wakes_0 = wake_counter()
+            added_at = time.monotonic()
+            await sleep(0.5)  # let the scheduler settle into its calibrated wait
+            assert not starts
+
+            # Simulate the system clock jumping backward
+            wall_clock.offset -= jump_back
+            with fail_after(10):
+                while not starts:
+                    await sleep(0.01)
+
+        start_mono, start_wall = starts[0]
+        actual_delay = start_mono - added_at
+        intermediate_wakes = wake_counter() - wakes_0
+        print(
+            f"\nbackward wall clock jump: next start {actual_delay:.3f}s after "
+            f"scheduling, {intermediate_wakes} intermediate wake(s)"
+        )
+        # The job must not run before its wall clock fire time; an uncalibrated
+        # wait would have started it at ~fire_delay seconds (too early)
+        assert start_wall >= run_time
+        assert actual_delay >= fire_delay + jump_back.total_seconds() - 0.3
+        assert intermediate_wakes >= 2
+
+    async def test_monotonic_clock_forward_jump(
+        self, monkeypatch: MonkeyPatch, wake_counter: Callable[[], int]
+    ) -> None:
+        """
+        Jump the monotonic clock forward: this may cause spurious intermediate
+        wake-ups, but the job must still start at its wall clock fire time.
+        """
+        calibration = 0.2
+        fire_delay = 1.0
+        starts: list[tuple[float, datetime]] = []
+
+        loop = asyncio.get_running_loop()
+        real_loop_time = loop.time
+        mono_offset = 0.0
+
+        def fake_monotonic() -> float:
+            return real_loop_time() + mono_offset
+
+        monkeypatch.setattr(loop, "time", fake_monotonic)
+
+        async with AsyncScheduler(
+            data_store=MemoryDataStore(),
+            clock_calibration_interval=calibration,
+        ) as scheduler:
+            await scheduler.start_in_background()
+            run_time = datetime.now(UTC) + timedelta(seconds=fire_delay)
+            await scheduler.add_schedule(
+                record_start_time, DateTrigger(run_time), args=[starts, datetime]
+            )
+            wakes_0 = wake_counter()
+            added_at = time.monotonic()
+            await sleep(0.5)  # let the scheduler settle into its calibrated wait
+            assert not starts
+
+            # Simulate the monotonic clock jumping forward
+            mono_offset += 100.0
+            with fail_after(10):
+                while not starts:
+                    await sleep(0.01)
+
+        start_mono, start_wall = starts[0]
+        actual_delay = start_mono - added_at
+        intermediate_wakes = wake_counter() - wakes_0
+        print(
+            f"\nforward monotonic clock jump: next start {actual_delay:.3f}s "
+            f"after scheduling, {intermediate_wakes} intermediate wake(s)"
+        )
+        # The job must still run at its wall clock fire time, not when the
+        # monotonic clock jumped
+        assert start_wall >= run_time
+        assert actual_delay >= fire_delay - 0.3
+        assert intermediate_wakes >= 2
+
+    async def test_earlier_schedule_wakes_wait(self) -> None:
+        """
+        A newly added schedule with an earlier fire time must wake the scheduler
+        immediately, even with a long calibration interval.
+        """
+        starts: list[tuple[float, datetime]] = []
+
+        async with AsyncScheduler(
+            data_store=MemoryDataStore(),
+            clock_calibration_interval=timedelta(seconds=30),
+        ) as scheduler:
+            await scheduler.start_in_background()
+            far_run_time = datetime.now(UTC) + timedelta(seconds=30)
+            await scheduler.add_schedule(
+                record_start_time,
+                DateTrigger(far_run_time),
+                id="far",
+                args=[starts, datetime],
+            )
+            await sleep(0.5)  # let the scheduler settle into the long wait
+
+            near_run_time = datetime.now(UTC) + timedelta(seconds=0.5)
+            added_at = time.monotonic()
+            await scheduler.add_schedule(
+                record_start_time,
+                DateTrigger(near_run_time),
+                id="near",
+                args=[starts, datetime],
+            )
+            with fail_after(10):
+                while not starts:
+                    await sleep(0.01)
+
+        start_mono, start_wall = starts[0]
+        actual_delay = start_mono - added_at
+        print(f"\nearlier schedule added: next start {actual_delay:.3f}s later")
+        # The wait must be woken up by the new schedule, not by the 30 second
+        # calibration interval or the fire time of the "far" schedule
+        assert actual_delay < 5
+        assert start_wall >= near_run_time
+
+    @pytest.mark.parametrize("interval", [0, -1])
+    async def test_invalid_clock_calibration_interval(self, interval: int) -> None:
+        with pytest.raises(
+            ValueError, match="clock_calibration_interval must be positive"
+        ):
+            AsyncScheduler(clock_calibration_interval=interval)
 
 
 class TestSyncScheduler:

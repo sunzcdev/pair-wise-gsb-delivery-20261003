@@ -52,6 +52,7 @@ class Scheduler:
         max_concurrent_jobs: int = 100,
         cleanup_interval: float | timedelta | None = timedelta(minutes=15),
         lease_duration: timedelta = timedelta(seconds=30),
+        clock_calibration_interval: float | timedelta = timedelta(seconds=30),
         job_executors: MutableMapping[str, JobExecutor] | None = None,
         task_defaults: TaskDefaults | None = None,
         logger: Logger | None = None,
@@ -80,6 +81,7 @@ class Scheduler:
             job_executors=job_executors or {},
             cleanup_interval=cleanup_interval,
             lease_duration=lease_duration,
+            clock_calibration_interval=clock_calibration_interval,
             **kwargs,
         )
         self.__attrs_init__(async_scheduler=async_scheduler)
@@ -115,6 +117,10 @@ class Scheduler:
     @property
     def lease_duration(self) -> timedelta:
         return self._async_scheduler.lease_duration
+
+    @property
+    def clock_calibration_interval(self) -> timedelta:
+        return self._async_scheduler.clock_calibration_interval
 
     @property
     def job_executors(self) -> MutableMapping[str, JobExecutor]:

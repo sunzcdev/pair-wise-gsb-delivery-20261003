@@ -593,6 +593,24 @@ Each scheduler runs the data store's :meth:`~.abc.DataStore.cleanup` method
 periodically, configurable via the ``cleanup_interval`` scheduler parameter. This
 ensures that the data store doesn't get filled with unused data over time.
 
+Dealing with system clock changes
+=================================
+
+Schedules always run according to the (UTC) wall clock, but the scheduler waits
+for them using the event loop's monotonic clock, which does not follow system
+clock changes. To keep the wall clock and the monotonic wait in sync, the
+scheduler recalibrates its wait against the wall clock at regular intervals,
+configurable via the ``clock_calibration_interval`` scheduler parameter (30
+seconds by default). This has the following effects:
+
+* If the system clock jumps **forward** (for example when a suspended machine
+  resumes), the expired schedules are detected within one calibration interval
+  at most.
+* If the system clock jumps **backward**, the remaining wait is extended
+  accordingly, so schedules never run earlier than their designated fire times.
+* Newly added or updated schedules with earlier fire times still wake the
+  scheduler up immediately, regardless of the calibration interval.
+
 Deployment
 ==========
 

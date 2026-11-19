@@ -6,6 +6,11 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **UNRELEASED**
 
+- Added the ``clock_calibration_interval`` scheduler option: while waiting for the
+  next schedule to become due, the scheduler now recalibrates its (monotonic clock
+  based) wait against the wall clock at this interval, so that forward system
+  clock jumps are detected within a bounded time, while backward jumps no longer
+  cause schedules to run too early
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+

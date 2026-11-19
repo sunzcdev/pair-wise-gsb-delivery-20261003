@@ -99,6 +99,11 @@ class AsyncScheduler:
         calls to :meth:`cleanup` – ``None`` to disable automatic clean-up
     :param lease_duration: maximum amount of time (as seconds or timedelta) that
         the scheduler can keep a lock on a schedule or task
+    :param clock_calibration_interval: maximum interval (as seconds or timedelta)
+        between wall clock checks while waiting for the next schedule to become
+        due; the wait itself is done on the monotonic clock, so a shorter interval
+        only makes the scheduler detect forward system clock jumps sooner, at the
+        cost of extra wake-ups
     :param logger: the logger instance used to log events from the scheduler, data store
         and event broker
     """
@@ -127,6 +132,9 @@ class AsyncScheduler:
         default=timedelta(minutes=15),
     )
     lease_duration: timedelta = attrs.field(converter=as_timedelta, default=30)
+    clock_calibration_interval: timedelta = attrs.field(
+        kw_only=True, converter=as_timedelta, default=timedelta(seconds=30)
+    )
     logger: Logger = attrs.field(kw_only=True, default=getLogger(__name__))
 
     _state: RunState = attrs.field(init=False, default=RunState.stopped)
@@ -138,6 +146,9 @@ class AsyncScheduler:
     _task_callables: dict[str, Callable] = attrs.field(init=False, factory=dict)
 
     def __attrs_post_init__(self) -> None:
+        if self.clock_calibration_interval <= _zero_timedelta:
+            raise ValueError("clock_calibration_interval must be positive")
+
         if not self.identity:
             self.identity = f"{platform.node()}-{os.getpid()}-{id(self)}"
 
@@ -1063,26 +1074,65 @@ class AsyncScheduler:
                 # If we received fewer schedules than the maximum amount, sleep
                 # until the next schedule is due or the scheduler is explicitly
                 # woken up
-                wait_time = None
                 if len(schedules) < 100:
                     wakeup_deadline = await self.data_store.get_next_schedule_run_time()
                     if wakeup_deadline:
-                        wait_time = (
-                            wakeup_deadline - datetime.now(UTC)
-                        ).total_seconds()
                         self.logger.debug(
                             "Sleeping %.3f seconds until the next fire time (%s)",
-                            wait_time,
+                            (wakeup_deadline - datetime.now(UTC)).total_seconds(),
                             wakeup_deadline,
                         )
                     else:
                         self.logger.debug("Waiting for any due schedules to appear")
 
-                    with move_on_after(wait_time):
-                        await wakeup_event.wait()
-                        wakeup_event = anyio.Event()
+                    wakeup_event = await self._wait_for_wakeup(
+                        wakeup_deadline, wakeup_event
+                    )
                 else:
                     self.logger.debug("Processing more schedules on the next iteration")
+
+    async def _wait_for_wakeup(
+        self, wakeup_deadline: datetime | None, wakeup_event: anyio.Event
+    ) -> anyio.Event:
+        """
+        Wait until the given wall clock deadline, or until woken up externally.
+
+        The wait is broken up into chunks of at most ``clock_calibration_interval``
+        (measured on the event loop's monotonic clock, and thus unaffected by
+        system clock changes), and the remaining wall clock time is recalculated
+        after every chunk. This ensures that:
+
+        * if the system clock jumps forward, the expired deadline is detected
+          within one calibration interval
+        * if the system clock jumps backward, the wait is extended accordingly
+          instead of ending too early
+        * newly added or updated schedules with earlier fire times still wake the
+          scheduler up immediately
+
+        :param wakeup_deadline: the wall clock time to wait until, or ``None`` to
+            only wait to be woken up externally
+        :param wakeup_event: the event to wait on
+        :return: the wakeup event to use for the next wait (a fresh one if the
+            given one was set)
+
+        """
+        while not wakeup_event.is_set():
+            if wakeup_deadline is None:
+                wait_time: float | None = None
+            else:
+                wait_time = (wakeup_deadline - datetime.now(UTC)).total_seconds()
+                if wait_time <= 0:
+                    break
+
+                wait_time = min(
+                    wait_time, self.clock_calibration_interval.total_seconds()
+                )
+
+            with move_on_after(wait_time):
+                await wakeup_event.wait()
+
+        # If the event was set, hand out a fresh one for the next wait
+        return anyio.Event() if wakeup_event.is_set() else wakeup_event
 
     def _get_task_callable(self, task: Task) -> Callable:
         try:
