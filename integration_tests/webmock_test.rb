@@ -1,0 +1,454 @@
+# frozen_string_literal: true
+
+require "webmock/minitest"
+require "httpx/adapters/webmock"
+require "test_helper"
+require "support/http_helpers"
+
+class WebmockTest < Minitest::Test
+  include HTTPHelpers
+  include FiberSchedulerTestHelpers
+
+  MOCK_URL_HTTP = "http://www.example.com"
+  MOCK_URL_HTTP_SAME_ORIGIN = "http://www.example.com/other"
+  MOCK_URL_HTTP_OTHER_ORIGIN = "http://www.example2.com"
+  MOCK_URL_HTTP_EXCEPTION = "http://exception.example.com"
+  MOCK_URL_HTTP_TIMEOUT = "http://timeout.example.com"
+  MOCK_URL_HTTP_TIMEOUT_RETRIES = "http://timeout-x-times.example.com"
+
+  def setup
+    super
+    WebMock.enable!
+    WebMock.disable_net_connect!
+    @stub_http = stub_http_request(:any, MOCK_URL_HTTP)
+    @stub_http_same_origin = stub_http_request(:any, MOCK_URL_HTTP_SAME_ORIGIN)
+    @stub_http_other_origin = stub_http_request(:any, MOCK_URL_HTTP_OTHER_ORIGIN)
+
+    @exception_class = Class.new(StandardError)
+    @stub_exception = stub_http_request(:any, MOCK_URL_HTTP_EXCEPTION).to_raise(@exception_class.new("exception message"))
+    @stub_timeout = stub_http_request(:any, MOCK_URL_HTTP_TIMEOUT).to_timeout
+    @stub_timeout_retries = stub_http_request(:any, MOCK_URL_HTTP_TIMEOUT_RETRIES).to_timeout.times(2).then.to_return(body: "body")
+  end
+
+  def teardown
+    super
+    WebMock.reset!
+    WebMock.allow_net_connect!
+    WebMock.disable!
+  end
+
+  def test_assert_requested_with_stub_and_block_raises_error
+    assert_raises ArgumentError do
+      assert_requested(@stub_http) {}
+    end
+  end
+
+  def test_assert_not_requested_with_stub_and_block_raises_error
+    assert_raises ArgumentError do
+      assert_not_requested(@stub_http) {}
+    end
+  end
+
+  def test_to_raise
+    response = http_request(:get, MOCK_URL_HTTP_EXCEPTION)
+    assert_requested(@stub_exception)
+    assert_equal(@exception_class.new("exception message"), response.error)
+  end
+
+  def test_response_not_decoded
+    request = stub_request(:get, MOCK_URL_HTTP).to_return(body: "body", headers: { content_encoding: "gzip" })
+    response = HTTPX.get(MOCK_URL_HTTP)
+
+    assert !response.body.empty?
+    assert_equal("body", response.body.to_s)
+    assert_requested(request)
+    assert response.mocked?
+  end
+
+  def test_to_timeout
+    response = http_request(:get, MOCK_URL_HTTP_TIMEOUT)
+    assert_requested(@stub_timeout)
+    assert_kind_of(HTTPX::RequestTimeoutError, response.error)
+  end
+
+  def test_to_timeout_with_retries
+    response = HTTPX.plugin(:retries, max_retries: 3).get(MOCK_URL_HTTP_TIMEOUT_RETRIES)
+    assert_requested(@stub_timeout_retries, times: 3)
+    assert !response.is_a?(HTTPX::ErrorResponse)
+    assert_equal("body", response.to_s)
+    assert response.mocked?
+  end
+
+  def test_error_on_non_stubbed_request
+    assert_raise_with_message(WebMock::NetConnectNotAllowedError, Regexp.new(
+                                                                    "Real HTTP connections are disabled. " \
+                                                                    "Unregistered request: GET http://www.example.net/ with headers"
+                                                                  )) do
+      http_request(:get, "http://www.example.net/")
+    end
+  end
+
+  def test_verification_that_expected_request_occured
+    http_request(:get, "#{MOCK_URL_HTTP}/")
+    assert_requested(:get, MOCK_URL_HTTP, times: 1)
+    assert_requested(:get, MOCK_URL_HTTP)
+  end
+
+  def test_verification_that_expected_stub_occured
+    http_request(:get, "#{MOCK_URL_HTTP}/")
+    assert_requested(@stub_http, times: 1)
+    assert_requested(@stub_http)
+  end
+
+  def test_multi_same_url
+    http_request(:get, "#{MOCK_URL_HTTP}/", "#{MOCK_URL_HTTP}/")
+    assert_requested(@stub_http, times: 2)
+  end
+
+  def test_multi_same_origin
+    http_request(:get, "#{MOCK_URL_HTTP}/", MOCK_URL_HTTP_SAME_ORIGIN)
+    assert_requested(@stub_http)
+    assert_requested(@stub_http_same_origin)
+  end
+
+  def test_multi_other_origin
+    http_request(:get, "#{MOCK_URL_HTTP}/", "#{MOCK_URL_HTTP_OTHER_ORIGIN}/")
+    assert_requested(@stub_http)
+    assert_requested(@stub_http_other_origin)
+  end
+
+  if Fiber.respond_to?(:set_scheduler) && RUBY_VERSION >= "3.1.0"
+    def test_multi_fiber_same_url
+      http = HTTPX.plugin(:fiber_concurrency)
+
+      with_test_fiber_scheduler do
+        2.times do
+          Fiber.schedule do
+            http.get("#{MOCK_URL_HTTP}/")
+          end
+        end
+        assert_requested(@stub_http, times: 2)
+      end
+    end
+
+    def test_multi_fiber_same_origin
+      http = HTTPX.plugin(:fiber_concurrency)
+
+      with_test_fiber_scheduler do
+        Fiber.schedule do
+          http.get("#{MOCK_URL_HTTP}/")
+        end
+        Fiber.schedule do
+          http.get(MOCK_URL_HTTP_SAME_ORIGIN)
+        end
+        assert_requested(@stub_http)
+        assert_requested(@stub_http_same_origin)
+      end
+    end
+
+    def test_multi_fiber_other_origin
+      http = HTTPX.plugin(:fiber_concurrency)
+
+      with_test_fiber_scheduler do
+        Fiber.schedule do
+          http.get("#{MOCK_URL_HTTP}/")
+        end
+        Fiber.schedule do
+          http.get(MOCK_URL_HTTP_OTHER_ORIGIN)
+        end
+        assert_requested(@stub_http)
+        assert_requested(@stub_http_other_origin)
+      end
+    end
+  end
+
+  def test_verification_that_expected_request_didnt_occur
+    expected_message = "The request GET #{MOCK_URL_HTTP}/ was expected to execute 1 time but it executed 0 times" \
+                       "\n\nThe following requests were made:\n\nNo requests were made.\n" \
+                       "============================================================"
+    assert_raise_with_message(Minitest::Assertion, expected_message) do
+      assert_requested(:get, MOCK_URL_HTTP)
+    end
+  end
+
+  def test_verification_that_expected_stub_didnt_occur
+    expected_message = "The request ANY #{MOCK_URL_HTTP}/ was expected to execute 1 time but it executed 0 times" \
+                       "\n\nThe following requests were made:\n\nNo requests were made.\n" \
+                       "============================================================"
+    assert_raise_with_message(Minitest::Assertion, expected_message) do
+      assert_requested(@stub_http)
+    end
+  end
+
+  def test_verification_that_expected_request_occured_with_body_and_headers
+    http_request(:get, "#{MOCK_URL_HTTP}/",
+                 body: "abc", headers: { "A" => "a" })
+    assert_requested(:get, MOCK_URL_HTTP,
+                     body: "abc", headers: { "A" => "a" })
+  end
+
+  def test_verification_that_expected_request_occured_with_io_body
+    stub_request(:post, MOCK_URL_HTTP).with(body: "abc")
+    http_request(:post, MOCK_URL_HTTP, body: StringIO.new("abc"))
+    assert_requested(:post, MOCK_URL_HTTP, body: "abc")
+  end
+
+  def test_verification_that_expected_request_occured_with_query_params
+    stub_request(:any, MOCK_URL_HTTP).with(query: hash_including("a" => %w[b c]))
+    http_request(:get, "#{MOCK_URL_HTTP}/?a[]=b&a[]=c&x=1")
+    assert_requested(:get, MOCK_URL_HTTP,
+                     query: hash_including("a" => %w[b c]))
+  end
+
+  def test_verification_that_requests_with_query_parameters_correctly_called
+    stub_request(:get, MOCK_URL_HTTP).to_return(body: "1")
+    stub_request(:get, "#{MOCK_URL_HTTP}/?a[]=b&a[]=c").to_return(body: "2")
+    stub_request(:get, "#{MOCK_URL_HTTP}/?test=value").to_return(body: "3")
+
+    response_1 = http_request(:get, MOCK_URL_HTTP)
+    response_2 = http_request(:get, MOCK_URL_HTTP, params: { "a" => %w[b c] })
+    response_3 = http_request(:get, MOCK_URL_HTTP, params: { test: "value" })
+
+    assert response_1.mocked?
+    assert response_2.mocked?
+    assert response_3.mocked?
+
+    assert_equal "1", response_1.body.to_s
+    assert_equal "2", response_2.body.to_s
+    assert_equal "3", response_3.body.to_s
+
+    assert_requested(:get, MOCK_URL_HTTP)
+    assert_requested(:get, "#{MOCK_URL_HTTP}/?a[]=b&a[]=c")
+    assert_requested(:get, "#{MOCK_URL_HTTP}/?test=value")
+  end
+
+  def test_verification_that_expected_request_not_occured_with_query_params
+    stub_request(:any, MOCK_URL_HTTP).with(query: hash_including(a: %w[b c]))
+    stub_request(:any, MOCK_URL_HTTP).with(query: hash_excluding(a: %w[b c]))
+    http_request(:get, "#{MOCK_URL_HTTP}/?a[]=b&a[]=c&x=1")
+    assert_not_requested(:get, MOCK_URL_HTTP, query: hash_excluding("a" => %w[b c]))
+  end
+
+  def test_verification_that_expected_request_occured_with_excluding_query_params
+    stub_request(:any, MOCK_URL_HTTP).with(query: hash_excluding("a" => %w[b c]))
+    http_request(:get, "#{MOCK_URL_HTTP}/?a[]=x&a[]=y&x=1")
+    assert_requested(:get, MOCK_URL_HTTP, query: hash_excluding("a" => %w[b c]))
+  end
+
+  def test_verification_that_expected_request_with_hash_as_body
+    stub_request(:post, MOCK_URL_HTTP).with(body: { foo: "bar" })
+    http_request(:post, MOCK_URL_HTTP, form: { foo: "bar" })
+    assert_requested(:post, MOCK_URL_HTTP, body: { foo: "bar" })
+  end
+
+  def test_verification_that_expected_request_occured_with_form_file
+    file = File.new(fixture_file_path)
+    stub_request(:post, MOCK_URL_HTTP)
+    http_request(:post, MOCK_URL_HTTP, form: { file: file })
+    # TODO: webmock does not support matching multipart request body
+    assert_requested(:post, MOCK_URL_HTTP)
+  end
+
+  def test_verification_that_expected_request_occured_with_form_tempfile
+    stub_request(:post, MOCK_URL_HTTP)
+    Tempfile.open("tmp") do |file|
+      http_request(:post, MOCK_URL_HTTP, form: { file: file })
+    end
+    # TODO: webmock does not support matching multipart request body
+    assert_requested(:post, MOCK_URL_HTTP)
+  end
+
+  def test_verification_that_non_expected_request_didnt_occur
+    expected_message = Regexp.new(
+      "The request GET #{MOCK_URL_HTTP}/ was not expected to execute but it executed 1 time\n\n" \
+      "The following requests were made:\n\nGET #{MOCK_URL_HTTP}/ with headers .+ was made 1 time\n\n" \
+      "============================================================"
+    )
+    assert_raise_with_message(Minitest::Assertion, expected_message) do
+      http_request(:get, "http://www.example.com/")
+      assert_not_requested(:get, "http://www.example.com")
+    end
+  end
+
+  def test_refute_requested_alias
+    expected_message = Regexp.new(
+      "The request GET #{MOCK_URL_HTTP}/ was not expected to execute but it executed 1 time\n\n" \
+      "The following requests were made:\n\nGET #{MOCK_URL_HTTP}/ with headers .+ was made 1 time\n\n" \
+      "============================================================"
+    )
+    assert_raise_with_message(Minitest::Assertion, expected_message) do
+      http_request(:get, "#{MOCK_URL_HTTP}/")
+      refute_requested(:get, MOCK_URL_HTTP)
+    end
+  end
+
+  def test_verification_that_non_expected_stub_didnt_occur
+    expected_message = Regexp.new(
+      "The request ANY #{MOCK_URL_HTTP}/ was not expected to execute but it executed 1 time\n\n" \
+      "The following requests were made:\n\nGET #{MOCK_URL_HTTP}/ with headers .+ was made 1 time\n\n" \
+      "============================================================"
+    )
+    assert_raise_with_message(Minitest::Assertion, expected_message) do
+      http_request(:get, "#{MOCK_URL_HTTP}/")
+      assert_not_requested(@stub_http)
+    end
+  end
+
+  def test_webmock_allows_real_request
+    WebMock.allow_net_connect!
+    uri = build_uri("/get?foo=bar")
+    response = HTTPX.get(uri)
+    verify_status(response, 200)
+    verify_body_length(response)
+    assert_requested(:get, uri, query: { "foo" => "bar" })
+    assert !response.mocked?
+  end
+
+  def test_webmock_allows_real_request_with_body
+    WebMock.allow_net_connect!
+    uri = build_uri("/post")
+    response = HTTPX.post(uri, form: { foo: "bar" })
+    verify_status(response, 200)
+    verify_body_length(response)
+    assert_requested(:post, uri, headers: { "Content-Type" => "application/x-www-form-urlencoded" }, body: "foo=bar")
+    assert !response.mocked?
+  end
+
+  def test_webmock_allows_real_request_with_io_body
+    WebMock.allow_net_connect!
+    uri = build_uri("/post")
+    response = HTTPX.post(uri, body: StringIO.new("abc"))
+    verify_status(response, 200)
+    body = json_body(response)
+    assert_equal("abc", body["data"])
+    assert_requested(:post, uri, body: "abc")
+    assert !response.mocked?
+  end
+
+  def test_webmock_allows_real_request_with_file_body
+    WebMock.allow_net_connect!
+    uri = build_uri("/post")
+    response = HTTPX.post(uri, form: { image: File.new(fixture_file_path) })
+    verify_status(response, 200)
+    verify_body_length(response)
+    body = json_body(response)
+    verify_header(body["headers"], "Content-Type", "multipart/form-data")
+    verify_uploaded_image(body, "image", "image/jpeg")
+    assert !response.mocked?
+    # TODO: webmock does not support matching multipart request body
+    # assert_requested(:post, uri, headers: { "Content-Type" => "multipart/form-data" }, form: { "image" => File.new(fixture_file_path) })
+  end
+
+  def test_webmock_mix_mock_and_real_request
+    WebMock.allow_net_connect!
+
+    @stub_http.to_return(status: 200)
+
+    # test webmock callback as well
+    responses = {}
+    WebMock.after_request do |request_signature, response|
+      responses[request_signature.uri.to_s] = response
+    end
+
+    # this one ain't stubbed
+    real_request_uri = build_uri("/get", "http://#{httpbin}")
+    http_request(:get, "#{MOCK_URL_HTTP}/", real_request_uri)
+
+    assert responses.size == 2, "received #{responses.size} instead (#{responses.keys})"
+    assert(responses.values.all? { |r| r.status.first == 200 })
+  ensure
+    WebMock.reset_callbacks
+    WebMock.disable_net_connect!
+  end
+
+  def test_webmock_disable_after_enable
+    WebMock.disable!
+
+    # WebMock is disabled so this will make a real http request
+    http_request(:get, "http://#{httpbin}")
+
+    # WebMock is disabled so it should not have registered the request
+    assert_not_requested(:get, "http://#{httpbin}")
+  end
+
+  def test_webmock_follow_redirects_with_stream_plugin_each
+    session = HTTPX.plugin(:follow_redirects).plugin(:stream)
+    redirect_url = "#{MOCK_URL_HTTP}/redirect"
+    initial_request = stub_request(:get, MOCK_URL_HTTP).to_return(status: 302, headers: { location: redirect_url }, body: "redirecting")
+    redirect_request = stub_request(:get, redirect_url).to_return(status: 200, body: "body")
+
+    response = session.get(MOCK_URL_HTTP, stream: true)
+    body = "".b
+    response.each do |chunk|
+      next if (300..399).cover?(response.status)
+
+      body << chunk
+    end
+    assert_equal("body", body)
+    assert_requested(initial_request)
+    assert_requested(redirect_request)
+  end
+
+  def test_webmock_with_stream_plugin_each
+    session = HTTPX.plugin(:stream)
+    request = stub_request(:get, MOCK_URL_HTTP).to_return(body: "body")
+
+    body = "".b
+    response = session.get(MOCK_URL_HTTP, stream: true)
+    response.each do |chunk|
+      next if (300..399).cover?(response.status)
+
+      body << chunk
+    end
+
+    assert_equal("body", body)
+    assert_requested(request)
+  end
+
+  def test_webmock_with_stream_plugin_each_line
+    session = HTTPX.plugin(:stream)
+    request = stub_request(:get, MOCK_URL_HTTP).to_return(body: "First line\nSecond line")
+
+    response = session.get(MOCK_URL_HTTP, stream: true)
+    assert_equal(["First line", "Second line"], response.each_line.to_a)
+    assert_requested(request)
+  end
+
+  def test_webmock_with_callbacks_plugin_response_completed
+    request = stub_request(:get, MOCK_URL_HTTP).to_return(body: "body")
+
+    body_in_callback = nil
+
+    session = HTTPX.plugin(:callbacks).on_response_completed do |_req, resp|
+      body_in_callback = resp.body.to_s
+    end
+
+    response = session.get(MOCK_URL_HTTP)
+    verify_status(response, 200)
+
+    # the body must already be populated by the time on_response_completed fires,
+    # i.e. before the mocked response is finalized/emitted (regression test for
+    # the webmock adapter writing the body after emitting the :response event).
+    assert_equal("body", body_in_callback)
+    assert_requested(request)
+  end
+
+  private
+
+  def assert_raise_with_message(e, message, &block)
+    e = assert_raises(e, &block)
+    if message.is_a?(Regexp)
+      assert_match(message, e.message)
+    else
+      assert_equal(message, e.message)
+    end
+  end
+
+  def http_request(meth, *uris, **options)
+    HTTPX.__send__(meth, *uris, **options)
+  end
+
+  def scheme
+    "http://"
+  end
+end

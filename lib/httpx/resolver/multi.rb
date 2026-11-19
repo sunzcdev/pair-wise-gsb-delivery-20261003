@@ -1,0 +1,84 @@
+# frozen_string_literal: true
+
+require "forwardable"
+require "resolv"
+
+module HTTPX
+  class Resolver::Multi
+    attr_reader :resolvers, :options
+
+    def initialize(resolver_type, options)
+      @current_selector = @current_session = nil
+      @options = options
+      @resolver_options = @options.resolver_options
+
+      ip_families = options.ip_families || Resolver.supported_ip_families
+
+      @resolvers = ip_families.map do |ip_family|
+        resolver = resolver_type.new(ip_family, options)
+        resolver.multi = self
+        resolver
+      end
+    end
+
+    def state
+      @resolvers.map(&:state).uniq.join(",")
+    end
+
+    def current_selector=(s)
+      @current_selector = s
+      @resolvers.each { |r| r.current_selector = s }
+    end
+
+    def current_session=(s)
+      @current_session = s
+      @resolvers.each { |r| r.current_session = s }
+    end
+
+    def log(...)
+      @resolvers.each { |r| r.log(...) }
+    end
+
+    def closed?
+      @resolvers.all?(&:closed?)
+    end
+
+    def early_resolve(connection)
+      hostname = connection.peer.host
+      addresses = @resolver_options[:cache] && (connection.addresses || nolookup_resolve(hostname, connection.options))
+      return false unless addresses
+
+      ip_families = connection.options.ip_families
+
+      resolved = false
+      addresses.group_by(&:family).sort { |(f1, _), (f2, _)| f2 <=> f1 }.each do |family, addrs|
+        next unless ip_families.nil? || ip_families.include?(family)
+
+        # try to match the resolver by family. However, there are cases where that's not possible, as when
+        # the system does not have IPv6 connectivity, but it does support IPv6 via loopback/link-local.
+        resolver = @resolvers.find { |r| r.family == family } || @resolvers.first
+
+        next unless resolver # this should ever happen
+
+        # it does not matter which resolver it is, as early-resolve code is shared.
+        resolver.emit_addresses(connection, family, addrs, true)
+
+        resolved = true
+      end
+
+      resolved
+    end
+
+    def lazy_resolve(connection)
+      @resolvers.each do |resolver|
+        resolver.lazy_resolve(connection)
+      end
+    end
+
+    private
+
+    def nolookup_resolve(hostname, options)
+      options.resolver_cache.resolve(hostname)
+    end
+  end
+end

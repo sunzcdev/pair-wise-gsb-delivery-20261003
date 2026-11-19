@@ -1,0 +1,153 @@
+volumes:
+  bundle:
+
+services:
+  httpx:
+    environment:
+      - HTTPBIN_HOST=nghttp2
+      - HTTPBIN_NO_PROXY_HOST=http://httpbin:8000
+      - HTTPX_HTTP_PROXY=http://proxyuser:password@httpproxy:3128
+      - HTTPX_HTTPS_PROXY=http://proxyuser:password@httpproxy:3128
+      - HTTPX_HTTP2_PROXY=http://proxyuser:password@http2proxy:80
+      - HTTPX_SOCKS4_PROXY=socks4://user4:@socksproxy:8080
+      - HTTPX_SOCKS4A_PROXY=socks4a://user4:@socksproxy:8080
+      - HTTPX_SOCKS5_PROXY=socks5://user5:password@socksproxy:8080
+      - HTTPX_SSH_PROXY=ssh://sshproxy:22
+      - HTTPX_NO_JITTER=1
+      - N=6 # minitest workers
+      - MT_CPU=6 # minitest workers
+      - CI=1
+      - GEM_HOME=/usr/local/bundle
+      - BUNDLE_PATH=/usr/local/bundle
+      - BUNDLE_SILENCE_ROOT_WARNING=1
+      - BUNDLE_APP_CONFIG=/usr/local/bundle
+      - HTTPBIN_ALTSVC_HOSTS=another2,another3
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AMZ_HOST=aws:9090
+      - AMZS_HOST=aws:9191
+      - WEBDAV_HOST=webdav
+      - DD_INSTRUMENTATION_TELEMETRY_ENABLED=false
+      - GRPC_VERBOSITY=ERROR
+    image: ruby:alpine
+    privileged: true
+    depends_on:
+      - httpproxy
+      - http2proxy
+      - socksproxy
+      - sshproxy
+      - nghttp2
+      - aws
+      - ws-echo-server
+      - webdav
+      - altsvc-nghttp2
+      - altsvc2-nghttp2
+    volumes:
+      - bundle:/usr/local/bundle
+      - ./:/home
+    entrypoint: /home/test/support/ci/build.sh
+
+  sshproxy:
+    image: connesc/ssh-gateway
+    volumes:
+      - ./test/support/ssh:/config
+    depends_on:
+      - nghttp2
+
+  socksproxy:
+    image: qautomatron/docker-3proxy
+    ports:
+      - "8080:8080"
+      - "3129:3129"
+    volumes:
+      - ./test/support/ci:/etc/3proxy
+
+  httpproxy:
+    image: sameersbn/squid:3.5.27-2
+    ports:
+      - "3128:3128"
+    volumes:
+      - ./test/support/ci/squid/proxy.conf:/etc/squid/squid.conf
+      - ./test/support/ci/squid/proxy-users-basic.txt:/etc/squid/proxy-users-basic.txt
+      - ./test/support/ci/squid/proxy-users-digest.txt:/etc/squid/proxy-users-digest.txt
+    command: -d 3
+
+  http2proxy:
+    image: dajobe/nghttpx
+    environment:
+      ARGS: "--no-ocsp  --frontend *,80;no-tls --backend httpproxy,3128 --http2-proxy"
+    ports:
+      - 3300:80
+    depends_on:
+      - httpproxy
+
+  nghttp2:
+    image: dajobe/nghttpx
+    environment:
+      ARGS: "--no-ocsp --frontend *,80;no-tls --frontend *,443"
+      KEY_FILE: /data/etc/certs/server.key
+      CERT_FILE: /data/etc/certs/server.crt
+    depends_on:
+      - httpbin
+    volumes:
+      - ./test/support/ci:/data/etc
+    networks:
+      default:
+        aliases:
+          - another
+
+  altsvc-nghttp2:
+    image: dajobe/nghttpx
+    environment:
+      ARGS: "--no-ocsp --frontend *,80;no-tls --frontend *,443 --frontend-keep-alive-timeout=10 --altsvc h2,443,nghttp2 --altsvc h2c,80,another3"
+      KEY_FILE: /data/etc/certs/server.key
+      CERT_FILE: /data/etc/certs/server.crt
+    depends_on:
+      - httpbin
+    volumes:
+      - ./test/support/ci:/data/etc
+    networks:
+      default:
+        aliases:
+          - another2
+  altsvc2-nghttp2:
+    image: dajobe/nghttpx
+    environment:
+      ARGS: "--no-ocsp --frontend *,80;no-tls --frontend *,443  --frontend-keep-alive-timeout=10 --altsvc h2c,80,another2 --altsvc h2,443,nghttp2"
+      KEY_FILE: /data/etc/certs/server.key
+      CERT_FILE: /data/etc/certs/server.crt
+    depends_on:
+      - httpbin
+    volumes:
+      - ./test/support/ci:/data/etc
+    networks:
+      default:
+        aliases:
+          - another3
+  httpbin:
+    environment:
+      - DEBUG=True
+    image: citizenstig/httpbin
+    command: gunicorn --bind=0.0.0.0:8000 --workers=12 --access-logfile - --error-logfile - --log-level debug --capture-output httpbin:app
+
+  aws:
+    image: adobe/s3mock
+    networks:
+      default:
+        aliases:
+          - test.aws
+
+  ws-echo-server:
+    environment:
+      - PORT=80
+    ports:
+      - 8083:80
+    image: jmalloc/echo-server
+
+  webdav:
+    image: bytemark/webdav
+    environment:
+      - AUTH_TYPE=Basic
+      - USERNAME=user
+      - PASSWORD=pass

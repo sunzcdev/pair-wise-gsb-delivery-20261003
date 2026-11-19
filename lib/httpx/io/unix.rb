@@ -1,0 +1,75 @@
+# frozen_string_literal: true
+
+module HTTPX
+  class UNIX < TCP
+    using URIExtensions
+
+    attr_reader :path
+
+    alias_method :host, :path
+
+    def initialize(origin, path, options)
+      @addresses = []
+      @hostname = origin.host
+      @state = :idle
+      @options = options
+      @fallback_protocol = @options.fallback_protocol
+      if (io = @options.io)
+        io =
+          case io
+          when Hash
+            io[origin.authority]
+          else
+            io
+          end
+        raise Error, "Given IO objects do not match the request authority" unless io
+
+        # @type var io: UNIXSocket
+
+        _, @path = io.addr
+        @io = io
+        @keep_open = true
+        @state = :connected
+      elsif path
+        @path = path
+      else
+        raise Error, "No path given where to store the socket"
+      end
+      @io ||= build_socket
+    end
+
+    def connect
+      return unless closed?
+
+      begin
+        if @io.closed?
+          transition(:idle)
+          @io = build_socket
+        end
+        @io.connect_nonblock(Socket.sockaddr_un(@path))
+      rescue Errno::EISCONN
+      end
+      transition(:connected)
+    rescue Errno::EINPROGRESS,
+           Errno::EALREADY,
+           IO::WaitReadable
+    end
+
+    # the path is always explicitly passed, so no point in resolving.
+    def addresses?
+      true
+    end
+
+    # simplecov:disable
+    def inspect
+      "#<#{self.class}:#{object_id} @path=#{@path}) @state=#{@state})>"
+    end
+    # simplecov:enable
+
+    private
+
+    def build_socket
+      Socket.new(Socket::PF_UNIX, :STREAM, 0)
+    end
+  end
+end

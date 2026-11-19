@@ -1,0 +1,714 @@
+# frozen_string_literal: true
+
+require "securerandom"
+require "http/2"
+
+module HTTPX
+  class Connection::HTTP2
+    include Callbacks
+    include Loggable
+
+    MAX_CONCURRENT_REQUESTS = ::HTTP2::DEFAULT_MAX_CONCURRENT_STREAMS
+
+    class Error < Error
+      def initialize(id, error)
+        super("stream #{id} closed with error: #{error}")
+      end
+    end
+
+    class PingError < Error
+      def initialize
+        super(0, :ping_error)
+      end
+    end
+
+    class GoawayError < Error
+      UNRECOVERABLE_ERRORS = %i[settings_timeout inadequate_security].freeze
+
+      def initialize(code, last_stream_id)
+        @code = code
+        @last_stream_id = last_stream_id
+        super(0, code)
+      end
+
+      def last_stream_id
+        return Float::INFINITY if unrecoverable?
+
+        @last_stream_id
+      end
+
+      def unrecoverable?
+        UNRECOVERABLE_ERRORS.include?(@code)
+      end
+    end
+
+    class RstStreamError < Error
+    end
+
+    class RefusedStreamError < RstStreamError
+    end
+
+    attr_reader :streams, :pending
+
+    def initialize(buffer, pending, options)
+      @callbacks = @last_error = nil
+      @options = options
+      @settings = @options.http2_settings
+      @pending = pending
+      @streams = {}
+      @drains = {}
+      @pings = []
+      @streams_to_close_after_receive = []
+      @buffer = buffer
+      @handshake_completed = false
+      @wait_for_handshake = @settings.key?(:wait_for_handshake) ? @settings.delete(:wait_for_handshake) : true
+      @max_concurrent_requests = @options.max_concurrent_requests || MAX_CONCURRENT_REQUESTS
+      @max_requests = @options.max_requests
+      init_connection
+    end
+
+    def timeout
+      return @options.timeout.operation_timeout if @handshake_completed
+
+      @options.timeout.settings_timeout
+    end
+
+    def interests
+      if @connection.state == :closed
+        return unless @handshake_completed
+
+        if @buffer.empty?
+          # a closed HTTP/2 connection can still receive DATA frames from inflight streams.
+          return :r unless @streams.empty?
+
+          return
+        end
+
+        # HTTP/2 GOAWAY frame buffered.
+        return :w
+      end
+
+      unless @connection.state == :connected && @handshake_completed
+        # HTTP/2 in intermediate state or still completing initialization-
+        return @buffer.empty? ? :r : :w
+      end
+
+      unless @connection.send_buffer.empty?
+        # HTTP/2 connection is buffering data chunks and failing to emit DATA frames,
+        # most likely because the flow control window is exhausted.
+        return :rw unless @buffer.empty?
+
+        # waiting for WINDOW_UPDATE frames
+        return :r
+      end
+
+      # there are pending bufferable requests
+      if !@pending.empty? && can_buffer_pending_requests?
+        # only wait for writable if not waiting on the peer.
+        return waiting_for_peer? ? :rw : :w
+      end
+
+      unless @drains.empty?
+        return :w unless @buffer.empty?
+
+        streams_with_no_window = @drains.none? do |stream, _|
+          # if an existing stream has buffered bytes, it must wait for
+          # WINDOW_UPDATE frames
+          stream.send_buffer.empty?
+        end
+
+        return streams_with_no_window ? :r : :rw
+
+      end
+
+      if @buffer.empty?
+        # skip if no more requests or pings to process
+        return unless waiting_for_peer?
+
+        :r
+      else
+        # buffered frames
+        waiting_for_peer? ? :rw : :w
+      end
+    end
+
+    def close
+      if @connection.closed?
+        # if there are inflight streams waiting to be completed AFTER the peer alread shut down the
+        # connection from their end, raise-or-retry depending on whether the error is recoverable.
+        if (ex = @last_error)
+          if @streams.any? || @pending.any?
+            if ex.is_a?(GoawayError) && !ex.unrecoverable?
+              inflight_unprocessed_requests = @streams.map do |req, _|
+                req.transition(:idle)
+                req
+              end
+              @streams.clear
+
+              # only signal exhaustion when inflight requests had to be moved back.
+              unless inflight_unprocessed_requests.empty?
+                @pending.unshift(*inflight_unprocessed_requests)
+                emit(:exhausted, ex)
+              end
+            else
+              while (req, _ = @streams.shift)
+                emit(:error, req, ex)
+              end
+              while (req = @pending.shift)
+                emit(:error, req, ex)
+              end
+            end
+          end
+
+          # clean pending payload now that everything's gone.
+          @buffer.clear
+        end
+      else
+        @connection.goaway
+        emit(:timeout, @options.timeout.close_handshake_timeout)
+      end
+      emit(:close)
+    end
+
+    def empty?
+      @connection.closed? || @streams.empty?
+    end
+
+    def exhausted?
+      !@max_requests.positive?
+    end
+
+    def <<(data)
+      @connection << data
+
+      while (stream, request, error = @streams_to_close_after_receive.shift)
+        # these streams were marked for cancellation due to errors found while processing the
+        # data received by the peer.
+        emit_stream_error(stream, request, error)
+      end
+
+      # if the connection transitioned to :closed, start tearing it down. Explicitly bypass the
+      # :closing transition to give it time to complete the inflight streams.
+      return unless @connection.state == :closed
+
+      close
+    end
+
+    def send(request, head = false)
+      unless can_buffer_pending_requests?
+        head ? @pending.unshift(request) : @pending << request
+        return false
+      end
+      unless (stream = @streams[request])
+        stream = @connection.new_stream(**request.http2_stream_options)
+        handle_stream(stream, request)
+        @streams[request] = stream
+        @max_requests -= 1
+        emit(:request_accepted, request)
+      end
+      handle(request, stream)
+      true
+    rescue ::HTTP2::Error::StreamLimitExceeded
+      @pending.unshift(request)
+      false
+    rescue ::HTTP2::Error::Error, ArgumentError => e
+      emit(:error, request, e)
+      false
+    end
+
+    def consume
+      @streams.each do |request, stream|
+        next unless request.can_buffer?
+
+        handle(request, stream)
+      end
+
+      send_pending
+    end
+
+    def handle_error(ex, request = nil)
+      last_stream_id = Float::INFINITY
+      case ex
+      when OperationTimeoutError
+        if !@handshake_completed && @connection.state != :closed
+          # timed out waiting for HTTP/2 connection handshake to complete.
+          @connection.goaway(:settings_timeout, "closing due to settings timeout")
+          emit(:close_handshake)
+          settings_ex = SettingsTimeoutError.new(ex.timeout, ex.message)
+          settings_ex.set_backtrace(ex.backtrace)
+          ex = settings_ex
+        elsif @connection.state == :closing
+          # failed to receive data for inflight streams in time.
+          ex = @last_error || ex
+        end
+      when EOFError
+        if @connection.state == :closing
+          # socket closed while waiting for inflight streams to finish
+          ex = @last_error || ex
+        end
+      when GoawayError
+        last_stream_id = ex.last_stream_id
+      end
+
+      inflight_unprocessed_requests = [] #: Array[Request]
+      unprocessed_streams = [] #: Array[::HTTP2::Stream]
+
+      @streams.delete_if do |req, stream|
+        # allow inflight streams to finish
+        next(false) if !last_stream_id.infinite? && stream.id <= last_stream_id
+
+        @drains.delete(stream)
+
+        next(true) if request && request == req
+
+        if stream.id > last_stream_id
+          req.transition(:idle)
+          # unprocessed request
+          inflight_unprocessed_requests << req
+          unprocessed_streams << stream
+
+          next(true)
+        end
+
+        emit(:error, req, ex)
+        true
+      end
+
+      @pending.unshift(*inflight_unprocessed_requests) if inflight_unprocessed_requests.any?
+
+      unless @streams.empty?
+        unprocessed_streams.each(&:close)
+
+        # streams covered by the GOAWAY are still being processed.
+        return
+      end
+
+      if ex.is_a?(GoawayError) && !ex.unrecoverable?
+        # resend unprocessed requests on a different connection
+        emit(:exhausted, ex) if @pending.any?
+        return
+      end
+
+      while (req = @pending.shift)
+        next if request && request == req
+
+        emit(:error, req, ex)
+      end
+    end
+
+    def ping
+      ping = SecureRandom.gen_random(8)
+      @connection.ping(ping.dup)
+    ensure
+      @pings << ping
+    end
+
+    def waiting_for_ping?
+      @pings.any?
+    end
+
+    def no_more_requests?
+      @streams.empty?
+    end
+
+    def reset_requests; end
+
+    private
+
+    # whether there are PING acks, or streams waiting for more data
+    # (that can be a response or WINDOW_UPDATE frames).
+    def waiting_for_peer?
+      waiting_for_ping? || @streams.any? { |r, s| !r.can_buffer? || !s.send_buffer.empty? }
+    end
+
+    def can_buffer_pending_requests?
+      !@connection.closed? &&
+        (@handshake_completed || !@wait_for_handshake) &&
+        @streams.size < @max_concurrent_requests &&
+        @streams.size < @max_requests
+    end
+
+    def send_pending
+      while !@buffer.full? && can_buffer_pending_requests? && (request = @pending.shift)
+        break unless send(request, true)
+      end
+    end
+
+    def handle(request, stream)
+      catch(:buffer_full) do
+        request.transition(:headers)
+        join_headers(stream, request) if request.state == :headers
+        request.transition(:body)
+        join_body(stream, request) if request.state == :body
+        request.transition(:trailers)
+        join_trailers(stream, request) if request.state == :trailers && !request.body.empty?
+        request.transition(:done)
+      end
+    end
+
+    def init_connection
+      @connection = ::HTTP2::Client.new(@settings)
+      @connection.on(:frame, &method(:on_frame))
+      @connection.on(:frame_sent, &method(:on_frame_sent))
+      @connection.on(:frame_received, &method(:on_frame_received))
+      @connection.on(:origin, &method(:on_origin))
+      @connection.on(:promise, &method(:on_promise))
+      @connection.on(:altsvc) { |frame| on_altsvc(frame[:origin], frame) }
+      @connection.on(:settings_ack, &method(:on_settings))
+      @connection.on(:ack, &method(:on_pong))
+      @connection.on(:goaway, &method(:on_close))
+      #
+      # Some servers initiate HTTP/2 negotiation right away, some don't.
+      # As such, we have to check the socket buffer. If there is something
+      # to read, the server initiated the negotiation. If not, we have to
+      # initiate it.
+      #
+      @connection.send_connection_preface
+    end
+
+    alias_method :reset, :init_connection
+    public :reset
+
+    def handle_stream(stream, request)
+      request.on(:refuse, &method(:on_stream_refuse).curry(3)[stream, request])
+      stream.on(:close, &method(:on_stream_close).curry(3)[stream, request])
+      stream.on(:half_close) { on_stream_half_close(stream, request) }
+      stream.on(:altsvc, &method(:on_altsvc).curry(2)[request.origin])
+      stream.on(:headers, &method(:on_stream_headers).curry(3)[stream, request])
+      stream.on(:data, &method(:on_stream_data).curry(3)[stream, request])
+    end
+
+    def set_protocol_headers(request)
+      {
+        ":scheme" => request.scheme,
+        ":method" => request.verb,
+        ":path" => request.path,
+        ":authority" => request.authority,
+      }
+    end
+
+    def join_headers(stream, request)
+      extra_headers = set_protocol_headers(request)
+
+      if request.headers.key?("host")
+        request.log { "forbidden \"host\" header found (#{log_redact_headers(request.headers["host"])}), will use it as authority..." }
+        extra_headers[":authority"] = request.headers["host"]
+      end
+
+      request.log(level: 1, color: :yellow) do
+        "\n#{request.headers.merge(extra_headers).each.map { |k, v| "#{stream.id}: -> HEADER: #{k}: #{log_redact_headers(v)}" }.join("\n")}"
+      end
+      stream.headers(request.headers.each(extra_headers), end_stream: request.body.empty?)
+    end
+
+    def join_trailers(stream, request)
+      unless request.trailers?
+        stream.data("", end_stream: true) if request.callbacks_for?(:trailers)
+        return
+      end
+
+      request.log(level: 1, color: :yellow) do
+        request.trailers.each.map { |k, v| "#{stream.id}: -> HEADER: #{k}: #{log_redact_headers(v)}" }.join("\n")
+      end
+      stream.headers(request.trailers.each, end_stream: true)
+    end
+
+    def join_body(stream, request)
+      return if request.body.empty?
+
+      # the next chunk waits until the peer grants more window.
+      throw(:buffer_full) if @drains.key?(stream) && (!stream.send_buffer.empty? || !@connection.send_buffer.empty?)
+
+      chunk = @drains.delete(stream) || request.drain_body
+      while chunk
+        next_chunk = request.drain_body
+        send_chunk(request, stream, chunk, next_chunk)
+
+        if next_chunk && (
+          # send window is full
+          @buffer.full? ||
+          # stream / chunked request, must write a chunk at a time
+          request.body.unbounded_body? ||
+          # peer window is full, must wait for WINDOW_UPDATE frame(s)
+          !stream.send_buffer.empty? || !@connection.send_buffer.empty?
+        )
+          @drains[stream] = next_chunk
+          throw(:buffer_full)
+        end
+
+        chunk = next_chunk
+      end
+
+      return unless (error = request.drain_error)
+
+      on_stream_refuse(stream, request, error)
+    end
+
+    def send_chunk(request, stream, chunk, next_chunk)
+      request.log(level: 1, color: :green) { "#{stream.id}: -> DATA: #{chunk.bytesize} bytes..." }
+      request.log(level: 2, color: :green) { "#{stream.id}: -> #{log_redact_body(chunk.inspect)}" }
+      stream.data(chunk, end_stream: end_stream?(request, next_chunk))
+    end
+
+    def end_stream?(request, next_chunk)
+      !(next_chunk || request.trailers? || request.callbacks_for?(:trailers))
+    end
+
+    ######
+    # HTTP/2 Callbacks
+    ######
+
+    def on_stream_headers(stream, request, h)
+      response = request.response
+
+      if response.is_a?(Response) && response.version == "2.0"
+        on_stream_trailers(stream, request, response, h)
+        return
+      end
+
+      request.log(color: :yellow) do
+        h.map { |k, v| "#{stream.id}: <- HEADER: #{k}: #{k == ":status" ? v : log_redact_headers(v)}" }.join("\n")
+      end
+      _, status = h.shift
+      headers = request.options.headers_class.new(h)
+
+      raise HTTPX::Error, "maximum number of response headers exceeded" if h.size > @options.max_response_headers
+
+      if (max_header_value_size = @options.max_response_header_value_size)
+        headers.each do |_, v| # rubocop:disable Style/HashEachMethods
+          raise HTTPX::Error, "maximum header value size exceeded" if v.size > max_header_value_size
+        end
+      end
+
+      response = request.options.response_class.new(request, status, "2.0", headers)
+
+      if response.content_length && response.content_length > request.options.max_response_body_size
+        raise HTTPX::Error.new, "maximum response body size exceeded"
+      end
+
+      request.response = response
+      @streams[request] = stream
+
+      handle(request, stream) if request.expects?
+    rescue HTTPX::Error => e
+      @streams_to_close_after_receive << [stream, request, e]
+    end
+
+    def on_stream_trailers(stream, request, response, h)
+      request.log(color: :yellow) do
+        h.map { |k, v| "#{stream.id}: <- HEADER: #{k}: #{log_redact_headers(v)}" }.join("\n")
+      end
+      response.merge_headers(h)
+    end
+
+    def on_stream_data(stream, request, data)
+      request.log(level: 1, color: :green) { "#{stream.id}: <- DATA: #{data.bytesize} bytes..." }
+      request.log(level: 2, color: :green) { "#{stream.id}: <- #{log_redact_body(data.inspect)}" }
+
+      return unless request.response
+
+      request.response << data
+    rescue HTTPX::Error => e
+      if stream.state == :closing
+        # there won't be any more chunks to process after this one.
+        emit_stream_error(stream, request, e)
+      else
+        # defer until the last chunk from the payload is processed.
+        @streams_to_close_after_receive << [stream, request, e]
+      end
+    end
+
+    def on_stream_refuse(stream, request, error)
+      on_stream_close(stream, request, error)
+      stream.close
+    end
+
+    def on_stream_half_close(stream, request)
+      unless stream.send_buffer.empty?
+        stream.send_buffer.clear
+        stream.data("", end_stream: true)
+      end
+
+      # TODO: omit log line if response already here
+      request.log(level: 2) { "#{stream.id}: waiting for response..." }
+    end
+
+    def on_stream_close(stream, request, error)
+      return if error == :stream_closed && !@streams.key?(request)
+
+      log(level: 2) { "#{stream.id}: closing stream" }
+      teardown(request)
+
+      if error
+        case error
+        when :http_1_1_required
+          emit(:error, request, error)
+        else
+          ex =
+            case error
+            when :refused_stream
+              RefusedStreamError.new(stream.id, error)
+            else
+              RstStreamError.new(stream.id, error)
+            end
+
+          ex.set_backtrace(caller)
+          response = ErrorResponse.new(request, ex)
+          request.response = response
+          emit(:response, request, response)
+        end
+      else
+        if (response = request.response)
+          if response.is_a?(Response) && response.status == 421
+            emit(:error, request, :http_1_1_required)
+          else
+            emit(:response, request, response)
+          end
+        end
+      end
+
+      consume
+
+      send(@pending.shift, true) unless @pending.empty?
+
+      return unless @streams.empty? && exhausted?
+
+      if @pending.empty?
+        close
+      else
+        emit(:exhausted)
+      end
+    end
+
+    def on_frame(bytes)
+      @buffer << bytes
+    end
+
+    def on_settings(*)
+      @handshake_completed = true
+      emit(:current_timeout)
+      @max_concurrent_requests = [@max_concurrent_requests, @connection.remote_settings[:settings_max_concurrent_streams]].min
+      send_pending
+    end
+
+    def on_close(last_stream_id, error, _payload)
+      is_connection_closed = @connection.closed?
+      if error
+        @buffer.clear if is_connection_closed
+        case error
+        when :http_1_1_required
+          while (request = @pending.shift)
+            emit(:error, request, error)
+          end
+        else
+          # keep goaway error around, in case inflight streams never complete.
+          @last_error = ex = GoawayError.new(error, last_stream_id)
+          ex.set_backtrace(caller)
+
+          handle_error(ex)
+        end
+      end
+      return unless is_connection_closed
+
+      if @streams.empty?
+        emit(:close)
+      else
+        # this connection should not start new streams.
+        emit(:closing)
+      end
+    end
+
+    def on_frame_sent(frame)
+      log(level: 2) { "#{frame[:stream]}: frame was sent!" }
+      log(level: 2, color: :blue) { "#{frame[:stream]}: #{frame_with_extra_info(frame)}" }
+    end
+
+    def on_frame_received(frame)
+      log(level: 2) { "#{frame[:stream]}: frame was received!" }
+      log(level: 2, color: :magenta) { "#{frame[:stream]}: #{frame_with_extra_info(frame)}" }
+    end
+
+    def frame_with_extra_info(frame)
+      flags_bits = frame.fetch(:flags, 0)
+      case frame[:type]
+      when :data
+        flags = [] #: Array[Symbol]
+        flags << :end_stream if flags_bits.anybits?(0b0001)
+        flags << :padded if flags_bits.anybits?(0b1000)
+        frame.merge(payload: frame[:payload].bytesize, flags: flags)
+      when :push_promise, :headers
+        flags = [] #: Array[Symbol]
+        flags << :end_stream if flags_bits.anybits?(0b0001)
+        flags << :priority if flags_bits.anybits?(0b0010)
+        flags << :end_headers if flags_bits.anybits?(0b0100)
+        flags << :padded if flags_bits.anybits?(0b1000)
+        frame.merge(payload: log_redact_headers(frame[:payload]), flags: flags)
+      when :ping
+        flags = [] #: Array[Symbol]
+        flags << :ack if flags_bits.anybits?(0b0001)
+        frame.merge(payload: log_redact_headers(frame[:payload]), flags: flags)
+      when :settings
+        flags = [] #: Array[Symbol]
+        flags << :ack if flags_bits.anybits?(0b0001)
+        frame.merge(flags: flags)
+      when :window_update
+        connection_or_stream = if (id = frame[:stream]).zero?
+          @connection
+        else
+          @streams.each_value.find { |s| s.id == id }
+        end
+        if connection_or_stream
+          frame.merge(
+            local_window: connection_or_stream.local_window,
+            remote_window: connection_or_stream.remote_window,
+            buffered_amount: connection_or_stream.buffered_amount,
+            stream_state: connection_or_stream.state,
+          )
+        else
+          frame
+        end
+      else
+        frame
+      end.merge(connection_state: @connection.state)
+    end
+
+    def on_altsvc(origin, frame)
+      log(level: 2) { "#{frame[:stream]}: altsvc frame was received" }
+      log(level: 2) { "#{frame[:stream]}: #{log_redact_headers(frame.inspect)}" }
+      alt_origin = URI.parse("#{frame[:proto]}://#{frame[:host]}:#{frame[:port]}")
+      params = { "ma" => frame[:max_age] }
+      emit(:altsvc, origin, alt_origin, origin, params)
+    end
+
+    def on_promise(stream)
+      emit(:promise, @streams.key(stream.parent), stream)
+    end
+
+    def on_origin(origin)
+      emit(:origin, origin)
+    end
+
+    def on_pong(ping)
+      raise PingError unless @pings.delete(ping.to_s)
+
+      emit(:pong)
+    end
+
+    def emit_stream_error(stream, request, error)
+      teardown(request)
+      stream.close
+      emit(:error, request, error)
+    end
+
+    def teardown(request = nil)
+      if request
+        if (stream = @streams.delete(request))
+          @drains.delete(stream)
+        end
+      else
+        @drains.clear
+        @streams.clear
+      end
+    end
+  end
+end

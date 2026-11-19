@@ -1,0 +1,79 @@
+module HTTPX
+  class TCP
+    include Loggable
+
+    attr_reader ip: Resolver::Entry?
+
+    attr_reader port: Integer
+
+    attr_reader addresses: Array[Resolver::Entry]
+
+    attr_reader state: Symbol
+
+    attr_reader interests: io_interests
+
+    alias host ip
+
+    @io: Socket
+
+    @hostname: String
+
+    @options: Options
+
+    @fallback_protocol: String
+
+    @keep_open: bool
+
+    @ip_index: Integer
+    @attempt_started_at: Float?
+
+    # TODO: lift when https://github.com/ruby/rbs/issues/1497 fixed
+    def initialize: (URI::Generic origin, Array[Resolver::Entry]? addresses, Options options) ?{ (instance) -> void } -> void
+
+    def add_addresses: (Array[Resolver::Entry] addrs) -> void
+
+    def addresses?: () -> bool
+
+    def connect_attempt_time_left: () -> Float?
+
+    def next_address!: (StandardError e) -> void
+
+    def to_io: () -> IO
+
+    def protocol: () -> String
+
+    def connect: () -> void
+
+    private
+
+    # :nocov:
+    def try_connect: () -> void
+
+    public
+
+    def read: (Integer size, Buffer | String buffer) -> (0 | nil | untyped)
+
+    def write: (Buffer buffer) -> Integer?
+
+    def close: () -> void
+
+    def can_disconnect?: () -> bool
+
+    def connected?: () -> bool
+
+    def closed?: () -> bool
+
+    # :nocov:
+    def inspect: () -> ::String
+
+    private
+
+    def build_socket: () -> Socket
+
+    def transition: (Symbol nextstate) -> void
+
+    def do_transition: (Symbol nextstate) -> void
+
+    def log_transition_state: (Symbol nextstate) -> String
+  end
+end

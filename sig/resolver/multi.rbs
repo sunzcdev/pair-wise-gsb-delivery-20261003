@@ -1,0 +1,31 @@
+module HTTPX
+  module Resolver
+    class Multi
+      attr_reader resolvers: Array[HTTPX::Resolver::Resolver]
+
+      attr_reader options: Options
+
+      @current_selector: Selector?
+      @current_session: Session?
+      @resolver_options: Hash[Symbol, untyped]
+
+      def state: () -> String
+
+      def current_selector=: (Selector s) -> void
+
+      def current_session=: (Session s) -> void
+
+      def closed?: () -> bool
+
+      def early_resolve: (Connection connection) -> bool
+
+      def lazy_resolve: (Connection connection) -> void
+
+      private
+
+      def nolookup_resolve: (String hostname, Options options) -> Array[Entry]?
+
+      def initialize: (singleton(Native) | singleton(HTTPS) resolver_type, Options options) -> void
+    end
+  end
+end

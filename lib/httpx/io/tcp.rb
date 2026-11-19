@@ -1,0 +1,283 @@
+# frozen_string_literal: true
+
+require "resolv"
+
+module HTTPX
+  class TCP
+    include Loggable
+
+    using URIExtensions
+
+    attr_reader :ip, :port, :addresses, :state, :interests
+
+    alias_method :host, :ip
+
+    def initialize(origin, addresses, options)
+      @state = :idle
+      @keep_open = false
+      @addresses = []
+      @ip_index = -1
+      @ip = @attempt_started_at = nil
+      @hostname = origin.host
+      @options = options
+      @fallback_protocol = @options.fallback_protocol
+      @port = origin.port
+      @interests = :w
+      if (io = @options.io)
+        io =
+          case io
+          when Hash
+            io[origin.authority]
+          else
+            io
+          end
+        raise Error, "Given IO objects do not match the request authority" unless io
+
+        # @type var io: TCPSocket | OpenSSL::SSL::SSLSocket
+
+        _, _, _, ip = io.addr
+        @io = io
+        @addresses << (@ip = Resolver::Entry.new(ip))
+        @keep_open = true
+        @state = :connected
+      else
+        add_addresses(addresses)
+      end
+      @ip_index = @addresses.size - 1
+    end
+
+    def socket
+      @io
+    end
+
+    def add_addresses(addrs)
+      return if addrs.empty?
+
+      ip_index = @ip_index || (@addresses.size - 1)
+      if addrs.first.ipv6?
+        # should be the next in line
+        @addresses = [*@addresses[0, ip_index], *addrs, *@addresses[ip_index..-1]]
+      else
+        @addresses.unshift(*addrs)
+      end
+      @ip_index += addrs.size
+    end
+
+    # eliminates expired entries and returns whether there are still any left.
+    def addresses?
+      prev_addr_size = @addresses.size
+
+      @addresses.delete_if(&:expired?).sort! do |addr1, addr2|
+        if addr1.ipv6?
+          addr2.ipv6? ? 0 : 1
+        else
+          addr2.ipv6? ? -1 : 0
+        end
+      end
+
+      @ip_index = @addresses.size - 1 if prev_addr_size != @addresses.size
+
+      @addresses.any?
+    end
+
+    # time left until the attempt to connect to the current address should be abandoned.
+    def connect_attempt_time_left
+      return unless @state == :idle && @ip_index.positive? && (attempt_started_at = @attempt_started_at)
+
+      timeouts = @options.timeout
+      timeout = timeouts.connect_timeout || timeouts.request_timeout || timeouts.total_request_timeout
+
+      return unless timeout && timeout.finite?
+
+      timeout.fdiv(@addresses.size) - Utils.elapsed_time(attempt_started_at)
+    end
+
+    # abandons the connection attempt to the current address.
+    def next_address!(e)
+      @io&.close
+      @ip_index -= 1
+      raise e if @ip_index.negative?
+
+      log { "failed connecting to #{@ip} (#{e.message}), trying next..." }
+    end
+
+    def to_io
+      @io.to_io
+    end
+
+    def protocol
+      @fallback_protocol
+    end
+
+    def connect
+      return unless closed?
+
+      if @addresses.empty?
+        # an idle connection trying to connect with no available addresses is a connection
+        # out of the initial context which is back to the DNS resolution loop. This may
+        # happen in a fiber-aware context where a connection reconnects with expired addresses,
+        # and context is passed back to a fiber on the same connection while waiting for the
+        # DNS answer.
+        log { "tried connecting while resolving, skipping..." }
+
+        return
+      end
+
+      if !@io || @io.closed?
+        transition(:idle)
+        @io = build_socket
+      end
+      try_connect
+    rescue Errno::EHOSTUNREACH,
+           Errno::ENETUNREACH => e
+      next_address!(e)
+      @options.resolver_cache.evict(@hostname, @ip)
+      @io = build_socket
+      retry
+    rescue Errno::ECONNREFUSED,
+           Errno::EADDRNOTAVAIL,
+           SocketError,
+           IOError => e
+      @ip_index -= 1
+
+      raise e if @ip_index.negative?
+
+      log { "failed connecting to #{@ip} (#{e.message}), trying next..." }
+      @io = build_socket
+      retry
+    rescue Errno::ETIMEDOUT => e
+      @ip_index -= 1
+
+      raise ConnectTimeoutError.new(@options.timeout.connect_timeout, e.message) if @ip_index.negative?
+
+      log { "failed connecting to #{@ip} (#{e.message}), trying next..." }
+
+      @io = build_socket
+      retry
+    end
+
+    def try_connect
+      ret = @io.connect_nonblock(Socket.sockaddr_in(@port, @ip.to_s), exception: false)
+      log(level: 3, color: :cyan) { "TCP CONNECT: #{ret}..." }
+      case ret
+      when :wait_readable
+        @interests = :r
+        return
+      when :wait_writable
+        @interests = :w
+        return
+      end
+      transition(:connected)
+      @interests = :w
+    rescue Errno::EALREADY
+      @interests = :w
+    end
+    private :try_connect
+
+    def read(size, buffer)
+      siz = @io.read_nonblock(size, buffer, exception: false)
+
+      case siz
+      when String
+        log { "READ: #{buffer.bytesize} bytes..." }
+        buffer.bytesize
+      when :wait_readable, :wait_writable
+        buffer.clear
+        0
+      end
+    end
+
+    def write(buffer)
+      siz = @io.write_nonblock(buffer, exception: false)
+
+      case siz
+      when Integer
+        log { "WRITE: #{siz} bytes..." }
+        buffer.shift!(siz)
+        siz
+      when :wait_readable, :wait_writable
+        0
+      end
+    end
+
+    def close
+      return if @keep_open
+
+      # mark tcp as closed, so that it can be disconnected.
+      # this bypasses the state machine API as not not allow the transition
+      # from idle to closed in normal circumstances.
+      @state = :closed if @state == :idle
+
+      return if closed?
+
+      begin
+        @io.close
+      rescue IOError => e
+        log { "error closing socket" }
+        log { e.full_message(highlight: false) }
+      ensure
+        # @fiber-switch-guard
+        # ensure that all :closed IOs don't leave dangling sockets
+        # behind. This may happen in a fiber scheduler scenario where
+        # connection is reused across fibers.
+        transition(:closed) if @io.closed?
+      end
+    end
+
+    # signals that the connection that contains this IO can be checked back into the pool.
+    # that includes sockets opened outside of the scope of the session, or closed IOs.
+    def can_disconnect?
+      @keep_open || @state == :closed
+    end
+
+    def connected?
+      @state == :connected
+    end
+
+    def closed?
+      @state == :idle || @state == :closed
+    end
+
+    # simplecov:disable
+    def inspect
+      "#<#{self.class}:#{object_id} " \
+        "#{@ip}:#{@port} " \
+        "@state=#{@state} " \
+        "@hostname=#{@hostname} " \
+        "@addresses=#{@addresses} " \
+        "@state=#{@state}>"
+    end
+    # simplecov:enable
+
+    private
+
+    def build_socket
+      @ip = @addresses[@ip_index]
+      @attempt_started_at = Utils.now
+      Socket.new(@ip.family, :STREAM, 0)
+    end
+
+    def transition(nextstate)
+      case nextstate
+      # when :idle
+      when :connected
+        return unless @state == :idle
+      when :closed
+        return unless @state == :connected
+      end
+      do_transition(nextstate)
+    end
+
+    def do_transition(nextstate)
+      log(level: 1) { log_transition_state(nextstate) }
+      @state = nextstate
+    end
+
+    def log_transition_state(nextstate)
+      label = host
+      label = "#{label}:#{@port}" if label
+      label = "#{label}(##{@io.fileno})" if nextstate == :connected
+      "#{label} #{@state} -> #{nextstate}"
+    end
+  end
+end

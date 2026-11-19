@@ -1,0 +1,211 @@
+inherit_from: .rubocop_todo.yml
+
+plugins:
+  - rubocop-performance
+  - rubocop-md
+
+AllCops:
+  NewCops: enable
+  TargetRubyVersion: 2.7
+  DisplayCopNames: true
+  Include:
+    - lib/**/*.rb
+    - test/**/*.rb
+    - regression_tests/**/*.rb
+    - integration_tests/**/*.rb
+    - standalone_tests/**/*.rb
+    - smoke_tests/**/*.rb
+    - Rakefile
+    - httpx.gemspec
+    - profiler/**/*
+  Exclude:
+    - '*.rb'
+    - 'bugreports/*'
+    - 'examples/**/*'
+    - '.bundle/**/*'
+    - 'vendor/**/*'
+    - 'www/**/*'
+    - 'lib/httpx/extensions.rb'
+    # Do not lint ffi block, for openssl parity
+    - 'test/extensions/response_pattern_match.rb'
+    # deliberately keep close to https://github.com/ruby/ruby/blob/master/test/fiber/scheduler.rb#L21
+    - 'test/support/test_fiber_scheduler.rb'
+    # Old release notes
+    - !ruby/regexp /doc/release_notes/0_.*.md/
+
+Metrics/ClassLength:
+  Enabled: false
+
+Metrics/ModuleLength:
+  Enabled: false
+
+Metrics/MethodLength:
+  Max: 200
+
+Metrics/ParameterLists:
+  Max: 6
+  CountKeywordArgs: false
+
+Naming/FileName:
+  Exclude:
+    - Gemfile
+    - Rakefile
+    - Steepfile
+    - "**/*.md"
+
+Layout/LeadingCommentSpace:
+  AllowRBSInlineAnnotation: true
+
+Layout/EndAlignment:
+  EnforcedStyleAlignWith: variable
+
+Style/Alias:
+  EnforcedStyle: prefer_alias_method
+
+Style/TrailingCommaInHashLiteral:
+  EnforcedStyleForMultiline: comma
+
+Style/TrailingCommaInArrayLiteral:
+  EnforcedStyleForMultiline: comma
+
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+Style/StringLiteralsInInterpolation:
+  EnforcedStyle: double_quotes
+
+Style/SignalException:
+  Enabled: false
+
+Style/ParallelAssignment:
+  Enabled: false
+
+Style/ParenthesesAroundCondition:
+  Enabled: false
+
+Style/IfInsideElse:
+  Enabled: false
+
+Style/MultilineIfModifier:
+  Enabled: false
+
+Style/TrailingCommaInArguments:
+  Enabled: false
+
+Style/TrailingUnderscoreVariable:
+  Enabled: false
+
+Style/AccessModifierDeclarations:
+  Enabled: false
+
+Style/GlobalVars:
+  Exclude:
+    - lib/httpx/plugins/internal_telemetry.rb
+
+Style/CommentedKeyword:
+  Exclude:
+    - integration_tests/faraday_datadog_test.rb
+
+Style/RedundantBegin:
+  Enabled: false
+
+Style/HashConversion:
+  Enabled: false
+
+Style/FetchEnvVar:
+  Enabled: False
+
+Style/OneClassPerFile:
+  Enabled: false
+
+Performance/TimesMap:
+  Enabled: false
+
+Performance/RedundantBlockCall:
+  Enabled: false
+
+Performance/CollectionLiteralInLoop:
+  Enabled: false # most useless perf cop ever...
+
+Naming/ClassAndModuleCamelCase:
+  Exclude:
+    - regression_tests/**/*.rb
+
+# TODO: remove this if min supported version of ruby is 2.3
+Style/HashSyntax:
+  Enabled: false
+
+Style/AndOr:
+  Enabled: False
+
+Style/ArgumentsForwarding:
+  Enabled: False
+
+Naming/MethodParameterName:
+  Enabled: false
+
+Lint/SuppressedException:
+  Enabled: false
+
+Layout/LineLength:
+  Exclude:
+    - 'test/resolver/native_test.rb'
+  Max: 140
+
+Layout/RescueEnsureAlignment:
+  Enabled: false
+
+Lint/RedundantSplatExpansion:
+  Enabled: false
+
+Style/OptionalBooleanParameter:
+  Enabled: false
+
+Gemspec/RequiredRubyVersion:
+  Enabled: false
+
+Lint/MissingSuper:
+  Exclude:
+    - 'lib/httpx/io/unix.rb'
+
+Lint/DuplicateBranch:
+  Enabled: false # this doesn't work correctly
+
+Lint/EmptyBlock:
+  Enabled: false # and neither does this. I don't control 3rd party methods.
+Style/HashTransformValues:
+  Exclude:
+    - 'lib/httpx/plugins/authentication/digest.rb'
+
+Lint/InheritException:
+  Exclude:
+    - 'test/**/*.rb'
+
+Lint/ConstantDefinitionInBlock:
+  Exclude:
+    - 'test/**/*.rb'
+
+Bundler/DuplicatedGem:
+  Enabled: false
+
+Naming/VariableNumber:
+  Enabled: false
+
+Style/SlicingWithRange:
+  Enabled: false
+
+Performance/StringIdentifierArgument:
+  Exclude:
+    - 'test/support/websocket_test_plugin.rb'
+    - 'test/support/requests/plugins/upgrade.rb'
+
+Style/Lambda:
+  Enabled: false
+
+Style/TrivialAccessors:
+  Exclude:
+    - 'test/pool_test.rb'
+
+Style/StructInheritance:
+   Exclude:
+     - 'lib/httpx/options.rb'

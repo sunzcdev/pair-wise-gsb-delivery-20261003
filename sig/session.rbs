@@ -1,0 +1,106 @@
+module HTTPX
+  class Session
+    include Loggable
+    include Chainable
+
+    EMPTY_HASH: Hash[untyped, untyped]
+
+    @options: Options
+
+    # returns the HTTPX::Pool object which manages the networking required to
+    # perform requests.
+    @pool: Pool
+
+    @persistent: bool
+    @wrapped: bool
+    @closing: bool
+
+    def wrap: () { (instance) -> void } -> void
+
+    def close: (?Selector selector) -> void
+
+    def build_request: (verb verb, generic_uri uri, ?request_params params, ?Options options) -> Request
+
+    def select_connection: (Connection connection, Selector selector) -> void
+
+    def pin: (resolver | Connection conn_or_resolver, Selector selector) -> void
+
+    def deselect_connection: (Connection connection, Selector selector, ?bool cloned) -> void
+
+    def select_resolver: (Resolver::Resolver resolver, Selector selector) -> void
+
+    def deselect_resolver: (Resolver::Resolver resolver, Selector selector) -> void
+
+    def try_clone_connection: (Connection connection, Selector selector, Integer? family) -> Connection
+
+    def find_connection: (http_uri request_uri, Selector selector, Options options) -> Connection
+
+    private
+
+    def initialize: (?options) { (self) -> void } -> void
+                  | (?options) -> void
+
+    def can_checkin?: (Connection connection) -> boolish
+
+    def selector_close: (Selector close, *untyped) -> void
+
+    def deactivate: (Selector selector, ?Exception? error) -> void
+
+    def on_promise: (untyped, untyped) -> void
+
+    def fetch_response: (Request request, Selector selector, Options options) -> response?
+
+    def send_request: (Request request, Selector selector, ?Options options) ?{ (Connection) -> void } -> void
+
+    def do_request: (Request request, Connection connection, Selector selector) -> void
+
+    def set_request_callbacks: (Request request) -> void
+
+    def build_requests: (verb, uri, request_params) -> Array[Request]
+                      | (Array[[verb, uri] | [verb, uri, request_params]], ?request_params) -> Array[Request]
+                      | (verb, _Each[uri | [uri] | [uri, request_params]], request_params) -> Array[Request]
+
+    def do_init_connection: (Connection connection, Selector selector) -> void
+
+    def send_requests: (*Request) -> Array[response]
+
+    def receive_requests: (Array[Request] requests, Selector selector) -> Array[response]
+
+    def early_resolve: (resolver resolver, Connection connection) -> bool
+
+    def resolve_connection: (Connection connection, Selector selector) -> void
+
+    def on_resolver_connection: (Connection connection, Selector selector) -> void
+
+    def on_resolver_close: (Resolver::Resolver resolver, Selector selector) -> void
+
+    def find_resolver_for: (Connection connection, Selector selector) -> resolver
+
+    def coalesce_connections: (Connection conn1, Connection conn2, Selector selector, bool from_pool) -> void
+
+    def get_current_selector: () -> Selector?
+                            | () { () -> Selector } -> Selector
+
+    def set_current_selector: (Selector? selector) -> void
+
+    def selector_store: () -> Hash[instance, Selector]
+
+    def thread_selector_store: (Thread th) -> Hash[instance, Selector]?
+
+    attr_reader self.default_options: Options
+    self.@plugins: Array[Module]
+
+    def self.plugin: (Symbol | Module plugin, ?options? options) ?{ (Class) -> void } -> singleton(Session)
+
+
+    INSTANCES: Hash[Session, Session]
+
+    def self.after_fork: () -> void
+
+    module ForkTracker
+      def _fork: () -> void
+    end
+  end
+
+  S: singleton(Session)
+end

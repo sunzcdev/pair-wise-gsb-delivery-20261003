@@ -1,0 +1,52 @@
+module HTTPX
+  class Response::Body
+    include _Reader
+    include _ToS
+    include _ToStr
+
+    attr_reader encoding: Encoding
+    attr_reader encodings: Array[String]
+
+    attr_reader buffer: Response::Buffer?
+
+    @response: Response
+    @headers: Headers
+    @options: Options
+    @state: :idle | :memory | :buffer | :closed
+    @window_size: Integer
+    @length: Integer
+    @reader: Response::Buffer?
+    @inflaters: Array[Transcoder::_Inflater]
+
+    def initialize: (Response, Options) -> void
+
+    def closed?: () -> bool
+
+    def write:(String chunk) -> Integer?
+
+    def filename: () -> String?
+
+    def bytesize: () -> Integer
+
+    def each: () { (String) -> void } -> void
+            | () -> Enumerable[String]
+
+    def empty?: () -> bool
+
+    def copy_to: (String | File | _Writer destination) -> void
+
+    def close: () -> void
+
+    def rewind: () -> void
+
+    private
+
+    def initialize_inflaters: () -> void
+
+    def self.initialize_inflater_by_encoding: (Encoding | String encoding, Response response, ?bytesize: Integer) -> (Object & Transcoder::_Inflater)
+
+    def decode_chunk: (String chunk) -> String
+
+    def transition: (Symbol nextstate) -> void
+  end
+end

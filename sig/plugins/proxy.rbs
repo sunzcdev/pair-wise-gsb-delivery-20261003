@@ -1,0 +1,76 @@
+module HTTPX
+  class ProxyError < ConnectionError
+  end
+
+  class ProxySSL < SSL
+    attr_reader proxy_io: TCP | SSL
+  end
+
+  module Plugins
+    interface _Authenticator
+      def authenticate: (Request request, String authenticate) -> String
+    end
+
+    module Proxy
+      class ProxyConnectionError < ProxyError
+      end
+
+      PROXY_ERRORS: Array[singleton(StandardError)]
+
+      class Parameters
+        attr_reader uri: URI::Generic?
+        attr_reader username: String?
+        attr_reader password: String?
+        attr_reader scheme: String?
+        attr_reader no_proxy: Array[String]?
+
+        @ns: Integer
+        @uris: Array[URI::Generic | String]
+        @initial_credentials: boolish
+        @authenticator: _Authenticator
+
+        def shift: () -> void
+
+        def can_authenticate?: (*untyped) -> boolish
+
+        def authenticate: (*untyped) -> String?
+
+        def ==: (untyped) -> bool
+
+        private
+
+        def initialize: (?uri: generic_uri | Array[generic_uri], ?ns: Integer, ?scheme: String?, ?username: String?, ?password: String?, ?no_proxy: Array[generic_uri] | generic_uri | nil, **untyped) -> void
+
+        def infer_default_auth_scheme: (URI::Generic uri) -> String?
+
+        def load_authenticator: (String scheme, String username, String password, **untyped) -> _Authenticator
+      end
+
+      def self.configure: (singleton(Session)) -> void
+
+      interface _ProxyOptions
+        def proxy: () -> Parameters?
+      end
+
+      def self.extra_options: (Options) -> (Options & _ProxyOptions)
+
+      module ConnectionMethods
+        @proxy_uri: generic_uri
+
+        private
+
+        def proxy_connecting?: (?Symbol state) -> bool
+      end
+
+      module InstanceMethods
+        @proxy_parameters: Parameters?
+
+        private
+
+        def proxy_error?: (Request request, response, Options options) -> bool
+      end
+    end
+
+    type sessionProxy = Session & Proxy::InstanceMethods
+  end
+end

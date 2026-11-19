@@ -1,0 +1,214 @@
+stages:
+  - build
+  - test
+  - prepare
+  - deploy
+
+image:
+  name: docker:latest
+
+variables:
+  # this variable enables caching within docker-in-docker
+  # https://docs.gitlab.com/ee/ci/docker/using_docker_build.html#use-docker-in-docker-workflow-with-docker-executor
+  MOUNT_POINT: /builds/$CI_PROJECT_PATH/vendor
+  # bundler-specific
+  BUNDLE_JOBS: 4
+  BUNDLE_PATH: vendor
+
+.test_settings: &test_settings
+  variables:
+    BUNDLE_WITHOUT: assorted
+  stage: test
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  artifacts:
+    paths:
+      - coverage/
+
+.yjit_matrix: &yjit_matrix
+  parallel:
+    matrix:
+      - RUBYOPT: ["", "--yjit"]
+
+# Cache gems in between builds
+cache:
+  key: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
+  paths:
+    - vendor
+
+lint rubocop code:
+  image: "ruby:4.0"
+  variables:
+    BUNDLE_WITHOUT: test:coverage:assorted
+  before_script:
+    - bundle install
+  script:
+    - bundle exec rake rubocop
+lint rubocop wiki:
+  image: "ruby:4.0"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  variables:
+    BUNDLE_ONLY: lint
+  before_script:
+    - git clone https://gitlab.com/os85/httpx.wiki.git
+    - bundle install
+    - |
+      cat > .rubocop-wiki.yml << FILE
+      require:
+        - rubocop-md
+
+      AllCops:
+        TargetRubyVersion: 4.0
+        DisabledByDefault: true
+      FILE
+  script:
+    - bundle exec rubocop httpx.wiki --config .rubocop-wiki.yml
+
+test jruby 9:
+  <<: *test_settings
+  script:
+    ./spec.sh jruby 9.0.0.0 tests
+  allow_failure: true
+test jruby 10:
+  <<: *test_settings
+  script:
+    ./spec.sh jruby 10 tests
+  allow_failure: true
+test ruby 2/7:
+  <<: *test_settings
+  script:
+    ./spec.sh ruby 2.7 tests
+test ruby 3/0:
+  <<: *test_settings
+  only:
+    - master
+  script:
+    ./spec.sh ruby 3.0 tests
+test ruby 3/1:
+  <<: *test_settings
+  only:
+    - master
+  script:
+    ./spec.sh ruby 3.1 tests
+test ruby 3/2:
+  <<: *test_settings
+  script:
+    ./spec.sh ruby 3.2 tests
+test ruby 3/3:
+  <<: *test_settings
+  script:
+    ./spec.sh ruby 3.3 tests
+test ruby 3/4:
+  <<: *test_settings
+  <<: *yjit_matrix
+  script:
+    ./spec.sh ruby 3.4 tests
+test ruby 4/0:
+  <<: *test_settings
+  <<: *yjit_matrix
+  script:
+    ./spec.sh ruby 4.0 tests
+test truffleruby:
+  <<: *test_settings
+  script:
+    ./spec.sh truffleruby latest tests
+  allow_failure: true
+regression tests:
+  <<: *test_settings
+  script:
+    ./spec.sh ruby 4.0 regression_tests
+# TODO: uncomment this if docker ever supports ipv6 connectivity, or CI runs
+# outside of docker
+# smoke_tests:
+#   image: "ruby:4.0"
+#   variables:
+#     BUNDLE_WITHOUT: lint:assorted
+#     CI: 1
+#     COVERAGE_KEY: "$RUBY_ENGINE-$RUBY_VERSION-smoke-tests"
+#   allow_failure: true
+#   artifacts:
+#     paths:
+#       - coverage/
+#   stage: test
+#   before_script:
+#     - apt-get update && apt-get install -y libmagic-dev shared-mime-info
+#     - bundle install
+#   script:
+#     - bundle exec rake smoke_tests
+
+coverage:
+  coverage: '/coverage: \d+ \/ \d+ \((\d+.\d+\%)/'
+  stage: prepare
+  variables:
+    BUNDLE_WITHOUT: lint:test:assorted
+  image: "ruby:4.0"
+  script:
+    - gem install simplecov --no-doc
+    # this is a workaround, because simplecov doesn't support relative paths.
+    #
+    # https://github.com/simplecov-ruby/simplecov/issues/887
+    #
+    # this is necessary in our case, because coverage files are generated inside
+    # the custom docker container, which runs in /home, and the absolute paths aren't
+    # gonna match the paths where the files are, once we merge them. Therefore,
+    # all of those have to be rewritten before the merge happens.
+    #
+    - find coverage -name "*resultset.json" -exec sed -i 's?/home?'`pwd`'?' {} \;
+    - rake coverage:report
+  artifacts:
+    paths:
+      - "coverage/"
+
+pages:
+  stage: deploy
+  needs:
+    - coverage
+  image: "ruby:4.0"
+  before_script:
+    - gem install hanna-nouveau
+  script:
+    - rake prepare_website
+    - mkdir -p public/
+    - cp -r coverage/ public/
+  artifacts:
+    paths:
+      - rdoc/
+      - wiki/
+      - data/
+      - coverage/
+      - public/
+  only:
+    - master
+
+prepare_release:
+  stage: prepare
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+  script:
+    - echo "EXTRA_DESCRIPTION=$(cat doc/release_notes/${${CI_COMMIT_TAG:1}//./_}.md)" >> variables.env
+    - echo "TAG=v$(cat CI_COMMIT_TAG)" >> variables.env
+  artifacts:
+    reports:
+      dotenv: variables.env
+
+release:
+  stage: deploy
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: prepare_release
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+  script:
+    - echo "running release_job for $TAG"
+  release:
+    name: 'Release $TAG'
+    description: '$EXTRA_DESCRIPTION'
+    tag_name: '$TAG'
+    ref: '$CI_COMMIT_SHA'

@@ -1,0 +1,61 @@
+module HTTPX
+  module Parser
+    class Error < HTTPX::Error
+    end
+
+    type parsed_headers = Hash[String, Array[String]]
+
+    interface _HTTP1Events
+
+      def on_start: () -> void
+      def on_headers: (parsed_headers headers) -> void
+      def on_trailers: (parsed_headers trailers) -> void
+      def on_data: (String data) -> void
+      def on_complete: () -> void
+    end
+
+    class HTTP1
+      VERSIONS: Array[String]
+
+      attr_reader status_code: Integer
+      attr_reader http_version: String
+      attr_reader headers: parsed_headers
+
+      @observer: _HTTP1Events
+      @state: Symbol
+      @buffer: String | Transcoder::Chunker::Decoder
+      @content_type: String?
+      @content_length: Integer
+      @_has_trailers: bool
+      @upgrade: bool
+      @max_headers: Options::maybe_unbounded
+      @max_header_value_size: Options::maybe_unbounded?
+
+      def <<: (string chunk) -> void
+
+      def reset!: () -> void
+
+      def upgrade?: () -> bool
+
+      def upgrade_data: () -> String
+
+      private
+
+      def initialize: (_HTTP1Events observer, Options::maybe_unbounded max_headers, Options::maybe_unbounded? max_header_value_size) -> void
+
+      def nextstate: (Symbol state) -> void
+
+      def no_more_data?: () -> bool
+
+      def parse: () -> void
+
+      def parse_data: () -> void
+
+      def parse_headers: () -> void
+
+      def parse_headline: () -> void
+
+      def prepare_data: (parsed_headers headers) -> void
+    end
+  end
+end

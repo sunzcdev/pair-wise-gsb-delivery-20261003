@@ -1,0 +1,336 @@
+# frozen_string_literal: true
+
+module HTTPX
+  module Plugins
+    #
+    # This plugin adds support for managing an OAuth Session associated with the given session.
+    #
+    # The scope of OAuth support is limited to the `client_crendentials` and `refresh_token` grants.
+    #
+    # https://gitlab.com/os85/httpx/wikis/OAuth
+    #
+    module OAuth
+      class << self
+        def load_dependencies(klass)
+          require "monitor"
+          require_relative "auth/basic"
+          klass.plugin(:auth)
+        end
+
+        def subplugins
+          {
+            retries: OAuthRetries,
+          }
+        end
+
+        def extra_options(options)
+          options.merge(auth_header_type: "Bearer")
+        end
+      end
+
+      SUPPORTED_GRANT_TYPES = %w[client_credentials refresh_token].freeze
+      SUPPORTED_AUTH_METHODS = %w[client_secret_basic client_secret_post].freeze
+
+      # Implements the bulk of functionality and maintains the state associated with the
+      # management of the the lifecycle of an OAuth session.
+      class OAuthSession
+        def initialize(
+          issuer:,
+          client_id:,
+          client_secret:,
+          access_token: nil,
+          refresh_token: nil,
+          scope: nil,
+          audience: nil,
+          token_endpoint: nil,
+          grant_type: nil,
+          token_endpoint_auth_method: nil
+        )
+          @issuer = URI(issuer)
+          @client_id = client_id
+          @client_secret = client_secret
+          @token_endpoint = URI(token_endpoint) if token_endpoint
+          @scope = case scope
+                   when String
+                     scope.split
+                   when Array
+                     scope
+          end
+          @audience = audience
+          @access_token = access_token
+          @refresh_token = refresh_token
+          @token_endpoint_auth_method = String(token_endpoint_auth_method) if token_endpoint_auth_method
+          @grant_type = grant_type || (@refresh_token ? "refresh_token" : "client_credentials")
+          @expires_at = nil
+          @token_mon = Monitor.new
+
+          unless @token_endpoint_auth_method.nil? || SUPPORTED_AUTH_METHODS.include?(@token_endpoint_auth_method)
+            raise Error, "#{@token_endpoint_auth_method} is not a supported auth method"
+          end
+
+          return if SUPPORTED_GRANT_TYPES.include?(@grant_type)
+
+          raise Error, "#{@grant_type} is not a supported grant type"
+        end
+
+        # returns the URL where to request access and refresh tokens from.
+        def token_endpoint
+          @token_endpoint || "#{@issuer}/token"
+        end
+
+        # returns the oauth-documented authorization method to use when requesting a token.
+        def token_endpoint_auth_method
+          @token_endpoint_auth_method || "client_secret_basic"
+        end
+
+        def expires_at
+          @token_mon.synchronize { @expires_at }
+        end
+
+        def access_token
+          @token_mon.synchronize do
+            if (expires_at = @expires_at) && expires_at < Time.now.to_i
+              reset!
+            end
+
+            @access_token
+          end
+        end
+
+        def reset!
+          @token_mon.synchronize do
+            @access_token = @expires_at = nil
+          end
+        end
+
+        # when not available, it uses the +http+ object to request new access and refresh tokens.
+        def fetch_access_token(http)
+          return access_token if access_token
+
+          load(http)
+
+          # always prefer refresh token grant if a refresh token is available
+          grant_type = @refresh_token ? "refresh_token" : @grant_type
+
+          headers = {} # : Hash[String ,String]
+          form_post = {
+            "grant_type" => @grant_type,
+            "scope" => Array(@scope).join(" "),
+            "audience" => @audience,
+          }.compact
+
+          # auth
+          case token_endpoint_auth_method
+          when "client_secret_post"
+            form_post["client_id"] = @client_id
+            form_post["client_secret"] = @client_secret
+          when "client_secret_basic"
+            headers["authorization"] = Authentication::Basic.new(@client_id, @client_secret).authenticate
+          end
+
+          case grant_type
+          when "client_credentials"
+            # do nothing
+          when "refresh_token"
+            ref_token = refresh_token
+
+            raise Error, "cannot use the `\"refresh_token\"` grant type without a refresh token" unless ref_token
+
+            form_post["refresh_token"] = ref_token
+          end
+
+          # POST /token
+          token_request = http.build_request("POST", token_endpoint, headers: headers, form: form_post)
+
+          token_request.headers.delete("authorization") unless token_endpoint_auth_method == "client_secret_basic"
+
+          token_response = http.skip_auth_header { http.request(token_request) }
+
+          begin
+            token_response.raise_for_status
+          rescue HTTPError => e
+            @refresh_token = nil if e.response.status == 401 && (grant_type == "refresh_token")
+            raise e
+          end
+
+          payload = token_response.json
+
+          @token_mon.synchronize do
+            @refresh_token = payload.fetch("refresh_token", @refresh_token)
+            if (expires_in = payload["expires_in"])
+              @expires_at = Time.now.to_i + Integer(expires_in)
+            end
+            @access_token = payload["access_token"]
+          end
+        end
+
+        # TODO: remove this after deprecating the `:oauth_session` option
+        def merge(other)
+          obj = dup
+
+          case other
+          when OAuthSession
+            other.instance_variables.each do |ivar|
+              val = other.instance_variable_get(ivar)
+              next unless val
+
+              obj.instance_variable_set(ivar, val)
+            end
+          when Hash
+            other.each do |k, v|
+              obj.instance_variable_set(:"@#{k}", v) if obj.instance_variable_defined?(:"@#{k}")
+            end
+          end
+          obj
+        end
+
+        private
+
+        def refresh_token
+          @token_mon.synchronize { @refresh_token }
+        end
+
+        # uses +http+ to fetch for the oauth server metadata.
+        def load(http)
+          return if @grant_type && @scope
+
+          metadata = http.skip_auth_header { http.get("#{@issuer}/.well-known/oauth-authorization-server").raise_for_status.json }
+
+          @token_mon.synchronize do
+            @token_endpoint = metadata["token_endpoint"]
+            @scope = metadata["scopes_supported"]
+            @grant_type = Array(metadata["grant_types_supported"]).find { |gr| SUPPORTED_GRANT_TYPES.include?(gr) }
+            @token_endpoint_auth_method = Array(metadata["token_endpoint_auth_methods_supported"]).find do |am|
+              SUPPORTED_AUTH_METHODS.include?(am)
+            end
+          end
+          nil
+        end
+      end
+
+      # adds support for the following options:
+      #
+      # :oauth_options :: an hash of options to be used during session management.
+      #                   check the parameters to initialize the OAuthSession class.
+      module OptionsMethods
+        private
+
+        def option_oauth_session(value)
+          warn "DEPRECATION WARNING: option `:oauth_session` is deprecated. " \
+               "Use `:oauth_options` instead."
+
+          case value
+          when Hash
+            OAuthSession.new(**value)
+          when OAuthSession
+            value
+          else
+            raise TypeError, ":oauth_session must be a #{OAuthSession}"
+          end
+        end
+
+        def option_oauth_options(value)
+          value = Hash[value] unless value.is_a?(Hash)
+          value
+        end
+      end
+
+      module InstanceMethods
+        attr_reader :oauth_session
+        protected :oauth_session
+
+        def initialize(*)
+          super
+
+          @oauth_session = if @options.oauth_options
+            OAuthSession.new(**@options.oauth_options)
+          elsif @options.oauth_session
+            @oauth_session = @options.oauth_session.dup
+          end
+        end
+
+        def initialize_dup(other)
+          super
+          @oauth_session = other.instance_variable_get(:@oauth_session).dup
+        end
+
+        def oauth_auth(**args)
+          warn "DEPRECATION WARNING: `#{__method__}` is deprecated. " \
+               "Use `with(oauth_options: options)` instead."
+
+          with(oauth_options: args)
+        end
+
+        # will eagerly negotiate new oauth tokens with the issuer
+        def refresh_oauth_tokens!
+          return unless @oauth_session
+
+          @oauth_session.reset!
+          @oauth_session.fetch_access_token(self)
+          if (expires_at = @oauth_session.expires_at)
+            @auth_header_value_mtx.synchronize do
+              @auth_header_expires_at = expires_at
+            end
+          end
+        end
+
+        # TODO: deprecate
+        def with_access_token
+          warn "DEPRECATION WARNING: `#{__method__}` is deprecated. " \
+               "The session will automatically handle token lifecycles for you."
+
+          other_session = dup # : instance
+          oauth_session = other_session.oauth_session
+          oauth_session.fetch_access_token(other_session)
+          if (expires_at = oauth_session.expires_at)
+            @auth_header_expires_at = expires_at
+          end
+          other_session
+        end
+
+        def reset_auth_header_value!
+          super.tap do
+            @oauth_session&.reset!
+          end
+        end
+
+        private
+
+        def generate_auth_token(*)
+          return super unless @oauth_session
+
+          # should_regenerate arg ignored, as there's no way to check
+          # for token expiration yet.
+          @oauth_session.fetch_access_token(self)
+        end
+
+        def set_auth_header_expires_at(_)
+          return super unless @oauth_session
+
+          expires_at = @oauth_session.expires_at
+
+          return super unless expires_at
+
+          @auth_header_expires_at = expires_at
+        end
+
+        def dynamic_auth_token?(_)
+          @oauth_session
+        end
+      end
+
+      module OAuthRetries
+        module InstanceMethods
+          private
+
+          def prepare_to_retry(*)
+            @oauth_session.reset! if @oauth_session
+
+            super
+          end
+        end
+      end
+    end
+    register_plugin :oauth, OAuth
+  end
+end

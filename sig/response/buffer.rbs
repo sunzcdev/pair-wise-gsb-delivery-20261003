@@ -1,0 +1,23 @@
+module HTTPX
+  class Response::Buffer
+    attr_reader buffer: StringIO | Tempfile
+
+    @threshold_size: Integer
+    @bytesize: Integer
+    @encoding: Encoding
+
+    def initialize: (threshold_size: Integer, ?bytesize: Integer, ?encoding: Encoding) -> void
+
+    def size: () -> Integer
+
+    def write: (String chunk) -> Integer
+
+    def to_s: () -> String
+
+    def close: () -> void
+
+    private
+
+    def try_upgrade_buffer: () -> void
+  end
+end

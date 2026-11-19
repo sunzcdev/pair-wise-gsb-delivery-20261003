@@ -1,0 +1,238 @@
+# frozen_string_literal: true
+
+require_relative "test_helper"
+
+class OptionsTest < Minitest::Test
+  include HTTPX
+
+  def test_options_unknown
+    ex = assert_raises(Error) { Options.new(foo: "bar") }
+    assert ex.message == "unknown option: `:foo`", ex.message
+  end
+
+  def test_options_no_method_error_during_validation
+    custom_opt_class = Class.new(Options) do
+      def option_foo(value)
+        raise TypeError, ":foo must be a Hash" unless value.is_a(Hash)
+
+        value
+      end
+    end
+    ex = assert_raises(NoMethodError) { custom_opt_class.new(foo: "bar") }
+    assert_match(/undefined method .+is_a/, ex.message)
+  end
+
+  def test_options_headers
+    opt1 = Options.new
+    assert opt1.headers["user-agent"].start_with?("httpx"), "should set default user-agent"
+    assert opt1.headers["accept"], "should set default accet"
+    assert opt1.headers.to_a.include?(%w[accept */*]), "accept headers are unexpected"
+    opt2 = Options.new(:headers => { "user-agent" => nil })
+    assert opt2.headers["user-agent"] == "", "should remove default user-agent"
+    assert opt2.headers.to_a.include?(%w[accept */*]), "accept headers are unexpected"
+    opt3 = Options.new(:headers => { "accept-encoding" => "text/plain", "range" => "100-" })
+    assert opt3.headers["range"] == "100-"
+    assert !opt3.headers.key?("accept-encoding")
+  end
+
+  def test_options_resolver_class
+    assert Options.new(resolver_class: :native).resolver_class < Resolver::Native
+    assert Options.new(resolver_class: :system).resolver_class < Resolver::System
+    assert Options.new(resolver_class: :https).resolver_class < Resolver::HTTPS
+
+    return if defined?(RBS)
+
+    assert_raises(TypeError) { Options.new(resolver_class: 1) }
+    ex = assert_raises(TypeError) { Options.new(resolver_class: :smth) }
+    assert(ex.message.include?("`:resolver_class` must be a supported type"))
+    assert Options.new(resolver_class: Resolver::HTTPS).resolver_class == Resolver::HTTPS
+
+    ex = assert_raises(TypeError) { Options.new(resolver_class: Object) }
+    assert(ex.message.include?("`:resolver_class` must be a subclass of `HTTPX::Resolver::Resolver`"))
+  end
+
+  def test_options_resolver_cache
+    assert Options.new(resolver_cache: :memory).resolver_cache.instance_of?(HTTPX::Resolver::Cache::Memory)
+    assert Options.new(resolver_cache: :file).resolver_cache.instance_of?(HTTPX::Resolver::Cache::File)
+
+    return if defined?(RBS)
+
+    assert_raises(TypeError) { Options.new(resolver_cache: :smth) }
+    ex = assert_raises(TypeError) { Options.new(resolver_cache: Object.new) }
+    assert(ex.message.include?("`:resolver_cache` must be a compatible resolver cache"))
+
+    custom_cache = Object.new
+    def custom_cache.resolve(*); end
+    def custom_cache.get(*); end
+    def custom_cache.set(*); end
+    def custom_cache.evict(*); end
+    assert Options.new(resolver_cache: custom_cache).resolver_cache == custom_cache
+  end
+
+  def test_options_headers_with_instance
+    proc_headers_class = Class.new(HTTPX::Headers) do
+      def initialize(headers = nil)
+        super(headers.transform_values(&:call))
+      end
+    end
+
+    opts = Options.new(headers_class: proc_headers_class, headers: { "x-number" => -> { 1 + 1 } })
+    assert_equal "2", opts.headers["x-number"]
+  end
+
+  def test_options_timeout_assignment
+    assert_equal 30, Options.new(timeout: { connect_timeout: 30 }).timeout[:connect_timeout]
+    assert_equal 30.5, Options.new(timeout: { connect_timeout: 30.5 }).timeout[:connect_timeout]
+    ex = assert_raises(TypeError) { Options.new(timeout: { connect_timeout: "30" }) }
+    assert_match(/`:connect_timeout` must be numeric/, ex.message)
+    ex = assert_raises(TypeError) { Options.new(timeout: { invalid_timeout: 30 }) }
+    assert_match(/invalid timeout: `:invalid_timeout`/, ex.message)
+  end
+
+  def test_options_merge_hash
+    opts = Options.new(fallback_protocol: "fat")
+    merged_opts = opts.merge(fallback_protocol: "thin")
+    assert merged_opts.fallback_protocol == "thin", "parameter hasn't been merged"
+    assert opts.fallback_protocol == "fat", "original parameter has been mutated after merge"
+    assert !opts.equal?(merged_opts), "merged options should be a different object"
+  end
+
+  def test_options_merge_options
+    opts = Options.new(fallback_protocol: "fat")
+    merged_opts2 = opts.merge(Options.new(fallback_protocol: "short"))
+    assert opts.fallback_protocol == "fat", "original parameter has been mutated after merge"
+    assert merged_opts2.fallback_protocol == "short", "options parameter hasn't been merged"
+    assert !opts.equal?(merged_opts2), "merged options should be a different object"
+  end
+
+  def test_options_merge_options_empty_hash
+    opts = Options.new(fallback_protocol: "fat")
+    merged_opts3 = opts.merge({})
+    assert opts.equal?(merged_opts3), "merged options should be the same object"
+  end
+
+  def test_options_merge_unknown
+    assert_output(nil, /DEPRECATION WARNING: unknown option: `:foo`/) do
+      Options.new(fallback_protocol: "fat").merge(foo: :bar)
+    end
+    # ex = assert_raises(Error) { Options.new(fallback_protocol: "fat").merge(foo: :bar) }
+    # assert ex.message == "unknown option: foo", ex.message
+  end
+
+  def test_options_merge_same_options
+    opts = Options.new(fallback_protocol: "fat")
+
+    merged_opts4 = opts.merge({ fallback_protocol: "fat" })
+    assert opts.equal?(merged_opts4), "merged options should be the same object"
+
+    merged_opts5 = opts.merge(Options.new(fallback_protocol: "fat"))
+    assert opts.equal?(merged_opts5), "merged options should be the same object"
+  end
+
+  def test_options_merge_origin_uri
+    opts = Options.new(origin: "http://example.com")
+    merged_opts = opts.merge(Options.new(origin: "http://example2.com"))
+    assert merged_opts.origin == URI("http://example2.com")
+
+    merged_opts = opts.merge({ origin: "http://example2.com" })
+    assert merged_opts.origin == URI("http://example2.com")
+  end
+
+  def test_options_merge_attributes_match
+    foo = Options.new(
+      :http2_settings => { :foo => 1 },
+      :headers => { :accept => "json", :foo => "foo" },
+    )
+
+    bar = Options.new(
+      :http2_settings => { :bar => 2 },
+      :headers => { :accept => "xml", :bar => "bar" },
+      :ssl => { :foo => "bar" },
+    )
+
+    expected = {
+      :io => ENV.key?("HTTPX_DEBUG") ? $stderr : nil,
+      :max_requests => Float::INFINITY,
+      :debug => nil,
+      :debug_level => 1,
+      :debug_redact => false,
+      :buffer_size => 16_384,
+      :window_size => 16_384,
+      :body_threshold_size => 114_688,
+      :max_response_headers => 1000,
+      :max_response_header_value_size => nil,
+      :max_response_body_size => Float::INFINITY,
+      :http2_settings => { foo: 1, :bar => 2 },
+      :timeout => Options::Timeouts.new,
+      :ssl => { :foo => "bar" },
+      :fallback_protocol => "http/1.1",
+      :supported_compression_formats => %w[gzip deflate],
+      :compress_request_body => true,
+      :decompress_response_body => true,
+      :headers => {
+        "accept" => "xml",
+        "foo" => "foo",
+        "bar" => "bar",
+        "user-agent" => "httpx.rb/#{HTTPX::VERSION}",
+        "accept-encoding" => "gzip, deflate",
+      },
+      :max_concurrent_requests => nil,
+      :request_class => bar.request_class,
+      :response_class => bar.response_class,
+      :headers_class => bar.headers_class,
+      :request_body_class => bar.request_body_class,
+      :response_body_class => bar.response_body_class,
+      :connection_class => bar.connection_class,
+      :http1_class => bar.http1_class,
+      :http2_class => bar.http2_class,
+      :resolver_native_class => bar.resolver_native_class,
+      :resolver_system_class => bar.resolver_system_class,
+      :resolver_https_class => bar.resolver_https_class,
+      :options_class => bar.options_class,
+      :pool_class => bar.pool_class,
+      :pool_options => bar.pool_options,
+      :transport => nil,
+      :transport_options => nil,
+      :addresses => nil,
+      :persistent => false,
+      :close_on_fork => false,
+      :resolver_class => bar.resolver_class,
+      :resolver_cache => bar.resolver_cache,
+      :resolver_options => bar.resolver_options,
+      :ip_families => bar.ip_families,
+    }.compact
+
+    assert foo.merge(bar).to_hash == expected, "options haven't merged correctly"
+  end unless ENV.key?("HTTPX_DEBUG")
+
+  def test_options_new
+    opts = Options.new
+    assert Options.new(opts).equal?(opts), "it should be the same options object"
+
+    opts_class = Class.new(Options)
+    opts2 = opts_class.new
+    assert Options.new(opts2).equal?(opts2), "it should return the most enhanced options object if build from Options"
+
+    assert opts_class.new(opts2).equal?(opts2), "returns the same object it using the same meta-class"
+  end
+
+  def test_options_to_hash
+    opts = Options.new
+    assert opts.to_hash.is_a?(Hash)
+  end
+
+  def test_connection_options_match
+    opts = Options.new(origin: "http://example.com")
+    assert opts.connection_options_match?(Options.new(origin: "http://example.com"))
+    assert Options.new(origin: "http://example.com", headers: { "foo" => "bar" }).connection_options_match?(Options.new(origin: "http://example.com"))
+    assert !opts.connection_options_match?(Options.new(origin: "http://example2.com"))
+  end
+
+  def test_resolver_options_match
+    opts = Options.new(origin: "http://example.com")
+    assert opts.resolver_options_match?(Options.new(origin: "http://example.com"))
+    assert Options.new(origin: "http://example.com", headers: { "foo" => "bar" }).resolver_options_match?(Options.new(origin: "http://example.com"))
+    assert opts.resolver_options_match?(Options.new(origin: "http://example2.com"))
+    assert !opts.resolver_options_match?(Options.new(resolver_options: { cache: false }))
+  end
+end

@@ -1,0 +1,27 @@
+module HTTPX
+  module Plugins
+    module Brotli
+      def self?.load_dependencies: (singleton(Session)) -> void
+
+      def self?.encode: (body_encoder body) -> Deflater
+
+      def self?.decode: (HTTPX::Response response, ?bytesize: Integer | Float) -> Inflater
+
+      class Error < ::HTTPX::Error
+      end
+
+      class Deflater < Transcoder::Deflater
+        @compressor: ::Brotli::Compressor
+      end
+
+      class Inflater
+        @inflater: ::Brotli::Decompressor
+        @bytesize: Integer | Float
+
+        def initialize: (Integer | Float bytesize) -> void
+
+        def call: (String chunk) -> String
+      end
+    end
+  end
+end

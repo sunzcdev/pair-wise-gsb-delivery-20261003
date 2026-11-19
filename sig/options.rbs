@@ -1,0 +1,263 @@
+module HTTPX
+  class Options
+    # include _ToHash
+
+    type maybe_unbounded = Integer | Float # because infinity
+
+    BUFFER_SIZE: Integer
+    WINDOW_SIZE: Integer
+    MAX_BODY_THRESHOLD_SIZE: Integer
+    CONNECT_TIMEOUT: Integer
+    READ_TIMEOUT: Integer
+    WRITE_TIMEOUT: Integer
+    KEEP_ALIVE_TIMEOUT: Integer
+    PING_TIMEOUT: Integer
+    SETTINGS_TIMEOUT: Integer
+    CLOSE_HANDSHAKE_TIMEOUT: Integer
+    SET_TEMPORARY_NAME: ^(Class klass, ?Symbol pl) -> void
+
+    DEFAULT_OPTIONS: Hash[Symbol, untyped]
+    REQUEST_BODY_IVARS: Array[Symbol]
+    RESOLVER_IVARS: Array[Symbol]
+    RESOLVER_TYPES: Array[Symbol]
+    USER_AGENT: String
+
+    type timeout_type = :connect_timeout | :settings_timeout | :close_handshake_timeout | :operation_timeout | :keep_alive_timeout | :read_timeout | :write_timeout | :total_request_timeout | :request_timeout | :ping_timeout
+    type redact_value = :headers | :body | bool
+    type resolver_cache_option = :memory | :file | (Object & Resolver::_Cache)
+
+    def self.new: (?options) -> instance
+
+    attr_reader self.options_names: Set[Symbol]
+
+    # headers
+    attr_reader uri: URI?
+
+    # headers
+    attr_reader headers: headers
+
+    # timeout
+    attr_reader timeout: Timeouts
+
+    # http2_settings
+    attr_reader http2_settings: Hash[Symbol, Integer | bool]
+
+    # max_concurrent_requests
+    attr_reader max_concurrent_requests: maybe_unbounded?
+
+    # max_requests
+    attr_reader max_requests: maybe_unbounded?
+
+    # window_size
+    attr_reader window_size: Integer
+
+    # buffer_size
+    attr_reader buffer_size: Integer
+
+    # body_threshold_size
+    attr_reader body_threshold_size: Integer
+
+    # max_response_headers
+    attr_reader max_response_headers: Integer
+
+    # max_response_header_value_size
+    attr_reader max_response_header_value_size: maybe_unbounded?
+
+    # max_response_body_size
+    attr_reader max_response_body_size: maybe_unbounded
+
+    # transport
+    attr_reader transport: io_type | nil
+
+    # addresses
+    attr_reader addresses: (Hash[String, Array[Resolver::Entry]] | Array[Resolver::Entry])?
+
+    # supported_compression_formats
+    attr_reader supported_compression_formats: Array[String]
+
+    # compress_request_body
+    attr_reader compress_request_body: bool
+
+    # decompress_response_body
+    attr_reader decompress_response_body: bool
+
+    # origin
+    attr_reader origin: URI::Generic?
+
+    # base_path
+    attr_reader base_path: String?
+
+    # classes
+    attr_reader resolver_native_class: singleton(Resolver::Native)
+
+    attr_reader resolver_system_class: singleton(Resolver::System)
+
+    attr_reader resolver_https_class: singleton(Resolver::HTTPS)
+
+    attr_reader http1_class: singleton(Connection::HTTP1)
+
+    attr_reader http2_class: singleton(Connection::HTTP2)
+
+    attr_reader connection_class: singleton(Connection)
+
+    attr_reader pool_class: singleton(Pool)
+
+    attr_reader request_class: singleton(Request)
+
+    attr_reader response_class: singleton(Response)
+
+    attr_reader headers_class: singleton(Headers)
+
+    attr_reader request_body_class: singleton(Request::Body)
+
+    attr_reader response_body_class: singleton(Response::Body)
+
+    attr_reader options_class: singleton(Options)
+
+    attr_reader ssl: Hash[Symbol, untyped]
+
+    type external_io = TCPSocket | OpenSSL::SSL::SSLSocket | UNIXSocket
+
+    type io_option = external_io | Hash[String, external_io]
+
+    attr_reader io: io_option?
+
+    # fallback_protocol
+    attr_reader fallback_protocol: String
+
+    # debug
+    attr_reader debug: _IOLogger?
+
+    # debug_level
+    attr_reader debug_level: Integer
+
+    # persistent
+    attr_reader persistent: bool
+
+    # close_on_fork
+    attr_reader close_on_fork: bool
+
+    # resolver_options
+    attr_reader resolver_options: Hash[Symbol, untyped]
+
+    # resolver_options
+    attr_reader pool_options: pool_options
+
+    # ip_families
+    attr_reader ip_families: Array[ip_family]?
+
+    @resolver_cache: resolver_cache_option
+
+    def resolver_class: () -> singleton(Resolver::Resolver)
+
+    def resolver_cache: () -> (Object & Resolver::_Cache)
+
+    def ==: (Options other) -> bool
+
+    def connection_options_match?: (Options other, ?Array[Symbol] ignore_ivars) -> bool
+
+    def resolver_options_match?: (Options other) -> bool
+
+    def merge: (Object & _ToHash[Symbol, untyped] other) -> (instance | self)
+
+    def to_hash: () -> Hash[Symbol, untyped]
+
+    def extend_with_plugin_classes: (Module pl) -> void
+
+    private
+
+    def initialize: (?options options) -> void
+
+    def do_initialize: () -> void
+
+    # integer
+    def option_max_concurrent_requests: (int value) -> maybe_unbounded
+    def option_max_requests: (int value) -> maybe_unbounded
+    def option_window_size: (int value) -> Integer
+    def option_buffer_size: (int value) -> Integer
+    def option_body_threshold_size: (int value) -> Integer
+    def option_debug_level: (int value) -> Integer
+
+    # to hash
+    def option_ssl: (_ToHash[Symbol, untyped] value) -> Hash[Symbol, untyped]
+    def option_http2_settings: (_ToHash[Symbol, untyped] value) -> Hash[Symbol, untyped]
+    def option_resolver_options: (_ToHash[Symbol, untyped] value) -> Hash[Symbol, untyped]
+    def option_pool_options: (_ToHash[Symbol, untyped] value) -> Hash[Symbol, untyped]
+
+    # no transform
+    def option_request_class: (singleton(Request) value) -> singleton(Request)
+    def option_response_class: (singleton(Response) value) -> singleton(Response)
+    def option_headers_class: (singleton(Headers) value) -> singleton(Headers)
+    def option_request_body_class: (singleton(Request::Body) value) -> singleton(Request::Body)
+    def option_response_body_class: (singleton(Response::Body) value) -> singleton(Response::Body)
+    def option_connection_class: (singleton(Connection) value) -> singleton(Connection)
+    def option_options_class: (singleton(Options) value) -> singleton(Options)
+    def option_pool_class: (singleton(Pool) value) -> singleton(Pool)
+    def option_resolver_class: (Symbol | resolver_type value) -> (Symbol | resolver_type)
+    def option_io: (io_option value) -> io_option
+    def option_fallback_protocol: (String value) -> String
+    def option_debug: (_IOLogger value) -> _IOLogger
+    def option_debug_redact: (redact_value value) -> redact_value
+    def option_compress_request_body: (bool value) -> bool
+    def option_decompress_response_body: (bool value) -> bool
+    def option_persistent: (bool value) -> bool
+    def option_close_on_fork: (bool value) -> bool
+
+    def option_resolver_cache: (resolver_cache_option value) -> resolver_cache_option
+
+    def option_origin: (http_uri | String value) -> http_uri
+
+    def option_base_path: (_ToStr value) -> String
+
+    def option_headers: (headers_input | Headers value) -> Headers
+
+    def option_timeout: (Timeouts | _ToHash[timeout_type, interval?]) -> Timeouts
+
+    def option_supported_compression_formats: (_ToS | _ToAry[_ToS] value) -> Array[String]
+
+    def option_transport: (_ToS value) -> String
+
+    def option_addresses: (ipaddr | _ToAry[ipaddr] value) -> Array[Resolver::Entry]
+                        | (Hash[String,  _ToAry[ipaddr]] value) -> Hash[String, Array[Resolver::Entry]]
+
+    def option_ip_families: (ip_family | _ToAry[ip_family] value) -> Array[ip_family]
+
+    class Timeouts
+      attr_reader connect_timeout: interval?
+      attr_reader settings_timeout: interval?
+      attr_reader read_timeout: interval?
+      attr_reader write_timeout: interval?
+      attr_reader request_timeout: interval?
+      attr_reader total_request_timeout: interval?
+      attr_reader operation_timeout: interval?
+      attr_reader close_handshake_timeout: interval
+      attr_reader keep_alive_timeout: interval
+      attr_reader ping_timeout: interval
+
+      def initialize: (
+        ?connect_timeout: interval?,
+        ?settings_timeout: interval?,
+        ?read_timeout: interval?,
+        ?write_timeout: interval?,
+        ?request_timeout: interval?,
+        ?total_request_timeout: interval?,
+        ?operation_timeout: interval?,
+        ?close_handshake_timeout: interval?,
+        ?keep_alive_timeout: interval?,
+        ?ping_timeout: interval?
+      ) -> void
+
+      def merge: (Timeouts | Hash[Symbol, interval?]) -> Timeouts
+
+      def []: (Symbol) -> interval?
+
+      def to_h: () -> Hash[Symbol, interval?]
+
+      private
+
+      def deadline_timeouts?: () -> boolish
+    end
+  end
+
+  type options = Options | Hash[Symbol, untyped]
+end

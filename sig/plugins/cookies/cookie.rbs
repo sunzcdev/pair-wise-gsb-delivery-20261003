@@ -1,0 +1,56 @@
+module HTTPX
+  module Plugins::Cookies
+    class Cookie
+      include Comparable
+
+      MAX_LENGTH: Integer
+
+      attr_reader domain: DomainName?
+
+      attr_reader path: String
+
+      attr_reader name: String
+
+      attr_reader value: String?
+
+      attr_reader created_at: Time
+
+      @for_domain: bool
+
+      @domain_name: DomainName
+
+      def path=: (string) -> void
+
+      def domain=: (string) -> void
+
+      def expires: () -> Time?
+
+      def expired?: () -> bool
+                  | (Time) -> bool
+
+      def cookie_value: () -> String
+      alias to_s cookie_value
+
+      def match?: (String | cookie_attributes name_or_options) -> bool
+
+      def valid_for_uri?: (http_uri uri) -> bool
+
+      def self.new: (Cookie) -> instance
+                    | (cookie_attributes) -> instance
+                    | (_ToS, _ToS, ?cookie_attributes) -> instance
+
+      def self.path_match?: (String, String) -> bool
+
+      private
+
+      def initialize: (_ToS name, _ToS value, ?cookie_attributes) -> void
+
+      def acceptable_from_uri?: (uri) -> bool
+
+      module Scanner
+        RE_BAD_CHAR: Regexp
+        def self?.quote: (String s) -> String
+      end
+    end
+  end
+end

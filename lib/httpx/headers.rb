@@ -1,0 +1,176 @@
+# frozen_string_literal: true
+
+module HTTPX
+  class Headers
+    class << self
+      def new(headers = nil)
+        return headers if headers.is_a?(self)
+
+        super
+      end
+    end
+
+    def initialize(headers = nil)
+      if headers.nil? || headers.empty?
+        @headers = headers.to_h
+        return
+      end
+
+      @headers = {}
+
+      headers.each do |field, value|
+        field = downcased(field)
+
+        value = array_value(value)
+
+        current = @headers[field]
+
+        if current.nil?
+          @headers[field] = value
+        else
+          current.concat(value)
+        end
+      end
+    end
+
+    # cloned initialization
+    def initialize_clone(orig, **kwargs)
+      super
+      @headers = orig.instance_variable_get(:@headers).clone(**kwargs)
+    end
+
+    # dupped initialization
+    def initialize_dup(orig)
+      super
+      @headers = orig.instance_variable_get(:@headers).transform_values(&:dup)
+    end
+
+    # freezes the headers hash
+    def freeze
+      @headers.each_value(&:freeze).freeze
+      super
+    end
+
+    # merges headers with another header-quack.
+    # the merge rule is, if the header already exists,
+    # ignore what the +other+ headers has. Otherwise, set
+    #
+    def merge(other)
+      headers = dup
+      other.each do |field, value|
+        headers[downcased(field)] = value
+      end
+      headers
+    end
+
+    # returns the comma-separated values of the header field
+    # identified by +field+, or nil otherwise.
+    #
+    def [](field)
+      a = @headers[downcased(field)] || return
+      a.join(", ")
+    end
+
+    # sets +value+ (if not nil) as single value for the +field+ header.
+    #
+    def []=(field, value)
+      return unless value
+
+      @headers[downcased(field)] = array_value(value)
+    end
+
+    # deletes all values associated with +field+ header.
+    #
+    def delete(field)
+      canonical = downcased(field)
+      @headers.delete(canonical) if @headers.key?(canonical)
+    end
+
+    # adds additional +value+ to the existing, for header +field+.
+    #
+    def add(field, value)
+      (@headers[downcased(field)] ||= []) << String(value)
+    end
+
+    # helper to be used when adding an header field as a value to another field
+    #
+    #     h2_headers.add_header("vary", "accept-encoding")
+    #     h2_headers["vary"] #=> "accept-encoding"
+    #     h1_headers.add_header("vary", "accept-encoding")
+    #     h1_headers["vary"] #=> "Accept-Encoding"
+    #
+    alias_method :add_header, :add
+
+    # returns the enumerable headers store in pairs of header field + the values in
+    # the comma-separated string format
+    #
+    def each(extra_headers = nil)
+      return enum_for(__method__, extra_headers) { @headers.size } unless block_given?
+
+      @headers.each do |field, value|
+        yield(field, value.join(", ")) unless value.empty?
+      end
+
+      extra_headers.each do |field, value|
+        yield(field, value) unless value.empty?
+      end if extra_headers
+    end
+
+    def ==(other)
+      other == to_hash
+    end
+
+    def empty?
+      @headers.empty?
+    end
+
+    # the headers store in Hash format
+    def to_hash
+      Hash[to_a]
+    end
+    alias_method :to_h, :to_hash
+
+    # the headers store in array of pairs format
+    def to_a
+      Array(each)
+    end
+
+    # headers as string
+    def to_s
+      @headers.to_s
+    end
+
+    # simplecov:disable
+    def inspect
+      "#<#{self.class}:#{object_id} " \
+        "#{to_hash.inspect}>"
+    end
+    # simplecov:enable
+
+    # this is internal API and doesn't abide to other public API
+    # guarantees, like downcasing strings.
+    # Please do not use this outside of core!
+    #
+    def key?(downcased_key)
+      @headers.key?(downcased_key)
+    end
+
+    # returns the values for the +field+ header in array format.
+    # This method is more internal, and for this reason doesn't try
+    # to "correct" the user input, i.e. it doesn't downcase the key.
+    #
+    def get(downcased_key)
+      @headers[downcased_key] || EMPTY
+    end
+
+    private
+
+    def array_value(value)
+      Array(value)
+    end
+
+    def downcased(field)
+      String(field).downcase
+    end
+  end
+end

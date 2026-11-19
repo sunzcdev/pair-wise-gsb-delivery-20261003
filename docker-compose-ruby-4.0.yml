@@ -1,0 +1,25 @@
+services:
+  httpx:
+    image: ruby:4.0
+    environment:
+      - HTTPBIN_COALESCING_HOST=another
+      - HTTPX_RESOLVER_URI=https://doh/dns-query
+    depends_on:
+      - doh
+
+  doh:
+    image: dajobe/nghttpx
+    environment:
+      ARGS: "--no-ocsp --frontend *,443"
+      KEY_FILE: /data/etc/certs/doh.key
+      CERT_FILE: /data/etc/certs/doh.crt
+    depends_on:
+      - doh-proxy
+    volumes:
+      - ./test/support/ci:/data/etc
+      - ./test/support/ci/doh-nghttp.conf:/data/etc/nghttpx.conf
+
+  doh-proxy:
+    image: publicarray/doh-proxy
+    environment:
+      - "UNBOUND_SERVICE_HOST=127.0.0.11"

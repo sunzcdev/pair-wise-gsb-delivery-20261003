@@ -1,0 +1,213 @@
+# frozen_string_literal: true
+
+require "resolv"
+
+module HTTPX
+  # Base class for all internal internet name resolvers. It handles basic blocks
+  # from the Selectable API.
+  #
+  class Resolver::Resolver
+    include Loggable
+
+    using ArrayExtensions::Intersect
+
+    RECORD_TYPES = {
+      Socket::AF_INET6 => Resolv::DNS::Resource::IN::AAAA,
+      Socket::AF_INET => Resolv::DNS::Resource::IN::A,
+    }.freeze
+
+    FAMILY_TYPES = {
+      Resolv::DNS::Resource::IN::AAAA => "AAAA",
+      Resolv::DNS::Resource::IN::A => "A",
+    }.freeze
+
+    class << self
+      def multi?
+        true
+      end
+    end
+
+    attr_reader :family, :options
+
+    attr_writer :current_session
+
+    attr_accessor :current_selector, :multi
+
+    def initialize(family, options)
+      @family = family
+      @record_type = RECORD_TYPES[family]
+      @options = options
+      @connections = []
+    end
+
+    def each_connection(&block)
+      enum_for(__method__) unless block
+
+      return unless @connections
+
+      @connections.each(&block)
+    end
+
+    def close; end
+
+    alias_method :terminate, :close
+
+    def initial_call
+      call
+    end
+
+    def force_close(...)
+      while (connection = @connections.shift)
+        connection.force_close(...)
+      end
+    end
+
+    def closed?
+      true
+    end
+
+    def empty?
+      true
+    end
+
+    def inflight?
+      false
+    end
+
+    def emit_addresses(connection, family, addresses, early_resolve = false)
+      addresses.map! { |address| address.is_a?(Resolver::Entry) ? address : Resolver::Entry.new(address) }
+
+      # double emission check, but allow early resolution to work
+      conn_addrs = connection.addresses
+      return if !early_resolve && conn_addrs && !conn_addrs.empty? && !addresses.intersect?(conn_addrs)
+
+      log do
+        "resolver #{FAMILY_TYPES[RECORD_TYPES[family]]}: " \
+          "answer #{connection.peer.host}: #{addresses.inspect} (early resolve: #{early_resolve})"
+      end
+
+      # do not apply resolution delay for non-dns name resolution
+      if !early_resolve &&
+         # just in case...
+         @current_selector &&
+         # resolution delay only applies to IPv4
+         family == Socket::AF_INET &&
+         # connection already has addresses and initiated/ended handshake
+         !connection.io &&
+         # no need to delay if not supporting dual stack / multi-homed IP
+         (connection.options.ip_families || Resolver.supported_ip_families).size > 1 &&
+         # connection URL host is already the IP (early resolve included perhaps?)
+         addresses.first.to_s != connection.peer.host.to_s
+        log { "resolver #{FAMILY_TYPES[RECORD_TYPES[family]]}: applying resolution delay..." }
+
+        @current_selector.after(0.05) do
+          # double emission check
+          unless connection.addresses && addresses.intersect?(connection.addresses)
+            emit_resolved_connection(connection, addresses, early_resolve)
+          end
+        end
+      else
+        emit_resolved_connection(connection, addresses, early_resolve)
+      end
+    end
+
+    def handle_error(error)
+      if error.respond_to?(:connection) &&
+         error.respond_to?(:host)
+        @connections.delete(error.connection)
+        emit_resolve_error(error.connection, error.host, error)
+      else
+        while (connection = @connections.shift)
+          emit_resolve_error(connection, connection.peer.host, error)
+        end
+      end
+    end
+
+    def on_io_error(e)
+      on_error(e)
+      force_close(true)
+    end
+
+    def on_error(error)
+      handle_error(error)
+      disconnect
+    end
+
+    def early_resolve(connection, hostname: connection.peer.host) # rubocop:disable Naming/PredicateMethod
+      addresses = @resolver_options[:cache] && (connection.addresses || @options.resolver_cache.resolve(hostname))
+
+      return false unless addresses
+
+      addresses = addresses.select { |addr| addr.family == @family }
+
+      return false if addresses.empty?
+
+      emit_addresses(connection, @family, addresses, true)
+
+      true
+    end
+
+    def lazy_resolve(connection)
+      return unless @current_session && @current_selector
+
+      conn_to_resolve = @current_session.try_clone_connection(connection, @current_selector, @family)
+      self << conn_to_resolve
+
+      return if empty?
+
+      # both the resolver and the connection it's resolving must be pinned to the session
+      @current_session.pin(conn_to_resolve, @current_selector)
+      @current_session.select_resolver(self, @current_selector)
+    end
+
+    private
+
+    def emit_resolved_connection(connection, addresses, early_resolve)
+      begin
+        connection.addresses = addresses
+
+        return if connection.state == :closed
+
+        resolve_connection(connection)
+      rescue StandardError => e
+        if early_resolve
+          connection.force_close
+          throw(:resolve_error, e)
+        else
+          emit_connection_error(connection, e)
+        end
+      end
+    end
+
+    def emit_resolve_error(connection, hostname = connection.peer.host, ex = nil)
+      emit_connection_error(connection, resolve_error(hostname, ex))
+    end
+
+    def resolve_error(hostname, ex = nil)
+      return ex if ex.is_a?(ResolveError) || ex.is_a?(ResolveTimeoutError)
+
+      message = ex ? ex.message : "Can't resolve #{hostname}"
+      error = ResolveError.new(message)
+      error.set_backtrace(ex ? ex.backtrace : caller)
+      error
+    end
+
+    def resolve_connection(connection)
+      @current_session.__send__(:on_resolver_connection, connection, @current_selector)
+    end
+
+    def emit_connection_error(connection, error)
+      return connection.handle_connect_error(error) if connection.connecting?
+
+      connection.on_error(error)
+    end
+
+    def disconnect
+      close
+
+      return unless closed?
+
+      @current_session.deselect_resolver(self, @current_selector)
+    end
+  end
+end

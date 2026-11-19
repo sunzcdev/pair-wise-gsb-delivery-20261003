@@ -1,0 +1,221 @@
+module HTTPX
+  class Connection
+    interface _Parser
+
+      def on: (Symbol) { (*untyped) -> void } -> void
+      def empty?: () -> bool
+      # def exhausted?: () -> bool
+      def close: () -> void
+      def consume: () -> void
+      def <<: (string) -> void
+      # def send: (Request) -> void
+      # def ping: () -> void
+      # def timeout: () -> (Integer | Float)
+
+    end
+
+    extend Forwardable
+    include Loggable
+    include Callbacks
+
+
+    attr_reader type: io_type
+    attr_reader io: TCP | SSL | UNIX | nil
+    attr_reader origin: http_uri
+    attr_reader origins: Array[String]
+    attr_reader state: Symbol
+    attr_reader pending: Array[Request]
+    attr_reader options: Options
+    attr_reader ssl_session: OpenSSL::SSL::Session?
+    attr_reader sibling: instance?
+    attr_writer current_selector: Selector?
+    attr_accessor current_session: Session?
+    attr_accessor family: Integer?
+
+    attr_reader read_buffer: Buffer
+    attr_reader write_buffer: Buffer
+
+
+    @window_size: Integer
+    @max_concurrent_requests: Integer?
+    @keep_alive_timeout: interval?
+    @timeout: interval?
+    @current_timeout: interval?
+    @parser: Object & _Parser
+    @connected_at: Float
+    @response_received_at: Float
+    @exhausted: bool
+    @cloned: bool
+    @reset_timeout_on_call: bool
+    @previously_exhausted_with_error: bool
+    @coalesced_connection: instance?
+    @altsvc_connection: instance?
+    @sibling: instance?
+    @main_sibling: bool
+    @no_more_requests_counter: Integer
+    @ping_timer: Timers::Timer?
+
+
+    def addresses: () -> Array[Resolver::Entry]?
+
+    def peer: () -> URI::Generic
+
+    def addresses=: (Array[Resolver::Entry] addresses) -> void
+
+    def send: (Request request) -> void
+
+    def addresses?: () -> boolish
+
+    def match?: (http_uri uri, Options options) -> bool
+
+    def mergeable?: (Connection connection) -> bool
+
+    def coalesce!: (instance connection) -> void
+
+    def coalesced?: () -> boolish
+
+    def coalescable?: (Connection connection) -> bool
+
+    def merge: (Connection connection) -> void
+
+    def pending_count: () -> Integer
+
+    def purge_pending: () { (Request request) -> void } -> void
+
+    def connecting?: (?Symbol state) -> bool
+
+    def current_context?: () -> bool
+
+    def io_connected?: () -> boolish
+
+    def inflight?: () -> boolish
+
+    def closed_for_select?: () -> bool
+
+    def interests: () -> io_interests?
+
+    def to_io: () -> IO
+
+    def call: () -> void
+
+    def initial_call: () -> void
+
+    def terminate: () -> void
+
+    def close: () -> void
+
+    def force_close: (?bool delete_pending) -> void
+
+    def force_reset: (?bool cloned) -> void
+
+    def reset: () -> void
+
+    def timeout: () -> interval?
+
+    def idling: () -> void
+
+    def used?: () -> boolish
+
+    def deactivate: () -> void
+
+    def open?: () -> bool
+
+    def handle_socket_timeout: (interval interval) -> void
+
+    def sibling=: (instance? connection) -> void
+
+    def handle_connect_error: (StandardError error) -> void
+
+    def disconnect: () -> bool
+
+    def on_error: (HTTPX::TimeoutError | Error | StandardError error, ?Request? request) -> void
+
+    def on_io_error: (SocketError | IOError | TLSError error) -> void
+
+    def on_connect_error: (Exception error) -> void
+
+    private
+
+    def initialize: (http_uri uri, Options options) -> void
+
+    def initialize_type: (http_uri uri, Options options) -> io_type
+
+    def connect_attempt_time_left: () -> interval?
+
+    def connect_next: (StandardError error) -> void
+
+    def try_connect: () -> void
+
+    def connect: () -> void
+
+    def exhausted?: () -> boolish
+
+    def consume: () -> void
+
+    def send_pending: () -> void
+
+    def parser: () -> (Object & _Parser)
+
+    def send_request_to_parser: (Request request, ?bool head) -> bool
+
+    def build_parser: (?String protocol) -> (Object & _Parser)
+
+    def on_parser_error: (Request request, Exception | Symbol error) -> void
+
+    def set_parser_callbacks: (HTTP1 | HTTP2 parser) -> void
+
+    def transition: (Symbol nextstate) -> void
+
+    def handle_transition: (Symbol nextstate) -> void
+
+    def build_altsvc_connection: (URI::Generic alt_origin, String origin, Hash[String, String] alt_params) -> void
+
+    def build_socket: (?Array[Resolver::Entry]? addrs) -> (TCP | SSL | UNIX)
+
+    def ping: (Request request) -> void
+
+    def pong: () -> void
+
+    def no_more_selector_check: () -> void
+
+    def clear_pending_requests: () -> void
+
+    def no_more_requests?: () -> boolish
+
+    def handle_error: (StandardError error, ?Request? request) -> void
+
+    def force_purge: () -> void
+
+    def reset_ping_timer: () -> void
+
+    def close_sibling: () -> void
+
+    def purge_after_closed: () -> void
+
+    def set_request_timeouts: (Request request) -> void
+
+    def set_connection_timeouts: (Request request) -> void
+
+    def set_request_read_timeout: (Request request) -> void
+
+    def set_request_write_timeout: (Request request) -> void
+
+    def set_request_request_timeout: (Request request) -> void
+
+    def set_request_total_request_timeout: (Request request) -> void
+
+    def write_timeout_callback: (Request request, interval timeout) -> void
+
+    def read_timeout_callback: (Request request, interval timeout, ?singleton(RequestTimeoutError) error_type) -> void
+
+    def set_request_timeout: (Symbol label, Request request, interval timeout, Symbol start_event, Symbol | Array[Symbol] finish_events) { () -> void } -> void
+
+    def set_connecting_request_timeout: (Request request) -> void
+
+    def set_connecting_total_request_timeout: (Request request) -> void
+
+    def set_connection_timeout: (Symbol label, Request request, interval timeout, Symbol start_event, Symbol | Array[Symbol] finish_events) { () -> void } -> void
+
+    def parser_type: (String protocol) -> (singleton(HTTP1) | singleton(HTTP2))
+  end
+end

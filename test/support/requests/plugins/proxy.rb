@@ -1,0 +1,616 @@
+# frozen_string_literal: true
+
+require "resolv"
+
+module Requests
+  module Plugins
+    module Proxy
+      include ProxyHelper
+
+      using HTTPX::URIExtensions
+
+      RESOLVER = Resolv::DNS.new
+
+      def test_plugin_no_proxy_defined
+        http = HTTPX.plugin(:proxy)
+        uri = build_uri("/get")
+        res = http.with_proxy(uri: []).get(uri)
+        verify_error_response(res, HTTPX::ProxyError)
+      end
+
+      def test_plugin_http_http_proxy
+        return unless origin.start_with?("http://")
+
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy, fallback_protocol: "http/1.1")
+                       .plugin(ProxyResponseDetector)
+                       .with_proxy(uri: http_proxy)
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert response.proxied?
+
+        assert session.connection_count == 1
+        connection = session.connections.first
+        assert connection.no_more_requests?
+      end
+
+      def test_plugin_http_no_proxy
+        return unless origin.start_with?("http://")
+
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy)
+                       .plugin(ProxyResponseDetector)
+        httpbin_no_proxy_session = session.with_proxy(uri: http_proxy, no_proxy: [httpbin_no_proxy.host])
+
+        # proxy
+        uri = build_uri("/get")
+        response = httpbin_no_proxy_session.get(uri)
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert response.proxied?
+
+        # no proxy
+        no_proxy_uri = build_uri("/get", httpbin_no_proxy)
+        no_proxy_response = httpbin_no_proxy_session.get(no_proxy_uri)
+        verify_status(no_proxy_response, 200)
+        verify_body_length(no_proxy_response)
+        assert !no_proxy_response.proxied?
+
+        all_no_proxy_session = session.with_proxy(uri: http_proxy, no_proxy: "*")
+        response = all_no_proxy_session.get(uri)
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert !response.proxied?
+
+        # no proxy
+        no_proxy_response = httpbin_no_proxy_session.get(no_proxy_uri)
+        verify_status(no_proxy_response, 200)
+        verify_body_length(no_proxy_response)
+        assert !no_proxy_response.proxied?
+      end
+
+      def test_plugin_http_h2_proxy
+        return unless origin.start_with?("http://")
+
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy, fallback_protocol: "h2")
+                       .plugin(ProxyResponseDetector)
+                       .with_proxy(uri: http2_proxy)
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert response.proxied?
+
+        assert session.connection_count == 1
+        connection = session.connections.first
+        assert connection.no_more_requests?
+      end
+
+      def test_plugin_tunnel_connect_http1_proxy
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy)
+                       .plugin(ProxyResponseDetector)
+                       .with_proxy(uri: http_proxy)
+
+        session = session.with(enable_proxy_tunnel: true) if origin.start_with?("http://")
+
+        uri = URI(build_uri("/get"))
+        response = session.get(uri)
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert response.proxied?
+
+        connection = session.connections.first
+        assert connection.no_more_requests?
+        connect_requests = connection.connect_requests
+        assert connect_requests.size == 1
+        connect_req = connect_requests.first
+        assert connect_req.verb == "CONNECT"
+        connect_req.headers["host"] == uri.authority
+      end
+
+      def test_plugin_https_connect_proxy_headers
+        return unless origin.start_with?("https://")
+
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy)
+                       .plugin(ProxyResponseDetector)
+                       .with_proxy(uri: http_proxy)
+                       .with(proxy_headers: { "foo" => "bar" })
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert response.proxied?
+
+        connection = session.connections.first
+        assert connection.no_more_requests?
+        connect_requests = connection.connect_requests
+        assert connect_requests.size == 1
+        connect_req = connect_requests.first
+        assert connect_req.verb == "CONNECT"
+        connect_req.headers["foo"] == "bar"
+      end
+
+      # TODO: uncomment when supporting H2 CONNECT
+      # def test_plugin_https_connect_h2_proxy
+      #   return unless origin.start_with?("https://")
+
+      #   session = HTTPX.plugin(:proxy, alpn_protocols: %w[h2]).with_proxy(uri: http2_proxy)
+      #   uri = build_uri("/get")
+      #   response = session.get(uri)
+      #   verify_status(response, 200)
+      #   verify_body_length(response)
+      # end
+
+      def test_plugin_proxy_http_persistent_connect_proxy_reconnect
+        start_test_servlet(KeepAliveServer, SSLEnable: true, SSLCertName: [%w[CN localhost]]) do |server|
+          start_test_servlet(ConnectProxyServer) do |proxy|
+            uri = server.origin
+            http = HTTPX.plugin(SessionWithPool)
+                        .plugin(:proxy)
+                        .plugin(ProxyResponseDetector)
+                        .plugin(:persistent)
+                        .with(
+                          ssl: { verify_mode: OpenSSL::SSL::VERIFY_NONE, alpn_protocols: %w[http/1.1] },
+                          timeout: {
+                            keep_alive_timeout: 1,
+                            connect_timeout: 3,
+                            request_timeout: 3,
+                          },
+                        ).with_proxy(uri: proxy.origin)
+
+            begin
+              response = http.get(uri)
+              verify_status(response, 200)
+              assert proxy.connect_requests.size == 1
+              assert http.connections.size == 1
+
+              connection = http.connections.first
+              assert connection.no_more_requests?
+
+              # lapse the keep alive window
+              sleep(1.5)
+              response = http.get(uri)
+              verify_status(response, 200)
+              assert http.connections.size == 1
+
+              connection = http.connections.first
+              assert connection.no_more_requests?
+
+              assert proxy.connect_requests.size == 2,
+                     "did not open new CONNECT proxy"
+              assert http.connections.size == 1,
+                     "should have reconnected on existing connection"
+            ensure
+              http.close
+            end
+          end
+        end
+      end
+
+      def test_plugin_http_next_proxy
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy)
+                       .plugin(ProxyResponseDetector)
+                       .with_proxy(uri: ["http://unavailable-proxy", *http_proxy])
+        uri = URI(build_uri("/get"))
+        response = session.get(uri)
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert response.proxied?
+
+        return unless uri.scheme == "https"
+
+        assert session.connections.size == 2
+        unavailable_connection, connection = session.connections
+        assert unavailable_connection.no_more_requests?
+        assert unavailable_connection.connect_requests.empty?
+
+        assert connection.no_more_requests?
+        connect_requests = connection.connect_requests
+        assert connect_requests.size == 1
+        connect_req = connect_requests.first
+        assert connect_req.verb == "CONNECT"
+        connect_req.headers["host"] == uri.authority
+      end
+
+      def test_plugin_http_proxy_auth_options
+        auth_proxy = URI(http_proxy.first)
+        return unless auth_proxy.user
+
+        user = auth_proxy.user
+        pass = auth_proxy.password
+        auth_proxy.user = nil
+        auth_proxy.password = nil
+
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy)
+                       .plugin(ProxyResponseDetector)
+                       .with_proxy(
+                         uri: auth_proxy.to_s,
+                         username: user,
+                         password: pass
+                       )
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert response.proxied?
+
+        assert session.connection_count == 1
+        connection = session.connections.first
+        assert connection.no_more_requests?
+      end
+
+      def test_plugin_http_proxy_connect_error
+        skip unless tls?
+
+        uri = build_uri("/get")
+
+        start_connect_timeout_tcp_server do |authority|
+          connect_error_proxy = "http://#{authority}"
+
+          session = HTTPX.plugin(SessionWithPool)
+                         .plugin(:proxy)
+                         .plugin(ProxyResponseDetector)
+                         .with_proxy(uri: connect_error_proxy)
+                         .with(timeout: { read_timeout: 1 })
+          response = session.get(uri)
+          verify_error_response(response, HTTPX::ConnectTimeoutError)
+
+          assert session.connections.size == 1
+          connection = session.connections.first
+          assert connection.no_more_requests?
+        end
+      end
+
+      def test_plugin_http_proxy_connection_error
+        uri = build_uri("/get")
+
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy)
+                       .plugin(ProxyResponseDetector)
+                       .with_proxy(uri: "http://localhost")
+        response = session.get(uri)
+        verify_error_response(response, HTTPX::ConnectionError)
+
+        assert session.connections.size == 1
+        connection = session.connections.first
+        assert connection.no_more_requests?
+      end
+
+      def test_plugin_http_proxy_auth_error
+        no_auth_proxy = URI(http_proxy.first)
+        return unless no_auth_proxy.user
+
+        no_auth_proxy.user = nil
+        no_auth_proxy.password = nil
+
+        session = HTTPX.plugin(:proxy).with_proxy(uri: no_auth_proxy.to_s)
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_status(response, 407)
+      end
+
+      def test_plugin_http_proxy_basic_auth_wrong_error
+        wrong_auth_proxy = URI(http_proxy.first)
+        return unless wrong_auth_proxy.user
+
+        wrong_auth_proxy.password = "wrongpass"
+
+        session = HTTPX.plugin(:proxy).with_proxy(uri: wrong_auth_proxy.to_s)
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_status(response, 407)
+      end
+
+      def test_plugin_http_proxy_digest_auth
+        auth_proxy = URI(http_proxy.first)
+        return unless auth_proxy.user
+
+        user = auth_proxy.user
+        pass = auth_proxy.password
+        auth_proxy.user = nil
+        auth_proxy.password = nil
+
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy)
+                       .plugin(ProxyResponseDetector)
+                       .with_proxy_digest_auth(
+                         uri: auth_proxy.to_s,
+                         username: user,
+                         password: pass
+                       )
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert response.proxied?
+      end
+
+      def test_plugin_http_proxy_connection_coalescing
+        return unless origin.start_with?("https://")
+
+        coalesced_origin = "https://#{ENV["HTTPBIN_COALESCING_HOST"]}"
+        HTTPX.plugin(SessionWithPool).plugin(:proxy).with_proxy(uri: http_proxy).wrap do |http|
+          response1 = http.get(origin)
+          verify_status(response1, 200)
+          response2 = http.get(coalesced_origin)
+          verify_status(response2, 200)
+          # introspection time
+          connections = http.connections
+          origins = connections.map(&:origins)
+          assert origins.any? { |orgs| orgs.sort == [origin, coalesced_origin].sort },
+                 "connections for #{[origin, coalesced_origin]} didn't coalesce (expected connection with both origins (#{origins}))"
+
+          unsafe_origin = URI(origin)
+          unsafe_origin.scheme = "http"
+          response3 = http.get(unsafe_origin)
+          verify_status(response3, 200)
+
+          # introspection time
+          connections = http.connections
+          origins = connections.map(&:origins)
+          refute origins.any?([origin]),
+                 "connection coalesced inexpectedly (expected connection with both origins (#{origins}))"
+        end
+      end if ENV.key?("HTTPBIN_COALESCING_HOST")
+
+      def test_plugin_http_proxy_redirect_305
+        return unless origin.start_with?("http://")
+
+        start_test_servlet(ProxyServer) do |proxy|
+          start_test_servlet(ProxyRedirectorServer, proxy.origin) do |server|
+            session = HTTPX.plugin(:follow_redirects)
+                           .plugin(:proxy)
+                           .plugin(ProxyResponseDetector)
+
+            uri = "#{server.origin}/"
+            response = session.get(uri)
+            verify_status(response, 200)
+            verify_body_length(response)
+            assert response.body.to_s == proxy.origin.to_s
+          end
+        end
+      end
+
+      def test_plugin_socks4_proxy
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy)
+                       .plugin(ProxyResponseDetector)
+                       .with_proxy(uri: socks4_proxy)
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert response.proxied?
+      end
+
+      def test_plugin_socks4_proxy_ip
+        proxy = URI(socks4_proxy.first)
+
+        # doing this bit of song and dance due to URI's CVE "fix" from 1.0.4
+        # https://github.com/ruby/uri/issues/184
+        user, _ = proxy.userinfo
+        proxy.host = Resolv.getaddress(proxy.host)
+        proxy.user = user
+
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy)
+                       .plugin(ProxyResponseDetector)
+                       .with_proxy(uri: [proxy])
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert response.proxied?
+      end
+
+      def test_plugin_socks4_proxy_error
+        proxy = URI(socks4_proxy.first)
+        proxy.user = nil
+
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy)
+                       .with_proxy(uri: [proxy])
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_error_response(response, HTTPX::Socks4Error)
+      end
+
+      def test_plugin_socks4a_proxy
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy)
+                       .plugin(ProxyResponseDetector)
+                       .with_proxy(uri: socks4a_proxy)
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert response.proxied?
+      end
+
+      def test_plugin_socks5_proxy
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy)
+                       .plugin(ProxyResponseDetector)
+                       .with_proxy(uri: socks5_proxy)
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert response.proxied?
+      end
+
+      def test_plugin_socks5_ipv4_proxy
+        session = HTTPX.plugin(SessionWithPool)
+                       .plugin(:proxy)
+                       .plugin(ProxyResponseDetector)
+                       .with_proxy(uri: socks5_proxy)
+        uri = URI(build_uri("/get"))
+        hostname = uri.host
+
+        ipv4 = RESOLVER.getresource(hostname, Resolv::DNS::Resource::IN::A).address.to_s
+        uri.hostname = ipv4
+
+        response = session.get(uri, headers: { "host" => uri.authority }, ssl: { hostname: hostname })
+        verify_status(response, 200)
+        verify_body_length(response)
+        assert response.proxied?
+      end
+
+      # TODO: enable when docker-compose supports ipv6 out of the box
+      # def test_plugin_socks5_ipv6_proxy
+      #   session = HTTPX.plugin(:proxy).with_proxy(uri: socks5_proxy)
+      #   uri = URI(build_uri("/get"))
+      #   hostname = uri.host
+
+      #   ipv6 = RESOLVER.getresource(hostname, Resolv::DNS::Resource::IN::AAAA).address.to_s
+      #   uri.hostname = ipv6
+
+      #   response = session.get(uri, headers: { "host" => uri.authority }, ssl: { hostname: hostname })
+      #   verify_status(response, 200)
+      #   verify_body_length(response)
+      # end
+
+      def test_plugin_http_proxy_unresponsive_during_connect_tunnel
+        skip unless tls?
+
+        start_test_servlet(UnresponsiveServer) do |proxy|
+          session = HTTPX.plugin(SessionWithPool)
+                         .plugin(:proxy)
+                         .with_proxy(uri: proxy.origin)
+                         .with(timeout: { connect_timeout: 1 })
+
+          verify_proxy_handshake_timed_out(session)
+        end
+      end
+
+      def test_plugin_socks5_proxy_unresponsive_during_negotiation
+        start_test_servlet(UnresponsiveServer) do |proxy|
+          session = HTTPX.plugin(SessionWithPool)
+                         .plugin(:proxy)
+                         .with_proxy(uri: "socks5://#{proxy.authority}")
+                         .with(timeout: { connect_timeout: 1 })
+
+          verify_proxy_handshake_timed_out(session)
+        end
+      end
+
+      def test_plugin_proxy_connect_timeout_does_not_time_out_other_connections
+        start_test_servlet(UnresponsiveServer) do |proxy|
+          slow_uri = URI(build_uri("/delay/2"))
+          session = HTTPX.plugin(SessionWithPool)
+                         .plugin(:proxy)
+                         .with_proxy(uri: "socks5://#{proxy.authority}", no_proxy: [slow_uri.host])
+                         .with(timeout: { connect_timeout: 1 })
+
+          started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          # the proxied connection times out while the other one is still waiting for the response.
+          unreachable, slow = session.get(build_uri("/get", "#{scheme}unreachable.httpx.test"), slow_uri)
+          elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+
+          verify_error_response(unreachable, HTTPX::ConnectTimeoutError)
+          verify_status(slow, 200)
+          assert elapsed < 10, "slow request should not have been held back (took #{elapsed} secs)"
+        end
+      end
+
+      def test_plugin_socks5_proxy_negotiation_error
+        proxy = URI(socks5_proxy.first)
+        proxy.password = nil
+
+        session = HTTPX.plugin(:proxy).with_proxy(uri: [proxy])
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_error_response(response, /negotiation error/)
+      end
+
+      def test_plugin_socks5_proxy_authentication_error
+        proxy = URI(socks5_proxy.first)
+        proxy.password = "1"
+
+        session = HTTPX.plugin(:proxy).with_proxy(uri: [proxy])
+        uri = build_uri("/get")
+        response = session.get(uri)
+        verify_error_response(response, /authentication error:/)
+      end
+
+      def test_plugin_socks5_proxy_none_error
+        start_test_servlet(Sock5WithNoneServer) do |server|
+          proxy = server.origin
+          session = HTTPX.plugin(:proxy).with_proxy(uri: [proxy])
+          uri = build_uri("/get")
+          response = session.get(uri)
+          verify_error_response(response, /no supported authorization methods/)
+        end
+      end
+
+      if ENV.key?("HTTPX_SSH_PROXY") && RUBY_ENGINE == "ruby" &&
+         # TODO: remove after https://bugs.ruby-lang.org/issues/22083 is fixed
+         RUBY_VERSION < "4.0.0"
+        def test_plugin_ssh_proxy
+          session = HTTPX.plugin(:"proxy/ssh")
+                         .with_proxy(uri: ssh_proxy,
+                                     username: "root",
+                                     auth_methods: %w[publickey],
+                                     host_key: "ssh-rsa",
+                                     keys: %w[test/support/ssh/ssh_host_ed25519_key])
+          uri = build_uri("/get")
+          response = session.get(uri)
+          verify_status(response, 200)
+          verify_body_length(response)
+        end
+
+        def test_plugin_ssh_next_proxy
+          session = HTTPX
+                    .plugin(SessionWithPool)
+                    .plugin(:"proxy/ssh")
+                    .with_proxy(uri: ["ssh://unavailable-proxy", "ssh://localhost:6543", *ssh_proxy],
+                                username: "root",
+                                auth_methods: %w[publickey],
+                                host_key: "ssh-rsa",
+                                keys: %w[test/support/ssh/ssh_host_ed25519_key])
+          uri = build_uri("/get")
+          response = session.get(uri)
+          verify_status(response, 200)
+          verify_body_length(response)
+
+          assert response.peer_address == "127.0.0.1", "expected request to have been SSH-tunneled"
+        end
+      end
+
+      def test_plugin_retries_on_proxy_error
+        start_test_servlet(Sock5WithNoneServer) do |server|
+          proxy = server.origin
+          uri = build_uri("/get")
+          session = HTTPX.plugin(RequestInspector).plugin(:proxy).plugin(:retries).with_proxy(uri: [proxy])
+          res = session.get(uri)
+          verify_error_response(res, /no supported authorization methods/)
+          assert session.calls == 3, "expect request to be built 3 times (was #{session.calls})"
+        end
+      end
+
+      private
+
+      # the proxy handshake hangs, so the connection must close while still connecting through the proxy.
+      def verify_proxy_handshake_timed_out(session)
+        started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        response = session.get(build_uri("/get"))
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+
+        verify_error_response(response, HTTPX::ConnectTimeoutError)
+        assert_in_delta 1, elapsed, 1.5, "expected the connect timeout to apply to the proxy handshake (took #{elapsed} secs)"
+
+        assert session.connections.size == 1
+        connection = session.connections.first
+        assert connection.state == :closed, "connection should have been closed (was #{connection.state})"
+        assert connection.no_more_requests?, "connection should not have kept any requests around"
+      end
+    end
+  end
+end

@@ -1,0 +1,66 @@
+# frozen_string_literal: true
+
+module HTTPX
+  module Plugins
+    #
+    # https://gitlab.com/os85/httpx/wikis/Auth#ntlm-auth
+    #
+    module NTLMAuth
+      class << self
+        def load_dependencies(klass)
+          require_relative "auth/ntlm"
+          klass.plugin(:auth)
+        end
+
+        def extra_options(options)
+          options.merge(max_concurrent_requests: 1)
+        end
+      end
+
+      module OptionsMethods
+        private
+
+        def option_ntlm(value)
+          raise TypeError, ":ntlm must be a #{Authentication::Ntlm}" unless value.is_a?(Authentication::Ntlm)
+
+          value
+        end
+      end
+
+      module InstanceMethods
+        # returns a new session which authenticates requests using NTLM auth.
+        def ntlm_auth(user, password, domain = nil)
+          with(ntlm: Authentication::Ntlm.new(user, password, domain: domain))
+        end
+
+        private
+
+        def send_requests(*requests)
+          requests.flat_map do |request|
+            ntlm = request.options.ntlm
+
+            if ntlm
+              request.authorize(ntlm.negotiate)
+              responses = wrap { super(request) }
+              probe_response = responses.first
+
+              return responses unless probe_response.is_a?(Response)
+
+              if probe_response.status == 401 && ntlm.can_authenticate?(probe_response.headers["www-authenticate"])
+                request.transition(:idle)
+                request.unauthorize!
+                request.authorize(ntlm.authenticate(request, probe_response.headers["www-authenticate"]).encode("utf-8"))
+                super(request)
+              else
+                responses
+              end
+            else
+              super(request)
+            end
+          end
+        end
+      end
+    end
+    register_plugin :ntlm_auth, NTLMAuth
+  end
+end

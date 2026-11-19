@@ -1,0 +1,114 @@
+# frozen_string_literal: true
+
+module SessionWithPool
+  module PoolMethods
+    attr_reader :resolvers, :connections, :connections_counter
+  end
+
+  module InstanceMethods
+    attr_reader :pool, :connections_exausted, :connection_count, :ping_count, :pong_count, :resolvers, :connections
+
+    def initialize(*)
+      @connection_count = @connections_exausted = @ping_count = @pong_count = 0
+      @connections = []
+      @resolvers = []
+      super
+    end
+
+    def resolver
+      resolver = @resolvers.first
+
+      resolver = resolver.resolvers[0] if resolver.is_a?(HTTPX::Resolver::Multi)
+
+      resolver
+    end
+
+    def get_current_selector(*)
+      super
+    end
+
+    private
+
+    def find_resolver_for(connection, selector)
+      resolver = super
+      @resolvers << resolver unless @resolvers.include?(resolver)
+      resolver
+    end
+
+    def do_init_connection(connection, *)
+      super
+      connection.on(:open) { @connection_count += 1 }
+      connection.on(:ping) { @ping_count += 1 }
+      connection.on(:pong) { @pong_count += 1 }
+      connection.on(:exhausted) do
+        @connections_exausted += 1
+      end
+      @connections << connection
+    end
+  end
+
+  module ConnectionMethods
+    module Pinger
+      def ping
+        super
+        emit(:ping)
+      end
+    end
+    attr_reader :origins, :main_sibling, :sibling, :current_session, :current_selector
+
+    def self.included(klass)
+      super
+      klass.class_eval do
+        public :parser
+        public :no_more_requests?
+      end
+    end
+
+    def closed?
+      @io.closed?
+    end
+
+    def set_parser_callbacks(parser)
+      super
+      parser.singleton_class.prepend(Pinger)
+      parser.on(:ping) { emit(:ping) }
+      parser.on(:pong) { emit(:pong) }
+    end
+  end
+
+  module RequestMethods
+    attr_accessor :stream # http2 stream
+  end
+
+  module ResponseMethods
+    attr_reader :request
+  end
+
+  module HTTP2Methods
+    def handle_stream(stream, request)
+      request.stream = stream
+
+      super
+    end
+  end
+
+  module ResolverNativeMethods
+    attr_reader :timeouts, :tries, :connections
+
+    def initialize(*)
+      super
+      @tries = Hash.new(0)
+    end
+
+    private
+
+    def resolve(*)
+      resolving = @name.nil?
+      super
+
+      return unless @name && resolving
+
+      @tries[@name.delete_suffix(".")] += 1
+    end
+  end
+end

@@ -1,0 +1,37 @@
+module HTTPX
+  module Plugins::Cookies
+    class Jar
+      type cookie = Cookie | Array[[String, String, cookie_attributes]] | Array[[String, String]] | cookie_attributes
+
+      include Enumerable[Cookie]
+
+      @cookies: Array[Cookie]
+      @mtx: Thread::Mutex
+
+      def parse: (String set_cookie) -> void
+
+      def get: (String | cookie_attributes name_or_options) -> Cookie?
+
+      def get_all: (String | cookie_attributes name_or_options) -> Array[Cookie]
+
+      def set: (_ToS | Cookie name, ?(cookie_attributes | _ToS) value_or_options) -> void
+
+      def add: (Cookie name, ?String path) -> void
+
+      def delete: (String | Cookie | cookie_attributes name_or_options) -> void
+
+      def []: (http_uri) -> Array[Cookie]
+
+      def each: (?http_uri?) { (Cookie) -> void } -> void
+              | (?http_uri?) -> Enumerable[Cookie]
+
+      def merge: (_Each[cookie] cookies) -> self
+
+      private
+
+      def initialize: (?_Each[cookie] cookies) -> untyped
+
+      def synchronize: [T] { () -> T } -> T
+    end
+  end
+end

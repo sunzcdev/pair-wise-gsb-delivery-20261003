@@ -1,0 +1,65 @@
+module HTTPX
+  module Plugins
+    module StreamBidi
+      def self.load_dependencies: (singleton(Session)) -> void
+
+      def self.extra_options: (Options) -> (Options)
+
+      module HTTP2Methods
+        @lock: Thread::Mutex
+
+        private
+
+        def handle_stream: (::HTTP2::Stream stream, Request & RequestMethods request) -> void
+
+        def end_stream?: (Request & RequestMethods request, String? next_chunk) -> void
+      end
+
+      class BidiBuffer < Buffer
+        @buffer_mutex: Thread::Mutex
+        @oob_mutex: Thread::Mutex
+        @oob_buffer: String
+
+        def rebuffer: () -> void
+      end
+
+      class Signal
+        attr_reader error: Exception?
+
+        @closed: bool
+        @pipe_read: IO
+        @pipe_write: IO
+
+        include _Selectable
+
+        def wakeup: () -> void
+      end
+
+      module InstanceMethods
+        @signal: Signal
+      end
+
+      module RequestMethods
+        attr_accessor headers_sent: bool
+
+        @closed: bool
+        @flush_buffer_on_body_cb: ^() -> void | nil
+        @mutex: Thread::Mutex
+
+        def flush_buffer_on_body: { () -> void } -> void
+
+        def closed?: () -> bool
+      end
+
+      module RequestBodyMethods
+      end
+
+      module ConnectionMethods
+        @write_buffer: BidiBuffer
+      end
+
+    end
+
+    type sessionStreamBidi = Session & StreamBidi::InstanceMethods
+  end
+end

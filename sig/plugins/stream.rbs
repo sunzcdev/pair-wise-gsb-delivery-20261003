@@ -1,0 +1,64 @@
+module HTTPX
+  module Plugins
+    module Stream
+      STREAM_REQUEST_OPTIONS: Hash[Symbol, untyped]
+
+      interface _StreamOptions
+        def stream: () -> boolish
+
+        def retry_stream_response_class: () -> singleton(StreamResponse)
+      end
+
+      module InstanceMethods
+        @options: Options & _StreamOptions
+
+        private
+
+        def request: (*Request, **untyped?) -> (response | Array[response] | StreamResponse)
+                   | (*untyped, **untyped?) -> (response | Array[response] | StreamResponse)
+      end
+
+      module RequestMethods
+        attr_accessor stream: StreamResponse?
+      end
+
+      module ResponseMethods
+        def stream: () -> StreamResponse?
+      end
+
+      module ResponseBodyMethods
+        @stream: StreamResponse?
+      end
+    end
+
+    type sessionStream = Session & Stream::InstanceMethods
+  end
+
+  class StreamResponse
+    include _ToS
+
+    type streamRequest = Request & Plugins::Stream::RequestMethods
+
+    attr_reader request: streamRequest
+    @options: Options & Plugins::Stream::_StreamOptions
+
+    @session: Plugins::sessionStream
+    @response_enum: Enumerator[String]?
+    @buffered_chunks: Array[String]
+    @on_chunk: ^(String) -> void | nil
+
+    def each: () { (String) -> void } -> void
+            | () -> Enumerable[String]
+
+    def each_line: () { (String) -> void } -> void
+                 | () -> Enumerable[String]
+
+    def on_chunk: (string) -> void
+
+    def initialize: (streamRequest, Plugins::sessionStream) -> void
+
+    private
+
+    def response: () -> response
+  end
+end

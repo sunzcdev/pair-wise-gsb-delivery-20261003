@@ -1,0 +1,303 @@
+[
+  {
+    "name": "google 301",
+    "raw": "HTTP/1.1 301 Moved Permanently\r\nLocation: http://www.google.com/\r\nContent-Type: text/html; charset=UTF-8\r\nDate: Sun, 26 Apr 2009 11:11:49 GMT\r\nExpires: Tue, 26 May 2009 11:11:49 GMT\r\nX-$PrototypeBI-Version: 1.6.0.3\r\nCache-Control: public, max-age=2592000\r\nServer: gws\r\nContent-Length:  219  \r\n\r\n<HTML><HEAD><meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">\n<TITLE>301 Moved</TITLE></HEAD><BODY>\n<H1>301 Moved</H1>\nThe document has moved\n<A HREF=\"http://www.google.com/\">here</A>.\r\n</BODY></HTML>\r\n",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 301,
+    "headers": {
+      "Location": "http://www.google.com/",
+      "Content-Type": "text/html; charset=UTF-8",
+      "Date": "Sun, 26 Apr 2009 11:11:49 GMT",
+      "Expires": "Tue, 26 May 2009 11:11:49 GMT",
+      "X-$PrototypeBI-Version": "1.6.0.3",
+      "Cache-Control": "public, max-age=2592000",
+      "Server": "gws",
+      "Content-Length": "219"
+    },
+    "body": "<HTML><HEAD><meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">\n<TITLE>301 Moved</TITLE></HEAD><BODY>\n<H1>301 Moved</H1>\nThe document has moved\n<A HREF=\"http://www.google.com/\">here</A>.\r\n</BODY></HTML>\r\n"
+  },
+  {
+    "name": "no content-length response",
+    "raw": "HTTP/1.1 200 OK\r\nDate: Tue, 04 Aug 2009 07:59:32 GMT\r\nServer: Apache\r\nX-Powered-By: Servlet/2.5 JSP/2.1\r\nContent-Type: text/xml; charset=utf-8\r\nConnection: close\r\n\r\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<SOAP-ENV:Envelope xmlns:SOAP-ENV=\"http://schemas.xmlsoap.org/soap/envelope/\">\n  <SOAP-ENV:Body>\n    <SOAP-ENV:Fault>\n       <faultcode>SOAP-ENV:Client</faultcode>\n       <faultstring>Client Error</faultstring>\n    </SOAP-ENV:Fault>\n  </SOAP-ENV:Body>\n</SOAP-ENV:Envelope>",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 200,
+    "headers": {
+      "Date": "Tue, 04 Aug 2009 07:59:32 GMT",
+      "Server": "Apache",
+      "X-Powered-By": "Servlet/2.5 JSP/2.1",
+      "Content-Type": "text/xml; charset=utf-8",
+      "Connection": "close"
+    },
+    "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<SOAP-ENV:Envelope xmlns:SOAP-ENV=\"http://schemas.xmlsoap.org/soap/envelope/\">\n  <SOAP-ENV:Body>\n    <SOAP-ENV:Fault>\n       <faultcode>SOAP-ENV:Client</faultcode>\n       <faultstring>Client Error</faultstring>\n    </SOAP-ENV:Fault>\n  </SOAP-ENV:Body>\n</SOAP-ENV:Envelope>"
+  },
+  {
+    "name": "404 no headers no body",
+    "raw": "HTTP/1.1 404 Not Found\r\n\r\n",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 404,
+    "headers": {
+
+    },
+    "body_size": 0,
+    "body": ""
+  },
+  {
+    "name": "301 no response phrase",
+    "raw": "HTTP/1.1 301\r\n\r\n",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 301,
+    "headers": {
+
+    },
+    "body": ""
+  },
+  {
+    "name": "200 trailing space on chunked body",
+    "raw": "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n25  \r\nThis is the data in the first chunk\r\n\r\n1C\r\nand this is the second one\r\n\r\n0  \r\n\r\n",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "text/plain",
+      "Transfer-Encoding": "chunked"
+    },
+    "body_size": 65,
+    "body": "This is the data in the first chunk\r\nand this is the second one\r\n"
+  },
+  {
+    "name": "no carriage ret",
+    "raw": "HTTP/1.1 200 OK\nContent-Type: text/html; charset=utf-8\nConnection: close\n\nthese headers are from http://news.ycombinator.com/",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "text/html; charset=utf-8",
+      "Connection": "close"
+    },
+    "body": "these headers are from http://news.ycombinator.com/"
+  },
+  {
+    "name": "proxy connection",
+    "raw": "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 11\r\nProxy-Connection: close\r\nDate: Thu, 31 Dec 2009 20:55:48 +0000\r\n\r\nhello world",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "text/html; charset=UTF-8",
+      "Content-Length": "11",
+      "Proxy-Connection": "close",
+      "Date": "Thu, 31 Dec 2009 20:55:48 +0000"
+    },
+    "body": "hello world"
+  },
+  {
+    "name": "underscore header key",
+    "raw": "HTTP/1.1 200 OK\r\nServer: DCLK-AdSvr\r\nContent-Type: text/xml\r\nContent-Length: 0\r\nDCLK_imp: v7;x;114750856;0-0;0;17820020;0/0;21603567/21621457/1;;~okv=;dcmt=text/xml;;~cs=o\r\n\r\n",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 200,
+    "headers": {
+      "Server": "DCLK-AdSvr",
+      "Content-Type": "text/xml",
+      "Content-Length": "0",
+      "DCLK_imp": "v7;x;114750856;0-0;0;17820020;0/0;21603567/21621457/1;;~okv=;dcmt=text/xml;;~cs=o"
+    },
+    "body": ""
+  },
+  {
+    "name": "bonjourmadame.fr",
+    "raw": "HTTP/1.0 301 Moved Permanently\r\nDate: Thu, 03 Jun 2010 09:56:32 GMT\r\nServer: Apache/2.2.3 (Red Hat)\r\nCache-Control: public\r\nPragma: \r\nLocation: http://www.bonjourmadame.fr/\r\nVary: Accept-Encoding\r\nContent-Length: 0\r\nContent-Type: text/html; charset=UTF-8\r\nConnection: keep-alive\r\n\r\n",
+    "http_major": 1,
+    "http_minor": 0,
+    "status_code": 301,
+    "headers": {
+      "Date": "Thu, 03 Jun 2010 09:56:32 GMT",
+      "Server": "Apache/2.2.3 (Red Hat)",
+      "Cache-Control": "public",
+      "Pragma": "",
+      "Location": "http://www.bonjourmadame.fr/",
+      "Vary": "Accept-Encoding",
+      "Content-Length": "0",
+      "Content-Type": "text/html; charset=UTF-8",
+      "Connection": "keep-alive"
+    },
+    "body": ""
+  },
+  {
+    "name": "field underscore",
+    "raw": "HTTP/1.1 200 OK\r\nDate: Tue, 28 Sep 2010 01:14:13 GMT\r\nServer: Apache\r\nCache-Control: no-cache, must-revalidate\r\nExpires: Mon, 26 Jul 1997 05:00:00 GMT\r\n.et-Cookie: PlaxoCS=1274804622353690521; path=/; domain=.plaxo.com\r\nVary: Accept-Encoding\r\n_eep-Alive: timeout=45\r\n_onnection: Keep-Alive\r\nTransfer-Encoding: chunked\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n0\r\n\r\n",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 200,
+    "headers": {
+      "Date": "Tue, 28 Sep 2010 01:14:13 GMT",
+      "Server": "Apache",
+      "Cache-Control": "no-cache, must-revalidate",
+      "Expires": "Mon, 26 Jul 1997 05:00:00 GMT",
+      ".et-Cookie": "PlaxoCS=1274804622353690521; path=/; domain=.plaxo.com",
+      "Vary": "Accept-Encoding",
+      "_eep-Alive": "timeout=45",
+      "_onnection": "Keep-Alive",
+      "Transfer-Encoding": "chunked",
+      "Content-Type": "text/html",
+      "Connection": "close"
+    },
+    "body": ""
+  },
+  {
+    "name": "non-ASCII in status line",
+    "raw": "HTTP/1.1 500 Oriëntatieprobleem\r\nDate: Fri, 5 Nov 2010 23:07:12 GMT+2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 500,
+    "headers": {
+      "Date": "Fri, 5 Nov 2010 23:07:12 GMT+2",
+      "Content-Length": "0",
+      "Connection": "close"
+    },
+    "body": ""
+  },
+  {
+    "name": "neither content-length nor transfer-encoding response",
+    "raw": "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello world",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "text/plain"
+    },
+    "body": "hello world"
+  },
+  {
+    "name": "HTTP/1.0 with keep-alive and EOF-terminated 200 status",
+    "raw": "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\n\r\n",
+    "http_major": 1,
+    "http_minor": 0,
+    "status_code": 200,
+    "headers": {
+      "Connection": "keep-alive"
+    },
+    "body_size": 0,
+    "body": ""
+  },
+  {
+    "name": "HTTP/1.0 with keep-alive and a 204 status",
+    "raw": "HTTP/1.0 204 No content\r\nConnection: keep-alive\r\n\r\n",
+    "http_major": 1,
+    "http_minor": 0,
+    "status_code": 204,
+    "headers": {
+      "Connection": "keep-alive"
+    },
+    "body_size": 0,
+    "body": ""
+  },
+  {
+    "name": "HTTP/1.1 with an EOF-terminated 200 status",
+    "raw": "HTTP/1.1 200 OK\r\n\r\n",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 200,
+    "headers": {
+
+    },
+    "body_size": 0,
+    "body": ""
+  },
+  {
+    "name": "HTTP/1.1 with a 204 status",
+    "raw": "HTTP/1.1 204 No content\r\n\r\n",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 204,
+    "headers": {
+
+    },
+    "body_size": 0,
+    "body": ""
+  },
+  {
+    "name": "HTTP/1.1 with a 204 status and keep-alive disabled",
+    "raw": "HTTP/1.1 204 No content\r\nConnection: close\r\n\r\n",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 204,
+    "headers": {
+      "Connection": "close"
+    },
+    "body_size": 0,
+    "body": ""
+  },
+  {
+    "name": "HTTP/1.1 with chunked encoding and a 200 response",
+    "raw": "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 200,
+    "status": "OK",
+    "headers": {
+      "Transfer-Encoding": "chunked"
+    },
+    "body_size": 0,
+    "body": ""
+  },
+   {
+    "name": "HTTP/1.1 with chunked encoding and a 200 response with trailers",
+    "raw": "HTTP/1.1 200 OK\r\nTrailer: Expires\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nExpires: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 200,
+    "headers": {
+      "Transfer-Encoding": "chunked",
+      "Expires": "Wed, 21 Oct 2015 07:28:00 GMT"
+    },
+    "body_size": 0,
+    "body": ""
+  },
+  {
+    "name": "field space",
+    "raw": "HTTP/1.1 200 OK\r\nServer: Microsoft-IIS/6.0\r\nX-Powered-By: ASP.NET\r\nen-US Content-Type: text/xml\r\nContent-Type: text/xml\r\nContent-Length: 16\r\nDate: Fri, 23 Jul 2010 18:45:38 GMT\r\nConnection: keep-alive\r\n\r\n<xml>hello</xml>",
+    "http_major": 1,
+    "http_minor": 1,
+    "status_code": 200,
+    "headers": {
+      "Server": "Microsoft-IIS/6.0",
+      "X-Powered-By": "ASP.NET",
+      "en-US Content-Type": "text/xml",
+      "Content-Type": "text/xml",
+      "Content-Length": "16",
+      "Date": "Fri, 23 Jul 2010 18:45:38 GMT",
+      "Connection": "keep-alive"
+    },
+    "body": "<xml>hello</xml>"
+  },
+  {
+    "name": "headline wrong format",
+    "raw": "TTP/1.1 200\r\n\r\n",
+    "error": "wrong head line format"
+  },
+  {
+    "name": "headline unsupported version",
+    "raw": "HTTP/1.3 200 OK\r\n\r\n",
+    "error": "unsupported HTTP version (HTTP/1.3)"
+  },
+  {
+    "name": "headline unsupported status code",
+    "raw": "HTTP/1.1 600 OK\r\n\r\n",
+    "error": "wrong status code (600)"
+  },
+  {
+    "name": "header no separator",
+    "raw": "HTTP/1.1 200 OK\r\nServer: Microsoft-IIS/6.0\r\nBambataa\r\n\r\nbody",
+    "error": "wrong header format"
+  },
+  {
+    "name": "header with tabs",
+    "raw": "HTTP/1.1 200 OK\r\n\tServer: Microsoft-IIS/6.0\r\n\r\nbody",
+    "error": "wrong header format"
+  }
+]

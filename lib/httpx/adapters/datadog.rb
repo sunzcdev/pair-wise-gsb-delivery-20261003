@@ -1,0 +1,343 @@
+# frozen_string_literal: true
+
+require "datadog/tracing/contrib/integration"
+require "datadog/tracing/contrib/configuration/settings"
+require "datadog/tracing/contrib/patcher"
+
+module Datadog::Tracing
+  module Contrib
+    module HTTPX
+      DATADOG_VERSION = defined?(::DDTrace) ? ::DDTrace::VERSION : ::Datadog::VERSION
+
+      METADATA_MODULE = Datadog::Tracing::Metadata
+
+      TYPE_OUTBOUND = Datadog::Tracing::Metadata::Ext::HTTP::TYPE_OUTBOUND
+
+      TAG_BASE_SERVICE = if Gem::Version.new(DATADOG_VERSION::STRING) < Gem::Version.new("1.15.0")
+        "_dd.base_service"
+      elsif Gem::Version.new(DATADOG_VERSION::STRING) < Gem::Version.new("2.34.0")
+        Datadog::Tracing::Contrib::Ext::Metadata::TAG_BASE_SERVICE
+      else
+        Datadog::Tracing::Metadata::Ext::TAG_BASE_SERVICE
+      end
+      TAG_PEER_HOSTNAME = Datadog::Tracing::Metadata::Ext::TAG_PEER_HOSTNAME
+      TAG_PEER_SERVICE = Datadog::Tracing::Metadata::Ext::TAG_PEER_SERVICE
+
+      TAG_KIND = Datadog::Tracing::Metadata::Ext::TAG_KIND
+      TAG_CLIENT = Datadog::Tracing::Metadata::Ext::SpanKind::TAG_CLIENT
+      TAG_COMPONENT = Datadog::Tracing::Metadata::Ext::TAG_COMPONENT
+      TAG_OPERATION = Datadog::Tracing::Metadata::Ext::TAG_OPERATION
+      TAG_URL = Datadog::Tracing::Metadata::Ext::HTTP::TAG_URL
+      TAG_METHOD = Datadog::Tracing::Metadata::Ext::HTTP::TAG_METHOD
+      TAG_TARGET_HOST = Datadog::Tracing::Metadata::Ext::NET::TAG_TARGET_HOST
+      TAG_TARGET_PORT = Datadog::Tracing::Metadata::Ext::NET::TAG_TARGET_PORT
+
+      TAG_STATUS_CODE = Datadog::Tracing::Metadata::Ext::HTTP::TAG_STATUS_CODE
+
+      # HTTPX Datadog Plugin
+      #
+      # Enables tracing for httpx requests.
+      #
+      # A span will be created for each request transaction; the span is created lazily only when
+      # buffering a request, and it is fed the start time stored inside the tracer object.
+      #
+      module Plugin
+        module RequestTracer
+          extend Contrib::HttpAnnotationHelper
+
+          module_function
+
+          SPAN_REQUEST = "httpx.request"
+
+          def enabled?(request)
+            configuration(request).enabled
+          end
+
+          def start(request)
+            request.datadog_span = initialize_span(request, request.init_time)
+          end
+
+          def reset(request)
+            request.datadog_span = nil
+          end
+
+          def finish(request, response)
+            request.datadog_span ||= initialize_span(request, request.init_time) if request.init_time
+
+            finish_span(response, request.datadog_span)
+          end
+
+          def finish_span(response, span)
+            if response.is_a?(::HTTPX::ErrorResponse)
+              span.set_error(response.error)
+            else
+              span.set_tag(TAG_STATUS_CODE, response.status.to_s)
+
+              span.set_error(::HTTPX::HTTPError.new(response)) if response.status.between?(400, 599)
+
+              span.set_tags(
+                Datadog.configuration.tracing.header_tags.response_tags(response.headers.to_h)
+              ) if Datadog.configuration.tracing.respond_to?(:header_tags)
+            end
+
+            span.finish
+          end
+
+          # return a span initialized with the +@request+ state.
+          def initialize_span(request, start_time)
+            verb = request.verb
+            uri = request.uri
+
+            config = configuration(request)
+
+            span = create_span(request, config, start_time)
+
+            span.resource = verb
+
+            # Tag original global service name if not used
+            span.set_tag(TAG_BASE_SERVICE, Datadog.configuration.service) if span.service != Datadog.configuration.service
+
+            span.set_tag(TAG_KIND, TAG_CLIENT)
+
+            span.set_tag(TAG_COMPONENT, "httpx")
+            span.set_tag(TAG_OPERATION, "request")
+
+            span.set_tag(TAG_URL, request.path)
+            span.set_tag(TAG_METHOD, verb)
+
+            span.set_tag(TAG_TARGET_HOST, uri.host)
+            span.set_tag(TAG_TARGET_PORT, uri.port)
+
+            span.set_tag(TAG_PEER_HOSTNAME, uri.host)
+
+            # Tag as an external peer service
+            if (peer_service = config[:peer_service])
+              span.set_tag(TAG_PEER_SERVICE, peer_service)
+            end
+
+            if config[:distributed_tracing]
+              propagate_trace_http(
+                Datadog::Tracing.active_trace,
+                request.headers
+              )
+            end
+
+            # Set analytics sample rate
+            if Contrib::Analytics.enabled?(config[:analytics_enabled])
+              Contrib::Analytics.set_sample_rate(span, config[:analytics_sample_rate])
+            end
+
+            span.set_tags(
+              Datadog.configuration.tracing.header_tags.request_tags(request.headers.to_h)
+            ) if Datadog.configuration.tracing.respond_to?(:header_tags)
+
+            span
+        rescue StandardError => e
+          Datadog.logger.error("error preparing span for http request: #{e}")
+          Datadog.logger.error(e.backtrace)
+          end
+
+          def configuration(request)
+            Datadog.configuration.tracing[:httpx, request.uri.host]
+          end
+
+          if Gem::Version.new(DATADOG_VERSION::STRING) >= Gem::Version.new("2.0.0")
+            def propagate_trace_http(trace, headers)
+              Datadog::Tracing::Contrib::HTTP.inject(trace, headers)
+            end
+
+            def create_span(request, configuration, start_time)
+              Datadog::Tracing.trace(
+                SPAN_REQUEST,
+                service: service_name(request.uri.host, configuration),
+                type: TYPE_OUTBOUND,
+                start_time: start_time
+              )
+            end
+          else
+            def propagate_trace_http(trace, headers)
+              Datadog::Tracing::Propagation::HTTP.inject!(trace.to_digest, headers)
+            end
+
+            def create_span(request, configuration, start_time)
+              Datadog::Tracing.trace(
+                SPAN_REQUEST,
+                service: service_name(request.uri.host, configuration),
+                span_type: TYPE_OUTBOUND,
+                start_time: start_time
+              )
+            end
+          end
+        end
+
+        class << self
+          def load_dependencies(klass)
+            klass.plugin(:tracing)
+          end
+
+          def extra_options(options)
+            options.merge(tracer: RequestTracer)
+          end
+        end
+
+        module RequestMethods
+          attr_accessor :datadog_span
+        end
+      end
+
+      # patches httpx debug logs to include datadog correlation ids
+      module LoggablePatch
+        def log_identifiers
+          "#{super} #{Datadog::Tracing.log_correlation}"
+        end
+      end
+
+      module Configuration
+        # Default settings for httpx
+        #
+        class Settings < Datadog::Tracing::Contrib::Configuration::Settings
+          DEFAULT_ERROR_HANDLER = lambda do |response|
+            Datadog::Ext::HTTP::ERROR_RANGE.cover?(response.status)
+          end
+
+          option :service_name, default: "httpx"
+          option :distributed_tracing, default: true
+          option :split_by_domain, default: false
+
+          if Gem::Version.new(DATADOG_VERSION::STRING) >= Gem::Version.new("1.13.0")
+            option :enabled do |o|
+              o.type :bool
+              o.env "DD_TRACE_HTTPX_ENABLED"
+              o.default true
+            end
+
+            option :analytics_enabled do |o|
+              o.type :bool
+              o.env "DD_TRACE_HTTPX_ANALYTICS_ENABLED"
+              o.default false
+            end
+
+            option :analytics_sample_rate do |o|
+              o.type :float
+              o.env "DD_TRACE_HTTPX_ANALYTICS_SAMPLE_RATE"
+              o.default 1.0
+            end
+
+            option :peer_service do |o|
+              o.type :string, nilable: true
+              o.env "DD_TRACE_HTTPX_PEER_SERVICE"
+            end
+          else
+            option :enabled do |o|
+              o.default { env_to_bool("DD_TRACE_HTTPX_ENABLED", true) }
+              o.lazy
+            end
+
+            option :analytics_enabled do |o|
+              o.default { env_to_bool(%w[DD_TRACE_HTTPX_ANALYTICS_ENABLED DD_HTTPX_ANALYTICS_ENABLED], false) }
+              o.lazy
+            end
+
+            option :analytics_sample_rate do |o|
+              o.default { env_to_float(%w[DD_TRACE_HTTPX_ANALYTICS_SAMPLE_RATE DD_HTTPX_ANALYTICS_SAMPLE_RATE], 1.0) }
+              o.lazy
+            end
+
+            option :peer_service do |o|
+              o.default { env_to_string("DD_TRACE_HTTPX_PEER_SERVICE", nil) }
+              o.lazy
+            end
+          end
+
+          if defined?(Datadog::Tracing::Contrib::SpanAttributeSchema)
+            option :service_name do |o|
+              o.default do
+                Datadog::Tracing::Contrib::SpanAttributeSchema.fetch_service_name(
+                  "DD_TRACE_HTTPX_SERVICE_NAME",
+                  "httpx"
+                )
+              end
+              o.lazy unless Gem::Version.new(DATADOG_VERSION::STRING) >= Gem::Version.new("1.13.0")
+            end
+          else
+            option :service_name do |o|
+              o.default do
+                ENV.fetch("DD_TRACE_HTTPX_SERVICE_NAME", "httpx")
+              end
+              o.lazy unless Gem::Version.new(DATADOG_VERSION::STRING) >= Gem::Version.new("1.13.0")
+            end
+          end
+
+          option :distributed_tracing, default: true
+
+          if Gem::Version.new(DATADOG_VERSION::STRING) >= Gem::Version.new("1.15.0")
+            option :error_handler do |o|
+              o.type :proc
+              o.default_proc(&DEFAULT_ERROR_HANDLER)
+            end
+          elsif Gem::Version.new(DATADOG_VERSION::STRING) >= Gem::Version.new("1.13.0")
+            option :error_handler do |o|
+              o.type :proc
+              o.experimental_default_proc(&DEFAULT_ERROR_HANDLER)
+            end
+          else
+            option :error_handler, default: DEFAULT_ERROR_HANDLER
+          end
+        end
+      end
+
+      # Patcher enables patching of 'httpx' with datadog components.
+      #
+      module Patcher
+        include Datadog::Tracing::Contrib::Patcher
+
+        module_function
+
+        def target_version
+          Integration.version
+        end
+
+        # loads a session instannce with the datadog plugin, and replaces the
+        # base HTTPX::Session with the patched session class.
+        def patch
+          datadog_session = ::HTTPX.plugin(Plugin)
+
+          ::HTTPX.send(:remove_const, :Session)
+          ::HTTPX.send(:const_set, :Session, datadog_session.class)
+
+          ::HTTPX::Loggable.singleton_class.prepend(LoggablePatch)
+        end
+      end
+
+      # Datadog Integration for HTTPX.
+      #
+      class Integration
+        include Contrib::Integration
+
+        MINIMUM_VERSION = Gem::Version.new("0.10.2")
+
+        register_as :httpx
+
+        def self.version
+          Gem.loaded_specs["httpx"] && Gem.loaded_specs["httpx"].version
+        end
+
+        def self.loaded?
+          defined?(::HTTPX::Request)
+        end
+
+        def self.compatible?
+          super && version >= MINIMUM_VERSION
+        end
+
+        def new_configuration
+          Configuration::Settings.new
+        end
+
+        def patcher
+          Patcher
+        end
+      end
+    end
+  end
+end

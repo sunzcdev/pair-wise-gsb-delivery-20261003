@@ -1,0 +1,41 @@
+module HTTPX
+  module AltSvc
+    module ConnectionMixin
+      H2_ALTSVC_SCHEMES: Array[String]
+
+      ALTSVC_IGNORE_IVARS: Array[Symbol]
+
+      def send: (Request request) -> void
+
+      def match?: (http_uri uri, Options options) -> bool
+
+      private
+
+      def match_altsvcs?: (http_uri uri) -> bool
+
+      def match_altsvc_options?: (http_uri uri, Options options) -> bool
+
+      def altsvc_match?: (http_uri uri, uri other_uri) -> bool
+    end
+
+    type altsvc_params = Hash[String, untyped]
+
+    self.@altsvc_mutex: Thread::Mutex
+    self.@altsvcs: Hash[String, Array[altsvc_params]]
+
+    def self?.cached_altsvc: (String origin) -> Array[altsvc_params]
+
+    def self?.cached_altsvc_set: (String origin, altsvc_params) -> void
+
+    def self?.lookup: (String origin, Integer | Float ttl) -> Array[altsvc_params]
+
+    def self?.emit: (Request request, response response) { (http_uri alt_origin, String origin, altsvc_params alt_params) -> void } -> void
+
+    def self?.parse: (String altsvc, ?host: String?) { (http_uri alt_origin, altsvc_params alt_params) -> void } -> void
+                   | (String altsvc, ?host: String?) -> Enumerable[[http_uri, altsvc_params]]
+
+    def self?.parse_altsvc_scheme: (String alt_proto) -> String?
+
+    def self.parse_altsvc_origin: (string alt_proto, String alt_origin, ?host: String?) -> http_uri?
+  end
+end

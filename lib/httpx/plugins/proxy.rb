@@ -1,0 +1,384 @@
+# frozen_string_literal: true
+
+require "cgi"
+
+module HTTPX
+  class ProxyError < ConnectionError; end
+
+  module Plugins
+    #
+    # This plugin adds support for proxies. It ships with support for:
+    #
+    # * HTTP proxies
+    # * HTTPS proxies
+    # * Socks4 proxies (also supports Socks4a)
+    # * Socks5 proxies
+    #
+    # https://gitlab.com/os85/httpx/wikis/Proxy
+    #
+    module Proxy
+      class ProxyConnectionError < ProxyError; end
+
+      # :nodoc:
+      PROXY_ERRORS = [TimeoutError, IOError, SystemCallError, Error].freeze
+
+      class << self
+        def configure(klass)
+          klass.plugin(:"proxy/http")
+          klass.plugin(:"proxy/socks4")
+          klass.plugin(:"proxy/socks5")
+        end
+
+        def extra_options(options)
+          options.merge(supported_proxy_protocols: [])
+        end
+
+        def subplugins
+          {
+            retries: ProxyRetries,
+          }
+        end
+      end
+
+      # Manages the proxy parameters and the proxy authentication flow.
+      class Parameters
+        attr_reader :uri, :username, :password, :scheme, :no_proxy
+
+        def initialize(uri: nil, ns: 0, scheme: nil, username: nil, password: nil, no_proxy: nil, **extra)
+          @no_proxy = Array(no_proxy) if no_proxy
+          @uris = Array(uri)
+          uri = @uris[ns]
+
+          @username = username
+          @password = password
+
+          @initial_credentials = @username && @password
+
+          @ns = ns
+
+          if uri
+            @uri = URI(uri)
+            @username ||= @uri.user
+            @password ||= @uri.password
+          end
+
+          @scheme = scheme
+
+          return unless @uri && @username && @password
+
+          @authenticator = nil
+          @scheme ||= infer_default_auth_scheme(@uri)
+
+          return unless @scheme
+
+          @username = CGI.unescape(@username) if @username
+          @password = CGI.unescape(@password) if @password
+
+          @authenticator = load_authenticator(@scheme, @username, @password, **extra)
+        end
+
+        def shift
+          return if @ns >= @uris.size - 1
+
+          Parameters.new(
+            uri: @uris,
+            ns: @ns + 1,
+            username: (@username if @initial_credentials),
+            password: (@password if @initial_credentials),
+            no_proxy: @no_proxy
+          )
+        end
+
+        def can_authenticate?(...)
+          return false unless @authenticator && @authenticator.respond_to?(:can_authenticate?)
+
+          @authenticator.can_authenticate?(...)
+        end
+
+        def authenticate(...)
+          return unless @authenticator
+
+          @authenticator.authenticate(...)
+        end
+
+        def ==(other)
+          case other
+          when Parameters
+            @uri == other.uri &&
+              @username == other.username &&
+              @password == other.password &&
+              @scheme == other.scheme
+          when URI::Generic, String
+            proxy_uri = @uri.dup
+            proxy_uri.user = @username
+            proxy_uri.password = @password
+            other_uri = other.is_a?(URI::Generic) ? other : URI.parse(other)
+            proxy_uri == other_uri
+          else
+            super
+          end
+        end
+
+        private
+
+        def infer_default_auth_scheme(uri)
+          case uri.scheme
+          when "socks5"
+            uri.scheme
+          when "http", "https"
+            "basic"
+          end
+        end
+
+        def load_authenticator(scheme, username, password, **extra)
+          auth_scheme = scheme.to_s.capitalize
+
+          require_relative "auth/#{scheme}" unless defined?(Authentication) && Authentication.const_defined?(auth_scheme, false)
+
+          Authentication.const_get(auth_scheme).new(username, password, **extra)
+        end
+      end
+
+      # adds support for the following options:
+      #
+      # :proxy :: hash of proxy options, where a URI an be passed containing most of the requred information,
+      #           or instead the different proxy options can be passed independently.
+      #
+      # The following proxy options are supported:
+      #
+      # :uri :: proxy origin URI, or list of URIs; in the case of the latter, any failed attempt to connect to a list item
+      #         will retry for the next item of the list, until all elements are exhausted or it times out meanwhile.
+      #         <tt>:username</tt> and <tt>:password</tt> will be inferred from it when available. The URI scheme will identify
+      #         the proxy type.  (ex: <tt>"http://proxi-uri:8980"</tt>, <tt>"http://user:pass@proxy-uri:8181"</tt>,
+      #         <tt>"socks5://user:pass@socks-proxy-uri:10300"</tt>, <tt>["http://proxi-uri:8980", "http://user:pass@proxy-uri:8181"]</tt>).
+      # :scheme :: identifies the authentication scheme to use with the proxy, if necessary; defaults to <tt>"basic"</tt>, for basic auth,
+      #            can also be <tt>"digest"</tt> or <tt>"ntml"</tt>). Your recommended to use session methods like HTTP::InstanceMethods#with_proxy_basic_auth
+      #            to set these instead.
+      # :username :: the username to use when authenticating with the proxy
+      # :password :: the password to use when authenticating with the proxy
+      # :no_proxy :: A list of hostnames (or regex patterns) for which the proxy should be bypassed
+      #              (ex: <tt>["example.com", "localhost", /.*\.google\.com/]</tt>). Can also receive ["*"] as a catch-all.
+      #
+      # if you systems setting environment variables like `HTTP_PROXY` or `NO_PROXY` though, you won't need to set
+      # most of the above.
+      module OptionsMethods
+        private
+
+        def option_proxy(value)
+          value.is_a?(Parameters) ? value : Parameters.new(**Hash[value])
+        end
+
+        def option_supported_proxy_protocols(value)
+          raise TypeError, ":supported_proxy_protocols must be an Array" unless value.is_a?(Array)
+
+          value.map(&:to_s)
+        end
+      end
+
+      module InstanceMethods
+        def initialize(*)
+          super
+          @proxy_parameters = @options.proxy
+        end
+
+        def initialize_dup(other)
+          @proxy_parameters = other.instance_variable_get(:@proxy_parameters)
+          super
+        end
+
+        def find_connection(request_uri, selector, options)
+          if (next_proxy = request_uri.find_proxy)
+            return super(request_uri, selector, options.merge(proxy: Parameters.new(uri: next_proxy)))
+          end
+
+          return super unless @proxy_parameters
+
+          next_proxy = @proxy_parameters.uri
+
+          raise ProxyError, "Failed to connect to proxy" unless next_proxy
+
+          raise ProxyError,
+                "#{next_proxy.scheme}: unsupported proxy protocol" unless options.supported_proxy_protocols.include?(next_proxy.scheme)
+
+          if (no_proxy = @proxy_parameters.no_proxy)
+            no_proxy = no_proxy.join(",") if no_proxy.is_a?(Array)
+
+            unless no_proxy != "*" && # NO_PROXY=* bypasses proxy use
+                   URI::Generic.use_proxy?(request_uri.host, next_proxy.host, next_proxy.port, no_proxy)
+              # TODO: setting proxy to nil leaks the connection object in the pool
+              return super(request_uri, selector, options.merge(proxy: nil))
+            end
+          end
+
+          super(request_uri, selector, options.merge(proxy: @proxy_parameters))
+        end
+
+        private
+
+        def fetch_response(request, selector, options)
+          response = request.response # in case it goes wrong later
+
+          begin
+            response = super
+
+            if response.is_a?(ErrorResponse) && proxy_error?(request, response, options)
+              @proxy_parameters = options.proxy.shift
+
+              # return last error response if no more proxies to try
+              return response unless @proxy_parameters
+
+              log { "failed connecting to proxy, trying next..." }
+              request.transition(:idle)
+              send_request(request, selector, options)
+
+              # recalling itself, in case an error was triggered by the above, and we can
+              # verify retriability again.
+              return fetch_response(request, selector, options)
+            end
+            response
+          rescue ProxyError
+            # may happen if coupled with retries, and there are no more proxies to try, in which case
+            # it'll end up here
+            response
+          end
+        end
+
+        def proxy_error?(_request, response, _options)
+          proxy_parameters = @proxy_parameters
+
+          return false unless proxy_parameters
+
+          error = response.error
+          case error
+          when NativeResolveError
+            proxy_uri = proxy_parameters.uri
+
+            unresolved_host = error.host
+
+            # failed resolving proxy domain
+            unresolved_host == proxy_uri.host
+          when ResolveError
+            error.message.end_with?(proxy_parameters.uri.to_s)
+          when ProxyConnectionError
+            # timeout errors connecting to proxy
+            true
+          else
+            false
+          end
+        end
+      end
+
+      module ConnectionMethods
+        using URIExtensions
+
+        def initialize(*)
+          super
+          return unless @options.proxy
+
+          # redefining the connection origin as the proxy's URI,
+          # as this will be used as the tcp peer ip.
+          @proxy_uri = @options.proxy.uri
+        end
+
+        def peer
+          @proxy_uri || super
+        end
+
+        def connecting?(*args)
+          return super unless @options.proxy
+
+          super || proxy_connecting?(*args)
+        end
+
+        def call
+          super
+
+          return unless @options.proxy
+
+          case @state
+          when :connecting
+            consume
+          end
+        rescue *PROXY_ERRORS => e
+          if connecting?
+            error = ProxyConnectionError.new(e.message)
+            error.set_backtrace(e.backtrace)
+            raise error
+          end
+
+          raise e
+        end
+
+        private
+
+        def initialize_type(uri, options)
+          return super unless options.proxy
+
+          "tcp"
+        end
+
+        def proxy_connecting?(state = @state)
+          %i[connecting connected].include?(state)
+        end
+
+        def connect
+          return super unless @options.proxy
+
+          case @state
+          when :idle
+            transition(:connecting)
+          when :connected
+            super
+          end
+        end
+
+        def handle_transition(nextstate)
+          return super unless @options.proxy
+
+          case nextstate
+          when :closing
+            @parser = nil if proxy_connecting?
+          end
+          super
+        end
+
+        def purge_after_closed
+          super
+
+          while @io.respond_to?(:proxy_io)
+            @io = @io.proxy_io
+
+            super
+          end
+        end
+      end
+
+      module ProxyRetries
+        module InstanceMethods
+          private
+
+          def proxy_error?(request, response, _)
+            super && !request.retries.positive?
+          end
+
+          def retryable_error?(ex, *)
+            super || ex.is_a?(ProxyConnectionError)
+          end
+        end
+      end
+    end
+    register_plugin :proxy, Proxy
+  end
+
+  class ProxySSL < SSL
+    attr_reader :proxy_io
+
+    def initialize(tcp, request_uri, options)
+      @proxy_io = tcp
+      @io = tcp.to_io
+      super(request_uri, tcp.addresses, options)
+      @hostname = request_uri.host
+      @state = :connected
+    end
+  end
+end

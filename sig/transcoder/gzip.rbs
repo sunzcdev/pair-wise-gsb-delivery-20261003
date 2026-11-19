@@ -1,0 +1,28 @@
+module HTTPX
+  module Transcoder
+    module GZIP
+      def self?.encode: (body_encoder body) -> Deflater
+      def self?.decode: (Response response, ?bytesize: Integer) -> Inflater
+
+      class Deflater < Transcoder::Deflater
+        include _Writer
+
+        @compressed_chunk: String
+        @deflater: Zlib::GzipWriter
+
+        private
+
+        def compressed_chunk: () -> String
+      end
+
+      class Inflater
+        @inflater: Zlib::Inflate
+        @bytesize: Integer | Float
+
+        def initialize: (Integer | Float bytesize) -> void
+
+        def call: (String chunk) -> String
+      end
+    end
+  end
+end

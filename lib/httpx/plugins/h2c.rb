@@ -1,0 +1,118 @@
+# frozen_string_literal: true
+
+module HTTPX
+  module Plugins
+    #
+    # This plugin adds support for upgrading a plaintext HTTP/1.1 connection to HTTP/2
+    # (https://datatracker.ietf.org/doc/html/rfc7540#section-3.2)
+    #
+    # https://gitlab.com/os85/httpx/wikis/Connection-Upgrade#h2c
+    #
+    module H2C
+      VALID_H2C_VERBS = %w[GET OPTIONS HEAD].freeze
+
+      class << self
+        def load_dependencies(klass)
+          klass.plugin(:upgrade)
+        end
+
+        def call(connection, request, response)
+          connection.upgrade_to_h2c(request, response)
+        end
+
+        def extra_options(options)
+          options.merge(
+            h2c_class: Class.new(options.http2_class) { include(H2CParser) },
+            max_concurrent_requests: 1,
+            upgrade_handlers: options.upgrade_handlers.merge("h2c" => self),
+          )
+        end
+      end
+
+      module OptionsMethods
+        def option_h2c_class(value)
+          value
+        end
+      end
+
+      module RequestMethods
+        def valid_h2c_verb?
+          VALID_H2C_VERBS.include?(@verb)
+        end
+      end
+
+      module ConnectionMethods
+        using URIExtensions
+
+        def initialize(*)
+          super
+          @h2c_handshake = false
+        end
+
+        def send(request)
+          return super if @h2c_handshake
+
+          return super unless request.valid_h2c_verb? && request.scheme == "http"
+
+          return super if @upgrade_protocol == "h2c"
+
+          @h2c_handshake = true
+
+          # build upgrade request
+          request.headers.add("connection", "upgrade")
+          request.headers.add("connection", "http2-settings")
+          request.headers["upgrade"] = "h2c"
+          request.headers["http2-settings"] = ::HTTP2::Client.settings_header(request.options.http2_settings)
+
+          super
+        end
+
+        def upgrade_to_h2c(request, response)
+          @parser.reset_requests
+
+          @parser = request.options.h2c_class.new(@write_buffer, @pending, @options)
+          set_parser_callbacks(@parser)
+          @parser.upgrade(request, response)
+          @upgrade_protocol = "h2c"
+        end
+
+        private
+
+        def send_request_to_parser(request, *)
+          super.tap do |is_inflight|
+            next unless is_inflight
+
+            next unless request.headers["upgrade"] == "h2c" && parser.is_a?(Connection::HTTP1)
+
+            max_concurrent_requests = parser.max_concurrent_requests
+
+            next if max_concurrent_requests == 1
+
+            parser.max_concurrent_requests = 1
+            request.once(:response) do
+              parser.max_concurrent_requests = max_concurrent_requests
+            end
+          end
+        end
+      end
+
+      module H2CParser
+        def upgrade(request, response)
+          # skip checks, it is assumed that this is the first
+          # request in the connection
+          stream = @connection.upgrade
+
+          # on_settings
+          handle_stream(stream, request)
+          @streams[request] = stream
+
+          # clean up data left behind in the buffer, if the server started
+          # sending frames
+          data = response.read
+          @connection << data
+        end
+      end
+    end
+    register_plugin(:h2c, H2C)
+  end
+end

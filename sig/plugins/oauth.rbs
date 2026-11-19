@@ -1,0 +1,97 @@
+module HTTPX
+  module Plugins
+    #
+    # https://gitlab.com/os85/httpx/wikis/OAuth
+    #
+    module OAuth
+      def self.load_dependencies: (singleton(Session) klass) -> void
+
+      type grant_type = "client_credentials" | "refresh_token"
+
+      type token_auth_method = "client_secret_basic" | "client_secret_post"
+
+      SUPPORTED_GRANT_TYPES: ::Array[grant_type]
+
+      SUPPORTED_AUTH_METHODS: ::Array[token_auth_method]
+
+      class OAuthSession
+        attr_reader access_token: String?
+
+        attr_reader refresh_token: String?
+
+        @issuer: http_uri
+        @grant_type: grant_type
+        @client_id: String
+        @client_secret: String
+        @token_endpoint: http_uri?
+        @scope: Array[String]?
+        @audience: String?
+        @token_endpoint_auth_method: String?
+
+        def initialize: (
+          issuer: uri,
+          client_id: String,
+          client_secret: String,
+          ?access_token: String?,
+          ?refresh_token: String?,
+          ?scope: (Array[String] | String)?,
+          ?token_endpoint: String?,
+          ?grant_type: String?,
+          ?token_endpoint_auth_method: ::String,
+          ?audience: ::String
+        ) -> void
+
+        def token_endpoint: () -> uri
+
+        def token_endpoint_auth_method: () -> String
+
+        def reset!: () -> void
+
+        def fetch_access_token: (sessionOAuth http) -> String
+
+        def merge: (instance | Hash[untyped, untyped] other) -> instance
+
+        private
+
+
+        def load: (sessionOAuth http) -> void
+      end
+
+      interface _OAuthOptions
+        def oauth_session: () -> OAuthSession?
+
+        def oauth_options: () -> {
+          issuer: uri,
+          client_id: String,
+          client_secret: String,
+          ?access_token: String?,
+          ?refresh_token: String?,
+          ?scope: (Array[String] | String)?,
+          ?token_endpoint: String?,
+          ?response_type: String?,
+          ?grant_type: String?,
+          ?token_endpoint_auth_method: ::String,
+          ?audience: ::String
+        }?
+      end
+
+      module InstanceMethods
+        attr_reader oauth_session: OAuthSession
+        @options: Options & _OAuthOptions
+
+        def oauth_auth: (**untyped args) -> instance
+
+        def with_access_token: () -> instance
+
+        def refresh_oauth_tokens!: () -> void
+      end
+
+      module OAuthRetries
+        module InstanceMethods
+        end
+      end
+    end
+
+    type sessionOAuth = Session & Auth::InstanceMethods & OAuth::InstanceMethods
+  end
+end

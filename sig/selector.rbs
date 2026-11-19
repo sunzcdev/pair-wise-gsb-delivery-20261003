@@ -1,0 +1,94 @@
+module HTTPX
+  interface _Selectable
+    def state: () -> Symbol
+
+    def closed_for_select?: () -> bool
+
+    def to_io: () -> IO
+
+    def call: () -> void
+
+    def initial_call: () -> void
+
+    def interests: () -> io_interests?
+
+    def timeout: () -> interval?
+
+    def handle_socket_timeout: (interval interval) -> void
+
+    def on_error: (StandardError) -> void
+
+    def on_io_error: (IOError error) -> void
+
+    def force_close: (?bool delete_pending) -> void
+
+    def terminate: () -> void
+
+    def inflight?: () -> boolish
+  end
+
+  class Selector
+    HAS_FIBER_SCHEDULER: bool
+
+    type selectable = Resolver::Resolver | Connection | (Object & _Loggable & _Selectable)
+
+    type io_select_selectable = (selectable | Array[selectable])?
+
+    extend Forwardable
+
+    READABLE: Array[io_interests]
+    WRITABLE: Array[io_interests]
+    MAX_BUSY_ITERATIONS: Integer
+
+    @timers: Timers
+
+    @selectables: Array[selectable]
+    @is_timer_interval: bool
+    @busy_iterations: Integer
+    @last_select_registered: Integer?
+
+    def each: () -> ::Enumerator[selectable, self]
+            | () { (selectable) -> void } -> self
+
+    def next_tick: () -> void
+
+    def terminate: (?Array[selectable]) -> void
+
+    def find_resolver: (Options options) -> resolver?
+
+    def find_connection: (http_uri request_uri, Options options) -> Connection?
+
+    def each_connection: () { (Connection) -> void} -> void
+                       | () -> Enumerable[Connection]
+
+    def find_mergeable_connection: (Connection connection) -> Connection?
+
+    def empty?: () -> bool
+
+    def register: (selectable io) -> void
+
+    def deregister: (selectable io) -> selectable?
+
+    private
+
+    def initialize: () -> void
+
+    def select: (interval? interval) { (selectable) -> void } -> void
+
+    def select_many: (io_select_selectable r, io_select_selectable w, interval? interval) { (selectable) -> void } -> void
+
+    def selectables_with_closed_ios: (io_select_selectable r, io_select_selectable w) -> _Each[selectable]
+
+    def select_one: (selectable io, io_interests interests, interval? interval) { (selectable) -> void } -> void
+
+    def next_timeout: () -> interval?
+
+    def busy_loop_check: (interval? timeout) -> void
+
+    def busy_loop_error_message: (interval? timeout) -> String
+
+    def rw_wait: (io_select_selectable IO, interval? interval) -> untyped?
+  end
+
+  type io_interests = :r | :w | :rw
+end

@@ -1,0 +1,472 @@
+# frozen_string_literal: true
+
+module FiberSchedulerTestHelpers
+  class TestFiberScheduler
+    if defined?(IO::Buffer)
+      experimental = Warning[:experimental]
+      begin
+        Warning[:experimental] = false
+        IO::Buffer.new(0)
+      ensure
+        Warning[:experimental] = experimental
+      end
+    end
+
+    def initialize(fiber = Fiber.current)
+      @fiber = fiber
+
+      @readable = Hash.new { |hs, k| hs[k] = [] }
+      @writable = Hash.new { |hs, k| hs[k] = [] }
+      @waiting = {}
+
+      @closed = false
+
+      @lock = Thread::Mutex.new
+      @blocking = Hash.new.compare_by_identity
+      @ready = Set.new
+
+      @urgent = IO.pipe
+
+      # https://bugs.ruby-lang.org/issues/22532
+      @fibers = []
+    end
+
+    attr :readable
+    attr :writable
+    attr :waiting
+
+    def transfer
+      @fiber.transfer
+    end
+
+    def next_timeout
+      _fiber, timeout = @waiting.min_by{|key, value| value}
+
+      if timeout
+        offset = timeout - current_time
+
+        if offset < 0
+          return 0
+        else
+          return offset
+        end
+      end
+    end
+
+    def run_once
+      readable = writable = nil
+
+      begin
+        readable, writable = IO.select(@readable.keys + [@urgent.first], @writable.keys, [], next_timeout)
+      rescue IOError
+        interrupt_closed_io_waiters
+      end
+
+      # puts "readable: #{readable}" if readable&.any?
+      # puts "writable: #{writable}" if writable&.any?
+
+      selected = {}
+
+      readable&.each do |io|
+        if (fibers = @readable.delete(io))
+          fibers.each do |fiber|
+            if @writable.key?(io) && @writable[io].include?(fiber)
+              @writable[io].delete(fiber)
+              @writable.delete(io) if @writable[io].empty?
+            end
+            selected[fiber] = IO::READABLE
+          end
+        elsif io == @urgent.first
+          @urgent.first.read_nonblock(1024)
+        end
+      end
+
+      writable&.each do |io|
+        if (fibers = @writable.delete(io))
+          fibers.each do |fiber|
+            if @readable.key?(io) && @readable[io].include?(fiber)
+              @readable[io].delete(fiber)
+              @readable.delete(io) if @readable[io].empty?
+            end
+            selected[fiber] = selected.fetch(fiber, 0) | IO::WRITABLE
+          end
+        end
+      end
+
+      selected.each do |fiber, events|
+        fiber.transfer(events)
+      end
+
+      if @waiting.any?
+        time = current_time
+        waiting, @waiting = @waiting, {}
+
+        waiting.each do |fiber, timeout|
+          if fiber.alive?
+            if timeout <= time
+              fiber.transfer
+            else
+              @waiting[fiber] = timeout
+            end
+          end
+        end
+      end
+
+      if @ready.any?
+        ready = nil
+
+        @lock.synchronize do
+          ready, @ready = @ready, Set.new
+        end
+
+        ready.each do |fiber|
+          fiber.transfer(selected[fiber]) if fiber.alive?
+        end
+      end
+    end
+
+    def run
+      # $stderr.puts [__method__, Fiber.current].inspect
+
+      # Use Thread.handle_interrupt like Async::Scheduler does
+      # This defers signal processing, which is the root cause of the gRPC bug
+      # See: https://github.com/socketry/async/blob/main/lib/async/scheduler.rb
+      Thread.handle_interrupt(::SignalException => :never) do
+        while @readable.any? or @writable.any? or @waiting.any? or @blocking.any?
+          run_once
+
+          break if Thread.pending_interrupt?
+        end
+      end
+    end
+
+    # A fiber scheduler hook, invoked when the scheduler goes out of scope.
+    def scheduler_close
+      close(true)
+    end
+
+    # If the `scheduler_close` hook does not exist, this method `close` will be
+    # invoked instead when the fiber scheduler goes out of scope. This is legacy
+    # behaviour, you should almost certainly use `scheduler_close`. The reason for
+    # this, is `scheduler_close` is called when the scheduler goes out of scope,
+    # while `close` may be called by the user.
+    def close(internal = false)
+      # $stderr.puts [__method__, Fiber.current].inspect
+
+      unless internal
+        if Fiber.scheduler == self
+          return Fiber.set_scheduler(nil)
+        end
+      end
+
+      if @closed
+        raise "Scheduler already closed!"
+      end
+
+      self.run
+    ensure
+      # https://bugs.ruby-lang.org/issues/22532
+      kill_fibers
+
+      if @urgent
+        @urgent.each(&:close)
+        @urgent = nil
+      end
+
+      @closed ||= true
+
+      # We freeze to detect any unintended modifications after the scheduler is closed:
+      self.freeze
+    end
+
+    def closed?
+      @closed
+    end
+
+    def current_time
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
+    # This hook is invoked by `Timeout.timeout` and related code.
+    def timeout_after(duration, klass, message, &block)
+      fiber = Fiber.current
+
+      self.fiber do
+        sleep(duration)
+
+        if fiber&.alive?
+          fiber.raise(klass, message)
+        end
+      end
+
+      begin
+        yield(duration)
+      ensure
+        fiber = nil
+      end
+    end
+
+    # This hook is invoked by `Process.wait`, `system`, and backticks.
+    def process_wait(pid, flags)
+      # $stderr.puts [__method__, pid, flags, Fiber.current].inspect
+
+      # This is a very simple way to implement a non-blocking wait:
+      Thread.new do
+        Process::Status.wait(pid, flags)
+      end.value
+    end
+
+    # This hook is invoked by `IO#read` and `IO#write` in the case that `io_read`
+    # and `io_write` hooks are not available. This implementation is not
+    # completely general, in the sense that calling `io_wait` multiple times with
+    # the same `io` and `events` will not work, which is okay for tests but not
+    # for real code. Correct fiber schedulers should not have this limitation.
+    def io_wait(io, events, duration)
+      # $stderr.puts [__method__, io, events, duration, Fiber.current].inspect
+
+      fiber = Fiber.current
+
+      unless (events & IO::READABLE).zero?
+        @readable[io] << fiber
+        readable = true
+      end
+
+      unless (events & IO::WRITABLE).zero?
+        @writable[io] << fiber
+        writable = true
+      end
+
+      if duration
+        @waiting[fiber] = current_time + duration
+      end
+
+      @fiber.transfer
+    ensure
+      @waiting.delete(fiber) if duration
+      if readable
+        @readable[io].delete(fiber)
+        @readable.delete(io) if @readable[io].empty?
+      end
+      if writable
+        @writable[io].delete(fiber)
+        @writable.delete(io) if @writable[io].empty?
+      end
+    end
+
+    # This hook is invoked by `IO.select`. Using a thread ensures that the
+    # operation does not block the fiber scheduler.
+    def io_select(...)
+      # Emulate the operation using a non-blocking thread:
+      Thread.new do
+        IO.select(...)
+      end.value
+    end
+
+    # This hook is invoked by `IO#close`. Using a separate IO object
+    # demonstrates that the close operation is asynchronous.
+    def io_close(descriptor)
+      Fiber.blocking{IO.for_fd(descriptor.to_i).close}
+      return true
+    end
+
+    # This hook is invoked by `Kernel#sleep` and `Thread::Mutex#sleep`.
+    def kernel_sleep(duration = nil)
+      # $stderr.puts [__method__, duration, Fiber.current].inspect
+
+      self.block(:sleep, duration)
+
+      return true
+    end
+
+    # This hook is invoked by blocking options such as `Thread::Mutex#lock`,
+    # `Thread::Queue#pop` and `Thread::SizedQueue#push`, which are unblocked by
+    # other threads/fibers. To unblock a blocked fiber, you should call `unblock`
+    # with the same `blocker` and `fiber` arguments.
+    def block(blocker, timeout = nil)
+      # $stderr.puts [__method__, blocker, timeout].inspect
+
+      fiber = Fiber.current
+
+      if timeout
+        @waiting[fiber] = current_time + timeout
+        begin
+          @fiber.transfer
+        ensure
+          # Remove from @waiting in the case #unblock was called before the timeout expired:
+          @waiting.delete(fiber)
+        end
+      else
+        @blocking[fiber] = true
+        begin
+          @fiber.transfer
+        ensure
+          @blocking.delete(fiber)
+        end
+      end
+    end
+
+    # This method is invoked from a thread or fiber to unblock a fiber that is
+    # blocked by `block`. It is expected to be thread safe.
+    def unblock(blocker, fiber)
+      # $stderr.puts [__method__, blocker, fiber].inspect
+      # $stderr.puts blocker.backtrace.inspect
+      # $stderr.puts fiber.backtrace.inspect
+
+      if @lock.owned?
+        @lock.synchronize do
+          @ready << fiber
+        end
+      else
+        @ready << fiber
+      end
+
+      io = @urgent.last
+      io.write_nonblock('.')
+    end
+
+    class FiberInterrupt
+      # https://bugs.ruby-lang.org/issues/22532
+      attr_reader :fiber
+
+      def initialize(fiber, exception)
+        @fiber = fiber
+        @exception = exception
+      end
+
+      def alive?
+        @fiber.alive?
+      end
+
+      def transfer(*)
+        @fiber.raise(@exception)
+      end
+    end
+
+    def fiber_interrupt(fiber, exception)
+      @lock.synchronize do
+        @ready << FiberInterrupt.new(fiber, exception)
+      end
+
+      io = @urgent.last
+      io.write_nonblock('.')
+    end
+
+    # This hook is invoked by `Fiber.schedule`. Strictly speaking, you should use
+    # it to create scheduled fibers, but it is not required in practice;
+    # `Fiber.new` is usually sufficient.
+    def fiber(&block)
+      fiber = Fiber.new(blocking: false, &block)
+
+      # https://bugs.ruby-lang.org/issues/22532
+      @fibers.select!(&:alive?)
+      @fibers << fiber
+
+      fiber.transfer
+
+      return fiber
+    end
+
+    # This hook is invoked by `Addrinfo.getaddrinfo`. Using a thread ensures that
+    # the operation does not block the fiber scheduler, since `getaddrinfo` is
+    # usually provided by `libc` and is blocking.
+    def address_resolve(hostname)
+      Thread.new do
+        Addrinfo.getaddrinfo(hostname, nil).map(&:ip_address).uniq
+      end.value
+    end
+
+    def blocking_operation_wait(work)
+      thread = Thread.new{work.call}
+
+      thread.join
+
+      thread = nil
+    ensure
+      thread&.kill
+    end
+
+    EAGAIN = -Errno::EAGAIN::Errno
+
+    def io_read(io, buffer, length, offset)
+      io.nonblock = true
+
+      blocking{buffer.read(io, offset, length)}
+    end
+
+    def io_write(io, buffer, length, offset)
+      io.nonblock = true
+
+      blocking{buffer.write(io, offset, length)}
+    end
+
+    def io_pread(io, buffer, from, length, offset)
+      io.nonblock = true
+
+      blocking{buffer.pread(io, from, offset, length)}
+    end
+
+    def io_pwrite(io, buffer, from, length, offset)
+      io.nonblock = true
+
+      blocking{buffer.pwrite(io, from, offset, length)}
+    end
+
+    def blocking(&block)
+      Fiber.blocking(&block)
+    end
+
+    private
+
+    # Fibers waiting on an IO which gets closed are interrupted by the VM via the #fiber_interrupt hook
+    # since ruby 4.0.
+    def interrupt_closed_io_waiters
+      interrupted = @ready.filter_map { |f| f.fiber if f.is_a?(FiberInterrupt) }
+
+      [@readable, @writable].each do |waiters|
+        waiters.keys.each do |io|
+          next unless io.closed?
+
+          waiters.delete(io).each do |fiber|
+            next if interrupted.include?(fiber)
+
+            interrupted << fiber
+            @lock.synchronize do
+              @ready << FiberInterrupt.new(fiber, IOError.new("stream closed in another thread"))
+            end
+          end
+        end
+      end
+    end
+
+    # Kills fibers which are still suspended when the scheduler closes (i.e. after a test failure or
+    # an interrupt broke the run loop), so that their ensure blocks run.
+    #
+    # https://bugs.ruby-lang.org/issues/22532
+    def kill_fibers
+      return unless Fiber.method_defined?(:kill)
+
+      fibers, @fibers = @fibers, []
+      fibers.each do |fiber|
+        fiber.kill if fiber.alive?
+      rescue FiberError
+        # can't kill the current fiber, or one from another thread.
+      end
+    end
+
+    def log(msg)
+      fid = Fiber.current.object_id
+
+      warn "(scheduler) fid:#{fid}: #{msg}"
+    end
+  end
+
+  def with_test_fiber_scheduler
+    Thread.start do
+      Thread.current.abort_on_exception = true
+      scheduler = TestFiberScheduler.new
+      Fiber.set_scheduler scheduler
+
+      yield(scheduler)
+    end.value
+  end
+end

@@ -1,0 +1,15 @@
+module HTTPX
+  module Plugins
+    module RateLimiter
+      RATE_LIMIT_CODES: Array[Integer]
+
+      def self.load_dependencies: (singleton(Session)) -> void
+
+      module InstanceMethods
+        def rate_limit_error?: (response response) -> bool
+      end
+    end
+
+    type sessionRateLimiter = Session & RateLimiter::InstanceMethods
+  end
+end

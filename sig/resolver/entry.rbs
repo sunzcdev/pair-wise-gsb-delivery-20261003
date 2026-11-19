@@ -1,0 +1,13 @@
+module HTTPX
+  class Resolver::Entry
+    attr_reader address: IPAddr | String
+
+    @expires_in: interval
+
+    def initialize: (ipaddr address, ?Numeric expires_in, ?rescue_on_convert: boolish) -> void
+
+    def expired?: () -> bool
+
+    def self.convert: (ipaddr address) -> Resolver::Entry
+  end
+end

@@ -1,0 +1,277 @@
+# frozen_string_literal: true
+
+module HTTPX
+  module Plugins
+    module Proxy
+      module HTTP
+        class << self
+          def extra_options(options)
+            options.merge(supported_proxy_protocols: options.supported_proxy_protocols + %w[http])
+          end
+        end
+
+        # adds support for the following options:
+        #
+        # :proxy_headers :: hash of HTTP headers to send while connecting to the proxy.
+        # :enable_proxy_tunnel :: when <tt>true</tt>, it forces the establishment of the CONNECT proxy
+        #                         tunnel, in cases where it wouldn't otherwise normally establish it
+        #                         (i.e. if the request is an http:// request).
+        # :connect_request_class :: class of the request object used for the CONNECT tunnel request.
+        module OptionsMethods
+          def extend_with_plugin_classes(pl)
+            super
+
+            @connect_request_class = @request_class.dup
+            Options::SET_TEMPORARY_NAME[@connect_request_class, pl]
+            @connect_request_class.__send__(:include, ConnectRequestMethods)
+          end
+
+          private
+
+          def option_connect_request_class(val)
+            val
+          end
+
+          def option_proxy_headers(value)
+            value = value.dup if value.frozen?
+
+            headers_class.new(value)
+          end
+
+          def option_enable_proxy_tunnel(value) # rubocop:disable Naming/PredicateMethod
+            !!value
+          end
+        end
+
+        module InstanceMethods
+          # returns a new session with the proxy authentication scheme set to <tt>"basic"</tt>, for HTTP Basic Auth.
+          def with_proxy_basic_auth(opts)
+            with(proxy: opts.merge(scheme: "basic"))
+          end
+
+          # returns a new session with the proxy authentication scheme set to <tt>"digest"</tt>, for HTTP Digest Auth.
+          def with_proxy_digest_auth(opts)
+            with(proxy: opts.merge(scheme: "digest"))
+          end
+
+          # returns a new session with the proxy authentication scheme set to <tt>"ntlm"</tt>, for NTLM Auth.
+          def with_proxy_ntlm_auth(opts)
+            with(proxy: opts.merge(scheme: "ntlm"))
+          end
+
+          private
+
+          def fetch_response(request, selector, options)
+            response = super
+
+            if response &&
+               response.is_a?(Response) &&
+               response.status == 407 &&
+               !request.headers.key?("proxy-authorization") &&
+               response.headers.key?("proxy-authenticate") && options.proxy.can_authenticate?(response.headers["proxy-authenticate"])
+              request.transition(:idle)
+              request.headers["proxy-authorization"] =
+                options.proxy.authenticate(request, response.headers["proxy-authenticate"])
+              send_request(request, selector, options)
+
+              # recalling itself, in case an error was triggered by the above, and we can
+              # verify retriability again.
+              return fetch_response(request, selector, options)
+            end
+
+            response
+          end
+        end
+
+        module ConnectionMethods
+          def initialize(*)
+            @tunnel_parser = nil
+            super
+          end
+
+          def handle_connect_error(*)
+            if @state == :connecting
+              # proxy connect related requests should not be reenqueed
+              @parser.reset
+            end
+
+            super
+          end
+
+          def on_error(error, *)
+            error = error.to_connection_error if error.is_a?(RequestTimeoutError) && connecting?
+
+            super
+          end
+
+          private
+
+          def purge_after_closed
+            super
+
+            @tunnel_parser = nil
+          end
+
+          def handle_transition(nextstate)
+            return super unless @options.proxy && @options.proxy.uri.scheme == "http"
+
+            case nextstate
+            when :connecting
+              return unless @state == :idle
+
+              @io.connect
+              return unless @io.connected?
+
+              @tunnel_parser || begin
+                if @parser
+                  # in case this happens, requests from @parser need to be reenqueued for delivery.
+                  @parser.reset_requests
+                  @parser = nil
+                end
+
+                @tunnel_parser = @parser = parser =
+                                   parser_type(@io.protocol).new(@write_buffer, @pending, @options.merge(max_concurrent_requests: 1))
+                parser.extend(ProxyParser)
+                parser.on(:response, &method(:__http_on_connect))
+                parser.on(:close) do
+                  next unless @parser
+
+                  reset
+                end
+                parser.on(:error, &method(:on_parser_error))
+                parser.on(:reset) do
+                  if parser.empty?
+                    reset
+                  else
+                    parser.reset_requests
+
+                    initial_state = @state
+
+                    # because #reset will nillify @parser...
+                    tunnel_parser = @parser
+
+                    reset
+
+                    if @pending.empty?
+                      @parser = nil
+                      next
+                    end
+                    # keep parser state around due to proxy auth protocol;
+                    # intermediate authenticated request is already inside
+                    # the parser
+                    connect_request = parser = nil
+
+                    if initial_state == :connecting
+                      parser = tunnel_parser
+                      parser.reset
+                      if @pending.first.is_a?(@options.connect_request_class)
+                        connect_request = @pending.shift # this happened when reenqueing
+                      end
+                    end
+
+                    idling
+
+                    @tunnel_parser = @parser = parser
+                    parser.send(connect_request) if connect_request
+                    transition(:connecting)
+                  end
+                end
+                __http_proxy_connect
+              end
+              return if @state == :connected
+            when :connected
+              return unless @state == :idle || @state == :connecting
+
+              case @state
+              when :connecting
+                parser = @parser
+                @tunnel_parser = @parser = nil
+                parser.close
+              when :idle
+                @parser.callbacks.clear
+                set_parser_callbacks(@parser)
+              end
+            end
+            super
+          end
+
+          def __http_proxy_connect
+            req = @pending.first
+            enable_proxy_tunnel = (
+              req.options.enable_proxy_tunnel.nil? && req && req.uri.scheme == "https"
+            ) || req.options.enable_proxy_tunnel
+
+            if enable_proxy_tunnel
+              # if the first request after CONNECT is to an https address, it is assumed that
+              # all requests in the queue are not only ALL HTTPS, but they also share the certificate,
+              # and therefore, will share the connection.
+              #
+              connect_request = @options.connect_request_class.new(req.uri, @options)
+              send(connect_request)
+            else
+              handle_transition(:connected)
+            end
+          end
+
+          def __http_on_connect(request, response)
+            if response.is_a?(Response) && response.status == 200
+              req = @pending.first
+              request_uri = req.uri
+              @io = ProxySSL.new(@io, request_uri, @options) if request_uri.scheme == "https"
+              transition(:connected)
+              throw(:called)
+            elsif response.is_a?(Response) &&
+                  response.status == 407 &&
+                  !request.headers.key?("proxy-authorization") &&
+                  @options.proxy.can_authenticate?(response.headers["proxy-authenticate"])
+
+              request.transition(:idle)
+              request.headers["proxy-authorization"] = @options.proxy.authenticate(request, response.headers["proxy-authenticate"])
+              send(request)
+            else
+              while (req = @pending.shift)
+                response.finish!
+                req.response = response
+                req.emit_response(response)
+              end
+              reset
+            end
+          end
+        end
+
+        module ProxyParser
+          def join_headline(request)
+            return super if request.verb == "CONNECT"
+
+            "#{request.verb} #{request.uri} HTTP/#{@version.join(".")}"
+          end
+
+          def set_protocol_headers(request)
+            extra_headers = super
+
+            proxy_params = @options.proxy
+            if proxy_params.scheme == "basic"
+              # opt for basic auth
+              extra_headers["proxy-authorization"] = proxy_params.authenticate(extra_headers)
+            end
+            extra_headers["proxy-connection"] = extra_headers.delete("connection") if extra_headers.key?("connection")
+            extra_headers
+          end
+        end
+
+        module ConnectRequestMethods
+          def initialize(uri, options)
+            super("CONNECT", uri, options)
+            @headers = options.headers_class.new
+            merge_headers(options.proxy_headers) if options.proxy_headers
+          end
+
+          def path
+            "#{@uri.hostname}:#{@uri.port}"
+          end
+        end
+      end
+    end
+    register_plugin :"proxy/http", Proxy::HTTP
+  end
+end

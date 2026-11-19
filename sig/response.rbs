@@ -1,0 +1,108 @@
+module HTTPX
+  interface _Response
+    def <<: (String data) -> void
+
+    def finished?: () -> bool
+
+    def finish!: () -> void
+
+    def raise_for_status: () -> self
+
+    def error: () -> StandardError?
+  end
+
+  class Response
+    extend Forwardable
+    include Callbacks
+
+    include _Response
+    include _ToS
+    include _Reader
+
+    attr_reader status: Integer
+    attr_reader headers: Headers
+    attr_reader body: Body
+    attr_reader version: String
+
+    @options: Options
+    @request: Request
+    @content_type: ContentType
+    @content_length: Integer?
+    @finished: bool
+
+    def copy_to: (_ToPath | _Writer destination) -> void
+
+    def close: () -> void
+
+    def uri: () -> URI::Generic
+
+    def peer_address: () -> (String | IPAddr)?
+
+    def merge_headers: (_Each[[String, headers_value]]) -> void
+
+    def bodyless?: () -> bool
+
+    def content_type: () -> ContentType
+
+    def content_length: () -> Integer?
+
+    def complete?: () -> bool
+
+    def json: (?JSON::options opts) -> untyped
+
+    def form: () -> Hash[String, untyped]
+
+    def initialize: (Request request, String | Integer status, String version, headers?) -> void
+
+    private
+
+    def decode:(Transcoder::_Decode transcoder, ?untyped options) -> untyped
+  end
+
+  class ContentType
+    SPLIT_PATTERN: Regexp
+
+    @header_value: String?
+    @mime_type: String?
+    @charset: String?
+    @initialized: bool
+
+    def mime_type: () -> String?
+
+    def charset: () -> String?
+
+    private
+
+    def initialize: (String? header_value) -> void
+
+    def load: () -> void
+  end
+
+  class ErrorResponse
+    include _Response
+    include _Reader
+    include Loggable
+    extend Forwardable
+
+    @options: Options
+    @error: Exception
+
+    %a{pure} attr_reader request: Request
+
+    %a{pure} attr_reader response: Response?
+
+    def status: () -> (Integer | _ToS)
+
+    def uri: () -> URI::Generic
+
+    def peer_address: () -> (String | IPAddr)?
+
+    def close: () -> void
+
+    private
+
+    def initialize: (Request, Exception) -> untyped
+  end
+
+  type response = Response | ErrorResponse
+end
