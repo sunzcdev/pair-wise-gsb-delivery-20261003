@@ -1290,6 +1290,9 @@ def _from_text(
     allow_directives: bool | Iterable[str] = True,
     transaction_setup: Callable[[dns.transaction.Transaction], None] | None = None,
     rfc2308_ttl: bool = True,
+    include_resolver: dns.zonefile.IncludeResolver | None = None,
+    include_directories: Iterable[str | os.PathLike[str]] | None = None,
+    max_include_depth: int = dns.zonefile.DEFAULT_MAX_INCLUDE_DEPTH,
 ) -> Zone:
     # See the comments for the public APIs from_text() and from_file() for
     # details.
@@ -1312,6 +1315,9 @@ def _from_text(
             allow_include=allow_include,
             allow_directives=allow_directives,
             rfc2308_ttl=rfc2308_ttl,
+            include_resolver=include_resolver,
+            include_directories=include_directories,
+            max_include_depth=max_include_depth,
         )
         try:
             reader.read()
@@ -1338,6 +1344,9 @@ def from_text(
     allow_directives: bool | Iterable[str] = True,
     transaction_setup: Callable[[dns.transaction.Transaction], None] | None = None,
     rfc2308_ttl: bool = True,
+    include_resolver: dns.zonefile.IncludeResolver | None = None,
+    include_directories: Iterable[str | os.PathLike[str]] | None = None,
+    max_include_depth: int = dns.zonefile.DEFAULT_MAX_INCLUDE_DEPTH,
 ) -> Zone:
     """Build a zone object from a zone file format string.
 
@@ -1353,7 +1362,8 @@ def from_text(
         :py:class:`dns.zone.Zone` will be used.  The value may be any class
         or callable that returns a subclass of :py:class:`dns.zone.Zone`.
     :param filename: The filename to emit when describing where an error
-        occurred; the default is ``'<string>'``.
+        occurred; the default is ``'<string>'``.  It is also the file whose
+        directory relative ``$INCLUDE`` names are resolved against.
     :type filename: str or ``None``
     :param bool allow_include: If ``True`` (the default), then ``$INCLUDE``
         directives are permitted.  If ``False``, then encountering a
@@ -1381,6 +1391,19 @@ def from_text(
         last resort if no TTL has been stated at all.  If ``False``, then a master
         file with no ``$TTL`` directive gets its default TTL from the SOA MINIMUM
         field, which is the pre-RFC 2308 behavior.
+    :param include_resolver: The resolver for ``$INCLUDE`` directives.  If not
+        ``None``, it handles all includes, and *include_directories* and
+        *max_include_depth* are ignored.
+    :type include_resolver: :py:class:`dns.zonefile.IncludeResolver` or ``None``
+    :param include_directories: The directories ``$INCLUDE`` directives may
+        read from.  If ``None`` (the default), includes are confined to the
+        directory of the file named by *filename*; input with no filename is
+        not confined.  If not ``None``, includes may only read files whose
+        canonical path is inside one of the listed directories, and an empty
+        iterable prohibits includes entirely.
+    :type include_directories: Iterable[str | os.PathLike[str]] or ``None``
+    :param int max_include_depth: The maximum number of nested ``$INCLUDE``
+        directives.  The outermost file is not counted.
     :raises dns.zone.NoSOA: if there is no SOA RRset.
     :raises dns.zone.NoNS: if there is no NS RRset.
     :raises KeyError: if there is no origin node.
@@ -1399,6 +1422,9 @@ def from_text(
         allow_directives,
         transaction_setup,
         rfc2308_ttl,
+        include_resolver,
+        include_directories,
+        max_include_depth,
     )
 
 
@@ -1415,6 +1441,9 @@ def from_file(
     allow_directives: bool | Iterable[str] = True,
     transaction_setup: Callable[[dns.transaction.Transaction], None] | None = None,
     rfc2308_ttl: bool = True,
+    include_resolver: dns.zonefile.IncludeResolver | None = None,
+    include_directories: Iterable[str | os.PathLike[str]] | None = None,
+    max_include_depth: int = dns.zonefile.DEFAULT_MAX_INCLUDE_DEPTH,
 ) -> Zone:
     """Read a zone file and build a zone object.
 
@@ -1431,7 +1460,8 @@ def from_file(
         :py:class:`dns.zone.Zone` will be used.  The value may be any class
         or callable that returns a subclass of :py:class:`dns.zone.Zone`.
     :param filename: The filename to emit when describing where an error
-        occurred; the default is ``'<string>'``.
+        occurred; the default is ``'<string>'``.  It is also the file whose
+        directory relative ``$INCLUDE`` names are resolved against.
     :type filename: str or ``None``
     :param bool allow_include: If ``True`` (the default), then ``$INCLUDE``
         directives are permitted.  If ``False``, then encountering a
@@ -1459,6 +1489,19 @@ def from_file(
         last resort if no TTL has been stated at all.  If ``False``, then a master
         file with no ``$TTL`` directive gets its default TTL from the SOA MINIMUM
         field, which is the pre-RFC 2308 behavior.
+    :param include_resolver: The resolver for ``$INCLUDE`` directives.  If not
+        ``None``, it handles all includes, and *include_directories* and
+        *max_include_depth* are ignored.
+    :type include_resolver: :py:class:`dns.zonefile.IncludeResolver` or ``None``
+    :param include_directories: The directories ``$INCLUDE`` directives may
+        read from.  If ``None`` (the default), includes are confined to the
+        directory of the file named by *filename*; input with no filename is
+        not confined.  If not ``None``, includes may only read files whose
+        canonical path is inside one of the listed directories, and an empty
+        iterable prohibits includes entirely.
+    :type include_directories: Iterable[str | os.PathLike[str]] or ``None``
+    :param int max_include_depth: The maximum number of nested ``$INCLUDE``
+        directives.  The outermost file is not counted.
     :raises dns.zone.NoSOA: if there is no SOA RRset.
     :raises dns.zone.NoNS: if there is no NS RRset.
     :raises KeyError: if there is no origin node.
@@ -1481,6 +1524,9 @@ def from_file(
             allow_directives,
             transaction_setup,
             rfc2308_ttl,
+            include_resolver,
+            include_directories,
+            max_include_depth,
         )
     assert False  # make mypy happy  lgtm[py/unreachable-statement]
 

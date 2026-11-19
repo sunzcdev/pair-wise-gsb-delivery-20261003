@@ -57,3 +57,57 @@ to process the zonefile format.
 .. autoclass:: dns.zonefile.Reader
    :members:
 
+$INCLUDE Directives
+===================
+
+The ``$INCLUDE`` directive reads another file as if its contents appeared at
+the point of the directive (RFC 1035 section 5.1).  Two aspects of this have
+security implications which callers loading zone files from an untrusted
+source should control: where a filename is looked for, and how far the
+inclusion may wander from that place.
+
+Relative filenames in an ``$INCLUDE`` are resolved against the directory of
+the file which contains the directive, not against the process working
+directory.  This means that a file can include its neighbors, and that the
+behavior of a zone file does not depend on where the process happens to be
+running.
+
+Includes are confined to the directory of the file being read, which is the
+directory the caller declared by naming that file.  A file may be included
+only if its canonical path, i.e. after resolving ``..`` components and
+symbolic links, is inside the allowed directory, so neither an absolute path,
+a parent-directory reference, nor a link can escape.  Input which is not a
+file, e.g. a string with no ``filename``, has no directory to be confined to
+and keeps the historical behavior of allowing any file.  Pass
+``include_directories`` to ``dns.zone.from_text()`` or
+``dns.zone.from_file()`` to name the allowed directories explicitly; an empty
+list prohibits includes entirely.  To read a trusted zone file without any
+confinement, pass ``include_resolver=dns.zonefile.IncludeResolver(None)``.
+
+``max_include_depth`` limits how deeply includes may nest.  The outermost
+file is not counted, so the default of
+:py:data:`dns.zonefile.DEFAULT_MAX_INCLUDE_DEPTH` allows that many levels of
+nested includes.  A file which is already being read may not be included
+again, as that is a cycle; the same file may be included any number of times
+elsewhere, however, as that is both legal and useful.  The current include
+chain is reported, with line numbers, when an include fails.
+
+The resolver which makes these decisions is available directly as
+:py:class:`dns.zonefile.IncludeResolver`, and can be passed to
+``dns.zone.from_text()`` or ``dns.zone.from_file()`` as
+``include_resolver`` when more control is needed.
+
+.. autoclass:: dns.zonefile.IncludeResolver
+   :members:
+
+.. autoclass:: dns.zonefile.IncludeSource
+   :members:
+
+.. autoclass:: dns.zonefile.IncludeOrigin
+   :members:
+
+.. autoexception:: dns.zonefile.IncludeError
+.. autoexception:: dns.zonefile.IncludeNotAllowed
+.. autoexception:: dns.zonefile.IncludeCycle
+.. autoexception:: dns.zonefile.IncludeTooDeep
+

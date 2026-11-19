@@ -17,6 +17,8 @@
 
 """DNS Zones."""
 
+import dataclasses
+import os
 import re
 import sys
 from collections.abc import Iterable
@@ -42,6 +44,49 @@ class UnknownOrigin(dns.exception.DNSException):
 
 class CNAMEAndOtherData(dns.exception.DNSException):
     """A node has a CNAME and other data"""
+
+
+class IncludeError(dns.exception.SyntaxError):
+    """A ``$INCLUDE`` directive could not be honored.
+
+    :ivar str reason: Why the directive could not be honored.
+    :ivar list[str] chain: The include chain, from the outermost file to the
+        file which could not be read.  Each item is a
+        ``filename:line`` location, except that the last one names the file
+        whose inclusion failed.
+
+    The string form of the exception is the reason followed by the chain,
+    one location per line, with the first location prefixed by ``"in "`` and
+    the others indented:
+    ::
+
+        $INCLUDE of 'foo.zone' would create a cycle
+        in example.zone:10
+           foo.zone:3
+             example.zone
+    """
+
+    def __init__(self, reason: str, chain: Iterable[str] = ()):
+        self.reason = reason
+        self.chain = list(chain)
+        super().__init__(reason)
+
+    def __str__(self) -> str:
+        if not self.chain:
+            return self.reason
+        return f"{self.reason}\n{_format_include_chain(self.chain)}"
+
+
+class IncludeNotAllowed(IncludeError):
+    """A ``$INCLUDE`` would read a file outside the allowed directories."""
+
+
+class IncludeCycle(IncludeError):
+    """A ``$INCLUDE`` would create a cycle of includes."""
+
+
+class IncludeTooDeep(IncludeError):
+    """``$INCLUDE`` directives are nested more deeply than is allowed."""
 
 
 def _check_cname_and_other_data(txn, name, rdataset):
@@ -165,8 +210,337 @@ def _generate_text(template: str, counter: int) -> str:
     return text
 
 
+# The default maximum number of nested $INCLUDE directives.
+DEFAULT_MAX_INCLUDE_DEPTH = 10
+
+# The default encoding of files read by $INCLUDE directives.
+DEFAULT_INCLUDE_ENCODING = "utf-8"
+
+
+def _is_synthetic_filename(filename: str) -> bool:
+    """Is *filename* a placeholder such as ``"<string>"`` rather than a path?"""
+    return filename.startswith("<") and filename.endswith(">")
+
+
+def _canonical_path(filename: str | os.PathLike[str] | None) -> str | None:
+    """Return the canonical absolute form of *filename*.
+
+    ``None`` is returned for names which are not paths, i.e. the synthetic
+    names like ``"<string>"`` which the tokenizer uses for input that did not
+    come from a file.  The path is canonicalized with
+    :py:func:`os.path.realpath`, so ``..`` components and symbolic links are
+    resolved.
+    """
+    if filename is None:
+        return None
+    text = os.fspath(filename)
+    if _is_synthetic_filename(text):
+        return None
+    return os.path.realpath(text)
+
+
+@dataclasses.dataclass(frozen=True)
+class IncludeOrigin:
+    """The place where an ``$INCLUDE`` directive was found.
+
+    *filename* is the name of the including file as reported in diagnostics,
+    *line* is the line number of the directive itself, and *path* is the
+    canonical path of the including file, or ``None`` if the including input
+    is not a file (e.g. it is a string).
+    """
+
+    filename: str
+    line: int
+    path: str | None = None
+
+    def __str__(self) -> str:
+        return f"{self.filename}:{self.line}"
+
+
+@dataclasses.dataclass(frozen=True)
+class IncludeSource:
+    """The resolved location of the file named by an ``$INCLUDE`` directive.
+
+    *filename* is the canonical absolute path of the file, and *directory* is
+    the canonical directory which contains it.  The latter is the base
+    against which relative ``$INCLUDE`` names in the file are resolved.
+    """
+
+    filename: str
+    directory: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _IncludeFrame:
+    source: IncludeSource
+    file: Any
+    origin: IncludeOrigin | None
+
+
+def _format_include_chain(chain: Iterable[str], indent: str = "") -> str:
+    """Format an include chain for a diagnostic.
+
+    The first location is where reading started and the others are the nested
+    directives, so the latter are indented to make the chain easy to read.
+    """
+    locations = list(chain)
+    if not locations:
+        return ""
+    lines = [f"{indent}in {locations[0]}"]
+    for depth, location in enumerate(locations[1:], start=1):
+        lines.append(f"{indent}{'  ' * depth}{location}")
+    return "\n".join(lines)
+
+
+class IncludeResolver:
+    """An explicit source resolver for ``$INCLUDE`` directives.
+
+    A resolver is responsible for turning the filename written in an
+    ``$INCLUDE`` directive into a file to read.  Relative filenames are
+    resolved against the directory of the file which contains the directive,
+    rather than against the process working directory, so an included file's
+    own includes are found next to it.  A resolver also detects an include
+    which leads back to a file which is already being read, and limits how
+    deeply includes may nest.
+
+    If *directories* is given, then it confines ``$INCLUDE`` to those
+    directories: only files whose canonical path (i.e. after resolving ``..``
+    components and symbolic links) is inside one of them may be included.  An
+    absolute path is then only usable if it points inside a declared
+    directory, and neither a parent directory reference nor a symbolic link
+    can lead outside of one.  If *directories* is ``None``, no such
+    confinement is done, which is only appropriate when the zone file is
+    trusted; :py:class:`Reader` uses a confined resolver by default.
+
+    A resolver keeps state, namely which files are currently being read, and
+    so a resolver instance must be used by only one :py:class:`Reader` at a
+    time.  The same file may be included any number of times, sequentially or
+    in different branches of the include tree; only including a file which is
+    already being read, i.e. one which is further up the current include
+    stack, is an error.
+
+    :param directories: The directories ``$INCLUDE`` may read from, or
+        ``None`` to allow any file.
+    :type directories: Iterable[str | os.PathLike[str]] or ``None``
+    :param int max_depth: The maximum number of nested includes.  The
+        outermost file is not counted, so a value of 0 prohibits includes
+        and a value of 1 allows the outermost file to include files which
+        themselves do not include anything.
+    :param str encoding: The encoding of the included files; the default is
+        ``"utf-8"``.
+    """
+
+    def __init__(
+        self,
+        directories: Iterable[str | os.PathLike[str]] | None = None,
+        max_depth: int = DEFAULT_MAX_INCLUDE_DEPTH,
+        encoding: str = DEFAULT_INCLUDE_ENCODING,
+    ):
+        if max_depth < 0:
+            raise ValueError("max_depth must not be negative")
+        if directories is None:
+            self._directories: tuple[str, ...] | None = None
+        else:
+            canonical: list[str] = []
+            for directory in directories:
+                path = os.path.realpath(os.fspath(directory))
+                if path not in canonical:
+                    canonical.append(path)
+            self._directories = tuple(canonical)
+        self._max_depth = max_depth
+        self._encoding = encoding
+        self._root: IncludeSource | None = None
+        self._stack: list[_IncludeFrame] = []
+
+    @property
+    def directories(self) -> tuple[str, ...] | None:
+        """The canonical directory names ``$INCLUDE`` may read from, or
+        ``None`` if any file may be included."""
+        return self._directories
+
+    @property
+    def max_depth(self) -> int:
+        """The maximum number of nested includes."""
+        return self._max_depth
+
+    @property
+    def depth(self) -> int:
+        """The number of includes currently being read."""
+        return len(self._stack)
+
+    @property
+    def root(self) -> IncludeSource | None:
+        """The outermost file, as declared with :py:meth:`set_root`."""
+        return self._root
+
+    def current_path(self) -> str | None:
+        """The canonical path of the file currently being read, if any.
+
+        This is the innermost file in the include stack, or the outermost
+        file if no include is being read.  ``None`` is returned if the input
+        is not a file at all, e.g. it is a string.
+        """
+        if self._stack:
+            return self._stack[-1].source.filename
+        if self._root is not None:
+            return self._root.filename
+        return None
+
+    def include_chain(self, where: IncludeOrigin | None = None) -> list[str]:
+        """Return the include chain as a list of locations.
+
+        The list starts with the location of the outermost ``$INCLUDE``
+        directive being read and ends with the innermost.  If *where* is
+        given, it is appended, which is how a diagnostic names the place
+        which could not be processed.
+        """
+        chain = [
+            str(frame.origin)
+            if frame.origin is not None
+            else frame.source.filename
+            for frame in self._stack
+        ]
+        if where is not None:
+            chain.append(str(where))
+        return chain
+
+    def set_root(self, filename: str | os.PathLike[str] | None) -> None:
+        """Declare the outermost file being read.
+
+        This lets the resolver recognize an include which leads back to the
+        outermost file, and gives relative ``$INCLUDE`` names in input which
+        is not a file itself a directory to be resolved against.  ``None``
+        says the outermost input has no location of its own, in which case
+        relative names are resolved against the current working directory.
+        """
+        path = _canonical_path(filename)
+        if path is None:
+            self._root = None
+        else:
+            self._root = IncludeSource(path, os.path.dirname(path))
+
+    def reset(self) -> None:
+        """Close any open included files and forget the include stack."""
+        while self._stack:
+            self._stack.pop().file.close()
+
+    def _is_allowed(self, path: str) -> bool:
+        if self._directories is None:
+            return True
+        normalized = os.path.normcase(path)
+        for directory in self._directories:
+            root = os.path.normcase(directory)
+            try:
+                if os.path.commonpath([normalized, root]) == root:
+                    return True
+            except ValueError:
+                # The paths are on different drives (Windows).
+                continue
+        return False
+
+    def _chain(self, origin: IncludeOrigin | None, tail: str) -> list[str]:
+        chain = self.include_chain(origin)
+        chain.append(tail)
+        return chain
+
+    def _base_directory(self, origin: IncludeOrigin | None) -> str:
+        if origin is not None and origin.path is not None:
+            return os.path.dirname(origin.path)
+        if self._root is not None:
+            return self._root.directory
+        return os.getcwd()
+
+    def resolve(self, name: str, origin: IncludeOrigin | None = None) -> IncludeSource:
+        """Resolve the filename of an ``$INCLUDE`` directive.
+
+        *name* is the filename as written in the directive.  A relative name
+        is resolved against the directory of *origin*, i.e. of the file which
+        contains the directive; if *origin* does not identify a file, then
+        the directory of the file declared with :py:meth:`set_root` is used,
+        or the current working directory if there is no such file either.
+
+        :raises IncludeNotAllowed: if the file is outside of the declared
+            directories.
+        :returns: An :py:class:`IncludeSource`.
+        """
+        if name == "":
+            raise IncludeError(
+                "empty filename in $INCLUDE", self._chain(origin, "<empty>")
+            )
+        if os.path.isabs(name):
+            candidate = name
+        else:
+            candidate = os.path.join(self._base_directory(origin), name)
+        path = os.path.realpath(candidate)
+        if not self._is_allowed(path):
+            raise IncludeNotAllowed(
+                f"$INCLUDE of '{name}' is outside the allowed directories",
+                self._chain(origin, path),
+            )
+        return IncludeSource(path, os.path.dirname(path))
+
+    def enter(
+        self, name: str, origin: IncludeOrigin | None = None
+    ) -> tuple[IncludeSource, Any]:
+        """Resolve, check, and open the file of an ``$INCLUDE`` directive.
+
+        *name* and *origin* are as for :py:meth:`resolve`.
+
+        :raises IncludeNotAllowed: if the file is outside of the declared
+            directories.
+        :raises IncludeCycle: if the file is already being read.
+        :raises IncludeTooDeep: if including the file would exceed the
+            maximum depth.
+        :raises IncludeError: if the file cannot be opened.
+        :returns: A ``(source, file)`` tuple.  The file must be released with
+            :py:meth:`leave`.
+        """
+        source = self.resolve(name, origin)
+        key = os.path.normcase(source.filename)
+        # Only files which are currently being read make a cycle.  A file
+        # which has already been read to its end may be included again, and
+        # the same file may be included from two different branches.
+        reading = [frame.source.filename for frame in self._stack]
+        if self._root is not None:
+            reading.append(self._root.filename)
+        if any(os.path.normcase(path) == key for path in reading):
+            raise IncludeCycle(
+                f"$INCLUDE of '{name}' would create a cycle",
+                self._chain(origin, source.filename),
+            )
+        if self.depth >= self._max_depth:
+            raise IncludeTooDeep(
+                f"$INCLUDE nesting exceeds the maximum depth of {self._max_depth}",
+                self._chain(origin, source.filename),
+            )
+        try:
+            file = open(source.filename, encoding=self._encoding)
+        except OSError as detail:
+            raise IncludeError(
+                f"cannot read the $INCLUDE file '{name}': {detail}",
+                self._chain(origin, source.filename),
+            ) from detail
+        self._stack.append(_IncludeFrame(source, file, origin))
+        return source, file
+
+    def leave(self) -> None:
+        """Finish reading the most recently entered include and close it."""
+        if self._stack:
+            self._stack.pop().file.close()
+
+
 class Reader:
-    """Read a DNS zone file into a transaction."""
+    """Read a DNS zone file into a transaction.
+
+    ``$INCLUDE`` directives are handled by *include_resolver* if it is
+    supplied; otherwise a resolver is created for the input.  It resolves
+    relative filenames against the directory of the including file, confines
+    includes to the directories named by *include_directories* (by default,
+    the directory of the input file if it is a file), detects include cycles,
+    and rejects nesting deeper than *max_include_depth*.  Pass
+    ``IncludeResolver(None)`` as *include_resolver* to read a trusted zone
+    file without confinement.
+    """
 
     def __init__(
         self,
@@ -181,6 +555,9 @@ class Reader:
         force_rdtype: dns.rdatatype.RdataType | None = None,
         default_ttl: int | None = None,
         rfc2308_ttl: bool = True,
+        include_resolver: IncludeResolver | None = None,
+        include_directories: Iterable[str | os.PathLike[str]] | None = None,
+        max_include_depth: int = DEFAULT_MAX_INCLUDE_DEPTH,
     ):
         self.tok = tok
         self.zone_origin, self.relativize, _ = txn.manager.origin_information()
@@ -202,6 +579,33 @@ class Reader:
         self.txn = txn
         self.saved_state: list[SavedStateType] = []
         self.current_file: Any | None = None
+        if include_resolver is not None:
+            self.include_resolver = include_resolver
+        else:
+            if include_directories is None:
+                # The caller declared the boundary by naming the file to read,
+                # so includes are confined to that file's directory.  Input
+                # which is not a file, e.g. a string, has no directory to be
+                # confined to, so it keeps the historical behavior of allowing
+                # any file.  Pass include_directories or an IncludeResolver to
+                # be explicit, or IncludeResolver(None) to read a trusted zone
+                # file without confinement.
+                root = _canonical_path(tok.filename)
+                if root is not None:
+                    include_directories = [os.path.dirname(root)]
+            self.include_resolver = IncludeResolver(
+                include_directories, max_depth=max_include_depth
+            )
+        # The file being read defines the root of the include tree, both for
+        # cycle detection and as the base for relative $INCLUDE names when the
+        # directive appears in input which is not itself a file.  Input with
+        # no path of its own (e.g. a string) leaves any root the caller has
+        # already declared alone.
+        root = _canonical_path(tok.filename)
+        if root is not None:
+            self.include_resolver.set_root(root)
+        elif include_resolver is None:
+            self.include_resolver.set_root(None)
         self.allowed_directives: set[str]
         if allow_directives is True:
             self.allowed_directives = {"$GENERATE", "$ORIGIN", "$TTL", "$UNICODE"}
@@ -493,9 +897,8 @@ class Reader:
             while 1:
                 token = self.tok.get(True, True)
                 if token.is_eof():
-                    if self.current_file is not None:
-                        self.current_file.close()
                     if len(self.saved_state) > 0:
+                        self.include_resolver.leave()
                         (
                             self.tok,
                             self.current_origin,
@@ -508,6 +911,9 @@ class Reader:
                             self.default_ttl_from_soa,
                         ) = self.saved_state.pop(-1)
                         continue
+                    if self.current_file is not None:
+                        self.current_file.close()
+                        self.current_file = None
                     break
                 elif token.is_eol():
                     continue
@@ -546,7 +952,16 @@ class Reader:
                             self.zone_origin = self.current_origin
                         self.txn._set_origin(self.current_origin)
                     elif c == "$INCLUDE":
+                        # Remember where the directive is, for diagnostics
+                        # and as the base for resolving relative filenames.
+                        include_filename, include_line = self.tok.where()
                         token = self.tok.get()
+                        if not (token.is_identifier() or token.is_quoted_string()):
+                            raise dns.exception.SyntaxError("bad $INCLUDE")
+                        # The token value is used as written: a path is not a
+                        # DNS name, so DNS escapes must not be applied to it
+                        # (a Windows path such as "C:\x" would lose the
+                        # backslashes).
                         filename = token.value
                         token = self.tok.get()
                         new_origin: dns.name.Name | None
@@ -559,6 +974,15 @@ class Reader:
                             raise dns.exception.SyntaxError("bad origin in $INCLUDE")
                         else:
                             new_origin = self.current_origin
+                        origin = IncludeOrigin(
+                            include_filename,
+                            include_line,
+                            self.include_resolver.current_path(),
+                        )
+                        # Open the file through the resolver, which also
+                        # checks it is allowed, is not a cycle, and is not too
+                        # deeply nested.
+                        _, file = self.include_resolver.enter(filename, origin)
                         self.saved_state.append(
                             (
                                 self.tok,
@@ -572,7 +996,7 @@ class Reader:
                                 self.default_ttl_from_soa,
                             )
                         )
-                        self.current_file = open(filename, encoding="utf-8")
+                        self.current_file = file
                         self.tok = dns.tokenizer.Tokenizer(self.current_file, filename)
                         self.current_origin = new_origin
                     elif c == "$GENERATE":
@@ -596,13 +1020,44 @@ class Reader:
                     continue
                 self.tok.unget(token)
                 self._rr_line()
+        except IncludeError:
+            # Include errors already carry their full include chain, so do not
+            # wrap them with a location prefix as well.
+            raise
         except dns.exception.SyntaxError as detail:
             filename, line_number = self.tok.where()
             if detail is None:
                 detail = "syntax error"
+            chain = self._include_chain()
+            if chain:
+                # Show the whole include chain, with the location of the
+                # actual error last.
+                here = f"{filename}:{line_number}"
+                detail = f"{detail}\n{_format_include_chain(chain + [here])}"
             ex = dns.exception.SyntaxError(f"{filename}:{line_number}: {detail}")
             tb = sys.exc_info()[2]
             raise ex.with_traceback(tb) from None
+        finally:
+            # On success the include stack has been fully unwound, so this is
+            # a no-op; on any failure it closes the files left open.
+            self._cleanup()
+
+    def _include_chain(self) -> list[str]:
+        """Return the locations of the `$INCLUDE` directives being read.
+
+        This is the chain leading to the file currently being read, from the
+        outermost directive inwards.  It deliberately does not name the
+        current location, as the caller already knows that.
+        """
+        return self.include_resolver.include_chain()
+
+    def _cleanup(self) -> None:
+        """Close any included files and clear the include stack."""
+        if self.current_file is not None:
+            self.current_file.close()
+            self.current_file = None
+        self.saved_state.clear()
+        self.include_resolver.reset()
 
 
 class RRsetsReaderTransaction(dns.transaction.Transaction):

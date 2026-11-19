@@ -95,3 +95,11 @@ dns.zone Exceptions
 .. autoexception:: dns.zone.NoSOA
 .. autoexception:: dns.zone.NoNS
 .. autoexception:: dns.zone.UnknownOrigin
+
+dns.zonefile Exceptions
+-----------------------
+
+.. autoexception:: dns.zonefile.IncludeError
+.. autoexception:: dns.zonefile.IncludeNotAllowed
+.. autoexception:: dns.zonefile.IncludeCycle
+.. autoexception:: dns.zonefile.IncludeTooDeep

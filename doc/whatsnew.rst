@@ -6,6 +6,21 @@ What's New in dnspython
 2.10.0 (in development)
 -----------------------
 
+* ``$INCLUDE`` directives are now confined and otherwise controlled.  A
+  relative filename in an ``$INCLUDE`` is resolved against the directory of
+  the file which contains the directive, rather than the process working
+  directory, so a file's own includes are found next to it.  Includes are
+  confined to the directory of the file being read, and the new
+  ``include_directories`` parameter of :py:func:`dns.zone.from_text` and
+  :py:func:`dns.zone.from_file` names the allowed directories explicitly.
+  Absolute paths, parent-directory references, and symbolic links that lead
+  outside of the allowed directories are rejected.  ``max_include_depth``
+  limits nesting, an include cycle is detected and reported as an error, and
+  ``$INCLUDE`` failures now report the full include chain with line numbers.
+  The decisions are made by the new :py:class:`dns.zonefile.IncludeResolver`,
+  which may also be supplied as ``include_resolver``; pass
+  ``IncludeResolver(None)`` to read a trusted zone file without confinement.
+
 * The text form of an IPSECKEY record may now omit the public key, which RFC
   4025 section 3.1 makes optional, e.g. ``10 1 0 192.0.2.38`` with algorithm
   0, which means that no key is present.  Such a record could not be read from
