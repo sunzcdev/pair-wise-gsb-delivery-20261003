@@ -139,6 +139,18 @@ Options are:
     If _output_ is <tt>stderr</tt>, or if it is missing, then trace
     output is sent to standard error.
 
+[<tt>--trace-events</tt>{=_output_}]
+    Write structured execution events as one JSON object per line. The
+    events are +dependency_wait+, +skipped_already_invoked+,
+    +skipped_not_needed+, +action_started+, +action_succeeded+ and
+    +action_failed+. Each event carries a stable invocation identity and
+    a monotonic timestamp; action events carry the action index and, for
+    failures, the exception class. The _output_ parameter is optional and
+    accepts <tt>stdout</tt> or <tt>stderr</tt> (the default). This option
+    does not enable or replace the text trace produced by <tt>--trace</tt>.
+    Event documents never include exception messages, backtraces, the
+    process environment or command lines.
+
 [<tt>--verbose</tt> (-v)]
     Echo the Sys commands to standard output.
 

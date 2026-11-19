@@ -1,3 +1,9 @@
+=== 13.4.2
+
+* Added Rake::ExecutionTrace and --trace-events, which record structured
+  dependency wait, skipped, and action start/success/failure events with a
+  stable invocation identity and monotonic timestamps.
+
 === 13.2.1
 
 * Suppressed "internal:array:52:in 'Array#each'" from backtrace by @hsbt in #554

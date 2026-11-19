@@ -26,6 +26,8 @@ module Rake
     attr_accessor :trace
     attr_accessor :trace_output
     attr_accessor :trace_rules
+    attr_accessor :trace_events
+    attr_accessor :trace_events_output
   end
 
 end

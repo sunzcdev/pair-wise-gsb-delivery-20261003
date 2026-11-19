@@ -7,6 +7,7 @@ require_relative "file_list"
 require_relative "thread_pool"
 require_relative "thread_history_display"
 require_relative "trace_output"
+require_relative "execution_trace"
 require_relative "win32"
 
 module Rake
@@ -63,6 +64,7 @@ module Rake
       add_loader("rake", DefaultLoader.new)
       @tty_output = STDOUT.tty?
       @terminal_columns = ENV["RAKE_COLUMNS"].to_i
+      @execution_trace = ExecutionTrace.new(self)
 
       set_default_options
     end
@@ -155,6 +157,7 @@ module Rake
       end
       ThreadHistoryDisplay.new(thread_pool.history).show if
         options.job_stats == :history
+      flush_execution_trace
     end
 
     # Add a loader to handle imported files ending in the extension
@@ -167,6 +170,12 @@ module Rake
     # Application options from the command line
     def options
       @options ||= Options.new
+    end
+
+    # The structured execution trace for this application.  Tooling can add
+    # observers here without changing the regular text trace.
+    def execution_trace
+      @execution_trace ||= ExecutionTrace.new(self)
     end
 
     # Return the thread pool used for multithreaded processing.
@@ -415,6 +424,16 @@ module Rake
       trace_on(options.trace_output, *strings)
     end
 
+    # Flush the structured execution trace stream, if one is selected.
+    # Output errors are swallowed: tracing never changes task outcomes.
+    def flush_execution_trace # :nodoc:
+      return unless defined?(@execution_trace) && @execution_trace
+      stream = @execution_trace.output
+      stream.flush if stream.respond_to?(:flush)
+    rescue StandardError
+      nil
+    end
+
     def sort_options(options) # :nodoc:
       options.sort_by { |opt|
         opt.select { |o| o.is_a?(String) && o =~ /^-/ }.map(&:downcase).sort.reverse
@@ -526,6 +545,14 @@ module Rake
           ["--multitask", "-m",
             "Treat all tasks as multitasks.",
             lambda { |value| options.always_multitask = true }
+          ],
+          ["--trace-events=[OUT]",
+            "Write one JSON object per structured execution event. " +
+            "OUT can be stderr (default) or stdout. The text trace is unaffected.",
+            lambda { |value|
+              options.trace_events = true
+              select_trace_output(options, "trace-events", value, :trace_events_output)
+            }
           ],
           ["--no-search", "--nosearch",
             "-N", "Do not search parent directories for the Rakefile.",
@@ -649,13 +676,13 @@ module Rake
     end
     private :select_tasks_to_show
 
-    def select_trace_output(options, trace_option, value) # :nodoc:
+    def select_trace_output(options, trace_option, value, target = :trace_output) # :nodoc:
       value = value.strip unless value.nil?
       case value
       when "stdout"
-        options.trace_output = $stdout
+        options.public_send("#{target}=", $stdout)
       when "stderr", nil
-        options.trace_output = $stderr
+        options.public_send("#{target}=", $stderr)
       else
         fail CommandLineOptionError,
           "Unrecognized --#{trace_option} option '#{value}'"
@@ -841,6 +868,8 @@ module Rake
       options.trace                      = false
       options.trace_output               = $stderr
       options.trace_rules                = false
+      options.trace_events               = false
+      options.trace_events_output        = $stderr
     end
 
   end

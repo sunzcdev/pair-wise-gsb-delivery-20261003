@@ -343,6 +343,28 @@ class TestRakeApplicationOptions < Rake::TestCase # :nodoc:
     end
   end
 
+  def test_trace_events
+    flags("--trace-events") do |opts|
+      assert opts.trace_events
+      assert_equal $stderr, opts.trace_events_output
+      assert ! opts.trace, "structured events do not imply the text trace"
+    end
+  end
+
+  def test_trace_events_with_stdout
+    flags("--trace-events=stdout") do |opts|
+      assert opts.trace_events
+      assert_equal $stdout, opts.trace_events_output
+    end
+  end
+
+  def test_trace_events_with_error
+    ex = assert_raises(Rake::CommandLineOptionError) do
+      flags("--trace-events=xyzzy") do |opts| end
+    end
+    assert_match(/un(known|recognized).*\btrace-events\b.*xyzzy/i, ex.message)
+  end
+
   def test_tasks
     flags("--tasks", "-T") do |opts|
       assert_equal :tasks, opts.show_tasks

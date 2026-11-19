@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 require_relative "invocation_exception_mixin"
+require_relative "execution_trace"
 
 module Rake
 
@@ -197,12 +198,15 @@ module Rake
     def invoke_with_call_chain(task_args, invocation_chain)
       new_chain = Rake::InvocationChain.append(self, invocation_chain)
       @lock.synchronize do
+        trace = execution_trace
+        invocation = trace.begin_invocation(self)
         begin
           if application.options.trace
             application.trace "** Invoke #{name} #{format_trace_flags}"
           end
 
           if @already_invoked
+            trace.skipped_already_invoked(self, invocation)
             if @invocation_exception
               if application.options.trace
                 application.trace "** Previous invocation of #{name} failed #{format_trace_flags}"
@@ -215,16 +219,59 @@ module Rake
 
           @already_invoked = true
 
-          invoke_prerequisites(task_args, new_chain)
-          execute(task_args) if needed?
+          invoke_prerequisites_with_trace(task_args, new_chain, trace, invocation)
+          if needed?
+            execute(task_args)
+          else
+            trace.skipped_not_needed(self, invocation)
+            nil
+          end
         rescue Exception => ex
           add_chain_to(ex, new_chain)
           @invocation_exception = ex
           raise ex
+        ensure
+          trace.finish_invocation(invocation)
         end
       end
     end
     protected :invoke_with_call_chain
+
+    # The trace receiving structured execution events for this task.
+    def execution_trace # :nodoc:
+      app = application
+      if app.respond_to?(:execution_trace)
+        app.execution_trace
+      else
+        ExecutionTrace::NULL
+      end
+    end
+    private :execution_trace
+
+    # Invoke the prerequisites while recording how long the wait took.
+    # A task with no prerequisites did not wait for anything, so it does
+    # not produce a dependency wait event.
+    def invoke_prerequisites_with_trace(task_args, invocation_chain, trace, invocation)
+      if invocation.nil?
+        return invoke_prerequisites(task_args, invocation_chain)
+      end
+      waited_on = declared_prerequisite_names
+      return invoke_prerequisites(task_args, invocation_chain) if waited_on.empty?
+      started_at = trace.now
+      begin
+        invoke_prerequisites(task_args, invocation_chain)
+      ensure
+        trace.dependency_wait(self, invocation, started_at, waited_on)
+      end
+    end
+    private :invoke_prerequisites_with_trace
+
+    # Declared prerequisite names, in resolution order, without forcing a
+    # task lookup just to describe the wait.
+    def declared_prerequisite_names # :nodoc:
+      (prerequisites + order_only_prerequisites).map(&:to_s)
+    end
+    private :declared_prerequisite_names
 
     def add_chain_to(exception, new_chain) # :nodoc:
       exception.extend(InvocationExceptionMixin) unless
@@ -247,10 +294,14 @@ module Rake
 
     # Invoke all the prerequisites of a task in parallel.
     def invoke_prerequisites_concurrently(task_args, invocation_chain)# :nodoc:
+      trace = execution_trace
+      parent_invocation = trace.current_invocation
       futures = prerequisite_tasks.map do |p|
         prereq_args = task_args.new_scope(p.arg_names)
         application.thread_pool.future(p) do |r|
-          r.invoke_with_call_chain(prereq_args, invocation_chain)
+          trace.with_current_invocation(parent_invocation) do
+            r.invoke_with_call_chain(prereq_args, invocation_chain)
+          end
         end
       end
       # Iterate in reverse to improve performance related to thread waiting and switching
@@ -267,6 +318,12 @@ module Rake
     private :format_trace_flags
 
     # Execute the actions associated with this task.
+    #
+    # Each action is bracketed by structured trace events when an
+    # ExecutionTrace is active.  An action that raises produces a single
+    # +:action_failed+ event and the original exception is re-raised, so
+    # only the task whose action actually failed is recorded.  A dry run
+    # executes nothing and therefore records no action events.
     def execute(args=nil)
       args ||= EMPTY_TASK_ARGS
       if application.options.dryrun
@@ -275,10 +332,35 @@ module Rake
       end
       application.trace "** Execute #{name}" if application.options.trace
       application.enhance_with_matching_rule(name) if @actions.empty?
-      if opts = Hash.try_convert(args) and !opts.empty?
-        @actions.each { |act| act.call(self, args, **opts) }
-      else
-        @actions.each { |act| act.call(self, args) }
+      trace = execution_trace
+      invocation = trace.current_invocation
+      standalone = false
+      if invocation.nil? && trace.enabled?
+        # Direct #execute calls still count as real work, even outside the
+        # usual invoke path.
+        invocation = trace.begin_invocation(self, nil)
+        standalone = !invocation.nil?
+      end
+      opts = Hash.try_convert(args)
+      opts = nil if opts && opts.empty?
+      begin
+        @actions.each_with_index { |act, index|
+          started_at = trace.action_started(self, invocation, index)
+          begin
+            if opts
+              act.call(self, args, **opts)
+            else
+              act.call(self, args)
+            end
+          rescue Exception => ex
+            trace.action_failed(self, invocation, index, started_at, ex)
+            raise
+          else
+            trace.action_succeeded(self, invocation, index, started_at)
+          end
+        }
+      ensure
+        trace.finish_invocation(invocation) if standalone
       end
     end
 

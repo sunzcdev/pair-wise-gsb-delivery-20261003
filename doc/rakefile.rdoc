@@ -628,6 +628,38 @@ The phony task can be used as a dependency to allow file-based tasks to use
 non-file-based-tasks as prerequisites without forcing them to rebuild.  You
 can <tt>require 'rake/phony'</tt> to add the +phony+ task.
 
+=== Observing Execution Events
+
+The <tt>--trace</tt> output is meant for humans.  Build tooling that needs to
+count real work can observe <tt>Rake.application.execution_trace</tt>
+instead:
+
+   Rake.application.execution_trace.add_observer do |event|
+     case event[:event]
+     when :action_started   then start_timer(event[:invocation])
+     when :action_succeeded then stop_timer(event[:invocation])
+     end
+   end
+
+Each event distinguishes a dependency wait (+:dependency_wait+), a task
+skipped because it was already invoked (+:skipped_already_invoked+), a task
+skipped because its artifact was up to date (+:skipped_not_needed+), and an
+action that started, succeeded or failed (+:action_started+,
++:action_succeeded+, +:action_failed+).  Events carry the task name, a stable
+invocation identity, the parent invocation, and a monotonic timestamp.
+
+A prerequisite shared by several tasks runs once, so its action is counted
+once; the other dependency edges report +:skipped_already_invoked+.  When a
+prerequisite fails, only the task whose action actually raised gets an
++:action_failed+ event, which keeps the real failure node in nested
+exceptions.
+
+An observer that raises is removed and recorded in
+<tt>observer_failures</tt>; it never causes a task to run again or aborts the
+build.  Use <tt>--trace-events</tt> to stream the same events as JSON lines
+without replacing the text trace.  Events never contain exception messages,
+backtraces, the process environment or command lines.
+
 ----
 
 == See

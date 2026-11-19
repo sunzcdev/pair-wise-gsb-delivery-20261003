@@ -56,6 +56,7 @@ Gem::Specification.new do |s|
     "lib/rake/default_loader.rb",
     "lib/rake/dsl_definition.rb",
     "lib/rake/early_time.rb",
+    "lib/rake/execution_trace.rb",
     "lib/rake/ext/core.rb",
     "lib/rake/ext/string.rb",
     "lib/rake/file_creation_task.rb",

@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 require File.expand_path("../helper", __FILE__)
+require "json"
 
 class TestRakeFunctional < Rake::TestCase # :nodoc:
   include RubyRunner
@@ -496,6 +497,47 @@ class TestRakeFunctional < Rake::TestCase # :nodoc:
     rakefile_failing_test_task
     rake
     assert @exit.exitstatus > 0, "should be non-zero"
+  end
+
+  def test_trace_events_writes_json_without_disabling_text_trace
+    rakefile <<~RAKEFILE
+      task :leaf do
+      end
+
+      task :top => :leaf do
+      end
+    RAKEFILE
+
+    rake "top", "--trace-events=stdout", "--trace"
+
+    records = @out.lines.grep(/^\{/).map { |line| JSON.parse(line) }
+    assert_equal %w[action_started action_succeeded dependency_wait
+                    action_started action_succeeded],
+                 records.map { |record| record["event"] }
+    assert_equal ["leaf", "leaf", "top", "top", "top"],
+                 records.map { |record| record["task"] }
+    assert_match(/Invoke top/, @err)
+    assert_match(/Execute leaf/, @err)
+  end
+
+  def test_trace_events_reports_failure_and_keeps_text_trace
+    rakefile <<~RAKEFILE
+      task :bad do
+        raise "boom"
+      end
+
+      task :top => :bad do
+      end
+    RAKEFILE
+
+    rake "top", "--trace-events=stdout"
+
+    records = @out.lines.grep(/^\{/).map { |line| JSON.parse(line) }
+    failures = records.select { |record| record["event"] == "action_failed" }
+    assert_equal ["bad"], failures.map { |record| record["task"] }
+    assert_equal "RuntimeError", failures.first["exception"]
+    assert_match(/rake aborted/, @err)
+    assert_match(/boom/, @err)
   end
 
   def test_stand_alone_filelist
