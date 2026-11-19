@@ -138,6 +138,37 @@ class ZoneStyle(dns.node.NodeStyle):
     want_unicode_directive: bool = True
 
 
+def _canonical_rdataset_sort_key(
+    rdataset: dns.rdataset.Rdataset,
+) -> tuple[
+    dns.rdataclass.RdataClass, dns.rdatatype.RdataType, dns.rdatatype.RdataType
+]:
+    # RRSIG rdatasets of different covered types are distinct rdatasets, so
+    # the covered type participates in the ordering.  The class is included so
+    # that the key is total even for a node holding rdatasets of more than one
+    # class.
+    return (rdataset.rdclass, rdataset.rdtype, rdataset.covers)
+
+
+def _canonical_rdata_sort_key(
+    rdata: dns.rdata.Rdata, origin: dns.name.Name
+) -> tuple[bytes, bytes]:
+    # Sort by the DNSSEC canonical RDATA (RFC 4034 section 6.2), which is
+    # well-defined for every type, including unknown types, and which does not
+    # depend on how the rdata would be rendered as text.  This is only a sort
+    # key; the rdata object itself is never modified or replaced, so the
+    # identity of records in the zone is unchanged.  In particular, unknown
+    # types stay lossless generic rdata; they are never turned into strings.
+    #
+    # The second element only makes the order total.  Two rdata in one rdataset
+    # can differ just in the relativity of a name: one holds a relative name,
+    # the other the absolute name it denotes, and the two encode identically
+    # against the origin.  Resolving against the root instead tells them apart.
+    # When even that ties, the two render to the same text anyway, so the order
+    # of their output lines cannot be observed.
+    return (rdata.to_digestable(origin), rdata.to_digestable(dns.name.root))
+
+
 class Zone(dns.transaction.TransactionManager):
     """A DNS zone.
 
@@ -785,6 +816,132 @@ class Zone(dns.transaction.TransactionManager):
 
         temp_buffer = io.StringIO()
         self.to_styled_file(style, temp_buffer)
+        return_value = temp_buffer.getvalue()
+        temp_buffer.close()
+        return return_value
+
+    def _canonical_style(self, origin: dns.name.Name) -> ZoneStyle:
+        # Only the options which affect how a name or rdata is rendered are
+        # needed here; ordering and layout are handled directly by
+        # to_canonical_file().  The style is derived only from the zone itself,
+        # so the same zone always renders the same way, and no lossy option
+        # (want_generic, omit_ttl, omit_rdclass, truncate_crypto, ...) is used.
+        idna_codec: dns.name.IDNACodec | None = None
+        txt_is_utf8 = False
+        if "2008" in self.unicode:
+            idna_codec = dns.name.IDNA_2008_Practical
+        elif "2003" in self.unicode:
+            idna_codec = dns.name.IDNA_2003_Practical
+        if "TXT" in self.unicode:
+            txt_is_utf8 = True
+        return ZoneStyle(
+            # Every name, including names inside RDATA, is emitted absolute, so
+            # the output does not depend on a relative/absolute mix in the
+            # stored zone.
+            origin=origin,
+            relativize=False,
+            idna_codec=idna_codec,
+            txt_is_utf8=txt_is_utf8,
+        )
+
+    def _canonical_names(
+        self, origin: dns.name.Name
+    ) -> list[tuple[dns.name.Name, dns.node.Node]]:
+        # Return (absolute name, node) pairs in DNSSEC canonical name order
+        # (RFC 4034 section 6.1).  This ordering is independent of how the
+        # zone's dictionary happens to be ordered, and Name comparison is
+        # case-insensitive, so it does not depend on how the names were
+        # entered either.  The zone itself is not reordered.
+        pairs = [
+            (stored.derelativize(origin), node) for stored, node in self.nodes.items()
+        ]
+        pairs.sort(key=lambda pair: pair[0])
+        return pairs
+
+    def to_canonical_file(self, f: str | os.PathLike | BinaryIO | TextIO) -> None:
+        """Write a zone to a file in canonical form.
+
+        The canonical form is intended for configuration review: the same zone
+        always produces byte-for-byte the same output, regardless of the order
+        in which its records were added, so that two versions of a zone can be
+        compared with an ordinary line-oriented diff.
+
+        The output is organized by DNSSEC canonical name order (RFC 4034
+        section 6.1), then by RR type (and covered type for RRSIG), and then
+        by DNSSEC canonical RDATA order (RFC 4034 section 6.2).  DNS name
+        comparison is case-insensitive, so the order does not depend on the
+        case of the labels, though each name is still rendered in its stored
+        case.  The canonical RDATA is used only as a sort key; it is never
+        substituted for the record itself, so unknown types keep their lossless
+        generic (``\\#``) form and no record identity is changed.  Empty
+        rdatasets, which serve the question section and dynamic updates rather
+        than zone data, are not written.
+
+        The TTL and origin policy is fixed: an ``$ORIGIN`` line giving the
+        zone's absolute origin is always emitted, every owner name is absolute,
+        and every record states its class and TTL explicitly, so no ``$TTL``
+        directive is needed.  Lines always end with a single LF.  If the zone
+        has Unicode display names, the ``$UNICODE`` directive is emitted so
+        that they read back the same way.
+
+        :param f: A file object, a ``str`` filename, or an ``os.PathLike``.
+            If not a file object, it is treated as the name of a file to
+            open.  Files are written in binary mode, so the LF endings are not
+            translated.  A text stream supplied by the caller is written
+            through its own newline translation, so open it with
+            ``newline="\\n"`` (or ``newline=""``) if the bytes must be exactly
+            the same on every platform.
+        :raises dns.zone.UnknownOrigin: if the zone has no origin.
+        """
+        if self.origin is None:
+            raise UnknownOrigin
+        origin = self.origin
+        style = self._canonical_style(origin)
+        with dns._file_util.maybe_open(f, "wb") as output:
+            # Text streams may not know their encoding; use UTF-8 then, which
+            # is what the zone file reader expects.
+            file_enc = getattr(f, "encoding", None)
+            if file_enc is None:
+                file_enc = "utf-8"
+            nl = "\n"
+            nl_b = b"\n"
+
+            def write_line(line: str) -> None:
+                self._write_line(output, line, line.encode(file_enc), nl, nl_b)
+
+            if len(self.unicode) > 0:
+                write_line("$UNICODE " + " ".join(sorted(self.unicode)))
+            write_line("$ORIGIN " + origin.to_styled_text(style))
+            for absolute, node in self._canonical_names(origin):
+                rdatasets = [rds for rds in node if len(rds) > 0]
+                rdatasets.sort(key=_canonical_rdataset_sort_key)
+                name_text = absolute.to_styled_text(style)
+                for rds in rdatasets:
+                    rdclass_text = dns.rdataclass.to_text(rds.rdclass)
+                    rdtype_text = dns.rdatatype.to_text(rds.rdtype)
+                    # Sort a copy of the rdatas; the rdataset itself is left
+                    # alone, so record identity is unchanged.
+                    rdatas = sorted(
+                        rds, key=lambda rd: _canonical_rdata_sort_key(rd, origin)
+                    )
+                    for rd in rdatas:
+                        write_line(
+                            f"{name_text} {rds.ttl} {rdclass_text} "
+                            f"{rdtype_text} {rd.to_styled_text(style)}"
+                        )
+
+    def to_canonical_text(self) -> str:
+        """Return a zone's canonical text as though it were written to a file.
+
+        See :py:meth:`to_canonical_file` for a description of the canonical
+        form.
+
+        :raises dns.zone.UnknownOrigin: if the zone has no origin.
+        :rtype: str
+        """
+
+        temp_buffer = io.StringIO()
+        self.to_canonical_file(temp_buffer)
         return_value = temp_buffer.getvalue()
         temp_buffer.close()
         return return_value

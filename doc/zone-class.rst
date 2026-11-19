@@ -45,6 +45,56 @@ desired.  The node factory is a class or callable that returns a subclass of
    :members:
    :inherited-members:
 
+Canonical export
+~~~~~~~~~~~~~~~~
+
+Ordinary zone text output (:py:meth:`dns.zone.Zone.to_text`,
+:py:meth:`dns.zone.Zone.to_file`, and the styled entry points) is meant to be
+read by people.  It sorts by name by default, but it keeps each node's
+rdatasets and each rdataset's rdatas in the order they happen to have, and it
+takes its TTL and origin policy from the caller.  Two zones which are equal
+may therefore be written out differently, which makes an ordinary textual diff
+unsuitable for reviewing a configuration change.
+
+For that purpose a zone also supports a *canonical* export, via
+:py:meth:`dns.zone.Zone.to_canonical_text` and
+:py:meth:`dns.zone.Zone.to_canonical_file`.  The canonical form is a total,
+stable order:
+
+* owner names are sorted in DNSSEC canonical name order (RFC 4034 section
+  6.1);
+* at each name, rdatasets are sorted by RR type, and RRSIG rdatasets also by
+  the type they cover;
+* within an rdataset, rdatas are sorted in DNSSEC canonical RDATA order
+  (RFC 4034 section 6.2).
+
+The canonical RDATA is a sort key only.  It is never written instead of the
+record, so a record's identity and its rendering are unchanged: unknown types
+keep their lossless generic (``\#``) form, and no type is ever converted to a
+lossy string in order to sort it.  Names are ordered case-insensitively, as
+DNS names compare, but each is rendered in the case in which it is stored.
+
+The layout policy is fixed and is not configurable, so the same zone always
+produces byte-for-byte the same output.  An ``$ORIGIN`` line with the zone's
+absolute origin is always emitted, every owner name is absolute, every record
+states its class and TTL explicitly, so no ``$TTL`` directive is used, and
+lines always end with a single LF.  If the zone records Unicode usage in its
+``unicode`` attribute, for example because it was read from a zone file with
+an ``$UNICODE`` directive, an ``$UNICODE`` directive is emitted so that the
+output reads back the same way.
+
+The canonical output is a valid zone file.  Reading it back produces a zone
+equal to the original, and re-exporting that zone produces identical bytes.
+
+The ordinary display styles remain available and are unaffected by canonical
+export.  For example::
+
+   # Stable, reviewable output; an ordinary diff now shows only real changes.
+   with open("zone.canonical", "w", encoding="utf-8", newline="\n") as f:
+       zone.to_canonical_file(f)
+
+   same = zone.to_canonical_text() == other_version.to_canonical_text()
+
 The dns.versioned.Zone Class
 ----------------------------
 

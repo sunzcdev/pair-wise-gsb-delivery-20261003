@@ -1692,6 +1692,322 @@ $ORIGIN example.
         z = dns.zone.from_file(here("example"), "example", transaction_setup=limiter)
 
 
+example_canonical_text = """$UNICODE 2008 TXT
+$ORIGIN example.
+example. 3600 IN NS ns1.example.
+example. 3600 IN SOA ns1.example. hostmaster.example. 1 2 3 4 5
+ns1.example. 3600 IN A 10.0.0.1
+*.wild.example. 3600 IN A 10.0.0.9
+www.example. 3600 IN A 10.0.0.2
+www.example. 3600 IN A 10.0.0.3
+www.example. 3600 IN MX 10 a.example.
+www.example. 3600 IN MX 20 b.example.
+élèves.example. 3600 IN TXT "hello"
+élèves.example. 3600 IN TYPE999 \\# 2 abcd
+"""
+
+# The same records as example_canonical_text, but written with the records and
+# the names in a different order, with the class and TTL options also varied.
+example_canonical_text_reordered = """$UNICODE 2008 TXT
+$TTL 3600
+$ORIGIN example.
+élèves IN TYPE999 \\# 2 abcd
+www MX 10 a
+*.wild A 10.0.0.9
+www 3600 IN A 10.0.0.3
+ns1 A 10.0.0.1
+www MX 20 b
+www A 10.0.0.2
+@ IN NS ns1
+élèves TXT "hello"
+@ SOA ns1 hostmaster 1 2 3 4 5
+"""
+
+
+def reordered_canonical_zone(zone_factory=dns.zone.Zone):
+    return dns.zone.from_text(
+        example_canonical_text_reordered, "example.", zone_factory=zone_factory
+    )
+
+
+class CanonicalZoneTestCase(unittest.TestCase):
+    zone_factory = dns.zone.Zone
+
+    def testCanonicalText(self):
+        z = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        )
+        self.assertEqual(z.to_canonical_text(), example_canonical_text)
+
+    def testCanonicalFixesNonStableDisplayOrder(self):
+        # The ordinary display output keeps each rdataset's rdatas in the order
+        # they were added, so it differs here, while the canonical output does
+        # not, which is the whole point of the canonical mode.
+        text_a = """$ORIGIN example.
+$TTL 300
+@ IN SOA ns1 hostmaster 1 2 3 4 5
+@ IN NS ns1
+ns1 IN A 10.0.0.53
+www IN A 10.0.0.2
+www IN A 10.0.0.1
+"""
+        text_b = """$ORIGIN example.
+$TTL 300
+www IN A 10.0.0.1
+ns1 IN A 10.0.0.53
+@ IN NS ns1
+@ IN SOA ns1 hostmaster 1 2 3 4 5
+www IN A 10.0.0.2
+"""
+        a = dns.zone.from_text(text_a, "example.", zone_factory=self.zone_factory)
+        b = dns.zone.from_text(text_b, "example.", zone_factory=self.zone_factory)
+        self.assertEqual(a, b)
+        self.assertNotEqual(a.to_text(), b.to_text())
+        self.assertEqual(a.to_canonical_text(), b.to_canonical_text())
+
+    def testCanonicalExportIsIndependentOfUpdateOrder(self):
+        expected = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        ).to_canonical_text()
+        reordered = reordered_canonical_zone(self.zone_factory)
+        self.assertEqual(reordered.to_canonical_text(), expected)
+
+    def testCanonicalExportIsIndependentOfRelativization(self):
+        relative = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        )
+        absolute = dns.zone.from_text(
+            example_canonical_text,
+            "example.",
+            relativize=False,
+            zone_factory=self.zone_factory,
+        )
+        self.assertEqual(relative.to_canonical_text(), absolute.to_canonical_text())
+
+    def testCanonicalRoundTrip(self):
+        z = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        )
+        text = z.to_canonical_text()
+        z2 = dns.zone.from_text(text, "example.", zone_factory=self.zone_factory)
+        self.assertEqual(z, z2)
+        # Exporting the reloaded zone must give exactly the same bytes.
+        self.assertEqual(z2.to_canonical_text(), text)
+
+    def testCanonicalRoundTripAbsolute(self):
+        z = dns.zone.from_text(
+            example_canonical_text,
+            "example.",
+            relativize=False,
+            check_origin=False,
+            zone_factory=self.zone_factory,
+        )
+        text = z.to_canonical_text()
+        z2 = dns.zone.from_text(
+            text,
+            "example.",
+            relativize=False,
+            check_origin=False,
+            zone_factory=self.zone_factory,
+        )
+        self.assertEqual(z, z2)
+        self.assertEqual(z2.to_canonical_text(), text)
+
+    def testCanonicalFileMatchesText(self):
+        z = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        )
+        f = StringIO()
+        z.to_canonical_file(f)
+        out = f.getvalue()
+        f.close()
+        self.assertEqual(out, z.to_canonical_text())
+
+    def testCanonicalFileBinaryStream(self):
+        z = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        )
+        f = BytesIO()
+        z.to_canonical_file(f)
+        out = f.getvalue()
+        f.close()
+        self.assertEqual(out, z.to_canonical_text().encode())
+        # The line ending is always a single LF, even on Windows.
+        self.assertNotIn(b"\r\n", out)
+
+    def testCanonicalFileWithPath(self):
+        z = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        )
+        path = here("example-canonical.out")
+        try:
+            z.to_canonical_file(pathlib.Path(path))
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), z.to_canonical_text().encode())
+        finally:
+            os.unlink(path)
+
+    def testCanonicalFileTextualStream(self):
+        z = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        )
+        path = here("example-canonical-textual.out")
+        try:
+            # A text stream knows its encoding, which is used for the output.
+            # newline="\n" keeps the caller's stream from translating the LF.
+            with open(path, "wt", encoding="utf-8", newline="\n") as f:
+                z.to_canonical_file(f)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), z.to_canonical_text().encode())
+        finally:
+            os.unlink(path)
+
+    def testCanonicalUnicodeDirectiveIsPreserved(self):
+        text = """$UNICODE 2003 TXT
+$ORIGIN example.
+@ 300 IN SOA a b 1 2 3 4 5
+@ 300 IN NS a
+élèves 300 IN TXT "café"
+"""
+        z = dns.zone.from_text(text, "example.", zone_factory=self.zone_factory)
+        canonical = z.to_canonical_text()
+        self.assertTrue(canonical.startswith("$UNICODE 2003 TXT\n"))
+        self.assertIn("\nélèves.example. 300 IN TXT \"café\"\n", canonical)
+        z2 = dns.zone.from_text(canonical, "example.", zone_factory=self.zone_factory)
+        self.assertEqual(z, z2)
+        self.assertEqual(z2.to_canonical_text(), canonical)
+
+    def testCanonicalNoUnicodeDirectiveWithoutMarkers(self):
+        z = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        )
+        z.unicode = set()
+        canonical = z.to_canonical_text()
+        self.assertNotIn("$UNICODE", canonical)
+        # Non-ASCII names are still written as A-labels, which read back as
+        # the same names.
+        self.assertIn("\nxn--lves-5oae.example. 3600 IN TXT ", canonical)
+        z2 = dns.zone.from_text(canonical, "example.", zone_factory=self.zone_factory)
+        self.assertEqual(z, z2)
+
+    def testCanonicalApexIsAbsolute(self):
+        z = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        )
+        assert z.origin is not None
+        self.assertTrue(z.origin.is_absolute())
+        canonical = z.to_canonical_text()
+        self.assertIn("\nexample. 3600 IN SOA ", canonical)
+        # No owner name is written as "@" or as a bare relative name, and names
+        # inside RDATA are absolute too, so the output does not rely on
+        # $ORIGIN-relative resolution.
+        for line in canonical.splitlines():
+            if line.startswith("$") or not line:
+                continue
+            owner, _ = line.split(" ", 1)
+            self.assertNotEqual(owner, "@")
+            self.assertTrue(owner.endswith("."), owner)
+        self.assertIn("ns1.example. hostmaster.example.", canonical)
+        self.assertIn("IN MX 10 a.example.", canonical)
+        self.assertIn("IN NS ns1.example.", canonical)
+
+    def testCanonicalWildcardName(self):
+        z = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        )
+        text = z.to_canonical_text()
+        self.assertIn("\n*.wild.example. 3600 IN A 10.0.0.9\n", text)
+        z2 = dns.zone.from_text(text, "example.", zone_factory=self.zone_factory)
+        self.assertIsNotNone(z2.get_rdataset("*.wild", "a"))
+
+    def testCanonicalNonAsciiName(self):
+        z = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        )
+        text = z.to_canonical_text()
+        self.assertIn("\nélèves.example. 3600 IN TXT ", text)
+        z2 = dns.zone.from_text(text, "example.", zone_factory=self.zone_factory)
+        self.assertIsNotNone(z2.get_rdataset("élèves", "txt"))
+
+    def testCanonicalUnknownTypeIsNotStringified(self):
+        z = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        )
+        text = z.to_canonical_text()
+        self.assertIn("TYPE999 \\# 2 abcd", text)
+        z2 = dns.zone.from_text(text, "example.", zone_factory=self.zone_factory)
+        rds = z2.get_rdataset("élèves", 999)
+        self.assertIsNotNone(rds)
+        self.assertIsInstance(rds[0], dns.rdata.GenericRdata)
+        self.assertEqual(rds[0].data, b"\xab\xcd")
+
+    def testCanonicalDoesNotReorderZone(self):
+        z = reordered_canonical_zone(self.zone_factory)
+        origin = z.origin
+        assert origin is not None
+
+        def snapshot():
+            return [
+                (name, [rd.to_digestable(origin) for rds in node for rd in rds])
+                for name, node in z.items()
+            ]
+
+        before = snapshot()
+        z.to_canonical_text()
+        self.assertEqual(snapshot(), before)
+
+    def testCanonicalRequiresOrigin(self):
+        z = dns.zone.Zone(None)
+        with self.assertRaises(dns.zone.UnknownOrigin):
+            z.to_canonical_text()
+
+    def testCanonicalIsSeparateFromDisplayStyle(self):
+        z = dns.zone.from_text(
+            example_canonical_text, "example.", zone_factory=self.zone_factory
+        )
+        # The ordinary display form remains available and unchanged.
+        display = z.to_styled_text(
+            dns.zone.ZoneStyle(want_origin=True, default_ttl=3600)
+        )
+        self.assertIn("$TTL 3600", display)
+        self.assertIn("@ IN SOA", display)
+        canonical = z.to_canonical_text()
+        self.assertNotEqual(canonical, display)
+        self.assertNotIn("$TTL", canonical)
+        self.assertIn("example. 3600 IN SOA", canonical)
+
+
+class CanonicalZoneEdgeCaseTestCase(unittest.TestCase):
+    def testCanonicalMixedRelativeAndAbsoluteRdata(self):
+        # A relative name and the absolute name it denotes can both be present
+        # in one rdataset and compare as distinct; such a state is not
+        # reachable from a zone file or a zone transfer, but the export must
+        # still be deterministic.
+        z = dns.zone.from_text(example_canonical_text, "example.")
+        rds = z.find_rdataset("www", "MX")
+        rds.add(
+            dns.rdata.from_text(
+                "IN", "MX", "10 a.example.", origin=z.origin, relativize=False
+            )
+        )
+        text = z.to_canonical_text()
+        self.assertEqual(text, z.to_canonical_text())
+        # Both forms render to the same line, so two identical lines appear;
+        # the output is still a readable zone file.
+        lines = text.splitlines()
+        self.assertEqual(lines.count("www.example. 3600 IN MX 10 a.example."), 2)
+        dns.zone.from_text(text, "example.")
+
+    def testCanonicalEmptyRdatasetIsNotWritten(self):
+        z = dns.zone.from_text(example_canonical_text, "example.")
+        z.get_node("www").replace_rdataset(
+            dns.rdataset.Rdataset(dns.rdataclass.IN, dns.rdatatype.AAAA)
+        )
+        # An empty rdataset is not a record, so it is skipped rather than
+        # written as an unreadable name/class/type line.
+        self.assertNotIn("AAAA", z.to_canonical_text())
+
+
 class VersionedZoneTestCase(unittest.TestCase):
     zone_factory = dns.versioned.Zone
 
@@ -1866,6 +2182,14 @@ class VersionedZoneTestCase(unittest.TestCase):
 
 class BTreeZoneTestCase(VersionedZoneTestCase):
     zone_factory = dns.btreezone.Zone
+
+
+class BTreeCanonicalZoneTestCase(CanonicalZoneTestCase):
+    zone_factory = dns.btreezone.Zone
+
+
+class VersionedCanonicalZoneTestCase(CanonicalZoneTestCase):
+    zone_factory = dns.versioned.Zone
 
 
 if __name__ == "__main__":

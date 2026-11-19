@@ -6,6 +6,21 @@ What's New in dnspython
 2.10.0 (in development)
 -----------------------
 
+* Zones now have a canonical export mode,
+  ``Zone.to_canonical_text()`` and ``Zone.to_canonical_file()``, for
+  configuration review.  The same zone always produces byte-for-byte the same
+  output regardless of the order in which its records were added, so two
+  versions of a zone can be compared with an ordinary line-oriented diff.
+  Records are ordered by DNSSEC canonical name order (RFC 4034 section 6.1),
+  then by RR type (and covered type for RRSIG), then by DNSSEC canonical RDATA
+  order (RFC 4034 section 6.2).  The canonical RDATA is used only as a sort
+  key, so record identity is unchanged and unknown types keep their lossless
+  generic (``\#``) form.  The TTL and origin policy is fixed: an ``$ORIGIN``
+  line is always emitted, owner names are absolute, every record states its
+  class and TTL explicitly, and lines always end with LF.  The output is a
+  valid zone file which reads back as an equal zone and re-exports to
+  identical bytes.  The ordinary display styles are unaffected.
+
 * The text form of an IPSECKEY record may now omit the public key, which RFC
   4025 section 3.1 makes optional, e.g. ``10 1 0 192.0.2.38`` with algorithm
   0, which means that no key is present.  Such a record could not be read from
