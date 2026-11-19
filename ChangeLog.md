@@ -1,6 +1,24 @@
 ## Changes between 2.10.0 and 2.11.0 (unreleased)
 
-No changes yet.
+### Strict, Description-Driven Content Header Property Decoding
+
+Content header property flags are now interpreted as a full sequence of
+16-bit flags words linked by the continuation bit (bit 0), driven by an
+ordered list of `[name, type]` property descriptions
+(`AMQ::Protocol::PropertiesCodec`) instead of a single hard-coded 16-bit word.
+
+Decoding is strict and never reads past the end of the frame payload.
+Each failure mode raises a dedicated `AMQ::Protocol::PropertiesError`
+subclass:
+
+ * `UnknownPropertyFlags` for flag bits without a declared property
+ * `MissingPropertyFlagsContinuation` when the continuation bit is set but the frame ends before the next flags word
+ * `TruncatedPropertyValue` when a declared property value is cut off by the end of the frame
+ * `UnexpectedPropertyBytes` when bytes remain after the last declared property
+
+`AMQ::Protocol::Basic.encode_properties` produces the same bytes as before
+for the standard Basic properties; the `Basic::DECODE_PROPERTIES*` constants
+were replaced by `Basic::PROPERTY_DESCRIPTIONS`.
 
 
 ## Changes between 2.9.0 and 2.10.0 (Nov 2, 2026)

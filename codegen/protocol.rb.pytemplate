@@ -10,6 +10,7 @@ require "amq/pack"
 
 require "amq/protocol/table"
 require "amq/protocol/frame"
+require "amq/protocol/properties_codec"
 
 require "amq/protocol/constants"
 require "amq/protocol/exceptions"
@@ -156,74 +157,23 @@ module AMQ
 
       % if klass.name == "basic" :
       def self.encode_properties(body_size, properties)
-        pieces, flags = [], 0
-
-        properties.reject {|key, value| value.nil?}.each do |key, value|
-          i, f, result = self.__send__(:"encode_#{key}", value)
-          flags |= f
-          pieces[i] = result
-        end
-
-        # result = [${klass.index}, 0, body_size, flags].pack('n2Qn')
         result = [${klass.index}, 0].pack(PACK_UINT16_X2)
         result += AMQ::Pack.pack_uint64_big_endian(body_size)
-        result += [flags].pack(PACK_UINT16)
-        pieces_joined = pieces.join(EMPTY_STRING)
-        result.force_encoding(pieces_joined.encoding) + pieces_joined
+        properties_payload = PropertiesCodec.encode(PROPERTY_DESCRIPTIONS, properties)
+        result.force_encoding(properties_payload.encoding) + properties_payload
       end
 
-      # THIS DECODES ONLY FLAGS
-      DECODE_PROPERTIES = {
+      # Ordered [name, type] pairs describing the property flags layout:
+      # bit 15 of a flags word announces the first property of that word,
+      # bit 0 of every flags word is the continuation bit.
+      PROPERTY_DESCRIPTIONS = [
         % for f in klass.fields:
-        ${"0x%04x" % ( 1 << (15 - klass.fields.index(f)),)} => :${f.ruby_name},
+        [:${f.ruby_name}, :${spec.resolveDomain(f.domain)}],
         % endfor
-      }
-
-      DECODE_PROPERTIES_TYPE = {
-        % for f in klass.fields:
-        ${"0x%04x" % ( 1 << (15 - klass.fields.index(f)),)} => :${spec.resolveDomain(f.domain)},
-        % endfor
-      }
-
-      # Hash doesn't give any guarantees on keys order, we will do it in a
-      # straightforward way
-      DECODE_PROPERTIES_KEYS = [
-        % for f in klass.fields:
-        ${"0x%04x" % ( 1 << (15 - klass.fields.index(f)),)},
-        % endfor
-      ]
+      ].freeze
 
       def self.decode_properties(data)
-        offset, data_length, properties = 0, data.bytesize, {}
-
-        compressed_index = data[offset, 2].unpack(PACK_UINT16)[0]
-        offset += 2
-        while data_length > offset
-          DECODE_PROPERTIES_KEYS.each do |key|
-            next unless compressed_index >= key
-            compressed_index -= key
-            name = DECODE_PROPERTIES[key] || raise(RuntimeError.new("No property found for index #{index.inspect}!"))
-            case DECODE_PROPERTIES_TYPE[key]
-            when :shortstr
-              size = data[offset, 1].unpack(PACK_CHAR)[0]
-              offset += 1
-              result = data[offset, size]
-            when :octet
-              size = 1
-              result = data[offset, size].unpack(PACK_CHAR).first
-            when :timestamp
-              size = 8
-              result = Time.at(data[offset, size].unpack(PACK_UINT64_BE).last)
-            when :table
-              size = 4 + data[offset, 4].unpack(PACK_UINT32)[0]
-              result = Table.decode(data[offset, size])
-            end
-            properties[name] = result
-            offset += size
-          end
-        end
-
-        properties
+        PropertiesCodec.decode(PROPERTY_DESCRIPTIONS, data)
       end
       % endif
 

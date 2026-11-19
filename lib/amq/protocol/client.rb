@@ -9,6 +9,7 @@ require "amq/pack"
 
 require "amq/protocol/table"
 require "amq/protocol/frame"
+require "amq/protocol/properties_codec"
 
 require "amq/protocol/constants"
 require "amq/protocol/exceptions"
@@ -1497,108 +1498,34 @@ module AMQ
 
 
       def self.encode_properties(body_size, properties)
-        pieces, flags = [], 0
-
-        properties.reject {|key, value| value.nil?}.each do |key, value|
-          i, f, result = self.__send__(:"encode_#{key}", value)
-          flags |= f
-          pieces[i] = result
-        end
-
-        # result = [60, 0, body_size, flags].pack('n2Qn')
         result = [60, 0].pack(PACK_UINT16_X2)
         result += AMQ::Pack.pack_uint64_big_endian(body_size)
-        result += [flags].pack(PACK_UINT16)
-        pieces_joined = pieces.join(EMPTY_STRING)
-        result.force_encoding(pieces_joined.encoding) + pieces_joined
+        properties_payload = PropertiesCodec.encode(PROPERTY_DESCRIPTIONS, properties)
+        result.force_encoding(properties_payload.encoding) + properties_payload
       end
 
-      # THIS DECODES ONLY FLAGS
-      DECODE_PROPERTIES = {
-        0x8000 => :content_type,
-        0x4000 => :content_encoding,
-        0x2000 => :headers,
-        0x1000 => :delivery_mode,
-        0x0800 => :priority,
-        0x0400 => :correlation_id,
-        0x0200 => :reply_to,
-        0x0100 => :expiration,
-        0x0080 => :message_id,
-        0x0040 => :timestamp,
-        0x0020 => :type,
-        0x0010 => :user_id,
-        0x0008 => :app_id,
-        0x0004 => :cluster_id,
-      }
+      # Ordered [name, type] pairs describing the property flags layout:
+      # bit 15 of a flags word announces the first property of that word,
+      # bit 0 of every flags word is the continuation bit.
+      PROPERTY_DESCRIPTIONS = [
+        [:content_type, :shortstr],
+        [:content_encoding, :shortstr],
+        [:headers, :table],
+        [:delivery_mode, :octet],
+        [:priority, :octet],
+        [:correlation_id, :shortstr],
+        [:reply_to, :shortstr],
+        [:expiration, :shortstr],
+        [:message_id, :shortstr],
+        [:timestamp, :timestamp],
+        [:type, :shortstr],
+        [:user_id, :shortstr],
+        [:app_id, :shortstr],
+        [:cluster_id, :shortstr],
+      ].freeze
 
-      DECODE_PROPERTIES_TYPE = {
-        0x8000 => :shortstr,
-        0x4000 => :shortstr,
-        0x2000 => :table,
-        0x1000 => :octet,
-        0x0800 => :octet,
-        0x0400 => :shortstr,
-        0x0200 => :shortstr,
-        0x0100 => :shortstr,
-        0x0080 => :shortstr,
-        0x0040 => :timestamp,
-        0x0020 => :shortstr,
-        0x0010 => :shortstr,
-        0x0008 => :shortstr,
-        0x0004 => :shortstr,
-      }
-
-      # Hash doesn't give any guarantees on keys order, we will do it in a
-      # straightforward way
-      DECODE_PROPERTIES_KEYS = [
-        0x8000,
-        0x4000,
-        0x2000,
-        0x1000,
-        0x0800,
-        0x0400,
-        0x0200,
-        0x0100,
-        0x0080,
-        0x0040,
-        0x0020,
-        0x0010,
-        0x0008,
-        0x0004,
-      ]
-
-      # Optimized decode_properties using getbyte and unpack1
       def self.decode_properties(data)
-        offset, data_length, properties = 0, data.bytesize, {}
-
-        compressed_index = data.byteslice(offset, 2).unpack1(PACK_UINT16)
-        offset += 2
-        while data_length > offset
-          DECODE_PROPERTIES_KEYS.each do |key|
-            next unless compressed_index >= key
-            compressed_index -= key
-            name = DECODE_PROPERTIES[key] || raise(RuntimeError.new("No property found for index #{key.inspect}!"))
-            case DECODE_PROPERTIES_TYPE[key]
-            when :shortstr
-              size = data.getbyte(offset)
-              offset += 1
-              result = data.byteslice(offset, size)
-            when :octet
-              size = 1
-              result = data.getbyte(offset)
-            when :timestamp
-              size = 8
-              result = Time.at(data.byteslice(offset, 8).unpack1(PACK_UINT64_BE))
-            when :table
-              size = 4 + data.byteslice(offset, 4).unpack1(PACK_UINT32)
-              result = Table.decode(data.byteslice(offset, size))
-            end
-            properties[name] = result
-            offset += size
-          end
-        end
-
-        properties
+        PropertiesCodec.decode(PROPERTY_DESCRIPTIONS, data)
       end
 
       class Qos < Protocol::Method

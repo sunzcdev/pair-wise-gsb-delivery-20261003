@@ -44,6 +44,36 @@ module AMQ
           result = Basic.decode_properties("\xB8@\x18application/octet-stream\x00\x00\x00\x10\x05helloS\x00\x00\x00\x05world\x02\x00\x00\x00\x00\x00\x00\x00\x00{")
           expect(result).to eq({:priority => 0, :delivery_mode => 2, :content_type => 'application/octet-stream', :timestamp => Time.at(123), :headers => {'hello' => 'world'}})
         end
+
+        it 'round-trips through .encode_properties' do
+          properties = {:content_type => 'text/plain', :delivery_mode => 2, :priority => 3, :headers => {'hello' => 'world'}}
+          encoded = Basic.encode_properties(0, properties)
+          expect(Basic.decode_properties(encoded.byteslice(12..-1))).to eq(properties)
+        end
+
+        it 'raises UnknownPropertyFlags for flag bits without a declared property' do
+          expect {
+            Basic.decode_properties("\x00\x02\x01")
+          }.to raise_error(AMQ::Protocol::UnknownPropertyFlags)
+        end
+
+        it 'raises MissingPropertyFlagsContinuation when the continuation bit is set but the frame ends' do
+          expect {
+            Basic.decode_properties("\x80\x01")
+          }.to raise_error(AMQ::Protocol::MissingPropertyFlagsContinuation)
+        end
+
+        it 'raises TruncatedPropertyValue when a value is cut off at the end of the frame' do
+          expect {
+            Basic.decode_properties("\x80\x00\x18application")
+          }.to raise_error(AMQ::Protocol::TruncatedPropertyValue)
+        end
+
+        it 'raises UnexpectedPropertyBytes when bytes remain after the last property' do
+          expect {
+            Basic.decode_properties("\x08\x00\x03\x00")
+          }.to raise_error(AMQ::Protocol::UnexpectedPropertyBytes)
+        end
       end
 
       %w(content_type content_encoding correlation_id reply_to expiration message_id type user_id app_id cluster_id).each do |method|
