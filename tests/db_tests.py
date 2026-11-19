@@ -269,6 +269,191 @@ class TestDatabase(DatabaseTestCase):
         self.assertEqual(recurse(2), alt_db)
         self.assertEqual(A._meta.database, db)
 
+    def test_bind_ctx_restores_per_model_bindings(self):
+        # Each model in the related graph may start out on a *different*
+        # database. Leaving the context must restore each model individually,
+        # not squash the whole group back onto the root's database.
+        db_a = get_in_memory_db()
+        db_b = get_in_memory_db()
+        alt_db = get_in_memory_db()
+
+        class A(Model):
+            class Meta:
+                database = db_a
+        class B(Model):
+            a = ForeignKeyField(A)
+            class Meta:
+                database = db_b
+        class C(Model):
+            b = ForeignKeyField(B)
+            class Meta:
+                database = db_a
+
+        with alt_db.bind_ctx([A]):
+            # Refs reach B and C; all are temporarily on alt_db.
+            self.assertTrue(A._meta.database is alt_db)
+            self.assertTrue(B._meta.database is alt_db)
+            self.assertTrue(C._meta.database is alt_db)
+
+        self.assertTrue(A._meta.database is db_a)
+        self.assertTrue(B._meta.database is db_b)
+        self.assertTrue(C._meta.database is db_a)
+
+        # Same guarantee through Model.bind_ctx().
+        with A.bind_ctx(alt_db):
+            self.assertTrue(B._meta.database is alt_db)
+        self.assertTrue(A._meta.database is db_a)
+        self.assertTrue(B._meta.database is db_b)
+        self.assertTrue(C._meta.database is db_a)
+
+    def test_bind_ctx_self_referential_and_shared_roots(self):
+        # A self-referential model must not be visited twice, and a model that
+        # is related to two roots must only be captured once per root.
+        db_a = get_in_memory_db()
+        alt_db = get_in_memory_db()
+
+        class Node(Model):
+            parent = ForeignKeyField('self', null=True, backref='children')
+            class Meta:
+                database = db_a
+        class Leaf(Model):
+            left = ForeignKeyField(Node, backref='+')
+            right = ForeignKeyField(Node, backref='+')
+            class Meta:
+                database = None
+
+        with alt_db.bind_ctx([Node, Leaf]):
+            self.assertTrue(Node._meta.database is alt_db)
+            self.assertTrue(Leaf._meta.database is alt_db)
+
+        self.assertTrue(Node._meta.database is db_a)
+        self.assertTrue(Leaf._meta.database is None)
+
+    def test_bind_ctx_preserves_original_with_shared_related_model(self):
+        # Both roots reference Shared. Restoring must leave Shared exactly as
+        # it was, even though two separate traversal paths touched it.
+        db = get_in_memory_db()
+        alt_db = get_in_memory_db()
+
+        class Shared(Model):
+            class Meta:
+                database = db
+        class Root1(Model):
+            shared = ForeignKeyField(Shared)
+            class Meta:
+                database = None
+        class Root2(Model):
+            shared = ForeignKeyField(Shared)
+            class Meta:
+                database = None
+
+        with alt_db.bind_ctx([Root1, Root2]):
+            for model in (Shared, Root1, Root2):
+                self.assertTrue(model._meta.database is alt_db)
+
+        self.assertTrue(Shared._meta.database is db)
+        self.assertTrue(Root1._meta.database is None)
+        self.assertTrue(Root2._meta.database is None)
+
+    def test_bind_ctx_nested_contexts_restore_stack(self):
+        db = get_in_memory_db()
+        db1 = get_in_memory_db()
+        db2 = get_in_memory_db()
+
+        class A(Model):
+            class Meta:
+                database = db
+        class B(Model):
+            a = ForeignKeyField(A)
+            class Meta:
+                database = db
+
+        with db1.bind_ctx([A]):
+            # Refs/backrefs pull B into the outer context as well.
+            self.assertTrue(A._meta.database is db1)
+            self.assertTrue(B._meta.database is db1)
+            with db2.bind_ctx([B], bind_refs=False):
+                self.assertTrue(B._meta.database is db2)
+                self.assertTrue(A._meta.database is db1)
+            # Inner context restores B to what it saw on entry (db1), not to
+            # the value at the top of the stack.
+            self.assertTrue(B._meta.database is db1)
+            self.assertTrue(A._meta.database is db1)
+
+        self.assertTrue(A._meta.database is db)
+        self.assertTrue(B._meta.database is db)
+
+    def test_bind_ctx_enter_failure_leaves_no_partial_graph(self):
+        # If wiring up the graph fails part-way, no model may be left on the
+        # temporary database.
+        db_a = get_in_memory_db()
+        db_b = get_in_memory_db()
+        alt_db = get_in_memory_db()
+
+        class A(Model):
+            class Meta:
+                database = db_a
+        class B(Model):
+            a = ForeignKeyField(A)
+            class Meta:
+                database = db_b
+
+        calls = []
+        orig_set_database = B._meta.set_database
+
+        def failing_set_database(database):
+            calls.append(database)
+            if database is alt_db:
+                raise ValueError('boom')
+            return orig_set_database(database)
+
+        with mock.patch.object(B._meta, 'set_database',
+                               side_effect=failing_set_database):
+            with self.assertRaises(ValueError):
+                with alt_db.bind_ctx([A, B]):
+                    pass
+
+        self.assertTrue(calls)  # The failure actually happened.
+        self.assertTrue(A._meta.database is db_a)
+        self.assertTrue(B._meta.database is db_b)
+
+    def test_bind_ctx_skips_backrefs_when_requested(self):
+        db = get_in_memory_db()
+        alt_db = get_in_memory_db()
+
+        class A(Model):
+            class Meta:
+                database = db
+        class B(Model):
+            a = ForeignKeyField(A)
+            class Meta:
+                database = db
+
+        with A.bind_ctx(alt_db, bind_backrefs=False):
+            self.assertTrue(A._meta.database is alt_db)
+            self.assertTrue(B._meta.database is db)
+
+        self.assertTrue(A._meta.database is db)
+        self.assertTrue(B._meta.database is db)
+
+    def test_bind_ctx_ends_after_enter_error(self):
+        # If __enter__ raises, Python never calls __exit__. A stale snapshot
+        # must not later restore the wrong database.
+        db = get_in_memory_db()
+        alt_db = get_in_memory_db()
+
+        class A(Model):
+            class Meta:
+                database = db
+
+        ctx = alt_db.bind_ctx([A])
+        with mock.patch.object(A._meta, 'set_database',
+                               side_effect=ValueError('boom')):
+            with self.assertRaises(ValueError):
+                ctx.__enter__()
+        ctx.__exit__(None, None, None)  # Must be a harmless no-op.
+        self.assertTrue(A._meta.database is db)
+
     def test_bind_regression(self):
         class Base(Model):
             class Meta:

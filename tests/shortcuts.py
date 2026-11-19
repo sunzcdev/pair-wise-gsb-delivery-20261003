@@ -917,6 +917,79 @@ class TestThreadSafeMetaRegression(ModelTestCase):
         self.assertSQL(query, sql)
 
 
+class TestThreadSafeDatabaseMetadataScope(BaseTestCase):
+    def test_table_is_rebuilt_for_the_active_database(self):
+        # The metadata's Table must follow the active database. A cached Table
+        # is shared through the metadata object, so reusing it across a
+        # database swap would send queries to the wrong database.
+        d1 = get_in_memory_db()
+        d2 = get_in_memory_db()
+
+        class M(TSBase):
+            key = TextField()
+            class Meta:
+                database = d1
+
+        self.assertTrue(M._meta.table._database is d1)
+        with d2.bind_ctx([M]):
+            self.assertTrue(M._meta.table._database is d2)
+        self.assertTrue(M._meta.table._database is d1)
+
+    def test_table_isolated_between_threads(self):
+        # Each thread's cached Table must belong to the database that thread
+        # has active -- not the one another thread installed.
+        d1 = get_in_memory_db()
+        d2 = get_in_memory_db()
+
+        class M(TSBase):
+            key = TextField()
+            class Meta:
+                database = d1
+
+        errors = []
+        def run():
+            try:
+                self.assertTrue(M._meta.table._database is d1)
+                self.assertTrue(M._schema.database is d1)
+                with d2.bind_ctx([M]):
+                    self.assertTrue(M._meta.table._database is d2)
+                    # The schema manager follows the thread-local database
+                    # instead of being pinned to the one a peer installed.
+                    self.assertTrue(M._schema.database is d2)
+                self.assertTrue(M._meta.table._database is d1)
+                self.assertTrue(M._schema.database is d1)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run) for _ in range(8)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual(errors, [])
+
+    def test_only_database_and_table_are_thread_local(self):
+        # The isolation scope is deliberately narrow: fields and other
+        # metadata remain shared, so the lock must not be described (or relied
+        # on) as full thread-isolation of the model.
+        d1 = get_in_memory_db()
+
+        class M(TSBase):
+            key = TextField()
+            class Meta:
+                database = d1
+
+        seen = {}
+        def run():
+            M.key.index = True  # Shared, process-wide field attribute.
+            seen['field'] = M._meta.fields['key']
+
+        t = threading.Thread(target=run)
+        t.start() ; t.join()
+
+        self.assertTrue(seen['field'] is M._meta.fields['key'])
+        self.assertTrue(M.key.index)
+        M.key.index = False
+
+
 class TIW(TestModel):
     key = CharField()
     value = IntegerField(default=0)

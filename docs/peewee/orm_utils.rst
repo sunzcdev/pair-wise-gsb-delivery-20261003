@@ -116,6 +116,8 @@ Compound Query Resolution
 Thread-Safe Database Swapping
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+.. _thread-safe-database-metadata:
+
 .. class:: ThreadSafeDatabaseMetadata()
 
    Model :class:`Metadata` implementation that stores the ``database``
@@ -125,6 +127,19 @@ Thread-Safe Database Swapping
    Each model class carries its own metadata instance, so the swap targets
    the model(s) being queried. Assigning on an abstract base class is a
    no-op for its subclasses.
+
+   The isolation is intentionally narrow and covers only what a runtime swap
+   touches:
+
+   * ``Model._meta.database`` -- the active database (per thread).
+   * ``Model._meta.table`` -- the :class:`Table` built from the active
+     database (per thread, rebuilt when the active database changes).
+
+   Everything else on the metadata -- fields, indexes, constraints, the
+   schema name and field database hooks (e.g. the ``BlobField`` constructor)
+   -- is still shared process-wide and is *not* isolated. The internal lock
+   only serializes updates to the shared default database; it is not a
+   guarantee of full thread-isolation of the model class.
 
    .. code-block:: python
 
@@ -145,7 +160,8 @@ Thread-Safe Database Swapping
        # to see the database they had bound.
        replica.bind([User])
 
-       # Or scoped to a block:
+       # Or scoped to a block. Nested contexts restore each model to the
+       # database it had before the block was entered.
        with primary.bind_ctx([User]):
            ...
 

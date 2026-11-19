@@ -7,6 +7,21 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Fix `Model.bind_ctx()` / `Database.bind_ctx()` (and `Table.bind_ctx()`) to
+  restore each affected model to the database it had on entry, rather than
+  rebinding the whole related graph back onto a single database. Related
+  models are collected by one cycle-safe graph walk (so self-referential and
+  shared relation models are visited once), nested / re-entrant contexts stack
+  their snapshots, and a failure while entering the block rolls back every
+  model already rebound instead of leaving a half-bound graph.
+* Relax `Metadata.set_database()` so it only writes through to a schema-manager
+  database that was explicitly configured; otherwise the manager keeps
+  deriving it from `Model._meta.database`.
+* `ThreadSafeDatabaseMetadata` now rebuilds its per-thread `Table` when the
+  active database changes, and the docs state its exact isolation scope: the
+  active database and derived `Table` are thread-local, while fields, indexes,
+  constraints and field database hooks remain shared (the lock only guards the
+  default database, it is not full thread-isolation).
 * Clear `after_commit` callbacks registered on a savepoint if that savepoint is
   then rolled-back.
 * Re-create triggers during sqlite migrator table rebuilds.

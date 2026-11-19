@@ -7138,6 +7138,122 @@ class TestModelGraph(BaseTestCase):
 
         self.assertTrue(User._meta.database is None)
 
+    def test_bind_ctx_does_not_globally_rebind_shared_related(self):
+        # A model reachable from two roots is captured once and restored to
+        # its own original database, even though the graph was walked twice.
+        db = get_in_memory_db()
+        fake_db = SqliteDatabase(None)
+
+        class Shared(Model):
+            class Meta:
+                database = db
+        class Left(Model):
+            shared = ForeignKeyField(Shared)
+        class Right(Model):
+            shared = ForeignKeyField(Shared)
+
+        with Left.bind_ctx(fake_db):
+            for model in (Shared, Left, Right):
+                self.assertTrue(model._meta.database is fake_db)
+        self.assertTrue(Shared._meta.database is db)
+        self.assertTrue(Left._meta.database is None)
+        self.assertTrue(Right._meta.database is None)
+
+        with Left.bind_ctx(fake_db, bind_backrefs=False) as (FLeft,):
+            self.assertTrue(FLeft._meta.database is fake_db)
+            self.assertTrue(Right._meta.database is None)
+
+    def test_bind_ctx_self_reference_terminates(self):
+        # A self-referential foreign-key must not recurse forever.
+        class Person(Model):
+            parent = ForeignKeyField('self', null=True, backref='children')
+
+        fake_db = SqliteDatabase(None)
+        with Person.bind_ctx(fake_db) as (FPerson,):
+            self.assertTrue(FPerson._meta.database is fake_db)
+        self.assertTrue(Person._meta.database is None)
+
+    def test_bind_ctx_table_restores_model_and_table_separately(self):
+        # Table.bind_ctx() binds the table *and* its owning model graph; exiting
+        # must put each back to its own prior database, not to a single shared
+        # one.
+        db = get_in_memory_db()
+        other_db = get_in_memory_db()
+        fake_db = SqliteDatabase(None)
+
+        class A(Model):
+            class Meta:
+                database = db
+        class B(Model):
+            a = ForeignKeyField(A)
+            class Meta:
+                database = other_db
+
+        table = A._meta.table
+        self.assertTrue(table._database is db)
+
+        with table.bind_ctx(fake_db):
+            self.assertTrue(table._database is fake_db)
+            self.assertTrue(A._meta.database is fake_db)
+            # The owning model's graph is bound too.
+            self.assertTrue(B._meta.database is fake_db)
+
+        self.assertTrue(table._database is db)
+        self.assertTrue(A._meta.database is db)
+        self.assertTrue(B._meta.database is other_db)
+
+    def test_model_graph_reports_self_reference_once(self):
+        class Person(Model):
+            parent = ForeignKeyField('self', null=True, backref='children')
+
+        graph = Person._meta.model_graph()
+        refs = [(fk.name, model, is_backref)
+                for fk, model, is_backref in graph
+                if fk is not None]
+        # The self-reference is reported once as a ref and once as a backref,
+        # and traversal terminates instead of looping forever.
+        self.assertEqual(sorted(refs, key=lambda r: r[2]), [
+            ('parent', Person, False),
+            ('parent', Person, True)])
+
+    def test_bind_ctx_restores_explicit_schema_manager_database(self):
+        # A schema manager configured with an explicit database is bound and
+        # restored alongside the model, without pinning it for managers that
+        # derive their database from the model metadata.
+        db = get_in_memory_db()
+        fake_db = SqliteDatabase(None)
+        schema_db = get_in_memory_db()
+
+        class A(Model):
+            class Meta:
+                database = db
+                schema_options = {'database': schema_db}
+
+        self.assertTrue(A._schema.database is schema_db)
+        with fake_db.bind_ctx([A]):
+            self.assertTrue(A._meta.database is fake_db)
+            self.assertTrue(A._schema.database is fake_db)
+        self.assertTrue(A._meta.database is db)
+        self.assertTrue(A._schema._database is schema_db)
+        self.assertTrue(A._schema.database is schema_db)
+
+    def test_bind_ctx_preserves_unset_schema_manager_database(self):
+        # With no explicit schema-manager database, the manager must keep
+        # following Model._meta.database rather than being pinned to whatever
+        # database happened to be bound at the time.
+        db = get_in_memory_db()
+        fake_db = SqliteDatabase(None)
+
+        class A(Model):
+            class Meta:
+                database = db
+
+        self.assertTrue(A._schema._database is None)
+        with fake_db.bind_ctx([A]):
+            self.assertTrue(A._schema.database is fake_db)
+        self.assertTrue(A._schema._database is None)
+        self.assertTrue(A._schema.database is db)
+
 
 class TestModelSetDatabase(BaseTestCase):
     def test_set_database(self):

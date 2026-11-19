@@ -998,21 +998,44 @@ class _BoundTableContext(_callable_context_manager):
     def __init__(self, table, database):
         self.table = table
         self.database = database
+        # A single instance may be nested/re-entered, so originals go on a
+        # stack rather than a single attribute.
+        self._stack = []
 
     def _build_ctx(self):
         return type(self)(self.table, self.database)
 
     def __enter__(self):
-        self._orig_database = self.table._database
-        self.table.bind(self.database)
-        if self.table._model is not None:
-            self.table._model.bind(self.database)
+        # The table and the model(s) it belongs to store their database
+        # separately; remember each original value so all are restored
+        # exactly on exit.
+        model = self.table._model
+        table_db = self.table._database
+        if model is not None:
+            targets = _model_bind_targets((model,))
+            model_snapshot = _snapshot_model_bindings(targets)
+        else:
+            targets = model_snapshot = None
+        try:
+            self.table.bind(self.database)
+            if model_snapshot is not None:
+                _apply_model_bindings(targets, self.database)
+        except Exception:
+            self.table.bind(table_db)
+            if model_snapshot is not None:
+                _restore_model_bindings(model_snapshot)
+            raise
+        self._stack.append((table_db, model_snapshot))
         return self.table
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.table.bind(self._orig_database)
-        if self.table._model is not None:
-            self.table._model.bind(self._orig_database)
+        # An empty stack means __enter__ failed; it already rolled back.
+        if not self._stack:
+            return
+        table_db, model_snapshot = self._stack.pop()
+        self.table.bind(table_db)
+        if model_snapshot is not None:
+            _restore_model_bindings(model_snapshot)
 
 
 class Table(_HashableSource, BaseTable):
@@ -4131,8 +4154,13 @@ class Database(_callable_context_manager):
         return fn.random()
 
     def bind(self, models, bind_refs=True, bind_backrefs=True):
-        for model in models:
-            model.bind(self, bind_refs=bind_refs, bind_backrefs=bind_backrefs)
+        targets = _model_bind_targets(models, bind_refs, bind_backrefs)
+        snapshot = _snapshot_model_bindings(targets)
+        try:
+            _apply_model_bindings(targets, self)
+        except Exception:
+            _restore_model_bindings(snapshot)
+            raise
 
     def bind_ctx(self, models, bind_refs=True, bind_backrefs=True):
         return _BoundModelsContext(models, self, bind_refs, bind_backrefs)
@@ -7402,15 +7430,18 @@ class Metadata(object):
     def remove_manytomany(self, field):
         del self.manytomany[field.name]
 
+    def _make_table(self):
+        return Table(
+            self.table_name,
+            [field.column_name for field in self.sorted_fields],
+            schema=self.schema,
+            _model=self.model,
+            _database=self.database)
+
     @property
     def table(self):
         if self._table is None:
-            self._table = Table(
-                self.table_name,
-                [field.column_name for field in self.sorted_fields],
-                schema=self.schema,
-                _model=self.model,
-                _database=self.database)
+            self._table = self._make_table()
         return self._table
 
     @table.setter
@@ -7548,7 +7579,15 @@ class Metadata(object):
 
     def set_database(self, database):
         self.database = database
-        self.model._schema.database = database
+
+        # Update the schema-manager database only if it was explicitly
+        # configured. When it is left unset the manager derives its database
+        # from ``model._meta.database`` on demand, so writing the value here
+        # would pin it -- and, because the schema manager is shared by all
+        # execution contexts, would leak one context's binding into another.
+        schema = self.model._schema
+        if getattr(schema, '_database', None) is not None:
+            schema.database = database
         del self.table
 
         # Apply any hooks that have been registered. If we have an
@@ -7716,29 +7755,114 @@ class ModelBase(type):
         return ctx.sql(self._meta.table)
 
 
+def _iter_model_graph(models, refs=True, backrefs=True):
+    """
+    Yield each model reachable from ``models`` exactly once, roots first.
+
+    Traversal is depth-first and cycle-safe, so self-referential models and
+    models shared by several roots (whether discovered through a foreign-key
+    reference or a back-reference) are visited a single time.
+    """
+    stack = [model for model in reversed(list(models))]
+    seen = set()
+    while stack:
+        model = stack.pop()
+        if model in seen:
+            continue
+        seen.add(model)
+        yield model
+
+        meta = model._meta
+        related = []
+        if refs:
+            related.extend(meta.refs.values())
+        if backrefs:
+            related.extend(meta.backrefs.values())
+        for rel_model in reversed(related):
+            if rel_model not in seen:
+                stack.append(rel_model)
+
+
+def _model_bind_targets(models, refs=True, backrefs=True):
+    """Return the models a bind of ``models`` would touch, deduped."""
+    return list(_iter_model_graph(models, refs, backrefs))
+
+
+def _snapshot_model_bindings(models):
+    # Record the model plus both places a database can live: the model's
+    # metadata and the schema manager's *explicit* override (``None`` when the
+    # manager derives its database from the metadata). The derived value is
+    # deliberately not snapshotted -- doing so would pin it.
+    snapshot = []
+    for model in models:
+        snapshot.append((model,
+                         model._meta.database,
+                         getattr(model._schema, '_database', None)))
+    return snapshot
+
+
+def _apply_model_bindings(models, database):
+    for model in models:
+        model._meta.set_database(database)
+
+
+def _restore_model_bindings(snapshot):
+    """Put each model back exactly as recorded in ``snapshot``.
+
+    Every model is restored even if one fails: a single broken hook must not
+    strand the rest of the graph on the temporary database.
+    """
+    for model, database, schema_database in snapshot:
+        try:
+            model._meta.set_database(database)
+        except Exception:
+            logger.warning('Error restoring metadata binding for %s.',
+                           model, exc_info=True)
+        finally:
+            # ``set_database`` may have written the schema-manager database
+            # (when one was explicitly configured); put the exact original
+            # value back afterwards.
+            if hasattr(model._schema, '_database'):
+                model._schema._database = schema_database
+
+
 class _BoundModelsContext(_callable_context_manager):
     def __init__(self, models, database, bind_refs, bind_backrefs):
-        self.models = models
+        self.models = list(models)
         self.database = database
         self.bind_refs = bind_refs
         self.bind_backrefs = bind_backrefs
+        # Bind contexts may be nested and a single instance may be re-entered,
+        # so snapshots are kept on a stack.
+        self._stack = []
 
     def _build_ctx(self):
         return type(self)(self.models, self.database, self.bind_refs,
                           self.bind_backrefs)
 
     def __enter__(self):
-        self._orig_database = []
-        for model in self.models:
-            self._orig_database.append(model._meta.database)
-            model.bind(self.database, self.bind_refs, self.bind_backrefs,
-                       _exclude=set(self.models))
+        targets = _model_bind_targets(self.models, self.bind_refs,
+                                      self.bind_backrefs)
+        # Snapshot every affected model *before* touching any of them, so a
+        # failure while wiring up the graph can be rolled back completely.
+        snapshot = _snapshot_model_bindings(targets)
+        try:
+            _apply_model_bindings(targets, self.database)
+        except Exception:
+            _restore_model_bindings(snapshot)
+            raise
+        self._stack.append(snapshot)
         return self.models
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        for model, db in zip(self.models, self._orig_database):
-            model.bind(db, self.bind_refs, self.bind_backrefs,
-                       _exclude=set(self.models))
+        # An empty stack means __enter__ failed; it already rolled back.
+        if not self._stack:
+            return
+        snapshot = self._stack.pop()
+        # Restore the models one-by-one to the exact database each had on
+        # entry. Re-walking the relationship graph here would clobber models
+        # that were shared between roots or originally bound elsewhere.
+        _restore_model_bindings(snapshot)
 
 
 class Model(Node, metaclass=ModelBase):
@@ -8141,16 +8265,22 @@ class Model(Node, metaclass=ModelBase):
 
     @classmethod
     def bind(cls, database, bind_refs=True, bind_backrefs=True, _exclude=None):
+        # Resolve the whole set of models up-front so a failure part-way
+        # through cannot leave a partially-rebound graph behind.
+        exclude = set() if _exclude is None else _exclude
+        targets = [model
+                   for model in _iter_model_graph((cls,), bind_refs,
+                                                  bind_backrefs)
+                   if model is cls or model not in exclude]
+        exclude.update(targets)
+
         is_different = cls._meta.database is not database
-        cls._meta.set_database(database)
-        if bind_refs or bind_backrefs:
-            if _exclude is None:
-                _exclude = set()
-            G = cls._meta.model_graph(refs=bind_refs, backrefs=bind_backrefs)
-            for _, model, is_backref in G:
-                if model not in _exclude:
-                    model._meta.set_database(database)
-                    _exclude.add(model)
+        snapshot = _snapshot_model_bindings(targets)
+        try:
+            _apply_model_bindings(targets, database)
+        except Exception:
+            _restore_model_bindings(snapshot)
+            raise
         return is_different
 
     @classmethod

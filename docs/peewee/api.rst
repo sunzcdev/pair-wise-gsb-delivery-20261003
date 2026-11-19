@@ -763,6 +763,20 @@ Database
                    # ... models are bound to test database ...
                    pass
 
+       The related models are collected by walking the foreign-key graph
+       from each of ``models`` before anything is rebound. A model is visited
+       once even if it is self-referential or reachable from several roots,
+       and back-references are only followed when ``bind_backrefs`` is true.
+
+       Leaving the block restores **each affected model to the database it
+       had on entry**. Models that started out on different databases keep
+       those databases -- the context never squashes the whole group back onto
+       a single shared database. Contexts may be nested, and a single
+       context-manager instance may be re-entered (e.g. recursively); each
+       entry registers its own snapshot. If an error occurs while entering the
+       block, every model already rebound is rolled back to its original
+       database, so no partially-bound graph is left behind.
+
    .. method:: extract_date(date_part, date_field)
 
       :param str date_part: date part to extract, e.g. 'year'.
@@ -2173,7 +2187,8 @@ Model
    .. classmethod:: bind_ctx(database, bind_refs=True, bind_backrefs=True)
 
       Like :meth:`~Model.bind`, but returns a context-manager or decorator that
-      only binds the models for the duration of the wrapped block.
+      only binds the models for the duration of the wrapped block. For the
+      restoration and nesting rules, see :meth:`Database.bind_ctx`.
 
       .. code-block:: python
 
@@ -4862,7 +4877,10 @@ Query-builder
       :param database: :class:`Database` object.
 
       Return a context manager that will bind the table to the given database
-      for the duration of the wrapped block.
+      for the duration of the wrapped block. If the table belongs to a model,
+      that model (and its related models) are bound as well. On exit the table
+      and every affected model are each restored to the database they had on
+      entry.
 
    .. method:: select(*columns)
 

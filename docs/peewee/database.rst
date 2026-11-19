@@ -349,10 +349,37 @@ for binding a given model class:
    # User is back to being bound to the sqlite_db.
    assert User._meta.database is sqlite_db
 
+A ``bind_ctx()`` block restores **each affected model to the database it had
+when the block was entered**. It does not simply put the whole group back onto
+the database of the model(s) passed in. This matters when the related models
+start on different databases:
+
+.. code-block:: python
+
+   User.bind(sqlite_db)
+   Tweet.bind(other_db)
+
+   with User.bind_ctx(third_db):      # binds User + Tweet for the block
+       assert User._meta.database is third_db
+       assert Tweet._meta.database is third_db
+
+   # Each goes back to its own previous database.
+   assert User._meta.database is sqlite_db
+   assert Tweet._meta.database is other_db
+
+The related-model graph is walked once before any model is rebound, so
+self-referential models and models shared by several roots are handled without
+duplicates. Nested contexts (and re-entrant decorator use) each record their
+own snapshot, and a failure while entering the block rolls back every model
+that had already been rebound.
+
 Peewee database connections are thread-safe. However, if you plan to **bind**
 the database at run-time in a multi-threaded application, storing the model's
 database in a thread-local is necessary. This can be accomplished with
-the :class:`~playhouse.shortcuts.ThreadSafeDatabaseMetadata`.
+the :class:`~playhouse.shortcuts.ThreadSafeDatabaseMetadata`. Note that this
+metadata class isolates only the *active database* (and the ``Table`` derived
+from it) per thread -- see :ref:`thread-safe-database-metadata` for the exact
+scope.
 
 .. code-block:: python
 

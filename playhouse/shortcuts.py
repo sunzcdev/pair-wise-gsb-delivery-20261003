@@ -317,9 +317,18 @@ class ThreadSafeDatabaseMetadata(Metadata):
     class Base(Model):
         class Meta:
             model_metadata_class = ThreadSafeDatabaseMetadata
+
+    The isolation scope is narrow and explicit: the *active database* and the
+    ``Table`` object built from it are stored per-thread (using
+    ``threading.local``). Everything else on the metadata -- fields, indexes,
+    constraints, the schema name, database hooks such as the ``BlobField``
+    constructor -- is still a plain process-wide attribute. ``self._lock``
+    only serializes updates to the shared initial/default database; it does
+    not make the whole model thread-isolated.
     """
     def __init__(self, *args, **kwargs):
-        # The database attribute is stored in a thread-local.
+        # The database attribute is stored in a thread-local. ``_database`` is
+        # the process-wide default, used by threads that never set their own.
         self._database = None
         self._table = None
         self._lock = threading.Lock()
@@ -335,18 +344,28 @@ class ThreadSafeDatabaseMetadata(Metadata):
     database = property(_get_db, _set_db)
 
     def set_database(self, database):
+        # Guards only the shared fallback default (see ``_set_db``); the
+        # per-thread value is written without contention.
         with self._lock:
             return super(ThreadSafeDatabaseMetadata,
                          self).set_database(database)
 
     @property
     def table(self):
-        if getattr(self._local, 'table', None) is None:
-            self._local.table = super(ThreadSafeDatabaseMetadata, self).table
-        return self._local.table
+        db = self.database
+        table = getattr(self._local, 'table', None)
+        # Rebuild when this thread has no table yet or when its active
+        # database changed. Do not consult the shared ``_table`` cache: it
+        # would hand this thread a Table bound to another thread's database.
+        if table is None or table._database is not db:
+            table = self._make_table()
+            self._local.table = table
+        return table
     @table.setter
     def table(self, value):
         raise AttributeError('Cannot set the "table".')
     @table.deleter
     def table(self):
+        # Only invalidate the calling thread's cached Table. Other threads
+        # notice a changed database on their next access and rebuild.
         self._local.table = None
