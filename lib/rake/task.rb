@@ -151,6 +151,7 @@ module Rake
 
     # Clear the existing prerequisites, actions, comments, and arguments of a rake task.
     def clear
+      application.assert_recordable_import_change!("clear task", name)
       clear_prerequisites
       clear_actions
       clear_comments
@@ -160,25 +161,56 @@ module Rake
 
     # Clear the existing prerequisites of a rake task.
     def clear_prerequisites
+      application.assert_recordable_import_change!("clear prerequisites of task", name)
       prerequisites.clear
       self
     end
 
     # Clear the existing actions on a rake task.
     def clear_actions
+      application.assert_recordable_import_change!("clear actions of task", name)
       actions.clear
       self
     end
 
     # Clear the existing comments on a rake task.
     def clear_comments
+      application.assert_recordable_import_change!("clear comments of task", name)
       @comments = []
       self
     end
 
     # Clear the existing arguments on a rake task.
     def clear_args
+      application.assert_recordable_import_change!("clear arguments of task", name)
       @arg_names = nil
+      self
+    end
+
+    # Capture the recordable, declarative state of this task:
+    # prerequisites, order-only prerequisites, actions, comments,
+    # argument names and definition locations.
+    # See Rake::ImportTransaction. :nodoc:
+    def snapshot_declarative_state # :nodoc:
+      {
+        prerequisites: @prerequisites.dup,
+        order_only_prerequisites: @order_only_prerequisites.dup,
+        actions: @actions.dup,
+        comments: @comments.dup,
+        arg_names: @arg_names && @arg_names.dup,
+        locations: @locations.dup,
+      }
+    end
+
+    # Restore declarative state captured by
+    # #snapshot_declarative_state. :nodoc:
+    def restore_declarative_state(state) # :nodoc:
+      @prerequisites            = state[:prerequisites]
+      @order_only_prerequisites = state[:order_only_prerequisites]
+      @actions                  = state[:actions]
+      @comments                 = state[:comments]
+      @arg_names                = state[:arg_names]
+      @locations                = state[:locations]
       self
     end
 

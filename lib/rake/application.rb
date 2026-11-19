@@ -8,6 +8,7 @@ require_relative "thread_pool"
 require_relative "thread_history_display"
 require_relative "trace_output"
 require_relative "win32"
+require_relative "import_transaction"
 
 module Rake
 
@@ -54,6 +55,7 @@ module Rake
       @rakefile = nil
       @pending_imports = []
       @imported = []
+      @importing = []
       @loaders = {}
       @default_loader = Rake::DefaultLoader.new
       @original_dir = Dir.pwd
@@ -795,21 +797,66 @@ module Rake
     end
 
     # Load the pending list of imported files.
+    #
+    # Each file is loaded inside a restricted, declarative import
+    # transaction (see Rake::ImportTransaction): if the file raises
+    # while loading, the tasks, rules and dependency definitions it has
+    # already made are rolled back, and the file is not recorded as
+    # imported, so it can be imported again after the problem is fixed.
     def load_imports # :nodoc:
       while fn = @pending_imports.shift
-        next if @imported.member?(fn)
-        fn_task = lookup(fn) and fn_task.invoke
-        ext = File.extname(fn)
-        loader = @loaders[ext] || @default_loader
-        loader.load(fn)
-        if fn_task = lookup(fn) and fn_task.needed?
-          fn_task.reenable
-          fn_task.invoke
-          loader.load(fn)
-        end
-        @imported << fn
+        import_file(fn)
       end
     end
+
+    # Import a single file, unless an alias of it has already been
+    # imported. :nodoc:
+    def import_file(fn) # :nodoc:
+      canonical = canonical_import_path(fn)
+      return if @imported.member?(canonical)
+      fail "Circular import of #{fn} detected" if @importing.member?(canonical)
+      @importing << canonical
+      begin
+        ImportTransaction.new(self).transaction do
+          load_import(fn)
+        end
+      rescue Exception
+        # The import failed and its definitions were rolled back.  Do
+        # not record the file as imported; re-queue it so that it can be
+        # retried once the problem is fixed.
+        @pending_imports.unshift(fn)
+        raise
+      ensure
+        @importing.delete(canonical)
+      end
+      @imported << canonical
+    end
+    private :import_file
+
+    # Deterministic identity for an imported file: path aliases such as
+    # "./x.rake", "x.rake" and the absolute path of the same file all
+    # map to a single canonical path. :nodoc:
+    def canonical_import_path(fn) # :nodoc:
+      path = File.expand_path(fn).tr("\\", "/")
+      path = path.downcase if windows?
+      path
+    end
+    private :canonical_import_path
+
+    # Load a single imported file, building it first if a task for it
+    # is defined. :nodoc:
+    def load_import(fn) # :nodoc:
+      fn_task = lookup(fn) and fn_task.invoke
+      ext = File.extname(fn)
+      loader = @loaders[ext] || @default_loader
+      loader.load(fn)
+      if fn_task = lookup(fn) and fn_task.needed?
+        fn_task.reenable
+        fn_task.invoke
+        loader.load(fn)
+      end
+    end
+    private :load_import
 
     def rakefile_location(backtrace=caller) # :nodoc:
       backtrace.map { |t| t[/([^:]+):/, 1] }

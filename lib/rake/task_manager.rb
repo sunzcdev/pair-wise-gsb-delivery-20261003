@@ -12,6 +12,7 @@ module Rake
       @rules = Array.new
       @scope = Scope.make
       @last_description = nil
+      @import_transaction_depth = 0
     end
 
     def create_rule(*args, &block) # :nodoc:
@@ -180,8 +181,59 @@ module Rake
 
     # Clear all tasks in this application.
     def clear
+      assert_recordable_import_change!("clear all tasks and rules")
       @tasks.clear
       @rules.clear
+    end
+
+    # True while an import transaction is recording definitions on this
+    # task manager.  See Rake::ImportTransaction.
+    def in_import_transaction? # :nodoc:
+      @import_transaction_depth > 0
+    end
+
+    # Mark the beginning of an import transaction. :nodoc:
+    def begin_import_transaction # :nodoc:
+      @import_transaction_depth += 1
+    end
+
+    # Mark the end of an import transaction. :nodoc:
+    def end_import_transaction # :nodoc:
+      @import_transaction_depth -= 1
+    end
+
+    # Reject +operation+ when it is attempted while an import
+    # transaction is active and cannot be recorded by it. :nodoc:
+    def assert_recordable_import_change!(operation, target=nil) # :nodoc:
+      if in_import_transaction?
+        raise UnsupportedImportOperation.new(operation, target)
+      end
+    end
+
+    # Capture the recordable, declarative state of this task manager:
+    # the defined tasks, the rules and the pending description.
+    # See Rake::ImportTransaction. :nodoc:
+    def snapshot_declarative_state # :nodoc:
+      {
+        tasks: @tasks.dup,
+        task_states: @tasks.each_with_object({}) { |(_, task), h|
+          h[task] = task.snapshot_declarative_state
+        },
+        rules_size: @rules.size,
+        last_description: @last_description,
+      }
+    end
+
+    # Restore declarative state captured by #snapshot_declarative_state,
+    # dropping every task and rule defined after the snapshot was taken
+    # and reverting definitions made to pre-existing tasks. :nodoc:
+    def restore_declarative_state(snapshot) # :nodoc:
+      @tasks = snapshot[:tasks].dup
+      snapshot[:task_states].each do |task, state|
+        task.restore_declarative_state(state)
+      end
+      @rules = @rules.first(snapshot[:rules_size])
+      @last_description = snapshot[:last_description]
     end
 
     # Lookup a task, using scope and the scope hints in the task name.

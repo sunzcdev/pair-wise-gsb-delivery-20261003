@@ -173,6 +173,15 @@ module Rake
     # allowing the imported files to depend on objects defined in the
     # importing file.
     #
+    # Each imported file is loaded inside a restricted, declarative
+    # transaction (see Rake::ImportTransaction).  If the file raises
+    # while loading, the tasks, rules and dependency definitions it has
+    # already made are rolled back and the file is not recorded as
+    # imported, so it can be imported again after the problem is fixed.
+    # Path aliases of the same file (relative, absolute, or
+    # <tt>./</tt>-prefixed) share a single identity and are imported at
+    # most once.
+    #
     # A common use of the import statement is to include files
     # containing dependency declarations.
     #
