@@ -384,6 +384,39 @@ results.each do |result|
 end
 ```
 
+#### Detailed results
+
+When a pipeline is interrupted by a connection error, a single exception doesn't tell
+which commands were replied to and which ones are in an unknown state — the server may
+or may not have received and executed them. `#pipelined_detailed` addresses that: it
+never retries nor resends commands automatically (some of them may be write commands
+that were already executed), and returns a `RedisClient::PipelinedResult` instead:
+
+```ruby
+outcome = redis.pipelined_detailed do |pipeline|
+  pipeline.call("SET", "foo", "bar")
+  pipeline.call("INCR", "baz")
+end
+
+outcome.complete?           # => false if the pipeline was interrupted
+outcome.failure             # => the RedisClient::ConnectionError, if any
+outcome.failure_stage       # => :write or :read, depending on where it broke
+outcome.results             # => replies aligned with the commands, unknown
+                            #    positions contain RedisClient::PipelinedResult::UNKNOWN
+outcome.errors              # => the server side errors among the confirmed replies
+outcome.confirmed_count     # => how many leading commands got their reply
+outcome.unconfirmed_range   # => the range of command positions in an unknown state
+outcome.unconfirmed_commands # => the commands that must not be blindly resent
+```
+
+For convenience, when the regular `#pipelined` mode is interrupted by a connection
+error, the raised exception exposes the same information through
+`RedisClient::Error#pipeline_result`, so partial progress isn't lost.
+
+Out-of-band RESP3 push messages (e.g. pubsub messages or client tracking
+invalidations) received while waiting for pipeline replies don't occupy a command
+position; they are collected in `outcome.pushes`.
+
 ### Transactions
 
 You can use [`MULTI/EXEC` to run a number of commands in an atomic fashion](https://redis.io/topics/transactions).

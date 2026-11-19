@@ -49,7 +49,7 @@ class RedisClient
       pool.size
     end
 
-    methods = %w(pipelined multi pubsub call call_v call_once call_once_v blocking_call blocking_call_v)
+    methods = %w(pipelined pipelined_detailed multi pubsub call call_v call_once call_once_v blocking_call blocking_call_v)
     iterable_methods = %w(scan sscan hscan zscan)
     methods.each do |method|
       class_eval <<~RUBY, __FILE__, __LINE__ + 1

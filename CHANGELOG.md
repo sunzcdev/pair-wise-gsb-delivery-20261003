@@ -1,5 +1,14 @@
 # Unreleased
 
+- Added a detailed pipelined mode: `RedisClient#pipelined_detailed` returns a `RedisClient::PipelinedResult`
+  describing exactly which commands were replied to, which server errors were received, which commands are
+  in an unknown state, and whether the write or the read phase was interrupted. It never automatically
+  retries nor resends commands that may already have been executed by the server.
+- Connection errors raised by `#pipelined` now expose the partial progress of the interrupted pipeline
+  via `RedisClient::Error#pipeline_result`.
+- RESP3 push messages received while waiting for pipeline replies no longer shift command positions.
+  They are parsed as `RedisClient::RESP3::Push` (a subclass of `Array`) and skipped over.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.

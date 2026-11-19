@@ -114,6 +114,16 @@ class RedisClient
       assert_parses [1, 2, 3], "*3\r\n:1\r\n:2\r\n:3\r\n"
     end
 
+    def test_load_push
+      raw_io = StringIO.new(">3\r\n+message\r\n$9\r\nmychannel\r\n$5\r\nhello\r\n".b)
+      io = RedisClient::RubyConnection::BufferedIO.new(raw_io, read_timeout: 1, write_timeout: 1)
+      push = RESP3.load(io)
+      assert_instance_of RESP3::Push, push
+      assert_kind_of Array, push
+      assert_equal ["message", "mychannel", "hello"], push
+      assert io.eof?, "Expected IO to be fully consumed"
+    end
+
     def test_load_multibyte_chars
       # Check that the buffer is properly operating over bytes and not characters
       assert_parses ["€™€™", 2], "*2\r\n$12\r\n€™€™\r\n:2\r\n"

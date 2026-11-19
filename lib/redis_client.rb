@@ -5,6 +5,7 @@ require "redis_client/command_builder"
 require "redis_client/url_config"
 require "redis_client/config"
 require "redis_client/pid_cache"
+require "redis_client/pipelined_result"
 require "redis_client/sentinel_config"
 require "redis_client/middlewares"
 
@@ -150,6 +151,11 @@ class RedisClient
 
     attr_reader :next_error
 
+    # When a pipeline was interrupted by this error, the detailed outcome
+    # of that pipeline (a PipelinedResult), so partial progress isn't
+    # entirely lost. nil otherwise.
+    attr_reader :pipeline_result
+
     def self.with_config(message, config = nil)
       error = new(message)
       error._set_config(config)
@@ -158,6 +164,10 @@ class RedisClient
 
     def _set_next_error(error) # :nodoc:
       @next_error = error
+    end
+
+    def _set_pipeline_result(result) # :nodoc:
+      @pipeline_result = result
     end
   end
 
@@ -522,6 +532,36 @@ class RedisClient
       end
 
       pipeline._coerce!(results)
+    end
+  end
+
+  # Detailed pipelined mode.
+  #
+  # Unlike #pipelined, it never retries nor resends commands automatically:
+  # if the connection is lost in the middle of the pipeline, some commands
+  # may already have been executed by the server, and blindly resending
+  # them could corrupt data.
+  #
+  # Instead it returns a PipelinedResult describing exactly which commands
+  # were replied to, which server errors were received, which commands are
+  # in an unknown state, and whether the write or the read phase was
+  # interrupted.
+  #
+  # Blocks passed to pipeline commands are not applied in this mode, the
+  # raw replies are reported as facts.
+  def pipelined_detailed
+    pipeline = Pipeline.new(@command_builder)
+    yield pipeline
+
+    if pipeline._size == 0
+      PipelinedResult.new(commands: [], results: [], errors: [], confirmed_count: 0)
+    else
+      ensure_connected(retryable: false) do |connection|
+        commands = pipeline._commands
+        @middlewares.call_pipelined(commands, config) do
+          connection.call_pipelined_detailed(commands, pipeline._timeouts)
+        end
+      end
     end
   end
 
