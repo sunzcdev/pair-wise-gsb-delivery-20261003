@@ -54,6 +54,8 @@ Base Classes
    spec.AbstractBufferedFile
    spec.AbstractFileSystem
    spec.Transaction
+   transaction.TransactionEntry
+   transaction.TransactionReport
 
 .. autoclass:: fsspec.archive.AbstractArchiveFileSystem
    :members:
@@ -99,6 +101,12 @@ Base Classes
    :members:
 
 .. autoclass:: fsspec.spec.Transaction
+   :members:
+
+.. autoclass:: fsspec.transaction.TransactionReport
+   :members:
+
+.. autoclass:: fsspec.transaction.TransactionEntry
    :members:
 
 .. _implementations:

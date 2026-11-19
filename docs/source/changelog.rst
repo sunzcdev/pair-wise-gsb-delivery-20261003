@@ -6,6 +6,13 @@ Dev
 
 Enhancements
 
+- Report the per-file outcome of a transaction. Each deferred file is reported
+  as committed, not committed (with its original error), discarded, or
+  indeterminate, together with the result of cleaning up its temporary
+  artifact. Committed targets are never removed as a rollback, temporary
+  artifacts of uncommitted files are still cleaned up, and a batch is never
+  reported as successful while anything is uncommitted or any cleanup failed.
+
 - List TAR archive descendants from the existing directory cache without
   rescanning the full archive for each directory.
 

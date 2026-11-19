@@ -142,6 +142,47 @@ The class :func:`fsspec.spec.Transaction` allows for fine-tuning of the operatio
 Note that synchronising transactions across multiple instances, perhaps across a cluster,
 is a harder problem to solve, and the implementation described here is only part of the solution.
 
+The commit is performed one file at a time by calling each file's ``commit()``. There is
+therefore **no atomic publish across objects**: if a later commit fails, files that already
+committed stay at their final destination, because for most backends a published object
+cannot be reliably withdrawn. Instead of pretending the batch either fully happened or fully
+did not, the transaction reports what actually happened for every file.
+
+When a transaction finishes, ``transaction.report`` (also returned by ``Transaction.complete()``
+and ``FileSystem.end_transaction()``) is a :class:`fsspec.transaction.TransactionReport` with
+one :class:`fsspec.transaction.TransactionEntry` per file. Each entry distinguishes:
+
+- whether the file was **committed**, **not committed** (its own ``commit()`` failed, or it was
+  never attempted because an earlier one failed), **discarded**, or **indeterminate** (a batch
+  operation gave no per-file outcome);
+- the identity of the object: its final ``path`` and the temporary ``temp`` artifact;
+- the original exception, for a failing file, preserved as-is;
+- the outcome of the cleanup attempt on the temporary artifact (cleaned, cleanup failed, or
+  not attempted).
+
+If a commit fails, the original exception is re-raised unchanged (the report is also attached
+to it as ``exception.transaction_report``), all remaining temporary artifacts are still cleaned
+up, and the filesystem leaves deferred-write mode. A transaction that had any uncommitted file
+or any failed cleanup is never reported as successful, so you can inspect the report and retry
+whatever is still legitimate:
+
+.. code-block:: python
+
+    fs = fsspec.filesystem(...)
+    try:
+        with fs.transaction as txn:
+            ...
+    except Exception:
+        report = txn.report
+        # files that really landed, and must not be deleted as a "rollback"
+        print(report.committed_paths)
+        # files that did not land (the exception for each is on the entry)
+        for entry in report.not_committed:
+            print(entry.path, entry.temp, entry.error)
+        # temporary artifacts that could not be removed
+        for entry in report.leftovers:
+            print(entry.path, entry.cleanup_error)
+
 Mount anything with FUSE
 ------------------------
 

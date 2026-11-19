@@ -25,7 +25,14 @@ from fsspec.implementations.cache_metadata import CacheMetadata
 from fsspec.implementations.chained import ChainedFileSystem
 from fsspec.implementations.local import LocalFileSystem
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
-from fsspec.transaction import Transaction
+from fsspec.transaction import (
+    COMMITTED,
+    UNKNOWN,
+    Transaction,
+    TransactionEntry,
+    TransactionReport,
+    _attach_report,
+)
 from fsspec.utils import infer_compression
 
 if TYPE_CHECKING:
@@ -74,14 +81,37 @@ class WriteCachedTransaction(Transaction):
     def complete(self, commit=True):
         if not commit:
             return super().complete(commit=False)
-        rpaths = [f.path for f in self.files]
-        lpaths = [f.fn for f in self.files]
-        if commit:
-            self.fs.put(lpaths, rpaths)
+
+        report = TransactionReport(requested="commit")
+        report.entries.extend(TransactionEntry.from_file(f) for f in self.files)
+        if self.files:
+            rpaths = [f.path for f in self.files]
+            lpaths = [f.fn for f in self.files]
+            try:
+                # One bulk upload: the backend reports no per-file outcome, so
+                # a failure leaves every file indeterminate rather than
+                # pretending the whole batch either landed or did not. The
+                # local copies are deliberately kept as a retry source.
+                self.fs.put(lpaths, rpaths)
+            except BaseException as e:
+                report.error = e
+                for entry in report.entries:
+                    entry.status = UNKNOWN
+            else:
+                for entry in report.entries:
+                    entry.status = COMMITTED
+        else:
+            for entry in report.entries:
+                entry.status = COMMITTED
+        self.report = report
         self.files.clear()
         self.fs._intrans = False
         self.fs._transaction = None
         self.fs = None  # break cycle
+        if report.error is not None:
+            _attach_report(report.error, report)
+            raise report.error
+        return report
 
 
 class CachingFileSystem(ChainedFileSystem):

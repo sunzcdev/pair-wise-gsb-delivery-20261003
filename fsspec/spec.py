@@ -353,13 +353,27 @@ class AbstractFileSystem(metaclass=_Cached):
         return self.transaction
 
     def end_transaction(self):
-        """Finish write transaction, non-context version"""
-        self.transaction.complete()
-        self._transaction = None
-        # The invalid cache must be cleared after the transaction is completed.
-        for path in self._invalidated_caches_in_transaction:
-            self.invalidate_cache(path)
-        self._invalidated_caches_in_transaction.clear()
+        """Finish write transaction, non-context version
+
+        Returns the transaction's per-file report (see
+        :class:`fsspec.transaction.TransactionReport`). If a commit fails, the
+        original exception is re-raised after the filesystem has left
+        deferred-write mode and caches have been invalidated, so callers can
+        inspect the report and retry whatever is still legitimate.
+        """
+        report = None
+        try:
+            report = self.transaction.complete()
+        finally:
+            self._transaction = None
+            # The invalid cache must be cleared after the transaction is
+            # completed, even when a commit or discard raised: otherwise the
+            # listings would keep hiding a write that did reach the backend.
+            invalidated = list(self._invalidated_caches_in_transaction)
+            self._invalidated_caches_in_transaction.clear()
+            for path in invalidated:
+                self.invalidate_cache(path)
+        return report
 
     def invalidate_cache(self, path=None):
         """
