@@ -63,6 +63,7 @@ Gem::Specification.new do |s|
     "lib/rake/file_task.rb",
     "lib/rake/file_utils.rb",
     "lib/rake/file_utils_ext.rb",
+    "lib/rake/fingerprint_manifest.rb",
     "lib/rake/invocation_chain.rb",
     "lib/rake/invocation_exception_mixin.rb",
     "lib/rake/late_time.rb",

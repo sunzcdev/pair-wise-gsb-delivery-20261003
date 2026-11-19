@@ -10,6 +10,8 @@ module Rake
     attr_accessor :backtrace
     attr_accessor :build_all
     attr_accessor :dryrun
+    attr_accessor :fingerprint
+    attr_accessor :fingerprint_manifest
     attr_accessor :ignore_deprecate
     attr_accessor :ignore_system
     attr_accessor :job_stats

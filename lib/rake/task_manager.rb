@@ -21,6 +21,7 @@ module Rake
     end
 
     def define_task(task_class, *args, &block) # :nodoc:
+      fingerprint, has_fingerprint = extract_fingerprint_option(task_class, args)
       task_name, arg_names, deps, order_only = resolve_args(args)
 
       original_scope = @scope
@@ -39,10 +40,41 @@ module Rake
       end
       task.enhance(Task.format_deps(deps), &block)
       task | order_only unless order_only.nil?
+      task.configure_fingerprint(fingerprint) if has_fingerprint
       task
     ensure
       @scope = original_scope
     end
+
+    # Pull the fingerprint option out of the trailing options hash so the
+    # regular dependency parsing is unaffected.  Only file based tasks
+    # accept it.  Returns [value, true] when the option was given, or
+    # [nil, false] when it was absent.
+    def extract_fingerprint_option(task_class, args) # :nodoc:
+      return [nil, false] unless task_class.ancestors.include?(Rake::FileTask)
+      options = args.last
+      return [nil, false] unless options.is_a?(Hash)
+      return [nil, false] unless options.key?(:fingerprint)
+
+      value = options[:fingerprint]
+      # `file fingerprint: [:dep]` (and similar) declares a task literally
+      # named "fingerprint"; only a boolean, nil or Hash value is an option.
+      return [nil, false] unless
+        value.nil? || value == true || value == false || value.is_a?(Hash)
+      # Likewise a hash that only holds the :fingerprint key and no task
+      # name describes a task named "fingerprint", not an option.
+      return [nil, false] if options.size == 1 && args.size == 1
+
+      remaining = options.dup
+      remaining.delete(:fingerprint)
+      if remaining.empty?
+        args.pop
+      else
+        args[-1] = remaining
+      end
+      [value, true]
+    end
+    private :extract_fingerprint_option
 
     # Lookup a task.  Return an existing task if found, otherwise
     # create a task of the current type.

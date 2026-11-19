@@ -73,6 +73,17 @@ module Rake
     #     end
     #  end
     #
+    # The optional +fingerprint:+ option switches this task from timestamp
+    # based freshness to content fingerprints (see the "Content Fingerprints"
+    # section of the Rakefile documentation):
+    #
+    #   file "app.o" => ["app.c"], fingerprint: { parameters: { cc: "gcc" } } do |t|
+    #     sh "gcc", "-c", "-o", t.name, t.source
+    #   end
+    #
+    # It accepts +true+, +false+ or a Hash with +:inputs+, +:parameters+ and
+    # +:manifest+ keys.
+    #
     def file(*args, &block) # :doc:
       Rake::FileTask.define_task(*args, &block)
     end

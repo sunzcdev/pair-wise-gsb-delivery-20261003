@@ -20,6 +20,15 @@ module Rake
     def timestamp
       Rake::EARLY
     end
+
+    # Creation tasks only ask whether the file exists, so they never
+    # participate in content fingerprinting.  Set an explicit mode on the
+    # task to override this.
+    def fingerprint_mode?
+      return @fingerprint_mode unless @fingerprint_mode.nil?
+
+      false
+    end
   end
 
 end

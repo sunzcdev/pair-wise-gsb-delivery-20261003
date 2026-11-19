@@ -81,6 +81,14 @@ is on.
 Trace the rules resolution.
 .It Fl n , Fl -dry-run
 Do a dry run without executing actions.
+.It Fl -fingerprint
+Use content fingerprints instead of timestamps for file tasks.
+.It Fl -no-fingerprint
+Use timestamps for file tasks, unless a task enabled fingerprints
+explicitly.
+.It Fl -fingerprint-manifest Ar file
+Store file task fingerprints in
+.Ar file .
 .It Fl T , Fl -tasks Op Ar pattern
 Display the tasks (matching optional
 .Ar pattern )

@@ -1,3 +1,11 @@
+=== Unreleased
+
+* Added opt-in content fingerprint mode for file tasks.  A reusable manifest
+  records the digest of the declared inputs, the digest of the build
+  parameters and the identity of the successful output, so a same timestamp
+  content replacement is detected.  Timestamp mode remains the default and
+  can still be requested per task.
+
 === 13.2.1
 
 * Suppressed "internal:array:52:in 'Array#each'" from backtrace by @hsbt in #554

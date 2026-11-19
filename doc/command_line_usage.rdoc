@@ -35,6 +35,19 @@ Options are:
     Do a dry run.  Print the tasks invoked and executed, but do not
     actually execute any of the actions.
 
+[<tt>--fingerprint</tt>]
+    Use content fingerprints instead of timestamps to decide whether file
+    tasks are up to date.  See the "Content Fingerprints" section of the
+    Rakefile format documentation.
+
+[<tt>--no-fingerprint</tt>]
+    Use timestamps for file tasks, unless a task enabled fingerprints
+    explicitly with <tt>fingerprint: true</tt>.
+
+[<tt>--fingerprint-manifest</tt> _file_]
+    Store file task fingerprints in _file_ instead of the default
+    <tt>.rake_fingerprint.json</tt>.
+
 [<tt>--execute</tt> _code_ (-e)]
     Execute some Ruby code and exit.
 

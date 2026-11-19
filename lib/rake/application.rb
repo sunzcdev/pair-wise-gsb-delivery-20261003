@@ -474,6 +474,24 @@ module Rake
               options.trace = true
             }
           ],
+          ["--fingerprint",
+            "Use content fingerprints instead of timestamps for file tasks.",
+            lambda { |value|
+              options.fingerprint = true
+            }
+          ],
+          ["--no-fingerprint",
+            "Use timestamps for file tasks, unless a task enabled fingerprints explicitly.",
+            lambda { |value|
+              options.fingerprint = false
+            }
+          ],
+          ["--fingerprint-manifest=FILE",
+            "Store file task fingerprints in FILE.",
+            lambda { |value|
+              options.fingerprint_manifest = value
+            }
+          ],
           ["--execute", "-e CODE",
             "Execute some Ruby code and exit.",
             lambda { |value|
@@ -825,6 +843,8 @@ module Rake
       options.backtrace                  = false
       options.build_all                  = false
       options.dryrun                     = false
+      options.fingerprint                = nil
+      options.fingerprint_manifest       = nil
       options.ignore_deprecate           = false
       options.ignore_system              = false
       options.job_stats                  = false

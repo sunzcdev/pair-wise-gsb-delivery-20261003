@@ -124,6 +124,61 @@ both prerequisites and actions can be added later.  For example ...
     cp Dir["standard_data/*.data"], "testdata"
   end
 
+== Content Fingerprints
+
+By default a file task is up to date when its output is newer than all of
+its prerequisites.  Time stamps alone cannot see a replacement that keeps
+the modification time, so a file that was rewritten (or restored from an
+archive) at the same instant looks unchanged.
+
+A file task can opt into content fingerprint mode instead.  Rake then
+records a small manifest entry with the SHA-256 digest of the declared
+inputs, the digest of the declared build parameters and the identity of
+the output that was actually produced.  On the next run the task is needed
+only when
+
+* there is no successful entry in the manifest,
+* a declared input (or a previously recorded one) disappeared,
+* a declared input has different content,
+* the build parameters changed, or
+* the output no longer matches the recorded output identity.
+
+  file "app.o" => ["app.c", "app.h"],
+       fingerprint: { parameters: { cc: ENV["CC"], flags: "-O2" } } do |t|
+    sh ENV["CC"], "-O2", "-c", "-o", t.name, t.source
+  end
+
+Because a matching fingerprint wins over time stamps, a source whose
+content changed without a new time stamp still triggers a rebuild.  Time
+stamp mode remains the default.  It can be selected for the whole
+application with <tt>--fingerprint</tt> (or <tt>Rake::FileTask.fingerprint_mode
+= true</tt>) and disabled again for a single task with
+<tt>fingerprint: false</tt>.
+
+The <tt>fingerprint:</tt> option accepts:
+
+[<tt>true</tt>]              enable fingerprint mode for this task.
+[<tt>false</tt>]             keep time stamp mode for this task.
+[<tt>inputs:</tt>]           the paths to digest.  Defaults to the file
+                             prerequisites of the task; plain task
+                             prerequisites and directories are ignored.
+[<tt>parameters:</tt>]       a Hash (or a Proc returning one) of build
+                             parameters such as compiler flags or a
+                             release channel.
+[<tt>manifest:</tt>]         the manifest file to use.  Defaults to
+                             <tt>.rake_fingerprint.json</tt>, overridable
+                             with <tt>--fingerprint-manifest</tt> or
+                             <tt>Rake::FileTask.fingerprint_manifest_path</tt>.
+
+Only paths declared by the task are digested.  Rake never scans a
+directory or the workspace, and it stores only digests: parameter values,
+which often come from the environment, are normalized and hashed, so
+secrets are not written to the manifest.  A failed action never records a
+successful fingerprint, and the previous success entry is dropped before
+the rebuild starts.  A dry run records nothing.  When a task has no
+declared inputs, the manifest is the only source of truth, so removing it
+forces a rebuild.
+
 == Tasks with Parallel Prerequisites
 
 Rake allows parallel execution of prerequisites using the following syntax:
