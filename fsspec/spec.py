@@ -368,8 +368,10 @@ class AbstractFileSystem(metaclass=_Cached):
         Parameters
         ----------
         path: string or None
-            If None, clear all listings cached else listings at or under given
-            path.
+            If None, clear all listings cached; else the listings at or
+            under the given path, and the listings of the directories
+            containing it (its ancestor chain), since their contents may
+            have changed too.
         """
         # Not necessary to implement invalidation mechanism, may have no cache.
         # But if have, you should call this method of parent class from your
@@ -377,6 +379,17 @@ class AbstractFileSystem(metaclass=_Cached):
         # See the implementation of FTPFileSystem in ftp.py
         if self._intrans:
             self._invalidated_caches_in_transaction.append(path)
+            return
+        if path is None:
+            self.dircache.clear()
+            return
+        # The filesystem's own path handling provides the canonical
+        # identity (root marker, trailing separators, backend-specific
+        # spellings) used to decide which cached listings are affected.
+        self.dircache.invalidate_subtree(path, canonicalize=self._strip_protocol)
+        self.dircache.invalidate_ancestors(
+            path, canonicalize=self._strip_protocol, parent=self._parent
+        )
 
     def mkdir(self, path, create_parents=True, **kwargs):
         """
@@ -1393,6 +1406,12 @@ class AbstractFileSystem(metaclass=_Cached):
                         self.rmdir(p)
             else:
                 self.rm(path1, recursive=recursive)
+            # A move changes the listings of the directories containing
+            # the source and of those containing the destination, so the
+            # ancestor chains on both sides are invalidated.
+            for moved in (path1, path2):
+                for p in moved if isinstance(moved, list) else [moved]:
+                    self.invalidate_cache(p)
 
     def rm_file(self, path):
         """Delete a file"""

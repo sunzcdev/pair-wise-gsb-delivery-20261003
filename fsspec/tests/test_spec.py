@@ -734,6 +734,97 @@ def test_find_file():
     assert test_fs.find(filename, detail=True) == {filename: {}}
 
 
+def test_invalidate_cache_drops_subtree_and_ancestors():
+    test_fs = DummyTestFS(skip_instance_cache=True)
+    test_fs.ls("top_level")
+    test_fs.ls("top_level/second_level")
+    test_fs.ls("misc")
+    # a directory whose name merely shares a string prefix with one of the
+    # invalidated paths must not be caught by the invalidation
+    test_fs.dircache["top_level2"] = []
+
+    test_fs.invalidate_cache("top_level/second_level/date=2019-10-01")
+
+    # the ancestor chain of the changed path is dropped...
+    assert "top_level/second_level" not in test_fs.dircache
+    assert "top_level" not in test_fs.dircache
+    # ...while unrelated listings survive
+    assert "misc" in test_fs.dircache
+    assert "top_level2" in test_fs.dircache
+
+
+def test_invalidate_cache_drops_whole_subtree():
+    test_fs = DummyTestFS(skip_instance_cache=True)
+    test_fs.ls("top_level")
+    test_fs.dircache["top_level/second_level"] = []
+    test_fs.dircache["top_level/second_level/date=2019-10-01"] = []
+    test_fs.ls("misc")
+
+    test_fs.invalidate_cache("top_level")
+
+    assert "top_level" not in test_fs.dircache
+    assert "top_level/second_level" not in test_fs.dircache
+    assert "top_level/second_level/date=2019-10-01" not in test_fs.dircache
+    assert "misc" in test_fs.dircache
+
+
+def test_invalidate_cache_none_clears_all():
+    test_fs = DummyTestFS(skip_instance_cache=True)
+    test_fs.ls("top_level")
+    test_fs.ls("misc")
+
+    test_fs.invalidate_cache(None)
+
+    assert len(test_fs.dircache) == 0
+
+
+def test_invalidate_cache_deferred_until_transaction_ends():
+    test_fs = DummyTestFS(skip_instance_cache=True)
+    test_fs.ls("top_level")
+
+    test_fs.start_transaction()
+    test_fs.invalidate_cache("top_level")
+    # still cached: invalidation is deferred while the transaction runs
+    assert "top_level" in test_fs.dircache
+
+    test_fs.end_transaction()
+    assert "top_level" not in test_fs.dircache
+
+
+def test_mv_invalidates_ancestors_on_both_sides():
+    fs = fsspec.filesystem("memory")
+    fs.touch("/mv_src/file")
+    fs.makedirs("/mv_dst", exist_ok=True)
+    fs.dircache["/mv_src"] = [{"name": "/mv_src/file", "type": "file", "size": 0}]
+    fs.dircache["/mv_dst"] = []
+    # shares a string prefix with "/mv_src" but is not beneath it
+    fs.dircache["/mv_src2"] = []
+
+    fs.mv("/mv_src/file", "/mv_dst/file")
+
+    assert fs.isfile("/mv_dst/file")
+    assert "/mv_src" not in fs.dircache
+    assert "/mv_dst" not in fs.dircache
+    assert "/mv_src2" in fs.dircache
+
+
+def test_mv_directory_invalidates_source_subtree():
+    fs = fsspec.filesystem("memory")
+    fs.makedirs("/mvdir/sub", exist_ok=True)
+    fs.touch("/mvdir/sub/f")
+    fs.dircache["/mvdir"] = []
+    fs.dircache["/mvdir/sub"] = []
+    fs.dircache["/"] = []
+
+    fs.mv("/mvdir", "/mvdir2", recursive=True)
+
+    assert fs.isfile("/mvdir2/sub/f")
+    assert "/mvdir" not in fs.dircache
+    assert "/mvdir/sub" not in fs.dircache
+    # the root listing is an ancestor of both source and destination
+    assert "/" not in fs.dircache
+
+
 def test_cache():
     fs = DummyTestFS()
     fs2 = DummyTestFS()

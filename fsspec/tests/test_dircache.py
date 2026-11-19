@@ -110,3 +110,128 @@ def test_dircache_pickle_roundtrip():
     assert dc2.use_listings_cache is True
     assert dc2.listings_expiry_time == 10
     assert dc2.max_paths == 5
+
+
+def test_dircache_invalidate_directory_removes_only_that_listing():
+    dc = DirCache()
+    dc["/a"] = ["/a/f"]
+    dc["/a/b"] = ["/a/b/f"]
+    dc["/a/b/c"] = []
+
+    dc.invalidate_directory("/a/b")
+
+    assert list(dc) == ["/a", "/a/b/c"]
+
+
+def test_dircache_invalidate_subtree_respects_name_boundaries():
+    dc = DirCache()
+    for key in ["/a", "/a/b", "/a/b/c", "/a/bc", "/a/bc/d", "/other"]:
+        dc[key] = []
+
+    dc.invalidate_subtree("/a/b")
+
+    # "/a/bc" shares a string prefix with "/a/b" but is not beneath it
+    assert sorted(dc) == ["/a", "/a/bc", "/a/bc/d", "/other"]
+
+
+@pytest.mark.parametrize("root", ["", "/"])
+def test_dircache_invalidate_subtree_root_clears_everything(root):
+    dc = DirCache()
+    dc[""] = []
+    dc["/a"] = []
+    dc["a/b"] = []
+
+    dc.invalidate_subtree(root)
+
+    assert len(dc) == 0
+
+
+def test_dircache_invalidate_subtree_trailing_separator():
+    dc = DirCache()
+    dc["/a"] = []
+    dc["/a/b"] = []
+
+    dc.invalidate_subtree("/a/")
+
+    assert len(dc) == 0
+
+
+def test_dircache_invalidate_with_backend_canonicalize():
+    dc = DirCache()
+    dc["bucket/a"] = []
+    dc["bucket/a/b"] = []
+    dc["bucket/ab"] = []
+
+    def canonicalize(path):
+        # backend-specific identity: protocol and trailing separators
+        return path.removeprefix("s3://").rstrip("/")
+
+    dc.invalidate_subtree("s3://bucket/a/", canonicalize=canonicalize)
+
+    assert list(dc) == ["bucket/ab"]
+
+
+def test_dircache_invalidate_ancestors_walks_chain_to_root():
+    dc = DirCache()
+    for key in ["", "a", "a/b", "a/b/c", "a/b/c/d", "a/other"]:
+        dc[key] = []
+
+    dc.invalidate_ancestors("a/b/c/d")
+
+    # the whole containing chain is gone; the path's own listing and
+    # unrelated listings stay
+    assert sorted(dc) == ["a/b/c/d", "a/other"]
+
+
+def test_dircache_invalidate_ancestors_custom_parent_stops_at_fixed_point():
+    dc = DirCache()
+    dc["/"] = []
+    dc["/a"] = []
+    dc["/a/b"] = []
+
+    def parent(path):
+        # like AbstractFileSystem._parent with root_marker="/": "/" is
+        # its own parent, so the walk must terminate rather than spin
+        return path.rsplit("/", 1)[0] or "/"
+
+    dc.invalidate_ancestors("/a/b/f", parent=parent)
+
+    assert len(dc) == 0
+
+
+def test_dircache_invalidate_purges_expired_entries():
+    dc = DirCache(listings_expiry_time=0.05)
+    dc["old"] = []
+    time.sleep(0.08)
+    dc["new"] = []
+
+    dc.invalidate_subtree("unrelated")
+
+    # the expired entry was dropped by the invalidation pass, not kept alive
+    assert "old" not in dc._cache
+    assert "old" not in dc._times
+    assert "new" in dc
+
+
+def test_dircache_read_does_not_mutate_caller_list():
+    dc = DirCache()
+    original = [{"name": "a/f"}]
+    dc["a"] = original
+
+    # a reader mutating what it got back must not change the caller's list
+    out = dc["a"]
+    out.append({"name": "a/g"})
+    out.reverse()
+
+    assert original == [{"name": "a/f"}]
+
+
+def test_dircache_caller_mutation_does_not_corrupt_cache():
+    dc = DirCache()
+    original = [{"name": "a/f"}]
+    dc["a"] = original
+
+    # the caller mutating its own list later must not change the cache
+    original.append({"name": "a/h"})
+
+    assert dc["a"] == [{"name": "a/f"}]
