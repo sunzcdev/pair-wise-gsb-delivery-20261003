@@ -1,6 +1,27 @@
 ## Changes between 2.10.0 and 2.11.0 (unreleased)
 
-No changes yet.
+### Exact BigDecimal Encoding Mode for Table Fields
+
+`AMQ::Protocol::TableValueEncoder` now supports an explicit exact encoding
+mode for `BigDecimal` field values:
+
+``` ruby
+AMQ::Protocol::TableValueEncoder.big_decimal_mode = :exact
+```
+
+In exact mode, values are encoded as a (scale, integer coefficient) pair
+exactly as defined by the protocol, and values that cannot be represented
+losslessly are rejected with an `ArgumentError` instead of being silently
+rounded or truncated. This covers non-finite values (`Infinity`, `-Infinity`,
+`NaN`), scales that do not fit into the protocol octet (above 255), and
+coefficients outside the signed 32-bit range.
+
+The mode applies uniformly to nested field tables and arrays, and
+`field_value_size` now matches the actual encoded size of decimal fields.
+The decoder interprets the coefficient as a signed 32-bit integer, consistent
+with the encoder, so negative decimals round-trip correctly.
+
+The default mode remains `:legacy`, which preserves the historical behavior.
 
 
 ## Changes between 2.9.0 and 2.10.0 (Nov 2, 2026)

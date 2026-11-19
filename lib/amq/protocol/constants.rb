@@ -18,6 +18,7 @@ module AMQ
     PACK_INT64              = 'q'.freeze
     PACK_INT64_BE           = 'q>'.freeze
     PACK_UCHAR_UINT32       = 'CN'.freeze
+    PACK_UCHAR_INT32_BE     = 'Cl>'.freeze
     PACK_CHAR_UINT16_UINT32 = 'cnN'.freeze
 
     PACK_32BIT_FLOAT        = 'f'.freeze

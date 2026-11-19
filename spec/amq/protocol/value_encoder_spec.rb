@@ -152,6 +152,110 @@ module AMQ
         expect(encoded).to start_with("D")
       end
 
+      it "calculates size of BigDecimal field values consistently with encoding" do
+        bd = BigDecimal("123.45")
+        expect(described_class.field_value_size(bd)).to eq(6)
+        expect(described_class.encode(bd).bytesize).to eq(6)
+      end
+
+      describe "BigDecimal encoding modes" do
+        after(:each) do
+          described_class.big_decimal_mode = :legacy
+        end
+
+        it "defaults to the legacy mode for backwards compatibility" do
+          expect(described_class.big_decimal_mode).to eq(:legacy)
+        end
+
+        it "rejects unknown modes" do
+          expect { described_class.big_decimal_mode = :bogus }.to raise_error(ArgumentError, /unknown BigDecimal encoding mode/)
+        end
+
+        context "in legacy mode" do
+          it "keeps the historical wire representation" do
+            expect(described_class.encode(BigDecimal("1.0"))).to eq("D\x00\x00\x00\x00\x01".b)
+            expect(described_class.encode(BigDecimal("5E-3"))).to eq("D\x03\x00\x00\x00\x05".b)
+          end
+        end
+
+        context "in exact mode" do
+          before(:each) do
+            described_class.big_decimal_mode = :exact
+          end
+
+          it "encodes scale and integer coefficient per the protocol" do
+            expect(described_class.encode(BigDecimal("123.45"))).to eq("D".b + "\x02".b + [12345].pack("l>"))
+          end
+
+          it "encodes negative values with a signed coefficient" do
+            expect(described_class.encode(BigDecimal("-123.45"))).to eq("D".b + "\x02".b + [-12345].pack("l>"))
+          end
+
+          it "encodes values in scientific notation" do
+            expect(described_class.encode(BigDecimal("5E-3"))).to eq("D".b + "\x03".b + [5].pack("l>"))
+            expect(described_class.encode(BigDecimal("1E+3"))).to eq("D".b + "\x00".b + [1000].pack("l>"))
+          end
+
+          it "encodes zero canonically" do
+            expect(described_class.encode(BigDecimal("0"))).to eq("D".b + "\x00".b + [0].pack("l>"))
+            expect(described_class.encode(BigDecimal("-0"))).to eq("D".b + "\x00".b + [0].pack("l>"))
+          end
+
+          it "accepts coefficient boundary values" do
+            expect(described_class.encode(BigDecimal("2147483647"))).to eq("D".b + "\x00".b + [2**31 - 1].pack("l>"))
+            expect(described_class.encode(BigDecimal("-2147483648"))).to eq("D".b + "\x00".b + [-2**31].pack("l>"))
+          end
+
+          it "rejects coefficients outside the signed 32-bit range" do
+            expect { described_class.encode(BigDecimal("2147483648")) }.to raise_error(ArgumentError, /coefficient/)
+            expect { described_class.encode(BigDecimal("-2147483649")) }.to raise_error(ArgumentError, /coefficient/)
+          end
+
+          it "rejects scales that do not fit into an octet" do
+            expect { described_class.encode(BigDecimal("1E-256")) }.to raise_error(ArgumentError, /scale/)
+          end
+
+          it "accepts the maximum representable scale" do
+            encoded = described_class.encode(BigDecimal("1E-255"))
+            expect(encoded.bytesize).to eq(6)
+            expect(encoded.getbyte(1)).to eq(255)
+          end
+
+          it "rejects non-finite values instead of emitting a payload" do
+            expect { described_class.encode(BigDecimal("Infinity")) }.to raise_error(ArgumentError, /non-finite/)
+            expect { described_class.encode(BigDecimal("-Infinity")) }.to raise_error(ArgumentError, /non-finite/)
+            expect { described_class.encode(BigDecimal("NaN")) }.to raise_error(ArgumentError, /non-finite/)
+          end
+
+          it "round-trips numeric values (not their textual form)" do
+            ["123.45", "-123.45", "0", "5E-3", "1E+3", "100", "0.1", "1.00"].each do |s|
+              decoded, _ = TableValueDecoder.decode_big_decimal(described_class.encode(BigDecimal(s))[1..-1], 0)
+              expect(decoded).to eq(BigDecimal(s))
+            end
+          end
+
+          it "keeps field_value_size consistent with the encoded size" do
+            bd = BigDecimal("123.45")
+            expect(described_class.field_value_size(bd)).to eq(described_class.encode(bd).bytesize)
+          end
+
+          it "applies the same implementation to nested tables and arrays" do
+            input = {
+              "price"  => BigDecimal("-9.99"),
+              "nested" => { "d" => BigDecimal("5E-3") },
+              "arr"    => [BigDecimal("1.5"), BigDecimal("-2.25")]
+            }
+            expect(Table.decode(Table.encode(input))).to eq(input)
+          end
+
+          it "rejects non-finite values nested in tables and arrays" do
+            expect { Table.encode({ "bad" => BigDecimal("NaN") }) }.to raise_error(ArgumentError, /non-finite/)
+            expect { Table.encode({ "bad" => [BigDecimal("Infinity")] }) }.to raise_error(ArgumentError, /non-finite/)
+          end
+        end
+      end
+
+
       it "raises ArgumentError for unsupported types" do
         expect { described_class.encode(Object.new) }.to raise_error(ArgumentError)
       end

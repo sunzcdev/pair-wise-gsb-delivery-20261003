@@ -23,6 +23,7 @@ module AMQ
       PACK_FLOAT32     = 'f'.freeze  # single precision float (native endian, matches encoder)
       PACK_FLOAT64     = 'G'.freeze  # big-endian double precision float
       PACK_UCHAR_UINT32 = 'CN'.freeze
+      PACK_UCHAR_INT32_BE = 'Cl>'.freeze
 
       #
       # API
@@ -120,7 +121,9 @@ module AMQ
 
 
       def self.decode_big_decimal(data, offset)
-        decimals, raw = data.byteslice(offset, 5).unpack(PACK_UCHAR_UINT32)
+        # AMQP decimal is a scale octet followed by a signed 32-bit
+        # big-endian integer coefficient, matching the encoder.
+        decimals, raw = data.byteslice(offset, 5).unpack(PACK_UCHAR_INT32_BE)
         offset += 5
         v = BigDecimal(raw.to_s) * (BigDecimal(TEN) ** -decimals)
 

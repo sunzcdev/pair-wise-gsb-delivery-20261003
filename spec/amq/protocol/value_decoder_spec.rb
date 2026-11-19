@@ -169,6 +169,27 @@ module AMQ
           expect(value).to be_a(BigDecimal)
           expect(offset).to eq(5)
         end
+
+        it "interprets the coefficient as a signed 32-bit integer" do
+          data = "\x02".b + [-12345].pack("l>")
+          value, offset = described_class.decode_big_decimal(data, 0)
+          expect(value).to eq(BigDecimal("-123.45"))
+          expect(offset).to eq(5)
+        end
+
+        it "decodes zero scale and coefficient" do
+          data = "\x00".b + [0].pack("l>")
+          value, _offset = described_class.decode_big_decimal(data, 0)
+          expect(value).to eq(BigDecimal("0"))
+        end
+
+        it "decodes the coefficient boundary values" do
+          value, _ = described_class.decode_big_decimal("\x00".b + [2**31 - 1].pack("l>"), 0)
+          expect(value).to eq(BigDecimal("2147483647"))
+
+          value, _ = described_class.decode_big_decimal("\x00".b + [-2**31].pack("l>"), 0)
+          expect(value).to eq(BigDecimal("-2147483648"))
+        end
       end
 
       describe ".decode_hash" do
