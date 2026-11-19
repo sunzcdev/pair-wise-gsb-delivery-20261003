@@ -719,15 +719,33 @@ class Router:
         route_path = get_route_path(scope)
         if scope["type"] == "http" and self.redirect_slashes and route_path != "/":
             redirect_scope = dict(scope)
+            # The decoded "path" is used for route matching, while the raw,
+            # percent-encoded "raw_path" is used to build the redirect target,
+            # so that the original encoding is preserved on the wire.
+            raw_path: bytes | None = scope.get("raw_path")
             if route_path.endswith("/"):
                 redirect_scope["path"] = redirect_scope["path"].rstrip("/")
+                redirect_raw_path = None if raw_path is None else raw_path.rstrip(b"/")
             else:
                 redirect_scope["path"] = redirect_scope["path"] + "/"
+                redirect_raw_path = None if raw_path is None else raw_path + b"/"
 
             for route in self.routes:
                 match, child_scope = route.matches(redirect_scope)
                 if match is not Match.NONE:
-                    redirect_url = URL(scope=redirect_scope)
+                    url_scope = redirect_scope
+                    if redirect_raw_path is not None:
+                        try:
+                            # The raw path already includes any mount prefixes,
+                            # so it is used as-is, with only the trailing slash
+                            # adjusted above.
+                            redirect_path = redirect_raw_path.decode("ascii")
+                        except UnicodeDecodeError:
+                            pass
+                        else:
+                            url_scope = dict(redirect_scope)
+                            url_scope["path"] = redirect_path
+                    redirect_url = URL(scope=url_scope)
                     response = RedirectResponse(url=str(redirect_url))
                     await response(scope, receive, send)
                     return

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import functools
 import json
@@ -1264,3 +1265,112 @@ def test_host_routing_is_case_insensitive(test_client_factory: TestClientFactory
     response = test_client_factory(router).get("/", headers={"host": "Sub.example.ORG"})
     assert response.status_code == 200
     assert response.text == "sub"
+
+
+def redirect_ok(request: Request) -> PlainTextResponse:
+    return PlainTextResponse("OK")
+
+
+async def ws_ok(websocket: WebSocket) -> None:
+    await websocket.accept()
+    await websocket.send_text("ws-ok")
+    await websocket.close()
+
+
+double_mounted_app = Starlette(
+    routes=[
+        Mount(
+            "/api",
+            app=Starlette(
+                routes=[
+                    Mount(
+                        "/v1",
+                        routes=[
+                            Route("/my items/", redirect_ok),
+                            Route("/x/y/", redirect_ok),
+                            WebSocketRoute("/ws/", ws_ok),
+                        ],
+                    )
+                ]
+            ),
+        )
+    ]
+)
+
+
+def test_redirect_slashes_with_double_mount(test_client_factory: TestClientFactory) -> None:
+    client = test_client_factory(double_mounted_app)
+
+    response = client.get("/api/v1/my%20items", follow_redirects=False)
+    assert response.status_code == 307
+    # The mount prefixes are included exactly once.
+    assert response.headers["location"] == "http://testserver/api/v1/my%20items/"
+
+    # Following the redirect reaches the expected endpoint.
+    response = client.get("/api/v1/my%20items", follow_redirects=True)
+    assert response.status_code == 200
+    assert response.text == "OK"
+
+
+def test_redirect_slashes_preserves_percent_encoding_and_query_string(
+    test_client_factory: TestClientFactory,
+) -> None:
+    client = test_client_factory(double_mounted_app)
+
+    # An encoded slash must not be decoded into a path separator in the redirect target.
+    response = client.get("/api/v1/x%2Fy?a=b%20c&d=%2F", follow_redirects=False)
+    assert response.status_code == 307
+    assert response.headers["location"] == "http://testserver/api/v1/x%2Fy/?a=b%20c&d=%2F"
+
+    # Following the redirect still reaches the expected endpoint.
+    response = client.get("/api/v1/x%2Fy?a=b%20c&d=%2F", follow_redirects=True)
+    assert response.status_code == 200
+    assert response.text == "OK"
+
+
+def test_redirect_slashes_without_raw_path() -> None:
+    async def run_client() -> list[Message]:
+        scope: Scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/x/y",
+            # No "raw_path" in the scope: the router must fall back to the decoded path.
+            "query_string": b"a=1",
+            "headers": [(b"host", b"example.org")],
+            "scheme": "http",
+            "server": ("example.org", 80),
+        }
+        messages: list[Message] = []
+
+        async def receive() -> Message:
+            return {"type": "http.request", "body": b""}
+
+        async def send(message: Message) -> None:
+            messages.append(message)
+
+        app = Starlette(
+            routes=[Mount("/api", app=Starlette(routes=[Mount("/v1", routes=[Route("/x/y/", redirect_ok)])]))]
+        )
+        # Exhaust the lifespan-less app directly.
+        await app(scope, receive, send)
+        return messages
+
+    messages = asyncio.run(run_client())
+    start = next(message for message in messages if message["type"] == "http.response.start")
+    assert start["status"] == 307
+    headers = {key.decode(): value.decode() for key, value in start["headers"]}
+    assert headers["location"] == "http://example.org/api/v1/x/y/?a=1"
+
+
+def test_redirect_slashes_does_not_intercept_websockets(test_client_factory: TestClientFactory) -> None:
+    client = test_client_factory(double_mounted_app)
+
+    # The websocket endpoint on the same prefix works...
+    with client.websocket_connect("/api/v1/ws/") as websocket:
+        assert websocket.receive_text() == "ws-ok"
+
+    # ...and a websocket request missing the trailing slash is not handed
+    # an HTTP redirect, but is simply not found.
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/api/v1/ws"):
+            pass  # pragma: no cover
