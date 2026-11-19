@@ -1,6 +1,15 @@
 ## Changes between 2.10.0 and 2.11.0 (unreleased)
 
-No changes yet.
+### Standalone AMQP Semantic Checker
+
+`AMQ::Protocol::SemanticChecker` adds semantic validation of frames and
+framesets against the same method descriptions the encoder uses. It checks
+frame type, channel scope (connection methods on channel 0, channel-scoped
+methods on nonzero channels), content class and the allowed payload
+structure, instead of treating an in-range channel number as proof that a
+packet is sendable. Unknown methods and content classes stay in a
+reviewable unsupported state without running any processing callbacks, and
+violations report the original field location and the rule that failed
 
 
 ## Changes between 2.9.0 and 2.10.0 (Nov 2, 2026)
