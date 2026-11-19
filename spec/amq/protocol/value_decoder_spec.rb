@@ -243,10 +243,10 @@ module AMQ
           expect(result).to include(nil)
         end
 
-        it "raises ArgumentError for unsupported types" do
+        it "raises UnknownTypeError for unsupported types without guessing a length" do
           data = array_binary("?\x00\x00\x00")
           expect { described_class.decode_array(data, 1) }
-            .to raise_error(ArgumentError, /unsupported type/)
+            .to raise_error(Table::UnknownTypeError, /unknown field table type code/)
         end
       end
     end

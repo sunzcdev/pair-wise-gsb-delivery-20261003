@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "amq/protocol/type_constants"
+require "amq/protocol/table_codec"
 require "amq/protocol/table_value_encoder"
 require "amq/protocol/table_value_decoder"
 
@@ -29,7 +30,7 @@ module AMQ
       end
 
 
-      def self.encode(table)
+      def self.encode(table, codecs: CodecSet.build)
         buffer = +''
 
         table ||= {}
@@ -38,13 +39,8 @@ module AMQ
           key = key.to_s # it can be a symbol as well
           buffer << key.bytesize.chr << key
 
-          case value
-          when Hash
-            buffer << TYPE_HASH
-            buffer << self.encode(value)
-          else
-            buffer << TableValueEncoder.encode(value).force_encoding(buffer.encoding)
-          end
+          type, encoded_value = codecs.encode_value(value)
+          buffer << type << encoded_value.force_encoding(buffer.encoding)
         end
 
         [buffer.bytesize].pack(PACK_UINT32_BE) << buffer
@@ -53,68 +49,24 @@ module AMQ
 
 
 
-      def self.decode(data)
-        table        = {}
-        table_length = data.unpack1(PACK_UINT32_BE)
+      def self.decode(data, codecs: CodecSet.build)
+        decode_fields(data, 4, data.unpack1(PACK_UINT32_BE), codecs).first
+      end
 
-        return table if table_length.zero?
+      # Decodes one field table that begins at +offset+ in +data+, reading it in
+      # place so that nested tables and arrays share the same absolute offset
+      # space and the same frozen codec view as the enclosing table.
+      def self.decode_fields(data, offset, table_length, codecs)
+        table = {}
+        limit = offset + table_length
 
-        offset       = 4
-        while offset <= table_length
+        while offset < limit
           key, offset  = decode_table_key(data, offset)
           type, offset = TableValueDecoder.decode_value_type(data, offset)
-
-          table[key] = case type
-                       when TYPE_STRING
-                         v, offset = TableValueDecoder.decode_string(data, offset)
-                         v
-                       when TYPE_BYTE_ARRAY
-                         # Ruby doesn't have a direct counterpart to
-                         # ByteBuffer or byte[], so using a string feels
-                         # more appropriate than an array of fixnums
-                         v, offset = TableValueDecoder.decode_string(data, offset)
-                         v
-                       when TYPE_INTEGER
-                         v, offset = TableValueDecoder.decode_integer(data, offset)
-                         v
-                       when TYPE_DECIMAL
-                         v, offset = TableValueDecoder.decode_big_decimal(data, offset)
-                         v
-                       when TYPE_TIME
-                         v, offset = TableValueDecoder.decode_time(data, offset)
-                         v
-                       when TYPE_HASH
-                         v, offset = TableValueDecoder.decode_hash(data, offset)
-                         v
-                       when TYPE_BOOLEAN
-                         v, offset = TableValueDecoder.decode_boolean(data, offset)
-                         v
-                       when TYPE_BYTE
-                         v, offset = TableValueDecoder.decode_byte(data, offset)
-                         v
-                       when TYPE_SIGNED_16BIT
-                         v, offset = TableValueDecoder.decode_short(data, offset)
-                         v
-                       when TYPE_SIGNED_64BIT
-                         v, offset = TableValueDecoder.decode_long(data, offset)
-                         v
-                       when TYPE_32BIT_FLOAT
-                         v, offset = TableValueDecoder.decode_32bit_float(data, offset)
-                         v
-                       when TYPE_64BIT_FLOAT
-                         v, offset = TableValueDecoder.decode_64bit_float(data, offset)
-                         v
-                       when TYPE_VOID
-                         nil
-                       when TYPE_ARRAY
-                         v, offset = TableValueDecoder.decode_array(data, offset)
-                         v
-                       else
-                         raise ArgumentError, "Not a valid type: #{type.inspect}\nData: #{data.inspect}\nUnprocessed data: #{data[offset..-1].inspect}\nOffset: #{offset}\nTotal size: #{table_length}\nProcessed data: #{table.inspect}"
-                       end
+          table[key], offset = codecs.decode_value(data, offset, type, limit)
         end
 
-        table
+        [table, limit]
       end
 
 
@@ -123,11 +75,11 @@ module AMQ
       end
 
 
-      def self.hash_size(value)
+      def self.hash_size(value, codecs: CodecSet.build)
         acc = 0
         value.each do |k, v|
           acc += (1 + k.to_s.bytesize)
-          acc += TableValueEncoder.field_value_size(v)
+          acc += codecs.value_size(v)
         end
 
         acc

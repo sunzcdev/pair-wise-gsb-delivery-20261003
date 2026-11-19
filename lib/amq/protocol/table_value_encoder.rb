@@ -5,6 +5,7 @@ require "amq/protocol/type_constants"
 require "date"
 
 require "amq/protocol/float_32bit"
+require "amq/protocol/table_codec"
 
 module AMQ
   module Protocol
@@ -21,7 +22,7 @@ module AMQ
       # API
       #
 
-      def self.encode(value)
+      def self.encode(value, codecs = Table::CodecSet.build)
         accumulator = String.new
 
         case value
@@ -53,12 +54,15 @@ module AMQ
           accumulator << TYPE_VOID
         when Array then
           accumulator << TYPE_ARRAY
-          accumulator << [self.array_size(value)].pack(PACK_UINT32)
+          accumulator << [self.array_size(value, codecs)].pack(PACK_UINT32)
 
-          value.each { |v| accumulator << self.encode(v) }
+          value.each do |v|
+            type, encoded = codecs.encode_value(v)
+            accumulator << type << encoded
+          end
         when Hash then
           accumulator << TYPE_HASH
-          accumulator << AMQ::Protocol::Table.encode(value)
+          accumulator << Table.encode(value, codecs: codecs)
         else
           # We don't want to require these libraries.
           if defined?(BigDecimal) && value.is_a?(BigDecimal)
@@ -77,12 +81,15 @@ module AMQ
         end # case
 
         accumulator
-      end # self.encode(value)
+      end # self.encode(value, codecs)
 
 
 
 
-      def self.field_value_size(value)
+      def self.field_value_size(value, codecs = Table::CodecSet.build)
+        # Custom codecs own the length rule for values they claim.
+        return codecs.value_size(value) if codecs.custom_value?(value)
+
         # the type tag takes 1 byte
         acc = 1
 
@@ -100,21 +107,21 @@ module AMQ
         when nil then
           # nothing, type tag alone is enough
         when Hash then
-          acc += (4 + Table.hash_size(value))
+          acc += (4 + Table.hash_size(value, codecs: codecs))
         when Array then
-          acc += (4 + self.array_size(value))
+          acc += (4 + self.array_size(value, codecs))
         end
 
         acc
-      end # self.field_value_size(value)
+      end # self.field_value_size(value, codecs)
 
 
-      def self.array_size(value)
+      def self.array_size(value, codecs = Table::CodecSet.build)
         acc = 0
-        value.each { |v| acc += self.field_value_size(v) }
+        value.each { |v| acc += self.field_value_size(v, codecs) }
 
         acc
-      end # self.array_size(value)
+      end # self.array_size(value, codecs)
 
     end # TableValueEncoder
 

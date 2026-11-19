@@ -26,22 +26,22 @@ module AMQ
         end
 
         it "should serialize { :test => true }" do
-          expect(Table.encode(:test => true)).
+          expect(Table.encode({ :test => true })).
             to eql("\x00\x00\x00\a\x04testt\x01".force_encoding(Encoding::ASCII_8BIT))
         end
 
         it "should serialize { :test => false }" do
-          expect(Table.encode(:test => false)).
+          expect(Table.encode({ :test => false })).
             to eql("\x00\x00\x00\a\x04testt\x00".force_encoding(Encoding::ASCII_8BIT))
         end
 
         it "should serialize { :coordinates => { :latitude  => 59.35 } }" do
-          expect(Table.encode(:coordinates => { :latitude  => 59.35 })).
+          expect(Table.encode({ :coordinates => { :latitude  => 59.35 } })).
             to eql("\x00\x00\x00#\vcoordinatesF\x00\x00\x00\x12\blatituded@M\xAC\xCC\xCC\xCC\xCC\xCD".force_encoding(Encoding::ASCII_8BIT))
         end
 
         it "should serialize { :coordinates => { :longitude => 18.066667 } }" do
-          expect(Table.encode(:coordinates => { :longitude => 18.066667 })).
+          expect(Table.encode({ :coordinates => { :longitude => 18.066667 } })).
             to eql("\x00\x00\x00$\vcoordinatesF\x00\x00\x00\x13\tlongituded@2\x11\x11\x16\xA8\xB8\xF1".force_encoding(Encoding::ASCII_8BIT))
         end
 
@@ -211,10 +211,11 @@ module AMQ
           expect(result["k"]).to be_within(0.001).of(1.5)
         end
 
-        it "raises ArgumentError for unknown type bytes" do
-          # "\x03key" key + unknown type '?'
+        it "raises UnknownTypeError for unknown type bytes without skipping bytes" do
+          # "\x03key" key + unknown type '?' whose value length cannot be known
           binary = [5].pack("N") + "\x03key?"
-          expect { Table.decode(binary.force_encoding("BINARY")) }.to raise_error(ArgumentError, /Not a valid type/)
+          expect { Table.decode(binary.force_encoding("BINARY")) }
+            .to raise_error(Table::UnknownTypeError, /unknown field table type code/)
         end
 
         it "is capable of decoding tables" do

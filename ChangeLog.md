@@ -1,7 +1,26 @@
 ## Changes between 2.10.0 and 2.11.0 (unreleased)
 
-No changes yet.
+### Pluggable field table codecs
 
+`AMQ::Protocol::Table.encode`, `Table.decode` and `Table.hash_size` now accept
+an optional `codecs:` argument built with `Table::CodecSet.build`. A codec set
+freezes the type codes together with their decoding, encoding and length rules
+for the duration of one field table operation, and nested tables and arrays use
+the same frozen view
+
+- registering a plugin codec never mutates the global `TypeConstants` table or
+  any other session, since every call builds an explicit, frozen local set
+- a custom codec that reuses a type code already present in the set is rejected
+  up front with `Table::CodecConflictError`, before any bytes are read
+- an unknown type code whose value length cannot be determined stops decoding
+  with `Table::UnknownTypeError` instead of guessing how many bytes to skip
+- a custom decoder that reports a non-integer, backwards or out-of-bounds
+  offset, or fails to return a `[value, new_offset]` pair, raises
+  `Table::InvalidOffsetError`
+- a custom length rule that disagrees with the bytes the encoder produces
+  raises `Table::InvalidOffsetError`, keeping table framing consistent
+- built-in encoding and decoding behavior and the existing method entry points
+  are unchanged when no custom codecs are supplied
 
 ## Changes between 2.9.0 and 2.10.0 (Nov 2, 2026)
 
