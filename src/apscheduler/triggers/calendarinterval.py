@@ -6,7 +6,7 @@ from typing import Any
 import attrs
 from attr.validators import instance_of, optional
 
-from .._converters import as_aware_datetime, as_date, as_timezone
+from .._converters import as_date, as_timezone
 from .._utils import require_state_version, timezone_repr
 from ..abc import Trigger
 
@@ -30,7 +30,15 @@ class CalendarIntervalTrigger(Trigger):
     If the resulting datetime is invalid due to a daylight saving forward shift, the
     date is discarded and the process moves on to the next date. If instead the datetime
     is ambiguous due to a backward DST shift, the earlier of the two resulting datetimes
-    is used.
+    is used. This guarantees that each calendar date in the interval produces exactly
+    one fire time, so a trigger restored from a serialized state always continues with
+    the same sequence of fire times as an instance that was never serialized,
+    regardless of which side of a DST transition the state was saved on.
+
+    .. note:: The serialized state format is at version 2. Version 1 states are still
+        accepted; if the stored ``last_fire_date`` is a datetime (which older
+        versions could produce when restoring a state on a machine whose local time
+        zone differed from the trigger's), only its calendar date is used.
 
     If no previous run time is specified when requesting a new run time (like when
     starting for the first time or resuming after being paused), ``start_date`` is used
@@ -78,7 +86,7 @@ class CalendarIntervalTrigger(Trigger):
     )
     _time: time = attrs.field(init=False, eq=False)
     _last_fire_date: date | None = attrs.field(
-        init=False, eq=False, converter=as_aware_datetime, default=None
+        init=False, eq=False, converter=as_date, default=None
     )
 
     def __attrs_post_init__(self) -> None:
@@ -113,7 +121,10 @@ class CalendarIntervalTrigger(Trigger):
             if self.end_date and next_date > self.end_date:
                 return None
 
-            # Combine the date with the designated time and normalize the result
+            # Combine the date with the designated time and normalize the result.
+            # The combined datetime always has fold=0, so when the wall clock time
+            # is ambiguous due to a backward DST shift, the earlier of the two
+            # occurrences is used.
             timestamp = datetime.combine(next_date, self._time).timestamp()
             next_time = datetime.fromtimestamp(timestamp, self.timezone)
 
@@ -126,7 +137,7 @@ class CalendarIntervalTrigger(Trigger):
 
     def __getstate__(self) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
             "interval": [self.years, self.months, self.weeks, self.days],
             "time": [self._time.hour, self._time.minute, self._time.second],
             "start_date": self.start_date,
@@ -136,13 +147,21 @@ class CalendarIntervalTrigger(Trigger):
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        require_state_version(self, state, 1)
+        require_state_version(self, state, 2)
         self.years, self.months, self.weeks, self.days = state["interval"]
         self.start_date = state["start_date"]
         self.end_date = state["end_date"]
         self.timezone = state["timezone"]
         self._time = time(*state["time"], tzinfo=self.timezone)
-        self._last_fire_date = state["last_fire_date"]
+
+        last_fire_date = state["last_fire_date"]
+        if isinstance(last_fire_date, datetime):
+            # Version 1 states could contain a datetime here (a serialized date
+            # that the old converter localized to the deserializing machine's
+            # local time zone); only the calendar date is significant
+            last_fire_date = last_fire_date.date()
+
+        self._last_fire_date = last_fire_date
 
     def __repr__(self) -> str:
         fields = []

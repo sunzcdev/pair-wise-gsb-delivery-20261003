@@ -1,14 +1,41 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import attrs
 from attr.validators import instance_of, optional
 
-from .._converters import as_aware_datetime
+from .._converters import as_aware_datetime, as_datetime
+from .._exceptions import DeserializationError
 from .._utils import require_state_version
 from ..abc import Trigger
+
+
+def _require_aware_datetime(value: datetime | str, field_name: str) -> datetime:
+    """
+    Convert a serialized state value to an aware datetime.
+
+    Strings are parsed as ISO 8601. Naive datetimes are rejected because the
+    actual instant they denote cannot be determined unambiguously (the offset is
+    unknown, and during a backward DST shift the same wall clock reading occurs
+    twice).
+    """
+    value = as_datetime(value)
+    if not isinstance(value, datetime):
+        raise DeserializationError(
+            f"Cannot deserialize IntervalTrigger: the {field_name} value "
+            f"({value!r}) is not a date/time"
+        )
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise DeserializationError(
+            f"Cannot deserialize IntervalTrigger: the {field_name} value "
+            f"({value.isoformat()!r}) has no time zone information, so the "
+            f"corresponding instant cannot be determined unambiguously"
+        )
+
+    return value
 
 
 @attrs.define(kw_only=True)
@@ -21,6 +48,22 @@ class IntervalTrigger(Trigger):
     trigger time will be at or before that time. If no ``end_time`` has been given, the
     trigger will produce new trigger times as long as the resulting datetimes are valid
     datetimes in Python.
+
+    The interval is always measured in absolute time. This means that the interval
+    does not stretch or shrink across daylight saving time transitions: on a backward
+    shift (fold), where a wall clock reading occurs twice, each occurrence gets its
+    own fire time if the interval lands on it, and on a forward shift (gap), the fire
+    times keep their absolute cadence even though the local clock readings skip an
+    hour. As a consequence, a trigger restored from a serialized state always
+    continues with the same sequence of fire times (as instants) as an instance that
+    was never serialized, regardless of which side of a DST transition the state was
+    saved on.
+
+    .. note:: The serialized state format is at version 2. Version 1 states (where
+        the fire times were computed using wall clock arithmetic) are still
+        accepted; the stored ``last_fire_time`` is then interpreted as the actual
+        instant of the last fire, and subsequent fire times are computed in absolute
+        time.
 
     :param weeks: number of weeks to wait
     :param days: number of days to wait
@@ -72,18 +115,25 @@ class IntervalTrigger(Trigger):
 
     def next(self) -> datetime | None:
         if self._last_fire_time is None:
-            self._last_fire_time = self.start_time
+            next_fire_time = self.start_time
         else:
-            self._last_fire_time += self._interval
+            # Add the interval in absolute (UTC) time so that DST transitions
+            # neither stretch nor shrink the interval, and so that a wall clock
+            # reading repeated by a backward shift yields a separate fire time
+            # for each occurrence instead of skipping one
+            next_fire_time = (
+                self._last_fire_time.astimezone(UTC) + self._interval
+            ).astimezone(self._last_fire_time.tzinfo)
 
-        if self.end_time is None or self._last_fire_time <= self.end_time:
-            return self._last_fire_time
+        if self.end_time is None or next_fire_time <= self.end_time:
+            self._last_fire_time = next_fire_time
+            return next_fire_time
         else:
             return None
 
     def __getstate__(self) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
             "interval": [
                 self.weeks,
                 self.days,
@@ -98,7 +148,7 @@ class IntervalTrigger(Trigger):
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        require_state_version(self, state, 1)
+        require_state_version(self, state, 2)
         (
             self.weeks,
             self.days,
@@ -107,9 +157,17 @@ class IntervalTrigger(Trigger):
             self.seconds,
             self.microseconds,
         ) = state["interval"]
-        self.start_time = state["start_time"]
-        self.end_time = state["end_time"]
-        self._last_fire_time = state["last_fire_time"]
+        self.start_time = _require_aware_datetime(state["start_time"], "start_time")
+        self.end_time = (
+            _require_aware_datetime(state["end_time"], "end_time")
+            if state["end_time"] is not None
+            else None
+        )
+        self._last_fire_time = (
+            _require_aware_datetime(state["last_fire_time"], "last_fire_time")
+            if state["last_fire_time"] is not None
+            else None
+        )
         self._interval = timedelta(
             weeks=self.weeks,
             days=self.days,

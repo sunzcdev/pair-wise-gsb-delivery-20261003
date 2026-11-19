@@ -31,6 +31,14 @@ APScheduler, see the :doc:`migration section <migration>`.
   (`#1131 <https://github.com/agronholm/apscheduler/issues/1131>`_; PR by @afonsojanu)
 - Fixed ``CalendarIntervalTrigger`` skipping valid dates or shifting subsequent run dates
   when a nonexistent local time normalizes past midnight during a forward DST shift
+- Fixed ``IntervalTrigger`` producing diverging fire times (skipped or repeated runs,
+  and a shifted stopping point) when restored from a serialized state across a backward
+  DST shift; the interval is now always measured in absolute time, so each occurrence
+  of a repeated wall clock reading gets its own fire time
+  (old version 1 serialized states are still readable)
+- Fixed ``CalendarIntervalTrigger`` restoring its last fire date from a serialized
+  state as a datetime localized to the deserializing machine's local time zone instead
+  of a plain date (old version 1 serialized states are still readable)
 - Fixed ``CronTrigger`` raising an unhelpful ``IndexError`` instead of a descriptive
   ``ValueError`` when given a numeric ``day_of_week`` value outside the 0–7 range
   (`#1130 <https://github.com/agronholm/apscheduler/pull/1130>`_; PR by @nikolauspschuetz)
