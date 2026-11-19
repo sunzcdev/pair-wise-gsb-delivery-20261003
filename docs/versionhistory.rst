@@ -51,6 +51,11 @@ APScheduler, see the :doc:`migration section <migration>`.
   scheduler wake up past a deadline that had already passed and process schedules in a
   tight loop
   (`#1158 <https://github.com/agronholm/apscheduler/pull/1158>`_; PR by @feiiiiii5)
+- Fixed a job, schedule or task that fails serialization (for example, a job with an
+  unserializable value in its ``args``, ``kwargs`` or ``metadata``) now failing with a
+  ``SerializationError`` that names the offending field and the type of the
+  unserializable value (without revealing the value itself), while retaining the
+  original exception as its cause
 
 **4.0.0a6**
 

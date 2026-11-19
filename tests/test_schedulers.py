@@ -49,6 +49,7 @@ from apscheduler import (
     SchedulerStarted,
     SchedulerStopped,
     ScheduleUpdated,
+    SerializationError,
     Task,
     TaskAdded,
     TaskDefaults,
@@ -822,6 +823,33 @@ class TestAsyncScheduler:
 
             with pytest.raises(JobLookupError), fail_after(1):
                 await scheduler.get_job_result(job_id, wait=False)
+
+    async def test_add_job_serialization_error(
+        self, raw_datastore: DataStore
+    ) -> None:
+        if not isinstance(raw_datastore, BaseExternalDataStore):
+            pytest.skip("Only applicable to external data stores")
+
+        class Unserializable:
+            def __getstate__(self) -> Any:
+                raise ValueError("this object refuses to be serialized")
+
+            def __repr__(self) -> str:
+                return "<TOP SECRET VALUE>"
+
+        async with AsyncScheduler(data_store=raw_datastore) as scheduler:
+            with pytest.raises(SerializationError) as exc_info:
+                await scheduler.add_job(dummy_async_job, args=(Unserializable(),))
+
+            assert "args" in str(exc_info.value)
+            assert "Unserializable" in str(exc_info.value)
+            assert "TOP SECRET" not in str(exc_info.value)
+            assert exc_info.value.__cause__ is not None
+            assert await scheduler.get_jobs() == []
+
+            # A good job submitted right after the bad one is stored normally
+            job_id = await scheduler.add_job(dummy_async_job)
+            assert [job.id for job in await scheduler.get_jobs()] == [job_id]
 
     async def test_add_job_not_rewriting_task_config(
         self, raw_datastore: DataStore

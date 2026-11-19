@@ -11,6 +11,7 @@ from attrs.validators import and_, gt, instance_of, matches_re, min_len, optiona
 
 from ._converters import as_aware_datetime, as_enum, as_timedelta
 from ._enums import CoalescePolicy, JobOutcome
+from ._marshalling import marshal_field, marshal_metadata
 from ._utils import UnsetValue, unset
 from ._validators import if_not_unset, valid_metadata
 from .abc import Serializer, Trigger
@@ -65,7 +66,9 @@ class Task:
     running_jobs: int = attrs.field(default=0)
 
     def marshal(self, serializer: Serializer) -> dict[str, Any]:
-        return attrs.asdict(self, value_serializer=serialize)
+        marshalled = attrs.asdict(self, value_serializer=serialize)
+        marshalled["metadata"] = marshal_metadata("task", self.metadata)
+        return marshalled
 
     @classmethod
     def unmarshal(cls, serializer: Serializer, marshalled: dict[str, Any]) -> Task:
@@ -198,9 +201,14 @@ class Schedule:
 
     def marshal(self, serializer: Serializer) -> dict[str, Any]:
         marshalled = attrs.asdict(self, recurse=False, value_serializer=serialize)
-        marshalled["trigger"] = serializer.serialize(self.trigger)
-        marshalled["args"] = serializer.serialize(self.args)
-        marshalled["kwargs"] = serializer.serialize(self.kwargs)
+        marshalled["trigger"] = marshal_field(
+            serializer, "schedule", "trigger", self.trigger
+        )
+        marshalled["args"] = marshal_field(serializer, "schedule", "args", self.args)
+        marshalled["kwargs"] = marshal_field(
+            serializer, "schedule", "kwargs", self.kwargs
+        )
+        marshalled["metadata"] = marshal_metadata("schedule", self.metadata)
         if not self.acquired_by:
             del marshalled["acquired_by"]
             del marshalled["acquired_until"]
@@ -328,8 +336,9 @@ class Job:
 
     def marshal(self, serializer: Serializer) -> dict[str, Any]:
         marshalled = attrs.asdict(self, recurse=False, value_serializer=serialize)
-        marshalled["args"] = serializer.serialize(self.args)
-        marshalled["kwargs"] = serializer.serialize(self.kwargs)
+        marshalled["args"] = marshal_field(serializer, "job", "args", self.args)
+        marshalled["kwargs"] = marshal_field(serializer, "job", "kwargs", self.kwargs)
+        marshalled["metadata"] = marshal_metadata("job", self.metadata)
         if not self.acquired_by:
             del marshalled["acquired_by"]
             del marshalled["acquired_until"]

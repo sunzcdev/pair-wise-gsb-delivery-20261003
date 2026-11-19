@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import json
 import platform
 from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from logging import Logger
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock
 from urllib.parse import unquote
+from uuid import uuid4
 
 import anyio
 import pytest
@@ -27,6 +29,7 @@ from apscheduler import (
     ScheduleAdded,
     ScheduleRemoved,
     ScheduleUpdated,
+    SerializationError,
     Task,
     TaskAdded,
     TaskLookupError,
@@ -38,6 +41,8 @@ from apscheduler.datastores.base import BaseExternalDataStore
 from apscheduler.datastores.memory import MemoryDataStore
 from apscheduler.datastores.mongodb import MongoDBDataStore
 from apscheduler.datastores.sqlalchemy import SQLAlchemyDataStore
+from apscheduler.eventbrokers.local import LocalEventBroker
+from apscheduler.serializers.json import JSONSerializer
 from apscheduler.triggers.date import DateTrigger
 
 if TYPE_CHECKING:
@@ -897,6 +902,223 @@ async def test_acquire_jobs_deserialization_failure(
 
     # This should not yield any jobs
     assert await datastore.acquire_jobs("scheduler_id", timedelta(seconds=30), 1) == []
+
+
+class Unserializable:
+    """A value that no serializer can handle."""
+
+    def __getstate__(self) -> Any:
+        raise ValueError("this object refuses to be serialized")
+
+    def __repr__(self) -> str:
+        return "<TOP SECRET VALUE>"
+
+
+def make_bad_job(field: str) -> Job:
+    if field == "args":
+        return Job(task_id="task1", executor="async", args=(Unserializable(),))
+    elif field == "kwargs":
+        return Job(task_id="task1", executor="async", kwargs={"bad": Unserializable()})
+    else:
+        job = Job(task_id="task1", executor="async")
+        # Bypass the attrs validator to simulate data that was mutated after creation
+        job.metadata["bad"] = Unserializable()
+        return job
+
+
+@pytest.mark.parametrize("field", ["args", "kwargs", "metadata"])
+async def test_add_job_serialization_error(
+    datastore: DataStore, field: str
+) -> None:
+    if not isinstance(datastore, BaseExternalDataStore):
+        pytest.skip("Only applicable to external data stores")
+
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+
+    with pytest.raises(SerializationError) as exc_info:
+        await datastore.add_job(make_bad_job(field))
+
+    # The error should name the offending field and its type, but not the value itself
+    message = str(exc_info.value)
+    assert field in message
+    assert Unserializable.__qualname__ in message
+    assert "TOP SECRET" not in message
+    assert "this object refuses" not in message
+
+    # The original exception should be chained to the raised one
+    assert isinstance(exc_info.value.__cause__, Exception)
+
+
+async def test_add_task_serialization_error(datastore: DataStore) -> None:
+    if not isinstance(datastore, BaseExternalDataStore):
+        pytest.skip("Only applicable to external data stores")
+
+    task = Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    # Bypass the attrs validator to simulate data that was mutated after creation
+    task.metadata["bad"] = Unserializable()
+
+    with pytest.raises(SerializationError) as exc_info:
+        await datastore.add_task(task)
+
+    assert "metadata" in str(exc_info.value)
+    assert Unserializable.__qualname__ in str(exc_info.value)
+    assert "TOP SECRET" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is not None
+    assert await datastore.get_tasks() == []
+
+
+async def test_add_job_serialization_error_leaves_no_trace(
+    datastore: DataStore,
+) -> None:
+    if not isinstance(datastore, BaseExternalDataStore):
+        pytest.skip("Only applicable to external data stores")
+
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+
+    bad_job = make_bad_job("args")
+    with pytest.raises(SerializationError):
+        await datastore.add_job(bad_job)
+
+    # A valid job submitted right after the failed one must be stored and acquirable
+    good_job = Job(task_id="task1", executor="async")
+    await datastore.add_job(good_job)
+
+    assert [job.id for job in await datastore.get_jobs()] == [good_job.id]
+    assert not await datastore.get_jobs({bad_job.id})
+
+    acquired = await datastore.acquire_jobs("worker1", timedelta(seconds=30), 10)
+    assert [job.id for job in acquired] == [good_job.id]
+
+
+async def test_add_schedule_serialization_error(datastore: DataStore) -> None:
+    if not isinstance(datastore, BaseExternalDataStore):
+        pytest.skip("Only applicable to external data stores")
+
+    await datastore.add_task(
+        Task(id="task1", func="contextlib:asynccontextmanager", job_executor="async")
+    )
+    trigger = DateTrigger(datetime(2020, 9, 13, tzinfo=UTC))
+    schedule = Schedule(
+        id="s1",
+        task_id="task1",
+        job_executor="async",
+        trigger=trigger,
+        args=(Unserializable(),),
+    )
+
+    with pytest.raises(SerializationError) as exc_info:
+        await datastore.add_schedule(schedule, ConflictPolicy.exception)
+
+    assert "args" in str(exc_info.value)
+    assert Unserializable.__qualname__ in str(exc_info.value)
+    assert "TOP SECRET" not in str(exc_info.value)
+    assert not await datastore.get_schedules()
+
+
+async def test_external_serializer_and_storage_format(tmp_path: Path) -> None:
+    """An external serializer is still honored and the stored format is unchanged."""
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    serializer = JSONSerializer()
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/test.db")
+    datastore = SQLAlchemyDataStore(engine, serializer=serializer)
+    async with AsyncExitStack() as exit_stack:
+        await datastore.start(exit_stack, LocalEventBroker(), Logger("apscheduler"))
+        task = Task(
+            id="task1", func="contextlib:asynccontextmanager", job_executor="async"
+        )
+        await datastore.add_task(task)
+        job = Job(task_id="task1", executor="async", kwargs={"delay": 3})
+        await datastore.add_job(job)
+
+        # The job must round-trip through the external serializer
+        stored_jobs = await datastore.get_jobs()
+        assert [stored.id for stored in stored_jobs] == [job.id]
+        assert stored_jobs[0].kwargs == {"delay": 3}
+        acquired = await datastore.acquire_jobs("worker1", timedelta(seconds=30), 10)
+        assert [stored.id for stored in acquired] == [job.id]
+
+    await engine.dispose()
+
+    # The serialized payload uses the same layout as before (args/kwargs are blobs
+    # produced by the configured serializer), so previously written data still loads
+    sync_engine = create_engine(f"sqlite:///{tmp_path}/test.db")
+    try:
+        with sync_engine.connect() as conn:
+            args, kwargs, metadata = conn.execute(
+                text("SELECT args, kwargs, metadata FROM jobs")
+            ).one()
+        assert args == serializer.serialize(())
+        assert kwargs == serializer.serialize({"delay": 3})
+        assert json.loads(metadata) == {}
+    finally:
+        sync_engine.dispose()
+
+
+async def test_legacy_json_data_still_readable(tmp_path: Path) -> None:
+    """Data written by an older version with the JSON serializer must still load."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    serializer = JSONSerializer()
+    url = f"sqlite+aiosqlite:///{tmp_path}/test.db"
+
+    # Create the schema with the current version of the data store
+    engine = create_async_engine(url)
+    datastore = SQLAlchemyDataStore(engine, serializer=serializer)
+    async with AsyncExitStack() as exit_stack:
+        await datastore.start(exit_stack, LocalEventBroker(), Logger("apscheduler"))
+
+    await engine.dispose()
+
+    # Simulate a row written by an older version: args serialized as a JSON list, and
+    # the metadata payload as a plain JSON dict
+    job_id = uuid4()
+    created_at = datetime(2021, 4, 5, 12, 30, tzinfo=UTC)
+    table = datastore._t_jobs
+    sync_engine = create_engine(f"sqlite:///{tmp_path}/test.db")
+    try:
+        with sync_engine.begin() as conn:
+            conn.execute(
+                table.insert().values(
+                    id=job_id,
+                    task_id="task1",
+                    args=serializer.serialize([1, "two"]),
+                    kwargs=serializer.serialize({"three": 3}),
+                    schedule_id=None,
+                    scheduled_fire_time=None,
+                    executor="async",
+                    jitter=timedelta(),
+                    start_deadline=None,
+                    result_expiration_time=timedelta(),
+                    metadata={"legacy": True},
+                    created_at=created_at,
+                    acquired_by=None,
+                    acquired_until=None,
+                )
+            )
+    finally:
+        sync_engine.dispose()
+
+    engine = create_async_engine(url)
+    datastore = SQLAlchemyDataStore(engine, serializer=serializer)
+    try:
+        async with AsyncExitStack() as exit_stack:
+            await datastore.start(exit_stack, LocalEventBroker(), Logger("apscheduler"))
+            jobs = await datastore.get_jobs()
+            assert len(jobs) == 1
+            assert jobs[0].id == job_id
+            assert jobs[0].args == (1, "two")
+            assert jobs[0].kwargs == {"three": 3}
+            assert jobs[0].metadata == {"legacy": True}
+            assert jobs[0].created_at == created_at
+    finally:
+        await engine.dispose()
 
 
 async def test_reap_abandoned_jobs(

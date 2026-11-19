@@ -75,6 +75,7 @@ from .._exceptions import (
     SerializationError,
     TaskLookupError,
 )
+from .._marshalling import marshal_metadata
 from .._structures import Job, JobResult, Schedule, ScheduleResult, Task
 from .._utils import create_repr, current_async_library
 from ..abc import EventBroker
@@ -484,13 +485,14 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         return jobs
 
     async def add_task(self, task: Task) -> None:
+        task_metadata = marshal_metadata("task", task.metadata)
         insert = self._t_tasks.insert().values(
             id=task.id,
             func=task.func,
             job_executor=task.job_executor,
             max_running_jobs=task.max_running_jobs,
             misfire_grace_time=task.misfire_grace_time,
-            metadata=task.metadata,
+            metadata=task_metadata,
         )
         try:
             async for attempt in self._retry():
@@ -505,7 +507,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     job_executor=task.job_executor,
                     max_running_jobs=task.max_running_jobs,
                     misfire_grace_time=task.misfire_grace_time,
-                    metadata=task.metadata,
+                    metadata=task_metadata,
                 )
                 .where(self._t_tasks.c.id == task.id)
             )

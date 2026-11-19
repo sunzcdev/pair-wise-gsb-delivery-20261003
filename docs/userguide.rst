@@ -627,6 +627,13 @@ built-in alternatives are:
 The former requires the cbor2_ library, but supports a wider variety of types natively.
 The latter has no dependencies but has very limited support for different types.
 
+If submitting a job, schedule or task fails because some value in its ``args``,
+``kwargs`` or ``metadata`` cannot be serialized, a :exc:`~apscheduler.SerializationError`
+is raised. Its message names the offending field and the type of the value that could
+not be serialized (but not the value itself, as it may contain sensitive data), and the
+original exception from the serializer is available as the ``__cause__`` of the raised
+exception.
+
 The third point relates to situations where you're essentially adding the same schedule
 to the data store over and over again. If you don't specify a static identifier for
 the schedules added at the start of the application, you will end up with an increasing
