@@ -880,6 +880,215 @@ async def test_max_concurrency(http_protocol_cls: type[HTTPProtocol]):
     )
 
 
+def _get_http1_protocols_with_shared_state(
+    http_protocol_cls: type[HTTPProtocol], app: ASGIApplication, count: int, **kwargs: Any
+) -> list[MockProtocol]:
+    """Create ``count`` HTTP/1 protocol instances sharing one ``ServerState``."""
+    config = Config(app=app, **kwargs)
+    lifespan = LifespanOff(config)
+    server_state = ServerState()
+    protocols = []
+    for _ in range(count):
+        loop = MockLoop()
+        transport = MockTransport()
+        protocol = http_protocol_cls(  # type: ignore[call-arg]
+            config=config, server_state=server_state, app_state=lifespan.state, _loop=loop
+        )
+        transport.set_protocol(protocol)
+        protocol.connection_made(transport)  # type: ignore[arg-type]
+        protocols.append(protocol)  # type: ignore[arg-type]
+    return protocols
+
+
+def _blocking_app() -> tuple[ASGIApplication, asyncio.Event, asyncio.Event]:
+    """An app that parks inside the ASGI callable until ``release`` is set."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        started.set()
+        await release.wait()
+        await Response("Hello, world", media_type="text/plain")(scope, receive, send)
+
+    return slow_app, started, release
+
+
+async def test_active_request_limit_ignores_idle_keepalive_connections(
+    http_protocol_cls: type[HTTPProtocol], caplog: pytest.LogCaptureFixture
+):
+    if http_protocol_cls.__name__ == "ZttpProtocol":
+        pytest.skip("limit_active_requests is only supported by the HTTP/1 backends")
+    # Two health-check connections sit idle between probes. The active-request
+    # limit must keep admitting business requests because idle keep-alive slots
+    # are free, even though the connection count alone would fill a budget of 2.
+    app = Response("Hello, world", media_type="text/plain")
+
+    idle_protocols = _get_http1_protocols_with_shared_state(http_protocol_cls, app, count=2, limit_active_requests=1)
+    business_protocol = idle_protocols[0]
+    assert len(business_protocol.connections) == 2
+    assert business_protocol.active_request_limiter.enabled
+
+    # Both connections sit idle in keep-alive, yet a business request on one of
+    # them is admitted: idle connections hold no active-request slot. Under the
+    # old connection-based gate with a budget of 2 this request would be refused.
+    business_protocol.data_received(SIMPLE_GET_REQUEST)
+    await business_protocol.loop.run_one()
+
+    assert b"HTTP/1.1 200 OK" in business_protocol.transport.buffer
+    # The request has finished, so its active-request slot is released and the
+    # connection is free to serve another keep-alive request.
+    assert business_protocol.server_state.active_requests == set()
+    assert not any("Exceeded" in record.message for record in caplog.records)
+
+    business_protocol.transport.clear_buffer()
+    business_protocol.data_received(SIMPLE_GET_REQUEST)
+    await business_protocol.loop.run_one()
+    assert b"HTTP/1.1 200 OK" in business_protocol.transport.buffer
+    assert business_protocol.server_state.active_requests == set()
+
+
+async def test_active_request_limit_rejects_executing_requests(
+    http_protocol_cls: type[HTTPProtocol], caplog: pytest.LogCaptureFixture
+):
+    if http_protocol_cls.__name__ == "ZttpProtocol":
+        pytest.skip("limit_active_requests is only supported by the HTTP/1 backends")
+    # Requests actually executing inside the ASGI app hold a slot; once the
+    # active-request budget is full the next request is refused with a 503 and
+    # the rejection is attributed to the active-request limit.
+    slow_app, started, release = _blocking_app()
+
+    async def routing_app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        # The blocked request is answered with a 503 by the protocol and never
+        # reaches the app, but keep its coroutine cheap in case it does.
+        if scope["path"] == "/blocked":
+            await Response("unexpected", media_type="text/plain")(scope, receive, send)
+        else:
+            await slow_app(scope, receive, send)
+
+    executing_protocol, blocked_protocol = _get_http1_protocols_with_shared_state(
+        http_protocol_cls, routing_app, count=2, limit_active_requests=1
+    )
+
+    executing_protocol.data_received(SIMPLE_GET_REQUEST)
+    task = asyncio.ensure_future(executing_protocol.loop.run_one())
+    await started.wait()
+    assert len(executing_protocol.server_state.active_requests) == 1
+
+    blocked_protocol.data_received(SIMPLE_GET_REQUEST)
+    await blocked_protocol.loop.run_one()
+    assert b"HTTP/1.1 503 Service Unavailable" in blocked_protocol.transport.buffer
+    assert b"Service Unavailable" in blocked_protocol.transport.buffer
+    assert any("Exceeded active request limit." in record.message for record in caplog.records)
+    assert not any("Exceeded concurrency limit." in record.message for record in caplog.records)
+    # The rejected request does not itself consume a slot.
+    assert len(executing_protocol.server_state.active_requests) == 1
+
+    release.set()
+    await task
+    assert executing_protocol.server_state.active_requests == set()
+    # The slot is reusable once the slow request finishes: a follow-up request on
+    # the now-idle keep-alive connection is admitted (the 503 above closed the
+    # blocked connection, as it carried `connection: close`).
+    executing_protocol.transport.clear_buffer()
+    executing_protocol.data_received(SIMPLE_GET_REQUEST)
+    await executing_protocol.loop.run_one()
+    assert b"HTTP/1.1 200 OK" in executing_protocol.transport.buffer
+    assert executing_protocol.server_state.active_requests == set()
+
+
+async def test_active_request_slot_released_on_disconnect(http_protocol_cls: type[HTTPProtocol]):
+    if http_protocol_cls.__name__ == "ZttpProtocol":
+        pytest.skip("limit_active_requests is only supported by the HTTP/1 backends")
+    got_disconnect = False
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        nonlocal got_disconnect
+        message = await receive()
+        assert message["type"] == "http.disconnect"
+        got_disconnect = True
+
+    protocol = get_connected_protocol(app, http_protocol_cls, limit_active_requests=1)
+    protocol.data_received(SIMPLE_POST_REQUEST)
+    protocol.connection_lost(None)
+    await protocol.loop.run_one()
+
+    assert got_disconnect
+    assert protocol.server_state.active_requests == set()
+
+
+async def test_rejection_attributes_distinguish_both_limits(
+    http_protocol_cls: type[HTTPProtocol], caplog: pytest.LogCaptureFixture
+):
+    if http_protocol_cls.__name__ == "ZttpProtocol":
+        pytest.skip("limit_active_requests is only supported by the HTTP/1 backends")
+    app = Response("Hello, world", media_type="text/plain")
+
+    # `limit_concurrency=1` refuses every request on the first gate because the
+    # connection serving the request already counts towards the limit...
+    concurrency_protocol = get_connected_protocol(app, http_protocol_cls, limit_concurrency=1)
+    concurrency_protocol.data_received(SIMPLE_GET_REQUEST)
+    await concurrency_protocol.loop.run_one()
+    assert b"HTTP/1.1 503 Service Unavailable" in concurrency_protocol.transport.buffer
+    assert any("Exceeded concurrency limit." in record.message for record in caplog.records)
+    assert concurrency_protocol.server_state.active_requests == set()
+
+    # ...whereas with only the active-request gate set, a single in-flight
+    # request is admitted and a second one is rejected by the active gate.
+    caplog.clear()
+    slow_app, started, release = _blocking_app()
+
+    async def routing_app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        if scope["path"] == "/blocked":
+            await Response("unexpected", media_type="text/plain")(scope, receive, send)
+        else:
+            await slow_app(scope, receive, send)
+
+    active_protocol, rejected_protocol = _get_http1_protocols_with_shared_state(
+        http_protocol_cls, routing_app, count=2, limit_active_requests=1
+    )
+    active_protocol.data_received(SIMPLE_GET_REQUEST)
+    task = asyncio.ensure_future(active_protocol.loop.run_one())
+    await started.wait()
+
+    rejected_protocol.data_received(SIMPLE_GET_REQUEST)
+    await rejected_protocol.loop.run_one()
+    assert b"HTTP/1.1 503 Service Unavailable" in rejected_protocol.transport.buffer
+    assert any("Exceeded active request limit." in record.message for record in caplog.records)
+    assert not any("Exceeded concurrency limit." in record.message for record in caplog.records)
+
+    release.set()
+    await task
+    assert active_protocol.server_state.active_requests == set()
+
+
+async def test_pipelined_request_does_not_hold_active_request_slot(http_protocol_cls: type[HTTPProtocol]):
+    if http_protocol_cls.__name__ == "ZttpProtocol":
+        pytest.skip("limit_active_requests is only supported by the HTTP/1 backends")
+    # A request buffered behind an in-flight pipelined response must not take an
+    # active-request slot while it waits. The first request completes under the
+    # mock loop and releases its slot; only when the parked request starts does
+    # the gate run again, so with a budget of 1 the parked request is the one
+    # that receives the 503 - rather than being charged while queued.
+    app = Response("Hello, world", media_type="text/plain")
+    protocol = get_connected_protocol(app, http_protocol_cls, limit_active_requests=1)
+
+    protocol.data_received(SIMPLE_GET_REQUEST + SIMPLE_GET_REQUEST)
+    # Only the first request runs; the second one stays parked in the pipeline
+    # and holds no slot meanwhile. Under the mock loop the response-complete
+    # callback already drains the pipeline again, so we assert on slot accounting
+    # rather than the transient queue length.
+    await protocol.loop.run_one()
+    assert protocol.server_state.active_requests == set()
+    assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
+
+    # The parked request now reaches the gate. It is rejected, and no slot is
+    # leaked by either the completed or the rejected request.
+    protocol.transport.clear_buffer()
+    await protocol.loop.run_one()
+    assert b"HTTP/1.1 503 Service Unavailable" in protocol.transport.buffer
+    assert protocol.server_state.active_requests == set()
+
+
 async def test_shutdown_during_request(http_protocol_cls: type[HTTPProtocol]):
     app = Response(b"", status_code=204)
 

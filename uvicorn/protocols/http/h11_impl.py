@@ -22,7 +22,13 @@ from uvicorn._types import (
 )
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
-from uvicorn.protocols.http.flow_control import CLOSE_HEADER, HIGH_WATER_LIMIT, FlowControl, service_unavailable
+from uvicorn.protocols.http.flow_control import (
+    CLOSE_HEADER,
+    HIGH_WATER_LIMIT,
+    ActiveRequestLimiter,
+    FlowControl,
+    service_unavailable,
+)
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
 from uvicorn.server import ServerState
 
@@ -64,6 +70,7 @@ class H11Protocol(asyncio.Protocol):
         self.root_path = config.root_path
         self.asgi_version = config.asgi_version
         self.limit_concurrency = config.limit_concurrency
+        self.active_request_limiter = ActiveRequestLimiter(config.limit_active_requests, server_state.active_requests)
         self.app_state = app_state
 
         # Timeouts
@@ -233,6 +240,16 @@ class H11Protocol(asyncio.Protocol):
                 else:
                     app = self.app
 
+                # A slot for `limit_active_requests` is only taken by requests that
+                # actually enter the ASGI app. Idle keep-alive connections never reach
+                # this point, and h11 processes pipelined requests one at a time, so
+                # nothing is charged while requests wait for their turn.
+                active_request_token = object()
+                if app is not service_unavailable and not self.active_request_limiter.admit(active_request_token):
+                    app = service_unavailable
+                    self.logger.warning("Exceeded active request limit.")
+                    active_request_token = None
+
                 self.cycle = RequestResponseCycle(
                     scope=self.scope,
                     conn=self.conn,
@@ -244,6 +261,8 @@ class H11Protocol(asyncio.Protocol):
                     default_headers=self.server_state.default_headers,
                     message_event=asyncio.Event(),
                     on_response=self.on_response_complete,
+                    active_request_limiter=self.active_request_limiter,
+                    active_request_token=active_request_token,
                 )
                 if self.config.reset_contextvars:
                     # Opt-in workaround for https://github.com/python/cpython/issues/140947:
@@ -376,6 +395,8 @@ class RequestResponseCycle:
         default_headers: list[tuple[bytes, bytes]],
         message_event: asyncio.Event,
         on_response: Callable[..., None],
+        active_request_limiter: ActiveRequestLimiter,
+        active_request_token: object | None,
     ) -> None:
         self.scope = scope
         self.conn = conn
@@ -387,6 +408,8 @@ class RequestResponseCycle:
         self.default_headers = default_headers
         self.message_event = message_event
         self.on_response = on_response
+        self.active_request_limiter = active_request_limiter
+        self.active_request_token = active_request_token
 
         # Connection state
         self.disconnected = False
@@ -428,6 +451,11 @@ class RequestResponseCycle:
                 self.logger.error(msg)
                 self.transport.close()
         finally:
+            # Release the active-request slot once the app is done, including when
+            # the connection was dropped or the task is cancelled at shutdown.
+            if self.active_request_token is not None:
+                self.active_request_limiter.release(self.active_request_token)
+                self.active_request_token = None
             self.on_response = lambda: None
 
     async def send_500_response(self) -> None:

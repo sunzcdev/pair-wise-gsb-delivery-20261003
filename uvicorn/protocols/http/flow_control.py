@@ -1,10 +1,52 @@
 import asyncio
+from typing import Any
 
 from uvicorn._types import ASGIReceiveCallable, ASGISendCallable, Scope
 
 CLOSE_HEADER = (b"connection", b"close")
 
 HIGH_WATER_LIMIT = 65536
+
+
+class ActiveRequestLimiter:
+    """Tracks requests that are about to enter (or are inside) the ASGI application.
+
+    Unlike ``limit_concurrency`` -- whose open-connection count also charges idle
+    keep-alive connections and whose task count charges requests still waiting in
+    the HTTP/1 pipeline -- a slot here is only taken once a request is admitted for
+    execution. Keep-alive idle time and requests queued behind a pipelined response
+    therefore do not consume the budget. The shared set of slots lives on the
+    :class:`~uvicorn.server.ServerState`, so all connections of a worker compete for
+    the same budget.
+    """
+
+    def __init__(self, limit: int | None, active_requests: set[Any]) -> None:
+        self.limit = limit
+        self.active_requests = active_requests
+
+    @property
+    def enabled(self) -> bool:
+        return self.limit is not None
+
+    def admit(self, token: Any) -> bool:
+        """Try to reserve a slot for ``token``.
+
+        Runs synchronously inside the event loop's protocol callback, so the
+        check-and-reserve sequence cannot be interleaved with another request.
+        Returns ``True`` when a slot was reserved, ``False`` when the limit was
+        already reached (the caller must answer with a 503).
+        """
+        if self.limit is None:
+            self.active_requests.add(token)
+            return True
+        if len(self.active_requests) >= self.limit:
+            return False
+        self.active_requests.add(token)
+        return True
+
+    def release(self, token: Any) -> None:
+        """Give the slot back. Safe to call more than once for the same token."""
+        self.active_requests.discard(token)
 
 
 class FlowControl:

@@ -71,6 +71,7 @@ Uvicorn provides the following timeouts:
 Uvicorn provides the following resource limiting:
 
 * Concurrency (`--limit-concurrency`). Defaults to `None`. If set, this provides a maximum number of concurrent tasks *or* open connections that should be allowed. Any new requests that arrive once this limit has been reached will result in a "503 Service Unavailable" response. Setting this value to a limit that you know your servers are able to support will help ensure reliable resource usage, even against significantly over-resourced servers.
+* Active requests (`--limit-active-requests`). Defaults to `None`. HTTP/1 backends only. If set, at most this many requests may be executing inside the ASGI application at the same time; further requests receive an immediate "503 Service Unavailable". Unlike `--limit-concurrency`, idle keep-alive connections and requests parked in the HTTP/1 pipeline do not consume the budget.
 * Backlog (`--backlog`). Defaults to `2048`. The maximum number of connections the operating system will hold in the socket's accept queue before the worker accepts them. This is passed straight to the listening socket's `listen()` call.
 * Max requests (`--limit-max-requests`). Defaults to `None`. If set, this provides a maximum number of HTTP requests that will be serviced before terminating a process. Together with a process manager this can be used to prevent memory leaks from impacting long running processes.
 
@@ -83,6 +84,17 @@ Uvicorn provides the following resource limiting:
 **`--backlog` is an OS-level socket setting.** It bounds the kernel's accept queue: connections that have completed the TCP handshake but that the worker has not yet `accept()`ed. Uvicorn accepts new connections eagerly, so under normal operation this queue stays near-empty and the setting has little observable effect. It only comes into play when connections arrive faster than the worker can accept them (for example during a large burst, or while the event loop is blocked). Once the queue is full the kernel stops accepting new connection attempts, and clients see a connection failure or timeout rather than a 503 (TCP will typically retry). Note that `--backlog` does not limit the number of connections a worker will ultimately serve - it only limits how many may sit *unaccepted* at once.
 
 To make the distinction concrete, consider `--limit-concurrency 5` with a slow application and a burst of simultaneous requests: once the limit is reached, the excess requests receive a 503 essentially immediately - they are not held in the backlog and processed later. To instead *queue* excess load, put a reverse proxy (e.g. nginx) in front of Uvicorn, or scale out with more workers.
+
+### Active-request limiting
+
+`--limit-active-requests` (supported by the `h11` and `httptools` HTTP/1 backends) addresses a blind spot of `--limit-concurrency`: the latter counts every open connection, including long-lived health-check connections that spend most of their life idle in keep-alive, so a fleet of health checks can exhaust the budget and make genuine business requests fail with a 503.
+
+With `--limit-active-requests`, a slot is reserved only once a request is about to enter the ASGI application and is released as soon as the application finishes the response (or the connection is dropped, including task cancellation during graceful shutdown). Two states therefore have an explicit owner and cost nothing:
+
+* **Keep-alive idle time.** A connection between responses holds no slot, no matter how long it stays open.
+* **Pipelined requests waiting their turn.** HTTP/1 allows several requests to be buffered on one connection; with `httptools` such requests sit in an internal pipeline and with `h11` the connection pauses reading, but in either case they are not charged until they actually start executing.
+
+Both gates can be enabled at the same time. They are checked in order: `--limit-concurrency` runs first when the request headers arrive, and `--limit-active-requests` runs when the request is admitted for execution. A 503 is logged either as `Exceeded concurrency limit.` (the connection/task gate) or `Exceeded active request limit.` (the application gate), so the limit that refused a request is always identifiable in the logs. Like `--limit-concurrency`, this is an application-level limit: refused requests get an immediate 503 and are never queued.
 
 ---
 

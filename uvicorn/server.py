@@ -61,6 +61,9 @@ class ServerState:
         self.total_requests = 0
         self.connections: set[Protocols] = set()
         self.tasks: set[asyncio.Task[None]] = set()
+        # Tokens of HTTP/1 requests admitted into the ASGI application. Shared by
+        # every connection so that `limit_active_requests` is enforced per worker.
+        self.active_requests: set[object] = set()
         self.default_headers: list[tuple[bytes, bytes]] = []
 
 

@@ -227,6 +227,7 @@ class Config:
         forwarded_allow_ips: list[str] | str | None = None,
         root_path: str = "",
         limit_concurrency: int | None = None,
+        limit_active_requests: int | None = None,
         limit_max_requests: int | None = None,
         limit_max_requests_jitter: int = 0,
         backlog: int = 2048,
@@ -276,6 +277,7 @@ class Config:
         self.date_header = date_header
         self.root_path = root_path
         self.limit_concurrency = limit_concurrency
+        self.limit_active_requests = limit_active_requests
         self.limit_max_requests = limit_max_requests
         self.limit_max_requests_jitter = limit_max_requests_jitter
         self.backlog = backlog

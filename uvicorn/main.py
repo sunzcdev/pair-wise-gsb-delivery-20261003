@@ -278,6 +278,14 @@ def _parse_headers(ctx: click.Context, param: click.Parameter, value: tuple[str,
     help="Maximum number of concurrent connections or tasks to allow, before issuing HTTP 503 responses.",
 )
 @click.option(
+    "--limit-active-requests",
+    type=int,
+    default=None,
+    help="Maximum number of HTTP/1 requests allowed to run inside the ASGI application at once, before issuing "
+    "HTTP 503 responses. Unlike --limit-concurrency, idle keep-alive connections and requests waiting in the "
+    "HTTP/1 pipeline do not consume the budget.",
+)
+@click.option(
     "--backlog",
     type=int,
     default=2048,
@@ -436,6 +444,7 @@ def main(
     forwarded_allow_ips: str,
     root_path: str,
     limit_concurrency: int,
+    limit_active_requests: int | None,
     backlog: int,
     limit_max_requests: int,
     limit_max_requests_jitter: int,
@@ -489,6 +498,7 @@ def main(
         forwarded_allow_ips=forwarded_allow_ips,
         root_path=root_path,
         limit_concurrency=limit_concurrency,
+        limit_active_requests=limit_active_requests,
         backlog=backlog,
         limit_max_requests=limit_max_requests,
         limit_max_requests_jitter=limit_max_requests_jitter,
@@ -545,6 +555,7 @@ def run(
     forwarded_allow_ips: list[str] | str | None = None,
     root_path: str = "",
     limit_concurrency: int | None = None,
+    limit_active_requests: int | None = None,
     backlog: int = 2048,
     limit_max_requests: int | None = None,
     limit_max_requests_jitter: int = 0,
@@ -602,6 +613,7 @@ def run(
         forwarded_allow_ips=forwarded_allow_ips,
         root_path=root_path,
         limit_concurrency=limit_concurrency,
+        limit_active_requests=limit_active_requests,
         backlog=backlog,
         limit_max_requests=limit_max_requests,
         limit_max_requests_jitter=limit_max_requests_jitter,

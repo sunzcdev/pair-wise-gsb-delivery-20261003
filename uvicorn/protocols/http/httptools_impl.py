@@ -22,7 +22,7 @@ from uvicorn._types import (
 )
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
-from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT, FlowControl, service_unavailable
+from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT, ActiveRequestLimiter, FlowControl, service_unavailable
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
 from uvicorn.server import ServerState
 
@@ -71,6 +71,7 @@ class HttpToolsProtocol(asyncio.Protocol):
         self.root_path = config.root_path
         self.asgi_version = config.asgi_version
         self.limit_concurrency = config.limit_concurrency
+        self.active_request_limiter = ActiveRequestLimiter(config.limit_active_requests, server_state.active_requests)
         self.app_state = app_state
 
         # Timeouts
@@ -288,16 +289,33 @@ class HttpToolsProtocol(asyncio.Protocol):
             expect_100_continue=self.expect_100_continue,
             keep_alive=http_version != "1.0" and self.parser.should_keep_alive(),
             on_response=self.on_response_complete,
+            active_request_limiter=self.active_request_limiter,
         )
         if existing_cycle is None or existing_cycle.response_complete:
             # Standard case - start processing the request.
             self._start_asgi_task(self.cycle, app)
         else:
-            # Pipelined HTTP requests need to be queued up.
+            # Pipelined HTTP requests need to be queued up. They do not hold an
+            # active-request slot until the preceding response is done and the
+            # request leaves the pipeline via `_start_asgi_task`.
             self.flow.pause_reading()
             self.pipeline.appendleft((self.cycle, app))
 
     def _start_asgi_task(self, cycle: RequestResponseCycle, app: ASGI3Application) -> None:
+        if app is not service_unavailable:
+            # The slot is reserved here, at the moment the request actually leaves
+            # the pipeline and enters the ASGI app, rather than when its headers
+            # were parsed.
+            if cycle.active_request_limiter.admit(cycle):
+                cycle.active_request_token = cycle
+            else:
+                # The active-request budget is exhausted, so answer with a 503
+                # instead of entering the ASGI application. The rejected request
+                # never reserves a slot, which keeps the limit effective under
+                # sustained overload.
+                app = service_unavailable
+                self.logger.warning("Exceeded active request limit.")
+
         if self.config.reset_contextvars:
             # Opt-in workaround for https://github.com/python/cpython/issues/140947:
             # asyncio can leak context vars between tasks. Hides context set in the
@@ -388,6 +406,7 @@ class RequestResponseCycle:
         expect_100_continue: bool,
         keep_alive: bool,
         on_response: Callable[..., None],
+        active_request_limiter: ActiveRequestLimiter,
     ):
         self.scope = scope
         self.transport = transport
@@ -398,6 +417,10 @@ class RequestResponseCycle:
         self.default_headers = default_headers
         self.message_event = message_event
         self.on_response = on_response
+        self.active_request_limiter = active_request_limiter
+        # Set when a slot is reserved in `_start_asgi_task`; ``None`` for 503
+        # responses and for requests still waiting inside the HTTP/1 pipeline.
+        self.active_request_token: object | None = None
 
         # Connection state
         self.disconnected = False
@@ -441,6 +464,11 @@ class RequestResponseCycle:
                 self.logger.error(msg)
                 self.transport.close()
         finally:
+            # Release the active-request slot once the app is done, including when
+            # the connection was dropped or the task is cancelled at shutdown.
+            if self.active_request_token is not None:
+                self.active_request_limiter.release(self.active_request_token)
+                self.active_request_token = None
             self.on_response = lambda: None
 
     async def send_500_response(self) -> None:
