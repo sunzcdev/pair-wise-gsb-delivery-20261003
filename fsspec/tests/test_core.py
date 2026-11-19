@@ -670,3 +670,209 @@ def test_repeated_argument():
             anon=False,
             account_name="OTHER",
         )
+
+
+@pytest.fixture
+def plan_fs():
+    fs = fsspec.filesystem("memory")
+    fs.store.clear()
+    fs.pseudo_dirs.clear()
+    yield fs
+    fs.store.clear()
+    fs.pseudo_dirs.clear()
+
+
+def _make_plan_files(fs, root="/plan", contents=None):
+    contents = contents or {"a.txt": b"aaa", "b.txt": b"bbb", "c.txt": b"ccc"}
+    fs.makedirs(root, exist_ok=True)
+    for name, data in contents.items():
+        fs.pipe_file(f"{root}/{name}", data)
+    return contents
+
+
+def test_plan_open_files_basic(plan_fs):
+    from fsspec.core import plan_open_files
+
+    contents = _make_plan_files(plan_fs)
+    plan = plan_open_files("memory://plan/*.txt")
+    # expansion order is pinned at plan time
+    assert plan.paths == tuple(sorted(f"/plan/{name}" for name in contents))
+    assert len(plan) == 3
+    assert all(r["status"] == "pending" for r in plan.results)
+    with plan as files:
+        assert [f.read() for f in files] == [b"aaa", b"bbb", b"ccc"]
+    assert all(r["status"] == "opened" for r in plan.results)
+    assert all(r["error"] is None for r in plan.results)
+
+
+def test_plan_open_files_late_files_not_included(plan_fs):
+    from fsspec.core import plan_open_files
+
+    _make_plan_files(plan_fs)
+    plan = plan_open_files("memory://plan/*.txt")
+    # a file added after planning must not silently join this round
+    plan_fs.pipe_file("/plan/d.txt", b"ddd")
+    with plan as files:
+        assert len(files) == 3
+    assert plan.paths == ("/plan/a.txt", "/plan/b.txt", "/plan/c.txt")
+
+
+def test_plan_open_files_change_raises(plan_fs):
+    from fsspec.core import plan_open_files
+    from fsspec.exceptions import FileChangedError
+
+    _make_plan_files(plan_fs)
+    plan = plan_open_files("memory://plan/*.txt")
+    plan_fs.pipe_file("/plan/b.txt", b"changed")
+    with pytest.raises(FileChangedError, match="b.txt"):
+        with plan:
+            pass
+
+
+def test_plan_open_files_change_removed(plan_fs):
+    from fsspec.core import plan_open_files
+    from fsspec.exceptions import FileChangedError
+
+    _make_plan_files(plan_fs)
+    plan = plan_open_files("memory://plan/*.txt")
+    plan_fs.rm("/plan/a.txt")
+    changes = plan.check_changes()
+    assert [c[0] for c in changes] == ["/plan/a.txt"]
+    assert changes[0][2] is None
+    with pytest.raises(FileChangedError):
+        with plan:
+            pass
+
+
+def test_plan_open_files_change_warn_and_ignore(plan_fs):
+    from fsspec.core import plan_open_files
+
+    _make_plan_files(plan_fs)
+    plan = plan_open_files("memory://plan/*.txt", on_change="warn")
+    plan_fs.pipe_file("/plan/b.txt", b"changed!")
+    with pytest.warns(UserWarning, match="b.txt"):
+        with plan as files:
+            assert files[1].read() == b"changed!"
+
+    plan2 = plan_open_files("memory://plan/*.txt", on_change="ignore")
+    plan_fs.pipe_file("/plan/b.txt", b"again")
+    with plan2 as files:  # no warning, no error
+        assert files[1].read() == b"again"
+
+
+def test_plan_open_files_on_error_keep(plan_fs):
+    from fsspec.core import plan_open_files
+
+    _make_plan_files(plan_fs)
+    plan = plan_open_files("memory://plan/*.txt", on_change="ignore", on_error="keep")
+    plan_fs.rm("/plan/b.txt")
+    with plan as files:
+        # successful items are kept, in expansion order
+        assert [f.read() for f in files] == [b"aaa", b"ccc"]
+    statuses = {r["path"]: r["status"] for r in plan.results}
+    assert statuses["/plan/b.txt"] == "failed"
+    assert statuses["/plan/a.txt"] == "opened"
+    assert "FileNotFoundError" in plan.results[1]["error"]
+
+
+def test_plan_open_files_on_error_fail_rejects_batch(plan_fs):
+    from fsspec.core import plan_open_files
+
+    _make_plan_files(plan_fs)
+    plan = plan_open_files("memory://plan/*.txt", on_change="ignore")
+    plan_fs.rm("/plan/c.txt")
+    with pytest.raises(FileNotFoundError):
+        with plan:
+            pass
+    # the whole batch was rejected: everything opened so far is closed
+    for of in plan.files:
+        assert of.fobjects == []
+    assert plan.results[0]["status"] == "opened"
+    assert plan.results[2]["status"] == "failed"
+
+
+def test_plan_open_files_compression_and_text(plan_fs, tmp_path):
+    import gzip
+
+    from fsspec.core import plan_open_files
+
+    for name in ("x.txt.gz", "y.txt.gz"):
+        with gzip.open(tmp_path / name, "wb") as f:
+            f.write(b"hello")
+    plan = plan_open_files(
+        f"{tmp_path}/*.txt.gz", mode="rt", compression="gzip", encoding="utf-8"
+    )
+    with plan as files:
+        assert [f.read() for f in files] == ["hello", "hello"]
+
+
+def test_plan_open_files_pickle_no_handles(plan_fs):
+    from fsspec.core import plan_open_files
+
+    _make_plan_files(plan_fs)
+    plan = plan_open_files("memory://plan/*.txt")
+    plan2 = pickle.loads(pickle.dumps(plan))
+    assert plan2.paths == plan.paths
+    assert plan2.identities == plan.identities
+    assert plan2.on_change == plan.on_change == "raise"
+
+    # even while open, serialization must not carry file handles
+    with plan:
+        state = plan.__getstate__()
+        assert state["_opened_files"] == []
+        assert state["_entered"] is False
+        plan3 = pickle.loads(pickle.dumps(plan))
+    assert plan3._opened_files == []
+    with plan3 as files:
+        assert len(files) == 3
+
+
+def test_plan_open_files_cleanup_failure_does_not_mask(plan_fs, monkeypatch):
+    from fsspec.core import OpenFile, plan_open_files
+
+    _make_plan_files(plan_fs)
+    plan = plan_open_files("memory://plan/*.txt")
+
+    real_close = OpenFile.close
+
+    def bad_close(self):
+        if self.path.endswith("b.txt"):
+            raise OSError("cannot close")
+        return real_close(self)
+
+    monkeypatch.setattr(OpenFile, "close", bad_close)
+
+    # cleanup failure alone surfaces as an ExceptionGroup
+    with pytest.raises(ExceptionGroup, match="OpenFilesPlan"):
+        with plan:
+            pass
+
+    # but it must not mask the main cause from the with-body
+    with pytest.raises(ValueError, match="main cause"):
+        with plan:
+            raise ValueError("main cause")
+
+
+def test_plan_open_files_bad_policy(plan_fs):
+    from fsspec.core import plan_open_files
+
+    _make_plan_files(plan_fs)
+    with pytest.raises(ValueError, match="on_change"):
+        plan_open_files("memory://plan/*.txt", on_change="bogus")
+    with pytest.raises(ValueError, match="on_error"):
+        plan_open_files("memory://plan/*.txt", on_error="bogus")
+
+
+def test_plan_open_files_write_mode(plan_fs):
+    from fsspec.core import plan_open_files
+
+    plan = plan_open_files("memory://plan/out-*.txt", mode="wb", num=2)
+    assert plan.paths == ("/plan/out-0.txt", "/plan/out-1.txt")
+    # write-mode plans do not track identities
+    assert plan.identities == {}
+    assert plan.check_changes() == []
+    with plan as files:
+        for f in files:
+            f.write(b"data")
+    assert plan_fs.cat("/plan/out-0.txt") == b"data"
+    assert plan_fs.cat("/plan/out-1.txt") == b"data"

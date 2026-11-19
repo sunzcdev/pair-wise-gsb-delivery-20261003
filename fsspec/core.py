@@ -4,6 +4,7 @@ import io
 import logging
 import posixpath
 import re
+import warnings
 from contextlib import ExitStack
 from glob import has_magic
 from pathlib import Path
@@ -19,6 +20,7 @@ from fsspec.caching import (  # noqa: F401
 )
 from fsspec.compression import compr
 from fsspec.config import conf
+from fsspec.exceptions import FileChangedError
 from fsspec.registry import available_protocols, filesystem, get_filesystem_class
 from fsspec.utils import (
     _unstrip_protocol,
@@ -345,6 +347,278 @@ def open_files(
         ],
         mode=mode,
         fs=fs,
+    )
+
+
+#: Fields of an ``fs.info()`` dict used to pin the identity of a planned file
+_IDENTITY_FIELDS = (
+    "size",
+    "mtime",
+    "created",
+    "etag",
+    "checksum",
+    "md5",
+    "version_id",
+)
+
+
+def _file_identity(info):
+    """Extract the stable, comparable parts of an ``fs.info()`` dict."""
+    return {k: info[k] for k in _IDENTITY_FIELDS if info.get(k) is not None}
+
+
+def _close_open_files(open_files):
+    """Close every given ``OpenFile``, returning any errors encountered."""
+    errors = []
+    for of in open_files:
+        try:
+            of.close()
+        except Exception as exc:  # noqa: BLE001 - collected, not raised here
+            errors.append(exc)
+    return errors
+
+
+class OpenFilesPlan:
+    """A fixed, explicit plan for opening a batch of files as a single round.
+
+    A plan is created by :func:`plan_open_files`, which expands any glob
+    pattern *once* and pins the resulting concrete paths (in expansion
+    order) together with the identity of each file at plan time. Files
+    created after planning, even if they match the original pattern, never
+    join this round silently.
+
+    Using the plan as a context manager opens every pinned file (compression
+    and text wrapping still apply to each concrete path) and records the
+    per-item outcome in ``results``. If a pinned file was replaced or
+    removed since planning, the ``on_change`` policy decides whether the
+    round is rejected (``"raise"``), merely reported (``"warn"``) or opened
+    anyway (``"ignore"``). If opening an individual item fails, the
+    ``on_error`` policy decides whether the whole batch is rejected
+    (``"fail"``, the default) or the successfully opened items are kept
+    (``"keep"``).
+
+    Plans are safe to serialize (pickle): the state never contains open
+    file handles, only paths, identities, policies and results.
+
+    Attributes
+    ----------
+    files: OpenFiles
+        The pinned ``OpenFile`` objects, in expansion order.
+    identities: dict
+        Mapping of path to the identity recorded at plan time (``None`` if
+        the file did not exist). Only populated in read mode.
+    results: list of dict
+        One entry per planned file, in expansion order, with keys ``path``,
+        ``status`` ("pending", "opened" or "failed") and ``error`` (a string
+        or None). Reset every time the plan context is entered.
+    """
+
+    #: Valid values for the ``on_change`` policy
+    ON_CHANGE_VALUES = ("raise", "warn", "ignore")
+    #: Valid values for the ``on_error`` policy
+    ON_ERROR_VALUES = ("fail", "keep")
+
+    def __init__(self, files, identities=None, on_change="raise", on_error="fail"):
+        if on_change not in self.ON_CHANGE_VALUES:
+            raise ValueError(
+                f"on_change must be one of {self.ON_CHANGE_VALUES}, got {on_change!r}"
+            )
+        if on_error not in self.ON_ERROR_VALUES:
+            raise ValueError(
+                f"on_error must be one of {self.ON_ERROR_VALUES}, got {on_error!r}"
+            )
+        self.files = files
+        self.identities = dict(identities or {})
+        self.on_change = on_change
+        self.on_error = on_error
+        self.results = [self._new_result(of) for of in self.files]
+        self._opened_files = []
+        self._entered = False
+
+    @staticmethod
+    def _new_result(of):
+        return {"path": of.path, "status": "pending", "error": None}
+
+    @property
+    def paths(self):
+        """The concrete paths of this round, in expansion order."""
+        return tuple(of.path for of in self.files)
+
+    def check_changes(self):
+        """Compare current file identities against the ones pinned at plan time.
+
+        Returns
+        -------
+        list of (path, planned_identity, current_identity)
+            One tuple per tracked path that was modified, removed or created
+            since the plan was made. Empty if everything is unchanged.
+        """
+        fs = self.files.fs
+        changes = []
+        for of in self.files:
+            if of.path not in self.identities:
+                # untracked (e.g. write-mode plans)
+                continue
+            planned = self.identities[of.path]
+            try:
+                current = _file_identity(fs.info(of.path))
+            except FileNotFoundError:
+                current = None
+            if current != planned:
+                changes.append((of.path, planned, current))
+        return changes
+
+    def __enter__(self):
+        if self._entered:
+            raise RuntimeError("This plan's context is already active")
+        changes = self.check_changes()
+        if changes:
+            message = "Files changed since the plan was created: " + ", ".join(
+                path for path, _, _ in changes
+            )
+            if self.on_change == "raise":
+                raise FileChangedError(message)
+            elif self.on_change == "warn":
+                warnings.warn(message, stacklevel=2)
+        self.results = [self._new_result(of) for of in self.files]
+        opened = []
+        file_objects = []
+        try:
+            for i, of in enumerate(self.files):
+                try:
+                    fo = of.open()
+                except Exception as exc:
+                    self.results[i]["status"] = "failed"
+                    self.results[i]["error"] = f"{type(exc).__name__}: {exc}"
+                    if self.on_error == "fail":
+                        raise
+                else:
+                    self.results[i]["status"] = "opened"
+                    opened.append(of)
+                    file_objects.append(fo)
+        except BaseException:
+            # Reject the whole batch: close whatever was opened, but a
+            # cleanup failure must never mask the original error.
+            for exc in _close_open_files(opened):
+                logger.warning("Error closing file while aborting plan: %s", exc)
+            raise
+        self._opened_files = opened
+        self._entered = True
+        return file_objects
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._entered = False
+        opened, self._opened_files = self._opened_files, []
+        errors = _close_open_files(opened)
+        if errors:
+            if exc_type is None:
+                raise ExceptionGroup(
+                    "Errors while closing files of an OpenFilesPlan", errors
+                )
+            # A failure is already propagating: cleanup errors must not
+            # mask that main cause, so only log them.
+            for exc in errors:
+                logger.warning("Error closing planned file: %s", exc)
+        return False
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # A serialized plan must never carry open file handles
+        state["_opened_files"] = []
+        state["_entered"] = False
+        return state
+
+    def __len__(self):
+        return len(self.files)
+
+    def __iter__(self):
+        return iter(self.files)
+
+    def __getitem__(self, item):
+        return self.files[item]
+
+    def __repr__(self):
+        return f"<OpenFilesPlan of {len(self)} pinned files>"
+
+
+def plan_open_files(
+    urlpath,
+    mode="rb",
+    compression=None,
+    encoding="utf8",
+    errors=None,
+    name_function=None,
+    num=1,
+    protocol=None,
+    newline=None,
+    auto_mkdir=True,
+    expand=True,
+    on_change="raise",
+    on_error="fail",
+    **kwargs,
+):
+    """Plan a fixed batch of files to be opened together as one round.
+
+    This is the explicit planning entry point for batch processing with
+    ``open_files``: any glob pattern is expanded immediately, and the
+    resulting concrete paths (in expansion order) and file identities are
+    pinned in the returned :class:`OpenFilesPlan`. Files created after this
+    call, even if they match the pattern, do not join the round.
+
+    Parameters
+    ----------
+    urlpath, mode, compression, encoding, errors, name_function, num, \
+protocol, newline, auto_mkdir, expand, **kwargs
+        Exactly as for :func:`open_files`; compression and text-mode
+        wrapping are applied to each concrete path when the plan is opened.
+    on_change: "raise" | "warn" | "ignore"
+        What to do when entering the plan context if a pinned file was
+        replaced, removed or created since planning: reject the round
+        (``"raise"``, the default, raising :class:`FileChangedError`),
+        report the change with a warning and continue (``"warn"``), or
+        proceed regardless (``"ignore"``). Identities are only tracked in
+        read mode.
+    on_error: "fail" | "keep"
+        What to do if opening an individual item fails: reject the whole
+        batch, closing anything already opened (``"fail"``, the default),
+        or keep the successfully opened items and record the failures in
+        ``plan.results`` (``"keep"``).
+
+    Returns
+    -------
+    OpenFilesPlan
+        A serializable plan; use it as a context manager to open the whole
+        pinned batch at once.
+
+    Examples
+    --------
+    >>> plan = plan_open_files("memory://bucket/*.csv")  # doctest: +SKIP
+    >>> with plan as files:  # exactly the files pinned at plan time
+    ...     data = [f.read() for f in files]  # doctest: +SKIP
+    """
+    files = open_files(
+        urlpath,
+        mode=mode,
+        compression=compression,
+        encoding=encoding,
+        errors=errors,
+        name_function=name_function,
+        num=num,
+        protocol=protocol,
+        newline=newline,
+        auto_mkdir=auto_mkdir,
+        expand=expand,
+        **kwargs,
+    )
+    identities = {}
+    if "r" in mode:
+        for of in files:
+            try:
+                identities[of.path] = _file_identity(files.fs.info(of.path))
+            except FileNotFoundError:
+                identities[of.path] = None
+    return OpenFilesPlan(
+        files, identities=identities, on_change=on_change, on_error=on_error
     )
 
 

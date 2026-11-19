@@ -16,3 +16,10 @@ class FSTimeoutError(asyncio.TimeoutError):
     """
     Raised when a fsspec function timed out occurs
     """
+
+
+class FileChangedError(RuntimeError):
+    """
+    Raised when a file pinned in an ``OpenFilesPlan`` no longer matches the
+    identity recorded when the plan was created
+    """
