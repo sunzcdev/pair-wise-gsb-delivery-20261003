@@ -8,6 +8,16 @@ All notable changes to this project will be documented in this file.
 `Unreleased`_
 -------------
 
+Added
+^^^^^
+
+* Added ``Worker.pause_queue``, ``Worker.resume_queue`` and
+  ``Worker.is_queue_paused`` so a single queue can be paused without
+  stopping the whole worker.  A queue's regular consumer and its delay
+  queue consumer are paused together, delayed messages keep their
+  original eta, and resuming a queue while the whole worker is paused
+  does not override the global pause.
+
 Fixed
 ^^^^^
 

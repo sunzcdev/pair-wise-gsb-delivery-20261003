@@ -23,7 +23,7 @@ import time
 from collections import defaultdict
 from functools import lru_cache
 from queue import Empty, PriorityQueue
-from threading import Event, Thread
+from threading import Event, RLock, Thread
 from typing import TYPE_CHECKING, Iterable, Optional, Union
 
 from .broker import Broker, Consumer, MessageProxy
@@ -102,6 +102,17 @@ class Worker:
         self.worker_timeout = worker_timeout
         self.worker_threads = worker_threads
 
+        # The canonical names of the queues that are individually
+        # paused.  A queue's regular consumer and its delay consumer
+        # share the same canonical name and so are paused together.
+        # The lock guards this set as pause/resume calls may come from
+        # any thread while the worker threads read from it.
+        self.paused_queues: set[str] = set()
+        self.paused_queues_lock = RLock()
+        # Set whenever a queue is resumed so worker threads waiting on
+        # a message from a previously paused queue wake up immediately.
+        self.queue_resumed_event = Event()
+
     def start(self) -> None:
         """Initialize the worker boot sequence and start up all the
         worker threads.
@@ -137,6 +148,71 @@ class Worker:
             child.resume()
         for child in self.workers:
             child.resume()
+
+    def pause_queue(self, queue_name: str) -> None:
+        """Pause consumption of a single queue without affecting the
+        other queues the worker is listening on.
+
+        The queue's regular consumer and its delay queue consumer are
+        paused together, so no new messages are fetched and messages
+        whose eta has yet to arrive keep their original eta instead of
+        being promoted onto the regular queue.  Messages that were
+        already handed off to worker threads when the pause took effect
+        are still processed.
+
+        Parameters:
+          queue_name(str): The name of the queue to pause.  This may be
+            either the canonical queue name or the name of its delay
+            queue (e.g. ``"queue"`` or ``"queue.DQ"``); both refer to
+            the same queue.
+        """
+        canonical_name = q_name(queue_name)
+        self.logger.info("Pausing queue %r.", canonical_name)
+        with self.paused_queues_lock:
+            self.paused_queues.add(canonical_name)
+            for name, consumer in self.consumers.items():
+                if q_name(name) == canonical_name:
+                    consumer.pause_queue()
+
+    def resume_queue(self, queue_name: str) -> None:
+        """Resume consumption of a previously paused queue.
+
+        Resuming a queue while the whole worker is paused (see
+        :meth:`pause`) does not override that global pause: the queue
+        stays paused until the worker itself is resumed.  Delayed
+        messages retain the eta they had when the queue was paused.
+
+        Parameters:
+          queue_name(str): The name of the queue to resume.  This may
+            be either the canonical queue name or the name of its
+            delay queue (e.g. ``"queue"`` or ``"queue.DQ"``); both
+            refer to the same queue.
+        """
+        canonical_name = q_name(queue_name)
+        self.logger.info("Resuming queue %r.", canonical_name)
+        with self.paused_queues_lock:
+            self.paused_queues.discard(canonical_name)
+            for name, consumer in self.consumers.items():
+                if q_name(name) == canonical_name:
+                    consumer.resume_queue()
+
+        # Wake up any worker thread that parked an already-fetched
+        # message while the queue was paused.
+        self.queue_resumed_event.set()
+        self.queue_resumed_event.clear()
+
+    def is_queue_paused(self, queue_name: str) -> bool:
+        """Returns whether the given queue is currently paused at the
+        queue level, independently of whether the whole worker is
+        paused.
+
+        Parameters:
+          queue_name(str): The name of the queue, either canonical or
+            suffixed (e.g. ``"queue"`` or ``"queue.DQ"``).
+        """
+        canonical_name = q_name(queue_name)
+        with self.paused_queues_lock:
+            return canonical_name in self.paused_queues
 
     def stop(self, timeout: int = 600000) -> None:
         """Gracefully stop the Worker and all of its consumers and
@@ -221,10 +297,16 @@ class Worker:
         consumer = self.consumers[queue_name] = ConsumerThread(
             broker=self.broker,
             queue_name=queue_name,
+            canonical_name=canonical_name,
             prefetch=self.delay_prefetch if delay else self.queue_prefetch,
             work_queue=self.work_queue,
+            paused_queues=self.paused_queues,
+            paused_queues_lock=self.paused_queues_lock,
             worker_timeout=self.worker_timeout,
         )
+        if self.is_queue_paused(canonical_name):
+            self.logger.debug("Starting consumer for already-paused queue %r.", queue_name)
+            consumer.pause_queue()
         consumer.start()
 
     def _add_worker(self) -> None:
@@ -232,6 +314,9 @@ class Worker:
             broker=self.broker,
             consumers=self.consumers,
             work_queue=self.work_queue,
+            paused_queues=self.paused_queues,
+            paused_queues_lock=self.paused_queues_lock,
+            queue_resumed_event=self.queue_resumed_event,
             worker_timeout=self.worker_timeout,
         )
         worker.start()
@@ -275,8 +360,11 @@ class ConsumerThread(Thread):
         *,
         broker: Broker,
         queue_name: str,
+        canonical_name: str,
         prefetch: int,
         work_queue: PriorityQueue[_WorkQueueItem],
+        paused_queues: set[str],
+        paused_queues_lock: RLock,
         worker_timeout: int,
     ) -> None:
         super().__init__(daemon=True)
@@ -289,18 +377,59 @@ class ConsumerThread(Thread):
         self.broker = broker
         self.prefetch = prefetch
         self.queue_name = queue_name
+        self.canonical_name = canonical_name
         self.work_queue = work_queue
+        # Shared with the Worker and the other consumer of the same
+        # queue (its delay queue consumer) as well as the worker
+        # threads.  Reads are lock-free; writes take the lock.
+        self.paused_queues = paused_queues
+        self.paused_queues_lock = paused_queues_lock
+        # Serializes pause/resume transitions against handling a single
+        # message so a message fetched just before a pause is always
+        # either parked or placed on the work queue, never dropped.
+        self.message_lock = RLock()
         self.worker_timeout = worker_timeout
         self.delay_queue: PriorityQueue[_WorkQueueItem] = PriorityQueue()
+        # Messages received from the broker while this consumer's queue
+        # is individually paused are parked here instead of being put on
+        # the shared work queue.  They're moved onto the work queue when
+        # the queue is resumed.  Keeping them out of the work queue means
+        # worker threads never spin requeueing paused messages and
+        # ``work_queue.join()`` isn't blocked by paused work.
+        self.paused_queue: PriorityQueue[_WorkQueueItem] = PriorityQueue()
+
+    def is_paused(self) -> bool:
+        """Returns whether this consumer is paused, either because the
+        whole worker was paused or because its queue was paused
+        individually.
+        """
+        return self.paused or self.canonical_name in self.paused_queues
+
+    def park_message(self, message: MessageProxy) -> None:
+        """Hold onto a message that was fetched from the broker while
+        the queue was paused.  Parked messages stay out of the shared
+        work queue until :meth:`resume_queue` moves them back, and
+        delayed messages keep their original eta.
+        """
+        self.logger.debug("Queue %r is paused. Parking message %r.", self.queue_name, message.message_id)
+        if "eta" in message.options:
+            self.delay_queue.put(_WorkQueueItem(message.options.get("eta", 0), message))
+        else:
+            actor = self.broker.get_actor(message.actor_name)
+            self.paused_queue.put(_WorkQueueItem(actor.priority, message))
 
     def run(self) -> None:
         self.logger.debug("Running consumer thread...")
         self.running = True
         self.broker.emit_after("consumer_thread_boot", self)
         while self.running:
-            if self.paused:
+            if self.is_paused():
                 self.logger.debug("Consumer is paused. Sleeping for %.02fms...", self.worker_timeout)
-                self.paused_event.set()
+                # Only the global pause waits on ``paused_event``; a
+                # queue-level pause doesn't touch it so a globally
+                # paused worker can still wait for every thread.
+                if self.paused:
+                    self.paused_event.set()
                 time.sleep(self.worker_timeout / 1000)
                 continue
 
@@ -311,16 +440,50 @@ class ConsumerThread(Thread):
                     timeout=self.worker_timeout,
                 )
 
-                for message in self.consumer:
+                # Use an explicit iterator so the pause state can be
+                # checked *before* each fetch.  A blocking fetch may
+                # still have been in flight when the pause happened, in
+                # which case the returned message is parked instead of
+                # being processed or lost.
+                consumer_iter = iter(self.consumer)
+                while self.running:
+                    if self.is_paused():
+                        break
+
+                    try:
+                        message = next(consumer_iter)
+                    except StopIteration:
+                        # The underlying consumer gave up its iterator;
+                        # drop back so a fresh consumer is created.
+                        break
+
                     if message is not None:
-                        self.handle_message(message)
+                        with self.message_lock:
+                            if self.is_paused():
+                                # The pause landed while the fetch was
+                                # blocking.  Hold onto the message (it's
+                                # already off the broker) until resume.
+                                self.park_message(message)
+                                break
+                            self.handle_message(message)
 
-                    elif self.paused:
+                    # Recheck after handling the message: the queue may
+                    # have been paused while this iteration was running,
+                    # in which case delayed messages must keep their eta
+                    # instead of being promoted.
+                    if self.is_paused():
                         break
 
-                    self.handle_delayed_messages()
-                    if not self.running:
-                        break
+                    with self.message_lock:
+                        if self.is_paused():
+                            break
+                        self.handle_delayed_messages()
+
+                # A pause interrupts the consume loop without breaking
+                # the underlying consumer, so skip the restart path and
+                # go straight back to the outer pause handling.
+                if self.is_paused():
+                    continue
 
             except BrokerConnectionError as e:
                 self.logger.critical("Consumer encountered a connection error: %s", e)
@@ -345,6 +508,12 @@ class ConsumerThread(Thread):
 
     def handle_delayed_messages(self) -> None:
         """Enqueue any delayed messages whose eta has passed."""
+        # Don't promote delayed messages while this queue is paused.
+        # The messages stay in the delay queue with their original eta
+        # so resuming the queue doesn't change when they become due.
+        if self.is_paused():
+            return
+
         for item in iter_queue(self.delay_queue):
             eta = item.priority
             message = item.message
@@ -470,6 +639,35 @@ class ConsumerThread(Thread):
         self.paused = False
         self.paused_event.clear()
 
+    def pause_queue(self) -> None:
+        """Pause this consumer as part of a queue-level pause.
+
+        Unlike :meth:`pause`, this doesn't touch ``paused_event`` so a
+        global :meth:`Worker.pause` can still independently wait on
+        every consumer thread.  Acquiring ``message_lock`` makes sure no
+        message handling is in flight when the pause takes effect.
+        """
+        with self.message_lock:
+            with self.paused_queues_lock:
+                self.paused_queues.add(self.canonical_name)
+
+    def resume_queue(self) -> None:
+        """Undo a queue-level pause of this consumer.
+
+        If the whole worker is paused, the consumer stays effectively
+        paused through its ``paused`` flag until the worker resumes.
+        Any messages parked while the queue was paused are moved back
+        onto the shared work queue.
+        """
+        with self.message_lock:
+            with self.paused_queues_lock:
+                self.paused_queues.discard(self.canonical_name)
+
+        for item in iter_queue(self.paused_queue):
+            self.logger.debug("Moving parked message %r onto work queue.", item.message.message_id)
+            self.work_queue.put(item)
+            self.paused_queue.task_done()
+
     def stop(self) -> None:
         """Initiate the ConsumerThread shutdown sequence.
 
@@ -483,7 +681,12 @@ class ConsumerThread(Thread):
         """Close this consumer thread and its underlying connection."""
         try:
             if self.consumer:
-                self.requeue_messages(item.message for item in iter_queue(self.delay_queue))
+                # Messages parked by a queue-level pause were already
+                # fetched from the broker but never acked, so they need
+                # to be requeued just like the in-memory delay messages.
+                parked_messages = [item.message for item in iter_queue(self.paused_queue)]
+                delayed_messages = [item.message for item in iter_queue(self.delay_queue)]
+                self.requeue_messages(delayed_messages + parked_messages)
                 self.consumer.close()
         except BrokerConnectionError:
             pass
@@ -506,6 +709,9 @@ class WorkerThread(Thread):
         broker: Broker,
         consumers: dict[str, ConsumerThread],
         work_queue: PriorityQueue[_WorkQueueItem],
+        paused_queues: set[str],
+        paused_queues_lock: RLock,
+        queue_resumed_event: Event,
         worker_timeout: int,
     ) -> None:
         super().__init__(daemon=True)
@@ -517,7 +723,22 @@ class WorkerThread(Thread):
         self.broker = broker
         self.consumers = consumers
         self.work_queue = work_queue
+        # Shared with the Worker and its consumer threads.  Reads are
+        # lock-free; writes take the lock.
+        self.paused_queues = paused_queues
+        self.paused_queues_lock = paused_queues_lock
+        # Signalled by the Worker whenever a queue is resumed so worker
+        # threads that parked a work-queue item can wake up promptly
+        # instead of polling.
+        self.queue_resumed_event = queue_resumed_event
         self.timeout = worker_timeout / 1000
+
+    def is_queue_paused(self, queue_name: str) -> bool:
+        """Returns whether the given message's queue is individually
+        paused.  Queue names are canonicalized so delay queues share
+        the fate of their regular queue.
+        """
+        return q_name(queue_name) in self.paused_queues
 
     def run(self) -> None:
         self.logger.debug("Running worker thread...")
@@ -532,9 +753,26 @@ class WorkerThread(Thread):
 
             try:
                 item = self.work_queue.get(timeout=self.timeout)
-                self.process_message(item.message)
             except Empty:
                 continue
+
+            if self.is_queue_paused(item.message.queue_name):
+                # The queue got paused in the window between its
+                # consumer fetching this message and a worker thread
+                # picking it up.  Put it back untouched and wait for the
+                # queue to resume so other queues' work isn't blocked
+                # and this thread doesn't spin on the same item.
+                self.logger.debug(
+                    "Queue %r is paused. Requeueing message %r.",
+                    item.message.queue_name,
+                    item.message.message_id,
+                )
+                self.work_queue.put(item)
+                self.work_queue.task_done()
+                self.queue_resumed_event.wait(timeout=self.timeout)
+                continue
+
+            self.process_message(item.message)
 
         self.broker.emit_before("worker_thread_shutdown", self)
         self.logger.debug("Worker thread stopped.")

@@ -12,6 +12,7 @@ import dramatiq
 import dramatiq.middleware
 import dramatiq.worker
 from dramatiq.brokers.stub import StubBroker
+from dramatiq.common import current_millis, dq_name
 
 from .common import worker
 
@@ -196,3 +197,264 @@ def test_exception_from_actor_doesnt_leak(
     finally:
         # Re-enable GC after test is finished.
         gc.enable()
+
+
+def _wait_until(predicate, timeout=5.0, interval=0.01):
+    """Poll ``predicate`` until it returns a truthy value or the
+    timeout elapses.  Returns the last predicate result.
+    """
+    deadline = time.monotonic() + timeout
+    result = predicate()
+    while not result and time.monotonic() < deadline:
+        time.sleep(interval)
+        result = predicate()
+    return result
+
+
+def test_pausing_one_queue_doesnt_pause_the_other_queues(stub_broker: StubBroker) -> None:
+    """Pausing a single queue must leave the other queues' consumers
+    and worker threads running normally."""
+    results_a: list[int] = []
+    results_b: list[int] = []
+
+    @dramatiq.actor(queue_name="queue_a")
+    def work_a(value):
+        results_a.append(value)
+
+    @dramatiq.actor(queue_name="queue_b")
+    def work_b(value):
+        results_b.append(value)
+
+    with worker(stub_broker, worker_timeout=25, worker_threads=4) as stub_worker:
+        # Sanity check: a regular queue and its delay queue share one
+        # canonical name, so both consumers are covered by the pause.
+        assert "queue_a" in stub_worker.consumers
+        assert dq_name("queue_a") in stub_worker.consumers
+
+        stub_worker.pause_queue("queue_a")
+        assert stub_worker.is_queue_paused("queue_a")
+        assert stub_worker.is_queue_paused(dq_name("queue_a"))
+        assert not stub_worker.is_queue_paused("queue_b")
+
+        for i in range(5):
+            work_a.send(i)
+            work_b.send(i)
+
+        # queue_b must drain completely while queue_a is paused.
+        stub_broker.join("queue_b")
+        stub_worker.join()
+        assert sorted(results_b) == [0, 1, 2, 3, 4]
+        assert results_a == []
+
+        # Nothing from queue_a should have been processed.  Its
+        # messages are either still on the broker's queue or parked in
+        # the consumer's paused queue if they were fetched right before
+        # the pause took effect.
+        parked = stub_worker.consumers["queue_a"].paused_queue.qsize()
+        assert stub_broker.queues["queue_a"].qsize() + parked == 5
+
+        stub_worker.resume_queue("queue_a")
+        assert not stub_worker.is_queue_paused("queue_a")
+
+        stub_broker.join("queue_a")
+        stub_worker.join()
+        assert sorted(results_a) == [0, 1, 2, 3, 4]
+
+
+def test_paused_queue_delay_messages_keep_their_eta_while_other_queue_runs(stub_broker: StubBroker) -> None:
+    """Regression test: two queues, both carrying delayed messages.
+    Pausing one side must not stop the other side, and on resume the
+    paused queue's delayed messages must run against their original
+    eta rather than being processed immediately."""
+    runs: dict[str, list[int]] = {"a": [], "b": []}
+
+    @dramatiq.actor(queue_name="queue_a")
+    def work_a():
+        runs["a"].append(current_millis())
+
+    @dramatiq.actor(queue_name="queue_b")
+    def work_b():
+        runs["b"].append(current_millis())
+
+    with worker(stub_broker, worker_timeout=25, worker_threads=4) as stub_worker:
+        # Wait for both delay consumers to be up before pausing.
+        assert _wait_until(
+            lambda: dq_name("queue_a") in stub_worker.consumers and dq_name("queue_b") in stub_worker.consumers
+        )
+        dq_consumer_a = stub_worker.consumers[dq_name("queue_a")]
+
+        # Pause queue_a before sending anything so its consumers are
+        # guaranteed to be in their paused state when the messages
+        # arrive.
+        stub_worker.pause_queue("queue_a")
+
+        delay_ms = 1500
+        start_a = current_millis()
+        message_a = work_a.send_with_options(delay=delay_ms)
+        start_b = current_millis()
+        work_b.send_with_options(delay=delay_ms)
+
+        original_eta = message_a.options["eta"]
+        assert original_eta >= start_a + delay_ms
+
+        def delayed_message_parked():
+            # The delayed message is either still on the broker's delay
+            # queue (the consumer was sleeping when it arrived) or has
+            # been fetched into the consumer's in-memory delay queue
+            # (it arrived just before the pause took effect).  Either
+            # way it must not have been promoted onto the work queue.
+            # qsize() (not unfinished_tasks) is used for the broker's
+            # queue because fetched messages are only counted as done
+            # when they're acked after processing.
+            on_broker = stub_broker.queues[dq_name("queue_a")].qsize()
+            in_memory = dq_consumer_a.delay_queue.qsize()
+            return on_broker + in_memory == 1
+
+        assert _wait_until(delayed_message_parked)
+
+        # Let the original eta pass while the queue stays paused.
+        time.sleep(delay_ms / 1000 + 0.4)
+
+        # queue_a must not have run anything and the message must still
+        # be parked somewhere with its original eta intact.
+        assert runs["a"] == []
+        assert delayed_message_parked()
+        if dq_consumer_a.delay_queue.qsize():
+            assert dq_consumer_a.delay_queue.queue[0].priority == original_eta
+
+        # queue_b is unaffected: its delayed message ran on schedule.
+        assert _wait_until(lambda: len(runs["b"]) == 1)
+        assert runs["b"][0] - start_b >= delay_ms
+
+        # Resume after the original eta has already expired.  The
+        # consumer fetches (or promotes) the message, whose eta is
+        # already due, so it gets processed promptly against the
+        # original eta.
+        resume_time = current_millis()
+        stub_worker.resume_queue("queue_a")
+
+        stub_broker.join("queue_a")
+        stub_worker.join()
+
+        assert len(runs["a"]) == 1
+        # The message can never run before its original eta, and once
+        # resumed it should be promoted and processed promptly since
+        # that eta has already passed.
+        assert runs["a"][0] >= original_eta
+        assert runs["a"][0] - resume_time < 1000
+
+
+def test_queue_resume_cannot_override_a_global_pause(stub_broker: StubBroker) -> None:
+    """Resuming a single queue while the whole worker is paused must
+    not let that queue's messages through until the worker resumes."""
+    results: list[int] = []
+
+    @dramatiq.actor(queue_name="queue_a")
+    def work_a(value):
+        results.append(value)
+
+    with worker(stub_broker, worker_timeout=25, worker_threads=2) as stub_worker:
+        # Pause the whole worker, then pause and "resume" the queue.
+        stub_worker.pause()
+        stub_worker.pause_queue("queue_a")
+        assert stub_worker.is_queue_paused("queue_a")
+
+        work_a.send(1)
+        time.sleep(0.2)
+        assert results == []
+
+        stub_worker.resume_queue("queue_a")
+        # The queue-level pause is gone, but the global pause remains.
+        assert not stub_worker.is_queue_paused("queue_a")
+        time.sleep(0.2)
+        assert results == []
+
+        # Only the global resume gets messages flowing again.
+        stub_worker.resume()
+        stub_broker.join("queue_a")
+        stub_worker.join()
+        assert results == [1]
+
+
+def test_global_resume_does_not_clear_a_queue_level_pause(stub_broker: StubBroker) -> None:
+    """Resuming the whole worker must not drop a queue-level pause that
+    was applied while the worker was paused."""
+    results: list[int] = []
+
+    @dramatiq.actor(queue_name="queue_a")
+    def work_a(value):
+        results.append(value)
+
+    with worker(stub_broker, worker_timeout=25, worker_threads=2) as stub_worker:
+        assert _wait_until(lambda: "queue_a" in stub_worker.consumers)
+
+        stub_worker.pause()
+        stub_worker.pause_queue("queue_a")
+        work_a.send(1)
+
+        # Resuming the worker must not resume the individually paused queue.
+        stub_worker.resume()
+        assert stub_worker.is_queue_paused("queue_a")
+        time.sleep(0.2)
+        assert results == []
+
+        # The queue stays blocked until its own resume is called.
+        stub_worker.resume_queue("queue_a")
+        stub_broker.join("queue_a")
+        stub_worker.join()
+        assert results == [1]
+
+
+def test_pausing_a_queue_covers_its_delay_queue_consumer(stub_broker: StubBroker) -> None:
+    """Passing the delay queue name must pause the same logical queue
+    as passing the canonical queue name, in both directions."""
+
+    @dramatiq.actor(queue_name="queue_a")
+    def work_a():
+        pass
+
+    with worker(stub_broker, worker_timeout=25, worker_threads=2) as stub_worker:
+        assert _wait_until(lambda: "queue_a" in stub_worker.consumers and dq_name("queue_a") in stub_worker.consumers)
+
+        stub_worker.pause_queue(dq_name("queue_a"))
+        try:
+            assert stub_worker.is_queue_paused("queue_a")
+            assert stub_worker.is_queue_paused(dq_name("queue_a"))
+            assert stub_worker.consumers["queue_a"].is_paused()
+            assert stub_worker.consumers[dq_name("queue_a")].is_paused()
+        finally:
+            stub_worker.resume_queue("queue_a")
+
+        assert not stub_worker.consumers["queue_a"].is_paused()
+        assert not stub_worker.consumers[dq_name("queue_a")].is_paused()
+
+
+def test_parked_messages_are_processed_after_resume(stub_broker: StubBroker) -> None:
+    """A message fetched from the broker while its queue is paused must
+    be parked (not lost or processed) and then handled normally once
+    the queue is resumed."""
+    results: list[int] = []
+
+    @dramatiq.actor(queue_name="queue_a")
+    def work_a(value):
+        results.append(value)
+
+    with worker(stub_broker, worker_timeout=25, worker_threads=2) as stub_worker:
+        assert _wait_until(lambda: "queue_a" in stub_worker.consumers)
+        consumer = stub_worker.consumers["queue_a"]
+
+        # Pause first so the message can never be processed, then send.
+        stub_worker.pause_queue("queue_a")
+        work_a.send(1)
+
+        # The message lands either on the broker's queue or, if a fetch
+        # was already in flight, in the consumer's parked queue.
+        assert _wait_until(lambda: stub_broker.queues["queue_a"].qsize() + consumer.paused_queue.qsize() == 1)
+        time.sleep(0.1)
+        assert results == []
+
+        stub_worker.resume_queue("queue_a")
+        stub_broker.join("queue_a")
+        stub_worker.join()
+        assert results == [1]
+        assert consumer.paused_queue.qsize() == 0
