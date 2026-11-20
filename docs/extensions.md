@@ -188,6 +188,36 @@ response = httpcore.request(
 )
 ```
 
+### `"on_early_hints"`
+
+Some servers send one or more interim `1xx` responses — most notably
+`103 Early Hints` — before the final response headers. The `"on_early_hints"`
+request extension lets you install a callback that is invoked as soon as each
+interim response is received, so that resources hinted via `Link` headers can
+start loading before the final response arrives.
+
+The callback is called once per interim response, with the informational
+status code and the response headers. The headers are passed as a list of
+two-tuples of bytes, preserving their original on-the-wire order. When using
+the async client the callback must be an `async def ...` function:
+
+```python
+def on_early_hints(status_code, headers):
+    # Called once for each interim response, e.g. `103`.
+    print(status_code, headers)
+
+response = httpcore.request(
+    "GET",
+    "https://www.example.com/",
+    extensions={"on_early_hints": on_early_hints},
+)
+```
+
+The callback is purely informational. It does not consume or terminate the
+response, which continues to be read in the usual way. A `101 Switching
+Protocols` response is not delivered to this callback, and keeps using its
+dedicated [upgrade](#upgrade-requests) path.
+
 ## Response Extensions
 
 ### `"http_version"`

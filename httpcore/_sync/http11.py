@@ -173,6 +173,14 @@ class HTTP11Connection(ConnectionInterface):
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("read", None)
 
+        # An optional callback may be installed on the request via the
+        # "on_early_hints" extension. It is invoked once for each interim
+        # (1xx) response that is received prior to the final response, with
+        # the informational status code and the headers in their original
+        # on-the-wire order. The callback does not consume or terminate the
+        # response, which continues to be read in the usual way.
+        on_early_hints = request.extensions.get("on_early_hints")
+
         while True:
             event = self._receive_event(timeout=timeout)
             if isinstance(event, h11.Response):
@@ -181,7 +189,16 @@ class HTTP11Connection(ConnectionInterface):
                 isinstance(event, h11.InformationalResponse)
                 and event.status_code == 101
             ):
+                # "101 Switching Protocols" keeps its existing dedicated
+                # path, and must never be surfaced as an early hint.
                 break
+            if (
+                on_early_hints is not None
+                and isinstance(event, h11.InformationalResponse)
+            ):
+                on_early_hints(
+                    event.status_code, event.headers.raw_items()
+                )
 
         http_version = b"HTTP/" + event.http_version
 
