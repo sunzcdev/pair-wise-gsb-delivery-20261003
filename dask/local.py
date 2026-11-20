@@ -371,6 +371,42 @@ We currently select tasks that have recently been made ready.  We hope that
 this first-in-first-out policy reduces memory footprint
 """
 
+def _pop_memory_aware(ready, state, results, nbytes):
+    """Pop the ready task with the lowest net memory impact.
+
+    For every ready task that has an estimate we compute
+
+        net = estimated output bytes
+              - bytes of cached dependencies that this task would release
+                (i.e. dependencies for which this task is the last
+                remaining dependent and that are not part of the results)
+
+    and run the task with the smallest ``net`` first.  This only ever
+    reorders tasks that are already runnable, so it can never produce an
+    illegal schedule.  Tasks without an estimate are never reordered: if
+    no ready task has an estimate we fall back to the default
+    last-in-first-out pop, and ties between estimated tasks are broken by
+    their existing position in the ready stack.
+    """
+    best = len(ready) - 1  # default: LIFO pop
+    best_net = None
+    for i, key in enumerate(ready):
+        out = nbytes(key)
+        if out is None:
+            continue
+        net = out
+        for dep in state["dependencies"][key]:
+            if dep in results:
+                continue
+            waiting = state["waiting_data"].get(dep)
+            if waiting is not None and len(waiting) == 1:
+                net -= nbytes(dep) or 0
+        if best_net is None or net < best_net:
+            best_net = net
+            best = i
+    return ready.pop(best)
+
+
 """
 `get`
 -----
@@ -393,6 +429,7 @@ def get_async(
     dumps=identity,
     loads=identity,
     chunksize=None,
+    nbytes=None,
     **kwargs,
 ):
     """Asynchronous get function
@@ -438,12 +475,24 @@ def get_async(
     chunksize: int, optional
         Size of chunks to use when dispatching work. Defaults to 1.
         If -1, will be computed to evenly divide ready work across workers.
+    nbytes: callable or mapping, optional
+        Estimates of task output sizes in bytes, either as a callable
+        ``nbytes(key) -> int | None`` or as a mapping of ``key -> int``.
+        When provided, the scheduler prefers, among tasks that are ready
+        to run, those whose estimated output is small and whose run allows
+        releasing large dependencies.  This only affects the order in
+        which ready tasks are executed; it never changes which tasks run.
+        Keys without an estimate keep the default ordering as a stable
+        fallback.
 
     See Also
     --------
     threaded.get
     """
     chunksize = chunksize or config.get("chunksize", 1)
+
+    if nbytes is not None and not callable(nbytes):
+        nbytes = nbytes.get
 
     queue = Queue()
 
@@ -500,8 +549,12 @@ def get_async(
                 # Prep all ready tasks for submission
                 args = []
                 for _ in range(ntasks):
-                    # Get the next task to compute (most recently added)
-                    key = state["ready"].pop()
+                    # Get the next task to compute (most recently added,
+                    # or the cheapest memory-wise if estimates are given)
+                    if nbytes is None:
+                        key = state["ready"].pop()
+                    else:
+                        key = _pop_memory_aware(state["ready"], state, results, nbytes)
                     # Notify task is running
                     state["running"].add(key)
                     for f in pretask_cbs:

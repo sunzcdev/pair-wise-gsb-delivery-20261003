@@ -220,3 +220,117 @@ def test_detect_malformed_graph():
     with pytest.raises(ValueError, match="Missing dependency"):
         get_sync(dsk, "y")
     assert get_sync(dsk, "y", cache={"x": 1}) == 1
+
+
+class _ResidentRecorder:
+    """Callback recording the resident bytes of the cache over time"""
+
+    def __init__(self):
+        from dask.callbacks import Callback
+
+        self.samples = []
+        self.cb = Callback(
+            start_state=lambda dsk, state: self._record(state),
+            posttask=lambda key, res, dsk, state, worker_id: self._record(state),
+        )
+
+    def _record(self, state):
+        self.samples.append(
+            sum(
+                len(v)
+                for v in state["cache"].values()
+                if isinstance(v, (bytes, bytearray))
+            )
+        )
+
+    @property
+    def peak(self):
+        return max(self.samples)
+
+    def __enter__(self):
+        return self.cb.__enter__()
+
+    def __exit__(self, *args):
+        return self.cb.__exit__(*args)
+
+
+def _two_branch_diamond(n):
+    """A small diamond whose two branches each hold a large intermediate
+
+    'a' starts in the cache; 'b' is produced by a runnable task.  Both
+    branches are ready at the same time.  Running 'b' before 'use_a'
+    keeps both large intermediates resident; running 'use_a' first
+    releases 'a' before 'b' is produced.
+    """
+
+    def make_big(n):
+        return bytearray(n)
+
+    def consume(x):
+        return len(x)
+
+    return {
+        "a": bytearray(n),
+        "b": (make_big, n),
+        "use_a": (consume, "a"),
+        "use_b": (consume, "b"),
+        "out": (add, "use_a", "use_b"),
+    }
+
+
+def test_nbytes_memory_aware_ordering():
+    n = 1_000_000
+    dsk = _two_branch_diamond(n)
+    nbytes = {"a": n, "b": n, "use_a": 100, "use_b": 100, "out": 100}
+
+    rec_off = _ResidentRecorder()
+    with rec_off:
+        out_off = get_sync(dsk, "out")
+
+    rec_on = _ResidentRecorder()
+    with rec_on:
+        out_on = get_sync(dsk, "out", nbytes=nbytes)
+
+    # Same correct result on both sides of the switch
+    assert out_off == out_on == 2 * n
+
+    # Default topological order holds both large intermediates at once;
+    # the estimates let the scheduler release one before making the other.
+    assert rec_off.peak == 2 * n
+    assert rec_on.peak == n
+
+
+def test_nbytes_stable_fallback_without_estimates():
+    # An empty / missing estimate must not change the default ordering
+    L = []
+
+    def append(i):
+        L.append(i)
+
+    dsk = {("x", i): (append, i) for i in range(10)}
+    x_keys = sorted(dsk)
+    dsk["y"] = (lambda *args: None, list(x_keys))
+
+    get_sync(dsk, "y", nbytes={})
+    assert L == sorted(L, reverse=True)
+
+
+def test_nbytes_partial_estimates_and_callable():
+    n = 1_000_000
+    dsk = _two_branch_diamond(n)
+
+    # Only some keys carry estimates; unestimated keys fall back to the
+    # default order among themselves, results stay correct.
+    rec = _ResidentRecorder()
+    with rec:
+        out = get_sync(dsk, "out", nbytes={"a": n, "use_a": 100})
+    assert out == 2 * n
+    assert rec.peak == n
+
+    # A callable works as well as a mapping
+    rec2 = _ResidentRecorder()
+    estimates = {"a": n, "b": n, "use_a": 100, "use_b": 100, "out": 100}
+    with rec2:
+        out2 = get_sync(dsk, "out", nbytes=lambda key: estimates.get(key))
+    assert out2 == 2 * n
+    assert rec2.peak == n
