@@ -12,7 +12,12 @@ from unittest.mock import patch
 import pytest
 
 from watchdog.utils import platform
-from watchdog.utils.dirsnapshot import DirectorySnapshot, DirectorySnapshotDiff, EmptyDirectorySnapshot
+from watchdog.utils.dirsnapshot import (
+    DirectorySnapshot,
+    DirectorySnapshotDiff,
+    EmptyDirectorySnapshot,
+    PartialDirectorySnapshot,
+)
 
 from .shell import chmod, mkdir, mv, rm, symlink, touch
 
@@ -197,6 +202,189 @@ def test_permission_error(p):
 
     # Children of a/b/ are no more accessible and so removed in the new snapshot
     assert diff.dirs_deleted == [(p("a", "b", "c"))]
+
+
+def _flaky_listdir(blocked: str, *, error: int = errno.EACCES):
+    """A ``listdir`` that fails for ``blocked`` and behaves normally elsewhere."""
+
+    def listdir(path):
+        if path == blocked:
+            raise OSError(error, os.strerror(error), path)
+        return os.scandir(path)
+
+    return listdir
+
+
+def test_plain_snapshot_drops_unreadable_subtree(p):
+    # Reference behavior: without the partial snapshot, an unreadable
+    # subdirectory loses all of its entries.
+    mkdir(p("sub"), parents=True)
+    touch(p("sub", "a"))
+
+    snapshot = DirectorySnapshot(p(""), listdir=_flaky_listdir(p("sub")))
+    assert p("sub", "a") not in snapshot.paths
+    assert snapshot.unreadable == {}
+
+
+def test_partial_snapshot_keeps_unreadable_subtree(p):
+    mkdir(p("sub"), parents=True)
+    touch(p("sub", "a"))
+    ref = PartialDirectorySnapshot(p(""))
+
+    snapshot = PartialDirectorySnapshot(p(""), listdir=_flaky_listdir(p("sub")), previous=ref)
+
+    # The subtree is reported as unreadable, but its last known state is kept.
+    assert list(snapshot.unreadable) == [p("sub")]
+    assert p("sub", "a") in snapshot.paths
+    assert snapshot.carried_over == {p("sub")}
+
+    # Nothing is reported as deleted for the part that could not be read.
+    diff = DirectorySnapshotDiff(ref, snapshot)
+    assert diff.files_deleted == []
+    assert diff.dirs_deleted == []
+    assert len(diff) == 0
+
+
+def test_partial_snapshot_reports_changes_outside_unreadable_subtree(p):
+    mkdir(p("readable"), parents=True)
+    mkdir(p("blocked"), parents=True)
+    touch(p("readable", "removed"))
+    touch(p("readable", "kept"))
+    ref = PartialDirectorySnapshot(p(""))
+
+    # While "blocked" cannot be read, changes keep happening in "readable".
+    touch(p("readable", "created"))
+    rm(p("readable", "removed"))
+    mkdir(p("readable", "newdir"))
+
+    snapshot = PartialDirectorySnapshot(p(""), listdir=_flaky_listdir(p("blocked")), previous=ref)
+    diff = DirectorySnapshotDiff(ref, snapshot)
+
+    assert diff.files_created == [p("readable", "created")]
+    assert diff.files_deleted == [p("readable", "removed")]
+    assert diff.dirs_created == [p("readable", "newdir")]
+    # Nothing from the unreadable subtree is reported as changed.
+    assert p("blocked") not in diff.dirs_deleted
+    assert all(not str(path).startswith(p("blocked")) for path in diff.files_deleted)
+
+
+def test_partial_snapshot_reports_unseen_changes_after_recovery(p):
+    mkdir(p("sub"), parents=True)
+    touch(p("sub", "before"))
+    ref = PartialDirectorySnapshot(p(""))
+
+    # Everything below "sub" happens while it cannot be read.
+    touch(p("sub", "during"))
+    rm(p("sub", "before"))
+    snapshot = PartialDirectorySnapshot(p(""), listdir=_flaky_listdir(p("sub")), previous=ref)
+
+    # The outage hides the changes, but does not report them as deletions.
+    assert DirectorySnapshotDiff(ref, snapshot).files_deleted == []
+
+    # Once readable again, the changes that really happened are reported.
+    recovered = PartialDirectorySnapshot(p(""), previous=snapshot)
+    diff = DirectorySnapshotDiff(snapshot, recovered)
+    assert recovered.unreadable == {}
+    assert diff.files_created == [p("sub", "during")]
+    assert diff.files_deleted == [p("sub", "before")]
+    assert diff.dirs_deleted == []
+
+
+def test_partial_snapshot_reports_removed_subtree_as_deleted(p):
+    # A directory that really disappeared is not an incomplete read: its
+    # entries must be reported as deleted, unlike an unreadable directory.
+    mkdir(p("sub"), parents=True)
+    touch(p("sub", "a"))
+    mkdir(p("sub", "nested"), parents=True)
+    ref = PartialDirectorySnapshot(p(""))
+
+    rm(p("sub"), recursive=True)
+    snapshot = PartialDirectorySnapshot(p(""), previous=ref)
+
+    # Nothing is retained for a directory that is really gone.
+    assert snapshot.unreadable == {}
+    assert snapshot.carried_over == set()
+
+    diff = DirectorySnapshotDiff(ref, snapshot)
+    assert set(diff.files_deleted) == {p("sub", "a")}
+    assert set(diff.dirs_deleted) == {p("sub"), p("sub", "nested")}
+
+
+@pytest.mark.parametrize("error", [errno.ENOENT, errno.ENOTDIR])
+def test_partial_snapshot_drops_children_of_vanished_subtree(p, error):
+    # The subtree root is stat'ed fine, but listing it fails because it was
+    # removed (or replaced by a file) in between: its children are really gone,
+    # so they are reported as deleted and not retained.
+    mkdir(p("sub"), parents=True)
+    touch(p("sub", "a"))
+    mkdir(p("sub", "nested"), parents=True)
+    ref = PartialDirectorySnapshot(p(""))
+
+    def listdir(path):
+        if path == p("sub"):
+            raise OSError(error, os.strerror(error), path)
+        return os.scandir(path)
+
+    snapshot = PartialDirectorySnapshot(p(""), listdir=listdir, previous=ref)
+    assert snapshot.unreadable == {}
+    assert snapshot.carried_over == set()
+
+    diff = DirectorySnapshotDiff(ref, snapshot)
+    assert set(diff.files_deleted) == {p("sub", "a")}
+    assert set(diff.dirs_deleted) == {p("sub", "nested")}
+
+
+def test_partial_snapshot_does_not_retain_children_found_again(p):
+    # If only part of the subtree became readable, the freshly read entries
+    # win over the carried-over state.
+    mkdir(p("sub", "nested"), parents=True)
+    touch(p("sub", "nested", "file"))
+    ref = PartialDirectorySnapshot(p(""))
+
+    def listdir(path):
+        if path == p("sub"):
+            raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+        return os.scandir(path)
+
+    snapshot = PartialDirectorySnapshot(p(""), listdir=listdir, previous=ref)
+    assert p("sub", "nested", "file") in snapshot.paths
+
+    # "sub" is readable again but "sub/nested" is now the unreadable one.
+    snapshot.listdir = _flaky_listdir(p("sub", "nested"), error=errno.EIO)
+    recovered = PartialDirectorySnapshot(p(""), listdir=snapshot.listdir, previous=snapshot)
+    assert list(recovered.unreadable) == [p("sub", "nested")]
+    assert p("sub", "nested", "file") in recovered.paths
+
+
+def test_partial_snapshot_unreadable_root(p):
+    # The watched directory itself cannot be listed: the whole tree is kept.
+    mkdir(p("a"), parents=True)
+    touch(p("a", "file"))
+    ref = PartialDirectorySnapshot(p(""))
+
+    def listdir(_):
+        raise OSError(errno.EHOSTDOWN, os.strerror(errno.EHOSTDOWN))
+
+    snapshot = PartialDirectorySnapshot(p(""), listdir=listdir, previous=ref)
+    assert list(snapshot.unreadable) == [p("")]
+    assert p("a", "file") in snapshot.paths
+    assert len(DirectorySnapshotDiff(ref, snapshot)) == 0
+
+
+def test_partial_snapshot_without_previous(p):
+    # With no previous snapshot there is nothing to carry over.
+    mkdir(p("sub"), parents=True)
+    touch(p("sub", "a"))
+    snapshot = PartialDirectorySnapshot(p(""), listdir=_flaky_listdir(p("sub")))
+    assert list(snapshot.unreadable) == [p("sub")]
+    assert snapshot.carried_over == set()
+    assert p("sub", "a") not in snapshot.paths
+
+
+def test_empty_snapshot_has_no_unreadable_paths():
+    assert EmptyDirectorySnapshot().unreadable == {}
+
+
 
 
 def test_ignore_device(p):

@@ -27,6 +27,10 @@ Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: PartialDirectorySnapshot
+   :members:
+   :show-inheritance:
+
 """
 
 from __future__ import annotations
@@ -384,6 +388,18 @@ class DirectorySnapshot:
         for every entry in the directory tree.
     :param listdir:
         Use custom listdir function. For details see ``os.scandir``.
+    :param previous:
+        The snapshot taken by the previous poll. Ignored by this class; only
+        subclasses that keep the last known state of the paths they cannot
+        read, such as :class:`PartialDirectorySnapshot`, use it.
+
+    Note
+    ----
+    A subdirectory that cannot be listed because of a :class:`PermissionError`
+    is simply not walked (see `#408`_). Use :class:`PartialDirectorySnapshot`
+    to keep the last known state of such directories instead.
+
+    .. _#408: https://github.com/gorakhargosh/watchdog/pull/408
     """
 
     def __init__(
@@ -393,6 +409,7 @@ class DirectorySnapshot:
         recursive: bool = True,
         stat: Callable[[str], os.stat_result] = os.stat,
         listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
+        previous: DirectorySnapshot | None = None,
     ) -> None:
         self.recursive = recursive
         self.stat = stat
@@ -401,6 +418,8 @@ class DirectorySnapshot:
         self._stat_info: dict[bytes | str, os.stat_result] = {}
         self._inode_to_path: dict[tuple[int, int], bytes | str] = {}
         self._birthtimes: dict[bytes | str, int | None] = {}
+        # Paths whose contents could not be read while taking this snapshot.
+        self._unreadable: dict[bytes | str, OSError] = {}
 
         st = self.stat(path)
         self._stat_info[path] = st
@@ -418,19 +437,16 @@ class DirectorySnapshot:
         try:
             paths = [os.path.join(root, entry.name) for entry in self.listdir(root)]
         except OSError as e:
-            # Directory may have been deleted between finding it in the directory
-            # list of its parent and trying to delete its contents. If this
-            # happens we treat it as empty. Likewise if the directory was replaced
-            # with a file of the same name (less likely, but possible).
-            if e.errno in (errno.ENOENT, errno.ENOTDIR, errno.EINVAL):
-                return
-            else:
-                raise
+            self._on_listdir_error(root, e)
+            return
 
         entries = []
         for p in paths:
-            with contextlib.suppress(OSError):
+            try:
                 entry = (p, self.stat(p))
+            except OSError as e:
+                self._on_stat_error(p, e)
+            else:
                 entries.append(entry)
                 yield entry
 
@@ -439,6 +455,47 @@ class DirectorySnapshot:
                 with contextlib.suppress(PermissionError):
                     if S_ISDIR(st.st_mode):
                         yield from self.walk(path)
+
+    @staticmethod
+    def _is_missing(error: OSError) -> bool:
+        """Whether ``error`` means the path is simply gone rather than unreadable."""
+        return error.errno in (errno.ENOENT, errno.ENOTDIR, errno.EINVAL)
+
+    def _on_listdir_error(self, root: str, error: OSError) -> None:
+        """Handle a failure to list the contents of the directory ``root``.
+
+        The directory may have been deleted between being found in its
+        parent's listing and being read. Likewise, it may have been replaced
+        with a file of the same name (less likely, but possible). In both
+        cases it is treated as empty. Any other error is raised.
+
+        :class:`PartialDirectorySnapshot` overrides this to remember the
+        directory instead of silently dropping its entries.
+
+        :raises OSError: For errors other than ``ENOENT``, ``ENOTDIR`` and
+            ``EINVAL``.
+        """
+        if not self._is_missing(error):
+            raise error
+
+    def _on_stat_error(self, path: bytes | str, error: OSError) -> None:
+        """Handle a failure to stat the entry ``path``.
+
+        The entry is skipped and therefore left out of the snapshot.
+        :class:`PartialDirectorySnapshot` overrides this to remember the entry
+        instead of dropping it.
+        """
+
+    @property
+    def unreadable(self) -> dict[bytes | str, OSError]:
+        """Paths whose contents could not be read while taking the snapshot.
+
+        Maps each such path (a directory that could not be listed, or an entry
+        that could not be stat'ed) to the :class:`OSError` that prevented
+        reading it. Always empty for a plain :class:`DirectorySnapshot`, which
+        instead silently drops the entries it cannot read.
+        """
+        return dict(self._unreadable)
 
     @property
     def paths(self) -> set[bytes | str]:
@@ -543,6 +600,7 @@ class EmptyDirectorySnapshot(DirectorySnapshot):
 
     def __init__(self) -> None:
         self._stat_info: dict[bytes | str, os.stat_result] = {}
+        self._unreadable: dict[bytes | str, OSError] = {}
 
     @staticmethod
     def path(_: Any) -> None:
@@ -569,3 +627,100 @@ class EmptyDirectorySnapshot(DirectorySnapshot):
         empty, it always returns None.
         """
         return None
+
+    @property
+    def unreadable(self) -> dict[bytes | str, OSError]:
+        """Mock up method to return the unreadable paths. As the snapshot is
+        intended to be empty, it always returns an empty dict.
+        """
+        return {}
+
+
+class PartialDirectorySnapshot(DirectorySnapshot):
+    """A snapshot that can carry an incomplete view of the directory tree.
+
+    When some paths cannot be read for reasons other than disappearing (a
+    ``PermissionError`` on a single subdirectory, an ``EIO`` while listing a
+    network mount, ...), a plain :class:`DirectorySnapshot` silently drops
+    them. Diffing two such snapshots then reports every entry of that subtree
+    as deleted, and every entry added while it was unreadable as deleted as
+    well once it becomes readable again.
+
+    This class instead remembers, for every path it could not read, the state
+    it had in the ``previous`` snapshot. Those paths are kept in this snapshot
+    as they were, so a diff against ``previous`` reports no change for them,
+    while the rest of the tree is compared normally.
+
+    :param path:
+        The directory path for which a snapshot should be taken.
+    :param previous:
+        The snapshot taken by the previous poll. The last known state of the
+        paths that cannot be read is inherited from it. When ``None``,
+        unreadable paths are simply not present, like
+        :class:`DirectorySnapshot` does.
+
+    :attr:`unreadable` lists the paths whose state could not be refreshed.
+    A directory that is genuinely gone (``ENOENT``) is *not* listed there: its
+    entries are really deleted, and are reported as such.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        recursive: bool = True,
+        stat: Callable[[str], os.stat_result] = os.stat,
+        listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
+        previous: DirectorySnapshot | None = None,
+    ) -> None:
+        # Paths whose *entries* are carried over from ``previous``, i.e. the
+        # unreadable subtree roots. Their state is not refreshed.
+        self._carried_roots: set[bytes | str] = set()
+        super().__init__(path, recursive=recursive, stat=stat, listdir=listdir, previous=previous)
+
+        # Keep the last known state of every unreadable subtree.
+        if previous is not None:
+            for unreadable_path in self._unreadable:
+                self._carry_over(unreadable_path, previous)
+
+    @staticmethod
+    def _is_below(path: bytes | str, root: bytes | str) -> bool:
+        """Whether ``path`` is a descendant of ``root``."""
+        empty = b"" if isinstance(root, bytes) else ""
+        return path != root and path.startswith(os.path.join(root, empty))
+
+    def _carry_over(self, root: bytes | str, previous: DirectorySnapshot) -> None:
+        """Copy the state of ``root`` and its descendants from ``previous``."""
+        self._carried_roots.add(root)
+        for path in previous.paths:
+            if path != root and not self._is_below(path, root):
+                continue
+            if path in self._stat_info:
+                # The path has been read again (e.g. it was recreated); prefer
+                # the fresh state.
+                continue
+            st = previous.stat_info(path)
+            self._stat_info[path] = st
+            # Do not steal the inode from a freshly read entry (e.g. a hard
+            # link): the fresh state must win.
+            self._inode_to_path.setdefault((st.st_ino, st.st_dev), path)
+            # Reuse the cached birth time rather than querying the live path,
+            # which is exactly the path we failed to read.
+            birthtimes = getattr(previous, "_birthtimes", {})
+            if path in birthtimes:
+                self._birthtimes[path] = birthtimes[path]
+
+    def _on_listdir_error(self, root: str, error: OSError) -> None:
+        # A disappearing directory is not an incomplete read: leaving it out
+        # is accurate, and its children (if any) are really gone too.
+        if not self._is_missing(error):
+            self._unreadable[root] = error
+
+    def _on_stat_error(self, path: bytes | str, error: OSError) -> None:
+        if not self._is_missing(error):
+            self._unreadable[path] = error
+
+    @property
+    def carried_over(self) -> set[bytes | str]:
+        """Subtree roots whose entries were inherited from the previous snapshot."""
+        return set(self._carried_roots)

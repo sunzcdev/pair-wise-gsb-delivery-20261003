@@ -40,7 +40,12 @@ from watchdog.events import (
     FileMovedEvent,
 )
 from watchdog.observers.api import DEFAULT_EMITTER_TIMEOUT, DEFAULT_OBSERVER_TIMEOUT, BaseObserver, EventEmitter
-from watchdog.utils.dirsnapshot import DirectorySnapshot, DirectorySnapshotDiff, EmptyDirectorySnapshot
+from watchdog.utils.dirsnapshot import (
+    DirectorySnapshot,
+    DirectorySnapshotDiff,
+    EmptyDirectorySnapshot,
+    PartialDirectorySnapshot,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -55,6 +60,16 @@ logger = logging.getLogger(__name__)
 class PollingEmitter(EventEmitter):
     """Platform-independent emitter that polls a directory to detect file
     system changes.
+
+    :param partial_snapshots:
+        When ``True``, polls use :class:`~watchdog.utils.dirsnapshot.PartialDirectorySnapshot`
+        instead of :class:`~watchdog.utils.dirsnapshot.DirectorySnapshot`. A
+        path that cannot be read (for instance a subdirectory that is briefly
+        unreadable, or an ``EIO`` from a network mount) then keeps the state it
+        had during the previous poll: changes elsewhere in the tree are still
+        reported, and nothing is reported as deleted for the part that could
+        not be read. Once it becomes readable again, its actual changes are
+        reported.
     """
 
     def __init__(
@@ -66,16 +81,33 @@ class PollingEmitter(EventEmitter):
         event_filter: list[type[FileSystemEvent]] | None = None,
         stat: Callable[[str], os.stat_result] = os.stat,
         listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
+        partial_snapshots: bool = False,
     ) -> None:
         super().__init__(event_queue, watch, timeout=timeout, event_filter=event_filter)
         self._snapshot: DirectorySnapshot = EmptyDirectorySnapshot()
         self._lock = threading.Lock()
         self._snapshot_failing = False
-        self._take_snapshot: Callable[[], DirectorySnapshot] = lambda: DirectorySnapshot(
+        self._partial_snapshots = partial_snapshots
+        self._unreadable_paths: set[bytes | str] = set()
+        self._stat = stat
+        self._listdir = listdir
+
+    def _new_snapshot(self) -> DirectorySnapshot:
+        if self._partial_snapshots:
+            # Unreadable paths inherit their last known state from the previous
+            # poll instead of being reported as deleted.
+            return PartialDirectorySnapshot(
+                self.watch.path,
+                recursive=self.watch.is_recursive,
+                stat=self._stat,
+                listdir=self._listdir,
+                previous=self._snapshot,
+            )
+        return DirectorySnapshot(
             self.watch.path,
             recursive=self.watch.is_recursive,
-            stat=stat,
-            listdir=listdir,
+            stat=self._stat,
+            listdir=self._listdir,
         )
 
     def on_thread_start(self) -> None:
@@ -84,7 +116,7 @@ class PollingEmitter(EventEmitter):
         Later snapshots are compared against this one to detect changes.
         """
 
-        self._snapshot = self._take_snapshot()
+        self._snapshot = self._new_snapshot()
 
     def queue_events(self, timeout: Seconds) -> None:
         """Wait ``timeout`` seconds, then queue events for any changes.
@@ -98,6 +130,10 @@ class PollingEmitter(EventEmitter):
         :class:`~watchdog.events.DirDeletedEvent` is queued and the emitter
         stops. Other :class:`OSError` exceptions are logged and retried on the
         next poll.
+
+        When :attr:`partial_snapshots` is enabled and some paths could not be
+        read, the events are still queued for the rest of the tree, and the
+        paths that could not be read keep their previous state.
 
         :param timeout:
             Seconds to wait between successive snapshots. Polling emitters use
@@ -116,7 +152,7 @@ class PollingEmitter(EventEmitter):
             # Get event diff between fresh snapshot and previous snapshot.
             # Update snapshot.
             try:
-                new_snapshot = self._take_snapshot()
+                new_snapshot = self._new_snapshot()
             except (FileNotFoundError, NotADirectoryError):
                 self.queue_event(DirDeletedEvent(self.watch.path))
                 self.stop()
@@ -134,6 +170,9 @@ class PollingEmitter(EventEmitter):
             if self._snapshot_failing:
                 self._snapshot_failing = False
                 logger.info("Snapshot of %r succeeded again, resuming", self.watch.path)
+
+            if self._partial_snapshots:
+                self._log_incomplete(new_snapshot)
 
             events = DirectorySnapshotDiff(self._snapshot, new_snapshot)
             self._snapshot = new_snapshot
@@ -162,6 +201,31 @@ class PollingEmitter(EventEmitter):
             for src_path in events.dirs_attrib:
                 self.queue_event(DirAttribEvent(src_path))
 
+    @property
+    def partial_snapshots(self) -> bool:
+        """Whether polls may return an incomplete snapshot of the tree."""
+        return self._partial_snapshots
+
+    def _log_incomplete(self, snapshot: DirectorySnapshot) -> None:
+        """Warn, once per outage, about paths whose state could not be refreshed."""
+        unreadable = snapshot.unreadable
+        if not unreadable:
+            if self._unreadable_paths:
+                self._unreadable_paths = set()
+                logger.info("Polling %r is complete again", self.watch.path)
+            return
+
+        new_paths = set(unreadable) - self._unreadable_paths
+        if new_paths:
+            for path in sorted(new_paths, key=str):
+                logger.warning(
+                    "Cannot read %r while polling %r, keeping its last known state: %s",
+                    path,
+                    self.watch.path,
+                    unreadable[path],
+                )
+        self._unreadable_paths = set(unreadable)
+
 
 class PollingObserver(BaseObserver):
     """Platform-independent observer that polls a directory to detect file
@@ -181,7 +245,27 @@ class PollingObserver(BaseObserver):
 
 
 class PollingObserverVFS(BaseObserver):
-    """File system independent observer that polls a directory to detect changes."""
+    """File system independent observer that polls a directory to detect changes.
+
+    Polls are allowed to return an incomplete view of the tree: when a single
+    subdirectory or file cannot be read (a ``PermissionError``, or a transient
+    ``OSError`` such as ``EIO`` from a network share), it keeps the state it
+    had during the previous poll. Changes elsewhere in the tree are still
+    reported, and the entries of the part that could not be read are not
+    reported as deleted. Once it can be read again, the changes that really
+    happened in the meantime are reported.
+
+    A directory that has genuinely disappeared is still reported as deleted:
+    it is not merely unreadable, so it is not kept. This makes the difference
+    between
+
+    - an unreadable directory, whose last known state is preserved, and
+    - a directory that was really removed, whose entries are reported deleted
+      (``DirDeletedEvent`` for the directory and ``DirDeletedEvent`` or
+      ``FileDeletedEvent`` for each entry), and
+    - a directory that became readable again with fewer files, whose missing
+      files are reported deleted at that point.
+    """
 
     def __init__(
         self,
@@ -195,5 +279,5 @@ class PollingObserverVFS(BaseObserver):
         :type polling_interval: Seconds
         :param polling_interval: interval between polling the file system.
         """
-        emitter_cls = partial(PollingEmitter, stat=stat, listdir=listdir)
+        emitter_cls = partial(PollingEmitter, stat=stat, listdir=listdir, partial_snapshots=True)
         super().__init__(emitter_cls, timeout=polling_interval)  # type: ignore[arg-type]

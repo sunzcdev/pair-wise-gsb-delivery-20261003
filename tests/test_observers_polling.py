@@ -21,11 +21,13 @@ from watchdog.events import (
     FileDeletedEvent,
     FileModifiedEvent,
     FileMovedEvent,
+    FileSystemEventHandler,
 )
 from watchdog.observers.api import ObservedWatch
 from watchdog.observers.polling import PollingEmitter as Emitter
+from watchdog.observers.polling import PollingObserverVFS
 from watchdog.utils import platform
-from watchdog.utils.dirsnapshot import EmptyDirectorySnapshot
+from watchdog.utils.dirsnapshot import EmptyDirectorySnapshot, PartialDirectorySnapshot
 
 from .shell import chmod, mkdir, msize, mv, rm, touch
 
@@ -208,6 +210,229 @@ def test_transient_error_in_subdirectory(p, event_queue):
         got = _wait_for_event(event_queue, FileCreatedEvent(p("sub", "during_outage")))
         assert DirDeletedEvent(p()) not in got
         assert emitter.should_keep_running()
+    finally:
+        emitter.stop()
+        emitter.join(5)
+
+
+def _drain(event_queue):
+    got = []
+    while True:
+        try:
+            event, _ = event_queue.get_nowait()
+        except Empty:
+            return got
+        got.append(event)
+
+
+class _CollectingHandler(FileSystemEventHandler):
+    """Puts every dispatched event on a queue, like an emitter's queue."""
+
+    def __init__(self, event_queue):
+        self.event_queue = event_queue
+
+    def dispatch(self, event):
+        self.event_queue.put((event, None))
+        super().dispatch(event)
+
+
+def _collect_events_until(event_queue, expected, timeout=10):
+    """Collect events until every event in ``expected`` has been seen.
+
+    Unlike :func:`_wait_for_event`, the events collected on the way are kept,
+    so a single pass can assert about several of them at once.
+    """
+    got = set()
+    deadline = monotonic() + timeout
+    while not expected <= got:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            pytest.fail(f"Missing events {expected - got} (got {got})")
+        got.add(event_queue.get(timeout=remaining)[0])
+    return got
+
+
+def _partial_emitter(p, event_queue, blocked, outage, *, error=errno.EACCES):
+    """Emitter using partial snapshots, with ``blocked`` unreadable during ``outage``."""
+
+    def flaky_listdir(path):
+        if outage.is_set() and path == blocked:
+            raise OSError(error, os.strerror(error), path)
+        return os.scandir(path)
+
+    watch = ObservedWatch(p(), recursive=True)
+    return Emitter(event_queue, watch, timeout=0.2, listdir=flaky_listdir, partial_snapshots=True)
+
+
+@pytest.mark.flaky(max_runs=3, min_passes=1)
+def test_partial_snapshot_keeps_unreadable_subtree_and_reports_other_changes(p, event_queue, caplog):
+    # One subdirectory is unreadable during a poll: the entries of the other
+    # branch are still reported as created/deleted, and nothing is reported as
+    # deleted for the unreadable branch.
+    mkdir(p("sub"))
+    mkdir(p("other"))
+    touch(p("sub", "kept"))
+    touch(p("other", "kept"))
+
+    outage = threading.Event()
+    emitter = _partial_emitter(p, event_queue, p("sub"), outage)
+    emitter.start()
+    try:
+        outage.set()
+        # Changes while "sub" is unreadable: one in each branch.
+        touch(p("sub", "hidden"))
+        touch(p("other", "created"))
+        rm(p("other", "kept"))
+
+        got = _collect_events_until(
+            event_queue,
+            {FileCreatedEvent(p("other", "created")), FileDeletedEvent(p("other", "kept"))},
+        )
+
+        assert FileDeletedEvent(p("sub", "kept")) not in got
+        assert DirDeletedEvent(p("sub")) not in got
+        assert emitter.should_keep_running()
+        # The unreadable subtree did not make the whole poll fail.
+        assert not emitter._snapshot_failing  # noqa: SLF001
+        assert isinstance(emitter._snapshot, PartialDirectorySnapshot)  # noqa: SLF001
+        assert p("sub", "kept") in emitter._snapshot.paths  # noqa: SLF001
+    finally:
+        emitter.stop()
+        emitter.join(5)
+
+    warnings = [r for r in caplog.records if r.name == "watchdog.observers.polling" and r.levelno == logging.WARNING]
+    assert any("keeping its last known state" in r.getMessage() for r in warnings)
+
+
+@pytest.mark.flaky(max_runs=3, min_passes=1)
+def test_partial_snapshot_reports_both_branches_after_recovery(p, event_queue):
+    # After the outage, every branch converges on the exact listing: the
+    # changes made while unreadable are reported, and no deletion is invented.
+    mkdir(p("sub"))
+    mkdir(p("other"))
+    touch(p("sub", "removed_during_outage"))
+    touch(p("other", "removed_during_outage"))
+
+    outage = threading.Event()
+    emitter = _partial_emitter(p, event_queue, p("sub"), outage)
+    emitter.start()
+    try:
+        outage.set()
+        rm(p("sub", "removed_during_outage"))
+        touch(p("sub", "created_during_outage"))
+        rm(p("other", "removed_during_outage"))
+        touch(p("other", "created_during_outage"))
+
+        _collect_events_until(event_queue, {FileCreatedEvent(p("other", "created_during_outage"))})
+        # While unreadable, the deletion inside "sub" is not reported.
+        assert FileDeletedEvent(p("sub", "removed_during_outage")) not in _drain(event_queue)
+
+        outage.clear()
+        got = _collect_events_until(
+            event_queue,
+            {
+                FileCreatedEvent(p("sub", "created_during_outage")),
+                FileDeletedEvent(p("sub", "removed_during_outage")),
+            },
+        )
+
+        assert DirDeletedEvent(p("sub")) not in got
+        assert DirDeletedEvent(p()) not in got
+        assert emitter.should_keep_running()
+        # Both branches now match the filesystem exactly.
+        snapshot = emitter._snapshot  # noqa: SLF001
+        assert snapshot.unreadable == {}
+        assert snapshot.paths == {path for path in snapshot.paths if os.path.exists(path)}
+        assert snapshot.paths >= {p("sub"), p("sub", "created_during_outage"), p("other", "created_during_outage")}
+    finally:
+        emitter.stop()
+        emitter.join(5)
+
+
+@pytest.mark.flaky(max_runs=3, min_passes=1)
+def test_partial_snapshot_still_reports_deleted_subtree(p, event_queue):
+    # A subdirectory that really goes away is not an unreadable one: its
+    # entries must be reported as deleted.
+    mkdir(p("sub"))
+    touch(p("sub", "a"))
+
+    emitter = _partial_emitter(p, event_queue, p("nowhere"), threading.Event())
+    emitter.start()
+    try:
+        rm(p("sub"), recursive=True)
+        got = _wait_for_event(event_queue, DirDeletedEvent(p("sub")), timeout=10)
+        assert FileDeletedEvent(p("sub", "a")) in got
+        assert DirDeletedEvent(p()) not in got
+        assert emitter.should_keep_running()
+        assert emitter._snapshot.unreadable == {}  # noqa: SLF001
+    finally:
+        emitter.stop()
+        emitter.join(5)
+
+
+def test_polling_observer_vfs_uses_partial_snapshots(p, event_queue):
+    # The VFS observer opts in to partial snapshots for every emitter it creates.
+    observer = PollingObserverVFS(stat=os.stat, listdir=os.scandir, polling_interval=0.1)
+    observer.schedule(_CollectingHandler(event_queue), p(), recursive=True)
+    observer.start()
+    try:
+        (emitter,) = observer.emitters
+        assert emitter.partial_snapshots is True
+    finally:
+        observer.stop()
+        observer.join(5)
+
+
+@pytest.mark.flaky(max_runs=3, min_passes=1)
+def test_polling_observer_vfs_survives_unreadable_subdirectory(p, event_queue):
+    # End-to-end through the observer: a failing listdir for a single
+    # subdirectory must not hide the other branch, and must not look like a
+    # deletion of the unreadable one.
+    mkdir(p("sub"))
+    mkdir(p("other"))
+    touch(p("sub", "kept"))
+    outage = threading.Event()
+
+    def flaky_listdir(path):
+        if outage.is_set() and path == p("sub"):
+            raise OSError(errno.EACCES, os.strerror(errno.EACCES), path)
+        return os.scandir(path)
+
+    observer = PollingObserverVFS(stat=os.stat, listdir=flaky_listdir, polling_interval=0.1)
+    watch = observer.schedule(_CollectingHandler(event_queue), p(), recursive=True)
+    observer.start()
+    try:
+        outage.set()
+        touch(p("other", "created"))
+        got = _collect_events_until(event_queue, {FileCreatedEvent(p("other", "created"))})
+        # The unreadable subtree did not take the watch down, nor look deleted.
+        assert watch in observer._watches  # noqa: SLF001
+        assert not any(isinstance(event, DirDeletedEvent) and event.src_path == p("sub") for event in got)
+    finally:
+        observer.stop()
+        observer.join(5)
+
+
+def test_transient_error_in_subdirectory_with_plain_snapshots(p, event_queue):
+    # Without partial snapshots (the historical behavior), a single failing
+    # listdir aborts the whole poll. This documents the difference.
+    mkdir(p("sub"))
+    outage = threading.Event()
+    failures = []
+
+    def flaky_listdir(path):
+        if outage.is_set() and path == p("sub"):
+            failures.append(path)
+            raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+        return os.scandir(path)
+
+    emitter = Emitter(event_queue, ObservedWatch(p(), recursive=True), timeout=0.2, listdir=flaky_listdir)
+    emitter.start()
+    try:
+        outage.set()
+        touch(p("other"))
+        _wait_for_failed_polls(emitter, failures)
+        assert emitter._snapshot_failing  # noqa: SLF001
     finally:
         emitter.stop()
         emitter.join(5)
