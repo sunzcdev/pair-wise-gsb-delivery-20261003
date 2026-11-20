@@ -695,3 +695,155 @@ class TestBinderMRI < TestBinderBase
     assert_equal 0x8000 | 0x200000, ssl_context_for_binder.verification_flags
   end
 end unless ::Puma::IS_JRUBY
+
+# On restart Puma hands the already-open listening sockets to the next
+# generation through +PUMA_INHERIT_*+ entries.  A bind string such as
+# +tcp://localhost:0+ does not name a concrete address/port, so the Binder has
+# to correlate each inherited handle with the current configuration using the
+# handle's actual bound address.  These tests drive that correlation with real,
+# controllable listening TCP sockets and an explicit parent-side mapping,
+# covering the precise-hit, ambiguous and unmatched outcomes while pinning the
+# legacy behaviour for ordinary, explicit ports.
+#
+# The class is deliberately not parallelized: the sockets bind real ports and
+# the assertions rely on which exact handles end up owned by the Binder.
+class TestBinderInheritedTcp < TestBinderBase
+  # --- precise hit ---------------------------------------------------------
+
+  def test_port_zero_inherits_the_socket_whose_actual_port_matches
+    server = bound_tcp_server("127.0.0.1")
+    port = server.local_address.ip_port
+    @binder.inherited_fds[tcp_url_for(server)] = server
+
+    @binder.parse ["tcp://127.0.0.1:0"], @log_writer
+
+    assert_equal 1, @binder.ios.length
+    assert_same server, @binder.ios.first
+    refute server.closed?
+    assert_equal [port], @binder.connected_ports
+    assert_empty @binder.inherited_fds
+  end
+
+  def test_localhost_port_zero_inherits_each_expanded_loopback_socket
+    servers = loopback_ip_addresses.map { |ip| bound_tcp_server(ip) }
+    servers.each { |s| @binder.inherited_fds[tcp_url_for(s)] = s }
+    ports = servers.map { |s| s.local_address.ip_port }.sort
+
+    @binder.parse ["tcp://localhost:0"], @log_writer
+
+    assert_equal servers.length, @binder.ios.length
+    servers.each do |s|
+      assert_includes @binder.ios, s
+      refute s.closed?, "inherited loopback handle #{s.local_address.ip_address} must stay open"
+    end
+    assert_equal ports, @binder.connected_ports.sort
+    assert_empty @binder.inherited_fds
+  end
+
+  # --- preserved behaviour for ordinary explicit ports ---------------------
+
+  def test_explicit_port_inherits_handle_with_matching_bind_string
+    server = bound_tcp_server("127.0.0.1")
+    port = server.local_address.ip_port
+    @binder.inherited_fds["tcp://127.0.0.1:#{port}"] = server
+
+    @binder.parse ["tcp://127.0.0.1:#{port}"], @log_writer
+
+    assert_equal 1, @binder.ios.length
+    assert_same server, @binder.ios.first
+    refute server.closed?
+    assert_equal [port], @binder.connected_ports
+  end
+
+  def test_explicit_port_inherits_integer_fd_from_parent_mapping
+    skip_unless :unix
+
+    server = bound_tcp_server("127.0.0.1")
+    server.autoclose = false
+    port = server.local_address.ip_port
+    fd = server.to_i
+    @binder.inherited_fds["tcp://127.0.0.1:#{port}"] = fd
+
+    @binder.parse ["tcp://127.0.0.1:#{port}"], @log_writer
+
+    assert_equal 1, @binder.ios.length
+    assert_equal fd, @binder.ios.first.to_i
+    assert_equal [port], @binder.connected_ports
+  end
+
+  # --- ambiguity ------------------------------------------------------------
+
+  def test_ambiguous_inherited_wildcard_sockets_are_not_guessed
+    first = bound_tcp_server("0.0.0.0")
+    second = bound_tcp_server("0.0.0.0")
+    [first, second].each { |s| @binder.inherited_fds[tcp_url_for(s)] = s }
+    stale_ports = [first, second].map { |s| s.local_address.ip_port }
+
+    @binder.parse ["tcp://0.0.0.0:0"], @log_writer
+
+    # With two eligible handles and a port of zero, neither can be mapped
+    # uniquely, so both stay unused and get closed; a fresh listener is opened.
+    assert_closed first
+    assert_closed second
+    assert_equal 1, @binder.ios.length
+    fresh = @binder.ios.first
+    refute_same first, fresh
+    refute_same second, fresh
+    refute_includes stale_ports, fresh.local_address.ip_port
+  end
+
+  # --- unmatched ------------------------------------------------------------
+
+  def test_unmatched_inherited_socket_is_closed_while_fresh_listener_opens
+    stale = bound_tcp_server("127.0.0.1")
+    stale_port = stale.local_address.ip_port
+    @binder.inherited_fds[tcp_url_for(stale)] = stale
+
+    @binder.parse ["tcp://0.0.0.0:0"], @log_writer
+
+    assert_closed stale
+    assert_equal 1, @binder.ios.length
+    fresh = @binder.ios.first
+    refute_same stale, fresh
+    refute_equal stale_port, fresh.local_address.ip_port
+  end
+
+  def test_explicit_port_without_matching_handle_binds_fresh_socket
+    stale = bound_tcp_server("127.0.0.1")
+    @binder.inherited_fds[tcp_url_for(stale)] = stale
+    fresh_port = UniquePort.call
+
+    @binder.parse ["tcp://127.0.0.1:#{fresh_port}"], @log_writer
+
+    assert_closed stale
+    assert_equal 1, @binder.ios.length
+    assert_equal fresh_port, @binder.ios.first.local_address.ip_port
+  end
+
+  private
+
+  # Mirrors the socket options Binder#add_tcp_listener applies so the test
+  # sockets are realistic inherited listeners.
+  def bound_tcp_server(host, port = 0)
+    server = TCPServer.new(host, port)
+    server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true)
+    server.listen(1024)
+    server
+  end
+
+  def tcp_url_for(server)
+    port, host = Socket.unpack_sockaddr_in(server.getsockname)
+    host = "[#{host}]" if host.include?(":")
+    "tcp://#{host}:#{port}"
+  end
+
+  def loopback_ip_addresses
+    %w[::1 127.0.0.1].select do |ip|
+      Socket.ip_address_list.any? { |addr| addr.ip_address == ip }
+    end
+  end
+
+  def assert_closed(io)
+    assert io.closed?, "expected inherited handle to be closed: #{io.inspect}"
+  end
+end
