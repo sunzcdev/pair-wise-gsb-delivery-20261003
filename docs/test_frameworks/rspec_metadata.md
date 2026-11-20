@@ -158,7 +158,29 @@ _When_ I run `rspec spec/vcr_example_spec.rb`
 
 _Then_ it should fail with "boom"
 
-_And_ the output should not contain "There are unused HTTP interactions".
+_And_ the output should contain "the original failure is reported first"
+
+_And_ the output should contain "0 of 1 recorded interaction were used; 1 remains unused.".
+
+## `allow_unused_http_interactions: false` does not raise for a pending example
+
+_And_ a file named "spec/vcr_example_spec.rb" with:
+
+```ruby
+require 'spec_helper'
+
+describe "Group", vcr: { allow_unused_http_interactions: false } do
+  it 'optionally raises an error' do
+    skip "not ready yet"
+  end
+end
+```
+
+_When_ I run `rspec spec/vcr_example_spec.rb`
+
+_Then_ it should pass with "1 example, 0 failures, 1 pending"
+
+_And_ the output should not contain "unused HTTP interaction".
 
 ## Pass a hash to set the cassette options
 

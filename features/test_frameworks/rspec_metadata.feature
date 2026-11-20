@@ -136,7 +136,23 @@ Feature: Usage with RSpec metadata
       """
     When I run `rspec spec/vcr_example_spec.rb`
     Then it should fail with "boom"
-     And the output should not contain "There are unused HTTP interactions"
+     And the output should contain "the original failure is reported first"
+     And the output should contain "0 of 1 recorded interaction were used; 1 remains unused."
+
+  Scenario: `allow_unused_http_interactions: false` does not raise for a pending example
+    And a file named "spec/vcr_example_spec.rb" with:
+      """ruby
+      require 'spec_helper'
+
+      describe "Group", vcr: { allow_unused_http_interactions: false } do
+        it 'optionally raises an error' do
+          skip "not ready yet"
+        end
+      end
+      """
+    When I run `rspec spec/vcr_example_spec.rb`
+    Then it should pass with "1 example, 0 failures, 1 pending"
+     And the output should not contain "unused HTTP interaction"
 
   Scenario: Pass a hash to set the cassette options
     Given a file named "spec/vcr_example_spec.rb" with:

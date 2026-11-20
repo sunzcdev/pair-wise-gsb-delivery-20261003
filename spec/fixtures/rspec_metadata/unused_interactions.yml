@@ -1,0 +1,54 @@
+---
+http_interactions:
+- request:
+    method: get
+    uri: http://example.com/one
+    body: ''
+    headers: {}
+  response:
+    status:
+      code: 200
+      message: OK
+    headers:
+      Content-Type:
+      - text/plain
+      Content-Length:
+      - '3'
+    body: One
+    http_version: '1.1'
+  recorded_at: Tue, 01 Nov 2011 04:49:54 GMT
+- request:
+    method: get
+    uri: http://example.com/two
+    body: ''
+    headers: {}
+  response:
+    status:
+      code: 200
+      message: OK
+    headers:
+      Content-Type:
+      - text/plain
+      Content-Length:
+      - '3'
+    body: Two
+    http_version: '1.1'
+  recorded_at: Tue, 01 Nov 2011 04:49:54 GMT
+- request:
+    method: get
+    uri: http://example.com/three
+    body: ''
+    headers: {}
+  response:
+    status:
+      code: 200
+      message: OK
+    headers:
+      Content-Type:
+      - text/plain
+      Content-Length:
+      - '5'
+    body: Three
+    http_version: '1.1'
+  recorded_at: Tue, 01 Nov 2011 04:49:54 GMT
+recorded_with: VCR 2.0.0

@@ -49,6 +49,11 @@ module VCR
     # @return [Boolean] Should unused requests be dropped from the cassette?
     attr_reader :drop_unused_requests
 
+    # @return [Boolean] Are unused HTTP interactions allowed? When false,
+    #  ejecting the cassette asserts that every recorded interaction was
+    #  played back.
+    attr_reader :allow_unused_http_interactions
+
     # @return [Array<Symbol>] If set, {VCR::Configuration#before_record} and
     #  {VCR::Configuration#before_playback} hooks with a corresponding tag will apply.
     attr_reader :tags
@@ -110,6 +115,13 @@ module VCR
           @parent_list,
           log_prefix
       end
+    end
+
+    # @return [String, nil] A human-readable summary of the cassette's
+    #  unused HTTP interactions (including usage counts), or nil when every
+    #  recorded interaction has been played back.
+    def unused_interactions_summary
+      http_interactions.unused_interactions_summary
     end
 
     # @private

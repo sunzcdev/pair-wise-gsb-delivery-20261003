@@ -27,6 +27,32 @@ module VCR
         end
       end
 
+      # @private
+      #
+      # Ejects the cassette inserted for the given example, applying the
+      # `assert_no_unused_interactions` semantics that match the example's
+      # result:
+      #
+      # * Passed example: the assertion runs normally and raises
+      #   {VCR::Errors::UnusedHTTPInteractionError} (with a usage summary)
+      #   when the cassette has leftover interactions.
+      # * Failed example: the example's original exception is preserved as
+      #   the reported failure; the assertion is skipped and the unused
+      #   interaction details are emitted as a warning for context.
+      # * Pending example: the example is not expected to run to
+      #   completion, so leftover interactions are expected and the
+      #   assertion is skipped silently.
+      def eject_cassette_for(example)
+        if example_failed?(example)
+          cassette = VCR.eject_cassette(skip_no_unused_interactions_assertion: true)
+          warn_about_unused_interactions(example, cassette)
+        elsif example_pending?(example)
+          VCR.eject_cassette(skip_no_unused_interactions_assertion: true)
+        else
+          VCR.eject_cassette
+        end
+      end
+
       def configure!
         ::RSpec.configure do |config|
 
@@ -54,9 +80,36 @@ module VCR
 
           config.after(:each, when_tagged_with_vcr) do |ex|
             example = ex.respond_to?(:metadata) ? ex : ex.example
-            VCR.eject_cassette(skip_no_unused_interactions_assertion: !!example.exception)
+            VCR::RSpec::Metadata.eject_cassette_for(example)
           end
         end
+      end
+
+    private
+
+      def example_failed?(example)
+        !!example.exception
+      end
+
+      def example_pending?(example)
+        execution_result = example.respond_to?(:execution_result) && example.execution_result
+        return true if execution_result && execution_result.pending_message
+        !!example.metadata[:pending]
+      end
+
+      def warn_about_unused_interactions(example, cassette)
+        return unless cassette
+        return if cassette.allow_unused_http_interactions
+
+        summary = cassette.unused_interactions_summary
+        return unless summary
+
+        exception = example.exception
+        warn "VCR: the example already failed with " \
+             "#{exception.class}: #{exception.message.inspect}, so the unused " \
+             "HTTP interaction assertion for cassette '#{cassette.name}' was " \
+             "skipped and the original failure is reported first. " \
+             "Unused interaction details:\n#{summary}"
       end
     end
   end

@@ -11,6 +11,8 @@ module VCR
         def has_interaction_matching?(*a); false; end
         def has_used_interaction_matching?(*a); false; end
         def remaining_unused_interaction_count(*a); 0; end
+        def used_interaction_count(*a); 0; end
+        def unused_interactions_summary(*a); nil; end
       end
 
       attr_reader :interactions, :request_matchers, :allow_playback_repeats, :parent_list
@@ -59,10 +61,18 @@ module VCR
         @interactions.size
       end
 
-      # Checks if there are no unused interactions left.
+      # @return [Integer] the number of interactions that have been played back.
+      def used_interaction_count
+        @used_interactions.size
+      end
+
+      # Builds a human-readable summary of the interactions that were
+      # recorded but never played back, including how many of the recorded
+      # interactions were used.
       #
-      # @raise [VCR::Errors::UnusedHTTPInteractionError] if not all interactions were played back.
-      def assert_no_unused_interactions!
+      # @return [String, nil] the summary, or nil when there are no
+      #   unused interactions left.
+      def unused_interactions_summary
         return unless has_unused_interactions?
         logger = Logger.new(nil)
 
@@ -70,7 +80,17 @@ module VCR
           "  - #{logger.request_summary(i.request, @request_matchers)} => #{logger.response_summary(i.response)}"
         end.join("\n")
 
-        raise Errors::UnusedHTTPInteractionError, "There are unused HTTP interactions left in the cassette:\n#{descriptions}"
+        "There are unused HTTP interactions left in the cassette:\n" \
+          "#{descriptions}\n" \
+          "#{usage_counts_description}"
+      end
+
+      # Checks if there are no unused interactions left.
+      #
+      # @raise [VCR::Errors::UnusedHTTPInteractionError] if not all interactions were played back.
+      def assert_no_unused_interactions!
+        return unless has_unused_interactions?
+        raise Errors::UnusedHTTPInteractionError, unused_interactions_summary
       end
 
     private
@@ -78,6 +98,18 @@ module VCR
       # @return [Boolean] Whether or not there are unused interactions left in the list.
       def has_unused_interactions?
         @interactions.size > 0
+      end
+
+      # @return [String] A description of how many of the recorded
+      #   interactions were used and how many remain unused.
+      def usage_counts_description
+        used   = used_interaction_count
+        unused = remaining_unused_interaction_count
+        total  = used + unused
+
+        "#{used} of #{total} recorded interaction#{'s' unless total == 1} " \
+          "#{used == 1 ? 'was' : 'were'} used; " \
+          "#{unused} remain#{'s' if unused == 1} unused."
       end
 
       def request_summary(request)
