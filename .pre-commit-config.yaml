@@ -1,0 +1,44 @@
+
+default_language_version:
+    python: python3.14
+
+repos:
+-   repo: https://github.com/python/black
+    rev: 26.10.1
+    hooks:
+    -   id: black
+
+-   repo: https://github.com/sqlalchemyorg/zimports
+    rev: v0.7.0
+    hooks:
+    -   id: zimports
+
+-   repo: https://github.com/pycqa/flake8
+    rev: 7.3.0
+    hooks:
+    -   id: flake8
+        entry: python -m flake8p
+        additional_dependencies:
+          - flake8-pyproject
+          - flake8-import-order>=0.19.2
+          - flake8-import-single==0.1.5
+          - flake8-builtins
+          - flake8-future-annotations>=0.0.5
+          - flake8-docstrings>=1.6.0
+          - flake8-unused-arguments
+          - flake8-rst-docstrings
+          # flake8-rst-docstrings dependency, leaving it here
+          # in case it requires a version pin
+          - pydocstyle
+          - pygments
+
+-   repo: local
+    hooks:
+    -   id: black-docs
+        name: Format docs code block with black
+        entry: python tools/format_docs_code.py -f
+        language: python
+        types: [rst]
+        exclude: README.*
+        additional_dependencies:
+            - black==26.10.1

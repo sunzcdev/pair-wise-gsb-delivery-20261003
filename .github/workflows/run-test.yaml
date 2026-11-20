@@ -1,0 +1,162 @@
+name: Run tests
+
+on:
+  # run on push in main or rel_* branches excluding changes are only on doc or example folders
+  push:
+    branches:
+      - main
+      - "rel_*"
+      # branches used to test the workflow
+      - "workflow_test_*"
+    paths-ignore:
+      - "doc/**"
+      - "examples/**"
+
+env:
+  # global env to all steps
+  TOX_WORKERS: -n4
+
+permissions:
+  contents: read
+
+jobs:
+  run-test:
+    name: test-${{ matrix.python-version }}-${{ matrix.os }}-${{ matrix.architecture }}-${{ matrix.build-type }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # run this job using this matrix, excluding some combinations below.
+      matrix:
+        os:
+          - "ubuntu-22.04"
+          - "ubuntu-22.04-arm"
+          - "windows-latest"
+          - "windows-11-arm"
+          - "macos-latest"
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+          - "3.14t"
+          - "3.15"
+        build-type:
+          # builds greenlet, runs asyncio tests.  includes aiosqlite driver
+          - "cext-greenlet"
+
+          # these do not install greenlet at all and skip asyncio tests.
+          # does not include aiosqlite driver
+          - "cext"
+          - "nocext"
+        architecture:
+          - x64
+          - x86
+          - arm64
+
+        include:
+          # autocommit tests fail on the ci for some reason
+          - python-version: "pypy-3.11"
+            pytest-args: "-k 'not test_autocommit_on and not test_turn_autocommit_off_via_default_iso_level and not test_autocommit_isolation_level'"
+            architecture: x64
+            build-type: "nocext"
+            os: "ubuntu-22.04"
+
+        exclude:
+
+          # the threaded pythons are not stable under greenlet. Even
+          # though we can run individual tests, when you run the whole suite
+          # with xdist and the greenlet wrapper, the workers keep crashing
+          # and getting replaced
+          - build-type: "cext-greenlet"
+            python-version: "3.14t"
+
+          # linux do not have x86 / arm64 python
+          - os: "ubuntu-22.04"
+            architecture: x86
+          - os: "ubuntu-22.04"
+            architecture: arm64
+          # linux-arm do not have x86 / x64 python
+          - os: "ubuntu-22.04-arm"
+            architecture: x86
+          - os: "ubuntu-22.04-arm"
+            architecture: x64
+          # windows des not have arm64 python
+          - os: "windows-latest"
+            architecture: arm64
+          # macos: latests uses arm macs. no x86/x64
+          - os: "macos-latest"
+            architecture: x86
+          - os: "macos-latest"
+            architecture: x64
+          - os: "windows-11-arm"
+            architecture: x86
+          - os: "windows-11-arm"
+            architecture: x64
+          # 3.14t is not yet supported on windows-11-arm
+          - os: "windows-11-arm"
+            python-version: "3.14t"
+
+      fail-fast: false
+
+    # steps to run in each job. Some are github actions, others run shell commands
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: ${{ matrix.architecture }}
+          # needed for python versions that are not yet released, e.g. 3.15
+          allow-prereleases: true
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade nox setuptools
+          pip list
+
+      - name: Run tests
+        run: nox -v -s github-${{ matrix.build-type }} -- ${{ matrix.pytest-args }}
+        continue-on-error: ${{ matrix.python-version == 'pypy-3.11' }}
+
+  run-nox:
+    name: ${{ matrix.nox-env }}-${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # run this job using this matrix, excluding some combinations below.
+      matrix:
+        os:
+          - "ubuntu-22.04"
+        python-version:
+          - "3.14"
+        nox-env:
+          - mypy
+          - pep484
+          - pep8
+
+      fail-fast: false
+
+    # steps to run in each job. Some are github actions, others run shell commands
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: ${{ matrix.architecture }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade nox setuptools
+          pip list
+
+      - name: Run nox
+        run: nox -v -e ${{ matrix.nox-env }} ${{ matrix.pytest-args }}
