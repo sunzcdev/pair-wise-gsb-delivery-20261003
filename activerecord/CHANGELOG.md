@@ -1,3 +1,16 @@
+*   Keep predicates on other aliases or tables in place when merging a scope
+    into a relation that joins a model to itself multiple times.
+
+    When a self-join produced several aliases that each carried a predicate on
+    the same column (for example `status`), merging a scope now only replaces
+    the predicate whose attribute is defined on the same relation (table alias)
+    and column. Predicates carried by the other self-join aliases, including
+    ones nested in compound `AND`/`OR` expressions, are preserved instead of
+    being matched by column name alone. Repeated `where` conditions on the same
+    column keep their last-wins behavior.
+
+    *Active Record*
+
 *   Log source location when scoped order is ignored in batching.
 
     *fatkodima*

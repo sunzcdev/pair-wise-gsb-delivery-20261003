@@ -74,6 +74,96 @@ class ActiveRecord::Relation
       assert_equal expected, a.merge(b)
     end
 
+    test "merge with a relation only replaces predicates on the same alias and column" do
+      parents = table.alias("parents_table")
+      children = table.alias("children_table")
+
+      a = WhereClause.new([
+        table["status"].eq(bind_param("root")),
+        parents["status"].eq(bind_param("parent")),
+        children["status"].eq(bind_param("child")),
+      ])
+      b = WhereClause.new([parents["status"].eq(bind_param("merged parent"))])
+      expected = WhereClause.new([
+        table["status"].eq(bind_param("root")),
+        children["status"].eq(bind_param("child")),
+        parents["status"].eq(bind_param("merged parent")),
+      ])
+
+      # Without a relation the structural identity of the attributes already
+      # keeps every alias in place; passing the owning relation must behave the
+      # same instead of displacing predicates carried by other aliases.
+      assert_equal expected, a.merge(b, parents)
+      assert_equal expected, a.merge(b)
+    end
+
+    test "merge with a relation keeps other aliases when an unqualified column is extracted" do
+      parents = table.alias("parents_table")
+      children = table.alias("children_table")
+
+      a = WhereClause.new([
+        table["status"].eq(bind_param("root")),
+        parents["status"].eq(bind_param("parent")),
+        children["status"].eq(bind_param("child")),
+      ])
+      # An unqualified column name, as `unscope(where: :status)` can leave in
+      # the column list, must only match the relation the merge is scoped to.
+      columns = [parents["status"], "status"]
+      scoped_predicates = a.send(:except_predicates, columns, parents)
+
+      assert_equal(
+        [table["status"].eq(bind_param("root")), children["status"].eq(bind_param("child"))],
+        scoped_predicates
+      )
+
+      # The same merge through the public API, scoped to the parents alias,
+      # preserves the predicates carried by the base table and the other alias.
+      b = WhereClause.new([parents["status"].eq(bind_param("merged parent"))])
+      assert_equal(
+        WhereClause.new([
+          table["status"].eq(bind_param("root")),
+          children["status"].eq(bind_param("child")),
+          parents["status"].eq(bind_param("merged parent")),
+        ]),
+        a.merge(b, parents)
+      )
+
+      # Legacy callers without a relation keep the name-based, cross-table match.
+      assert_empty a.send(:except_predicates, columns, nil)
+    end
+
+    test "merge with a relation leaves compound predicates on other aliases intact" do
+      parents = table.alias("parents_table")
+      compound = Arel::Nodes::Grouping.new(
+        parents["status"].eq("x").or(parents["position"].gt(1))
+      )
+      a = WhereClause.new([
+        table["status"].eq(bind_param("root")),
+        parents["status"].eq(bind_param("parent")),
+        compound,
+        Arel.sql("1 = 1"),
+      ])
+      b = WhereClause.new([parents["status"].eq(bind_param("merged parent"))])
+      expected = WhereClause.new([
+        table["status"].eq(bind_param("root")),
+        compound,
+        Arel.sql("1 = 1"),
+        parents["status"].eq(bind_param("merged parent")),
+      ])
+
+      assert_equal expected, a.merge(b, parents)
+    end
+
+    test "except with an unqualified column keeps the legacy cross-table behavior without a relation" do
+      parents = table.alias("parents_table")
+      where_clause = WhereClause.new([
+        table["status"].eq(bind_param("root")),
+        parents["status"].eq(bind_param("parent")),
+      ])
+
+      assert_empty where_clause.except("status")
+    end
+
     test "merge with or/and correctly handles SQL literals and attributes" do
       a = WhereClause.new([
         table["id"].eq(1),

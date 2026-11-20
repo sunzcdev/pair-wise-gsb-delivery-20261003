@@ -26,8 +26,8 @@ module ActiveRecord
         WhereClause.new(predicates | other.predicates)
       end
 
-      def merge(other)
-        predicates = empty? ? self.predicates : except_predicates(other.extract_attributes)
+      def merge(other, relation = nil)
+        predicates = empty? ? self.predicates : except_predicates(other.extract_attributes, relation)
 
         WhereClause.new(predicates | other.predicates)
       end
@@ -179,7 +179,7 @@ module ActiveRecord
           end
         end
 
-        def except_predicates(columns)
+        def except_predicates(columns, relation = nil)
           return predicates if columns.empty? || predicates.empty?
 
           attrs = columns.extract! { |node| node.is_a?(Arel::Attribute) }
@@ -189,8 +189,25 @@ module ActiveRecord
             if non_attrs && !non_attrs.empty? && equality_node?(node) && node.left.is_a?(Arel::Predications)
               non_attrs.include?(node.left)
             end || Arel.fetch_attribute(node) do |attr|
-              attrs.include?(attr) || columns.include?(attr.name.to_s)
+              referencing_column?(attr, attrs, columns, relation)
             end
+          end
+        end
+
+        # Checks whether `attr` is targeted by one of the columns passed to
+        # #except. An +Arel::Attribute+ column matches by its full identity:
+        # the relation (which may be a table alias produced by a self-join)
+        # and the column name. An unqualified column name matches by name
+        # alone for backwards compatibility, but when `relation` is given it
+        # only matches attributes defined on that same relation, so a
+        # predicate carried by another alias or table is never displaced.
+        def referencing_column?(attr, attrs, columns, relation)
+          if attrs.include?(attr)
+            true
+          elsif relation && attr.relation != relation
+            false
+          else
+            columns.include?(attr.name.to_s)
           end
         end
 
