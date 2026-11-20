@@ -140,14 +140,25 @@ def parse_input(obj: Any) -> object:
 
     if isinstance(obj, dict):
         parsed_dict = {k: parse_input(v) for k, v in obj.items()}
-        if any(isinstance(v, GraphNode) for v in parsed_dict.values()):
+        if any(isinstance(v, (GraphNode, TaskRef)) for v in parsed_dict.values()):
             return Dict(parsed_dict)
 
-    if isinstance(obj, (list, set, tuple)):
-        parsed_collection = tuple(parse_input(o) for o in obj)
-        if any(isinstance(o, GraphNode) for o in parsed_collection):
+    if isinstance(obj, (list, set, frozenset, tuple)):
+        # Elements of sets/frozensets have to stay hashable. A `TaskRef` is
+        # hashable and understood by the whole task machinery, so keep explicit
+        # references as `TaskRef` instead of rewriting them into an unhashable
+        # `Alias` node. This also keeps a reference distinct from a plain
+        # literal with the same value.
+        set_like = isinstance(obj, (set, frozenset))
+        parsed_collection = tuple(
+            TaskRef(o.key) if set_like and _is_dask_future(o) else parse_input(o)
+            for o in obj
+        )
+        if any(isinstance(o, (GraphNode, TaskRef)) for o in parsed_collection):
             if isinstance(obj, list):
                 return List(*parsed_collection)
+            if isinstance(obj, frozenset):
+                return FrozenSet(*parsed_collection)
             if isinstance(obj, set):
                 return Set(*parsed_collection)
             if isinstance(obj, tuple):
@@ -242,9 +253,33 @@ def convert_legacy_task(
                 ),
             )
         else:
-            parsed_args = tuple(convert_legacy_task(None, t, all_keys) for t in task)
-            if any(isinstance(a, GraphNode) for a in parsed_args):
-                return Task(key, _identity_cast, *parsed_args, typ=type(task))
+            # Elements of sets/frozensets must stay hashable. References are
+            # kept as `TaskRef` instead of an unhashable `Alias`, which also
+            # prevents a reference from being collapsed with a same-valued
+            # plain literal.
+            set_like = isinstance(task, (set, frozenset))
+
+            def _convert_element(t):
+                converted = convert_legacy_task(None, t, all_keys)
+                if set_like and isinstance(converted, Alias):
+                    return TaskRef(converted.target)
+                return converted
+
+            parsed_args = tuple(_convert_element(t) for t in task)
+            if any(isinstance(a, (GraphNode, TaskRef)) for a in parsed_args):
+                node: GraphNode
+                if isinstance(task, frozenset):
+                    # Resolved lazily at execution; materializing the frozenset
+                    # earlier would collapse a TaskRef with a same-valued plain
+                    # literal since both share the same hash.
+                    node = FrozenSet(*parsed_args)
+                elif isinstance(task, set):
+                    node = Set(*parsed_args)
+                else:
+                    return Task(key, _identity_cast, *parsed_args, typ=type(task))
+                if key is not None:
+                    node.key = key
+                return node
             else:
                 return cast(_T, type(task)(parsed_args))
     elif _is_dask_future(task):
@@ -619,7 +654,7 @@ class DataNode(GraphNode):
 
 def _get_dependencies(obj: object) -> set | frozenset:
     if _is_dask_future(obj):
-        return obj.key  # type: ignore[attr-defined]
+        return {obj.key}  # type: ignore[attr-defined]
     elif isinstance(obj, GraphNode):
         return obj.dependencies
     elif isinstance(obj, dict):
@@ -842,6 +877,11 @@ class NestedContainer(Task, Iterable):
     constructor: Callable
     klass: type
     __slots__ = tuple(__annotations__)
+    # Set-like containers can only hold hashable elements. Parsing user input
+    # may replace an element with an unhashable node (e.g. an ``Alias``). Raise
+    # eagerly so the error points at the offending argument position instead of
+    # surfacing much later during execution.
+    require_hashable = False
 
     def __init__(
         self,
@@ -851,6 +891,15 @@ class NestedContainer(Task, Iterable):
     ):
         if len(args) == 1 and isinstance(args[0], self.klass):
             args = args[0]  # type: ignore[assignment]
+        if self.require_hashable:
+            for index, arg in enumerate(args):
+                try:
+                    hash(arg)
+                except TypeError as e:
+                    raise TypeError(
+                        f"Elements of {type(self).__name__} must be hashable but "
+                        f"the element at position {index} is not: {arg!r}"
+                    ) from e
         super().__init__(
             None,
             self.to_container,
@@ -930,6 +979,12 @@ class Tuple(NestedContainer):
 
 class Set(NestedContainer):
     constructor = klass = set
+    require_hashable = True
+
+
+class FrozenSet(NestedContainer):
+    constructor = klass = frozenset
+    require_hashable = True
 
 
 class Dict(NestedContainer, Mapping):

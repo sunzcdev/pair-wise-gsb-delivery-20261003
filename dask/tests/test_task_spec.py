@@ -13,6 +13,7 @@ from dask._task_spec import (
     DataNode,
     DependenciesMapping,
     Dict,
+    FrozenSet,
     List,
     Set,
     Task,
@@ -20,6 +21,7 @@ from dask._task_spec import (
     Tuple,
     _get_dependencies,
     convert_legacy_graph,
+    cull,
     execute_graph,
     fuse_linear_task_spec,
     parse_input,
@@ -1078,6 +1080,7 @@ def test_data_producer():
         (Tuple, tuple),
         (List, list),
         (Set, set),
+        (FrozenSet, frozenset),
     ],
 )
 def test_nested_containers_different_types(task_type, python_type):
@@ -1125,7 +1128,7 @@ def test_substitute_nested():
     assert t1({"a": "a", "b": "b"}) == t2({"c": "a", "d": "b"})
 
 
-@pytest.mark.parametrize("Container", [Dict, List, Set, Tuple])
+@pytest.mark.parametrize("Container", [Dict, List, Set, FrozenSet, Tuple])
 def test_nested_containers_empty(Container):
     assert Container(Container.klass())() == Container.klass()
 
@@ -1143,3 +1146,155 @@ def test_substitute_subclasses():
     t2 = t.substitute({"b": "c"})
     assert t2.custom_kwarg_only == "foo"
     assert t2({"a": "a", "c": "b"}) == t({"a": "a", "b": "b"})
+
+
+@pytest.mark.parametrize(
+    "container_type, wrapper_type",
+    [(set, Set), (frozenset, FrozenSet)],
+)
+def test_parse_set_like_with_taskref(container_type, wrapper_type):
+    # A plain string with the same value as a referenced key sits next to the
+    # TaskRef in the same container. It must stay a literal, while the TaskRef
+    # is a dependency. A set/frozenset is preserved as-is.
+    obj = container_type({TaskRef("x"), "x"})
+    parsed = parse_input(obj)
+    assert isinstance(parsed, wrapper_type)
+    assert parsed.dependencies == frozenset({"x"})
+    # Dependency scanning agrees on the raw and the parsed container
+    assert _get_dependencies(obj) == {"x"}
+    assert _get_dependencies(parsed) == {"x"}
+    assert keys_in_tasks({"x"}, [parsed]) == {"x"}
+
+    result = parsed({"x": "x-value"})
+    assert isinstance(result, container_type)
+    assert result == container_type({"x-value", "x"})
+
+
+@pytest.mark.parametrize(
+    "container_type, wrapper_type",
+    [(set, Set), (frozenset, FrozenSet)],
+)
+def test_parse_set_like_substitute(container_type, wrapper_type):
+    parsed = parse_input(container_type({TaskRef("x"), "x", "literal"}))
+    substituted = parsed.substitute({"x": "y"})
+    assert isinstance(substituted, wrapper_type)
+    assert substituted.dependencies == frozenset({"y"})
+    result = substituted({"y": "y-value"})
+    assert isinstance(result, container_type)
+    # Only the TaskRef was rewritten; the plain "x" was left untouched
+    assert result == container_type({"y-value", "x", "literal"})
+
+
+def test_parse_frozenset_type_preserved_nested():
+    # A frozenset nested in another collection keeps its type and references
+    parsed = parse_input([frozenset({TaskRef("x"), "x"}), "y"])
+    assert isinstance(parsed, List)
+    assert isinstance(parsed.args[0], FrozenSet)
+    assert parsed.dependencies == frozenset({"x"})
+    assert parsed({"x": "x-value"}) == [frozenset({"x-value", "x"}), "y"]
+
+
+def test_parse_set_like_exists_in_dict():
+    # A set-like container must also be detected as a dependency when it is
+    # nested inside a dict argument
+    parsed = parse_input({"s": frozenset({TaskRef("x"), "x"})})
+    assert isinstance(parsed, Dict)
+    assert isinstance(parsed["s"], FrozenSet)
+    assert parsed.dependencies == frozenset({"x"})
+    assert parsed({"x": "x-value"}) == {"s": frozenset({"x-value", "x"})}
+
+
+@pytest.mark.parametrize("container_type", [set, frozenset])
+def test_parse_set_like_empty_and_literal(container_type):
+    # Empty containers and containers without references stay untouched
+    assert parse_input(container_type()) == container_type()
+    assert parse_input(container_type({"a", "b"})) == container_type({"a", "b"})
+
+
+@pytest.mark.parametrize("wrapper_type", [Set, FrozenSet])
+def test_set_like_unhashable_element_reports_position(wrapper_type):
+    # Alias / DataNode are unhashable and cannot live in a set. The failure must
+    # point at the offending argument position.
+    with pytest.raises(TypeError, match="position 2"):
+        wrapper_type(TaskRef("a"), "ok", Alias("b"))
+    with pytest.raises(TypeError, match="position 0"):
+        wrapper_type(Alias("b"))
+    with pytest.raises(TypeError, match="position 1"):
+        wrapper_type("ok", DataNode("x", 1))
+
+
+class _FakeFuture(TaskRef):
+    __dask_future__ = True
+
+
+@pytest.mark.parametrize("container_type", [set, frozenset])
+def test_parse_set_like_with_future(container_type):
+    # Futures inside set-like containers are kept as hashable TaskRefs rather
+    # than unhashable Alias nodes
+    parsed = parse_input(container_type({_FakeFuture("b"), "lit"}))
+    assert isinstance(parsed, (Set, FrozenSet))
+    assert parsed.dependencies == frozenset({"b"})
+    assert all(not isinstance(a, Alias) for a in parsed.args)
+    assert parsed({"b": "b-value"}) == container_type({"b-value", "lit"})
+
+
+@pytest.mark.parametrize("container_type", [set, frozenset])
+def test_set_like_cull_fuse_evaluation(container_type):
+    # Build the graph directly from Task / TaskRef with a nested set-like
+    # container. Evaluating before and after cull / fuse must yield the same
+    # result and the dependency on "x" must survive even though "x" is also a
+    # same-valued plain string inside the container.
+    container = parse_input(container_type({TaskRef("x"), "x", "lit"}))
+    dsk = {
+        "x": Task("x", lambda: "x-value"),
+        "unused": Task("unused", lambda: "removed"),
+        "out": Task("out", lambda s: tuple(sorted(s)), container),
+    }
+    assert dsk["out"].dependencies == frozenset({"x"})
+
+    expected = {"out": ("lit", "x", "x-value")}
+
+    def check(d):
+        res = execute_graph(d, keys=["out"])
+        assert {k: res[k] for k in expected} == expected
+
+    check(dsk)
+
+    culled = cull(dsk, ["out"])
+    assert "unused" not in culled
+    check(culled)
+
+    fused = fuse_linear_task_spec(dsk, ["out"])
+    check(fused)
+
+    fused_culled = fuse_linear_task_spec(culled, ["out"])
+    check(fused_culled)
+
+    # For a linear graph all three layers must fold into a single fused task
+    linear = {
+        "x": Task("x", lambda: "x-value"),
+        "mid": Task("mid", lambda v: v + "-mid", TaskRef("x")),
+        "out": Task(
+            "out", lambda s, m: (tuple(sorted(s)), m), container, TaskRef("mid")
+        ),
+    }
+    fused = fuse_linear_task_spec(linear, ["out"])
+    res = execute_graph(fused, keys=["out"])
+    assert res["out"] == (("lit", "x", "x-value"), "x-value-mid")
+
+
+@pytest.mark.parametrize("container_type", [set, frozenset])
+def test_set_like_legacy_graph(container_type):
+    # The legacy graph path keeps the container type and the reference, while a
+    # same-valued plain string stays a literal
+    dsk = {
+        "x": 1,
+        "out": (lambda s: tuple(sorted(s, key=str)), container_type({"x", "lit"})),
+    }
+    converted = convert_legacy_graph(dsk)
+    wrapper_type = Set if container_type is set else FrozenSet
+    assert isinstance(converted["out"].args[0], wrapper_type)
+    assert converted["out"].dependencies == frozenset({"x"})
+    result = execute_graph(converted, keys=["out"])
+    assert result["out"] == (1, "lit")
+    assert isinstance(result["out"], tuple)
