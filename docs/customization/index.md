@@ -86,6 +86,43 @@ Faraday::NestedParamsEncoder.sort_params = false
 Faraday::FlatParamsEncoder.sort_params = false
 ```
 
+### Merging query parameters in `build_url`
+
+Query parameters normally come from three sources, in increasing priority:
+the connection `params` (including the connection URL's own query string), the
+query string of the requested URL, and the hash passed as the second argument.
+By default each source replaces the value of the previous ones for the same
+key.
+
+`Connection#build_url` accepts an optional third argument with per-key merge
+policies, so a single call can reset one parameter while leaving another alone:
+
+```ruby
+conn = Faraday.new('http://httpbingo.org/api?page=1&sort[]=name&sort[]=created_at')
+
+# reset "page" but keep the URL's own "sort" values after the connection ones
+conn.build_url('items?sort[]=price&sort[]=rating', { page: 3 }, sort: :append)
+# => GET http://httpbingo.org/api/items?page=3&sort%5B%5D=name&sort%5B%5D=created_at&sort%5B%5D=price&sort%5B%5D=rating
+```
+
+The supported policies are:
+
+| Policy     | Behaviour                                                           |
+|------------|---------------------------------------------------------------------|
+| `:replace` | The last source defining the key wins (default).                    |
+| `:append`  | Values are concatenated in source order.                            |
+| `:prepend` | Same as `:append`, but later sources come first.                    |
+| `:delete`  | The key is dropped from the result.                                 |
+
+Policies are applied per key, so `{ page: :replace, sort: :append }` is valid.
+Values are handed to the current `params_encoder` in a reproducible order: keys
+keep the order in which they first appear across the sources, and appended
+values keep their per-source order. The same rules apply to relative and
+absolute request URLs; an absolute URL still ignores the connection path prefix.
+
+An explicit empty query (a trailing `?`, as in `conn.build_url('items?')`) is
+preserved and stays distinguishable from a URL with no query at all.
+
 ## Proxy
 
 Faraday will try to automatically infer the proxy settings from your system using [`URI#find_proxy`][ruby-find-proxy].

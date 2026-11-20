@@ -17,6 +17,14 @@ module Faraday
     METHODS = Set.new %i[get post put delete head patch options trace]
     USER_AGENT = "Faraday v#{VERSION}".freeze
 
+    # Per-key merge policies accepted by {#build_url}.
+    #
+    # * +:replace+ - the last source defining the key wins (default).
+    # * +:append+  - values are concatenated in source order.
+    # * +:prepend+ - values are concatenated in reverse source order.
+    # * +:delete+  - the key is dropped from the result.
+    PARAMS_MERGE_POLICIES = %i[replace append prepend delete].freeze
+
     # @return [Hash] URI query unencoded key/value pairs.
     attr_reader :params
 
@@ -400,8 +408,37 @@ module Faraday
     # Takes a relative url for a request and combines it with the defaults
     # set on the connection instance.
     #
+    # Query parameters are merged per key from three sources, in increasing
+    # priority: the connection {#params} (which already include the query
+    # string of {#url_prefix}), the query string of +url+, and
+    # +extra_params+. By default a source replaces the value of the previous
+    # ones for the same key; +params_merge+ selects a different policy for
+    # individual keys.
+    #
+    # Policies are applied per key, so a call can reset one parameter while
+    # still appending repeated values of another. Values are handed to the
+    # current params encoder in a reproducible order: the order in which the
+    # keys first appear in the sources, and, for +:append+/+:prepend+, the
+    # order in which the values appear in each source.
+    #
+    # An explicit empty query (a trailing "?") is preserved, so it stays
+    # distinguishable from a URL that has no query string at all.
+    #
     # @param url [String, URI, nil]
-    # @param extra_params [Hash]
+    # @param extra_params [Hash, nil] highest priority params.
+    # @param params_merge [Hash{Symbol, String => Symbol}, nil] per-key merge
+    #   policies. Keys name a param; values are one of
+    #   {PARAMS_MERGE_POLICIES}:
+    #   * +:replace+ (default) - the last source defining the key wins.
+    #   * +:append+ - values are concatenated in source order, so values from
+    #     the url keep their own order after the connection ones.
+    #   * +:prepend+ - same as +:append+, but later sources come first.
+    #   * +:delete+ - the key is dropped from the result.
+    #
+    # @return [URI]
+    #
+    # @raise [ArgumentError] if +params_merge+ is not a Hash or names an
+    #   unknown policy.
     #
     # @example
     #   conn = Faraday::Connection.new { ... }
@@ -415,17 +452,31 @@ module Faraday
     #   conn.build_url("nigiri", page: 2)
     #   # => https://httpbingo.org/api/nigiri?token=abc&page=2
     #
-    def build_url(url = nil, extra_params = nil)
+    # @example reset "page" but append the url's own "sort" values
+    #   conn.params = { page: 1, sort: %w[name created_at] }
+    #   conn.build_url("items?sort[]=price&sort[]=rating", { page: 3 }, sort: :append)
+    #   # => https://httpbingo.org/api/items?page=3&sort%5B%5D=name&sort%5B%5D=created_at&sort%5B%5D=price&sort%5B%5D=rating
+    #
+    # @example keep an explicit empty query
+    #   conn.params = {}
+    #   conn.build_url("items?").to_s
+    #   # => https://httpbingo.org/api/items?
+    #
+    def build_url(url = nil, extra_params = nil, params_merge = nil)
       uri = build_exclusive_url(url)
+      empty_query = explicit_empty_query?(url)
 
-      query_values = params.dup.merge_query(uri.query, options.params_encoder)
-      query_values.update(extra_params) if extra_params
-      uri.query =
-        if query_values.empty?
-          nil
-        else
-          query_values.to_query(options.params_encoder)
-        end
+      query_values = merge_params_sources(
+        [params, params_from_query(uri.query), extra_params],
+        params_merge
+      )
+
+      query = query_values.empty? ? nil : query_values.to_query(options.params_encoder)
+      uri.query = if query.nil? || query.empty?
+                    empty_query ? '' : nil
+                  else
+                    query
+                  end
 
       uri
     end
@@ -569,6 +620,109 @@ module Faraday
     # @return [Boolean]
     def support_parallel?(adapter = @builder.adapter&.klass)
       adapter.respond_to?(:supports_parallel?) && adapter&.supports_parallel?
+    end
+
+    private
+
+    # Detects whether +url+ carries an explicit but empty query string, e.g.
+    # "items?" or URI("http://example.com/items?"), as opposed to no query
+    # string at all.
+    #
+    # @param url [String, URI, nil]
+    # @return [Boolean]
+    # @api private
+    def explicit_empty_query?(url)
+      return false if url.nil?
+
+      if url.respond_to?(:query)
+        url.query == ''
+      else
+        path = url.to_s
+        anchor_index = path.index('#')
+        path = path.slice(0, anchor_index) unless anchor_index.nil?
+        path.split('?', 2)[1] == ''
+      end
+    end
+
+    # Decodes a query string with the encoder currently in effect.
+    #
+    # @param query [String, nil]
+    # @return [Faraday::Utils::ParamsHash]
+    # @api private
+    def params_from_query(query)
+      Utils::ParamsHash.new.merge_query(query, options.params_encoder)
+    end
+
+    # Merges query param sources, lowest priority first, applying the per-key
+    # policies in +params_merge+.
+    #
+    # Keys keep the order in which they first appear across the sources, and
+    # values under +:append+/+:prepend+ keep their per-source order, so the
+    # result handed to the encoder is reproducible.
+    #
+    # @param sources [Array<Hash, nil>]
+    # @param params_merge [Hash, nil]
+    # @return [Faraday::Utils::ParamsHash]
+    # @api private
+    def merge_params_sources(sources, params_merge)
+      policies = normalize_params_merge(params_merge)
+
+      sources.each_with_object(Utils::ParamsHash.new) do |source, merged|
+        next if source.nil?
+
+        source.each do |key, value|
+          policy = policies[key.to_s] || :replace
+          merge_param!(merged, key, value, policy)
+        end
+      end
+    end
+
+    # @api private
+    def merge_param!(merged, key, value, policy)
+      if policy == :delete
+        merged.delete(key)
+      elsif !merged.include?(key) || policy == :replace
+        merged[key] = value
+      elsif policy == :append
+        merged[key] = concatenate_param_values(merged[key], value)
+      else # :prepend
+        merged[key] = concatenate_param_values(value, merged[key])
+      end
+    end
+
+    # Concatenates the values of two sources for one key, keeping the order in
+    # which they are given. A single value stays a scalar; repeated values
+    # become an Array so the encoder repeats the key.
+    #
+    # @api private
+    def concatenate_param_values(first, second)
+      param_values(first) + param_values(second)
+    end
+
+    # @api private
+    def param_values(value)
+      value.is_a?(Array) ? value : [value]
+    end
+
+    # @api private
+    def normalize_params_merge(params_merge)
+      return {} if params_merge.nil?
+
+      unless params_merge.respond_to?(:to_hash)
+        raise ArgumentError,
+              "params_merge must be a Hash of param => policy, got #{params_merge.class}"
+      end
+
+      params_merge.to_hash.each_with_object({}) do |(key, policy), policies|
+        policy = policy.to_sym if policy.respond_to?(:to_sym)
+        unless PARAMS_MERGE_POLICIES.include?(policy)
+          raise ArgumentError,
+                "unknown params_merge policy #{policy.inspect} for #{key.to_s.inspect}; " \
+                "expected one of #{PARAMS_MERGE_POLICIES.join(', ')}"
+        end
+
+        policies[key.to_s] = policy
+      end
     end
   end
 end

@@ -421,6 +421,183 @@ RSpec.describe Faraday::Connection do
     ensure
       Faraday::NestedParamsEncoder.param_depth_limit = original_param_depth_limit
     end
+
+    context 'with per-key merge policies' do
+      let(:conn) do
+        Faraday::Connection.new('http://httpbingo.org/api?page=1&sort[]=name&sort[]=created_at')
+      end
+
+      it 'replaces a single key while leaving the other defaults alone' do
+        url = conn.build_url('nigiri', { page: 3 })
+        expect(url.to_s).to eq('http://httpbingo.org/api/nigiri?page=3&sort%5B%5D=name&sort%5B%5D=created_at')
+      end
+
+      it 'appends url values after the connection ones when asked' do
+        url = conn.build_url('nigiri?sort[]=price&sort[]=rating', { page: 3 }, { sort: :append })
+
+        expect(url.path).to eq('/api/nigiri')
+        expect(url.query).to eq(
+          'page=3&sort%5B%5D=name&sort%5B%5D=created_at&sort%5B%5D=price&sort%5B%5D=rating'
+        )
+      end
+
+      it 'prepends url values before the connection ones when asked' do
+        url = conn.build_url('nigiri?sort[]=price', nil, { sort: :prepend })
+
+        expect(url.query).to eq('page=1&sort%5B%5D=price&sort%5B%5D=name&sort%5B%5D=created_at')
+      end
+
+      it 'appends extra_params after the url values' do
+        url = conn.build_url('nigiri?sort[]=price', { sort: ['rating'] }, { sort: :append })
+
+        expect(url.query).to eq(
+          'page=1&sort%5B%5D=name&sort%5B%5D=created_at&sort%5B%5D=price&sort%5B%5D=rating'
+        )
+      end
+
+      it 'deletes a key no matter which source defines it' do
+        url = conn.build_url('nigiri?sort[]=price', { page: 2 }, { sort: :delete })
+
+        expect(url.to_s).to eq('http://httpbingo.org/api/nigiri?page=2')
+      end
+
+      it 'hands keys in a reproducible order to the encoder' do
+        original_sort_params = Faraday::NestedParamsEncoder.sort_params
+        Faraday::NestedParamsEncoder.sort_params = false
+
+        url = conn.build_url('nigiri?zeta=1&alpha=2', { extra: 3 }, { sort: :append })
+
+        expect(url.query).to eq(
+          'page=1&sort%5B%5D=name&sort%5B%5D=created_at&zeta=1&alpha=2&extra=3'
+        )
+      ensure
+        Faraday::NestedParamsEncoder.sort_params = original_sort_params
+      end
+
+      it 'does not mutate the connection params' do
+        conn.build_url('nigiri?sort[]=price', { page: 9 }, { sort: :append })
+
+        expect(conn.params).to eq('page' => '1', 'sort' => %w[name created_at])
+      end
+
+      it 'accepts string keys and string policies' do
+        url = conn.build_url('nigiri?sort[]=price', nil, { 'sort' => 'append' })
+
+        expect(url.query).to eq(
+          'page=1&sort%5B%5D=name&sort%5B%5D=created_at&sort%5B%5D=price'
+        )
+      end
+
+      it 'hands the merged values to the current params encoder' do
+        conn.options.params_encoder = Faraday::FlatParamsEncoder
+
+        url = conn.build_url('nigiri?sort=price&sort=rating', { page: 3 }, { sort: :append })
+
+        expect(url.query).to eq('page=3&sort=name&sort=created_at&sort=price&sort=rating')
+      end
+
+      it 'raises on an unknown policy' do
+        expect { conn.build_url('nigiri', nil, { sort: :bogus }) }.to raise_error(
+          ArgumentError, /unknown params_merge policy :bogus for "sort"/
+        )
+      end
+
+      it 'raises when params_merge is not a Hash' do
+        expect { conn.build_url('nigiri', nil, :append) }.to raise_error(
+          ArgumentError, /params_merge must be a Hash/
+        )
+      end
+    end
+
+    context 'with an explicit empty query' do
+      it 'keeps the empty query with an empty connection params' do
+        empty = Faraday::Connection.new('http://httpbingo.org/api')
+
+        expect(empty.build_url('nigiri?').to_s).to eq('http://httpbingo.org/api/nigiri?')
+        expect(empty.build_url('nigiri?').query).to eq('')
+      end
+
+      it 'distinguishes it from a URL with no query at all' do
+        empty = Faraday::Connection.new('http://httpbingo.org/api')
+
+        expect(empty.build_url('nigiri').query).to be_nil
+      end
+
+      it 'keeps the empty query when policies delete every param' do
+        empty = Faraday::Connection.new('http://httpbingo.org/api', params: { a: 1 })
+
+        expect(empty.build_url('nigiri?', nil, { a: :delete }).to_s)
+          .to eq('http://httpbingo.org/api/nigiri?')
+      end
+
+      it 'keeps the empty query for an absolute url given as a URI' do
+        empty = Faraday::Connection.new('http://httpbingo.org/api')
+        url = empty.build_url(URI('http://other.example.com/v2/nigiri?'))
+
+        expect(url.path).to eq('/v2/nigiri')
+        expect(url.query).to eq('')
+      end
+
+      it 'fills it with the connection params when they exist' do
+        empty = Faraday::Connection.new('http://httpbingo.org/api', params: { a: 1 })
+
+        expect(empty.build_url('nigiri?').to_s).to eq('http://httpbingo.org/api/nigiri?a=1')
+      end
+    end
+
+    context 'with the same connection building relative and absolute urls' do
+      let(:conn) do
+        Faraday::Connection.new('http://httpbingo.org/api?page=1&sort[]=name&sort[]=created_at')
+      end
+
+      it 'does not extend the path prefix for an absolute url' do
+        relative = conn.build_url('nigiri?sort[]=price', { page: 2 }, { sort: :append })
+        absolute = conn.build_url('http://other.example.com/v2/nigiri?sort[]=price',
+                                  { page: 2 }, { sort: :append })
+
+        expect(relative.path).to eq('/api/nigiri')
+        expect(absolute.path).to eq('/v2/nigiri')
+        expect(absolute.host).to eq('other.example.com')
+      end
+
+      it 'overrides the same params the same way for both' do
+        relative = conn.build_url('nigiri?sort[]=price', { page: 2 }, { sort: :append })
+        absolute = conn.build_url('http://other.example.com/v2/nigiri?sort[]=price',
+                                  { page: 2 }, { sort: :append })
+
+        expected_query = 'page=2&sort%5B%5D=name&sort%5B%5D=created_at&sort%5B%5D=price'
+        expect(relative.query).to eq(expected_query)
+        expect(absolute.query).to eq(expected_query)
+      end
+
+      it 'sends both built urls with the expected path and query' do
+        seen = []
+        capture = Class.new(Faraday::Middleware) do
+          define_method(:call) do |env|
+            seen << [env[:url].host, env[:url].path, env[:url].query]
+            app.call(env)
+          end
+        end
+        stubs = Faraday::Adapter::Test::Stubs.new
+        test_conn = Faraday::Connection.new('http://httpbingo.org/api?page=1&sort[]=name&sort[]=created_at') do |b|
+          b.use capture
+          b.adapter :test, stubs
+        end
+        stubs.get(%r{.*}) { [200, {}, 'ok'] }
+
+        relative = test_conn.build_url('nigiri?sort[]=price', { page: 2 }, { sort: :append })
+        absolute = test_conn.build_url('http://other.example.com/v2/nigiri?sort[]=price',
+                                       { page: 2 }, { sort: :append })
+        test_conn.get(relative.to_s)
+        test_conn.get(absolute.to_s)
+
+        expected_query = 'page=2&sort%5B%5D=name&sort%5B%5D=created_at&sort%5B%5D=price'
+        expect(seen).to eq([
+                             ['httpbingo.org', '/api/nigiri', expected_query],
+                             ['other.example.com', '/v2/nigiri', expected_query]
+                           ])
+      end
+    end
   end
 
   describe '#build_request' do
