@@ -1117,8 +1117,16 @@ module Puma
     # processing and there are no busy threads on the worker.
     # The worker doesn't accept new requests until this code finishes.
     #
+    # Because a quiescent pool (no request being processed) is required,
+    # the hook never overlaps a request and never runs concurrently with
+    # another hook of either kind.
+    #
     # This hook is useful for running out-of-band garbage collection
     # or scheduling asynchronous tasks to execute after a response.
+    #
+    # For maintenance work that is safe to run alongside in-flight
+    # requests, use {#out_of_band_parallel} instead, which only needs a
+    # single idle pool thread.
     #
     # This can be called multiple times to add several hooks.
     #
@@ -1129,6 +1137,37 @@ module Puma
     #
     def out_of_band(&block)
       process_hook :out_of_band, nil, block
+    end
+
+    # Code to run out-of-band on an idle thread while the worker keeps
+    # accepting and processing requests. These hooks run immediately after a
+    # request has finished processing, on the thread that handled it, and
+    # only require that one thread to be free. Other pool threads may keep
+    # processing requests concurrently.
+    #
+    # A hook is never reentered: while one is running, further trigger
+    # requests coalesce into a single follow-up run once the current one
+    # finishes. A slow or stuck hook therefore does not block scheduling of
+    # new requests on the remaining pool threads.
+    #
+    # Hooks registered with {#out_of_band} (which require a fully quiescent
+    # pool) wait until no request and no parallel hook is running, so the two
+    # kinds never overlap.
+    #
+    # This hook is useful for maintenance work that is safe to run
+    # concurrently with requests, such as flushing metrics or refreshing
+    # cached metadata.
+    #
+    # This can be called multiple times to add several hooks.
+    #
+    # @example
+    #   out_of_band_parallel do
+    #     Metrics.flush
+    #   end
+    #
+    # @version 8.2.0
+    def out_of_band_parallel(&block)
+      process_hook :out_of_band_parallel, nil, block
     end
 
     # The directory to operate out of.

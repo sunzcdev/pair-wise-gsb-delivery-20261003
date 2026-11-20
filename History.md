@@ -1,3 +1,8 @@
+## Next
+
+* Features
+  * Add `out_of_band_parallel` DSL hook. Like `out_of_band`, it runs after a request finishes, but it only needs a single idle pool thread and can run in parallel with in-flight requests. A hook is never reentered: triggers that arrive while it is running coalesce into one follow-up run. The existing `out_of_band` hook still requires the whole pool to be quiescent and waits for any parallel hook to finish.
+
 ## 8.1.2 / 2026-11-17
 
 * Security

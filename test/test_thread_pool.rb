@@ -201,6 +201,204 @@ class TestThreadPool < PumaTest
     assert_equal 1, out_of_band_called.length
   end
 
+  def test_out_of_band_parallel_hook_runs_after_request
+    parallel_called = Queue.new
+    options = {
+      min_threads: 0,
+      max_threads: 1,
+      out_of_band_parallel: [
+        {
+          id: nil,
+          block: proc { parallel_called << 1 },
+          cluster_only: false,
+        }
+      ]
+    }
+    block = proc { true }
+    @pool = Puma::ThreadPool.new("tst", options, &block)
+
+    @pool << 1
+
+    assert_equal 1, Timeout.timeout(2) { parallel_called.pop }
+    refute @pool.out_of_band_parallel_running
+    refute @pool.out_of_band_parallel_pending?
+  end
+
+  # A parallel hook occupies only its own thread; other requests must still be
+  # picked up by the remaining pool threads while it is stuck.
+  def test_requests_scheduled_while_parallel_hook_is_running
+    hook_started = Queue.new
+    release_hook = Queue.new
+    requests_seen = Queue.new
+    options = {
+      min_threads: 0,
+      max_threads: 2,
+      out_of_band_parallel: [
+        {
+          id: nil,
+          block: proc do
+            hook_started << 1
+            release_hook.pop
+          end,
+          cluster_only: false,
+        }
+      ]
+    }
+    block = proc { |_, work| requests_seen << work; true }
+    @pool = Puma::ThreadPool.new("tst", options, &block)
+
+    # Request 1 finishes, then its thread enters the parallel hook and blocks.
+    @pool << 1
+    hook_started.pop
+    assert_predicate @pool, :out_of_band_parallel_running
+
+    # Request 2 must be processed by the other thread even though the hook is stuck.
+    @pool << 2
+    Timeout.timeout(2) do
+      Thread.pass until requests_seen.length == 2
+    end
+    assert_equal [1, 2], [requests_seen.pop, requests_seen.pop].sort
+    assert_equal 2, @pool.spawned
+    # The stuck hook still occupies its own thread; request 2's thread is idle again.
+    assert_predicate @pool, :out_of_band_parallel_running
+    assert_equal 1, @pool.waiting
+  ensure
+    release_hook << 1
+  end
+
+  # A parallel hook must not be reentered: triggers arriving while it runs
+  # coalesce into a single follow-up run.
+  def test_parallel_hook_is_not_reentered
+    hook_started = Queue.new
+    release_hook = Queue.new
+    hook_completed = Queue.new
+    options = {
+      min_threads: 0,
+      max_threads: 1,
+      out_of_band_parallel: [
+        {
+          id: nil,
+          block: proc do
+            hook_started << 1
+            release_hook.pop
+            hook_completed << 1
+          end,
+          cluster_only: false,
+        }
+      ]
+    }
+    block = proc { true }
+    @pool = Puma::ThreadPool.new("tst", options, &block)
+
+    @pool << 1
+    hook_started.pop
+
+    # Two more requests complete while the hook is still in progress. Both
+    # merely (re)assert the single pending flag, so only one follow-up runs.
+    @pool << 2
+    @pool << 3
+    sleep 0.05
+    assert_predicate @pool, :out_of_band_parallel_running
+
+    release_hook << 1
+    hook_completed.pop
+
+    # Exactly one coalesced follow-up run, then the queue is fully drained.
+    hook_started.pop
+    release_hook << 1
+    hook_completed.pop
+
+    Timeout.timeout(2) do
+      Thread.pass until @pool.backlog.zero? &&
+        !@pool.out_of_band_parallel_running &&
+        !@pool.out_of_band_parallel_pending?
+    end
+    assert_equal 0, hook_started.length
+  ensure
+    release_hook << 1 rescue nil
+  end
+
+  # The quiescent hook must wait until no request and no parallel hook is
+  # running, even when both hook kinds are registered.
+  def test_quiescent_hook_waits_for_parallel_hook
+    parallel_started = Queue.new
+    release_parallel = Queue.new
+    quiescent_called = Queue.new
+    in_quiescent = Mutex.new
+    options = {
+      min_threads: 0,
+      max_threads: 2,
+      out_of_band: [
+        {
+          id: nil,
+          block: proc { in_quiescent.synchronize { quiescent_called << 1 } },
+          cluster_only: false,
+        }
+      ],
+      out_of_band_parallel: [
+        {
+          id: nil,
+          block: proc do
+            parallel_started << 1
+            release_parallel.pop
+          end,
+          cluster_only: false,
+        }
+      ]
+    }
+    block = proc { true }
+    @pool = Puma::ThreadPool.new("tst", options, &block)
+
+    @pool << 1
+    parallel_started.pop
+    sleep 0.05
+    # The quiescent hook cannot start while the parallel one is running.
+    assert_equal 0, quiescent_called.length
+    assert_predicate @pool, :out_of_band_parallel_running
+
+    release_parallel << 1
+    assert_equal 1, Timeout.timeout(2) { quiescent_called.pop }
+    refute @pool.out_of_band_running
+  ensure
+    release_parallel << 1 rescue nil
+  end
+
+  # A stuck parallel hook must not prevent a forced shutdown: the shutdown
+  # raises ForceShutdown into the hook thread and the pool drains fully.
+  def test_forced_shutdown_interrupts_stuck_parallel_hook
+    hook_started = Queue.new
+    release_hook = Queue.new
+    options = {
+      min_threads: 0,
+      max_threads: 1,
+      pool_shutdown_grace_time: 0.05,
+      out_of_band_parallel: [
+        {
+          id: nil,
+          block: proc do
+            hook_started << 1
+            # Simulates maintenance that never returns.
+            release_hook.pop
+          end,
+          cluster_only: false,
+        }
+      ]
+    }
+    block = proc { true }
+    @pool = Puma::ThreadPool.new("tst", options, &block)
+
+    @pool << 1
+    hook_started.pop
+    assert_predicate @pool, :out_of_band_parallel_running
+
+    Timeout.timeout(2) { @pool.shutdown(0.05) }
+    assert_equal 0, @pool.spawned
+    assert_equal 0, @pool.instance_variable_get(:@processors).length
+    refute @pool.out_of_band_parallel_running
+  ensure
+    release_hook << 1 rescue nil
+  end
+
   def test_trim
     pool = mutex_pool(0, 1)
 

@@ -161,6 +161,9 @@ module Puma
       mode: :http,
       mutate_stdout_and_stderr_to_sync_on_write: true,
       out_of_band: [],
+      # Hooks that may run in parallel with request processing on an idle
+      # pool thread. Unlike `out_of_band`, the pool does not need to be idle.
+      out_of_band_parallel: [],
       # Number of seconds for another request within a persistent session.
       persistent_timeout: 65, # PUMA_PERSISTENT_TIMEOUT
       prune_bundler: false,

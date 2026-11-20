@@ -74,7 +74,14 @@ module Puma
     # up its work before leaving the thread to die on the vine.
     SHUTDOWN_GRACE_TIME = 5 # seconds
 
+    # True while an `out_of_band` hook (which requires the whole pool to be
+    # quiescent) is executing. While true, the server does not hand new
+    # clients to the pool.
     attr_reader :out_of_band_running
+
+    # True while an `out_of_band_parallel` hook is executing. The pool keeps
+    # accepting and processing requests while this is true.
+    attr_reader :out_of_band_parallel_running
 
     # Maintain a minimum of +min+ and maximum of +max+ threads
     # in the pool.
@@ -105,9 +112,14 @@ module Puma
       @shutdown_grace_time = Float(options[:pool_shutdown_grace_time] || SHUTDOWN_GRACE_TIME)
       @shutdown_debug = options[:shutdown_debug]
       @block = block
+      # Hooks that require the entire pool to be quiescent.
       @out_of_band = options[:out_of_band]
+      # Hooks that may run on a single idle thread in parallel with requests.
+      @out_of_band_parallel = options[:out_of_band_parallel]
       @out_of_band_running = false
+      @out_of_band_parallel_running = false
       @out_of_band_condvar = ConditionVariable.new
+      @out_of_band_parallel_condvar = ConditionVariable.new
       @before_thread_start = options[:before_thread_start]
       @before_thread_exit = options[:before_thread_exit]
       @reaping_time = options[:reaping_time]
@@ -117,6 +129,7 @@ module Puma
 
       @trim_requested = 0
       @out_of_band_pending = false
+      @out_of_band_parallel_pending = false
 
       @processors = []
 
@@ -136,6 +149,19 @@ module Puma
 
     attr_reader :spawned, :trim_requested, :waiting
     attr_accessor :min, :max
+
+    # True when a quiescent `out_of_band` run has been requested but not yet
+    # performed because the pool still has busy threads.
+    def out_of_band_pending?
+      with_mutex { @out_of_band_pending }
+    end
+
+    # True when an `out_of_band_parallel` run has been requested but not yet
+    # performed, either because the previous run is still in progress or
+    # because no thread has cycled through the idle loop yet.
+    def out_of_band_parallel_pending?
+      with_mutex { @out_of_band_parallel_pending }
+    end
 
     # generate stats hash so as not to perform multiple locks
     # @return [Hash] hash containing stat info from ThreadPool
@@ -202,6 +228,7 @@ module Puma
 
         while true
           work = nil
+          run_parallel_hook = false
 
           mutex.synchronize do
             if processor.marked_as_io_thread?
@@ -228,6 +255,26 @@ module Puma
               end
 
               @waiting += 1
+
+              # A parallel hook only needs this one idle thread. It is executed
+              # outside this mutex (below), so the rest of the pool and the
+              # server's accept loop keep working while it runs.
+              if @out_of_band_parallel_pending &&
+                 @out_of_band_parallel&.any? &&
+                 !@out_of_band_parallel_running
+                @out_of_band_parallel_pending = false
+                # This thread is about to run the hook, so it is no longer
+                # idle. Keeping it counted as waiting would let a quiescent
+                # hook start while the parallel hook is still running.
+                @waiting -= 1
+                run_parallel_hook = true
+                break
+              end
+
+              # The quiescent hook requires every thread to be idle, including
+              # threads running a parallel hook. If the pool is not quiescent
+              # yet, the pending flag is retained so another idle cycle
+              # retries it instead of dropping the request.
               if @out_of_band_pending && trigger_out_of_band_hook
                 @out_of_band_pending = false
               end
@@ -239,11 +286,21 @@ module Puma
               end
             end
 
-            work = todo.shift
+            work = todo.shift unless run_parallel_hook
+          end
+
+          if run_parallel_hook
+            trigger_out_of_band_parallel_hook
+            # Re-enter the loop: this thread becomes idle again and retries
+            # any pending quiescent hook there.
+            next
           end
 
           begin
-            @out_of_band_pending = true if block.call(processor, work)
+            if block.call(processor, work)
+              @out_of_band_pending = true if @out_of_band&.any?
+              @out_of_band_parallel_pending = true if @out_of_band_parallel&.any?
+            end
           rescue Exception => e
             STDERR.puts "Error reached top of thread-pool: #{e.message} (#{e.class})"
           end
@@ -288,10 +345,14 @@ module Puma
     private :trigger_before_thread_exit_hooks
 
     # @version 5.0.0
+    #
+    # Must be called with @mutex held.
     def trigger_out_of_band_hook
       return false unless @out_of_band&.any?
 
-      # we execute on idle hook when all threads are free
+      # we execute on idle hook when all threads are free. A thread running a
+      # parallel hook is not counted as waiting, so this also waits for any
+      # parallel maintenance to finish.
       return false unless @spawned == @waiting
       @out_of_band_running = true
       @out_of_band.each { |b| b[:block].call }
@@ -306,11 +367,52 @@ module Puma
 
     private :trigger_out_of_band_hook
 
+    # Runs the parallel out-of-band hooks without holding @mutex, so requests
+    # keep being scheduled and processed on other threads while it executes.
+    # Reentrancy is prevented by @out_of_band_parallel_running: triggers that
+    # arrive while a run is in progress set @out_of_band_parallel_pending and
+    # coalesce into a single follow-up run.
+    #
+    # The hook runs inside #with_force_shutdown, so a forced pool shutdown can
+    # interrupt it instead of waiting forever for a stuck maintenance task.
+    def trigger_out_of_band_parallel_hook
+      with_mutex do
+        return if @out_of_band_parallel_running
+        @out_of_band_parallel_running = true
+      end
+
+      begin
+        with_force_shutdown do
+          @out_of_band_parallel&.each { |b| b[:block].call }
+        end
+      rescue ForceShutdown
+        # Raised by a forced pool shutdown to interrupt a stuck hook. Nothing
+        # to clean up here; the ensure block clears the running state.
+      rescue Exception => e
+        STDERR.puts "Exception calling out_of_band_parallel_hook: #{e.message} (#{e.class})"
+      end
+    ensure
+      with_mutex do
+        @out_of_band_parallel_running = false
+        @out_of_band_parallel_condvar.broadcast
+      end
+    end
+
+    private :trigger_out_of_band_parallel_hook
+
     def wait_while_out_of_band_running
       return unless @out_of_band_running
 
       with_mutex do
         @out_of_band_condvar.wait(@mutex) while @out_of_band_running
+      end
+    end
+
+    def wait_while_out_of_band_parallel_running
+      return unless @out_of_band_parallel_running
+
+      with_mutex do
+        @out_of_band_parallel_condvar.wait(@mutex) while @out_of_band_parallel_running
       end
     end
 

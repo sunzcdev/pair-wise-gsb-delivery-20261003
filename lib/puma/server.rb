@@ -410,8 +410,10 @@ module Puma
               if sock == check
                 break if handle_check
               else
-                # if ThreadPool out_of_band code is running, we don't want to add
-                # clients until the code is finished.
+                # If a quiescent out_of_band hook (the kind that requires the
+                # whole pool to be idle) is running, don't add clients until
+                # it finishes. out_of_band_parallel hooks do not block here,
+                # so requests keep being accepted while they run.
                 pool.wait_while_out_of_band_running
 
                 unless shutting_down?

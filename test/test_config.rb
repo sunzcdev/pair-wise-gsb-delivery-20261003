@@ -724,6 +724,12 @@ class TestConfigFile < PumaTest
     assert_raise_on_hooks_without_block :out_of_band
   end
 
+  def test_run_hooks_out_of_band_parallel
+    assert_run_hooks :out_of_band_parallel
+
+    assert_raise_on_hooks_without_block :out_of_band_parallel
+  end
+
   def test_run_hooks_and_exception
     conf = Puma::Configuration.new do |c|
       c.before_restart do |a|

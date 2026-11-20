@@ -22,6 +22,7 @@ class TestOutOfBandServer < PumaTest
     @app_released = true
     @oob_finished.broadcast
     @app_finished.broadcast
+    @mutex&.synchronize { @parallel_release&.broadcast }
     @server&.stop true
   end
 
@@ -61,6 +62,66 @@ class TestOutOfBandServer < PumaTest
     options[:log_writer]  ||= Puma::LogWriter.strings
 
     @server = Puma::Server.new app, nil, out_of_band: [oob], **options
+    @bind_port = (@server.add_tcp_listener @host, 0).addr[1]
+    @server.run
+    sleep 0.15 if Puma.jruby?
+  end
+
+  # A server carrying both kinds of out-of-band hooks. The parallel hook may
+  # overlap requests; the quiescent hook must never overlap a request or the
+  # parallel hook.
+  def mixed_oob_server(**options)
+    @request_count = 0
+    @oob_count = 0
+    @parallel_count = 0
+    @in_hook = Mutex.new
+    @mutex = Mutex.new
+    parallel_wait = options.delete(:parallel_wait)
+    quiescent_wait = options.delete(:quiescent_wait)
+    @parallel_release = ConditionVariable.new
+
+    quiescent = {
+      block: -> do
+        locked = @in_hook.try_lock
+        raise 'Quiescent hook overlapped another hook' unless locked
+        @mutex.synchronize do
+          @oob_count += 1
+          @oob_finished.signal
+          @oob_finished.wait(@mutex, 1) if quiescent_wait
+        end
+      ensure
+        @in_hook.unlock if locked
+      end
+    }
+    parallel = {
+      block: -> do
+        locked = @in_hook.try_lock
+        raise 'Parallel hook overlapped the quiescent hook' unless locked
+        @mutex.synchronize do
+          @parallel_count += 1
+          @parallel_release.signal
+          @parallel_release.wait(@mutex, 1) if parallel_wait
+        end
+      ensure
+        @in_hook.unlock if locked
+      end
+    }
+    app = ->(_) do
+      @mutex.synchronize do
+        @request_count += 1
+        @app_finished.signal
+      end
+      [200, {}, [""]]
+    end
+
+    options[:min_threads] ||= 1
+    options[:max_threads] ||= 2
+    options[:log_writer]  ||= Puma::LogWriter.strings
+
+    @server = Puma::Server.new app, nil,
+      out_of_band: [quiescent],
+      out_of_band_parallel: [parallel],
+      **options
     @bind_port = (@server.add_tcp_listener @host, 0).addr[1]
     @server.run
     sleep 0.15 if Puma.jruby?
@@ -156,5 +217,54 @@ class TestOutOfBandServer < PumaTest
       sleep 0.01
     end
     refute accepted, 'New connection accepted during out of band'
+  end
+
+  # Sequential requests trigger both hooks after each request, and the two
+  # hook kinds never overlap each other or a request.
+  def test_mixed_hooks_sequential_requests
+    mixed_oob_server
+    n = 20
+    n.times do |i|
+      send_http GET_10
+      target = i + 1
+      Timeout.timeout(2) do
+        @mutex.synchronize do
+          @parallel_release.wait(@mutex) until @parallel_count >= target
+          @oob_finished.wait(@mutex) until @oob_count >= target
+        end
+      end
+    end
+    assert_equal n, @request_count
+    assert_equal n, @parallel_count
+    assert_equal n, @oob_count
+  end
+
+  # While a parallel hook is stuck, new requests must still be accepted and
+  # processed on another pool thread. The quiescent hook waits until the
+  # parallel hook has finished.
+  def test_parallel_hook_does_not_block_requests
+    mixed_oob_server parallel_wait: true, max_threads: 2
+
+    # First request triggers the parallel hook, which then blocks.
+    @mutex.synchronize do
+      send_http GET_10
+      @parallel_release.wait(@mutex, 1) until @parallel_count == 1
+    end
+    assert_predicate @server.instance_variable_get(:@thread_pool), :out_of_band_parallel_running
+    assert_equal 0, @oob_count, 'Quiescent hook ran while parallel hook was active'
+
+    # A second request must still complete despite the stuck parallel hook.
+    Timeout.timeout(2) do
+      send_http GET_10
+      @mutex.synchronize { @app_finished.wait(@mutex, 1) until @request_count == 2 }
+    end
+    assert_equal 2, @request_count
+
+    # Releasing the parallel hook eventually lets the quiescent hook run.
+    @mutex.synchronize do
+      @parallel_release.broadcast
+      @oob_finished.wait(@mutex, 2) until @oob_count >= 1
+    end
+    assert_operator @oob_count, :>=, 1
   end
 end
