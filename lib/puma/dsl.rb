@@ -386,7 +386,26 @@ module Puma
       @options[:fiber_per_request] = which
     end
 
-    alias clean_thread_locals fiber_per_request
+    # When enabled, Puma clears the per-request thread locals and fiber
+    # locals of each thread-pool thread after every request, including
+    # requests that raise or whose client disconnects. This prevents
+    # request-scoped state stored on +Thread.current+ by a Rack application
+    # from leaking into the next request handled by the same thread.
+    #
+    # Values registered on a thread for its whole lifetime are preserved,
+    # notably +Puma::Server.current+ and anything a plugin or the application
+    # stores on a processor thread outside of request handling.
+    #
+    # The default is +false+.
+    #
+    # @example
+    #   clean_thread_locals
+    #
+    # @see Puma::ThreadLocalCleaner
+    #
+    def clean_thread_locals(which=true)
+      @options[:clean_thread_locals] = which
+    end
 
     # When shutting down, drain the accept socket of pending connections and
     # process them before waiting for in-flight requests to finish.

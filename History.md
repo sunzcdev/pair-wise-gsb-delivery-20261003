@@ -1,3 +1,8 @@
+## Unreleased
+
+* Features
+  * Reintroduce the `clean_thread_locals` option as a standalone setting. When enabled, thread locals and fiber locals written by a Rack application during a request are removed before the processor thread handles its next request. Values registered on the thread for its whole lifetime, such as `Puma::Server.current` and values a plugin stores on the thread, are preserved. Cleanup also runs when the application raises or the client disconnects.
+
 ## 8.1.2 / 2026-11-17
 
 * Security

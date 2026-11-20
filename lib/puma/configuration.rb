@@ -141,6 +141,9 @@ module Puma
       enable_keep_alives: true,
       environment: 'development'.freeze,
       fiber_per_request: !!ENV.fetch("PUMA_FIBER_PER_REQUEST", false),
+      # Reset thread locals and fiber locals written during a request once
+      # the request has completed, even on error or client disconnect.
+      clean_thread_locals: false,
       # Number of seconds to wait until we get the first data for the request.
       first_data_timeout: 30,
       force_shutdown_after: -1,

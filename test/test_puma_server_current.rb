@@ -42,4 +42,27 @@ class PumaServerCurrentTest < PumaTest
 
     assert_equal [server_string]*3, responses
   end
+
+  # Puma::Server.current is a long-lived thread local, advertised onto the
+  # processor thread when it is spawned. Cleaning request-scoped thread locals
+  # must never remove it, including after the app raises.
+  def test_server_current_survives_cleanup_after_an_exception
+    raising_app = ->(env) do
+      raise "boom" if env["PATH_INFO"] == "/raise"
+
+      [200, {"Content-Type" => "text/plain"}, [Puma::Server.current.to_s]]
+    end
+    @server.app = raising_app
+
+    server_string = @server.to_s
+
+    Net::HTTP.new(@url.host, @url.port).start do |connection|
+      error_response = connection.get("/raise")
+      assert_match(/500/, error_response.code)
+
+      # The thread local advertising the server must still be in place.
+      assert_equal server_string, connection.get("/").body
+      assert_equal server_string, connection.get("/").body
+    end
+  end
 end

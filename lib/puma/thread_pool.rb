@@ -9,6 +9,75 @@ module Puma
 
   Thread.attr_accessor(:puma_server)
 
+  # Encapsulates cleaning the per-request values out of a processor thread's
+  # thread local and fiber local storage.
+  #
+  # Puma and its plugins may register values on a processor thread for its
+  # whole lifetime (e.g. `Thread.current.puma_server`, set when the thread is
+  # spawned). Those must survive request after request. A Rack application, on
+  # the other hand, may store request-scoped state on `Thread.current` while it
+  # handles a request. When `clean_thread_locals` is enabled, the storage is
+  # snapshotted before the request and restored afterwards, so everything the
+  # application wrote is handed back while the values the thread was born with
+  # remain in place.
+  #
+  # The snapshot/restore runs in an `ensure`, so request fields are also
+  # returned when the application raises or the client goes away.
+  module ThreadLocalCleaner
+    module_function
+
+    # Snapshot the thread's current storage, run the block, then restore the
+    # snapshot. Keys the application created are deleted and keys it changed
+    # are reset to their original values, on every code path.
+    def wrap(thread)
+      fiber_locals   = snapshot_fiber_locals(thread)
+      thread_locals  = snapshot_thread_locals(thread)
+
+      begin
+        yield
+      ensure
+        restore_fiber_locals(thread, fiber_locals)
+        restore_thread_locals(thread, thread_locals)
+      end
+    end
+
+    # `Thread#keys` only exposes the fiber local storage, which is what
+    # `Thread#[]` / `Thread#[]=` operate on. Assigning `nil` removes a key on
+    # supported Ruby versions, so the snapshot can be restored exactly.
+    def snapshot_fiber_locals(thread)
+      thread.keys.each_with_object({}) do |key, snapshot|
+        snapshot[key] = thread[key]
+      end
+    end
+
+    def restore_fiber_locals(thread, snapshot)
+      thread.keys.each do |key|
+        thread[key] = snapshot.fetch(key) { nil }
+      end
+      snapshot.each do |key, value|
+        thread[key] = value unless thread.key?(key)
+      end
+    end
+
+    def snapshot_thread_locals(thread)
+      thread.thread_variables.each_with_object({}) do |key, snapshot|
+        snapshot[key] = thread.thread_variable_get(key)
+      end
+    end
+
+    def restore_thread_locals(thread, snapshot)
+      # Ruby exposes no API to delete a thread variable, but a variable set
+      # to nil reports `thread_variable?(key) == false`, which is the same
+      # observable state as an unset variable.
+      thread.thread_variables.each do |key|
+        thread.thread_variable_set(key, nil) unless snapshot.key?(key)
+      end
+      snapshot.each do |key, value|
+        thread.thread_variable_set(key, value)
+      end
+    end
+  end
+
   # Internal Docs for A simple thread pool management object.
   #
   # Each Puma "worker" has a thread pool to process requests.
@@ -112,6 +181,13 @@ module Puma
       @before_thread_exit = options[:before_thread_exit]
       @reaping_time = options[:reaping_time]
       @auto_trim_time = options[:auto_trim_time]
+
+      # When true, thread locals and fiber locals written while a request is
+      # being handled are removed before the processor thread picks up its
+      # next piece of work. Values registered on the thread outside of a
+      # request (e.g. `puma_server`, or anything a plugin stores on the
+      # processor thread for its whole lifetime) are preserved.
+      @clean_thread_locals = options[:clean_thread_locals]
 
       @shutdown = false
 
@@ -243,7 +319,14 @@ module Puma
           end
 
           begin
-            @out_of_band_pending = true if block.call(processor, work)
+            result = if @clean_thread_locals
+              ThreadLocalCleaner.wrap(Thread.current) do
+                block.call(processor, work)
+              end
+            else
+              block.call(processor, work)
+            end
+            @out_of_band_pending = true if result
           rescue Exception => e
             STDERR.puts "Error reached top of thread-pool: #{e.message} (#{e.class})"
           end

@@ -1396,4 +1396,40 @@ class TestConfigFileWithFakeEnv < PumaTest
     assert_match(/Use 'after_stopped', 'on_stopped' is deprecated and will be removed in Puma v9/, err)
     assert ran, "on_stopped callback should have run"
   end
+
+  def test_clean_thread_locals_defaults_to_false
+    conf = Puma::Configuration.new
+    conf.clamp
+
+    assert_equal false, conf.options[:clean_thread_locals]
+  end
+
+  def test_clean_thread_locals_enabled_via_dsl
+    conf = Puma::Configuration.new do |c|
+      c.clean_thread_locals
+    end
+    conf.clamp
+
+    assert_equal true, conf.options[:clean_thread_locals]
+  end
+
+  def test_clean_thread_locals_disabled_via_dsl
+    conf = Puma::Configuration.new do |c|
+      c.clean_thread_locals false
+    end
+    conf.clamp
+
+    assert_equal false, conf.options[:clean_thread_locals]
+  end
+
+  # clean_thread_locals and fiber_per_request are independent options.
+  def test_clean_thread_locals_does_not_enable_fiber_per_request
+    conf = Puma::Configuration.new do |c|
+      c.clean_thread_locals
+    end
+    conf.clamp
+
+    assert_equal true,  conf.options[:clean_thread_locals]
+    assert_equal false, conf.options[:fiber_per_request]
+  end
 end
