@@ -106,6 +106,257 @@ module ActiveRecord
         assert_equal 0, active_connections(pool).size
       end
 
+      def test_with_connection_borrowing_a_leased_connection_only_ends_the_borrow
+        # The caller already holds a leased connection (e.g. through #lease_connection)
+        # and lends it to #with_connection. Because the caller owns the lease, an
+        # exception raised inside the block must only end the borrow: the connection
+        # must not be checked back into the pool.
+        connection = pool.lease_connection
+        connection.begin_transaction(_lazy: false)
+
+        error = assert_raises(RuntimeError) do
+          pool.with_connection do |borrowed|
+            assert_same connection, borrowed
+            raise "interrupt while borrowing an existing connection"
+          end
+        end
+        assert_equal "interrupt while borrowing an existing connection", error.message
+
+        # The original exception bubbles up unchanged, and the outer holder still
+        # owns the very same connection with its transaction intact.
+        assert_same connection, pool.active_connection?
+        assert_predicate connection, :in_use?
+        assert connection.transaction_open?
+        assert_equal [connection], active_connections(pool)
+
+        # The outer holder is still free to end its unit of work by rolling back.
+        connection.rollback_transaction
+        assert_not connection.transaction_open?
+        assert_same connection, pool.active_connection?
+
+        # It is the holder's responsibility to actually return the connection.
+        assert pool.release_connection
+        assert_not pool.active_connection?
+        assert_empty active_connections(pool)
+      end
+
+      def test_with_connection_wrapping_a_transaction_preserves_the_original_exception
+        # A realistic caller: an outer transaction lends its connection into
+        # #with_connection, something inside raises, and the transaction block is
+        # expected to see that exception and roll back per its contract.
+        connection = pool.lease_connection
+        interruption = RuntimeError.new("interrupt inside the borrow")
+
+        raised = assert_raises(RuntimeError) do
+          connection.transaction do
+            pool.with_connection do |borrowed|
+              assert_same connection, borrowed
+              raise interruption
+            end
+          end
+        end
+        assert_same interruption, raised
+
+        # The transaction block completed its convention with a rollback, and the
+        # holder's lease is untouched.
+        assert_not connection.transaction_open?
+        assert_same connection, pool.active_connection?
+        assert_equal [connection], active_connections(pool)
+      ensure
+        pool.release_connection if pool.active_connection?
+      end
+
+      def test_with_connection_checks_out_and_returns_a_connection_when_none_is_leased
+        # Without an existing lease, #with_connection owns the checkout itself, so a
+        # clean exit really returns the connection to the pool.
+        connection = nil
+        pool.with_connection do |conn|
+          connection = conn
+          assert_predicate conn, :in_use?
+        end
+
+        assert_not pool.active_connection?
+        assert_not_predicate connection, :in_use?
+        assert_empty active_connections(pool)
+
+        # The next borrower receives the same physical connection, reset and clean.
+        pool.with_connection do |conn|
+          assert_same connection, conn
+          assert_not conn.transaction_open?
+          assert_predicate conn, :in_use?
+        end
+        assert_not pool.active_connection?
+      end
+
+      def test_nested_with_connection_normal_exit_keeps_the_outer_lease
+        # Contrast with an exception: a normal return from a nested #with_connection
+        # that merely borrows an existing leased connection also leaves the lease and
+        # its open transaction alone.
+        connection = pool.lease_connection
+        connection.begin_transaction(_lazy: false)
+
+        pool.with_connection do |borrowed|
+          assert_same connection, borrowed
+        end
+
+        assert_same connection, pool.active_connection?
+        assert_predicate connection, :in_use?
+        assert connection.transaction_open?
+      ensure
+        connection.rollback_transaction if connection.transaction_open?
+        pool.release_connection if pool.active_connection?
+      end
+
+      def test_checkin_failure_keeps_the_broken_connection_away_from_later_borrowers
+        # An adapter explicitly reports that it cannot reset the connection while it
+        # is being checked in. The failure must surface to the caller instead of
+        # silently handing a dirty connection back out.
+        connection = pool.lease_connection
+        connection.connect!
+
+        reset_error = StandardError.new("adapter failed to reset the connection")
+        failing_reset = -> { raise reset_error }
+        ActiveRecord::ConnectionAdapters::AbstractAdapter.set_callback(:checkin, :before, failing_reset)
+
+        error = assert_raises(StandardError) do
+          pool.release_connection
+        end
+        assert_same reset_error, error
+
+        # The thread/lease association was cleared, but the connection could not be
+        # reset, so it stays marked busy and out of the available set: nobody may
+        # borrow the potentially-dirty connection.
+        assert_not pool.active_connection?
+        assert_includes pool.connections, connection
+        assert_predicate connection, :in_use?
+        assert_equal 1, pool.stat[:busy]
+        assert_equal 0, pool.stat[:idle]
+      ensure
+        ActiveRecord::ConnectionAdapters::AbstractAdapter.skip_callback(:checkin, :before, failing_reset) if failing_reset
+      end
+
+      def test_checkin_failure_blocks_a_single_connection_pool_until_reset_succeeds
+        # With only one connection, a failed check-in leaves nothing available to
+        # lend: another borrower times out rather than receiving the broken
+        # connection. Once the adapter can reset again and the connection is
+        # recovered, a later borrow succeeds and is clean.
+        pool = new_pool_with_options(max_connections: 1)
+        connection = pool.lease_connection
+        connection.connect!
+
+        attempts = 0
+        failing_reset = -> { attempts += 1; raise StandardError, "reset failed" }
+        ActiveRecord::ConnectionAdapters::AbstractAdapter.set_callback(:checkin, :before, failing_reset)
+
+        assert_raises(StandardError) { pool.release_connection }
+        assert_raises(ConnectionTimeoutError) do
+          pool.with_connection { }
+        end
+        assert_equal 1, attempts
+
+        adapter_class = ActiveRecord::ConnectionAdapters::AbstractAdapter
+        adapter_class.skip_callback(:checkin, :before, failing_reset)
+
+        # The stuck connection is still busy and owned by this (live) context, so it
+        # remains unlendable until the owner releases it.
+        assert_raises(ConnectionTimeoutError) do
+          pool.with_connection { }
+        end
+
+        # Recovering the connection (as the reaper does for a dead owner) resets and
+        # checks it in, after which the next borrow gets a clean connection.
+        connection.steal!
+        connection.reset!
+        pool.checkin(connection)
+        assert_equal 0, pool.stat[:busy]
+
+        pool.with_connection do |borrowed|
+          assert_same connection, borrowed
+          assert_not borrowed.transaction_open?
+        end
+      end
+
+      def test_checkout_reset_failure_removes_the_connection_and_lends_a_fresh_one
+        # Contrast with the check-in failure: when the adapter reports that it cannot
+        # reset/verify a connection while checking it out, the pool discards that
+        # connection and the next borrow establishes a fresh, clean one.
+        connection = pool.lease_connection
+        connection.connect!
+        pool.release_connection
+        assert_equal 1, pool.connections.size
+
+        reset_error = StandardError.new("adapter failed to reset on checkout")
+        failing_reset = -> { raise reset_error }
+        ActiveRecord::ConnectionAdapters::AbstractAdapter.set_callback(:checkout, :after, failing_reset)
+
+        error = assert_raises(StandardError) do
+          pool.lease_connection
+        end
+        assert_same reset_error, error
+
+        # The un-resettable connection was removed from the pool and disconnected.
+        assert_empty pool.connections
+        assert_not pool.connections.include?(connection)
+        assert_not connection.connected?
+        assert_not pool.active_connection?
+      ensure
+        ActiveRecord::ConnectionAdapters::AbstractAdapter.skip_callback(:checkout, :after, failing_reset) if failing_reset
+      end
+
+      def test_fresh_borrow_after_checkout_reset_failure_is_clean
+        # Following the discard in the previous scenario, once the adapter resets
+        # normally again the next borrower gets a brand new, clean connection rather
+        # than the discarded one.
+        connection = pool.lease_connection
+        connection.connect!
+        pool.release_connection
+
+        failing_reset = -> { raise StandardError, "adapter failed to reset on checkout" }
+        adapter_class = ActiveRecord::ConnectionAdapters::AbstractAdapter
+        adapter_class.set_callback(:checkout, :after, failing_reset)
+        assert_raises(StandardError) { pool.lease_connection }
+        adapter_class.skip_callback(:checkout, :after, failing_reset)
+
+        pool.with_connection do |borrowed|
+          assert_not_same connection, borrowed
+          borrowed.connect!
+          assert_predicate borrowed, :active?
+          assert_not borrowed.transaction_open?
+          assert_predicate borrowed, :in_use?
+        end
+        assert_not pool.active_connection?
+      end
+
+      def test_connection_with_unknown_commit_state_is_discarded_and_replaced
+        # If a COMMIT fails with a connection-level error the pool cannot know
+        # whether it committed, so the transaction manager throws the connection
+        # away instead of returning it for reuse. A later borrow must get a
+        # different, clean connection.
+        connection = pool.lease_connection
+
+        assert_raises(ActiveRecord::ConnectionFailed) do
+          connection.stub(:commit_db_transaction, -> { raise ActiveRecord::ConnectionFailed, "lost during commit" }) do
+            connection.transaction do
+              connection.execute("SELECT 1")
+            end
+          end
+        end
+
+        assert_not pool.connections.include?(connection)
+        assert_not connection.active?
+        assert_not pool.active_connection?
+        assert_empty active_connections(pool)
+
+        pool.with_connection do |borrowed|
+          assert_not_same connection, borrowed
+          borrowed.connect!
+          assert_predicate borrowed, :active?
+          assert_not borrowed.transaction_open?
+        end
+      ensure
+        pool.release_connection if pool.active_connection?
+      end
+
       def test_checkin_finalizes_unfinished_intent_logs_before_callbacks
         pool.with_connection { }
         intent = nil
