@@ -237,5 +237,94 @@ describe OpenTelemetry::SDK::Trace::TracerProvider do
       tracer = tracer_provider.tracer('component', '1.0', attributes: { 'key' => 'value' })
       _(tracer).wont_be_nil
     end
+
+    it 'deep copies array-valued attributes so caller mutations cannot change the registered scope' do
+      values = ['a', 'b']
+      attrs = { 'key' => values }
+      tracer = tracer_provider.tracer('component', '1.0', attributes: attrs)
+
+      values << 'mutated'
+
+      scope_attributes = tracer.start_root_span('test').instrumentation_scope.attributes
+      expected_attributes = { 'key' => ['a', 'b'] }
+      _(scope_attributes).must_equal(expected_attributes)
+      _(scope_attributes).wont_equal(attrs)
+    end
+
+    it 'deep copies string keys and scalar values so caller mutations cannot change the registered scope' do
+      key = +'key'
+      value = +'value'
+      tracer = tracer_provider.tracer('component', '1.0', attributes: { key => value })
+
+      key << '-mutated'
+      value << '-mutated'
+
+      scope_attributes = tracer.start_root_span('test').instrumentation_scope.attributes
+      expected_attributes = { 'key' => 'value' }
+      _(scope_attributes).must_equal(expected_attributes)
+    end
+
+    it 'freezes the registered attributes hash, its keys, and its array values' do
+      tracer = tracer_provider.tracer('component', '1.0', attributes: { 'key' => ['a', 'b'] })
+      attributes = tracer.start_root_span('test').instrumentation_scope.attributes
+
+      _(attributes).must_be :frozen?
+      _(attributes.keys.first).must_be :frozen?
+      _(attributes.values.first).must_be :frozen?
+      _(attributes.values.first.first).must_be :frozen?
+    end
+
+    it 'shares one deep-frozen value between the registry key and the exported scope' do
+      tracer = tracer_provider.tracer('component', '1.0', attributes: { 'key' => ['a', 'b'] })
+      registry_key = tracer_provider.instance_variable_get(:@registry).keys.last
+      scope_attributes = tracer.start_root_span('test').instrumentation_scope.attributes
+
+      _(registry_key.attributes).must_equal(scope_attributes)
+      assert_same(registry_key.attributes, scope_attributes)
+    end
+
+    it 'reuses the tracer when attributes are equal regardless of hash insertion order' do
+      tracer1 = tracer_provider.tracer('component', '1.0', attributes: { 'a' => '1', 'b' => '2' })
+      tracer2 = tracer_provider.tracer('component', '1.0', attributes: { 'b' => '2', 'a' => '1' })
+
+      _(tracer1).must_equal(tracer2)
+    end
+
+    it 'returns different tracers when array element order differs' do
+      tracer1 = tracer_provider.tracer('component', '1.0', attributes: { 'key' => ['a', 'b'] })
+      tracer2 = tracer_provider.tracer('component', '1.0', attributes: { 'key' => ['b', 'a'] })
+
+      _(tracer1).wont_equal(tracer2)
+    end
+
+    it 'keeps the originally exported scope stable and creates a separate tracer for the mutated value' do
+      exporter = OpenTelemetry::SDK::Trace::Export::InMemorySpanExporter.new
+      tracer_provider.add_span_processor(OpenTelemetry::SDK::Trace::Export::SimpleSpanProcessor.new(exporter))
+
+      values = ['a', 'b']
+      original_tracer = tracer_provider.tracer('component', '1.0', attributes: { 'key' => values })
+      original_tracer.in_span('before-mutation') {}
+
+      values << 'c'
+
+      old_value_tracer = tracer_provider.tracer('component', '1.0', attributes: { 'key' => ['a', 'b'] })
+      old_value_tracer.in_span('old-value') {}
+
+      new_value_tracer = tracer_provider.tracer('component', '1.0', attributes: { 'key' => ['a', 'b', 'c'] })
+      new_value_tracer.in_span('new-value') {}
+
+      _(old_value_tracer).must_equal(original_tracer)
+      _(new_value_tracer).wont_equal(original_tracer)
+
+      spans = exporter.finished_spans
+      expected_names = %w[before-mutation old-value new-value]
+      _(spans.map(&:name)).must_equal(expected_names)
+
+      old_attributes = { 'key' => ['a', 'b'] }
+      new_attributes = { 'key' => ['a', 'b', 'c'] }
+      _(spans[0].instrumentation_scope.attributes).must_equal(old_attributes)
+      _(spans[1].instrumentation_scope.attributes).must_equal(old_attributes)
+      _(spans[2].instrumentation_scope.attributes).must_equal(new_attributes)
+    end
   end
 end

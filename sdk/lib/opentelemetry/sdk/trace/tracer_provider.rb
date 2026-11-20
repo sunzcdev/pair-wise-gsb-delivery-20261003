@@ -62,7 +62,7 @@ module OpenTelemetry
         def tracer(deprecated_name = nil, deprecated_version = nil, name: nil, version: nil, attributes: nil) # rubocop:disable Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
           name ||= deprecated_name || ''
           version ||= deprecated_version || ''
-          attributes = attributes&.dup&.freeze || EMPTY_ATTRIBUTES
+          attributes = attributes ? deep_dup_and_freeze_attributes(attributes) : EMPTY_ATTRIBUTES
           OpenTelemetry.logger.warn 'calling TracerProvider#tracer without providing a tracer name.' if name.empty?
           @registry_mutex.synchronize do
             @registry[Key.new(name, version, attributes)] ||=
@@ -183,6 +183,25 @@ module OpenTelemetry
         end
 
         private
+
+        # Returns a deeply copied and frozen copy of the given scope
+        # attributes. Hash keys and scalar values are frozen as well, and
+        # array-valued attributes are duplicated element-by-element so that
+        # callers mutating their original arrays (or strings) after
+        # registering a tracer cannot change either the registry key or the
+        # exported instrumentation scope. Hash insertion order is not
+        # semantically meaningful for reuse, while the order of array
+        # elements is preserved.
+        def deep_dup_and_freeze_attributes(attributes)
+          attributes.each_with_object({}) do |(key, value), copy|
+            copied_value =
+              case value
+              when Array then value.map { |element| element.dup.freeze }.freeze
+              else value.dup.freeze
+              end
+            copy[key.dup.freeze] = copied_value
+          end.freeze
+        end
 
         def sampler_from_environment(default_sampler)
           case ENV.fetch('OTEL_TRACES_SAMPLER', nil)
