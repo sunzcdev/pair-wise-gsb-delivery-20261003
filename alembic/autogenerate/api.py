@@ -8,6 +8,8 @@ from typing import Any
 from typing import TYPE_CHECKING
 
 from sqlalchemy import inspect
+from sqlalchemy import schema as sa_schema
+from sqlalchemy.sql import ddl as sqla_ddl
 
 from . import compare
 from . import render
@@ -20,6 +22,7 @@ if TYPE_CHECKING:
     from sqlalchemy.engine import Connection
     from sqlalchemy.engine import Dialect
     from sqlalchemy.engine import Inspector
+    from sqlalchemy.sql.schema import ForeignKeyConstraint
     from sqlalchemy.sql.schema import MetaData
     from sqlalchemy.sql.schema import SchemaItem
     from sqlalchemy.sql.schema import Table
@@ -271,6 +274,23 @@ def _render_migration_diffs(
     )
 
 
+def _table_description(table: Table, index: int | None = None) -> str:
+    """Describe a :class:`.Table` for use in an error message, so that the
+    source object of a duplicate table key can be identified.
+
+    A plain ``MetaData()`` repr carries no identity of its own, so the object
+    id and the position in the given sequence are included in order to tell
+    the two objects apart.
+
+    """
+    return "Table(%r, schema=%r) from MetaData %s at index %s" % (
+        table.name,
+        table.schema,
+        "0x%x" % id(table.metadata),
+        index if index is not None else "?",
+    )
+
+
 class AutogenContext:
     """Maintains configuration and state that's specific to an
     autogenerate operation."""
@@ -483,16 +503,114 @@ class AutogenContext:
         """Return an aggregate of the :attr:`.MetaData.sorted_tables`
         collection(s).
 
-        For a sequence of :class:`.MetaData` objects, this
-        concatenates the :attr:`.MetaData.sorted_tables` collection
-        for each individual :class:`.MetaData`  in the order of the
-        sequence.  It does **not** collate the sorted tables collections.
+        For a sequence of :class:`.MetaData` objects, the tables of all the
+        objects are sorted together as a single group whenever a foreign key
+        points from a table in one :class:`.MetaData` to a table in another.
+        In that case the position of each :class:`.MetaData` object in the
+        sequence does not affect the dependency ordering of the tables; it
+        only orders tables that have no dependency relationship between them.
+
+        .. versionchanged:: 1.20.3  The tables of multiple
+           :class:`.MetaData` objects are now sorted as one group when
+           dependencies span the objects, rather than concatenating each
+           object's own :attr:`.MetaData.sorted_tables` collection.
 
         """
-        result = []
-        for m in util.to_list(self.metadata):
-            result.extend(m.sorted_tables)
-        return result
+        metadata = util.to_list(self.metadata)
+
+        # run the duplicate key check first so that a conflict is reported in
+        # terms of the source Table objects and not as a sorting failure.
+        self.table_key_to_table
+
+        if len(metadata) <= 1 or not self._has_cross_metadata_dependencies(
+            metadata
+        ):
+            # each MetaData object's own collection is already sorted, and
+            # any dependencies that cross a MetaData boundary have been ruled
+            # out; concatenating them is therefore a valid dependency order.
+            result = []
+            for m in metadata:
+                result.extend(m.sorted_tables)
+            return result
+
+        # a ForeignKey points at a Table in another MetaData object, which
+        # SQLAlchemy's sort cannot follow.  copy the tables into one
+        # temporary MetaData so that SQLAlchemy's own dependency sort,
+        # including its handling of unresolvable cycles, sees the whole set.
+        default_schema = getattr(self.dialect, "default_schema_name", None)
+        aggregate = sa_schema.MetaData()
+        copy_to_table: dict[Table, Table] = {}
+
+        def _referred_schema_fn(
+            table: Table,
+            to_schema: str | None,
+            constraint: ForeignKeyConstraint,
+            referred_schema: str | None,
+        ) -> Any:
+            tokens = sqla_compat._fk_target_tokens(constraint.elements[0])
+
+            schema = tokens.schema
+            if schema is None:
+                # a ForeignKey that names no schema refers to a table in the
+                # same schema as its own table.
+                schema = table.schema
+
+            if schema is None or schema == default_schema:
+                # the default schema is represented as "no schema" within
+                # the aggregate MetaData object.
+                return sa_schema.BLANK_SCHEMA
+            else:
+                return schema
+
+        # mirror the input collection that MetaData.sorted_tables itself
+        # uses, so that tables without dependencies are emitted in a stable
+        # order.
+        for m in metadata:
+            for table in sorted(m.tables.values(), key=lambda t: t.key):
+                schema = table.schema
+                if schema == default_schema:
+                    # represent the default schema as "no schema" so that a
+                    # table naming it explicitly and one that omits it are
+                    # placed together.
+                    schema = None
+
+                copy_to_table[
+                    table.to_metadata(
+                        aggregate,
+                        schema=schema,
+                        referred_schema_fn=_referred_schema_fn,
+                    )
+                ] = table
+
+        return [
+            copy_to_table[table]
+            for table in sqla_ddl.sort_tables(list(copy_to_table))
+        ]
+
+    @staticmethod
+    def _has_cross_metadata_dependencies(metadata: list[MetaData]) -> bool:
+        """Return True if a foreign key owned by a table in one
+        :class:`.MetaData` object points at a table that is not present in
+        the same object.
+
+        Such a dependency can only be resolved by looking at the whole group
+        of :class:`.MetaData` objects together.
+
+        """
+        for m in metadata:
+            for table in m.tables.values():
+                for fk_constraint in table.foreign_key_constraints:
+                    for fk in fk_constraint.elements:
+                        tokens = sqla_compat._fk_target_tokens(fk)
+                        schema = tokens.schema
+                        if schema is None:
+                            schema = table.metadata.schema
+                        key = sqla_compat._get_table_key(
+                            tokens.table_name, schema
+                        )
+                        if key not in m.tables:
+                            return True
+        return False
 
     @util.memoized_property
     def table_key_to_table(self) -> dict[str, Table]:
@@ -503,19 +621,53 @@ class AutogenContext:
         multiple :class:`.MetaData` objects into one dictionary.
 
         Duplicate table keys are **not** supported; if two :class:`.MetaData`
-        objects contain the same table key, an exception is raised.
+        objects contain the same table key, an exception is raised that
+        identifies the source :class:`.Table` objects.  A table that names
+        the default schema explicitly and one that omits it are considered
+        to have the same table key.
 
         """
-        result: dict[str, Table] = {}
-        for m in util.to_list(self.metadata):
-            intersect = set(result).intersection(set(m.tables))
-            if intersect:
-                raise ValueError(
-                    "Duplicate table keys across multiple "
-                    "MetaData objects: %s"
-                    % (", ".join('"%s"' % key for key in sorted(intersect)))
-                )
+        metadata = util.to_list(self.metadata)
+        default_schema = getattr(self.dialect, "default_schema_name", None)
 
+        # group the tables by their normalized key, where the default schema
+        # is treated the same as no schema.
+        key_to_tables: dict[str, list[tuple[int, Table]]] = {}
+        for index, m in enumerate(metadata):
+            for table in m.tables.values():
+                schema = table.schema
+                if schema is not None and schema == default_schema:
+                    schema = None
+                key = sqla_compat._get_table_key(table.name, schema)
+                key_to_tables.setdefault(key, []).append((index, table))
+
+        duplicates = {
+            key: locations
+            for key, locations in key_to_tables.items()
+            if len({index for index, table in locations}) > 1
+        }
+        if duplicates:
+            raise ValueError(
+                "Duplicate table keys across multiple MetaData objects: %s. "
+                "%s"
+                % (
+                    ", ".join('"%s"' % key for key in sorted(duplicates)),
+                    "; ".join(
+                        'table key "%s" is defined by %s'
+                        % (
+                            key,
+                            " and ".join(
+                                _table_description(table, index)
+                                for index, table in locations
+                            ),
+                        )
+                        for key, locations in sorted(duplicates.items())
+                    ),
+                )
+            )
+
+        result: dict[str, Table] = {}
+        for m in metadata:
             result.update(m.tables)
         return result
 

@@ -297,11 +297,19 @@ collections involved::
     target_metadata = [Model1Base.metadata, Model2Base.metadata]
 
 The sequence of :class:`~sqlalchemy.schema.MetaData` collections will be
-consulted in order during the autogenerate process.  Note that each
-:class:`~sqlalchemy.schema.MetaData` must contain **unique** table keys
-(e.g. the "key" is the combination of the table's name and schema);
-if two :class:`~sqlalchemy.schema.MetaData` objects contain a table
-with the same schema/name combination, an error is raised.
+consulted as a group during the autogenerate process.  In particular, the
+tables from all the collections are ordered by their foreign key
+dependencies together, so that a table in one collection may refer to a
+table in another; the order in which the collections are listed does not
+determine the order in which their tables are created or dropped.
+
+Note that each :class:`~sqlalchemy.schema.MetaData` must contain **unique**
+table keys (e.g. the "key" is the combination of the table's name and
+schema); if two :class:`~sqlalchemy.schema.MetaData` objects contain a
+table with the same schema/name combination, an error is raised that
+identifies the conflicting :class:`~sqlalchemy.schema.Table` objects.  A
+table that names the default schema explicitly and one that omits it are
+considered to have the same key.
 
 .. _autogenerate_include_hooks:
 

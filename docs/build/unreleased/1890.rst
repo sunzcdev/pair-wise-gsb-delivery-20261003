@@ -1,0 +1,26 @@
+.. change::
+    :tags: bug, autogenerate
+
+    Fixed autogenerate so that when the
+    :paramref:`.EnvironmentContext.configure.target_metadata` parameter is
+    a sequence of :class:`.MetaData` objects, the tables from all the
+    objects are sorted by foreign key dependency as a single group.  A
+    table in one :class:`.MetaData` that has a :class:`.ForeignKey` to a
+    table in another :class:`.MetaData` is now created after its referent
+    regardless of which :class:`.MetaData` object is listed first, so that
+    the generated migration can actually be applied.  Previously the
+    tables were sorted per :class:`.MetaData` object and then concatenated,
+    so that an unexpected input order could produce a migration that
+    failed because a referenced table did not yet exist; a cross-object
+    reference could also raise ``NoReferencedTableError`` while the
+    comparison was running.  The tables are still sorted by SQLAlchemy's
+    own dependency sort, so a genuine foreign key cycle between tables
+    continues to be handled by the existing dialect-aware logic and emits
+    SQLAlchemy's usual cycle warning.
+
+    The error raised for duplicate table keys across multiple
+    :class:`.MetaData` objects now identifies the source
+    :class:`.Table` objects, including the position of the
+    :class:`.MetaData` object that contains each one.  A table that names
+    the default schema explicitly is now treated as the same key as one
+    that omits it.

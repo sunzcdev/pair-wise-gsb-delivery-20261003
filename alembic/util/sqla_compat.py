@@ -315,9 +315,11 @@ def _fk_spec(constraint: ForeignKeyConstraint) -> Any:
 
     source_table = constraint.parent.name
     source_schema = constraint.parent.schema
-    target_schema = constraint.elements[0].column.table.schema
-    target_table = constraint.elements[0].column.table.name
-    target_columns = [element.column.name for element in constraint.elements]
+
+    target_schema, target_table, target_columns = _fk_target_spec(
+        constraint, resolve=True
+    )
+
     ondelete = constraint.ondelete
     onupdate = constraint.onupdate
     deferrable = constraint.deferrable
@@ -333,6 +335,48 @@ def _fk_spec(constraint: ForeignKeyConstraint) -> Any:
         ondelete,
         deferrable,
         initially,
+    )
+
+
+def _fk_target_spec(
+    constraint: ForeignKeyConstraint, resolve: bool = False
+) -> tuple[str | None, str, list[str]]:
+    """Return the ``(schema, table, columns)`` that a
+    :class:`.ForeignKeyConstraint` refers to.
+
+    When ``resolve`` is True, the resolved target :class:`.Table` and
+    :class:`.Column` objects are used where possible, so that the result
+    reflects the actual schema and column names.  A :class:`.ForeignKey` may
+    nevertheless point at a table that lives in a *different*
+    :class:`.MetaData` object, in which case SQLAlchemy can't resolve it;
+    the names stated in the ``ForeignKey`` itself are used instead, so that
+    autogenerate can still compare such a constraint rather than raising.
+
+    """
+    if resolve:
+        try:
+            return (
+                constraint.elements[0].column.table.schema,
+                constraint.elements[0].column.table.name,
+                [element.column.name for element in constraint.elements],
+            )
+        except sa_exc.NoReferencedTableError:
+            pass
+
+    first_tokens = _fk_target_tokens(constraint.elements[0])
+    schema = first_tokens.schema
+    if schema is None and constraint.parent is not None:
+        # a ForeignKey names no schema; SQLAlchemy resolves this against the
+        # schema of the owning Table's MetaData object.
+        schema = constraint.parent.metadata.schema
+
+    return (
+        schema,
+        first_tokens.table_name,
+        [
+            _fk_target_tokens(element).column_name
+            for element in constraint.elements
+        ],
     )
 
 

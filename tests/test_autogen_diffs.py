@@ -42,11 +42,13 @@ from alembic.autogenerate import api
 from alembic.autogenerate.compare.tables import _compare_tables
 from alembic.autogenerate.compare.util import _InspectorConv
 from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from alembic.operations import ops
 from alembic.testing import assert_raises_message
 from alembic.testing import config
 from alembic.testing import eq_
 from alembic.testing import exclusions
+from alembic.testing import expect_warnings
 from alembic.testing import is_
 from alembic.testing import is_not_
 from alembic.testing import mock
@@ -298,12 +300,20 @@ class AutogenDefaultSchemaIsNoneTest(AutogenFixtureTest, TestBase):
     def setUp(self):
         super().setUp()
 
+        # the engine and its dialect are shared across the test process, so
+        # preserve the original value and put it back in tearDown().
+        self._original_default_schema = self.bind.dialect.default_schema_name
+
         # in SQLAlchemy 1.4, SQLite dialect is setting this name
         # to "main" as is the actual default schema name for SQLite.
         self.bind.dialect.default_schema_name = None
 
         # prerequisite
         eq_(self.bind.dialect.default_schema_name, None)
+
+    def tearDown(self):
+        self.bind.dialect.default_schema_name = self._original_default_schema
+        super().tearDown()
 
     def test_no_default_schema(self):
         m1 = MetaData()
@@ -1883,6 +1893,31 @@ class OrigObjectTest(TestBase):
         )
 
 
+def _default_schema_name(bind):
+    """Return the dialect's default schema name.
+
+    The value is only populated once a connection has been established, so
+    it is not reliable when read from the engine alone.
+    """
+    with bind.connect() as conn:
+        return conn.dialect.default_schema_name
+
+
+def _require_default_schema(testcase):
+    """Return the default schema name, skipping the test when the backend
+    doesn't have one.
+
+    A few backends don't report a default schema name; the tests that name
+    the default schema explicitly can't run on those.
+    """
+    default_schema = _default_schema_name(testcase.bind)
+    if default_schema is None:
+        import pytest
+
+        pytest.skip("backend does not report a default schema name")
+    return default_schema
+
+
 class MultipleMetaDataTest(AutogenFixtureTest, TestBase):
     def test_multiple(self):
         m1a = MetaData()
@@ -1975,6 +2010,343 @@ class MultipleMetaDataTest(AutogenFixtureTest, TestBase):
             [m1a, m1b],
             [m2a, m2b],
         )
+
+    def test_raise_on_dupe_identifies_source_objects(self):
+        """the duplicate key error names the source Table objects and the
+        MetaData objects they belong to, so that the conflict can be located
+        in the application's model definitions.
+        """
+
+        m1a = MetaData()
+
+        m2a = MetaData()
+        m2b = MetaData()
+
+        Table("a", m1a, Column("id", Integer, primary_key=True))
+        Table("a", m2a, Column("id", Integer, primary_key=True))
+        Table("a", m2b, Column("id", Integer, primary_key=True))
+
+        error = assert_raises_message(
+            ValueError,
+            'Duplicate table keys across multiple MetaData objects: "a"',
+            self._fixture,
+            [m1a],
+            [m2a, m2b],
+        )
+
+        message = str(error)
+        # both conflicting Table objects are described, along with the
+        # position of the MetaData object that contains each one.  the
+        # MetaData id distinguishes the two otherwise identical reprs.
+        assert "Table('a', schema=None) from MetaData 0x" in message
+        assert "at index 0" in message
+        assert "at index 1" in message
+        assert message.count("Table('a', schema=None) from MetaData 0x") == 2
+
+    def test_raise_on_dupe_explicit_default_schema(self):
+        """a table that names the default schema explicitly collides with
+        one that omits it, since they refer to the same database table.
+        """
+
+        default_schema = _require_default_schema(self)
+
+        m1a = MetaData()
+
+        m2a = MetaData()
+        m2b = MetaData()
+
+        Table("a", m1a, Column("id", Integer, primary_key=True))
+        Table("a", m2a, Column("id", Integer, primary_key=True))
+        Table(
+            "a",
+            m2b,
+            Column("id", Integer, primary_key=True),
+            schema=default_schema,
+        )
+
+        assert_raises_message(
+            ValueError,
+            'Duplicate table keys across multiple MetaData objects: "a"',
+            self._fixture,
+            [m1a],
+            [m2a, m2b],
+        )
+
+
+class MultipleMetaDataDependencyTest(AutogenFixtureTest, TestBase):
+    """Test that tables spread across a sequence of :class:`.MetaData`
+    objects are ordered by foreign key dependency as a single group, rather
+    than in the order the :class:`.MetaData` objects happen to be given.
+
+    """
+
+    def _assert_create_order(self, uo, expected_names):
+        created = [
+            op.table_name
+            for op in uo.ops
+            if isinstance(op, ops.CreateTableOp)
+        ]
+        eq_(created, expected_names)
+
+    def test_dependency_order_independent_of_input_order(self):
+        m_parent = MetaData()
+        m_child = MetaData()
+
+        Table(
+            "parent",
+            m_parent,
+            Column("id", Integer, primary_key=True),
+            Column("name", String(50)),
+        )
+        Table(
+            "child",
+            m_child,
+            Column("id", Integer, primary_key=True),
+            Column("parent_id", Integer),
+            ForeignKeyConstraint(["parent_id"], ["parent.id"]),
+        )
+
+        for metadata in ([m_parent, m_child], [m_child, m_parent]):
+            uo = self._fixture([], metadata, return_ops=True)
+            self._assert_create_order(uo, ["parent", "child"])
+
+    def test_dependency_order_fk_by_column_object(self):
+        # the ForeignKey names its target using a Column object that belongs
+        # to a Table in a different MetaData object.
+        m_parent = MetaData()
+        m_child = MetaData()
+
+        parent = Table(
+            "parent", m_parent, Column("id", Integer, primary_key=True)
+        )
+        child = Table(
+            "child",
+            m_child,
+            Column("id", Integer, primary_key=True),
+            Column("parent_id", Integer),
+        )
+        child.append_constraint(
+            ForeignKeyConstraint([child.c.parent_id], [parent.c.id])
+        )
+
+        for metadata in ([m_parent, m_child], [m_child, m_parent]):
+            uo = self._fixture([], metadata, return_ops=True)
+            self._assert_create_order(uo, ["parent", "child"])
+
+    def test_dependency_order_explicit_default_schema(self):
+        default_schema = _require_default_schema(self)
+
+        m_parent = MetaData()
+        m_child = MetaData()
+
+        Table(
+            "parent",
+            m_parent,
+            Column("id", Integer, primary_key=True),
+            schema=default_schema,
+        )
+        Table(
+            "child",
+            m_child,
+            Column("id", Integer, primary_key=True),
+            Column("parent_id", Integer),
+            ForeignKeyConstraint(
+                ["parent_id"], ["%s.parent.id" % default_schema]
+            ),
+            schema=default_schema,
+        )
+
+        for metadata in ([m_parent, m_child], [m_child, m_parent]):
+            uo = self._fixture([], metadata, return_ops=True)
+            self._assert_create_order(uo, ["parent", "child"])
+
+            created = {
+                (op.schema, op.table_name)
+                for op in uo.ops
+                if isinstance(op, ops.CreateTableOp)
+            }
+            eq_(
+                created,
+                {
+                    (default_schema, "parent"),
+                    (default_schema, "child"),
+                },
+            )
+
+    def test_dependency_order_mixed_default_schema_notation(self):
+        """one module names the default schema explicitly and the other
+        omits it; the dependency between them is still resolved.
+        """
+
+        default_schema = _require_default_schema(self)
+
+        m_parent = MetaData()
+        m_child = MetaData()
+
+        Table(
+            "parent",
+            m_parent,
+            Column("id", Integer, primary_key=True),
+            schema=default_schema,
+        )
+        Table(
+            "child",
+            m_child,
+            Column("id", Integer, primary_key=True),
+            Column("parent_id", Integer),
+            ForeignKeyConstraint(
+                ["parent_id"], ["%s.parent.id" % default_schema]
+            ),
+        )
+
+        for metadata in ([m_parent, m_child], [m_child, m_parent]):
+            uo = self._fixture([], metadata, return_ops=True)
+            self._assert_create_order(uo, ["parent", "child"])
+
+    def test_migrations_are_applied_in_either_input_order(self):
+        """the generated operations must actually run against the database
+        no matter which order the MetaData objects were given in.
+        """
+
+        for metadata_order in ("parent_first", "child_first"):
+            m_parent = MetaData()
+            m_child = MetaData()
+
+            Table(
+                "parent",
+                m_parent,
+                Column("id", Integer, primary_key=True),
+                Column("name", String(50)),
+            )
+            Table(
+                "child",
+                m_child,
+                Column("id", Integer, primary_key=True),
+                Column("parent_id", Integer),
+                ForeignKeyConstraint(
+                    ["parent_id"], ["parent.id"], name="fk_child_parent"
+                ),
+            )
+
+            metadata = (
+                [m_parent, m_child]
+                if metadata_order == "parent_first"
+                else [m_child, m_parent]
+            )
+
+            uo = self._fixture([], metadata, return_ops=True)
+
+            # apply the generated operations against the database within a
+            # connection that stays open for the duration of the test.
+            with self.bind.connect() as conn:
+                op_impl = Operations(MigrationContext.configure(conn))
+                for operation in uo.ops:
+                    op_impl.invoke(operation)
+
+                insp = inspect(conn)
+
+                tables = insp.get_table_names()
+                assert "parent" in tables
+                assert "child" in tables
+
+                fks = insp.get_foreign_keys("child")
+                eq_(len(fks), 1)
+                eq_(fks[0]["referred_table"], "parent")
+                eq_(fks[0]["constrained_columns"], ["parent_id"])
+
+                # the child table is dropped first so that the foreign key
+                # dependency is satisfied.  ``Table.drop()`` is used since
+                # ``MetaData.drop_all()`` can't resolve the cross-MetaData
+                # foreign key on its own.
+                m_child.tables["child"].drop(conn)
+                m_parent.tables["parent"].drop(conn)
+
+    def test_circular_dependency_still_uses_sqlalchemy_path(self):
+        """a genuine foreign key cycle is still left to SQLAlchemy's own
+        cycle handling, which emits the usual warning.
+        """
+
+        m_a = MetaData()
+        m_b = MetaData()
+
+        a = Table(
+            "a",
+            m_a,
+            Column("id", Integer, primary_key=True),
+            Column("b_id", Integer),
+        )
+        b = Table(
+            "b",
+            m_b,
+            Column("id", Integer, primary_key=True),
+            Column("a_id", Integer),
+        )
+        a.append_constraint(
+            ForeignKeyConstraint([a.c.b_id], ["b.id"], name="fk_a_b")
+        )
+        b.append_constraint(
+            ForeignKeyConstraint([b.c.a_id], ["a.id"], name="fk_b_a")
+        )
+
+        for metadata in ([m_a, m_b], [m_b, m_a]):
+            with expect_warnings(
+                "Cannot correctly sort tables; there are unresolvable "
+                "cycles between tables"
+            ):
+                uo = self._fixture([], metadata, return_ops=True)
+
+            created = {
+                op.table_name
+                for op in uo.ops
+                if isinstance(op, ops.CreateTableOp)
+            }
+            eq_(created, {"a", "b"})
+
+    def test_existing_tables_compare_across_metadata(self):
+        """when both tables already exist in the database, the foreign key
+        between them is compared without error and no spurious diffs are
+        produced.  ``sorted_tables`` must resolve the cross-MetaData
+        reference for the comparison to run at all.
+        """
+
+        m_db = MetaData()
+        Table(
+            "parent",
+            m_db,
+            Column("id", Integer, primary_key=True),
+            Column("name", String(50)),
+        )
+        Table(
+            "child",
+            m_db,
+            Column("id", Integer, primary_key=True),
+            Column("parent_id", Integer),
+            ForeignKeyConstraint(["parent_id"], ["parent.id"]),
+        )
+        m_db.create_all(self.bind)
+
+        try:
+            m_parent = MetaData()
+            m_child = MetaData()
+            Table(
+                "parent",
+                m_parent,
+                Column("id", Integer, primary_key=True),
+                Column("name", String(50)),
+            )
+            Table(
+                "child",
+                m_child,
+                Column("id", Integer, primary_key=True),
+                Column("parent_id", Integer),
+                ForeignKeyConstraint(["parent_id"], ["parent.id"]),
+            )
+
+            for metadata in ([m_parent, m_child], [m_child, m_parent]):
+                diffs = self._fixture(m_db, metadata)
+                eq_(diffs, [])
+        finally:
+            m_db.drop_all(self.bind)
 
 
 class AutogenFKTest(AutogenFixtureTest, TestBase):
