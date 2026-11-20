@@ -21,6 +21,7 @@ module ActiveRecord
         "column" => "ActiveRecord::ConnectionAdapters::Column",
         "index" => "ActiveRecord::ConnectionAdapters::IndexDefinition",
         "schema_cache" => "ActiveRecord::ConnectionAdapters::SchemaCache",
+        "multi_schema_cache" => "ActiveRecord::ConnectionAdapters::MultiSchemaCache",
         "sql_type_metadata" => "ActiveRecord::ConnectionAdapters::SqlTypeMetadata",
 
         "date" => "ActiveRecord::Type::Date",

@@ -4,6 +4,98 @@ require "active_support/core_ext/file/atomic"
 
 module ActiveRecord
   module ConnectionAdapters
+    # A schema cache dump that holds a separate {SchemaCache} entry for every
+    # target database, keyed by the target's identity (the database
+    # configuration name). This keeps databases that share a dump file but own
+    # different tables, columns and indexes isolated from each other: an entry
+    # is only ever handed back to the reflection bound to the same target.
+    class MultiSchemaCache
+      MARKER = "multi_schema_cache" # :nodoc:
+
+      def initialize(caches = nil)
+        @caches = caches || {}
+      end
+
+      def [](target)
+        @caches[target]
+      end
+
+      def []=(target, cache)
+        @caches[target] = cache
+      end
+
+      def key?(target)
+        @caches.key?(target)
+      end
+
+      def targets
+        @caches.keys
+      end
+
+      def empty?
+        @caches.empty?
+      end
+
+      def encode_with(coder) # :nodoc:
+        coder[MARKER] = true
+        coder["caches"] = @caches.sort.to_h
+      end
+
+      def init_with(coder) # :nodoc:
+        @caches = coder["caches"] || {}
+        self
+      end
+
+      def as_schema_json # :nodoc:
+        data = {}
+        encode_with(data)
+        data
+      end
+
+      def init_from_schema_json(coder, references) # :nodoc:
+        @caches = (coder["caches"] || {}).transform_values { |reference| references[reference] }
+        self
+      end
+
+      def marshal_dump # :nodoc:
+        [MARKER, @caches]
+      end
+
+      def marshal_load(array) # :nodoc:
+        _marker, @caches = array
+        @caches ||= {}
+      end
+
+      def dump_to(filename)
+        open_dump(filename) { |f|
+          if filename.include?(".dump")
+            f.write(Marshal.dump(self))
+          elsif filename.include?(".json")
+            f.write(JSONSchemaCacheSerializer.dump(self))
+          else
+            f.write(YAML.dump(self))
+          end
+        }
+      end
+
+      private
+        def open_dump(filename)
+          FileUtils.mkdir_p(File.dirname(filename))
+
+          File.atomic_write(filename) do |file|
+            if File.extname(filename) == ".gz"
+              zipper = Zlib::GzipWriter.new file
+              zipper.mtime = 0
+              yield zipper
+              zipper.flush
+              zipper.close
+            else
+              yield file
+            end
+          end
+        end
+    end
+
     class SchemaReflection
       class << self
         attr_accessor :use_schema_cache_dump
@@ -13,13 +105,28 @@ module ActiveRecord
       self.use_schema_cache_dump = true
       self.check_schema_cache_dump_version = true
 
-      def initialize(cache_path, cache = nil)
+      # ==== Parameters
+      #
+      # * +cache_path+ - Path of the schema cache dump file.
+      # * +cache+ - An already loaded {SchemaCache} to serve directly.
+      # * +target+ - Identity of the database this reflection is bound to
+      #   (usually the database configuration name). Named reflections only read
+      #   and write the matching entry of a {MultiSchemaCache}; +nil+ keeps the
+      #   historical single-database behavior.
+      def initialize(cache_path, cache = nil, target: nil)
         @cache = cache
         @cache_path = cache_path
+        @target = target
+        @container = nil
       end
 
       def clear!
         @cache = empty_cache
+
+        # Only the entry for the database this reflection represents is reset;
+        # entries belonging to other targets stay untouched on disk and in any
+        # already loaded container.
+        @container&.[]=(@target, @cache) if @target
 
         nil
       end
@@ -91,8 +198,8 @@ module ActiveRecord
       def dump_to(pool, filename)
         fresh_cache = empty_cache
         fresh_cache.add_all(pool)
-        fresh_cache.dump_to(filename)
 
+        store_cache(filename, fresh_cache)
         @cache = fresh_cache
       end
 
@@ -113,12 +220,44 @@ module ActiveRecord
             File.file?(@cache_path)
         end
 
+        # Persist +fresh_cache+ for the target this reflection represents. An
+        # existing dump is preserved entry by entry so warming up one database
+        # never overwrites the entries of the others sharing the same file.
+        def store_cache(filename, fresh_cache)
+          container = load_container(filename)
+          container = MultiSchemaCache.new if container.nil? || legacy_single_cache?(container)
+
+          if @target
+            container[@target] = fresh_cache
+            container.dump_to(filename)
+          elsif container.is_a?(MultiSchemaCache) && !container.empty?
+            raise ArgumentError,
+              "Cannot dump a single-database cache into the multi-database dump #{filename} without a target"
+          else
+            # Historical behavior: unnamed reflections write a bare SchemaCache.
+            fresh_cache.dump_to(filename)
+          end
+        end
+
+        def load_container(filename)
+          return unless File.file?(filename)
+
+          SchemaCache._load_from(filename)
+        end
+
+        def legacy_single_cache?(object)
+          object.is_a?(SchemaCache)
+        end
+
         def load_cache(pool)
           # Can't load if schema dumps are disabled
           return unless possible_cache_available?
 
           # Check we can find one
-          return unless new_cache = SchemaCache._load_from(@cache_path)
+          return unless loaded = SchemaCache._load_from(@cache_path)
+
+          new_cache = extract_target_cache(loaded)
+          return unless new_cache
 
           if self.class.check_schema_cache_dump_version
             begin
@@ -126,7 +265,8 @@ module ActiveRecord
                 current_version = connection.schema_version
 
                 if new_cache.version(connection) != current_version
-                  warn "Ignoring #{@cache_path} because it has expired. The current schema version is #{current_version}, but the one in the schema cache file is #{new_cache.schema_version}."
+                  warn "Ignoring the #{@target || "default"} entry in #{@cache_path} because it has expired. " \
+                    "Current schema version is #{current_version}, but the cache file has #{new_cache.schema_version}."
                   return
                 end
               end
@@ -137,6 +277,24 @@ module ActiveRecord
           end
 
           new_cache
+        end
+
+        # Resolve the entry belonging to this reflection's target out of the
+        # loaded dump, applying a clear compatibility decision for historical
+        # single-database cache files.
+        def extract_target_cache(loaded)
+          if loaded.is_a?(MultiSchemaCache)
+            @container = loaded
+            loaded[@target]
+          elsif @target.nil?
+            # Backwards compatibility: a legacy bare SchemaCache is only accepted
+            # by an unnamed reflection, which itself represents a single database.
+            loaded
+          else
+            warn "Ignoring #{@cache_path} because it contains a legacy single-database schema cache and " \
+              "cannot be assigned to the #{@target} database. Re-dump the schema cache to upgrade it."
+            nil
+          end
         end
     end
 
@@ -245,6 +403,10 @@ module ActiveRecord
           Zlib::GzipReader.open(filename) { |gz|
             yield gz.read
           }
+        elsif filename.include?(".dump")
+          # Marshal output is binary. On Windows a plain File.read runs in text
+          # mode and treats the 0x1A byte as end-of-file, truncating the stream.
+          yield File.binread(filename)
         else
           yield File.read(filename)
         end

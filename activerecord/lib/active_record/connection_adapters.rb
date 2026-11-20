@@ -84,6 +84,7 @@ module ActiveRecord
     autoload :RactorConnectionHandler, "active_record/connection_adapters/ractor_connection_handler"
     autoload :RetryBudget
     autoload :SchemaCache
+    autoload :MultiSchemaCache, "active_record/connection_adapters/schema_cache"
     autoload :BoundSchemaReflection, "active_record/connection_adapters/schema_cache"
     autoload :SchemaReflection, "active_record/connection_adapters/schema_cache"
     autoload :Deduplicable

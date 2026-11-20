@@ -1,3 +1,20 @@
+*   Support multiple databases sharing one schema cache dump file.
+
+    When several databases are configured with the same `schema_cache_path`,
+    the dump now stores a separate schema cache entry per database, keyed by
+    the database configuration name. Each connection pool's schema reflection
+    is bound to its target identity, so warming up or loading one database can
+    no longer serve another database's columns, indexes or primary keys. A
+    schema version mismatch now only invalidates the matching entry, leaving
+    the other entries untouched.
+
+    Historical single-database dump files keep loading for an unnamed
+    reflection. A reflection bound to a named database rejects such a legacy
+    dump with a clear warning instead of applying it to the wrong database;
+    re-dumping upgrades the file to the new multi-entry format.
+
+    *Active Record*
+
 *   Log source location when scoped order is ignored in batching.
 
     *fatkodima*

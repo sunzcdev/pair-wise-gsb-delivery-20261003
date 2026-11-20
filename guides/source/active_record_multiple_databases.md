@@ -1102,10 +1102,10 @@ need to query the database for schema information each time a connection is
 established. By loading this metadata from the cache instead, applications can
 reduce unnecessary database queries and improve boot and connection performance.
 
-In a multiple database application, each database should use its own schema
-cache file. By default, the primary database uses `db/schema_cache.yml`, and
-other databases use `db/[DATABASE_CONFIGURATION_NAME]_schema_cache.yml`. For
-example, the `animals` database uses `db/animals_schema_cache.yml`.
+In a multiple database application, each database gets its own schema cache
+entry. By default, the primary database uses `db/schema_cache.yml`, and other
+databases use `db/[DATABASE_CONFIGURATION_NAME]_schema_cache.yml`. For example,
+the `animals` database uses `db/animals_schema_cache.yml`.
 
 You can configure the schema cache path explicitly with `schema_cache_path`:
 
@@ -1118,6 +1118,13 @@ production:
     database: my_animals_database
     schema_cache_path: db/animals_schema_cache.yml
 ```
+
+Databases may also point at the same `schema_cache_path`. In that case the dump
+stores a separate entry per database, keyed by the database configuration name.
+A connection only ever reads the entry matching its own database, so databases
+that define a table with the same name but different columns or indexes cannot
+contaminate each other. If a database's schema version changes, only its own
+entry is ignored; the other entries keep loading.
 
 To load schema cache files lazily as database connections are established, set
 `config.active_record.lazily_load_schema_cache = true` in your application
@@ -1133,9 +1140,10 @@ You can generate schema cache files with:
 $ bin/rails db:schema:cache:dump
 ```
 
-For multiple databases, this command dumps a schema cache for each managed
-database configuration. Each database needs its own cache file because each
-database can have different tables, columns, and metadata.
+For multiple databases, this command dumps a schema cache entry for each
+managed database configuration. Each entry describes the tables, columns, and
+metadata of its own database, so a shared cache file still keeps the databases
+isolated.
 
 You can read more about schema management in the
 [Command Line guide](command_line.html#schema-management).
