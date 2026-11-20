@@ -15,6 +15,12 @@ module OpenTelemetry
         # the unstable OpenTelemetry Metrics API. An example implementation in
         # terms of StatsD is:
         #
+        # When the BatchSpanProcessor reports dropped spans it uses the
+        # +otel.bsp.dropped_spans+ counter with a bounded set of labels: the
+        # +group+ label is one of the configured service group keys (or
+        # +'default'+), and the +reason+ label is one of +'buffer-full'+,
+        # +'export-failure'+ or +'terminating'+.
+        #
         # @example
         #   module MetricsReporter
         #     def add_to_counter(metric, increment: 1, labels: {})

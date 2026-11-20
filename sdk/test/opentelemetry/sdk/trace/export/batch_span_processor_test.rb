@@ -51,6 +51,56 @@ describe OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor do
     def force_flush(timeout: nil); end
   end
 
+  # An ordinary exporter whose export call blocks until #resume is called. It
+  # lets a test stall the export pipeline (so the queue fills up) and then let
+  # every buffered span through again, without bypassing the normal exporter
+  # path.
+  class PausableExporter
+    def initialize
+      @mutex = Mutex.new
+      @condition = ConditionVariable.new
+      @paused = false
+      @exporting = false
+      @batches = []
+    end
+
+    def batches
+      @mutex.synchronize { @batches.dup }
+    end
+
+    def pause
+      @mutex.synchronize { @paused = true }
+    end
+
+    def resume
+      @mutex.synchronize do
+        @paused = false
+        @condition.broadcast
+      end
+    end
+
+    def wait_until_exporting
+      @mutex.synchronize do
+        @condition.wait(@mutex) until @exporting
+      end
+    end
+
+    def export(batch, timeout: nil)
+      @mutex.synchronize do
+        @exporting = true
+        @condition.broadcast
+        @condition.wait(@mutex) while @paused
+        @exporting = false
+        @batches << batch
+      end
+      SUCCESS
+    end
+
+    def shutdown(timeout: nil); end
+
+    def force_flush(timeout: nil); end
+  end
+
   class TestMetricsReporter
     attr_reader :reported_metrics
 
@@ -85,6 +135,36 @@ describe OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor do
     def to_span_data
       self
     end
+  end
+
+  class GroupedTestSpan < TestSpan
+    def initialize(group, id = nil)
+      super(id)
+      @group = group
+    end
+
+    attr_reader :group
+  end
+
+  # Minimal stand-in for OpenTelemetry::SDK::Resources::Resource that exposes a
+  # service.name attribute through the public enumerator.
+  class ServiceResource
+    def initialize(service_name)
+      @service_name = service_name
+    end
+
+    def attribute_enumerator
+      [[OpenTelemetry::SemanticConventions::Resource::SERVICE_NAME, @service_name]].each
+    end
+  end
+
+  class ServiceTestSpan < TestSpan
+    def initialize(service_name, id = nil)
+      super(id)
+      @resource = ServiceResource.new(service_name)
+    end
+
+    attr_reader :resource
   end
 
   describe 'initialization' do
@@ -406,6 +486,239 @@ describe OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor do
       _(dropped).wont_be_nil
       dropped_buffer_full_label_names, dropped_export_failure_label_names = dropped.map { |_count, labels| labels.keys.sort }
       _(dropped_buffer_full_label_names).must_equal(dropped_export_failure_label_names)
+    end
+  end
+
+  describe 'group reservations' do
+    let(:group_by) { ->(span) { span.group } }
+
+    def received_groups(exporter)
+      exporter.batches.flatten.map(&:group)
+    end
+
+    it 'rejects reservations that are not a hash of non-negative integers' do
+      assert_raises(ArgumentError) { BatchSpanProcessor.new(TestExporter.new, group_reservations: 'nope') }
+      assert_raises(ArgumentError) { BatchSpanProcessor.new(TestExporter.new, group_reservations: { 'a' => -1 }) }
+      assert_raises(ArgumentError) { BatchSpanProcessor.new(TestExporter.new, group_reservations: { 'a' => 1.5 }) }
+    end
+
+    it 'rejects reservations that exceed the global queue cap' do
+      assert_raises(ArgumentError) do
+        BatchSpanProcessor.new(TestExporter.new, max_queue_size: 10, group_reservations: { 'a' => 6, 'b' => 5 })
+      end
+    end
+
+    it 'rejects a group_by that does not respond to call' do
+      assert_raises(ArgumentError) { BatchSpanProcessor.new(TestExporter.new, group_by: 'nope') }
+    end
+
+    it 'normalizes reservation keys to strings' do
+      bsp = BatchSpanProcessor.new(TestExporter.new,
+                                   max_queue_size: 10,
+                                   max_export_batch_size: 1,
+                                   group_reservations: { a: 4, b: 4 })
+      _(bsp.instance_variable_get(:@group_reservations)).must_equal({ 'a' => 4, 'b' => 4 })
+    end
+
+    it 'keeps the original FIFO behavior when no reservations are configured' do
+      exporter = TestExporter.new
+      reporter = TestMetricsReporter.new
+      bsp = BatchSpanProcessor.new(exporter,
+                                   max_queue_size: 2,
+                                   max_export_batch_size: 1,
+                                   metrics_reporter: reporter,
+                                   start_thread_on_boot: false)
+
+      3.times { |i| bsp.on_finish(TestSpan.new(i)) }
+
+      _(bsp.instance_variable_get(:@spans).map(&:span).map(&:id)).must_equal([1, 2])
+      dropped = reporter.reported_metrics['otel.bsp.dropped_spans']
+      _(dropped).must_equal([[1, { 'group' => 'default', 'reason' => 'buffer-full', OpenTelemetry::SemanticConventions::Trace::CODE_FUNCTION => 'on_finish' }]])
+    end
+
+    it 'lets an idle group lend its unused share to other groups' do
+      exporter = TestExporter.new
+      bsp = BatchSpanProcessor.new(exporter,
+                                   max_queue_size: 10,
+                                   max_export_batch_size: 3,
+                                   group_reservations: { 'a' => 4, 'b' => 4 },
+                                   group_by: group_by,
+                                   start_thread_on_boot: false)
+
+      10.times { bsp.on_finish(GroupedTestSpan.new('a')) }
+
+      _(bsp.instance_variable_get(:@spans).size).must_equal(10)
+      bsp.shutdown
+      _(exporter.batches.flatten.size).must_equal(10)
+    end
+
+    it 'sheds only the overloaded group\'s own oldest entries when it is at its share' do
+      reporter = TestMetricsReporter.new
+      bsp = BatchSpanProcessor.new(TestExporter.new,
+                                   max_queue_size: 10,
+                                   max_export_batch_size: 2,
+                                   group_reservations: { 'a' => 5, 'b' => 5 },
+                                   group_by: group_by,
+                                   metrics_reporter: reporter,
+                                   start_thread_on_boot: false)
+
+      5.times { bsp.on_finish(GroupedTestSpan.new('b', 'b')) }
+      5.times { bsp.on_finish(GroupedTestSpan.new('a', 'a')) }
+      bsp.on_finish(GroupedTestSpan.new('a', 'a-late'))
+
+      # The full queue stays at each group's share; the overloaded group
+      # replaces its own oldest span instead of evicting group 'b'.
+      _(bsp.instance_variable_get(:@spans).size).must_equal(10)
+      _(bsp.instance_variable_get(:@group_counts).to_h).must_equal({ 'b' => 5, 'a' => 5 })
+      _(bsp.instance_variable_get(:@spans).count { |entry| entry.group == 'b' }).must_equal(5)
+      _(bsp.instance_variable_get(:@spans).map(&:span).map(&:id)).must_equal(%w[b b b b b a a a a a-late])
+      dropped = reporter.reported_metrics['otel.bsp.dropped_spans']
+      _(dropped.size).must_equal(1)
+      _(dropped[0][1]['group']).must_equal('a')
+      _(dropped[0][1]['reason']).must_equal('buffer-full')
+    end
+
+    it 'drops incoming spans from a group with no reservation and no borrowed space' do
+      reporter = TestMetricsReporter.new
+      bsp = BatchSpanProcessor.new(TestExporter.new,
+                                   max_queue_size: 2,
+                                   max_export_batch_size: 1,
+                                   group_reservations: { 'a' => 1, 'b' => 1 },
+                                   group_by: group_by,
+                                   metrics_reporter: reporter,
+                                   start_thread_on_boot: false)
+
+      bsp.on_finish(GroupedTestSpan.new('a'))
+      bsp.on_finish(GroupedTestSpan.new('b'))
+      bsp.on_finish(GroupedTestSpan.new('c'))
+
+      _(bsp.instance_variable_get(:@spans).size).must_equal(2)
+      dropped = reporter.reported_metrics['otel.bsp.dropped_spans']
+      _(dropped.size).must_equal(1)
+      _(dropped[0][1]['group']).must_equal('default')
+    end
+
+    it 'maps unconfigured groups and nil to a single bounded default group' do
+      reporter = TestMetricsReporter.new
+      bsp = BatchSpanProcessor.new(TestExporter.new,
+                                   max_queue_size: 1,
+                                   max_export_batch_size: 1,
+                                   group_reservations: { 'a' => 1 },
+                                   group_by: group_by,
+                                   metrics_reporter: reporter,
+                                   start_thread_on_boot: false)
+
+      bsp.on_finish(GroupedTestSpan.new('a'))
+      bsp.on_finish(GroupedTestSpan.new('b'))
+      bsp.on_finish(GroupedTestSpan.new(nil))
+
+      groups = reporter.reported_metrics['otel.bsp.dropped_spans'].map { |_count, labels| labels['group'] }
+      _(groups.uniq).must_equal(['default'])
+    end
+
+    it 'falls back to the default group when group_by raises' do
+      bsp = BatchSpanProcessor.new(TestExporter.new,
+                                   group_reservations: { 'a' => 1 },
+                                   group_by: ->(_span) { raise 'boom!' },
+                                   start_thread_on_boot: false)
+
+      bsp.on_finish(GroupedTestSpan.new('a'))
+
+      _(bsp.instance_variable_get(:@spans).first.group).must_equal('default')
+    end
+
+    it 'groups spans by their resource service name when no group_by is given' do
+      exporter = TestExporter.new
+      bsp = BatchSpanProcessor.new(exporter,
+                                   max_queue_size: 10,
+                                   max_export_batch_size: 10,
+                                   group_reservations: { 'service-a' => 4, 'service-b' => 4 },
+                                   start_thread_on_boot: false)
+
+      bsp.on_finish(ServiceTestSpan.new('service-a'))
+      bsp.on_finish(ServiceTestSpan.new('service-b'))
+
+      groups = bsp.instance_variable_get(:@spans).map(&:group)
+      _(groups).must_equal(%w[service-a service-b])
+
+      bsp.shutdown
+      _(exporter.batches.flatten.size).must_equal(2)
+    end
+
+    it 'maps an unknown service name to the default group' do
+      bsp = BatchSpanProcessor.new(TestExporter.new,
+                                   group_reservations: { 'service-a' => 1 },
+                                   start_thread_on_boot: false)
+
+      bsp.on_finish(ServiceTestSpan.new('other-service'))
+
+      _(bsp.instance_variable_get(:@spans).first.group).must_equal('default')
+    end
+
+    it 'reports bounded group and reason labels on every drop path' do
+      reporter = TestMetricsReporter.new
+      exporter = TestExporter.new(status_codes: [FAILURE])
+      bsp = BatchSpanProcessor.new(exporter,
+                                   max_queue_size: 1,
+                                   max_export_batch_size: 1,
+                                   group_reservations: { 'a' => 1 },
+                                   group_by: group_by,
+                                   metrics_reporter: reporter,
+                                   start_thread_on_boot: false)
+
+      bsp.on_finish(GroupedTestSpan.new('a', 'kept'))
+      bsp.on_finish(GroupedTestSpan.new('b', 'dropped-because-buffer-full'))
+      bsp.shutdown # triggers export failure, reporting an export-failure drop
+
+      dropped = reporter.reported_metrics['otel.bsp.dropped_spans']
+      _(dropped).wont_be_nil
+      _(dropped.map { |_count, labels| labels.keys.sort }.uniq.size).must_equal(1)
+      _(dropped.map { |_count, labels| labels['group'] }.sort.uniq).must_equal(%w[a default])
+      _(dropped.map { |_count, labels| labels['reason'] }.sort.uniq).must_equal(%w[buffer-full export-failure])
+    end
+
+    it 'protects each group minimum while the exporter is paused' do
+      queue_size = 10
+      reservations = { 'a' => 6, 'b' => 4 }
+
+      # The first span is already inside the blocked export call when the queue
+      # fills, so the exporter ultimately receives the queue plus that one.
+      total_received = queue_size + 1
+
+      without_reservations = run_squeeze_scenario(queue_size: queue_size, reservations: nil)
+      with_reservations = run_squeeze_scenario(queue_size: queue_size, reservations: reservations)
+
+      # Without reservations the noisy group 'a' squeezes every 'b' span out.
+      _(without_reservations.count('b')).must_equal(0)
+      _(without_reservations.count('a')).must_equal(total_received)
+
+      # With reservations the quieter group keeps at least its minimum share.
+      _(with_reservations.count('b')).must_equal(reservations['b'])
+      _(with_reservations.count('a')).must_equal(total_received - reservations['b'])
+    end
+
+    def run_squeeze_scenario(queue_size:, reservations:)
+      exporter = PausableExporter.new
+      bsp = BatchSpanProcessor.new(exporter,
+                                   schedule_delay: 1,
+                                   max_queue_size: queue_size,
+                                   max_export_batch_size: 1,
+                                   group_reservations: reservations || {},
+                                   group_by: group_by)
+
+      # Pause the exporter first, then hand it one span so the pipeline stalls
+      # while the queue keeps filling from both services.
+      exporter.pause
+      bsp.on_finish(GroupedTestSpan.new('a'))
+      exporter.wait_until_exporting
+
+      5.times { bsp.on_finish(GroupedTestSpan.new('b')) }
+      25.times { bsp.on_finish(GroupedTestSpan.new('a')) }
+
+      exporter.resume
+      bsp.shutdown
+
+      received_groups(exporter)
     end
   end
 
