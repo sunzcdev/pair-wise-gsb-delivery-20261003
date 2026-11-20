@@ -259,4 +259,112 @@ RSpec.describe Faraday::Error do
       it { expect(subject.message).to eq('the server responded with status 404 for GET http://example.com/test') }
     end
   end
+
+  describe 'two-stage response view' do
+    let(:raw_response) do
+      { status: 500, headers: { 'Content-Type' => 'application/json' }, body: '{"error":"boom"}' }
+    end
+
+    context 'when the response hash carries the raw adapter snapshot' do
+      let(:current_response) do
+        {
+          status: 500,
+          headers: { 'Content-Type' => 'application/json' },
+          body: { 'error' => 'boom' },
+          Faraday::RAW_ADAPTER_RESPONSE_KEY => raw_response
+        }
+      end
+      subject(:error) { described_class.new(current_response) }
+
+      it 'exposes both stages without changing the legacy response reader' do
+        expect(error.response).to be_a(Hash)
+        expect(error.response).not_to have_key(Faraday::RAW_ADAPTER_RESPONSE_KEY)
+        expect(error.response).to equal(error.current_response)
+        expect(error.response_body).to eq('error' => 'boom')
+        expect(error.response_stages).to be_a(Faraday::ResponseStages)
+        expect(error.raw_response).to eq(raw_response)
+        expect(error.adapter_response).to eq(raw_response)
+        expect(error.raw_response[:body]).to be_a(String)
+        expect(error.current_response[:body]).to eq('error' => 'boom')
+        expect(error.response_stages.to_a).to eq([raw_response, error.response])
+      end
+
+      it 'freezes the stage container so the view cannot be tampered with' do
+        expect(error.response_stages).to be_frozen
+        expect { error.response_stages.instance_variable_set(:@raw, 'changed') }.to raise_error(FrozenError)
+      end
+    end
+
+    context 'when no raw adapter snapshot is attached' do
+      subject(:error) { described_class.new(status: 500, body: 'fail') }
+
+      it 'leaves the two-stage view disabled' do
+        expect(error.response_stages).to be_nil
+        expect(error.raw_response).to be_nil
+        expect(error.adapter_response).to be_nil
+        expect(error.current_response).to be_nil
+        expect(error.response).to eq(status: 500, body: 'fail')
+      end
+    end
+
+    context 'when an exception and a response hash both carry a raw snapshot' do
+      let(:wrapped) { RuntimeError.new('boom') }
+      let(:response) do
+        { status: 502, body: 'bad gateway', Faraday::RAW_ADAPTER_RESPONSE_KEY => raw_response }
+      end
+      subject(:error) { described_class.new(wrapped, response) }
+
+      it 'extracts the stages from the response argument' do
+        expect(error.wrapped_exception).to eq(wrapped)
+        expect(error.raw_response).to eq(raw_response)
+        expect(error.current_response).to equal(response)
+        expect(error.response).not_to have_key(Faraday::RAW_ADAPTER_RESPONSE_KEY)
+      end
+    end
+
+    context 'with a Faraday::Env carrying the raw adapter snapshot' do
+      let(:env) do
+        Faraday::Env.from(
+          status: 200,
+          response_headers: { 'Content-Type' => 'application/json' },
+          response_body: '{"ok":true}'
+        )
+      end
+      subject(:error) { described_class.new(env) }
+
+      before do
+        env[Faraday::RAW_ADAPTER_RESPONSE_KEY] = raw_response
+      end
+
+      it 'removes the private marker from the env and exposes the stages' do
+        expect(error.response).to eq(env)
+        expect(env[Faraday::RAW_ADAPTER_RESPONSE_KEY]).to be_nil
+        expect(error.raw_response).to eq(raw_response)
+        expect(error.current_response).to eq(env)
+      end
+    end
+
+    context 'with a Faraday::Response carrying the raw adapter snapshot' do
+      let(:env) do
+        Faraday::Env.from(
+          status: 500,
+          response_headers: { 'Content-Type' => 'application/json' },
+          response_body: 'fail'
+        )
+      end
+      let(:response) { Faraday::Response.new(env) }
+      subject(:error) { described_class.new(RuntimeError.new('boom'), response) }
+
+      before do
+        env[Faraday::RAW_ADAPTER_RESPONSE_KEY] = raw_response
+      end
+
+      it 'exposes the stages while keeping the Response reader' do
+        expect(error.response).to eq(response)
+        expect(error.response.env[Faraday::RAW_ADAPTER_RESPONSE_KEY]).to be_nil
+        expect(error.raw_response).to eq(raw_response)
+        expect(error.current_response).to eq(response)
+      end
+    end
+  end
 end

@@ -66,6 +66,7 @@ module Faraday
 
     private
 
+    # Saves the response properties on the env.
     def save_response(env, status, body, headers = nil, reason_phrase = nil, finished: true)
       env.status = status
       env.body = body
@@ -74,6 +75,8 @@ module Faraday
         response_headers.update headers unless headers.nil?
         yield(response_headers) if block_given?
       end
+
+      capture_raw_response(env) if env[:capture_raw_response]
 
       env.response.finish(env) unless env.parallel? || !finished
       env.response
@@ -95,6 +98,20 @@ module Faraday
         raise ArgumentError, msg
       end
       options[key] || options[:timeout]
+    end
+
+    # Leaves a frozen snapshot of the response on the env, as seen by the
+    # adapter before any response middleware transforms it. Only triggered when
+    # the RaiseError middleware opts in with `response_stages: true`.
+    # The body reads `Env#body` because it aliases the request body while the
+    # status is nil, mirroring `Faraday::Response#body`.
+    def capture_raw_response(env)
+      body = env.body
+      env[Faraday::RAW_ADAPTER_RESPONSE_KEY] = {
+        status: env.status,
+        headers: env.response_headers.dup,
+        body: body.nil? ? nil : body.dup
+      }.freeze
     end
   end
 end

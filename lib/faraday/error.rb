@@ -2,13 +2,19 @@
 
 # Faraday namespace.
 module Faraday
+  # Key used by the RaiseError middleware to carry the raw adapter response
+  # while two-stage response views are enabled. Defined here so that
+  # Faraday::Error can read it without loading response middleware.
+  RAW_ADAPTER_RESPONSE_KEY = :raw_adapter_response
+
   # Faraday error base class.
   class Error < StandardError
-    attr_reader :response, :wrapped_exception
+    attr_reader :response, :wrapped_exception, :response_stages
 
     def initialize(exc = nil, response = nil)
       @wrapped_exception = nil unless defined?(@wrapped_exception)
       @response = nil unless defined?(@response)
+      @response_stages = nil unless defined?(@response_stages)
       super(exc_msg_and_response!(exc, response))
     end
 
@@ -46,6 +52,33 @@ module Faraday
       @response.is_a?(Faraday::Response) ? @response.body : @response[:body]
     end
 
+    # Two-stage view of the response, available when the RaiseError middleware
+    # is configured with `response_stages: true`.
+    #
+    # @return [Faraday::ResponseStages, nil] the response as seen by the adapter
+    #   and the response at the point where the error was raised, or nil when
+    #   the feature was not enabled.
+    def raw_response
+      @response_stages&.raw
+    end
+
+    # The response captured when the adapter finished, before any response
+    # middleware transformed it.
+    #
+    # @return [Hash, Faraday::Response, nil] a snapshot of the adapter response.
+    def adapter_response
+      @response_stages&.adapter
+    end
+
+    # The response at the point where the error was raised, after any response
+    # middleware positioned before RaiseError had run. This is the same object
+    # returned by {#response} when two stages were captured.
+    #
+    # @return [Hash, Faraday::Response, nil] a snapshot of the current response.
+    def current_response
+      @response_stages&.current
+    end
+
     protected
 
     # Pulls out potential parent exception and response hash, storing them in
@@ -70,6 +103,7 @@ module Faraday
     # to `super`. See NilStatusError.
     def exc_msg_and_response!(exc, response = nil)
       if @response.nil? && @wrapped_exception.nil?
+        exc, response = extract_response_stages!(exc, response)
         @wrapped_exception, msg, @response = exc_msg_and_response(exc, omit_request_data(response))
         return msg
       end
@@ -99,6 +133,34 @@ module Faraday
     end
 
     private
+
+    # Detects the optional two-stage view attached by RaiseError. The raw
+    # adapter snapshot is carried on the Env (or inside the response hash) and
+    # is removed from the stored response so `#response` keeps its historical
+    # shape. Returns the (possibly updated) exception and response arguments.
+    def extract_response_stages!(exc, response)
+      if exc.is_a?(Hash) && exc.key?(Faraday::RAW_ADAPTER_RESPONSE_KEY)
+        raw = exc.delete(Faraday::RAW_ADAPTER_RESPONSE_KEY)
+        @response_stages = Faraday::ResponseStages.new(raw: raw, current: exc)
+      elsif response.is_a?(Hash) && response.key?(Faraday::RAW_ADAPTER_RESPONSE_KEY)
+        raw = response.delete(Faraday::RAW_ADAPTER_RESPONSE_KEY)
+        @response_stages = Faraday::ResponseStages.new(raw: raw, current: response)
+      elsif response.is_a?(Faraday::Response)
+        extract_stages_from_env!(response.env, response)
+      end
+
+      extract_stages_from_env!(exc, exc) if exc.is_a?(Faraday::Env)
+      [exc, response]
+    end
+
+    def extract_stages_from_env!(env, current)
+      return unless env.is_a?(Faraday::Env)
+
+      raw = env.custom_members.delete(Faraday::RAW_ADAPTER_RESPONSE_KEY)
+      return unless raw
+
+      @response_stages ||= Faraday::ResponseStages.new(raw: raw, current: current)
+    end
 
     # When the RaiseError middleware opted this request out of request data
     # (`include_request: false`), it marks the Env. Build a fresh Response from

@@ -264,6 +264,235 @@ RSpec.describe Faraday::Response::RaiseError do
     end
   end
 
+  describe 'two-stage response view' do
+    let(:raw_body) { '{"error":"boom"}' }
+    let(:parsed_body) { { 'error' => 'boom' } }
+    let(:response_headers) { { 'Content-Type' => 'application/json', 'X-Raw' => 'yes' } }
+
+    let(:conn) do
+      Faraday.new do |b|
+        stack_order.call(b)
+        b.adapter :test do |stub|
+          stub.get('boom') { [500, response_headers, raw_body] }
+        end
+      end
+    end
+
+    # Middleware complete responses in reverse registration order, so the last
+    # registered middleware sees the adapter-fresh response first.
+    shared_examples 'a request without the two-stage view' do
+      it 'keeps the legacy response reader and leaves the stages empty' do
+        expect { conn.get('boom') }.to raise_error(Faraday::ServerError) do |ex|
+          expect(ex.response_stages).to be_nil
+          expect(ex.raw_response).to be_nil
+          expect(ex.adapter_response).to be_nil
+          expect(ex.current_response).to be_nil
+          expect(ex.response).not_to have_key(Faraday::RAW_ADAPTER_RESPONSE_KEY)
+        end
+      end
+    end
+
+    context 'when RaiseError is positioned before the transformation in the stack' do
+      let(:stack_order) do
+        lambda do |b|
+          b.response :raise_error, response_stages: response_stages
+          b.response :json
+        end
+      end
+
+      context 'with response_stages enabled' do
+        let(:response_stages) { true }
+
+        it 'raises after Json parsed the body, but keeps the raw adapter stage' do
+          expect { conn.get('boom') }.to raise_error(Faraday::ServerError) do |ex|
+            # request info is still available on the raised error
+            expect(ex.response[:request][:method]).to eq(:get)
+            expect(ex.response[:request][:url]).to eq(URI('http:/boom'))
+
+            # the legacy reader shows the transformed (parsed) response
+            expect(ex.response[:status]).to eq(500)
+            expect(ex.response_body).to eq(parsed_body)
+
+            # the adapter stage still holds the untouched string body
+            expect(ex.raw_response[:status]).to eq(500)
+            expect(ex.raw_response[:headers]).to eq(response_headers)
+            expect(ex.raw_response[:body]).to eq(raw_body)
+            expect(ex.raw_response[:body]).to be_a(String)
+            expect(ex.adapter_response).to eq(ex.raw_response)
+
+            # the current stage reflects the Json transformation
+            expect(ex.current_response).to equal(ex.response)
+            expect(ex.current_response[:body]).to eq(parsed_body)
+            expect(ex.current_response[:headers]).to eq(response_headers)
+
+            # the private transport key never leaks into the stored response
+            expect(ex.response).not_to have_key(Faraday::RAW_ADAPTER_RESPONSE_KEY)
+          end
+        end
+
+        it 'captures an independent snapshot that later mutations do not affect' do
+          captured_raw = nil
+          begin
+            conn.get('boom')
+          rescue Faraday::ServerError => ex
+            captured_raw = ex.raw_response.dup
+            ex.response[:body] = { 'tampered' => true }
+          end
+
+          expect(captured_raw[:body]).to eq(raw_body)
+        end
+      end
+
+      context 'with response_stages disabled (default)' do
+        let(:response_stages) { false }
+
+        include_examples 'a request without the two-stage view'
+      end
+    end
+
+    context 'when the transformation is positioned before RaiseError in the stack' do
+      let(:stack_order) do
+        lambda do |b|
+          b.response :json
+          b.response :raise_error, response_stages: response_stages
+        end
+      end
+
+      context 'with response_stages enabled' do
+        let(:response_stages) { true }
+
+        it 'raises before Json runs, so both stages hold the raw adapter response' do
+          expect { conn.get('boom') }.to raise_error(Faraday::ServerError) do |ex|
+            # request info is still available on the raised error
+            expect(ex.response[:request][:method]).to eq(:get)
+            expect(ex.response[:request][:url]).to eq(URI('http:/boom'))
+
+            # the legacy reader shows the untransformed adapter response
+            expect(ex.response[:status]).to eq(500)
+            expect(ex.response_body).to eq(raw_body)
+
+            # both stages carry the adapter-fresh, unparsed response
+            expect(ex.raw_response[:status]).to eq(500)
+            expect(ex.raw_response[:headers]).to eq(response_headers)
+            expect(ex.raw_response[:body]).to eq(raw_body)
+            expect(ex.raw_response[:body]).to be_a(String)
+            expect(ex.adapter_response).to eq(ex.raw_response)
+            expect(ex.current_response).to equal(ex.response)
+            expect(ex.current_response[:body]).to eq(raw_body)
+          end
+        end
+      end
+
+      context 'with response_stages disabled (default)' do
+        let(:response_stages) { false }
+
+        include_examples 'a request without the two-stage view'
+      end
+    end
+
+    context 'when include_request is false' do
+      let(:conn) do
+        Faraday.new do |b|
+          b.response :json
+          b.response :raise_error, include_request: false, response_stages: true
+          b.adapter :test do |stub|
+            stub.get('boom?token=SECRET') { [500, response_headers, raw_body] }
+          end
+        end
+      end
+
+      it 'omits request info from every stage and the message while keeping both responses' do
+        expect { conn.get('boom?token=SECRET') }.to raise_error(Faraday::ServerError) do |ex|
+          expect(ex.response.keys).to contain_exactly(:status, :headers, :body)
+          expect(ex.message).to include('method and url are not available')
+          expect(ex.inspect).not_to include('SECRET')
+
+          expect(ex.raw_response).to eq(
+            status: 500,
+            headers: response_headers,
+            body: raw_body
+          )
+          expect(ex.current_response.keys).to contain_exactly(:status, :headers, :body)
+          expect(ex.current_response[:body]).to eq(raw_body)
+        end
+      end
+    end
+
+    context 'when another middleware raises before RaiseError' do
+      let(:conn) do
+        Faraday.new do |b|
+          # Json is registered last, so it completes first and raises while
+          # RaiseError (outer) still has its on_complete callback pending.
+          b.response :raise_error, **middleware_options
+          b.response :json
+          b.adapter :test do |stub|
+            stub.post('invalid-json') { [200, { 'Content-Type' => 'application/json' }, 'not-json'] }
+          end
+        end
+      end
+      let(:middleware_options) { { response_stages: true } }
+
+      it 'attaches the two stages to the ParsingError as well' do
+        expect { conn.post('invalid-json') }.to raise_error(Faraday::ParsingError) do |ex|
+          expect(ex.response).to be_a(Faraday::Response)
+          expect(ex.raw_response).to eq(
+            status: 200,
+            headers: { 'Content-Type' => 'application/json' },
+            body: 'not-json'
+          )
+          expect(ex.current_response).to eq(ex.response)
+          expect(ex.current_response.body).to eq('not-json')
+          expect(ex.response.env[Faraday::RAW_ADAPTER_RESPONSE_KEY]).to be_nil
+        end
+      end
+    end
+
+    context 'with a nil status response' do
+      let(:conn) do
+        Faraday.new do |b|
+          b.response :raise_error, response_stages: true
+          b.adapter :test do |stub|
+            stub.get('nil-status') { [nil, { 'X-Reason' => 'nil' }, 'fail'] }
+          end
+        end
+      end
+
+      it 'captures the response body in both stages' do
+        expect { conn.get('nil-status') }.to raise_error(Faraday::NilStatusError) do |ex|
+          expect(ex.raw_response).to eq(
+            status: nil,
+            headers: { 'X-Reason' => 'nil' },
+            body: 'fail'
+          )
+          expect(ex.current_response[:body]).to eq('fail')
+          expect(ex.response_body).to eq('fail')
+        end
+      end
+    end
+
+    context 'when the response does not raise' do
+      let(:conn) do
+        Faraday.new do |b|
+          b.response :raise_error, response_stages: true, allowed_statuses: [404]
+          b.adapter :test do |stub|
+            stub.get('ok') { [200, {}, 'fine'] }
+            stub.get('allowed') { [404, {}, 'nope'] }
+          end
+        end
+      end
+
+      it 'does not leave the private raw-response marker on the successful env' do
+        ok_response = conn.get('ok')
+        allowed_response = conn.get('allowed')
+
+        expect(ok_response.env[Faraday::RAW_ADAPTER_RESPONSE_KEY]).to be_nil
+        expect(allowed_response.env[Faraday::RAW_ADAPTER_RESPONSE_KEY]).to be_nil
+        expect(ok_response.body).to eq('fine')
+        expect(allowed_response.body).to eq('nope')
+      end
+    end
+  end
+
   describe 'default allowed_statuses' do
     it 'cannot be mutated through a middleware instance' do
       middleware = described_class.new(->(env) { env })

@@ -20,16 +20,26 @@ module Faraday
       }.freeze
       # rubocop:enable Naming/ConstantName
 
-      DEFAULT_OPTIONS = { include_request: true, allowed_statuses: [].freeze }.freeze
+      DEFAULT_OPTIONS = {
+        include_request: true,
+        allowed_statuses: [].freeze,
+        response_stages: false
+      }.freeze
 
       def on_request(env)
         # Announce the opt-out on the shared Env so that errors raised by other
         # middlewares (e.g. ParsingError from the Json middleware) honor it too.
         env[:include_request] = false unless options[:include_request]
+        # Ask the adapter to leave a snapshot of the response as it was when it
+        # finished, before any response middleware transformed it.
+        env[:capture_raw_response] = true if options[:response_stages]
       end
 
       def on_complete(env)
-        return if Array(options[:allowed_statuses]).include?(env[:status])
+        if Array(options[:allowed_statuses]).include?(env[:status])
+          release_raw_response(env)
+          return
+        end
 
         case env[:status]
         when *ClientErrorStatusesWithCustomExceptions.keys
@@ -44,6 +54,8 @@ module Faraday
           raise Faraday::ServerError, response_values(env)
         when nil
           raise Faraday::NilStatusError, response_values(env)
+        else
+          release_raw_response(env)
         end
       end
 
@@ -54,7 +66,9 @@ module Faraday
       #   - request
       #
       # The `request` key is omitted when the middleware is explicitly
-      # configured with the option `include_request: false`.
+      # configured with the option `include_request: false`. When
+      # `response_stages: true` is configured, the raw adapter response
+      # snapshot is added under a private key consumed by Faraday::Error.
       def response_values(env)
         response = {
           status: env.status,
@@ -64,23 +78,34 @@ module Faraday
 
         # Include the request data by default. If the middleware was explicitly
         # configured to _not_ include request data, then omit it.
-        return response unless options[:include_request]
+        if options[:include_request]
+          response.merge!(
+            request: {
+              method: env.method,
+              url: env.url,
+              url_path: env.url.path,
+              params: query_params(env),
+              headers: env.request_headers,
+              body: env.request_body
+            }
+          )
+        end
 
-        response.merge(
-          request: {
-            method: env.method,
-            url: env.url,
-            url_path: env.url.path,
-            params: query_params(env),
-            headers: env.request_headers,
-            body: env.request_body
-          }
-        )
+        raw = env.custom_members[Faraday::RAW_ADAPTER_RESPONSE_KEY]
+        response[Faraday::RAW_ADAPTER_RESPONSE_KEY] = raw if raw
+        response
       end
 
       def query_params(env)
         env.request.params_encoder ||= Faraday::Utils.default_params_encoder
         env.params_encoder.decode(env.url.query)
+      end
+
+      # Removes the private raw-response marker from successful responses so it
+      # never leaks on the Env of a response that did not raise an error.
+      def release_raw_response(env)
+        env.custom_members.delete(Faraday::RAW_ADAPTER_RESPONSE_KEY)
+        env.custom_members.delete(:capture_raw_response)
       end
     end
   end

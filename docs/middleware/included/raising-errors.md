@@ -67,6 +67,7 @@ The behavior of this middleware can be customized with the following options:
 |----------------------|---------|-------------|
 | **include_request**  | true    | When true, exceptions are initialized with request information including `method`, `url`, `url_path`, `params`, `headers`, and `body`. |
 | **allowed_statuses** | []      | An array of status codes that should not raise an error. |
+| **response_stages**  | false   | When true, exceptions carry an optional two-stage view of the response, separating the adapter-fresh response from the response after middleware transformations. |
 
 ### Example Usage
 
@@ -99,3 +100,59 @@ from the `json` middleware) and from errors initialized with the request's `Fara
 When sanitizing errors initialized with a `Faraday::Response` or `Faraday::Env`, `Faraday::Error#response` is a new
 `Faraday::Response`. Its Env contains only the response status, headers, and body, so APIs such as `on_complete` remain
 available without retaining request fields or custom members from the original Env.
+
+### Two-stage response view
+
+The same HTTP error can look different depending on where `RaiseError` sits in the middleware stack: a response
+middleware such as `:json` may have already parsed the body, or the error may be raised before that transformation
+runs. Enabling `response_stages: true` attaches a two-stage view to the raised exception so troubleshooting can tell
+which fields came straight from the adapter and which were changed by middleware.
+
+```ruby
+conn = Faraday.new do |faraday|
+  faraday.response :json
+  faraday.response :raise_error, response_stages: true
+  faraday.adapter Faraday.default_adapter
+end
+
+begin
+  conn.get('/failing-resource')
+rescue Faraday::Error => e
+  e.response            # unchanged: the response at the point the error was raised
+  e.response_stages     # #<Faraday::ResponseStages ...>, or nil when the option is off
+  e.raw_response        # frozen snapshot of the adapter response (String body, original headers)
+  e.adapter_response    # alias of raw_response
+  e.current_response    # the response at raise time, after earlier middleware ran
+end
+```
+
+`raw_response` (and its `adapter_response` alias) is a frozen snapshot taken when the adapter finished, before any
+response middleware transformed the response. `current_response` is the same object returned by the legacy
+`response` reader. When the option is not enabled, `response_stages`, `raw_response`, `adapter_response`, and
+`current_response` are all `nil`, and `response` behaves exactly as before. The private transport key used to carry
+the raw snapshot is consumed by `Faraday::Error` and never appears in `response`, and it is removed from successful
+responses that do not raise.
+
+The two stages make stack ordering visible. Middleware complete responses in reverse registration order, so the last
+registered response middleware sees the adapter-fresh response first:
+
+```ruby
+# RaiseError registered first => Json completes before the error is raised,
+# so current_response holds the parsed body.
+Faraday.new do |b|
+  b.response :raise_error, response_stages: true
+  b.response :json
+  b.adapter :test
+end
+
+# Json registered first => RaiseError completes before Json ever runs,
+# so both stages hold the raw, unparsed adapter response.
+Faraday.new do |b|
+  b.response :json
+  b.response :raise_error, response_stages: true
+  b.adapter :test
+end
+```
+
+The view honors `include_request: false`: request information is omitted from both stages and from the error message,
+while the response status, headers, and body remain available in each stage.
