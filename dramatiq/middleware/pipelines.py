@@ -27,6 +27,9 @@ class Pipelines(Middleware):
     Parameters:
       pipe_ignore(bool): When True, ignores the result of the previous
         actor in the pipeline.
+      pipe_kwarg(str): When set, the result of the previous actor in
+        the pipeline is passed to the next one under this keyword
+        argument instead of being appended to its positional args.
       pipe_target(dict): A message representing the actor the current
         result should be fed into.
     """
@@ -35,6 +38,7 @@ class Pipelines(Middleware):
     def actor_options(self):
         return {
             "pipe_ignore",
+            "pipe_kwarg",
             "pipe_target",
         }
 
@@ -53,6 +57,10 @@ class Pipelines(Middleware):
             next_message = Message(**message_data)
             pipe_ignore = next_message.options.get("pipe_ignore") or actor.options.get("pipe_ignore")
             if not pipe_ignore:
-                next_message = next_message.copy(args=next_message.args + (result,))
+                pipe_kwarg = next_message.options.get("pipe_kwarg")
+                if pipe_kwarg is not None:
+                    next_message = next_message.copy(kwargs={**next_message.kwargs, pipe_kwarg: result})
+                else:
+                    next_message = next_message.copy(args=next_message.args + (result,))
 
             broker.enqueue(next_message, delay=next_message.options.get("delay"))

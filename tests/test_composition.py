@@ -71,6 +71,255 @@ def test_pipe_ignore_applies_to_receiving_message(stub_broker, stub_worker, resu
     assert results == [[1], [2], [3, [2]]]
 
 
+def test_pipe_kwarg_binds_the_previous_result_to_a_keyword_argument(stub_broker, stub_worker):
+    # Given an actor that only accepts a keyword-only argument
+    received = []
+
+    @dramatiq.actor
+    def take_kwarg(*, value):
+        received.append(value)
+        return value
+
+    # And an actor that produces a result
+    @dramatiq.actor
+    def produce():
+        return 42
+
+    # When I pipe the producer into the keyword-only actor, declaring the parameter to fill
+    pipe = produce.message() | take_kwarg.message_with_options(pipe_kwarg="value")
+    pipe.run()
+    stub_broker.join(take_kwarg.queue_name)
+    stub_worker.join()
+
+    # Then the previous result should have been passed under that keyword argument
+    assert received == [42]
+
+    # And the binding should be recorded on the receiving message of the pipeline
+    assert pipe.messages[1].options["pipe_kwarg"] == "value"
+
+
+def test_pipe_kwarg_passes_none_results_through_as_normal_values(stub_broker, stub_worker):
+    # Given an actor that returns None
+    @dramatiq.actor
+    def produce_none():
+        return None
+
+    # And an actor that records the keyword argument it receives
+    received = []
+
+    @dramatiq.actor
+    def take_kwarg(*, value):
+        received.append(value)
+
+    # When I pipe them together with pipe_kwarg
+    pipe = produce_none.message() | take_kwarg.message_with_options(pipe_kwarg="value")
+    pipe.run()
+    stub_broker.join(take_kwarg.queue_name)
+    stub_worker.join()
+
+    # Then None should have been passed as a regular value rather than dropped
+    assert received == [None]
+
+
+def test_pipe_kwarg_works_through_a_nested_pipeline(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    received = []
+
+    @dramatiq.actor(store_results=True)
+    def produce(x):
+        return x + 1
+
+    @dramatiq.actor(store_results=True)
+    def transform(value):
+        return value * 2
+
+    @dramatiq.actor(store_results=True)
+    def take_kwarg(*, value):
+        received.append(value)
+
+    # When I compose a nested pipeline whose final step binds a keyword-only parameter
+    inner = transform.message() | take_kwarg.message_with_options(pipe_kwarg="value")
+    pipe = produce.message(10) | inner
+
+    # Then the nested pipeline should be flattened and bind successfully at composition time
+    assert len(pipe) == 3
+    assert pipe.messages[2].options["pipe_kwarg"] == "value"
+
+    # And it should run end to end: produce(10)->11, transform(11)->22 and
+    # take_kwarg(value=22)
+    pipe.run()
+    stub_broker.join(take_kwarg.queue_name)
+    stub_worker.join()
+    assert received == [22]
+
+
+def test_pipe_kwarg_rejects_a_keyword_argument_that_is_already_bound(stub_broker):
+    # Given an actor with a keyword parameter
+    @dramatiq.actor
+    def take_kwarg(*, value):
+        return value
+
+    @dramatiq.actor
+    def produce():
+        return 42
+
+    # When I try to pipe into a message that already binds that same keyword argument
+    # Then a ValueError should be raised while the pipeline is being composed
+    with pytest.raises(ValueError, match="already bound"):
+        produce.message() | take_kwarg.message_with_options(kwargs={"value": 1}, pipe_kwarg="value")
+
+    # And nothing should have been enqueued
+    assert stub_broker.queues[produce.queue_name].empty()
+    assert stub_broker.queues[take_kwarg.queue_name].empty()
+
+
+def test_pipe_kwarg_rejects_parameters_the_downstream_signature_cannot_accept(stub_broker):
+    # Given an actor that has no such keyword parameter
+    @dramatiq.actor
+    def take_positional(x):
+        return x
+
+    @dramatiq.actor
+    def produce():
+        return 42
+
+    # When I try to pipe the result into a parameter the actor doesn't accept
+    # Then a ValueError should be raised at composition time
+    with pytest.raises(ValueError, match="no keyword argument named"):
+        produce.message() | take_positional.message_with_options(pipe_kwarg="value")
+
+    # And nothing should have been enqueued
+    assert stub_broker.queues[produce.queue_name].empty()
+    assert stub_broker.queues[take_positional.queue_name].empty()
+
+
+def test_pipe_kwarg_rejects_positional_only_parameters(stub_broker):
+    # Given an actor with a positional-only parameter
+    @dramatiq.actor
+    def take_positional_only(x, /):
+        return x
+
+    @dramatiq.actor
+    def produce():
+        return 42
+
+    # When I try to pipe the result into it by keyword
+    # Then a ValueError should be raised at composition time
+    with pytest.raises(ValueError, match="cannot be passed as a keyword argument"):
+        produce.message() | take_positional_only.message_with_options(pipe_kwarg="x")
+
+    # And nothing should have been enqueued
+    assert stub_broker.queues[produce.queue_name].empty()
+    assert stub_broker.queues[take_positional_only.queue_name].empty()
+
+
+def test_pipe_kwarg_can_target_an_actors_var_keyword_arguments(stub_broker, stub_worker):
+    # Given an actor that accepts arbitrary keyword arguments
+    received = []
+
+    @dramatiq.actor
+    def take_kwargs(**kwargs):
+        received.append(kwargs)
+
+    @dramatiq.actor
+    def produce():
+        return 42
+
+    # When I pipe the result into one of those keyword arguments
+    pipe = produce.message() | take_kwargs.message_with_options(pipe_kwarg="value")
+    pipe.run()
+    stub_broker.join(take_kwargs.queue_name)
+    stub_worker.join()
+
+    # Then the result should be delivered under the declared name
+    assert received == [{"value": 42}]
+
+
+def test_pipe_kwarg_can_target_a_regular_named_parameter(stub_broker, stub_worker):
+    # Given an actor with a regular (positional-or-keyword) parameter
+    received = []
+
+    @dramatiq.actor
+    def take_named(value):
+        received.append(value)
+
+    @dramatiq.actor
+    def produce():
+        return 42
+
+    # When I pipe the result into that parameter by name
+    pipe = produce.message() | take_named.message_with_options(pipe_kwarg="value")
+    pipe.run()
+    stub_broker.join(take_named.queue_name)
+    stub_worker.join()
+
+    # Then the result should be delivered as a keyword argument
+    assert received == [42]
+
+
+def test_pipe_kwarg_validation_runs_for_pipelines_built_with_the_constructor(stub_broker):
+    # Given actors
+    @dramatiq.actor
+    def take_kwarg(*, value):
+        return value
+
+    @dramatiq.actor
+    def produce():
+        return 42
+
+    # When I build a pipeline directly with an invalid duplicate binding
+    # Then the constructor should raise rather than return a half-built pipeline
+    with pytest.raises(ValueError, match="already bound"):
+        pipeline(
+            [
+                produce.message(),
+                take_kwarg.message_with_options(kwargs={"value": 1}, pipe_kwarg="value"),
+            ]
+        )
+
+    # And nothing should have been enqueued
+    assert stub_broker.queues[produce.queue_name].empty()
+    assert stub_broker.queues[take_kwarg.queue_name].empty()
+
+
+def test_pipe_kwarg_cannot_be_combined_with_pipe_ignore(stub_broker):
+    # Given two actors
+    @dramatiq.actor
+    def take_kwarg(*, value):
+        return value
+
+    @dramatiq.actor
+    def produce():
+        return 42
+
+    # When I declare both pipe_ignore and pipe_kwarg on the same message
+    # Then a ValueError should be raised at composition time
+    with pytest.raises(ValueError, match="pipe_ignore"):
+        produce.message() | take_kwarg.message_with_options(pipe_ignore=True, pipe_kwarg="value")
+
+    # And nothing should have been enqueued
+    assert stub_broker.queues[produce.queue_name].empty()
+    assert stub_broker.queues[take_kwarg.queue_name].empty()
+
+
+def test_default_positional_piping_still_appends_the_previous_result(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def add(x, y):
+        return x + y
+
+    # When I pipe messages together without declaring any pipe option
+    pipe = add.message(1, 2) | add.message(3)
+    pipe.run()
+
+    # Then the previous result should still be appended positionally
+    assert pipe.get_result(block=True) == 6
+
+
 def test_pipeline_results_can_be_retrieved(stub_broker, stub_worker, result_backend):
     # Given a result backend
     # And a broker with the results middleware

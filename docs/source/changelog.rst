@@ -20,6 +20,18 @@ Fixed
 .. _#895: https://github.com/Bogdanp/dramatiq/pull/895
 .. _@HardMax71: https://github.com/HardMax71
 
+Added
+^^^^^
+
+* Added a ``pipe_kwarg`` option to pipeline messages so the previous
+  actor's result can be fed into a specific parameter of the next one,
+  including keyword-only parameters, instead of being appended to its
+  positional arguments. Invalid bindings (an already-bound keyword
+  argument or a parameter the downstream signature cannot accept) raise
+  a ``ValueError`` while the pipeline is being composed, before any
+  message enters a queue.
+
+
 
 `2.2.1`_ -- 2026-09-01
 ----------------------

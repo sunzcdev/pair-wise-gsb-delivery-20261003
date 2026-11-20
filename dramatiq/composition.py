@@ -16,11 +16,13 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 from __future__ import annotations
 
+import inspect
 import time
 from typing import TYPE_CHECKING, Iterable
 from uuid import uuid4
 
 from .broker import get_broker
+from .errors import ActorNotFound
 from .rate_limits import Barrier
 from .results import ResultMissing
 
@@ -28,9 +30,73 @@ if TYPE_CHECKING:
     from .message import Message
 
 
+def _validate_pipe_binding(broker, next_message: Message) -> None:
+    """Validate that the result of the previous message in a pipeline
+    can be fed into ``next_message`` the way its options declare it
+    should be.
+
+    The check runs while the pipeline is being composed so that an
+    invalid binding is reported before any message is enqueued.
+
+    Raises:
+      ValueError: If the binding is invalid.
+    """
+    pipe_ignore = next_message.options.get("pipe_ignore")
+    pipe_kwarg = next_message.options.get("pipe_kwarg")
+
+    if pipe_kwarg is None:
+        # The default behavior is to append the result as a positional
+        # argument, which is always representable on a message.
+        return
+
+    if not isinstance(pipe_kwarg, str):
+        raise ValueError("The 'pipe_kwarg' option must be the name of a keyword argument as a string.")
+
+    if pipe_ignore:
+        raise ValueError("A message cannot declare both 'pipe_ignore' and 'pipe_kwarg'.")
+
+    if pipe_kwarg in next_message.kwargs:
+        raise ValueError(
+            "Cannot pipe the previous result into %r of %r: that keyword argument is already bound."
+            % (pipe_kwarg, next_message.actor_name)
+        )
+
+    # If the downstream actor isn't registered on this broker (e.g. it
+    # lives on another broker), there's nothing more to check here.
+    try:
+        actor = broker.get_actor(next_message.actor_name)
+    except ActorNotFound:
+        return
+
+    parameters = inspect.signature(actor.fn).parameters
+    parameter = parameters.get(pipe_kwarg)
+    accepts_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+    if parameter is None:
+        if not accepts_kwargs:
+            raise ValueError(
+                "Actor %r has no keyword argument named %r to receive the previous pipeline result."
+                % (next_message.actor_name, pipe_kwarg)
+            )
+    elif parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.VAR_POSITIONAL):
+        raise ValueError(
+            "Parameter %r of actor %r cannot be passed as a keyword argument."
+            % (pipe_kwarg, next_message.actor_name)
+        )
+
+
 class pipeline:
     """Chain actors together, passing the result of one actor to the
     next one in line.
+
+    By default, the result of each actor is appended to the next
+    actor's positional arguments (a result of ``None`` is passed just
+    like any other value).  Set the ``pipe_kwarg`` option on a
+    receiving message to the name of a keyword argument if the result
+    should be passed there instead, or set ``pipe_ignore`` to not pass
+    it along at all.  Invalid bindings (an already-bound keyword
+    argument, an unknown parameter or one that can't be passed by
+    keyword) raise a ``ValueError`` while the pipeline is being built,
+    before any message enters a queue.
 
     Parameters:
       children(Iterable[Message|pipeline]): A sequence of messages or
@@ -54,6 +120,7 @@ class pipeline:
                 messages.append(child.copy())
 
         for message, next_message in zip(messages, messages[1:]):
+            _validate_pipe_binding(self.broker, next_message)
             message.options["pipe_target"] = next_message.asdict()
 
     def __len__(self):

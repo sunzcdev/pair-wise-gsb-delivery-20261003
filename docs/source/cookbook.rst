@@ -132,9 +132,28 @@ line, set the ``pipe_ignore`` option to ``True`` when you create the
 
 Here, the result of ``bust_caches()`` will not be passed to
 ``prepare_codes()``, but the result of ``prepare_codes()`` will be
-passed to ``launch_missiles(codes)``.  To get the end result of a
-pipeline -- that is, the result of the last actor in the pipeline --
-you can call |pipeline_get_result|::
+passed to ``launch_missiles(codes)``.
+
+If the next actor in line only takes keyword-only arguments (or you
+simply want to feed the previous result into a specific parameter),
+set the ``pipe_kwarg`` option on the receiving message to the name of
+that parameter::
+
+  (
+      fetch_user.message(user_id) |
+      send_welcome_email.message_with_options(pipe_kwarg="user")
+  )
+
+Here, the result of ``fetch_user()`` is passed as
+``send_welcome_email(user=<result>)`` instead of being appended to its
+positional arguments.  As with the default positional behavior, a
+result of ``None`` is passed along just like any other value.  If the
+named parameter is already bound on the message or the downstream
+actor can't accept it, a ``ValueError`` is raised while the pipeline
+is being composed, before any message enters a queue.
+
+To get the end result of a pipeline -- that is, the result of the last
+actor in the pipeline -- you can call |pipeline_get_result|::
 
   pipe.get_result(block=True, timeout=5_000)
 
