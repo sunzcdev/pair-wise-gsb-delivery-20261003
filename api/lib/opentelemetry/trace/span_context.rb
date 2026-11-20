@@ -63,7 +63,21 @@ module OpenTelemetry
       #
       # @return [Boolean]
       def valid?
-        @trace_id != INVALID_TRACE_ID && @span_id != INVALID_SPAN_ID
+        trace_id_valid? && span_id_valid?
+      end
+
+      # Returns true if the {SpanContext} has a non-zero trace ID.
+      #
+      # @return [Boolean]
+      def trace_id_valid?
+        @trace_id != INVALID_TRACE_ID
+      end
+
+      # Returns true if the {SpanContext} has a non-zero span ID.
+      #
+      # @return [Boolean]
+      def span_id_valid?
+        @span_id != INVALID_SPAN_ID
       end
 
       # Returns true if the {SpanContext} was propagated from a remote parent.

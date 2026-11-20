@@ -77,6 +77,51 @@ describe OpenTelemetry::Trace::Propagation::TraceContext::TextMapPropagator do
     end
   end
 
+  describe '#extract_candidate' do
+    it 'reports a complete candidate with this header family flags and tracestate' do
+      candidate = propagator.extract_candidate(carrier, context: context)
+
+      _(candidate).must_be(:valid?)
+      _(candidate).wont_be(:missing?)
+      _(candidate).wont_be(:invalid?)
+      _(candidate.propagator).must_be_same_as(propagator)
+      _(candidate.trace_id).must_equal((("\0" * 15) + "\xaa").b)
+      _(candidate.span_id).must_equal((("\0" * 7) + "\xea").b)
+      _(candidate.trace_flags).must_be(:sampled?)
+      _(candidate.tracestate.to_s).must_equal(tracestate_header)
+      _(candidate).must_be(:remote?)
+    end
+
+    it 'reports a missing candidate when there is no traceparent header' do
+      candidate = propagator.extract_candidate({ tracestate_key => tracestate_header }, context: context)
+
+      _(candidate).must_be(:missing?)
+      _(candidate.state).must_equal(:missing)
+      _(candidate.trace_id).must_be_nil
+      _(candidate.trace_flags).must_be_nil
+      _(candidate.tracestate).must_be_nil
+    end
+
+    it 'distinguishes a malformed traceparent header from a missing one' do
+      candidate = propagator.extract_candidate({ traceparent_key => invalid_traceparent_header }, context: context)
+
+      _(candidate).wont_be(:missing?)
+      _(candidate).must_be(:invalid?)
+      _(candidate.state).must_equal(:invalid)
+    end
+
+    it 'exposes a hash form for logging and assertions' do
+      candidate = propagator.extract_candidate(carrier, context: context)
+      hash = candidate.to_h
+
+      _(hash[:state]).must_equal(:valid)
+      _(hash[:trace_id]).must_equal('0' * 30 + 'aa')
+      _(hash[:span_id]).must_equal('0' * 14 + 'ea')
+      _(hash[:tracestate]).must_equal(tracestate_header)
+      _(hash[:remote]).must_equal(true)
+    end
+  end
+
   describe '#inject' do
     it 'writes traceparent into the carrier' do
       carrier = {}

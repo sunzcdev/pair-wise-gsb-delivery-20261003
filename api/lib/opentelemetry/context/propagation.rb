@@ -10,6 +10,7 @@ require 'opentelemetry/context/propagation/rack_env_getter'
 require 'opentelemetry/context/propagation/text_map_getter'
 require 'opentelemetry/context/propagation/text_map_propagator'
 require 'opentelemetry/context/propagation/text_map_setter'
+require 'opentelemetry/context/propagation/trace_context_candidate'
 
 module OpenTelemetry
   class Context

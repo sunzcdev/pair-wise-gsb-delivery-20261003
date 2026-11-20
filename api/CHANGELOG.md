@@ -1,5 +1,13 @@
 # Release History: opentelemetry-api
 
+### Unreleased
+
+* ADDED: Composite propagator adopts one complete trace context candidate, with
+  explicit precedence and observable candidates
+* ADDED: TraceContext::TextMapPropagator#extract_candidate reports missing and
+  invalid trace contexts separately
+* ADDED: SpanContext#trace_id_valid? and SpanContext#span_id_valid?
+
 ### v1.11.1 / 2026-09-15
 
 * FIXED: Enforce W3C Baggage limits on the extract path (#2298)

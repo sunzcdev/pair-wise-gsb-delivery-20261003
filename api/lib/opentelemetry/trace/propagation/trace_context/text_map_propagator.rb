@@ -51,15 +51,41 @@ module OpenTelemetry
             tp = TraceParent.from_string(trace_parent_value)
             tracestate = Tracestate.from_string(getter.get(carrier, TRACESTATE_KEY))
 
-            span_context = Trace::SpanContext.new(trace_id: tp.trace_id,
-                                                  span_id: tp.span_id,
-                                                  trace_flags: tp.flags,
-                                                  tracestate: tracestate,
-                                                  remote: true)
-            span = OpenTelemetry::Trace.non_recording_span(span_context)
+            span = OpenTelemetry::Trace.non_recording_span(span_context(tp, tracestate))
             OpenTelemetry::Trace.context_with_span(span, parent_context: context)
           rescue OpenTelemetry::Error
             context
+          end
+
+          # Reports the trace context this propagator parses from the carrier as a
+          # {Context::Propagation::TraceContextCandidate}, without modifying the
+          # supplied context.
+          #
+          # A missing +traceparent+ header yields a missing candidate, while a
+          # header that is present but cannot be parsed yields an invalid one, so
+          # a composite propagator can tell the two apart. The trace flags and
+          # tracestate reported on the candidate always belong to this header
+          # family.
+          #
+          # @param [Carrier] carrier The carrier to get the header from
+          # @param [optional Context] context Context used as the base for the
+          #   candidate. Defaults to +Context.current+.
+          # @param [optional Getter] getter If the optional getter is provided, it
+          #   will be used to read the header from the carrier, otherwise the default
+          #   text map getter will be used.
+          #
+          # @return [Context::Propagation::TraceContextCandidate]
+          def extract_candidate(carrier, context: Context.current, getter: Context::Propagation.text_map_getter)
+            trace_parent_value = getter.get(carrier, TRACEPARENT_KEY)
+            if trace_parent_value.nil? || trace_parent_value.empty?
+              return OpenTelemetry::Context::Propagation::TraceContextCandidate.missing(self)
+            end
+
+            tp = TraceParent.from_string(trace_parent_value)
+            tracestate = Tracestate.from_string(getter.get(carrier, TRACESTATE_KEY))
+            OpenTelemetry::Context::Propagation::TraceContextCandidate.from_span_context(self, span_context(tp, tracestate))
+          rescue OpenTelemetry::Error
+            OpenTelemetry::Context::Propagation::TraceContextCandidate.invalid(self)
           end
 
           # Returns the predefined propagation fields. If your carrier is reused, you
@@ -68,6 +94,16 @@ module OpenTelemetry
           # @return [Array<String>] a list of fields that will be used by this propagator.
           def fields
             FIELDS
+          end
+
+          private
+
+          def span_context(trace_parent, tracestate)
+            Trace::SpanContext.new(trace_id: trace_parent.trace_id,
+                                   span_id: trace_parent.span_id,
+                                   trace_flags: trace_parent.flags,
+                                   tracestate: tracestate,
+                                   remote: true)
           end
         end
       end
