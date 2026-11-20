@@ -1,0 +1,151 @@
+# frozen_string_literal: true
+#--
+# typed: true
+
+module GraphQL
+  class Schema
+    class Member
+      module HasDirectives
+        def self.extended(child_cls)
+          super
+          child_cls.module_exec {
+            #: self as GraphQL::Schema::Member::HasDirectives
+            self.own_directives = nil
+          }
+        end
+
+        def inherited(child_cls)
+          super
+          child_cls.own_directives = nil
+        end
+
+        # Create an instance of `dir_class` for `self`, using `options`.
+        #
+        # It removes a previously-attached instance of `dir_class`, if there is one.
+        #
+        # **Returns**
+        #
+        # - `void`
+        #
+        # :call-seq:
+        #   directive(dir_class, **options) -> void
+        def directive(dir_class, **options)
+          @own_directives ||= []
+          HasDirectives.add_directive(self, @own_directives, dir_class, options)
+          nil
+        end
+
+        # Remove an attached instance of `dir_class`, if there is one
+        #
+        # **Parameters**
+        #
+        # - `dir_class` (`Class<GraphQL::Schema::Directive>`)
+        #
+        # **Returns**
+        #
+        # - `void`
+        #
+        # :call-seq:
+        #   remove_directive(Class[GraphQL::Schema::Directive] dir_class) -> void
+        def remove_directive(dir_class)
+          HasDirectives.remove_directive(@own_directives, dir_class)
+          nil
+        end
+
+        def directives
+          HasDirectives.get_directives(self, @own_directives, :directives)
+        end
+
+        class << self
+          def add_directive(schema_member, directives, directive_class, directive_options)
+            remove_directive(directives, directive_class) unless directive_class.repeatable?
+            directives << directive_class.new(schema_member, **directive_options)
+          end
+
+          def remove_directive(directives, directive_class)
+            directives && directives.reject! { |d| d.is_a?(directive_class) }
+          end
+
+          def get_directives(schema_member, directives, directives_method)
+            case schema_member
+            when Class
+              inherited_directives = if schema_member.superclass.respond_to?(directives_method)
+                superclass_directives = schema_member.superclass.public_send(directives_method)
+                if superclass_directives.empty?
+                  # `superclass_directives` includes inherited ones, so there's nothing to merge
+                  GraphQL::EmptyObjects::EMPTY_ARRAY
+                else
+                  get_directives(schema_member.superclass, superclass_directives, directives_method)
+                end
+              else
+                GraphQL::EmptyObjects::EMPTY_ARRAY
+              end
+              if !inherited_directives.empty? && directives
+                dirs = [] #: Array[GraphQL::Schema::Directive]?
+                merge_directives(dirs, inherited_directives)
+                merge_directives(dirs, directives)
+                dirs
+              elsif directives
+                directives
+              elsif !inherited_directives.empty?
+                inherited_directives
+              else
+                GraphQL::EmptyObjects::EMPTY_ARRAY
+              end
+            when HasDirectives
+              directives || GraphQL::EmptyObjects::EMPTY_ARRAY
+            else
+              raise "Invariant: how could #{schema_member} not be a Class or instance of HasDirectives?"
+            end
+          end
+
+          private
+
+          # Modify `target` by adding items from `dirs` such that:
+          # - Any name conflict is overridden by the incoming member(s) of `dirs`.
+          #   (Repeatable directives replace _all_ same-named directives in `target`, and all incoming ones are kept.)
+          # - Any other member of `dirs` is appended
+          #
+          # **Parameters**
+          #
+          # - `target` (`Array<GraphQL::Schema::Directive>`)
+          # - `dirs` (`Array<GraphQL::Schema::Directive>`)
+          #
+          # **Returns**
+          #
+          # - `void`
+          #
+          # :call-seq:
+          #   merge_directives(Array[GraphQL::Schema::Directive] target, Array[GraphQL::Schema::Directive] dirs) -> void
+          def merge_directives(target, dirs)
+            incoming = dirs.group_by(&:graphql_name)
+            merged = [] #: Array[GraphQL::Schema::Directive]
+            target.each do |d|
+              name = d.graphql_name
+              if incoming.key?(name)
+                # Put the incoming directive(s) where the first overridden one was
+                if (replacements = incoming[name])
+                  merged.concat(replacements)
+                  incoming[name] = nil
+                end
+              else
+                merged << d
+              end
+            end
+            dirs.each do |dir|
+              if incoming[dir.graphql_name]
+                merged << dir
+              end
+            end
+            target.replace(merged)
+            nil
+          end
+        end
+
+        protected
+
+        attr_accessor :own_directives
+      end
+    end
+  end
+end

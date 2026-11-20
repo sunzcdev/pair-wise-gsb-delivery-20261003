@@ -1,0 +1,366 @@
+# frozen_string_literal: true
+#--
+# typed: true
+require "graphql/pagination/connection"
+require "monitor"
+
+module GraphQL
+  module Pagination
+    # A generic class for working with database query objects.
+    class RelationConnection < Pagination::Connection
+      # Database limits and offsets must fit in a signed 64-bit integer.
+      MAX_OFFSET = (2**63) - 1
+      private_constant :MAX_OFFSET
+
+      def nodes
+        load_nodes
+        @nodes
+      end
+
+      def has_previous_page
+        if @has_previous_page.nil?
+          @has_previous_page = if after_offset && after_offset > 0
+            true
+          elsif last
+            # See whether there are any nodes _before_ the current offset.
+            # If there _is no_ current offset, then there can't be any nodes before it.
+            # Assume that if the offset is positive, there are nodes before the offset.
+            limited_nodes
+            !(@paged_nodes_offset.nil? || @paged_nodes_offset == 0)
+          else
+            false
+          end
+        end
+        @has_previous_page
+      end
+
+      def has_next_page
+        # If the query loads the page anyway, load it now so its extra row answers this
+        if @has_next_page.nil? && peek_next_page? &&
+            (lookahead.selects?(:nodes) || lookahead.selects?(:edges) ||
+              page_info_selection.selects?(:start_cursor) || page_info_selection.selects?(:end_cursor))
+          load_nodes
+        end
+        if @has_next_page.nil?
+          @has_next_page = if before_offset && before_offset > 0
+            true
+          elsif first
+            if @nodes && @nodes.count < first
+              false
+            else
+              relation_larger_than(sliced_nodes, @sliced_nodes_offset, first)
+            end
+          else
+            false
+          end
+        end
+        @has_next_page
+      end
+
+      def cursor_for(item)
+        load_nodes
+        position = cursor_index_for(item, nodes)
+        offset_cursor_for_position(position)
+      end
+
+      def cursor_for_position(item, position) # :nodoc:
+        if self.class.custom_cursor_for?(RelationConnection)
+          super
+        else
+          offset_cursor_for_position(position)
+        end
+      end
+
+      private
+
+      def offset_cursor_for_position(position)
+        # position in nodes + existing offset + 1 (because it's offset, not index)
+        offset = position + 1 + (@paged_nodes_offset || 0) - (relation_offset(items) || 0)
+        encode(offset.to_s)
+      end
+
+      # **Parameters**
+      #
+      # - `relation` (`Object`) — A database query object
+      # - `_initial_offset` (`Integer`) — The number of items already excluded from the relation
+      # - `size` (`Integer`) — The value against which we check the relation size
+      #
+      # **Returns**
+      #
+      # - `Boolean` — True if the number of items in this relation is larger than `size`
+      #
+      # :call-seq:
+      #   relation_larger_than(Object relation, Integer _initial_offset, Integer size) -> bool
+      def relation_larger_than(relation, _initial_offset, size)
+        if (limit = relation_limit(relation)) && limit <= size
+          false
+        else
+          relation_count(set_limit(relation, size + 1)) == size + 1
+        end
+      end
+
+      # **Parameters**
+      #
+      # - `relation` (`Object`) — A database query object
+      #
+      # **Returns**
+      #
+      # - `Integer, nil` — The offset value, or nil if there isn't one
+      #
+      # :call-seq:
+      #   relation_offset(Object relation) -> Integer | nil
+      def relation_offset(relation)
+        raise "#{self.class}#relation_offset(relation) must return the offset value for a #{relation.class} (#{relation.inspect})"
+      end
+
+      # **Parameters**
+      #
+      # - `relation` (`Object`) — A database query object
+      #
+      # **Returns**
+      #
+      # - `Integer, nil` — The limit value, or nil if there isn't one
+      #
+      # :call-seq:
+      #   relation_limit(Object relation) -> Integer | nil
+      def relation_limit(relation)
+        raise "#{self.class}#relation_limit(relation) must return the limit value for a #{relation.class} (#{relation.inspect})"
+      end
+
+      # **Parameters**
+      #
+      # - `relation` (`Object`) — A database query object
+      #
+      # **Returns**
+      #
+      # - `Integer, nil` — The number of items in this relation (hopefully determined without loading all records into memory!)
+      #
+      # :call-seq:
+      #   relation_count(Object relation) -> Integer | nil
+      def relation_count(relation)
+        raise "#{self.class}#relation_count(relation) must return the count of records for a #{relation.class} (#{relation.inspect})"
+      end
+
+      # **Parameters**
+      #
+      # - `relation` (`Object`) — A database query object
+      #
+      # **Returns**
+      #
+      # - `Object` — A modified query object which will return no records
+      #
+      # :call-seq:
+      #   null_relation(Object relation) -> Object
+      def null_relation(relation)
+        raise "#{self.class}#null_relation(relation) must return an empty relation for a #{relation.class} (#{relation.inspect})"
+      end
+
+      # **Returns**
+      #
+      # - `Integer`
+      #
+      # :call-seq:
+      #   offset_from_cursor(cursor, allow_zero:) -> Integer
+      def offset_from_cursor(cursor, allow_zero: false)
+        offset = Integer(decode(cursor), 10, exception: false) #: Integer?
+        if offset.nil? || offset < 0 || (offset == 0 && !allow_zero) || offset > MAX_OFFSET ||
+            offset + (relation_offset(items) || 0) > MAX_OFFSET
+          raise GraphQL::ExecutionError, "Invalid cursor: #{cursor.inspect}"
+        end
+        offset
+      end
+
+      # Abstract this operation so we can always ignore inputs less than zero.
+      # (Sequel doesn't like it, understandably.)
+      def set_offset(relation, offset_value)
+        if offset_value >= 0
+          relation.offset(offset_value)
+        else
+          relation.offset(0)
+        end
+      end
+
+      # Abstract this operation so we can always ignore inputs less than zero.
+      # (Sequel doesn't like it, understandably.)
+      def set_limit(relation, limit_value)
+        if limit_value > 0
+          relation.limit(limit_value)
+        elsif limit_value == 0
+          null_relation(relation)
+        else
+          relation
+        end
+      end
+
+      def calculate_sliced_nodes_parameters
+        if defined?(@sliced_nodes_limit)
+          return
+        else
+          next_offset = relation_offset(items) || 0
+          relation_limit = relation_limit(items)
+
+          if after_offset
+            next_offset += after_offset
+            relation_limit = [relation_limit - after_offset, 0].max if relation_limit
+          end
+
+          if before_offset && after_offset
+            if after_offset < before_offset
+              # Get the number of items between the two cursors
+              space_between = before_offset - after_offset - 1
+              relation_limit = [relation_limit, space_between].compact.min
+            else
+              # The cursors overextend one another to an empty set
+              @sliced_nodes_null_relation = true
+            end
+          elsif before_offset
+            # Use limit to cut off the tail of the relation
+            relation_limit = [relation_limit, before_offset - 1].compact.min
+          end
+
+          @sliced_nodes_limit = relation_limit
+          @sliced_nodes_offset = next_offset
+        end
+      end
+
+      # Apply `before` and `after` to the underlying `items`,
+      # returning a new relation.
+      def sliced_nodes
+        @sliced_nodes ||= begin
+          calculate_sliced_nodes_parameters
+          paginated_nodes = items
+
+          if @sliced_nodes_null_relation
+            paginated_nodes = null_relation(paginated_nodes)
+          else
+            if @sliced_nodes_offset
+              paginated_nodes = set_offset(paginated_nodes, @sliced_nodes_offset)
+            end
+
+            if @sliced_nodes_limit
+              paginated_nodes = set_limit(paginated_nodes, @sliced_nodes_limit)
+            end
+          end
+
+          paginated_nodes
+        end
+      end
+
+      # **Returns**
+      #
+      # - `Integer, nil`
+      #
+      # :call-seq:
+      #   before_offset() -> Integer | nil
+      def before_offset
+        @before_offset ||= before && offset_from_cursor(before)
+      end
+
+      # **Returns**
+      #
+      # - `Integer, nil`
+      #
+      # :call-seq:
+      #   after_offset() -> Integer | nil
+      def after_offset
+        @after_offset ||= after && offset_from_cursor(after, allow_zero: true)
+      end
+
+      # Apply `first` and `last` to `sliced_nodes`,
+      # returning a new relation
+      def limited_nodes
+        return @limited_nodes if @limited_nodes
+        if async_dataloader?
+          (@load_monitor ||= Monitor.new).synchronize do
+            build_limited_nodes
+          end
+        else
+          build_limited_nodes
+        end
+      end
+
+      def build_limited_nodes
+        @limited_nodes ||= begin
+          calculate_sliced_nodes_parameters
+          if @sliced_nodes_null_relation
+            # it's an empty set
+            return sliced_nodes
+          end
+          relation_limit = @sliced_nodes_limit
+          relation_offset = @sliced_nodes_offset
+
+          if first && (relation_limit.nil? || relation_limit > first)
+            # `first` would create a stricter limit that the one already applied, so add it
+            relation_limit = first
+          end
+
+          if last
+            if relation_limit
+              if last <= relation_limit
+                # `last` is a smaller slice than the current limit, so apply it
+                relation_offset += (relation_limit - last)
+                relation_limit = last
+              end
+            else
+              # No limit, so get the last items
+              sliced_nodes_count = relation_count(sliced_nodes)
+              relation_offset += (sliced_nodes_count - [last, sliced_nodes_count].min)
+              relation_limit = last
+            end
+          end
+
+          @paged_nodes_offset = relation_offset
+          paginated_nodes = items
+          paginated_nodes = set_offset(paginated_nodes, relation_offset)
+          if relation_limit
+            paginated_nodes = set_limit(paginated_nodes, relation_limit)
+          end
+          paginated_nodes
+        end
+      end
+
+      def async_dataloader?
+        @context&.dataloader.is_a?(GraphQL::Dataloader::AsyncDataloader)
+      end
+
+      # Load nodes after applying first/last/before/after,
+      # returns an array of nodes
+      def load_nodes
+        # Return an array so we can consistently use `.index(node)` on it
+        return @nodes if @nodes
+        if async_dataloader?
+          # `AsyncDataloader` may resolve sibling fields (eg, `edges` and `pageInfo`)
+          # in separate Fibers, so several callers can get here before `@nodes` is set.
+          (@load_monitor ||= Monitor.new).synchronize do
+            # Not `||=`: Sorbet assumes `@nodes` is still falsy in this block
+            @nodes = load_page unless @nodes
+          end
+        else
+          @nodes = load_page
+        end
+      end
+
+      # Fetch one row past `first` so `has_next_page` needs no extra query.
+      # Skips arrays (no query to save) and slices limited to `first` or fewer rows (no next page).
+      def load_page
+        page = limited_nodes
+        return page.to_a if page.is_a?(Array) || !peek_next_page? || relation_limit(page) != first ||
+          (@sliced_nodes_limit && @sliced_nodes_limit <= first)
+
+        rows = set_limit(page, first + 1).to_a
+        @has_next_page = rows.size > first
+        rows.first(first)
+      end
+
+      # Peek on forward pages that select `hasNextPage`; `last` and `before` keep the separate check
+      def peek_next_page?
+        return @peek_next_page if defined?(@peek_next_page)
+        @peek_next_page = first&.positive? && last.nil? && before.nil? && page_info_selection.selects?(:has_next_page)
+      end
+
+      def page_info_selection
+        @page_info_selection ||= (lookahead || GraphQL::Execution::Lookahead::NULL_LOOKAHEAD).selection(:page_info)
+      end
+    end
+  end
+end

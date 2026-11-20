@@ -1,0 +1,624 @@
+# frozen_string_literal: true
+require "spec_helper"
+if RUBY_VERSION >= "3.2.0"
+  require "async"
+  require "timeout"
+  describe GraphQL::Dataloader::AsyncDataloader do
+    class AsyncSchema < GraphQL::Schema
+      class SleepSource < GraphQL::Dataloader::Source
+        def initialize(tag = nil)
+          @tag = tag
+        end
+
+        def fetch(keys)
+          max_sleep = keys.max
+          # t1 = Time.now
+          # puts "----- SleepSource => #{max_sleep} (from: #{keys})"
+          sleep(max_sleep)
+          # puts "----- SleepSource done #{max_sleep} after #{Time.now - t1}"
+          keys.map { |_k| max_sleep }
+        end
+      end
+
+      class WaitForSource < GraphQL::Dataloader::Source
+        def initialize(tag)
+          @tag = tag
+        end
+
+        def fetch(waits)
+          max_wait = waits.max
+          # puts "[#{Time.now.to_f}] Waiting #{max_wait} for #{@tag}"
+          `sleep #{max_wait}`
+          # puts "[#{Time.now.to_f}] Finished for #{@tag}"
+          waits.map { |_w| @tag }
+        end
+      end
+
+      class KeyWaitForSource < GraphQL::Dataloader::Source
+        class << self
+          attr_accessor :fetches
+          def reset
+            @fetches = []
+          end
+        end
+
+        def initialize(wait)
+          @wait = wait
+        end
+
+        def fetch(keys)
+          self.class.fetches << keys
+          sleep(@wait)
+          keys
+        end
+      end
+
+      class FiberLocalContextSource < GraphQL::Dataloader::Source
+        def fetch(keys)
+          keys.map { |key| Thread.current[key] }
+        end
+      end
+
+      class Sleeper < GraphQL::Schema::Object
+        field :sleeper, Sleeper, null: false, resolve_static: true  do
+          argument :duration, Float
+        end
+
+        def self.sleeper(context, duration:)
+          context[:key_i] ||= 0
+          new_key = context[:key_i] += 1
+          context.dataloader.with(SleepSource, new_key).load(duration)
+          duration
+        end
+
+        def sleeper(duration:)
+          self.class.sleeper(context, duration: duration)
+        end
+
+        field :duration, Float, null: false, resolve_each: true
+        def self.duration(object, context); object; end
+        def duration; object; end
+      end
+
+      class Waiter < GraphQL::Schema::Object
+        field :wait_for, Waiter, null: false, resolve_batch: true do
+          argument :tag, String
+          argument :wait, Float
+        end
+
+        def self.wait_for(objects, context, tag:, wait:)
+          context.dataload_all(WaitForSource, tag, Array.new(objects.size, wait))
+        end
+
+        def wait_for(tag:, wait:)
+          dataloader.with(WaitForSource, tag).load(wait)
+        end
+
+        field :tag, String, null: false, resolve_each: true
+        def self.tag(object, context)
+          object
+        end
+
+        def tag
+          self.class.tag(object, context)
+        end
+      end
+
+      class Query < GraphQL::Schema::Object
+        field :sleep, Float, null: false, resolve_static: true do
+          argument :duration, Float
+        end
+
+        field :sleeper, Sleeper, null: false, resolver_method: :sleep, resolve_static: :sleep do
+          argument :duration, Float
+        end
+
+        def self.sleep(context, duration:)
+          context[:key_i] ||= 0
+          new_key = context[:key_i] += 1
+          context.dataloader.with(SleepSource, new_key).load(duration)
+          duration
+        end
+
+        def sleep(duration:)
+          self.class.sleep(context, duration: duration)
+        end
+
+        field :wait_for, Waiter, null: false, resolve_batch: true do
+          argument :tag, String
+          argument :wait, Float
+        end
+
+        def self.wait_for(objects, context, tag:, wait:)
+          context.dataload_all(WaitForSource, tag, Array.new(objects.size, wait))
+        end
+
+        def wait_for(tag:, wait:)
+          dataloader.with(WaitForSource, tag).load(wait)
+        end
+
+        class ListWaiter < GraphQL::Schema::Object
+          field :waiter, Waiter, resolve_batch: true
+
+          def self.waiter(objects, context)
+            reqs = objects.map { |obj| context.dataloader.with(KeyWaitForSource, obj[:wait]).request(obj[:tag]) }
+            reqs.map(&:load)
+          end
+
+          def waiter
+            dataloader.with(KeyWaitForSource, object[:wait]).load(object[:tag])
+          end
+        end
+
+        field :list_waiters, [ListWaiter], resolve_static: true do
+          argument :wait, Float
+          argument :tags, [String]
+        end
+
+        def self.list_waiters(context, wait:, tags:)
+          Kernel.sleep(0.05)
+          tags.map { |t| { tag: t, wait: wait }}
+        end
+
+        def list_waiters(wait:, tags:)
+          self.class.list_waiters(context, wait: wait, tags: tags)
+        end
+
+        field :fiber_local_context, String, resolve_batch: true do
+          argument :key, String
+        end
+        def self.fiber_local_context(objects, context, key:)
+          context.dataload_all(FiberLocalContextSource, Array.new(objects.size, key))
+        end
+
+        def fiber_local_context(key:)
+          dataloader.with(FiberLocalContextSource).load(key)
+        end
+      end
+
+      query(Query)
+      use GraphQL::Dataloader::AsyncDataloader
+    end
+
+    module AsyncDataloaderAssertions
+      ASYNC_DATALOADER_OVERHEAD_ALLOWANCE = 0.07
+
+      def self.included(child_class)
+        child_class.class_eval do
+          it "works with sources" do
+            dataloader = GraphQL::Dataloader::AsyncDataloader.new
+            r1 = dataloader.with(AsyncSchema::SleepSource, :s1).request(0.05)
+            r2 = dataloader.with(AsyncSchema::SleepSource, :s2).request(0.1)
+            r3 = dataloader.with(AsyncSchema::SleepSource, :s3).request(0.15)
+
+            v1 = nil
+            dataloader.append_job {
+              v1 = r1.load
+            }
+            started_at = Time.now
+            dataloader.run
+            ended_at = Time.now
+            assert_equal 0.05, v1
+            started_at_2 = Time.now
+            # These should take no time at all since they're already resolved
+            v2 = r2.load
+            v3 = r3.load
+            ended_at_2 = Time.now
+
+            assert_equal 0.1, v2
+            assert_equal 0.15, v3
+            assert_in_delta 0.0, ended_at_2 - started_at_2, ASYNC_DATALOADER_OVERHEAD_ALLOWANCE, "Already-loaded values returned instantly"
+
+            assert_in_delta 0.15, ended_at - started_at, ASYNC_DATALOADER_OVERHEAD_ALLOWANCE, "IO ran in parallel"
+          end
+
+          it "works with GraphQL" do
+            started_at = Time.now
+            res = @schema.execute("{ s1: sleep(duration: 0.05) s2: sleep(duration: 0.1) s3: sleep(duration: 0.15) }")
+            ended_at = Time.now
+            assert_equal({"s1"=>0.05, "s2"=>0.1, "s3"=>0.15}, res["data"])
+            assert_in_delta 0.15, ended_at - started_at, ASYNC_DATALOADER_OVERHEAD_ALLOWANCE, "IO ran in parallel"
+          end
+
+          it "runs fields by depth" do
+            query_str = <<-GRAPHQL
+            {
+              s1: sleeper(duration: 0.05) {
+                sleeper(duration: 0.05) {
+                  sleeper(duration: 0.05) {
+                    duration
+                  }
+                }
+              }
+              s2: sleeper(duration: 0.1) {
+                sleeper(duration: 0.05) {
+                  duration
+                }
+              }
+              s3: sleeper(duration: 0.15) {
+                duration
+              }
+            }
+            GRAPHQL
+            started_at = Time.now
+            res = @schema.execute(query_str)
+            ended_at = Time.now
+
+            expected_data = {
+              "s1" => { "sleeper" => { "sleeper" => { "duration" => 0.05 } } },
+              "s2" => { "sleeper" => { "duration" => 0.05 } },
+              "s3" => { "duration" => 0.15 }
+            }
+            assert_graphql_equal expected_data, res["data"]
+            assert_in_delta 0.25, ended_at - started_at, ASYNC_DATALOADER_OVERHEAD_ALLOWANCE, "Each depth ran in parallel"
+          end
+
+          it "runs dataloaders in parallel across branches" do
+            query_str = <<-GRAPHQL
+            {
+              w1: waitFor(tag: "a", wait: 0.1) {
+                waitFor(tag: "b", wait: 0.1) {
+                  waitFor(tag: "c", wait: 0.1) {
+                    tag
+                  }
+                }
+              }
+              # After the first, these are returned eagerly from cache
+              w2: waitFor(tag: "a", wait: 0.1) {
+                waitFor(tag: "a", wait: 0.1) {
+                  waitFor(tag: "a", wait: 0.1) {
+                    tag
+                  }
+                }
+              }
+              w3: waitFor(tag: "a", wait: 0.1) {
+                waitFor(tag: "b", wait: 0.1) {
+                  waitFor(tag: "d", wait: 0.1) {
+                    tag
+                  }
+                }
+              }
+              w4: waitFor(tag: "e", wait: 0.3) {
+                tag
+              }
+            }
+            GRAPHQL
+            started_at = Time.now
+            res = @schema.execute(query_str)
+            ended_at = Time.now
+
+            expected_data = {
+              "w1" => { "waitFor" => { "waitFor" => { "tag" => "c" } } },
+              "w2" => { "waitFor" => { "waitFor" => { "tag" => "a" } } },
+              "w3" => { "waitFor" => { "waitFor" => { "tag" => "d" } } },
+              "w4" => { "tag" => "e" }
+            }
+            assert_graphql_equal expected_data, res["data"]
+            # We've basically got two options here:
+            # - Put all jobs in the same queue (fields and sources), but then you don't get predictable batching.
+            # - Work one-layer-at-a-time, but then layers can get stuck behind one another. That's what's implemented here.
+            assert_in_delta 0.5, ended_at - started_at, ASYNC_DATALOADER_OVERHEAD_ALLOWANCE, "Sources were executed in parallel"
+          end
+
+          it "groups across list items" do
+            query_str = <<-GRAPHQL
+              {
+                listWaiters(wait: 0.1, tags: ["a", "b", "c"]) {
+                  waiter {
+                    tag
+                  }
+                }
+              }
+            GRAPHQL
+
+            t1 = Time.now
+            result = @schema.execute(query_str)
+            t2 = Time.now
+            assert_equal ["a", "b", "c"], result["data"]["listWaiters"].map { |lw| lw["waiter"]["tag"]}
+            assert_equal [["a", "b", "c"]], AsyncSchema::KeyWaitForSource.fetches, "All keys were fetched at once"
+            # The field itself waits 0.05
+            assert_in_delta 0.15, t2 - t1, ASYNC_DATALOADER_OVERHEAD_ALLOWANCE, "Wait was parallel"
+          end
+
+          it 'copies fiber-local variables over to sources' do
+            key = 'arbitrary_context'
+            value = 'test'
+            Thread.current[key] = value
+            query_str = <<-GRAPHQL
+              {
+                fiberLocalContext(key: "#{key}")
+              }
+            GRAPHQL
+
+            result = @schema.execute(query_str)
+            assert_equal value, result['data']['fiberLocalContext']
+          end
+        end
+      end
+    end
+
+    describe "with async" do
+      before do
+        @schema = AsyncSchema
+        AsyncSchema::KeyWaitForSource.reset
+      end
+      include AsyncDataloaderAssertions
+    end
+
+    describe "with perfetto trace turned on" do
+      class TraceAsyncSchema < AsyncSchema
+        trace_with GraphQL::Tracing::PerfettoTrace
+        use GraphQL::Dataloader::AsyncDataloader
+      end
+
+      before do
+        @schema = TraceAsyncSchema
+        AsyncSchema::KeyWaitForSource.reset
+      end
+
+      include AsyncDataloaderAssertions
+      include PerfettoSnapshot
+
+      it "produces a trace" do
+        query_str = <<-GRAPHQL
+        {
+          s1: sleeper(duration: 0.1) {
+            sleeper(duration: 0.1) {
+              sleeper(duration: 0.1) {
+                duration
+              }
+            }
+          }
+          s2: sleeper(duration: 0.2) {
+            sleeper(duration: 0.1) {
+              duration
+            }
+          }
+          s3: sleeper(duration: 0.3) {
+            duration
+          }
+        }
+        GRAPHQL
+        res = @schema.execute(query_str)
+        if ENV["DUMP_PERFETTO"]
+          res.context.query.current_trace.write(file: "perfetto.dump")
+        end
+
+        json = res.context.query.current_trace.write(file: nil, debug_json: true)
+        data = JSON.parse(json)
+
+        check_snapshot(data, if_exec_next("example-next.json", "example.json"))
+      end
+    end
+
+    if testing_rails? && ISOLATION_LEVEL_FIBER
+      describe "with activerecord" do
+        class ActiveRecordAsyncSchema < GraphQL::Schema
+          class Author < GraphQL::Schema::Object
+            field :name, String
+          end
+
+          class Book < GraphQL::Schema::Object
+            field :title, String
+            field :author, Author
+          end
+
+          Author.field(:books, Book.connection_type)
+
+          class Query < GraphQL::Schema::Object
+            field :book, Book, resolve_static: true do
+              argument :title, String
+            end
+
+            def self.book(context, title:)
+              context.dataload_record(::Book, title, find_by: :title)
+            end
+
+            def book(title:)
+              self.class.book(context, title: title)
+            end
+
+            field :author, Author, resolve_static: true do
+              argument :name, String
+            end
+
+            def self.author(context, name:)
+              context.dataload_record(::Author, name, find_by: :name)
+            end
+
+            def author(name:)
+              self.class.author(context, name: name)
+            end
+          end
+
+          query(Query)
+          use GraphQL::Dataloader::AsyncDataloader
+        end
+
+        it "works with repeated queries" do
+          query_str = <<~GRAPHQL
+          {
+            author(name: "William Shakespeare") { name }
+            b1: book(title: "A Midsummer Night's Dream") { title author { name } }
+            b2: book(title: "Hamlet") { title author { name } }
+          }
+          GRAPHQL
+
+          results = []
+          # Emit the warning about buffer being experimental:
+          ActiveRecordAsyncSchema.execute(query_str)
+          10.times do
+            stdout, stderr = capture_io do
+              result = ActiveRecordAsyncSchema.execute(query_str)
+              results << [
+                result["data"]["author"]["name"],
+                result["data"]["b2"]["title"]
+              ]
+            end
+            assert_equal "", stderr, "Nothing to stderr (like warnings from Task errors)"
+            assert_equal "", stdout, "Nothing to stdout"
+          rescue
+            :failed
+          end
+
+          assert_equal Array.new(10, ["William Shakespeare", "Hamlet"]), results
+        end
+      end
+    end
+
+    describe "when another dataloader runs inside a job" do
+      class EchoSource < GraphQL::Dataloader::Source
+        def fetch(keys)
+          keys.map { |k| "v#{k}" }
+        end
+      end
+
+      # A query executed from inside a resolver (or a subscription trigger) gets its own
+      # dataloader, but shares the outer dataloader's task tree. `run_isolated` used to
+      # mistake the outer task's run for its own and clear `@pending_run`, so the inner
+      # `run` took over the outer run's queues and the outer run never finished.
+      it "doesn't take over the outer dataloader's run" do
+        outer = GraphQL::Dataloader::AsyncDataloader.new
+        inner_result = nil
+        outer.append_job do
+          inner = GraphQL::Dataloader::AsyncDataloader.new
+          inner.run_isolated { inner.with(EchoSource).load(1) }
+          inner.append_job { inner_result = inner.with(EchoSource).load(2) }
+          inner.run
+        end
+
+        Timeout.timeout(5) { outer.run }
+        assert_equal "v2", inner_result
+      end
+    end
+
+    describe "stress test" do
+      RNG = Random.new(20260724)
+      # Set ASYNC_DATALOADER_STRESS_ITERATIONS=2000 for a more thorough run
+      MAX_ITERATIONS = Integer(ENV.fetch("ASYNC_DATALOADER_STRESS_ITERATIONS", 50))
+      WEDGE_AFTER = 10
+      class SlowSource < GraphQL::Dataloader::Source
+        def initialize(delay)
+          @delay = delay
+        end
+
+        def fetch(keys)
+          sleep(@delay)
+          keys.map { |k| "v#{k}" }
+        end
+      end
+
+      it "works" do
+        # Standalone reproduction of graphql-ruby#5671 (AsyncDataloader hang / ClosedQueueError)
+        $stdout.sync = true
+
+        GraphQL::Dataloader::AsyncDataloader.install_graphql_methods
+
+
+        iter_started_at = nil
+        iter = nil
+        iter_finished = false
+        main = Thread.current
+
+        watchdog = Thread.new do
+          loop do
+            sleep 0.1
+            started = iter_started_at
+            break if iter_finished
+            next unless started
+            if Process.clock_gettime(Process::CLOCK_MONOTONIC) - started > WEDGE_AFTER
+              puts "\n=== WEDGE: iteration #{iter} hung for >#{WEDGE_AFTER}s ==="
+              puts "--- main thread backtrace ---"
+              puts((main.backtrace || []).first(15))
+              assert false, "Failed"
+            end
+          end
+        end
+
+        MAX_ITERATIONS.times do |i|
+          iter = i
+          iter_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          n_jobs = 4 + RNG.rand(12)
+          seed_delay = RNG.rand(0.002)
+
+          begin
+            dl = GraphQL::Dataloader::AsyncDataloader.new
+            n_jobs.times do |j|
+              dl.append_job do
+                # Everyone snoozes on the shared source first:
+                dl.with(SlowSource, seed_delay).load(j % 3)
+                case j % 3
+                when 0
+                  # finishes in its first resumed slice - pure CPU, no yields.
+                when 1
+                  # stays "running" across the generation boundary via non-dataloader IO,
+                  # then needs another source round:
+                  sleep(RNG.rand(0.002))
+                  dl.with(SlowSource, RNG.rand(0.001)).load(100 + j)
+                when 2
+                  # a second wave of snoozers to force more generations:
+                  dl.with(SlowSource, RNG.rand(0.001)).load(200 + (j % 2))
+                  sleep(RNG.rand(0.001))
+                  dl.with(SlowSource, RNG.rand(0.001)).load(300 + j)
+                end
+              end
+            end
+            dl.run
+            print "," if (i + 1) % 50 == 0
+          rescue => e
+            puts "\n=== ERROR at iteration #{i}: #{e.class}: #{e.message} ==="
+            puts e.backtrace.first(12)
+            exit!(1)
+          end
+          iter_started_at = nil
+        end
+        iter_finished = true
+        assert "completed #{MAX_ITERATIONS} iterations cleanly"
+        assert watchdog.join
+      end
+    end
+
+    describe "when a job errors while sibling tasks are parked in non-dataloader IO" do
+      # When a job errors, `run_queue` closes the tasks_channel while sibling tasks are still
+      # parked in non-Dataloader IO; a straggler's next push used to leak
+      # `Async::Queue::ClosedError` into resolver code and lose its own error report.
+      it "doesn't leak Async::Queue::ClosedError into straggler fibers or lose the original error" do
+        rng = Random.new(20260814)
+        leaked_error = nil
+
+        250.times do |i|
+          break if leaked_error
+
+          dataloader = GraphQL::Dataloader::AsyncDataloader.new
+
+          3.times do |j|
+            io_delay = rng.rand(0.003)
+            fetch_delay = rng.rand(0.002)
+            dataloader.append_job do
+              sleep(io_delay)
+              begin
+                dataloader.with(SlowSource, fetch_delay).load([i, j])
+              rescue Async::Queue::ClosedError => err
+                leaked_error = err
+                raise
+              end
+            end
+          end
+
+          err_delay = rng.rand(0.003)
+          dataloader.append_job do
+            sleep(err_delay)
+            raise "boom-#{i}"
+          end
+
+          err = assert_raises(RuntimeError) do
+            Timeout.timeout(15) { dataloader.run }
+          end
+          assert_equal "boom-#{i}", err.message
+        end
+
+        assert_nil leaked_error, "Async::Queue::ClosedError leaked into straggler fibers"
+      end
+    end
+  end
+end

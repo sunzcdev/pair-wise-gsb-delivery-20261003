@@ -1,0 +1,174 @@
+# frozen_string_literal: true
+#--
+# typed: true
+module GraphQL
+  module Execution
+    class PrepareObjectStep
+      def initialize(object:, runner:, graphql_result:, key:, is_non_null:, field_resolve_step:, next_objects:, next_results:, is_from_array:)
+        @object = object
+        @runner = runner
+        @field_resolve_step = field_resolve_step
+        @is_non_null = is_non_null
+        @next_objects = next_objects
+        @next_results = next_results
+        @graphql_result = graphql_result
+        @resolved_type = nil
+        @authorized_value = nil
+        @authorization_error = nil
+        @execution_error = nil
+        @key = key
+        @next_step = :resolve_type
+        @is_from_array = is_from_array
+      end
+
+      def value
+        @field_resolve_step.set_current_field
+        if @authorized_value
+          query = @field_resolve_step.selections_step.query
+          query.current_trace.begin_authorized(@resolved_type, @object, query.context)
+          begin
+            @authorized_value = @runner.schema.sync_lazy(@authorized_value)
+          rescue StandardError => err
+            @authorized_value = nil
+            handle_authorization_error(err, query)
+          end
+          query.current_trace.end_authorized(@resolved_type, @object, query.context, @authorized_value)
+        elsif @resolved_type
+          ctx = @field_resolve_step.selections_step.query.context
+          st = @field_resolve_step.static_type
+          ctx.query.current_trace.begin_resolve_type(st, @object, ctx)
+          @resolved_type, new_value = @field_resolve_step.sync(@resolved_type)
+          ResolveTypeStep.assert_valid_resolved_type(st, @resolved_type, new_value, @field_resolve_step)
+          if new_value
+            @object = new_value
+          end
+          ctx.query.current_trace.end_resolve_type(st, @object, ctx, @resolved_type)
+        end
+        @runner.add_step(self)
+      ensure
+        @field_resolve_step.set_current_field(nil)
+      end
+
+      def call
+        @field_resolve_step.set_current_field
+        case @next_step
+        when :resolve_type
+          static_type = @field_resolve_step.static_type
+          if static_type.kind.abstract?
+            query = @field_resolve_step.selections_step.query
+            @resolved_type, new_value = ResolveTypeStep.resolve_type(static_type, @object, query)
+            if new_value
+              ResolveTypeStep.assert_valid_resolved_type(static_type, @resolved_type, new_value, @field_resolve_step)
+              @object = new_value
+            end
+          else
+            @resolved_type = static_type
+          end
+          if @runner.resolves_lazies && @runner.lazy?(@resolved_type)
+            @next_step = :authorize
+            @runner.dataloader.lazy_at_depth(@field_resolve_step.path.size, self)
+          else
+            authorize
+          end
+        when :authorize
+          authorize
+        when :create_result
+          create_result
+        else
+          raise ArgumentError, "This is a bug, unknown step: #{@next_step.inspect}"
+        end
+      ensure
+        @field_resolve_step.set_current_field(nil)
+      end
+
+      def add_field_error(err)
+        @field_resolve_step.add_graphql_error(@graphql_result, @key, err)
+      end
+
+      def authorize
+        if @field_resolve_step.was_scoped && !@resolved_type.reauthorize_scoped_objects
+          @authorized_value = @object
+          create_result
+          return
+        end
+
+        query = @field_resolve_step.selections_step.query
+        begin
+          query.current_trace.begin_authorized(@resolved_type, @object, query.context)
+          @authorized_value = @resolved_type.authorized?(@object, query.context)
+          query.current_trace.end_authorized(@resolved_type, @object, query.context, @authorized_value)
+        rescue StandardError => err
+          @authorized_value = nil
+          handle_authorization_error(err, query)
+        end
+
+        if @runner.resolves_lazies && @runner.lazy?(@authorized_value)
+          @runner.dataloader.lazy_at_depth(@field_resolve_step.path.size, self)
+          @next_step = :create_result
+        else
+          create_result
+        end
+      end
+
+      def create_result
+        if @execution_error
+          # `.authorized?` raised (or its lazy value raised) an error other than UnauthorizedError:
+          # it isn't an authorization decision, so don't call `unauthorized_object`.
+          @graphql_result[@key] = add_field_error(@execution_error)
+        elsif !@authorized_value
+          @authorization_error ||= GraphQL::UnauthorizedError.new(object: @object, type: @resolved_type, context: @field_resolve_step.selections_step.query.context)
+        end
+
+        if @authorization_error
+          begin
+            new_obj = @runner.schema.unauthorized_object(@authorization_error)
+            if new_obj
+              @authorized_value = true
+              @object = new_obj
+            elsif @is_non_null
+              @graphql_result[@key] = @field_resolve_step.add_non_null_error(@is_from_array)
+            else
+              @graphql_result[@key] = add_field_error(@authorization_error)
+            end
+          rescue GraphQL::RuntimeError => err
+            # Like the classic runtime, report the raised error itself; add_graphql_error propagates the null for non-null types.
+            @graphql_result[@key] = add_field_error(err)
+          end
+        end
+
+        if @authorized_value
+          next_result_h = {}
+          @next_results << next_result_h
+          @next_objects << @object
+          @graphql_result[@key] = next_result_h
+          @runner.runtime_type_at[next_result_h] = @resolved_type
+          @runner.static_type_at[next_result_h] = @field_resolve_step.static_type
+        end
+
+        @field_resolve_step.authorized_finished(self)
+      end
+
+      private
+
+      # Errors raised by `.authorized?` (or by syncing its lazy return value):
+      #
+      # - `UnauthorizedError` is equivalent to returning `false`, so it goes to `unauthorized_object`
+      # - Other `GraphQL::RuntimeError`s are added to the response for this field
+      # - Other errors go to `rescue_from` handlers, which might return a `GraphQL::RuntimeError`, or else re-raise
+      def handle_authorization_error(err, query)
+        case err
+        when GraphQL::UnauthorizedError
+          @authorization_error = err
+        when GraphQL::RuntimeError
+          @execution_error = err
+        else
+          begin
+            @authorized_value = query.handle_or_reraise(err, field: @field_resolve_step.field_definition, arguments: @field_resolve_step.arguments, object: @object) # rubocop:disable Development/ContextIsPassedCop
+          rescue GraphQL::RuntimeError => runtime_err
+            handle_authorization_error(runtime_err, query)
+          end
+        end
+      end
+    end
+  end
+end

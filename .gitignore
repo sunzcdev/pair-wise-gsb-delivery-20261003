@@ -1,0 +1,46 @@
+.ruby-version
+doc/
+pkg/
+Gemfile.lock
+gemfiles/*.lock
+# Test database
+*.db
+*.db-shm
+*.db-wal
+*.sqlite3
+.byebug_history
+.bundle/
+vendor/
+.idea/
+coverage/
+
+_site
+.sass-cache
+.jekyll-metadata
+.jekyll-cache
+gh-pages/
+tmp/*
+node_modules/
+yarn.lock
+OperationStoreClient.js
+DumpPayloadExample.json
+spec/integration/tmp*
+.vscode/
+*.swp
+*.swo
+.DS_Store
+# These are generated for distribution, but shouldn't be
+# versioned with the typescript source (which is in javascript_client/src):
+javascript_client/__tests__
+javascript_client/subscriptions
+javascript_client/sync
+javascript_client/cli*
+javascript_client/index*
+javascript_client/esm/**/*.d.ts
+javascript_client/esm/**/*.js
+!javascript_client/esm/package.json
+# Don't commit compiled extension files:
+*.bundle
+*.so
+# Ragel generates Ruby type hints which is great, but I'm not ready to support them
+*.ri

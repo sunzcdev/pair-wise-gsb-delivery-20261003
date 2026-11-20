@@ -1,0 +1,461 @@
+# frozen_string_literal: true
+require "spec_helper"
+
+describe GraphQL::Language::Nodes::AbstractNode do
+  describe ".visit_method" do
+    # `.visit_method` is really helpful for generating methods in
+    # custom visitor classes -- make sure this API keeps working.
+    it "names a method on the visitor class" do
+      node_classes = GraphQL::Language::Nodes.constants
+        .map { |c| GraphQL::Language::Nodes.const_get(c) }
+        .select { |obj| obj.is_a?(Class) && obj < GraphQL::Language::Nodes::AbstractNode }
+
+
+      node_classes -= [GraphQL::Language::Nodes::WrapperType, GraphQL::Language::Nodes::NameOnlyNode]
+      expected_classes = 35
+      assert_equal 35, node_classes.size
+      tested_classes = 0
+      node_classes.each do |node_class|
+        expected_method_name = "on_#{GraphQL::Schema::Member::BuildType.underscore(node_class.name.split("::").last)}"
+        assert_equal node_class.visit_method.to_s, expected_method_name, "#{node_class} has #{expected_method_name} for visit_method"
+        assert GraphQL::Language::Visitor.method_defined?(expected_method_name), "Visitor has ##{expected_method_name}"
+        assert GraphQL::Language::StaticVisitor.method_defined?(expected_method_name), "Visitor has ##{expected_method_name}"
+        tested_classes += 1
+      end
+      assert_equal expected_classes, tested_classes, "All classes were tested"
+    end
+  end
+
+  describe "Marshal" do
+    it "marshals and unmarshals parsed ASTs" do
+      str = "query($var: [Int!] = [100001]) {
+  f1(arg: {input: $var, nullInput: null}) @stuff {
+    ...F2
+  }
+}
+
+fragment F2 on SomeType {
+  ... {
+    someField(arg1: true, arg2: THING, arg3: 5.01234) {
+      a @someDirective @anotherDirective @yetAnother
+      b
+      c
+    }
+  }
+}"
+      doc = GraphQL.parse(str)
+      data = Marshal.dump(doc)
+      new_doc = Marshal.load(data)
+      assert_equal doc, new_doc
+      assert_equal str, doc.to_query_string
+      assert_equal str, new_doc.to_query_string
+
+      # also test schema definition nodes:
+      str2 = Dummy::Schema.to_definition.strip
+      doc2 = GraphQL.parse(str2)
+      data2 = Marshal.dump(doc2)
+      new_doc2 = Marshal.load(data2)
+      assert_equal doc, new_doc
+      assert_equal str2, doc2.to_query_string
+      assert_equal str2, new_doc2.to_query_string
+    end
+  end
+
+  describe "#filename" do
+    it "is set after .parse_file" do
+      filename = "spec/support/parser/filename_example.graphql"
+      doc = GraphQL.parse_file(filename)
+      op = doc.definitions.first
+      field = op.selections.first
+      arg = field.arguments.first
+
+      assert_equal filename, doc.filename
+      assert_equal filename, op.filename
+      assert_equal filename, field.filename
+      assert_equal filename, arg.filename
+    end
+
+    it "is null when parse from string" do
+      doc = GraphQL.parse("{ thing }")
+      assert_nil doc.filename
+    end
+  end
+
+  describe "#to_query_tring" do
+    let(:document) {
+      GraphQL.parse('type Query { a: String! }')
+    }
+
+    let(:custom_printer_class) {
+      Class.new(GraphQL::Language::Printer) {
+        def print_field_definition(print_field_definition)
+          print_string("<Field Hidden>")
+        end
+      }
+    }
+
+    it "accepts a custom printer" do
+      expected = <<-SCHEMA
+type Query {
+  <Field Hidden>
+}
+      SCHEMA
+      assert_equal expected.chomp, document.to_query_string(printer: custom_printer_class.new)
+    end
+  end
+
+  describe "#dup" do
+    it "works with adding selections" do
+      f = GraphQL::Language::Nodes::Field.new(name: "f")
+      # Calling `.children` may populate an internal cache
+      assert_equal "f", f.to_query_string, "the original is unchanged"
+      assert_equal 0, f.children.size
+      assert_equal 0, f.selections.size
+
+      f2 = f.merge(selections: [GraphQL::Language::Nodes::Field.new(name: "__typename")])
+
+      assert_equal "f", f.to_query_string, "the original is unchanged"
+      assert_equal 0, f.children.size
+      assert_equal 0, f.selections.size
+
+      assert_equal "f {\n  __typename\n}", f2.to_query_string, "the duplicate is updated"
+      assert_equal 1, f2.children.size
+      assert_equal 1, f2.selections.size
+    end
+  end
+
+  describe "merge_methods" do
+    it "generates merge methods" do
+      classes_to_test = {
+        GraphQL::Language::Nodes::Argument => [],
+        GraphQL::Language::Nodes::Directive => [:merge_argument],
+        GraphQL::Language::Nodes::DirectiveDefinition => [:merge_argument, :merge_location],
+        GraphQL::Language::Nodes::DirectiveLocation => [],
+        GraphQL::Language::Nodes::Document => [],
+        GraphQL::Language::Nodes::Enum => [],
+        GraphQL::Language::Nodes::EnumTypeDefinition => [:merge_directive, :merge_value],
+        GraphQL::Language::Nodes::EnumTypeExtension => [:merge_directive, :merge_value],
+        GraphQL::Language::Nodes::EnumValueDefinition => [:merge_directive],
+        GraphQL::Language::Nodes::Field => [:merge_argument, :merge_directive, :merge_selection],
+        GraphQL::Language::Nodes::FieldDefinition => [:merge_argument, :merge_directive],
+        GraphQL::Language::Nodes::FragmentDefinition => [:merge_directive, :merge_selection],
+        GraphQL::Language::Nodes::FragmentSpread => [:merge_directive],
+        GraphQL::Language::Nodes::InlineFragment => [:merge_directive, :merge_selection],
+        GraphQL::Language::Nodes::InputObject => [:merge_argument],
+        GraphQL::Language::Nodes::InputObjectTypeDefinition => [:merge_directive, :merge_field],
+        GraphQL::Language::Nodes::InputObjectTypeExtension => [:merge_directive, :merge_field],
+        GraphQL::Language::Nodes::InputValueDefinition => [:merge_directive],
+        GraphQL::Language::Nodes::InterfaceTypeDefinition => [:merge_directive, :merge_field, :merge_interface],
+        GraphQL::Language::Nodes::InterfaceTypeExtension => [:merge_directive, :merge_field, :merge_interface],
+        GraphQL::Language::Nodes::ListType => [],
+        GraphQL::Language::Nodes::NonNullType => [],
+        GraphQL::Language::Nodes::NullValue => [],
+        GraphQL::Language::Nodes::ObjectTypeDefinition => [:merge_directive, :merge_field],
+        GraphQL::Language::Nodes::ObjectTypeExtension => [:merge_directive, :merge_field],
+        GraphQL::Language::Nodes::OperationDefinition => [:merge_directive, :merge_selection, :merge_variable],
+        GraphQL::Language::Nodes::ScalarTypeDefinition => [:merge_directive],
+        GraphQL::Language::Nodes::ScalarTypeExtension => [:merge_directive],
+        GraphQL::Language::Nodes::SchemaDefinition => [:merge_directive],
+        GraphQL::Language::Nodes::SchemaExtension => [:merge_directive],
+        GraphQL::Language::Nodes::TypeName => [],
+        GraphQL::Language::Nodes::UnionTypeDefinition => [:merge_directive],
+        GraphQL::Language::Nodes::UnionTypeExtension => [:merge_directive],
+        GraphQL::Language::Nodes::VariableDefinition => [:merge_directive],
+        GraphQL::Language::Nodes::VariableIdentifier => []
+      }
+
+      classes_to_test.each do |cls, expected_methods|
+        assert cls.instance_methods.include?(:merge), "#{cls} has a merge method"
+        assert cls.instance_methods.include?(:merge!), "#{cls} has a merge! method"
+        assert_equal expected_methods, cls.instance_methods.select { |m| m.start_with?("merge_")}.sort, "#{cls} has the expected merge children methods"
+      end
+    end
+
+    it "makes copies with merged children" do
+      node_1 = GraphQL::Language::Nodes::Field.new(
+        name: "f1",
+        field_alias: "myField"
+      )
+
+      node_2 = node_1
+        .merge_argument(name: "arg1", value: 5)
+        .merge_directive(name: "topSecret")
+        .merge_argument(name: "arg2", value: GraphQL::Language::Nodes::Enum.new(name: "HELLO"))
+        .merge_selection(name: "f2", field_alias: "myOtherField")
+
+      assert_equal "myField: f1", node_1.to_query_string
+      assert_equal "myField: f1(arg1: 5, arg2: HELLO) @topSecret {\n  myOtherField: f2\n}", node_2.to_query_string
+    end
+  end
+
+  describe "manually-created AST nodes" do
+    it "works with line and column" do
+      node = GraphQL::Language::Nodes::Document.new(
+        definitions: [
+          GraphQL::Language::Nodes::OperationDefinition.new(
+            operation_type: "query",
+            selections: [
+              GraphQL::Language::Nodes::Field.new(name: "f1"),
+              GraphQL::Language::Nodes::FragmentSpread.new(name: "DoesntExist")
+            ]
+          )
+        ]
+      )
+
+      assert_equal "query {\n  f1\n  ...DoesntExist\n}", node.to_query_string
+
+      schema = GraphQL::Schema.from_definition <<-GRAPHQL
+        type Query {
+          f1: String
+        }
+      GRAPHQL
+      result = GraphQL::StaticValidation::Validator.new(schema: schema).validate(GraphQL::Query.new(schema, nil, document: node))
+      expected_errs = [
+        {
+          "message"=>"Fragment DoesntExist was used, but not defined",
+          "locations"=>[{"line"=>nil, "column"=>nil}],
+          "path"=>["query", "... DoesntExist"],
+          "extensions"=> {
+            "code"=>"useAndDefineFragment",
+            "fragmentName"=>"DoesntExist"
+          }
+        }
+      ]
+      assert_equal expected_errs, result[:errors].map(&:to_h)
+    end
+  end
+
+  describe "description interning" do
+    SDL = <<~GRAPHQL
+      """
+      A container for things.
+      """
+      type Query {
+        """
+        A unique identifier for the client performing the mutation.
+        """
+        clientMutationId: ID
+        items(
+          """
+          Returns the first _n_ elements from the list.
+          """
+          first: Int
+        ): String
+      }
+
+      enum Color {
+        """
+        A cursor for use in pagination.
+        """
+        RED
+      }
+    GRAPHQL
+
+    ALL_DEFINITION_SDL = <<~GRAPHQL
+      """A scalar type."""
+      scalar Foo
+
+      """An object type."""
+      type Query {
+        """A field."""
+        field("""An argument.""" arg: String): String
+      }
+
+      """An interface type."""
+      interface Node { id: ID! }
+
+      """A union type."""
+      union SearchResult = Query
+
+      """An enum type."""
+      enum Status {
+        """An enum value."""
+        ACTIVE
+      }
+
+      """An input object type."""
+      input Input { value: String }
+
+      """A directive."""
+      directive @skip(if: Boolean!) on FIELD
+    GRAPHQL
+
+    it "deduplicates field descriptions across parse calls" do
+      first = GraphQL.parse(SDL).definitions.first.fields.first.description
+      second = GraphQL.parse(SDL).definitions.first.fields.first.description
+      assert_equal("A unique identifier for the client performing the mutation.", first)
+      assert_predicate(first, :frozen?)
+      assert_same(first, second)
+    end
+
+    it "deduplicates argument descriptions across parse calls" do
+      first = GraphQL.parse(SDL).definitions.first.fields[1].arguments.first.description
+      second = GraphQL.parse(SDL).definitions.first.fields[1].arguments.first.description
+      assert_equal("Returns the first _n_ elements from the list.", first)
+      assert_same(first, second)
+    end
+
+    it "deduplicates type descriptions across parse calls" do
+      first = GraphQL.parse(SDL).definitions.first.description
+      second = GraphQL.parse(SDL).definitions.first.description
+      assert_equal("A container for things.", first)
+      assert_same(first, second)
+    end
+
+    it "deduplicates enum value descriptions across parse calls" do
+      first = GraphQL.parse(SDL).definitions[1].values.first.description
+      second = GraphQL.parse(SDL).definitions[1].values.first.description
+      assert_equal("A cursor for use in pagination.", first)
+      assert_same(first, second)
+    end
+
+    it "freezes multi-line descriptions with interior newlines and stripped indentation" do
+      sdl = "type Query {\n  \"\"\"\n  first line\n    second line\n  \"\"\"\n  field: ID\n}"
+      description = GraphQL.parse(sdl).definitions.first.fields.first.description
+      assert_equal("first line\n  second line", description)
+      assert_predicate(description, :frozen?)
+    end
+
+    it "shares the description object between AST node and SDL-built schema member" do
+      document = GraphQL.parse(SDL)
+      schema = GraphQL::Schema.from_definition(SDL)
+      assert_same(document.definitions.first.fields.first.description, schema.query.fields["clientMutationId"].description)
+    end
+
+    it "does not freeze block-string argument literals in executable documents" do
+      document = GraphQL.parse('{ domain(host: """Example.COM""") }')
+      host = document.definitions.first.selections.first.arguments.first.value
+      assert_equal("Example.COM", host)
+      refute_predicate(host, :frozen?)
+      assert_equal("example.com", host.downcase!)
+    end
+
+    it "freezes descriptions on every definition node class that exposes one" do
+      doc = GraphQL.parse(ALL_DEFINITION_SDL)
+      visited = []
+      doc.definitions.each do |defn|
+        if defn.respond_to?(:description) && defn.description
+          assert_predicate(defn.description, :frozen?, "#{defn.class} description should be frozen")
+          visited << defn.class
+        end
+        defn.children.each { |c| visited.concat(check_description_frozen(c)) } if defn.respond_to?(:children)
+      end
+      # At minimum, we should have seen type definitions, field definitions, argument definitions,
+      # and enum value definitions.
+      assert_includes(visited, GraphQL::Language::Nodes::FieldDefinition)
+      assert_includes(visited, GraphQL::Language::Nodes::InputValueDefinition)
+      assert_includes(visited, GraphQL::Language::Nodes::EnumValueDefinition)
+    end
+
+    def check_description_frozen(node)
+      visited = []
+      return visited unless node.is_a?(GraphQL::Language::Nodes::AbstractNode)
+      if node.respond_to?(:description) && node.description
+        assert_predicate(node.description, :frozen?, "#{node.class} description should be frozen")
+        visited << node.class
+      end
+      node.children.each { |c| visited.concat(check_description_frozen(c)) } if node.respond_to?(:children)
+      visited
+    end
+  end
+  # These methods used to be generated by a DSL. Now they're written out by hand,
+  # so make sure they stay consistent with each other.
+  describe "node class invariants" do
+    node_classes = GraphQL::Language::Nodes.constants
+      .map { |c| GraphQL::Language::Nodes.const_get(c) }
+      .select { |obj| obj.is_a?(Class) && obj < GraphQL::Language::Nodes::AbstractNode }
+
+    non_value_keywords = [:line, :col, :pos, :filename, :source, :definition_pos]
+
+    children_of_type_for = ->(node_class) {
+      node_class.ancestors.each do |a|
+        if a.respond_to?(:children_of_type) && (c = a.children_of_type)
+          break c
+        end
+      end
+    }
+
+    # Build a node with a distinct value for every keyword
+    build_node = ->(node_class) {
+      child_keys = children_of_type_for.call(node_class).keys
+      values = {}
+      node_class.instance_method(:initialize).parameters.each do |(_kind, kw)|
+        next if non_value_keywords.include?(kw)
+        values[kw] = if child_keys.include?(kw)
+          [GraphQL::Language::Nodes::Directive.new(name: "#{kw}-child")]
+        else
+          "#{kw}-value"
+        end
+      end
+      node = node_class.new(filename: "f.graphql", line: 1, col: 2, **values)
+      [node, values, child_keys]
+    }
+
+    reader_for = ->(keyword) { keyword == :field_alias ? :alias : keyword }
+
+    it "has an instance-level visit_method matching the class-level one" do
+      node_classes.each do |node_class|
+        node, _values = build_node.call(node_class)
+        assert_equal node_class.visit_method, node.visit_method, "#{node_class}#visit_method"
+      end
+    end
+
+    it "assigns every initialize keyword to a reader" do
+      node_classes.each do |node_class|
+        node, values = build_node.call(node_class)
+        values.each do |kw, value|
+          assert_equal value, node.public_send(reader_for.call(kw)), "#{node_class}##{reader_for.call(kw)}"
+        end
+        assert_equal 1, node.line
+        assert_equal 2, node.col
+        assert_equal "f.graphql", node.filename
+      end
+    end
+
+    it "includes child readers in #children and other readers in #scalars" do
+      node_classes.each do |node_class|
+        next if node_class == GraphQL::Language::Nodes::Argument # custom #children
+        node, values, child_keys = build_node.call(node_class)
+        expected_children = child_keys.flat_map { |k| node.public_send(k) }
+        assert_equal expected_children, node.children, "#{node_class}#children"
+        values.each do |kw, value|
+          next if child_keys.include?(kw) || [:description, :comment, :types, :field_alias].include?(kw)
+          assert_includes node.scalars, value, "#{node_class}#scalars includes #{kw}"
+        end
+      end
+    end
+
+    it "round-trips through Marshal and .from_a" do
+      node_classes.each do |node_class|
+        node, values = build_node.call(node_class)
+        copy = Marshal.load(Marshal.dump(node))
+        assert_equal node, copy, "#{node_class} Marshal round-trip"
+
+        _line, _col, filename, *rest = node.marshal_dump
+        # Field's `.from_a` takes `field_alias` first, but `#marshal_dump` puts `@alias` last
+        rest.unshift(rest.pop) if node_class == GraphQL::Language::Nodes::Field
+        from_a_node = node_class.from_a(filename, 1, 2, *rest)
+
+        values.each do |kw, value|
+          next if kw == :comment # not marshalled
+          reader = reader_for.call(kw)
+          assert_equal value, copy.public_send(reader), "#{node_class}##{reader} after Marshal"
+          assert_equal value, from_a_node.public_send(reader), "#{node_class}##{reader} after .from_a"
+        end
+      end
+    end
+
+    it "has working merge_* methods for typed children" do
+      node_classes.each do |node_class|
+        (node_class.children_of_type || {}).each do |method_name, child_class|
+          next if child_class.nil?
+          node, _values = build_node.call(node_class)
+          merge_method = :"merge_#{method_name.to_s.sub(/s\z/, "")}"
+          new_node = node.public_send(merge_method, name: "merged")
+          assert_instance_of child_class, new_node.public_send(method_name).last, "#{node_class}##{merge_method}"
+          assert_equal node.public_send(method_name).size + 1, new_node.public_send(method_name).size
+        end
+      end
+    end
+  end
+end

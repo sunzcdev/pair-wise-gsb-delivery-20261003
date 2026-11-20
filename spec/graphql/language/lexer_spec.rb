@@ -1,0 +1,94 @@
+# frozen_string_literal: true
+require "spec_helper"
+require "timeout"
+require_relative "./lexer_examples"
+describe GraphQL::Language::Lexer do
+  subject { GraphQL::Language::Lexer }
+  include LexerExamples
+
+  def assert_bad_unicode(string, expected_err_message = "Parse error on bad Unicode escape sequence")
+    err = assert_raises(GraphQL::ParseError) do
+      subject.tokenize(string)
+    end
+    assert_equal expected_err_message, err.message
+  end
+
+  it "rejects unicode escapes outside the valid range" do
+    assert_bad_unicode('"\\u{FFFFFFFFFF}"', 'Bad unicode escape in "\\\\u{FFFFFFFFFF}"')
+  end
+
+  it "rejects unterminated block strings without backtracking" do
+    ["\\", '\\"', '"a'].each do |fragment|
+      assert_raises(GraphQL::ParseError) do
+        Timeout.timeout(1) { subject.tokenize('"""' + fragment * 1_000) }
+      end
+    end
+  end
+
+  it "reports positions correctly after multibyte input" do
+    err = assert_raises(GraphQL::ParseError) do
+      subject.tokenize("{\n  # 日本語\n  field(arg: -foo)\n}")
+    end
+
+    assert_equal 3, err.line
+    assert_equal 14, err.col
+  end
+
+  [
+    ["{ __typename }", 0, 1, 1],
+    ["# comment\n# comment\n  { __typename }", 2, 3, 3],
+    ["{\n  __typename\n}", 1, 2, 3],
+  ].each do |query, max_tokens, line, col|
+    it "reports the token exceeding max_tokens=#{max_tokens} at #{line}:#{col}" do
+      lexer = subject.new(query, max_tokens: max_tokens)
+      err = assert_raises(GraphQL::ParseError) do
+        lexer.advance until lexer.finished?
+      end
+
+      assert_equal "This query is too large to execute.", err.message
+      assert_equal [line, col], [err.line, err.col]
+    end
+  end
+
+  it "reports column one after a newline" do
+    tokens = subject.tokenize("{ field }\n# 日本語\nfragment F on Type { field }")
+    fragment_token = tokens.find { |token| token.first == :FRAGMENT }
+
+    assert_equal [:FRAGMENT, 3, 1, "fragment"], fragment_token
+  end
+
+  it "reports error positions with CR, LF, and CRLF line terminators" do
+    ["\r", "\n", "\r\n"].each do |newline|
+      query_string = ["{", '  field(arg: "日本語")', "  field(arg: -foo)", "}"].join(newline)
+      err = assert_raises(GraphQL::ParseError) { subject.tokenize(query_string) }
+
+      assert_equal [3, 14], [err.line, err.col]
+    end
+  end
+
+  it "reports column one after consecutive line terminators" do
+    ["\r", "\n", "\r\n"].each do |newline|
+      tokens = subject.tokenize(['{ field(arg: "日本語") }', "", "fragment F on Type { field }"].join(newline))
+      fragment_token = tokens.find { |token| token.first == :FRAGMENT }
+
+      assert_equal [:FRAGMENT, 3, 1, "fragment"], fragment_token
+    end
+  end
+
+  it "reports positions with mixed line terminators and multibyte input" do
+    tokens = subject.tokenize("{ field(arg: \"日本語\") }\r\r\n\n\rfragment F on Type { field }\r\n")
+    fragment_token = tokens.find { |token| token.first == :FRAGMENT }
+
+    assert_equal [:FRAGMENT, 5, 1, "fragment"], fragment_token
+  end
+
+  it "reraises unexpected argument errors" do
+    lexer = subject.new("{")
+    scanner = lexer.instance_variable_get(:@scanner)
+
+    scanner.stub(:skip, ->(*) { raise ArgumentError, "unexpected failure" }) do
+      err = assert_raises(ArgumentError) { lexer.advance }
+      assert_equal "unexpected failure", err.message
+    end
+  end
+end

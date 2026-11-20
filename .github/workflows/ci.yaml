@@ -1,0 +1,186 @@
+name: CI Suite
+on:
+  pull_request:
+  # Runs on master save gem caches that pull requests can restore from
+  # (PRs can only read caches from their own ref or their base branch)
+  push:
+    branches:
+      - master
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    env:
+      BUNDLE_GEMFILE: gemfiles/sorbet.gemfile
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+      with:
+        ruby-version: 3.4
+        bundler-cache: true
+    - run: bundle exec rake rubocop
+    - run: bundle exec srb tc
+    # Fails if any `# typed: false` file passes at `typed: true`.
+    # Spoom drops BUNDLE_GEMFILE when it shells out, so pass the full command (https://github.com/Shopify/spoom/issues/349)
+    - run: bundle exec spoom srb bump --from false --to true --dry --sorbet "BUNDLE_GEMFILE=gemfiles/sorbet.gemfile bundle exec srb tc" lib
+    - run: npx @herb-tools/linter@0.8.10
+  # Type-checks the RBI that Tapioca generates for this gem, the way apps that use Sorbet do.
+  # `srb tc` above checks the gem's source, but not the ancestors that Tapioca finds at runtime.
+  sorbet_consumer:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: spec/integration/sorbet_consumer
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+      with:
+        ruby-version: 3.4
+        bundler-cache: true
+        working-directory: spec/integration/sorbet_consumer
+    - run: bin/check
+  system_tests:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: shogo82148/actions-setup-redis@d566e806806d1bac2b414538d57b2b7f721e1d83 # v1.60.0
+      with:
+        redis-version: "7.x"
+    - run: redis-cli ping
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+      with:
+        ruby-version: 3.4
+        bundler-cache: true
+      env:
+        BUNDLE_GEMS__GRAPHQL__PRO: ${{ secrets.BUNDLE_GEMS__GRAPHQL__PRO }}
+        BUNDLE_GEMFILE: gemfiles/rails_master.gemfile
+    - run: bin/rails test:all
+      working-directory: ./spec/dummy
+      env:
+        BUNDLE_GEMS__GRAPHQL__PRO: ${{ secrets.BUNDLE_GEMS__GRAPHQL__PRO }}
+        BUNDLE_GEMFILE: ../../gemfiles/rails_master.gemfile
+  # Some coverage goals of these tests:
+  # - Test once without Rails at all
+  # - Test postgres, to make sure that the ActiveRecord
+  #   stuff works on that (as well as the default sqlite)
+  # - Test mongoid -- and several versions, since they're quite different
+  # - Run the JS unit tests once
+  # - Test each major version of Rails we support
+  # - Test the min/max minor Ruby version we support (and others?)
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gemfile: Gemfile
+            ruby: head
+          - gemfile: Gemfile
+            ruby: 2.7 # lowest supported version
+          - gemfile: gemfiles/rails_8.0.gemfile
+            ruby: 3.3
+            graphql_future: 1
+          - gemfile: gemfiles/rails_8.1.gemfile
+            ruby: 4.0
+            graphql_future: 1
+            redis: 1
+          - gemfile: gemfiles/rails_master.gemfile
+            ruby: 3.4
+            graphql_future: 1
+            isolation_level_fiber: 1
+            redis: 1
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo BUNDLE_GEMFILE=${{ matrix.gemfile }} > "$GITHUB_ENV"
+    - run: echo GRAPHQL_FUTURE=1 > "$GITHUB_ENV"
+      if: ${{ !!matrix.graphql_future }}
+    - run: echo ISOLATION_LEVEL_FIBER=1 > "$GITHUB_ENV"
+      if: ${{ !!matrix.isolation_level_fiber }}
+    - uses: shogo82148/actions-setup-redis@d566e806806d1bac2b414538d57b2b7f721e1d83 # v1.60.0
+      with:
+        redis-version: "7.x"
+      if: ${{ !!matrix.redis }}
+    - run: redis-cli ping
+      if: ${{ !!matrix.redis }}
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+      with:
+        ruby-version: ${{ matrix.ruby }}
+        bundler-cache: true
+    # graphql-c_parser requires Ruby 3.0+ (it uses rb_enc_interned_str), so don't build it on 2.7
+    - run: bundle exec rake compile
+      if: ${{ matrix.ruby != '2.7' }}
+    - run: bundle exec rake test
+  javascript_test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: latest
+    - run: npm ci
+      working-directory: ./javascript_client
+    - run: npm test
+      working-directory: ./javascript_client
+  postgres_test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+        - gemfile: gemfiles/rails_master.gemfile
+          ruby: 3.3
+          isolation_level_fiber: 1
+        - gemfile: gemfiles/rails_7.2_postgresql.gemfile
+          ruby: 3.3
+    services:
+      postgres:
+        image: postgres:18.4@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+        - 5432:5432
+        # needed because the postgres container does not provide a healthcheck
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+    - run: echo BUNDLE_GEMFILE='' > "$GITHUB_ENV"
+    - run: echo DATABASE='POSTGRESQL' > "$GITHUB_ENV"
+    - run: echo PGPASSWORD='postgres' > "$GITHUB_ENV"
+    - run: echo GRAPHQL_CPARSER=1 > "$GITHUB_ENV"
+    - run: echo ISOLATION_LEVEL_FIBER=1 > "$GITHUB_ENV"
+      if: ${{ !!matrix.isolation_level_fiber }}
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+      with:
+        ruby-version: "3.3"
+        bundler-cache: true
+    - run: bundle exec rake compile test
+  mongodb_test:
+    strategy:
+      fail-fast: false
+      matrix:
+        gemfile:
+          - gemfiles/mongoid_9.gemfile
+          - gemfiles/mongoid_8.gemfile
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:8.2.12@sha256:e0ce8c35124d4a9f9785532d1f268f39e9728ffa1cb38f46fa482436424c4bd3
+        ports:
+        - 27017:27017
+    steps:
+    - run: echo BUNDLE_GEMFILE=${{ matrix.gemfile }} > "$GITHUB_ENV"
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+      with:
+        ruby-version: 3.4
+        bundler-cache: true
+    - run: bundle exec rake compile
+    # The rest of the suite is covered by other jobs; only test Mongoid integration here
+    - run: bundle exec rake test
+      env:
+        TEST: "spec/integration/mongoid/**/*_spec.rb,spec/graphql/pagination/mongoid_relation_connection_spec.rb"

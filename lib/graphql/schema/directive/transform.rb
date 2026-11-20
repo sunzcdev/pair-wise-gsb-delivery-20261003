@@ -1,0 +1,94 @@
+# frozen_string_literal: true
+#--
+# typed: strict
+module GraphQL
+  class Schema
+    class Directive < GraphQL::Schema::Member
+      # An example directive to show how you might interact with the runtime.
+      #
+      # This directive takes the return value of the tagged part of the query,
+      # and if the named transform is whitelisted and applies to the return value,
+      # it's applied by calling a method with that name.
+      #
+      # **Examples**
+      #
+      # **Example: Installing the directive**
+      #
+      # ```ruby
+      # class MySchema < GraphQL::Schema
+      #   directive(GraphQL::Schema::Directive::Transform)
+      # end
+      # ```
+      #
+      # **Example: Transforming strings**
+      #
+      # ```ruby
+      # viewer {
+      #   username @transform(by: "upcase")
+      # }
+      # ```
+      class Transform < Schema::Directive
+        description "Directs the executor to run named transform on the return value."
+
+        locations(
+          GraphQL::Schema::Directive::FIELD,
+        )
+
+        argument :by, String,
+          description: "The name of the transform to run if applicable"
+
+        TRANSFORMS = [
+          "upcase",
+          "downcase",
+          # ??
+        ] #: Array[String]
+        # Implement the Directive API
+        #: (untyped object, Hash[Symbol, untyped] arguments, GraphQL::Query::Context context) { () -> untyped } -> nil
+        def self.resolve(object, arguments, context, &block)
+          path = context.namespace(:interpreter)[:current_path]
+          return_value = yield
+          transform_name = arguments[:by]
+          if TRANSFORMS.include?(transform_name) && return_value.respond_to?(transform_name)
+            return_value = return_value.public_send(transform_name)
+            response = context.namespace(:interpreter_runtime)[:runtime].final_result
+            *keys, last = path
+            keys.each do |key|
+              if response && (response = response[key])
+                next
+              else
+                break
+              end
+            end
+            if response
+              response[last] = return_value
+            end
+            nil
+          end
+        end
+
+        #: (Array[GraphQL::Language::Nodes::Field] ast_nodes, untyped parent_type, GraphQL::Schema::Field field_defn, Array[untyped] objects, Hash[Symbol, untyped] arguments, GraphQL::Query::Context context) -> Transformer?
+        def self.resolve_field(ast_nodes, parent_type, field_defn, objects, arguments, context)
+          transform_name = arguments[:by]
+          if TRANSFORMS.include?(transform_name)
+            Transformer.new(transform_name)
+          else
+            nil
+          end
+        end
+
+        class Transformer
+          include Execution::PostProcessor
+          #: (String transform) -> void
+          def initialize(transform)
+            @transform = transform #: String
+          end
+          #: (Array[untyped] field_results) -> Array[untyped]
+          def after_resolve(field_results)
+            field_results.map! { |r| r.respond_to?(@transform) ? r.public_send(@transform) : r }
+            field_results
+          end
+        end
+      end
+    end
+  end
+end

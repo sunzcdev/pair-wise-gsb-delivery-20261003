@@ -1,0 +1,406 @@
+# frozen_string_literal: true
+#--
+# typed: true
+
+module GraphQL
+  class Schema
+    class Member
+      # Shared code for Objects, Interfaces, Mutations, Subscriptions
+      #--
+      # @requires_ancestor: Kernel
+      # @requires_ancestor: Module
+      # @requires_ancestor: GraphQL::Schema::Member::BaseDSLMethods
+      module HasFields
+        include EmptyObjects
+        # Add a field to this object or interface with the given definition
+        #
+        # **Parameters**
+        #
+        # - `name_positional` (`Symbol`) — The underscore-cased version of this field name (will be camelized for the GraphQL API); `name:` keyword is also accepted
+        # - `type_positional` (`Class, GraphQL::BaseType, Array`) — The return type of this field; `type:` keyword is also accepted
+        # - `desc_positional` (`String`) — Field description; `description:` keyword is also accepted
+        # - `kwargs` (`Hash`) — Keywords for defining the field. Any not documented here will be passed to your base field class where they must be handled.
+        # - `definition_block` (`Proc`) — an additional block for configuring the field. Receive the field as a block param, or, if no block params are defined, then the block is `instance_eval`'d on the new [Field](rdoc-ref:Field).
+        #
+        # **Options**
+        #
+        # - `kwargs.:name` (`Symbol`) — The underscore-cased version of this field name (will be camelized for the GraphQL API); positional argument also accepted
+        # - `kwargs.:type` (`Class, GraphQL::BaseType, Array`) — The return type of this field; positional argument is also accepted
+        # - `kwargs.:null` (`Boolean`) — (defaults to `true`) `true` if this field may return `null`, `false` if it is never `null`
+        # - `kwargs.:description` (`String`) — Field description; positional argument also accepted
+        # - `kwargs.:comment` (`String`) — Field comment
+        # - `kwargs.:deprecation_reason` (`String`) — If present, the field is marked "deprecated" with this message
+        # - `kwargs.:method` (`Symbol`) — The method to call on the underlying object to resolve this field (defaults to `name`)
+        # - `kwargs.:hash_key` (`String, Symbol`) — The hash key to lookup on the underlying object (if its a Hash) to resolve this field (defaults to `name` or `name.to_s`)
+        # - `kwargs.:dig` (`Array<String, Symbol>`) — The nested hash keys to lookup on the underlying hash to resolve this field using dig
+        # - `kwargs.:resolver_method` (`Symbol, true`) — The method on the type to call to resolve this field (defaults to `name`)
+        # - `kwargs.:resolve_static` (`Symbol, true`) — Used by `Schema.execute_next` to produce a single value, shared by all objects which resolve this field. Called on the owner type class with `context, **arguments`
+        # - `kwargs.:resolve_batch` (`Symbol, true`) — Used by `Schema.execute_next` map `objects` to a same-sized Array of results. Called on the owner type class with `objects, context, **arguments`.
+        # - `kwargs.:resolve_each` (`Symbol, true`) — Used by `Schema.execute_next` to get a value value for each item. Called on the owner type class with `object, context, **arguments`.
+        # - `kwargs.:resolve_legacy_instance_method` (`Symbol, true`) — Used by `Schema.execute_next` to get a value value for each item. Calls an instance method on the object type class.
+        # - `kwargs.:connection` (`Boolean`) — `true` if this field should get automagic connection behavior; default is to infer by `*Connection` in the return type name
+        # - `kwargs.:connection_extension` (`Class`) — The extension to add, to implement connections. If `nil`, no extension is added.
+        # - `kwargs.:max_page_size` (`Integer, nil`) — For connections, the maximum number of items to return from this field, or `nil` to allow unlimited results.
+        # - `kwargs.:default_page_size` (`Integer, nil`) — For connections, the default number of items to return from this field, or `nil` to return unlimited results.
+        # - `kwargs.:introspection` (`Boolean`) — If true, this field will be marked as `#introspection?` and the name may begin with `__`
+        # - `kwargs.:arguments` (`{String=>GraphQL::Schema::Argument, Hash}`) — Arguments for this field (may be added in the block, also)
+        # - `kwargs.:camelize` (`Boolean`) — If true, the field name will be camelized when building the schema
+        # - `kwargs.:complexity` (`Numeric`) — When provided, set the complexity for this field
+        # - `kwargs.:scope` (`Boolean`) — If true, the return type's `.scope_items` method will be called on the return value
+        # - `kwargs.:subscription_scope` (`Symbol, String`) — A key in `context` which will be used to scope subscription payloads
+        # - `kwargs.:extensions` (`Array<Class, Hash<Class => Object>>`) — Named extensions to apply to this field (see also [Field#extension](rdoc-ref:GraphQL::Schema::Field#extension))
+        # - `kwargs.:directives` (`Hash{Class => Hash}`) — Directives to apply to this field
+        # - `kwargs.:trace` (`Boolean`) — If true, a [GraphQL::Tracing](rdoc-ref:GraphQL::Tracing) tracer will measure this scalar field
+        # - `kwargs.:broadcastable` (`Boolean`) — Whether or not this field can be distributed in subscription broadcasts
+        # - `kwargs.:ast_node` (`Language::Nodes::FieldDefinition, nil`) — If this schema was parsed from definition, this AST node defined the field
+        # - `kwargs.:method_conflict_warning` (`Boolean`) — If false, skip the warning if this field's method conflicts with a built-in method
+        # - `kwargs.:validates` (`Array<Hash>`) — Configurations for validating this field
+        # - `kwargs.:fallback_value` (`Object`) — A fallback value if the method is not defined
+        # - `kwargs.:mutation` (`Class<GraphQL::Schema::Mutation>`)
+        # - `kwargs.:resolver` (`Class<GraphQL::Schema::Resolver>`)
+        # - `kwargs.:subscription` (`Class<GraphQL::Schema::Subscription>`)
+        # - `kwargs.:dynamic_introspection` (`Boolean`) — (Private, used by GraphQL-Ruby)
+        # - `kwargs.:relay_node_field` (`Boolean`) — (Private, used by GraphQL-Ruby)
+        # - `kwargs.:relay_nodes_field` (`Boolean`) — (Private, used by GraphQL-Ruby)
+        # - `kwargs.:dataload` (`Class, Hash`) — Shorthand for dataloader lookups
+        # - `kwargs.:extras` (`Array<:ast_node, :parent, :lookahead, :owner, :execution_errors, :graphql_name, :argument_details, Symbol>`) — Extra arguments to be injected into the resolver for this field
+        #
+        # **Yields**
+        #
+        # - `field` (`GraphQL::Schema::Field`) — The newly-created field instance
+        # - `void`
+        #
+        # **Returns**
+        #
+        # - `GraphQL::Schema::Field`
+        #
+        # :call-seq:
+        #   field(Symbol name_positional, Class | GraphQL::BaseType | Array type_positional, String desc_positional, Hash **kwargs, Proc &definition_block) -> GraphQL::Schema::Field
+        def field(name_positional = nil, type_positional = nil, desc_positional = nil, **kwargs, &definition_block)
+          resolver = kwargs.delete(:resolver)
+          mutation = kwargs.delete(:mutation)
+          subscription = kwargs.delete(:subscription)
+          if (resolver_class = resolver || mutation || subscription)
+            # Add a reference to that parent class
+            kwargs[:resolver_class] = resolver_class
+          end
+
+          kwargs[:name] ||= name_positional
+          if !type_positional.nil?
+            if desc_positional
+              if kwargs[:description]
+                raise ArgumentError, "Provide description as a positional argument or `description:` keyword, but not both (#{desc_positional.inspect}, #{kwargs[:description].inspect})"
+              end
+
+              kwargs[:description] = desc_positional
+              kwargs[:type] = type_positional
+            elsif (resolver || mutation) && type_positional.is_a?(String)
+              # The return type should be copied from the resolver, and the second positional argument is the description
+              kwargs[:description] = type_positional
+            else
+              kwargs[:type] = type_positional
+            end
+
+            if type_positional.is_a?(Class) && type_positional < GraphQL::Schema::Mutation
+              raise ArgumentError, "Use `field #{name_positional.inspect}, mutation: Mutation, ...` to provide a mutation to this field instead"
+            end
+          end
+
+          kwargs[:owner] = self
+          field_defn = field_class.new(**kwargs, &definition_block)
+          add_field(field_defn)
+          field_defn
+        end
+
+        # A list of Ruby keywords.
+        #
+        # :nodoc:
+        RUBY_KEYWORDS = [:class, :module, :def, :undef, :begin, :rescue, :ensure, :end, :if, :unless, :then, :elsif, :else, :case, :when, :while, :until, :for, :break, :next, :redo, :retry, :in, :do, :return, :yield, :super, :self, :nil, :true, :false, :and, :or, :not, :alias, :defined?, :BEGIN, :END, :__LINE__, :__FILE__]
+
+        # A list of GraphQL-Ruby keywords.
+        #
+        # :nodoc:
+        GRAPHQL_RUBY_KEYWORDS = [:context, :object, :raw_value]
+
+        # A list of field names that we should advise users to pick a different
+        # resolve method name.
+        #
+        # :nodoc:
+        CONFLICT_FIELD_NAMES = Set.new(GRAPHQL_RUBY_KEYWORDS + RUBY_KEYWORDS + Object.instance_methods)
+
+        # Register this field with the class, overriding a previous one if needed.
+        #
+        # **Parameters**
+        #
+        # - `field_defn` (`GraphQL::Schema::Field`)
+        #
+        # **Returns**
+        #
+        # - `void`
+        #
+        # :call-seq:
+        #   add_field(GraphQL::Schema::Field field_defn, method_conflict_warning:) -> void
+        def add_field(field_defn, method_conflict_warning: field_defn.method_conflict_warning?)
+          # Check that `field_defn.original_name` equals `resolver_method` and `method_sym` --
+          # that shows that no override value was given manually.
+          if method_conflict_warning &&
+              CONFLICT_FIELD_NAMES.include?(field_defn.resolver_method) &&
+              field_defn.original_name == field_defn.resolver_method &&
+              field_defn.original_name == field_defn.method_sym &&
+              field_defn.hash_key == NOT_CONFIGURED &&
+              field_defn.dig_keys.nil?
+            warn(conflict_field_name_warning(field_defn))
+          end
+          prev_defn = own_fields[field_defn.name]
+
+          case prev_defn
+          when nil
+            own_fields[field_defn.name] = field_defn
+          when Array
+            prev_defn << field_defn
+          when GraphQL::Schema::Field
+            own_fields[field_defn.name] = [prev_defn, field_defn]
+          else
+            raise "Invariant: unexpected previous field definition for #{field_defn.name.inspect}: #{prev_defn.inspect}"
+          end
+
+          nil
+        end
+
+        # **Returns**
+        #
+        # - `Class` — The class to initialize when adding fields to this kind of schema member
+        #
+        # :call-seq:
+        #   field_class(new_field_class) -> Class
+        def field_class(new_field_class = nil)
+          if new_field_class
+            @field_class = new_field_class
+          elsif defined?(@field_class) && @field_class
+            @field_class
+          else
+            find_inherited_value(:field_class, GraphQL::Schema::Field)
+          end
+        end
+
+        def global_id_field(field_name, **kwargs)
+          type = self
+          field field_name, "ID", **kwargs, null: false, resolve_each: true
+          define_method(field_name) do
+            #: self as GraphQL::Schema::Object
+            context.schema.id_from_object(object, type, context)
+          end
+
+          define_singleton_method(field_name) do |object, context|
+            context.schema.id_from_object(object, type, context)
+          end
+        end
+
+        # **Parameters**
+        #
+        # - `new_has_no_fields` (`Boolean`) — Call with `true` to make this Object type ignore the requirement to have any defined fields.
+        #
+        # **Returns**
+        #
+        # - `void`
+        #
+        # :call-seq:
+        #   has_no_fields(bool new_has_no_fields) -> void
+        def has_no_fields(new_has_no_fields)
+          @has_no_fields = new_has_no_fields
+          nil
+        end
+
+        # **Returns**
+        #
+        # - `Boolean` — `true` if `has_no_fields(true)` was configued
+        #
+        # :call-seq:
+        #   has_no_fields?() -> bool
+        def has_no_fields?
+          @has_no_fields
+        end
+
+        # **Returns**
+        #
+        # - `Hash<String => GraphQL::Schema::Field, Array<GraphQL::Schema::Field>>` — Fields defined on this class _specifically_, not parent classes
+        #
+        # :call-seq:
+        #   own_fields() -> Hash[String, GraphQL::Schema::Field | Array[GraphQL::Schema::Field]]
+        def own_fields
+          @own_fields ||= {}
+        end
+
+        def all_field_definitions
+          all_fields = {}
+          all_ancestors = ancestors #: Array[untyped]
+          all_ancestors.reverse_each do |ancestor|
+            if ancestor.respond_to?(:own_fields)
+              all_fields.merge!(ancestor.own_fields)
+            end
+          end
+          all_fields = all_fields.values
+          all_fields.flatten!
+          all_fields
+        end
+
+        #--
+        # @requires_ancestor: Module
+        module InterfaceMethods
+          def get_field(field_name, context = GraphQL::Query::NullContext.instance)
+            warden = Warden.from_context(context)
+            skip_visible = context.respond_to?(:types) && context.types.is_a?(GraphQL::Schema::Visibility::Profile)
+            all_ancestors = ancestors #: Array[untyped]
+            for ancestor in all_ancestors
+              if ancestor.respond_to?(:own_fields) &&
+                  (f_entry = ancestor.own_fields[field_name]) &&
+                  (skip_visible || (f_entry = Warden.visible_entry?(:visible_field?, f_entry, context, warden)))
+                return f_entry
+              end
+            end
+            nil
+          end
+
+          # **Returns**
+          #
+          # - `Hash<String => GraphQL::Schema::Field>` — Fields on this object, keyed by name, including inherited fields
+          #
+          # :call-seq:
+          #   fields(context:) -> Hash[String, GraphQL::Schema::Field]
+          def fields(context = GraphQL::Query::NullContext.instance)
+            warden = Warden.from_context(context)
+            # Local overrides take precedence over inherited fields
+            visible_fields = {}
+            all_ancestors = ancestors #: Array[untyped]
+            for ancestor in all_ancestors
+              if ancestor.respond_to?(:own_fields)
+                ancestor.own_fields.each do |field_name, fields_entry|
+                  # Choose the most local definition that passes `.visible?` --
+                  # stop checking for fields by name once one has been found.
+                  if !visible_fields.key?(field_name) && (f = Warden.visible_entry?(:visible_field?, fields_entry, context, warden))
+                    visible_fields[field_name] = f.ensure_loaded
+                  end
+                end
+              end
+            end
+            visible_fields
+          end
+        end
+
+        #--
+        # @requires_ancestor: Kernel
+        # @requires_ancestor: Module
+        # @requires_ancestor: GraphQL::Schema::Member::HasFields
+        module ObjectMethods
+          def get_field(field_name, context = GraphQL::Query::NullContext.instance)
+            # Objects need to check that the interface implementation is visible, too
+            warden = Warden.from_context(context)
+            ancs = ancestors #: Array[untyped]
+            skip_visible = context.respond_to?(:types) && context.types.is_a?(GraphQL::Schema::Visibility::Profile)
+            i = 0
+            while (ancestor = ancs[i])
+              if ancestor.respond_to?(:own_fields) &&
+                  visible_interface_implementation?(ancestor, context, warden) &&
+                  (f_entry = ancestor.own_fields[field_name]) &&
+                  (skip_visible || (f_entry = Warden.visible_entry?(:visible_field?, f_entry, context, warden)))
+                return (skip_visible ? f_entry : f_entry.ensure_loaded)
+              end
+              i += 1
+            end
+            nil
+          end
+
+          # **Returns**
+          #
+          # - `Hash<String => GraphQL::Schema::Field>` — Fields on this object, keyed by name, including inherited fields
+          #
+          # :call-seq:
+          #   fields(context:) -> Hash[String, GraphQL::Schema::Field]
+          def fields(context = GraphQL::Query::NullContext.instance)
+            # Objects need to check that the interface implementation is visible, too
+            warden = Warden.from_context(context)
+            # Local overrides take precedence over inherited fields
+            visible_fields = {}
+            had_any_fields_at_all = false #: bool
+            all_ancestors = ancestors #: Array[untyped]
+            for ancestor in all_ancestors
+              if ancestor.respond_to?(:own_fields) && visible_interface_implementation?(ancestor, context, warden)
+                ancestor.own_fields.each do |field_name, fields_entry|
+                  had_any_fields_at_all = true
+                  # Choose the most local definition that passes `.visible?` --
+                  # stop checking for fields by name once one has been found.
+                  if !visible_fields.key?(field_name) && (f = Warden.visible_entry?(:visible_field?, fields_entry, context, warden))
+                    visible_fields[field_name] = f.ensure_loaded
+                  end
+                end
+              end
+            end
+            if !had_any_fields_at_all && !has_no_fields?
+              warn(GraphQL::Schema::Object::FieldsAreRequiredError.new(self).message + "\n\nThis will raise an error in a future GraphQL-Ruby version.")
+            end
+            visible_fields
+          end
+        end
+
+        def self.included(child_class)
+          # Included in an interface definition methods module
+          child_class.include(InterfaceMethods)
+          super
+        end
+
+        def self.extended(child_class)
+          child_class.extend(ObjectMethods)
+          super
+        end
+
+        private
+
+        def inherited(subclass)
+          super
+          subclass.class_exec do
+            @own_fields ||= nil
+            @field_class ||= nil
+            @has_no_fields ||= false
+          end
+        end
+
+        # If `type` is an interface, and `self` has a type membership for `type`, then make sure it's visible.
+        def visible_interface_implementation?(type, context, warden)
+          if type.respond_to?(:kind) && type.kind.interface?
+            implements_this_interface = false #: bool
+            implementation_is_visible = false #: bool
+            warden.interface_type_memberships(self, context).each do |tm|
+              if tm.abstract_type == type
+                implements_this_interface ||= true
+                if warden.visible_type_membership?(tm, context)
+                  implementation_is_visible = true
+                  break
+                end
+              end
+            end
+            # It's possible this interface came by way of `include` in another interface which this
+            # object type _does_ implement, and that's ok
+            implements_this_interface ? implementation_is_visible : true
+          else
+            # If there's no implementation, then we're looking at Ruby-style inheritance instead
+            true
+          end
+        end
+
+        # **Parameters**
+        #
+        # - `field_defn` (`GraphQL::Schema::Field`)
+        #
+        # **Returns**
+        #
+        # - `String` — A warning to give when this field definition might conflict with a built-in method
+        #
+        # :call-seq:
+        #   conflict_field_name_warning(GraphQL::Schema::Field field_defn) -> String
+        def conflict_field_name_warning(field_defn)
+          "#{self.graphql_name}'s `field :#{field_defn.original_name}` conflicts with a built-in method, use `resolver_method:` to pick a different resolver method for this field (for example, `resolver_method: :resolve_#{field_defn.resolver_method}` and `def resolve_#{field_defn.resolver_method}`). Or use `method_conflict_warning: false` to suppress this warning."
+        end
+      end
+    end
+  end
+end

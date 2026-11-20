@@ -1,0 +1,45 @@
+# frozen_string_literal: true
+#--
+# typed: strict
+
+module GraphQL
+  class Schema
+    class Field
+      class ConnectionExtension < GraphQL::Schema::FieldExtension
+        extras [:lookahead]
+
+        #: -> void
+        def apply
+          field.argument :after, "String", "Returns the elements in the list that come after the specified cursor.", required: false
+          field.argument :before, "String", "Returns the elements in the list that come before the specified cursor.", required: false
+          field.argument :first, "Int", "Returns the first _n_ elements from the list.", required: false
+          field.argument :last, "Int", "Returns the last _n_ elements from the list.", required: false
+        end
+
+        # Remove pagination args before passing it to a user method
+        #: (arguments: Hash[Symbol, untyped], context: GraphQL::Query::Context, ?object: untyped, ?objects: untyped) { (untyped, Hash[Symbol, untyped], Hash[Symbol, untyped]) -> untyped } -> untyped
+        def resolve(arguments:, context:, object: nil, objects: nil, &block)
+          next_args = arguments.dup
+          next_args.delete(:first)
+          next_args.delete(:last)
+          next_args.delete(:before)
+          next_args.delete(:after)
+          # Keep the extension's extras (`:lookahead`) out of `connection.arguments`
+          original_arguments = added_extras ? arguments.reject { |k, _v| added_extras.include?(k) } : arguments
+          yield(object || objects, next_args, original_arguments)
+        end
+
+        #: (value: untyped, object: untyped, arguments: Hash[Symbol, untyped], context: GraphQL::Query::Context, memo: untyped) -> untyped
+        def after_resolve(value:, object:, arguments:, context:, memo:)
+          original_arguments = memo
+          lookahead = arguments[:lookahead]
+          context.query.after_lazy(value) do |resolved_value|
+            connection = context.schema.connections.populate_connection(field, object.object, resolved_value, original_arguments, context)
+            connection.lookahead ||= lookahead if connection.is_a?(GraphQL::Pagination::Connection)
+            connection
+          end
+        end
+      end
+    end
+  end
+end

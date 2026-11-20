@@ -1,0 +1,115 @@
+# frozen_string_literal: true
+#--
+# typed: strict
+module GraphQL
+  module Types
+    # This scalar takes `Duration`s and transmits them as strings,
+    # using ISO 8601 format. ActiveSupport >= 5.0 must be loaded to use
+    # this scalar.
+    #
+    # Use it for fields or arguments as follows:
+    #
+    #     field :age, GraphQL::Types::ISO8601Duration, null: false
+    #
+    #     argument :interval, GraphQL::Types::ISO8601Duration, null: false
+    #
+    # Alternatively, use this built-in scalar as inspiration for your
+    # own Duration type.
+    class ISO8601Duration < GraphQL::Schema::Scalar
+      description "An ISO 8601-encoded duration"
+
+      # **Returns**
+      #
+      # - `Integer, nil`
+      #
+      # :call-seq:
+      #   seconds_precision() -> Integer | nil
+      #: -> Integer?
+      def self.seconds_precision
+        # ActiveSupport::Duration precision defaults to whatever input was given
+        @seconds_precision
+      end
+
+      # **Parameters**
+      #
+      # - `value` (`Integer, nil`)
+      #
+      # :call-seq:
+      #   seconds_precision=(Integer | nil value)
+      #: (Integer? value) -> Integer?
+      def self.seconds_precision=(value)
+        @seconds_precision = value #: Integer?
+      end
+
+      # **Parameters**
+      #
+      # - `value` (`ActiveSupport::Duration, String`)
+      #
+      # **Returns**
+      #
+      # - `String`
+      #
+      # **Raises**
+      #
+      # - `GraphQL::Error` — if ActiveSupport::Duration is not defined or if an incompatible object is passed
+      #
+      # :call-seq:
+      #   coerce_result(ActiveSupport::Duration | String value, _ctx) -> String | GraphQL::Error
+      #: (untyped value, GraphQL::Query::Context _ctx) -> ::String
+      def self.coerce_result(value, _ctx)
+        unless defined?(ActiveSupport::Duration)
+          raise GraphQL::Error, "ActiveSupport >= 5.0 must be loaded to use the built-in ISO8601Duration type."
+        end
+
+        begin
+          case value
+          when ActiveSupport::Duration
+            value.iso8601(precision: seconds_precision)
+          when ::String
+            ActiveSupport::Duration.parse(value).iso8601(precision: seconds_precision)
+          else
+            # Try calling as ActiveSupport::Duration compatible as a fallback
+            value.iso8601(precision: seconds_precision)
+          end
+        rescue StandardError => error
+          raise GraphQL::Error, "An incompatible object (#{value.class}) was given to #{self}. Make sure that only ActiveSupport::Durations and well-formatted Strings are used with this type. (#{error.message})"
+        end
+      end
+
+      # **Parameters**
+      #
+      # - `value` (`String, ActiveSupport::Duration`)
+      #
+      # **Returns**
+      #
+      # - `ActiveSupport::Duration, nil`
+      #
+      # **Raises**
+      #
+      # - `GraphQL::Error` — if ActiveSupport::Duration is not defined
+      # - `GraphQL::DurationEncodingError` — if duration cannot be parsed
+      #
+      # :call-seq:
+      #   coerce_input(String | ActiveSupport::Duration value, ctx) -> ActiveSupport::Duration | nil | GraphQL::Error | GraphQL::DurationEncodingError
+      #: (untyped value, GraphQL::Query::Context ctx) -> untyped
+      def self.coerce_input(value, ctx)
+        unless defined?(ActiveSupport::Duration)
+          raise GraphQL::Error, "ActiveSupport >= 5.0 must be loaded to use the built-in ISO8601Duration type."
+        end
+
+        begin
+          if value.is_a?(ActiveSupport::Duration)
+            value
+          elsif value.nil?
+            nil
+          else
+            ActiveSupport::Duration.parse(value)
+          end
+        rescue ArgumentError, TypeError
+          err = GraphQL::DurationEncodingError.new(value)
+          ctx.schema.type_error(err, ctx)
+        end
+      end
+    end
+  end
+end

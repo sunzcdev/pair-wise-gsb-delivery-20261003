@@ -1,0 +1,23 @@
+# frozen_string_literal: true
+#--
+# typed: strict
+module GraphQL
+  module Analysis
+    # Used under the hood to implement complexity validation,
+    # See [Schema.max_complexity](rdoc-ref:GraphQL::Schema.max_complexity) and `Query#max_complexity`.
+    class MaxQueryComplexity < QueryComplexity
+      #: -> GraphQL::AnalysisError?
+      def result
+        return if subject.max_complexity.nil?
+
+        total_complexity = super
+
+        if total_complexity > subject.max_complexity
+          GraphQL::AnalysisError.new("Query has complexity of #{total_complexity}, which exceeds max complexity of #{subject.max_complexity}")
+        else
+          nil
+        end
+      end
+    end
+  end
+end

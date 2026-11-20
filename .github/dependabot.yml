@@ -1,0 +1,9 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      # Pinned to a build with Ruby support (ruby-v1 branch), see .github/workflows/benchmarks.yaml
+      - dependency-name: "rmosolgo/github-action-benchmark"

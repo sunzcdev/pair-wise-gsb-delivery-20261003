@@ -1,0 +1,111 @@
+# frozen_string_literal: true
+#--
+# typed: strict
+require "timeout"
+
+module GraphQL
+  module StaticValidation
+    # Initialized with a [GraphQL::Schema](rdoc-ref:GraphQL::Schema), then it can validate [GraphQL::Language::Nodes::Document](rdoc-ref:GraphQL::Language::Nodes::Document) nodes based on that schema.
+    #
+    # By default, it's used by [GraphQL::Query](rdoc-ref:GraphQL::Query)
+    #
+    # **Examples**
+    #
+    # **Example: Validate a query**
+    #
+    # ```ruby
+    # validator = GraphQL::StaticValidation::Validator.new(schema: MySchema)
+    # query = GraphQL::Query.new(MySchema, query_string)
+    # errors = validator.validate(query)[:errors]
+    # ```
+    class Validator
+      # **Parameters**
+      #
+      # - `schema` (`GraphQL::Schema`)
+      # - `rules` (`Array<#validate(context)>`) — a list of rules to use when validating
+      #
+      # :call-seq:
+      #   initialize(GraphQL::Schema schema:, Array[#validate(context)] rules:)
+      #: (schema: singleton(GraphQL::Schema), ?rules: Array[Module[untyped]]) -> void
+      def initialize(schema:, rules: GraphQL::StaticValidation::ALL_RULES)
+        @schema = schema #: singleton(GraphQL::Schema)
+        @rules = rules #: Array[Module[untyped]]
+      end
+
+      # Validate `query` against the schema. Returns an array of message hashes.
+      #
+      # **Parameters**
+      #
+      # - `query` (`GraphQL::Query`)
+      # - `validate` (`Boolean`)
+      # - `timeout` (`Float`) — Number of seconds to wait before aborting validation. Any positive number may be used, including Floats to specify fractional seconds.
+      # - `max_errors` (`Integer`) — Maximum number of errors before aborting validation. Any positive number will limit the number of errors. Defaults to nil for no limit.
+      #
+      # **Returns**
+      #
+      # - `Array<Hash>`
+      #
+      # :call-seq:
+      #   validate(GraphQL::Query query, bool validate:, Float timeout:, Integer max_errors:) -> Array[Hash]
+      #: (GraphQL::Query query, ?validate: bool?, ?timeout: Numeric?, ?max_errors: Integer?) -> Hash[Symbol, untyped]
+      def validate(query, validate: true, timeout: nil, max_errors: nil)
+        errors = nil #: untyped
+        query.current_trace.begin_validate(query, validate)
+        query.current_trace.validate(validate: validate, query: query) do
+          begin_t = Time.now
+          errors = if validate == false
+            []
+          else
+            rules_to_use = validate ? @rules : []
+            visitor_class = BaseVisitor.including_rules(rules_to_use)
+
+            context = GraphQL::StaticValidation::ValidationContext.new(query, visitor_class, max_errors)
+
+            begin
+              # CAUTION: Usage of the timeout module makes the assumption that validation rules are stateless Ruby code that requires no cleanup if process was interrupted. This means no blocking IO calls, native gems, locks, or `rescue` clauses that must be reached.
+              # A timeout value of 0 or nil will execute the block without any timeout.
+              Timeout::timeout(timeout) do
+                catch(:too_many_validation_errors) do
+                  context.visitor.visit
+                end
+              end
+            rescue Timeout::Error
+              handle_timeout(query, context)
+            end
+
+            context.errors
+          end
+
+          {
+            remaining_timeout: timeout ? (timeout - (Time.now - begin_t)) : nil,
+            errors: errors,
+          }
+        end
+      rescue GraphQL::ExecutionError => e
+        errors = [e]
+        {
+          remaining_timeout: nil,
+          errors: errors,
+        }
+      ensure
+        query.current_trace.end_validate(query, validate, errors)
+      end
+
+      # Invoked when static validation times out.
+      #
+      # **Parameters**
+      #
+      # - `query` (`GraphQL::Query`)
+      # - `context` (`GraphQL::StaticValidation::ValidationContext`)
+      #
+      # :call-seq:
+      #   handle_timeout(GraphQL::Query query, GraphQL::StaticValidation::ValidationContext context)
+      #: (GraphQL::Query query, GraphQL::StaticValidation::ValidationContext context) -> void
+      def handle_timeout(query, context)
+        context.errors << GraphQL::StaticValidation::ValidationTimeoutError.new(
+          "Timeout on validation of query"
+        )
+      end
+    end
+  end
+end

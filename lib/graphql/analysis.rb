@@ -1,0 +1,120 @@
+# frozen_string_literal: true
+#--
+# typed: true
+require "graphql/analysis/visitor"
+require "graphql/analysis/analyzer"
+require "graphql/analysis/field_usage"
+require "graphql/analysis/query_complexity"
+require "graphql/analysis/max_query_complexity"
+require "graphql/analysis/query_depth"
+require "graphql/analysis/max_query_depth"
+module GraphQL
+  module Analysis
+    AST = self
+
+    class TimeoutError < AnalysisError
+      def initialize(...)
+        super("Timeout on validation of query")
+      end
+    end
+
+    module_function
+    # Analyze a multiplex, and all queries within.
+    # Multiplex analyzers are ran for all queries, keeping state.
+    # Query analyzers are ran per query, without carrying state between queries.
+    #
+    # **Parameters**
+    #
+    # - `multiplex` (`GraphQL::Execution::Multiplex`)
+    # - `analyzers` (`Array<GraphQL::Analysis::Analyzer>`)
+    #
+    # **Returns**
+    #
+    # - `Array<Any>` — Results from multiplex analyzers
+    #
+    # :call-seq:
+    #   analyze_multiplex(GraphQL::Execution::Multiplex multiplex, Array[GraphQL::Analysis::Analyzer] analyzers) -> Array[Any]
+    def analyze_multiplex(multiplex, analyzers)
+      multiplex_analyzers = analyzers.map { |analyzer| analyzer.new(multiplex) }
+
+      multiplex.current_trace.analyze_multiplex(multiplex: multiplex) do
+        query_results = multiplex.queries.map do |query|
+          if query.valid?
+            analyze_query(
+              query,
+              query.analyzers,
+              multiplex_analyzers: multiplex_analyzers
+            )
+          else
+            []
+          end
+        end
+
+
+        multiplex_analyzers.map!(&:result)
+        multiplex_errors = analysis_errors(EmptyObjects::EMPTY_ARRAY, multiplex_analyzers)
+        multiplex.queries.each_with_index do |query, idx|
+          query.analysis_errors = analysis_errors(multiplex_errors, query_results[idx])
+        end
+        multiplex_analyzers
+      end
+    end
+
+    # **Parameters**
+    #
+    # - `query` (`GraphQL::Query`)
+    # - `analyzers` (`Array<GraphQL::Analysis::Analyzer>`)
+    #
+    # **Returns**
+    #
+    # - `Array<Any>` — Results from those analyzers
+    #
+    # :call-seq:
+    #   analyze_query(GraphQL::Query query, Array[GraphQL::Analysis::Analyzer] analyzers, multiplex_analyzers:) -> Array[Any]
+    def analyze_query(query, analyzers, multiplex_analyzers: [])
+      query.current_trace.analyze_query(query: query) do
+        query_analyzers = analyzers.map { |analyzer| analyzer.new(query) }
+        query_analyzers.select!(&:analyze?)
+        analyzers_to_run = query_analyzers + multiplex_analyzers
+
+        if !analyzers_to_run.empty?
+          analyzers_to_run.select!(&:visit?)
+          if !analyzers_to_run.empty?
+            visitor = GraphQL::Analysis::Visitor.new(
+              query: query,
+              analyzers: analyzers_to_run,
+              timeout: query.validate_timeout_remaining,
+            )
+
+            visitor.visit
+
+            if !visitor.rescued_errors.empty?
+              return visitor.rescued_errors
+            end
+          end
+
+          query_analyzers.map(&:result)
+        else
+          EmptyObjects::EMPTY_ARRAY
+        end
+      end
+    rescue GraphQL::ExecutionError => err
+      [err]
+    rescue GraphQL::UnauthorizedError => err
+      [GraphQL::AnalysisError.new(err.message)]
+    end
+
+    def analysis_errors(parent_errors, results)
+      if !results.empty?
+        results = results.flatten
+        results.select! { |r| r.is_a?(GraphQL::ExecutionError) }
+      end
+
+      if parent_errors.empty?
+        results
+      else
+        parent_errors + results
+      end
+    end
+  end
+end

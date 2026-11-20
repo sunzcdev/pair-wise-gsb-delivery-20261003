@@ -1,0 +1,952 @@
+# frozen_string_literal: true
+require "spec_helper"
+
+describe GraphQL::Language::Parser do
+  subject { GraphQL }
+
+  it "parses byte order marks between tokens without counting them towards max_tokens" do
+    query = "\uFEFF{\uFEFFfield\uFEFF}\uFEFF"
+    document = subject.parse(query, max_tokens: 3)
+    assert_equal "field", document.definitions.first.selections.first.name
+  end
+
+  ["#\r{ field }", "#a#b\n{ field }", "{ field }#", "{ field }#\r", "{ field }#a#b"].each do |query|
+    it "parses #{query.inspect} exactly at max_tokens including comments" do
+      document = subject.parse(query, max_tokens: 4)
+      assert_equal "field", document.definitions.first.selections.first.name
+    end
+
+    it "rejects #{query.inspect} one token over max_tokens including comments" do
+      error = assert_raises(GraphQL::ParseError) { subject.parse(query, max_tokens: 3) }
+      assert_equal "This query is too large to execute.", error.message
+    end
+  end
+
+  it "reports executable and type system definitions as expected at the top level" do
+    error = assert_raises(GraphQL::ParseError) { GraphQL::Language::Parser.parse("? { a }") }
+    expected_tokens = "QUERY, MUTATION, SUBSCRIPTION, FRAGMENT, LCURLY, EXTEND, STRING, SCHEMA, SCALAR, TYPE, ENUM, INPUT, UNION, INTERFACE, DIRECTIVE"
+
+    assert_includes error.message, "Expected one of #{expected_tokens}, actual:"
+  end
+
+  it "keeps expected definitions specific to descriptions and extensions" do
+    {
+      '"description" ?' => "SCHEMA, SCALAR, TYPE, ENUM, INPUT, UNION, INTERFACE, DIRECTIVE",
+      '"" ?' => "SCHEMA, SCALAR, TYPE, ENUM, INPUT, UNION, INTERFACE, DIRECTIVE",
+      "extend ?" => "SCHEMA, SCALAR, TYPE, ENUM, INPUT, UNION, INTERFACE",
+    }.each do |query_string, expected_tokens|
+      error = assert_raises(GraphQL::ParseError) { GraphQL::Language::Parser.parse(query_string) }
+
+      assert_includes error.message, "Expected one of #{expected_tokens}, actual:"
+    end
+  end
+
+  it "parses a document after a CR-terminated comment" do
+    document = subject.parse("# c\r{ a }")
+
+    assert_equal ["a"], document.definitions.first.selections.map(&:name)
+  end
+
+  it "returns an error on bad UTF-8" do
+    err = assert_raises GraphQL::ParseError do
+      subject.parse("{ foo(query: \"\xBF\") }")
+    end
+    expected_message = if USING_C_PARSER
+      'Parse error on bad Unicode escape sequence: "{ foo(query: \"\xBF\") }" (error) at [1, 1]'
+    else
+      'Parse error on bad Unicode escape sequence'
+    end
+    assert_equal expected_message, err.message
+  end
+
+  describe "source locations" do
+    it "reports parse errors with CR, LF, and CRLF line terminators" do
+      ["\r", "\n", "\r\n"].each do |newline|
+        query_string = ["{", "  a", "  b( : )", "}"].join(newline)
+        error = assert_raises(GraphQL::ParseError) { GraphQL::Language::Parser.parse(query_string) }
+
+        assert_equal [3, 6], [error.line, error.col]
+      end
+    end
+
+    it "reports validation errors with CR, LF, and CRLF line terminators" do
+      ["\r", "\n", "\r\n"].each do |newline|
+        query_string = ["{", "  __typename", "  missing", "}"].join(newline)
+        document = GraphQL::Language::Parser.parse(query_string)
+        assert_equal [[2, 3], [3, 3]], document.definitions.first.selections.map(&:position)
+
+        query = GraphQL::Query.new(Dummy::Schema, document: document)
+        assert_equal [[{ "line" => 3, "column" => 3 }]], query.validation_errors.map { |error| error.to_h["locations"] }
+      end
+    end
+
+    it "reports positions with mixed line terminators and multibyte input" do
+      query_string = "{\r\n  __type(name: \"日本語😀\") { name }\r  __typename\n  missing\r}"
+      document = GraphQL::Language::Parser.parse(query_string)
+
+      assert_equal [[2, 3], [3, 3], [4, 3]], document.definitions.first.selections.map(&:position)
+    end
+
+    it "reports validation errors after multibyte comments at their original position" do
+      ["\n", "\r\n"].each do |newline|
+        query_string = ["{", "  # 日本語を含むコメント", "  __typename", "  missing", "}"].join(newline)
+        document = GraphQL::Language::Parser.parse(query_string)
+        assert_equal [[3, 3], [4, 3]], document.definitions.first.selections.map(&:position)
+
+        query = GraphQL::Query.new(Dummy::Schema, document: document)
+        assert_equal [[{ "line" => 4, "column" => 3 }]], query.validation_errors.map { |error| error.to_h["locations"] }
+      end
+    end
+
+    it "uses the same character columns as parse errors after multibyte strings" do
+      query_string = '{ __type(name: "日本語😀") { name } missing }'
+      document = GraphQL::Language::Parser.parse(query_string)
+      field = document.definitions.first.selections.last
+      error = assert_raises(GraphQL::ParseError) do
+        GraphQL::Language::Parser.parse(query_string.sub("missing", ")"))
+      end
+
+      assert_equal [1, 33], field.position
+      assert_equal field.position, [error.line, error.col]
+    end
+
+    it "reports columns on the final line without a trailing newline" do
+      ["# comment\n", "# 日本語\n"].each do |comment|
+        document = GraphQL::Language::Parser.parse(comment + "{ __typename missing }")
+        assert_equal [2, 14], document.definitions.first.selections.last.position
+      end
+    end
+
+    it "reports positions after multibyte block strings" do
+      ["\r", "\n", "\r\n"].each do |newline|
+        query_string = "{ __type(name: \"\"\"日本語#{newline}続き#{newline}\"\"\") { name } missing }"
+        document = GraphQL::Language::Parser.parse(query_string)
+        assert_equal [3, 15], document.definitions.first.selections.last.position
+      end
+    end
+
+    it "reports definition positions after multibyte descriptions" do
+      document = GraphQL::Language::Parser.parse("\"日本語の説明\"\nscalar Thing\n\n\"別の説明\"\nscalar Other\n")
+      assert_equal [[1, 1], [4, 1]], document.definitions.map(&:position)
+      assert_equal [2, 5], document.definitions.map(&:definition_line)
+    end
+
+    it "counts UTF-8 characters in binary input without changing its encoding" do
+      query_string = '{ __type(name: "日本語😀") { name } missing }'.b.freeze
+      document = GraphQL::Language::Parser.parse(query_string)
+      assert_equal [1, 33], document.definitions.first.selections.last.position
+      assert_equal Encoding::ASCII_8BIT, query_string.encoding
+    end
+  end
+
+  it "rejects newlines in single-quoted strings unless escaped" do
+    nl_query_string_1 = "{ doStuff(arg: \"
+    abc\") }"
+    nl_query_string_2 = "{ doStuff(arg: \"\rabc\") }"
+
+    assert_raises(GraphQL::ParseError) {
+      GraphQL.parse(nl_query_string_2)
+    }
+    assert_raises(GraphQL::ParseError) {
+      GraphQL.parse(nl_query_string_2)
+    }
+
+    assert GraphQL.parse(GraphQL::Language.escape_single_quoted_newlines(nl_query_string_1))
+    assert GraphQL.parse(GraphQL::Language.escape_single_quoted_newlines(nl_query_string_2))
+
+    example_query_str = "mutation {
+createRecord(data: {
+  dynamicFields: { string_test: \"avenue 1st
+2nd line\"}
+})
+  { id, dynamicFields }
+}"
+    assert_raises GraphQL::ParseError do
+      GraphQL.parse(example_query_str)
+    end
+
+    escaped_query_str = GraphQL::Language.escape_single_quoted_newlines(example_query_str)
+
+    expected_escaped_query_str = "mutation {
+createRecord(data: {
+  dynamicFields: { string_test: \"avenue 1st\\n2nd line\"}
+})
+  { id, dynamicFields }
+}"
+    assert_equal expected_escaped_query_str, escaped_query_str
+    assert GraphQL.parse(escaped_query_str )
+  end
+
+  it "parses single-quoted strings with escaped newlines" do
+    example_query_str = 'mutation {
+createRecord(data: {
+  dynamicFields: { string_test: "avenue 1st\n2nd line"}
+})
+  { id, dynamicFields }
+}'
+    assert GraphQL.parse(example_query_str)
+  end
+
+  it "can replace single-quoted newlines" do
+    replacements = {
+      "{ a(\"\n abc\n\") }" => '{ a("\\n abc\\n") }',
+      "{ a(\"\r\n ab\rc\n\") }" => '{ a("\\r\\n ab\\rc\\n") }',
+      "{ a(\"\n abc\n\") b(\"\n \\\"abc\n\") }" => '{ a("\\n abc\\n") b("\\n \\"abc\\n") }',
+      # No modification to block strings:
+      "{ a(\"\"\"\n abc\n\"\"\") }" => "{ a(\"\"\"\n abc\n\"\"\") }",
+      "{ a(\"\"\"\r\n abc\r\n\"\"\") }" => "{ a(\"\"\"\r\n abc\r\n\"\"\") }",
+      "{ x(s: \"\"\"The user said \"Did\n\"you change my input ?\"\"\") }" => "{ x(s: \"\"\"The user said \"Did\n\"you change my input ?\"\"\") }",
+    }
+
+    replacements.each_with_index do |(before_str, after_str), idx|
+      assert_equal after_str, GraphQL::Language.escape_single_quoted_newlines(before_str), "It works for example pair ##{idx + 1} (#{after_str})"
+    end
+  end
+
+  it "preserves newlines after strings ending in escaped backslashes" do
+    [2, 4].each do |count|
+      ["\n", "\r", "\r\n"].each do |newline|
+        query_string = %({ field(arg: "x#{"\\" * count}")#{newline}})
+        escaped = GraphQL::Language.escape_single_quoted_newlines(query_string)
+
+        assert_same query_string, escaped
+        assert GraphQL.parse(escaped)
+      end
+    end
+  end
+
+  it "escapes newlines inside strings with escaped backslashes and quotes" do
+    [1, 2, 3, 4].each do |count|
+      { "\n" => '\\n', "\r" => '\\r', "\r\n" => '\\r\\n' }.each do |newline, escaped_newline|
+        content = "\\" * count + (count.odd? ? '"' : '')
+        ending = "\\" * 2
+        query_string = %({ field(arg: "x#{content}#{newline}y#{ending}")#{newline}})
+        expected = %({ field(arg: "x#{content}#{escaped_newline}y#{ending}")#{newline}})
+        escaped = GraphQL::Language.escape_single_quoted_newlines(query_string)
+
+        assert_equal expected, escaped
+        assert GraphQL.parse(escaped)
+      end
+    end
+  end
+
+  it "preserves escaped triple quotes after backslashes in block strings" do
+    query_string = %({ field(block: """a#{"\\" * 2}"""b"\nc""", arg: "a\nb")\n})
+    expected = %({ field(block: """a#{"\\" * 2}"""b"\nc""", arg: "a\\nb")\n})
+    escaped = GraphQL::Language.escape_single_quoted_newlines(query_string)
+
+    assert_equal expected, escaped
+    assert GraphQL.parse(escaped)
+  end
+
+  it "can parse strings with null bytes" do
+    assert GraphQL.parse("{ a(b: \"\\u0000\") }")
+  end
+
+  it "raises a parse error when there's a dangling close curly brace" do
+    assert_raises(GraphQL::ParseError) {
+      GraphQL.parse('{ foo } }')
+    }
+  end
+
+  it "raises a parse error when there's a dangling identifier" do
+    assert_raises(GraphQL::ParseError) {
+      GraphQL.parse('{ foo } fooagain')
+    }
+  end
+
+  it "raises a parse error for invalid type modification on inline fragment spread" do
+    assert_raises(GraphQL::ParseError) {
+      GraphQL.parse("{ ... on Foo! { id } }")
+    }
+  end
+
+  it "raises a parse error for invalid type modification on fragment definition" do
+    assert_raises(GraphQL::ParseError) {
+      GraphQL.parse("fragment on Foo! { id }")
+    }
+  end
+
+  describe "when there are no selections" do
+    it 'raises a ParseError' do
+      assert_raises(GraphQL::ParseError) {
+        GraphQL.parse('# comment')
+      }
+    end
+  end
+
+  it "parses directives on variable definitions" do
+    ast = GraphQL.parse("query($var: Int = 1 @special) { do(something: $var) }")
+    assert_equal ["special"], ast.definitions.first.variables.first.directives.map(&:name)
+  end
+
+  describe "default values" do
+    ["$other", "[$other]", "[1, [$other]]", "{nested: $other}", "[{nested: $other}]", "{nested: [1, {value: $other}]}"].each do |default_value|
+      it "rejects variables in #{default_value}" do
+        [
+          "query($a: Input = #{default_value}) { field(arg: $a) }",
+          "input Input { a: Input = #{default_value} }",
+          "type Query { field(arg: Input = #{default_value}): Int }",
+          "interface Interface { field(arg: Input = #{default_value}): Int }",
+          "directive @test(arg: Input = #{default_value}) on FIELD",
+          "extend input Input { a: Input = #{default_value} }",
+        ].each do |query_string|
+          error = assert_raises(GraphQL::ParseError, query_string) { subject.parse(query_string) }
+          assert_equal [1, query_string.index("$other") + 1], [error.line, error.col]
+          assert_equal query_string, error.query
+        end
+      end
+    end
+
+    it "parses nested constant lists and input objects" do
+      default_value = '{values: [null, 1, 1.5, "value", true, false, ENUM, [], {}]}'
+      query_ast = subject.parse("query($a: Input = #{default_value}) { field(arg: $a) }")
+      input_ast = subject.parse("input Input { a: Input = #{default_value} }")
+      expected_value = { "values" => [nil, 1, 1.5, "value", true, false, "ENUM", [], {}] }
+
+      assert_equal expected_value, query_ast.definitions.first.variables.first.default_value.to_h
+      assert_equal expected_value, input_ast.definitions.first.fields.first.default_value.to_h
+    end
+
+    it "still allows nested variables in field and executable directive arguments" do
+      ast = subject.parse("query($a: Int = 1) { field(arg: {values: [$a]}) @test(arg: [{value: $a}]) }")
+      field = ast.definitions.first.selections.first
+      field_variable = field.arguments.first.value.arguments.first.value.first
+      directive_variable = field.directives.first.arguments.first.value.first.arguments.first.value
+
+      [field_variable, directive_variable].each do |variable|
+        assert_instance_of GraphQL::Language::Nodes::VariableIdentifier, variable
+        assert_equal "a", variable.name
+      end
+    end
+
+    it "returns a parse error instead of executing a variable default as null" do
+      query = GraphQL::Query.new(Dummy::Schema, "query($a: Int = $b) { allDairy(executionErrorAtIndex: $a) { __typename } }")
+      result = query.result.to_h
+
+      assert_instance_of GraphQL::ParseError, query.static_errors.first
+      assert_equal [query.static_errors.first.to_h], result["errors"]
+      refute result.key?("data")
+    end
+  end
+
+  it "allows fragments, fields and arguments named null" do
+    assert GraphQL.parse("{ field(null: false) ... null } fragment null on Query { null }")
+  end
+
+  it "allows fields, arguments, and enum values named on and directive" do
+    assert GraphQL.parse("{ on(on: on) directive(directive: directive)}")
+  end
+
+  it "allows fields, arguments, and enum values named extend" do
+    assert GraphQL.parse("{ extend(extend: extend) }")
+  end
+
+  it "allows fields, arguments, and enum values named type" do
+    doc = GraphQL.parse("{ type(type: type) }")
+    assert_instance_of GraphQL::Language::Nodes::Enum, doc.definitions.first.selections.first.arguments.first.value
+  end
+
+  it "handles invalid minus signs" do
+    err = assert_raises GraphQL::ParseError do
+      GraphQL.parse("{ a(b: -c) }")
+    end
+    expected_message = if USING_C_PARSER
+      "syntax error, unexpected invalid token (\"-\") at [1, 8]"
+    else
+      "Expected type 'number', but it was malformed: \"-c\"."
+    end
+    assert_equal expected_message, err.message
+  end
+
+  it "handles invalid minus signs in variable default values" do
+    err = assert_raises GraphQL::ParseError do
+      GraphQL.parse("query($something: Int = -foo) { }")
+    end
+    expected_message = if USING_C_PARSER
+      "syntax error, unexpected invalid token (\"-\") at [1, 25]"
+    else
+      "Expected type 'number', but it was malformed: \"-foo\"."
+    end
+    assert_equal expected_message, err.message
+  end
+
+  it "handles invalid minus signs in deeply nested input objects" do
+    err = assert_raises GraphQL::ParseError do
+      GraphQL.parse("{ doSomething(a: { b: { c: { d: -foo } } }) }")
+    end
+    expected_message = if USING_C_PARSER
+      "syntax error, unexpected invalid token (\"-\") at [1, 33]"
+    else
+      "Expected type 'number', but it was malformed: \"-foo\"."
+    end
+    assert_equal expected_message, err.message
+  end
+
+  it "handles invalid minus signs in schema definitions" do
+    err = assert_raises GraphQL::ParseError do
+      GraphQL.parse("
+      type Query {
+        someField(a: Int = -foo): Int
+      }
+      ")
+    end
+    expected_message = if USING_C_PARSER
+      "syntax error, unexpected invalid token (\"-\") at [3, 28]"
+    else
+      "Expected type 'number', but it was malformed: \"-foo\"."
+    end
+    assert_equal expected_message, err.message
+  end
+
+  it "handles invalid minus signs in list literals" do
+    err = assert_raises GraphQL::ParseError do
+      GraphQL.parse("{
+        a1: a(b: [1,2,3])
+        a2: a(b: [1, 2, -foo])
+      }")
+    end
+    expected_message = if USING_C_PARSER
+      "syntax error, unexpected invalid token (\"-\") at [3, 25]"
+    else
+      "Expected type 'number', but it was malformed: \"-foo\"."
+    end
+    assert_equal expected_message, err.message
+  end
+
+  it "allows operation names to match operation types" do
+    doc = GraphQL.parse("query subscription { foo }")
+    assert_equal "subscription", doc.definitions.first.name
+  end
+
+  it "raises an error for bad variables definition" do
+    err = assert_raises(GraphQL::ParseError) do
+      GraphQL.parse("query someQuery($someVariable: ,) { account { id } }")
+    end
+    expected_msg = if USING_C_PARSER
+      "syntax error, unexpected RPAREN (\")\") at [1, 33]"
+    else
+      "Missing type definition for variable: $someVariable at [1, 33]"
+    end
+
+    assert_equal expected_msg, err.message
+  end
+
+  it "raises an error when unicode is used as names" do
+    err = assert_raises(GraphQL::ParseError) {
+      GraphQL.parse('query 😘 { a b }')
+    }
+    expected_msg = if USING_C_PARSER
+      "syntax error, unexpected invalid token (\"\\xF0\"), expecting LCURLY at [1, 7]"
+    else
+      "Expected NAME, actual: UNKNOWN_CHAR (\"\\xF0\") at [1, 7]"
+    end
+
+    assert_equal expected_msg, err.message
+  end
+
+  it "shows the right character in error messages" do
+    err = assert_raises(GraphQL::ParseError) {
+      GraphQL.parse("query # comment\n ~ { a b }")
+    }
+    expected_msg = if USING_C_PARSER
+      "syntax error, unexpected invalid token (\"~\"), expecting LCURLY at [2, 2]"
+    else
+      "Expected NAME, actual: UNKNOWN_CHAR (\"~\") at [2, 2]"
+    end
+
+    assert_equal expected_msg, err.message
+  end
+
+  ["01", "00", "-01", "01.2", "1.0.1"].each do |number|
+    it "rejects #{number.inspect} instead of splitting it into list values" do
+      assert_raises(GraphQL::ParseError) { GraphQL.parse("{ a(b: [#{number}]) }") }
+    end
+  end
+
+  it "can reject name start at the end of numbers" do
+    prev_reject_numers_followed_by_names = GraphQL.reject_numbers_followed_by_names
+    GraphQL.reject_numbers_followed_by_names = false
+    assert GraphQL.parse("{ a(b: 123cde: 456)}"), "It accepts invalid constructions ... for now"
+    GraphQL.reject_numbers_followed_by_names = true
+    err = assert_raises GraphQL::ParseError do
+      GraphQL.parse("{ a(b: 123cde: 456)}")
+    end
+    assert_equal "Name after number is not allowed (in `123cde`)", err.message
+
+    err = assert_raises GraphQL::ParseError do
+      GraphQL.parse("{ a(b: 12.3e5cfg: 456)}")
+    end
+    assert_equal "Name after number is not allowed (in `12.3e5cfg`)", err.message
+
+    err2 = assert_raises GraphQL::ParseError do
+      GraphQL.parse("query($input: SomeInput = { i1: 12i2: 15}) { t }")
+    end
+    assert_equal "Name after number is not allowed (in `12i2`)", err2.message
+
+    err3 = assert_raises GraphQL::ParseError do
+      GraphQL.parse("{ a(b: [1.0e]) }")
+    end
+    assert_equal "Name after number is not allowed (in `1.0e`)", err3.message
+  ensure
+    GraphQL.reject_numbers_followed_by_names = prev_reject_numers_followed_by_names
+  end
+
+  it "can replace namestart at the end of numbers" do
+    expected_transforms = {
+      "{ a(b: 123cde: 456)}"    => "{ a(b: 123 cde: 456)}",
+      "{ a(b: 12.3e5cde: 456)}" => "{ a(b: 12.3e5 cde: 456)}",
+      "{ a(b: 123e56cde: 456)}" => "{ a(b: 123e56 cde: 456)}",
+      "{ a(b: 123e5) }" => nil,
+      "{ a(b: 123e5 ) }" => nil,
+      "{ a(b: 12.3e5) }" => nil,
+      "{ a(b: 12.3e5 ) }" => nil,
+      "query($cursor1_something: Int) { f(a: $cursor1_something) }" => nil,
+      "query($obj: Input = { a: 1e5b: 2c: 3e-1}) { t }" => "query($obj: Input = { a: 1e5 b: 2 c: 3e-1}) { t }" ,
+    }
+
+    expected_transforms.each do |(start_str, finish_str)|
+      changed_str = GraphQL::Language.add_space_between_numbers_and_names(start_str)
+      if finish_str.nil?
+        assert start_str.equal?(changed_str), "#{start_str.inspect} is unchanged (was: #{changed_str.inspect})"
+      else
+        assert_equal finish_str, changed_str, "Expected #{start_str.inspect} to become #{finish_str.inspect}"
+        assert_equal finish_str, GraphQL::Language.add_space_between_numbers_and_names(finish_str), "Expected #{finish_str.inspect} not to change"
+      end
+    end
+  end
+
+  it "handles hyphens with errors" do
+    err = assert_raises(GraphQL::ParseError) {
+      GraphQL.parse("{ field(argument:a-b) }")
+    }
+    expected_msg = if USING_C_PARSER
+      "syntax error, unexpected invalid token (\"-\") at [1, 19]"
+    else
+      "Expected type 'number', but it was malformed: \"-b\"."
+    end
+
+    assert_equal expected_msg, err.message
+  end
+
+  describe "anonymous fragment extension" do
+    let(:document) { GraphQL.parse(query_string) }
+    let(:query_string) {%|
+      fragment on NestedType @or(something: "ok") {
+        anotherNestedField
+      }
+    |}
+
+    let(:fragment) { document.definitions.first }
+
+    it "creates an anonymous fragment definition" do
+      assert fragment.is_a?(GraphQL::Language::Nodes::FragmentDefinition)
+      assert_nil fragment.name
+      assert_equal 1, fragment.selections.length
+      assert_equal "NestedType", fragment.type.name
+      assert_equal 1, fragment.directives.length
+      assert_equal [2, 7], fragment.position
+    end
+  end
+
+  describe "string description" do
+    it "is parsed for scalar definitions" do
+      document = subject.parse <<-GRAPHQL
+        "Thing description"
+        scalar Thing
+      GRAPHQL
+      thing_defn = document.definitions[0]
+      assert_equal "Thing", thing_defn.name
+      assert_equal "Thing description", thing_defn.description
+    end
+
+    it "is parsed for object definitions, field definitions, and input value definitions" do
+      document = subject.parse <<-GRAPHQL
+      "Thing description"
+      type Thing {
+        "field description"
+        field("arg description" arg: Stuff @yikes): Stuff @wow
+      }
+      GRAPHQL
+
+      thing_defn = document.definitions[0]
+      assert_equal "Thing", thing_defn.name
+      assert_equal "Thing description", thing_defn.description
+
+      field_defn = thing_defn.fields[0]
+      assert_equal "field", field_defn.name
+      assert_equal "field description", field_defn.description
+      assert_equal ["wow"], field_defn.directives.map(&:name)
+
+      arg_defn = field_defn.arguments[0]
+      assert_equal "arg", arg_defn.name
+      assert_equal "arg description", arg_defn.description
+      assert_equal ["yikes"], arg_defn.directives.map(&:name)
+    end
+
+    it "is parsed for interface definitions" do
+      document = subject.parse <<-GRAPHQL
+        "Thing description"
+        interface Thing {}
+      GRAPHQL
+
+      thing_defn = document.definitions[0]
+      assert_equal "Thing", thing_defn.name
+      assert_equal "Thing description", thing_defn.description
+    end
+
+    it "is parsed for union definitions" do
+      document = subject.parse <<-GRAPHQL
+        "Thing description"
+        union Thing = Int | String
+      GRAPHQL
+
+      thing_defn = document.definitions[0]
+      assert_equal "Thing", thing_defn.name
+      assert_equal "Thing description", thing_defn.description
+    end
+
+    it "is parsed for enum definitions and enum value definitions" do
+      document = subject.parse <<-GRAPHQL
+        "Thing description"
+        enum Thing {
+          "VALUE description"
+          VALUE
+          type
+        }
+      GRAPHQL
+
+      thing_defn = document.definitions[0]
+      assert_equal "Thing", thing_defn.name
+      assert_equal "Thing description", thing_defn.description
+
+      value_defn = thing_defn.values[0]
+      assert_equal "VALUE", value_defn.name
+      assert_equal "VALUE description", value_defn.description
+
+      value_defn = thing_defn.values[1]
+      assert_equal "type", value_defn.name
+      assert_nil value_defn.description
+    end
+
+    it "is parsed for directive definitions" do
+      document = subject.parse <<-GRAPHQL
+      "thing description" directive @thing repeatable on FIELD
+      GRAPHQL
+
+      thing_defn = document.definitions[0]
+      assert_equal "thing", thing_defn.name
+      assert_equal true, thing_defn.repeatable
+      assert_equal "thing description", thing_defn.description
+    end
+  end
+
+  it "parses query without arguments" do
+    strings = [
+      "{ field { inner } }"
+    ]
+    strings.each do |query_str|
+      doc = subject.parse(query_str)
+      field = doc.definitions.first.selections.first
+      assert_equal 0, field.arguments.length
+      assert_equal 1, field.selections.length
+    end
+  end
+
+  it "parses backslashes in arguments" do
+    document = subject.parse <<-GRAPHQL
+      query {
+        item(text: "a", otherText: "b\\\\") {
+          text
+          otherText
+        }
+      }
+    GRAPHQL
+    assert_equal "b\\", document.definitions[0].selections[0].arguments[1].value
+  end
+
+  it "parses backslashes in non-last arguments" do
+    document = subject.parse <<-GRAPHQL
+      query {
+        item(text: "b\\\\", otherText: "a") {
+          text
+          otherText
+        }
+      }
+    GRAPHQL
+    assert_equal "b\\", document.definitions[0].selections[0].arguments[0].value
+  end
+
+  it "parses a great big object type" do
+    str = <<-GRAPHQL
+"""
+Query root of the system
+"""
+type Query {
+  allAnimal: [Animal]!
+  allAnimalAsCow: [AnimalAsCow]!
+  allDairy(executionErrorAtIndex: Int): [DairyProduct]
+  allEdible: [Edible]
+  allEdibleAsMilk: [EdibleAsMilk]
+
+  """
+  Find a Dummy::Cheese by id
+  """
+  cheese(id: Int!): Cheese
+
+  """
+  Find the only Dummy::Cow
+  """
+  cow: Cow
+
+  """
+  Find the only Dummy::Dairy
+  """
+  dairy: Dairy
+  deepNonNull: DeepNonNull!
+
+  """
+  Raise an error
+  """
+  error: String
+  executionError: String
+  executionErrorWithExtensions: Int
+  executionErrorWithOptions: Int
+
+  """
+  My favorite food
+  """
+  favoriteEdible: Edible
+
+  """
+  Cheese from source
+  """
+  fromSource(oldSource: String @deprecated, source: DairyAnimal = COW): [Cheese]
+  hugeInteger: Int
+  maybeNull: MaybeNull
+
+  """
+  Find a Dummy::Milk by id
+  """
+  milk(id: ID!): Milk
+  multipleErrorsOnNonNullableField: String!
+  multipleErrorsOnNonNullableListField: [String!]!
+  root: String
+
+  """
+  Find dairy products matching a description
+  """
+  searchDairy(expiresAfter: Time, oldProduct: [DairyProductInput!] @deprecated, product: [DairyProductInput] = [{source: SHEEP}], productIds: [String!] @deprecated, singleProduct: DairyProductInput): DairyProduct!
+  tracingScalar: TracingScalar
+  valueWithExecutionError: Int!
+}
+    GRAPHQL
+
+    doc = subject.parse(str)
+    assert_equal str.chomp, doc.to_query_string
+  end
+
+  it "parses input types" do
+    doc = subject.parse <<~GRAPHQL
+input ReplaceValuesInput {
+  values: [Int!]!
+}
+GRAPHQL
+    input_t = doc.definitions.first
+    assert_equal "ReplaceValuesInput", input_t.name
+    assert_equal ["values"], input_t.fields.map(&:name)
+    assert_equal [nil], input_t.fields.map(&:description)
+  end
+
+  it "parses the test schema" do
+    schema = Dummy::Schema
+    schema_string = GraphQL::Schema::Printer.print_schema(schema)
+    document = subject.parse(schema_string)
+    assert_equal schema_string.chomp, document.to_query_string
+  end
+
+  it "parses various implements" do
+    doc = subject.parse <<-GRAPHQL
+    type Milk implements AnimalProduct & Edible & EdibleAsMilk & LocalProduct {
+      executionError: String
+    }
+    GRAPHQL
+    expected_names = ["AnimalProduct", "Edible", "EdibleAsMilk", "LocalProduct"]
+
+    assert_equal expected_names, doc.definitions.first.interfaces.map(&:name)
+    doc2 = subject.parse <<-GRAPHQL
+    type Milk implements & AnimalProduct & Edible & EdibleAsMilk & LocalProduct {
+      executionError: String
+    }
+    GRAPHQL
+
+    assert_equal expected_names, doc2.definitions.first.interfaces.map(&:name)
+
+    doc3 = subject.parse <<-GRAPHQL
+    type Milk implements AnimalProduct, Edible, EdibleAsMilk  LocalProduct {
+      executionError: String
+    }
+    GRAPHQL
+    assert_equal expected_names, doc3.definitions.first.interfaces.map(&:name)
+  end
+
+  it "parses union types with leading pipes" do
+    doc = subject.parse("union U =\n  | A\n  | B")
+    assert_equal ["A", "B"], doc.definitions.first.types.map(&:name)
+  end
+
+  describe "parse errors" do
+    it "preserves the query when parsing exceeds the stack limit" do
+      query_string = "{ field }"
+      parser = GraphQL::Language::Parser.new(query_string, filename: "query.graphql")
+
+      err = parser.stub(:document, -> { raise SystemStackError }) do
+        assert_raises(GraphQL::ParseError) { parser.parse }
+      end
+
+      assert_equal query_string, err.query
+      assert_equal "This query is too large to execute. (query.graphql)", err.message
+    end
+
+    it "raises parse errors for nil" do
+      assert_raises(GraphQL::ParseError) {
+        GraphQL.parse(nil)
+      }
+    end
+
+    it 'raises parse errors for empty argument sets' do
+      # Regression spec from https://github.com/rmosolgo/graphql-ruby/pull/2344
+      query_with_empty_arguments = '{ node() { id } }'
+
+      assert_raises(GraphQL::ParseError) {
+        subject.parse(query_with_empty_arguments)
+      }
+    end
+
+    it 'raises parse errors for argument sets without value' do
+      # Regression spec from https://github.com/rmosolgo/graphql-ruby/pull/2344
+      query_with_malformed_argument_value = '{ node(id:) { name } }'
+
+      assert_raises(GraphQL::ParseError) {
+        pp subject.parse(query_with_malformed_argument_value)
+      }
+    end
+  end
+
+  describe ".parse_file" do
+    it "assigns filename to all nodes" do
+      example_filename = "spec/support/parser/filename_example.graphql"
+      doc = GraphQL.parse_file(example_filename)
+      assert_equal example_filename, doc.filename
+      field = doc.definitions[0].selections[0].selections[0]
+      assert_equal example_filename, field.filename
+    end
+
+    it "raises errors with filename" do
+      error_filename = "spec/support/parser/filename_example_error_1.graphql"
+      err = assert_raises(GraphQL::ParseError) {
+        GraphQL.parse_file(error_filename)
+      }
+
+      assert_includes err.message, error_filename
+
+      error_filename_2 = "spec/support/parser/filename_example_error_2.graphql"
+      err_2 = assert_raises(GraphQL::ParseError) {
+        GraphQL.parse_file(error_filename_2)
+      }
+
+      assert_includes err_2.message, error_filename_2
+      assert_includes err_2.message, "3, 11"
+
+    end
+  end
+
+  describe "#tokens_count" do
+    it "counts parsed token" do
+      str = "type Query { f1: Int }"
+      parser = GraphQL::Language::Parser.new(str)
+
+      assert_equal 7, parser.tokens_count
+    end
+  end
+
+  module ParserTrace
+    TRACES = []
+    def parse(query_string:)
+      TRACES << (trace = { key: "parse", query_string: query_string })
+      result = super
+      trace[:result] = result
+      result
+    end
+
+    def lex(query_string:)
+      TRACES << (trace = { key: "lex", query_string: query_string })
+      result = super
+      trace[:result] = result
+      result
+    end
+
+    def self.clear
+      TRACES.clear
+    end
+
+    def self.traces
+      TRACES
+    end
+  end
+
+  it "serves traces" do
+    ParserTrace.clear
+    schema = Class.new(GraphQL::Schema) do
+      trace_with(ParserTrace)
+    end
+    query = GraphQL::Query.new(schema, "{ t: __typename }")
+    subject.parse("{ t: __typename }", trace: query.current_trace)
+    traces = ParserTrace.traces
+    expected_traces = if USING_C_PARSER
+      2
+    else
+      1
+    end
+    assert_equal expected_traces, traces.length
+    lex_trace, parse_trace = traces
+
+    if USING_C_PARSER
+      assert_equal "{ t: __typename }", lex_trace[:query_string]
+      assert_equal "lex", lex_trace[:key]
+      assert_instance_of Array, lex_trace[:result]
+    else
+      parse_trace = lex_trace
+    end
+
+    assert_equal "{ t: __typename }", parse_trace[:query_string]
+    assert_equal "parse", parse_trace[:key]
+    assert_instance_of GraphQL::Language::Nodes::Document, parse_trace[:result]
+  end
+
+  it "returns a parse error for var types without type names" do
+    err = assert_raises GraphQL::ParseError do
+      GraphQL.parse <<-GRAPHQL
+        query GetStuff($things: []) { stuff }
+      GRAPHQL
+    end
+    expected_message = if USING_C_PARSER
+      "syntax error, unexpected RBRACKET (\"]\") at [1, 34]"
+    else
+      "Missing type definition for variable: $things at [1, 35]"
+    end
+    assert_equal expected_message, err.message
+
+    err = assert_raises GraphQL::ParseError do
+      GraphQL.parse <<-GRAPHQL
+        query GetStuff($things: !) { stuff }
+      GRAPHQL
+    end
+    expected_message = if USING_C_PARSER
+      "syntax error, unexpected BANG (\"!\") at [1, 33]"
+    else
+      "Missing type definition for variable: $things at [1, 33]"
+    end
+    assert_equal expected_message, err.message
+  end
+end

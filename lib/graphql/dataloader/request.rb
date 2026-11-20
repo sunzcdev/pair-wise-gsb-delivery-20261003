@@ -1,0 +1,31 @@
+# frozen_string_literal: true
+#--
+# typed: true
+module GraphQL
+  class Dataloader
+    # See [Source#request](rdoc-ref:Source#request) which returns an instance of this
+    class Request
+      def initialize(source, key)
+        @source = source
+        @key = key
+      end
+
+      # Call this method to cause the current Fiber to wait for the results of this request.
+      #
+      # **Returns**
+      #
+      # - `Object` — the object loaded for `key`
+      #
+      # :call-seq:
+      #   load() -> Object
+      def load
+        @source.load(@key)
+      end
+
+      def load_with_deprecation_warning
+        warn("Returning `.request(...)` from GraphQL::Dataloader is deprecated, use `.load(...)` instead. (See usage of #{@source} with #{@key.inspect}).")
+        load
+      end
+    end
+  end
+end
