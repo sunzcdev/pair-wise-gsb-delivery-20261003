@@ -210,6 +210,27 @@ When no key is included, a default based on the status code may be used.
 
 When HTTP/2 is being used the `"stream_id"` response extension can be accessed to determine the ID of the data stream that the response was sent on.
 
+### `"connection_info"`
+
+The `"connection_info"` extension provides a read-only snapshot of the connection a response was delivered over. Unlike `"network_stream"`, which is a live handle onto a connection that may be pooled and reused, this snapshot is taken when the response is delivered and remains valid after the response has been read and closed.
+
+It is exposed as a `ConnectionInfo` named tuple with the following fields:
+
+* `remote_addr`: The outgoing (peer) address of the connection, such as the `(host, port)` tuple returned by a TCP socket.
+* `alpn_protocol`: The ALPN protocol negotiated during the TLS handshake, such as `"h2"` or `"http/1.1"`. `None` when no TLS/ALPN is in use, or when the network stream does not expose the information.
+* `stream_id`: The HTTP/2 stream the response was delivered on. `None` for HTTP/1.1 connections, which do not multiplex streams.
+
+Fields the underlying network stream cannot provide are left as `None`:
+
+```python
+response = httpcore.request("GET", "https://www.example.com")
+info = response.extensions["connection_info"]
+
+print(info.remote_addr)
+print(info.alpn_protocol)
+print(info.stream_id)
+```
+
 ### `"network_stream"`
 
 The `"network_stream"` extension allows developers to handle HTTP `CONNECT` and `Upgrade` requests, by providing an API that steps outside the standard request/response model, and can directly read or write to the network.

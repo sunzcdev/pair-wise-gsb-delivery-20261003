@@ -34,7 +34,7 @@ from ._exceptions import (
     WriteError,
     WriteTimeout,
 )
-from ._models import URL, Origin, Proxy, Request, Response
+from ._models import URL, ConnectionInfo, Origin, Proxy, Request, Response
 from ._ssl import default_ssl_context
 from ._sync import (
     ConnectionInterface,
@@ -79,6 +79,7 @@ __all__ = [
     "URL",
     "Request",
     "Response",
+    "ConnectionInfo",
     "Proxy",
     # async
     "AsyncHTTPConnection",

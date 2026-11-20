@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+- Add a read-only `"connection_info"` response extension, snapshotting the outgoing remote address, negotiated ALPN protocol and HTTP/2 stream identifier at response delivery time.
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
 
 ## Version 1.0.9 (April 24th, 2025)

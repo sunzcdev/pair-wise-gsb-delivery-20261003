@@ -5,6 +5,9 @@ import ssl
 import typing
 import urllib.parse
 
+if typing.TYPE_CHECKING:
+    from ._backends.base import AsyncNetworkStream, NetworkStream
+
 # Functions for typechecking...
 
 
@@ -363,6 +366,65 @@ class Request:
         return f"<{self.__class__.__name__} [{self.method!r}]>"
 
 
+class ConnectionInfo(typing.NamedTuple):
+    """
+    A read-only snapshot of the connection properties a response was
+    delivered over.
+
+    Unlike the `"network_stream"` response extension, which remains a live
+    handle onto a connection that may be pooled and reused for subsequent
+    requests, a `ConnectionInfo` instance captures the relevant values at
+    the point the response is delivered. It can therefore be inspected
+    safely after the response has been read and closed.
+
+    Fields that the underlying network stream cannot provide are left as
+    `None` rather than guessed at:
+
+    * `remote_addr`: The outgoing (peer) address of the connection, such as
+      the `(host, port)` tuple returned by a TCP socket.
+    * `alpn_protocol`: The ALPN protocol negotiated during the TLS handshake,
+      such as `"h2"` or `"http/1.1"`. `None` when no TLS/ALPN is in use, or
+      when the information is not exposed by the network stream.
+    * `stream_id`: The HTTP/2 stream the response was delivered on. `None`
+      for HTTP/1.1 connections, which do not multiplex streams.
+    """
+
+    remote_addr: typing.Any
+    alpn_protocol: typing.Optional[str]
+    stream_id: typing.Optional[int]
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(remote_addr={self.remote_addr!r}, "
+            f"alpn_protocol={self.alpn_protocol!r}, stream_id={self.stream_id!r})"
+        )
+
+
+def build_connection_info(
+    network_stream: typing.Union["NetworkStream", "AsyncNetworkStream"],
+    stream_id: int | None = None,
+) -> ConnectionInfo:
+    """
+    Build a read-only `ConnectionInfo` snapshot from a network stream.
+
+    The information is read once, at response delivery time. Any values the
+    stream does not expose stay as `None`, so callers never see information
+    belonging to a later request that reuses the same pooled connection.
+    """
+    remote_addr = network_stream.get_extra_info("server_addr")
+
+    ssl_object = network_stream.get_extra_info("ssl_object")
+    alpn_protocol: str | None = None
+    if ssl_object is not None:
+        alpn_protocol = ssl_object.selected_alpn_protocol()
+
+    return ConnectionInfo(
+        remote_addr=remote_addr,
+        alpn_protocol=alpn_protocol,
+        stream_id=stream_id,
+    )
+
+
 class Response:
     """
     An HTTP response.
@@ -386,7 +448,8 @@ class Response:
             content: The content of the response body.
             extensions: A dictionary of optional extra information included on
                 the responseself.Possible keys include `"http_version"`,
-                `"reason_phrase"`, and `"network_stream"`.
+                `"reason_phrase"`, `"network_stream"`, and
+                `"connection_info"`.
         """
         self.status: int = status
         self.headers: list[tuple[bytes, bytes]] = enforce_headers(

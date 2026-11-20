@@ -18,7 +18,7 @@ from .._exceptions import (
     LocalProtocolError,
     RemoteProtocolError,
 )
-from .._models import Origin, Request, Response
+from .._models import Origin, Request, Response, build_connection_info
 from .._synchronization import Lock, Semaphore, ShieldCancellation
 from .._trace import Trace
 from .interfaces import ConnectionInterface
@@ -160,6 +160,9 @@ class HTTP2Connection(ConnectionInterface):
                     "http_version": b"HTTP/2",
                     "network_stream": self._network_stream,
                     "stream_id": stream_id,
+                    "connection_info": build_connection_info(
+                        self._network_stream, stream_id=stream_id
+                    ),
                 },
             )
         except BaseException as exc:  # noqa: PIE786

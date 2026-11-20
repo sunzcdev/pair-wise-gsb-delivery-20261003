@@ -17,7 +17,7 @@ from .._exceptions import (
     WriteError,
     map_exceptions,
 )
-from .._models import Origin, Request, Response
+from .._models import Origin, Request, Response, build_connection_info
 from .._synchronization import Lock, ShieldCancellation
 from .._trace import Trace
 from .interfaces import ConnectionInterface
@@ -127,6 +127,7 @@ class HTTP11Connection(ConnectionInterface):
                     "http_version": http_version,
                     "reason_phrase": reason_phrase,
                     "network_stream": network_stream,
+                    "connection_info": build_connection_info(network_stream),
                 },
             )
         except BaseException as exc:
