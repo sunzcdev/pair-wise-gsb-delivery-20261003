@@ -3476,7 +3476,10 @@ EXPLAIN SELECT "customers".* FROM "customers" INNER JOIN "orders" ON "orders"."c
 
 Eager loading may trigger more than one query under the hood, and some queries
 may need the results of previous ones. Because of that, `explain` actually
-executes the query, and then asks for the query plans. For example, running:
+executes the query, and then asks for the query plans. When more than one phase
+contributes, the output labels each statement with the phase that triggered it,
+so a preload's plan is not mistaken for the plan of the main query. For example,
+running:
 
 ```ruby
 Customer.where(id: 1).includes(:orders).explain
@@ -3485,6 +3488,7 @@ Customer.where(id: 1).includes(:orders).explain
 may yield this for MySQL and MariaDB:
 
 ```sql
+-- main query
 EXPLAIN SELECT `customers`.* FROM `customers`  WHERE `customers`.`id` = 1
 +----+-------------+-----------+-------+---------------+
 | id | select_type | table     | type  | possible_keys |
@@ -3499,6 +3503,7 @@ EXPLAIN SELECT `customers`.* FROM `customers`  WHERE `customers`.`id` = 1
 
 1 row in set (0.00 sec)
 
+-- preload
 EXPLAIN SELECT `orders`.* FROM `orders`  WHERE `orders`.`customer_id` IN (1)
 +----+-------------+--------+------+---------------+
 | id | select_type | table  | type | possible_keys |
@@ -3520,11 +3525,20 @@ and may yield this for PostgreSQL:
 ```sql
   Customer Load (0.3ms)  SELECT "customers".* FROM "customers" WHERE "customers"."id" = $1  [["id", 1]]
   Order Load (0.3ms)  SELECT "orders".* FROM "orders" WHERE "orders"."customer_id" = $1  [["customer_id", 1]]
-=> EXPLAIN SELECT "customers".* FROM "customers" WHERE "customers"."id" = $1 [["id", 1]]
+=> -- main query
+   EXPLAIN SELECT "customers".* FROM "customers" WHERE "customers"."id" = $1 [["id", 1]]
                                     QUERY PLAN
 ----------------------------------------------------------------------------------
  Index Scan using customers_pkey on customers  (cost=0.15..8.17 rows=1 width=164)
    Index Cond: (id = "1"::bigint)
+(2 rows)
+
+-- preload
+EXPLAIN SELECT "orders".* FROM "orders" WHERE "orders"."customer_id" = $1 [["customer_id", 1]]
+                                    QUERY PLAN
+----------------------------------------------------------------------------------
+ Index Scan using index_orders_on_customer_id on orders  (cost=0.15..8.17 rows=1 width=8)
+   Index Cond: (customer_id = 1)
 (2 rows)
 ```
 

@@ -56,6 +56,7 @@ module ActiveRecord
   autoload :Encryption
   autoload :Enum
   autoload :Explain
+  autoload :ExplainRegistry, "active_record/explain_registry"
   autoload :FixtureSet, "active_record/fixtures"
   autoload :FilterAttributeHandler
   autoload :Inheritance

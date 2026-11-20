@@ -49,7 +49,8 @@ module ActiveRecord
 
       private
         def exec_explain(&block)
-          @relation.exec_explain(@relation.collecting_queries_for_explain { block.call }, @options)
+          queries = @relation.collecting_queries_for_explain { block.call }
+          @relation.exec_explain(queries, @options)
         end
     end
 
@@ -1474,16 +1475,25 @@ module ActiveRecord
         end
 
         skip_query_cache_if_necessary do
-          rows = if scheduled?
-            future = @future_result
-            @future_result = nil
-            future.result
-          else
-            exec_main_query
+          rows = ExplainRegistry.with_owner(ExplainRegistry::MAIN_QUERY) do
+            if scheduled?
+              future = @future_result
+              @future_result = nil
+              future.result
+            else
+              exec_main_query
+            end
           end
 
           records = instantiate_records(rows, &block)
-          preload_associations(records) unless skip_preloading_value
+          unless skip_preloading_value
+            # Sticky, so queries that the preloader runs through ordinary
+            # nested relations are still reported as preloads rather than as
+            # those relations' main queries.
+            ExplainRegistry.with_owner(ExplainRegistry::PRELOAD, sticky: true) do
+              preload_associations(records)
+            end
+          end
 
           records.each(&:readonly!) if readonly_value
           records.each { |record| record.strict_loading!(strict_loading_value) } unless strict_loading_value.nil?

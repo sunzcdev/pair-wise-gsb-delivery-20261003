@@ -2,10 +2,11 @@
 
 require "cases/helper"
 require "models/car"
+require "models/bulb"
 
 if ActiveRecord::Base.lease_connection.supports_explain?
   class ExplainTest < ActiveRecord::TestCase
-    fixtures :cars
+    fixtures :cars, :bulbs
 
     def base
       ActiveRecord::Base
@@ -21,11 +22,11 @@ if ActiveRecord::Base.lease_connection.supports_explain?
     end
 
     def test_collecting_queries_for_explain
-      queries = ActiveRecord::Base.collecting_queries_for_explain do
+      capture = ActiveRecord::Base.collecting_queries_for_explain do
         Car.where(name: "honda").to_a
       end
 
-      sql, binds = queries[0]
+      sql, binds = capture[0]
       assert_match "SELECT", sql
       if binds.any?
         assert_equal 1, binds.length
@@ -33,6 +34,95 @@ if ActiveRecord::Base.lease_connection.supports_explain?
       else
         assert_match "honda", sql
       end
+    end
+
+    def test_collecting_queries_for_explain_attributes_main_query_and_preload
+      capture = ActiveRecord::Base.collecting_queries_for_explain do
+        Car.where(name: "honda").includes(:bulbs).to_a
+      end
+
+      assert_equal [ActiveRecord::ExplainRegistry::MAIN_QUERY, ActiveRecord::ExplainRegistry::PRELOAD], capture.owners
+      assert_equal 2, capture.size
+      assert_match "cars", capture.queries_for(ActiveRecord::ExplainRegistry::MAIN_QUERY).first.sql
+      assert_match "bulbs", capture.queries_for(ActiveRecord::ExplainRegistry::PRELOAD).first.sql
+    end
+
+    def test_nested_capture_does_not_absorb_the_enclosing_capture
+      helper_capture = nil
+      outer_capture = ActiveRecord::Base.collecting_queries_for_explain do
+        helper_capture = ActiveRecord::Base.collecting_queries_for_explain("helper") do
+          Car.where(name: "zyke").to_a
+        end
+
+        Car.where(name: "honda").to_a
+      end
+
+      assert_equal 1, helper_capture.size
+      assert_equal "zyke", helper_capture[0].binds.last.value
+      assert_equal 1, outer_capture.size
+      assert_equal "honda", outer_capture[0].binds.last.value
+      assert_equal [helper_capture], outer_capture.children
+      assert_equal outer_capture, helper_capture.parent
+      assert_nil ActiveRecord::ExplainRegistry.current_capture
+    end
+
+    def test_explain_inside_a_capture_stays_in_its_own_capture
+      outer_capture = ActiveRecord::Base.collecting_queries_for_explain do
+        message = Car.where(name: "zyke").explain.inspect
+        assert_match(/^EXPLAIN/, message)
+        assert_no_match(/honda/, message)
+
+        Car.where(name: "honda").to_a
+      end
+
+      assert_equal 1, outer_capture.size
+      assert_equal "honda", outer_capture[0].binds.last.value
+      assert_equal 1, outer_capture.children.size
+      assert_equal "zyke", outer_capture.children.first[0].binds.last.value
+    end
+
+    def test_explain_inside_a_capture_renders_only_its_own_plans
+      inner_message = nil
+      ActiveRecord::Base.collecting_queries_for_explain do
+        inner_message = Car.where(name: "zyke").includes(:bulbs).explain.inspect
+      end
+
+      assert_match(/^EXPLAIN/, inner_message)
+      assert_no_match(/honda/, inner_message)
+      assert_match(/zyke/, inner_message)
+    end
+
+    def test_capture_is_released_when_the_query_raises
+      assert_raises(ActiveRecord::StatementInvalid) do
+        ActiveRecord::Base.collecting_queries_for_explain("broken") do
+          ActiveRecord::Base.lease_connection.select_all("SELECT * FROM missing_table_for_explain", "SQL")
+        end
+      end
+
+      assert_nil ActiveRecord::ExplainRegistry.current_capture
+      assert_not ActiveRecord::ExplainRegistry.collect?
+
+      capture = ActiveRecord::Base.collecting_queries_for_explain do
+        Car.where(name: "honda").to_a
+      end
+      assert_equal 1, capture.size
+      assert_equal [ActiveRecord::ExplainRegistry::MAIN_QUERY], capture.owners
+    end
+
+    def test_explain_output_labels_each_owner
+      message = Car.where(name: "honda").includes(:bulbs).explain.inspect
+
+      assert_match(/^-- #{Regexp.escape(ActiveRecord::ExplainRegistry::MAIN_QUERY)}$/, message)
+      assert_match(/^-- #{Regexp.escape(ActiveRecord::ExplainRegistry::PRELOAD)}$/, message)
+      assert_operator message.index("-- #{ActiveRecord::ExplainRegistry::MAIN_QUERY}"), :<,
+        message.index("-- #{ActiveRecord::ExplainRegistry::PRELOAD}")
+    end
+
+    def test_explain_output_keeps_plain_form_for_a_single_owner
+      message = Car.where(name: "honda").explain.inspect
+
+      assert_match(/\AEXPLAIN/, message)
+      assert_no_match(/^--/, message)
     end
 
     def test_relation_explain_with_average

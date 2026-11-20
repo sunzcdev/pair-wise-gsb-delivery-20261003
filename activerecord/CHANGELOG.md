@@ -1,3 +1,35 @@
+*   Scope EXPLAIN query captures so nested captures and preloads keep their own
+    queries, and label each plan with the phase that triggered it.
+
+    `explain` used to funnel every statement triggered by the relation into one
+    flat per-thread list. A nested `explain` (for example one run by a helper
+    while an `includes` relation is being explained) could therefore end up
+    rendered with the other capture's statements.
+
+    Captures are now stacked: `collecting_queries_for_explain` pushes a new
+    capture and releases it when its block returns or raises, so a failing
+    statement cannot leave a partial capture behind. Statements raised inside a
+    nested capture stay there. Each captured query records the owner that
+    triggered it (`main query`, `preload`, or the label of a nested capture),
+    and `exec_explain` labels each run of statements when more than one owner
+    contributed:
+
+    ```ruby
+    Car.where(name: "honda").includes(:tires).explain
+    # -- main query
+    # EXPLAIN SELECT "cars".* FROM "cars" WHERE "cars"."name" = ? ...
+    #
+    # -- preload
+    # EXPLAIN SELECT "tires".* FROM "tires" WHERE "tires"."car_id" = ? ...
+    ```
+
+    The plans are still produced by the adapter, and the output of a single
+    query is unchanged. `collecting_queries_for_explain` now returns a capture
+    that keeps working like the previous array of `[sql, binds]` pairs:
+    positional indexing and destructuring still yield those pairs.
+
+    *Rails*
+
 *   Log source location when scoped order is ignored in batching.
 
     *fatkodima*
