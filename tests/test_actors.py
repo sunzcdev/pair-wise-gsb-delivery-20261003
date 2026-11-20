@@ -284,6 +284,151 @@ def test_actor_messages_can_be_assigned_message_age_limits(stub_broker):
         assert sum(runs) == 0
 
 
+def test_age_limit_can_be_measured_from_first_due_time(stub_broker, monkeypatch):
+    # Given a fake clock
+    import dramatiq.middleware.age_limit
+    from dramatiq.middleware.age_limit import AgeLimit
+
+    now = [0]
+    monkeypatch.setattr(dramatiq.middleware.age_limit, "current_millis", lambda: now[0])
+
+    # And an actor that measures its age limit from its first due time
+    @dramatiq.actor(max_age=100, max_age_from_due=True)
+    def do_work():
+        pass
+
+    middleware = AgeLimit()
+
+    # And three messages that were submitted an hour before their due
+    # time (i.e. they sat in the delay queue far longer than max_age)
+    submitted_at = 1_000
+    delay = 3_600_000
+    due = submitted_at + delay
+
+    def build(message_id):
+        return Message(
+            queue_name=do_work.queue_name,
+            actor_name=do_work.actor_name,
+            args=(),
+            kwargs={},
+            options={},
+            message_id=message_id,
+            message_timestamp=submitted_at,
+        )
+
+    not_yet_due, just_due, missed = (build(f"msg-{i}") for i in range(3))
+
+    # When they are enqueued with a delay, the middleware records their
+    # first due time while the submission time is preserved
+    now[0] = submitted_at
+    for message in (not_yet_due, just_due, missed):
+        message.options["eta"] = now[0] + delay  # what the broker stamps
+        middleware.before_enqueue(stub_broker, message, delay=delay)
+        assert message.options["due_timestamp"] == due
+        assert message.message_timestamp == submitted_at
+
+    # Then a message processed before its due time runs
+    now[0] = due - 1
+    middleware.before_process_message(stub_broker, dramatiq.MessageProxy(not_yet_due))
+
+    # And a message processed exactly at its due time runs
+    now[0] = due
+    middleware.before_process_message(stub_broker, dramatiq.MessageProxy(just_due))
+
+    # But a message processed after its due time plus max_age is skipped
+    now[0] = due + 100
+    with pytest.raises(SkipMessage):
+        middleware.before_process_message(stub_broker, dramatiq.MessageProxy(missed))
+
+
+def test_age_limit_due_time_baseline_survives_redelivery(stub_broker, monkeypatch):
+    # Given a fake clock
+    import dramatiq.middleware.age_limit
+    from dramatiq.middleware.age_limit import AgeLimit
+
+    now = [0]
+    monkeypatch.setattr(dramatiq.middleware.age_limit, "current_millis", lambda: now[0])
+
+    # And an actor that measures its age limit from its first due time
+    @dramatiq.actor(max_age=100, max_age_from_due=True)
+    def do_work():
+        pass
+
+    middleware = AgeLimit()
+
+    # And a message that was enqueued with a delay
+    submitted_at = 1_000
+    delay = 3_600_000
+    due = submitted_at + delay
+    message = Message(
+        queue_name=do_work.queue_name,
+        actor_name=do_work.actor_name,
+        args=(),
+        kwargs={},
+        options={"eta": due},
+        message_timestamp=submitted_at,
+    )
+    now[0] = submitted_at
+    middleware.before_enqueue(stub_broker, message, delay=delay)
+    assert message.options["due_timestamp"] == due
+
+    # When the worker promotes it off the delay queue (a re-enqueue
+    # without a delay), the baseline is left alone
+    now[0] = due
+    middleware.before_enqueue(stub_broker, message, delay=None)
+    assert message.options["due_timestamp"] == due
+
+    # And when the broker redelivers it (a re-enqueue carrying the
+    # option forward, e.g. a retry with its own delay), the baseline
+    # does not move to the redelivery time
+    now[0] = due + 50
+    middleware.before_enqueue(stub_broker, message, delay=5_000)
+    assert message.options["due_timestamp"] == due
+
+    # Then the message is still skipped once the window from the
+    # original due time has passed
+    now[0] = due + 100
+    with pytest.raises(SkipMessage):
+        middleware.before_process_message(stub_broker, dramatiq.MessageProxy(message))
+
+
+def test_age_limit_without_from_due_still_counts_delay_queue_time(stub_broker, monkeypatch):
+    # Given a fake clock
+    import dramatiq.middleware.age_limit
+    from dramatiq.middleware.age_limit import AgeLimit
+
+    now = [0]
+    monkeypatch.setattr(dramatiq.middleware.age_limit, "current_millis", lambda: now[0])
+
+    # And an actor that uses the default submission-based age limit
+    @dramatiq.actor(max_age=100)
+    def do_work():
+        pass
+
+    middleware = AgeLimit()
+
+    # And a message that sat in the delay queue longer than max_age
+    submitted_at = 1_000
+    message = Message(
+        queue_name=do_work.queue_name,
+        actor_name=do_work.actor_name,
+        args=(),
+        kwargs={},
+        options={},
+        message_timestamp=submitted_at,
+    )
+
+    # When it is enqueued with a delay, no due-time baseline is recorded
+    now[0] = submitted_at
+    middleware.before_enqueue(stub_broker, message, delay=3_600_000)
+    assert "due_timestamp" not in message.options
+
+    # Then it is skipped based on its submission age
+    now[0] = submitted_at + 3_600_000
+    with pytest.raises(SkipMessage):
+        middleware.before_process_message(stub_broker, dramatiq.MessageProxy(message))
+
+
 def test_actors_can_delay_messages_independent_of_each_other(stub_broker, stub_worker):
     # Given that I have a database
     results = []

@@ -8,6 +8,15 @@ All notable changes to this project will be documented in this file.
 `Unreleased`_
 -------------
 
+Added
+^^^^^
+
+* Added the ``max_age_from_due`` option to |AgeLimit|, allowing actors
+  to measure message age from the first time a message became due
+  rather than from when it was submitted, so that messages scheduled
+  far in advance are not expired by the time they leave the delay
+  queue.
+
 Fixed
 ^^^^^
 

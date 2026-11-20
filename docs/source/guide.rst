@@ -261,6 +261,21 @@ messages (given in milliseconds) on a per-actor basis::
   def count_words(url):
       ...
 
+By default, a message's age is measured from the moment it was
+submitted.  If you schedule messages far in advance (e.g. with
+``send_with_options(delay=...)``), the time they spend waiting in the
+delay queue counts against their age limit.  To instead measure the
+age from the first time a message became due, set
+``max_age_from_due``::
+
+  @dramatiq.actor(max_age=60000, max_age_from_due=True)
+  def count_words(url):
+      ...
+
+The original submission time is always kept on
+``message.message_timestamp`` for diagnostics, and redeliveries never
+move the start of the age window.
+
 Dead Letters
 ^^^^^^^^^^^^
 
