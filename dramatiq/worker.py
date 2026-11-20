@@ -573,10 +573,27 @@ class WorkerThread(Thread):
             self.broker.emit_after("process_message", message, result=res)
 
         except SkipMessage as e:
-            if message.failed:
+            if message.failed or e.fail:
+                # A skip can be marked as a failure either by another
+                # middleware calling message.fail() first (e.g. AgeLimit)
+                # or by the skip itself declaring fail=True.
+                message.fail()
                 message.stuff_exception(e)
             self.logger.warning("Message %s was skipped.", message)
-            self.broker.emit_after("skip_message", message)
+            self.broker.emit_after("skip_message", message, result=e.result, skip=e)
+
+            # Explicit skips declare a terminal state, so align them with
+            # the terminal states of ordinary messages by emitting
+            # after_process_message as well.  This lets terminal-state
+            # middleware (Callbacks, Pipelines, ...) handle explicit skips
+            # exactly like actor return values or actor exceptions.
+            # Legacy skips (no explicit result, not failed) keep emitting
+            # skip_message only, preserving their historical behaviour.
+            if e.explicit:
+                if message.failed:
+                    self.broker.emit_after("process_message", message, exception=e)
+                else:
+                    self.broker.emit_after("process_message", message, result=e.result)
 
         except BaseException as e:
             message.stuff_exception(e)

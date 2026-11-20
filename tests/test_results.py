@@ -432,3 +432,86 @@ def test_custom_skipped_messages_with_no_fail_stores_none(stub_broker, stub_work
 
     # Then the result should still be None.
     assert result_backend.get_result(sent_message) is None
+
+
+def test_skipped_messages_with_an_explicit_result_store_that_result(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    # And a middleware that skips messages while declaring an explicit result
+    class SkipWithResultMiddleware(Middleware):
+        def before_process_message(self, broker, message):
+            raise SkipMessage("already done", result={"status": "skipped", "value": 7})
+
+    stub_broker.add_middleware(SkipWithResultMiddleware())
+
+    # And an actor that stores a result
+    @dramatiq.actor(store_results=True)
+    def do_work():
+        return 42
+
+    # When I send that actor a message that will be skipped
+    sent_message = do_work.send()
+
+    # Then the explicit skip result should be stored and queryable
+    assert result_backend.get_result(sent_message, block=True) == {"status": "skipped", "value": 7}
+
+    # And the message should have been acknowledged rather than dead-lettered
+    assert stub_broker.dead_letters == []
+
+
+def test_skipped_messages_with_an_explicit_none_result_store_none(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    # And a middleware that explicitly skips with result=None
+    class SkipWithNoneMiddleware(Middleware):
+        def before_process_message(self, broker, message):
+            raise SkipMessage("nothing to do", result=None)
+
+    stub_broker.add_middleware(SkipWithNoneMiddleware())
+
+    # And an actor that stores a result
+    @dramatiq.actor(store_results=True)
+    def do_work():
+        return 42
+
+    # When I send that actor a message
+    sent_message = do_work.send()
+
+    # Then None should be stored just like for legacy skips
+    assert result_backend.get_result(sent_message, block=True) is None
+
+
+def test_failed_skipped_messages_store_the_skip_exception(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    # And a middleware that skips messages as failures
+    class FailingSkipMiddleware(Middleware):
+        def before_process_message(self, broker, message):
+            raise SkipMessage("resources incomplete", fail=True)
+
+    stub_broker.add_middleware(FailingSkipMiddleware())
+
+    # And an actor that stores a result
+    @dramatiq.actor(store_results=True, max_retries=0)
+    def do_work():
+        return 42
+
+    # When I send that actor a message that will be skipped as a failure
+    sent_message = do_work.send()
+
+    # And wait for a result
+    # Then the skip exception should be stored as a failure result
+    with pytest.raises(ResultFailure) as exc_info:
+        result_backend.get_result(sent_message, block=True)
+
+    assert exc_info.value.orig_exc_type == "SkipMessage"
+    assert exc_info.value.orig_exc_msg == "resources incomplete"
+
+    # And the message should have been dead-lettered rather than acknowledged
+    assert [m.message_id for m in stub_broker.dead_letters] == [sent_message.message_id]

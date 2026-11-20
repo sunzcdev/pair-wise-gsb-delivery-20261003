@@ -17,8 +17,10 @@
 
 from __future__ import annotations
 
+import inspect
 import warnings
-from typing import TYPE_CHECKING, Any, Iterable, Optional, Self, cast
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Self, cast
 
 from .errors import ActorNotFound
 from .logging import get_logger
@@ -31,6 +33,26 @@ if TYPE_CHECKING:
 
 #: The global broker instance.
 global_broker: Optional[Broker] = None
+
+
+@lru_cache(maxsize=None)
+def _hook_keyword_arguments(hook: Callable[..., Any]) -> tuple[frozenset[str], bool]:
+    """The keyword arguments a middleware hook can accept.
+
+    Returns the set of explicitly named (keyword or positional-or-keyword)
+    parameters and whether the hook takes ``**kwargs``.  Used to keep
+    legacy middleware implementing the two-argument
+    ``after_skip_message(broker, message)`` hook working after keyword
+    arguments (``result``, ``skip``) were added to it.
+    """
+    parameters = inspect.signature(hook).parameters
+    has_var_keyword = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    names = frozenset(
+        name
+        for name, parameter in parameters.items()
+        if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    )
+    return names, has_var_keyword
 
 
 def get_broker() -> Broker:
@@ -122,7 +144,18 @@ class Broker:
         signal = "after_" + signal
         for middleware in reversed(self.middleware):
             try:
-                getattr(middleware, signal)(self, *args, **kwargs)
+                hook = getattr(middleware, signal)
+                # Backwards compatibility: legacy middleware implements
+                # after_skip_message(broker, message) without the keyword
+                # arguments, so call it positionally when it can't take them.
+                if signal == "after_skip_message" and kwargs:
+                    names, has_var_keyword = _hook_keyword_arguments(hook)
+                    if not has_var_keyword and not set(kwargs).issubset(names):
+                        hook(self, *args)
+                    else:
+                        hook(self, *args, **kwargs)
+                else:
+                    hook(self, *args, **kwargs)
             except Exception:
                 self.logger.critical("Unexpected failure in %s of %r.", signal, middleware, exc_info=True)
 

@@ -168,7 +168,21 @@ class Prometheus(Middleware):
         if exception is not None:
             self.total_errored_messages.labels(*labels).inc()
 
-    after_skip_message = after_process_message
+    def after_skip_message(self, broker, message, *, result=None, skip=None):
+        # Legacy skips never emit after_process_message, so their metrics
+        # are recorded here.  Explicit skips additionally emit
+        # after_process_message, which records all the metrics, so in that
+        # case this hook does nothing to avoid double counting or
+        # decrementing the in-progress gauge twice.
+        if skip is not None and skip.explicit:
+            return
+
+        labels = (message.queue_name, message.actor_name)
+        message_start_time = self.message_start_times.pop(message.message_id, current_millis())
+        message_duration = current_millis() - message_start_time
+        self.message_durations.labels(*labels).observe(message_duration)
+        self.inprogress_messages.labels(*labels).dec()
+        self.total_messages.labels(*labels).inc()
 
 
 class _metrics_handler(BaseHTTPRequestHandler):

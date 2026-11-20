@@ -5,6 +5,7 @@ from collections import Counter
 import pytest
 
 import dramatiq
+from dramatiq.middleware import Middleware, SkipMessage
 
 
 def test_actors_can_define_success_callbacks(stub_broker, stub_worker):
@@ -109,3 +110,103 @@ def test_actor_callback_knows_correct_number_of_retries(stub_broker, stub_worker
     assert retries == [1, 2, 3, 4]
     # And I expect the callback to have handled the failure
     assert handled
+
+
+def test_legacy_skips_dont_emit_any_callbacks(stub_broker, stub_worker):
+    # Given actors that record callbacks
+    successes, failures = [], []
+
+    @dramatiq.actor
+    def save(message_data, result):
+        successes.append((message_data["actor_name"], result))
+
+    @dramatiq.actor
+    def report_failure(message_data, exception_data):
+        failures.append((message_data["actor_name"], exception_data))
+
+    # And a middleware that raises the legacy form of SkipMessage
+    class LegacySkipMiddleware(Middleware):
+        def before_process_message(self, broker, message):
+            if message.actor_name == "do_work":
+                raise SkipMessage("legacy skip")
+
+    stub_broker.add_middleware(LegacySkipMiddleware())
+
+    # And an actor with both callbacks
+    @dramatiq.actor(on_success=save.actor_name, on_failure=report_failure.actor_name)
+    def do_work():
+        return 42
+
+    # When I send it a message that gets skipped
+    do_work.send()
+    stub_broker.join(do_work.queue_name)
+    stub_worker.join()
+
+    # Then no callbacks should have been emitted
+    assert successes == []
+    assert failures == []
+
+
+def test_explicit_success_skips_emit_the_success_callback(stub_broker, stub_worker):
+    # Given an actor that records the success callback
+    successes = []
+
+    @dramatiq.actor
+    def save(message_data, result):
+        successes.append((message_data["actor_name"], result))
+
+    # And a middleware that skips with an explicit result
+    class SkipWithResultMiddleware(Middleware):
+        def before_process_message(self, broker, message):
+            if message.actor_name == "do_work":
+                raise SkipMessage("already done", result="cached-result")
+
+    stub_broker.add_middleware(SkipWithResultMiddleware())
+
+    # And an actor with a success callback
+    @dramatiq.actor(on_success=save.actor_name)
+    def do_work():
+        return 42
+
+    # When I send it a message that gets skipped successfully
+    do_work.send()
+    stub_broker.join(do_work.queue_name)
+    stub_worker.join()
+
+    # Then the success callback should have received the explicit skip result
+    assert successes == [(do_work.actor_name, "cached-result")]
+
+
+def test_failed_skips_emit_the_failure_callback(stub_broker, stub_worker):
+    # Given an actor that records the failure callback
+    failures = []
+
+    @dramatiq.actor
+    def report_failure(message_data, exception_data):
+        failures.append((message_data["actor_name"], exception_data))
+
+    # And a middleware that skips messages as failures
+    class FailingSkipMiddleware(Middleware):
+        def before_process_message(self, broker, message):
+            if message.actor_name == "do_work":
+                raise SkipMessage("resources incomplete", fail=True)
+
+    stub_broker.add_middleware(FailingSkipMiddleware())
+
+    # And an actor with a failure callback
+    @dramatiq.actor(max_retries=0, on_failure=report_failure.actor_name)
+    def do_work():
+        return 42
+
+    # When I send it a message that gets skipped as a failure
+    do_work.send()
+    stub_broker.join(do_work.queue_name, fail_fast=False)
+    stub_worker.join()
+
+    # Then the failure callback should have received the skip exception data
+    assert failures == [
+        (
+            do_work.actor_name,
+            {"type": "SkipMessage", "message": "resources incomplete"},
+        )
+    ]

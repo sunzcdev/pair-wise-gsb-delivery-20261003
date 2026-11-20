@@ -8,6 +8,18 @@ All notable changes to this project will be documented in this file.
 `Unreleased`_
 -------------
 
+Added
+^^^^^
+
+* |SkipMessage| now accepts an optional explicit ``result`` and a
+  ``fail`` flag so middleware can declare the terminal state of a
+  skipped message.  A skip with a ``result`` is acknowledged, stores
+  that result and fires the actor's ``on_success`` callback just like
+  an actor return value.  A skip raised with ``fail=True`` is rejected,
+  stores the exception and fires ``on_failure`` like an actor failure.
+  Raising |SkipMessage| without the new arguments is unchanged: the
+  message is acknowledged, ``None`` is stored and no callbacks fire.
+
 Fixed
 ^^^^^
 

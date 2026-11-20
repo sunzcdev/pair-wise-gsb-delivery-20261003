@@ -102,12 +102,14 @@ class Results(Middleware):
                 "the value has been discarded." % message.actor_name
             )
 
-    def after_skip_message(self, broker, message):
-        """If the message was skipped but not failed, then store None.
-        Let after_nack handle the case where the message was skipped and failed.
+    def after_skip_message(self, broker, message, *, result=None, skip=None):
+        """Legacy skips (those raised without an explicit result) that
+        didn't fail store ``None``.  Explicit skips are handled by the
+        companion ``after_process_message`` emission, while failed
+        skips are handled by ``after_nack``.
         """
         store_results, result_ttl = self._lookup_options(broker, message)
-        if store_results and not message.failed:
+        if store_results and not message.failed and (skip is None or not skip.explicit):
             self.backend.store_result(message, None, result_ttl)
 
     def after_nack(self, broker, message):

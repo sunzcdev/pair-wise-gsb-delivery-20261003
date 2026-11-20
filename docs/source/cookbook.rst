@@ -428,6 +428,33 @@ When a message fails, getting a result raises |ResultFailure|.  When a
 message is skipped via |SkipMessage|, ``None`` is stored as the
 result.
 
+A |SkipMessage| can also declare an explicit terminal state.  Passing
+``result`` treats the skip as an intentional success ("the work is
+already done"): the message is acknowledged, the given value is stored
+as the result and any ``on_success`` callback receives it, exactly as
+if the actor had returned that value.  Passing ``fail=True`` treats the
+skip as a failure instead ("the required resources aren't available"):
+the message is rejected, the |SkipMessage| is stored as a failure
+result and any ``on_failure`` callback is invoked.  Raising
+|SkipMessage| without these arguments keeps the legacy behaviour where
+the message is acknowledged, ``None`` is stored and no callbacks are
+emitted.
+
+.. code-block:: python
+
+   from dramatiq.middleware import Middleware, SkipMessage
+
+   class CacheMiddleware(Middleware):
+       def before_process_message(self, broker, message):
+           cached = lookup_cached_result(message.message_id)
+           if cached is not None:
+               # Intentional success: acknowledge with the cached value.
+               raise SkipMessage("cache hit", result=cached)
+
+           if not resources_available():
+               # Intentional failure: reject the message.
+               raise SkipMessage("resources missing", fail=True)
+
 Results expire, otherwise the result backend would eventually run out
 of space.  The timeout for the results expiration is set on
 `result_ttl` argument of |Results|, given in milliseconds, and the

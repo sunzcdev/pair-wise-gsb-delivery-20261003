@@ -94,7 +94,8 @@ class TimeLimit(Middleware):
     def after_process_message(self, broker, message, *, result=None, exception=None):
         self.manager.remove_timeout(threading.get_ident())
 
-    after_skip_message = after_process_message
+    def after_skip_message(self, broker, message, *, result=None, skip=None):
+        self.manager.remove_timeout(threading.get_ident())
 
 
 class _CtypesTimeoutManager(Thread):

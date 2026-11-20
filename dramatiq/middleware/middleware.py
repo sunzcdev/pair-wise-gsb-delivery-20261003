@@ -31,10 +31,66 @@ class MiddlewareError(Exception):
     """Base class for middleware errors."""
 
 
+#: Sentinel used to tell apart a skip that carries an explicit result
+#: (which may itself be ``None``) from a legacy skip that doesn't.
+_UNSET = object()
+
+
 class SkipMessage(MiddlewareError):
     """An exception that may be raised by Middleware inside the
     ``before_process_message`` hook in order to skip a message.
+
+    There are three ways to use this exception:
+
+    * Raising it without an explicit result (the legacy form, e.g.
+      ``raise SkipMessage()``) keeps the historical behaviour: the
+      actor is not run, the message is acknowledged and, when the
+      :class:`~dramatiq.results.Results` middleware is enabled,
+      ``None`` is stored as its result.  No callbacks are emitted.
+    * Passing an explicit ``result`` marks the skip as an intentional,
+      successful terminal state ("the work is already done, nothing
+      left to do").  The message is acknowledged, the result is stored
+      and the actor's ``on_success`` callback is invoked with it, just
+      as if the actor had returned that value.
+    * Passing ``fail=True`` marks the skip as a failure ("the required
+      resources aren't available, this message counts as failed").  The
+      message is rejected (nacked/dead-lettered), the exception is
+      stored as the result and the actor's ``on_failure`` callback is
+      invoked, just like a message whose actor raised an exception.
+
+    Parameters:
+      message(str): An optional human-readable reason for the skip.
+      result(Any): The explicit result of the skip.  When provided,
+        the skip is treated as a successful terminal state and the
+        value flows through callbacks and result backends exactly like
+        an actor return value.  Defaults to an unset sentinel so that
+        ``SkipMessage(result=None)`` can be distinguished from the
+        legacy ``SkipMessage()`` form.
+      fail(bool): When ``True``, the skipped message is treated as a
+        failure and rejected instead of acknowledged.  Defaults to
+        ``False``.
     """
+
+    def __init__(self, message: str = "", *, result: Any = _UNSET, fail: bool = False):  # noqa: B042
+        super().__init__(message)
+        self.result = result
+        self.fail = fail
+
+    @property
+    def has_result(self) -> bool:
+        """Whether this skip carries an explicit result."""
+        return self.result is not _UNSET
+
+    @property
+    def explicit(self) -> bool:
+        """Whether this skip declares an explicit terminal state.
+
+        Legacy skips (no explicit result, not marked as failed) stay
+        fully backwards compatible, while explicit skips align with the
+        callback, Results and ack/nack terminal states of ordinary
+        messages.
+        """
+        return self.fail or self.has_result
 
 
 class Middleware:
@@ -117,9 +173,26 @@ class Middleware:
     ) -> None:
         """Called after a message has been processed."""
 
-    def after_skip_message(self, broker: Broker, message: MessageProxy) -> None:
+    def after_skip_message(
+        self,
+        broker: Broker,
+        message: MessageProxy,
+        *,
+        result: Any = _UNSET,
+        skip: Optional[SkipMessage] = None,
+    ) -> None:
         """Called instead of ``after_process_message`` after a message
         has been skipped.
+
+        Parameters:
+          broker(Broker): The current broker.
+          message(MessageProxy): The message that was skipped.
+          result(Any): The explicit result carried by the skip.  This
+            is an unset sentinel for legacy skips (those raised without
+            an explicit result); it may be ``None`` when a skip was
+            raised explicitly with ``result=None``.
+          skip(Optional[SkipMessage]): The ``SkipMessage`` exception
+            that was raised, if any.
         """
 
     def after_process_boot(self, broker: Broker) -> None:

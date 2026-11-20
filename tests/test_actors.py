@@ -12,6 +12,8 @@ import dramatiq.worker
 from dramatiq import Message, Middleware
 from dramatiq.errors import ActorNotFound, RateLimitExceeded
 from dramatiq.middleware import CurrentMessage, SkipMessage, TimeLimitExceeded
+from dramatiq.results import ResultFailure, Results
+from dramatiq.results.backends import StubBackend
 
 from .common import skip_on_pypy, worker
 
@@ -369,6 +371,8 @@ def test_middleware_can_decide_to_skip_messages(stub_broker, stub_worker):
         def before_process_message(self, broker, message):
             raise SkipMessage()
 
+        # Deliberately keep the legacy two-argument signature to verify
+        # that old middleware keeps working with the new skip events.
         def after_skip_message(self, broker, message):
             skipped_messages.append(1)
 
@@ -393,6 +397,112 @@ def test_middleware_can_decide_to_skip_messages(stub_broker, stub_worker):
 
     # And the skipped_messages list to contain one item
     assert sum(skipped_messages) == 1
+
+
+def test_skips_can_declare_explicit_terminal_states(stub_broker, stub_worker):
+    # Given a result backend and the Results middleware
+    result_backend = StubBackend()
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    # And side-effect trackers shared by the actors and their callbacks
+    side_effects = []
+    success_callbacks = []
+    failure_callbacks = []
+    terminal_states = []
+
+    # And a middleware that records every terminal state and decides how
+    # each of the three local actors gets skipped.
+    class SkipRoutingMiddleware(Middleware):
+        def before_process_message(self, broker, message):
+            if message.actor_name == "legacy_skip":
+                # Legacy form: no explicit result, no failure.
+                raise SkipMessage()
+            if message.actor_name == "completed_skip":
+                # The work is already done: acknowledge with an explicit result.
+                raise SkipMessage("already done", result={"status": "done"})
+            if message.actor_name == "failed_skip":
+                # The resources aren't complete: treat the skip as a failure.
+                raise SkipMessage("resources incomplete", fail=True)
+
+        def after_ack(self, broker, message):
+            terminal_states.append(("ack", message.actor_name))
+
+        def after_nack(self, broker, message):
+            terminal_states.append(("nack", message.actor_name))
+
+        def after_skip_message(self, broker, message, *, result=None, skip=None):
+            terminal_states.append(("skip", message.actor_name, type(skip).__name__))
+
+    stub_broker.add_middleware(SkipRoutingMiddleware())
+
+    # And success/failure callback actors
+    @dramatiq.actor
+    def on_success(message_data, result):
+        success_callbacks.append((message_data["actor_name"], result))
+
+    @dramatiq.actor
+    def on_failure(message_data, exception_data):
+        failure_callbacks.append((message_data["actor_name"], exception_data))
+
+    # And three local actors: legacy skip, explicit completion and failed skip
+    @dramatiq.actor(store_results=True, on_success=on_success.actor_name, on_failure=on_failure.actor_name)
+    def legacy_skip():
+        side_effects.append(("legacy_skip", "ran"))
+
+    @dramatiq.actor(store_results=True, on_success=on_success.actor_name, on_failure=on_failure.actor_name)
+    def completed_skip():
+        side_effects.append(("completed_skip", "ran"))
+
+    @dramatiq.actor(store_results=True, on_success=on_success.actor_name, on_failure=on_failure.actor_name)
+    def failed_skip():
+        side_effects.append(("failed_skip", "ran"))
+
+    # When I send one message to each actor
+    legacy_message = legacy_skip.send()
+    completed_message = completed_skip.send()
+    failed_message = failed_skip.send()
+
+    # And join on the broker and the worker
+    stub_broker.join(legacy_skip.queue_name, fail_fast=False)
+    stub_broker.join(completed_skip.queue_name, fail_fast=False)
+    stub_broker.join(failed_skip.queue_name, fail_fast=False)
+    stub_worker.join()
+
+    # Then none of the skipped actors should have actually run
+    assert side_effects == []
+
+    # And only the failed skip should have been dead-lettered (nacked)
+    dead_lettered = [m.actor_name for m in stub_broker.dead_letters]
+    assert dead_lettered == ["failed_skip"]
+
+    # And the two non-failed messages should be acknowledged
+    assert ("ack", "legacy_skip") in terminal_states
+    assert ("ack", "completed_skip") in terminal_states
+    assert ("nack", "failed_skip") in terminal_states
+
+    # And every message should have gone through the skip hook exactly once
+    skip_hooks = [state for state in terminal_states if state[0] == "skip"]
+    assert sorted(state[1] for state in skip_hooks) == ["completed_skip", "failed_skip", "legacy_skip"]
+    assert all(state[2] == "SkipMessage" for state in skip_hooks)
+
+    # And the legacy skip should not have emitted any callbacks
+    # while the explicit completion emits on_success and the failure on_failure
+    assert not any(actor == legacy_skip.actor_name for actor, _ in success_callbacks)
+    assert not any(actor == legacy_skip.actor_name for actor, _ in failure_callbacks)
+    assert ("completed_skip", {"status": "done"}) in success_callbacks
+    assert not any(actor == "completed_skip" for actor, _ in failure_callbacks)
+    assert not any(actor == "failed_skip" for actor, _ in success_callbacks)
+    failed_actor, failed_payload = next(item for item in failure_callbacks if item[0] == "failed_skip")
+    assert failed_actor == "failed_skip"
+    assert failed_payload == {"type": "SkipMessage", "message": "resources incomplete"}
+
+    # And the queryable results should reflect the same terminal states
+    assert result_backend.get_result(legacy_message) is None
+    assert result_backend.get_result(completed_message) == {"status": "done"}
+    with pytest.raises(ResultFailure) as exc_info:
+        result_backend.get_result(failed_message)
+    assert exc_info.value.orig_exc_type == "SkipMessage"
+    assert exc_info.value.orig_exc_msg == "resources incomplete"
 
 
 def test_workers_can_be_paused(stub_broker, stub_worker):

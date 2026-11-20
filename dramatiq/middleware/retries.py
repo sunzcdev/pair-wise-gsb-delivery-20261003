@@ -24,7 +24,7 @@ from typing import Callable, Optional
 from ..common import compute_backoff
 from ..errors import Retry
 from ..logging import get_logger
-from .middleware import Middleware
+from .middleware import Middleware, SkipMessage
 
 #: The default minimum amount of backoff to apply to retried tasks.
 DEFAULT_MIN_BACKOFF = 15000
@@ -96,6 +96,13 @@ class Retries(Middleware):
 
     def after_process_message(self, broker, message, *, result=None, exception=None):
         if exception is None:
+            return
+
+        # A skipped message carries an intentional terminal-state decision
+        # made by middleware (e.g. resources missing, message superseded).
+        # Such messages are acked or nacked directly and must never be
+        # retried, regardless of the actor's retry configuration.
+        if isinstance(exception, SkipMessage):
             return
 
         actor = broker.get_actor(message.actor_name)
