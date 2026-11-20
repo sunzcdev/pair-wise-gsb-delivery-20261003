@@ -1016,6 +1016,207 @@ class PessimisticLockingTest < ActiveRecord::TestCase
   end
 end
 
+class PessimisticLockingWithLockRetryTest < ActiveRecord::TestCase
+  self.use_transactional_tests = false
+  fixtures :people
+
+  def setup
+    Person.connection_pool.clear_reloadable_connections!
+    # Avoid introspection queries during tests.
+    Person.columns
+  end
+
+  def test_lock_retry_retries_lock_acquisition_until_it_succeeds
+    person = Person.find(1)
+    block_calls = 0
+
+    with_flaky_lock_selects(2, error: ActiveRecord::Deadlocked) do |lock_attempts|
+      person.with_lock(lock_retry: { attempts: 3, backoff: 0 }) do
+        block_calls += 1
+        person.first_name = "retry-man"
+        person.save!
+      end
+
+      assert_equal 3, lock_attempts.call
+    end
+
+    assert_equal 1, block_calls
+    assert_equal "retry-man", person.reload.first_name
+    assert_not_predicate Person.lease_connection, :transaction_open?
+  end
+
+  def test_lock_retry_true_uses_defaults
+    person = Person.find(1)
+    block_calls = 0
+
+    with_flaky_lock_selects(2, error: ActiveRecord::LockWaitTimeout) do |lock_attempts|
+      person.with_lock(lock_retry: true) { block_calls += 1 }
+
+      assert_equal 3, lock_attempts.call
+    end
+
+    assert_equal 1, block_calls
+    assert_not_predicate Person.lease_connection, :transaction_open?
+  end
+
+  def test_lock_retry_gives_up_after_attempts_and_raises
+    person = Person.find(1)
+    block_calls = 0
+    lock_attempts = nil
+
+    assert_raises(ActiveRecord::LockWaitTimeout) do
+      with_flaky_lock_selects(Float::INFINITY, error: ActiveRecord::LockWaitTimeout) do |attempts|
+        lock_attempts = attempts
+        person.with_lock(lock_retry: { attempts: 2, backoff: 0 }) { block_calls += 1 }
+      end
+    end
+
+    assert_equal 2, lock_attempts.call
+    assert_equal 0, block_calls
+    assert_not_predicate Person.lease_connection, :transaction_open?
+  end
+
+  def test_lock_retry_stops_at_deadline
+    person = Person.find(1)
+    block_calls = 0
+    lock_attempts = nil
+
+    assert_raises(ActiveRecord::Deadlocked) do
+      with_flaky_lock_selects(Float::INFINITY, error: ActiveRecord::Deadlocked) do |attempts|
+        lock_attempts = attempts
+        # A deadline in the past means not a single retry is allowed.
+        person.with_lock(lock_retry: { attempts: 1000, backoff: 0, deadline: 0 }) { block_calls += 1 }
+      end
+    end
+
+    assert_equal 1, lock_attempts.call
+    assert_equal 0, block_calls
+    assert_not_predicate Person.lease_connection, :transaction_open?
+  end
+
+  def test_lock_retry_does_not_retry_errors_raised_inside_the_block
+    person = Person.find(1)
+    block_calls = 0
+    lock_attempts = nil
+
+    assert_raises(ActiveRecord::Deadlocked) do
+      with_flaky_lock_selects(0) do |attempts|
+        lock_attempts = attempts
+        person.with_lock(lock_retry: { attempts: 5, backoff: 0 }) do
+          block_calls += 1
+          # A retryable error class, but raised by the block itself.
+          raise ActiveRecord::Deadlocked
+        end
+      end
+    end
+
+    assert_equal 1, lock_attempts.call
+    assert_equal 1, block_calls
+    assert_not_predicate Person.lease_connection, :transaction_open?
+  end
+
+  def test_lock_retry_does_not_retry_non_retryable_errors
+    person = Person.find(1)
+    block_calls = 0
+    lock_attempts = nil
+
+    assert_raises(ActiveRecord::StatementInvalid) do
+      with_flaky_lock_selects(Float::INFINITY, error: ActiveRecord::StatementInvalid) do |attempts|
+        lock_attempts = attempts
+        person.with_lock(lock_retry: { attempts: 5, backoff: 0 }) { block_calls += 1 }
+      end
+    end
+
+    assert_equal 1, lock_attempts.call
+    assert_equal 0, block_calls
+    assert_not_predicate Person.lease_connection, :transaction_open?
+  end
+
+  def test_lock_retry_honors_custom_retry_on
+    person = Person.find(1)
+    block_calls = 0
+
+    with_flaky_lock_selects(1, error: ActiveRecord::StatementInvalid) do |lock_attempts|
+      person.with_lock(lock_retry: { attempts: 2, backoff: 0, retry_on: ActiveRecord::StatementInvalid }) do
+        block_calls += 1
+      end
+
+      assert_equal 2, lock_attempts.call
+    end
+
+    assert_equal 1, block_calls
+    assert_not_predicate Person.lease_connection, :transaction_open?
+  end
+
+  def test_lock_retry_is_skipped_when_joining_an_outer_transaction
+    person = Person.find(1)
+    block_calls = 0
+    lock_attempts = nil
+
+    assert_raises(ActiveRecord::Deadlocked) do
+      Person.transaction do
+        with_flaky_lock_selects(Float::INFINITY, error: ActiveRecord::Deadlocked) do |attempts|
+          lock_attempts = attempts
+          person.with_lock(lock_retry: { attempts: 5, backoff: 0 }) { block_calls += 1 }
+        end
+      end
+    end
+
+    # The failure is left for the outer transaction to handle by its own
+    # rules: the lock was tried exactly once and the block never ran.
+    assert_equal 1, lock_attempts.call
+    assert_equal 0, block_calls
+    assert_not_predicate Person.lease_connection, :transaction_open?
+  end
+
+  def test_lock_retry_still_applies_with_requires_new_inside_an_outer_transaction
+    person = Person.find(1)
+    block_calls = 0
+    lock_attempts = nil
+
+    Person.transaction do
+      with_flaky_lock_selects(2, error: ActiveRecord::Deadlocked) do |attempts|
+        lock_attempts = attempts
+        person.with_lock(requires_new: true, lock_retry: { attempts: 3, backoff: 0 }) do
+          block_calls += 1
+          person.first_name = "nested-man"
+          person.save!
+        end
+      end
+
+      assert_equal 3, lock_attempts.call
+    end
+
+    assert_equal 1, block_calls
+    assert_equal "nested-man", person.reload.first_name
+    assert_not_predicate Person.lease_connection, :transaction_open?
+  end
+
+  private
+    # Replaces the adapter's #select_all with a double that raises +error+
+    # the first +failures+ times a (locking) SELECT is issued, then delegates
+    # to the real adapter. Yields a callable returning how many SELECTs the
+    # double saw, i.e. how many lock acquisitions were attempted. The
+    # original adapter method is restored in +ensure+, whatever happened.
+    def with_flaky_lock_selects(failures, error: ActiveRecord::Deadlocked)
+      connection = Person.lease_connection
+      original = connection.method(:select_all)
+      calls = 0
+
+      connection.define_singleton_method(:select_all) do |*args, **kwargs, &blk|
+        calls += 1
+        raise error if calls <= failures
+        original.call(*args, **kwargs, &blk)
+      end
+
+      begin
+        yield -> { calls }
+      ensure
+        connection.singleton_class.remove_method(:select_all)
+      end
+    end
+end
+
 class PessimisticLockingWhilePreventingWritesTest < ActiveRecord::TestCase
   CUSTOM_LOCK = if current_adapter?(:SQLite3Adapter)
     "FOR UPDATE" # no-op

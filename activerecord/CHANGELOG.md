@@ -1,3 +1,25 @@
+*   Add `lock_retry` option to `with_lock` to retry lock acquisition.
+
+    When the database refuses to grant the row lock with a retryable error
+    (a deadlock, a lock wait timeout, or a dropped connection) before any
+    work was done, `with_lock` can now retry just the lock acquisition, so
+    the block is still guaranteed to run at most once:
+
+    ```ruby
+    account.with_lock(lock_retry: { attempts: 3, deadline: 2.0 }) do
+      account.balance -= 100
+      account.save!
+    end
+    ```
+
+    `lock_retry` accepts `true` (to use the defaults) or a hash with
+    `:attempts`, `:deadline`, `:backoff`, and `:retry_on` keys. Errors raised
+    from inside the block are never retried, and no retry happens when
+    joining an outer transaction, where the failure is handled by that
+    transaction's rules.
+
+    *GSB Harness*
+
 *   Log source location when scoped order is ignored in batching.
 
     *fatkodima*
