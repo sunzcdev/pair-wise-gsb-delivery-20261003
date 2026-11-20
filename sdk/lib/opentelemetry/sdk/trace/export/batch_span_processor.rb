@@ -102,23 +102,36 @@ module OpenTelemetry
           #   non-specific failure occurred, TIMEOUT if a timeout occurred.
           def force_flush(timeout: nil) # rubocop:disable Metrics/MethodLength
             start_time = OpenTelemetry::Common::Utilities.timeout_timestamp
+            # Snapshot the spans that have already ended before waiting on the
+            # export barrier, so spans ending while an export is in flight are not
+            # pulled into this flush and cannot extend how long it waits.
             snapshot = lock do
               reset_on_fork(restart_thread: @keep_running)
               spans.shift(spans.size)
             end
-            until snapshot.empty?
-              remaining_timeout = OpenTelemetry::Common::Utilities.maybe_timeout(timeout, start_time)
-              return TIMEOUT if remaining_timeout&.zero?
 
-              batch = snapshot.shift(@batch_size)
-              result_code = export_batch(batch, timeout: remaining_timeout)
-              return result_code unless result_code == SUCCESS
+            # Block at the export exit until any export in flight has settled, so
+            # the flush accounts for batches the worker had already taken from the
+            # buffer. The worker takes the same barrier, so it cannot start another
+            # export while this flush is running.
+            @export_mutex.synchronize do
+              until snapshot.empty?
+                remaining_timeout = OpenTelemetry::Common::Utilities.maybe_timeout(timeout, start_time)
+                return TIMEOUT if remaining_timeout&.zero?
+
+                batch = snapshot.shift(@batch_size)
+                result_code = export_batch(batch, timeout: remaining_timeout)
+                return result_code unless result_code == SUCCESS
+              end
+
+              @exporter.force_flush(timeout: OpenTelemetry::Common::Utilities.maybe_timeout(timeout, start_time))
             end
-
-            @exporter.force_flush(timeout: OpenTelemetry::Common::Utilities.maybe_timeout(timeout, start_time))
           ensure
-            # Unshift the remaining spans if we timed out. We drop excess spans from
-            # the snapshot because they're older than any spans in the spans buffer.
+            # Unshift the remaining spans if we timed out. Batches already handed
+            # to the exporter were removed from the snapshot and are never
+            # re-enqueued, so they cannot be exported again. Excess spans from the
+            # snapshot are dropped because they're older than any spans in the
+            # spans buffer.
             lock do
               n = spans.size + snapshot.size - max_queue_size
               if n.positive?
@@ -167,7 +180,9 @@ module OpenTelemetry
 
               @metrics_reporter.observe_value('otel.bsp.buffer_utilization', value: spans.size / max_queue_size.to_f)
 
-              export_batch(batch)
+              # Hold the same barrier used by force_flush so the two export paths
+              # cannot interleave and a flush always observes a settled pipeline.
+              @export_mutex.synchronize { export_batch(batch) }
             end
           end
 
@@ -185,7 +200,7 @@ module OpenTelemetry
 
           def export_batch(span_array, timeout: @exporter_timeout_seconds)
             batch = span_array.map(&:to_span_data)
-            result_code = @export_mutex.synchronize { @exporter.export(batch, timeout: timeout) }
+            result_code = @exporter.export(batch, timeout: timeout)
             report_result(result_code, span_array)
             result_code
           rescue StandardError => e

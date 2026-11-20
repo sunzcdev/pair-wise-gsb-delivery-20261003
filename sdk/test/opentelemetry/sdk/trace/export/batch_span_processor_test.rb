@@ -51,6 +51,70 @@ describe OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor do
     def force_flush(timeout: nil); end
   end
 
+  # Exporter whose export blocks at a closed gate until it is released,
+  # allowing tests to hold the processor's export barrier at a known point.
+  class BarrierExporter
+    def initialize
+      @mutex = Mutex.new
+      @gate = ConditionVariable.new
+      @blocking = true
+      @batches = []
+      @export_started = Queue.new
+    end
+
+    attr_reader :batches
+
+    def export(batch, timeout: nil)
+      @mutex.synchronize do
+        @batches << batch
+        @export_started << true
+        @gate.wait(@mutex) while @blocking
+      end
+      SUCCESS
+    end
+
+    def wait_until_export_started
+      @export_started.pop
+    end
+
+    # Opens the gate permanently, unblocking the current export and any later
+    # ones (such as the final flush during shutdown).
+    def release
+      @mutex.synchronize do
+        @blocking = false
+        @gate.broadcast
+      end
+    end
+
+    def shutdown(timeout: nil); end
+
+    def force_flush(timeout: nil)
+      SUCCESS
+    end
+  end
+
+  class SlowExporter
+    def initialize(export_delay)
+      @export_delay = export_delay
+      @mutex = Mutex.new
+      @batches = []
+    end
+
+    attr_reader :batches
+
+    def export(batch, timeout: nil)
+      sleep(@export_delay)
+      @mutex.synchronize { @batches << batch }
+      SUCCESS
+    end
+
+    def shutdown(timeout: nil); end
+
+    def force_flush(timeout: nil)
+      SUCCESS
+    end
+  end
+
   class TestMetricsReporter
     attr_reader :reported_metrics
 
@@ -210,6 +274,92 @@ describe OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor do
       _(test_exporter.batches.size).must_equal(0)
 
       _(bsp.instance_variable_get(:@spans).size).must_equal(2)
+    end
+
+    it 'waits for an export already in flight before settling the flush' do
+      exporter = BarrierExporter.new
+      # A short schedule delay lets the worker pick the span up and enter the
+      # exporter, leaving the processor's own buffer empty.
+      bsp = BatchSpanProcessor.new(exporter, schedule_delay: 10)
+      span = TestSpan.new
+      bsp.on_finish(span)
+      exporter.wait_until_export_started
+
+      result = nil
+      flush_thread = Thread.new do
+        result = bsp.force_flush
+      end
+
+      begin
+        # The flush must be parked behind the in-flight export rather than
+        # returning early just because the buffer was drained by the worker.
+        sleep(0.05)
+        _(flush_thread.alive?).must_equal(true)
+
+        exporter.release
+        flush_thread.join
+
+        _(result).must_equal(SUCCESS)
+        _(exporter.batches.flatten).must_equal([span])
+      ensure
+        exporter.release
+        flush_thread&.join(5)
+        bsp.shutdown
+      end
+    end
+
+    it 'only settles spans that had ended when the flush was called' do
+      exporter = BarrierExporter.new
+      # No worker thread: the flush itself takes the snapshot and blocks in the
+      # exporter, giving a deterministic point at which to finish another span.
+      bsp = BatchSpanProcessor.new(exporter, start_thread_on_boot: false)
+      first_span = TestSpan.new
+      bsp.on_finish(first_span)
+
+      flush_thread = Thread.new { bsp.force_flush }
+      exporter.wait_until_export_started
+
+      begin
+        # A span that ends while the flush is in flight must not be pulled into
+        # the flush's snapshot.
+        later_span = TestSpan.new
+        bsp.on_finish(later_span)
+
+        exporter.release
+        flush_thread.join
+
+        _(exporter.batches.flatten).must_equal([first_span])
+        _(bsp.instance_variable_get(:@spans)).must_equal([later_span])
+      ensure
+        exporter.release
+        flush_thread&.join(5)
+        bsp.shutdown
+      end
+    end
+
+    it 'does not re-export batches already handed to the exporter on timeout' do
+      exporter = SlowExporter.new(0.2)
+      bsp = BatchSpanProcessor.new(exporter,
+                                   start_thread_on_boot: false,
+                                   max_queue_size: 10,
+                                   max_export_batch_size: 2)
+      spans = Array.new(6) { |i| TestSpan.new(i) }
+      spans.each { |span| bsp.on_finish(span) }
+
+      begin
+        # Two exports take ~0.4s; the 0.3s timeout fires during the third.
+        result = bsp.force_flush(timeout: 0.3)
+
+        _(result).must_equal(TIMEOUT)
+        # The two batches delivered before the timeout must appear exactly once
+        # and never be handed to the exporter again.
+        delivered = exporter.batches.flatten
+        _(delivered.map(&:id)).must_equal([0, 1, 2, 3])
+        # The spans that were never sent remain buffered for a later flush.
+        _(bsp.instance_variable_get(:@spans).map(&:id)).must_equal([4, 5])
+      ensure
+        bsp.shutdown
+      end
     end
   end
 
