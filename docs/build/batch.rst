@@ -285,6 +285,46 @@ by a batch migration.  Therefore it may be necessary to manipulate the
 ``PRAGMA FOREIGN KEYS`` setting if a migration seeks to rename a table vs.
 batch migrate it.
 
+.. _sqlite_foreign_key_pragma:
+
+Deferring SQLite Foreign Key Enforcement Across a Migration
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Manipulating ``PRAGMA FOREIGN KEYS`` directly inside ``env.py`` is awkward
+because the pragma is only honored **outside** of a transaction, and a
+migration often needs enforcement to stay off while *two* tables that
+reference each other are being created or rebuilt — turning it back on after
+the first table would immediately reject the second one.
+
+The :paramref:`.EnvironmentContext.configure.sqlite_foreign_keys` option
+manages this lifecycle explicitly::
+
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        sqlite_foreign_keys="deferred",
+    )
+
+With ``"deferred"``, Alembic switches ``PRAGMA foreign_keys`` off for the
+duration of the migration run and runs ``PRAGMA foreign_key_check`` instead:
+
+* when Alembic controls the migration transactions (the usual
+  ``with context.begin_transaction():`` form in ``env.py``), the check runs
+  once per revision, inside that revision's transaction, so a violation
+  rolls the revision back and the raised :class:`.CommandError` names the
+  revision that failed together with the offending rows;
+* when the connection already has an externally opened transaction, there
+  is no boundary Alembic can roll back, so the check runs once for the
+  whole migration run instead.
+
+The connection's original pragma setting is always restored when the run
+finishes, including when it raises.  Because the pragma cannot be changed
+inside a transaction, ``"deferred"`` (and the alternative ``"immediate"``
+mode, which keeps enforcement on for the whole run) cannot be combined with
+an enclosing transaction opened before :meth:`.EnvironmentContext.configure`;
+the default ``"manual"`` mode leaves the pragma entirely untouched for those
+setups.
+
 .. _batch_offline_mode:
 
 Working in Offline Mode

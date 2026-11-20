@@ -600,6 +600,34 @@ class MigrationContext:
 
         head_maintainer = HeadMaintainer(self, heads)
 
+        # Deferred foreign key enforcement (currently SQLite-only): turn
+        # enforcement off for the whole run so that migrations which build
+        # two mutually referencing tables are not rejected halfway through,
+        # then run PRAGMA foreign_key_check at an explicit scope and restore
+        # the connection's original pragma setting.
+        self.impl.begin_foreign_keys_deferred(self._in_external_transaction)
+        try:
+            self._run_migration_steps(heads, head_maintainer, kw)
+            # With an externally opened transaction there is no transaction
+            # boundary Alembic controls per revision, so a failure could not
+            # be rolled back independently; validate the whole run instead.
+            if not self.as_sql and self._in_external_transaction:
+                self.impl.check_foreign_keys(None)
+        finally:
+            self.impl.end_foreign_keys_deferred()
+
+        # NOTE: offline ("--sql") mode intentionally does not emit a DROP
+        # of the version table when ending at base.  Online mode never drops
+        # the version table (e.g. ``downgrade base`` only deletes its row),
+        # so dropping it in offline mode only was an inconsistency present
+        # since the version table was first introduced.  See #1822.
+
+    def _run_migration_steps(
+        self,
+        heads: tuple[str, ...],
+        head_maintainer: HeadMaintainer,
+        kw: dict[str, Any],
+    ) -> None:
         assert self._migrations_fn is not None
         for step in self._migrations_fn(heads, self):
             with self.begin_transaction(_per_migration=True):
@@ -629,11 +657,18 @@ class MigrationContext:
                         run_args=kw,
                     )
 
-        # NOTE: offline ("--sql") mode intentionally does not emit a DROP
-        # of the version table when ending at base.  Online mode never drops
-        # the version table (e.g. ``downgrade base`` only deletes its row),
-        # so dropping it in offline mode only was an inconsistency present
-        # since the version table was first introduced.  See #1822.
+                # Validate while the per-migration transaction (if any) is
+                # still open: a violation then rolls the whole revision back
+                # and the error message identifies exactly which revision
+                # failed.  When the connection manages its own transaction
+                # there is no boundary Alembic can roll back, so the whole
+                # run is validated once from run_migrations() instead.
+                if (
+                    not self.as_sql
+                    and not self._in_external_transaction
+                    and isinstance(step, RevisionStep)
+                ):
+                    self.impl.check_foreign_keys(step.revision.revision)
 
     def _in_connection_transaction(self) -> bool:
         try:

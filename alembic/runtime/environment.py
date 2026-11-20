@@ -895,6 +895,30 @@ class EnvironmentContext(util.ModuleClsProxy):
          Oracle migrations.  Defaults to ``/``.  Oracle doesn't add a
          semicolon between statements like most other backends.
 
+        :param sqlite_foreign_keys: Selects how SQLite foreign key
+         enforcement is handled during an online migration run.  Only
+         applies to the SQLite dialect.  Accepted values are:
+
+         * ``"manual"`` (the default): Alembic does not emit any
+           ``PRAGMA foreign_keys`` statements; the connection keeps
+           whatever setting it was opened with.
+         * ``"deferred"``: Alembic switches ``PRAGMA foreign_keys`` off
+           for the duration of the run and instead runs
+           ``PRAGMA foreign_key_check`` to validate the schema once each
+           migration (or once for the whole run when an externally opened
+           transaction is in use).  This allows a migration to build two
+           tables that reference each other without the first table being
+           rejected.  The original pragma setting is restored when the
+           connection is returned.  Because SQLite ignores
+           ``PRAGMA foreign_keys`` inside a transaction, this mode cannot
+           be combined with an enclosing transaction opened before
+           :meth:`.configure`.
+         * ``"immediate"``: Alembic switches ``PRAGMA foreign_keys`` on
+           for the duration of the run and restores the original setting
+           afterwards; no deferred check is emitted.
+
+         .. versionadded:: 1.21.0
+
         """
         opts = self.context_opts
         if transactional_ddl is not None:

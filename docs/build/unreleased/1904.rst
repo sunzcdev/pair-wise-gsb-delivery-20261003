@@ -1,0 +1,19 @@
+.. change::
+    :tags: feature, sqlite
+    :tickets: 1904
+
+    Added a new ``sqlite_foreign_keys`` option to
+    :meth:`.EnvironmentContext.configure` to control SQLite foreign key
+    enforcement during an online migration run.  With
+    ``sqlite_foreign_keys="deferred"``, Alembic switches
+    ``PRAGMA foreign_keys`` off for the duration of the run and instead runs
+    ``PRAGMA foreign_key_check`` once per migration (or once for the whole
+    run when an externally opened transaction is in use), allowing a
+    migration that builds two mutually referencing tables to complete
+    before referential integrity is verified.  A failed check raises a
+    :class:`.CommandError` naming the revision responsible together with
+    every violating row, and the connection's original pragma setting is
+    restored when the run finishes, including after an error.  The new
+    ``"immediate"`` mode switches enforcement on for the run and likewise
+    restores the original setting, while the default ``"manual"`` mode
+    leaves the pragma untouched.

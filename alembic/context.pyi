@@ -96,6 +96,7 @@ def configure(
     tag: str | None = None,
     template_args: dict[str, Any] | None = None,
     render_as_batch: bool = False,
+    sqlite_foreign_keys: Literal["manual", "deferred", "immediate"] = "manual",
     target_metadata: MetaData | Sequence[MetaData] | None = None,
     include_name: (
         Callable[
@@ -498,6 +499,12 @@ def configure(
      .. seealso::
 
         :ref:`batch_migrations`
+
+    :param sqlite_foreign_keys: selects how SQLite foreign key
+     enforcement is handled during an online migration run; one of
+     ``"manual"``, ``"deferred"`` or ``"immediate"``.
+
+     .. versionadded:: 1.21.0
 
     :param include_schemas: If True, autogenerate will scan across
      all schemas located by the SQLAlchemy

@@ -34,6 +34,20 @@ if TYPE_CHECKING:
 
     from ..operations.batch import BatchOperationsImpl
 
+#: Accepted values for the ``sqlite_foreign_keys`` migration context option.
+#:
+#: * ``"manual"`` (the default): Alembic does not touch
+#:   ``PRAGMA foreign_keys``; the connection keeps whatever setting it
+#:   arrived with.
+#: * ``"deferred"``: enforcement is switched off for the duration of the
+#:   migration run and a ``PRAGMA foreign_key_check`` is emitted instead,
+#:   so that migrations which build (or rebuild) two tables that reference
+#:   each other are not rejected halfway through.
+#: * ``"immediate"``: enforcement is switched on and no deferred check is
+#:   emitted; this is the historical behavior available to users who
+#:   configured the pragma themselves.
+SQLITE_FOREIGN_KEY_MODES = ("manual", "deferred", "immediate")
+
 
 class SQLiteImpl(DefaultImpl):
     __dialect__ = "sqlite"
@@ -42,6 +56,159 @@ class SQLiteImpl(DefaultImpl):
     """SQLite supports transactional DDL, but pysqlite does not:
     see: http://bugs.python.org/issue10740
     """
+
+    def __init__(
+        self,
+        dialect,
+        connection,
+        as_sql,
+        transactional_ddl,
+        output_buffer,
+        context_opts,
+    ):
+        super().__init__(
+            dialect,
+            connection,
+            as_sql,
+            transactional_ddl,
+            output_buffer,
+            context_opts,
+        )
+        mode = context_opts.get("sqlite_foreign_keys", "manual")
+        if mode not in SQLITE_FOREIGN_KEY_MODES:
+            raise util.CommandError(
+                "Unknown value %r for 'sqlite_foreign_keys'; expected one "
+                "of %s"
+                % (mode, ", ".join(repr(m) for m in SQLITE_FOREIGN_KEY_MODES))
+            )
+        self.foreign_key_mode = mode
+
+        # the value of PRAGMA foreign_keys the connection was opened with;
+        # captured by :meth:`begin_foreign_keys_deferred`.  ``None`` means
+        # deferred enforcement has not been activated.
+        self._foreign_keys_initial: bool | None = None
+
+    def _get_foreign_keys_pragma(self) -> bool:
+        assert self.connection is not None
+        return bool(
+            self.connection.exec_driver_sql("PRAGMA foreign_keys").scalar()
+        )
+
+    def _set_foreign_keys_pragma(self, value: bool) -> None:
+        # PRAGMA foreign_keys is only honored by SQLite when no transaction
+        # is open; issuing it inside a transaction is silently ignored.
+        # Callers are therefore responsible for ensuring the connection
+        # is outside of any transaction first.
+        assert self.connection is not None
+        self.connection.exec_driver_sql(
+            "PRAGMA foreign_keys=%s" % ("ON" if value else "OFF")
+        )
+
+    def begin_foreign_keys_deferred(
+        self, in_external_transaction: bool
+    ) -> None:
+        """Establish the foreign key enforcement mode for a migration run.
+
+        For ``sqlite_foreign_keys="deferred"`` the pragma is switched off
+        (the original value being remembered) and violations are instead
+        surfaced later by :meth:`check_foreign_keys`.  For
+        ``sqlite_foreign_keys="immediate"`` the pragma is switched on so
+        that SQLite enforces every statement as it is emitted.  In both
+        cases :meth:`end_foreign_keys_deferred` restores the original
+        setting.
+
+        Because ``PRAGMA foreign_keys`` cannot be changed inside a
+        transaction, either active mode is incompatible with a connection
+        that already has an externally opened transaction; that situation
+        is reported explicitly instead of being left to fail with an
+        opaque SQLite error later.
+
+        """
+        if self.as_sql or self.foreign_key_mode == "manual":
+            return
+
+        if in_external_transaction:
+            raise util.CommandError(
+                "sqlite_foreign_keys=%r cannot be used with a connection "
+                "that is already inside a transaction; SQLite only honors "
+                "'PRAGMA foreign_keys' outside of a transaction. Open the "
+                "connection without an enclosing transaction, or use "
+                "sqlite_foreign_keys='manual'."
+                % self.foreign_key_mode
+            )
+
+        # reading the pragma autobegins a transaction on SQLAlchemy 2.x;
+        # commit it so the subsequent pragma change is actually honored.
+        initial = self._get_foreign_keys_pragma()
+        self._foreign_keys_initial = initial
+
+        desired = self.foreign_key_mode == "immediate"
+        if initial != desired:
+            assert self.connection is not None
+            self.connection.commit()
+            self._set_foreign_keys_pragma(desired)
+            self.connection.commit()
+
+    def check_foreign_keys(self, revision: str | None = None) -> None:
+        """Run ``PRAGMA foreign_key_check`` and raise on any violation.
+
+        The pragma works regardless of whether ``PRAGMA foreign_keys`` is
+        currently enabled, which is what makes deferred enforcement
+        possible.  When violations are present the raised
+        :class:`.CommandError` names the revision that was being applied
+        (``None`` for a check spanning the whole migration run) together
+        with every offending row reported by SQLite.
+
+        """
+        if self.as_sql or self.foreign_key_mode != "deferred":
+            return
+
+        assert self.connection is not None
+        # each row is (table, rowid, target, fk_index)
+        violations = self.connection.exec_driver_sql(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+        if violations:
+            detail = ", ".join(
+                "table %r row %s -> table %r (fk #%s)" % tuple(row)
+                for row in violations
+            )
+            if revision is None:
+                scope = "the migration run"
+            else:
+                scope = "revision %r" % revision
+            raise util.CommandError(
+                "Foreign key constraint validation failed for %s; "
+                "PRAGMA foreign_key_check reported %d violation(s): %s"
+                % (scope, len(violations), detail)
+            )
+
+    def end_foreign_keys_deferred(self) -> None:
+        """Restore the connection's original ``PRAGMA foreign_keys`` value.
+
+        Only a setting that was actually changed by
+        :meth:`begin_foreign_keys_deferred` is restored, so a connection
+        whose pragma already matched the requested mode is left exactly as
+        it was found.
+
+        """
+        if (
+            self.as_sql
+            or self.foreign_key_mode == "manual"
+            or self._foreign_keys_initial is None
+        ):
+            return
+
+        initial = self._foreign_keys_initial
+        self._foreign_keys_initial = None
+
+        desired = self.foreign_key_mode == "immediate"
+        if initial != desired:
+            assert self.connection is not None
+            # clear any autobegun transaction so the pragma change sticks
+            self.connection.commit()
+            self._set_foreign_keys_pragma(initial)
+            self.connection.commit()
 
     def requires_recreate_in_batch(
         self, batch_op: BatchOperationsImpl

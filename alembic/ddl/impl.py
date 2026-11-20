@@ -688,6 +688,34 @@ class DefaultImpl(metaclass=ImplMeta):
 
         """
 
+    def begin_foreign_keys_deferred(
+        self, in_external_transaction: bool
+    ) -> None:
+        """Dialect hook for deferred foreign key enforcement.
+
+        Backends which cannot alter their foreign key enforcement setting
+        in the middle of a migration run (notably SQLite) can override this
+        to switch enforcement off for the duration of the run.  The
+        default implementation is a no-op.
+
+        """
+
+    def check_foreign_keys(self, revision: str | None = None) -> None:
+        """Dialect hook for an explicit foreign key validation pass.
+
+        Called at the scope chosen by the migration context when deferred
+        foreign key enforcement is in use.  The default implementation is
+        a no-op.
+
+        """
+
+    def end_foreign_keys_deferred(self) -> None:
+        """Dialect hook undoing :meth:`begin_foreign_keys_deferred`.
+
+        The default implementation is a no-op.
+
+        """
+
     def emit_begin(self) -> None:
         """Emit the string ``BEGIN``, or the backend-specific
         equivalent, on the current connection context.
