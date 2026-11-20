@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+- Add `PoolClosed` exception. Closing a `ConnectionPool`/`AsyncConnectionPool` now wakes any requests waiting for a connection with `PoolClosed`, rejects requests submitted after closure deterministically, and supports `drain_connections=True` to let in-flight responses finish before their connections are released.
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
 
 ## Version 1.0.9 (April 24th, 2025)

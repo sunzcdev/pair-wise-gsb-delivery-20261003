@@ -113,6 +113,26 @@ finally:
     http.close()
 ```
 
+### What happens when a pool is closed?
+
+Closing a pool gives every request a definite outcome:
+
+* Any request still queued and waiting for a connection is woken immediately
+  and raises `httpcore.PoolClosed`.
+* Any new request submitted once the pool is closed fails deterministically
+  with `httpcore.PoolClosed`, instead of blocking until a timeout.
+* Connections that are already servicing a request are closed by default, so
+  reading a response that has not finished will raise an error. Pass
+  `drain_connections=True` to instead keep active connections open until their
+  in-flight responses have been fully read and closed; the connections are then
+  released automatically. Idle connections are always closed right away.
+
+```python
+# Allow responses that have already started transferring to finish,
+# while rejecting any new requests and waking any queued requests.
+await pool.aclose(drain_connections=True)
+```
+
 ## Thread and task safety
 
 Connection pools are designed to be thread-safe. Similarly, when using `httpcore` in an async context connection pools are task-safe.

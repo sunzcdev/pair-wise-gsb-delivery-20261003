@@ -7,7 +7,7 @@ import typing
 
 from .._backends.auto import AutoBackend
 from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend
-from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
+from .._exceptions import ConnectionNotAvailable, PoolClosed, UnsupportedProtocol
 from .._models import Origin, Proxy, Request, Response
 from .._synchronization import AsyncEvent, AsyncShieldCancellation, AsyncThreadLock
 from .connection import AsyncHTTPConnection
@@ -19,13 +19,26 @@ class AsyncPoolRequest:
         self.request = request
         self.connection: AsyncConnectionInterface | None = None
         self._connection_acquired = AsyncEvent()
+        # An exception may be delivered to a waiting request if the pool is
+        # closed while it is still queued, waiting to be assigned a connection.
+        self._acquired_exception: Exception | None = None
 
     def assign_to_connection(self, connection: AsyncConnectionInterface | None) -> None:
         self.connection = connection
         self._connection_acquired.set()
 
+    def assign_exception(self, exception: Exception) -> None:
+        """
+        Wake up a request that is still queued, and deliver a result to it
+        without ever assigning it a connection. Used when the pool is closed
+        while the request is waiting for a connection to become available.
+        """
+        self._acquired_exception = exception
+        self._connection_acquired.set()
+
     def clear_connection(self) -> None:
         self.connection = None
+        self._acquired_exception = None
         self._connection_acquired = AsyncEvent()
 
     async def wait_for_connection(
@@ -33,6 +46,10 @@ class AsyncPoolRequest:
     ) -> AsyncConnectionInterface:
         if self.connection is None:
             await self._connection_acquired.wait(timeout=timeout)
+            if self._acquired_exception is not None:
+                # We were woken because the pool was closed while we were
+                # still waiting for a connection.
+                raise self._acquired_exception
         assert self.connection is not None
         return self.connection
 
@@ -119,6 +136,10 @@ class AsyncConnectionPool(AsyncRequestInterface):
         # and the set of connections that are servicing those requests.
         self._connections: list[AsyncConnectionInterface] = []
         self._requests: list[AsyncPoolRequest] = []
+        # Set to `True` once the pool has been closed. Once closed the pool no
+        # longer accepts new requests, and any queued requests are woken with
+        # a `PoolClosed` exception.
+        self._closed = False
 
         # We only mutate the state of the connection pool within an 'optional_thread_lock'
         # context. This holds a threading lock unless we're running in async mode,
@@ -212,13 +233,18 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 f"Request URL has an unsupported protocol '{scheme}://'."
             )
 
-        timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("pool", None)
-
         with self._optional_thread_lock:
+            if self._closed:
+                # A request submitted to a pool that has already been closed
+                # has a deterministic outcome, rather than ever blocking.
+                raise PoolClosed("Cannot submit a request to a closed connection pool.")
+
             # Add the incoming request to our request queue.
             pool_request = AsyncPoolRequest(request)
             self._requests.append(pool_request)
+
+        timeouts = request.extensions.get("timeout", {})
+        timeout = timeouts.get("pool", None)
 
         try:
             while True:
@@ -289,9 +315,12 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 # log: "closing expired connection"
                 self._connections.remove(connection)
                 closing_connections.append(connection)
-            elif (
-                connection.is_idle()
-                and sum(connection.is_idle() for connection in self._connections)
+            elif connection.is_idle() and (
+                self._closed
+                # Once the pool is closed any connection that becomes idle is
+                # released, including ones that were retained so an in-flight
+                # response could finish.
+                or sum(c.is_idle() for c in self._connections)
                 > self._max_keepalive_connections
             ):
                 # log: "closing idle connection"
@@ -299,6 +328,12 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 closing_connections.append(connection)
 
         # Assign queued requests to connections.
+        #
+        # A closed pool never assigns queued requests to connections. Those
+        # requests are instead woken with a `PoolClosed` exception by `aclose()`.
+        if self._closed:
+            return closing_connections
+
         queued_requests = [request for request in self._requests if request.is_queued()]
         for pool_request in queued_requests:
             origin = pool_request.request.url.origin
@@ -344,12 +379,60 @@ class AsyncConnectionPool(AsyncRequestInterface):
             for connection in closing:
                 await connection.aclose()
 
-    async def aclose(self) -> None:
-        # Explicitly close the connection pool.
-        # Clears all existing requests and connections.
+    async def aclose(self, drain_connections: bool = False) -> None:
+        """
+        Close the connection pool.
+
+        This makes an explicit promise about every request that is currently
+        associated with the pool:
+
+        * Any request still waiting in the queue for a connection to become
+          available is woken immediately and receives a `PoolClosed` exception.
+        * Any new request submitted after the pool has been closed fails
+          deterministically with a `PoolClosed` exception, instead of blocking.
+        * Requests that have already been assigned a connection are handled
+          according to `drain_connections`. By default their connections are
+          closed right away, so reading an unfinished response raises an error.
+          With `drain_connections=True` a response that has genuinely started
+          transferring is allowed to finish, and its connection is only
+          released back to the operating system once that response is closed.
+
+        Parameters:
+            drain_connections: When `False` (the default) every connection held
+                by the pool is closed immediately. When `True`, connections
+                that are actively servicing a response are kept open until that
+                response has been fully read and closed, allowing in-flight
+                responses to finish gracefully before their connections are
+                released. Idle connections are always closed right away.
+        """
         with self._optional_thread_lock:
-            closing_connections = list(self._connections)
-            self._connections = []
+            if self._closed:
+                # Closing an already closed pool is a no-op.
+                return
+            self._closed = True
+
+            # Wake every request that is still waiting for a connection, and
+            # deliver an unambiguous closure result to each of them.
+            for pool_request in self._requests:
+                if pool_request.is_queued():
+                    pool_request.assign_exception(
+                        PoolClosed(
+                            "Connection pool was closed while the request was "
+                            "waiting to be assigned a connection."
+                        )
+                    )
+
+            closing_connections: list[AsyncConnectionInterface] = []
+            retained_connections: list[AsyncConnectionInterface] = []
+            for connection in self._connections:
+                if drain_connections and not connection.is_idle():
+                    # Keep active connections alive so an in-flight response can
+                    # finish. They will be closed when the response is closed.
+                    retained_connections.append(connection)
+                else:
+                    closing_connections.append(connection)
+            self._connections = retained_connections
+
         await self._close_connections(closing_connections)
 
     async def __aenter__(self) -> AsyncConnectionPool:
@@ -414,7 +497,8 @@ class PoolByteStream:
                     await self._stream.aclose()
 
             with self._pool._optional_thread_lock:
-                self._pool._requests.remove(self._pool_request)
+                if self._pool_request in self._pool._requests:
+                    self._pool._requests.remove(self._pool_request)
                 closing = self._pool._assign_requests_to_connections()
 
             await self._pool._close_connections(closing)

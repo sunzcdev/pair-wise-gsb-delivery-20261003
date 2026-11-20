@@ -10,6 +10,7 @@ childen, because we don't need that for our use-case.
 """
 
 import threading
+import time
 from types import TracebackType
 from typing import Any, Callable, List, Optional, Type
 
@@ -28,14 +29,27 @@ class Nursery:
         traceback: Optional[TracebackType] = None,
     ) -> None:
         for thread in self._threads:
-            thread.start()
-        for thread in self._threads:
             thread.join()
 
     def start_soon(self, func: Callable[..., object], *args: Any) -> None:
+        # Start the worker straight away, mirroring trio's `Nursery.start_soon`,
+        # and join all of the workers when the nursery context exits.
         thread = threading.Thread(target=func, args=args)
         self._threads.append(thread)
+        thread.start()
 
 
 def open_nursery() -> Nursery:
     return Nursery()
+
+
+# A thread-based counterpart to `trio.Event`.
+Event = threading.Event
+
+
+def sleep(seconds: float) -> None:
+    """
+    A thread-based counterpart to `trio.sleep`, used by the unasync-generated
+    synchronous tests that need to yield control to other worker threads.
+    """
+    time.sleep(seconds)

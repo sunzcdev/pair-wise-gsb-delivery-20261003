@@ -19,6 +19,14 @@ class ConnectionNotAvailable(Exception):
     pass
 
 
+class PoolClosed(Exception):
+    """
+    Raised when a request is submitted to a connection pool that has already
+    been closed, or when a request is still waiting for a connection at the
+    point the pool is closed.
+    """
+
+
 class ProxyError(Exception):
     pass
 

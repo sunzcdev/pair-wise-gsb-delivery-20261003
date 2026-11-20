@@ -23,6 +23,7 @@ from ._exceptions import (
     ConnectTimeout,
     LocalProtocolError,
     NetworkError,
+    PoolClosed,
     PoolTimeout,
     ProtocolError,
     ProxyError,
@@ -115,6 +116,7 @@ __all__ = [
     "SOCKET_OPTION",
     # exceptions
     "ConnectionNotAvailable",
+    "PoolClosed",
     "ProxyError",
     "ProtocolError",
     "LocalProtocolError",

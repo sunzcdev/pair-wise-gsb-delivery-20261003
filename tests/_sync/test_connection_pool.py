@@ -9,7 +9,6 @@ from tests import concurrency
 import httpcore
 
 
-
 def test_connection_pool_with_keepalive():
     """
     By default HTTP/1.1 requests should be returned to the connection pool.
@@ -835,3 +834,154 @@ def test_http11_upgrade_connection():
         "http11.response_closed.started",
         "http11.response_closed.complete",
     ]
+
+
+
+def test_connection_pool_request_after_close():
+    """
+    A request submitted once the pool has been closed must fail deterministically
+    with a clear `PoolClosed` result, rather than blocking or timing out.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    pool = httpcore.ConnectionPool(network_backend=network_backend)
+    pool.close()
+
+    with pytest.raises(httpcore.PoolClosed):
+        pool.request("GET", "https://example.com/")
+
+
+
+def test_connection_pool_close_wakes_waiting_requests():
+    """
+    Requests that are still queued, waiting for a connection in a saturated
+    pool, must be woken when the pool closes and receive a clear `PoolClosed`
+    result. Requests submitted after the close must also fail deterministically.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    # Gates that make the scheduling deterministic:
+    # - `active_ready` is set once the first request owns the single connection.
+    # - `release_response` keeps that response open until the pool is closed.
+    # - `start_waiting` releases the second request into the saturated pool.
+    active_ready = concurrency.Event()
+    release_response = concurrency.Event()
+    start_waiting = concurrency.Event()
+
+    def active_request(pool):
+        with pool.stream("GET", "https://example.com/") as response:
+            active_ready.set()
+            release_response.wait()
+            response.read()
+        return response
+
+    def waiting_request(pool, results):
+        start_waiting.wait()
+        try:
+            pool.request("GET", "https://example.com/")
+            results.append("ok")
+        except httpcore.PoolClosed:
+            results.append("closed")
+
+    pool = httpcore.ConnectionPool(
+        network_backend=network_backend, max_connections=1
+    )
+    results = []
+
+    with concurrency.open_nursery() as nursery:
+        nursery.start_soon(active_request, pool)
+        nursery.start_soon(waiting_request, pool, results)
+
+        # Wait until the single connection is owned by the active request...
+        active_ready.wait()
+        # ...then allow the second request to enter the now saturated pool and
+        # block while waiting for a connection.
+        start_waiting.set()
+        while "queued" not in repr(pool):
+            concurrency.sleep(0.001)
+
+        # Close the pool while a request is still waiting for a connection.
+        # Drain the active response so it can finish, while the waiting request
+        # is still woken immediately with an explicit closure result.
+        pool.close(drain_connections=True)
+        # Now let the in-flight response finish and release its connection.
+        release_response.set()
+
+    # The waiting request was woken with an explicit closure result.
+    assert results == ["closed"]
+
+    # A new request submitted after the close has a deterministic result.
+    with pytest.raises(httpcore.PoolClosed):
+        pool.request("GET", "https://example.com/")
+
+
+
+def test_connection_pool_close_drains_in_flight_response():
+    """
+    With `drain_connections=True` a response that has genuinely started
+    transferring is allowed to finish, and its connection is only released
+    once the response is closed. New requests are still rejected outright.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    pool = httpcore.ConnectionPool(network_backend=network_backend)
+
+    # Start a request and hold the response open (it has begun transferring).
+    with pool.stream("GET", "https://example.com/") as response:
+        # Close the pool, asking it to let in-flight responses complete first.
+        pool.close(drain_connections=True)
+
+        # The active connection is retained while the response is still open...
+        assert len(pool.connections) == 1
+
+        # ...but the pool no longer accepts new requests.
+        with pytest.raises(httpcore.PoolClosed):
+            pool.request("GET", "https://example.com/")
+
+        # The in-flight response can still be read to completion.
+        response.read()
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+    # Once the response is closed the drained connection is released.
+    assert pool.connections == []
+
+
+
+def test_connection_pool_close_is_idempotent():
+    """
+    Closing an already closed pool must be a safe no-op.
+    """
+    network_backend = httpcore.MockBackend([])
+    pool = httpcore.ConnectionPool(network_backend=network_backend)
+
+    pool.close()
+    pool.close()
+    pool.close(drain_connections=True)
+
+    with pytest.raises(httpcore.PoolClosed):
+        pool.request("GET", "https://example.com/")
