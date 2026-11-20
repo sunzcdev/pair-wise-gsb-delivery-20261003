@@ -457,6 +457,163 @@ class CacheTestMixin(SimplifiedTestCaseProtocol):
         self.assertEqual(1, len(cache))
         self.assertEqual(4, cache.currsize)
 
+    def test_resize_grow(self):
+        cache = self.Cache(maxsize=2)
+        cache.update({1: 1, 2: 2})
+
+        # growing the limit removes nothing and keeps all entries
+        self.assertEqual([], cache.resize(4))
+        self.assertEqual(4, cache.maxsize)
+        self.assertEqual(2, cache.currsize)
+        self.assertEqual({1, 2}, set(cache))
+
+        # the larger limit actually allows more entries
+        cache[3] = 3
+        cache[4] = 4
+        self.assertEqual(4, len(cache))
+        self.assertEqual(4, cache.currsize)
+
+    def test_resize_grow_getsizeof(self):
+        cache = self.Cache(maxsize=3, getsizeof=lambda x: x)
+        cache[1] = 1
+        cache[2] = 2
+
+        self.assertEqual([], cache.resize(10))
+        self.assertEqual(10, cache.maxsize)
+        self.assertEqual(3, cache.currsize)
+
+        cache[3] = 3
+        cache[4] = 4
+        self.assertEqual(10, cache.currsize)
+        self.assertEqual({1, 2, 3, 4}, set(cache))
+
+    def test_resize_shrink(self):
+        cache = self.Cache(maxsize=4)
+        cache.update({1: 1, 2: 2, 3: 3, 4: 4})
+
+        removed = cache.resize(2)
+
+        self.assertEqual(2, cache.maxsize)
+        self.assertEqual(2, len(cache))
+        self.assertEqual(2, cache.currsize)
+        self.assertEqual(2, len(removed))
+        # the cache is shrunk, not rebuilt: every key is kept or reported
+        self.assertEqual({1, 2, 3, 4}, set(removed) | set(cache))
+        self.assertEqual(set(), set(removed) & set(cache))
+
+    def test_resize_shrink_keeps_fitting_entries(self):
+        cache = self.Cache(maxsize=4)
+        cache.update({1: 1, 2: 2})
+
+        # nothing exceeds the smaller limit yet, so nothing is removed
+        self.assertEqual([], cache.resize(3))
+        self.assertEqual(3, cache.maxsize)
+        self.assertEqual({1, 2}, set(cache))
+
+        # eviction afterwards still honors the new, smaller limit
+        cache[3] = 3
+        self.assertEqual(3, len(cache))
+        cache[4] = 4
+        self.assertEqual(3, len(cache))
+        self.assertEqual(3, cache.currsize)
+
+    def test_resize_zero(self):
+        cache = self.Cache(maxsize=2)
+        cache.update({1: 1, 2: 2})
+
+        removed = cache.resize(0)
+
+        self.assertEqual(0, cache.maxsize)
+        self.assertEqual(0, len(cache))
+        self.assertEqual(0, cache.currsize)
+        self.assertEqual(2, len(removed))
+        self.assertEqual({1, 2}, set(removed))
+
+        # resizing an empty cache again removes nothing
+        self.assertEqual([], cache.resize(0))
+
+        # the zero limit keeps rejecting new entries
+        with self.assertRaises(ValueError):
+            cache[3] = 3
+        self.assertEqual(0, len(cache))
+
+    def test_resize_empty(self):
+        cache = self.Cache(maxsize=2)
+
+        self.assertEqual([], cache.resize(0))
+        self.assertEqual(0, cache.maxsize)
+        self.assertEqual(0, cache.currsize)
+
+        self.assertEqual([], cache.resize(3))
+        self.assertEqual(3, cache.maxsize)
+        self.assertEqual(0, cache.currsize)
+
+        cache[1] = 1
+        self.assertEqual(1, len(cache))
+        self.assertEqual(1, cache.currsize)
+
+    def test_resize_negative(self):
+        cache = self.Cache(maxsize=2)
+        cache[1] = 1
+
+        with self.assertRaises(ValueError):
+            cache.resize(-1)
+
+        # a failed resize must not change the cache
+        self.assertEqual(2, cache.maxsize)
+        self.assertEqual(1, len(cache))
+        self.assertEqual(1, cache.currsize)
+
+    def test_resize_getsizeof(self):
+        cache = self.Cache(maxsize=10, getsizeof=lambda x: x)
+        cache[1] = 1
+        cache[2] = 2
+        cache[3] = 3
+        self.assertEqual(6, cache.currsize)
+
+        # the limit is checked against total weight, not item count
+        removed = cache.resize(5)
+
+        self.assertEqual(5, cache.maxsize)
+        self.assertTrue(cache.currsize <= 5)
+        retained_weight = sum(cache.getsizeof(cache[key]) for key in cache)
+        self.assertEqual(retained_weight, cache.currsize)
+        # keys equal values in this data, so removed keys give removed weight
+        self.assertEqual(6, retained_weight + sum(removed))
+        # surviving entries keep their values: the cache is not rebuilt
+        for key in cache:
+            self.assertEqual(key, cache[key])
+
+    def test_resize_getsizeof_to_the_limit(self):
+        cache = self.Cache(maxsize=10, getsizeof=lambda x: x)
+        cache[2] = 2
+        cache[3] = 3
+        cache[4] = 4
+        self.assertEqual(9, cache.currsize)
+
+        removed = cache.resize(3)
+
+        # eviction stops as soon as the remaining weight fits
+        self.assertTrue(cache.currsize <= 3)
+        self.assertEqual(9, cache.currsize + sum(removed))
+        self.assertEqual({2, 3, 4}, set(removed) | set(cache))
+
+        # growing back allows new weight up to the new limit
+        self.assertEqual([], cache.resize(10))
+        cache[5] = 5
+        self.assertTrue(cache.currsize <= 10)
+
+    def test_resize_getsizeof_zero(self):
+        cache = self.Cache(maxsize=10, getsizeof=lambda x: x)
+        cache[1] = 1
+        cache[2] = 2
+
+        removed = cache.resize(0)
+
+        self.assertEqual({1, 2}, set(removed))
+        self.assertEqual(0, cache.currsize)
+        self.assertEqual(0, len(cache))
+
     def test_iter_update(self):
         cache = self.Cache(maxsize=3)
         cache.update({1: 1, 2: 2, 3: 3})

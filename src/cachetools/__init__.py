@@ -168,6 +168,27 @@ class Cache(collections.abc.MutableMapping):
         self.__data.clear()
         self.__currsize = 0
 
+    def resize(self, maxsize):
+        """Set the maximum size of the cache to `maxsize`.
+
+        If the cache's current size exceeds the new maximum size, items
+        are discarded by repeatedly calling :meth:`popitem` until the
+        cache fits.  This does not empty the cache, so items that still
+        fit are kept.
+
+        :returns: A list of the keys of the items removed from the
+            cache, in the order they were removed.
+
+        """
+        if maxsize < 0:
+            raise ValueError("maxsize must be non-negative")
+        self.__maxsize = maxsize
+        removed = []
+        while self.__currsize > maxsize:
+            key, _value = self.popitem()
+            removed.append(key)
+        return removed
+
     @property
     def maxsize(self):
         """The maximum size of the cache."""
@@ -525,6 +546,17 @@ class _TimedCache(Cache):
         # time-tracking structures.  We do not call expire() here,
         # since clear() should be O(1) regardless of cache contents.
         Cache.clear(self)
+
+    def resize(self, maxsize, cache_resize=Cache.resize):
+        # Expired items are removed first, so they count towards the
+        # returned keys before the cache's own eviction order applies.
+        if maxsize < 0:
+            raise ValueError("maxsize must be non-negative")
+        with self.__timer as time:
+            expired = self.expire(time)
+        removed = [key for key, _value in expired]
+        removed.extend(cache_resize(self, maxsize))
+        return removed
 
     def expire(self, time=None):  # pragma: no cover
         raise NotImplementedError

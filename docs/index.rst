@@ -69,7 +69,7 @@ inserted into the cache.
    suitable `lock` object.
 
 .. autoclass:: Cache(maxsize, getsizeof=None)
-   :members: currsize, getsizeof, maxsize
+   :members: currsize, getsizeof, maxsize, resize
 
    This class discards arbitrary items using :meth:`popitem` to make
    space when necessary.  Derived classes may override :meth:`popitem`
@@ -77,6 +77,16 @@ inserted into the cache.
    keep track of item access, insertion or deletion, it may
    additionally need to override :meth:`__getitem__`,
    :meth:`__setitem__` and :meth:`__delitem__`.
+
+   The maximum size can be changed at any time by calling
+   :meth:`resize` with the new `maxsize`.  If the cache's current size
+   exceeds the new maximum size, items are discarded until the cache
+   fits, and the keys of the removed items are returned in the order
+   they were removed.  Note that the cache is shrunk rather than
+   rebuilt, so items that still fit are always kept.  With time-aware
+   caches such as :class:`TTLCache` and :class:`TLRUCache`, expired
+   items are removed first, before the cache's own eviction order is
+   applied to any remaining items.
 
    .. note::
 

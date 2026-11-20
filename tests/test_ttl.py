@@ -1,7 +1,7 @@
 import math
 import unittest
 
-from cachetools import TTLCache
+from cachetools import LRUCache, TTLCache
 
 from . import CacheTestMixin
 
@@ -355,4 +355,144 @@ class TTLCacheTest(unittest.TestCase, CacheTestMixin):
             keys.append(key)
             cache.clear()
         self.assertEqual([1], keys)
-        self.assertEqual([], list(cache))
+
+    def test_ttl_resize_expired_first(self):
+        cache = TTLCache[int, int, int](maxsize=3, ttl=2, timer=Timer())
+
+        cache[1] = 1
+        cache.timer.tick()
+        cache[2] = 2
+        cache[3] = 3  # key 1 expires at time 2; keys 2 and 3 stay live
+        cache.timer.tick()
+
+        # the expired item is removed before any live item is evicted
+        removed = cache.resize(2)
+        self.assertEqual([1], removed)
+        self.assertEqual({2, 3}, set(cache))
+        self.assertEqual(2, cache.maxsize)
+        self.assertEqual(2, cache.currsize)
+
+    def test_ttl_resize_expired_frees_space(self):
+        cache = TTLCache[int, int, int](maxsize=4, ttl=2, timer=Timer())
+
+        cache[1] = 1
+        cache[2] = 2
+        cache.timer.tick()
+        cache[3] = 3
+        cache[4] = 4  # keys 1, 2 expire at time 2; keys 3, 4 stay live
+        cache.timer.tick()
+
+        # the two expired entries already satisfy the smaller limit
+        removed = cache.resize(2)
+        self.assertEqual([1, 2], removed)
+        self.assertEqual([3, 4], list(cache))
+        self.assertEqual(2, cache.currsize)
+
+    def test_ttl_resize_lru_order(self):
+        cache = TTLCache[int, int, int](maxsize=4, ttl=10, timer=Timer())
+
+        cache[1] = 1
+        cache[2] = 2
+        cache[3] = 3
+        cache[4] = 4
+        cache[1]  # make key 1 most recently used, key 2 least recently used
+
+        # nothing expires within this short test, so LRU order applies
+        removed = cache.resize(2)
+        self.assertEqual([2, 3], removed)
+        self.assertEqual({4, 1}, set(cache))
+        self.assertEqual(2, cache.currsize)
+
+        # further shrinking keeps the most recently used survivor
+        self.assertEqual([4], cache.resize(1))
+        self.assertEqual([1], list(cache))
+
+    def test_ttl_resize_negative(self):
+        cache = TTLCache[int, int, int](maxsize=2, ttl=2, timer=Timer())
+        cache[1] = 1
+
+        with self.assertRaises(ValueError):
+            cache.resize(-1)
+
+        # a failed resize must neither change the limit nor expire items
+        self.assertEqual(2, cache.maxsize)
+        self.assertEqual(1, cache.currsize)
+        self.assertIn(1, cache)
+
+    def test_ttl_resize_getsizeof(self):
+        cache = TTLCache[int, int, int](
+            maxsize=10, ttl=10, timer=Timer(), getsizeof=lambda x: x
+        )
+        cache[1] = 1
+        cache[2] = 2
+        cache[3] = 3
+        cache[4] = 4
+        self.assertEqual(10, cache.currsize)
+
+        # the limit is checked against total weight, not item count
+        removed = cache.resize(4)
+        self.assertEqual([1, 2, 3], removed)
+        self.assertEqual([4], list(cache))
+        self.assertEqual(4, cache.currsize)
+
+        with self.assertRaises(ValueError):
+            cache[5] = 5
+        self.assertEqual([4], list(cache))
+
+    def test_ttl_resize_getsizeof_expired(self):
+        cache = TTLCache[int, int, int](
+            maxsize=10, ttl=2, timer=Timer(), getsizeof=lambda x: x
+        )
+        cache[1] = 1
+        cache[2] = 2
+        cache.timer.tick()
+        cache[3] = 3
+        cache[4] = 4
+        cache.timer.tick()  # keys 1 and 2 expire; no writes happen afterwards
+
+        # expired weight is reported first, then live items are evicted
+        # by weight until the remaining total fits the new limit
+        removed = cache.resize(4)
+        self.assertEqual([1, 2, 3], removed)
+        self.assertEqual([4], list(cache))
+        self.assertEqual(4, cache.currsize)
+
+    def test_ttl_and_lru_resize_same_data(self):
+        # The same data distribution goes into a TTL and an LRU cache.
+        ttl = TTLCache[int, int, int](maxsize=5, ttl=2, timer=Timer())
+        lru = LRUCache[int, int](maxsize=5)
+        ttl[1] = lru[1] = 1
+        ttl[2] = lru[2] = 2
+        ttl.timer.tick()
+        ttl[3] = lru[3] = 3
+        ttl[4] = lru[4] = 4
+        ttl[5] = lru[5] = 5
+        # make key 1 most recently used, key 2 least recently used in LRU
+        lru[1]
+        ttl.timer.tick()  # keys 1 and 2 expire in the TTL cache only
+
+        # moderate shrink: the TTL cache loses its expired entries and
+        # needs no further eviction, while the LRU cache evicts live ones
+        ttl_removed = ttl.resize(3)
+        lru_removed = lru.resize(3)
+
+        self.assertEqual([1, 2], ttl_removed)
+        self.assertEqual({3, 4, 5}, set(ttl))
+        self.assertEqual(3, len(ttl))
+        self.assertEqual([2, 3], lru_removed)
+        self.assertEqual({1, 4, 5}, set(lru))
+        self.assertEqual(3, len(lru))
+        self.assertEqual(3, lru.maxsize)
+        self.assertEqual(3, ttl.maxsize)
+
+        # shrink to the limit and compare what each cache really keeps:
+        # the TTL cache reports expiry order first, the LRU cache pure LRU
+        ttl_removed = ttl.resize(0)
+        lru_removed = lru.resize(0)
+
+        self.assertEqual([3, 4, 5], ttl_removed)
+        self.assertEqual([4, 5, 1], lru_removed)
+        self.assertEqual(0, len(ttl))
+        self.assertEqual(0, len(lru))
+        self.assertEqual(0, ttl.currsize)
+        self.assertEqual(0, lru.currsize)

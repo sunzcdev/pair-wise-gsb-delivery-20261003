@@ -490,3 +490,27 @@ class TLRUCacheTest(unittest.TestCase, CacheTestMixin):
             cache.clear()
         self.assertEqual([1], keys)
         self.assertEqual([], list(cache))
+
+    def test_tlru_resize_expired_first(self):
+        cache = TLRUCache[int, int, int](
+            maxsize=4, ttu=lambda _, v, t: t + v, timer=Timer()
+        )
+
+        cache[1] = 1  # expires at time 1
+        cache[2] = 2  # expires at time 2
+        cache[3] = 3  # expires at time 3
+        cache.timer.tick()
+        cache.timer.tick()  # keys 1 and 2 have now expired
+
+        # expired items are reported in expiry order before LRU eviction
+        removed = cache.resize(1)
+        self.assertEqual([1, 2], removed)
+        self.assertEqual([3], list(cache))
+        self.assertEqual(1, cache.maxsize)
+        self.assertEqual(1, cache.currsize)
+
+        # a failed resize does not mutate the cache
+        with self.assertRaises(ValueError):
+            cache.resize(-1)
+        self.assertEqual(1, cache.maxsize)
+        self.assertEqual([3], list(cache))
