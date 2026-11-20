@@ -142,6 +142,118 @@ class IntailPositionFileTest < Test::Unit::TestCase
     end
   end
 
+  sub_test_case '#try_compact handoff' do
+    TARGETS = {
+      'path1' => Fluent::Plugin::TailInput::TargetInfo.new('path1', 1),
+      'path2' => Fluent::Plugin::TailInput::TargetInfo.new('path2', 2),
+      'path3' => Fluent::Plugin::TailInput::TargetInfo.new('path3', 3),
+    }
+    HANDOFF_CONTENT = <<~EOF
+      path1\t0000000000000001\t0000000000000001
+      path2\t0000000000000002\t0000000000000002
+      path3\t0000000000000003\t0000000000000003
+    EOF
+
+    test 'hands off updates made during compaction and keeps unwatched entries removed' do
+      write_data(@file, HANDOFF_CONTENT)
+      pf = Fluent::Plugin::TailInput::PositionFile.load(@file, false, TARGETS, logger: $log)
+      entry2 = pf[TARGETS['path2']]
+
+      # Coordinate two threads on the same file: the updater rewrites an
+      # offset and unwatches a path while the compactor is fetching entries.
+      update_begin = Queue.new
+      update_done = Queue.new
+      updater = Thread.new do
+        update_begin.pop
+        entry2.update_pos(0x1234)
+        pf.unwatch(TARGETS['path3'])
+        update_done << true
+      end
+
+      mock.proxy(pf).fetch_compacted_entries do |entries|
+        update_begin << true
+        update_done.pop
+        entries
+      end
+      # Compact even though the file was written while fetching entries.
+      fixed_mtime = @file.mtime
+      stub(@file).mtime { fixed_mtime }
+
+      pf.try_compact
+      updater.join
+
+      @file.seek(0)
+      lines = @file.readlines
+      assert_equal 2, lines.size
+      assert_equal "path1\t0000000000000001\t0000000000000001\n", lines[0]
+      assert_equal "path2\t0000000000001234\t0000000000000002\n", lines[1]
+
+      # Updates through the old entry must land in the rewritten file.
+      entry2.update_pos(0x5678)
+      @file.seek(0)
+      assert_equal "path2\t0000000000005678\t0000000000000002\n", @file.readlines[1]
+
+      # Reopen the position file and compare the recovered active positions.
+      reopened = Fluent::Plugin::TailInput::PositionFile.load(@file, false, TARGETS, logger: $log)
+      assert_equal 1, reopened[TARGETS['path1']].read_pos
+      assert_equal 0x5678, reopened[TARGETS['path2']].read_pos
+      # The unwatched path must not be brought back.
+      assert_equal ['path1', 'path2'], reopened.instance_variable_get(:@map).keys
+    end
+
+    test 'keeps the old format readable and writable when compaction fails' do
+      write_data(@file, HANDOFF_CONTENT)
+      pf = Fluent::Plugin::TailInput::PositionFile.load(@file, false, TARGETS, logger: $log)
+
+      original_write = @file.method(:write)
+      fail_write = true
+      stub(@file).write do |*args|
+        if fail_write
+          fail_write = false
+          raise IOError, 'simulated compaction failure'
+        end
+        original_write.call(*args)
+      end
+
+      assert_nothing_raised { pf.try_compact }
+
+      # The old content is still readable.
+      @file.seek(0)
+      assert_equal 3, @file.readlines.size
+      reopened = Fluent::Plugin::TailInput::PositionFile.load(@file, false, TARGETS, logger: $log)
+      assert_equal 1, reopened[TARGETS['path1']].read_pos
+      assert_equal 2, reopened[TARGETS['path2']].read_pos
+      assert_equal 3, reopened[TARGETS['path3']].read_pos
+
+      # ... and entries are still writable in the old format.
+      reopened[TARGETS['path1']].update_pos(0xabcd)
+      @file.seek(0)
+      assert_equal "path1\t000000000000abcd\t0000000000000001\n", @file.readlines[0]
+    end
+
+    test 'keeps active positions consistent under concurrent compaction and updates' do
+      write_data(@file, HANDOFF_CONTENT)
+      pf = Fluent::Plugin::TailInput::PositionFile.load(@file, false, TARGETS, logger: $log)
+      entry2 = pf[TARGETS['path2']]
+
+      updates = 100
+      compactor = Thread.new do
+        20.times { pf.try_compact }
+      end
+      updater = Thread.new do
+        1.upto(updates) { |i| entry2.update_pos(i) }
+      end
+      compactor.join
+      updater.join
+
+      # Reopen the position file and compare the recovered active positions.
+      reopened = Fluent::Plugin::TailInput::PositionFile.load(@file, false, TARGETS, logger: $log)
+      assert_equal 1, reopened[TARGETS['path1']].read_pos
+      assert_equal updates, reopened[TARGETS['path2']].read_pos
+      assert_equal 3, reopened[TARGETS['path3']].read_pos
+    end
+  end
+
   sub_test_case '#load' do
     test 'compact invalid and convert 32 bit inode value' do
       write_data(@file, TEST_CONTENT)

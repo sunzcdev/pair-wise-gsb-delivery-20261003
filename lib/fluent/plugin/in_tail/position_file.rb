@@ -33,11 +33,13 @@ module Fluent::Plugin
         @logger = logger
         @file_mutex = Mutex.new
         @map = {}
+        @unwatched_keys = {}
         @follow_inodes = follow_inodes
       end
 
       def [](target_info)
-        if m = @map[@follow_inodes ? target_info.ino : target_info.path]
+        key = @follow_inodes ? target_info.ino : target_info.path
+        if m = @map[key]
           return m
         end
 
@@ -45,11 +47,8 @@ module Fluent::Plugin
           @file.seek(0, IO::SEEK_END)
           seek = @file.pos + target_info.path.bytesize + 1
           @file.write "#{target_info.path}\t0000000000000000\t0000000000000000\n"
-          if @follow_inodes
-            @map[target_info.ino] = FilePositionEntry.new(@file, @file_mutex, seek, 0, 0)
-          else
-            @map[target_info.path] = FilePositionEntry.new(@file, @file_mutex, seek, 0, 0)
-          end
+          @unwatched_keys.delete(key)
+          @map[key] = FilePositionEntry.new(@file, @file_mutex, seek, 0, 0)
         }
       end
 
@@ -89,6 +88,7 @@ module Fluent::Plugin
         end
 
         @map = map
+        @unwatched_keys.clear
       end
 
       # This method is similar to #compact but it tries to get less lock to avoid a lock contention
@@ -106,15 +106,35 @@ module Fluent::Plugin
 
         @file_mutex.synchronize do
           if last_modified == @file.mtime && size == @file.size
-            @file.pos = 0
-            @file.truncate(0)
-            @file.write(entries.values.map(&:to_entry_fmt).join)
-
-            # entry contains path/ino key and value.
-            entries.each do |key, val|
-              if (m = @map[key])
-                m.seek = val.seek
+            # Hand off the latest state before rewriting the file.
+            # Entries unwatched while fetching must not be brought back.
+            entries.delete_if { |key, _| @unwatched_keys.key?(key) }
+            # Offsets updated while fetching must not be lost.
+            @map.each do |key, entry|
+              if (e = entries[key])
+                e.pos = entry.read_pos
+                e.ino = entry.read_inode
               end
+            end
+
+            new_content = entries.values.map(&:to_entry_fmt).join
+            begin
+              # Write the new content before truncating so that the file
+              # stays readable/writable in the old format even when this
+              # compaction fails.
+              @file.pos = 0
+              @file.write(new_content)
+              @file.truncate(new_content.bytesize)
+            rescue => e
+              @logger&.warn "Failed to compact pos_file. Keep using the current pos_file.", error: e
+            else
+              # entry contains path/ino key and value.
+              entries.each do |key, val|
+                if (m = @map[key])
+                  m.seek = val.seek
+                end
+              end
+              @unwatched_keys.clear
             end
           else
             # skip
@@ -125,8 +145,13 @@ module Fluent::Plugin
       private
 
       def unwatch_key(key)
-        if (entry = @map.delete(key))
-          entry.update_pos(UNWATCHED_POSITION)
+        # Mark the entry as unwatched atomically so that a concurrent
+        # compaction never writes it back with a stale seek position.
+        @file_mutex.synchronize do
+          if (entry = @map.delete(key))
+            entry.update_pos(UNWATCHED_POSITION)
+            @unwatched_keys[key] = true
+          end
         end
       end
 
@@ -215,20 +240,20 @@ module Fluent::Plugin
       attr_writer :seek
 
       def update(ino, pos)
-        @file_mutex.synchronize {
+        file_synchronize {
           @file.pos = @seek
           @file.write "%016x\t%016x" % [pos, ino]
+          @pos = pos
+          @inode = ino
         }
-        @pos = pos
-        @inode = ino
       end
 
       def update_pos(pos)
-        @file_mutex.synchronize {
+        file_synchronize {
           @file.pos = @seek
           @file.write "%016x" % pos
+          @pos = pos
         }
-        @pos = pos
       end
 
       def read_inode
@@ -237,6 +262,19 @@ module Fluent::Plugin
 
       def read_pos
         @pos
+      end
+
+      private
+
+      # PositionFile may call #update/#update_pos while it already holds
+      # @file_mutex (e.g. when unwatching an entry). Mutex is not reentrant,
+      # so take the lock only when the current thread does not own it.
+      def file_synchronize(&block)
+        if @file_mutex.owned?
+          yield
+        else
+          @file_mutex.synchronize(&block)
+        end
       end
     end
 
