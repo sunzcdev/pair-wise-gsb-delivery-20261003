@@ -7,3 +7,4 @@
 /pkg/
 /spec/reports/
 /tmp/
+/test/webrick/webrick_slow_cgi.pid

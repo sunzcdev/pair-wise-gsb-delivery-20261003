@@ -20,15 +20,13 @@ def sysread(io, size)
 end
 
 STDIN.binmode
+STDOUT.binmode
+STDERR.binmode
 
-len = sysread(STDIN, 8).to_i
-out = sysread(STDIN, len)
-STDOUT.reopen(File.open(out, "w"))
-
-len = sysread(STDIN, 8).to_i
-err = sysread(STDIN, len)
-STDERR.reopen(File.open(err, "w"))
-
+# The CGIHandler spawns us with three pipes attached to STDIN, STDOUT and
+# STDERR.  STDIN first carries the marshaled CGI environment; everything left
+# on it afterwards is the request body, which the executed script inherits
+# unchanged through the exec below.
 len  = sysread(STDIN, 8).to_i
 dump = sysread(STDIN, len)
 hash = Marshal.restore(dump)
