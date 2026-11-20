@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import time
 
-from .rate_limiter import RateLimiter
+from .rate_limiter import RateLimiter, RateLimitResult
 
 
 class WindowRateLimiter(RateLimiter):
@@ -32,6 +32,16 @@ class WindowRateLimiter(RateLimiter):
       different from most durations and intervals used in Dramatiq,
       because keeping metadata at the millisecond level is far too
       expensive for most use cases.
+
+    Examples:
+
+      Ask a rejected caller when it's worth retrying:
+
+      >>> with limiter.acquire(raise_on_failure=False, with_retry_at=True) as result:
+      ...     if result:
+      ...         print("Acquired.")
+      ...     else:
+      ...         print("Retry around", result.retry_at)
 
     Parameters:
       backend(RateLimiterBackend): The backend to use.
@@ -50,19 +60,35 @@ class WindowRateLimiter(RateLimiter):
         self.window = window
         self.window_millis = window * 1000
 
-    def _get_keys(self):
-        timestamp = int(time.time())
+    def _get_keys(self, timestamp=None):
+        if timestamp is None:
+            timestamp = int(time.time())
         return ["%s@%s" % (self.key, timestamp - i) for i in range(self.window)]
 
     def _acquire(self):
-        keys = self._get_keys()
-        return self.backend.incr_and_sum(
+        return self._acquire_result().acquired
+
+    def _acquire_result(self):
+        # Sample the clock once so the bucket keys and the retry
+        # boundary that is reported alongside them agree.
+        timestamp = int(time.time())
+        keys = self._get_keys(timestamp)
+        acquired, retry_after = self.backend.incr_and_sum_with_retry_after(
             keys[0],
-            self._get_keys,
+            lambda: keys,
             1,
             maximum=self.limit,
             ttl=self.window_millis,
         )
+        if acquired:
+            return RateLimitResult(True)
+
+        # Rejections don't touch any bucket, so `retry_after` is only a
+        # hint: the earliest whole second at which the same request
+        # would have fit under the limit if nothing else changed.  It
+        # doesn't reserve anything, so other callers may still win.
+        retry_at = None if retry_after is None else timestamp + retry_after
+        return RateLimitResult(False, retry_at=retry_at)
 
     def _release(self):
         pass

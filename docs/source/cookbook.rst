@@ -386,6 +386,40 @@ acquired, you should pass ``raise_on_failure=False`` to ``acquire``::
           print("Lock was acquired.")
 
 
+Keeping an eye on the next window
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When a |WindowRateLimiter| turns a request down, the caller usually
+wants to know how long to wait before trying again, rather than polling
+on a fixed schedule.  Pass ``with_retry_at=True`` to get a
+|RateLimitResult| back instead of a plain boolean::
+
+  import time
+
+  from dramatiq.rate_limits import WindowRateLimiter
+  from dramatiq.rate_limits.backends import RedisBackend
+
+  backend = RedisBackend()
+  limiter = WindowRateLimiter(backend, "outbound-calls", limit=10, window=1)
+
+  while True:
+      with limiter.acquire(raise_on_failure=False, with_retry_at=True) as result:
+          if result:
+              break
+
+      # ``retry_at`` is a Unix timestamp on the same clock the limiter
+      # uses to admit requests.  It is only a hint: nothing is reserved
+      # for this caller, so it may still lose the race at that time.
+      time.sleep(max(0, result.retry_at - time.time()))
+
+The hint is anchored to the requests that were actually admitted, so a
+refused attempt never pushes the window forward on its own.  The
+existing boolean form keeps working unchanged, and limiters that can't
+estimate a boundary (like
+:class:`ConcurrentRateLimiter<dramatiq.rate_limits.ConcurrentRateLimiter>`)
+simply leave ``retry_at`` unset.
+
+
 Results
 -------
 

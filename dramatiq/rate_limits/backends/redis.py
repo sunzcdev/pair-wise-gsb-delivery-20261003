@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import redis
 
-from ..backend import RateLimiterBackend
+from ..backend import RateLimiterBackend, retry_delay_from_counts
 
 
 class RedisBackend(RateLimiterBackend):
@@ -99,6 +99,30 @@ class RedisBackend(RateLimiterBackend):
                     pipe.set(key, value, px=ttl)
                     pipe.execute()
                     return True
+                except redis.WatchError:
+                    continue
+
+    def incr_and_sum_with_retry_after(self, key, keys, amount, maximum, ttl):
+        with self.client.pipeline() as pipe:
+            while True:
+                # Sample the bucket list once so the watch, the reads and
+                # the retry hint all describe the same window.
+                window = keys()
+                try:
+                    pipe.watch(key, *window)
+                    value = int(pipe.get(key) or b"0") + amount
+                    values = pipe.mget(window)
+                    counts = [int(n or 0) for n in values]
+                    if value > maximum or amount + sum(counts) > maximum:
+                        # Note: nothing is written on the rejection
+                        # path, so a refused attempt doesn't extend the
+                        # window.  The hint is advisory only.
+                        return False, retry_delay_from_counts(counts, amount, maximum)
+
+                    pipe.multi()
+                    pipe.set(key, value, px=ttl)
+                    pipe.execute()
+                    return True, None
                 except redis.WatchError:
                     continue
 

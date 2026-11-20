@@ -21,7 +21,7 @@ import time
 from collections import defaultdict
 from threading import Condition, Lock
 
-from ..backend import RateLimiterBackend
+from ..backend import RateLimiterBackend, retry_delay_from_counts
 
 
 class StubBackend(RateLimiterBackend):
@@ -69,6 +69,19 @@ class StubBackend(RateLimiterBackend):
                 return False
 
             return self._put(key, value, ttl)
+
+    def incr_and_sum_with_retry_after(self, key, keys, amount, maximum, ttl):
+        self.add(key, 0, ttl)
+        with self.mutex:
+            value = self._get(key, default=0) + amount
+            buckets = [self._get(k, default=0) for k in keys()]
+            if value > maximum or amount + sum(buckets) > maximum:
+                # The rejection is decided from the same snapshot the
+                # hint is derived from, and nothing gets written, so
+                # the rejected attempt doesn't extend the window.
+                return False, retry_delay_from_counts(buckets, amount, maximum)
+
+            return self._put(key, value, ttl), None
 
     def wait(self, key, timeout):
         cond = self.conditions[key]

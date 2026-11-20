@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from pylibmc import Client, ClientPool, NotFound
 
-from ..backend import RateLimiterBackend
+from ..backend import RateLimiterBackend, retry_delay_from_counts
 
 
 class MemcachedBackend(RateLimiterBackend):
@@ -79,5 +79,33 @@ class MemcachedBackend(RateLimiterBackend):
                     swapped = client.cas(key, value, cid, ttl)
                     if swapped:
                         return True
+                except NotFound:  # pragma: no cover
+                    continue
+
+    def incr_and_sum_with_retry_after(self, key, keys, amount, maximum, ttl):
+        ttl = int(ttl / 1000)
+        with self.pool.reserve(block=True) as client:
+            client.add(key, 0, time=ttl)
+
+            while True:
+                # Sample the bucket list once so the reads and the retry
+                # hint describe the same window.
+                window = keys()
+                value, cid = client.gets(key)
+                if cid is None:
+                    return False, None
+
+                value += amount
+                mapping = client.get_multi(window)
+                counts = [mapping.get(k, 0) for k in window]
+                if value > maximum or amount + sum(counts) > maximum:
+                    # Nothing is written on the rejection path, so a
+                    # refused attempt doesn't extend the window.
+                    return False, retry_delay_from_counts(counts, amount, maximum)
+
+                try:
+                    swapped = client.cas(key, value, cid, ttl)
+                    if swapped:
+                        return True, None
                 except NotFound:  # pragma: no cover
                     continue

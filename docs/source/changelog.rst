@@ -8,6 +8,19 @@ All notable changes to this project will be documented in this file.
 `Unreleased`_
 -------------
 
+Added
+^^^^^
+
+* ``WindowRateLimiter`` can now report when a rejected attempt is worth
+  retrying.  Pass ``with_retry_at=True`` to ``acquire`` to receive a
+  ``RateLimitResult`` instead of a plain boolean; its ``retry_at``
+  attribute is the Unix timestamp, on the same clock the limiter uses to
+  admit requests, of the earliest whole second at which the request is
+  expected to fit again.  The value is only a hint: it doesn't reserve
+  any quota, other callers may still win the race, and rejected attempts
+  never extend the window.  The default behaviour, and every other
+  limiter, still yields plain booleans.
+
 Fixed
 ^^^^^
 

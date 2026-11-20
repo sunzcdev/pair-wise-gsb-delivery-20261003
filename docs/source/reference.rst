@@ -201,6 +201,8 @@ Limiters
 
 .. autoclass:: dramatiq.rate_limits.RateLimiter
    :members:
+.. autoclass:: dramatiq.rate_limits.RateLimitResult
+   :members:
 .. autoclass:: dramatiq.rate_limits.BucketRateLimiter
    :show-inheritance:
 .. autoclass:: dramatiq.rate_limits.ConcurrentRateLimiter

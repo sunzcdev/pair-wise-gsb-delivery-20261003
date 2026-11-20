@@ -21,13 +21,14 @@ from .backend import RateLimiterBackend
 from .barrier import Barrier
 from .bucket import BucketRateLimiter
 from .concurrent import ConcurrentRateLimiter
-from .rate_limiter import RateLimiter, RateLimitExceeded
+from .rate_limiter import RateLimiter, RateLimitExceeded, RateLimitResult
 from .window import WindowRateLimiter
 
 __all__ = [
     "RateLimiterBackend",
     "RateLimiter",
     "RateLimitExceeded",
+    "RateLimitResult",
     "Barrier",
     "BucketRateLimiter",
     "ConcurrentRateLimiter",

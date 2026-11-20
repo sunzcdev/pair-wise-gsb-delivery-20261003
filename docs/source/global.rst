@@ -22,6 +22,7 @@
 .. |RabbitmqBroker_join| replace:: :meth:`join<dramatiq.brokers.rabbitmq.RabbitmqBroker.join>`
 .. |RabbitmqBroker| replace:: :class:`RabbitmqBroker<dramatiq.brokers.rabbitmq.RabbitmqBroker>`
 .. |RateLimitExceeded| replace:: :class:`RateLimitExceeded<dramatiq.RateLimitExceeded>`
+.. |RateLimitResult| replace:: :class:`RateLimitResult<dramatiq.rate_limits.RateLimitResult>`
 .. |RateLimiters| replace:: :class:`RateLimiters<dramatiq.rate_limits.RateLimiter>`
 .. |RedisBroker| replace:: :class:`RedisBroker<dramatiq.brokers.redis.RedisBroker>`
 .. |RedisRLBackend| replace:: :class:`Redis<dramatiq.rate_limits.backends.RedisBackend>`

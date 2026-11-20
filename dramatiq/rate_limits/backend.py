@@ -19,6 +19,38 @@
 from __future__ import annotations
 
 
+def retry_delay_from_counts(counts, amount, maximum):
+    """Work out how many of the oldest counts have to leave the window
+    before an operation of `amount` units fits under `maximum`.
+
+    Backends use this to turn the counts that a rate limiter like
+    |WindowRateLimiter| keeps per bucket into a retry hint.  `counts`
+    must be ordered from newest to oldest, which is the order the
+    limiter's key list uses, so the oldest entry rolls out of the
+    window first.
+
+    Parameters:
+      counts(list[int]): The counts of the buckets in the window,
+        ordered from newest to oldest.
+      amount(int): The amount the rejected operation wanted to add.
+      maximum(int): The maximum sum of the buckets.
+
+    Returns:
+      int: The number of whole buckets that must be dropped.  This is
+      always at least 1 because it's only computed after a rejection.
+    """
+    remaining = sum(counts) + amount
+    delay = 0
+    for count in reversed(counts):
+        if remaining <= maximum:
+            break
+
+        remaining -= count
+        delay += 1
+
+    return max(delay, 1)
+
+
 class RateLimiterBackend:
     """ABC for rate limiter backends."""
 
@@ -82,6 +114,33 @@ class RateLimiterBackend:
           bool: True if the key was successfully incremented.
         """
         raise NotImplementedError
+
+    def incr_and_sum_with_retry_after(self, key, keys, amount, maximum, ttl):
+        """Like :meth:`incr_and_sum`, but also report how long a
+        rejection should last.
+
+        The default implementation falls back to :meth:`incr_and_sum`
+        and reports `None`, so backends that can't estimate a boundary
+        stay usable.  Overrides must read the buckets and decide the
+        outcome under one consistent view, so the hint matches the
+        counts that produced the rejection.
+
+        Parameters:
+          key(str): The key to increment.
+          keys(callable): A callable to return the list of keys to be
+            summed over.
+          amount(int): The amount to increment the value by.
+          maximum(int): The maximum sum of the keys.
+          ttl(int): The max amount of time in milliseconds the key can
+            live in the backend for.
+
+        Returns:
+          tuple[bool, Optional[int]]: Whether the key was incremented
+          and, when it wasn't, how many buckets must roll out of the
+          window before the same request is expected to fit again.
+          The second item is `None` when the backend can't tell.
+        """
+        return self.incr_and_sum(key, keys, amount, maximum, ttl), None
 
     def wait(self, key, timeout):  # pragma: no cover
         """Wait until an event is published to the given key or the

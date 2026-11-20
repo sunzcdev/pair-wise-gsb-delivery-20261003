@@ -3,7 +3,25 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from dramatiq.rate_limits import ConcurrentRateLimiter, RateLimitExceeded
+from dramatiq.rate_limits import ConcurrentRateLimiter, RateLimitExceeded, RateLimitResult
+
+
+def test_limiters_without_a_retry_boundary_still_report_results(rate_limiter_backend):
+    # Given that I have a distributed mutex
+    mutex = ConcurrentRateLimiter(rate_limiter_backend, "sequential-test", limit=1)
+
+    # When I acquire it, asking for the richer result
+    with mutex.acquire(raise_on_failure=False, with_retry_at=True) as result:
+        # Then I get a truthy result without a retry hint
+        assert result == RateLimitResult(True)
+        assert result.retry_at is None
+
+        # And a refused attempt is falsy, also without a hint, because
+        # this limiter can't estimate one
+        with mutex.acquire(raise_on_failure=False, with_retry_at=True) as refused:
+            assert not refused
+            assert refused.acquired is False
+            assert refused.retry_at is None
 
 
 def test_concurrent_rate_limiter_releases_the_lock_after_each_call(rate_limiter_backend):
