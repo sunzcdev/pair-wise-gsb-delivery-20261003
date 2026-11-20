@@ -141,6 +141,9 @@ class MigrationContext:
             "transaction_per_migration", False
         )
         self.on_version_apply_callbacks = opts.get("on_version_apply", ())
+        self.on_version_finalize_callbacks = opts.get(
+            "on_version_finalize", ()
+        )
         self._transaction: Transaction | None = None
 
         if as_sql:
@@ -628,6 +631,32 @@ class MigrationContext:
                         heads=set(head_maintainer.heads),
                         run_args=kw,
                     )
+            if self.on_version_finalize_callbacks:
+                if self._in_external_transaction:
+                    # the caller began the transaction on the connection
+                    # themselves; commit/rollback is entirely up to them
+                    version_state = "external"
+                elif self.as_sql or (
+                    self.impl.transactional_ddl
+                    and not self._transaction_per_migration
+                ):
+                    # the step's DDL was executed within a transaction
+                    # that is still open and may still be rolled back
+                    # (or, in offline mode, no real transaction exists
+                    # at all)
+                    version_state = "executed"
+                else:
+                    # the transaction demarcated for this step was
+                    # committed when the block above exited
+                    version_state = "committed"
+                for callback in self.on_version_finalize_callbacks:
+                    callback(
+                        ctx=self,
+                        step=step.info,
+                        heads=set(head_maintainer.heads),
+                        run_args=kw,
+                        state=version_state,
+                    )
 
         # NOTE: offline ("--sql") mode intentionally does not emit a DROP
         # of the version table when ending at base.  Online mode never drops
@@ -814,7 +843,8 @@ class MigrationInfo:
 
     The :class:`.MigrationInfo` object is available exclusively for the
     benefit of the :paramref:`.EnvironmentContext.on_version_apply`
-    callback hook.
+    and :paramref:`.EnvironmentContext.on_version_finalize`
+    callback hooks.
 
     """
 

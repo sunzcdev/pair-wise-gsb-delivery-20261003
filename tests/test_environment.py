@@ -1,6 +1,8 @@
 import os
 import sys
 
+from sqlalchemy.exc import OperationalError
+
 from alembic import command
 from alembic import testing
 from alembic import util
@@ -9,6 +11,7 @@ from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from alembic.testing import config
 from alembic.testing import eq_
+from alembic.testing import expect_raises
 from alembic.testing import is_
 from alembic.testing import mock
 from alembic.testing.assertions import expect_raises_message
@@ -143,6 +146,151 @@ def downgrade():
             env.configure(
                 connection=engine, fn=upgrade, transactional_ddl=False
             )
+
+
+class VersionFinalizeCallbackTest(TestBase):
+    """Run the same two-step migration, where the second step fails with
+    a database error, on both sides of the transaction_per_migration
+    switch (plus an externally-managed transaction), and verify the
+    on_version_finalize events against the versions left in the database.
+    """
+
+    def setUp(self):
+        staging_env()
+        self.cfg = _sqlite_testing_config()
+        self.bind = _sqlite_file_db()
+
+    def tearDown(self):
+        clear_staging_env()
+
+    def _env_with_scripts(self):
+        env = EnvironmentContext(
+            self.cfg, ScriptDirectory.from_config(self.cfg)
+        )
+        a_rev = "arev"
+        b_rev = "brev"
+        env.script.generate_revision(a_rev, "revision a", refresh=True)
+        write_script(
+            env.script,
+            a_rev,
+            """\
+"Rev A"
+revision = 'arev'
+down_revision = None
+
+from alembic import op
+from sqlalchemy import Column, Integer
+
+
+def upgrade():
+    op.create_table("foo", Column("x", Integer))
+
+
+def downgrade():
+    op.drop_table("foo")
+
+""",
+        )
+        env.script.generate_revision(b_rev, "revision b", refresh=True)
+        write_script(
+            env.script,
+            b_rev,
+            """\
+"Rev B"
+revision = 'brev'
+down_revision = 'arev'
+
+from alembic import op
+
+
+def upgrade():
+    # fails with the database's own error
+    op.execute("INSERT INTO table_that_does_not_exist (x) VALUES (1)")
+
+
+def downgrade():
+    pass
+
+""",
+        )
+        return env
+
+    def _run_failing_migration(
+        self, transaction_per_migration, external_transaction=False
+    ):
+        env = self._env_with_scripts()
+        events = []
+
+        connection = self.bind.connect()
+        if external_transaction:
+            outer_transaction = connection.begin()
+        else:
+            outer_transaction = None
+
+        env.configure(
+            connection=connection,
+            fn=lambda heads, context: env.script._upgrade_revs(
+                "brev", heads
+            ),
+            transactional_ddl=True,
+            transaction_per_migration=transaction_per_migration,
+            on_version_apply=lambda **kw: events.append(("apply", kw)),
+            on_version_finalize=lambda **kw: events.append(("finalize", kw)),
+        )
+        context = env.get_context()
+
+        # the original database exception from the failing second step
+        # propagates to the caller unchanged
+        with expect_raises(OperationalError):
+            with context.begin_transaction():
+                env.run_migrations()
+
+        if outer_transaction is not None:
+            outer_transaction.rollback()
+        connection.close()
+        return events
+
+    def _current_heads(self):
+        with self.bind.connect() as conn:
+            context = MigrationContext.configure(conn)
+            return context.get_current_heads()
+
+    def _assert_events(self, events, expected_finalize_state):
+        eq_([kind for kind, kw in events], ["apply", "finalize"])
+
+        apply_kw = events[0][1]
+        eq_(apply_kw["step"].up_revision_id, "arev")
+        assert hasattr(apply_kw["ctx"], "get_current_revision")
+
+        finalize_kw = events[1][1]
+        eq_(finalize_kw["step"].up_revision_id, "arev")
+        eq_(finalize_kw["heads"], {"arev"})
+        eq_(finalize_kw["run_args"], {})
+        eq_(finalize_kw["state"], expected_finalize_state)
+
+    def test_transaction_per_migration(self):
+        events = self._run_failing_migration(transaction_per_migration=True)
+
+        # step one's transaction was committed before step two failed
+        self._assert_events(events, "committed")
+        eq_(self._current_heads(), ("arev",))
+
+    def test_transaction_per_run(self):
+        events = self._run_failing_migration(transaction_per_migration=False)
+
+        # step one was only executed; its transaction was still open and
+        # rolled back along with the failing second step
+        self._assert_events(events, "executed")
+        eq_(self._current_heads(), ())
+
+    def test_external_transaction(self):
+        events = self._run_failing_migration(
+            transaction_per_migration=False, external_transaction=True
+        )
+
+        # the transaction belongs to the caller, who rolls it back
+        self._assert_events(events, "external")
+        eq_(self._current_heads(), ())
 
 
 class CWDTest(TestBase):

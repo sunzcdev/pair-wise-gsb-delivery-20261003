@@ -81,6 +81,19 @@ OnVersionApplyFn = Callable[
     None,
 ]
 
+VersionFinalizeState = Literal["executed", "committed", "external"]
+
+OnVersionFinalizeFn = Callable[
+    [
+        MigrationContext,
+        "MigrationInfo",
+        Collection[Any],
+        Mapping[str, Any],
+        VersionFinalizeState,
+    ],
+    None,
+]
+
 CompareServerDefault = Callable[
     [
         MigrationContext,
@@ -439,6 +452,7 @@ class EnvironmentContext(util.ModuleClsProxy):
         sqlalchemy_module_prefix: str = "sa.",
         user_module_prefix: str | None = None,
         on_version_apply: OnVersionApplyFn | None = None,
+        on_version_finalize: OnVersionFinalizeFn | None = None,
         autogenerate_plugins: Sequence[str] | None = None,
         **kw: Any,
     ) -> None:
@@ -554,6 +568,54 @@ class EnvironmentContext(util.ModuleClsProxy):
             * ``heads``: a collection of version strings representing the
               current heads,
             * ``run_args``: the ``**kwargs`` passed to :meth:`.run_migrations`.
+
+        :param on_version_finalize: a callable or collection of callables
+            to be run for each migration step, after the transaction
+            demarcated for that step has been finalized.
+
+            In contrast to :paramref:`.EnvironmentContext.on_version_apply`,
+            which runs while the transaction that applied the step is still
+            pending and may still be rolled back, these callables run only
+            after the step's transaction, if Alembic owned one, has been
+            committed, and are not invoked at all for a step that fails;
+            in the failure case the original database exception propagates
+            to the caller unchanged.
+
+            Each callable accepts no positional arguments and the following
+            keyword arguments:
+
+            * ``ctx``: the :class:`.MigrationContext` running the migration,
+            * ``step``: a :class:`.MigrationInfo` representing the
+              step currently being applied,
+            * ``heads``: a collection of version strings representing the
+              current heads,
+            * ``run_args``: the ``**kwargs`` passed to :meth:`.run_migrations`,
+            * ``state``: a string indicating how the step's work was
+              finalized; one of:
+
+              - ``"committed"`` - Alembic committed the transaction for
+                this step when the step completed; the step's changes are
+                durable.  This is the case when
+                :paramref:`.EnvironmentContext.transaction_per_migration`
+                is set, or when the target database does not support
+                transactional DDL and each step is committed individually.
+              - ``"executed"`` - the step's DDL was executed within a
+                transaction that remains open; it will be committed or
+                rolled back along with the rest of the migration run.
+                This is the case when
+                :paramref:`.EnvironmentContext.transaction_per_migration`
+                is not set and the database uses transactional DDL.
+                This state is also used in offline ("--sql") mode, where
+                no real transaction takes place.
+              - ``"external"`` - the connection was already inside a
+                transaction begun by the caller; commit or rollback of
+                the step is entirely under the caller's control.
+
+            .. versionadded:: 1.21.0
+
+            .. seealso::
+
+                :paramref:`.EnvironmentContext.on_version_apply`
 
         Parameters specific to the autogenerate feature, when
         ``alembic revision`` is run with the ``--autogenerate`` feature:
@@ -923,6 +985,9 @@ class EnvironmentContext(util.ModuleClsProxy):
         opts["literal_binds"] = literal_binds
         opts["process_revision_directives"] = process_revision_directives
         opts["on_version_apply"] = util.to_tuple(on_version_apply, default=())
+        opts["on_version_finalize"] = util.to_tuple(
+            on_version_finalize, default=()
+        )
 
         if autogenerate_plugins is not None:
             opts["autogenerate_plugins"] = autogenerate_plugins

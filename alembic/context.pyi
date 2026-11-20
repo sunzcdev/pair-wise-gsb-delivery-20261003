@@ -204,6 +204,19 @@ def configure(
         ]
         | None
     ) = None,
+    on_version_finalize: (
+        Callable[
+            [
+                MigrationContext,
+                MigrationInfo,
+                Collection[Any],
+                Mapping[str, Any],
+                Literal["executed", "committed", "external"],
+            ],
+            None,
+        ]
+        | None
+    ) = None,
     autogenerate_plugins: Sequence[str] | None = None,
     **kw: Any,
 ) -> None:
@@ -319,6 +332,32 @@ def configure(
         * ``heads``: a collection of version strings representing the
           current heads,
         * ``run_args``: the ``**kwargs`` passed to :meth:`.run_migrations`.
+    :param on_version_finalize: a callable or collection of callables
+        to be run for each migration step, after the transaction
+        demarcated for that step has been finalized.
+        In contrast to ``on_version_apply``, which runs while the
+        transaction that applied the step is still pending and may still
+        be rolled back, these callables run only after the step's
+        transaction, if Alembic owned one, has been committed, and are
+        not invoked at all for a step that fails; in the failure case the
+        original database exception propagates to the caller unchanged.
+        Each callable accepts no positional arguments and the following
+        keyword arguments:
+
+        * ``ctx``: the :class:`.MigrationContext` running the migration,
+        * ``step``: a :class:`.MigrationInfo` representing the
+          step currently being applied,
+        * ``heads``: a collection of version strings representing the
+          current heads,
+        * ``run_args``: the ``**kwargs`` passed to :meth:`.run_migrations`.
+        * ``state``: a string indicating how the step's work was
+          finalized; one of ``"committed"`` (Alembic committed the step's
+          transaction), ``"executed"`` (the step's DDL ran within a
+          transaction that remains open and may still be rolled back,
+          or offline "--sql" mode), or ``"external"`` (the transaction
+          is managed by the caller).
+
+        .. versionadded:: 1.21.0
 
     Parameters specific to the autogenerate feature, when
     ``alembic revision`` is run with the ``--autogenerate`` feature:
