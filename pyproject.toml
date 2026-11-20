@@ -1,0 +1,111 @@
+[project]
+name = "Hypercorn"
+version = "0.18.0"
+description = "A ASGI Server based on Hyper libraries and inspired by Gunicorn"
+authors = [
+    {name = "pgjones", email = "philip.graham.jones@googlemail.com"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+include = ["src/hypercorn/py.typed"]
+license = {text = "MIT"}
+readme = "README.rst"
+repository = "https://github.com/pgjones/hypercorn/"
+dependencies = [
+    "exceptiongroup >= 1.1.0; python_version < '3.11'",
+    "h11",
+    "h2 >= 4.3.0",
+    "priority",
+    "taskgroup; python_version < '3.11'",
+    "tomli; python_version < '3.11'",
+    "typing_extensions; python_version < '3.11'",
+    "wsproto >= 0.14.0"
+]
+documentation = "https://hypercorn.readthedocs.io"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+docs = ["pydata_sphinx_theme", "sphinxcontrib_mermaid"]
+h3 = ["aioquic >= 0.9.0"]
+trio = ["trio"]
+uvloop = ["uvloop"]
+
+[dependency-groups]
+dev = [
+    "httpx",
+    "hypothesis",
+    "mock",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-trio",
+    "trio"
+]
+
+[project.scripts]
+hypercorn = "hypercorn.__main__:main"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.isort]
+combine_as_imports = true
+force_grid_wrap = 0
+include_trailing_comma = true
+known_first_party = "hypercorn, tests"
+line_length = 100
+multi_line_output = 3
+no_lines_before = "LOCALFOLDER"
+order_by_type = false
+reverse_relative = true
+
+[tool.mypy]
+allow_redefinition = true
+disallow_any_generics = false
+disallow_subclassing_any = true
+disallow_untyped_calls = false
+disallow_untyped_defs = true
+implicit_reexport = true
+no_implicit_optional = true
+show_error_codes = true
+strict = true
+strict_equality = true
+strict_optional = false
+warn_redundant_casts = true
+warn_return_any = false
+warn_unused_configs = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module =["aioquic.*", "cryptography.*", "h11.*", "h2.*", "priority.*", "pytest_asyncio.*", "uvloop.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["trio.*", "tests.trio.*"]
+disallow_any_generics = true
+disallow_untyped_calls = true
+strict_optional = true
+warn_return_any = true
+
+[tool.pytest.ini_options]
+addopts = "--no-cov-on-fail --showlocals --strict-markers"
+asyncio_mode = "strict"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
