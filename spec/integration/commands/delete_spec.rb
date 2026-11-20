@@ -1,0 +1,101 @@
+# frozen_string_literal: true
+
+RSpec.describe 'Commands / Delete' do
+  include_context 'database setup'
+
+  let(:delete_user) { user_commands.delete }
+
+  let(:user_commands) { container.commands[:users] }
+
+  with_adapters do
+    setup_tables do
+      conn.drop_table?(:users)
+
+      conn.create_table(:users) do
+        primary_key :id
+        String :name, null: false
+      end
+    end
+
+    let(:users) { container.relations[:users] }
+
+    setup_relations do
+      conf.relation(:users) do
+        def by_name(name)
+          where(name: name)
+        end
+      end
+
+      conf.commands(:users) do
+        define(:delete) do
+          result :one
+        end
+      end
+    end
+
+    seed do
+      users.insert(id: 3, name: 'Jade')
+      users.insert(id: 4, name: 'John')
+    end
+
+    describe '#transaction' do
+      it 'deletes in normal way if no error raised' do
+        expect {
+          users.transaction do
+            delete_user.by_name('Jade').call
+          end
+        }.to change { users.count }.by(-1)
+      end
+
+      it 'deletes nothing if error was raised' do
+        expect {
+          users.transaction do |t|
+            delete_user.by_name('Jade').call
+            t.rollback!
+          end
+        }.to_not(change { users.count })
+      end
+    end
+
+    describe '#call' do
+      it 'deletes all tuples in a restricted relation' do
+        result = delete_user.by_name('Jade').call
+
+        expect(result).to eql(id: 3, name: 'Jade')
+      end
+
+      it 're-raises database error' do
+        command = delete_user.by_name('Jade')
+
+        expect(command.relation).to receive(:delete).and_raise(
+          Sequel::DatabaseError, 'totally wrong'
+        )
+
+        expect {
+          command.call
+        }.to raise_error(ROM::SQL::DatabaseError, /totally wrong/)
+      end
+    end
+
+    describe '#execute' do
+      context 'with a single record' do
+        it 'materializes the result' do
+          result = container.commands[:users].delete.by_name(%w[Jade]).execute
+          expect(result).to eq([
+            { id: 3, name: 'Jade' }
+          ])
+        end
+      end
+
+      context 'with multiple records' do
+        it 'materializes the results' do
+          result = container.commands[:users].delete.by_name(%w[Jade John]).execute
+          expect(result).to eq([
+            { id: 3, name: 'Jade' },
+            { id: 4, name: 'John' }
+          ])
+        end
+      end
+    end
+  end
+end
