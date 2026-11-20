@@ -21,7 +21,7 @@ method calls.
 
 .. testsetup:: *
 
-   from cachetools import cached, cachedmethod, LRUCache, TLRUCache, TTLCache
+   from cachetools import cached, cachedmethod, LRUCache, SLRUCache, TLRUCache, TTLCache
 
    from unittest import mock
    urllib = mock.MagicMock()
@@ -119,6 +119,36 @@ inserted into the cache.
 
    This class discards the least recently used items first to make
    space when necessary.
+
+.. autoclass:: SLRUCache(maxsize, maxprotected=None, getsizeof=None)
+   :members: maxprotected, popitem
+
+   This segmented variant of :class:`LRUCache` splits its items into
+   a probationary and a protected segment.  Newly inserted items go
+   into the probationary segment, and an item retrieved again is
+   promoted to the protected segment.  When the protected segment is
+   full, its least recently used item is demoted back to the
+   probationary segment instead of being discarded.
+   :meth:`popitem` always discards from the probationary segment
+   first, so a stream of one-off keys cannot flush frequently used,
+   protected items, e.g. while warming a service.
+
+   The optional `maxprotected` argument limits the total size of the
+   protected segment; it defaults to half of `maxsize`.  A key belongs
+   to exactly one segment at any time, so updating an item's size only
+   counts it once.
+
+   .. doctest::
+
+      >>> cache = SLRUCache(maxsize=4, maxprotected=2)
+      >>> cache['a'] = 1
+      >>> cache['b'] = 2
+      >>> cache['a']  # repeated hit promotes 'a' to protected
+      1
+      >>> for key in ('c', 'd', 'e', 'f'):
+      ...     cache[key] = 1
+      >>> 'a' in cache  # the hot key survives the stream of new keys
+      True
 
 .. autoclass:: RRCache(maxsize, choice=random.choice, getsizeof=None)
    :members: choice, popitem

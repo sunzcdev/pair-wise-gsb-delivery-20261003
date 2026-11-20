@@ -22,6 +22,7 @@ __all__: Final = (
     "LFUCache",
     "LRUCache",
     "RRCache",
+    "SLRUCache",
     "TLRUCache",
     "TTLCache",
     "cached",
@@ -78,6 +79,25 @@ class RRCache(Cache[_KT, _VT]):
     ) -> None: ...
     @property
     def choice(self) -> Callable[[Sequence[_KT]], _KT]: ...
+
+class SLRUCache(Cache[_KT, _VT]):
+    @overload
+    def __init__(
+        self,
+        maxsize: float,
+        maxprotected: float | None = None,
+        *,
+        getsizeof: Callable[[_VT], float] | None = None,
+    ) -> None: ...
+    @overload
+    def __init__(
+        self,
+        maxsize: float,
+        maxprotected: float | None,
+        getsizeof: Callable[[_VT], float],
+    ) -> None: ...
+    @property
+    def maxprotected(self) -> float: ...
 
 class _TimedCache(Cache[_KT, _VT], Generic[_KT, _VT, _TT]):
     def __init__(

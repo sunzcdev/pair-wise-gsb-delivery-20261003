@@ -7,6 +7,7 @@ __all__ = (
     "LFUCache",
     "LRUCache",
     "RRCache",
+    "SLRUCache",
     "TLRUCache",
     "TTLCache",
     "cached",
@@ -385,6 +386,108 @@ class LRUCache(Cache):
     def clear(self):
         Cache.clear(self)
         self.__order.clear()
+
+
+class SLRUCache(Cache):
+    """Segmented Least Recently Used (SLRU) cache implementation.
+
+    The cache is split into a probationary segment holding items seen
+    only once, and a protected segment holding items that have been
+    retrieved at least twice.  A newly inserted item goes into the
+    probationary segment; retrieving it again promotes it to the
+    protected segment.  When the protected segment is full, its least
+    recently used item is demoted back to the probationary segment
+    instead of being discarded.  Items are evicted from the
+    probationary segment first, so a stream of one-off keys cannot
+    flush the protected hot data.
+
+    """
+
+    def __init__(self, maxsize, maxprotected=None, getsizeof=None):
+        Cache.__init__(self, maxsize, getsizeof)
+        if maxprotected is None:
+            maxprotected = maxsize / 2
+        if maxprotected < 0:
+            raise ValueError("maxprotected must be non-negative")
+        self.__probation = collections.OrderedDict()
+        self.__protected = collections.OrderedDict()
+        self.__protsize = 0
+        self.__maxprotected = maxprotected
+        self.__weighted = self.getsizeof is not Cache.getsizeof
+
+    def __getitem__(self, key, cache_getitem=Cache.__getitem__):
+        value = cache_getitem(self, key)
+        probation = self.__probation
+        protected = self.__protected
+        if key in protected:
+            protected.move_to_end(key)
+        elif key in probation:  # __missing__ may not store the item
+            if self.__maxprotected > 0:
+                itemsize = self.getsizeof(value) if self.__weighted else 1
+                del probation[key]
+                while protected and self.__protsize + itemsize > self.__maxprotected:
+                    demoted, demoted_size = protected.popitem(last=False)
+                    probation[demoted] = None
+                    self.__protsize -= demoted_size
+                protected[key] = itemsize
+                self.__protsize += itemsize
+            else:
+                probation.move_to_end(key)
+        return value
+
+    def __setitem__(self, key, value, cache_setitem=Cache.__setitem__):
+        cache_setitem(self, key, value)
+        probation = self.__probation
+        protected = self.__protected
+        if key in protected:
+            itemsize = self.getsizeof(value) if self.__weighted else 1
+            self.__protsize += itemsize - protected[key]
+            protected[key] = itemsize
+            protected.move_to_end(key)
+        elif key not in probation:
+            probation[key] = None
+        else:
+            probation.move_to_end(key)
+
+    def __delitem__(self, key, cache_delitem=Cache.__delitem__):
+        cache_delitem(self, key)
+        try:
+            del self.__probation[key]
+        except KeyError:
+            self.__protsize -= self.__protected.pop(key)
+
+    def __copy__(self):
+        copy = super().__copy__()
+        copy.__probation = self.__probation.copy()
+        copy.__protected = self.__protected.copy()
+        return copy
+
+    @property
+    def maxprotected(self):
+        """The maximum size of the protected segment."""
+        return self.__maxprotected
+
+    def popitem(self):
+        """Remove and return the least recently used `(key, value)`
+        pair, from the probationary segment first.
+
+        """
+        try:
+            key = next(iter(self.__probation))
+        except StopIteration:
+            try:
+                key = next(iter(self.__protected))
+            except StopIteration:
+                raise KeyError("%s is empty" % type(self).__name__) from None
+        value = Cache.__getitem__(self, key)
+        del self[key]
+        return (key, value)
+
+    def clear(self):
+        Cache.clear(self)
+        self.__probation.clear()
+        self.__protected.clear()
+        self.__protsize = 0
 
 
 class RRCache(Cache):
