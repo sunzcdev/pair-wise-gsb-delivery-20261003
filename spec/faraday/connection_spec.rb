@@ -436,6 +436,86 @@ RSpec.describe Faraday::Connection do
     it { expect(conn.headers.include?('Authorization')).to be_truthy }
     it { expect(request.headers.keys).to be_empty }
     it { expect(request.headers.include?('Authorization')).to be_falsey }
+
+    context 'with caller-provided nested request options' do
+      let(:url) { 'http://example.com' }
+      let(:encoder) { Faraday::FlatParamsEncoder }
+      let(:options) do
+        { request: { context: { trace: { steps: [] } }, oauth: { consumer_key: 'anonymous' },
+                     params_encoder: encoder } }
+      end
+      let(:conn) do
+        Faraday::Connection.new(url, options) do |builder|
+          builder.adapter :test do |stub|
+            stub.get('/a') { |env| [200, {}, env.request.context.inspect] }
+            stub.get('/b') { |env| [200, {}, env.request.context.inspect] }
+          end
+        end
+      end
+
+      it 'gives every request its own copy of the nested structures' do
+        first = request
+        second = conn.build_request(:get)
+
+        expect(first.options).not_to equal(second.options)
+        expect(first.options.context).not_to equal(second.options.context)
+        expect(first.options.context[:trace]).not_to equal(second.options.context[:trace])
+        expect(first.options.context[:trace][:steps]).not_to equal(second.options.context[:trace][:steps])
+        expect(first.options.oauth).not_to equal(second.options.oauth)
+      end
+
+      it 'does not change the connection defaults from a request' do
+        request = conn.build_request(:get) do |req|
+          req.options.context[:trace][:steps] << :first
+          req.options.oauth[:consumer_secret] = 'secret'
+        end
+        request.to_env(conn)
+
+        expect(conn.options.context).to eq(trace: { steps: [] })
+        expect(conn.options.oauth).to eq(consumer_key: 'anonymous')
+        expect(request.options.context).to eq(trace: { steps: [:first] })
+      end
+
+      it 'keeps the declared shared members by reference' do
+        expect(conn.build_request(:get).options.params_encoder).to equal(encoder)
+      end
+
+      it 'keeps interleaved requests isolated from each other' do
+        first = conn.build_request(:get) do |req|
+          req.url('/a')
+          req.options.context[:trace][:steps] << :first
+        end
+        second = conn.build_request(:get) do |req|
+          req.url('/b')
+          req.options.context[:trace][:steps] << :second
+        end
+
+        # Both requests are built and customised before either reaches the
+        # adapter, so any sharing would be visible in what the adapter sees.
+        contexts = [first, second].map do |request|
+          conn.builder.app.call(request.to_env(conn)).env.request.context
+        end
+
+        expect(contexts).to eq([{ trace: { steps: [:first] } }, { trace: { steps: [:second] } }])
+        expect(conn.options.context).to eq(trace: { steps: [] })
+      end
+
+      it 'lets interleaved requests report their own context through the adapter' do
+        contexts = []
+        conn = Faraday::Connection.new(url, options) do |builder|
+          builder.adapter :test do |stub|
+            stub.get('/a') { |env| contexts << env.request.context; [200, {}, 'a'] }
+            stub.get('/b') { |env| contexts << env.request.context; [200, {}, 'b'] }
+          end
+        end
+
+        conn.get('/a') { |req| req.options.context[:trace][:steps] << :first }
+        conn.get('/b') { |req| req.options.context[:trace][:steps] << :second }
+
+        expect(contexts).to eq([{ trace: { steps: [:first] } }, { trace: { steps: [:second] } }])
+        expect(conn.options.context).to eq(trace: { steps: [] })
+      end
+    end
   end
 
   describe '#to_env' do

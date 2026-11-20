@@ -15,7 +15,13 @@ Not every adapter supports all of them: check your adapter's documentation (e.g.
 | `:write_timeout`  | Integer, Float    | nil (adapter default)                                          | The max number of seconds to wait for one block to be written.          |
 | `:boundary`       | String            | nil                                                            | The boundary string for multipart requests.                             |
 | `:context`        | Hash              | nil                                                            | Arbitrary data that you can pass to your request.                       |
-| `:on_data`        | Proc              | nil                                                            | A callback that will be called when data is received. See [Streaming]   |
+| `:on_data`        | Proc              | nil                                                            | A callback that will be called when data is received. See [Streaming] |
+| `:oauth`          | Hash              | nil                                                            | OAuth options used by OAuth middleware.                                 |
+
+Every request built by a connection gets its own deep copy of these options, so mutating a nested value such as
+`context`, `oauth` or `bind` inside middleware or a request block never affects another request, nor the connection
+defaults. Members that are declared as read-only collaborators (`params_encoder` and `on_data`) are shared with
+every request instead of being copied.
 
 ## Example
 

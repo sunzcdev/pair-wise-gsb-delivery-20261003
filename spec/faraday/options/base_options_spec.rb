@@ -13,6 +13,13 @@ RSpec.describe Faraday::BaseOptions do
       attr_accessor :timeout, :open_timeout
     end
   end
+  let(:shared_options_class) do
+    Class.new(described_class) do
+      const_set(:MEMBERS, %i[timeout callback context].freeze)
+      const_set(:SHARED_MEMBERS, %i[callback].freeze)
+      attr_accessor :timeout, :callback, :context
+    end
+  end
   let(:parent_options_class) do
     nested = nested_options_class
     Class.new(described_class) do
@@ -34,9 +41,33 @@ RSpec.describe Faraday::BaseOptions do
       expect(described_class::COERCIONS).to eq({}).and be_frozen
     end
 
+    it 'defines no shared members by default' do
+      expect(described_class::SHARED_MEMBERS).to eq([]).and be_frozen
+      expect(described_class.shared_member?(:anything)).to be(false)
+    end
+
     it 'lets subclasses omit COERCIONS' do
       expect(simple_options_class::COERCIONS).to eq({})
       expect(simple_options_class.new(timeout: 1).timeout).to eq(1)
+    end
+  end
+
+  describe 'shared members' do
+    it 'reports whether a member is declared as shared' do
+      expect(shared_options_class.shared_member?(:callback)).to be(true)
+      expect(shared_options_class.shared_member?('callback')).to be(true)
+      expect(shared_options_class.shared_member?(:context)).to be(false)
+    end
+
+    it 'keeps the declared member by reference when duplicating' do
+      callback = proc { |_value| }
+      options = shared_options_class.new(timeout: 1, callback: callback, context: { a: [1] })
+
+      duped = options.deep_dup
+
+      expect(duped.callback).to equal(callback)
+      expect(duped.context).not_to equal(options.context)
+      expect(duped.context[:a]).not_to equal(options.context[:a])
     end
   end
 
@@ -461,6 +492,34 @@ RSpec.describe Faraday::BaseOptions do
       end
 
       expect(klass.new.deep_dup.timeout).to eq(99)
+    end
+
+    it 'keeps members declared as shared by reference' do
+      callback = proc { |_value| }
+      options = shared_options_class.new(timeout: 10, callback: callback, context: { a: [1] })
+
+      duped = options.deep_dup
+
+      expect(duped.callback).to equal(callback)
+      expect(duped.context).not_to equal(options.context)
+      expect(duped.context[:a]).not_to equal(options.context[:a])
+      expect(duped.context[:a]).to eq([1])
+    end
+
+    it 'copies a shared member that holds an options object without duplicating it' do
+      nested_class = nested_options_class
+      klass = Class.new(described_class) do
+        const_set(:MEMBERS, %i[nested context].freeze)
+        const_set(:COERCIONS, { nested: nested_class }.freeze)
+        const_set(:SHARED_MEMBERS, %i[nested].freeze)
+        attr_accessor :nested, :context
+      end
+      options = klass.new(nested: { value: 'shared' }, context: { a: 1 })
+
+      duped = options.deep_dup
+
+      expect(duped.nested).to equal(options.nested)
+      expect(duped.context).not_to equal(options.context)
     end
   end
 

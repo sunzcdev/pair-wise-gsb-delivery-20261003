@@ -457,6 +457,11 @@ module Faraday
 
     # Creates and configures the request object.
     #
+    # The request gets its own deep copy of the connection's request options, so
+    # its nested `context`, `oauth` and similar structures belong to this call
+    # alone. Members declared as shared (such as `params_encoder` and `on_data`)
+    # are still kept by reference.
+    #
     # @param method [Symbol]
     #
     # @yield [Faraday::Request] if block given
@@ -465,7 +470,7 @@ module Faraday
       Request.create(method) do |req|
         req.params  = params.dup
         req.headers = headers.dup
-        req.options = options.dup
+        req.options = options.deep_dup
         yield(req) if block_given?
       end
     end

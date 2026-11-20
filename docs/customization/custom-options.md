@@ -17,6 +17,9 @@ A subclass lists its attributes in `MEMBERS` and defines a public reader and wri
 * a `Class`, coerced with `Class.from(value)` (for example another `BaseOptions` subclass);
 * a `Proc`, coerced with `proc.call(value)`.
 
+`SHARED_MEMBERS` is optional and lists attributes that are read-only collaborators, shared by reference
+instead of being copied. Use it for classes, proc callbacks or IO objects that are the same for every copy:
+
 ```ruby
 class CacheOptions < Faraday::BaseOptions
   MEMBERS = %i[ttl store].freeze
@@ -25,14 +28,16 @@ class CacheOptions < Faraday::BaseOptions
 end
 
 class MyOptions < Faraday::BaseOptions
-  MEMBERS = %i[timeout cache headers].freeze
+  MEMBERS = %i[timeout cache logger].freeze
   COERCIONS = { cache: CacheOptions }.freeze
+  SHARED_MEMBERS = %i[logger].freeze
 
-  attr_accessor :timeout, :cache, :headers
+  attr_accessor :timeout, :cache, :logger
 end
 
-options = MyOptions.new(timeout: 5, cache: { ttl: 60 })
+options = MyOptions.new(timeout: 5, cache: { ttl: 60 }, logger: Logger.new($stdout))
 options.cache.class # => CacheOptions
+options.deep_dup.logger.equal?(options.logger) # => true
 ```
 
 ## Behavior
@@ -47,9 +52,10 @@ options.cache.class # => CacheOptions
 * `merge!` deep merges a hash into the existing hash or options value of the same attribute, recursively.
   Other values are replaced. Nested options objects are replaced by a merged copy rather than mutated.
 * `merge` and `deep_dup` copy hashes, arrays and nested options recursively, so the result shares none of them with the
-  original. Any other object (strings, procs, IO objects and so on) is kept as is.
-* `to_hash` skips `nil` attributes and converts nested options to hashes. Because `deep_dup` and `merge` go through
-  `to_hash`, an attribute holding an options object needs a matching entry in `COERCIONS` to stay an options object.
+  original. Members listed in `SHARED_MEMBERS` are kept by reference. Any other object (strings, procs, IO objects and
+  so on) is kept as is.
+* `to_hash` skips `nil` attributes and converts nested options to hashes. Because `merge` goes through `to_hash`, an
+  attribute holding an options object needs a matching entry in `COERCIONS` to stay an options object.
 
 ```ruby
 options.merge(cache: { store: :memory }).to_hash

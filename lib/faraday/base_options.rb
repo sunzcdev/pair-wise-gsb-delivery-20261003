@@ -11,6 +11,10 @@ module Faraday
   # - +COERCIONS+ (optional): Hash mapping attribute names to either a Class
   #   (coerced with +Class.from(value)+) or a Proc (coerced with +proc.call(value)+).
   #   +nil+ values are never coerced.
+  # - +SHARED_MEMBERS+ (optional): Array of attribute names whose value is kept
+  #   by reference when the instance is copied, see {#deep_dup}. Use it for
+  #   read-only collaborators that are the same for every copy, such as encoders,
+  #   callbacks or IO objects.
   #
   # Keys can be Symbols or Strings. Assigning an unknown key raises
   # +NoMethodError+, like {Options} does. +nil+ values are skipped by
@@ -41,6 +45,7 @@ module Faraday
 
     MEMBERS = [].freeze
     COERCIONS = {}.freeze
+    SHARED_MEMBERS = [].freeze
 
     class << self
       # Create new instance from hash or existing instance.
@@ -129,6 +134,11 @@ module Faraday
 
     # Create a deep duplicate of this instance.
     #
+    # Nested hashes, arrays and {OptionsLike} values are copied recursively, so
+    # the result shares none of them with the receiver. Members listed in
+    # +SHARED_MEMBERS+ are the exception: they are declared read-only and the
+    # same object is kept in the copy.
+    #
     # @return [BaseOptions] a new instance with deeply duplicated values
     #
     # @example
@@ -137,7 +147,15 @@ module Faraday
     #   copy.timeout = 20
     #   original.timeout # => 10 (unchanged)
     def deep_dup
-      self.class.new(Utils.deep_dup(to_hash))
+      copy = self.class.new
+      self.class::MEMBERS.each do |key|
+        value = public_send(key)
+        # Write through the public writer, without coercing again: a shared
+        # member must stay the very same object, and a duplicated one is
+        # already of the coerced type.
+        copy.public_send(:"#{key}=", deep_dup_value(key, value)) unless value.nil?
+      end
+      copy
     end
 
     # Convert to a hash.
@@ -169,6 +187,11 @@ module Faraday
       "#<#{self.class} #{pairs.empty? ? '(empty)' : pairs.join(', ')}>"
     end
 
+    # @return [Boolean] true if +key+ is declared as a shared member
+    def self.shared_member?(key)
+      self::SHARED_MEMBERS.include?(key.to_sym)
+    end
+
     private
 
     # Yields each non-nil pair of +obj+ with a Symbol key.
@@ -192,6 +215,12 @@ module Faraday
       mergeable = (current.is_a?(Hash) || current.is_a?(OptionsLike)) &&
                   (value.is_a?(Hash) || value.is_a?(OptionsLike))
       mergeable ? Utils.deep_merge(current, value.to_hash) : value
+    end
+
+    # Copy a single member value for {#deep_dup}. Shared members are kept by
+    # reference, everything else is duplicated by {Utils.deep_dup}.
+    def deep_dup_value(key, value)
+      self.class.shared_member?(key) ? value : Utils.deep_dup(value)
     end
 
     # Coerce a value based on the COERCIONS configuration.

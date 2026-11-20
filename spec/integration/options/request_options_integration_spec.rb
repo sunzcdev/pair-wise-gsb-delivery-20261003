@@ -1,6 +1,76 @@
 # frozen_string_literal: true
 
 RSpec.describe Faraday::RequestOptions do
+  describe 'request context' do
+    def json(response)
+      JSON.parse(response.body)
+    end
+
+    it 'keeps interleaved requests on the same connection independent' do
+      seen = []
+      responses = {}
+      connection = nil
+      spawned = false
+
+      # Runs for every request and stores a marker in its own request context,
+      # then mirrors it into a header so the server echoes it back. While the
+      # outer request is in flight it also fires a nested request, so both
+      # request options exist at the same time.
+      mutating_middleware = Class.new(Faraday::Middleware) do
+        define_method(:on_request) do |env|
+          context = env.request.context
+          context[:marker] = context[:tag]
+          env.request_headers['X-Context'] = context[:tag].to_s
+          env.request_headers['X-Timeout'] = env.request.timeout.to_s
+
+          next unless context[:tag] == :outer && !spawned
+
+          spawned = true
+          responses[:inner] = connection.get('/get') do |req|
+            req.options.context[:tag] = :inner
+            req.options.timeout = 2
+          end
+        end
+      end
+
+      # Sits directly above the adapter, so it sees the env the adapter receives.
+      recording_middleware = Class.new(Faraday::Middleware) do
+        define_method(:on_request) do |env|
+          context = env.request.context
+          seen << { tag: context[:tag], marker: context[:marker], timeout: env.request.timeout }
+        end
+      end
+
+      connection = httpbin_connection(request: { context: { marker: nil } }) do |f|
+        f.use mutating_middleware
+        f.use recording_middleware
+      end
+
+      responses[:outer] = connection.get('/get') do |req|
+        req.options.context[:tag] = :outer
+        req.options.timeout = 5
+      end
+
+      expect(responses[:outer].status).to eq(200)
+      expect(responses[:inner].status).to eq(200)
+
+      # Each adapter sees its own timeout and its own context marker, even
+      # though the inner request was created while the outer one was running.
+      expect(seen).to contain_exactly(
+        { tag: :outer, marker: :outer, timeout: 5 },
+        { tag: :inner, marker: :inner, timeout: 2 }
+      )
+
+      # The server echoes the header each request derived from its own context.
+      expect(json(responses[:outer])['headers']).to include('X-Context' => 'outer', 'X-Timeout' => '5')
+      expect(json(responses[:inner])['headers']).to include('X-Context' => 'inner', 'X-Timeout' => '2')
+
+      # The connection defaults were never used as shared mutable storage.
+      expect(connection.options.context).to eq(marker: nil)
+      expect(connection.options.timeout).to be_nil
+    end
+  end
+
   describe 'timeout option' do
     it 'raises TimeoutError when request exceeds timeout' do
       conn = httpbin_connection(request: { timeout: 1 })
