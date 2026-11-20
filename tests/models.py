@@ -5163,6 +5163,96 @@ class TestCTEIntegration(ModelTestCase):
         # sum of 3^2 + 4^2 + 5^2 = 9 + 16 + 25 = 50
         self.assertEqual(result, 50.0)
 
+    @skip_if((IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES)
+             or IS_CRDB, 'requires recursive cte')
+    def test_recursive_cte_column_contract_sqlite(self):
+        # A finite recursion that walks the category tree, exercising column
+        # references and parameter placement through the real driver.
+        anchor = (Category
+                  .select(Category.name, Category.parent,
+                          Value(1).alias('depth'))
+                  .where(Category.name == 'c31')
+                  .cte('tree', recursive=True,
+                       columns=('name', 'parent_id', 'depth')))
+        rterm = (Category
+                 .select(Category.name, Category.parent,
+                         (anchor.c.depth + 1).alias('depth'))
+                 .join(anchor, on=(Category.name == anchor.c.parent_id)))
+        cte = anchor.union_all(rterm)
+        self.assertEqual(cte.column_contract,
+                         ('name', 'parent_id', 'depth'))
+        self.assertTrue(cte.explicit_contract)
+
+        query = (cte
+                 .select_from(cte.c.name, cte.c.depth)
+                 .order_by(cte.c.depth))
+        sql, params = query.sql()
+        # Parameters: anchor depth literal, anchor WHERE value, rterm delta.
+        self.assertEqual(params, [1, 'c31', 1])
+        self.assertIn('"tree" ("name", "parent_id", "depth")', sql)
+        self.assertEqual([row for row in query.tuples()], [
+            ('c31', 1),
+            ('p3', 2),
+            ('root', 3)])
+
+        # An outer filter adds a parameter after the recursive CTE's own.
+        filtered = (cte
+                    .select_from(cte.c.name)
+                    .where(cte.c.depth > 1)
+                    .order_by(cte.c.name))
+        sql, params = filtered.sql()
+        self.assertEqual(params, [1, 'c31', 1, 1])
+        self.assertEqual([row[0] for row in filtered.tuples()],
+                         ['p3', 'root'])
+
+    @skip_if((IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES)
+             or IS_CRDB, 'requires recursive cte')
+    def test_recursive_cte_contract_violations(self):
+        anchor = (Category
+                  .select(Category.name)
+                  .cte('tree', recursive=True, columns=('name',)))
+
+        # Branch arity mismatch.
+        bad_arity = Category.select(Category.name, Category.parent)
+        self.assertRaises(CTEError, anchor.union_all, bad_arity)
+
+        # Reference to a column outside the declared contract.
+        bad_ref = (Category
+                   .select(Category.name)
+                   .join(anchor, on=(Category.parent == anchor.c.unknown)))
+        self.assertRaises(CTEError, anchor.union_all, bad_ref)
+
+        # Duplicate declared aliases.
+        def duplicate():
+            return (Category
+                    .select(Category.name, Category.parent)
+                    .cte('tree', recursive=True,
+                         columns=('name', 'name')))
+        self.assertRaises(CTEError, duplicate)
+
+    @skip_if((IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES)
+             or IS_CRDB, 'requires recursive cte')
+    def test_recursive_cte_derived_contract_roundtrip(self):
+        # No explicit columns: the contract is derived and the query still
+        # executes correctly against sqlite.
+        anchor = (Category
+                  .select(Category.name, Value(0).alias('depth'))
+                  .where(Category.parent.is_null())
+                  .cte('down', recursive=True))
+        self.assertEqual(anchor.column_contract, ('name', 'depth'))
+
+        rterm = (Category
+                 .select(Category.name,
+                         (anchor.c.depth + 1).alias('depth'))
+                 .join(anchor, on=(Category.parent == anchor.c.name)))
+        cte = anchor.union_all(rterm)
+        self.assertEqual(cte.column_contract, ('name', 'depth'))
+
+        query = (cte
+                 .select_from(cte.c.name, cte.c.depth)
+                 .where(cte.c.name == 'c31'))
+        self.assertEqual([row for row in query.tuples()], [('c31', 2)])
+
 
 @skip_unless(IS_POSTGRESQL or IS_SQLITE_35, 'requires cte materialization')
 class TestPostgresCTEMaterialization(ModelTestCase):

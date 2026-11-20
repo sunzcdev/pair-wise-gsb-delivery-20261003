@@ -2940,6 +2940,14 @@ Model
 
    Exception raised for configuration issues like missing drivers.
 
+.. class:: CTEError
+
+   Exception raised when the column contract of a recursive CTE is not
+   satisfied. This includes duplicate declared column names, anchor and
+   recursive branches exposing a different number of columns, and a
+   recursive term referencing a column that is not part of an explicitly
+   declared contract. Ordinary (non-recursive) CTEs are never validated.
+
 .. class:: DatabaseError
            DataError
            IntegrityError
@@ -5004,6 +5012,32 @@ Query-builder
    :param bool materialized: Specify ``MATERIALIZED`` or ``NOT MATERIALIZED``
        clause.
 
+   A recursive CTE carries a *column contract* describing the output columns
+   shared by its anchor and recursive branches. The branches must always
+   expose the same number of columns, otherwise a :class:`CTEError` is raised
+   when the CTE is created or combined using :meth:`union_all` /
+   :meth:`union`.
+
+   When ``columns`` is given the names are authoritative: duplicate names are
+   rejected, every branch must match the declared arity, and references to the
+   CTE's own columns inside the recursive term must resolve to a declared
+   name. Without an explicit declaration the anchor branch's projection names
+   are reported when they are all known; unaliased expressions and ``*``
+   projections yield an unknown contract (``None``) rather than a guess. SQL
+   binds the branches of a ``UNION`` positionally, so recursive-term names
+   are only enforced against an explicit declaration.
+
+   .. attribute:: column_contract
+
+      A tuple of the shared output column names, or ``None`` when the
+      complete contract cannot be determined. Always ``None`` for a
+      non-recursive CTE.
+
+   .. attribute:: explicit_contract
+
+      ``True`` when the contract was declared using the ``columns`` parameter
+      and is therefore authoritative for name validation.
+
    .. method:: select_from(*columns)
 
       Create a SELECT query that uses the given common table expression
@@ -5018,6 +5052,11 @@ Query-builder
 
       :param other: recursive term, generally a :class:`Select` query.
       :return: a recursive :class:`CTE` with the given recursive term.
+
+   .. method:: union(rhs)
+
+      Like :meth:`union_all`, but combines the branches using ``UNION``
+      (de-duplicating rows) instead of ``UNION ALL``.
 
 
 .. class:: ColumnBase()

@@ -821,6 +821,165 @@ class TestSelectQuery(BaseTestCase):
                 'SELECT "fibonacci"."n", "fibonacci"."fib_n" '
                 'FROM "fibonacci"' % clause), [1, 0, 1, 1, 10])
 
+    def test_recursive_cte_explicit_column_contract(self):
+        # An explicitly declared contract is exposed unchanged and emitted in
+        # the generated SQL.
+        cte = (User
+               .select(User.c.id)
+               .cte('nums', recursive=True, columns=('id',)))
+        self.assertEqual(cte.column_contract, ('id',))
+
+        rterm = User.select(cte.c.id).from_(cte).where(cte.c.id < 10)
+        combined = cte.union_all(rterm)
+        self.assertEqual(combined.column_contract, ('id',))
+        query = combined.select_from(combined.c.id)
+        self.assertSQL(query, (
+            'WITH RECURSIVE "nums" ("id") AS ('
+            'SELECT "t1"."id" FROM "users" AS "t1" '
+            'UNION ALL '
+            'SELECT "nums"."id" FROM "nums" WHERE ("nums"."id" < ?)) '
+            'SELECT "nums"."id" FROM "nums"'), [10])
+
+    def test_recursive_cte_derived_column_contract(self):
+        # Without an explicit declaration the contract is derived from the
+        # anchor branch, but only when every output name is known.
+        anchor = Select(columns=(
+            Value(1).alias('n'),
+            Value(0).alias('v'))).cte('seq', recursive=True)
+        self.assertEqual(anchor.column_contract, ('n', 'v'))
+
+        rterm = Select(columns=(
+            (anchor.c.n + 1).alias('n'),
+            (anchor.c.v + 1).alias('v'))).from_(anchor)
+        combined = anchor.union_all(rterm)
+        self.assertEqual(combined.column_contract, ('n', 'v'))
+
+    def test_recursive_cte_unknown_contract_not_guessed(self):
+        # An unaliased expression has no knowable output name: the contract
+        # stays unknown (None) instead of being guessed or cast.
+        anchor = Select(columns=(
+            Value(1),
+            Value(0).alias('v'))).cte('seq', recursive=True)
+        self.assertIsNone(anchor.column_contract)
+
+        rterm = Select(columns=(anchor.c.v, Value(2))).from_(anchor)
+        combined = anchor.union_all(rterm)
+        self.assertIsNone(combined.column_contract)
+        # SQL generation still works, without forcing a type conversion.
+        query = combined.select_from(combined.c.v)
+        sql, params = query.sql()
+        self.assertIn('WITH RECURSIVE "seq" AS', sql)
+        self.assertNotIn('CAST', sql)
+
+    def test_recursive_cte_duplicate_declared_columns(self):
+        def build():
+            return (User
+                    .select(User.c.id, User.c.username)
+                    .cte('nums', recursive=True, columns=('id', 'id')))
+        self.assertRaises(CTEError, build)
+        try:
+            build()
+        except CTEError as exc:
+            self.assertIn('duplicate', str(exc))
+
+    def test_recursive_cte_arity_mismatch(self):
+        anchor = (User
+                  .select(User.c.id)
+                  .cte('nums', recursive=True, columns=('id',)))
+        rterm = User.select(User.c.id, User.c.username)
+        self.assertRaises(CTEError, anchor.union_all, rterm)
+        self.assertRaises(CTEError, anchor.union, rterm)
+
+    def test_recursive_cte_declared_arity_mismatch(self):
+        # Declaring two columns while the anchor branch selects one is an
+        # error: the declaration cannot silently reshape the branch.
+        def build():
+            return (User
+                    .select(User.c.id)
+                    .cte('nums', recursive=True, columns=('id', 'other')))
+        self.assertRaises(CTEError, build)
+
+        # A later branch adding a column is rejected when it is combined.
+        anchor = (User
+                  .select(User.c.id, User.c.username)
+                  .cte('nums2', recursive=True, columns=('id', 'name')))
+        rterm = User.select(User.c.id)
+        self.assertRaises(CTEError, anchor.union_all, rterm)
+
+    def test_recursive_cte_branch_name_mismatch(self):
+        # Without an explicit declaration UNION binds branches positionally:
+        # differing recursive-term names are legal and the anchor names are
+        # reported as the contract.
+        anchor = Select(columns=(Value(1).alias('a'),)).cte(
+            'm', recursive=True)
+        rterm = Select(columns=(Value(1).alias('b'),))
+        combined = anchor.union_all(rterm)
+        self.assertEqual(combined.column_contract, ('a',))
+        self.assertFalse(combined.explicit_contract)
+
+        # An explicit declaration still enforces arity against each branch.
+        declared = Select(columns=(Value(1).alias('a'),)).cte(
+            'm2', recursive=True, columns=('a',))
+        wrong = Select(columns=(
+            Value(1).alias('b'), Value(2).alias('c')))
+        self.assertRaises(CTEError, declared.union_all, wrong)
+
+    def test_recursive_cte_unknown_self_reference(self):
+        anchor = (User
+                  .select(User.c.id)
+                  .cte('nums', recursive=True, columns=('id',)))
+        # A reference to a column that is not part of the contract.
+        rterm = (User
+                 .select(anchor.c.id)
+                 .from_(anchor)
+                 .where(anchor.c.missing > 0))
+        self.assertRaises(CTEError, anchor.union_all, rterm)
+
+    def test_recursive_cte_unknown_entity_self_reference(self):
+        anchor = Select(columns=(Value(1).alias('n'),)).cte(
+            'cnt', recursive=True, columns=('n',))
+        rterm = Select(columns=(Entity('cnt', 'bogus'),))
+        self.assertRaises(CTEError, anchor.union_all, rterm)
+
+    def test_recursive_cte_self_reference_only_in_recursive_term(self):
+        # The recursive name is not visible in the anchor: a same-named table
+        # in the anchor branch must not be rejected as a self-reference.
+        shadow = Table('nums')
+        anchor = shadow.select(shadow.c.id).cte(
+            'nums', recursive=True, columns=('id',))
+        rterm = User.select(anchor.c.id).from_(anchor)
+        combined = anchor.union_all(rterm)
+        self.assertEqual(combined.column_contract, ('id',))
+        query = combined.select_from(combined.c.id)
+        sql, params = query.sql()
+        self.assertIn('FROM "nums" AS "t1"', sql)
+        self.assertIn('FROM "nums"', sql)
+
+    def test_recursive_cte_union_distinct_preserved(self):
+        anchor = (User
+                  .select(User.c.id)
+                  .where(User.c.id == 1)
+                  .cte('nums', recursive=True, columns=('id',)))
+        rterm = User.select(User.c.id).where(User.c.id < 5)
+
+        all_sql = anchor.union_all(rterm).select_from(anchor.c.id).sql()[0]
+        distinct_cte = anchor.union(rterm)
+        distinct_sql = distinct_cte.select_from(distinct_cte.c.id).sql()[0]
+        self.assertIn('UNION ALL', all_sql)
+        self.assertNotIn('UNION ALL', distinct_sql)
+        self.assertIn('UNION ', distinct_sql)
+
+    def test_non_recursive_cte_no_contract_enforcement(self):
+        # An ordinary, non-recursive CTE keeps its interface untouched: no
+        # contract is derived and mismatched branches do not raise.
+        cte = User.select(User.c.id).cte('plain')
+        self.assertIsNone(cte.column_contract)
+        combined = cte.union_all(User.select(User.c.id, User.c.username))
+        self.assertIsNone(combined.column_contract)
+        query = combined.select_from(combined.c.id)
+        sql, params = query.sql()
+        self.assertIn('WITH "plain" AS', sql)
+
     def test_cte_with_count(self):
         cte = User.select(User.c.id).cte('user_ids')
         query = (User

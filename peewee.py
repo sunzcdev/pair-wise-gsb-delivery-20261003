@@ -83,6 +83,7 @@ __all__ = [
     'BooleanField',
     'Case',
     'Cast',
+    'CTEError',
     'CharField',
     'Check',
     'chunked',
@@ -1170,6 +1171,77 @@ class ValuesList(_HashableSource, BaseTable):
         return ctx
 
 
+class CTEError(ValueError):
+    """The declared column contract of a (recursive) CTE is not satisfied.
+
+    The anchor and recursive branches of a recursive CTE must expose the same
+    number of output columns, declared names must be unique, and references to
+    the CTE's own output columns must match a name in the contract. The
+    contract is never inferred from a single branch.
+    """
+    pass
+
+
+def _projection_column_name(node):
+    """Best-effort output column name for a SELECT projection item.
+
+    Returns a ``str`` when the name is known, otherwise ``None`` so the caller
+    can report an unknown name instead of guessing.
+    """
+    if isinstance(node, Alias):
+        return node._alias
+    node = node.unwrap() if isinstance(node, WrappedNode) else node
+    if isinstance(node, Alias):
+        return node._alias
+    if isinstance(node, Column):
+        return node.name
+    if isinstance(node, Entity):
+        # A qualified or bare entity: the last path component is the column.
+        return node._path[-1] if node._path else None
+    if isinstance(node, Field):
+        return node.name
+    return None
+
+
+def _select_output_columns(query):
+    """Return the output columns exposed by a SELECT-like query.
+
+    A list of ``(name, node)`` tuples is returned; ``name`` is ``None`` when
+    the output name cannot be determined (e.g. an unaliased expression or an
+    explicit star). The full schema is never guessed in that case.
+    """
+    returning = getattr(query, '_returning', None)
+    if not returning:
+        return None
+    columns = []
+    for node in returning:
+        if isinstance(node, (Star, SQL)) and not isinstance(node, Alias):
+            # "SELECT *" / raw SQL fragments cannot be enumerated.
+            return None
+        columns.append((_projection_column_name(node), node))
+    return columns
+
+
+def _walk_nodes(node):
+    """Yield ``node`` and every nested node reachable through its attributes."""
+    seen = set()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, Node) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        for value in vars(current).values():
+            if isinstance(value, Node):
+                stack.append(value)
+            elif isinstance(value, (list, tuple, set, frozenset)):
+                stack.extend(v for v in value if isinstance(v, Node))
+            elif isinstance(value, dict):
+                stack.extend(v for v in value.values()
+                             if isinstance(v, Node))
+
+
 class CTE(_HashableSource, Source):
     def __init__(self, name, query, recursive=False, columns=None,
                  materialized=None):
@@ -1181,8 +1253,178 @@ class CTE(_HashableSource, Source):
             columns = [Entity(c) if isinstance(c, str) else c
                        for c in columns]
         self._columns = columns
+        # The validated column contract: a tuple of names (``str``) shared by
+        # every UNION branch, or ``None`` when no complete contract exists.
+        self._column_contract = None
+        # Whether the contract was declared explicitly via ``columns=(...)``
+        # and is therefore authoritative for name checks.
+        self._explicit_contract = False
         query._cte_list = ()
         super(CTE, self).__init__(alias=name)
+        if recursive:
+            self._column_contract = self._build_column_contract()
+
+    def _contract_names(self):
+        # Names explicitly declared via the "columns" argument take
+        # precedence and are the only authoritative source when the query
+        # output names cannot all be determined.
+        if self._columns is None:
+            return None
+        names = []
+        for entity in self._columns:
+            if isinstance(entity, Entity):
+                names.append(entity._path[-1])
+            elif isinstance(entity, Column):
+                names.append(entity.name)
+            else:
+                # Fall back to the node's string form rather than guessing.
+                names.append(str(entity))
+        return names
+
+    def _branch_columns(self, query):
+        """Flatten a (possibly compound) branch into ordered member selects.
+
+        Left-to-right order is preserved so the anchor term is always first.
+        """
+        members = []
+
+        def collect(node):
+            if isinstance(node, CompoundSelectQuery):
+                collect(node.lhs)
+                collect(node.rhs)
+            else:
+                members.append(node)
+
+        collect(query)
+        return members
+
+    def _build_column_contract(self):
+        """Validate and derive the shared output-column contract.
+
+        Every branch must expose the same number of columns. When names are
+        declared explicitly (``columns=(...)``) they are checked for
+        duplicates and used as the authoritative contract, including
+        validation of references to the CTE name. Otherwise the anchor
+        branch's projection names are reported, but only when every output
+        name is known -- a branch alone is never used to guess a partial
+        schema, and branch names are matched positionally as SQL requires.
+        """
+        declared = self._contract_names()
+        if declared is not None:
+            duplicates = sorted({n for n in declared
+                                 if declared.count(n) > 1})
+            if duplicates:
+                raise CTEError(
+                    'Recursive CTE "%s" declares duplicate column name(s): '
+                    '%s.' % (self._alias, ', '.join(duplicates)))
+            if not declared:
+                raise CTEError('Recursive CTE "%s" must declare at least one '
+                               'column.' % self._alias)
+
+        members = self._branch_columns(self._query)
+        if not members:
+            raise CTEError('Recursive CTE "%s" has no SELECT branch.'
+                           % self._alias)
+
+        arities = []
+        unknown_members = []
+        for member in members:
+            outputs = _select_output_columns(member)
+            if outputs is None:
+                unknown_members.append(member)
+                arities.append(None)
+                continue
+            arities.append(len(outputs))
+
+        # The number of output columns is a hard requirement regardless of
+        # how the contract names are supplied.
+        known_arities = [a for a in arities if a is not None]
+        if len(set(known_arities)) > 1:
+            detail = ', '.join('branch %d has %d' % (i + 1, arity)
+                               for i, arity in enumerate(arities)
+                               if arity is not None)
+            raise CTEError(
+                'Recursive CTE "%s" branches must expose the same number of '
+                'columns (%s).' % (self._alias, detail))
+
+        if declared is not None:
+            expected = len(declared)
+            mismatched = [i + 1 for i, arity in enumerate(arities)
+                          if arity is not None and arity != expected]
+            if mismatched:
+                raise CTEError(
+                    'Recursive CTE "%s" declares %d column(s) but branch(es) '
+                    '%s expose a different number of columns.'
+                    % (self._alias, expected,
+                       ', '.join(str(i) for i in mismatched)))
+            # The declared names are authoritative: self-references must
+            # resolve to one of them.
+            self._validate_self_references(tuple(declared))
+            self._explicit_contract = True
+            return tuple(declared)
+
+        # No explicit declaration: report the anchor names when they are all
+        # known. Recursive-term names are bound positionally by SQL, so they
+        # are not required to match, and self-references are not name-checked.
+        self._explicit_contract = False
+        if unknown_members:
+            return None
+
+        anchor_outputs = _select_output_columns(members[0])
+        names = [name for name, node in anchor_outputs]
+        if any(name is None for name in names):
+            return None
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        if duplicates:
+            # Ambiguous anchor names: do not guess a contract.
+            return None
+        return tuple(names)
+
+    def _validate_self_references(self, contract):
+        """Check that references to this CTE name resolve to contract names.
+
+        Only references appearing inside the recursive term (i.e. any branch
+        beyond the anchor) are self-references; the CTE name is not visible
+        inside the anchor. This check is only used for an explicitly declared
+        contract, where the names are authoritative.
+        """
+        if contract is None:
+            return
+        members = self._branch_columns(self._query)
+        recursive_members = members[1:]
+        for member in recursive_members:
+            for node in _walk_nodes(member):
+                if isinstance(node, Column):
+                    # The query is cloned when the branches are combined, so
+                    # identity comparison is unreliable: match the CTE by its
+                    # class and declared name instead.
+                    source = node.source
+                    if isinstance(source, CTE) and source._alias == self._alias:
+                        if node.name not in contract:
+                            raise CTEError(
+                                'Recursive CTE "%s" has no column named "%s" '
+                                'in its column contract %s.'
+                                % (self._alias, node.name, tuple(contract)))
+                elif isinstance(node, Entity) and node._path:
+                    # Bare/qualified entities naming the CTE directly, e.g.
+                    # Entity("parents", "level").
+                    if node._path[0] == self._alias and len(node._path) > 1:
+                        ref_name = node._path[1]
+                        if ref_name not in contract:
+                            raise CTEError(
+                                'Recursive CTE "%s" has no column named "%s" '
+                                'in its column contract %s.'
+                                % (self._alias, ref_name, tuple(contract)))
+
+    @property
+    def column_contract(self):
+        """Tuple of shared output column names, or ``None`` if not known."""
+        return self._column_contract
+
+    @property
+    def explicit_contract(self):
+        """Whether the contract was declared explicitly via ``columns``."""
+        return self._explicit_contract
 
     def select_from(self, *columns):
         if not columns:
@@ -1203,16 +1445,19 @@ class CTE(_HashableSource, Source):
     def _get_hash(self):
         return hash((self.__class__, self._alias, id(self._query)))
 
+    def _compound(self, query):
+        cte = CTE(self._alias, query, self._recursive, self._columns,
+                  self._materialized)
+        return cte
+
     def union_all(self, rhs):
         clone = self._query.clone()
-        return CTE(self._alias, clone + rhs, self._recursive, self._columns,
-                   self._materialized)
+        return self._compound(clone + rhs)
     __add__ = union_all
 
     def union(self, rhs):
         clone = self._query.clone()
-        return CTE(self._alias, clone | rhs, self._recursive, self._columns,
-                   self._materialized)
+        return self._compound(clone | rhs)
     __or__ = union
 
     def __sql__(self, ctx):

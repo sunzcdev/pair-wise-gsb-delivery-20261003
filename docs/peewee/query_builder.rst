@@ -372,6 +372,52 @@ calculate the first 10 fibonacci numbers:
      {'fib_n': 21, 'n': 9},
      {'fib_n': 34, 'n': 10}]
 
+Recursive CTE column contract
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The anchor and recursive branches of a recursive CTE must expose the same
+number of output columns. Peewee exposes this shared schema as a *column
+contract* on the :class:`CTE`:
+
+.. code-block:: python
+
+    base = Select(columns=(
+        Value(1).alias('n'),
+        Value(0).alias('fib_n'))).cte('fib', recursive=True)
+
+    base.column_contract  # ('n', 'fib_n')
+
+When a projection name cannot be determined (an unaliased expression or a
+``*`` projection) the contract is reported as ``None`` instead of being
+guessed, and no type conversion is forced.
+
+For an authoritative contract, declare the column names explicitly with
+``columns=(...)``. The declared names must be unique, every branch must match
+their arity, and any reference to the CTE inside the recursive term must
+resolve to a declared name. Violations raise :class:`CTEError`:
+
+.. code-block:: python
+
+    base = (Select(columns=(Value(1),))
+            .cte('counter', recursive=True, columns=('n',)))
+
+    recursive_term = (Select(columns=(base.c.n + 1,))
+                      .from_(base)
+                      .where(base.c.n < 10))  # base.c.n is a contract column
+
+    cte = base.union_all(recursive_term)
+    cte.column_contract     # ('n',)
+    cte.explicit_contract   # True
+
+    # Referencing a column outside the contract raises CTEError.
+    bad = Select(columns=(base.c.unknown,)).from_(base)
+    base.union_all(bad)  # raises CTEError
+
+Recursive-term names are bound positionally by ``UNION`` / ``UNION ALL``, so
+name matching against the recursive term is only enforced when the contract
+is declared explicitly. Ordinary, non-recursive CTEs are not validated and
+keep an empty (``None``) contract.
+
 More
 ----
 
