@@ -87,6 +87,39 @@ Or you can iterate over the results::
 Results are returned in the same order that the messages were added to
 the group.
 
+Because :meth:`~dramatiq.group.get_results` waits on each message in
+turn, a slow message at the front of the group keeps the results of
+faster messages behind it from being yielded.  If you'd rather process
+each result as soon as its job finishes, call
+:meth:`~dramatiq.group.iter_results` instead::
+
+  for result in g.iter_results(block=True, timeout=5_000):
+      print(result.index_path, result.status, result.value)
+
+This yields a :class:`~dramatiq.results.GroupResult` per job in
+*completion* order rather than submission order.  Each one carries the
+``index_path`` of its job within the group, so results remain
+correlated with the original messages even when nested groups and
+pipelines are used (a pipeline child is represented by the result of
+its terminal message).  Failures, jobs that have not finished yet and
+jobs whose result is genuinely ``None`` are distinguished through the
+result's :class:`~dramatiq.results.ResultStatus` instead of being
+raised or conflated:
+
+* :attr:`~dramatiq.results.ResultStatus.COMPLETE` -- the result was
+  retrieved; its value is on ``value`` (and may legitimately be
+  ``None``).
+* :attr:`~dramatiq.results.ResultStatus.FAILED` -- the actor failed;
+  the stored exception is on ``error``.
+* :attr:`~dramatiq.results.ResultStatus.MISSING` -- no result was
+  available before the shared deadline expired.
+
+The ``timeout`` is a single deadline for the whole iteration, so jobs
+that are still unfinished when it expires are yielded once as missing
+rather than causing an error.  With ``block=False`` every job is
+inspected once: available results are yielded and the rest are
+reported as missing immediately.
+
 Pipelines
 ^^^^^^^^^
 

@@ -17,15 +17,58 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, Iterator
 from uuid import uuid4
 
 from .broker import get_broker
 from .rate_limits import Barrier
-from .results import ResultMissing
+from .results import ResultFailure, ResultMissing, ResultStatus
+from .results.backend import DEFAULT_TIMEOUT
+from .results.group_result import GroupResult
 
 if TYPE_CHECKING:
     from .message import Message
+
+#: The minimum amount of time, in milliseconds, to wait between polls
+#: of group results while iterating them in completion order.
+ITER_RESULTS_BACKOFF = 100
+
+
+def _get_composition_result(child: Message | pipeline, backend, *, block: bool, timeout: int | None) -> Any:
+    """Fetch the terminal result of a group leaf.
+
+    Pipeline results are represented by their terminal message, so
+    this mirrors what :meth:`group.get_results` yields for pipeline
+    children.
+    """
+    if isinstance(child, pipeline):
+        return child.get_result(block=block, timeout=timeout)
+
+    return child.get_result(backend=backend, block=block, timeout=timeout)
+
+
+def _collect_group_leaves(
+    children: list[Message | group | pipeline], prefix: tuple[int, ...] = ()
+) -> list[tuple[tuple[int, ...], Message | pipeline]]:
+    """Flatten a group's children into the terminal jobs whose results
+    can be polled, pairing each one with its index path.
+
+    The index path records the position of the job at every level of
+    nesting, so the terminal job of a pipeline nested inside the second
+    child of an inner group keeps a path such as ``(1, 0)`` that can
+    be used to locate it within the original composition.
+    """
+    leaves: list[tuple[tuple[int, ...], Message | pipeline]] = []
+    for index, child in enumerate(children):
+        index_path = prefix + (index,)
+        if isinstance(child, group):
+            leaves.extend(_collect_group_leaves(child.children, index_path))
+        else:
+            # Pipelines are treated as a single leaf: only the result
+            # of the terminal message of the chain is exposed.
+            leaves.append((index_path, child))
+
+    return leaves
 
 
 class pipeline:
@@ -358,6 +401,90 @@ class group:
             else:
                 backend = self.broker.get_results_backend()
                 yield child.get_result(backend=backend, block=block, timeout=timeout)
+
+    def iter_results(self, *, block: bool = False, timeout: int | None = None) -> Iterator[GroupResult]:
+        """Iterate over the group's results in the order they complete.
+
+        Unlike :meth:`get_results`, which yields results in submission
+        order and blocks on each one in turn, this polls every job in
+        the group and yields each result as soon as it becomes
+        available.  A job that finishes ahead of the others is
+        therefore yielded immediately instead of being held up by a
+        slower job earlier in the group.
+
+        Each yielded :class:`~dramatiq.results.GroupResult` carries the
+        ``index_path`` of its job within the group.  Nested groups are
+        flattened and each leaf keeps the full path of indices leading
+        to it (for example ``(0, 1)`` for the second child of the first
+        nested group), while a pipeline child is represented by the
+        result of its terminal message.
+
+        Failures, jobs that have not finished yet and jobs whose
+        result is genuinely ``None`` are all expressed distinctly via
+        the result's :class:`~dramatiq.results.ResultStatus` instead of
+        being raised or collapsed into a single value.
+
+        A single shared deadline applies to the whole iteration: when
+        ``block`` is True, the total time spent waiting is capped by
+        ``timeout`` (in milliseconds, defaulting to 10 seconds).  Any
+        jobs still unfinished once the deadline expires are yielded
+        once with :attr:`~dramatiq.results.ResultStatus.MISSING`, and
+        iteration then stops.  When ``block`` is False, every job is
+        inspected exactly once; available results are yielded and the
+        rest are yielded as missing.
+
+        Parameters:
+          block(bool): Whether or not to keep polling until every job
+            has a result or the timeout expires.
+          timeout(int): The maximum amount of time, in milliseconds, to
+            wait for the whole group's results when block is True.
+            Defaults to 10 seconds.  Ignored when block is False.
+
+        Raises:
+          RuntimeError: If your broker doesn't have a result backend
+            set up.
+
+        Returns:
+          An iterator of :class:`~dramatiq.results.GroupResult`
+          instances, one per leaf job in the group.
+        """
+        backend = self.broker.get_results_backend()
+        pending = _collect_group_leaves(self.children)
+
+        deadline = None
+        if block:
+            deadline = time.monotonic() + (timeout or DEFAULT_TIMEOUT) / 1000
+
+        while pending:
+            remaining_timeout: int | None = None
+            if deadline is not None:
+                remaining_timeout = max(0, int((deadline - time.monotonic()) * 1000))
+                if remaining_timeout == 0:
+                    for index_path, _child in pending:
+                        yield GroupResult(index_path=index_path, status=ResultStatus.MISSING)
+                    return
+
+            still_pending: list[tuple[tuple[int, ...], Message | pipeline]] = []
+            for index_path, child in pending:
+                try:
+                    value = _get_composition_result(child, backend, block=False, timeout=remaining_timeout)
+                except ResultFailure as e:
+                    yield GroupResult(index_path=index_path, status=ResultStatus.FAILED, error=e)
+                except ResultMissing:
+                    still_pending.append((index_path, child))
+                else:
+                    yield GroupResult(index_path=index_path, status=ResultStatus.COMPLETE, value=value)
+
+            if not still_pending:
+                return
+
+            if not block:
+                for index_path, _child in still_pending:
+                    yield GroupResult(index_path=index_path, status=ResultStatus.MISSING)
+                return
+
+            pending = still_pending
+            time.sleep(ITER_RESULTS_BACKOFF / 1000)
 
     def wait(self, *, timeout=None):
         """Block until all the jobs in the group have finished or

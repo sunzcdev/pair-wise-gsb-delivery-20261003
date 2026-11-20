@@ -8,7 +8,7 @@ import pytest
 import dramatiq
 from dramatiq import group, middleware, pipeline
 from dramatiq.middleware import GroupCallbacks
-from dramatiq.results import Results, ResultTimeout
+from dramatiq.results import GroupResult, Results, ResultStatus, ResultTimeout
 
 
 def test_messages_can_be_piped(stub_broker):
@@ -507,3 +507,245 @@ def test_groups_of_pipelines_can_have_completion_callbacks(stub_broker, stub_wor
 
     # And the callback should run after all the messages
     assert sorted(do_nothing_times)[-1] <= finalize_times[0]
+
+
+def test_iter_results_yields_results_in_completion_order_with_their_index_paths(
+    stub_broker, stub_worker, result_backend
+):
+    # Given that I have a result backend
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    # And an actor that waits some amount of time before returning its argument
+    @dramatiq.actor(store_results=True)
+    def wait(n):
+        time.sleep(n)
+        return n
+
+    # When I group two jobs whose durations make them finish in the reverse
+    # order of the one they were submitted in
+    g = group([wait.message(0.4), wait.message(0.05)])
+    g.run()
+
+    # And iterate the results as they complete
+    results = list(g.iter_results(block=True, timeout=10_000))
+
+    # Then I should get one GroupResult per job
+    assert len(results) == 2
+    assert all(isinstance(result, GroupResult) for result in results)
+
+    # And the job that finished first (the second one in the group) should
+    # be yielded first even though it was submitted last
+    assert [result.index_path for result in results] == [(1,), (0,)]
+    assert [result.value for result in results] == [0.05, 0.4]
+    assert all(result.complete for result in results)
+
+
+def test_iter_results_does_not_hold_back_completed_results_behind_a_slow_first_job(
+    stub_broker, stub_worker, result_backend
+):
+    # Given that I have a result backend
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def wait(n):
+        time.sleep(n)
+        return n
+
+    # When the first job in the group is the slow one
+    g = group([wait.message(0.3), wait.message(0.05)])
+    g.run()
+
+    # Then the fast, second job's result should be available well before the
+    # slow, first job finishes
+    iterator = g.iter_results(block=True, timeout=10_000)
+    first = next(iterator)
+    assert first.index_path == (1,)
+    assert first.value == 0.05
+
+    second = next(iterator)
+    assert second.index_path == (0,)
+    assert second.value == 0.3
+
+
+def test_iter_results_reports_missing_results_when_not_blocking(stub_broker, result_backend):
+    # Given that I have a result backend but no worker
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def do_work():
+        return 42
+
+    # When I run a group without processing any of its messages
+    g = group(do_work.message() for _ in range(2))
+    g.run()
+
+    # And iterate the results without blocking
+    results = list(g.iter_results())
+
+    # Then every job should be reported exactly once as missing, rather
+    # than a ResultMissing error being raised
+    assert len(results) == 2
+    assert [result.index_path for result in results] == [(0,), (1,)]
+    assert all(result.missing for result in results)
+    assert all(result.status is ResultStatus.MISSING for result in results)
+    assert all(result.value is None for result in results)
+    assert all(result.error is None for result in results)
+
+
+def test_iter_results_uses_a_single_shared_deadline(stub_broker, stub_worker, result_backend):
+    # Given that I have a result backend
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    # And an actor that takes longer than the deadline I'm willing to wait
+    @dramatiq.actor(store_results=True)
+    def wait():
+        time.sleep(0.4)
+        return 42
+
+    # When I run the group and iterate with a timeout shorter than the job
+    g = group([wait.message(), wait.message()])
+    g.run()
+
+    started = time.monotonic()
+    results = list(g.iter_results(block=True, timeout=100))
+    elapsed = time.monotonic() - started
+
+    # Then the whole iteration should stop once the single deadline expires
+    assert elapsed < 1.0
+
+    # And every unfinished job should be reported as missing instead of
+    # the deadline causing a ResultTimeout to be raised
+    assert len(results) == 2
+    assert [result.index_path for result in results] == [(0,), (1,)]
+    assert all(result.missing for result in results)
+
+
+def test_iter_results_distinguishes_failures_missing_and_none(stub_broker, stub_worker, result_backend):
+    # Given that I have a result backend
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True, max_retries=0)
+    def fails():
+        raise RuntimeError("boom")
+
+    @dramatiq.actor(store_results=True)
+    def returns_none():
+        return None
+
+    @dramatiq.actor(store_results=True)
+    def slow():
+        time.sleep(0.3)
+        return "done"
+
+    # When I group a failing job together with a job that legitimately
+    # returns None and wait for both to settle
+    settled = group([fails.message(), returns_none.message()])
+    settled.run()
+    results = list(settled.iter_results(block=True, timeout=10_000))
+    by_path = {result.index_path: result for result in results}
+    assert set(by_path) == {(0,), (1,)}
+
+    # The failed job is reported as a failure carrying the stored exception
+    failed = by_path[(0,)]
+    assert failed.failed
+    assert failed.status is ResultStatus.FAILED
+    assert failed.error is not None
+    assert failed.error.orig_exc_type == "RuntimeError"
+    assert failed.error.orig_exc_msg == "boom"
+    assert failed.value is None
+
+    # The None result is complete and distinct from a missing result
+    none_result = by_path[(1,)]
+    assert none_result.complete
+    assert none_result.value is None
+    assert not none_result.missing
+
+    # And a job that has not finished by the deadline is reported once as
+    # missing rather than raising an error
+    pending = group([slow.message()])
+    pending.run()
+    timed_out = list(pending.iter_results(block=True, timeout=100))
+    assert len(timed_out) == 1
+    missing = timed_out[0]
+    assert missing.index_path == (0,)
+    assert missing.missing
+    assert missing.status is ResultStatus.MISSING
+    assert missing.error is None
+
+
+def test_iter_results_flattens_nested_groups_and_keeps_full_index_paths(stub_broker, stub_worker, result_backend):
+    # Given that I have a result backend
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def add(x, y):
+        return x + y
+
+    # When I build nested groups and run them
+    g = group(
+        [
+            group([add.message(1, 1), add.message(2, 2)]),
+            group([add.message(3, 3)]),
+        ]
+    )
+    g.run()
+
+    results = list(g.iter_results(block=True, timeout=10_000))
+    by_path = {result.index_path: result.value for result in results}
+
+    # Then every leaf should be locatable through its full index path
+    assert by_path == {(0, 0): 2, (0, 1): 4, (1, 0): 6}
+    assert all(result.complete for result in results)
+
+
+def test_iter_results_locates_pipeline_ends_via_their_index_path(stub_broker, stub_worker, result_backend):
+    # Given that I have a result backend
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def add(x, y):
+        return x + y
+
+    # When I group pipelines together with plain messages
+    g = group(
+        [
+            add.message(1, 1) | add.message(10),
+            add.message(2, 2),
+        ]
+    )
+    g.run()
+
+    results = list(g.iter_results(block=True, timeout=10_000))
+    by_path = {result.index_path: result for result in results}
+
+    # Then the pipeline is a single leaf whose value is the result of the
+    # terminal message in the chain
+    assert set(by_path) == {(0,), (1,)}
+    assert by_path[(0,)].complete
+    assert by_path[(0,)].value == 12
+    assert by_path[(1,)].value == 4
+
+
+def test_iter_results_does_not_change_submission_order_entrypoint(stub_broker, stub_worker, result_backend):
+    # Given that I have a result backend
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def wait(n):
+        time.sleep(n)
+        return n
+
+    # Then the existing get_results entrypoint must still yield in the
+    # original submission order, waiting on each job in turn
+    ordered = group([wait.message(0.3), wait.message(0.05)])
+    ordered.run()
+    assert list(ordered.get_results(block=True, timeout=10_000)) == [0.3, 0.05]
+
+    # And the new entrypoint, consumed while its jobs are still running,
+    # surfaces the job that finishes first ahead of the slower one even
+    # though that job was submitted last
+    streamed = group([wait.message(0.3), wait.message(0.05)])
+    streamed.run()
+    first = next(streamed.iter_results(block=True, timeout=10_000))
+    assert first.index_path == (1,)
+    assert first.value == 0.05

@@ -8,6 +8,18 @@ All notable changes to this project will be documented in this file.
 `Unreleased`_
 -------------
 
+Added
+^^^^^
+
+* Added ``group.iter_results``, which yields group results in the order
+  their jobs complete instead of in submission order, so a slow job at
+  the front of a group no longer holds back already-finished results.
+  Each result is a ``GroupResult`` carrying its ``index_path`` within
+  the (possibly nested) group, and failures, still-missing jobs and
+  results that are genuinely ``None`` are reported separately via
+  ``ResultStatus`` under a single shared deadline.  The existing
+  ``get_results`` entrypoint is unchanged.
+
 Fixed
 ^^^^^
 

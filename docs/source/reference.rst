@@ -161,6 +161,14 @@ Results Middleware
 
 .. autoclass:: dramatiq.results.Results
 
+Group Results
+^^^^^^^^^^^^^
+
+.. autoclass:: dramatiq.results.GroupResult
+   :members:
+.. autoclass:: dramatiq.results.ResultStatus
+   :members:
+
 Results Backends
 ^^^^^^^^^^^^^^^^
 

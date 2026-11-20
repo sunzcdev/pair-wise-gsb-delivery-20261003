@@ -19,13 +19,16 @@ from __future__ import annotations
 
 from .backend import Missing, ResultBackend
 from .errors import ResultError, ResultFailure, ResultMissing, ResultTimeout
+from .group_result import GroupResult, ResultStatus
 from .middleware import Results
 
 __all__ = [
     "Missing",
+    "GroupResult",
     "ResultBackend",
     "ResultError",
     "ResultFailure",
+    "ResultStatus",
     "ResultTimeout",
     "ResultMissing",
     "Results",
