@@ -299,10 +299,22 @@ module WEBrick
       Net::HTTP.new(uri.host, uri.port, upstream.host, upstream.port)
     end
 
+    # RFC 9112 3.2: an absolute-form request-target is forwarded to
+    # the origin server in origin-form.  Only the scheme and authority
+    # are stripped from the raw request-target; the path and query are
+    # forwarded verbatim so that the original percent-encoding (e.g. an
+    # encoded "/"), the order and duplication of query parameters and
+    # even an empty query are preserved.
+    def proxy_request_target(req)
+      target = req.unparsed_uri.sub(%r{\A[^/?#]*://[^/?#]*}, "")
+      target = "/" if target.empty?
+      target = "/#{target}" unless target.start_with?("/")
+      target
+    end
+
     def perform_proxy_request(req, res, req_class, body_stream = nil)
       uri = req.request_uri
-      path = uri.path.dup
-      path << "?" << uri.query if uri.query
+      path = proxy_request_target(req)
       header = setup_proxy_header(req, res)
       upstream = setup_upstream_proxy_authentication(req, res, header)
 

@@ -56,6 +56,8 @@ module WEBrick
 
     def create_net_http: (untyped uri, untyped upstream) -> untyped
 
+    def proxy_request_target: (HTTPRequest req) -> ::String
+
     def perform_proxy_request: (HTTPRequest req, HTTPResponse res, untyped req_class, ?untyped? body_stream) -> untyped
   end
 end

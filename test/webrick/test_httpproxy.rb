@@ -120,6 +120,63 @@ class TestWEBrickHTTPProxy < Test::Unit::TestCase
     }
   end
 
+  def test_proxy_preserves_raw_request_target
+    # The proxy must connect to the authority parsed from an
+    # absolute-form request-target, but forward the path and query to
+    # the upstream verbatim: no re-decoding of an encoded segment
+    # separator (%2F), no reordering or re-encoding of duplicate query
+    # parameters, and no dropping of an empty query.
+    #
+    #  client -------> proxy -------> upstream (records raw request lines)
+    #
+    request_lines = []
+    TestWEBrick.start_httpserver do |o_server, o_addr, o_port, o_log|
+      o_server.mount_proc("/") do |req, res|
+        request_lines << req.request_line
+        res['content-type'] = 'text/plain'
+        res.body = req.request_line
+      end
+      TestWEBrick.start_httpproxy do |p_server, p_addr, p_port, p_log|
+        authority = "#{o_addr}:#{o_port}"
+        cases = [
+          # [absolute-form request-target, origin-form expected upstream]
+          ["http://#{authority}/a%2Fb/c?x=1&x=2", "/a%2Fb/c?x=1&x=2"],
+          ["http://#{authority}/%41%2f%2F",       "/%41%2f%2F"],
+          ["http://#{authority}/p?",              "/p?"],
+          ["http://#{authority}/?b=2&a=1&a=0",    "/?b=2&a=1&a=0"],
+          ["http://#{authority}",                 "/"],
+          ["http://#{authority}?x=1",             "/?x=1"],
+        ]
+        cases.each do |absolute, origin|
+          TCPSocket.open(p_addr, p_port) do |s|
+            s.write "GET #{absolute} HTTP/1.1\r\n" \
+                    "Host: #{authority}\r\nConnection: close\r\n\r\n"
+            response = s.read
+            # the proxy's chosen target is what the upstream recorded
+            assert_include(response, "GET #{origin} HTTP/1.1\r\n",
+                           o_log.call + p_log.call)
+          end
+        end
+        assert_equal(cases.map {|_, origin| "GET #{origin} HTTP/1.1\r\n" },
+                     request_lines, o_log.call + p_log.call)
+
+        # an origin-form request is still served by the proxy itself
+        # and must not be forwarded to the upstream
+        p_server.mount_proc("/") do |req, res|
+          res.body = "local: #{req.request_line}"
+        end
+        TCPSocket.open(p_addr, p_port) do |s|
+          s.write "GET /origin%2Fform?y=2&y=1 HTTP/1.1\r\n" \
+                  "Host: #{authority}\r\nConnection: close\r\n\r\n"
+          response = s.read
+          assert_include(response, "local: GET /origin%2Fform?y=2&y=1 HTTP/1.1",
+                         o_log.call + p_log.call)
+        end
+        assert_equal(cases.size, request_lines.size, o_log.call + p_log.call)
+      end
+    end
+  end
+
   def test_big_bodies
     require 'digest/md5'
     rand_str = File.read(__FILE__)

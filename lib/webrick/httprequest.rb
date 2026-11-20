@@ -223,6 +223,9 @@ module WEBrick
       begin
         @request_uri = parse_uri(@unparsed_uri)
         @path = HTTPUtils::unescape(@request_uri.path)
+        # An absolute-form request-target without a path (e.g.
+        # "http://example.com") is equivalent to "/" (RFC 9112 3.2.1).
+        @path = "/" if @path.empty?
         @path = HTTPUtils::normalize_path(@path)
         @host = @request_uri.host
         @port = @request_uri.port
