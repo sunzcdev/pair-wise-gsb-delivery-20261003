@@ -67,6 +67,7 @@ class _ConditionMixin:
     def __init__(self, func):
         self.__func = func
         self.__pending = set()
+        self.__generation = 0
 
     def __call__(self, /, *args, **kwargs):
         cache = self.cache
@@ -77,6 +78,7 @@ class _ConditionMixin:
         with lock:
             while key in self.__pending:
                 cond.wait()
+            generation = self.__generation
             try:
                 return cache[key]
             except KeyError:
@@ -84,19 +86,29 @@ class _ConditionMixin:
         try:
             val = self.__func(*args, **kwargs)
             with lock:
-                try:
-                    cache[key] = val
-                except ValueError:
-                    pass  # value too large
+                if generation == self.__generation:
+                    try:
+                        cache[key] = val
+                    except ValueError:
+                        pass  # value too large
                 return val
         finally:
             with lock:
-                self.__pending.remove(key)
-                cond.notify_all()
+                if generation == self.__generation:
+                    self.__pending.remove(key)
+                    cond.notify_all()
 
     def cache_clear(self):
         with self.cache_lock:
             self.cache.clear()
+            # Disown calls still executing for the cleared contents, so
+            # they neither store their stale result nor withdraw a newer
+            # pending key.  Wake any waiters, since their pending call
+            # will not notify them.
+            if self.__pending:
+                self.__pending.clear()
+                self.__generation += 1
+                self.cache_condition.notify_all()
 
 
 class _InfoMixin:
@@ -174,6 +186,7 @@ class _ConditionInfoMixin:
         self.__info = info
         self.__hits = self.__misses = 0
         self.__pending = set()
+        self.__generation = 0
 
     def __call__(self, /, *args, **kwargs):
         cache = self.cache
@@ -184,6 +197,7 @@ class _ConditionInfoMixin:
         with lock:
             while key in self.__pending:
                 cond.wait()
+            generation = self.__generation
             try:
                 result = cache[key]
                 self.__hits += 1
@@ -194,20 +208,30 @@ class _ConditionInfoMixin:
         try:
             val = self.__func(*args, **kwargs)
             with lock:
-                try:
-                    cache[key] = val
-                except ValueError:
-                    pass  # value too large
+                if generation == self.__generation:
+                    try:
+                        cache[key] = val
+                    except ValueError:
+                        pass  # value too large
                 return val
         finally:
             with lock:
-                self.__pending.remove(key)
-                cond.notify_all()
+                if generation == self.__generation:
+                    self.__pending.remove(key)
+                    cond.notify_all()
 
     def cache_clear(self):
         with self.cache_lock:
             self.cache.clear()
             self.__hits = self.__misses = 0
+            # Disown calls still executing for the cleared contents, so
+            # they neither store their stale result nor withdraw a newer
+            # pending key.  Wake any waiters, since their pending call
+            # will not notify them.
+            if self.__pending:
+                self.__pending.clear()
+                self.__generation += 1
+                self.cache_condition.notify_all()
 
     def cache_info(self):
         with self.cache_lock:

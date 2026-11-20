@@ -413,6 +413,15 @@ often called with the same arguments:
       # no need for get_pep.cache_lock here
       get_pep.cache_clear()
 
+   With a `condition` variable, clearing the cache while calls for
+   some key are still executing draws a boundary.  A call that started
+   before the clear still returns its own result to its callers, but
+   it will no longer store that result, and it will not disturb calls
+   started after the clear, including a pending call for the same
+   key.  Threads waiting for such a call are woken up and will either
+   compute the value anew or collect a newer pending result, so a
+   stale result never becomes visible through the cache.
+
    If `info` is set to :const:`True`, the wrapped function is
    instrumented with a :meth:`cache_info()` function that returns a
    :class:`CacheInfo` instance, a named tuple with fields `hits`,
@@ -583,7 +592,10 @@ often called with the same arguments:
    :attr:`cache_condition` attributes of the wrapped instance method.
    A :meth:`cache_clear()` function will also be provided, as well as
    an optional :meth:`cache_info()` function reporting per-instance
-   cache statistics.
+   cache statistics.  As with :func:`cached`, clearing the cache draws
+   a boundary for calls that are still executing: they return their
+   own results, but no longer store them or interfere with calls
+   started after clearing.
 
    Also, mostly for efficiency, this decorator requires that the
    :attr:`__dict__` attribute on each instance be a mutable mapping.
