@@ -795,3 +795,78 @@ If there's any point to be made here, it's if you are too freely branching, merg
 and labeling, things can get pretty crazy!  Hence the branching system should
 be used carefully and thoughtfully for best results.
 
+
+
+.. _version_table_recovery:
+
+Recovering a Version Table that References Removed Revisions
+------------------------------------------------------------
+
+A database restored from a backup may carry rows in ``alembic_version``
+that the current migration scripts no longer contain.  This usually means
+the backup was taken from a different release branch, one that has since
+been replaced.  The ordinary :func:`.command.upgrade` command cannot help
+here: while resolving the stored revision it fails with::
+
+    Can't locate revision identified by '<rev>'
+
+and that behaviour is intentional.  Recovery is instead a deliberate,
+administrator-driven process built around three commands:
+
+``alembic inspect_versions``
+    Read-only.  It reads the version table, resolves each row *exactly*
+    against the current scripts and reports which rows are still valid
+    heads, which are redundant ancestors of another row, and which are
+    unknown and therefore need an explicit mapping.  Nothing is created or
+    stamped; a missing version table is reported as such rather than being
+    created.
+
+``alembic plan_versions "<old>:<new>"``
+    Read-only against your database.  It replays the current version rows
+    into a throwaway in-memory SQLite database, applies the proposed
+    mapping there, and reports the heads and the upgrade steps that would
+    follow.  Use it to check that only the intended branch would advance.
+
+``alembic repair_versions "<old>:<new>" --confirm``
+    The one write in the workflow.  It replaces exactly one version table
+    row, ``old``, with ``new``.  ``old`` must already be present and
+    ``new`` must be an exact revision in the current scripts.  Every other
+    row, including the heads of unrelated branches, is left untouched.
+    Without ``--confirm`` nothing is written.
+
+A typical session against a restored backup looks like::
+
+    $ alembic inspect_versions
+    Recovery inspection of version table 'alembic_version'
+    Script directory heads: 27c6a30d7c24, 34e094ad6ef1
+      [valid head] 27c6a30d7c24
+      [unknown] 55af2cb1c267: no such revision in the current scripts; ...
+    Unrelated rows are left untouched; map each unknown row with
+    'alembic repair_versions OLD:NEW --confirm'.
+
+    $ alembic plan_versions "55af2cb1c267:ae1027a6acf"
+    Rehearsed mapping '55af2cb1c267' -> 'ae1027a6acf' against a ...
+      version table before: 27c6a30d7c24, 55af2cb1c267
+      version table after:  27c6a30d7c24, ae1027a6acf
+      left untouched:       27c6a30d7c24
+      upgrade steps after mapping: 34e094ad6ef1
+
+    $ alembic repair_versions "55af2cb1c267:ae1027a6acf" --confirm
+    Replaced version '55af2cb1c267' with 'ae1027a6acf'; version table now
+    contains: 27c6a30d7c24, ae1027a6acf
+
+    $ alembic upgrade heads
+    INFO  [alembic.runtime.migration] Running upgrade ae1027a6acf -> ...
+    INFO  [alembic.runtime.migration] Context impl SQLiteImpl.
+
+After the upgrade, ``27c6a30d7c24`` was already at its head and was not
+touched, while only the mapped branch advanced to ``34e094ad6ef1``.
+
+The same workflow is available programmatically through
+:func:`.command.inspect_versions`, :func:`.command.plan_versions` and
+:func:`.command.repair_versions`, or at a lower level through
+:meth:`.MigrationContext.get_recovery_report`,
+:meth:`.MigrationContext.plan_revision_mapping` and
+:meth:`.MigrationContext.apply_revision_mapping`.
+
+.. versionadded:: 1.20.3

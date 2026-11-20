@@ -825,6 +825,16 @@ class CommandLine:
                 ),
             ),
         ),
+        "confirm": (
+            "--confirm",
+            dict(
+                action="store_true",
+                help=(
+                    "Confirm a version table change; without it nothing "
+                    "is written."
+                ),
+            ),
+        ),
     }
     _POSITIONAL_OPTS = {
         "directory": dict(help="location of scripts directory"),
@@ -834,6 +844,9 @@ class CommandLine:
         "revisions": dict(
             nargs="+",
             help="one or more revisions, or 'heads' for all heads",
+        ),
+        "mapping": dict(
+            help="version table replacement as '<old>:<new>'",
         ),
     }
     _POSITIONAL_TRANSLATIONS: dict[Any, dict[str, str]] = {

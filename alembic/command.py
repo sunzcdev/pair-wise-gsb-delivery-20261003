@@ -14,9 +14,206 @@ from .util import compat
 
 if TYPE_CHECKING:
     from alembic.config import Config
+    from alembic.runtime.migration import RecoveryReport
+    from alembic.runtime.migration import RevisionMappingPlan
     from alembic.script.base import Script
     from alembic.script.revision import _RevIdType
     from .runtime.environment import ProcessRevisionDirectiveFn
+
+
+def inspect_versions(config: Config) -> RecoveryReport:
+    """Report which stored version identifiers are still valid.
+
+    This is the read-only entry point of the version-table recovery
+    workflow.  It reads ``alembic_version`` (or the configured version
+    table) and classifies each row as a still-valid head, a redundant
+    ancestor of another row, or unknown; unknown rows are the ones that
+    require an explicit administrator mapping.  Nothing is stamped and the
+    version table is not created if it is missing.
+
+    The report is printed to :attr:`.Config.stdout` as well as returned.
+
+    :param config: a :class:`.Config` instance.
+
+    .. versionadded:: 1.20.3
+
+    .. seealso::
+
+        :func:`.command.plan_versions`
+
+        :func:`.command.repair_versions`
+
+    """
+    script = ScriptDirectory.from_config(config)
+    state: dict[str, RecoveryReport] = {}
+
+    def do_inspect(rev, context):
+        state["report"] = context.get_recovery_report()
+        return []
+
+    with EnvironmentContext(
+        config, script, fn=do_inspect, dont_mutate=True
+    ):
+        script.run_env()
+
+    report = state.get("report")
+    if report is None:
+        raise util.CommandError(
+            "Recovery inspection requires an env.py that calls "
+            "context.run_migrations()"
+        )
+    config.print_stdout(report.format_report())
+    return report
+
+
+def plan_versions(config: Config, mapping: str) -> RevisionMappingPlan:
+    """Rehearse one revision mapping against a temporary database.
+
+    Reads the current version rows from the configured database, replays
+    them into a throwaway in-memory SQLite database, applies ``mapping``
+    (given as ``"<old>:<new>"``) there and reports the resulting heads and
+    the upgrade steps that would follow.  The configured database is only
+    read, never written, which makes this safe to run against a restored
+    backup before deciding on a mapping.
+
+    The plan is printed to :attr:`.Config.stdout` as well as returned.
+
+    :param config: a :class:`.Config` instance.
+
+    :param mapping: mapping in ``"<old>:<new>"`` form.
+
+    .. versionadded:: 1.20.3
+
+    .. seealso::
+
+        :func:`.command.inspect_versions`
+
+        :func:`.command.repair_versions`
+
+    """
+    old_revision, new_revision = _parse_recovery_mapping(mapping)
+    script = ScriptDirectory.from_config(config)
+    state: dict[str, RevisionMappingPlan] = {}
+
+    def do_plan(rev, context):
+        state["plan"] = context.plan_revision_mapping(
+            old_revision, new_revision
+        )
+        return []
+
+    with EnvironmentContext(
+        config, script, fn=do_plan, dont_mutate=True
+    ):
+        script.run_env()
+
+    plan = state.get("plan")
+    if plan is None:
+        raise util.CommandError(
+            "Rehearsing a revision mapping requires an env.py that calls "
+            "context.run_migrations()"
+        )
+    config.print_stdout(plan.format_plan())
+    return plan
+
+
+def repair_versions(
+    config: Config,
+    mapping: str,
+    confirm: bool = False,
+) -> tuple[str, ...]:
+    """Replace one administrator-confirmed version table row.
+
+    Given ``mapping`` in the form ``"<old>:<new>"``, this command replaces
+    exactly that one row with ``new``.  ``old`` must be present in the
+    version table and ``new`` must resolve against the current scripts;
+    every other row, including the heads of unrelated branches, is left
+    untouched.  Because this changes recorded state without running any
+    migration, the replacement is only performed when ``confirm=True``.
+
+    Running :func:`.command.inspect_versions` first is strongly
+    recommended; its report identifies which rows need mapping.
+
+    :param config: a :class:`.Config` instance.
+
+    :param mapping: replacement in ``"<old>:<new>"`` form; for example
+     ``"a1b2c3d4:9f8e7d6c"``.
+
+    :param confirm: must be ``True``; without it nothing is written and a
+     :class:`.CommandError` is raised.
+
+    :return: the version identifiers present after the replacement.
+
+    .. versionadded:: 1.20.3
+
+    .. seealso::
+
+        :func:`.command.inspect_versions`
+
+    """
+    old_revision, new_revision = _parse_recovery_mapping(mapping)
+    if old_revision == new_revision:
+        raise util.CommandError(
+            "Replacement revision is identical to the existing revision "
+            "'%s'" % old_revision
+        )
+
+    script = ScriptDirectory.from_config(config)
+
+    # validate against the scripts before touching the database, so that an
+    # unconfirmed or misspelled mapping performs no work at all
+    if script.revision_map.get_exact_revision(new_revision) is None:
+        raise util.CommandError(
+            "Can't map to revision '%s'; it is not an exact revision "
+            "identifier present in the current scripts" % new_revision
+        )
+
+    if not confirm:
+        raise util.CommandError(
+            "Refusing to replace revision '%s' with '%s' without explicit "
+            "confirmation; re-run with --confirm once the mapping has been "
+            "reviewed" % (old_revision, new_revision)
+        )
+
+    state: dict[str, tuple[str, ...]] = {}
+
+    def do_repair(rev, context):
+        # the replacement is applied while env.py's connection is still open
+        state["heads"] = context.apply_revision_mapping(
+            old_revision, new_revision
+        )
+        return []
+
+    with EnvironmentContext(
+        config, script, fn=do_repair, dont_mutate=True
+    ):
+        script.run_env()
+
+    heads = state.get("heads")
+    if heads is None:
+        raise util.CommandError(
+            "Applying a revision mapping requires an env.py that calls "
+            "context.run_migrations()"
+        )
+    config.print_stdout(
+        "Replaced version '%s' with '%s'; version table now contains: %s",
+        old_revision,
+        new_revision,
+        util.format_as_comma(heads),
+    )
+    return heads
+
+
+def _parse_recovery_mapping(mapping: str) -> tuple[str, str]:
+    """Split a ``"<old>:<new>"`` recovery mapping into its two parts."""
+    old_revision, sep, new_revision = mapping.partition(":")
+    old_revision = old_revision.strip()
+    new_revision = new_revision.strip()
+    if not sep or not old_revision or not new_revision:
+        raise util.CommandError(
+            "Revision mapping must be given as '<old>:<new>', got %r"
+            % (mapping,)
+        )
+    return old_revision, new_revision
 
 
 def list_templates(config: Config) -> None:

@@ -5,6 +5,7 @@ from collections.abc import Collection
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Sequence
+from dataclasses import dataclass
 import re
 from typing import Any
 from typing import Callable
@@ -116,6 +117,52 @@ class DependencyLoopDetected(DependencyCycleDetected, LoopDetected):
 
     def __init__(self, revision: Sequence[str]) -> None:
         super().__init__(revision)
+
+
+@dataclass(frozen=True)
+class RevisionStatus:
+    """Diagnosis of a single revision identifier found in a database's
+    version table.
+
+    Instances are produced by
+    :meth:`.RevisionMap.classify_revision_ids`, which is a read-only
+    operation; nothing is stamped or otherwise written as a result.
+
+    .. versionadded:: 1.20.3
+
+    """
+
+    revision: str
+    """The identifier exactly as it was read from the version table."""
+
+    known: bool
+    """``True`` if the current scripts contain this identifier."""
+
+    is_head: bool = False
+    """For a known row, ``True`` when the identifier is itself one of the
+    current script directory heads, meaning no upgrade is needed for it."""
+
+    is_ancestor_of: tuple[str, ...] = ()
+    """Other stored identifiers which descend from this one.  A non-empty
+    value marks this row as a redundant ancestor duplicate: the branch is
+    already covered by the rows named here."""
+
+    reachable_heads: tuple[str, ...] = ()
+    """For a known row, the current heads reachable by upgrading along its
+    own branch.  Empty for an unknown row."""
+
+    branch_labels: tuple[str, ...] = ()
+    """Branch labels declared on the resolved revision, if any."""
+
+    @property
+    def redundant(self) -> bool:
+        """``True`` when another stored row already implies this one."""
+        return self.known and bool(self.is_ancestor_of)
+
+    @property
+    def needs_mapping(self) -> bool:
+        """``True`` when an administrator must map this row explicitly."""
+        return not self.known
 
 
 class RevisionMap:
@@ -580,6 +627,25 @@ class RevisionMap:
 
         resolved: str | tuple[()] = resolved_id[0] if resolved_id else ()
         return self._revision_for_ident(resolved, branch_label)
+
+    def get_exact_revision(self, id_: str) -> Revision | None:
+        """Return the :class:`.Revision` whose identifier is exactly ``id_``.
+
+        Unlike :meth:`.RevisionMap.get_revision`, no symbolic name, branch
+        label or partial identifier matching takes place and an unknown
+        identifier returns ``None`` rather than raising.  This is used by
+        the version-table recovery workflow, where a stored row must be
+        reported for exactly what it says.
+
+        .. versionadded:: 1.20.3
+
+        """
+        self._revision_map
+        rev = self._revision_map.get(id_)
+        if isinstance(rev, Revision) and rev.revision == id_:
+            return rev
+        else:
+            return None
 
     def _resolve_branch(self, branch_label: str) -> Revision | None:
         try:
@@ -1526,6 +1592,80 @@ class RevisionMap:
             self._get_ancestor_nodes(list(top_revs), include_dependencies=True)
         )
         return self._filter_into_branch_heads(top_revs)
+
+    def classify_revision_ids(
+        self, stored_ids: Iterable[str]
+    ) -> tuple[RevisionStatus, ...]:
+        """Diagnose revision identifiers read from a version table.
+
+        This method is **read-only**: it neither resolves an identifier
+        against the database nor performs any kind of stamp.  Each
+        identifier is resolved against the current scripts and reported as
+        one of:
+
+        * a still-valid head (:attr:`.RevisionStatus.is_head`);
+        * a still-valid ancestor that another stored identifier already
+          implies, i.e. a redundant duplicate
+          (:attr:`.RevisionStatus.redundant`);
+        * an identifier that no longer exists in the current scripts and
+          must therefore be mapped by an administrator
+          (:attr:`.RevisionStatus.needs_mapping`).
+
+        Identifiers are never partially matched and an unknown identifier
+        never raises; use :meth:`.RevisionMap.get_revisions` for the strict
+        behaviour used by the regular migration commands.
+
+        .. versionadded:: 1.20.3
+
+        """
+        ids: list[str] = []
+        for stored_id in stored_ids:
+            if stored_id not in ids:
+                ids.append(stored_id)
+
+        resolved: dict[str, Revision] = {}
+        for stored_id in ids:
+            # exact identifiers only: branch labels, partial identifiers and
+            # symbolic names are deliberately not matched, so that an
+            # administrator sees the row for what it really is.
+            rev = self.get_exact_revision(stored_id)
+            if rev is not None:
+                resolved[stored_id] = rev
+
+        statuses: list[RevisionStatus] = []
+        for stored_id in ids:
+            rev = resolved.get(stored_id)
+            if rev is None:
+                statuses.append(
+                    RevisionStatus(revision=stored_id, known=False)
+                )
+                continue
+
+            descendants = {
+                other.revision
+                for other in self._get_descendant_nodes(
+                    [rev], include_dependencies=True
+                )
+            }
+            statuses.append(
+                RevisionStatus(
+                    revision=stored_id,
+                    known=True,
+                    is_head=stored_id in self._real_heads,
+                    is_ancestor_of=tuple(
+                        other
+                        for other in ids
+                        if other != stored_id and other in descendants
+                    ),
+                    reachable_heads=tuple(
+                        head
+                        for head in self._real_heads
+                        if head == stored_id or head in descendants
+                    ),
+                    branch_labels=tuple(sorted(rev.branch_labels)),
+                )
+            )
+        return tuple(statuses)
 
 
 class Revision:

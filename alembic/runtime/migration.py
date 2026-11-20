@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextlib import nullcontext
+from dataclasses import dataclass
 import logging
 import sys
 from typing import Any
@@ -16,11 +17,13 @@ from typing import cast
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from sqlalchemy import create_engine
 from sqlalchemy import literal_column
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine import url as sqla_url
 from sqlalchemy.engine.strategies import MockEngineStrategy
+from sqlalchemy.pool import StaticPool
 from typing_extensions import ContextManager
 
 from .. import ddl
@@ -43,6 +46,7 @@ if TYPE_CHECKING:
     from ..script.revision import _RevisionOrBase
     from ..script.revision import Revision
     from ..script.revision import RevisionMap
+    from ..script.revision import RevisionStatus
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +78,159 @@ class _ProxyTransaction:
         if self._proxied_transaction is not None:
             self._proxied_transaction.__exit__(type_, value, traceback)
             self.migration_context._transaction = None
+
+
+@dataclass(frozen=True)
+class RevisionMappingPlan:
+    """Outcome of previewing a single revision mapping.
+
+    Produced by :meth:`.MigrationContext.plan_revision_mapping`, which
+    performs no writes against the target database.  The mapping is
+    rehearsed against a throwaway in-memory SQLite database instead.
+
+    .. versionadded:: 1.20.3
+
+    """
+
+    old_revision: str
+    new_revision: str
+
+    heads_before: tuple[str, ...]
+    """Version identifiers present before the mapping."""
+
+    heads_after: tuple[str, ...]
+    """Version identifiers the scratch database held after the mapping."""
+
+    upgrade_revisions: tuple[str, ...]
+    """Revisions a subsequent ``upgrade heads`` would run, in order."""
+
+    untouched_revisions: tuple[str, ...]
+    """Stored identifiers the mapping leaves completely alone."""
+
+    @property
+    def unrelated_heads_preserved(self) -> bool:
+        """``True`` when every stored row other than ``old_revision``
+        survives the mapping unchanged."""
+        remaining = set(self.heads_before).difference([self.old_revision])
+        return remaining.issubset(self.heads_after)
+
+    def format_plan(self) -> str:
+        """Render a human-readable summary of the rehearsed mapping."""
+        lines = [
+            "Rehearsed mapping '%s' -> '%s' against a temporary database"
+            % (self.old_revision, self.new_revision),
+            "  version table before: %s"
+            % (util.format_as_comma(self.heads_before) or "<empty>"),
+            "  version table after:  %s"
+            % (util.format_as_comma(self.heads_after) or "<empty>"),
+            "  left untouched:       %s"
+            % (util.format_as_comma(self.untouched_revisions) or "<none>"),
+            "  upgrade steps after mapping: %s"
+            % (util.format_as_comma(self.upgrade_revisions) or "<none>"),
+        ]
+        if not self.unrelated_heads_preserved:
+            lines.append(
+                "  WARNING: the mapping would alter rows other than '%s'"
+                % self.old_revision
+            )
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    """Read-only diagnosis of a version table, as produced by
+    :meth:`.MigrationContext.get_recovery_report`.
+
+    .. versionadded:: 1.20.3
+
+    """
+
+    version_table: str
+    """Name of the version table that was inspected."""
+
+    version_table_present: bool
+    """``False`` when the database has no version table at all, in which
+    case :attr:`.RecoveryReport.rows` is empty."""
+
+    rows: tuple[RevisionStatus, ...]
+    """One :class:`.RevisionStatus` per distinct stored identifier."""
+
+    script_heads: tuple[str, ...]
+    """All heads advertised by the current script directory."""
+
+    current_ids: tuple[str, ...]
+    """Identifiers as read from the version table, in storage order."""
+
+    @property
+    def valid_rows(self) -> tuple[RevisionStatus, ...]:
+        """Rows whose identifier still resolves against current scripts."""
+        return tuple(row for row in self.rows if row.known)
+
+    @property
+    def unknown_rows(self) -> tuple[RevisionStatus, ...]:
+        """Rows that require an explicit administrator mapping."""
+        return tuple(row for row in self.rows if row.needs_mapping)
+
+    @property
+    def redundant_rows(self) -> tuple[RevisionStatus, ...]:
+        """Rows superseded by another row that descends from them."""
+        return tuple(row for row in self.rows if row.redundant)
+
+    @property
+    def needs_mapping(self) -> bool:
+        """``True`` when at least one stored identifier is unknown."""
+        return bool(self.unknown_rows)
+
+    def format_report(self) -> str:
+        """Render a human-readable, administrator-facing report."""
+
+        lines = [
+            "Recovery inspection of version table '%s'" % self.version_table
+        ]
+        lines.append(
+            "Script directory heads: %s"
+            % (util.format_as_comma(self.script_heads) or "<none>")
+        )
+        if not self.version_table_present:
+            lines.append(
+                "Version table is not present; the database is unversioned."
+            )
+            return "\n".join(lines)
+        if not self.rows:
+            lines.append("Version table is empty.")
+            return "\n".join(lines)
+
+        for row in self.rows:
+            if not row.known:
+                lines.append(
+                    "  [unknown] %s: no such revision in the current "
+                    "scripts; an explicit administrator mapping is "
+                    "required" % row.revision
+                )
+            elif row.redundant:
+                lines.append(
+                    "  [valid, redundant] %s: superseded by %s"
+                    % (row.revision, util.format_as_comma(row.is_ancestor_of))
+                )
+            elif row.is_head:
+                lines.append("  [valid head] %s" % row.revision)
+            else:
+                lines.append(
+                    "  [valid] %s: upgrades to head %s"
+                    % (
+                        row.revision,
+                        util.format_as_comma(row.reachable_heads) or "<none>",
+                    )
+                )
+
+        if self.needs_mapping:
+            lines.append(
+                "Unrelated rows are left untouched; map each unknown row "
+                "with 'alembic repair_versions OLD:NEW --confirm'."
+            )
+        else:
+            lines.append("All stored revisions are valid; no mapping needed.")
+        return "\n".join(lines)
 
 
 class MigrationContext:
@@ -543,6 +700,249 @@ class MigrationContext:
         assert self.connection is not None
         return sqla_compat._connectable_has_table(
             self.connection, self.version_table, self.version_table_schema
+        )
+
+    def get_recovery_report(self) -> RecoveryReport:
+        """Inspect the version table and classify every stored revision.
+
+        A database restored from a backup may carry a row written by a
+        branch that has since been replaced, in which case the ordinary
+        :func:`~alembic.command.upgrade` command fails while resolving the
+        stored identifier.  This method is the read-only half of the
+        recovery workflow: it reads the version table, resolves each row
+        exactly against the current scripts and reports which rows are
+        still valid heads, which are redundant ancestors, and which are
+        unknown and therefore require an explicit administrator mapping.
+
+        No ``stamp`` is performed and nothing is written to the database.
+        Ordinary commands keep raising
+        :class:`~alembic.util.exc.CommandError` for an unknown revision;
+        this method never raises for one.
+
+        The script directory must have been passed to the
+        :class:`.MigrationContext` via the ``script`` option, which
+        :class:`.EnvironmentContext` does automatically.
+
+        .. versionadded:: 1.20.3
+
+        .. seealso::
+
+            :meth:`.MigrationContext.apply_revision_mapping`
+
+        """
+        if self.as_sql:
+            raise util.CommandError(
+                "Recovery inspection requires a database connection; it is "
+                "not available in --sql / offline mode"
+            )
+        if self.script is None:
+            raise util.CommandError(
+                "Recovery inspection requires a ScriptDirectory; configure "
+                "the context via EnvironmentContext or pass the 'script' "
+                "option"
+            )
+
+        stored = self.get_current_heads()
+        statuses = self.script.revision_map.classify_revision_ids(stored)
+
+        return RecoveryReport(
+            version_table=self.version_table,
+            version_table_present=self._has_version_table(),
+            rows=statuses,
+            script_heads=tuple(self.script.get_heads()),
+            current_ids=tuple(stored),
+        )
+
+    def apply_revision_mapping(
+        self, old_revision: str, new_revision: str
+    ) -> tuple[str, ...]:
+        """Replace a single, administrator-confirmed version row.
+
+        This is the only write performed by the recovery workflow.  Exactly
+        one row in the version table is replaced with ``new_revision``;
+        every other row, including the heads of unrelated branches, is left
+        untouched.  ``new_revision`` must resolve against the current
+        scripts, while ``old_revision`` must be a row that is actually
+        present, so that a typo cannot silently insert a brand new branch.
+
+        The replacement happens within a single transaction.  Callers are
+        responsible for obtaining explicit confirmation before invoking
+        this method; see :func:`alembic.command.repair_versions`.
+
+        Returns the full set of version identifiers present afterwards.
+
+        .. versionadded:: 1.20.3
+
+        .. seealso::
+
+            :meth:`.MigrationContext.get_recovery_report`
+
+        """
+        if self.as_sql:
+            raise util.CommandError(
+                "Applying a revision mapping requires a database connection; "
+                "it is not available in --sql / offline mode"
+            )
+        if self.script is None:
+            raise util.CommandError(
+                "Applying a revision mapping requires a ScriptDirectory"
+            )
+        if old_revision == new_revision:
+            raise util.CommandError(
+                "Replacement revision is identical to the existing revision "
+                "'%s'" % old_revision
+            )
+
+        target = self.script.revision_map.get_exact_revision(new_revision)
+        if target is None:
+            raise util.CommandError(
+                "Can't map to revision '%s'; it is not an exact revision "
+                "identifier present in the current scripts" % new_revision
+            )
+
+        statuses = {
+            status.revision: status
+            for status in self.script.revision_map.classify_revision_ids(
+                self.get_current_heads()
+            )
+        }
+        if old_revision not in statuses:
+            raise util.CommandError(
+                "Can't replace revision '%s'; it is not present in version "
+                "table '%s'" % (old_revision, self.version_table)
+            )
+        if new_revision in statuses:
+            raise util.CommandError(
+                "Can't map to revision '%s'; that revision is already "
+                "present in version table '%s'"
+                % (new_revision, self.version_table)
+            )
+
+        # a single UPDATE of a single row.  If an enclosing transaction is
+        # already owned by somebody else -- an external transaction from the
+        # connection-sharing recipe, or the transaction managed by
+        # :meth:`.MigrationContext.begin_transaction` within ``env.py`` --
+        # the update participates in it and that owner commits.  Otherwise
+        # the implicit transaction opened by the reads above is committed
+        # here, so that the replacement is durable.
+        assert self.connection is not None
+        with sqla_compat._ensure_scope_for_ddl(self.connection):
+            self.connection.execute(
+                self._version.update()
+                .values(version_num=new_revision)
+                .where(
+                    self._version.c.version_num
+                    == literal_column("'%s'" % old_revision)
+                )
+            )
+        if not self._in_external_transaction and self._transaction is None:
+            sqla_compat._safe_commit_connection_transaction(self.connection)
+
+        heads = self.get_current_heads()
+        if new_revision not in heads or old_revision in heads:
+            raise util.CommandError(
+                "Version table '%s' did not reflect the requested mapping of "
+                "'%s' to '%s'"
+                % (self.version_table, old_revision, new_revision)
+            )
+        return heads
+
+    def plan_revision_mapping(
+        self, old_revision: str, new_revision: str
+    ) -> RevisionMappingPlan:
+        """Preview a single revision mapping without touching the database.
+
+        The current version rows are read from this context's database and
+        replayed into a throwaway in-memory SQLite database, where the
+        mapping is applied and the resulting upgrade steps are calculated.
+        The source database is never written to, so this is safe to run
+        against a restored production backup before deciding what to do.
+
+        Only the branch that owns ``old_revision`` is expected to advance;
+        :attr:`.RevisionMappingPlan.unrelated_heads_preserved` reports
+        whether every other stored row survived the rehearsal unchanged.
+
+        .. versionadded:: 1.20.3
+
+        .. seealso::
+
+            :meth:`.MigrationContext.get_recovery_report`
+
+            :meth:`.MigrationContext.apply_revision_mapping`
+
+        """
+        if self.as_sql:
+            raise util.CommandError(
+                "Planning a revision mapping requires a database connection; "
+                "it is not available in --sql / offline mode"
+            )
+        if self.script is None:
+            raise util.CommandError(
+                "Planning a revision mapping requires a ScriptDirectory"
+            )
+        if self.version_table_schema is not None:
+            raise util.CommandError(
+                "Planning a revision mapping is not supported for a version "
+                "table in schema '%s'; apply and inspect the mapping "
+                "directly instead" % self.version_table_schema
+            )
+
+        heads_before = self.get_current_heads()
+
+        target = self.script.revision_map.get_exact_revision(new_revision)
+        if target is None:
+            raise util.CommandError(
+                "Can't map to revision '%s'; it is not an exact revision "
+                "identifier present in the current scripts" % new_revision
+            )
+        if old_revision not in heads_before:
+            raise util.CommandError(
+                "Can't replace revision '%s'; it is not present in version "
+                "table '%s'" % (old_revision, self.version_table)
+            )
+
+        engine = create_engine("sqlite://", poolclass=StaticPool)
+        try:
+            with engine.connect() as scratch_connection:
+                scratch = MigrationContext.configure(
+                    connection=scratch_connection,
+                    opts={
+                        "version_table": self.version_table,
+                        "version_table_schema": None,
+                        "script": self.script,
+                    },
+                )
+                scratch._ensure_version_table()
+                for head in heads_before:
+                    scratch_connection.execute(
+                        scratch._version.insert().values(version_num=head)
+                    )
+
+                heads_after = scratch.apply_revision_mapping(
+                    old_revision, new_revision
+                )
+        finally:
+            engine.dispose()
+
+        try:
+            steps = self.script._upgrade_revs("heads", heads_after)
+        except util.CommandError as err:
+            raise util.CommandError(
+                "The proposed mapping '%s' -> '%s' does not leave the version "
+                "table in a state that can be upgraded normally: %s"
+                % (old_revision, new_revision, err)
+            ) from err
+        upgrade_revisions = tuple(step.revision.revision for step in steps)
+
+        return RevisionMappingPlan(
+            old_revision=old_revision,
+            new_revision=new_revision,
+            heads_before=heads_before,
+            heads_after=heads_after,
+            upgrade_revisions=upgrade_revisions,
+            untouched_revisions=tuple(
+                head for head in heads_before if head != old_revision
+            ),
         )
 
     def stamp(self, script_directory: ScriptDirectory, revision: str) -> None:

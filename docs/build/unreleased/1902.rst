@@ -1,0 +1,20 @@
+.. change::
+    :tags: feature, commands
+
+    Added a read-only version table recovery workflow for databases whose
+    ``alembic_version`` table references revisions that no longer exist in
+    the current scripts, typically because the database was restored from a
+    backup taken on a branch that has since been replaced.  The new
+    :func:`.command.inspect_versions` command classifies each stored row as
+    a still-valid head, a redundant ancestor of another row, or unknown;
+    :func:`.command.plan_versions` rehearses a proposed mapping against a
+    throwaway in-memory database without touching the target database; and
+    :func:`.command.repair_versions` replaces exactly one
+    administrator-confirmed row, leaving the heads of unrelated branches
+    untouched.  The regular :func:`.command.upgrade` command is unchanged
+    and continues to raise "Can't locate revision identified by ..." for an
+    unmapped unknown revision.  The underlying API is also available as
+    :meth:`.RevisionMap.classify_revision_ids`,
+    :meth:`.MigrationContext.get_recovery_report`,
+    :meth:`.MigrationContext.plan_revision_mapping` and
+    :meth:`.MigrationContext.apply_revision_mapping`.
