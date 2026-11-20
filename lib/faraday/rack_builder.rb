@@ -32,16 +32,23 @@ module Faraday
 
       attr_reader :name
 
-      def initialize(klass, *args, **kwargs, &block)
+      def initialize(klass, *args, registry: nil, **kwargs, &block)
         @name = klass.to_s
-        REGISTRY.set(klass) if klass.respond_to?(:name)
+        @registry = registry || REGISTRY
+        # Named classes are published in the process-wide registry so the
+        # public constant convention keeps working. Scoped registries also
+        # record their own classes, including anonymous ones, so handlers can
+        # resolve them without going through Object.const_get.
+        @registry.set(klass) if klass.respond_to?(:name)
         @args = args
         @kwargs = kwargs
         @block = block
       end
 
       def klass
-        REGISTRY.get(@name)
+        # A scoped registry only shadows names registered inside it. Anything
+        # else still resolves through the public, process-wide convention.
+        @registry.fetch(@name) || REGISTRY.get(@name)
       end
 
       def inspect
@@ -63,9 +70,14 @@ module Faraday
       end
     end
 
-    def initialize(&block)
+    # @return [Faraday::AdapterRegistry, nil] the local naming scope used to
+    #   resolve adapters for this builder, or nil to use the public registry.
+    attr_reader :adapter_registry
+
+    def initialize(adapter_registry: nil, &block)
       @adapter = nil
       @handlers = []
+      @adapter_registry = adapter_registry
       build(&block)
     end
 
@@ -73,6 +85,7 @@ module Faraday
       super
       @adapter = original.adapter
       @handlers = original.handlers.dup
+      @adapter_registry = original.adapter_registry
       # @app is memoized on the first request. Drop it so the duplicate
       # rebuilds from the copied handlers and middleware added after dup runs.
       @app = nil
@@ -97,13 +110,15 @@ module Faraday
       @handlers.frozen?
     end
 
-    def use(klass, ...)
+    def use(klass, *args, **kwargs, &block)
       if klass.is_a? Symbol
-        use_symbol(Faraday::Middleware, klass, ...)
+        use_symbol(Faraday::Middleware, klass, *args, **kwargs, &block)
       else
         raise_if_locked
         raise_if_adapter(klass)
-        @handlers << self.class::Handler.new(klass, ...)
+        @handlers << self.class::Handler.new(
+          klass, *args, registry: @adapter_registry, **kwargs, &block
+        )
       end
     end
 
@@ -119,16 +134,25 @@ module Faraday
       return @adapter if klass == NO_ARGUMENT || klass.nil?
 
       raise_if_locked
-      klass = Faraday::Adapter.lookup_middleware(klass) if klass.is_a?(Symbol)
-      @adapter = self.class::Handler.new(klass, *args, **kwargs, &block)
+      if klass.is_a?(Symbol)
+        # The local naming scope wins when it knows the adapter. Otherwise the
+        # lookup falls back to the public registration convention.
+        klass = (@adapter_registry && @adapter_registry.fetch(klass)) ||
+                Faraday::Adapter.lookup_middleware(klass)
+      end
+      @adapter = self.class::Handler.new(
+        klass, *args, registry: @adapter_registry, **kwargs, &block
+      )
     end
 
     ## methods to push onto the various positions in the stack:
 
-    def insert(index, ...)
+    def insert(index, *args, **kwargs, &block)
       raise_if_locked
       index = assert_index(index)
-      handler = self.class::Handler.new(...)
+      handler = self.class::Handler.new(
+        *args, registry: @adapter_registry, **kwargs, &block
+      )
       @handlers.insert(index, handler)
     end
 

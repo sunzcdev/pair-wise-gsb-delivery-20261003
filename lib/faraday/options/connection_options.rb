@@ -31,10 +31,15 @@ module Faraday
   #   #
   #   # @!attribute builder_class
   #   #   @return [Class] the class used to build the middleware stack
+  #   #
+  #   # @!attribute adapter_registry
+  #   #   @return [Faraday::AdapterRegistry, nil] an optional local naming scope
+  #   #     used to resolve adapters for this connection. When set, adapters
+  #   #     registered in it take precedence over the public registry.
   #   class ConnectionOptions < Options; end
   ConnectionOptions = Options.new(:request, :proxy, :ssl, :builder, :url,
                                   :parallel_manager, :params, :headers,
-                                  :builder_class) do
+                                  :builder_class, :adapter_registry) do
     options request: RequestOptions, ssl: SSLOptions
 
     memoized(:request) { self.class.options_for(:request).new }
@@ -44,7 +49,7 @@ module Faraday
     memoized(:builder_class) { RackBuilder }
 
     def new_builder(block)
-      builder_class.new(&block)
+      builder_class.new(adapter_registry: adapter_registry, &block)
     end
   end
 end

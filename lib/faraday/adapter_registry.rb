@@ -20,6 +20,18 @@ module Faraday
       Object.const_get(name).tap { |c| set(c, name) }
     end
 
+    # Looks up a name only within this registry, without falling back to
+    # Object.const_get. Returns nil when the name has not been registered
+    # locally, so callers can apply their own lookup convention.
+    #
+    # @param name [Symbol, String] the registered adapter name.
+    # @return [Class, Module, nil] the registered constant, or nil.
+    def fetch(name)
+      @lock.synchronize do
+        @constants[name]
+      end
+    end
+
     def set(klass, name = nil)
       name ||= klass.to_s
       @lock.synchronize do
