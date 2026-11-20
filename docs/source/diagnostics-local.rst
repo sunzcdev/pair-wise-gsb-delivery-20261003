@@ -130,6 +130,41 @@ the number of bytes in the scheduler cache:
     >>> cprof = CacheProfiler(metric=nbytes)
 
 
+ExecutionObserver
+-----------------
+
+.. autosummary::
+   ExecutionObserver
+
+The ``ExecutionObserver`` class is a lightweight observer of local scheduler
+execution, aimed at analyzing the resident memory of multi-output
+computations. Where the ``Profiler`` only shows how long each task ran, the
+``ExecutionObserver`` records what happened to the data between tasks:
+
+1. ``requested_outputs``: the outputs requested from the scheduler, still
+   held in the cache when the computation completes
+2. ``cache_hits``: values that were already cached when execution started
+   and were reused instead of recomputed
+3. ``releases``: the last release of every cached dependency, including the
+   finished task that triggered it -- a key is released exactly once, when
+   its last remaining downstream consumer finishes
+4. ``cached_on_failure``: the keys still sitting in the cache if the
+   computation fails
+
+For example, when one input feeds both a short and a long branch of the
+graph, the release log shows when the input stopped being used by *any*
+branch:
+
+.. code-block:: python
+
+    >>> from dask.diagnostics import ExecutionObserver
+    >>> obs = ExecutionObserver()
+    >>> with obs:
+    ...     out = get(dsk, ['short', 'long-3'])
+    >>> [r for r in obs.releases if r.key == 'x']
+    [ReleaseData(key='x', released_by='long-1', time=...)]
+
+
 Example
 -------
 
