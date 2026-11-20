@@ -81,6 +81,29 @@ end
 
 For additional examples, see the [examples on github][examples-github].
 
+### Exporting from forked processes
+
+`BatchSpanProcessor` detects forks and resets its queue in the child, but the
+exporter it was constructed with may hold sockets or other resources that
+cannot be shared with the parent. If your application forks workers after the
+SDK is configured, pass an `exporter_factory` so each process gets its own
+exporter:
+
+```ruby
+OpenTelemetry::SDK.configure do |c|
+  c.add_span_processor(
+    OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor.new(
+      exporter_factory: -> { MyExporter.new }
+    )
+  )
+end
+```
+
+The factory is called at most once per process, the first time that process
+needs to export something. A forked child never uses, flushes, or shuts down the
+exporter its parent created, and spans that the parent had already taken from
+the queue are not exported by the child.
+
 ## How can I get involved?
 
 The `opentelemetry-sdk` gem source is [on github][repo-github], along with related gems including `opentelemetry-api`.

@@ -41,6 +41,26 @@ describe OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor do
   class NotAnExporter
   end
 
+  class LifecycleExporter < TestExporter
+    attr_reader :force_flush_calls, :shutdown_calls
+
+    def initialize(status_codes: nil)
+      super
+      @force_flush_calls = 0
+      @shutdown_calls = 0
+    end
+
+    def force_flush(timeout: nil)
+      @force_flush_calls += 1
+      SUCCESS
+    end
+
+    def shutdown(timeout: nil)
+      @shutdown_calls += 1
+      SUCCESS
+    end
+  end
+
   class RaisingExporter
     def export(batch, timeout: nil)
       raise 'boom!'
@@ -409,6 +429,248 @@ describe OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor do
     end
   end
 
+  describe 'exporter factory' do
+    # Drives a processor through a simulated fork without spawning a process.
+    # Process.pid is replaced for the duration of the block, which is how the
+    # processor decides whether it still owns its exporter. State is captured
+    # and restored around the block so that, as with a real fork, changes made
+    # by the child are invisible to the parent. Thread.new is stubbed out so
+    # the child's simulated worker never races with the assertions.
+    def in_forked_process(processor, pid)
+      saved_ivars = processor.instance_variables.to_h { |name| [name, processor.instance_variable_get(name)] }
+      saved_spans = processor.instance_variable_get(:@spans).dup
+      Process.stub(:pid, pid) do
+        Thread.stub(:new, ->(&_block) { nil }) do
+          yield
+        end
+      end
+    ensure
+      saved_ivars&.each { |name, value| processor.instance_variable_set(name, value) }
+      processor.instance_variable_set(:@spans, saved_spans) if saved_spans
+    end
+
+    let(:parent_pid) { Process.pid }
+    let(:child_pid) { parent_pid + 1 }
+    let(:parent_exporter) { LifecycleExporter.new }
+    let(:child_exporter) { LifecycleExporter.new }
+    let(:factory_calls) { [] }
+    let(:factory) do
+      lambda do
+        factory_calls << Process.pid
+        child_exporter
+      end
+    end
+    let(:bsp) do
+      BatchSpanProcessor.new(parent_exporter,
+                             exporter_factory: factory,
+                             max_queue_size: 10,
+                             max_export_batch_size: 3,
+                             start_thread_on_boot: false)
+    end
+
+    it 'does not require an exporter when a factory is given' do
+      processor = BatchSpanProcessor.new(exporter_factory: -> { TestExporter.new }, start_thread_on_boot: false)
+      _(processor.instance_variable_get(:@exporter)).must_be_nil
+    end
+
+    it 'raises when neither an exporter nor a factory is given' do
+      _(-> { BatchSpanProcessor.new }).must_raise(ArgumentError)
+    end
+
+    it 'raises when the factory is not callable' do
+      _(-> { BatchSpanProcessor.new(exporter_factory: Object.new) }).must_raise(ArgumentError)
+    end
+
+    it 'never calls the factory in the process that constructed it' do
+      bsp.on_finish(TestSpan.new)
+      bsp.shutdown
+
+      _(factory_calls).must_be_empty
+      _(parent_exporter.shutdown_calls).must_equal(1)
+      _(child_exporter.shutdown_calls).must_equal(0)
+    end
+
+    it 'calls the factory on the first on_finish in a forked process' do
+      in_forked_process(bsp, child_pid) do
+        _(factory_calls).must_be_empty
+        bsp.on_finish(TestSpan.new)
+        _(factory_calls).must_equal([child_pid])
+        bsp.on_finish(TestSpan.new)
+        _(factory_calls).must_equal([child_pid])
+      end
+    end
+
+    it 'exports spans from a forked process through its own exporter' do
+      span = TestSpan.new
+      in_forked_process(bsp, child_pid) do
+        bsp.on_finish(span)
+        _(bsp.force_flush).must_equal(SUCCESS)
+      end
+
+      _(child_exporter.batches).must_equal([[span]])
+      _(parent_exporter.batches).must_be_empty
+    end
+
+    it 'settles each process with its own exporter exactly once' do
+      in_forked_process(bsp, child_pid) do
+        bsp.on_finish(TestSpan.new)
+        _(bsp.shutdown).must_equal(SUCCESS)
+        _(child_exporter.shutdown_calls).must_equal(1)
+      end
+
+      _(parent_exporter.shutdown_calls).must_equal(0)
+
+      bsp.shutdown
+      _(parent_exporter.shutdown_calls).must_equal(1)
+      _(child_exporter.shutdown_calls).must_equal(1)
+    end
+
+    it 'does not create an exporter in a forked process that has nothing to flush' do
+      in_forked_process(bsp, child_pid) do
+        _(bsp.force_flush).must_equal(SUCCESS)
+        _(factory_calls).must_be_empty
+
+        _(bsp.shutdown).must_equal(SUCCESS)
+        _(factory_calls).must_be_empty
+        _(child_exporter.force_flush_calls).must_equal(0)
+        _(child_exporter.shutdown_calls).must_equal(0)
+      end
+    end
+
+    it 'does not hand spans queued by the parent to the child exporter' do
+      parent_span = TestSpan.new
+      bsp.on_finish(parent_span)
+
+      child_span = TestSpan.new
+      in_forked_process(bsp, child_pid) do
+        bsp.on_finish(child_span)
+        bsp.force_flush
+      end
+
+      _(child_exporter.batches.flatten).must_equal([child_span])
+      _(parent_exporter.batches).must_be_empty
+    end
+
+    it 'does not export a batch taken by the parent through the child exporter' do
+      # Simulate a worker that removed the batch before the fork and finishes
+      # exporting after it: the exporter paired with the batch is the parent's.
+      batch = [TestSpan.new]
+      in_forked_process(bsp, child_pid) do
+        bsp.on_finish(TestSpan.new) # create the child exporter
+        result = bsp.send(:export_batch, batch, exporter: parent_exporter)
+        _(result).must_equal(FAILURE)
+      end
+
+      _(parent_exporter.batches).must_be_empty
+      _(child_exporter.batches).must_be_empty
+    end
+
+    it 'drops a parent snapshot instead of requeueing it when the fork happens mid-flush' do
+      # The parent takes the snapshot, then the process forks during the
+      # export. The spans left in the snapshot belong to the parent and must
+      # not be requeued in the child or exported through the child's exporter.
+      current_pid = parent_pid
+      forked_pid = child_pid
+      forking_exporter = Class.new(TestExporter) do
+        define_method(:export) do |batch, timeout: nil|
+          current_pid = forked_pid # the fork happens here
+          super(batch, timeout: timeout)
+        end
+      end
+
+      metrics_reporter = TestMetricsReporter.new
+      processor = BatchSpanProcessor.new(exporter_factory: -> { forking_exporter.new(status_codes: [FAILURE]) },
+                                         metrics_reporter: metrics_reporter,
+                                         max_queue_size: 10,
+                                         max_export_batch_size: 1,
+                                         start_thread_on_boot: false)
+
+      Process.stub(:pid, -> { current_pid }) do
+        Thread.stub(:new, ->(&_block) { nil }) do
+          3.times { processor.on_finish(TestSpan.new) }
+          _(processor.force_flush).must_equal(FAILURE)
+        end
+      end
+
+      dropped = metrics_reporter.reported_metrics['otel.bsp.dropped_spans']
+      reasons = dropped.map { |_increment, labels| labels['reason'] }
+      _(reasons).must_include('fork')
+      _(processor.instance_variable_get(:@spans)).must_be_empty
+    end
+
+    it 'reports a factory that raises without propagating it' do
+      reported = []
+      OpenTelemetry.stub(:handle_error, ->(exception: nil, message: nil) { reported << [exception, message] }) do
+        processor = BatchSpanProcessor.new(exporter_factory: -> { raise 'no exporter for you' }, start_thread_on_boot: false)
+        processor.on_finish(TestSpan.new)
+        _(processor.instance_variable_get(:@exporter)).must_be_nil
+
+        # The span cannot be exported, so the flush reports a failure instead
+        # of raising; the factory error is the first one reported.
+        _(processor.force_flush).must_equal(FAILURE)
+      end
+      _(reported.first.first).must_be_instance_of(RuntimeError)
+      _(reported.first.first.message).must_equal('no exporter for you')
+    end
+
+    it 'reports a factory that returns something that is not an exporter' do
+      reported = []
+      factory = -> { NotAnExporter.new }
+      OpenTelemetry.stub(:handle_error, ->(exception: nil, message: nil) { reported << [exception, message] }) do
+        processor = BatchSpanProcessor.new(exporter_factory: factory, start_thread_on_boot: false)
+        processor.on_finish(TestSpan.new)
+        _(processor.instance_variable_get(:@exporter)).must_be_nil
+      end
+      _(reported.size).must_equal(1)
+      _(reported.first.first).must_be_instance_of(ArgumentError)
+    end
+
+    it 'does not retry a failing factory for later spans' do
+      calls = 0
+      factory = lambda do
+        calls += 1
+        raise 'nope'
+      end
+      OpenTelemetry.stub(:handle_error, ->(exception: nil, message: nil) {}) do
+        processor = BatchSpanProcessor.new(exporter_factory: factory, start_thread_on_boot: false)
+        3.times { processor.on_finish(TestSpan.new) }
+      end
+      _(calls).must_equal(1)
+    end
+
+    it 'recreates the exporter after the pid changes a second time' do
+      second_child_pid = child_pid + 1
+      second_child_exporter = LifecycleExporter.new
+      factory = lambda do
+        factory_calls << Process.pid
+        Process.pid == second_child_pid ? second_child_exporter : child_exporter
+      end
+      processor = BatchSpanProcessor.new(exporter_factory: factory, start_thread_on_boot: false)
+
+      in_forked_process(processor, child_pid) { processor.on_finish(TestSpan.new) }
+      in_forked_process(processor, second_child_pid) { processor.on_finish(TestSpan.new) }
+
+      _(factory_calls).must_equal([child_pid, second_child_pid])
+    end
+
+    it 'creates the exporter on the first on_finish when only a factory is given' do
+      exporter = LifecycleExporter.new
+      processor = BatchSpanProcessor.new(exporter_factory: -> { exporter },
+                                         schedule_delay: 10,
+                                         max_queue_size: 10,
+                                         max_export_batch_size: 1)
+      span = TestSpan.new
+      processor.on_finish(span)
+
+      deadline = Time.now + 5
+      sleep(0.01) until exporter.batches.any? || Time.now > deadline
+
+      _(processor.shutdown).must_equal(SUCCESS)
+      _(exporter.batches).must_equal([[span]])
+      _(exporter.shutdown_calls).must_equal(1)
+    end
+  end
+
   describe 'fork safety test' do
     let(:exporter) { TestExporter.new }
     let(:bsp) do
@@ -461,3 +723,4 @@ describe OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor do
     end
   end
 end
+
