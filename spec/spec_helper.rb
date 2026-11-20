@@ -30,8 +30,45 @@ require "stringio"
 
 ENV['MT_NO_PLUGINS'] = '1' # Work around stupid autoloading of plugins
 gem 'minitest'
-require "minitest/global_expectations/autorun"
-require 'minitest/hooks/default'
+begin
+  require "minitest/global_expectations/autorun"
+rescue LoadError
+  # minitest 6 removed minitest/global_expectations.  Provide a fallback
+  # so the specs can keep using must_* expectation methods directly on
+  # objects.
+  require "minitest/autorun"
+  require "minitest/expectations"
+
+  module MinitestGlobalExpectationsFallback
+    def run
+      Thread.current[:current_spec] = self
+      super
+    ensure
+      Thread.current[:current_spec] = nil
+    end
+  end
+  Minitest::Test.prepend(MinitestGlobalExpectationsFallback)
+
+  class Object
+    include Minitest::Expectations
+
+    def target
+      self
+    end
+
+    def ctx
+      Thread.current[:current_spec]
+    end
+  end
+end
+
+begin
+  require 'minitest/hooks/default'
+rescue LoadError
+  # minitest-hooks is not available.  The before/after spec methods in
+  # minitest 6 accept and ignore a :all positional argument, so specs
+  # using before(:all)/after(:all) still run, just with per-test hooks.
+end
 
 if ENV['CHECK_METHOD_VISIBILITY']
   require 'visibility_checker'
