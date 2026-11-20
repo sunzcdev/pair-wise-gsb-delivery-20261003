@@ -453,6 +453,10 @@ module HTTPX
       # safety net so that connection state does not corrupt.
       clear_pending_requests
 
+      # the connection idle/ping timer is owned by the connection; an inactive
+      # connection leaves the selector, so its pending timer must not survive it.
+      reset_ping_timer
+
       transition(:inactive)
     end
 
@@ -974,6 +978,11 @@ module HTTPX
 
       @state = :closed
       @write_buffer.clear
+
+      # a force-closed connection takes its own idle/ping timer down with it;
+      # request timers are owned and cancelled by the requests themselves.
+      reset_ping_timer
+
       begin
         purge_after_closed
       rescue IOError
@@ -1100,6 +1109,11 @@ module HTTPX
       ping_timeout = @options.timeout.ping_timeout
 
       @ping_timer = @current_selector.after(ping_timeout) do
+        # this timer is owned by the connection, not by any request. If the
+        # connection was reset, closed or deactivated in the meantime, the timer
+        # must have been cancelled and the callback must be inert here.
+        next unless @ping_timer
+
         log(level: 3) { "ping timeout expired..." }
         error = PingTimeoutError.new(ping_timeout, "Timed out after #{ping_timeout} seconds")
         on_error(error)
@@ -1210,10 +1224,18 @@ module HTTPX
     end
 
     def write_timeout_callback(request, timeout)
+      # request timers belong to the request they were registered for. A stale
+      # callback which reaches the selector after the request completed (i.e.
+      # when the connection was immediately reused for another request) must not
+      # interrupt the new request by clearing its write buffer.
       return if request.state == :done
 
+      response = request.response
+
+      return if response && response.finished?
+
       @write_buffer.clear
-      error = WriteTimeoutError.new(request, nil, timeout)
+      error = WriteTimeoutError.new(request, response, timeout)
 
       request.handle_error(error)
     end

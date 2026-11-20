@@ -3,11 +3,11 @@ module HTTPX
     type callback = ^() -> void
 
     @intervals: Array[Interval]
-    @next_interval_at: Float
 
     def after: (interval interval_in_secs, ^() -> void) -> Timer
              | (interval interval_in_secs) { () -> void } -> Timer
 
+    # returns the remaining time until the next deadline, or nil when empty
     def wait_interval: () -> interval?
 
     def fire: (?TimeoutError error) -> void
@@ -18,7 +18,7 @@ module HTTPX
 
     private
 
-    def drop_elapsed!: (Numeric elapsed_time) -> void
+    def prune!: () -> void
 
     class Interval
       include Comparable
@@ -26,6 +26,7 @@ module HTTPX
       attr_reader interval: interval
 
       @callbacks: Array[callback]
+      @deadline: Float?
 
       def to_f: () -> Float
 
@@ -33,9 +34,11 @@ module HTTPX
 
       def delete: (callback) -> void
 
-      def elapse: (Numeric elapsed) -> Numeric
+      def elapse: () -> void
 
-      def elapsed?: (?Numeric elapsed_time) -> bool
+      def due?: (?Numeric now) -> bool
+
+      def time_left: (?Numeric now) -> Numeric
 
       def no_callbacks?: () -> bool
 
@@ -47,12 +50,15 @@ module HTTPX
     class Timer
       @interval: Interval
       @callback: callback
+      @cancelled: bool
 
       attr_accessor label: Symbol?
 
       def initialize: (Interval interval, callback callback) -> void
 
       def cancel: () -> void
+
+      def cancelled?: () -> bool
     end
   end
 end

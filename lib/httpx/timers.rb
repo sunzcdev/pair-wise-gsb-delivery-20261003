@@ -3,10 +3,17 @@
 module HTTPX
   class Timers
     def initialize
+      # timers are kept ordered by their absolute monotonic deadline. Grouping
+      # callbacks sharing the same delay (see #after) is preserved by reusing an
+      # already scheduled interval, which is also how a timer "belongs" to an
+      # interval: cancelling a timer only removes its own callback, and an empty
+      # interval is always dropped, so a stale request timer can never block or
+      # interrupt timers scheduled by another request reusing the same selector.
       @intervals = []
     end
 
     def empty?
+      prune!
       @intervals.empty?
     end
 
@@ -27,36 +34,43 @@ module HTTPX
 
       interval << callback
 
-      @next_interval_at = nil
-
       Timer.new(interval, callback)
     end
 
+    # returns the delay until the next timer deadline, or +nil+ when there is
+    # nothing scheduled. Intervals whose callbacks were all cancelled are pruned
+    # here, so they never contribute a wait interval.
     def wait_interval
-      drop_elapsed!(0) if @intervals.first&.elapsed?(0)
+      prune!
 
       return if @intervals.empty?
 
-      @next_interval_at = Utils.now
-
-      @intervals.first.interval
+      @intervals.first.time_left(Utils.now)
     end
 
+    # runs every timer whose deadline has been reached. A cancelled timer is
+    # never invoked, even when its interval fires while the cancellation happens
+    # during the dispatch of another callback sharing the same interval.
     def fire(error = nil)
-      raise error if error && error.timeout != @intervals.first
-      return if @intervals.empty? || !@next_interval_at
+      prune!
 
-      elapsed_time = Utils.elapsed_time(@next_interval_at)
+      return if @intervals.empty?
 
-      drop_elapsed!(elapsed_time)
+      now = Utils.now
 
-      @next_interval_at = nil if @intervals.empty?
+      raise error if error && error.timeout != @intervals.first.time_left(now)
+
+      due, @intervals = @intervals.partition { |interval| interval.due?(now) }
+
+      due.each(&:elapse)
     end
 
     private
 
-    def drop_elapsed!(elapsed_time)
-      @intervals = @intervals.drop_while { |interval| interval.elapse(elapsed_time) <= 0 }
+    # only intervals without any live callback are removed; due intervals with
+    # pending callbacks are kept so that #fire can dispatch them.
+    def prune!
+      @intervals = @intervals.reject(&:no_callbacks?)
     end
 
     class Timer
@@ -66,10 +80,20 @@ module HTTPX
       def initialize(interval, callback)
         @interval = interval
         @callback = callback
+        @cancelled = false
       end
 
+      # cancelling is idempotent and only affects this timer. The owning interval
+      # is left untouched otherwise; it gets pruned once it has no callbacks left.
       def cancel
+        return if @cancelled
+
+        @cancelled = true
         @interval.delete(@callback)
+      end
+
+      def cancelled?
+        @cancelled
       end
     end
 
@@ -81,6 +105,7 @@ module HTTPX
       def initialize(interval)
         @interval = interval
         @callbacks = []
+        @deadline = nil
       end
 
       def <=>(other)
@@ -98,7 +123,14 @@ module HTTPX
       end
 
       def <<(callback)
+        was_empty = @callbacks.empty?
+
         @callbacks << callback
+
+        # arm (or re-arm after all previous timers were cancelled) the absolute
+        # monotonic deadline when the interval gains its first live callback;
+        # callbacks joining an already-armed interval share that deadline.
+        @deadline = Utils.now + @interval if was_empty
       end
 
       def delete(callback)
@@ -109,22 +141,30 @@ module HTTPX
         @callbacks.empty?
       end
 
-      def elapsed?(elapsed = 0)
-        (@interval - elapsed) <= 0 || @callbacks.empty?
+      def time_left(now = Utils.now)
+        return @interval if @deadline.nil?
+
+        @deadline - now
       end
 
-      def elapse(elapsed)
-        # same as elapsing
-        return 0 if @callbacks.empty?
+      def due?(now = Utils.now)
+        return false if @callbacks.empty? || @deadline.nil?
 
-        @interval -= elapsed
+        time_left(now) <= 0
+      end
 
-        if @interval <= 0
-          cb = @callbacks.dup
-          cb.each(&:call)
+      # dispatches the callbacks still registered at fire time. The list is
+      # iterated over a snapshot, but each callback is re-checked against the
+      # live registration list, so a timer cancelled (by a sibling callback of
+      # the same interval, or externally) while the interval fires does not run.
+      def elapse
+        return if @callbacks.empty?
+
+        @callbacks.dup.each do |callback|
+          next unless @callbacks.include?(callback)
+
+          callback.call
         end
-
-        @interval
       end
     end
     private_constant :Interval
