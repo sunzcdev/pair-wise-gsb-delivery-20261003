@@ -1,0 +1,56 @@
+name: Test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    name: ${{ matrix.os }} ${{ matrix.python-version }} ${{ matrix.environment }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.9", "3.11"]
+        environment: [alldeps]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+            environment: alldeps
+          - os: ubuntu-latest
+            python-version: "3.9"
+            environment: nodeps
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v3.3.0
+        with:
+          fetch-depth: 0
+
+      - name: Setup Conda Environment
+        uses: conda-incubator/setup-miniconda@v2.2.0
+        with:
+          miniforge-variant: Mambaforge
+          miniforge-version: latest
+          use-mamba: true
+          activate-environment: test
+          condarc-file: continuous_integration/condarc
+          python-version: ${{ matrix.python-version }}
+          environment-file: continuous_integration/environment-${{ matrix.environment }}.yml
+
+      - name: Install zict
+        shell: bash -l {0}
+        run: python setup.py install
+
+      - name: mamba list
+        shell: bash -l {0}
+        run: mamba list
+
+      - name: mamba env export
+        shell: bash -l {0}
+        run: |
+          echo -e "--\n--Conda Environment (re-create this with \`mamba env create --name <name> -f <output_file>\`)\n--"
+          mamba env export | grep -E -v '^prefix:.*$'
+
+      - name: Run pytest
+        shell: bash -l {0}
+        run: pytest --doctest-modules zict

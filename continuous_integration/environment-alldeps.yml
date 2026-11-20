@@ -1,0 +1,10 @@
+name: test
+channels:
+  - conda-forge
+dependencies:
+  - psutil  # Enables extra tests
+  - python-lmdb  # Optional dependency
+  - pytest
+  - pytest-asyncio
+  - pytest-repeat
+  - pytest-timeout
