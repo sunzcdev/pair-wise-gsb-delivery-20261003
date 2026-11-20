@@ -140,17 +140,21 @@ module Fluent
         when format.is_a?(String)
           return Proc.new {|time|
             time = time.to_time
-            time.localtime(tz.period_for_utc(time).utc_total_offset).strftime(format)
+            # TZInfo 2 treats the clock reading of the argument as UTC and
+            # ignores its own UTC offset, so the time must be converted to
+            # UTC first. Otherwise the period is looked up at a wrong instant
+            # and DST transitions are applied at wrong times.
+            time.localtime(tz.period_for_utc(time.getutc).utc_total_offset).strftime(format)
           }
         when format.is_a?(Strftime)
           return Proc.new {|time|
             time = time.to_time
-            format.exec(time.localtime(tz.period_for_utc(time).utc_total_offset))
+            format.exec(time.localtime(tz.period_for_utc(time.getutc).utc_total_offset))
           }
         else
           return Proc.new {|time|
             time = time.to_time
-            time.localtime(tz.period_for_utc(time).utc_total_offset).iso8601
+            time.localtime(tz.period_for_utc(time.getutc).utc_total_offset).iso8601
           }
         end
       end
@@ -167,7 +171,10 @@ module Fluent
       when NAME_PATTERN
         tz = TZInfo::Timezone.get(timezone)
         ->(time) {
-          tz.period_for_utc(time.to_time).utc_total_offset
+          # TZInfo 2 ignores the UTC offset of the argument and treats its
+          # clock reading as UTC. Convert to UTC so that the period is looked
+          # up at the instant the event actually happened.
+          tz.period_for_utc(time.to_time.getutc).utc_total_offset
         }
       end
     end

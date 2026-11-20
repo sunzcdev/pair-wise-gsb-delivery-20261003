@@ -74,4 +74,41 @@ class TimezoneTest < ::Test::Unit::TestCase
     # must not be accepted as a stand-in for '+10:00'.
     assert_nil Fluent::Timezone.formatter('+09:60', '%Y-%m-%dT%H:%M:%S%z')
   end
+
+  # America/New_York transition instants used below:
+  #   fall-back:       2026-11-01 06:00 UTC (02:00 EDT -> 01:00 EST)
+  #   spring-forward:  2026-03-08 07:00 UTC (02:00 EST -> 03:00 EDT)
+  FALLBACK_UTC  = Time.utc(2026, 11, 1, 6, 0, 0).to_i
+  SPRING_FWD_UTC = Time.utc(2026, 3, 8, 7, 0, 0).to_i
+
+  def test_formatter_applies_the_offset_in_effect_at_each_instant
+    formatter = Fluent::Timezone.formatter('America/New_York', '%Y-%m-%d %H:%M %z')
+    assert_not_nil formatter
+
+    # Run under a system timezone far from the named one. TZInfo 2 ignores the
+    # UTC offset of the Time passed to period_for_utc, so a formatter that
+    # looks up periods through the system local time applies DST transitions
+    # at wrong instants.
+    with_timezone('UTC-8') do
+      # The local 01:00 hour happens twice around the fall-back.
+      assert_equal '2026-11-01 01:00 -0400', formatter.call(FALLBACK_UTC - 3600)
+      assert_equal '2026-11-01 01:00 -0500', formatter.call(FALLBACK_UTC)
+
+      # The local 02:00 hour never happens around the spring-forward.
+      assert_equal '2026-03-08 01:00 -0500', formatter.call(SPRING_FWD_UTC - 3600)
+      assert_equal '2026-03-08 03:00 -0400', formatter.call(SPRING_FWD_UTC)
+    end
+  end
+
+  def test_utc_offset_of_named_zone_follows_the_period_at_each_instant
+    offset = Fluent::Timezone.utc_offset('America/New_York')
+    assert_respond_to offset, :call
+
+    with_timezone('UTC-8') do
+      assert_equal(-14400, offset.call(FALLBACK_UTC - 1)) # EDT until 06:00 UTC
+      assert_equal(-18000, offset.call(FALLBACK_UTC))     # EST from 06:00 UTC
+      assert_equal(-18000, offset.call(SPRING_FWD_UTC - 1)) # EST until 07:00 UTC
+      assert_equal(-14400, offset.call(SPRING_FWD_UTC))     # EDT from 07:00 UTC
+    end
+  end
 end
