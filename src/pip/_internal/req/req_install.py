@@ -80,12 +80,20 @@ class InstallRequirement:
         constraint: bool = False,
         extras: Collection[str] = (),
         user_supplied: bool = False,
+        find_links_scope: tuple[tuple[str, str], ...] = (),
     ) -> None:
         assert req is None or isinstance(req, Requirement), req
         self.req = req
         self.comes_from = comes_from
         self.constraint = constraint
         self.editable = editable
+
+        # The find-links scopes in effect when this requirement was parsed
+        # from a requirements file, as (location, source) pairs, innermost
+        # last.  Dependencies inherit the scope of the requirement that
+        # pulled them in.  Used to verify that the package is available
+        # from each declared find-links source.
+        self.find_links_scope = find_links_scope
 
         # source_dir is the local directory where the linked requirement is
         # located, or unpacked. In case unpacking is needed, creating and

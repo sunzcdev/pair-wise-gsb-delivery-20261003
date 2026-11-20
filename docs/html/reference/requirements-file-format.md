@@ -126,6 +126,39 @@ You can also refer to {ref}`constraints files <Constraints Files>`, like this:
 -c some_constraints.txt
 ```
 
+## Scoping find-links to specific includes
+
+When a single requirements file pulls in dependencies from different
+internal package sources, a plain `--find-links` line cannot express which
+source each requirement is expected to come from. The requirements-file-only
+directives `--find-links-scope` and `--end-find-links-scope` declare this
+explicitly:
+
+```
+--find-links-scope ./wheelhouse-a
+-r reqs-a.txt
+--end-find-links-scope
+
+--find-links-scope ./wheelhouse-b
+-r reqs-b.txt
+--end-find-links-scope
+```
+
+`--find-links-scope <location>` opens a scope: the location is registered as
+a find-links source (relative paths are resolved against the requirements
+file, like `--find-links`), and every requirement and `-r`/`-c` include that
+follows is expected to be satisfied from it. Scopes nest, and an include
+inherits the scope in effect where it is referenced. `--end-find-links-scope`
+closes the innermost scope and restores the enclosing one; a scope opened
+inside an included file is implicitly closed when that file ends.
+
+Dependencies of a scoped requirement inherit its scope. When the same
+package is required under several scopes, pip checks all of the declared
+sources together; if no candidate for the package is available from one of
+them, pip reports the location where that restriction was introduced.
+
+Requirements files that do not use these directives are unaffected.
+
 ## Using environment variables
 
 ```{versionadded} 10.0

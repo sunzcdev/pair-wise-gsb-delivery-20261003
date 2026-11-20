@@ -1092,3 +1092,112 @@ class TestParseRequirements:
             ),
         ):
             next(parse_reqfile(req_file.resolve(), session=session))
+
+
+class TestFindLinksScope:
+    """Tests for --find-links-scope/--end-find-links-scope directives."""
+
+    def test_scope_attached_and_restored_after_end(
+        self, tmp_path: Path, session: PipSession, finder: PackageFinder
+    ) -> None:
+        wheelhouse = tmp_path / "wheelhouse-a"
+        wheelhouse.mkdir()
+        reqs_file = tmp_path / "requirements.txt"
+        reqs_file.write_text(
+            "--find-links-scope ./wheelhouse-a\n"
+            "pkg-a\n"
+            "--end-find-links-scope\n"
+            "pkg-outer\n"
+        )
+
+        reqs = list(parse_reqfile(reqs_file, session=session, finder=finder))
+        by_name = {req.name: req for req in reqs}
+
+        expected_scope = (
+            (os.path.normpath(os.fspath(wheelhouse)), f"line 1 of {reqs_file}"),
+        )
+        assert by_name["pkg-a"].find_links_scope == expected_scope
+        # The scope ends before pkg-outer, so it is back to the outer
+        # (unscoped) state.
+        assert by_name["pkg-outer"].find_links_scope == ()
+        # The scoped location is also registered as a plain find-links
+        # source so candidates can be discovered.
+        assert os.path.normpath(os.fspath(wheelhouse)) in [
+            os.path.normpath(link) for link in finder.find_links
+        ]
+
+    def test_scope_flows_into_includes_and_is_restored_after(
+        self, tmp_path: Path, session: PipSession, finder: PackageFinder
+    ) -> None:
+        outer_wheelhouse = tmp_path / "wheelhouse-a"
+        outer_wheelhouse.mkdir()
+        inner_wheelhouse = tmp_path / "wheelhouse-b"
+        inner_wheelhouse.mkdir()
+        included = tmp_path / "reqs-inner.txt"
+        included.write_text("--find-links-scope ./wheelhouse-b\npkg-b\n")
+        reqs_file = tmp_path / "requirements.txt"
+        reqs_file.write_text(
+            "--find-links-scope ./wheelhouse-a\n"
+            "-r reqs-inner.txt\n"
+            "pkg-after\n"
+        )
+
+        reqs = list(parse_reqfile(reqs_file, session=session, finder=finder))
+        by_name = {req.name: req for req in reqs}
+
+        outer_scope = (
+            os.path.normpath(os.fspath(outer_wheelhouse)),
+            f"line 1 of {reqs_file}",
+        )
+        inner_scope = (
+            os.path.normpath(os.fspath(inner_wheelhouse)),
+            f"line 1 of {included}",
+        )
+        # The included file inherits the outer scope and nests its own.
+        assert by_name["pkg-b"].find_links_scope == (outer_scope, inner_scope)
+        # Once the include ends, the inner scope is handed back to the outer
+        # file, which keeps only its own scope.
+        assert by_name["pkg-after"].find_links_scope == (outer_scope,)
+
+    def test_scope_opened_in_include_does_not_leak(
+        self, tmp_path: Path, session: PipSession, finder: PackageFinder
+    ) -> None:
+        wheelhouse = tmp_path / "wheelhouse-b"
+        wheelhouse.mkdir()
+        included = tmp_path / "reqs-inner.txt"
+        included.write_text("--find-links-scope ./wheelhouse-b\npkg-b\n")
+        reqs_file = tmp_path / "requirements.txt"
+        reqs_file.write_text("-r reqs-inner.txt\npkg-outer\n")
+
+        reqs = list(parse_reqfile(reqs_file, session=session, finder=finder))
+        by_name = {req.name: req for req in reqs}
+
+        assert len(by_name["pkg-b"].find_links_scope) == 1
+        assert by_name["pkg-outer"].find_links_scope == ()
+
+    def test_unbalanced_end_scope_errors(
+        self, tmp_path: Path, session: PipSession
+    ) -> None:
+        reqs_file = tmp_path / "requirements.txt"
+        reqs_file.write_text("--end-find-links-scope\n")
+
+        with pytest.raises(RequirementsFileParseError, match="--end-find-links-scope"):
+            list(parse_reqfile(reqs_file, session=session))
+
+    def test_scope_requires_exactly_one_argument(
+        self, tmp_path: Path, session: PipSession
+    ) -> None:
+        reqs_file = tmp_path / "requirements.txt"
+        reqs_file.write_text("--find-links-scope ./a ./b\n")
+
+        with pytest.raises(RequirementsFileParseError, match="exactly one argument"):
+            list(parse_reqfile(reqs_file, session=session))
+
+    def test_no_scope_by_default(
+        self, tmp_path: Path, session: PipSession, finder: PackageFinder
+    ) -> None:
+        reqs_file = tmp_path / "requirements.txt"
+        reqs_file.write_text("pkg-a\n")
+
+        (req,) = list(parse_reqfile(reqs_file, session=session, finder=finder))
+        assert req.find_links_scope == ()

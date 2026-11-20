@@ -1,0 +1,5 @@
+Add ``--find-links-scope``/``--end-find-links-scope`` requirements file
+directives, which declare the find-links location that the requirements and
+includes that follow are expected to come from. When a package is required
+under multiple scopes, pip checks every declared source and, if no candidate
+can satisfy one of them, reports where that restriction was introduced.

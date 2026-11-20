@@ -193,6 +193,11 @@ class RequirementsFileParseError(InstallationError):
     """Raised when a general error occurs parsing a requirements file line."""
 
 
+class FindLinksScopeError(InstallationError):
+    """Raised when a requirement cannot be satisfied from the find-links
+    location(s) declared by a ``--find-links-scope`` directive."""
+
+
 class BestVersionAlreadyInstalled(PipError):
     """Raised when the most up-to-date version of a package is already
     installed."""

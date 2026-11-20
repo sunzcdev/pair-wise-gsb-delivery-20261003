@@ -76,6 +76,21 @@ SUPPORTED_OPTIONS_EDITABLE_REQ: list[Callable[..., optparse.Option]] = [
     cmdoptions.config_settings,
 ]
 
+# Requirements-file-only directives to explicitly scope which find-links
+# location(s) the requirements that follow are expected to come from.
+# ``--find-links-scope <location>`` pushes a new scope onto a stack (so
+# scopes nest), ``--end-find-links-scope`` pops the innermost scope and
+# hands control back to the enclosing one.  A scope opened inside an
+# included (-r) file is implicitly closed when that file ends.
+FIND_LINKS_SCOPE_BEGIN_RE = re.compile(
+    r"^--find-links-scope(?:\s*=\s*|\s+)(?P<value>\S.*)$"
+)
+FIND_LINKS_SCOPE_END = "--end-find-links-scope"
+
+# A find-links scope entry: (location, source) where ``source`` describes
+# where the restriction was introduced, e.g. "line 3 of requirements.txt".
+FindLinksScopeEntry = tuple[str, str]
+
 
 # the 'dest' string values
 SUPPORTED_OPTIONS_REQ_DEST = [str(o().dest) for o in SUPPORTED_OPTIONS_REQ]
@@ -109,6 +124,9 @@ class ParsedRequirement:
     constraint: bool
     options: dict[str, Any] | None
     line_source: str | None
+    # The find-links scopes in effect when this requirement was parsed,
+    # innermost last.  Empty when no --find-links-scope was in effect.
+    find_links_scope: tuple[FindLinksScopeEntry, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +136,7 @@ class ParsedLine:
     args: str
     opts: Values
     constraint: bool
+    find_links_scope: tuple[FindLinksScopeEntry, ...] = ()
 
     @property
     def is_editable(self) -> bool:
@@ -203,6 +222,7 @@ def handle_requirement_line(
         constraint=line.constraint,
         options=req_options,
         line_source=line_source,
+        find_links_scope=line.find_links_scope,
     )
 
 
@@ -338,6 +358,11 @@ class RequirementsFileParser:
     ) -> None:
         self._session = session
         self._line_parser = line_parser
+        # Stack of (location, source) pairs making up the find-links scope
+        # currently in effect, innermost last.  Entries are pushed by
+        # ``--find-links-scope`` lines and popped by ``--end-find-links-scope``
+        # lines (or implicitly when the file that introduced them ends).
+        self._find_links_scope: list[FindLinksScopeEntry] = []
 
     def parse(
         self, filename: str, constraint: bool
@@ -393,9 +418,18 @@ class RequirementsFileParser:
                 # Keeping a track where was each file first included in
                 new_parsed_files = parsed_files.copy()
                 new_parsed_files[req_path] = filename
-                yield from self._parse_and_recurse(
-                    req_path, nested_constraint, [new_parsed_files, *parsed_files_stack]
-                )
+                # The included file inherits the current find-links scope,
+                # but scopes it opens (or closes) must not leak back into
+                # this file: restore the outer scope once the include ends.
+                saved_find_links_scope = self._find_links_scope[:]
+                try:
+                    yield from self._parse_and_recurse(
+                        req_path,
+                        nested_constraint,
+                        [new_parsed_files, *parsed_files_stack],
+                    )
+                finally:
+                    self._find_links_scope[:] = saved_find_links_scope
             else:
                 yield line
 
@@ -407,6 +441,12 @@ class RequirementsFileParser:
         lines_enum = preprocess(content)
 
         for line_number, line in lines_enum:
+            line = self._handle_find_links_scope_directive(
+                line, filename, line_number
+            )
+            if line is None:
+                # A scope directive that is fully handled by the parser.
+                continue
             try:
                 args_str, opts = self._line_parser(line)
             except OptionParsingError as e:
@@ -420,7 +460,51 @@ class RequirementsFileParser:
                 args_str,
                 opts,
                 constraint,
+                find_links_scope=tuple(self._find_links_scope),
             )
+
+    def _handle_find_links_scope_directive(
+        self, line: str, filename: str, line_number: int
+    ) -> str | None:
+        """Process ``--find-links-scope``/``--end-find-links-scope`` lines.
+
+        Returns the line to parse normally (a ``--find-links-scope`` line is
+        rewritten to a plain ``--find-links`` line so the location is also
+        registered on the finder), or ``None`` if the line was a scope
+        directive that needs no further processing.
+        """
+        begin_match = FIND_LINKS_SCOPE_BEGIN_RE.match(line)
+        if begin_match is not None:
+            raw_value = begin_match.group("value").strip()
+            try:
+                parts = shlex.split(raw_value)
+            except ValueError as e:
+                raise RequirementsFileParseError(
+                    f"Invalid --find-links-scope value: {line}\n{e}"
+                )
+            if len(parts) != 1:
+                raise RequirementsFileParseError(
+                    f"--find-links-scope expects exactly one argument: {line}"
+                )
+            value = parts[0]
+            # Resolve relative locations against the requirements file,
+            # mirroring how plain --find-links values are handled.
+            req_dir = os.path.dirname(os.path.abspath(filename))
+            relative_to_reqs_file = os.path.join(req_dir, value)
+            if os.path.exists(relative_to_reqs_file):
+                value = os.path.normpath(relative_to_reqs_file)
+            source = f"line {line_number} of {filename}"
+            self._find_links_scope.append((value, source))
+            return f"--find-links {shlex.quote(value)}"
+        if line == FIND_LINKS_SCOPE_END:
+            if not self._find_links_scope:
+                raise RequirementsFileParseError(
+                    f"--end-find-links-scope without a matching "
+                    f"--find-links-scope at line {line_number} of {filename}"
+                )
+            self._find_links_scope.pop()
+            return None
+        return line
 
 
 def get_line_parser(finder: PackageFinder | None) -> LineParser:

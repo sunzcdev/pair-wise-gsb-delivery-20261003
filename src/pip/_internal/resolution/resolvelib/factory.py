@@ -4,6 +4,8 @@ import contextlib
 import copy
 import functools
 import logging
+import os
+import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import (
     TYPE_CHECKING,
@@ -23,6 +25,7 @@ from pip._vendor.rich.markup import escape
 from pip._internal.cache import CacheEntry, WheelCache
 from pip._internal.exceptions import (
     DistributionNotFound,
+    FindLinksScopeError,
     InstallationError,
     InvalidInstalledPackage,
     MetadataInconsistent,
@@ -47,6 +50,7 @@ from pip._internal.resolution.base import InstallRequirementProvider
 from pip._internal.utils.compatibility_tags import get_supported
 from pip._internal.utils.hashes import Hashes
 from pip._internal.utils.packaging import get_requirement, requirement_without_marker
+from pip._internal.utils.urls import url_to_path
 from pip._internal.utils.virtualenv import running_under_virtualenv
 
 from .base import Candidate, Constraint, Requirement
@@ -79,6 +83,36 @@ logger = logging.getLogger(__name__)
 
 C = TypeVar("C")
 Cache = dict[Link, C]
+
+_FIND_LINKS_URL_RE = re.compile(r"^(?P<scheme>http|https|file):", re.I)
+
+
+def _link_is_within_find_links(link: Link, find_links: str) -> bool:
+    """Check whether a candidate link originates from a find-links location.
+
+    ``find_links`` is a location as declared by a ``--find-links-scope``
+    directive: a local path, a ``file:`` URL, or an ``http(s):`` URL.
+    """
+    match = _FIND_LINKS_URL_RE.match(find_links)
+    scheme = match.group("scheme").lower() if match else None
+    if scheme in ("http", "https"):
+        location = find_links.rstrip("/") + "/"
+        return link.url == find_links or link.url.startswith(location)
+    # A local path or a file: URL (typically a directory of archives).
+    if scheme == "file":
+        find_links_path = url_to_path(find_links)
+    else:
+        find_links_path = find_links
+    if find_links_path is None or not link.is_file:
+        return False
+    find_links_path = os.path.normcase(os.path.abspath(find_links_path))
+    link_path = os.path.normcase(os.path.abspath(link.file_path))
+    # A local find-links location is listed non-recursively, so a candidate
+    # comes from it if it is the location itself (a find-links location may
+    # point at a single archive) or sits directly inside it.
+    if link_path == find_links_path:
+        return True
+    return os.path.dirname(link_path) == find_links_path
 
 
 class CollectedRootRequirements(NamedTuple):
@@ -471,6 +505,7 @@ class Factory:
         # If none of the requirements want an explicit candidate, we can ask
         # the finder for candidates.
         if not explicit_candidates:
+            self._check_find_links_scopes(identifier, ireqs)
             return self._iter_found_candidates(
                 ireqs,
                 constraint.specifier,
@@ -487,6 +522,48 @@ class Factory:
             and constraint.is_satisfied_by(c)
             and all(is_satisfied_by(req, c) for req in requirements[identifier])
         )
+
+    def _check_find_links_scopes(
+        self,
+        identifier: str,
+        ireqs: Sequence[InstallRequirement],
+    ) -> None:
+        """Check a package against the find-links scopes restricting it.
+
+        Every requirement (including transitive ones, which inherit the
+        scope of what pulled them in) may declare the find-links location
+        it is expected to come from.  All restrictions applying to the same
+        package are checked together; for each restriction that no known
+        candidate can satisfy, report where the restriction was introduced.
+        """
+        scopes: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for ireq in ireqs:
+            for entry in ireq.find_links_scope:
+                if entry not in seen:
+                    seen.add(entry)
+                    scopes.append(entry)
+        if not scopes:
+            return
+
+        links = [c.link for c in self._finder.find_all_candidates(identifier)]
+        unsatisfied = [
+            (location, source)
+            for location, source in scopes
+            if not any(_link_is_within_find_links(link, location) for link in links)
+        ]
+        if not unsatisfied:
+            return
+
+        message_lines = [
+            f"Cannot install {identifier!r}: no candidate is available from "
+            "the following scoped find-links source(s):"
+        ]
+        message_lines += [
+            f"* {location} (restriction introduced at {source})"
+            for location, source in unsatisfied
+        ]
+        raise FindLinksScopeError("\n".join(message_lines))
 
     def _make_requirements_from_install_req(
         self, ireq: InstallRequirement, requested_extras: Iterable[str]
@@ -604,6 +681,11 @@ class Factory:
                 resulting in fewer candidate rejections.
         """
         ireq = self._make_install_req_from_spec(specifier, comes_from)
+        if isinstance(comes_from, InstallRequirement) and comes_from.find_links_scope:
+            # Dependencies inherit the find-links scope of the requirement
+            # that pulled them in, so a source restriction declared for an
+            # include applies to its whole dependency subtree.
+            ireq.find_links_scope = comes_from.find_links_scope
         return self._make_requirements_from_install_req(ireq, requested_extras)
 
     def make_requires_python_requirement(

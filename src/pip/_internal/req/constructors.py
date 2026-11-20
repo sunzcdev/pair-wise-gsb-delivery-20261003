@@ -474,13 +474,14 @@ def install_req_from_parsed_requirement(
             user_supplied=user_supplied,
             config_settings=config_settings,
         )
+    req.find_links_scope = parsed_req.find_links_scope
     return req
 
 
 def install_req_from_link_and_ireq(
     link: Link, ireq: InstallRequirement
 ) -> InstallRequirement:
-    return InstallRequirement(
+    result = InstallRequirement(
         req=ireq.req,
         comes_from=ireq.comes_from,
         editable=ireq.editable,
@@ -491,6 +492,8 @@ def install_req_from_link_and_ireq(
         config_settings=ireq.config_settings,
         user_supplied=ireq.user_supplied,
     )
+    result.find_links_scope = ireq.find_links_scope
+    return result
 
 
 def install_req_drop_extras(ireq: InstallRequirement) -> InstallRequirement:
@@ -514,6 +517,7 @@ def install_req_drop_extras(ireq: InstallRequirement) -> InstallRequirement:
         config_settings=ireq.config_settings,
         user_supplied=ireq.user_supplied,
         source_link=ireq.source_link,
+        find_links_scope=ireq.find_links_scope,
     )
 
 

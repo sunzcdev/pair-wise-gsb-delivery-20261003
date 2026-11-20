@@ -87,6 +87,7 @@ def make_install_req_from_link(
     ireq.link = link
     ireq.set_source_link(source_link)
     ireq.extras = template.extras
+    ireq.find_links_scope = template.find_links_scope
     return ireq
 
 
@@ -108,6 +109,7 @@ def make_install_req_from_editable(
         config_settings=template.config_settings,
     )
     ireq.extras = template.extras
+    ireq.find_links_scope = template.find_links_scope
     return ireq
 
 
@@ -130,6 +132,7 @@ def _make_install_req_from_dist(
         config_settings=template.config_settings,
     )
     ireq.satisfied_by = dist
+    ireq.find_links_scope = template.find_links_scope
     return ireq
 
 
