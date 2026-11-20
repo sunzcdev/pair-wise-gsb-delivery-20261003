@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import queue
 import threading
 from collections import defaultdict
+from concurrent.futures import Future
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,6 +23,8 @@ if TYPE_CHECKING:
 
 DEFAULT_EMITTER_TIMEOUT: Seconds = 1.0
 DEFAULT_OBSERVER_TIMEOUT: Seconds = 1.0
+
+logger = logging.getLogger(__name__)
 
 
 class EventQueue(SkipRepeatsQueue):
@@ -111,6 +115,89 @@ class ObservedWatch:
 
 
 # Observer classes
+class _HandlerSubscription:
+    """Dispatch state for one (watch, handler) subscription.
+
+    Each subscription owns a FIFO queue and a lazily started daemon worker
+    thread, so a handler stuck in its callback never stalls dispatch to other
+    handlers of the same watch. All mutable attributes are guarded by the
+    owning observer's ``_lock``; methods ending in ``_locked`` must be called
+    with that lock held.
+    """
+
+    _STOP = object()
+    """Sentinel queued on close to terminate the worker thread."""
+
+    def __init__(self, observer: BaseObserver, watch: ObservedWatch, handler: FileSystemEventHandler) -> None:
+        self._observer = observer
+        self.watch = watch
+        self.handler = handler
+        self._queue: queue.Queue[FileSystemEvent | object] = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._in_flight = 0
+        self._closed = False
+        self._done_future: Future[None] | None = None
+
+    def _enqueue_locked(self, event: FileSystemEvent) -> None:
+        """Queues an event for this subscription. Caller must hold the observer lock."""
+        if self._closed:
+            return
+        if self._thread is None:
+            self._thread = threading.Thread(
+                target=self._run,
+                name=f"watchdog-handler-{id(self):x}",
+                daemon=True,
+            )
+            self._thread.start()
+        self._queue.put(event)
+
+    def _close_locked(self) -> Future[None]:
+        """Stops new dispatches and returns a future for in-flight completion.
+
+        Caller must hold the observer lock. Events still queued are dropped, so
+        a handler re-registered later never receives this subscription's old
+        queue. The returned future resolves once the currently executing
+        callback (if any) returns; it resolves immediately when idle.
+        """
+        if self._done_future is not None:
+            return self._done_future
+        self._closed = True
+        future: Future[None] = Future()
+        self._done_future = future
+        if self._in_flight == 0:
+            future.set_result(None)
+        if self._thread is not None:
+            # Drop pending events: no new callback may start after close. The
+            # worker dequeues under the observer lock too, so it cannot be
+            # between the closed check and dispatch while we hold the lock.
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            self._queue.put(self._STOP)
+        return future
+
+    def _run(self) -> None:
+        while True:
+            event = self._queue.get()
+            if event is self._STOP:
+                return
+            with self._observer._lock:  # noqa: SLF001
+                if self._closed:
+                    continue
+                self._in_flight += 1
+            try:
+                self.handler.dispatch(event)  # type: ignore[union-attr]
+            except Exception:
+                logger.exception("Unhandled exception in event handler %r", self.handler)
+            finally:
+                with self._observer._lock:  # noqa: SLF001
+                    self._in_flight -= 1
+                    if self._closed and self._in_flight == 0 and self._done_future is not None:
+                        self._done_future.set_result(None)
+
+
 class EventEmitter(BaseThread):
     """Producer thread base class subclassed by event emitters
     that generate events and populate a queue with them.
@@ -279,6 +366,7 @@ class BaseObserver(EventDispatcher):
         self._lock = threading.RLock()
         self._watches: set[ObservedWatch] = set()
         self._handlers: defaultdict[ObservedWatch, set[FileSystemEventHandler]] = defaultdict(set)
+        self._subscriptions: dict[tuple[ObservedWatch, FileSystemEventHandler], _HandlerSubscription] = {}
         self._emitters: set[EventEmitter] = set()
         self._emitter_for_watch: dict[ObservedWatch, EventEmitter] = {}
 
@@ -304,9 +392,14 @@ class BaseObserver(EventDispatcher):
 
     def _add_handler_for_watch(self, event_handler: FileSystemEventHandler, watch: ObservedWatch) -> None:
         self._handlers[watch].add(event_handler)
+        key = (watch, event_handler)
+        if key not in self._subscriptions:
+            self._subscriptions[key] = _HandlerSubscription(self, watch, event_handler)
 
     def _remove_handlers_for_watch(self, watch: ObservedWatch) -> None:
         del self._handlers[watch]
+        for key in [key for key in self._subscriptions if key[0] == watch]:
+            self._subscriptions.pop(key)._close_locked()
 
     @property
     def emitters(self) -> set[EventEmitter]:
@@ -425,8 +518,58 @@ class BaseObserver(EventDispatcher):
         with self._lock:
             self._add_handler_for_watch(event_handler, watch)
 
+    def unregister_handler(self, event_handler: FileSystemEventHandler, watch: ObservedWatch) -> Future[None]:
+        """Unregisters a handler from a watch and returns an awaitable completion handle.
+
+        No new callback is dispatched to this subscription once this method
+        returns, and events still queued for it are dropped (a handler
+        re-registered afterwards starts from a fresh queue). The returned
+        :class:`concurrent.futures.Future` resolves when the callback currently
+        executing for this subscription, if any, has finished; it is already
+        resolved when no callback is in flight.
+
+        The method itself never blocks and never waits while holding the
+        observer lock, so a handler may call it from within its own callback
+        without deadlocking on itself. Callers running outside that callback
+        may wait on the returned future to learn when in-flight work ends.
+
+        :param event_handler:
+            The event handler to unregister.
+        :type event_handler:
+            :class:`watchdog.events.FileSystemEventHandler` or a subclass
+        :param watch:
+            The watch the handler is registered for.
+        :type watch:
+            An instance of :class:`ObservedWatch` or a subclass of
+            :class:`ObservedWatch`
+        :return:
+            A :class:`concurrent.futures.Future` resolving to ``None`` once the
+            subscription's in-flight callbacks have finished.
+        :raises KeyError:
+            If the handler is not registered for the watch.
+        """
+        with self._lock:
+            # Use .get() rather than indexing: _handlers is a defaultdict, so
+            # indexing it here would resurrect a watch that unschedule() already
+            # removed, leaving a permanent empty-set entry behind.
+            handlers = self._handlers.get(watch)
+            if not handlers or event_handler not in handlers:
+                error = f"{event_handler!r} is not registered for {watch!r}"
+                raise KeyError(error)
+            handlers.discard(event_handler)
+            subscription = self._subscriptions.pop((watch, event_handler), None)
+            if subscription is None:  # pragma: no cover - defensive; kept in sync with _handlers
+                future: Future[None] = Future()
+                future.set_result(None)
+            else:
+                future = subscription._close_locked()
+        return future
+
     def remove_handler_for_watch(self, event_handler: FileSystemEventHandler, watch: ObservedWatch) -> None:
         """Removes a handler for the given watch.
+
+        Equivalent to :meth:`unregister_handler` without waiting on the
+        returned completion future.
 
         :param event_handler:
             An event handler instance that has appropriate event handling
@@ -440,11 +583,7 @@ class BaseObserver(EventDispatcher):
             An instance of :class:`ObservedWatch` or a subclass of
             :class:`ObservedWatch`
         """
-        with self._lock:
-            # Use .get() rather than indexing: _handlers is a defaultdict, so
-            # indexing it here would resurrect a watch that unschedule() already
-            # removed, leaving a permanent empty-set entry behind.
-            self._handlers.get(watch, set()).remove(event_handler)
+        self.unregister_handler(event_handler, watch)
 
     def unschedule(self, watch: ObservedWatch) -> None:
         """Unschedules a watch.
@@ -457,7 +596,7 @@ class BaseObserver(EventDispatcher):
         """
         with self._lock:
             emitter = self._emitter_for_watch[watch]
-            del self._handlers[watch]
+            self._remove_handlers_for_watch(watch)
             self._remove_emitter(emitter)
             self._watches.remove(watch)
 
@@ -465,6 +604,9 @@ class BaseObserver(EventDispatcher):
         """Unschedules all watches and detaches all associated event handlers."""
         with self._lock:
             self._handlers.clear()
+            for subscription in self._subscriptions.values():
+                subscription._close_locked()
+            self._subscriptions.clear()
             self._clear_emitters()
             self._watches.clear()
 
@@ -503,15 +645,14 @@ class BaseObserver(EventDispatcher):
         # Use .get() rather than indexing: _handlers is a defaultdict, so
         # indexing it here would resurrect a watch that unschedule() removed
         # but whose events were already queued.
-        # Handlers are dispatched without holding self._lock to avoid blocking
-        # concurrent calls to schedule(), unschedule(), or stop().
+        # Each subscription owns a worker thread that invokes its handler
+        # serially, so a handler blocked in its callback never stalls the
+        # other handlers of the same watch, and this dispatcher never runs
+        # user code while holding self._lock.
+        event.watch_path = watch.path
         with self._lock:
-            handlers = list(self._handlers.get(watch, ()))
-
-        for handler in handlers:
-            with self._lock:
-                is_active = handler in self._handlers.get(watch, ())
-            if is_active:
-                event.watch_path = watch.path
-                handler.dispatch(event)
+            for handler in self._handlers.get(watch, ()):
+                subscription = self._subscriptions.get((watch, handler))
+                if subscription is not None:
+                    subscription._enqueue_locked(event)
         event_queue.task_done()

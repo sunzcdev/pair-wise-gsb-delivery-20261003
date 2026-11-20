@@ -307,11 +307,19 @@ def test_single_file_dispatch_events(tmp_path: Path):
     move_event = FileMovedEvent(str(file_a), str(file_b))
     observer.event_queue.put((move_event, watch_a))
 
-    observer.dispatch_events(observer.event_queue)
-    observer.dispatch_events(observer.event_queue)
-    observer.dispatch_events(observer.event_queue)
+    try:
+        observer.dispatch_events(observer.event_queue)
+        observer.dispatch_events(observer.event_queue)
+        observer.dispatch_events(observer.event_queue)
 
-    assert events == [mod_event, move_event]
+        # Handlers run on per-subscription worker threads; wait for delivery.
+        deadline = time.monotonic() + 5.0
+        while len(events) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert events == [mod_event, move_event]
+    finally:
+        observer.unschedule_all()
 
 
 def test_symlinked_directory_not_treated_as_file(tmp_path: Path):
@@ -499,3 +507,152 @@ def test_observer_start_and_schedule_race() -> None:
             t_sched.join(timeout=1.0)
         observer.stop()
         observer.join(timeout=2.0)
+
+class _IdleEmitter(EventEmitter):
+    """Emitter that produces no events; tests push events directly into the observer queue."""
+
+    def queue_events(self, timeout: float) -> None:
+        self.stopped_event.wait(timeout=timeout)
+
+
+def _wait_until(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_unregister_handler_future_resolves_when_inflight_callback_finishes():
+    """unregister_handler() stops new dispatches and its future tracks the in-flight callback."""
+    observer = BaseObserver(_IdleEmitter, timeout=0.01)
+    entered = Event()
+    release = Event()
+    calls = []
+
+    class BlockingHandler(FileSystemEventHandler):
+        def on_modified(self, event):
+            calls.append(event.src_path)
+            entered.set()
+            assert release.wait(timeout=5.0)
+
+    handler = BlockingHandler()
+    watch = observer.schedule(handler, "/path", recursive=True)
+    observer.start()
+    try:
+        observer.event_queue.put((FileModifiedEvent("/path/first"), watch))
+        assert entered.wait(timeout=5.0), "Handler was not invoked"
+
+        future = observer.unregister_handler(handler, watch)
+        assert not future.done(), "Future must stay pending while the callback is in flight"
+
+        release.set()
+        assert future.result(timeout=5.0) is None, "Future must resolve once the callback returns"
+
+        # No new dispatch may start after unregistration.
+        observer.event_queue.put((FileModifiedEvent("/path/second"), watch))
+        time.sleep(0.5)
+        assert calls == ["/path/first"]
+    finally:
+        release.set()
+        observer.stop()
+        observer.join(timeout=5.0)
+
+
+def test_unregister_handler_unknown_handler_raises_key_error():
+    observer = BaseObserver(EventEmitter)
+    handler = LoggingEventHandler()
+    watch = observer.schedule(handler, "/foobar", recursive=True)
+
+    future = observer.unregister_handler(handler, watch)
+    assert future.done(), "Idle subscription must resolve immediately"
+
+    with pytest.raises(KeyError):
+        observer.unregister_handler(handler, watch)
+    with pytest.raises(KeyError):
+        observer.remove_handler_for_watch(handler, watch)
+
+
+def test_handler_can_unregister_itself_from_within_callback():
+    """A callback unregistering itself must return normally, not wait on itself under the lock."""
+    observer = BaseObserver(_IdleEmitter, timeout=0.01)
+    returned = Event()
+    holder = {}
+
+    class SelfRemovingHandler(FileSystemEventHandler):
+        def on_modified(self, event):
+            holder["future"] = observer.unregister_handler(self, holder["watch"])
+            returned.set()
+
+    handler = SelfRemovingHandler()
+    holder["watch"] = observer.schedule(handler, "/path", recursive=True)
+    observer.start()
+    try:
+        observer.event_queue.put((FileModifiedEvent("/path/first"), holder["watch"]))
+        assert returned.wait(timeout=5.0), "Self-unregistering callback deadlocked"
+        # The future resolves once this very callback has finished.
+        assert holder["future"].result(timeout=5.0) is None
+    finally:
+        observer.stop()
+        observer.join(timeout=5.0)
+
+
+def test_blocked_handler_does_not_starve_peers_and_reregistered_handler_gets_fresh_queue():
+    """Two handlers share one watch; while one is stuck in its callback:
+
+    - the other handler still receives subsequent events,
+    - unregistering the stuck one drops its queued backlog,
+    - re-registering the same handler starts from a fresh queue (no old events).
+    """
+    observer = BaseObserver(_IdleEmitter, timeout=0.01)
+    entered = Event()
+    release = Event()
+    blocked_calls = []
+    peer_calls = []
+
+    class BlockingHandler(FileSystemEventHandler):
+        def on_modified(self, event):
+            blocked_calls.append(event.src_path)
+            entered.set()
+            assert release.wait(timeout=5.0)
+
+    class RecordingHandler(FileSystemEventHandler):
+        def on_modified(self, event):
+            peer_calls.append(event.src_path)
+
+    blocked = BlockingHandler()
+    peer = RecordingHandler()
+    watch = observer.schedule(blocked, "/path", recursive=True)
+    observer.add_handler_for_watch(peer, watch)
+    observer.start()
+    try:
+        observer.event_queue.put((FileModifiedEvent("/path/first"), watch))
+        assert entered.wait(timeout=5.0), "Blocking handler was not invoked"
+
+        # The peer handler still receives subsequent events while the first is stuck.
+        observer.event_queue.put((FileModifiedEvent("/path/second"), watch))
+        assert _wait_until(lambda: "/path/second" in peer_calls), "Peer handler was starved"
+
+        # Queue an event for the stuck handler, then unregister it: the queued
+        # event belongs to the old subscription and must never be dispatched.
+        observer.event_queue.put((FileModifiedEvent("/path/third"), watch))
+        assert _wait_until(lambda: "/path/third" in peer_calls), "Observer did not fan out the event"
+        future = observer.unregister_handler(blocked, watch)
+        release.set()
+        assert future.result(timeout=5.0) is None
+        assert blocked_calls == ["/path/first"], "Unregistered handler received queued events"
+
+        # Re-registering the same handler creates a fresh subscription: it only
+        # receives new events, never the old queue.
+        entered.clear()
+        observer.add_handler_for_watch(blocked, watch)
+        observer.event_queue.put((FileModifiedEvent("/path/fourth"), watch))
+        assert entered.wait(timeout=5.0), "Re-registered handler did not receive new events"
+        release.set()
+        assert _wait_until(lambda: len(blocked_calls) == 2)
+        assert blocked_calls == ["/path/first", "/path/fourth"]
+    finally:
+        release.set()
+        observer.stop()
+        observer.join(timeout=5.0)
