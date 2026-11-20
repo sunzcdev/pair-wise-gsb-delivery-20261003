@@ -1,15 +1,26 @@
+from __future__ import annotations
+
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pip._vendor.packaging.markers import default_environment
 
 from pip import __version__
+from pip._internal.operations.check import check_diff_to_dict
 from pip._internal.req.req_install import InstallRequirement
+
+if TYPE_CHECKING:
+    from pip._internal.operations.check import ConflictDetails
 
 
 class InstallationReport:
-    def __init__(self, install_requirements: Sequence[InstallRequirement]):
+    def __init__(
+        self,
+        install_requirements: Sequence[InstallRequirement],
+        conflict_details: ConflictDetails | None = None,
+    ):
         self._install_requirements = install_requirements
+        self._conflict_details = conflict_details
 
     @classmethod
     def _install_req_to_dict(cls, ireq: InstallRequirement) -> dict[str, Any]:
@@ -41,7 +52,7 @@ class InstallationReport:
         return res
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "version": "1",
             "pip_version": __version__,
             "install": [
@@ -55,3 +66,9 @@ class InstallationReport:
             # https://github.com/pypa/pip/issues/11198
             "environment": default_environment(),
         }
+        if self._conflict_details is not None:
+            # Non-normative extension: how the planned installation changes the
+            # set of broken dependency relations of the environment. Only present
+            # when pip determined conflicts for this run.
+            result["conflicts"] = check_diff_to_dict(self._conflict_details.diff)
+        return result

@@ -50,11 +50,15 @@ from pip._internal.locations import get_scheme
 from pip._internal.metadata import BaseEnvironment, get_environment
 from pip._internal.models.installation_report import InstallationReport
 from pip._internal.operations.build.build_tracker import get_build_tracker
-from pip._internal.operations.check import ConflictDetails, check_install_conflicts
+from pip._internal.operations.check import (
+    ConflictDetails,
+    check_install_conflicts,
+)
 from pip._internal.req import InstallationResult, install_given_reqs
 from pip._internal.req.req_install import (
     InstallRequirement,
 )
+from pip._internal.req.req_set import RequirementSet
 from pip._internal.utils.compat import WINDOWS
 from pip._internal.utils.filesystem import test_writable_dir
 from pip._internal.utils.logging import getLogger
@@ -656,15 +660,20 @@ class InstallCommand(RequirementCommand):
                 reqs, check_supported_wheels=not options.target_dir
             )
 
-            if options.json_report_file:
-                report = InstallationReport(requirement_set.requirements_to_install)
-                if options.json_report_file == "-":
-                    rich.print_json(data=report.to_dict())
-                else:
-                    with open(options.json_report_file, "w", encoding="utf-8") as f:
-                        json.dump(report.to_dict(), f, indent=2, ensure_ascii=False)
+            # Check for conflicts in the package set we're installing. The check
+            # compares the pre-install dependency graph with the planned one, so
+            # it works from the same set of requirements the report describes.
+            should_warn_about_conflicts = (
+                not options.ignore_dependencies and options.warn_about_conflicts
+            )
 
             if options.dry_run:
+                conflicts: ConflictDetails | None = None
+                if should_warn_about_conflicts:
+                    conflicts = self._determine_conflicts(
+                        requirement_set.requirements_to_install
+                    )
+                self._write_installation_report(options, requirement_set, conflicts)
                 would_install_items = sorted(
                     (r.metadata["name"], r.metadata["version"])
                     for r in requirement_set.requirements_to_install
@@ -709,13 +718,11 @@ class InstallCommand(RequirementCommand):
 
             to_install = resolver.get_installation_order(requirement_set)
 
-            # Check for conflicts in the package set we're installing.
-            conflicts: ConflictDetails | None = None
-            should_warn_about_conflicts = (
-                not options.ignore_dependencies and options.warn_about_conflicts
-            )
+            conflicts = None
             if should_warn_about_conflicts:
                 conflicts = self._determine_conflicts(to_install)
+
+            self._write_installation_report(options, requirement_set, conflicts)
 
             # Don't warn about script install locations if
             # --target or --prefix has been specified
@@ -852,10 +859,29 @@ class InstallCommand(RequirementCommand):
             )
             return None
 
+    def _write_installation_report(
+        self,
+        options: Values,
+        requirement_set: RequirementSet,
+        conflicts: ConflictDetails | None,
+    ) -> None:
+        if not options.json_report_file:
+            return
+        report = InstallationReport(
+            requirement_set.requirements_to_install,
+            conflict_details=conflicts,
+        )
+        if options.json_report_file == "-":
+            rich.print_json(data=report.to_dict())
+        else:
+            with open(options.json_report_file, "w", encoding="utf-8") as f:
+                json.dump(report.to_dict(), f, indent=2, ensure_ascii=False)
+
     def _warn_about_conflicts(
         self, conflict_details: ConflictDetails, resolver_variant: str
     ) -> None:
-        package_set, (missing, conflicting) = conflict_details
+        package_set = conflict_details.package_set
+        missing, conflicting = conflict_details.check_result
         if not missing and not conflicting:
             return
 

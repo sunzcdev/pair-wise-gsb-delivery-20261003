@@ -81,6 +81,51 @@ package with the following properties:
 - `requested_extras`: extras requested by the user. This field is only present when the
   `requested` field is true.
 
+## Broken dependency relations
+
+```{versionadded} 27.0
+```
+
+When pip determines dependency conflicts for the run (the default, unless
+`--no-warn-conflicts` or `--no-deps` is given), the report also contains a
+`conflicts` object. It is **not** part of the stable `version` `1` specification
+described above: consumers that only care about the installed packages can ignore it,
+and it may gain fields in the future.
+
+`conflicts` describes the *edges* of the dependency graph that are unsatisfied, comparing
+the environment as it was before the installation with the environment as it would be
+afterwards:
+
+- `introduced`: relations that are broken only after the installation.
+- `resolved`: relations that were broken before the installation and are consistent
+  afterwards.
+- `already_present`: relations that are broken both before and after the installation.
+
+Each relation is an object with the following properties:
+
+- `kind`: `"missing"` when the required project is not installed at all, or
+  `"conflicting"` when it is installed at a version that the requirement rejects.
+- `project`: the canonical name of the package that declares the requirement.
+- `project_version`: the version of `project` (`introduced` and `already_present`
+  describe the version that is about to be installed, `resolved` the version that was
+  installed before).
+- `dependency`: the canonical name of the required package.
+- `requirements`: the requirement strings that were flagged. Markers are evaluated with
+  the same rules `pip check` uses, so a requirement guarded by an inactive marker or by
+  an extra that was not requested is never listed.
+- `installed_version`: the version found for `dependency`, or `null` when it is missing.
+
+A relation is identified by `kind`, `project` and `dependency` only. Changing the
+version constraint, or changing the version that happens to violate it, therefore keeps
+the relation in `already_present` instead of reporting it as newly introduced. A
+dependency moving from absent to installed-at-the-wrong-version is reported as one
+`missing` relation being resolved and one `conflicting` relation being introduced,
+because that is what changed in the environment.
+
+Because `already_present` and `introduced` describe the environment *after* the
+installation, they line up with what `pip check` reports once the installation has
+completed; `resolved` entries have no counterpart there by design.
+
 ## Example
 
 The following command:
