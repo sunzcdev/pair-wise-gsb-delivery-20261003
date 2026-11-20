@@ -111,6 +111,8 @@ def session_via_cli(
         seeder,  # ty: ignore[invalid-argument-type]
         # the builders are untyped, so their create results are object to ty
         activators,  # ty: ignore[invalid-argument-type]
+        # options is set by parse_args above, ty still sees the optional type
+        options.complete,  # ty: ignore[missing-union-attribute]
     )
 
 
@@ -142,6 +144,15 @@ def build_parser(
         action="store_true",
         default=False,
         help="on failure also display the stacktrace internals of virtualenv",
+    )
+    parser.add_argument(
+        "--complete",
+        dest="complete",
+        action="store_true",
+        default=False,
+        help="run the creation as one complete operation: serialize concurrent runs for the destination behind a "
+        "lock, record when the creator, seeder and activation phases finish, reuse a finished environment, resume "
+        "an interrupted one, and only expose the environment after the final phase succeeds",
     )
     _do_report_setup(parser, args, setup_logging)
     options = load_app_data(args, parser, options)

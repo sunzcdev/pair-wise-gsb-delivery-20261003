@@ -1,0 +1,4 @@
+Add a ``--complete`` creation mode that serializes concurrent runs targeting the same destination behind a
+cross-process lock and records the finished creator, seeder, activation and configuration phases inside the
+environment. A finished environment is reused, an interrupted one (for example after a seeder failure) is resumed at
+the phase that failed, and an unrecognized destination is refused unless ``--clear`` replaces it.
