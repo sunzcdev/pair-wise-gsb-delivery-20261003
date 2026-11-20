@@ -117,6 +117,11 @@ module VCR
   # @option options :preserve_exact_body_bytes [Boolean] Whether or not
   #  to base64 encode the bytes of the requests and responses for this cassette
   #  when serializing it. See also `VCR::Configuration#preserve_exact_body_bytes`.
+  # @option options :read_only [Boolean] When true, the cassette is used for
+  #  playback only: its recorded interactions still match requests (and still
+  #  act as a parent list for nested cassettes), but new HTTP interactions are
+  #  not stored and the cassette file is never rewritten. Cassettes linked
+  #  from another thread are always read-only regardless of this option.
   #
   # @return [VCR::Cassette] the inserted cassette
   #

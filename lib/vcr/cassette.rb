@@ -49,6 +49,13 @@ module VCR
     # @return [Boolean] Should unused requests be dropped from the cassette?
     attr_reader :drop_unused_requests
 
+    # @return [Boolean] Whether the cassette is read-only. A read-only cassette
+    #  can play back recorded interactions, but new HTTP interactions are never
+    #  stored on it or written to its file. Used for cassettes linked from
+    #  another thread so that requests which fall through to the shared parent
+    #  cassette cannot mutate the shared fixture.
+    attr_reader :read_only
+
     # @return [Array<Symbol>] If set, {VCR::Configuration#before_record} and
     #  {VCR::Configuration#before_playback} hooks with a corresponding tag will apply.
     attr_reader :tags
@@ -95,7 +102,7 @@ module VCR
     end
 
     def should_write_recorded_interactions_to_disk?
-      !run_failed? || record_on_error
+      !read_only? && (!run_failed? || record_on_error)
     end
 
     # @private
@@ -114,6 +121,8 @@ module VCR
 
     # @private
     def record_http_interaction(interaction)
+      return if read_only?
+
       VCR::CassetteMutex.synchronize do
         log "Recorded HTTP interaction #{request_summary(interaction.request)} => #{response_summary(interaction.response)}"
         new_recorded_interactions << interaction
@@ -138,6 +147,8 @@ module VCR
 
     # @return [Boolean] Whether or not the cassette is recording.
     def recording?
+      return false if read_only?
+
       case record_mode
         when :none; false
         when :once; raw_cassette_bytes.to_s.empty?
@@ -179,6 +190,14 @@ module VCR
       false
     end
 
+    # @return [Boolean] Whether the cassette refuses new interactions and disk
+    #  writes. Defaults to false; a {LinkedCassette} (a cassette owned by
+    #  another thread) is always read-only, and any cassette can be made
+    #  read-only with the `read_only: true` cassette option.
+    def read_only?
+      !!@read_only
+    end
+
   private
 
     def assert_valid_options!
@@ -187,7 +206,7 @@ module VCR
         :update_content_length_header, :allow_playback_repeats, :allow_unused_http_interactions,
         :exclusive, :serialize_with, :preserve_exact_body_bytes, :decode_compressed_response,
         :recompress_response, :persist_with, :persister_options, :clean_outdated_http_interactions,
-        :drop_unused_requests
+        :drop_unused_requests, :read_only
       ]
 
       if invalid_options.size > 0
@@ -197,7 +216,8 @@ module VCR
 
     def extract_options
       [:record_on_error, :erb, :match_requests_on, :re_record_interval, :clean_outdated_http_interactions,
-       :allow_playback_repeats, :allow_unused_http_interactions, :exclusive, :drop_unused_requests].each do |name|
+       :allow_playback_repeats, :allow_unused_http_interactions, :exclusive, :drop_unused_requests,
+       :read_only].each do |name|
         instance_variable_set("@#{name}", @options[name])
       end
 

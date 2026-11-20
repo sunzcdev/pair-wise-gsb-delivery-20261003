@@ -3,6 +3,8 @@ Changelog
 
 ## Unreleased
 
+- [fix] Treat cassettes linked from another thread as read-only so requests that fall through to the shared parent cassette can no longer be recorded into its fixture file
+- [new] Add a `read_only:` cassette option that keeps a cassette available for playback while refusing new interactions and disk writes
 - [fix] `uri_without_params` ignores percent-encoded query params given by their decoded name, e.g. `uri_without_params('date[gte]')` now ignores `date%5Bgte%5D` (#633)
 - [fix] Leave the Content-Length header of HEAD and 304 responses untouched when `update_content_length_header` is enabled (#779)
 

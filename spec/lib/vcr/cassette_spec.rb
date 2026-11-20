@@ -172,6 +172,65 @@ RSpec.describe VCR::Cassette do
     end
   end
 
+  describe 'read-only cassettes' do
+    let(:the_interaction) do
+      request = VCR::Request.new(:get, 'http://example.com/new')
+      response = VCR::Response.new(VCR::ResponseStatus.new(200), nil, 'new body', '1.1')
+      VCR::HTTPInteraction.new(request, response)
+    end
+
+    it 'accepts :read_only as a valid option' do
+      expect { VCR::Cassette.new(:test, read_only: true) }.not_to raise_error
+    end
+
+    it 'is writable by default' do
+      expect(VCR::Cassette.new(:test)).not_to be_read_only
+    end
+
+    it 'reports read_only? truthy when given read_only: true' do
+      expect(VCR::Cassette.new(:test, read_only: true)).to be_read_only
+    end
+
+    it 'never records, regardless of the record mode' do
+      cassette = VCR::Cassette.new(:test, record: :all, read_only: true)
+      expect(cassette).not_to be_recording
+      expect(VCR).not_to be_real_http_connections_allowed
+    end
+
+    it 'silently drops interactions passed to #record_http_interaction' do
+      cassette = VCR::Cassette.new(:test, record: :new_episodes, read_only: true)
+      cassette.record_http_interaction(the_interaction)
+      expect(cassette.new_recorded_interactions).to eq([])
+    end
+
+    it 'still plays back previously recorded interactions' do
+      VCR.configuration.cassette_library_dir = "#{VCR::SPEC_ROOT}/fixtures/cassette_spec"
+      cassette = VCR::Cassette.new('example', record: :none, read_only: true)
+      expect(cassette.http_interactions.remaining_unused_interaction_count).to eq(3)
+    end
+
+    it 'never writes the cassette file on eject, even with new interactions' do
+      cassette = VCR::Cassette.new(:test, record: :new_episodes, read_only: true)
+      cassette.record_http_interaction(the_interaction)
+      cassette.eject
+      expect(::File).not_to exist(cassette.file)
+    end
+
+    it 'leaves an existing cassette file untouched on eject' do
+      library_dir = VCR.configuration.cassette_library_dir
+      FileUtils.cp(
+        "#{VCR::SPEC_ROOT}/fixtures/cassette_spec/example.yml",
+        File.join(library_dir, 'example.yml')
+      )
+
+      cassette = VCR::Cassette.new('example', record: :new_episodes, read_only: true)
+      cassette.record_http_interaction(the_interaction)
+
+      expect { cassette.eject }.not_to change { ::File.read(cassette.file) }
+      expect(YAML.load_file(cassette.file)['http_interactions'].size).to eq(3)
+    end
+  end
+
   describe "reading the file from disk" do
     let(:empty_cassette_yaml) { YAML.dump("http_interactions" => []) }
 
