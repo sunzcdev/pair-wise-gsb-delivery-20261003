@@ -67,6 +67,108 @@ module Requests
         end
       end
 
+      def test_plugin_server_sent_events_chunked_across_byte_boundaries
+        messages = [
+          { event: "test", data: "tést1", id: 1 },
+          { data: %w[tést2 tést3] },
+          { id: 2, data: "tést4" },
+        ]
+        reference = nil
+
+        [nil, 1, 2, 3, 5, 7].each do |chunk_size|
+          session = HTTPX.plugin(:server_sent_events).with(ssl: { verify_hostname: false })
+          start_test_servlet(SSE, tls: tls?, messages: messages, chunk_size: chunk_size) do |server|
+            uri = "#{server.origin}/"
+
+            response = session.get(uri, event_stream: true)
+            received = response.each_message.to_a
+            parsed = received.map { |m| [m.id, m.event, m.data] }
+            last_id = response.last_event_id
+
+            if reference
+              assert parsed == reference[0], "messages should not depend on the read chunking (chunk_size: #{chunk_size})"
+              assert last_id == reference[1], "last event id should not depend on the read chunking (chunk_size: #{chunk_size})"
+            else
+              reference = [parsed, last_id]
+            end
+
+            assert received.size == 3
+            assert received[0].data == "tést1"
+            assert received[0].id == "1"
+            assert received[1].data == "tést2\ntést3"
+            assert received[2].data == "tést4"
+            assert received[2].id == "2"
+            assert last_id == "2"
+          end
+        end
+      end
+
+      def test_plugin_server_sent_events_empty_id_resets_recovery_position
+        messages = [
+          { data: "test1", id: 1 },
+          { data: "test2", id: 2 },
+          { data: "test3", id: "" },
+          { data: "test4" },
+        ]
+        session = HTTPX.plugin(:server_sent_events).with(ssl: { verify_hostname: false })
+        start_test_servlet(SSE, tls: tls?, messages: messages) do |server|
+          uri = "#{server.origin}/"
+
+          response = session.get(uri, event_stream: true)
+          received = response.each_message.to_a
+
+          # an event with an empty "id" resets the recovery position, which is then
+          # reported as an empty string (as opposed to "no id seen yet", which is nil).
+          assert received.map(&:id) == ["1", "2", "", nil]
+          assert response.last_event_id == ""
+
+          # an event without an "id" field leaves the position untouched.
+          assert received[-1].data == "test4"
+        end
+      end
+
+      def test_plugin_server_sent_events_last_event_id_option
+        session = HTTPX.plugin(:server_sent_events).with(ssl: { verify_hostname: false })
+
+        start_test_servlet(SSE, tls: tls?, messages: [{ data: "test" }]) do |server|
+          uri = "#{server.origin}/"
+
+          request = session.build_request("GET", uri, event_stream: true)
+          verify_no_header(request.headers, "last-event-id")
+
+          request = session.build_request("GET", uri, event_stream: true, last_event_id: "42")
+          verify_header(request.headers, "last-event-id", "42")
+
+          # an empty id resets the position, so it must not be sent.
+          request = session.build_request("GET", uri, event_stream: true, last_event_id: "")
+          verify_no_header(request.headers, "last-event-id")
+
+          # the option defaults do not leak between requests built from the same session.
+          request = session.build_request("GET", uri, event_stream: true)
+          verify_no_header(request.headers, "last-event-id")
+        end
+      end
+
+      def test_plugin_server_sent_events_dropped_mid_event_does_not_advance_last_event_id
+        messages = [
+          { data: "test1", id: 1 },
+          { data: "test2", id: 2 },
+        ]
+        session = HTTPX.plugin(:server_sent_events).with(ssl: { verify_hostname: false })
+        # the stream ends in the middle of an event, and in the middle of a character.
+        start_test_servlet(SSE, tls: tls?, messages: messages, trailing: +"data: hal\xC3".b) do |server|
+          uri = "#{server.origin}/"
+
+          response = session.get(uri, event_stream: true)
+          received = response.each_message.to_a
+
+          # the incomplete event must neither be yielded, nor move the recovery position.
+          assert received.map(&:id) == %w[1 2]
+          assert received.map(&:data) == %w[test1 test2]
+          assert response.last_event_id == "2"
+        end
+      end
+
       def test_plugin_server_sent_events_retries_last_used_id
         return unless tls?
 

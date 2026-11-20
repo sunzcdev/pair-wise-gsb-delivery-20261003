@@ -3,10 +3,18 @@
 require_relative "test"
 
 class SSE < TestHTTP2Server
-  def initialize(messages: [], close_after: nil, **kwargs)
+  # +chunk_size+ forces the event stream to be written in slices of that many bytes, which
+  # makes it possible to exercise a client's incremental parsing across byte boundaries
+  # (including multi-byte characters and lines split in the middle).
+  #
+  # +trailing+ is appended to the stream after the last message, without a terminating
+  # blank line (i.e. a stream which ends in the middle of an event).
+  def initialize(messages: [], close_after: nil, chunk_size: nil, trailing: nil, **kwargs)
     super(**kwargs)
     @messages = messages
     @close_after = close_after
+    @chunk_size = chunk_size
+    @trailing = trailing
     @already_closed = false
   end
 
@@ -38,10 +46,10 @@ class SSE < TestHTTP2Server
     last_event_id = h["Last-Event-ID"] if h.key?("Last-Event-ID")
 
     if event_stream
-      sock.write "HTTP/1.1 200 OK\r\n" \
-                 "Connection: keep-alive\r\n" \
-                 "Cache-Control: no-cache\r\n" \
-                 "Content-Type: text/event-stream\r\n\r\n"
+      write_event_bytes(sock, "HTTP/1.1 200 OK\r\n" \
+                              "Connection: keep-alive\r\n" \
+                              "Cache-Control: no-cache\r\n" \
+                              "Content-Type: text/event-stream\r\n\r\n")
       @messages.each do |msg|
         if last_event_id
           last_event_id = nil if msg[:id] && last_event_id == msg[:id].to_s
@@ -50,35 +58,37 @@ class SSE < TestHTTP2Server
         end
 
         if (comment = msg[:comment])
-          sock.write ": #{comment}\n"
+          write_event_bytes(sock, ": #{comment}\n")
         end
 
         if (event = msg[:event])
-          sock.write "event: #{event}\n"
+          write_event_bytes(sock, "event: #{event}\n")
         end
 
         case (data = msg[:data])
         when Array
-          data.each { |d| sock.write "data: #{d}\n" }
+          data.each { |d| write_event_bytes(sock, "data: #{d}\n") }
         else
-          sock.write "data: #{data}\n"
+          write_event_bytes(sock, "data: #{data}\n")
         end
 
         if (id = msg[:id])
-          sock.write "id: #{id}\n"
+          write_event_bytes(sock, "id: #{id}\n")
         end
 
         if (retry_after = msg[:retry])
-          sock.write "retry: #{retry_after}\n"
+          write_event_bytes(sock, "retry: #{retry_after}\n")
         end
 
-        sock.write "\n"
+        write_event_bytes(sock, "\n")
 
         next unless @close_after && @close_after == id && !@already_closed
 
-        sock.write "incompleteline"
+        write_event_bytes(sock, "incompleteline")
         break
       end
+
+      write_event_bytes(sock, @trailing) if @trailing
 
       sock.close
     else
@@ -86,6 +96,18 @@ class SSE < TestHTTP2Server
                  "Connection: close\r\n" \
                  "Content-Type: text/plain\r\n" \
                  "Content-Length: 2\r\n\r\nOK"
+    end
+  end
+
+  # writes +bytes+ to +sock+, sliced in +@chunk_size+ chunks when set, so that the client
+  # is made to parse the stream across arbitrary byte boundaries.
+  def write_event_bytes(sock, bytes)
+    return sock.write(bytes) unless @chunk_size
+
+    offset = 0
+    while offset < bytes.bytesize
+      sock.write(bytes.byteslice(offset, @chunk_size))
+      offset += @chunk_size
     end
   end
 
@@ -147,6 +169,9 @@ class SSE < TestHTTP2Server
           stream_already_closed = true
           break
         end
+
+        stream.data(@trailing, end_stream: false) if @trailing && !stream_already_closed
+
         stream.data("", end_stream: true) unless stream_already_closed
       else
         response = "OK"
