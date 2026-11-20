@@ -369,3 +369,327 @@ describe 'request.etag' do
     end
   end
 end
+
+describe 'request.preconditions' do
+  before(:all) do
+    @precondition_checks = []
+    checks = @precondition_checks
+    lm = @precondition_last_modified = Time.now
+    app(:caching) do |r|
+      r.is "" do
+        checks << r.request_method
+        r.preconditions(etag: 'foo', last_modified: lm)
+        checks << :continued
+        'ok'
+      end
+
+      r.is 'etag_only' do
+        checks << r.request_method
+        r.preconditions(etag: 'foo')
+        checks << :continued
+        'ok'
+      end
+
+      r.is 'last_modified_only' do
+        checks << r.request_method
+        r.preconditions(last_modified: lm)
+        checks << :continued
+        'ok'
+      end
+
+      r.is 'weak' do
+        checks << r.request_method
+        r.preconditions(etag: 'foo', last_modified: lm, weak: true)
+        checks << :continued
+        'ok'
+      end
+
+      r.is 'no_values' do
+        r.preconditions
+        'ok'
+      end
+
+      r.is 'preset_status' do
+        checks << r.request_method
+        response.status = r.env['status'].to_i
+        r.preconditions(etag: 'foo', last_modified: lm)
+        checks << :continued
+        'ok'
+      end
+    end
+  end
+
+  before do
+    @precondition_checks.clear
+  end
+
+  def res(env={})
+    s, _, b = req(env)
+    [s, b.join]
+  end
+
+  it 'sets both ETag and Last-Modified headers' do
+    s, h, b = req
+    s.must_equal 200
+    h[RodaResponseHeaders::ETAG].must_equal '"foo"'
+    h[RodaResponseHeaders::LAST_MODIFIED].must_equal @precondition_last_modified.httpdate
+    b.join.must_equal 'ok'
+  end
+
+  it 'ignores nil values' do
+    res('PATH_INFO'=>'/no_values').must_equal [200, 'ok']
+  end
+
+  describe 'for GET requests' do
+    it 'continues processing when no preconditions are given' do
+      res.must_equal [200, 'ok']
+      @precondition_checks.must_equal ['GET', :continued]
+    end
+
+    it 'halts with 304 if If-None-Match matches' do
+      s, h, b = req('HTTP_IF_NONE_MATCH'=>'"foo"')
+      [s, b.join].must_equal [304, '']
+      h[RodaResponseHeaders::ETAG].must_equal '"foo"'
+      h[RodaResponseHeaders::LAST_MODIFIED].must_equal @precondition_last_modified.httpdate
+      @precondition_checks.must_equal ['GET']
+    end
+
+    it 'halts with 304 if If-None-Match matches using a weak comparison' do
+      res('HTTP_IF_NONE_MATCH'=>'W/"foo"').must_equal [304, '']
+      @precondition_checks.must_equal ['GET']
+    end
+
+    it 'continues if If-None-Match does not match' do
+      res('HTTP_IF_NONE_MATCH'=>'"bar"').must_equal [200, 'ok']
+      @precondition_checks.must_equal ['GET', :continued]
+    end
+
+    it 'halts with 304 if If-Modified-Since is not before Last-Modified' do
+      res('HTTP_IF_MODIFIED_SINCE'=>@precondition_last_modified.httpdate).must_equal [304, '']
+      res('HTTP_IF_MODIFIED_SINCE'=>(@precondition_last_modified + 1).httpdate).must_equal [304, '']
+      @precondition_checks.must_equal ['GET', 'GET']
+    end
+
+    it 'continues processing if If-Modified-Since is before Last-Modified' do
+      res('HTTP_IF_MODIFIED_SINCE'=>(@precondition_last_modified - 1).httpdate).must_equal [200, 'ok']
+      @precondition_checks.must_equal ['GET', :continued]
+    end
+
+    it 'ignores If-Modified-Since if If-None-Match is present' do
+      res('HTTP_IF_NONE_MATCH'=>'"bar"', 'HTTP_IF_MODIFIED_SINCE'=>(@precondition_last_modified + 1).httpdate).must_equal [200, 'ok']
+      @precondition_checks.must_equal ['GET', :continued]
+    end
+
+    it 'halts with 412 if If-Match does not match' do
+      res('HTTP_IF_MATCH'=>'"bar"').must_equal [412, '']
+      @precondition_checks.must_equal ['GET']
+    end
+
+    it 'continues processing if If-Match matches' do
+      res('HTTP_IF_MATCH'=>'*').must_equal [200, 'ok']
+      res('HTTP_IF_MATCH'=>'"bar", "foo"').must_equal [200, 'ok']
+      @precondition_checks.must_equal ['GET', :continued, 'GET', :continued]
+    end
+
+    it 'checks If-Match before If-Unmodified-Since' do
+      res('HTTP_IF_MATCH'=>'"foo"', 'HTTP_IF_UNMODIFIED_SINCE'=>(@precondition_last_modified - 1).httpdate).must_equal [200, 'ok']
+      @precondition_checks.must_equal ['GET', :continued]
+    end
+
+    it 'halts with 412 if If-Unmodified-Since is before Last-Modified and If-Match is not given' do
+      res('HTTP_IF_UNMODIFIED_SINCE'=>(@precondition_last_modified - 1).httpdate).must_equal [412, '']
+      @precondition_checks.must_equal ['GET']
+    end
+
+    it 'continues processing if If-Unmodified-Since is not before Last-Modified' do
+      res('HTTP_IF_UNMODIFIED_SINCE'=>@precondition_last_modified.httpdate).must_equal [200, 'ok']
+      res('HTTP_IF_UNMODIFIED_SINCE'=>(@precondition_last_modified + 1).httpdate).must_equal [200, 'ok']
+      @precondition_checks.must_equal ['GET', :continued, 'GET', :continued]
+    end
+
+    it 'checks If-Match before If-None-Match' do
+      res('HTTP_IF_MATCH'=>'"bar"', 'HTTP_IF_NONE_MATCH'=>'"foo"').must_equal [412, '']
+      @precondition_checks.must_equal ['GET']
+    end
+
+    it 'checks If-None-Match before If-Modified-Since' do
+      res('HTTP_IF_NONE_MATCH'=>'"foo"', 'HTTP_IF_MODIFIED_SINCE'=>(@precondition_last_modified - 1).httpdate).must_equal [304, '']
+      @precondition_checks.must_equal ['GET']
+    end
+  end
+
+  describe 'for PUT requests' do
+    def res(env={})
+      super(env.merge('REQUEST_METHOD'=>'PUT'))
+    end
+
+    it 'continues processing when no preconditions are given' do
+      res.must_equal [200, 'ok']
+      @precondition_checks.must_equal ['PUT', :continued]
+    end
+
+    it 'halts with 412 if If-None-Match matches' do
+      res('HTTP_IF_NONE_MATCH'=>'"foo"').must_equal [412, '']
+      @precondition_checks.must_equal ['PUT']
+    end
+
+    it 'continues if If-None-Match does not match' do
+      res('HTTP_IF_NONE_MATCH'=>'"bar"').must_equal [200, 'ok']
+      @precondition_checks.must_equal ['PUT', :continued]
+    end
+
+    it 'does not use If-Modified-Since to return a 304' do
+      res('HTTP_IF_MODIFIED_SINCE'=>(@precondition_last_modified + 1).httpdate).must_equal [200, 'ok']
+      @precondition_checks.must_equal ['PUT', :continued]
+    end
+
+    it 'halts with 412 if If-Unmodified-Since is before Last-Modified' do
+      res('HTTP_IF_UNMODIFIED_SINCE'=>(@precondition_last_modified - 1).httpdate).must_equal [412, '']
+      @precondition_checks.must_equal ['PUT']
+    end
+
+    it 'continues processing if If-Unmodified-Since is not before Last-Modified' do
+      res('HTTP_IF_UNMODIFIED_SINCE'=>@precondition_last_modified.httpdate).must_equal [200, 'ok']
+      @precondition_checks.must_equal ['PUT', :continued]
+    end
+  end
+
+  describe 'for HEAD requests' do
+    it 'halts with 304 if If-None-Match matches' do
+      res('REQUEST_METHOD'=>'HEAD', 'HTTP_IF_NONE_MATCH'=>'"foo"').must_equal [304, '']
+      @precondition_checks.must_equal ['HEAD']
+    end
+
+    it 'halts with 304 if If-Modified-Since is not before Last-Modified' do
+      res('REQUEST_METHOD'=>'HEAD', 'HTTP_IF_MODIFIED_SINCE'=>(@precondition_last_modified + 1).httpdate).must_equal [304, '']
+      @precondition_checks.must_equal ['HEAD']
+    end
+  end
+
+  describe 'for other request methods' do
+    it 'halts with 412 and not 304 if If-None-Match matches' do
+      %w'POST DELETE PATCH OPTIONS TRACE'.each do |method|
+        res('REQUEST_METHOD'=>method, 'HTTP_IF_NONE_MATCH'=>'"foo"').must_equal [412, '']
+      end
+      @precondition_checks.must_equal %w'POST DELETE PATCH OPTIONS TRACE'
+    end
+  end
+
+  describe 'with only one validator' do
+    it 'skips etag-based preconditions when only last_modified is given' do
+      res('PATH_INFO'=>'/last_modified_only', 'HTTP_IF_NONE_MATCH'=>'"foo"').must_equal [200, 'ok']
+      res('PATH_INFO'=>'/last_modified_only', 'HTTP_IF_MATCH'=>'"bar"').must_equal [200, 'ok']
+      @precondition_checks.must_equal ['GET', :continued, 'GET', :continued]
+    end
+
+    it 'skips time-based preconditions when only etag is given' do
+      res('PATH_INFO'=>'/etag_only', 'HTTP_IF_MODIFIED_SINCE'=>(@precondition_last_modified + 1).httpdate).must_equal [200, 'ok']
+      res('PATH_INFO'=>'/etag_only', 'HTTP_IF_UNMODIFIED_SINCE'=>(@precondition_last_modified - 1).httpdate).must_equal [200, 'ok']
+      @precondition_checks.must_equal ['GET', :continued, 'GET', :continued]
+    end
+  end
+
+  describe 'with a weak etag' do
+    it 'uses the weak form of the etag in the ETag header' do
+      header(RodaResponseHeaders::ETAG, 'PATH_INFO'=>'/weak').must_equal 'W/"foo"'
+    end
+
+    it 'halts with 304 if If-None-Match includes the strong form of the etag' do
+      res('PATH_INFO'=>'/weak', 'HTTP_IF_NONE_MATCH'=>'"foo"').must_equal [304, '']
+    end
+
+    it 'halts with 412 if If-Match is given an etag, as strong comparison never matches a weak etag' do
+      res('PATH_INFO'=>'/weak', 'HTTP_IF_MATCH'=>'"foo"').must_equal [412, '']
+      res('PATH_INFO'=>'/weak', 'HTTP_IF_MATCH'=>'W/"foo"').must_equal [412, '']
+      @precondition_checks.must_equal ['GET', 'GET']
+    end
+
+    it 'matches If-Match * for a weak etag as long as the resource exists' do
+      res('PATH_INFO'=>'/weak', 'HTTP_IF_MATCH'=>'*').must_equal [200, 'ok']
+      @precondition_checks.must_equal ['GET', :continued]
+    end
+  end
+
+  describe 'with an existing non-2xx status' do
+    it 'still sets validators but does not halt' do
+      s, h, b = req('PATH_INFO'=>'/preset_status', 'status'=>'499', 'HTTP_IF_NONE_MATCH'=>'"foo"')
+      [s, b.join].must_equal [499, 'ok']
+      h[RodaResponseHeaders::ETAG].must_equal '"foo"'
+      h[RodaResponseHeaders::LAST_MODIFIED].must_equal @precondition_last_modified.httpdate
+      @precondition_checks.must_equal ['GET', :continued]
+    end
+
+    it 'checks preconditions for a 2xx status' do
+      s, h, b = req('PATH_INFO'=>'/preset_status', 'status'=>'201', 'HTTP_IF_NONE_MATCH'=>'"foo"')
+      [s, b.join].must_equal [304, '']
+      h[RodaResponseHeaders::ETAG].must_equal '"foo"'
+      @precondition_checks.must_equal ['GET']
+    end
+  end
+
+  describe 'when the same resource is requested with different methods and multiple preconditions' do
+    def precondition_status(method, env)
+      status(env.merge('REQUEST_METHOD'=>method, 'PATH_INFO'=>'/'))
+    end
+
+    it 'returns the same 304 status for repeated GET requests regardless of header order' do
+      envs = [
+        {'HTTP_IF_MATCH'=>'"foo"', 'HTTP_IF_NONE_MATCH'=>'"foo"', 'HTTP_IF_MODIFIED_SINCE'=>@precondition_last_modified.httpdate},
+        {'HTTP_IF_MODIFIED_SINCE'=>@precondition_last_modified.httpdate, 'HTTP_IF_NONE_MATCH'=>'"foo"', 'HTTP_IF_MATCH'=>'"foo"'},
+      ]
+      envs.each do |env|
+        precondition_status('GET', env).must_equal 304
+      end
+      @precondition_checks.must_equal ['GET', 'GET']
+    end
+
+    it 'returns the same 412 status for repeated PUT requests regardless of header order' do
+      envs = [
+        {'HTTP_IF_MATCH'=>'"foo"', 'HTTP_IF_NONE_MATCH'=>'"foo"', 'HTTP_IF_UNMODIFIED_SINCE'=>@precondition_last_modified.httpdate},
+        {'HTTP_IF_UNMODIFIED_SINCE'=>@precondition_last_modified.httpdate, 'HTTP_IF_NONE_MATCH'=>'"foo"', 'HTTP_IF_MATCH'=>'"foo"'},
+      ]
+      envs.each do |env|
+        precondition_status('PUT', env).must_equal 412
+      end
+      @precondition_checks.must_equal ['PUT', 'PUT']
+    end
+
+    it 'only continues processing when all preconditions pass' do
+      precondition_status('GET', 'HTTP_IF_MATCH'=>'"foo"', 'HTTP_IF_NONE_MATCH'=>'"bar"', 'HTTP_IF_UNMODIFIED_SINCE'=>(@precondition_last_modified - 1).httpdate).must_equal 200
+      @precondition_checks.must_equal ['GET', :continued]
+
+      @precondition_checks.clear
+      precondition_status('PUT', 'HTTP_IF_MATCH'=>'"bar"', 'HTTP_IF_NONE_MATCH'=>'"bar"', 'HTTP_IF_UNMODIFIED_SINCE'=>(@precondition_last_modified - 1).httpdate).must_equal 412
+      @precondition_checks.must_equal ['PUT']
+    end
+
+    it 'does not perform side effects when a later precondition fails' do
+      @side_effects = []
+      side_effects = @side_effects
+      lm = @precondition_last_modified
+      app(:caching) do |r|
+        r.is 'write' do
+          r.preconditions(etag: 'foo', last_modified: lm)
+          side_effects << :performed
+          'ok'
+        end
+      end
+      status('PATH_INFO'=>'/write', 'REQUEST_METHOD'=>'PUT', 'HTTP_IF_MATCH'=>'"foo"', 'HTTP_IF_NONE_MATCH'=>'"foo"').must_equal 412
+      @side_effects.must_equal []
+      status('PATH_INFO'=>'/write', 'REQUEST_METHOD'=>'PUT', 'HTTP_IF_MATCH'=>'"foo"', 'HTTP_IF_NONE_MATCH'=>'"bar"').must_equal 200
+      @side_effects.must_equal [:performed]
+    end
+  end
+
+  it 'warns for positional hash usage and unexpected keywords' do
+    deprecated do
+      app(:caching) do |r|
+        r.preconditions({'etag'=>'foo', 'bad'=>true})
+        'ok'
+      end
+      body.must_equal 'ok'
+    end
+  end
+end
+
+

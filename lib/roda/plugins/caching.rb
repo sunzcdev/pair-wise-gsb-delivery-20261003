@@ -29,6 +29,28 @@ class Roda
     # client requested the resource, assuming the client uses the
     # appropriate HTTP 1.1 request headers.
     #
+    # If the last modified time and entity tag for a resource are not
+    # available at the same time (for example, if they are stored on
+    # different objects), you can use the +preconditions+ request method
+    # after collecting both values.  It sets the appropriate response
+    # headers and checks all request preconditions at once, instead of
+    # checking each precondition as soon as the related value is available:
+    #
+    #   r.get 'albums', Integer do |album_id|
+    #     album = Album[album_id]
+    #     stats = Stats.for_album(album)
+    #     r.preconditions etag: stats.sha1, last_modified: album.updated_at
+    #     view('album')
+    #   end
+    #
+    # This is useful for resources where +last_modified+ or +etag+ would
+    # halt with a 304 or 412 response before all validators were known.
+    # Unlike +last_modified+ and +etag+, +preconditions+ uses the
+    # precondition evaluation order specified by RFC 9110, section 13.2.2,
+    # so the result doesn't depend on the order the client sends the
+    # request headers in, and modification requests (such as PUT and POST)
+    # never receive a 304 response for a matching If-None-Match header.
+    #
     # This plugin also includes the +cache_control+ and +expires+
     # response methods.  The +cache_control+ method sets the
     # Cache-Control header using the given hash:
@@ -138,14 +160,96 @@ class Roda
           end
         end
 
+        # Set the response validators and check all request preconditions at
+        # once.  This is designed for cases where the last modified time and
+        # entity tag are not available at the same time, such as when they are
+        # stored on different objects.  Instead of checking preconditions as
+        # soon as each value is known (as +last_modified+ and +etag+ do), it
+        # waits until the caller has collected every value it wants to use.
+        #
+        # Keyword Arguments:
+        # +etag+ :: The current entity tag for the resource, or nil to skip setting ETag and checking etag-based preconditions
+        # +last_modified+ :: The last modified time (a Time instance) for the resource, or nil to skip setting Last-Modified and checking time-based preconditions
+        # +weak+ :: Use a weak cache validator for the etag (a strong cache validator is the default)
+        # +new_resource+ :: Whether this etag should match an etag of * (true for POST, false otherwise)
+        #
+        #   r.preconditions etag: @stats.sha1, last_modified: @album.updated_at
+        #
+        # If no precondition fails, this returns nil and processing continues.
+        # If a precondition fails, this immediately halts processing with the
+        # appropriate status:
+        #
+        # 304 :: For GET and HEAD requests, when If-None-Match matches the current etag (using the weak comparison required for If-None-Match) or, if there is no If-None-Match header, when If-Modified-Since is not earlier than the last modified time.
+        # 412 :: When If-Match does not match the current etag (using the strong comparison required for If-Match, so a weak etag only satisfies <tt>If-Match: *</tt> when the resource exists), when If-Unmodified-Since is earlier than the last modified time (and there is no If-Match header), or when If-None-Match matches for a request method other than GET or HEAD.
+        #
+        # The preconditions are evaluated in the order specified by RFC 9110,
+        # section 13.2.2, so the result does not depend on the order the client
+        # sends the request headers in.  If-Match takes precedence over
+        # If-Unmodified-Since, and If-None-Match takes precedence over
+        # If-Modified-Since.  Preconditions that require a validator that was
+        # not provided are skipped.  Preconditions are only checked if the
+        # response status has not been set, or has been set to a 2xx or 304
+        # status.  This makes it safe to call this method before performing
+        # any side effects for the request, since preconditions are checked
+        # before the caller continues processing.
+        def preconditions(opts=(no_positional_opts = true; OPTS), etag: opts[:etag], last_modified: opts[:last_modified], weak: opts[:weak], new_resource: opts.fetch(:new_resource){post?}, **kw)
+          RodaPlugins.check_keywords(__callee__, no_positional_opts, opts, kw)
+
+          res = response
+          e = env
+          etag = "#{'W/' if weak}\"#{etag}\"" if etag
+          res[RodaResponseHeaders::ETAG] = etag if etag
+          res[RodaResponseHeaders::LAST_MODIFIED] = last_modified.httpdate if last_modified
+
+          status = res.status
+          return unless !status || (status >= 200 && status < 300) || status == 304
+
+          # If-Match is checked first.  If it is present, If-Unmodified-Since
+          # must be ignored (RFC 9110, section 13.2.2).  If-Match uses the
+          # strong comparison, so a weak etag only matches if the header is *.
+          if ifm = e['HTTP_IF_MATCH']
+            if etag && !etag_matches?(ifm, etag, new_resource, strong: true)
+              res.status = 412
+              halt
+            end
+          elsif last_modified && (ius = time_from_header(e['HTTP_IF_UNMODIFIED_SINCE'])) && ius < last_modified.to_i
+            res.status = 412
+            halt
+          end
+
+          # If-None-Match is checked next.  If it is present, If-Modified-Since
+          # must be ignored (RFC 9110, section 13.2.2).  If-None-Match uses the
+          # weak comparison, so a strong form of a weak etag also matches.
+          if inm = e['HTTP_IF_NONE_MATCH']
+            if etag && etag_matches?(inm, etag, new_resource, weak: true)
+              res.status = get_or_head_request? ? 304 : 412
+              halt
+            end
+          elsif last_modified && get_or_head_request? && (ims = time_from_header(e['HTTP_IF_MODIFIED_SINCE'])) && ims >= last_modified.to_i
+            res.status = 304
+            halt
+          end
+        end
+
         private
+
+        # Whether the request method is GET or HEAD, the only methods for which
+        # a failed If-None-Match or If-Modified-Since precondition results in a
+        # 304 response instead of a 412 response.
+        def get_or_head_request?
+          request_method = @env['REQUEST_METHOD'].to_s.upcase
+          request_method == 'GET' || request_method == 'HEAD'
+        end
 
         # Helper method checking if a ETag value list includes the current ETag.
         # If +weak+ is true, uses the weak comparison that <tt>If-None-Match</tt> requires
         # (RFC 9110 section 13.1.2), which ignores a W/ prefix on both sides.
-        def etag_matches?(list, etag, new_resource, weak: false)
+        # If +strong+ is true, uses the strong comparison that <tt>If-Match</tt> requires
+        # (RFC 9110 section 13.1.1), which never matches a weak ETag.
+        def etag_matches?(list, etag, new_resource, weak: false, strong: false)
           return unless list
           return !new_resource if list == '*'
+          return false if strong && etag.start_with?('W/')
           list = list.to_s.split(/\s*,\s*/)
           if weak
             etag = etag.sub(/\AW\//, '')
