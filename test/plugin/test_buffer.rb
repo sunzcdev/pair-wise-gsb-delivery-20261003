@@ -1844,4 +1844,242 @@ class BufferTest < Test::Unit::TestCase
       b&.stop
     end
   end
+
+  sub_test_case '#chunk_statistics' do
+    def create_empty_buffer(hash = {})
+      buffer_conf = config_element('buffer', '', hash, [])
+      owner = FluentPluginBufferTest::DummyOutputPlugin.new
+      owner.configure(config_element('ROOT', '', {}, [ buffer_conf ]))
+      p = EmptyResumeDummyPlugin.new
+      p.owner = owner
+      p.configure(buffer_conf)
+      p
+    end
+
+    def assert_bucket(bucket, length:, byte_size:, record_size:,
+                      unknown_byte_size_length: 0, unknown_record_size_length: 0)
+      assert_equal length, bucket['length']
+      assert_equal byte_size, bucket['byte_size']
+      assert_equal record_size, bucket['record_size']
+      assert_equal unknown_byte_size_length, bucket['unknown_byte_size_length']
+      assert_equal unknown_record_size_length, bucket['unknown_record_size_length']
+    end
+
+    test 'reports all-zero ownership buckets on an empty buffer' do
+      b = create_empty_buffer
+      b.start
+
+      snapshot = b.chunk_statistics
+      %w[stage queue dequeued].each do |ownership|
+        assert_bucket snapshot['ownership'][ownership], length: 0, byte_size: 0, record_size: 0
+      end
+      assert_bucket snapshot['total'], length: 0, byte_size: 0, record_size: 0
+    ensure
+      b&.stop
+    end
+
+    test 'attributes one memory chunk to each ownership across enqueue, dequeue, takeback (rollback) and purge (commit)' do
+      b = create_empty_buffer('total_limit_size' => 10 * 1024 * 1024, 'chunk_limit_size' => 4096)
+      b.start
+      m = create_metadata
+      records = ['a' * 100, 'b' * 200, 'c' * 300]
+      bytes = records.map(&:bytesize).sum
+      count = records.size
+
+      # write: committed data lives on the stage
+      b.write({ m => records })
+      chunk = b.stage[m]
+      refute_nil chunk
+
+      snapshot = b.chunk_statistics
+      assert_bucket snapshot['ownership']['stage'], length: 1, byte_size: bytes, record_size: count
+      assert_bucket snapshot['ownership']['queue'], length: 0, byte_size: 0, record_size: 0
+      assert_bucket snapshot['ownership']['dequeued'], length: 0, byte_size: 0, record_size: 0
+      assert_bucket snapshot['total'], length: 1, byte_size: bytes, record_size: count
+
+      # enqueue: the same data moves from stage to queue, still counted exactly once
+      b.enqueue_chunk(m)
+      assert_nil b.stage[m]
+      assert_equal chunk, b.queue.last
+
+      snapshot = b.chunk_statistics
+      assert_bucket snapshot['ownership']['stage'], length: 0, byte_size: 0, record_size: 0
+      assert_bucket snapshot['ownership']['queue'], length: 1, byte_size: bytes, record_size: count
+      assert_bucket snapshot['ownership']['dequeued'], length: 0, byte_size: 0, record_size: 0
+      assert_bucket snapshot['total'], length: 1, byte_size: bytes, record_size: count
+
+      # dequeue: ownership moves to the in-flight flush (dequeued). The legacy
+      # queue_byte_size gauge still counts the chunk, which is the double
+      # counting this snapshot exists to avoid.
+      dequeued = b.dequeue_chunk
+      assert_equal chunk, dequeued
+      assert_equal [chunk.unique_id], b.dequeued.keys
+
+      snapshot = b.chunk_statistics
+      assert_bucket snapshot['ownership']['stage'], length: 0, byte_size: 0, record_size: 0
+      assert_bucket snapshot['ownership']['queue'], length: 0, byte_size: 0, record_size: 0
+      assert_bucket snapshot['ownership']['dequeued'], length: 1, byte_size: bytes, record_size: count
+      assert_bucket snapshot['total'], length: 1, byte_size: bytes, record_size: count
+      assert_equal bytes, b.queue_size, 'legacy gauge still counts the dequeued chunk'
+
+      # takeback is the flush-side rollback: the chunk returns to the queue head
+      assert b.takeback_chunk(chunk.unique_id)
+      assert_equal({}, b.dequeued)
+      assert_equal chunk, b.queue.first
+
+      snapshot = b.chunk_statistics
+      assert_bucket snapshot['ownership']['queue'], length: 1, byte_size: bytes, record_size: count
+      assert_bucket snapshot['ownership']['dequeued'], length: 0, byte_size: 0, record_size: 0
+      assert_bucket snapshot['total'], length: 1, byte_size: bytes, record_size: count
+
+      # dequeue again, then purge is the flush-side commit: the data is released
+      dequeued = b.dequeue_chunk
+      assert_equal chunk, dequeued
+      b.purge_chunk(chunk.unique_id)
+
+      assert_equal({}, b.dequeued)
+      assert_equal [], b.queue
+      assert_nil b.stage[m]
+
+      snapshot = b.chunk_statistics
+      assert_bucket snapshot['ownership']['stage'], length: 0, byte_size: 0, record_size: 0
+      assert_bucket snapshot['ownership']['queue'], length: 0, byte_size: 0, record_size: 0
+      assert_bucket snapshot['ownership']['dequeued'], length: 0, byte_size: 0, record_size: 0
+      assert_bucket snapshot['total'], length: 0, byte_size: 0, record_size: 0
+      assert_equal 0, b.queue_size
+    ensure
+      b&.stop
+    end
+
+    test 'never double counts a chunk across ownerships at any point of the lifecycle' do
+      b = create_empty_buffer('total_limit_size' => 10 * 1024 * 1024, 'chunk_limit_size' => 4096)
+      b.start
+      m = create_metadata
+      b.write({ m => ['x' * 123, 'y' * 7] })
+      chunk = b.stage[m]
+      bytes = chunk.bytesize
+      records = chunk.size
+
+      checkpoints = [
+        -> { b.enqueue_chunk(m) },
+        -> { @dequeued_chunk = b.dequeue_chunk },
+        -> { b.takeback_chunk(@dequeued_chunk.unique_id) },
+        -> { @dequeued_chunk = b.dequeue_chunk },
+        -> { b.purge_chunk(@dequeued_chunk.unique_id) },
+      ]
+
+      checkpoints.each do |checkpoint|
+        checkpoint.call
+        snapshot = b.chunk_statistics
+        ownerships = snapshot['ownership']
+        lengths = ownerships.values.map { |bucket| bucket['length'] }
+        # the chunk (while alive) appears in exactly one ownership, never two
+        assert lengths.sum <= 1
+        assert_equal lengths.sum, snapshot['total']['length']
+
+        byte_sizes = ownerships.values.map { |bucket| bucket['byte_size'] }
+        record_sizes = ownerships.values.map { |bucket| bucket['record_size'] }
+        unless byte_sizes.all?(&:zero?)
+          assert_equal bytes, byte_sizes.sum
+          assert_equal records, record_sizes.sum
+        end
+        assert_equal byte_sizes.sum, snapshot['total']['byte_size']
+        assert_equal record_sizes.sum, snapshot['total']['record_size']
+      end
+    ensure
+      b&.stop
+    end
+
+    test 'excludes uncommitted appends after a chunk rollback' do
+      b = create_empty_buffer
+      b.start
+      m = create_metadata
+      b.write({ m => ['a' * 50] })
+      chunk = b.stage[m]
+      assert_equal 50, chunk.bytesize
+
+      chunk.concat('b' * 30, 1)
+      assert_equal 80, chunk.bytesize, 'bytesize includes the pending append'
+      chunk.rollback
+
+      snapshot = b.chunk_statistics
+      assert_bucket snapshot['ownership']['stage'], length: 1, byte_size: 50, record_size: 1
+      assert_bucket snapshot['total'], length: 1, byte_size: 50, record_size: 1
+    ensure
+      b&.stop
+    end
+
+    test 'keeps byte statistics unknown when a chunk cannot report a reliable bytesize' do
+      b = create_empty_buffer
+      b.start
+      m = create_metadata
+      chunk = create_chunk(m, ['a' * 10, 'b' * 10])
+      (class << chunk; self; end).module_eval do
+        define_method(:bytesize) { raise NotImplementedError, 'custom chunk has no byte accounting' }
+      end
+      b.stage[m] = chunk
+
+      snapshot = b.chunk_statistics
+      stage = snapshot['ownership']['stage']
+      assert_bucket stage, length: 1, byte_size: nil, record_size: 2,
+                    unknown_byte_size_length: 1, unknown_record_size_length: 0
+      # record counts stay reliable; only the unmeasurable statistic is unknown
+      assert_nil snapshot['total']['byte_size']
+      assert_equal 2, snapshot['total']['record_size']
+      assert_equal 1, snapshot['total']['unknown_byte_size_length']
+      assert_equal 0, snapshot['total']['unknown_record_size_length']
+    ensure
+      b&.stop
+    end
+
+    test 'keeps record statistics unknown when a chunk reports a non-numeric size' do
+      b = create_empty_buffer
+      b.start
+      m = create_metadata
+      chunk = create_chunk(m, ['a' * 10])
+      (class << chunk; self; end).module_eval do
+        define_method(:size) { 'unknown' }
+      end
+      b.stage[m] = chunk
+
+      snapshot = b.chunk_statistics
+      stage = snapshot['ownership']['stage']
+      assert_bucket stage, length: 1, byte_size: 10, record_size: nil,
+                    unknown_byte_size_length: 0, unknown_record_size_length: 1
+      assert_equal 10, snapshot['total']['byte_size']
+      assert_nil snapshot['total']['record_size']
+      assert_equal 1, snapshot['total']['unknown_record_size_length']
+    ensure
+      b&.stop
+    end
+
+    test 'is embedded in #statistics while the legacy scalar fields stay unchanged' do
+      b = create_empty_buffer
+      b.start
+      m = create_metadata
+      b.write({ m => ['a' * 100] })
+
+      stats = b.statistics['buffer']
+      legacy_keys = %w[
+        stage_length stage_byte_size queue_length queue_byte_size
+        available_buffer_space_ratios total_queued_size
+      ]
+      legacy_keys.each do |key|
+        assert stats.key?(key), "legacy field #{key} must still be emitted"
+      end
+      assert_equal 1, stats['stage_length']
+      assert_equal 100, stats['stage_byte_size']
+      assert_equal 0, stats['queue_length']
+      assert_equal 0, stats['queue_byte_size']
+      assert_equal 100, stats['total_queued_size']
+
+      snapshot = stats['chunk_statistics']
+      assert_equal %w[ownership total].sort, snapshot.keys.sort
+      assert_equal %w[stage queue dequeued].sort, snapshot['ownership'].keys.sort
+      assert_bucket snapshot['ownership']['stage'], length: 1, byte_size: 100, record_size: 1
+      assert_bucket snapshot['total'], length: 1, byte_size: 100, record_size: 1
+    ensure
+      b&.stop
+    end
+  end
 end

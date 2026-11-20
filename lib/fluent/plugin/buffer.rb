@@ -970,6 +970,9 @@ module Fluent
         'newest_timekey'
       ]
 
+      # Chunk ownership categories exposed by #chunk_statistics.
+      CHUNK_OWNERSHIPS = ['stage', 'queue', 'dequeued'].freeze
+
       def statistics
         # Export-only clamp: internal gauges may go transiently negative during
         # the deferred stage_size add vs enqueue_chunk sub race (#5303, #2712).
@@ -1003,7 +1006,61 @@ module Fluent
           stats['newest_timekey'] = @newest_timekey_metrics.get
         end
 
+        # A consistent, single-read snapshot of chunk ownership. The legacy
+        # gauges above are maintained independently and stay unchanged.
+        stats['chunk_statistics'] = chunk_statistics
+
         { 'buffer' => stats }
+      end
+
+      # Collect buffer usage in one synchronized pass over the actual chunk
+      # containers (@stage, @queue and @dequeued). Each chunk is attributed to
+      # exactly one ownership at the instant of the read, so a chunk that is
+      # moving between stage, queue and an in-flight flush is never counted
+      # twice -- unlike the separately read stage_*/queue_* gauges, whose
+      # queue byte counter keeps counting dequeued chunks until they are purged.
+      #
+      # Every ownership and the overall total carry:
+      # * length: number of chunks (always available)
+      # * byte_size: sum of chunk bytes, or nil when any chunk cannot report it
+      # * record_size: sum of chunk record counts, or nil when any chunk cannot report it
+      # * unknown_byte_size_length / unknown_record_size_length: how many chunks
+      #   failed to expose the respective statistic
+      #
+      # Third-party chunk implementations are not required to provide reliable
+      # bytes/records: the unmeasurable statistic stays unknown (nil) instead of
+      # raising, while chunk counts remain trustworthy.
+      def chunk_statistics
+        synchronize do
+          buckets = {}
+          CHUNK_OWNERSHIPS.each do |ownership|
+            buckets[ownership] = collect_chunk_measurements(chunk_ownership_container(ownership))
+          end
+
+          total = {
+            'length' => buckets.each_value.sum { |bucket| bucket['length'] },
+            'byte_size' => 0,
+            'record_size' => 0,
+            'unknown_byte_size_length' => 0,
+            'unknown_record_size_length' => 0,
+          }
+          buckets.each_value do |bucket|
+            total['unknown_byte_size_length'] += bucket['unknown_byte_size_length']
+            total['unknown_record_size_length'] += bucket['unknown_record_size_length']
+            if bucket['byte_size'].nil?
+              total['byte_size'] = nil
+            elsif total['byte_size']
+              total['byte_size'] += bucket['byte_size']
+            end
+            if bucket['record_size'].nil?
+              total['record_size'] = nil
+            elsif total['record_size']
+              total['record_size'] += bucket['record_size']
+            end
+          end
+
+          { 'ownership' => buckets, 'total' => total }
+        end
       end
 
       def backup(chunk_unique_id)
@@ -1023,6 +1080,58 @@ module Fluent
       end
 
       private
+
+      def chunk_ownership_container(ownership)
+        case ownership
+        when 'stage' then @stage.values
+        when 'queue' then @queue
+        when 'dequeued' then @dequeued.values
+        else raise "BUG: unknown chunk ownership '#{ownership}'"
+        end
+      end
+
+      def collect_chunk_measurements(chunks)
+        byte_size = 0
+        record_size = 0
+        unknown_byte_size_length = 0
+        unknown_record_size_length = 0
+
+        chunks.each do |chunk|
+          measured_bytes = measure_chunk_statistic(chunk, :bytesize)
+          if measured_bytes.nil?
+            unknown_byte_size_length += 1
+            byte_size = nil
+          elsif byte_size
+            byte_size += measured_bytes
+          end
+
+          measured_records = measure_chunk_statistic(chunk, :size)
+          if measured_records.nil?
+            unknown_record_size_length += 1
+            record_size = nil
+          elsif record_size
+            record_size += measured_records
+          end
+        end
+
+        {
+          'length' => chunks.size,
+          'byte_size' => byte_size,
+          'record_size' => record_size,
+          'unknown_byte_size_length' => unknown_byte_size_length,
+          'unknown_record_size_length' => unknown_record_size_length,
+        }
+      end
+
+      # Returns the measured numeric statistic, or nil when the chunk cannot
+      # reliably provide it (a custom chunk that raises or returns a non-numeric
+      # value from bytesize/size).
+      def measure_chunk_statistic(chunk, method_name)
+        value = chunk.public_send(method_name)
+        value.is_a?(Numeric) ? value : nil
+      rescue StandardError, NotImplementedError
+        nil
+      end
 
       def optimistic_queued?(metadata = nil)
         if metadata

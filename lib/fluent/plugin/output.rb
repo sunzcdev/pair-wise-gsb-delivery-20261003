@@ -1655,6 +1655,10 @@ module Fluent
 
         if @buffer && @buffer.respond_to?(:statistics)
           (@buffer.statistics['buffer'] || {}).each do |k, v|
+            # The nested chunk_statistics snapshot (a hash, not a scalar gauge)
+            # has no flat buffer_* counterpart; skip it instead of emitting a
+            # nil-keyed entry. Existing scalar stats keep their legacy names.
+            next unless BUFFER_STATS_KEYS.key?(k)
             stats[BUFFER_STATS_KEYS[k]] = v
           end
         end
