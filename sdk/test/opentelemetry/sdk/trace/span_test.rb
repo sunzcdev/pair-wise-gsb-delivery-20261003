@@ -405,6 +405,209 @@ describe OpenTelemetry::SDK::Trace::Span do
         _(ev.attributes['exception.stacktrace']).must_equal(error.full_message(highlight: false, order: :top))
       end
     end
+
+    it 'does not record the cause chain by default' do
+      span.record_exception(wrapped_error)
+      attributes = span.events.first.attributes
+
+      _(attributes.key?('exception.cause.count')).must_equal(false)
+      _(attributes.keys.grep(/exception\.cause\./)).must_be_empty
+    end
+
+    describe 'with record_cause_chain' do
+      let(:span_limits) do
+        SpanLimits.new(
+          attribute_count_limit: 128,
+          event_count_limit: 5,
+          event_attribute_count_limit: 128
+        )
+      end
+
+      it 'records the depth of each cause and how many causes were recorded' do
+        span.record_exception(wrapped_error, record_cause_chain: true)
+        attributes = span.events.first.attributes
+
+        _(attributes['exception.type']).must_equal('RuntimeError')
+        _(attributes['exception.message']).must_equal('repository failed')
+        _(attributes['exception.cause.count']).must_equal(2)
+        _(attributes['exception.cause.1.depth']).must_equal(1)
+        _(attributes['exception.cause.1.type']).must_equal('ArgumentError')
+        _(attributes['exception.cause.1.message']).must_equal('connection refused')
+        _(attributes['exception.cause.2.depth']).must_equal(2)
+        _(attributes['exception.cause.2.type']).must_equal('IOError')
+        _(attributes['exception.cause.2.message']).must_equal('socket timed out')
+        _(attributes.key?('exception.cause.truncated')).must_equal(false)
+      end
+
+      it 'keeps the existing exception attributes unchanged' do
+        span.record_exception(wrapped_error, record_cause_chain: true)
+        attributes = span.events.first.attributes
+
+        _(attributes['exception.type']).must_equal(wrapped_error.class.to_s)
+        _(attributes['exception.message']).must_equal(wrapped_error.message)
+        _(attributes['exception.stacktrace']).must_equal(wrapped_error.full_message(highlight: false, order: :top))
+      end
+
+      it 'records only frames above the boundary shared with the wrapping exception' do
+        span.record_exception(wrapped_error, record_cause_chain: true)
+        attributes = span.events.first.attributes
+
+        _(attributes['exception.cause.1.shared_frames']).must_equal(1)
+        _(attributes['exception.cause.1.stacktrace']).must_equal("app/repo.rb:21:in 'fetch'\napp/repo.rb:20:in 'fetch'")
+        _(attributes['exception.cause.2.shared_frames']).must_equal(2)
+        _(attributes['exception.cause.2.stacktrace']).must_equal("app/db.rb:10:in 'connect'")
+      end
+
+      it 'records a cause with no cause of its own as count 0' do
+        span.record_exception(ArgumentError.new('lonely'), record_cause_chain: true)
+        attributes = span.events.first.attributes
+
+        _(attributes['exception.cause.count']).must_equal(0)
+        _(attributes.keys.grep(/exception\.cause\.\d/)).must_be_empty
+      end
+
+      it 'points a repeated exception reference at the depth that already recorded it' do
+        span.record_exception(cyclic_error, record_cause_chain: true)
+        attributes = span.events.first.attributes
+
+        _(attributes['exception.cause.count']).must_equal(1)
+        _(attributes['exception.cause.2.alias_of']).must_equal(0)
+        _(attributes['exception.cause.2.depth']).must_equal(2)
+        _(attributes['exception.cause.2.type']).must_equal('RuntimeError')
+        _(attributes['exception.cause.truncated']).must_equal('alias')
+      end
+
+      it 'points a self-referencing exception at its own depth' do
+        self_referencing = RuntimeError.new('self')
+        self_referencing.define_singleton_method(:cause) { self_referencing }
+
+        span.record_exception(self_referencing, record_cause_chain: true)
+        attributes = span.events.first.attributes
+
+        _(attributes['exception.cause.count']).must_equal(0)
+        _(attributes['exception.cause.1.alias_of']).must_equal(0)
+        _(attributes['exception.cause.truncated']).must_equal('alias')
+      end
+
+      it 'stops at the cause count limit and says so' do
+        limited_span_limits = SpanLimits.new(exception_cause_count_limit: 1)
+        limited_span = build_span(limited_span_limits)
+        limited_span.record_exception(wrapped_error, record_cause_chain: true)
+        attributes = limited_span.events.first.attributes
+
+        _(attributes['exception.cause.count']).must_equal(1)
+        _(attributes['exception.cause.truncated']).must_equal('cause_count_limit')
+        _(attributes.key?('exception.cause.2.type')).must_equal(false)
+      end
+
+      it 'truncates long cause values at the cause length limit and says so' do
+        limited_span_limits = SpanLimits.new(exception_cause_length_limit: 32)
+        limited_span = build_span(limited_span_limits)
+        long_error = build_wrapped_error('outer message')
+        limited_span.record_exception(long_error, record_cause_chain: true)
+        attributes = limited_span.events.first.attributes
+
+        _(attributes['exception.cause.1.message'].length).must_equal(32)
+        _(attributes['exception.cause.1.truncated']).must_include('message')
+        _(attributes['exception.cause.1.truncated']).must_include('stacktrace')
+        _(attributes['exception.cause.truncated']).must_equal('length_limit')
+      end
+
+      it 'stops when the event attribute budget cannot fit another cause and says so' do
+        limited_span_limits = SpanLimits.new(event_attribute_count_limit: 10)
+        limited_span = build_span(limited_span_limits)
+        limited_span.record_exception(wrapped_error, record_cause_chain: true)
+        attributes = limited_span.events.first.attributes
+
+        _(attributes['exception.type']).must_equal('RuntimeError')
+        _(attributes['exception.message']).must_equal('repository failed')
+        _(attributes['exception.cause.count']).must_equal(1)
+        _(attributes['exception.cause.truncated']).must_equal('attribute_count_limit')
+      end
+
+      it 'keeps caller attributes that collide with cause attributes' do
+        span.record_exception(wrapped_error, attributes: { 'exception.cause.count' => 'caller' }, record_cause_chain: true)
+        attributes = span.events.first.attributes
+
+        _(attributes['exception.cause.count']).must_equal('caller')
+      end
+
+      it 'does not raise for an exception whose cause raises' do
+        broken = RuntimeError.new('broken cause')
+        broken.define_singleton_method(:cause) { raise 'nope' }
+
+        span.record_exception(broken, record_cause_chain: true)
+        attributes = span.events.first.attributes
+
+        _(attributes['exception.type']).must_equal('RuntimeError')
+        _(attributes['exception.cause.truncated']).must_equal('error')
+      end
+
+      it 'reports only the cause count when the budget leaves room for nothing else' do
+        limited_span_limits = SpanLimits.new(event_attribute_count_limit: 4)
+        limited_span = build_span(limited_span_limits)
+        limited_span.record_exception(wrapped_error, record_cause_chain: true)
+        attributes = limited_span.events.first.attributes
+
+        _(attributes['exception.type']).must_equal('RuntimeError')
+        _(attributes['exception.message']).must_equal('repository failed')
+        _(attributes['exception.cause.count']).must_equal(0)
+        _(attributes.keys.grep(/exception\.cause\.\d/)).must_be_empty
+      end
+
+      it 'omits the cause chain when even the base attributes do not fit' do
+        limited_span_limits = SpanLimits.new(event_attribute_count_limit: 3)
+        limited_span = build_span(limited_span_limits)
+        limited_span.record_exception(wrapped_error, record_cause_chain: true)
+        attributes = limited_span.events.first.attributes
+
+        _(attributes['exception.type']).must_equal('RuntimeError')
+        _(attributes['exception.message']).must_equal('repository failed')
+        _(attributes.keys.grep(/exception\.cause/)).must_be_empty
+      end
+    end
+
+    def build_span(limits)
+      Span.new(context, Context.empty, OpenTelemetry::Trace::Span::INVALID, 'name', SpanKind::INTERNAL, nil, limits,
+               [], nil, nil, Time.now, nil, nil)
+    end
+
+    # top -> middle -> root, where each wrapper repeats the trailing frames of the
+    # exception it wraps, as happens when a wrapper is raised from inside a rescue.
+    def wrapped_error
+      @wrapped_error ||= begin
+        root = IOError.new('socket timed out')
+        root.set_backtrace(["app/db.rb:10:in 'connect'", "app/repo.rb:20:in 'fetch'", "app/app.rb:30:in 'call'"])
+        middle = ArgumentError.new('connection refused')
+        middle.define_singleton_method(:cause) { root }
+        middle.set_backtrace(["app/repo.rb:21:in 'fetch'", "app/repo.rb:20:in 'fetch'", "app/app.rb:30:in 'call'"])
+        outer = RuntimeError.new('repository failed')
+        outer.define_singleton_method(:cause) { middle }
+        outer.set_backtrace(["app/app.rb:35:in 'call'", "app/app.rb:30:in 'call'"])
+        outer
+      end
+    end
+
+    def build_wrapped_error(message)
+      root = ArgumentError.new('an inner message that is long enough to be truncated')
+      root.set_backtrace(["app/db.rb:10:in 'connect'", "app/db.rb:11:in 'retry'", "app/repo.rb:20:in 'fetch'"])
+      wrapper = RuntimeError.new(message)
+      wrapper.define_singleton_method(:cause) { root }
+      wrapper.set_backtrace(["app/repo.rb:21:in 'fetch'", "app/repo.rb:20:in 'fetch'"])
+      wrapper
+    end
+
+    # outer -> inner -> outer: the second link repeats the exception the walk
+    # started from, so recording it again would never terminate.
+    def cyclic_error
+      inner = RuntimeError.new('inner')
+      inner.set_backtrace(['app/app.rb:30:in `call`'])
+      outer = RuntimeError.new('outer')
+      outer.set_backtrace(['app/app.rb:31:in `call`'])
+      outer.define_singleton_method(:cause) { inner }
+      inner.define_singleton_method(:cause) { outer }
+      outer
+    end
   end
 
   describe '#status=' do

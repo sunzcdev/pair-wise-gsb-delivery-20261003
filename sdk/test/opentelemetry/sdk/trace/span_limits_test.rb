@@ -18,6 +18,23 @@ describe OpenTelemetry::SDK::Trace::SpanLimits do
       _(span_limits.event_attribute_count_limit).must_equal 128
       _(span_limits.event_attribute_length_limit).must_be_nil
       _(span_limits.link_attribute_count_limit).must_equal 128
+      _(span_limits.exception_cause_count_limit).must_equal 8
+      _(span_limits.exception_cause_length_limit).must_be_nil
+    end
+
+    it 'reflects exception cause overrides' do
+      span_limits = OpenTelemetry::SDK::Trace::SpanLimits.new(exception_cause_count_limit: 3,
+                                                              exception_cause_length_limit: 64)
+      _(span_limits.exception_cause_count_limit).must_equal 3
+      _(span_limits.exception_cause_length_limit).must_equal 64
+    end
+
+    it 'rejects a non-positive exception cause count limit' do
+      _(proc { OpenTelemetry::SDK::Trace::SpanLimits.new(exception_cause_count_limit: 0) }).must_raise(ArgumentError)
+    end
+
+    it 'rejects an exception cause length limit below 32' do
+      _(proc { OpenTelemetry::SDK::Trace::SpanLimits.new(exception_cause_length_limit: 31) }).must_raise(ArgumentError)
     end
 
     it 'prioritizes specific environment variables for attribute value length limits' do

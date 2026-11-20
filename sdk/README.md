@@ -81,6 +81,44 @@ end
 
 For additional examples, see the [examples on github][examples-github].
 
+## How do I record an exception's cause chain?
+
+`Span#record_exception` records the exception's type, message, and stacktrace as
+an `exception` event. Pass `record_cause_chain: true` to also record the Ruby
+`cause` chain, which is where a wrapped error usually keeps the first failure:
+
+```ruby
+tracer.in_span('request') do |span|
+  begin
+    handle_request
+  rescue StandardError => e
+    span.record_exception(e, record_cause_chain: true)
+    raise
+  end
+end
+```
+
+Each cause is recorded as a value snapshot under `exception.cause.<depth>.*`,
+where the recorded exception itself is depth 0. A cause carries its `type`,
+`depth`, `message`, the number of `shared_frames` it has in common with the
+exception wrapping it, and a `stacktrace` containing only the frames above that
+shared boundary, so frames already present on the wrapper are not repeated.
+
+`exception.cause.count` reports how many causes were recorded. When the chain
+could not be recorded in full, `exception.cause.truncated` says where it
+stopped: `cause_count_limit` (`SpanLimits#exception_cause_count_limit`),
+`length_limit` (`SpanLimits#exception_cause_length_limit`), `alias` (a repeated
+exception reference, pointed at by `exception.cause.<depth>.alias_of`),
+`attribute_count_limit` (the event attribute budget), or `error`. The limits can
+be configured like the other span limits:
+
+```ruby
+OpenTelemetry::SDK::Trace::SpanLimits.new(
+  exception_cause_count_limit: 8,
+  exception_cause_length_limit: 512
+)
+```
+
 ## How can I get involved?
 
 The `opentelemetry-sdk` gem source is [on github][repo-github], along with related gems including `opentelemetry-api`.

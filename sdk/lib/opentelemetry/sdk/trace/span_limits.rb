@@ -30,6 +30,14 @@ module OpenTelemetry
         # The global default max number of attributes per {OpenTelemetry::Trace::Link}.
         attr_reader :link_attribute_count_limit
 
+        # The global default max number of causes recorded by {Span#record_exception}
+        # when it records an exception's cause chain.
+        attr_reader :exception_cause_count_limit
+
+        # The global default max length of the cause chain snapshot recorded by
+        # {Span#record_exception}.
+        attr_reader :exception_cause_length_limit
+
         # Returns a {SpanLimits} with the desired values.
         #
         # @return [SpanLimits] with the desired values.
@@ -40,7 +48,9 @@ module OpenTelemetry
                        link_count_limit: Integer(OpenTelemetry::Common::Utilities.config_opt('OTEL_SPAN_LINK_COUNT_LIMIT', default: 128)),
                        event_attribute_count_limit: Integer(OpenTelemetry::Common::Utilities.config_opt('OTEL_EVENT_ATTRIBUTE_COUNT_LIMIT', default: 128)),
                        event_attribute_length_limit: OpenTelemetry::Common::Utilities.config_opt('OTEL_EVENT_ATTRIBUTE_VALUE_LENGTH_LIMIT', 'OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT'),
-                       link_attribute_count_limit: Integer(OpenTelemetry::Common::Utilities.config_opt('OTEL_LINK_ATTRIBUTE_COUNT_LIMIT', default: 128)))
+                       link_attribute_count_limit: Integer(OpenTelemetry::Common::Utilities.config_opt('OTEL_LINK_ATTRIBUTE_COUNT_LIMIT', default: 128)),
+                       exception_cause_count_limit: 8,
+                       exception_cause_length_limit: nil)
           raise ArgumentError, 'attribute_count_limit must be positive' unless attribute_count_limit.positive?
           raise ArgumentError, 'attribute_length_limit must not be less than 32' unless attribute_length_limit.nil? || Integer(attribute_length_limit) >= 32
           raise ArgumentError, 'event_count_limit must be positive' unless event_count_limit.positive?
@@ -48,6 +58,8 @@ module OpenTelemetry
           raise ArgumentError, 'event_attribute_count_limit must be positive' unless event_attribute_count_limit.positive?
           raise ArgumentError, 'event_attribute_length_limit must not be less than 32' unless event_attribute_length_limit.nil? || Integer(event_attribute_length_limit) >= 32
           raise ArgumentError, 'link_attribute_count_limit must be positive' unless link_attribute_count_limit.positive?
+          raise ArgumentError, 'exception_cause_count_limit must be positive' unless exception_cause_count_limit.positive?
+          raise ArgumentError, 'exception_cause_length_limit must not be less than 32' unless exception_cause_length_limit.nil? || Integer(exception_cause_length_limit) >= 32
 
           @attribute_count_limit = attribute_count_limit
           @attribute_length_limit = attribute_length_limit.nil? ? nil : Integer(attribute_length_limit)
@@ -56,6 +68,8 @@ module OpenTelemetry
           @event_attribute_count_limit = event_attribute_count_limit
           @event_attribute_length_limit = event_attribute_length_limit.nil? ? nil : Integer(event_attribute_length_limit)
           @link_attribute_count_limit = link_attribute_count_limit
+          @exception_cause_count_limit = exception_cause_count_limit
+          @exception_cause_length_limit = exception_cause_length_limit.nil? ? nil : Integer(exception_cause_length_limit)
         end
 
         # The default {SpanLimits}.

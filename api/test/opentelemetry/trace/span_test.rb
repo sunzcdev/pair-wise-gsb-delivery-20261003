@@ -67,6 +67,9 @@ describe OpenTelemetry::Trace::Span do
     it 'accepts attributes' do
       _(span.record_exception(StandardError.new('oops'), attributes: { 'foo' => 'bar' })).must_be_nil
     end
+    it 'accepts a record_cause_chain option' do
+      _(span.record_exception(StandardError.new('oops'), record_cause_chain: true)).must_be_nil
+    end
   end
 
   describe '#finish' do

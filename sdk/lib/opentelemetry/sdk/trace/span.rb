@@ -18,8 +18,9 @@ module OpenTelemetry
       class Span < OpenTelemetry::Trace::Span
         DEFAULT_STATUS = OpenTelemetry::Trace::Status.unset
         EMPTY_ATTRIBUTES = {}.freeze
+        BASE_EXCEPTION_ATTRIBUTE_COUNT = 3
 
-        private_constant :DEFAULT_STATUS, :EMPTY_ATTRIBUTES
+        private_constant :DEFAULT_STATUS, :EMPTY_ATTRIBUTES, :BASE_EXCEPTION_ATTRIBUTE_COUNT
 
         # The following readers are intended for the use of SpanProcessors and
         # should not be considered part of the public interface for instrumentation.
@@ -185,19 +186,37 @@ module OpenTelemetry
         # Record an exception during the execution of this span. Multiple exceptions
         # can be recorded on a span.
         #
+        # When `record_cause_chain` is true, the exception's `cause` chain is
+        # recorded alongside the event as a bounded value snapshot. Each recorded
+        # cause carries its depth (`exception.cause.<depth>.depth`, where the
+        # recorded exception itself is depth 0), its own frames, and the number of
+        # trailing frames it shares with the exception wrapping it
+        # (`exception.cause.<depth>.shared_frames`). Shared frames are not repeated
+        # in `exception.cause.<depth>.stacktrace`, so the frames recorded there
+        # locate the point where that cause diverged from its wrapper.
+        #
+        # `exception.cause.count` reports how many causes were recorded. When the
+        # chain could not be recorded in full, `exception.cause.truncated` explains
+        # where it stopped: a cause count limit, a message or stacktrace length
+        # limit, or an exception reference that was already recorded
+        # (`exception.cause.<depth>.alias_of` names the earlier depth).
+        #
         # @param [Exception] exception The exception to be recorded
         # @param [optional Hash{String => String, Numeric, Boolean, Array<String, Numeric, Boolean>}]
         #   attributes One or more key:value pairs, where the keys must be
         #   strings and the values may be (array of) string, boolean or numeric
         #   type.
+        # @param [optional Boolean] record_cause_chain Whether to record the
+        #   exception's cause chain. Defaults to false.
         #
         # @return [void]
-        def record_exception(exception, attributes: nil)
+        def record_exception(exception, attributes: nil, record_cause_chain: false)
           event_attributes = {
             'exception.type' => exception.class.to_s,
             'exception.message' => exception.message,
-            'exception.stacktrace' => exception.full_message(highlight: false, order: :top).encode('UTF-8', invalid: :replace, undef: :replace, replace: '�')
+            'exception.stacktrace' => utf8_scrub(exception.full_message(highlight: false, order: :top))
           }
+          event_attributes.merge!(cause_chain_attributes(exception, attributes&.size || 0)) if record_cause_chain
           event_attributes.merge!(attributes) unless attributes.nil?
           add_event('exception', attributes: event_attributes)
         end
@@ -374,6 +393,160 @@ module OpenTelemetry
         attr_reader :monotonic_start_timestamp, :realtime_start_timestamp
 
         private
+
+        # Attributes describing the `cause` chain of an exception, bounded by the
+        # span's exception cause limits and by the event attribute budget.
+        def cause_chain_attributes(exception, extra_attribute_count)
+          # Space left for the chain once the base exception attributes and the
+          # caller's attributes are accounted for.
+          remaining = @span_limits.event_attribute_count_limit - BASE_EXCEPTION_ATTRIBUTE_COUNT - extra_attribute_count
+          walk = { attributes: {}, truncated: [], seen: [exception], budget: remaining - 2, bookkeeping: bookkeeping_slots(remaining) }
+          walk_cause_chain(walk, exception) if remaining >= 1
+          finish_cause_chain(walk)
+        rescue StandardError => e
+          OpenTelemetry.handle_error(exception: e, message: 'error recording exception cause chain')
+          # Keep whatever was gathered before the failure; the marker explains
+          # that the truncation was unexpected rather than a configured limit.
+          walk ||= { attributes: {}, truncated: [], seen: nil, bookkeeping: %i[count truncated] }
+          walk[:truncated] << 'error'
+          finish_cause_chain(walk)
+        end
+
+        def walk_cause_chain(walk, current)
+          while (cause = current.cause)
+            depth = walk[:seen].size
+            # A cause already recorded at an earlier depth means the chain loops;
+            # point at the earlier depth instead of walking it again.
+            if (aliased_depth = aliased_depth_of(walk[:seen], cause))
+              walk[:truncated] << 'alias'
+              add_aliased_cause(walk, cause, depth, aliased_depth)
+              return
+            end
+            if depth > @span_limits.exception_cause_count_limit
+              walk[:truncated] << 'cause_count_limit'
+              return
+            end
+            unless record_cause(walk, cause, depth, current)
+              walk[:truncated] << 'attribute_count_limit'
+              return
+            end
+
+            current = cause
+          end
+        end
+
+        # Records one cause only when its whole description fits the remaining
+        # budget; a cause that can say less than its type and message is not
+        # worth counting as recorded.
+        def record_cause(walk, cause, depth, wrapper)
+          values, length_truncated = cause_attributes(cause, depth, wrapper)
+          return false if walk[:budget] < values.size
+
+          walk[:attributes].merge!(values)
+          walk[:budget] -= values.size
+          walk[:seen] << cause
+          walk[:truncated] << 'length_limit' unless length_truncated.empty?
+          true
+        end
+
+        def finish_cause_chain(walk)
+          slots = walk[:bookkeeping]
+          # `exception.cause.count` outranks the truncation marker: a reader
+          # almost always wants to know how many causes were captured.
+          walk[:attributes]['exception.cause.count'] = [walk[:seen].size - 1, 0].max if walk[:seen] && slots.include?(:count)
+          if slots.include?(:truncated) && !walk[:truncated].empty?
+            walk[:attributes]['exception.cause.truncated'] = walk[:truncated].uniq.join(',')
+          end
+          walk[:attributes]
+        end
+
+        def bookkeeping_slots(remaining)
+          # Reserve the bookkeeping attributes last, so a very tight budget still
+          # reports how many causes were captured even when nothing else fits.
+          case remaining
+          when 0 then []
+          when 1 then [:count]
+          else %i[count truncated]
+          end
+        end
+
+        def aliased_depth_of(seen, cause)
+          seen.index { |seen_exception| seen_exception.equal?(cause) }
+        end
+
+        def add_aliased_cause(walk, cause, depth, aliased_depth)
+          # The pointer back to the earlier depth is what a reader needs most, so
+          # it is recorded before the descriptive fields, which are dropped when
+          # the event attribute budget cannot fit them.
+          fields = [['alias_of', aliased_depth], ['depth', depth], ['type', cause.class.to_s]]
+          recorded = fields.first([walk[:budget], 0].max).to_h { |name, value| [cause_key(depth, name), value] }
+          walk[:truncated] << 'attribute_count_limit' if recorded.size < fields.size
+          walk[:attributes].merge!(recorded)
+          walk[:budget] -= recorded.size
+        end
+
+        # Builds the attributes describing one cause. Returns the attributes and
+        # which values a length limit shortened.
+        def cause_attributes(cause, depth, wrapper)
+          length_truncated = []
+          fields = cause_fields(cause, depth, wrapper, length_truncated)
+          fields << ['truncated', length_truncated.uniq.join(',')] unless length_truncated.empty?
+          [fields.to_h { |name, value| [cause_key(depth, name), value] }, length_truncated]
+        end
+
+        def cause_fields(cause, depth, wrapper, length_truncated)
+          message = cause_message(cause, length_truncated)
+          backtrace = cause.backtrace || []
+          shared_frames = shared_frame_count(backtrace, wrapper.backtrace || [])
+          # The boundary starts where the two exceptions share frames, so the
+          # recorded prefix stops exactly where the wrapping exception takes over.
+          stacktrace = cause_stacktrace(backtrace.first(backtrace.size - shared_frames), length_truncated)
+
+          fields = [['type', cause.class.to_s], ['depth', depth], ['message', message], ['shared_frames', shared_frames]]
+          fields << ['stacktrace', stacktrace] unless stacktrace.empty?
+          fields
+        end
+
+        def cause_message(cause, length_truncated)
+          message = utf8_scrub(cause.message.to_s)
+          return message unless over_length_limit?(message)
+
+          length_truncated << 'message'
+          OpenTelemetry::Common::Utilities.truncate(message, cause_length_limit)
+        end
+
+        def cause_stacktrace(frames, length_truncated)
+          stacktrace = frames.map { |frame| utf8_scrub(frame.to_s) }.join("\n")
+          return stacktrace unless over_length_limit?(stacktrace)
+
+          length_truncated << 'stacktrace'
+          OpenTelemetry::Common::Utilities.truncate(stacktrace, cause_length_limit)
+        end
+
+        def over_length_limit?(value)
+          !cause_length_limit.nil? && value.size > cause_length_limit
+        end
+
+        def cause_key(depth, name)
+          "exception.cause.#{depth}.#{name}"
+        end
+
+        def shared_frame_count(frames, wrapper_frames)
+          limit = [frames.size, wrapper_frames.size].min
+          count = 0
+          count += 1 while count < limit && frames[-1 - count] == wrapper_frames[-1 - count]
+          count
+        end
+
+        def cause_length_limit
+          # Cause values pass through the same truncation as any other event
+          # attribute, so the tighter limit is the one worth reporting against.
+          [@span_limits.exception_cause_length_limit, @span_limits.event_attribute_length_limit].compact.min
+        end
+
+        def utf8_scrub(string)
+          string.encode('UTF-8', invalid: :replace, undef: :replace, replace: '�')
+        end
 
         def validated_attributes(attrs)
           return attrs if Internal.valid_attributes?(name, 'span', attrs)

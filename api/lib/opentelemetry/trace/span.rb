@@ -131,9 +131,12 @@ module OpenTelemetry
       #   attributes One or more key:value pairs, where the keys must be
       #   strings and the values may be (array of) string, boolean or numeric
       #   type.
+      # @param [optional Boolean] record_cause_chain Whether an implementation
+      #   should record the exception's cause chain. Implementations may ignore
+      #   this option.
       #
       # @return [void]
-      def record_exception(exception, attributes: nil); end
+      def record_exception(exception, attributes: nil, record_cause_chain: false); end
 
       # Sets the Status to the Span
       #
