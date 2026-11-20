@@ -74,6 +74,8 @@ GRACE_PERIOD_MINOR: Final[timedelta] = timedelta(days=28)  # simplint: ignore[mo
 UPDATE_PERIOD: Final[timedelta] = timedelta(days=14)  # simplint: ignore[module-variable-prefix]  # existing name
 #: An update that started longer ago than this is considered aborted.
 UPDATE_ABORTED_DELAY: Final[timedelta] = timedelta(hours=1)  # simplint: ignore[module-variable-prefix]  # existing name
+#: Delay before a failed update check is retried; each consecutive failure doubles it, up to the update period.
+UPDATE_FAILURE_BACKOFF: Final[timedelta] = timedelta(hours=1)  # simplint: ignore[module-variable-prefix]  # existing name
 
 
 # from_bundle passes these inputs through, and the update needs each one
@@ -207,16 +209,24 @@ class UpdateLog:
     :param completed: when the last update completed, ``None`` when it never did
     :param versions: the versions found
     :param periodic: ``True`` when the update was periodic, ``None`` when unknown
+    :param failures: when recent periodic updates failed, oldest first; kept apart from ``completed`` so a failure
+        never moves the last valid check
 
     """
 
     def __init__(
-        self, started: datetime | None, completed: datetime | None, versions: list[NewVersion], periodic: bool | None
+        self,
+        started: datetime | None,
+        completed: datetime | None,
+        versions: list[NewVersion],
+        periodic: bool | None,
+        failures: list[datetime] | None = None,
     ) -> None:
         self.started = started
         self.completed = completed
         self.versions = versions
         self.periodic = periodic
+        self.failures = [] if failures is None else failures
 
     @classmethod
     def from_app_data(cls, app_data: AppData, distribution: str, for_py_version: str) -> UpdateLog:
@@ -263,17 +273,31 @@ class UpdateLog:
             [NewVersion.from_dict(v) for v in dictionary.get("versions", [])],  # ty: ignore[not-iterable]
             # the log is parsed JSON, typed object, so the value is not narrowed
             dictionary.get("periodic"),  # ty: ignore[invalid-argument-type]
+            # the log is parsed JSON, typed object, so the list is not narrowed
+            [_load_failure_datetime(f) for f in dictionary.get("failures", [])],  # ty: ignore[not-iterable]
         )
 
     @property
     def needs_update(self) -> bool:
-        """Whether an update is due: none has completed, or the last completion is older than the update period."""
+        """Whether an update is due: none has completed, or the last completion is older than the update period.
+
+        A recent failure holds the check off for a backoff that grows with each consecutive failure, so jobs sharing
+        one application data folder do not keep re-issuing a check that keeps failing.
+        """
         now = datetime.now(tz=timezone.utc)
+        if self._in_failure_backoff(now):
+            return False
         if self.completed is None:  # never completed
             return self._check_start(now)
         if now - self.completed <= UPDATE_PERIOD:
             return False
         return self._check_start(now)
+
+    def _in_failure_backoff(self, now: datetime) -> bool:
+        if not self.failures:
+            return False
+        delay = min(UPDATE_FAILURE_BACKOFF * 2 ** (len(self.failures) - 1), UPDATE_PERIOD)
+        return now - self.failures[-1] < delay
 
     def _check_start(self, now: datetime) -> bool:
         return self.started is None or now - self.started > UPDATE_ABORTED_DELAY
@@ -289,6 +313,7 @@ class UpdateLog:
             "completed": dump_datetime(self.completed),
             "periodic": self.periodic,
             "versions": [r.to_dict() for r in self.versions],
+            "failures": [dump_datetime(f) for f in self.failures],
         }
 
 
@@ -301,6 +326,15 @@ def load_datetime(value: str | None) -> datetime | None:
 
     """
     return None if value is None else datetime.strptime(value, DATETIME_FMT).replace(tzinfo=timezone.utc)
+
+
+def _load_failure_datetime(value: str | None) -> datetime:
+    # a null failure entry is malformed, so it drops the log like an unparsable one does
+    result = load_datetime(value)
+    if result is None:
+        msg = "a failure entry of the update log must be a datetime"
+        raise ValueError(msg)
+    return result
 
 
 # source is reassigned after creation, so instances must not be hashed
@@ -623,9 +657,33 @@ def do_update(  # ruff:ignore[too-many-arguments]
     versions = None
     try:
         versions = _run_do_update(app_data, distribution, embed_filename, for_py_version, periodic, search_dirs)
+    # any failure of a periodic update is recorded before it propagates, so the next check backs off
+    except Exception:  # ruff:ignore[blind-except]
+        if periodic:
+            _record_failed_update(app_data, distribution, for_py_version)
+        raise
     finally:
         LOGGER.debug("done %s %s with %s", distribution, for_py_version, versions)
     return versions
+
+
+def _record_failed_update(app_data: str | AppData, distribution: str, for_py_version: str) -> None:
+    """Record that a periodic update failed, keeping the versions the last valid check found usable.
+
+    :param app_data: the application data folder, or its path
+    :param distribution: the distribution name
+    :param for_py_version: the Python version the update was for
+
+    """
+    try:
+        folder = AppDataDiskFolder(app_data) if isinstance(app_data, str) else app_data
+        u_log = UpdateLog.from_app_data(folder, distribution, for_py_version)
+        u_log.failures.append(datetime.now(tz=timezone.utc))
+        folder.embed_update_log(distribution, for_py_version).write(u_log.to_dict())
+    # a broken store must not mask the update failure being recorded
+    except Exception as exception:  # ruff:ignore[blind-except]
+        # the log line carries the exception repr, a traceback adds nothing
+        LOGGER.warning("could not record the failed periodic update of %s because %r", distribution, exception)  # ruff:ignore[error-instead-of-exception]
 
 
 # one update pass; the download comes first, then the log bookkeeping records what it found
@@ -674,6 +732,8 @@ def _run_do_update(  # ruff:ignore[too-many-arguments]
     other_versions = [version for version in other_versions if version.filename not in filenames]
     u_log.versions = versions + update_versions + other_versions
     u_log.completed = datetime.now(tz=timezone.utc)
+    # a completed check is valid again, so the failure backoff starts over
+    u_log.failures = []
     app_data.embed_update_log(distribution, for_py_version).write(u_log.to_dict())
     return versions
 

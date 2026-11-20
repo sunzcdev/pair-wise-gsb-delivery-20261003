@@ -322,6 +322,7 @@ def test_get_wheel_download_cached(
                 "source": "download",
             },
         ],
+        "failures": [],
     }
 
 

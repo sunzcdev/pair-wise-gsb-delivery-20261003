@@ -615,6 +615,7 @@ def test_do_update_first(tmp_path, mocker, time_freeze) -> None:
         "completed": dump_datetime(_UP_NOW),
         "periodic": True,
         "versions": [e.to_dict() for e in expected],
+        "failures": [],
     }
 
 
@@ -666,6 +667,7 @@ def test_do_update_skip_already_done(tmp_path, mocker, time_freeze) -> None:
                 "source": "manual",  # changed from "periodic" to "manual"
             },
         ],
+        "failures": [],
     }
 
 
@@ -1239,3 +1241,163 @@ def test_do_update_finding_nothing_new_skips_yank_check(
 
     assert [v.filename for v in UpdateLog.from_app_data(app_data, "pip", "3.9").versions] == [logged.name]
     index.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("failure_ages", "expected"),
+    [
+        pytest.param([], True, id="no-failures"),
+        pytest.param([timedelta(minutes=59)], False, id="first-failure-within-backoff"),
+        pytest.param([timedelta(hours=1)], True, id="first-failure-backoff-elapsed"),
+        pytest.param(
+            [timedelta(days=3), timedelta(hours=1, minutes=59)], False, id="second-failure-doubles-backoff"
+        ),
+        pytest.param([timedelta(days=3), timedelta(hours=2)], True, id="second-failure-backoff-elapsed"),
+        pytest.param([timedelta(days=30)] * 9 + [timedelta(days=13)], False, id="backoff-capped-at-update-period"),
+        pytest.param([timedelta(days=30)] * 9 + [timedelta(days=14)], True, id="capped-backoff-elapsed"),
+    ],
+)
+@pytest.mark.usefixtures("periodic_update_clock")
+def test_update_log_failure_backoff(failure_ages: list[timedelta], expected: bool) -> None:
+    overdue: Final = _UP_NOW - timedelta(days=14, seconds=1)
+    u_log: Final = UpdateLog(
+        started=overdue,
+        completed=overdue,
+        versions=[],
+        periodic=True,
+        failures=[_UP_NOW - age for age in failure_ages],
+    )
+
+    assert u_log.needs_update == expected
+
+
+def test_do_update_records_failure_and_keeps_usable_versions(
+    app_data: AppDataDiskFolder, mocker: MockerFixture, time_freeze: Callable[[datetime], None]
+) -> None:
+    time_freeze(_UP_NOW)
+    current: Final = get_embed_wheel("pip", "3.9")
+    assert current is not None
+    released: Final = _UP_NOW - timedelta(days=40)
+    logged: Final = NewVersion(Path(wheel_path(current, (0, 1))).name, released, released, "periodic")
+    completed: Final = _UP_NOW - timedelta(days=30)
+    app_data.embed_update_log("pip", "3.9").write(UpdateLog(completed, completed, [logged], True).to_dict())
+    mocker.patch(
+        "virtualenv.seed.wheels.acquire.download_wheel",
+        autospec=True,
+        side_effect=subprocess.CalledProcessError(1, ["pip", "download"], output="", stderr="index unreachable"),
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        do_update("pip", "3.9", str(current.path), app_data, [], True)
+
+    # the failure is remembered apart from the last valid check, and the versions it found stay usable
+    assert app_data.embed_update_log("pip", "3.9").read() == UpdateLog(
+        completed, completed, [logged], True, [_UP_NOW]
+    ).to_dict()
+    assert not UpdateLog.from_app_data(app_data, "pip", "3.9").needs_update
+    result: Final = periodic_update("pip", None, "3.9", current, [], app_data, False, {})
+    assert result is not None
+    assert result.name == logged.filename
+
+
+def test_do_update_manual_failure_leaves_no_backoff(
+    app_data: AppDataDiskFolder, mocker: MockerFixture, time_freeze: Callable[[datetime], None]
+) -> None:
+    time_freeze(_UP_NOW)
+    current: Final = get_embed_wheel("pip", "3.9")
+    assert current is not None
+    completed: Final = _UP_NOW - timedelta(days=30)
+    app_data.embed_update_log("pip", "3.9").write(UpdateLog(completed, completed, [], False).to_dict())
+    mocker.patch(
+        "virtualenv.seed.wheels.acquire.download_wheel",
+        autospec=True,
+        side_effect=subprocess.CalledProcessError(1, ["pip", "download"], output="", stderr="index unreachable"),
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        do_update("pip", "3.9", str(current.path), app_data, [], False)
+
+    # a manual upgrade fails in front of the user, so it does not throttle later checks
+    assert app_data.embed_update_log("pip", "3.9").read() == UpdateLog(completed, completed, [], False).to_dict()
+
+
+def test_do_update_success_clears_failure_backoff(
+    app_data: AppDataDiskFolder, mocker: MockerFixture, time_freeze: Callable[[datetime], None]
+) -> None:
+    time_freeze(_UP_NOW)
+    current: Final = get_embed_wheel("pip", "3.9")
+    assert current is not None
+    completed: Final = _UP_NOW - timedelta(days=30)
+    failures: Final = [_UP_NOW - timedelta(hours=3), _UP_NOW - timedelta(hours=1)]
+    app_data.embed_update_log("pip", "3.9").write(UpdateLog(completed, completed, [], True, failures).to_dict())
+    newer: Final = Wheel(Path(wheel_path(current, (0, 1, 1))))
+    mocker.patch("virtualenv.seed.wheels.acquire.download_wheel", autospec=True, return_value=newer)
+    _fake_index(mocker, set(), {newer.name: _UP_NOW - timedelta(days=40)})
+
+    versions: Final = do_update("pip", "3.9", str(current.path), app_data, [], True)
+
+    assert [v.filename for v in versions] == [newer.name]
+    log: Final = UpdateLog.from_app_data(app_data, "pip", "3.9")
+    assert (log.failures, log.completed) == ([], _UP_NOW)
+
+
+def test_periodic_update_consecutive_creations_backoff_and_recovery(
+    app_data: AppDataDiskFolder, mocker: MockerFixture, time_freeze: Callable[[datetime], None]
+) -> None:
+    current: Final = get_embed_wheel("pip", "3.9")
+    assert current is not None
+    released: Final = _UP_NOW - timedelta(days=40)
+    usable: Final = NewVersion(Path(wheel_path(current, (0, 1, 0))).name, released, released, "periodic")
+    completed: Final = _UP_NOW - timedelta(days=30)
+    app_data.embed_update_log("pip", "3.9").write(UpdateLog(completed, completed, [usable], True).to_dict())
+    newer: Final = Wheel(Path(wheel_path(current, (0, 1, 1))))
+    index_up = False
+
+    def _download_wheel(**_kwargs):  # the index stand-in: unreachable until the test brings it back
+        if not index_up:
+            raise subprocess.CalledProcessError(1, ["pip", "download"], output="", stderr="index unreachable")
+        return newer
+
+    mocker.patch("virtualenv.seed.wheels.acquire.download_wheel", autospec=True, side_effect=_download_wheel)
+    _fake_index(mocker, set(), {newer.name: released})
+
+    triggered: Final[list[datetime]] = []
+
+    # the background process runs inline here, so the test sees which creations triggered an update
+    def _trigger_update(distribution, for_py_version, wheel, search_dirs, target, env, periodic):  # ruff:ignore[too-many-arguments]  # the fake takes the same inputs as trigger_update
+        triggered.append(datetime.now(tz=timezone.utc))
+        try:
+            do_update(
+                distribution, for_py_version, None if wheel is None else str(wheel.path), target, search_dirs, periodic
+            )
+        except subprocess.CalledProcessError:
+            pass  # the detached process just exits, the creating process only sees the log it leaves
+
+    mocker.patch("virtualenv.seed.wheels.periodic_update.trigger_update", autospec=True, side_effect=_trigger_update)
+
+    def _create() -> str:
+        wheel: Final = periodic_update("pip", None, "3.9", current, [], app_data, True, {})
+        assert wheel is not None
+        return wheel.name
+
+    first: Final = _UP_NOW  # the first check fails
+    second: Final = _UP_NOW + timedelta(hours=1, seconds=1)  # the retry fails too, doubling the backoff
+    third: Final = _UP_NOW + timedelta(hours=3, seconds=2)  # the index is back, the check succeeds
+    moments: Final = [
+        first,
+        _UP_NOW + timedelta(minutes=30),  # within the backoff of the first failure
+        second,
+        _UP_NOW + timedelta(hours=2),  # within the doubled backoff
+        third,
+        _UP_NOW + timedelta(hours=4, seconds=4),  # no new check due, the CI grace period of the find has passed
+    ]
+    seeded: Final[list[str]] = []
+    for moment in moments:
+        if moment == third:
+            index_up = True
+        time_freeze(moment)
+        seeded.append(_create())
+
+    assert triggered == [first, second, third]
+    # the failures keep seeding the last usable wheel, the recovery picks the new one once its grace periods pass
+    assert seeded == [usable.filename] * 5 + [newer.name]
