@@ -31,6 +31,20 @@ class Roda
     # (once before the error handler is called and once after) if
     # later after processing raises an exception.
     #
+    # In the case where routing already produced a response before the
+    # exception was raised (for example, an after hook raised after the
+    # routing tree used r.halt with a custom body), the body of that
+    # abandoned response is closed if it responds to +close+, so
+    # resources are not leaked.  The abandoned body is closed exactly
+    # once, and the status and headers set for the abandoned response
+    # are not used for the error response.
+    #
+    # If the error handler itself raises an exception, the error handler
+    # is not called again for that exception.  On Ruby 2.1+, the raised
+    # exception will have the original exception as its +cause+, so
+    # both the original exception and the error handler's exception can
+    # be located.
+    #
     # By default, this plugin handles StandardError and ScriptError.
     # To override the exception classes it will handle, pass a +classes+
     # argument to the plugin:
@@ -73,7 +87,7 @@ class Roda
             _roda_after(res)
           end
         rescue *self.class.error_handler_classes => e
-          _handle_error(e)
+          _handle_error(e, res)
         end
 
         # If an error occurs, set the response status to 500 and call
@@ -85,7 +99,7 @@ class Roda
             _roda_after(res)
           end
         rescue *self.class.error_handler_classes => e
-          _handle_error(e)
+          _handle_error(e, res)
         end
 
         private
@@ -98,11 +112,43 @@ class Roda
         # Handle the given exception using handle_error, using a default status
         # of 500.  Run after hooks on the rack response, but if any error occurs
         # when doing so, log the error using rack.errors and return the response.
-        def _handle_error(e)
+        #
+        # If an exception is raised during after processing, res is the rack
+        # response that routing produced before the exception was raised.  That
+        # response is abandoned, since the error handler returns a new response.
+        # Close the abandoned response's body if it responds to close, so
+        # resources used by the body are released.  The abandoned body is only
+        # closed here, and since the abandoned rack response is never returned
+        # to the caller, it will not be closed a second time.
+        #
+        # The response object is reset before calling the error handler, so the
+        # abandoned response's status and headers are not used for the error
+        # response.  initialize resets the headers and body, and the status is
+        # explicitly set to 500 below.
+        def _handle_error(e, res=nil)
+          if res && (body = res[2]) && body.respond_to?(:close)
+            body.close
+          end
+
           res = @_response
           res.send(:initialize)
           res.status = 500
-          res = _roda_handle_route{handle_error(e)}
+
+          begin
+            res = _roda_handle_route{handle_error(e)}
+          rescue Exception => e2
+            # The error handler raised an exception.  Do not call the error
+            # handler again for this exception, to avoid an infinite loop.
+            # On Ruby 2.1+, if the raised exception does not already have a
+            # cause, set its cause to the original exception, so the original
+            # exception and the exception raised by the error handler can both
+            # be located.
+            if !e2.equal?(e) && e2.respond_to?(:cause) && e2.cause.nil? && !e2.frozen?
+              raise e2, cause: e
+            end
+            raise
+          end
+
           begin
             _roda_after(res)
           rescue => e2
