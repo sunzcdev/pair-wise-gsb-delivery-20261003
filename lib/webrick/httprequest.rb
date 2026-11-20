@@ -172,6 +172,17 @@ module WEBrick
       @accept_language = []
       @body = +""
 
+      # Single decoded copy of the entity body.  Both #body and #body_reader
+      # consume from this buffer, so the socket is read exactly once even when
+      # a hook peeks at a prefix before handing the request to someone else.
+      @body_data = +"".b
+      @body_pos = 0
+      @body_complete = false
+      @body_error = nil
+      @body_mode = nil
+      @chunk_remaining = nil
+      @body_chunked = false
+
       @addr = []
       @peeraddr = []
       @attributes = {}
@@ -257,41 +268,106 @@ module WEBrick
 
     ##
     # Returns the request body.
+    #
+    # Without arguments the body is read from the current position of the
+    # body stream.  If a request hook already consumed a prefix through
+    # #body_reader or #readpartial, only the remainder is returned, so the
+    # hook's bytes and this call's bytes together reconstruct the entity
+    # body exactly once.
+    #
+    # Pass <tt>from: :start</tt> when the caller explicitly wants the whole
+    # entity body from byte 0, replaying whatever a previous consumer already
+    # took.  This is the handoff used by forwarders that must reproduce the
+    # full body even though a hook inspected a prefix.
+    #
+    # When a block is given the chunks are yielded as they become available
+    # and nil is returned.
 
-    def body(&block) # :yields: body_chunk
-      block ||= Proc.new{|chunk| @body << chunk }
-      read_body(@socket, block)
-      @body.empty? ? nil : @body
+    def body(from: :current, &block) # :yields: body_chunk
+      rewind_body if from == :start
+      if block
+        while chunk = body_chunk
+          block.call(chunk)
+        end
+        nil
+      else
+        while chunk = body_chunk
+          @body << chunk
+        end
+        @body.empty? ? nil : @body
+      end
     end
 
     ##
     # Prepares the HTTPRequest object for use as the
-    # source for IO.copy_stream
+    # source for IO.copy_stream.
+    #
+    # Like #body, the reader starts at the current position unless
+    # <tt>from: :start</tt> is given, in which case the whole entity body is
+    # replayed from the beginning.
 
-    def body_reader
-      @body_tmp = []
-      @body_rd = Fiber.new do
-        body do |buf|
-          @body_tmp << buf
-          Fiber.yield
-        end
-      end
-      @body_rd.resume # grab the first chunk and yield
+    def body_reader(from: :current)
+      rewind_body if from == :start
       self
     end
 
     # for IO.copy_stream.
     def readpartial(size, buf = ''.b) # :nodoc
-      res = @body_tmp.shift or raise EOFError, 'end of file reached'
-      if res.length > size
-        @body_tmp.unshift(res[size..-1])
-        res = res[0..size - 1]
-      end
-      buf.replace(res)
-      res.clear
-      # get more chunks - check alive? because we can take a partial chunk
-      @body_rd.resume if @body_rd.alive?
+      return buf.clear if size <= 0
+      chunk = body_chunk(size) or raise EOFError, 'end of file reached'
+      buf.replace(chunk)
       buf
+    end
+
+    ##
+    # Moves the body stream back to the beginning of the entity body so the
+    # next #body or #body_reader call sees the whole request body again.
+    # Bytes already decoded from the socket are replayed from memory.
+
+    def rewind_body
+      @body_pos = 0
+      @body = +""
+      self
+    end
+
+    ##
+    # Number of entity body bytes decoded from the socket so far.
+
+    def body_bytes_read
+      @body_data.bytesize
+    end
+
+    ##
+    # Number of entity body bytes handed to #body, #body_reader or
+    # #readpartial so far.
+
+    def body_bytes_consumed
+      @body_pos
+    end
+
+    ##
+    # Total size of the entity body, or nil while it is still incomplete.
+    # A body that failed to decode has no reliable length and also returns nil.
+
+    def body_length
+      @body_complete && !@body_error ? @body_data.bytesize : nil
+    end
+
+    ##
+    # True once the whole entity body (including chunked trailers) has been
+    # decoded from the socket.
+
+    def body_complete?
+      @body_complete
+    end
+
+    ##
+    # True when the request body arrived with chunked transfer-encoding.
+    # Unlike the deleted +transfer-encoding+ header after decoding, this
+    # stays set so a forwarder can choose how to re-frame the upstream body.
+
+    def chunked_body?
+      @body_chunked
     end
 
     ##
@@ -388,7 +464,13 @@ module WEBrick
       ret = @request_line.dup
       @raw_header.each{|line| ret << line }
       ret << CRLF
-      ret << body if body
+      # Render the full entity body without disturbing the offset (or the
+      # accumulated #body buffer) a caller may still be reading from.
+      pos, saved = @body_pos, @body
+      if data = body(from: :start)
+        ret << data
+      end
+      @body_pos, @body = pos, saved
       ret
     end
 
@@ -397,7 +479,7 @@ module WEBrick
 
     def fixup() # :nodoc:
       begin
-        body{|chunk| }   # read remaining body
+        body{|chunk| }   # read remaining body from the current offset
       rescue HTTPStatus::Error => ex
         @logger.error("HTTPRequest#fixup: #{ex.class} occurred.")
         @keep_alive = false
@@ -405,6 +487,9 @@ module WEBrick
         @logger.error(ex)
         @keep_alive = false
       end
+      # A body that could not be fully decoded must not silently shift the
+      # framing of the next request on this connection.
+      @keep_alive = false if @body_error
     end
 
     # This method provides the metavariables defined by the revision 3
@@ -576,30 +661,156 @@ module WEBrick
 
     def read_body(socket, block)
       return unless socket
-      if tc = self['transfer-encoding']
-        if self['content-length']
-          raise HTTPStatus::BadRequest, "request with both transfer-encoding and content-length, possible request smuggling"
-        end
-
-        case tc
-        when /\Achunked\z/io then read_chunked(socket, block)
-        else raise HTTPStatus::NotImplemented, "Transfer-Encoding: #{tc}."
-        end
-      elsif self['content-length'] || @remaining_size
-        @remaining_size ||= self['content-length'].to_i
-        while @remaining_size > 0
-          sz = [@buffer_size, @remaining_size].min
-          break unless buf = read_data(socket, sz)
-          @remaining_size -= buf.bytesize
-          block.call(buf)
-        end
-        if @remaining_size > 0 && @socket.eof?
-          raise HTTPStatus::BadRequest, "invalid body size."
-        end
-      elsif BODY_CONTAINABLE_METHODS.member?(@request_method)
-        raise HTTPStatus::LengthRequired
+      @socket = socket
+      while chunk = body_chunk
+        block.call(chunk)
       end
       return @body
+    end
+
+    # Returns the next +size+ bytes of the entity body starting at the current
+    # offset, or nil at the end of the body.
+    #
+    # The entity body is decoded from the socket only once; every requested
+    # range is served from @body_data, so a later #body (or a request on the
+    # same keep-alive connection after #fixup) never re-reads socket bytes
+    # that belong to this request.  Decoding errors are kept in @body_error so
+    # that consumers which stop early still see the failure when they reach
+    # the end of what could be decoded.
+    def body_chunk(size = @buffer_size)
+      bytes = read_body_bytes(size)
+      bytes unless bytes.nil? || bytes.empty?
+    end
+
+    def read_body_bytes(size)
+      need = @body_pos + size
+      while @body_data.bytesize < need && !@body_complete
+        break if @body_error
+        begin
+          break unless fill_body_buffer(@socket)
+        rescue StandardError => ex
+          # Serve the bytes that were decoded before the failure; the error is
+          # re-raised once the consumer reaches the end of them.
+          @body_error ||= ex
+          @body_complete = true
+          break
+        end
+      end
+      available = @body_data.bytesize - @body_pos
+      if available <= 0
+        raise @body_error if @body_error
+        return nil
+      end
+      chunk = @body_data.byteslice(@body_pos, [size, available].min)
+      @body_pos += chunk.bytesize
+      chunk
+    end
+
+    # Reads one more piece of the entity body from +socket+ into @body_data and
+    # returns true when the buffer grew.  Chunked framing is decoded
+    # incrementally so a hook can stop in the middle of a chunk and the next
+    # consumer continues from the same offset.
+    def fill_body_buffer(socket)
+      before = @body_data.bytesize
+      unless @body_mode
+        if socket.nil?
+          @body_mode = :none
+          @body_complete = true
+          return false
+        end
+        if tc = self['transfer-encoding']
+          if self['content-length']
+            raise HTTPStatus::BadRequest, "request with both transfer-encoding and content-length, possible request smuggling"
+          end
+          unless /\Achunked\z/io =~ tc
+            raise HTTPStatus::NotImplemented, "Transfer-Encoding: #{tc}."
+          end
+          @body_mode = :chunked
+          @chunk_remaining = nil
+          @body_chunked = true
+        elsif self['content-length'] || @remaining_size
+          @body_mode = :length
+          @remaining_size ||= self['content-length'].to_i
+        elsif BODY_CONTAINABLE_METHODS.member?(@request_method)
+          raise HTTPStatus::LengthRequired
+        else
+          @body_mode = :none
+          @body_complete = true
+          return false
+        end
+      end
+
+      begin
+        case @body_mode
+        when :none
+          @body_complete = true
+        when :length
+          if @remaining_size <= 0
+            @body_complete = true
+            return false
+          end
+          sz = [@buffer_size, @remaining_size].min
+          buf = read_data(socket, sz)
+          if buf.nil? || buf.empty?
+            # A nil read without EOF means the peer sent nothing more yet;
+            # leave the request readable instead of silently truncating.
+            @body_complete = true if socket_eof?(socket)
+            if @remaining_size > 0 && @body_complete
+              raise HTTPStatus::BadRequest, "invalid body size."
+            end
+            return false
+          end
+          @remaining_size -= buf.bytesize
+          @body_data << buf
+        when :chunked
+          fill_chunked_buffer(socket)
+        end
+      rescue StandardError => ex
+        # Keep the failure so consumers reach it after the bytes that could be
+        # decoded, and so #fixup can refuse to reuse the connection.
+        @body_error ||= ex
+        @body_complete = true
+        raise ex
+      end
+
+      @body_data.bytesize > before
+    end
+
+    def socket_eof?(socket)
+      return true unless socket.respond_to?(:eof?)
+      socket.eof?
+    rescue IOError, SystemCallError
+      true
+    end
+
+    def fill_chunked_buffer(socket)
+      if @chunk_remaining.nil?
+        chunk_size, = read_chunk_size(socket)
+        if chunk_size == 0
+          read_header(socket)                # trailer + CRLF
+          @header.delete("transfer-encoding")
+          @remaining_size = 0
+          @body_complete = true
+          return
+        end
+        @chunk_remaining = chunk_size
+      end
+
+      sz = [@chunk_remaining, @buffer_size].min
+      data = read_data(socket, sz)           # read chunk-data
+      if data.nil? || data.bytesize != sz
+        raise HTTPStatus::BadRequest, "bad chunk data size."
+      end
+      @body_data << data
+      @chunk_remaining -= sz
+
+      if @chunk_remaining <= 0
+        line = read_line(socket)             # skip CRLF
+        unless line == "\r\n"
+          raise HTTPStatus::BadRequest, "extra data after chunk '#{line}'."
+        end
+        @chunk_remaining = nil
+      end
     end
 
     def read_chunk_size(socket)
@@ -611,30 +822,6 @@ module WEBrick
       else
         raise HTTPStatus::BadRequest, "bad chunk '#{line}'."
       end
-    end
-
-    def read_chunked(socket, block)
-      chunk_size, = read_chunk_size(socket)
-      while chunk_size > 0
-        begin
-          sz = [ chunk_size, @buffer_size ].min
-          data = read_data(socket, sz) # read chunk-data
-          if data.nil? || data.bytesize != sz
-            raise HTTPStatus::BadRequest, "bad chunk data size."
-          end
-          block.call(data)
-        end while (chunk_size -= sz) > 0
-
-        line = read_line(socket)              # skip CRLF
-        unless line == "\r\n"
-          raise HTTPStatus::BadRequest, "extra data after chunk '#{line}'."
-        end
-
-        chunk_size, = read_chunk_size(socket)
-      end
-      read_header(socket)                    # trailer + CRLF
-      @header.delete("transfer-encoding")
-      @remaining_size = 0
     end
 
     def _read_data(io, method, *arg)
@@ -662,10 +849,12 @@ module WEBrick
         if @request_method == "GET" || @request_method == "HEAD"
           @query = HTTPUtils::parse_query(@query_string)
         elsif self['content-type'] =~ /^application\/x-www-form-urlencoded/
-          @query = HTTPUtils::parse_query(body)
+          # Form parsing needs the complete entity body, even if a hook has
+          # already peeked at a prefix through the incremental reader.
+          @query = HTTPUtils::parse_query(body(from: :start))
         elsif self['content-type'] =~ /^multipart\/form-data; boundary=(.+)/
           boundary = HTTPUtils::dequote($1)
-          @query = HTTPUtils::parse_form_data(body, boundary)
+          @query = HTTPUtils::parse_form_data(body(from: :start), boundary)
         else
           @query = Hash.new
         end

@@ -254,6 +254,88 @@ class TestWEBrickHTTPProxy < Test::Unit::TestCase
     }
   end
 
+  def test_proxy_forwards_full_chunked_body_after_hook_prefix
+    payload = "prefix-and-then-the-rest-of-the-chunked-body"
+    consumed = []
+    config = {
+      :ServerName => "localhost.localdomain",
+      :RequestCallback => Proc.new{|req, res|
+        next unless req.request_method == "POST"
+        # The hook only peeks at a prefix; the proxy must still forward the
+        # complete entity body to the upstream server.
+        consumed << [:hook, req.body_reader.readpartial(6), req.body_bytes_consumed]
+      },
+    }
+    TestWEBrick.start_httpserver do |origin, o_addr, o_port, o_log|
+      origin.mount_proc("/upload") {|req, res|
+        body = +""
+        req.body {|chunk| body << chunk }
+        consumed << [:upstream, body]
+        res.body = body
+      }
+      TestWEBrick.start_httpproxy(config){|server, addr, port, log|
+        TCPSocket.open(addr, port) do |c|
+          c.write("POST http://127.0.0.1:#{o_port}/upload HTTP/1.1\r\n" \
+                  "Host: 127.0.0.1:#{o_port}\r\n" \
+                  "Transfer-Encoding: chunked\r\n\r\n")
+          payload.chars.each_slice(7) do |slice|
+            chunk = slice.join
+            c.write("#{chunk.bytesize.to_s(16)}\r\n#{chunk}\r\n")
+          end
+          c.write("0\r\n\r\n")
+
+          response = c.read
+          head, body = response.split("\r\n\r\n", 2)
+          assert_match(%r{\AHTTP/1\.1 200 OK}, head, log.call)
+          assert_equal(payload, body, log.call)
+        end
+      }
+    end
+
+    assert_equal([
+      [:hook, "prefix", 6],
+      [:upstream, payload],
+    ], consumed)
+  end
+
+  def test_proxy_forwards_full_body_when_hook_drained_chunked_body
+    payload = "drained-by-the-hook"
+    consumed = []
+    config = {
+      :ServerName => "localhost.localdomain",
+      :RequestCallback => Proc.new{|req, res|
+        next unless req.request_method == "POST"
+        consumed << [:hook, req.body(from: :start), req.body_complete?]
+      },
+    }
+    TestWEBrick.start_httpserver do |origin, o_addr, o_port, o_log|
+      origin.mount_proc("/upload") {|req, res|
+        body = +""
+        req.body {|chunk| body << chunk }
+        consumed << [:upstream, body]
+        res.body = body
+      }
+      TestWEBrick.start_httpproxy(config){|server, addr, port, log|
+        TCPSocket.open(addr, port) do |c|
+          c.write("POST http://127.0.0.1:#{o_port}/upload HTTP/1.1\r\n" \
+                  "Host: 127.0.0.1:#{o_port}\r\n" \
+                  "Transfer-Encoding: chunked\r\n\r\n" \
+                  "#{payload.bytesize.to_s(16)}\r\n#{payload}\r\n" \
+                  "0\r\n\r\n")
+          response = c.read
+          head, body = response.split("\r\n\r\n", 2)
+          assert_match(%r{\AHTTP/1\.1 200 OK}, head, log.call)
+          assert_equal(payload, body, log.call)
+        end
+      }
+    end
+
+    assert_equal([
+      [:hook, payload, true],
+      [:upstream, payload],
+    ], consumed)
+  end
+
   def make_certificate(key, cn)
     subject = OpenSSL::X509::Name.parse("/DC=org/DC=ruby-lang/CN=#{cn}")
     exts = [

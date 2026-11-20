@@ -593,4 +593,101 @@ class TestWEBrickHTTPServer < Test::Unit::TestCase
       sleep 0.1
     end
   end
+
+  def test_request_hook_prefix_handoff_on_keep_alive_connection
+    seen = []
+    config = {
+      :ServerName => "localhost",
+      :RequestCallback => Proc.new{|req, res|
+        # The hook inspects a small prefix and leaves the rest to the servlet.
+        prefix = req.body_reader.readpartial(3)
+        seen << [:hook, prefix, req.body_bytes_consumed]
+      },
+    }
+    TestWEBrick.start_httpserver(config) do |server, addr, port, log|
+      server.mount_proc("/body", ->(req, res) {
+        # The servlet continues from the hook's offset.
+        remainder = req.body
+        seen << [:handler, remainder, req.body_bytes_consumed, req.body_bytes_read]
+        res['connection'] = 'close'
+        res.body = remainder
+      })
+      server.mount_proc("/plain", ->(req, res) {
+        seen << [:plain, req.request_method, req.path, req.body]
+        res.body = "plain-ok"
+      })
+      Thread.pass while server.status != :Running
+
+      TCPSocket.open(addr, port) do |c|
+        chunk = "abcdefghij"
+        c.write("POST /body HTTP/1.1\r\nHost: localhost\r\n" \
+                "Transfer-Encoding: chunked\r\n\r\n")
+        c.write("#{chunk.bytesize.to_s(16)}\r\n#{chunk}\r\n0\r\n\r\n")
+        head, body = c.read.split("\r\n\r\n", 2)
+        assert_match(%r{\AHTTP/1\.1 200 OK}, head, log.call)
+        assert_equal("defghij", body, log.call)
+      end
+    end
+
+    assert_equal([
+      [:hook, "abc", 3],
+      [:handler, "defghij", 10, 10],
+    ], seen)
+  end
+
+  def test_chunked_then_plain_request_share_keep_alive_connection
+    seen = []
+    config = {
+      :ServerName => "localhost",
+      :RequestCallback => Proc.new{|req, res|
+        next unless req.request_method == "POST"
+        prefix = req.body_reader.readpartial(4)
+        seen << [:hook, prefix, req.body_bytes_consumed]
+      },
+    }
+    TestWEBrick.start_httpserver(config) do |server, addr, port, log|
+      server.mount_proc("/upload", ->(req, res) {
+        body = +""
+        req.body(from: :start) {|chunk| body << chunk }
+        seen << [:upload, body, req.body_bytes_read, req.body_complete?]
+        res.body = body
+      })
+      server.mount_proc("/ping", ->(req, res) {
+        seen << [:ping, req.request_method, req.path]
+        res.body = "pong"
+      })
+      Thread.pass while server.status != :Running
+
+      TCPSocket.open(addr, port) do |c|
+        payload = "0123456789abcdef"
+        c.write("POST /upload HTTP/1.1\r\nHost: localhost\r\n" \
+                "Transfer-Encoding: chunked\r\n\r\n")
+        payload.chars.each_slice(5) do |slice|
+          chunk = slice.join
+          c.write("#{chunk.bytesize.to_s(16)}\r\n#{chunk}\r\n")
+        end
+        c.write("0\r\n\r\n")
+
+        # Read just the first response so the second request is issued on the
+        # same socket before the server loops.
+        head = c.gets("\r\n\r\n")
+        assert_match(%r{\AHTTP/1\.1 200 OK}, head, log.call)
+        assert_equal(payload.bytesize.to_s, head[/^Content-Length: (\d+)/i, 1], log.call)
+        assert_equal(payload, c.read(payload.bytesize))
+
+        # A plain request on the same keep-alive connection must not be
+        # shifted by the chunked body that the hook partially consumed.
+        c.write("GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        rest = c.read
+        assert_match(%r{\AHTTP/1\.1 200 OK}, rest, log.call)
+        assert_equal("pong", rest.split("\r\n\r\n", 2)[1], log.call)
+      end
+    end
+
+    assert_equal([
+      [:hook, "0123", 4],
+      [:upload, "0123456789abcdef", 16, true],
+      [:ping, "GET", "/ping"],
+    ], seen)
+  end
 end

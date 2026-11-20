@@ -761,4 +761,130 @@ class TestWEBrickHTTPRequest < Test::Unit::TestCase
     meta = req.meta_vars
     assert_equal("test.ruby-lang.org", meta["SERVER_NAME"])
   end
+
+  def test_body_continues_after_body_reader_prefix
+    msg = "POST /path HTTP/1.1\r\n" \
+          "Host: test.ruby-lang.org:8080\r\n" \
+          "Content-Length: 10\r\n" \
+          "\r\n" \
+          "0123456789"
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(StringIO.new(msg))
+
+    # A request hook peeks at a small prefix through the incremental reader.
+    prefix = req.body_reader.readpartial(3)
+    assert_equal("012", prefix)
+    assert_equal(3, req.body_bytes_consumed)
+
+    # Continuing with #body resumes at the current offset, not at byte 0 and
+    # not at whatever the socket happens to hold.
+    assert_equal("3456789", req.body)
+    assert_equal(10, req.body_bytes_consumed)
+    assert_equal(10, req.body_bytes_read)
+    assert_equal(10, req.body_length)
+    assert_predicate(req, :body_complete?)
+  end
+
+  def test_body_from_start_replays_consumed_prefix
+    msg = "POST /path HTTP/1.1\r\n" \
+          "Host: test.ruby-lang.org:8080\r\n" \
+          "Content-Length: 10\r\n" \
+          "\r\n" \
+          "0123456789"
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(StringIO.new(msg))
+
+    assert_equal("01", req.body_reader.readpartial(2))
+    # The caller explicitly asks for the whole entity body.
+    assert_equal("0123456789", req.body(from: :start))
+    # Replay is repeatable and does not touch the socket more than once.
+    assert_equal("0123456789", req.body(from: :start))
+    assert_equal(10, req.body_bytes_read)
+  end
+
+  def test_chunked_prefix_handoff_and_next_request_stays_aligned
+    body = "0123456789abcdef"
+    msg = "POST /path HTTP/1.1\r\n" \
+          "Host: test.ruby-lang.org:8080\r\n" \
+          "Transfer-Encoding: chunked\r\n" \
+          "\r\n"
+    body.chars.each_slice(5) do |slice|
+      chunk = slice.join
+      msg << chunk.bytesize.to_s(16) << "\r\n" << chunk << "\r\n"
+    end
+    msg << "0\r\n\r\n"
+    msg << "GET /next HTTP/1.1\r\nHost: test.ruby-lang.org:8080\r\n\r\n"
+
+    io = StringIO.new(msg)
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(io)
+
+    # Hook consumes a prefix that ends in the middle of the first chunk.
+    assert_equal("01", req.body_reader.readpartial(2))
+    # Forwarding asks for the complete body.
+    assert_equal(body, req.body(from: :start))
+    assert_equal(body.bytesize, req.body_bytes_read)
+
+    # A regular next request on the same keep-alive connection is still
+    # parsed from the correct offset.
+    nxt = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    nxt.parse(io)
+    assert_equal("GET", nxt.request_method)
+    assert_equal("/next", nxt.unparsed_uri)
+    assert_nil(nxt.body)
+  end
+
+  def test_chunked_body_reader_continues_after_prefix
+    body = "abcdef"
+    msg = "POST /path HTTP/1.1\r\n" \
+          "Transfer-Encoding: chunked\r\n" \
+          "\r\n" \
+          "2\r\nab\r\n" \
+          "4\r\ncdef\r\n" \
+          "0\r\n\r\n"
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(StringIO.new(msg))
+
+    assert_equal("abc", req.body_reader.readpartial(3))
+    dst = StringIO.new
+    IO.copy_stream(req.body_reader, dst)
+    assert_equal("def", dst.string)
+    assert_equal(body.bytesize, req.body_bytes_consumed)
+  end
+
+  def test_chunked_error_preserved_after_partial_prefix
+    msg = "POST /path HTTP/1.1\r\n" \
+          "Transfer-Encoding: chunked\r\n" \
+          "\r\n" \
+          "3\r\nabc\r\n" \
+          "zz\r\n"
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(StringIO.new(msg))
+
+    # The decodable part is still available ...
+    assert_equal("ab", req.body_reader.readpartial(2))
+    dst = StringIO.new
+    # ... and the framing error is raised once the buffer is exhausted.
+    assert_raise(WEBrick::HTTPStatus::BadRequest) do
+      IO.copy_stream(req.body_reader, dst)
+    end
+    assert_equal("c", dst.string)
+  end
+
+  def test_query_uses_full_body_after_prefix
+    param = "foo=1&bar=2"
+    msg = "POST /path HTTP/1.1\r\n" \
+          "Content-Length: #{param.bytesize}\r\n" \
+          "Content-Type: application/x-www-form-urlencoded\r\n" \
+          "\r\n" \
+          "#{param}"
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(StringIO.new(msg))
+
+    # A hook inspects a prefix of the form data before the query is computed.
+    assert_equal("foo", req.body_reader.readpartial(3))
+    query = req.query
+    assert_equal("1", query["foo"])
+    assert_equal("2", query["bar"])
+  end
 end

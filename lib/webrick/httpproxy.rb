@@ -219,7 +219,11 @@ module WEBrick
     end
 
     def do_POST(req, res)
-      perform_proxy_request(req, res, Net::HTTP::Post, req.body_reader)
+      # A request hook may have peeked at a prefix of the body before handing
+      # the request to the proxy.  The upstream server must still receive the
+      # complete entity body, so ask for an explicit replay from the start
+      # rather than continuing from whatever offset the hook left behind.
+      perform_proxy_request(req, res, Net::HTTP::Post, req.body_reader(from: :start))
     end
 
     def do_OPTIONS(req, res)
@@ -316,8 +320,15 @@ module WEBrick
             http.read_timeout = 60   # secs  #   Ruby's bug, but why?)
             ##################################
           end
-          if body_stream && req['transfer-encoding'] =~ /\bchunked\b/i
+          # The request may already have been decoded (a hook drained it, or
+          # #body_reader(from: :start) was used), in which case the
+          # transfer-encoding header is gone.  Re-frame the upstream body from
+          # the recorded framing instead of the header alone.
+          if body_stream && (req['transfer-encoding'] =~ /\bchunked\b/i || req.chunked_body?)
             header['Transfer-Encoding'] = 'chunked'
+            # :choose_header copies header keys downcased; drop any length so
+            # the upstream uses the chunked framing exclusively.
+            header.delete('content-length')
           end
           http_req = req_class.new(path, header)
           http_req.body_stream = body_stream if body_stream

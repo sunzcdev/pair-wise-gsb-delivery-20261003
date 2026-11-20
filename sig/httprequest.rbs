@@ -20,9 +20,19 @@ module WEBrick
 
     @port: Integer?
 
-    @body_tmp: Array[String]
+    @body_data: String
 
-    @body_rd: Fiber
+    @body_pos: Integer
+
+    @body_complete: bool
+
+    @body_error: StandardError?
+
+    @body_mode: (:length | :chunked | :none)?
+
+    @chunk_remaining: Integer?
+
+    @body_chunked: bool
 
     @request_bytes: Integer
 
@@ -88,12 +98,26 @@ module WEBrick
 
     type body_chunk_block = ^(String body_chunk) -> void
 
-    def body: () ?{ (String body_chunk) -> void } -> String
+    type body_origin = :current | :start
 
-    def body_reader: () -> self
+    def body: (?from: body_origin) ?{ (String body_chunk) -> void } -> String?
+
+    def body_reader: (?from: body_origin) -> self
 
     # for IO.copy_stream.
     def readpartial: (Integer size, ?String buf) -> String
+
+    def rewind_body: () -> self
+
+    def body_bytes_read: () -> Integer
+
+    def body_bytes_consumed: () -> Integer
+
+    def body_length: () -> Integer?
+
+    def body_complete?: () -> bool
+
+    def chunked_body?: () -> bool
 
     def query: () -> Hash[String, HTTPUtils::FormData]
 
@@ -143,9 +167,17 @@ module WEBrick
     def read_body: (IO socket, body_chunk_block block) -> String
                  | (nil socket, top block) -> nil
 
-    def read_chunk_size: (IO socket) -> [Integer, String?]
+    def body_chunk: (?Integer size) -> String?
 
-    def read_chunked: (IO socket, body_chunk_block block) -> void
+    def read_body_bytes: (Integer size) -> String?
+
+    def fill_body_buffer: (IO? socket) -> bool
+
+    def fill_chunked_buffer: (IO socket) -> void
+
+    def socket_eof?: (untyped socket) -> bool
+
+    def read_chunk_size: (IO socket) -> [Integer, String?]
 
     def _read_data: (IO io, Symbol method, *untyped arg) -> String?
 

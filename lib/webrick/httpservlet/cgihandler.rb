@@ -71,7 +71,10 @@ module WEBrick
           cgi_in.write("%8d" % dump.bytesize)
           cgi_in.write(dump)
 
-          req.body { |chunk| cgi_in.write(chunk) }
+          # The CGI meta variables describe the whole entity body, so feed the
+          # complete body to stdin even if a request hook already peeked at a
+          # prefix through the incremental reader.
+          req.body(from: :start) { |chunk| cgi_in.write(chunk) }
         ensure
           cgi_in.close
           status = $?.exitstatus
