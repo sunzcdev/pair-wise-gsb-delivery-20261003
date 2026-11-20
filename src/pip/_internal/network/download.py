@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import email.message
+import hashlib
 import logging
 import mimetypes
 import os
+import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -22,6 +24,7 @@ from pip._internal.cli.progress_bars import BarType, get_download_progress_rende
 from pip._internal.exceptions import (
     ConnectionFailedError,
     ConnectionTimeoutError,
+    DownloadDestinationCollision,
     IncompleteDownloadError,
     NetworkConnectionError,
     ProxyConnectionError,
@@ -182,6 +185,28 @@ class _FileDownload:
         self.bytes_received = 0
 
 
+@dataclass(frozen=True)
+class _DownloadArtifact:
+    """Provenance record for a file a Downloader has materialized on disk.
+
+    The digest identifies the exact bytes at a destination, while the source
+    URL names the link that produced them. Together they let later downloads
+    tell a reusable copy from a same-named file fetched from another source.
+    """
+
+    sha256: str
+    source: str
+
+
+def _sha256_of_file(path: str) -> str:
+    """Return the hex sha256 digest of the file at ``path``."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class Downloader:
     def __init__(
         self,
@@ -194,6 +219,10 @@ class Downloader:
         assert (
             self._resume_retries >= 0
         ), "Number of max resume retries must be bigger or equal to zero"
+        # Provenance of files this downloader has placed, keyed by the
+        # destination path. Used to decide whether a same-named destination
+        # can be reused or hides content from a different source.
+        self._artifacts: dict[str, _DownloadArtifact] = {}
 
     def batch(
         self, links: Iterable[Link], location: str
@@ -211,19 +240,136 @@ class Downloader:
         filepath = join_within_directory(
             location, _get_http_response_filename(resp, link)
         )
+
+        # If the link advertises a digest, an identical existing file can be
+        # reused without fetching anything. Otherwise the content has to be
+        # downloaded into a temp file first so its real digest can be compared
+        # against whatever already occupies the destination.
+        reuse = self._try_reuse_with_link_hash(filepath, link)
+        if reuse is not None:
+            logger.info(
+                "Using previously downloaded %s for %s",
+                filepath,
+                link.redacted_url,
+            )
+            return reuse, resp.headers.get("Content-Type", "")
+
+        # Download into a sibling temporary file so an interrupted write can
+        # never leave partial bytes masquerading as a complete wheel at the
+        # final destination. The temp file is only atomically moved into place
+        # once the full response has been received and provenance checked.
+        fd, temp_path = tempfile.mkstemp(
+            dir=location, prefix=f".{os.path.basename(filepath)}.", suffix=".part"
+        )
+        os.close(fd)
         try:
-            with open(filepath, "wb") as content_file:
+            with open(temp_path, "wb") as content_file:
                 download = _FileDownload(link, content_file, download_size)
                 self._process_response(download, resp)
                 if download.is_incomplete():
                     self._attempt_resumes_or_redownloads(download, resp)
-        except IncompleteDownloadError:
+                content_file.flush()
+                os.fsync(content_file.fileno())
+
+            digest = _sha256_of_file(temp_path)
+            # Provenance check before anything is written to the destination:
+            # identical content means the existing file is reused as-is, while
+            # different content under the same name is a collision naming both
+            # sources instead of clobbering the file.
+            if self._is_reusable(filepath, digest):
+                logger.info(
+                    "Using previously downloaded %s for %s",
+                    filepath,
+                    link.redacted_url,
+                )
+            else:
+                self._claim_destination(filepath, link, digest)
+                os.replace(temp_path, filepath)
+        except BaseException:
             with contextlib.suppress(OSError):
-                os.remove(filepath)
+                os.remove(temp_path)
             raise
+        else:
+            self._artifacts[filepath] = _DownloadArtifact(
+                sha256=digest,
+                source=link.url_without_fragment,
+            )
 
         content_type = resp.headers.get("Content-Type", "")
         return filepath, content_type
+
+    def _recorded_or_disk_artifact(self, filepath: str) -> _DownloadArtifact | None:
+        """Return provenance for a destination, learning it from disk if needed.
+
+        A finished file already sitting in the directory (e.g. left by an
+        earlier run or copied in by hand) has no in-memory record yet: hash it
+        and adopt it so later same-named downloads can be judged against it.
+        """
+        recorded = self._artifacts.get(filepath)
+        if recorded is not None:
+            return recorded
+        if not os.path.exists(filepath):
+            return None
+        recorded = _DownloadArtifact(
+            sha256=_sha256_of_file(filepath),
+            source="<pre-existing file>",
+        )
+        self._artifacts[filepath] = recorded
+        return recorded
+
+    def _try_reuse_with_link_hash(
+        self, filepath: str, link: Link
+    ) -> str | None:
+        """Reuse an existing file without downloading when the link pins a hash.
+
+        Returns the destination path when a matching finished file is present.
+        Raises if a same-named file exists but its digest differs. Returns
+        ``None`` when there is nothing to compare against (no link hash or no
+        existing file), in which case the caller downloads normally.
+        """
+        expected = self._expected_digest(link)
+        if expected is None:
+            return None
+        recorded = self._recorded_or_disk_artifact(filepath)
+        if recorded is None:
+            return None
+        if recorded.sha256 == expected:
+            return filepath
+        raise DownloadDestinationCollision(
+            destination=filepath,
+            existing_source=recorded.source,
+            incoming_source=link.url_without_fragment,
+        )
+
+    def _is_reusable(self, filepath: str, digest: str) -> bool:
+        """Whether freshly downloaded ``digest`` bytes match an existing file."""
+        recorded = self._recorded_or_disk_artifact(filepath)
+        return recorded is not None and recorded.sha256 == digest
+
+    def _claim_destination(
+        self, filepath: str, link: Link, digest: str
+    ) -> None:
+        """Guard a destination about to be written against same-named content.
+
+        The bytes have just been fully received into a temporary file; check
+        provenance before moving them into place. If a same-named destination
+        with a different digest already exists, name both sources and leave
+        the existing file untouched.
+        """
+        recorded = self._recorded_or_disk_artifact(filepath)
+        if recorded is not None and recorded.sha256 != digest:
+            raise DownloadDestinationCollision(
+                destination=filepath,
+                existing_source=recorded.source,
+                incoming_source=link.url_without_fragment,
+            )
+
+    @staticmethod
+    def _expected_digest(link: Link) -> str | None:
+        """Return the link's embedded sha256 digest, if it carries one."""
+        if link.hash_name == "sha256":
+            return link.hash
+        return None
 
     def _process_response(self, download: _FileDownload, resp: Response) -> None:
         """Download and save chunks from a response."""

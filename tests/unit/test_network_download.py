@@ -14,6 +14,7 @@ from pip._vendor.urllib3.exceptions import ProtocolError, ProxyError, ReadTimeou
 from pip._internal.exceptions import (
     ConnectionFailedError,
     ConnectionTimeoutError,
+    DownloadDestinationCollision,
     IncompleteDownloadError,
     ProxyConnectionError,
     SSLMissingError,
@@ -440,7 +441,13 @@ def test_failed_removal_does_not_mask_incomplete_download(tmpdir: Path) -> None:
     ):
         downloader(link, str(tmpdir))
 
-    assert (tmpdir / "foo.tgz").exists()
+    # Writes go to a sibling temporary file, so the interrupted download can
+    # never leave partial bytes at the destination even when cleanup fails.
+    assert not (tmpdir / "foo.tgz").exists()
+    # The temp file could not be removed, but it must not masquerade as the
+    # finished wheel: it stays a dot-prefixed ".part" file instead.
+    part_files = list(tmpdir.glob(".foo.tgz.*.part"))
+    assert len(part_files) == 1
 
 
 def test_downloader_resumes_on_protocol_error(tmpdir: Path) -> None:
@@ -694,3 +701,269 @@ def test_resumed_download_caching(tmpdir: Path) -> None:
         cache_files = list(cache_dir.rglob("*"))
         # Should have cache files (both metadata and body files)
         assert len([f for f in cache_files if f.is_file()]) == 2
+
+
+def _mock_response(body: bytes, url: str) -> MockResponse:
+    resp = MockResponse(body)
+    resp.url = url
+    resp.status_code = 200
+    resp.headers.update({"content-length": str(len(body))})
+    return resp
+
+
+def _sha256_hex(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def test_download_uses_atomic_temp_file_and_cleans_up(tmpdir: Path) -> None:
+    """An interrupted download must never leave a complete-looking destination."""
+    session = PipSession(resume_retries=0)
+    link = Link("http://example.com/foo.whl")
+    downloader = Downloader(session, "on")
+
+    response = _mock_response(b"partial-bytes", "http://example.com/foo.whl")
+    # Advertise more bytes than the body contains.
+    response.headers["content-length"] = "100"
+
+    with (
+        patch.object(Downloader, "_http_get", MagicMock(return_value=response)),
+        pytest.raises(IncompleteDownloadError),
+    ):
+        downloader(link, str(tmpdir))
+
+    # The destination name must not exist at all...
+    assert not (tmpdir / "foo.whl").exists()
+    # ...and no temp file should survive a successful cleanup.
+    assert list(tmpdir.glob(".*.part")) == []
+
+
+def test_download_writes_via_temp_file_then_replaces(tmpdir: Path) -> None:
+    """A successful download lands at the destination via an atomic replace."""
+    session = PipSession(resume_retries=0)
+    body = b"wheel-body-contents"
+    link = Link("http://example.com/foo.whl")
+    downloader = Downloader(session, "on")
+
+    with patch.object(
+        Downloader,
+        "_http_get",
+        MagicMock(return_value=_mock_response(body, link.url)),
+    ):
+        filepath, _ = downloader(link, str(tmpdir))
+
+    assert filepath == str(tmpdir / "foo.whl")
+    assert Path(filepath).read_bytes() == body
+    assert list(tmpdir.glob(".*.part")) == []
+
+
+def test_same_named_same_content_is_reused_within_a_run(tmpdir: Path) -> None:
+    """Two sources that deliver identical content reuse one destination."""
+    session = PipSession(resume_retries=0)
+    body = b"identical-wheel"
+    first = Link("http://find-links.example.com/foo.whl")
+    second = Link("http://direct.example.com/files/foo.whl")
+    downloader = Downloader(session, "on")
+
+    get = MagicMock(
+        side_effect=[
+            _mock_response(body, first.url),
+            _mock_response(body, second.url),
+        ]
+    )
+    with patch.object(Downloader, "_http_get", get):
+        first_path, _ = downloader(first, str(tmpdir))
+        second_path, _ = downloader(second, str(tmpdir))
+
+    assert first_path == second_path == str(tmpdir / "foo.whl")
+    assert Path(first_path).read_bytes() == body
+
+
+def test_same_named_different_content_reports_both_sources(tmpdir: Path) -> None:
+    """Same filename, different bytes: the collision names both sources and
+    leaves the original file in place."""
+    session = PipSession(resume_retries=0)
+    first_body = b"first-wheel-content"
+    second_body = b"totally-different-wheel"
+    first = Link("http://find-links.example.com/foo.whl")
+    second = Link("http://direct.example.com/files/foo.whl")
+    downloader = Downloader(session, "on")
+
+    get = MagicMock(
+        side_effect=[
+            _mock_response(first_body, first.url),
+            _mock_response(second_body, second.url),
+        ]
+    )
+    with patch.object(Downloader, "_http_get", get):
+        first_path, _ = downloader(first, str(tmpdir))
+        with pytest.raises(DownloadDestinationCollision) as exc_info:
+            downloader(second, str(tmpdir))
+
+    # The pre-existing finished wheel must still be usable.
+    assert Path(first_path).read_bytes() == first_body
+    message = str(exc_info.value.message) + str(exc_info.value.context)
+    assert "find-links.example.com" in message
+    assert "direct.example.com" in message
+    assert "foo.whl" in message
+
+
+def test_pre_existing_file_with_matching_content_is_reused(tmpdir: Path) -> None:
+    """A finished wheel already in the directory is reused when the download
+    turns out to be byte-identical."""
+    session = PipSession(resume_retries=0)
+    body = b"pre-existing-wheel-bytes"
+    destination = tmpdir / "foo.whl"
+    destination.write_bytes(body)
+
+    link = Link("http://example.com/foo.whl")
+    downloader = Downloader(session, "on")
+
+    with patch.object(
+        Downloader,
+        "_http_get",
+        MagicMock(return_value=_mock_response(body, link.url)),
+    ):
+        filepath, _ = downloader(link, str(tmpdir))
+
+    assert filepath == str(destination)
+    assert Path(filepath).read_bytes() == body
+
+
+def test_pre_existing_file_with_different_content_is_protected(tmpdir: Path) -> None:
+    """A same-named but different incoming file must not overwrite an existing
+    finished artifact; both sources are reported instead."""
+    session = PipSession(resume_retries=0)
+    existing_body = b"already-on-disk"
+    incoming_body = b"different-incoming-bytes"
+    destination = tmpdir / "foo.whl"
+    destination.write_bytes(existing_body)
+
+    link = Link("http://example.com/foo.whl")
+    downloader = Downloader(session, "on")
+
+    with patch.object(
+        Downloader,
+        "_http_get",
+        MagicMock(return_value=_mock_response(incoming_body, link.url)),
+    ):
+        with pytest.raises(DownloadDestinationCollision) as exc_info:
+            downloader(link, str(tmpdir))
+
+    # The existing artifact is untouched and stays usable.
+    assert destination.read_bytes() == existing_body
+    message = str(exc_info.value.message) + str(exc_info.value.context)
+    assert "example.com" in message
+    assert "foo.whl" in message
+
+
+def test_link_hash_allows_reuse_without_downloading(tmpdir: Path) -> None:
+    """When the link pins a sha256, a matching existing file is reused and no
+    HTTP request beyond the initial response lookup needs its body consumed."""
+    session = PipSession(resume_retries=0)
+    body = b"hash-pinned-wheel"
+    digest = _sha256_hex(body)
+    destination = tmpdir / "foo.whl"
+    destination.write_bytes(body)
+
+    link = Link(f"http://example.com/foo.whl#sha256={digest}")
+    downloader = Downloader(session, "on")
+
+    response = _mock_response(body, link.url_without_fragment)
+    with patch.object(Downloader, "_http_get", MagicMock(return_value=response)):
+        filepath, _ = downloader(link, str(tmpdir))
+
+    assert filepath == str(destination)
+    assert destination.read_bytes() == body
+
+
+def test_link_hash_mismatch_against_existing_file_raises(tmpdir: Path) -> None:
+    """A link hash that disagrees with an existing same-named file is a
+    collision, not a silent overwrite."""
+    session = PipSession(resume_retries=0)
+    destination = tmpdir / "foo.whl"
+    destination.write_bytes(b"on-disk-bytes")
+
+    digest = _sha256_hex(b"different-bytes")
+    link = Link(f"http://example.com/foo.whl#sha256={digest}")
+    downloader = Downloader(session, "on")
+
+    response = _mock_response(b"different-bytes", link.url_without_fragment)
+    with patch.object(Downloader, "_http_get", MagicMock(return_value=response)):
+        with pytest.raises(DownloadDestinationCollision):
+            downloader(link, str(tmpdir))
+
+    assert destination.read_bytes() == b"on-disk-bytes"
+
+
+def test_local_files_same_name_different_content(tmpdir: Path) -> None:
+    """End-to-end check through a real PipSession with file:// sources:
+
+    two local files named alike but holding different content, downloaded into
+    one directory, collide; the first finished file remains usable.
+    """
+    from pip._internal.utils.urls import path_to_url
+
+    sources = tmpdir / "sources"
+    sources.mkdir()
+    first_source = sources / "a"
+    second_source = sources / "b"
+    first_source.mkdir()
+    second_source.mkdir()
+
+    first_body = b"local-wheel-one"
+    second_body = b"local-wheel-two-different"
+    (first_source / "foo.whl").write_bytes(first_body)
+    (second_source / "foo.whl").write_bytes(second_body)
+
+    dest = tmpdir / "dest"
+    dest.mkdir()
+
+    session = PipSession(resume_retries=0)
+    downloader = Downloader(session, "on")
+
+    first_link = Link(path_to_url(str(first_source / "foo.whl")))
+    second_link = Link(path_to_url(str(second_source / "foo.whl")))
+
+    first_path, _ = downloader(first_link, str(dest))
+    assert Path(first_path).read_bytes() == first_body
+
+    with pytest.raises(DownloadDestinationCollision) as exc_info:
+        downloader(second_link, str(dest))
+
+    # Both local source paths are named in the diagnostic.
+    message = str(exc_info.value.message) + str(exc_info.value.context)
+    assert "foo.whl" in message
+    assert Path(first_path).read_bytes() == first_body
+
+
+def test_local_files_same_name_same_content(tmpdir: Path) -> None:
+    """Two same-named local files with identical content share one destination."""
+    from pip._internal.utils.urls import path_to_url
+
+    sources = tmpdir / "sources"
+    sources.mkdir()
+    first_source = sources / "a"
+    second_source = sources / "b"
+    first_source.mkdir()
+    second_source.mkdir()
+
+    body = b"same-local-wheel"
+    (first_source / "foo.whl").write_bytes(body)
+    (second_source / "foo.whl").write_bytes(body)
+
+    dest = tmpdir / "dest"
+    dest.mkdir()
+
+    session = PipSession(resume_retries=0)
+    downloader = Downloader(session, "on")
+
+    first_link = Link(path_to_url(str(first_source / "foo.whl")))
+    second_link = Link(path_to_url(str(second_source / "foo.whl")))
+
+    first_path, _ = downloader(first_link, str(dest))
+    second_path, _ = downloader(second_link, str(dest))
+
+    assert first_path == second_path == str(dest / "foo.whl")
+    assert Path(first_path).read_bytes() == body

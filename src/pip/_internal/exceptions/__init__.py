@@ -54,6 +54,7 @@ from pip._internal.exceptions.hashes import (
 from pip._internal.exceptions.network import (
     ConnectionFailedError,
     ConnectionTimeoutError,
+    DownloadDestinationCollision,
     IncompleteDownloadError,
     NetworkConnectionError,
     ProxyConnectionError,
@@ -103,6 +104,7 @@ __all__ = [
     # network
     "ConnectionFailedError",
     "ConnectionTimeoutError",
+    "DownloadDestinationCollision",
     "IncompleteDownloadError",
     "NetworkConnectionError",
     "ProxyConnectionError",

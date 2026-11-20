@@ -189,3 +189,32 @@ class IncompleteDownloadError(DiagnosticPipError):
             hint_stmt=hint,
             note_stmt="This is an issue with network connectivity, not pip.",
         )
+
+
+class DownloadDestinationCollision(DiagnosticPipError):
+    """Raised when two distinct sources would be saved under the same file name
+    but their contents do not match."""
+
+    reference = "download-destination-collision"
+
+    def __init__(
+        self,
+        *,
+        destination: str,
+        existing_source: str,
+        incoming_source: str,
+    ) -> None:
+        super().__init__(
+            message=(
+                f"Cannot save a second, different file as {escape(destination)}"
+            ),
+            context=Text.from_markup(
+                f"already populated from [magenta]{escape(existing_source)}[/]\n"
+                f"incoming content from [magenta]{escape(incoming_source)}[/]"
+            ),
+            hint_stmt=(
+                "The two sources use the same file name but have different "
+                "contents. Download them into separate directories, or remove "
+                "the existing file if it is no longer needed."
+            ),
+        )

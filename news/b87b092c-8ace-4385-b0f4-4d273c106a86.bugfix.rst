@@ -1,0 +1,1 @@
+Download files atomically via a sibling temporary file, so an interrupted write no longer leaves partial content under the final file name. When two sources produce the same destination name, reuse the existing file if the contents match; otherwise fail with an error naming both sources instead of silently overwriting the existing file.
