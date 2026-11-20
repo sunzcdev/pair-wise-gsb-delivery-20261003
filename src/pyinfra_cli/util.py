@@ -1,0 +1,263 @@
+from __future__ import annotations
+
+import ast
+import json
+from datetime import datetime
+from importlib import import_module
+from importlib.util import find_spec
+from io import IOBase
+from pathlib import Path
+from types import CodeType, FunctionType, ModuleType
+from collections.abc import Callable
+
+import gevent
+
+from pyinfra import logger
+from pyinfra.api.command import PyinfraCommand
+from pyinfra.api.exceptions import PyinfraError
+from pyinfra.api.host import HostData
+from pyinfra.api.operation import OperationMeta
+from pyinfra.api.output import format_text
+from pyinfra.api.state import (
+    State,
+    StateHostMeta,
+    StateHostResults,
+    StateOperationHostData,
+    StateOperationMeta,
+)
+from pyinfra.context import ctx_config, ctx_host, ctx_state
+from pyinfra.progress import progress_spinner
+
+from .exceptions import CliError, UnexpectedExternalError
+
+# Cache for compiled Python deploy code
+PYTHON_CODES: dict[str, CodeType] = {}
+
+
+def is_subdir(child, parent):
+    child_resolved = Path(child).resolve()
+    parent_resolved = Path(parent).resolve()
+    try:
+        child_resolved.relative_to(parent_resolved)
+    except ValueError:
+        return False
+    return True
+
+
+def exec_file(filename, return_locals: bool = False, is_deploy_code: bool = False):
+    """
+    Execute a Python file and optionally return it's attributes as a dict.
+    """
+
+    # The state context may be unset (eg when called via the API with no
+    # `ctx_state.use(state)`) - skip tracking the executing file then (#1432).
+    state = ctx_state.get()
+    if state is not None:
+        old_current_exec_filename = state.current_exec_filename
+        state.current_exec_filename = filename
+
+    if filename not in PYTHON_CODES:
+        with open(filename, encoding="utf-8") as f:
+            code_str = f.read()
+
+        code = compile(code_str, filename, "exec")
+        PYTHON_CODES[filename] = code
+
+    # Create some base attributes for our "module"
+    data = {"__file__": filename}
+
+    # Execute the code with locals/globals going into the dict above
+    try:
+        exec(PYTHON_CODES[filename], data)
+    except PyinfraError:
+        # Raise pyinfra errors as-is
+        raise
+    except Exception as e:
+        # Wrap & re-raise errors in user code so we highlight filename/etc
+        raise UnexpectedExternalError(e, filename)
+    finally:
+        if state is not None:
+            state.current_exec_filename = old_current_exec_filename
+
+    return data
+
+
+def json_encode(obj):
+    # pyinfra types
+    if isinstance(obj, HostData):
+        return obj.dict()
+
+    if isinstance(obj, PyinfraCommand):
+        return repr(obj)
+
+    if isinstance(
+        obj,
+        (
+            OperationMeta,
+            StateOperationMeta,
+            StateOperationHostData,
+            StateHostMeta,
+            StateHostResults,
+        ),
+    ):
+        return repr(obj)
+
+    # Python types
+    if isinstance(obj, ModuleType):
+        return f"Module: {obj.__name__}"
+
+    if isinstance(obj, FunctionType):
+        return f"Function: {obj.__name__}"
+
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+
+    if isinstance(obj, IOBase):
+        if hasattr(obj, "name"):
+            return f"File: {obj.name}"
+
+        if hasattr(obj, "template"):
+            return f"Template: {obj.template}"
+
+        obj.seek(0)
+        return f"In memory file: {obj.read()}"
+
+    if isinstance(obj, Path):
+        return str(obj)
+
+    if isinstance(obj, set):
+        return sorted(list(obj))
+
+    if isinstance(obj, bytes):
+        return obj.decode()
+
+    if hasattr(obj, "to_json"):
+        return obj.to_json()
+
+    raise TypeError(f"Cannot serialize: {type(obj)} ({obj})")
+
+
+def parse_cli_arg(arg):
+    if isinstance(arg, list):
+        return [parse_cli_arg(a) for a in arg]
+
+    if arg.lower() == "false":
+        return False
+
+    if arg.lower() == "true":
+        return True
+
+    try:
+        return int(arg)
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        return json.loads(arg)
+    except ValueError:
+        pass
+
+    if len(arg) >= 2 and (arg[0], arg[-1]) in (("[", "]"), ("{", "}"), ("(", ")")):
+        try:
+            parsed_arg = ast.literal_eval(arg)
+        except (SyntaxError, ValueError):
+            pass
+        else:
+            if isinstance(parsed_arg, (dict, list, tuple)):
+                return parsed_arg
+
+    return arg
+
+
+def _is_windows_drive_path(path: str) -> bool:
+    return len(path) >= 3 and path[1] == ":" and path[2] in ("/", "\\")
+
+
+def try_import_module_attribute(path, prefix=None, raise_for_none=True):
+    if _is_windows_drive_path(path):
+        if raise_for_none:
+            raise CliError(f"No such module: {path}")
+        return None
+
+    if ":" in path:
+        # Allow a.module.name:function syntax
+        mod_path, attr_name = path.rsplit(":", 1)
+    elif "." in path:
+        # And also a.module.name.function
+        mod_path, attr_name = path.rsplit(".", 1)
+    else:
+        return None
+
+    possible_modules = [mod_path]
+    if prefix:
+        possible_modules.append(f"{prefix}.{mod_path}")
+
+    any_module_found = False
+
+    for possible in possible_modules:
+        try:
+            # Look for the module/fn, note that from the find_spec doc:
+            # "If the name is for submodule (contains a dot), the parent module is
+            # automatically imported."
+            spec = find_spec(possible)
+        except ModuleNotFoundError:
+            continue
+        except Exception as e:
+            # Capture all exceptions here which may be triggered from the automatic module import
+            # referenced above the find_spec call.
+            logger.warning(f"Exception raised during inventory search on: {possible}: {e}")
+            continue
+
+        if spec is None:
+            continue
+
+        any_module_found = True
+        candidate = import_module(possible)
+        # A bare module name may shadow a prefixed pyinfra fact/operation (eg. an
+        # installed `pip` package vs. `pyinfra.facts.pip`); keep trying remaining
+        # candidates when the attribute is missing rather than short-circuiting.
+        attr = getattr(candidate, attr_name, None)
+        if attr is not None:
+            return attr
+
+    if not raise_for_none:
+        return
+
+    if not any_module_found:
+        raise CliError(f"No such module: {possible_modules[0]}")
+
+    raise CliError(f"No such attribute in module {possible_modules[0]}: {attr_name}")
+
+
+def _parallel_load_hosts(state: State, callback: Callable, name: str):
+    def load_file(local_host):
+        try:
+            with ctx_config.use(state.config.copy()):
+                with ctx_host.use(local_host):
+                    callback()
+                    logger.info(
+                        f"{local_host.print_prefix}{format_text('Ready:', 'green')} {format_text(name, bold=True)}",
+                    )
+        except Exception as e:
+            return e
+
+    greenlet_to_host = {
+        state.pool.spawn(load_file, host): host for host in state.inventory.get_active_hosts()
+    }
+
+    with progress_spinner(greenlet_to_host.values()) as progress:
+        for greenlet in gevent.iwait(greenlet_to_host.keys()):
+            host = greenlet_to_host[greenlet]
+            result = greenlet.get()
+            if isinstance(result, Exception):
+                raise result
+            progress(host)
+
+
+def load_deploy_file(state: State, filename):
+    state.current_deploy_filename = filename
+    _parallel_load_hosts(state, lambda: exec_file(filename), filename)
+
+
+def load_func(state: State, op_func, *args, **kwargs):
+    _parallel_load_hosts(state, lambda: op_func(*args, **kwargs), op_func.__name__)

@@ -1,0 +1,15 @@
+{
+    "args": ["somefile"],
+    "kwargs": {
+        "database": "somedb",
+        "mysql_user": "root",
+        "mysql_password": "somepass"
+    },
+    "commands": [
+        {
+            "raw": "mysqldump somedb -uroot -psomepass > somefile",
+            "masked": "mysqldump somedb -uroot -p'*MASKED*' > somefile"
+        }
+    ],
+    "idempotent": false
+}

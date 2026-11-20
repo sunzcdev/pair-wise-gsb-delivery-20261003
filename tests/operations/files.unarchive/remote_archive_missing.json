@@ -1,0 +1,16 @@
+{
+    "kwargs": {
+        "src": "/tmp/missing.tar.gz",
+        "dest": "/opt/app",
+        "remote_src": true
+    },
+    "facts": {
+        "files.Directory": {
+            "path=/opt/app": true
+        },
+        "files.File": {
+            "path=/tmp/missing.tar.gz": null
+        }
+    },
+    "commands": ["tar -xz -f /tmp/missing.tar.gz -C /opt/app"]
+}

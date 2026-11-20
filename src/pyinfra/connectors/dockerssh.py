@@ -1,0 +1,366 @@
+import os
+from tempfile import mkstemp
+from typing import TYPE_CHECKING
+
+from typing_extensions import Unpack, override
+
+from pyinfra import logger
+from pyinfra.api.output import echo, format_text
+from pyinfra.api import QuoteString, StringCommand
+from pyinfra.api.exceptions import ConnectError, InventoryError, PyinfraError
+from pyinfra.api.util import get_file_io, memoize
+from pyinfra.progress import progress_spinner
+
+from .base import BaseConnector
+from .ssh import SSHConnector
+from .util import extract_control_arguments, make_unix_command_for_host
+
+if TYPE_CHECKING:
+    from pyinfra.api.arguments import ConnectorArguments
+    from pyinfra.api.host import Host
+    from pyinfra.api.state import State
+
+
+@memoize
+def show_warning() -> None:
+    logger.warning("The @dockerssh connector is in beta!")
+
+
+class DockerSSHConnector(BaseConnector):
+    """
+    **Note**: this connector is in beta!
+
+    The ``@dockerssh`` connector allows you to run commands on Docker containers \
+    on a remote machine.
+
+    .. note::
+
+        For running Podman containers on remote hosts, see the :doc:`podmanssh` connector.
+
+    .. code:: shell
+
+        # A Docker base image must be provided
+        pyinfra @dockerssh/remotehost:alpine:3.8 ...
+
+        # pyinfra can run on multiple Docker images in parallel
+        pyinfra @dockerssh/remotehost:alpine:3.8,@dockerssh/remotehost:ubuntu:bionic ...
+    """
+
+    handles_execution = True
+    # enable the use of other docker cli compatible tools like podman
+    docker_cmd = "docker"
+
+    ssh: SSHConnector
+
+    def __init__(self, state: "State", host: "Host"):
+        super().__init__(state, host)
+        self.ssh = SSHConnector(state, host)
+
+    @override
+    @staticmethod
+    def make_names_data(name):
+        try:
+            hostname, image = name.split(":", 1)
+        except (AttributeError, ValueError):  # failure to parse the name
+            raise InventoryError("No ssh host or docker base image provided!")
+
+        if not image:
+            raise InventoryError("No docker base image provided!")
+
+        show_warning()
+
+        yield (
+            f"@dockerssh/{hostname}:{image}",
+            {"ssh_hostname": hostname, "docker_image": image},
+            ["@dockerssh"],
+        )
+
+    @override
+    def connect(self) -> None:
+        self.ssh.connect()
+
+        if "docker_container_id" in self.host.host_data:  # user can provide a docker_container_id
+            return
+
+        try:
+            with progress_spinner({f"{self.docker_cmd} run"}):
+                # last line is the container ID
+                status, output = self.ssh.run_shell_command(
+                    StringCommand(
+                        self.docker_cmd,
+                        "run",
+                        "-d",
+                        QuoteString(self.host.data.docker_image),
+                        "tail",
+                        "-f",
+                        "/dev/null",
+                    ),
+                )
+                if not status:
+                    raise OSError(output.stderr)
+                container_id = output.stdout_lines[-1]
+
+        except PyinfraError as e:
+            raise ConnectError(e.args[0])
+
+        self.host.host_data["docker_container_id"] = container_id
+
+    @override
+    def disconnect(self) -> None:
+        container_id = self.host.host_data["docker_container_id"][:12]
+
+        with progress_spinner({f"{self.docker_cmd} commit"}):
+            _, output = self.ssh.run_shell_command(
+                StringCommand(self.docker_cmd, "commit", QuoteString(container_id))
+            )
+
+            # Last line is the image ID, get sha256:[XXXXXXXXXX]...
+            image_id = output.stdout_lines[-1][7:19]
+
+        with progress_spinner({f"{self.docker_cmd} rm"}):
+            self.ssh.run_shell_command(
+                StringCommand(self.docker_cmd, "rm", "-f", QuoteString(container_id)),
+            )
+
+        logger.info(
+            f"{self.host.print_prefix}{self.docker_cmd} build complete, image ID: {format_text(image_id, bold=True)}",
+        )
+
+    @override
+    def run_shell_command(
+        self,
+        command,
+        print_output: bool = False,
+        print_input: bool = False,
+        **arguments: Unpack["ConnectorArguments"],
+    ):
+        local_arguments = extract_control_arguments(arguments)
+
+        container_id = self.host.host_data["docker_container_id"]
+
+        command = make_unix_command_for_host(self.state, self.host, command, **arguments)
+        command = QuoteString(command)
+
+        docker_flags = "-it" if local_arguments.get("_get_pty") else "-i"
+        docker_command = StringCommand(
+            self.docker_cmd,
+            "exec",
+            docker_flags,
+            QuoteString(container_id),
+            "sh",
+            "-c",
+            command,
+        )
+
+        return self.ssh.run_shell_command(
+            docker_command,
+            print_output=print_output,
+            print_input=print_input,
+            **local_arguments,
+        )
+
+    @override
+    def put_file(
+        self,
+        filename_or_io,
+        remote_filename,
+        remote_temp_filename=None,
+        print_output: bool = False,
+        print_input: bool = False,
+        **kwargs,  # ignored (sudo/etc)
+    ):
+        """
+        Upload a file/IO object to the target Docker container by copying it to a
+        temporary location and then uploading it into the container using ``docker cp``.
+        """
+
+        fd, local_temp_filename = mkstemp()
+        remote_temp_filename = remote_temp_filename or self.host.get_temp_filename(
+            local_temp_filename
+        )
+
+        # Load our file or IO object and write it to the temporary file
+        with get_file_io(filename_or_io) as file_io:
+            with open(local_temp_filename, "wb") as temp_f:
+                data = file_io.read()
+
+                if isinstance(data, str):
+                    data = data.encode()
+
+                temp_f.write(data)
+
+        # upload file to remote server
+        ssh_status = self.ssh.put_file(local_temp_filename, remote_temp_filename)
+        if not ssh_status:
+            raise OSError("Failed to copy file over ssh")
+
+        try:
+            docker_id = self.host.host_data["docker_container_id"]
+            docker_command = StringCommand(
+                self.docker_cmd,
+                "cp",
+                QuoteString(remote_temp_filename),
+                QuoteString(f"{docker_id}:{remote_filename}"),
+            )
+
+            status, output = self.ssh.run_shell_command(
+                docker_command,
+                print_output=print_output,
+                print_input=print_input,
+            )
+        finally:
+            os.close(fd)
+            os.remove(local_temp_filename)
+            self.remote_remove(
+                local_temp_filename,
+                print_output=print_output,
+                print_input=print_input,
+            )
+
+        if not status:
+            raise OSError(output.stderr)
+
+        if print_output:
+            echo(
+                f"{self.host.print_prefix}file uploaded to container: {remote_filename}",
+                err=True,
+            )
+
+        return status
+
+    @override
+    def get_file(
+        self,
+        remote_filename,
+        filename_or_io,
+        remote_temp_filename=None,
+        print_output: bool = False,
+        print_input: bool = False,
+        **kwargs,  # ignored (sudo/etc)
+    ):
+        """
+        Download a file from the target Docker container by copying it to a temporary
+        location and then reading that into our final file/IO object.
+        """
+
+        remote_temp_filename = remote_temp_filename or self.host.get_temp_filename(remote_filename)
+
+        try:
+            docker_id = self.host.host_data["docker_container_id"]
+            docker_command = StringCommand(
+                self.docker_cmd,
+                "cp",
+                QuoteString(f"{docker_id}:{remote_filename}"),
+                QuoteString(remote_temp_filename),
+            )
+
+            status, output = self.ssh.run_shell_command(
+                docker_command,
+                print_output=print_output,
+                print_input=print_input,
+            )
+
+            ssh_status = self.ssh.get_file(remote_temp_filename, filename_or_io)
+        finally:
+            self.remote_remove(
+                remote_temp_filename,
+                print_output=print_output,
+                print_input=print_input,
+            )
+
+        if not ssh_status:
+            raise OSError("failed to copy file over ssh")
+
+        if not status:
+            raise OSError(output.stderr)
+
+        if print_output:
+            echo(
+                f"{self.host.print_prefix}file downloaded from container: {remote_filename}",
+                err=True,
+            )
+
+        return status
+
+    def remote_remove(self, filename, print_output: bool = False, print_input: bool = False):
+        """
+        Deletes a file on a remote machine over ssh.
+        """
+        remove_status, output = self.ssh.run_shell_command(
+            StringCommand("rm", "-f", filename),
+            print_output=print_output,
+            print_input=print_input,
+        )
+
+        if not remove_status:
+            raise OSError(output.stderr)
+
+
+@memoize
+def show_warning_podman() -> None:
+    logger.warning("The @podmanssh connector is in beta!")
+
+
+class PodmanSSHConnector(DockerSSHConnector):
+    """
+    **Note**: this connector is in beta!
+
+    The ``@podmanssh`` connector allows you to run commands on Podman containers
+    on a remote machine over SSH. This is useful when you need to manage containers
+    running on remote hosts where Podman is installed instead of Docker.
+
+    .. note::
+
+        This connector requires SSH access to the remote host and Podman to be installed
+        on the target machine. It operates similarly to ``@dockerssh`` but uses the
+        ``podman`` command instead of ``docker``.
+
+    + **Remote container creation**: Creates a new container from the specified image on the remote host
+    + **Command execution**: Runs operations inside the container via ``podman exec``
+    + **File operations**: Supports uploading/downloading files to/from containers via ``podman cp``
+    + **Container cleanup**: Automatically commits and removes containers when operations complete
+
+    .. code:: shell
+
+        # A Podman base image must be provided
+        pyinfra @podmanssh/remotehost:alpine:3.8 ...
+
+        # Run operations on multiple remote Podman containers in parallel
+        pyinfra @podmanssh/web1:nginx:latest,@podmanssh/web2:nginx:latest deploy.py
+
+        # Use with specific SSH connection settings
+        pyinfra @podmanssh/production-server:alpine:3.18 --sudo --port 2222 operations/
+
+    **Comparison with other connectors:**
+
+    + Use ``@podman`` for local Podman containers
+    + Use ``@dockerssh`` for remote Docker containers
+    + Use ``@podmanssh`` for remote Podman containers (this connector)
+
+    The Podman SSH connector is particularly useful in environments where:
+
+    + Docker is not available but Podman is installed
+    + Rootless containers are preferred for security
+    + You need OCI-compliant container operations on remote hosts
+    """
+
+    docker_cmd = "podman"
+
+    @override
+    @staticmethod
+    def make_names_data(name):
+        try:
+            hostname, image = name.split(":", 1)
+        except (AttributeError, ValueError):  # failure to parse the name
+            raise InventoryError("No ssh host or podman base image provided!")
+
+        if not image:
+            raise InventoryError("No podman base image provided!")
+
+        show_warning_podman()
+
+        yield (
+            f"@podmanssh/{hostname}:{image}",
+            {"ssh_hostname": hostname, "docker_image": image},
+            ["@podmanssh"],
+        )

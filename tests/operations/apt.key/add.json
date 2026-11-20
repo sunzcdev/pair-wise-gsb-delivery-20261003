@@ -1,0 +1,19 @@
+{
+    "args": ["mykey"],
+    "facts": {
+        "files.Directory": {
+            "path=/etc/apt/keyrings": null
+        },
+        "files.File": {
+            "path=/etc/apt/keyrings/mykey.gpg": null
+        }
+    },
+    "commands": [
+        "mkdir -p /etc/apt/keyrings",
+        "chmod 755 /etc/apt/keyrings",
+        "if grep -q \"BEGIN PGP PUBLIC KEY BLOCK\" \"mykey\"; then gpg --batch --dearmor -o \"/etc/apt/keyrings/mykey.gpg\" \"mykey\"; else cp \"mykey\" \"/etc/apt/keyrings/mykey.gpg\"; fi",
+        "mkdir -p /etc/apt/keyrings",
+        "touch /etc/apt/keyrings/mykey.gpg",
+        "chmod 644 /etc/apt/keyrings/mykey.gpg"
+    ]
+}

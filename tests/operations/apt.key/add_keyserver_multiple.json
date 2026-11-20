@@ -1,0 +1,26 @@
+{
+    "kwargs": {
+        "keyserver": "key-server.net",
+        "keyid": ["abc", "def"]
+    },
+    "facts": {
+        "files.Directory": {
+            "path=/etc/apt/keyrings": null,
+            "path=_tempfile_": null
+        },
+        "files.File": {
+            "path=/etc/apt/keyrings/keyserver-abc-def.gpg": null
+        }
+    },
+    "commands": [
+        "mkdir -p /etc/apt/keyrings",
+        "chmod 755 /etc/apt/keyrings",
+        "mkdir -p _tempfile_",
+        "chmod 700 _tempfile_",
+        "export GNUPGHOME=\"_tempfile_\" && gpg --batch --keyserver \"key-server.net\" --recv-keys abc def",
+        "export GNUPGHOME=\"_tempfile_\" && gpg --batch --export abc def > \"/etc/apt/keyrings/keyserver-abc-def.gpg\"",
+        "mkdir -p /etc/apt/keyrings",
+        "touch /etc/apt/keyrings/keyserver-abc-def.gpg",
+        "chmod 644 /etc/apt/keyrings/keyserver-abc-def.gpg"
+    ]
+}

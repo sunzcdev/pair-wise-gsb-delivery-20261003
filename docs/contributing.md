@@ -1,0 +1,151 @@
+# Contributing
+
+🎉 Thank you for taking the time to contribute to pyinfra! 🎉
+
+Third party pull requests help expand pyinfra's functionality and are essential to its continued growth. This guide should help get you started adding additional operations, facts and other functionality to pyinfra.
+
+## Guides
+
++ [How to write operations](api/operations)
++ [How to write facts](api/facts)
++ [How to write connectors](api/connectors) - note that new connectors **will not be merged to pyinfra**, instead they should be provided as a separate installable package. PR's that link to these packages in the docs very welcome.
++ Low level [API reference](api/reference) - this is pyinfra's internal APIs and does not come with the same compatibility guarantees as facts & operations - ie expect breaking changes on non-major versions.
+
+## Branches
+
++ There is a branch per major version, ie `3.x`, that tracks the latest release of that version
++ Changes should generally be based off the latest major branch, unless fixing an old version
+
+## Dev Setup
+
+First, install [uv](https://docs.astral.sh/uv/).
+
+Then, set up a development environment:
+
+```sh
+# There is no need to create a virtualenv, uv will do that for you
+
+# Clone the repo
+git clone git@github.com:pyinfra-dev/pyinfra.git
+
+# Install the package in editable mode with development requirements
+cd pyinfra
+uv sync
+```
+
+Re-run `uv sync` every time you switch branches. The editable install records the connector entry
+points in the virtualenv metadata at install time, while the modules themselves are read from the
+checked out tree, and `uv` does not notice a checkout: its staleness marker is the modification
+time of `src/`, which `git checkout` leaves alone. A branch that adds or removes a connector can
+therefore leave an entry point pointing at a module that is not there.
+
+pyinfra imports only the connectors an inventory asks for, so an entry point you never use is
+harmless - but the connector you do use will fail to load until the virtualenv is resynced.
+
+A plain `uv sync` also drops the `docs` dependency group, so pass `--group docs` when you want to
+build the documentation.
+
+If you will use pyinfra as a module, and want to be able to edit its code as you go, make sure you add it as an editable dependency to your project instead:
+
+```
+# There is no need to create a virtualenv, uv will do that for you
+
+# Clone the repo
+git clone git@github.com:pyinfra-dev/pyinfra.git
+
+# Add as an editable dependency
+# Note that the path should be relative from you project to where you cloned pyinfra
+uv add --editable ./pyinfra
+```
+
+### Code Style & Type Checking
+
+Code style is enforced via [ruff](https://docs.astral.sh/ruff/). Types are checked with mypy currently, and pyright is
+recommended for local development though currently optional. Shell scripts are checked with
+[shellcheck](https://www.shellcheck.net/), so install it before running the lint script (eg `apt-get install shellcheck`
+or `brew install shellcheck`). There is a script to run the linting & type-checking:
+
+```sh
+# Check formatting & types
+scripts/dev-lint.sh
+
+# Fix formatting
+scripts/dev-format.sh
+```
+
+### Commit Messages
+
+Commit messages should follow the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+standard. PRs that follow this will be rebased, PRs that do not will be squashed.
+
+The following scopes are (optionally) allowed: `api`, `cli`, `deps`, `operations`, `facts`, `connectors`. 
+With the last three an optional sub-scope can be added, ie `operations.docker` or `facts.apt`.
+
+When creating a PR, the last commit message is typically used as the PR title. When merging PRs, 
+we typically squash all commits into a single commit, and use the PR title as the commit message.
+For this reason, PR titles are linted to check if they follow our commit message conventions.
+
+### Tests
+
+GitHub will run all the test suites as part of any pull requests. There's a handy script that runs the unit tests:
+
+```sh
+scripts/dev-test.sh
+```
+
+To limit the pytests to a specific fact or operation:
+
+```sh
+# Only run fact tests for facts.efibootmgr.EFIBootMGR
+uv run pytest tests/test_facts.py -k "efibootmgr.EFIBootMGR"
+
+# Only run operation tests for operations.selinux
+uv run pytest tests/test_operations.py -k "selinux."
+```
+
+Tests for facts and operations are written in a declarative manner and use the 
+[pyinfra-testing harness](https://github.com/pyinfra-dev/pyinfra-testing). Review the harness README 
+to understand how tests for facts and operations are written, and how to add new tests.
+
+The test harness can also be used for writing tests for 3rd party facts and operations.
+
+#### End-to-End Tests
+
+The end-to-end tests are also executed via `pytest` but not selected by default, options/usage:
+
+```sh
+# Run all the e2e tests (local, SSH, Docker)
+scripts/dev-test-e2e.sh
+
+# Run local e2e tests (works on Linux / MacOS, no Windows yet)
+uv run pytest -m end_to_end_local
+
+# Run Docker and SSH e2e tests (Linux / MacOS with Docker installed)
+uv run pytest -m end_to_end_ssh
+uv run pytest -m end_to_end_docker
+```
+
+## Documentation
+
+Documentation changes should be made in the [pyinfra git repository](https://github.com/pyinfra-dev/pyinfra) - the repository `docs.pyinfra.com` should
+not be changed, it contains build artifacts.
+
+### Generate Documentation
+
+To generate the per-module operation, fact and connector pages:
+
+```sh
+scripts/generate-docs.sh
+```
+
+To preview the documentation site locally ([localhost:8000](http://localhost:8000)):
+
+```sh
+uv run zensical serve
+```
+
+To produce a full static build:
+
+```sh
+scripts/build-public-docs.sh
+```

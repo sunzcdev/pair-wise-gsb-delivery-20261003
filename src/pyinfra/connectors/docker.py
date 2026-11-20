@@ -1,0 +1,434 @@
+from __future__ import annotations
+
+import json
+import os
+import shlex
+from tempfile import mkstemp
+from typing import TYPE_CHECKING
+
+from typing_extensions import TypedDict, Unpack, override
+
+from pyinfra import local, logger
+from pyinfra.api.output import echo, format_text
+from pyinfra.api import QuoteString, StringCommand
+from pyinfra.api.exceptions import ConnectError, InventoryError, PyinfraError
+from pyinfra.api.util import get_file_io
+from pyinfra.progress import progress_spinner
+
+from .base import BaseConnector, DataMeta
+from .local import LocalConnector
+from .util import CommandOutput, extract_control_arguments, make_unix_command_for_host
+
+if TYPE_CHECKING:
+    from pyinfra.api.arguments import ConnectorArguments
+    from pyinfra.api.host import Host
+    from pyinfra.api.state import State
+
+
+class ConnectorData(TypedDict):
+    docker_identifier: str
+    docker_platform: str
+    docker_architecture: str
+    docker_user: str
+    docker_tag: str
+
+
+connector_data_meta: dict[str, DataMeta] = {
+    "docker_identifier": DataMeta("ID of container or image to start from"),
+    "docker_platform": DataMeta("Platform to use for Docker image (e.g., linux/amd64)"),
+    "docker_architecture": DataMeta("Architecture to use for Docker image (e.g., amd64, arm64)"),
+    "docker_user": DataMeta("User to execute commands as inside the container"),
+    "docker_tag": DataMeta("Image reference to apply to the committed image"),
+}
+
+
+class DockerConnector(BaseConnector):
+    """
+    The Docker connector allows you to use pyinfra to create new Docker images or modify running
+    Docker containers.
+
+    .. note::
+
+        The Docker connector allows pyinfra to target Docker containers as inventory and is
+        unrelated to the :doc:`../operations/docker` & :doc:`../facts/docker`.
+
+    You can pass either an image name or existing container ID:
+
+    + Image - will create a new container from the image, execute operations against it, save into \
+        a new Docker image and remove the container
+    + Existing container ID - will execute operations against the running container, leaving it \
+        running
+
+    .. code:: shell
+
+        # A Docker base image must be provided
+        pyinfra @docker/alpine:3.8 ...
+
+        # pyinfra can run on multiple Docker images in parallel
+        pyinfra @docker/alpine:3.8,@docker/ubuntu:bionic ...
+
+        # Execute against a running container
+        pyinfra @docker/2beb8c15a1b1 ...
+
+    The Docker connector is great for testing pyinfra operations locally, rather than connecting to
+    a remote host over SSH each time. This gives you a fast, local-first devloop to iterate on when
+    writing deploys, operations or facts.
+
+    See :doc:`../examples/docker-image-builds` for a complete image build and tagging example.
+
+    .. note::
+
+        For running Docker containers on remote hosts, see the :doc:`dockerssh` connector.
+    """
+
+    # enable the use of other docker cli compatible tools like podman
+    docker_cmd = "docker"
+
+    handles_execution = True
+
+    data_cls = ConnectorData
+    data_meta = connector_data_meta
+    data: ConnectorData
+
+    local: LocalConnector
+
+    container_id: str
+    no_stop: bool = False
+
+    def __init__(self, state: State, host: Host):
+        super().__init__(state, host)
+        self.local = LocalConnector(state, host)
+
+    @override
+    @staticmethod
+    def make_names_data(name=None):
+        if not name:
+            raise InventoryError("No docker base ID provided!")
+
+        yield (
+            f"@docker/{name}",
+            {"docker_identifier": name},
+            ["@docker"],
+        )
+
+    # 2 helper functions
+    def _find_start_docker_container(self, container_id) -> tuple[str, bool]:
+        quoted_container_id = shlex.quote(container_id)
+        docker_info = local.shell(f"{self.docker_cmd} container inspect {quoted_container_id}")
+        assert isinstance(docker_info, str)
+        docker_info = json.loads(docker_info)[0]
+        if docker_info["State"]["Running"] is False:
+            logger.info(f"Starting stopped container: {container_id}")
+            local.shell(f"{self.docker_cmd} container start {quoted_container_id}")
+            return container_id, False
+        return container_id, True
+
+    def _start_docker_image(self, image_name):
+        docker_cmd_parts = [
+            self.docker_cmd,
+            "run",
+            "-d",
+        ]
+
+        if self.data.get("docker_platform"):
+            docker_cmd_parts.extend(["--platform", shlex.quote(self.data["docker_platform"])])
+        if self.data.get("docker_architecture"):
+            docker_cmd_parts.extend(["--arch", shlex.quote(self.data["docker_architecture"])])
+
+        docker_cmd_parts.extend(
+            [
+                shlex.quote(image_name),
+                "tail",
+                "-f",
+                "/dev/null",
+            ]
+        )
+
+        try:
+            return local.shell(
+                " ".join(docker_cmd_parts),
+                splitlines=True,
+            )[-1]  # last line is the container ID
+        except PyinfraError as e:
+            raise ConnectError(e.args[0])
+
+    @override
+    def connect(self) -> None:
+        self.local.connect()
+
+        docker_identifier = self.data["docker_identifier"]
+        with progress_spinner({f"prepare {self.docker_cmd} container"}):
+            try:
+                self.container_id, was_running = self._find_start_docker_container(
+                    docker_identifier
+                )
+                if was_running:
+                    self.no_stop = True
+            except PyinfraError:
+                self.container_id = self._start_docker_image(docker_identifier)
+
+        if self.no_stop and self.data.get("docker_tag") is not None:
+            raise ConnectError("docker_tag cannot be used with an existing container")
+
+    @override
+    def disconnect(self) -> None:
+        container_id = self.container_id
+
+        if self.no_stop:
+            logger.info(
+                f"{self.host.print_prefix}{self.docker_cmd} build complete, container left running: {format_text(container_id, bold=True)}",
+            )
+            return
+
+        quoted_container_id = shlex.quote(container_id)
+
+        with progress_spinner({f"{self.docker_cmd} commit"}):
+            # last line is the image ID, optionally prefixed with the digest algorithm
+            # (docker prints "sha256:XXXX...", podman prints the bare digest)
+            image_id = (
+                local.shell(f"{self.docker_cmd} commit {quoted_container_id}", splitlines=True)[-1]
+                .strip()
+                .removeprefix("sha256:")[:12]
+            )
+
+        with progress_spinner({f"{self.docker_cmd} rm"}):
+            local.shell(
+                f"{self.docker_cmd} rm -f {quoted_container_id}",
+            )
+
+        docker_tag = self.data.get("docker_tag")
+        if docker_tag is not None:
+            with progress_spinner({f"{self.docker_cmd} tag"}):
+                tag_command = StringCommand(
+                    self.docker_cmd,
+                    "tag",
+                    QuoteString(image_id),
+                    QuoteString(docker_tag),
+                )
+                local.shell(tag_command.get_raw_value())
+
+        image_description = image_id if docker_tag is None else f"{image_id}, tag: {docker_tag}"
+        logger.info(
+            f"{self.host.print_prefix}{self.docker_cmd} build complete, image ID: {format_text(image_description, bold=True)}",
+        )
+
+    @override
+    def run_shell_command(
+        self,
+        command: StringCommand,
+        print_output: bool = False,
+        print_input: bool = False,
+        **arguments: Unpack[ConnectorArguments],
+    ) -> tuple[bool, CommandOutput]:
+        local_arguments = extract_control_arguments(arguments)
+
+        container_id = self.container_id
+
+        command = make_unix_command_for_host(self.state, self.host, command, **arguments)
+        command = StringCommand(QuoteString(command))
+
+        docker_flags = "-it" if local_arguments.get("_get_pty") else "-i"
+
+        docker_command_bits: list[str | QuoteString] = [self.docker_cmd, "exec"]
+
+        docker_user = self.data.get("docker_user")
+        if docker_user:
+            docker_command_bits.extend(["--user", QuoteString(docker_user)])
+
+        docker_command = StringCommand(
+            *docker_command_bits,
+            docker_flags,
+            container_id,
+            "sh",
+            "-c",
+            command,
+        )
+
+        return self.local.run_shell_command(
+            docker_command,
+            print_output=print_output,
+            print_input=print_input,
+            **local_arguments,
+        )
+
+    @override
+    def put_file(
+        self,
+        filename_or_io,
+        remote_filename,
+        remote_temp_filename=None,  # ignored
+        print_output=False,
+        print_input=False,
+        **kwargs,  # ignored (sudo/etc)
+    ) -> bool:
+        """
+        Upload a file/IO object to the target container by copying it to a
+        temporary location and then uploading it into the container using ``docker cp``.
+        """
+
+        fd, temp_filename = mkstemp()
+
+        try:
+            # Load our file or IO object and write it to the temporary file
+            with get_file_io(filename_or_io) as file_io:
+                with open(temp_filename, "wb") as temp_f:
+                    data = file_io.read()
+
+                    if isinstance(data, str):
+                        data = data.encode()
+
+                    temp_f.write(data)
+
+            docker_command = StringCommand(
+                self.docker_cmd,
+                "cp",
+                QuoteString(temp_filename),
+                QuoteString(f"{self.container_id}:{remote_filename}"),
+            )
+
+            status, output = self.local.run_shell_command(
+                docker_command,
+                print_output=print_output,
+                print_input=print_input,
+            )
+        finally:
+            os.close(fd)
+            os.remove(temp_filename)
+
+        if not status:
+            raise OSError(output.stderr)
+
+        if print_output:
+            echo(
+                f"{self.host.print_prefix}file uploaded to container: {remote_filename}",
+                err=True,
+            )
+
+        return status
+
+    @override
+    def get_file(
+        self,
+        remote_filename,
+        filename_or_io,
+        remote_temp_filename=None,  # ignored
+        print_output=False,
+        print_input=False,
+        **kwargs,  # ignored (sudo/etc)
+    ) -> bool:
+        """
+        Download a file from the target container by copying it to a temporary
+        location and then reading that into our final file/IO object.
+        """
+
+        fd, temp_filename = mkstemp()
+
+        try:
+            docker_command = StringCommand(
+                self.docker_cmd,
+                "cp",
+                QuoteString(f"{self.container_id}:{remote_filename}"),
+                QuoteString(temp_filename),
+            )
+
+            status, output = self.local.run_shell_command(
+                docker_command,
+                print_output=print_output,
+                print_input=print_input,
+            )
+
+            # Load the temporary file and write it to our file or IO object
+            with open(temp_filename, "rb") as temp_f:
+                with get_file_io(filename_or_io, "wb") as file_io:
+                    data = temp_f.read()
+                    file_io.write(data)
+        finally:
+            os.close(fd)
+            os.remove(temp_filename)
+
+        if not status:
+            raise OSError(output.stderr)
+
+        if print_output:
+            echo(
+                f"{self.host.print_prefix}file downloaded from container: {remote_filename}",
+                err=True,
+            )
+
+        return status
+
+
+class PodmanConnector(DockerConnector):
+    """
+    The Podman connector allows you to use pyinfra to create new Podman images or modify running
+    Podman containers.
+
+    .. note::
+
+        The Podman connector allows pyinfra to target Podman containers as inventory and is
+        unrelated to the :doc:`../operations/docker` & :doc:`../facts/docker`.
+
+    You can pass either an image name or existing container ID:
+
+    + Image - will create a new container from the image, execute operations against it, save into \
+        a new Podman image and remove the container
+    + Existing container ID - will execute operations against the running container, leaving it \
+        running
+
+    .. code:: shell
+
+        # A Podman base image must be provided
+        pyinfra @podman/alpine:3.8 ...
+
+        # pyinfra can run on multiple Docker images in parallel
+        pyinfra @podman/alpine:3.8,@podman/ubuntu:bionic ...
+
+        # Execute against a running container
+        pyinfra @podman/2beb8c15a1b1 ...
+
+    The Podman connector is great for testing pyinfra operations locally, rather than connecting to
+    a remote host over SSH each time. This gives you a fast, local-first devloop to iterate on when
+    writing deploys, operations or facts.
+
+    .. note::
+
+        For running Podman containers on remote hosts, see the :doc:`podmanssh` connector.
+    """
+
+    docker_cmd = "podman"
+
+    @override
+    @staticmethod
+    def make_names_data(name=None):
+        if not name:
+            raise InventoryError("No podman base ID provided!")
+
+        yield (
+            f"@podman/{name}",
+            {"docker_identifier": name},
+            ["@podman"],
+        )
+
+    # Duplicate function definition to swap the docstring.
+    @override
+    def put_file(
+        self,
+        filename_or_io,
+        remote_filename,
+        remote_temp_filename=None,  # ignored
+        print_output=False,
+        print_input=False,
+        **kwargs,  # ignored (sudo/etc)
+    ) -> bool:
+        """
+        Upload a file/IO object to the target container by copying it to a
+        temporary location and then uploading it into the container using ``podman cp``.
+        """
+        return super().put_file(
+            filename_or_io,
+            remote_filename,
+            remote_temp_filename,  # ignored
+            print_output,
+            print_input,
+            **kwargs,  # ignored (sudo/etc)
+        )

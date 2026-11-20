@@ -1,0 +1,111 @@
+"""
+Manage flatpak packages. See https://www.flatpak.org/
+"""
+
+from __future__ import annotations
+
+from pyinfra import host
+from pyinfra.api import QuoteString, StringCommand, operation
+from pyinfra.facts.flatpak import FlatpakPackages
+
+
+@operation()
+def packages(
+    packages: str | list[str] | None = None,
+    remote: str | None = None,
+    present: bool = True,
+    user: bool = False,
+):
+    """
+    Install/remove a flatpak package
+
+    + packages: List of packages
+    + remote: Source from which to install the application or runtime
+    + present: whether the package should be installed
+    + user: use the current user's installation instead of Flatpak's default
+
+    **Examples:**
+
+    .. code:: python
+
+        from pyinfra.operations import flatpak
+        # Install vlc flatpak
+        flatpak.packages(
+            name="Install vlc",
+            packages="org.videolan.VLC",
+        )
+
+        # Install vlc flatpak from flathub
+        flatpak.packages(
+            name="Install vlc",
+            packages="org.videolan.VLC",
+            remote="flathub",
+        )
+
+        # Install vlc flatpak for the current user
+        flatpak.packages(
+            name="Install vlc",
+            packages="org.videolan.VLC",
+            remote="flathub",
+            user=True,
+        )
+
+        # Install multiple flatpaks
+        flatpak.packages(
+            name="Install vlc and kodi",
+            packages=["org.videolan.VLC", "tv.kodi.Kodi"],
+        )
+
+        # Remove vlc
+        flatpak.packages(
+            name="Remove vlc",
+            packages="org.videolan.VLC",
+            present=False,
+        )
+    """
+
+    if packages is None:
+        return
+
+    if isinstance(packages, str):
+        packages = [packages]
+
+    flatpak_packages = host.get_fact(FlatpakPackages, user=user)
+
+    install_packages = []
+    remove_packages = []
+
+    if remote is not None:
+        remote = remote.strip()
+
+    for package in packages:
+        # it's installed
+        if package in flatpak_packages:
+            if not present:
+                # we don't want it
+                remove_packages.append(package)
+
+        # it's not installed
+        if package not in flatpak_packages:
+            # we want it
+            if present:
+                install_packages.append(package)
+
+            # we don't want it
+            else:
+                host.noop(f"flatpak package {package} is not installed")
+
+    if install_packages:
+        command: list[str | QuoteString] = [
+            f"flatpak install --noninteractive{' --user' if user else ''}"
+        ]
+        if remote:
+            command.append(QuoteString(remote))
+        command += [QuoteString(package) for package in install_packages]
+        yield StringCommand(*command)
+
+    if remove_packages:
+        yield StringCommand(
+            f"flatpak uninstall --noninteractive{' --user' if user else ''}",
+            *[QuoteString(package) for package in remove_packages],
+        )

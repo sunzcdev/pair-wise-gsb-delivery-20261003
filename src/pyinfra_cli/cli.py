@@ -1,0 +1,964 @@
+import logging
+import os.path
+import sys
+import warnings
+from fnmatch import fnmatch
+from getpass import getpass
+from typing import Annotated
+from collections.abc import Iterable
+from os import chdir as os_chdir, environ, getcwd
+from pathlib import Path
+
+from cyclopts import App, Group, Parameter
+from rich.prompt import Confirm
+
+from pyinfra import __version__, logger, state
+from pyinfra.api import Config, Host, Inventory, State
+from pyinfra.api.connect import connect_all, disconnect_all
+from pyinfra.api.exceptions import NoGroupError, PyinfraError
+from pyinfra.api.facts import get_facts
+from pyinfra.api.operations import run_ops
+from pyinfra.api.state import StateStage
+from pyinfra.api.util import get_kwargs_str
+from pyinfra.context import ctx_config, ctx_inventory, ctx_state
+from pyinfra.operations import server
+
+from pyinfra.api.output import format_text
+
+from .commands import get_facts_and_args, get_func_and_args
+from .console import console, stdout_console
+from .exceptions import CliError, UnexpectedExternalError, UnexpectedInternalError, WrappedError
+from .inventory import make_inventory
+from .log import setup_logging
+from .prints import (
+    print_facts,
+    print_facts_json,
+    print_inventory,
+    print_inventory_json,
+    print_meta,
+    print_results,
+    print_run_json,
+    print_state_operations,
+    print_state_operations_json,
+    print_support_info,
+)
+from .util import exec_file, load_deploy_file, load_func, parse_cli_arg
+from .virtualenv import init_virtualenv
+
+# A repeatable flag: each occurrence appends a ``True``; the count is the verbosity level.
+CountFlag = Annotated[list[bool], Parameter(negative="")]
+
+_FALSY_BOOL_VALUES = ("", "0", "n", "no", "off", "false", "f")
+_TRUTHY_BOOL_VALUES = ("1", "y", "yes", "on", "true", "t")
+
+
+def _lenient_bool(type_, tokens) -> bool:
+    """Lenient boolean conversion for environment variables.
+
+    An empty value counts as unset (False) and ``on``/``off`` are accepted,
+    matching the legacy Click behaviour for ``PYINFRA_YES``.
+    """
+    value = tokens[0].value.strip().lower() if tokens else ""
+    if value in _FALSY_BOOL_VALUES:
+        return False
+    if value in _TRUTHY_BOOL_VALUES:
+        return True
+    raise ValueError(f"invalid boolean value: {tokens[0].value!r}")
+
+
+_EXAMPLES = """\
+# Run one or more deploys against the inventory
+pyinfra INVENTORY deploy_web.py [deploy_db.py]...
+
+# Run a single operation against the inventory
+pyinfra INVENTORY server.user pyinfra home=/home/pyinfra
+
+# Execute an arbitrary command against the inventory
+pyinfra INVENTORY exec -- echo "hello world"
+
+# Run one or more facts against the inventory
+pyinfra INVENTORY fact server.LinuxName [server.Users]...
+pyinfra INVENTORY fact files.File path=/path/to/file...
+
+# Debug the inventory hosts and data
+pyinfra INVENTORY debug-inventory"""
+
+
+def _build_examples_epilogue() -> str:
+    """Render the CLI examples as syntax-highlighted (bash) ANSI text.
+
+    Used as a ``help_format="rich"`` epilogue so the examples show up
+    colourised on the help page.
+    """
+    from rich.syntax import Syntax
+
+    syntax = Syntax(_EXAMPLES, "bash", background_color="default", word_wrap=True)
+    with stdout_console.capture() as capture:
+        stdout_console.print("[bold]Examples:[/bold]\n")
+        stdout_console.print(syntax)
+    return capture.get()
+
+
+def _build_usage() -> str:
+    """Colourised usage line: required args in cyan, optionals dimmed.
+
+    Rendered to an ANSI string because Cyclopts concatenates ``usage`` as a
+    plain string; the ``Usage:`` label is added by the help formatter.  Colour
+    is only emitted when stdout is a terminal so piped output stays plain.
+    """
+    from rich.text import Text
+
+    line = Text.assemble(
+        ("pyinfra ", "bold"),
+        ("[OPTIONS] ", "dim"),
+        ("INVENTORY ", "bold cyan"),
+        ("[OPERATIONS...]", "cyan"),
+    )
+    if not stdout_console.is_terminal:
+        return line.plain
+    with stdout_console.capture() as capture:
+        stdout_console.print(line, end="")
+    return capture.get()
+
+
+app = App(
+    name="pyinfra",
+    version=f"pyinfra: v{__version__}",
+    version_flags=["--version"],
+    help_flags=["-h", "--help"],
+    help_format="rich",
+    usage=_build_usage(),
+    console=stdout_console,
+    error_console=console,
+    help_epilogue=_build_examples_epilogue(),
+)
+
+# Enable ``pyinfra --install-completion`` for shell autocompletion.
+app.register_install_completion_command()
+
+
+@app.command(name="--support")
+def _support_command() -> None:
+    """Print useful information for support and exit."""
+    print_support_info()
+
+
+# Parameter groups for the help page (ordered top-to-bottom as declared).
+# ``negative=""`` disables the auto-generated ``--no-*`` / ``--empty-*`` flags to
+# match the original flag-only CLI UX.
+_no_negative = Parameter(negative="")
+GROUP_EXECUTION = Group.create_ordered("Execution", default_parameter=_no_negative)
+GROUP_INVENTORY = Group.create_ordered("Inventory & Data", default_parameter=_no_negative)
+GROUP_PRIVILEGE = Group.create_ordered("Privilege Escalation", default_parameter=_no_negative)
+GROUP_SSH = Group.create_ordered("SSH Connection", default_parameter=_no_negative)
+GROUP_DEBUG = Group.create_ordered("Debugging & Output", default_parameter=_no_negative)
+
+
+def _exit() -> None:
+    if ctx_state.isset() and state.failed_hosts:
+        sys.exit(1)
+    sys.exit(0)
+
+
+class CliCommands:
+    DEBUG_INVENTORY = "DEBUG_INVENTORY"
+    FACT = "FACT"
+    SHELL = "SHELL"
+    DEPLOY_FILES = "DEPLOY_FILES"
+    FUNC = "FUNC"
+
+
+@app.default
+def cli(
+    inventory: str,
+    *operations: str,
+    verbose: Annotated[CountFlag, Parameter(name="-v", group=GROUP_DEBUG)] = [],
+    dry: Annotated[bool, Parameter(group=GROUP_EXECUTION)] = False,
+    diff: Annotated[bool, Parameter(group=GROUP_DEBUG)] = False,
+    yes: Annotated[
+        bool,
+        Parameter(
+            name=["-y", "--yes"],
+            env_var="PYINFRA_YES",
+            converter=_lenient_bool,
+            group=GROUP_EXECUTION,
+        ),
+    ] = False,
+    limit: Annotated[tuple[str, ...], Parameter(group=GROUP_INVENTORY)] = (),
+    exclude: Annotated[tuple[str, ...], Parameter(group=GROUP_INVENTORY)] = (),
+    fail_percent: Annotated[int | None, Parameter(group=GROUP_EXECUTION)] = None,
+    data: Annotated[tuple[str, ...], Parameter(group=GROUP_INVENTORY)] = (),
+    group_data: Annotated[tuple[str, ...], Parameter(group=GROUP_INVENTORY)] = (),
+    config_filename: Annotated[
+        str, Parameter(name="--config", group=GROUP_INVENTORY)
+    ] = "config.py",
+    chdir: Annotated[str | None, Parameter(group=GROUP_INVENTORY)] = None,
+    sudo: Annotated[bool, Parameter(group=GROUP_PRIVILEGE)] = False,
+    sudo_user: Annotated[str | None, Parameter(group=GROUP_PRIVILEGE)] = None,
+    same_sudo_password: Annotated[bool, Parameter(group=GROUP_PRIVILEGE)] = False,
+    use_sudo_password: Annotated[bool, Parameter(group=GROUP_PRIVILEGE)] = False,
+    use_sudo_login: Annotated[bool, Parameter(group=GROUP_PRIVILEGE)] = False,
+    su_user: Annotated[str | None, Parameter(group=GROUP_PRIVILEGE)] = None,
+    dzdo: Annotated[bool, Parameter(group=GROUP_PRIVILEGE)] = False,
+    dzdo_user: Annotated[str | None, Parameter(group=GROUP_PRIVILEGE)] = None,
+    shell_executable: Annotated[str | None, Parameter(group=GROUP_EXECUTION)] = None,
+    parallel: Annotated[int | None, Parameter(group=GROUP_EXECUTION)] = None,
+    no_wait: Annotated[bool, Parameter(group=GROUP_EXECUTION)] = False,
+    serial: Annotated[bool, Parameter(group=GROUP_EXECUTION)] = False,
+    retry: Annotated[int, Parameter(group=GROUP_EXECUTION)] = 0,
+    retry_delay: Annotated[int, Parameter(group=GROUP_EXECUTION)] = 5,
+    ssh_user: Annotated[
+        str | None, Parameter(name=["--ssh-user", "--user"], group=GROUP_SSH)
+    ] = None,
+    ssh_port: Annotated[
+        int | None, Parameter(name=["--ssh-port", "--port"], group=GROUP_SSH)
+    ] = None,
+    ssh_key: Annotated[str | None, Parameter(name=["--ssh-key", "--key"], group=GROUP_SSH)] = None,
+    ssh_key_password: Annotated[
+        str | None, Parameter(name=["--ssh-key-password", "--key-password"], group=GROUP_SSH)
+    ] = None,
+    ssh_password: Annotated[
+        str | None, Parameter(name=["--ssh-password", "--password"], group=GROUP_SSH)
+    ] = None,
+    ssh_password_prompt: Annotated[bool, Parameter(group=GROUP_SSH)] = False,
+    debug: Annotated[bool, Parameter(group=GROUP_DEBUG)] = False,
+    debug_all: Annotated[bool, Parameter(group=GROUP_DEBUG)] = False,
+    debug_facts: Annotated[bool, Parameter(group=GROUP_DEBUG)] = False,
+    debug_operations: Annotated[bool, Parameter(group=GROUP_DEBUG)] = False,
+    json_output: Annotated[bool, Parameter(name="--json", group=GROUP_DEBUG)] = False,
+):
+    """pyinfra manages the state of one or more servers.
+
+    It can be used for app/service deployment, config management and ad-hoc
+    command execution.
+
+    Documentation: [cyan][link=https://docs.pyinfra.com]docs.pyinfra.com[/link][/cyan]
+
+    INVENTORY can be:
+    - a file ([cyan]inventory.py[/cyan])
+    - a hostname ([cyan]host.net[/cyan])
+    - comma separated hostnames ([cyan]host-1.net,host-2.net,@local[/cyan])
+
+    Parameters
+    ----------
+    inventory
+        Inventory file, hostname(s) or connector to target.
+    operations
+        Deploy file(s), an operation + args, `exec -- command`, `fact ...` or
+        `debug-inventory`.
+    verbose
+        Print meta (-v), input (-vv) and output (-vvv).
+    dry
+        Don't execute operations on the target hosts.
+    diff
+        Show the differences when changing text files and templates.
+    yes
+        Execute operations immediately without prompt or checking for changes.
+    limit
+        Restrict the target hosts by name and group name.
+    exclude
+        Exclude target hosts by name and group name.
+    fail_percent
+        % of hosts that need to fail before exiting early.
+    data
+        Override data values, format key=value.
+    group_data
+        Paths to load additional group data from (overrides matching keys).
+    config_filename
+        Specify config file to use (default: config.py).
+    chdir
+        Set the working directory before executing.
+    sudo
+        Whether to execute operations with sudo.
+    sudo_user
+        Which user to sudo when sudoing.
+    same_sudo_password
+        All hosts have the same sudo password, so ask only once.
+    use_sudo_password
+        Whether to use a password with sudo.
+    use_sudo_login
+        Use a login shell when sudo-ing.
+    su_user
+        Which user to su to.
+    dzdo
+        Whether to execute operations with dzdo.
+    dzdo_user
+        Which user to dzdo when using dzdo.
+    shell_executable
+        Shell to use (ex: "sh", "cmd", "ps").
+    parallel
+        Number of operations to run in parallel.
+    no_wait
+        Don't wait between operations for hosts.
+    serial
+        Run operations in serial, host by host.
+    retry
+        Number of times to retry failed operations.
+    retry_delay
+        Delay in seconds between retry attempts.
+    ssh_user
+        SSH user to connect as.
+    ssh_port
+        SSH port to connect to.
+    ssh_key
+        SSH Private key filename.
+    ssh_key_password
+        SSH Private key password.
+    ssh_password
+        SSH password.
+    ssh_password_prompt
+        Prompt for SSH password instead of passing it on the command line.
+    debug
+        Print debug logs from pyinfra.
+    debug_all
+        Print debug logs from all packages including pyinfra.
+    debug_facts
+        Print facts after generating operations and exit.
+    debug_operations
+        Print operations after generating and exit.
+    json_output
+        Emit pure JSON output on stdout (for facts, debug-inventory,
+        debug-operations, dry runs and deploy results).
+    """
+    if not operations:
+        raise CliError(
+            "No operations provided.\n\n"
+            "    Operation usage:\n"
+            "    pyinfra INVENTORY deploy_web.py [deploy_db.py]...\n"
+            "    pyinfra INVENTORY server.user pyinfra home=/home/pyinfra\n"
+            '    pyinfra INVENTORY exec -- echo "hello world"\n'
+            "    pyinfra INVENTORY fact server.LinuxName [server.Users]..."
+        )
+
+    try:
+        _main(
+            inventory=inventory,
+            operations=list(operations),
+            verbosity=len(verbose),
+            chdir=chdir,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            ssh_key=ssh_key,
+            ssh_key_password=ssh_key_password,
+            ssh_password=ssh_password,
+            ssh_password_prompt=ssh_password_prompt,
+            same_sudo_password=same_sudo_password,
+            shell_executable=shell_executable,
+            sudo=sudo,
+            sudo_user=sudo_user,
+            use_sudo_password=use_sudo_password,
+            use_sudo_login=use_sudo_login,
+            su_user=su_user,
+            dzdo=dzdo,
+            dzdo_user=dzdo_user,
+            parallel=parallel,
+            fail_percent=fail_percent,
+            data=data,
+            group_data=group_data,
+            config_filename=config_filename,
+            dry=dry,
+            diff=diff,
+            yes=yes,
+            limit=limit,
+            exclude=exclude,
+            no_wait=no_wait,
+            serial=serial,
+            retry=retry,
+            retry_delay=retry_delay,
+            debug=debug,
+            debug_all=debug_all,
+            debug_facts=debug_facts,
+            debug_operations=debug_operations,
+            json_output=json_output,
+        )
+    except (CliError, UnexpectedExternalError):
+        raise
+    except PyinfraError as e:
+        # Re-raise "expected" pyinfra exceptions with our exception wrapper
+        raise WrappedError(e)
+    except Exception as e:
+        # Re-raise any unexpected internal exceptions as UnexpectedInternalError
+        raise UnexpectedInternalError(e)
+    finally:
+        if ctx_state.isset() and state.initialised:
+            logger.info("--> Disconnecting from hosts...")
+            # Triggers any executor disconnect requirements
+            disconnect_all(state)
+
+
+def _main(
+    inventory,
+    operations: list | tuple,
+    verbosity: int,
+    chdir: str | None,
+    ssh_user: str | None,
+    ssh_port: int | None,
+    ssh_key: str | None,
+    ssh_key_password: str | None,
+    ssh_password: str | None,
+    ssh_password_prompt: bool,
+    same_sudo_password: bool,
+    shell_executable: str | None,
+    sudo: bool,
+    sudo_user: str | None,
+    use_sudo_password: bool,
+    use_sudo_login: bool,
+    su_user: str | None,
+    dzdo: bool,
+    dzdo_user: str | None,
+    parallel: int | None,
+    fail_percent: int | None,
+    data,
+    group_data,
+    config_filename: str,
+    dry: bool,
+    diff: bool,
+    yes: bool,
+    limit: Iterable,
+    exclude: Iterable,
+    no_wait: bool,
+    serial: bool,
+    retry: int,
+    retry_delay: int,
+    debug: bool,
+    debug_all: bool,
+    debug_facts: bool,
+    debug_operations: bool,
+    json_output: bool = False,
+):
+    # In JSON mode keep the spinner quiet so stdout stays pure JSON. Do not
+    # force --yes: a JSON run must be able to diff a host without mutating
+    # it. Applying still requires an explicit --yes; without it the proposed
+    # changes are emitted as JSON instead of blocking on a confirm prompt.
+    if json_output:
+        environ.setdefault("PYINFRA_PROGRESS", "off")
+    # Setup working directory
+    #
+    if chdir:
+        os_chdir(chdir)
+
+    # Setup logging & Bootstrap/Venv
+    #
+    _setup_log_level(debug, debug_all)
+    init_virtualenv()
+
+    # Check operations are valid and setup commands
+    #
+    original_operations, operations, command, chdir = _validate_operations(operations, chdir)
+
+    # Setup state, config & inventory
+    #
+    state = _setup_state(verbosity, yes)
+    config = Config()
+    ctx_config.set(config)
+
+    # Update Config & Override Data
+    #
+    config = _set_config(
+        config,
+        config_filename,
+        sudo,
+        sudo_user,
+        use_sudo_password,
+        use_sudo_login,
+        same_sudo_password,
+        su_user,
+        dzdo,
+        dzdo_user,
+        parallel,
+        shell_executable,
+        fail_percent,
+        yes,
+        diff,
+        retry,
+        retry_delay,
+    )
+    if ssh_password_prompt:
+        ssh_password = getpass("SSH password: ")
+
+    override_data = _set_override_data(
+        data,
+        ssh_user,
+        ssh_key,
+        ssh_key_password,
+        ssh_port,
+        ssh_password,
+    )
+
+    # JSON mode is non-interactive: a failure prompt would block the
+    # pure-JSON stdout pipe, so never install the confirm callbacks there.
+    if yes is False and not json_output:
+        _set_fail_prompts(state, config)
+
+    # Load up the inventory from the filesystem
+    #
+    logger.info("--> Loading inventory...")
+    inventory = make_inventory(
+        inventory,
+        cwd=state.cwd,
+        override_data=override_data,
+        group_data_directories=group_data,
+    )
+    ctx_inventory.set(inventory)
+
+    # Now that we have inventory, apply --limit/--exclude config override
+    initial_limit = _apply_inventory_limit(inventory, limit)
+    initial_limit = _apply_inventory_exclude(inventory, initial_limit, exclude)
+
+    # Initialise the state
+    state.init(inventory, config, initial_limit=initial_limit)
+
+    if command == CliCommands.DEBUG_INVENTORY:
+        if json_output:
+            print_inventory_json(state)
+        else:
+            print_inventory(state)
+        _exit()
+
+    # Connect to the hosts & start handling the user commands
+    #
+    logger.info("--> Connecting to hosts...")
+    state.set_stage(StateStage.Connect)
+    connect_all(state)
+
+    state.set_stage(StateStage.Prepare)
+    can_diff, state, config = _handle_commands(
+        state, config, command, original_operations, operations, json_output=json_output
+    )
+
+    # Print proposed changes, execute unless --dry, and exit
+    #
+    if can_diff and not json_output:
+        if yes:
+            logger.info("--> Skipping change detection")
+        else:
+            logger.info("--> Detected changes:")
+            print_meta(state)
+            console.print(
+                """
+    Detected changes may not include every change pyinfra will execute.
+    Hidden side effects of operations may alter behaviour of future operations,
+    this will be shown in the results. The remote state will always be updated
+    to reflect the state defined by the input operations.""",
+            )
+
+    # If --debug-facts or --debug-operations, print and exit
+    if debug_facts or debug_operations:
+        if debug_operations:
+            if json_output:
+                print_state_operations_json(state)
+            else:
+                print_state_operations(state)
+
+        _exit()
+
+    if dry:
+        if json_output:
+            print_run_json(state, dry=True)
+        _exit()
+
+    if can_diff and not yes:
+        if json_output:
+            # Non-interactive JSON run without --yes: emit the proposed
+            # changes (like --dry) and exit without touching the host.
+            print_run_json(state, dry=True)
+            _exit()
+        if not _do_confirm("Detected changes displayed above, skip this step with -y"):
+            _exit()
+
+    logger.info("--> Beginning operation run...")
+    state.set_stage(StateStage.Execute)
+    run_ops(state, serial=serial, no_wait=no_wait)
+
+    logger.info("--> Results:")
+    state.set_stage(StateStage.Disconnect)
+    if json_output:
+        print_run_json(state, dry=False)
+    else:
+        print_results(state)
+    _exit()
+
+
+def _do_confirm(msg: str) -> bool:
+    console.print()
+    console.print(f"    {msg}")
+    warning_count = state.get_warning_counter()
+    if warning_count > 0:
+        console.print(
+            f"    {warning_count} warnings shown during change detection, see above",
+            style="yellow",
+        )
+    return Confirm.ask("    Execute?", console=console, default=True)
+
+
+# Setup
+#
+def _setup_log_level(debug, debug_all):
+    if not debug and not sys.warnoptions:
+        warnings.simplefilter("ignore")
+
+    log_level = logging.INFO
+    if debug or debug_all:
+        log_level = logging.DEBUG
+
+    other_log_level = None
+    if debug_all:
+        other_log_level = logging.DEBUG
+
+    setup_logging(log_level, other_log_level)
+
+
+def _validate_operations(operations, chdir):
+    # Make a copy before we overwrite
+    original_operations = operations
+
+    # Debug (print) inventory + group data
+    if operations[0] == "debug-inventory":
+        command = CliCommands.DEBUG_INVENTORY
+
+    # Get one or more facts
+    elif operations[0] == "fact":
+        command = CliCommands.FACT
+        operations = get_facts_and_args(operations[1:])
+
+    # Execute a raw command with server.shell
+    elif operations[0] == "exec":
+        command = CliCommands.SHELL
+        operations = operations[1:]
+
+    # Execute one or more deploy files
+    elif all(cmd.endswith(".py") for cmd in operations):
+        command = CliCommands.DEPLOY_FILES
+
+        filenames = []
+
+        for filename in operations[0:]:
+            if Path(filename).exists():
+                filenames.append(filename)
+                continue
+            if chdir and filename.startswith(chdir):
+                correct_filename = os.path.relpath(filename, chdir)
+                logger.warning(
+                    (
+                        "Fixing deploy filename under `--chdir` argument: "
+                        f"{filename} -> {correct_filename}"
+                    ),
+                )
+                filenames.append(correct_filename)
+                continue
+            raise CliError(
+                f"No deploy file: {str(Path(chdir) / filename) if chdir else filename}",
+            )
+
+        operations = filenames
+
+    # Load a function (op or deploy) directly with arguments
+    elif "." in operations[0]:
+        command = CliCommands.FUNC
+        operations = get_func_and_args(operations)
+
+    else:
+        raise CliError(
+            f"""Invalid operations: {operations}
+
+    Operation usage:
+    pyinfra INVENTORY deploy_web.py [deploy_db.py]...
+    pyinfra INVENTORY server.user pyinfra home=/home/pyinfra
+    pyinfra INVENTORY exec -- echo "hello world"
+    pyinfra INVENTORY fact os [users]...""",
+        )
+
+    return original_operations, operations, command, chdir
+
+
+def _set_verbosity(state, verbosity):
+    if verbosity > 0:
+        state.print_fact_info = True
+        state.print_noop_info = True
+
+    if verbosity > 1:
+        state.print_input = True
+        state.print_fact_input = True
+
+    if verbosity > 2:
+        state.print_output = True
+        state.print_fact_output = True
+
+    return state
+
+
+def _setup_state(verbosity, yes):
+    cwd = getcwd()
+    if cwd not in sys.path:  # ensure cwd is present in sys.path
+        sys.path.append(cwd)
+
+    state = State(check_for_changes=not yes)
+    state.cwd = cwd
+    ctx_state.set(state)
+
+    state = _set_verbosity(state, verbosity)
+    return state
+
+
+def _set_config(
+    config,
+    config_filename,
+    sudo,
+    sudo_user,
+    use_sudo_password,
+    use_sudo_login,
+    same_sudo_password,
+    su_user,
+    dzdo,
+    dzdo_user,
+    parallel,
+    shell_executable,
+    fail_percent,
+    yes,
+    diff,
+    retry,
+    retry_delay,
+):
+    logger.info("--> Loading config...")
+
+    # Load up any config.py from the filesystem
+    if state.cwd:
+        config_filename = str(Path(state.cwd) / config_filename)
+    if Path(config_filename).exists():
+        exec_file(config_filename)
+
+    # Arg based config overrides
+    if sudo:
+        config.SUDO = True
+        if sudo_user:
+            config.SUDO_USER = sudo_user
+
+    if use_sudo_password:
+        config.USE_SUDO_PASSWORD = use_sudo_password
+
+    if use_sudo_login:
+        config.USE_SUDO_LOGIN = True
+
+    if same_sudo_password:
+        config.SUDO_PASSWORD = getpass("sudo password: ")
+
+    if su_user:
+        config.SU_USER = su_user
+
+    if dzdo:
+        config.DZDO = True
+        if dzdo_user:
+            config.DZDO_USER = dzdo_user
+
+    if parallel:
+        config.PARALLEL = parallel
+
+    if shell_executable:
+        config.SHELL = None if shell_executable in ("None", "null") else shell_executable
+
+    if fail_percent is not None:
+        config.FAIL_PERCENT = fail_percent
+
+    if diff:
+        config.DIFF = True
+
+    if retry is not None:
+        config.RETRY = retry
+
+    if retry_delay is not None:
+        config.RETRY_DELAY = retry_delay
+
+    # Lock the current config, this allows us to restore this version after
+    # executing deploy files that may alter them. This must happen after CLI
+    # args are applied so they persist across multiple deploy files.
+    config.lock_current_state()
+
+    return config
+
+
+def _set_override_data(
+    data,
+    ssh_user,
+    ssh_key,
+    ssh_key_password,
+    ssh_port,
+    ssh_password,
+):
+    override_data = {}
+
+    for arg in data:
+        key, value = arg.split("=", 1)
+        override_data[key] = value
+
+    override_data = {key: parse_cli_arg(value) for key, value in override_data.items()}
+
+    for key, value in (
+        ("ssh_user", ssh_user),
+        ("ssh_key", ssh_key),
+        ("ssh_key_password", ssh_key_password),
+        ("ssh_port", ssh_port),
+        ("ssh_password", ssh_password),
+    ):
+        if value:
+            override_data[key] = value
+
+    return override_data
+
+
+def _set_fail_prompts(state: State, config: Config) -> None:
+    # Set fail percent to zero, meaning we'll raise an exception for any fail,
+    # and we can capture + prompt the user to continue/exit.
+    config.FAIL_PERCENT = 0
+
+    def should_raise_failed_hosts(state: State) -> bool:
+        if state.current_stage == StateStage.Connect:
+            return not _do_confirm("One of more hosts failed to connect, continue?")
+        return not _do_confirm("One of more hosts failed, continue?")
+
+    state.should_raise_failed_hosts = should_raise_failed_hosts
+
+
+def _get_inventory_pattern_matches(
+    inventory: Inventory,
+    patterns: Iterable[str],
+    option_name: str,
+) -> list[Host]:
+    all_hosts: list[Host] = []
+
+    for pattern in patterns:
+        try:
+            hosts = inventory.get_group(pattern)
+        except NoGroupError:
+            hosts = [host for host in inventory if fnmatch(host.name, pattern)]
+
+        if not hosts:
+            logger.warning(f"No host matches found for {option_name} pattern: {pattern}")
+
+        all_hosts.extend(hosts)
+
+    return list(set(all_hosts))
+
+
+def _apply_inventory_limit(
+    inventory: Inventory,
+    limit: Iterable[str] | None,
+) -> list[Host] | None:
+    if limit:
+        return _get_inventory_pattern_matches(inventory, limit, "--limit")
+
+    return None
+
+
+def _apply_inventory_exclude(
+    inventory: Inventory,
+    initial_limit: list[Host] | None,
+    exclude: Iterable[str] | None,
+) -> list[Host] | None:
+    if not exclude:
+        return initial_limit
+
+    excluded_hosts = set(_get_inventory_pattern_matches(inventory, exclude, "--exclude"))
+    limit_hosts = initial_limit if initial_limit is not None else list(inventory)
+
+    return [host for host in limit_hosts if host not in excluded_hosts]
+
+
+# Operations Execution
+#
+def _handle_commands(state, config, command, original_operations, operations, json_output=False):
+    if command is CliCommands.FACT:
+        logger.info("--> Gathering facts...")
+        state, fact_data = _run_fact_operations(state, config, operations)
+        if json_output:
+            print_facts_json(fact_data)
+        else:
+            print_facts(fact_data)
+        _exit()
+
+    can_diff = True
+
+    if command == CliCommands.SHELL:
+        logger.info("--> Preparing exec operation...")
+        state = _prepare_exec_operations(state, config, operations)
+        can_diff = False
+
+    elif command == CliCommands.DEPLOY_FILES:
+        logger.info("--> Preparing operation files...")
+        state, config, operations = _prepare_deploy_operations(state, config, operations)
+
+    elif command == CliCommands.FUNC:
+        logger.info("--> Preparing operation func...")
+        state, kwargs = _prepare_func_operations(
+            state,
+            config,
+            operations,
+            original_operations,
+        )
+
+    return can_diff, state, config
+
+
+def _run_fact_operations(state, config, operations):
+    state.print_fact_info = True
+    fact_data = {}
+
+    for i, command in enumerate(operations):
+        fact_cls, args, kwargs = command
+        fact_key = fact_cls.name
+
+        if args or kwargs:
+            _fact_args = args or ""
+            _fact_details = f" ({get_kwargs_str(kwargs)})" if kwargs else ""
+            fact_key = f"{fact_cls.name}{_fact_args}{_fact_details}"
+
+        try:
+            fact_data[fact_key] = get_facts(
+                state,
+                fact_cls,
+                args=args,
+                kwargs=kwargs,
+                apply_failed_hosts=False,
+            )
+        except PyinfraError:
+            pass
+
+    return state, fact_data
+
+
+def _prepare_exec_operations(state, config, operations):
+    state.print_output = True
+    # Pass the retry settings from config to the shell operation
+    load_func(
+        state,
+        server.shell,
+        " ".join(operations),
+        _retries=config.RETRY,
+        _retry_delay=config.RETRY_DELAY,
+    )
+    return state
+
+
+def _prepare_deploy_operations(state, config, operations):
+    # Number of "steps" to make = number of files * number of hosts
+    for i, filename in enumerate(operations):
+        config.lock_current_state()
+
+        _log_styled_msg = format_text(filename, bold=True)
+        logger.info(f"Loading: {_log_styled_msg}")
+
+        state.current_op_file_number = i
+        load_deploy_file(state, filename)
+
+        # Remove any config changes introduced by the deploy file & any includes
+        config.reset_locked_state()
+
+    return state, config, operations
+
+
+def _prepare_func_operations(state, config, operations, original_operations):
+    op, args = operations
+    args, kwargs = args
+
+    load_func(state, op, *args, **kwargs)
+
+    return state, kwargs

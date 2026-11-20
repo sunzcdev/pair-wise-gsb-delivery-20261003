@@ -1,0 +1,6 @@
+{
+    "command": "efibootmgr || true",
+    "requires_command": "efibootmgr",
+    "output": [],
+    "fact": null
+}

@@ -1,0 +1,407 @@
+import shlex
+from subprocess import PIPE
+from unittest import TestCase
+from unittest.mock import MagicMock, mock_open, patch
+
+from pyinfra.api import Config, State
+from pyinfra.api.connect import connect_all
+from pyinfra.api.exceptions import ConnectError, InventoryError, PyinfraError
+from pyinfra.connectors.util import make_unix_command
+
+from ..util import make_inventory
+
+# Digest of the committed image, as printed by `docker commit` / `podman commit`. Docker
+# prefixes it with the algorithm, podman prints it bare.
+FAKE_IMAGE_DIGEST = "0d05fac3b9bc6d8d5fc7b323a35a23daf0ab61fc38685de569ce69f6feb7fbe6"
+
+
+class TestContainerConnector(TestCase):
+    # we use this class as a template to prevent the decorators from being invoked twice on
+    # the podman test class (since it needs to override fake_docker_shell)
+    __test__ = False  # this class should not be tested.
+    cli_cmd = "docker"
+    connector_name = "docker"
+
+    def setUp(self):
+        self.fake_popen_patch = patch("pyinfra.connectors.util.Popen")
+        self.fake_popen_mock = self.fake_popen_patch.start()
+
+    def tearDown(self):
+        self.fake_popen_patch.stop()
+
+    def test_missing_image(self):
+        with self.assertRaises(InventoryError):
+            make_inventory(hosts=(f"@{self.connector_name}",))
+
+    def test_user_provided_container_id(self):
+        inventory = make_inventory(
+            hosts=((f"@{self.connector_name}/not-an-image", {"docker_container_id": "abc"}),),
+        )
+        State(inventory, Config())
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect()
+        assert host.data.docker_container_id == "abc"
+
+    def test_connect_all(self):
+        inventory = make_inventory(hosts=(f"@{self.connector_name}/not-an-image",))
+        state = State(inventory, Config())
+        connect_all(state)
+        assert len(state.active_hosts) == 1
+
+    def test_connect_all_error(self):
+        inventory = make_inventory(hosts=(f"@{self.connector_name}/a-broken-image",))
+        state = State(inventory, Config())
+
+        with self.assertRaises(PyinfraError):
+            connect_all(state)
+
+    def test_connect_disconnect_host(self):
+        inventory = make_inventory(hosts=(f"@{self.connector_name}/not-an-image",))
+        state = State(inventory, Config())
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect(reason=True)
+        assert len(state.active_hosts) == 0
+        host.disconnect()
+
+    def test_disconnect_host_logs_short_image_id(self):
+        inventory = make_inventory(hosts=(f"@{self.connector_name}/not-an-image",))
+        State(inventory, Config())
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect(reason=True)
+
+        with patch("pyinfra.connectors.docker.logger") as fake_logger:
+            host.disconnect()
+
+        message = fake_logger.info.call_args[0][0]
+        assert message.endswith(f"image ID: {FAKE_IMAGE_DIGEST[:12]}")
+
+    def _fake_shell(self):
+        if self.cli_cmd == "docker":
+            return fake_docker_shell
+        return fake_podman_shell
+
+    def _get_tag_commands(self, tag):
+        inventory = make_inventory(
+            hosts=(f"@{self.connector_name}/not-an-image",),
+            override_data={"docker_tag": tag},
+        )
+        State(inventory, Config())
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect()
+
+        with patch("pyinfra.connectors.docker.local.shell", wraps=self._fake_shell()) as fake_shell:
+            host.disconnect()
+
+        return [call.args[0] for call in fake_shell.call_args_list]
+
+    def test_disconnect_host_with_tag(self):
+        tag = "registry.example.com/team/app:1.2.3"
+        commands = self._get_tag_commands(tag)
+        assert commands == [
+            f"{self.cli_cmd} commit containerid",
+            f"{self.cli_cmd} rm -f containerid",
+            f"{self.cli_cmd} tag {FAKE_IMAGE_DIGEST[:12]} {tag}",
+        ]
+
+    def test_disconnect_host_quotes_tag(self):
+        tag = "example.com/team/app:prod; echo injected"
+        commands = self._get_tag_commands(tag)
+        assert commands[-1] == f"{self.cli_cmd} tag {FAKE_IMAGE_DIGEST[:12]} '{tag}'"
+
+    def test_disconnect_host_tag_failure_after_cleanup(self):
+        inventory = make_inventory(
+            hosts=(f"@{self.connector_name}/not-an-image",),
+            override_data={"docker_tag": "bad"},
+        )
+        State(inventory, Config())
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect()
+
+        with patch("pyinfra.connectors.docker.local.shell", wraps=self._fake_shell()) as fake_shell:
+            with self.assertRaisesRegex(PyinfraError, "tag failed"):
+                host.disconnect()
+
+        commands = [call.args[0] for call in fake_shell.call_args_list]
+        assert commands[-2:] == [
+            f"{self.cli_cmd} rm -f containerid",
+            f"{self.cli_cmd} tag {FAKE_IMAGE_DIGEST[:12]} bad",
+        ]
+
+    def test_tag_rejected_for_existing_container(self):
+        inventory = make_inventory(
+            hosts=(f"@{self.connector_name}/existing",),
+            override_data={"docker_tag": "app:latest"},
+        )
+        State(inventory, Config())
+        host = inventory.get_host(f"@{self.connector_name}/existing")
+
+        with self.assertRaisesRegex(ConnectError, "existing container"):
+            host.connect(raise_exceptions=True)
+
+    def test_run_shell_command(self):
+        inventory = make_inventory(hosts=(f"@{self.connector_name}/not-an-image",))
+        State(inventory, Config())
+
+        command = "echo hi"
+        self.fake_popen_mock().returncode = 0
+
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect()
+        out = host.run_shell_command(
+            command,
+            _stdin="hello",
+            _get_pty=True,
+            print_output=True,
+        )
+        assert len(out) == 2
+        assert out[0] is True
+
+        command = make_unix_command(command).get_raw_value()
+        command = shlex.quote(command)
+        docker_command = f"{self.cli_cmd} exec -it containerid sh -c {command}"
+        shell_command = make_unix_command(docker_command).get_raw_value()
+
+        self.fake_popen_mock.assert_called_with(
+            shell_command,
+            shell=True,
+            stdout=PIPE,
+            stderr=PIPE,
+            stdin=PIPE,
+        )
+
+    def test_run_shell_command_with_user(self):
+        inventory = make_inventory(
+            hosts=(f"@{self.connector_name}/not-an-image",),
+            override_data={"docker_user": "myuser"},
+        )
+        State(inventory, Config())
+
+        command = "echo hi"
+        self.fake_popen_mock().returncode = 0
+
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect()
+        out = host.run_shell_command(command, _get_pty=True)
+        assert out[0] is True
+
+        command = make_unix_command(command).get_raw_value()
+        command = shlex.quote(command)
+        docker_command = f"{self.cli_cmd} exec --user myuser -it containerid sh -c {command}"
+        shell_command = make_unix_command(docker_command).get_raw_value()
+
+        self.fake_popen_mock.assert_called_with(
+            shell_command,
+            shell=True,
+            stdout=PIPE,
+            stderr=PIPE,
+            stdin=PIPE,
+        )
+
+    def test_run_shell_command_success_exit_codes(self):
+        inventory = make_inventory(hosts=(f"@{self.connector_name}/not-an-image",))
+        State(inventory, Config())
+
+        command = "echo hi"
+        self.fake_popen_mock().returncode = 1
+
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect()
+        out = host.run_shell_command(command, _success_exit_codes=[1])
+        assert out[0] is True
+
+    def test_run_shell_command_error(self):
+        inventory = make_inventory(hosts=(f"@{self.connector_name}/not-an-image",))
+        state = State(inventory, Config())
+
+        command = "echo hi"
+        self.fake_popen_mock().returncode = 1
+
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect(state)
+        out = host.run_shell_command(command)
+        assert out[0] is False
+
+    def test_put_file(self):
+        inventory = make_inventory(hosts=(f"@{self.connector_name}/not-an-image",))
+        State(inventory, Config())
+
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect()
+
+        fake_process = MagicMock(returncode=0)
+        self.fake_popen_mock.return_value = fake_process
+
+        host.put_file("not-a-file", "not-another-file", print_output=True)
+
+        self.fake_popen_mock.assert_called_with(
+            f"sh -c '{self.cli_cmd} cp __tempfile__ containerid:not-another-file'",
+            shell=True,
+            stdout=PIPE,
+            stderr=PIPE,
+            stdin=PIPE,
+        )
+
+    def test_put_file_error(self):
+        inventory = make_inventory(hosts=(f"@{self.connector_name}/not-an-image",))
+        State(inventory, Config())
+
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect()
+
+        fake_process = MagicMock(returncode=1)
+        self.fake_popen_mock.return_value = fake_process
+
+        with self.assertRaises(IOError):
+            host.put_file("not-a-file", "not-another-file", print_output=True)
+
+    def test_get_file(self):
+        inventory = make_inventory(hosts=(f"@{self.connector_name}/not-an-image",))
+        State(inventory, Config())
+
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect()
+
+        fake_process = MagicMock(returncode=0)
+        self.fake_popen_mock.return_value = fake_process
+
+        host.get_file("not-a-file", "not-another-file", print_output=True)
+
+        self.fake_popen_mock.assert_called_with(
+            f"sh -c '{self.cli_cmd} cp containerid:not-a-file __tempfile__'",
+            shell=True,
+            stdout=PIPE,
+            stderr=PIPE,
+            stdin=PIPE,
+        )
+
+    def test_get_file_error(self):
+        inventory = make_inventory(hosts=(f"@{self.connector_name}/not-an-image",))
+        State(inventory, Config())
+
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect()
+
+        fake_process = MagicMock(returncode=1)
+        self.fake_popen_mock.return_value = fake_process
+
+        with self.assertRaises(IOError):
+            host.get_file("not-a-file", "not-another-file", print_output=True)
+
+    def test_docker_platform(self):
+        inventory = make_inventory(
+            hosts=((f"@{self.connector_name}/not-an-image", {"docker_platform": "linux/amd64"}),),
+        )
+        State(inventory, Config())
+
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        assert host.data.docker_platform == "linux/amd64"
+
+    def test_docker_architecture(self):
+        inventory = make_inventory(
+            hosts=((f"@{self.connector_name}/not-an-image", {"docker_architecture": "arm64"}),),
+        )
+        State(inventory, Config())
+
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        assert host.data.docker_architecture == "arm64"
+
+    def test_connect_with_docker_platform(self):
+        inventory = make_inventory(
+            hosts=((f"@{self.connector_name}/not-an-image", {"docker_platform": "linux/amd64"}),),
+        )
+        state = State(inventory, Config())
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect(reason=True)
+        assert len(state.active_hosts) == 0
+        host.disconnect()
+
+    def test_connect_with_docker_architecture(self):
+        inventory = make_inventory(
+            hosts=((f"@{self.connector_name}/not-an-image", {"docker_architecture": "arm64"}),),
+        )
+        state = State(inventory, Config())
+        host = inventory.get_host(f"@{self.connector_name}/not-an-image")
+        host.connect(reason=True)
+        assert len(state.active_hosts) == 0
+        host.disconnect()
+
+
+# Reuse the container testing code for docker and podman
+
+
+def fake_docker_shell(command, splitlines=None):
+    if command == "docker container inspect existing":
+        return '[{"State": {"Running": true}}]'
+
+    if command == "docker run -d not-an-image tail -f /dev/null":
+        return ["containerid"]
+
+    if command == "docker run -d --platform linux/amd64 not-an-image tail -f /dev/null":
+        return ["containerid"]
+
+    if command == "docker run -d --arch arm64 not-an-image tail -f /dev/null":
+        return ["containerid"]
+
+    if command == "docker commit containerid":
+        return [f"sha256:{FAKE_IMAGE_DIGEST}"]
+
+    if command == "docker rm -f containerid":
+        return []
+
+    if command.startswith("docker tag "):
+        if command.endswith(" bad"):
+            raise PyinfraError("tag failed")
+        return []
+
+    raise PyinfraError(f"Invalid command: {command}")
+
+
+@patch("pyinfra.connectors.docker.local.shell", fake_docker_shell)
+@patch("pyinfra.connectors.docker.mkstemp", lambda: (None, "__tempfile__"))
+@patch("pyinfra.connectors.docker.os.remove", lambda f: None)
+@patch("pyinfra.connectors.docker.os.close", lambda f: None)
+@patch("pyinfra.connectors.docker.open", mock_open(read_data="test!"), create=True)
+@patch("pyinfra.api.util.open", mock_open(read_data="test!"), create=True)
+class TestDocker2Connector(TestContainerConnector):
+    __test__ = True
+    cli_cmd = "docker"
+    connector_name = "docker"
+
+
+def fake_podman_shell(command, splitlines=None):
+    if command == "podman container inspect existing":
+        return '[{"State": {"Running": true}}]'
+
+    if command == "podman run -d not-an-image tail -f /dev/null":
+        return ["containerid"]
+
+    if command == "podman run -d --platform linux/amd64 not-an-image tail -f /dev/null":
+        return ["containerid"]
+
+    if command == "podman run -d --arch arm64 not-an-image tail -f /dev/null":
+        return ["containerid"]
+
+    if command == "podman commit containerid":
+        return [FAKE_IMAGE_DIGEST]
+
+    if command == "podman rm -f containerid":
+        return []
+
+    if command.startswith("podman tag "):
+        if command.endswith(" bad"):
+            raise PyinfraError("tag failed")
+        return []
+
+    raise PyinfraError(f"Invalid command: {command}")
+
+
+@patch("pyinfra.connectors.docker.local.shell", fake_podman_shell)
+@patch("pyinfra.connectors.docker.mkstemp", lambda: (None, "__tempfile__"))
+@patch("pyinfra.connectors.docker.os.remove", lambda f: None)
+@patch("pyinfra.connectors.docker.os.close", lambda f: None)
+@patch("pyinfra.connectors.docker.open", mock_open(read_data="test!"), create=True)
+@patch("pyinfra.api.util.open", mock_open(read_data="test!"), create=True)
+class TestPodmanConnector(TestContainerConnector):
+    __test__ = True
+    cli_cmd = "podman"
+    connector_name = "podman"

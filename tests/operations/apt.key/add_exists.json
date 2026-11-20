@@ -1,0 +1,10 @@
+{
+    "args": ["mykey"],
+    "facts": {
+        "files.File": {
+            "path=/etc/apt/keyrings/mykey.gpg": {"mode": 644, "user": "root", "group": "root"}
+        }
+    },
+    "commands": [],
+    "noop_description": "GPG keyring /etc/apt/keyrings/mykey.gpg already exists"
+}

@@ -1,0 +1,690 @@
+"""
+Manage git repositories and configuration.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+from urllib.parse import urlsplit
+
+from pyinfra import host
+from pyinfra.api import OperationError, QuoteString, StringCommand, operation
+from pyinfra.api.arguments import EnvValue
+from pyinfra.facts.files import Directory, File
+from pyinfra.facts.git import (
+    GitBranch,
+    GitConfig,
+    GitLocalCommit,
+    GitRemoteBranchCommit,
+    GitTag,
+    GitTrackingBranch,
+)
+
+from . import files, ssh
+from .util.files import chown, unix_path_join
+
+
+def _git_command(safe_directory: str | None = None) -> StringCommand:
+    command: list[str | StringCommand] = ["git"]
+    if safe_directory is not None:
+        command.extend(
+            [
+                "-c",
+                StringCommand("safe.directory=", QuoteString(safe_directory), _separator=""),
+            ],
+        )
+    return StringCommand(*command)
+
+
+def _git_safe_directory_env(safe_directory: str | None) -> dict[str, str]:
+    if safe_directory is None:
+        return {}
+
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": safe_directory,
+    }
+
+
+def _git_safe_directory_fact_kwargs(
+    safe_directory: str | None,
+) -> dict[str, Mapping[str, EnvValue]]:
+    safe_env = _git_safe_directory_env(safe_directory)
+    if not safe_env:
+        return {}
+
+    env: dict[str, EnvValue] = {}
+    if host.current_op_global_arguments:
+        env.update(host.current_op_global_arguments.get("_env") or {})
+    env.update(safe_env)
+    return {"_env": env}
+
+
+@operation()
+def config(key: str, value: str, multi_value=False, repo: str | None = None, system=False):
+    """
+    Manage git config at repository, user or system level.
+
+    + key: the key of the config to ensure
+    + value: the value this key should have
+    + multi_value: Add the value rather than set it for settings that can have multiple values
+    + repo: specify the git repo path to edit local config (defaults to global)
+    + system: whether, when ``repo`` is unspecified, to work at system level (or default to global)
+
+    **Examples:**
+
+    .. code:: python
+
+        from pyinfra.operations import git
+        git.config(
+            name="Always prune specified repo",
+            key="fetch.prune",
+            value="true",
+            repo="/usr/local/src/pyinfra",
+        )
+
+        git.config(
+            name="Ensure user name is set for all repos of specified user",
+            key="user.name",
+            value="Anon E. Mouse",
+            _sudo=True,
+            _sudo_user="anon"
+        )
+
+        git.config(
+            name="Ensure same date format for all users",
+            key="log.date",
+            value="iso",
+            system=True
+        )
+
+    """
+
+    existing_config = {}
+
+    if not repo:
+        existing_config = host.get_fact(GitConfig, system=system)
+
+    # Only get the config if the repo exists at this stage
+    elif host.get_fact(Directory, path=unix_path_join(repo, ".git")):
+        existing_config = host.get_fact(GitConfig, repo=repo)
+
+    if repo is None:
+        base_command = StringCommand("git", "config", "--system" if system else "--global")
+    else:
+        base_command = StringCommand("cd", QuoteString(repo), "&&", "git", "config", "--local")
+
+    quoted_value = StringCommand('"', value, '"', _separator="")
+
+    if not multi_value and existing_config.get(key) != [value]:
+        yield StringCommand(base_command, QuoteString(key), quoted_value)
+
+    elif multi_value and value not in existing_config.get(key, []):
+        yield StringCommand(base_command, "--add", QuoteString(key), quoted_value)
+
+    else:
+        host.noop(f"git config {key} is set to {value}")
+
+
+# scp-like sources: [user@]host:path (git has no port syntax in this form)
+_SCP_LIKE_RE = re.compile(r"^(?:[^@/]+@)?(?P<host>\[[^\]]+\]|[^:@/]+):")
+
+
+def _parse_keyscan_source(src: str) -> tuple[str, int]:
+    """
+    Extract the SSH host and port to keyscan from a git source.
+
+    Only SSH sources can be keyscanned: the scp-like ``[user@]host:path`` syntax and
+    ``ssh://[user@]host[:port]/path`` URLs, bracketed IPv6 included, with the port read
+    from the URL where it really is an sshd port.
+
+    + src: the git source URL
+    """
+    if "://" in src:
+        # Discriminate on "://" rather than on urlsplit's scheme, which treats any word
+        # before a ":" as a scheme, and would thus parse scp-like sources (git@host:path)
+        # as URLs.
+        if src.split("://", 1)[0].lower() != "ssh":
+            raise OperationError(
+                f"ssh_keyscan only applies to SSH sources, not: {src} "
+                "(a clone over any other transport never reads known_hosts)",
+            )
+
+        try:
+            parsed = urlsplit(src)
+            hostname = parsed.hostname
+            port = parsed.port or 22
+        except ValueError:  # invalid IPv6 URL / non-numeric port
+            hostname = None
+
+        if hostname is None:
+            raise OperationError(f"Could not parse domain (to SSH keyscan) from: {src}")
+        return hostname, port
+
+    match = _SCP_LIKE_RE.match(src)
+    if match is None:
+        raise OperationError(f"Could not parse domain (to SSH keyscan) from: {src}")
+
+    hostname = match.group("host")
+    if hostname.startswith("["):  # bracketed IPv6: git@[2001:db8::1]:org/repo.git
+        hostname = hostname[1:-1]
+    return hostname, 22
+
+
+@operation()
+def repo(
+    src: str,
+    dest: str,
+    branch: str | None = None,
+    pull: bool = True,
+    rebase: bool = False,
+    user: str | None = None,
+    group: str | None = None,
+    ssh_keyscan: bool = False,
+    update_submodules: bool = False,
+    recursive_submodules: bool = False,
+    depth: int | None = None,
+    *,
+    fetch_tags: bool = False,
+    force: bool = False,
+):
+    """
+    Clone/pull git repositories.
+
+    + src: the git source URL
+    + dest: directory to clone to
+    + branch: branch to pull/checkout
+    + pull: pull any changes for the branch
+    + rebase: when pulling, use ``--rebase``
+    + user: chown files to this user after
+    + group: chown files to this group after
+    + ssh_keyscan: keyscan the remote host if not in known_hosts before clone/pull; only
+      SSH sources can be keyscanned (``user@host:path`` or ``ssh://host[:port]/path``),
+      with the host and port read from ``src``
+    + update_submodules: update any git submodules
+    + recursive_submodules: update git submodules recursively
+    + depth: truncate clone, fetch and pull history to the specified number of commits
+    + fetch_tags: Whether all tags should be fetched prior to attempting to
+      check out the specified revision.
+    + force: Execute ``fetch``, ``pull`` and ``checkout`` commands with ``--force``.
+
+    **Examples:**
+
+    .. code:: python
+
+        git.repo(
+            name="Clone repo",
+            src="https://github.com/Fizzadar/pyinfra.git",
+            dest="/usr/local/src/pyinfra",
+        )
+
+        git.repo(
+            name="Clone repo with SSH keyscan (non-standard port)",
+            src="ssh://git@git.example.com:2222/org/repo.git",
+            dest="/usr/local/src/repo",
+            ssh_keyscan=True,
+        )
+    """
+
+    force_flag_list = ["--force"] if force else []
+
+    # Ensure our target directory exists
+    yield from files.directory._inner(dest)
+
+    # Do we need to scan for the remote host key?
+    if ssh_keyscan:
+        hostname, port = _parse_keyscan_source(src)
+        yield from ssh.keyscan._inner(hostname, port=port)
+
+    # Store git commands for directory prefix
+    git_commands: list[str | StringCommand] = []
+    git_dir = unix_path_join(dest, ".git")
+    is_repo = host.get_fact(Directory, path=git_dir)
+
+    # The depth argument can be passed to clone, fetch and pull operations.
+    # We prepare the argument list to reuse it later on
+    depth_options: list[str | QuoteString] = []
+    if depth is not None:
+        depth_options.extend(["--depth", QuoteString(str(depth))])
+
+    # Cloning new repo?
+    if not is_repo:
+        clone_options: list[str | QuoteString] = []
+        clone_options.extend(depth_options)
+        if branch:
+            clone_options.extend(["--branch", QuoteString(branch)])
+
+        git_commands.append(StringCommand("clone", QuoteString(src), *clone_options, "."))
+
+    # Ensuring existing repo
+    else:
+        safe_directory = dest if user or group else None
+        safe_directory_fact_kwargs = _git_safe_directory_fact_kwargs(safe_directory)
+        # Reconcile the `origin` remote URL with `src`. If `src` has changed for
+        # an existing working copy, update `origin` so the fetch/pull below
+        # operate against the new source instead of silently continuing to track
+        # the old remote (see GH #1763). Only act when an `origin` URL already
+        # exists and differs - if it is missing we leave remote management alone.
+        existing_remote = host.get_fact(
+            GitConfig,
+            repo=dest,
+            **safe_directory_fact_kwargs,
+        ).get("remote.origin.url")
+        remote_changed = existing_remote is not None and existing_remote != [src]
+        if remote_changed:
+            git_commands.append(StringCommand("remote", "set-url", "origin", QuoteString(src)))
+
+        is_tag = False
+        current_branch = host.get_fact(
+            GitBranch,
+            repo=dest,
+            **safe_directory_fact_kwargs,
+        )
+        if branch is not None and current_branch != branch:
+            # fetch to ensure we have the branch/tag locally
+            fetch_options: list[str | QuoteString] = []
+            fetch_options.extend(depth_options)
+            if fetch_tags:
+                fetch_options.append("--tags")
+            git_commands.append(StringCommand("fetch", *fetch_options, *force_flag_list))
+
+            git_commands.append(StringCommand("checkout", QuoteString(branch), *force_flag_list))
+        if branch and branch in (
+            host.get_fact(
+                GitTag,
+                repo=dest,
+                **safe_directory_fact_kwargs,
+            )
+            or []
+        ):
+            git_commands.append(StringCommand("checkout", QuoteString(branch), *force_flag_list))
+            is_tag = True
+        if pull and not is_tag:
+            skip_pull = False
+            # Skip `git pull` when the local branch tip already matches the
+            # remote tip, so pyinfra reports the operation unchanged rather
+            # than always "Success". This still applies when we switch branch:
+            # if the target branch already exists locally at the remote tip,
+            # the fetch+checkout leaves nothing for pull to do. When the remote
+            # URL just changed, the cached remote-tip fact was gathered against
+            # the old origin, so never skip - we must pull from the new source.
+            effective_branch = branch or current_branch
+            if not remote_changed and effective_branch:
+                local_commit = host.get_fact(
+                    GitLocalCommit,
+                    repo=dest,
+                    ref=effective_branch,
+                    **safe_directory_fact_kwargs,
+                )
+                remote_commit = host.get_fact(
+                    GitRemoteBranchCommit,
+                    repo=dest,
+                    branch=effective_branch,
+                    **safe_directory_fact_kwargs,
+                )
+                if local_commit and remote_commit and local_commit == remote_commit:
+                    skip_pull = True
+            if skip_pull:
+                host.noop(
+                    f"git repository {dest} is already up to date",
+                )
+            else:
+                pull_options: list[str | QuoteString] = []
+                pull_options.extend(depth_options)
+                if rebase:
+                    pull_options.append("--rebase")
+                git_commands.append(StringCommand("pull", *pull_options, *force_flag_list))
+
+    if update_submodules:
+        if recursive_submodules:
+            git_commands.append(StringCommand("submodule", "update", "--init", "--recursive"))
+        else:
+            git_commands.append(StringCommand("submodule", "update", "--init"))
+
+    # Attach prefixes for directory
+    command_prefix = StringCommand(
+        "cd",
+        QuoteString(dest),
+        "&&",
+        _git_command(safe_directory if is_repo else None),
+    )
+
+    for cmd in git_commands:
+        yield StringCommand(command_prefix, cmd)
+
+    # Apply any user or group if we did anything
+    if git_commands and (user or group):
+        yield chown(dest, user, group, recursive=True)
+
+
+@operation()
+def worktree(
+    worktree: str,
+    repo: str | None = None,
+    detached=False,
+    new_branch: str | None = None,
+    commitish: str | None = None,
+    pull=True,
+    rebase=False,
+    from_remote_branch: tuple[str, str] | None = None,
+    present=True,
+    assume_repo_exists=False,
+    force=False,
+    user: str | None = None,
+    group: str | None = None,
+):
+    """
+    Manage git worktrees.
+
+    + worktree: git working tree directory
+    + repo: git main repository directory
+    + detached: create a working tree with a detached HEAD
+    + new_branch: local branch name created at the same time than the worktree
+    + commitish: from which git commit, branch, ... the worktree is created
+    + pull: pull any changes from a remote branch if set
+    + rebase: when pulling, use ``--rebase``
+    + from_remote_branch: a 2-tuple ``(remote, branch)`` that identifies a remote branch
+    + present: whether the working tree should exist
+    + assume_repo_exists: whether to assume the main repo exists
+    + force: whether to use ``--force`` when adding/removing worktrees
+    + user: chown files to this user after
+    + group: chown files to this group after
+
+    **Examples:**
+
+    .. code:: python
+
+        git.worktree(
+            name="Create a worktree from the current repo `HEAD`",
+            repo="/usr/local/src/pyinfra/master",
+            worktree="/usr/local/src/pyinfra/hotfix"
+        )
+
+        git.worktree(
+            name="Create a worktree from the commit `4e091aa0`",
+            repo="/usr/local/src/pyinfra/master",
+            worktree="/usr/local/src/pyinfra/hotfix",
+            commitish="4e091aa0"
+        )
+
+        git.worktree(
+            name="Create a worktree from the tag `4e091aa0`, even if already registered",
+            repo="/usr/local/src/pyinfra/master",
+            worktree="/usr/local/src/pyinfra/2.x",
+            commitish="2.x",
+            force=True
+        )
+
+        git.worktree(
+            name="Create a worktree with a new local branch `v1.0`",
+            repo="/usr/local/src/pyinfra/master",
+            worktree="/usr/local/src/pyinfra/hotfix",
+            new_branch="v1.0",
+        )
+
+        git.worktree(
+            name="Create a worktree from the commit 4e091aa0 with the new local branch `v1.0`",
+            repo="/usr/local/src/pyinfra/master",
+            worktree="/usr/local/src/pyinfra/hotfix",
+            new_branch="v1.0",
+            commitish="4e091aa0"
+        )
+
+        git.worktree(
+            name="Create a worktree with a detached `HEAD`",
+            repo="/usr/local/src/pyinfra/master",
+            worktree="/usr/local/src/pyinfra/hotfix",
+            detached=True,
+        )
+
+        git.worktree(
+            name="Create a worktree with a detached `HEAD` from commit `4e091aa0`",
+            repo="/usr/local/src/pyinfra/master",
+            worktree="/usr/local/src/pyinfra/hotfix",
+            commitish="4e091aa0",
+            detached=True,
+        )
+
+        git.worktree(
+            name="Create a worktree from the existing local branch `v1.0`",
+            repo="/usr/local/src/pyinfra/master",
+            worktree="/usr/local/src/pyinfra/hotfix",
+            commitish="v1.0"
+        )
+
+        git.worktree(
+            name="Create a worktree with a new branch `v1.0` that tracks `origin/v1.0`",
+            repo="/usr/local/src/pyinfra/master",
+            worktree="/usr/local/src/pyinfra/hotfix",
+            new_branch="v1.0",
+            commitish="v1.0"
+        )
+
+        git.worktree(
+            name="Idempotent worktree creation, never pulls",
+            repo="/usr/local/src/pyinfra/master",
+            worktree="/usr/local/src/pyinfra/hotfix",
+            new_branch="v1.0",
+            commitish="v1.0",
+            pull=False
+        )
+
+        git.worktree(
+            name="Pull an existing worktree already linked to a tracking branch",
+            repo="/usr/local/src/pyinfra/master",
+            worktree="/usr/local/src/pyinfra/hotfix"
+        )
+
+        git.worktree(
+            name="Pull an existing worktree from a specific remote branch",
+            repo="/usr/local/src/pyinfra/master",
+            worktree="/usr/local/src/pyinfra/hotfix",
+            from_remote_branch=("origin", "master")
+        )
+
+        git.worktree(
+            name="Remove a worktree",
+            worktree="/usr/local/src/pyinfra/hotfix",
+            present=False,
+        )
+
+        git.worktree(
+            name="Remove an unclean worktree",
+            worktree="/usr/local/src/pyinfra/hotfix",
+            present=False,
+            force=True,
+        )
+    """
+
+    # Doesn't exist & we want it
+    if not host.get_fact(Directory, path=worktree) and present:
+        # be sure that `repo` is a GIT repository
+        if not assume_repo_exists and not host.get_fact(
+            Directory,
+            path=unix_path_join(repo, ".git"),
+        ):
+            raise OperationError(
+                f"The following folder is not a valid GIT repository : {repo}",
+            )
+
+        if repo is None:
+            raise OperationError("repo must be specified when creating a worktree")
+
+        args: list[str | QuoteString] = [
+            "cd",
+            QuoteString(repo),
+            "&&",
+            "git",
+            "worktree",
+            "add",
+        ]
+
+        if new_branch:
+            args.extend(["-b", QuoteString(new_branch)])
+        elif detached:
+            args.append("--detach")
+
+        if force:
+            args.append("--force")
+
+        args.append(QuoteString(worktree))
+
+        if commitish:
+            args.append(QuoteString(commitish))
+
+        yield StringCommand(*args)
+
+        # Apply any user or group
+        if user or group:
+            yield chown(worktree, user, group, recursive=True)
+            # `git worktree add` writes per-worktree metadata under the source
+            # repo's `.git/worktrees/<name>/`, plus refs/logs for any new
+            # branch it creates. When the command runs as root (e.g. via
+            # `_sudo`), those files end up root-owned and break later git
+            # commands run as the worktree owner.
+            worktree_name = worktree.rstrip("/").rsplit("/", 1)[-1]
+            yield chown(
+                unix_path_join(repo, ".git", "worktrees", worktree_name),
+                user,
+                group,
+                recursive=True,
+            )
+            branch_for_chown = new_branch
+            if not branch_for_chown and not detached and not commitish:
+                branch_for_chown = worktree_name
+            if branch_for_chown:
+                yield chown(
+                    unix_path_join(repo, ".git", "refs", "heads", branch_for_chown),
+                    user,
+                    group,
+                )
+                yield chown(
+                    unix_path_join(repo, ".git", "logs", "refs", "heads", branch_for_chown),
+                    user,
+                    group,
+                    recursive=True,
+                )
+
+    # It exists and we don't want it
+    elif host.get_fact(Directory, path=worktree) and not present:
+        remove_args: list[str | QuoteString] = [
+            "cd",
+            QuoteString(worktree),
+            "&&",
+            "git",
+            "worktree",
+            "remove",
+            ".",
+        ]
+
+        if force:
+            remove_args.append("--force")
+
+        yield StringCommand(*remove_args)
+
+    # It exists and we still want it => pull/rebase it
+    elif host.get_fact(Directory, path=worktree) and present:
+        if not pull:
+            host.noop("Pull is disabled")
+
+        # pull the worktree only if it's already linked to a tracking branch or
+        # if a remote branch is set
+        elif host.get_fact(GitTrackingBranch, repo=worktree) or from_remote_branch:
+            if from_remote_branch and (
+                len(from_remote_branch) != 2 or type(from_remote_branch) not in (tuple, list)
+            ):
+                raise OperationError(
+                    "The remote branch must be a 2-tuple (remote, branch) such as "
+                    '("origin", "master")',
+                )
+
+            # Determine the remote ref we would pull from, so we can short-circuit
+            # the pull when the worktree HEAD already matches the remote tip.
+            remote_name: str | None = None
+            remote_branch: str | None = None
+            if from_remote_branch:
+                remote_name, remote_branch = from_remote_branch[0], from_remote_branch[1]
+            else:
+                tracking = host.get_fact(GitTrackingBranch, repo=worktree)
+                if tracking and "/" in tracking:
+                    remote_name, remote_branch = tracking.split("/", 1)
+
+            skip_pull = False
+            if remote_name and remote_branch:
+                local_commit = host.get_fact(GitLocalCommit, repo=worktree)
+                remote_commit = host.get_fact(
+                    GitRemoteBranchCommit,
+                    repo=worktree,
+                    remote=remote_name,
+                    branch=remote_branch,
+                )
+                if local_commit and remote_commit and local_commit == remote_commit:
+                    skip_pull = True
+
+            if skip_pull:
+                host.noop(
+                    f"git worktree {worktree} is already up to date",
+                )
+            else:
+                pull_args: list[str | QuoteString] = [
+                    "cd",
+                    QuoteString(worktree),
+                    "&&",
+                    "git",
+                    "pull",
+                ]
+
+                if rebase:
+                    pull_args.append("--rebase")
+
+                if from_remote_branch:
+                    pull_args.extend(
+                        [
+                            QuoteString(from_remote_branch[0]),
+                            QuoteString(from_remote_branch[1]),
+                        ]
+                    )
+
+                yield StringCommand(*pull_args)
+
+
+@operation()
+def bare_repo(
+    path: str,
+    user: str | None = None,
+    group: str | None = None,
+    present=True,
+):
+    """
+    Create bare git repositories.
+
+    + path: path to the folder
+    + present: whether the bare repository should exist
+    + user: chown files to this user after
+    + group: chown files to this group after
+
+    **Example:**
+
+    .. code:: python
+
+        git.bare_repo(
+            name="Create bare repo",
+            path="/home/git/test.git",
+        )
+    """
+
+    yield from files.directory._inner(path, present=present)
+
+    if present:
+        head_filename = unix_path_join(path, "HEAD")
+        head_file = host.get_fact(File, path=head_filename)
+
+        if not head_file:
+            yield StringCommand("git", "init", "--bare", QuoteString(path))
+            if user or group:
+                yield chown(path, user, group, recursive=True)
+        else:
+            if (user and head_file["user"] != user) or (group and head_file["group"] != group):
+                yield chown(path, user, group, recursive=True)

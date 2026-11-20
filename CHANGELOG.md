@@ -1,0 +1,802 @@
+# v3.11.1
+
+Core:
+
+- api: name operations and hosts in dependency cycle errors (#2049) (@ynaamane)
+
+Operations/facts:
+
+- facts.files: add return type to FileContents (#2065) (@kelno)
+- facts.iptables: accept table in Ip6tablesChains.requires_command (#2059)
+- facts.server: match usernames exactly (#2072) (@wowi42)
+- fix: make fact conditions explicit and reject bare fact classes (#2064) (@mvanhorn)
+
+Docs/meta:
+
+- ci: prevent spell check failing on changelog usernames
+
+# v3.11.0
+
+Core:
+
+- api: include name and arguments in operation hash (#1942) (@wowi42)
+- api.facts: use _is_executing boolean over CLI only stage
+- api: strip su password prompt from fact output (#1981) (@0xTaoZ)
+- api: omit variadic kwargs from auto labels (#1983) (@0xTaoZ)
+- api: document BaseStateCallback, fix reported doc typos (#1985) (@maisim)
+- api: unmask a HiddenValue wrapped in another one (#1987) (@maisim)
+- api: give check_preconditions the fact's own arguments (#1988) (@maisim)
+- api: skip connectors whose module cannot be imported (#1974) (@maisim)
+- api: tolerate missing connector kwargs in fact execution (#1995) (@wowi42)
+- api: mark the hosts that fail when running with no_wait (#2016) (@maisim)
+- api: honour fail percent between _serial hosts and _parallel batches (#2021) (@1sakshm)
+
+Operations/facts:
+
+- facts.sysvinit: allow underscores in service names (#1923) (@NoiceHax)
+- operations.dnf: install pinned package versions (#1913) (@0xTaoZ)
+- operations.iptables,facts.iptables: extras comparison losing duplicate flags and quoted values (#1712) (@JustScreaMy)
+- operations.pnpm, facts.pnpm: pnpm facts and operations with support of package manager and build tool (#1928) (@yagarea)
+- operations.server: mention shell executable (#1941) (@0xTaoZ)
+- facts.podman: add more basic facts (#1900) (@lsg551)
+- facts.files: read checksum targets via stdin to fix backslash escaping (#1911) (#1912) (@wowi42)
+- facts.server: preserve full executable names and args on macOS (#1953) (@ynaamane)
+- operations.files: Ensure file ops don't fail if source missing in prepare phase (#1915) (@aktiur)
+- operations.apt: add wait_for_lock argument to apt operations (#1937) (@wowi42)
+- operations.git.repo: pass depth argument to fetch and pull (#1934) (@evilham)
+- operations.bsdinit: enable OpenBSD services with rcctl (#1916) (@0xTaoZ)
+- operations.ssh: add keyscan option to command (#1960) (@StasShk)
+- operations.git: support ssh://, raise explicit error on bad proto/keyscan combination (#1785) (@maisim)
+- operations.ssh: make keyscan checks port-aware (#1969)
+- operations.files: make files.link idempotent for existing hard links (#1962) (@ethanstoner)
+- operations.files: warn rsync deletes extra files (#1979) (@0xTaoZ)
+- operations.git: allow chowned repo pulls (#1982) (@0xTaoZ)
+- facts.brew: handle third-party tap packages idempotently (#1280) (#1990) (@Macejdo)
+- facts.flatpak: Optimize FlatpakPackage.process (#1993) (@antoinenicls)
+- operations.files: handle missing directory destinations in put (#1966) (@StasShk)
+- operations.files: don't fail files.block on an unneeded chown (#1973) (@ynaamane)
+- operations.bsdinit: Use the service command to enable/disable services on FreeBSD (#2012) (@abergeron)
+- operations.flatpak: Correct examples and touch-up remote text (#2022) (@jbjorkang)
+- operations.xbps: update xbps itself before installing packages (#2018) (@1sakshm)
+- operations.apt: add apt.hold operation and AptHeldPackages fact (#2017) (@1sakshm)
+- operations.server: add password_lock option to server.user (#2014) (@1sakshm)
+- operations.crontab: match existing commands literally in sed (#2030) (@SparkDrago05)
+- operations.flatpak: Add 'user' installation option to flatpak install operation (#1968) (@isFakeAccount)
+- operations: match documented argument names to signatures (#2033) (@mmporong)
+- operations.crontab: don't escape ^ and $ in the matched command (#2040) (@SparkDrago05)
+- operations.files: don't show a text diff for a binary file in put (#2043) (@SparkDrago05)
+- operations.iptables: quote user input in iptables commands (#1810) (@wowi42)
+
+Connectors:
+
+- connectors.ssh: skip unparsable known_hosts lines instead of dropping the file (#1926) (@NoiceHax)
+- connectors.docker: strip sha256 prefix instead of slicing image ID (#1925) (@NoiceHax)
+- connectors.ssh: treat ProxyJump none as no jump host (#1445) (#1922) (@NoiceHax)
+- connectors.ssh: prompt for encrypted ssh_config IdentityFile passphrase (#1917) (#1921) (@NoiceHax)
+- connectors.ssh: don't truncate local file when download fails (#1440) (#1924) (@NoiceHax)
+- connectors.ssh: retry NFSv4 ACL handover (#1955) (@0xTaoZ)
+- connectors.docker: add docker_user connector data option (#1938) (@wowi42)
+- connectors.ssh: trust known_hosts certificate authorities (#1945) (@0xTaoZ)
+- connectors.ssh: support sudo passwords with rsync (#1950) (@0xTaoZ)
+- connectors.util: prompt for sudo password up front with --use-sudo-password (#1961) (@anandghegde)
+- connectors.ssh: preserve nested ProxyJump sockets (#1980) (@0xTaoZ)
+- connectors.ssh: require paramiko>=3.2 (#1992) (@wolfgang-aura)
+- connectors.ssh: match host CAs on custom ports (#1971) (@0xTaoZ)
+- connectors: add _sudo_set_home argument to control sudo -H (#1998) (@1sakshm)
+- connectors: skip futile re-run after sudo password prompt (#2013) (@wowi42)
+- connectors: default optional args in read_output_buffers (#2001) (@wowi42)
+- connectors.ssh: unflake SFTP client mock assertions (#2003) (@wowi42)
+
+CLI:
+
+- cli: migrate argument parsing from Click to Cyclopts (#1901) (@noirbizarre)
+- cli: parse literal list arguments (#1892) (@0xTaoZ)
+- cli: size result table columns by terminal cell width (#1977) (@xqliu)
+- cli: allow make_inventory without CLI context state (#2011) (@wowi42)
+- cli: Rich-based output, prints and debug-inventory (#1902) (@noirbizarre)
+
+Docs/meta:
+
+- docs: add debugging guide (#1919) (@Himanshuagrawal4)
+- docs: fix links to connector and fact guides (#1918) (@Himanshuagrawal4)
+- docs: add mode example to files.directory operation (#1933) (@evilham)
+- docs: fix links to connectors, operations, and facts indexes (#1956) (@castanearie)
+- chore: allow paramiko 5.0.0 to avoid CVE-2026-44405 (#1743) (@dpinol)
+- docs: fix connectors index link (#1958) (@0xTaoZ)
+- docs: correct claims that fact results are cached (#2000) (@1sakshm)
+- docs: add Simplified Chinese translation of README (#2027) (@WanderLandWalker)
+- ci: remove retired macOS 14 runners (#2051) (@wowi42)
+- docs: add deploy testing guide (#2052) (@wowi42)
+
+Other:
+
+- fix: add target, slice and device substates to systemd status check (#1914) (@kevinschweikert)
+- fix: parse packages with a brew "version" correctly. (#1601) (@morrison12)
+- feat: Allow `fetch_tags="force"` in `git.repo` (#1766) (@inducer)
+- feat: add files.rename operation (#1932) (@wowi42)
+- refactor: make AI skills harness generic
+- fix: handle long inline keys in server.user_authorized_keys (#1908) (@wowi42)
+- fix: explicitly re-export context objects from the pyinfra package (#2042) (@sarankumar1325)
+- feat: add supervisorctl operations and facts (#1822) (@wowi42)
+
+# v3.10.0
+
+Another bumper update with lots of security fixes in user input quoting and many other improvements. Thank you all new and returning contributors (there are many of you!).
+
+- facts.files: render import example as a code block (#1801) (@wowi42)
+- operations.files.line: strip regex anchors from appended lines (#1802) (@wowi42)
+- operations.zfs: avoid mutable default properties leaking across operation calls (#1792) (@mvanhorn)
+- facts.zfs,facts.server.KernelModules: zfs operations broken on freebsd (#1791) (@jgelens)
+- facts.deb: DebPackage failing when file/directory with same name exists in cwd (#1829) (@bendigg)
+- operations.files: clear error for file-like src with directory dest (#1144) (#1849) (@vjsai)
+- operations.server: detach reboot from SSH session (#1711) (@wowi42)
+- facts.server: resolve major.minor from distro release file (#1859) (@wlix13)
+- operations.go,facts.go: implement go operations and facts (#1776) (@yagarea)
+- facts.server: Add OpenBSD support to server.Mounts (#1863) (@epicrazzmatazz)
+- operations.docker: add container_exec operation (#1821) (@wowi42)
+- facts.hardware: use JSON from ip address show in NetworkDevices to cope with lack of prefix length and/or broadcast (#1851) (@morrison12)
+- operations.selinux: harden commands with QuoteString and remove asserts (#1846) (@Muhammad-Ikhwan-Fathulloh)
+- operations.files: type annotation for mode in files.template (#1866) (@bbonf)
+- operations.git: update origin remote when src changes (#1763) (#1843) (@vjsai)
+- facts.pacman: parse packages with uppercase version strings (#1865) (@zlangbert)
+- operations.zypper: fix gpg validation, auto-import keys, and permissions (#1833) (@doraem-on)
+- operations.server.Mount: generalize remount to more BSDs (#1872) (@epicrazzmatazz)
+- operations.docker.volume: allow options to be passed when creating docker volumes (#1882) (@DonDebonair)
+- facts.git: GitLocalCommit fact failing on nonlocal ref (#1881) (@yagarea)
+- operations.brew, facts.brew: add support for brew trust (#1836) (@morrison12)
+- operations.brew: use enum value strings in brew.trust fixtures (#1887) (@wowi42)
+- facts.deb: clarify package resolution (#1897) (@Sanjays2402)
+- operations.{apt,crontab,dnf,docker,flatpak,lxd,openrc,puppet,server,sysvinit,vzctl,yum,zfs},facts.{crontab,mysql,server}: quote user input (#1803-#1809, #1811-#1818) (@wowi42)
+
+Connectors:
+
+- connectors.ssh: respect ssh_key_password over ssh_config IdentityFile (#1855) (@wowi42)
+- connectors: allow HiddenValue in _env (#1853) (@Jesse-11)
+- connectors: add @fake no-op execution connector (#1888) (@noirbizarre)
+
+CLI:
+
+- cli: preserve Windows paths in module errors (#1884) (@0xTaoZ)
+
+Docs/meta:
+
+- docs: add llms.txt and llms-full.txt for LLM consumption (#1800) (@wowi42)
+- docs: clarify server.shell shell usage (#1835) (@Himanshuagrawal4)
+- docs: fix version banner
+- ci: add shellcheck workflow and fix scripts (#1827) (@wowi42)
+- docs: correct documentation rendering  of operations that no parameters (#1840) (@morrison12)
+- test: Enable tests from fixtures to work with string-valued Enum params (#1841) (@morrison12)
+- chore: keep ruff away from fixtures (#1871) (@morrison12)
+- style: fix ruff lint errors (PEP 585/604, f-strings, imports) (#1856) (@wowi42)
+- test: move freezegun; `dev`→`test` (#1868) (@ScegfOd)
+- docs: clarify commit message format and PR linting (#1879) (@DonDebonair)
+- test: use pyinfra-testing harness for facts and operations tests (#1878) (@DonDebonair)
+- chore: fix mypy warning (#1890) (@simonhammes)
+- chore: deduplicate shellcheck lint command (#1891) (@0xTaoZ)
+
+Other:
+
+- feat: add --exclude CLI argument to restrict target hosts (#1789) (@mvanhorn)
+- fix: allow SSH connections when an ED25519-SK (FIDO2) key is present in the agent (#1858) (@mvanhorn)
+- refactor: replace os.path usage with pathlib (#1753) (@wowi42)
+- ci: use uv.lock for ruff action
+
+# v3.9.2
+
+- Fix documentation recursive copy mess
+
+# v3.9.1
+
+- Fix documentation redirect pages generation
+
+# v3.9.0
+
+Another big release with a lot of fixes and improvements across the board - thank you to all contributors! This release also comes alongside completely refreshed documentation site, with a huge number of UX and copy improvements and a shiny new marketing site.
+
+Core:
+
+- api.host: restore deploy state when body raises (#1724) (@wowi42)
+- api: honour ctx_config TEMP_DIR override in get_temp_dir_config (#1751) (@wowi42)
+- api: New MaskString (#1709) (@gwelch-contegix)
+
+Operations/facts:
+
+- operations.dnf: add support for DNF modules (#1660) (@yagarea)
+- operations.git: chown worktree metadata in source repo (#1710) (@wowi42)
+- operations.files: add extended_regex option to line and replace (#1714) (@case)
+- operations.server: pre-check shadow tools in user op (#1707) (@wowi42)
+- operations.docker.volume: use docker volume rm to delete volumes (#1741) (@wowi42)
+- operations.apt: add sources_file operation (#1597) (@maisim)
+- operations.crontab: detect change of crontab entry with only special time (#1722) (@sebastiaanhoogeveen)
+- operations: handle output from the 'uutils' version of stat (eg. recent Ubuntu) (#1733) (@egnor)
+- operations.server: handle OpenBSD useradd properly (#1739) (@epicrazzmatazz)
+- facts.server: add EtcHosts, Last, Lastb, LoadAverage facts + server.etc_hosts op (#1669) (@wowi42)
+- facts.iptables: requires_command() error in when table specified (#1730) (@doug-fitzmaurice-rowden)
+- operations: handle password prompt from sudo-rs (eg. recent Ubuntu) (#1734) (@egnor)
+- facts: add AptPackages fact (#1740) (@mvanhorn)
+- operations.files: handle large download cache time (#1774) (@puneetdixit200)
+- facts.openrc: make OpenrcStatus match service names containing a dot (#1777) (@chimekkoo)
+- operations.python: correct type on exception argument
+- facts.util.packages: add PackageInfo model (phase 1 of #1725) (#1726) (@wowi42)
+- operations.files: shell-quote files.block content (#1759) (@wowi42)
+- operations.util.files: normalize octal mode spellings in ensure_mode_int (#1786) (@mvanhorn)
+- operations.gpg.key: use _matches_keyid for full-fingerprint idempotency check (#1718) (@maisim)
+
+Connectors:
+
+- connectors.util: honour _temp_dir in askpass helpers (#1666) (@wowi42)
+- connectors.ssh: auto-load OpenSSH user certificates from ssh_config (#1750) (@wowi42)
+
+CLI:
+
+- cli: add --use-sudo-login option (#1728) (@wucm667)
+- cli: keep trying module candidates when attribute is missing (#1748) (@wowi42)
+- cli: add --json flag for pure JSON stdout output (#1662) (@wowi42)
+
+Docs/meta:
+
+- AGENTS: codify recurring PR review feedback as rules (#1700) (@wowi42)
+- style: extend linting with modern Python syntax checks (#1721) (@DonDebonair)
+- test: fix apt.packages update_cached fixture for non-UTC contributors (#1716) (@case)
+- docs: add contributing setup for editable module (#1755) (@evilham)
+- docs: Add missing apostrophes (#1761) (@blinskey)
+- docs: remove stray 'LINK' in chmod/chown FAQ entry (#1762) (#1765) (@mvanhorn)
+- docs: warn that _if must be a callable (#1771) (@wowi42)
+- docs: restore loop cycle error guidance (#1767) (@puneetdixit200)
+- docs: clarify fact-failure semantics for requires_command and check_preconditions (#1770) (@wowi42)
+- docs: correct python.raise_exception example (#1772) (@puneetdixit200)
+- docs: add BSD platform-specific instructions (#1754) (@evilham)
+- docs: convert docs to use zensical (#1713)
+- docs: add darkreader-lock
+- docs: remove redundant css and drop google fonts dependency
+- ci: update changelog generation
+
+Other:
+
+- feat: enforce conventional commits standard for commit messages and PR titles (#1719) (@DonDebonair)
+- PR template: typo fix (#1715) (@case)
+- fix: extra linting rules (#1721) broke the build (#1732) (@DonDebonair)
+- fix: make dnf.packages work with dnf5 and handle multiple installation candidates (#1655) (@yacoob)
+- feat: Add server.Uptime fact (#1735) (@Tbruno25)
+- fix: Use Uptime fact in server.reboot (#1737) (@Tbruno25)
+- feat: Add `fetch_tags` flag to `git.repo` (#1745) (@inducer)
+- fix: update askpass test with new tmp path keys
+- fix: parse flat apt repos with empty component list (#1775) (#1779) (@mvanhorn)
+
+# v3.8.0
+
+Big release with a lot of fixes and improvements across the board! We're also switching to full semver (so .0 on the 3.8.0) for this release and others going forward. Thank you to all contributors!
+
+Core:
+
+- api.command: fix `make_formatted_string_command` adding unwanted spaces between format args (#1610) (@wowi42)
+- api: decouple core API from click by introducing pluggable output functions (#1616) (@wowi42)
+
+Operations/facts:
+
+- operations: expand quoting of user inputs to prevent command injection (#1576) (@wowi42)
+- facts.selinux.FileContext: handle missing SELinux context (#1581) (@wowi42)
+- facts.systemd: ensure that user-mode systemd facts do not fail if user manager is not available (#1604) (@martenlienen)
+- facts.apt.AptSources: add deb822 format support (#1465) (@maisim)
+- operations.files: expand diff output (#1552) (@gwelch-contegix)
+- facts.server: add Ports fact returning all listening ports (#1637) (@wowi42)
+- facts.choco: remove invalid shell_executable on ChocoPackages (#1598) (@wowi42)
+- operations.git.repo: add depth support (#1656) (@bsaussay)
+- operations.docker: add extra parameters (#1593) (@wowi42)
+- operations.selinux.port: fix a bug where the op would not find existing labels if `sepolicy` command was missing from the host (#1654) (@yacoob)
+- operations.server.reboot: survive dead SSH session during askpass cleanup (#1665) (@wowi42)
+- facts.docker: add version, container, image, network detail facts (#1668) (@wowi42)
+- facts.server: add AuthorizedKeys, make user_authorized_keys idempotent (#1670) (@wowi42)
+- facts.crontab: match full crontab(5) env var syntax (#1678) (@wowi42)
+- operations.files: add limit_rate to cap download bandwidth (#1681) (@wowi42)
+- operations.files: add files.unarchive (#1631) (@wowi42)
+- operations.docker: add support for custom command (#1625) (@EricDriussi)
+- facts.{yum,dnf,zypper}: add filename field to each repository entry (#1684) (@wowi42)
+- operations.server: dispatch BSD rc.d before sysvinit in server.service (#1685) (@wowi42)
+- operations.files.download: reconcile mode/user/group on existing files (#1687) (@wowi42)
+
+Connectors:
+
+- connectors.ssh: fix parsing of SSH config file comments (#1574) (@wowi42)
+- connectors: use gevent.subprocess in util for macOS + Python 3.13 compatibility (#1653) (@Yaminyam)
+- connectors: show askpass generation errors (#1628) (@matthijskooijman)
+- connectors.ssh: honor ConnectTimeout through ProxyJump (#1679) (@wowi42)
+
+Docs/meta:
+
+- docs: facts.opkg, operations.opkg - add note about Openwrt switch to apk (#1595) (@morrison12)
+- docs: fix extra trailing comma in operation argument lists (#1596) (@morrison12)
+- docs: fix missing keyword-only args in operations documentation (#1600) (@morrison12)
+- docs: fix `generate_operations_docs.py` and add docs build to CI (#1614) (@wowi42)
+- docs: operations.files - clarify template vars use (#1615) (@EricDriussi)
+- docs: update Python version requirements (#1627) (@pascal-cm)
+- docs: generate fact/operation docs for modules (vs files) (#1606) (@morrison12)
+- docs: clarify group_data/ is file-inventory only (#1696) (@wowi42)
+
+Other:
+
+- facts+operations: add `GpgKeyrings` fact and `gpg.*` operations (#1460) (@maisim)
+- dependencies/paramiko: support paramiko v4, remove DSS key support (#1525) (@5long)
+- operations.server.mount fix not detecting already-mounted devices (#1611) (@wowi42)
+- facts+operations: add uv support (#1500) (@morrison12)
+- meta,api: lazy load fact and operation modules (#1609) (@Dexmachi)
+- facts,operations: migrate `shlex.quote` to `StringCommand` + `QuoteString` everywhere (#1617) (@wowi42)
+- operations+facts: `server.Processes` fact and `server.kill` operation (#1583) (@wowi42)
+- arguments: add `dzdo` support for privilege escalation, including CLI options and configuration. (#1633) (@guinuxbr)
+- zfs: return an empty dict if zfs/zpool commands are not available (#1650) (@yacoob)
+- meta,ci: make ruff checks in ci+dev-lint.sh consistent
+- progress: finish spinner as soon as possible (#1657) (@matthijskooijman)
+- feat: support SSH IdentityAgent config directive (#1630) (@wowi42)
+- security: quote untrusted values in command construction across connectors, operations, and util (#1664) (@wowi42)
+- ci: upgrade default Python to 3.14 (#1667) (@wowi42)
+- fix: Add timeout support in FunctionCommand (#1663) (@Tbruno25)
+- feat: add config.INHERIT_ENV to pass local process env vars to all op… (#1677) (@maisim)
+- Add support for using AI coding agents (#1672) (@DonDebonair)
+- fix(cli): exclude imports from group data (#1676) (@wowi42)
+- fix: scripts/generate_facts_docs: add canonical-name label for re-exported facts (#1686) (@wowi42)
+- fix(operations.git): don't pull when already up to date (#1690) (@wowi42)
+- feat(facts): add requires_command guard sentinel and check_preconditions() hook (@maisim)
+- feat(facts.zfs): add check_preconditions for ZfsDatasets and update command method (@maisim)
+- feat(operations.docker): add login/logout operations (#1694) (@wowi42)
+- feat(operations.docker): add compose operation (#1693) (@wowi42)
+- feat(operations.docker): add build operation (#1695) (@wowi42)
+- operations/facts: modernize apt.key to replace deprecated apt-key command (@maisim)
+- chore: make Claude use modern type hints (#1692) (@DonDebonair)
+- feat(apt): add purge option to apt.packages (closes #1698) (#1702) (@mvanhorn)
+- fix(facts): add semicolons to TmpDir shell script for sh -c compatibility (#1703) (@wucm667)
+- fix(operations.server): normalize sysctl value for comparison (#1706) (@wowi42)
+- feat: add PR review skill (#1683)
+
+Operations/facts:
+
+- operations.files.line, operations.files.replace: add `extended_regex` parameter (default `False`) to opt in to extended regular expressions (`grep -E` / `sed -E`) so quantifiers like `+` and `?` and groups like `(a|b)` work without backslash escaping (#1019, #1400).
+- facts.files.FindInFile: add `extended_regex` parameter (default `False`) to use `grep -E`.
+
+# v3.7
+
+Thank you to all contributors - particular shout out to @wowi42 for an incredible run of PRs!
+
+Core:
+
+- api.facts: fix `requires_command` shell operator precedence with compound commands (#1579) (@wowi42)
+
+Operations/facts:
+
+- operations.docker: add support for env files (#1572) (@EricDriussi)
+- operations.docker: add support for dns (#1590) (@EricDriussi)
+- operations.files.sync: support symlinks
+- facts.server.Port: add UDP support and multi-platform backends (#1550) (@wowi42)
+- facts.hardware.Memory: use LANG=C while calling vmstat (#1553) (@soltysek)
+- facts.hardware: add `CpuInfo` fact (#1577) (@soltysek)
+- facts.server.Sysctl: fix non-zero exit code causing empty result (#1578) (@wowi42)
+- facts.runit.RunitManaged: handle missing service directory gracefully (#1580) (@wowi42)
+- facts.hardware.Memory: fix FreeBSD support by summing page categories (#1584) (@wowi42)
+- facts.server.SecurityLimits: handle missing limits.conf (#1582) (@wowi42)
+- facts.server.Port: fix `ss` command for Alpine/BusyBox compatibility (#1586) (@wowi42)
+- facts.iptables: add `requires_command` to all iptables facts (#1587) (@wowi42)
+- facts.opkg: add `requires_command` and stop hardcoding /bin/opkg (#1588) (@wowi42)
+- facts.choco: add `requires_command` to `ChocoPackages` and `ChocoVersion` (#1589) (@wowi42)
+
+Connectors:
+
+- connectors: `@podmanssh` connector for remote Podman container operations (#1547) (@elazar)
+- connectors.ssh: exclude `_chdir` from global arguments used when removing temporary file (fix #1426) (#1429) (@morrison12)
+- connectors.ssh: don't include password in SSH exception authentication data (#1538) (@oliverhr)
+
+CLI:
+
+- cli: use gevent for the progress spinner
+- cli: add `--ssh-password-prompt` flag for interactive SSH password input (#1585) (@wowi42)
+
+Other:
+
+- global arguments: `_su_password` argument for su password authentication (#1573) (@wowi42)
+- operations+facts: `server.timezone` and `server.Timezone` fact (#1575) (@wowi42)
+- scripts: add `generate_changelog.py`
+
+# v3.6.1
+
+Thank you to all contributors. A solid bugfix release including some rather old bugs at this point.
+
+Core fixes:
+
+- api: handle/propagate nested operation errors
+- api: don't apply stage check in API mode
+- api: change `iter_active_hosts` -> `get_active_hosts`
+
+Operation/fact fixes:
+
+- operations.docker.container: add support for `--restart` and `--rm` arguments (@levinion)
+- operations.postgres: add idempotency notice on passwords to `postgres.role`
+- facts.flatpak.FlatpakPackages: handle headless output correctly
+- facts.crontab: don't return non-command cron entries in `get_command`
+- facts.files.FileContents: fix return None when no file exists
+- facts.files.FindFiles: fix args parameter being ignored (@wowi42)
+
+Connector fixes:
+
+- connectors.ssh: handle multiple known hosts files in SSH config
+
+CLI fixes:
+
+- cli: fix missing config lock
+- cli: fix config flags lost on multiple deploy files (@wowi42)
+- cli/inventory: support loading host groups directly from module attributes (@wowi42)
+
+Docs/meta:
+
+- docs: fix many minor errors (@romain-dartigues)
+- docs: fix typo in inventory-data.rst (@EshemMimi)
+- meta: add arguments linter
+- meta: fix dev linting scripts
+
+# v3.6
+
+First 2026 release - Happy New Year all! Thank you to all contributors. One big highlight is new metadata spec for plugins, this is the start of better discovery and documentation generation for third party facts and operations:
+
+- add metadata spec for pyinfra plugins (@rod7760)
+
+New and updated operations/facts:
+
+- operations: add `_temp_dir` global argument for configuring temp directory (@wowi42)
+- operations: add `files.copy` operation (@EricDriussi)
+- operations.crontab: fix modification not properly relying on the `cron_name` parameter (@information-redacted)
+- operations.docker.container: add support for setting labels (@spookyvision)
+- operations: add import statements on at least one example of every operation (@mkinney)
+- operations.docker.image: make operation idempotent (@DonDebonair)
+- operations.files.template: allow custom jinja2 template loaders (@DaRasch)
+- operations.files.block/connectors.util: use correct temporary directory (@morrison12)
+- operations.util.packaging: allow empty package list in `ensure_packages` (@schenker)
+- operations: fix tmpdir to properly use all the POSIX environment variables (@wowi42)
+- facts.files.FileContents: improve docstring (@adonm)
+- facts.apt.update: fix computation of cache_time when host is not UTC (@philippemilink)
+- facts: add `FactProcessError` to log, not explode, issues processing facts (@NichtJens)
+- facts.npm: check directory exists before cd-ing (wowi42)
+
+Connectors:
+
+- connectors.docker: add platform and architecture option via connector data (@JP-Ellis)
+- connectors: close stdin after writing any input
+- connectors.ssh: add workaround for paramiko no session error (@dfaerch)
+
+CLI:  
+
+- cli: change color of "No changes" to cyan
+- cli: add option `--same-sudo-password` (@philippemilink)
+
+Docs/meta:
+
+- docs: replace `python -m` with `uv run -m` (@JP-Ellis)
+- docs: fix URLs in API documentation (@kelno)
+- docs/connectors: document command wrapping and parameter filtering best practices (@elazar)
+- tests: freeze date for fact tests
+
+
+# v3.5.3
+
+- another release to fix different doc generation issues 🫠
+
+# v3.5.2
+
+- fix operation & fact docs generation
+
+# v3.5.1
+
+Patch release with a bunch of great fixes. But notably want to call out two major changes for anyone working on the pyinfra code itself (huge thank you Daan for implementing these):
+
+- feat: use ruff for linting and formatting (@DonDebonair)
+- feat: use uv for project and dependency management (@DonDebonair)
+
+Core fixes:
+
+- api: correctly set context state+host when calling `get_facts` 
+- cli: catch exceptions when testing inventory/operation imports 
+- cli: fix/remove datetime timezone warnings (@wowi42)
+- operations/files.block: correct behaviour when markers/block not found and no line provided (@morrison12)
+- operations.util.packaging: extend PkgInfo for winget (@rod7760)
+- facts/server: support negative value in sysctl (@imlonghao)
+
+Docs:
+
+- docs: fix dynamic execution example (@wowi42)
+- docs: Specify how the recursive argument to directory() works (@cliffmccarthy)
+- docs: change recommended installation methods (@DonDebonair)
+- docs: update writing connectors 
+
+Tests:
+
+- op.server.user tests: add exists_noop.json for user existence checks (fix warning) (@maisim)
+- op.server.user tests: add noop_description (fix warning) (@maisim)
+- fix: add missing command field in test (@maisim)
+- tests: clear the host sftp memoization cache before setting up the mock (@wowi42)
+- tests: export testgen class to a new package/repo 
+- tests: fix missing stage sets on state 
+
+# v3.5
+
+New release with some really awesome new features, brought to you by the fantastic contributions of the community. New stuff:
+
+- add `--diff` argument to show file diffs for potential file changes (@jgelens)
+- add `_retries`, `_retry_delay` and `_retry_until` global arguments (@shohamd4)
+- parallelize disconnecting from hosts (@gwelch-contegix)
+- enable using SCP instead of SFTP for SSH file transfers (@DonDebonair)
+
+New and updated operations/facts:
+
+- facts/server: add `RebootRequired` fact (@wowi42)
+- operations/pip: support PEP-508 package versions (@morrison12)
+- operations+facts/docker: add Docker plugin support (@DonDebonair)
+- operations/files.put: add `atime` and `mtime` arguments (@vram0gh2)
+- operations/openrc: support runlevel when enabling services (@sengo4hd)
+- facts/yum+dnf+zypper: return `repoid` in repository facts
+
+Operation/fact fixes:
+
+- facts/files.File: add ls fallback support (@mrkbac)
+- operations/openrc: add missing noop messages (@sengo4hd)
+- operations/server.crontab: fix newline when replacing existing values (@Nananas)
+- operations/files.block: fix examples doc (@morrison12)
+- operations/files.block: fix case where file exists but line is missing (@morrison12)
+- operations/files.block: improve handling of special characters in marker lines (@morrison12)
+
+Internal/meta:
+
+- documentation link fix (@sengo4hd)
+
+
+# v3.4.1
+
+- fix config context when getting operation arguments
+
+# v3.4
+
+Much delayed 3.4, great collection of additions and improvements. Huge THANK YOU to all contributors as always. New features:
+
+- Add @podman connector (@Griffoen)
+
+New and updated operations/facts:
+
+- operations/docker.network: add support for aux addresses (@DonDebonair)
+- operations/files: try multiple hash functions in `files.get` + `files.put` (@mrkbac)
+- operations/files.download: add `temp_dir` argument (@scy)
+- operations/files.download: add `extra_curl_args` and `extra_wget_args` arguments (@jgelens)
+- operations/flatpak: add remote support (@Griffoen)
+- operations/git + facts/git: add `GitTag` fact and support tag checkout (@wowi42)
+- operations/server.mount: add support for FreeBSD mounts (@DtxdF)
+- facts/server: add `server.Port` fact to find process listening on port (@missytake)
+
+Operation/fact fixes:
+
+- operations/docker: handle case where no docker containers/etc exist (@wowi42)
+- operations/files + operations/crontab: fix deletion of lines when `present=False` (@bad)
+- operations/files.block: avoid use of non-POSIX `chown -n`
+- operations/files.put: fix copying of local file mode (@vram0gh2)
+- operations/server.user: fix appending of user groups (@aaron-riact)
+- facts/server.Mounts: fix whitespace and escaped character parsing (@lemmi)
+- facts/systemd: treat mounted units as active
+
+Internal/meta:
+
+- remove unnecessary setuptools runtime dependency (@karlicoss)
+
+
+# v3.3.1
+
+- connectors/ssh: fix extra `keep_alive` key passing through to paramiko `connect` call (@chipot)
+- docs: refine installation guide with updated Python requirements and best practices (@wowi42)
+
+# v3.3
+
+Second release of 2025: loads of adds, fixes and documentation improvements. A huge THANK YOU to all contributors. Slightly changed format for the change list based on commit messages which should speed up releases:
+
+New operations & arguments:
+
+- operations/freebsd: add FreeBSD operations & facts (@DtxdF)
+- operations/files.move: new operation (@Pirols)
+- operations/server.user: enable adding user to secondary groups (Pirols)
+- operations/postgres: enhance role management by adding `ALTER ROLE` support (@wowi42)
+- operations/postgres: enable modifying existing postgres databases (@wowi42)
+- operations/docker.container: refactor to support container recreation (@minor-fixes)
+
+Operation/fact fixes:
+
+- operations/postgres: fix quoting of locale parameters (@xvello)
+- operations/server: remove leftover deprecated parameter (@wowi42)
+- operations/pacmen: update PACMAN_REGEX to support additional characters (@wowi42)
+- operations/server.sysctl: handle 0 integer values correctly (@lemmi)
+- operations/apt: dist-upgrade also supports --autoremove (@bauen1)
+- operations/apt: fix parameter name in docs (@bauen1)
+- operations/server: fix: lastlog is always null (@ingstem)
+- operations/docker: Fixed a typo with the volumes parameter to docker.prune operation (@mpilone)
+- facts/xbps.XbpsPackages: allow . in package names (@lemmi)
+
+Connectors, CLI:
+
+- connectors: improve detection of sudo password needed
+- connectors/ssh: add support for `ServerAliveInterval` (@chipot)
+- cli: enable -h as shorthand for --help (@NichtJens)
+
+Docs:
+
+- docs: Add a section explaining connector flow (@goetzk)
+- docs: Add inventory processing note and reference it (@goetzk)
+- docs: Add example of logging to using operations docs (@goetzk)
+- docs: fix wrong example operation using forbidden argument 'name' (@robertmx)
+- docs: Add a note to the docs about using `_inner` when calling operations from other operations (@CSDUMMI)
+- docs: Document host, state, inventory in files.template (@mpilone)
+- docs: Minor adjustments to wording help docs and help (@goetzk)
+- docs: expand connectors documentation (@goetzk)
+- docs: correct import path for any_changed, all_changed (@lemmi)
+- docs: Add note re: global arguments to operations (@simonhammes)
+
+Internal/meta:
+
+- refactor: update opkg documentation and add requires_command to ZFS and Git tests (@wowi42)
+- Update testing and development dependencies in setup.py (@wowi42)
+- tests: Load test specs with PyYAML instead of json (@taliaferro)
+- typing: Require explicit override decorator (@bauen1)
+- api: don't execute callbacks within a greenlet if we're already in one
+- ci: Github Actions support for python 3.12 (@wowi42)
+- ci: Prevent docs job from running on forks (@simonhammes)
+
+
+# v3.2
+
+Hello 2025! Here's pyinfra 3.2 - with another incredible round of contributions from the community, THANK YOU ALL. New stuff:
+
+- Add total counts to results summary (@NichtJens)
+- Enable passing extra data via `local.include` (@TimothyWillard)
+- Validate inventory files and display warnings for unexpected variables (@simonhammes)
+
+New operations/facts:
+
+- Add `pipx` operations (`packages`, `upgrade_all`, `ensure_path`) facts (`PipxPackages`, `PipxEnvironment`) and operations (@maisim)
+- Add `server.OsRelease` fact (@wowi42)
+- Add `podman.PodmanSystemInfo` and `podman.PodmanPs` facts (@bauen1)
+- Add many extra arguments (including generic args) to `files.FindFiles*` facts (@JakkuSakura)
+- Add `system` argument to `git.config` operation (@Pirols)
+- Add `psql_database` argument to postgres operations & facts (@hamishfagg)
+- Add `files.Sha384File` fact and `sha384sum` argument to `files.download` operation (@simonhammes)
+- Add `apt.SimulateOperationWillChange` fact (@bauen1)
+- Detect changes in `apt.upgrade` and `apt.dist_upgrade` operations (@bauen1)
+- Add `fibootmgr.EFIBootMgr` fact (@bauen1)
+- Add opkg facts and operations (@morrison12)
+
+Fixes:
+
+- Multiple fixes for `server.crontab` operation and facts (@JakkuSakura)
+- Correctly handle `latest` argument with requirements file in `pip.packages` operation (@amiraliakbari)
+- Fix regex used to parse installed apk packages (@simonhammes)
+- Fix SSH connector overwriting known hosts files (@vo452)
+
+Docs/internal tweaks:
+
+- Add type annotations for many more operations (@simonhammes)
+- Add typos CI checking to replace flake8-spellcheck (@simonhammes)
+- Bump CI actions and dependencies (@simonhammes)
+- Require JSON tests to include all arguments
+- Remove unused `configparser` dependency (@bkmgit)
+- Many small documentation fixes/tweaks
+
+
+# v3.1.1
+
+- Improve errors with 2.x style `@decorator` (vs `@decorator()`) functions
+- Document adding custom connectors (@simonhammes)
+- Add basic API example to docs (@pirate)
+- Fix sphinx warnings (@simonhammes)
+- Fix force & pull arguments in `git.worktree` operation
+- Fix `server.reboot` reconnection (@wackou)
+- Fix chroot/local connector non-utf file gets (@evoldstad)
+- Fix `AptSources` fact to parse components in order & with digits (@rsfzi)
+
+# v3.1
+
+Here's pyinfra 3.1 - a release primarily driven by contributors new and old - a HUGE THANK YOU to all of you who dedicate time to work on pushing pyinfra forward. New stuff:
+
+- Add `zfs` operations (`dataset`, `snapshot`, `volume`, `filesystem`) facts (`Pools`, `Datasets`, `Filesystems`, `Snapshots`, `Volumes`) (@taliaferro)
+- Add `flatpak` operations (`packages`) and facts (`FlatpakPackage`, `FlatpakPackages`) (@JustScreaMy)
+- Add `jinja_env_kwargs` argument to `files.template` operation (@DonDebonair)
+- Add using dictionaries as `@terraform` output (map from group -> hosts)
+- Add default `@terraform` output key - `pyinfra_inventory.value`, promote connector to beta
+- Add support for multiple keys in each `server.authorized_keys` file (@matthijskooijman)
+- Add print all dependency versions with `--support` flag (@kytta)
+
+Fixes:
+
+- Fix when `ssh_hostname` is set as override data, don't do inventory hostname check
+- Fix `apt.AptSources` parsing special characters (@CondensedTea)
+- Fix `server.reboot` connection detection (@bauen1 + @lemmi)
+- Fix systemd flagging of sockets running (@bauen1)
+- Fix mysql dump quoting (@simonhammes)
+- Fix tilde expansion in files facts (@simonhammes)
+- Fix host lookup check with SSH alias config (@simonhammes)
+- Fix crontab comparison (@andrew-d)
+
+Docs/internal tweaks:
+
+- Improve operations documentation (@bauen1)
+- Default to local machine if `user_name` set in systecmt (@bauen1)
+- Improve efficiency of Docker operations (@apecnascimento)
+- Shallow copy `host.data` data to mutation
+
+
+# v3.0.2
+
+- Fix `OperationMeta.did_change`: this is now a function as originally designed
+- Add quick test for `host.when` context manager
+- Remove extra detected changes note when not relevant
+
+# v3.0.1
+
+- Switch to `command -v` not `which` in `server.Which` fact (@lemmi)
+- Fix detection of xbps in `server.packages` operation (@romain-dartigues)
+- Fix argument typo in operations doc (@scoufman)
+- Add expanded note about detected changes + hidden side effects during execution
+- Fix missing global arguments in group data files
+- Fix `--group-data` CLI argument behaviour
+- Remove unused/dead `--quiet` flag
+
+# v3.0
+
+Welcome to pyinfra v3! This version is the biggest overhaul of pyinfra since it was created back in 2015. Most v2 deployment code should be automatically compatible, but as always be aware. Major changes:
+
+### Runtime operation execution
+
+pyinfra now executes operations at runtime, rather than pre-generating commands. Although the change isn't noticeable this fixes an entire class of bugs and confusion. See the [limitations](https://docs.pyinfra.com/en/2.x/deploy-process.html#limitations) section in the v2 docs. All of those issues are now a thing of the past.
+
+This represents a huge overhaul of pyinfra's internals and should be a huge improvement for users.
+
+Care has been taken to reduce the overhead of this change which still supports the same diffs and change proposal mechanism.
+
+### CLI flow & prompts
+
+The pyinfra CLI will now prompt (instead of ignore, or immediately exit) when problems are encountered, allowing the user to choose to continue. Additionally an approval step is added before executing changes (this can be skipped with `-y` or setting the `PYINFRA_YES` environment variable).
+
+### Extendable connectors API, typing overhaul
+
+v3 of pyinfra includes for the first time a (mostly) typed internal API with proper support for IDE linting. There's a whole new connectors API that provides a framework for building new connectors.
+
+### Breaking changes
+
+- Rename `_use_sudo_password` argument to `_sudo_password`
+- Remove `winrm` connector and `windows*` operations/facts, moving to [`pyinfra-windows`](https://github.com/pyinfra-dev/pyinfra-windows)
+- The deploy decorator must now be called, ie used as `@deploy()`, and is now typed
+- Remove broken Ansible inventory connector
+
+### Operations & Facts
+
+- Add `docker.container`, `docker.image`, `docker.volume`, `docker.network` & `docker.prune` operations (@apecnascimento)
+- Add `runit.service` operation and `RunitStatus` fact (@lemmi)
+- Add `TmpDir` fact
+- Add `services` argument to systemd facts for filtering
+- Add type hints for all the operations (@stone-w4tch3r)
+- Lowercase pip packages properly (PEP-0426)
+- Rename `postgresql` -> `postgres` operations & facts (old ones still work)
+- Improve IP/MAC parsing in `NetworkDevices` fact (@sudoBash418)
+- Enable getting `Home` fact for other users (@matthijskooijman)
+- Use users correct home directory in `server.user_authorized_keys` operation (@matthijskooijman)
+- Fix `destination`/`not_destination` arguments in `iptables.rule` operation
+- Fix remote dirs when executing from Windows in `files.sync` operation (@Renerick)
+- Fix quoting of systemd unit names (@martenlienen)
+
+### Other Changes
+
+- Add new `_if` global argument to control operation execution at runtime
+- Add `--debug-all` flag to set debug logging for all packages
+- Retry SSH connections on failure (configurable, see [SSH connector](https://docs.pyinfra.com/en/3.x/connectors/ssh.html#available-data)) (@fwiesel)
+- Documentation typo fixes (@szepeviktor, @sudoBash418)
+- Fix handling of binary files in Docker connector (@matthijskooijman)
+- Add `will_change` attribute and `did_change` context manager to `OperationMeta`
+- Replace use of `pkg_resources` with `importlib.metadata` (@diazona)
+- Fix identifying Python inventory files as modules (@martenlienen)
+- Fix typed arguments order (@cdleonard)
+- Check that fact commands don't take global arguments (@martenlienen)
+
+# v2.x
+
+[See this file in the `2.x` branch](https://github.com/Fizzadar/pyinfra/blob/2.x/CHANGELOG.md).
+
+# v1.x
+
+[See this file in the `1.x` branch](https://github.com/Fizzadar/pyinfra/blob/1.x/CHANGELOG.md).

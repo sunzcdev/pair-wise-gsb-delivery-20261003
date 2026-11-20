@@ -1,0 +1,24 @@
+{
+    "args": ["/home/myworktree"],
+    "facts": {
+        "files.Directory": {
+            "path=/home/myworktree": {
+                "mode": 0
+            }
+        },
+        "git.GitTrackingBranch" : {
+            "repo=/home/myworktree": "origin/master"
+        },
+        "git.GitLocalCommit": {
+            "ref=HEAD, repo=/home/myworktree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "git.GitRemoteBranchCommit": {
+            "branch=master, remote=origin, repo=/home/myworktree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+    },
+    "commands": [
+        "cd /home/myworktree && git pull"
+    ],
+    "idempotent": false,
+    "disable_idempotent_warning_reason": "git pull is always executed"
+}

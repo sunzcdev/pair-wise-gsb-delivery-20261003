@@ -1,0 +1,11 @@
+{
+    "args": ["some file"],
+    "kwargs": {
+        "database": "somedb",
+        "mysql_user": "root"
+    },
+    "commands": [
+        "mysql somedb -uroot < 'some file'"
+    ],
+    "idempotent": false
+}

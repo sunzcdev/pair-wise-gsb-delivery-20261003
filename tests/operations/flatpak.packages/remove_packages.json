@@ -1,0 +1,14 @@
+{
+  "kwargs": {
+    "packages": ["org.videolan.VLC", "tv.kodi.Kodi"],
+    "present": false
+  },
+  "facts": {
+    "flatpak.FlatpakPackage": {},
+    "flatpak.FlatpakPackages": {
+      "user=False": ["org.videolan.VLC"]
+    }
+  },
+  "commands": ["flatpak uninstall --noninteractive org.videolan.VLC"],
+  "noop_description": "flatpak package tv.kodi.Kodi is not installed"
+}

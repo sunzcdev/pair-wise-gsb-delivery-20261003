@@ -1,0 +1,12 @@
+{
+  "kwargs": {
+    "packages": ["org.videolan.VLC"]
+  },
+  "facts": {
+    "flatpak.FlatpakPackage": {},
+    "flatpak.FlatpakPackages": {
+      "user=False": []
+    }
+  },
+  "commands": ["flatpak install --noninteractive org.videolan.VLC"]
+}

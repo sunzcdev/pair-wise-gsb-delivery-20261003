@@ -1,0 +1,24 @@
+{
+    "command": "rc-status default",
+    "requires_command": "rc-status",
+    "args": ["default"],
+    "output": [
+        "Runlevel: default",
+        "  net-online                                    [  started  ]",
+        "  sshd                                    [  started  ]",
+        "  virtualbox-guest-additions              [  crashed  ]",
+        "  crond                                    [  started  ]",
+        "  nftables.default                         [  started  ]",
+        "  podman                                   [  started 00:34:14 (10) ]",
+        "  podman-long-running                      [  started 15 day(s) 00:34:14 (10) ]"
+    ],
+    "fact":  {
+        "net-online": true,
+        "sshd": true,
+        "virtualbox-guest-additions": false,
+        "crond": true,
+        "nftables.default": true,
+        "podman": true,
+        "podman-long-running": true
+    }
+}

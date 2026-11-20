@@ -1,0 +1,23 @@
+{
+    "args": ["someuser"],
+    "kwargs": {
+        "home": "homedir"
+    },
+    "facts": {
+        "server.Os": "Linux",
+        "server.Users": {},
+        "server.Groups": {},
+        "files.Directory": {
+            "path=homedir": false
+        },
+        "files.Link": {
+            "path=homedir": true
+        },
+        "server.Which": {
+            "command=useradd": "/usr/sbin/useradd"
+        }
+    },
+    "commands": [
+        "useradd -d homedir -M someuser"
+    ]
+}

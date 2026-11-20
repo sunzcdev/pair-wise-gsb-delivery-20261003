@@ -1,0 +1,15 @@
+{
+    "command": "\n        for SERVICE in `ls /etc/init.d/`; do\n            _=`cat /etc/init.d/$SERVICE | grep \"### BEGIN INIT INFO\"`\n\n            if [ \"$?\" = \"0\" ]; then\n                STATUS=`/etc/init.d/$SERVICE status`\n                echo \"$SERVICE=$?\"\n            fi\n        done\n    ",
+    "output": [
+        "rpcsvcgssd=0",
+        "rsyslog=4",
+        "saslauthd=3",
+        "node_exporter=0"
+    ],
+    "fact": {
+        "rpcsvcgssd": true,
+        "rsyslog": null,
+        "saslauthd": false,
+        "node_exporter": true
+    }
+}

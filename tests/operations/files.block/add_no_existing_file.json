@@ -1,0 +1,22 @@
+{
+    "require_platform": [
+        "Darwin",
+        "Linux"
+    ],
+    "args": [
+        "/home/someone/something"
+    ],
+    "kwargs": {
+        "content": "please add this",
+        "line": "after this",
+        "after": true
+    },
+    "facts": {
+        "files.Block": {
+            "begin=None, end=None, marker=None, path=/home/someone/something": null
+        }
+    },
+    "commands": [
+        "OUT=\"$(TMPDIR=_tempdir_ mktemp -t pyinfra.XXXXXX)\" &&  ( awk '{{print}}' /dev/null  -  > \"$OUT\" <<'PYINFRAHERE'\n# BEGIN PYINFRA BLOCK\nplease add this\n# END PYINFRA BLOCK\nPYINFRAHERE\n )  && mv \"$OUT\" /home/someone/something"
+    ]
+}

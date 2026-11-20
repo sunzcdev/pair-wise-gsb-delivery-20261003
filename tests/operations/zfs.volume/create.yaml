@@ -1,0 +1,10 @@
+args:
+  - tank/myzvol
+  - 5G
+kwargs:
+  present: true
+  compression: lz4
+facts:
+  zfs.ZfsDatasets: {}
+commands:
+  - zfs create -o compression=lz4 -V 5G tank/myzvol

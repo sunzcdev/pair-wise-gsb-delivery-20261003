@@ -1,0 +1,31 @@
+[files]
+extend-exclude = [
+    "tests/facts/apt.SimulateOperationWillChange/upgrade.json",
+    "tests/facts/opkg.OpkgPackages/opkg_packages.json",
+    "tests/words.txt",
+    "tests/facts/gpg.GpgKeyrings/*.json",  # GPG keyring test files contain hex key IDs
+]
+
+[default]
+extend-ignore-re = [
+    "shell\\('uptim'\\)",
+    '"fpr:::::::::',
+    '"tru:',
+    '== "fpr":',
+    "00740ba1",
+    "forr something in",
+    "unknown tag 'forr'",
+    "nd6 options=",
+    "4Ue1", # Ignore false positive in test_sshuserclient.py (EXAMPLE_KEY_1)
+    "\\[d\\]efault", # Literal dnf module list hint legend
+    "\\[e\\]nabled", # Literal dnf module list hint legend
+    "\\[i\\]nstalled", # Literal dnf module list hint legend
+    "\\(@[\\w-]+\\)", # GitHub usernames credited in CHANGELOG.md
+]
+
+[default.extend-words]
+datas = "datas"
+requiere = "requiere"
+ein = "ein"
+ist = "ist"
+passord = "passord"
