@@ -170,6 +170,8 @@ module Fluent::Plugin
               # this is FilePositionEntry and fluentd once started.
               # read data from the head of the rotated file.
               # logs never duplicate because this file is a rotated new file.
+              # The persisted offset belongs to the old inode; applying it
+              # to this file after a restart would skip or duplicate records.
               @pe.update(inode, 0)
             else
               # this is MemoryPositionEntry or this is the first time fluentd started.
@@ -220,6 +222,12 @@ module Fluent::Plugin
               # calling `#refresh_watchers`s, and `#refresh_watchers` won't run `#start_watchers`
               # and `#stop_watchers()` for the path because `target_paths_hash`
               # always contains the path.
+              #
+              # A rename + create rotation splits the ownership of this
+              # watcher's state here: this watcher keeps its reader on the
+              # renamed inode and receives a memory-only position entry,
+              # while the persistent position entry is handed over to the
+              # watcher TailInput creates for the new file. See #swap_state.
               @update_watcher.call(self, swap_state(@pe), stat&.ino)
             end
           else
@@ -236,6 +244,21 @@ module Fluent::Plugin
         handler
       end
 
+      # Splits the ownership of this watcher's state for a rename + create
+      # rotation.
+      #
+      # This (old) watcher keeps its reader: the IOHandler's open file
+      # description still refers to the renamed inode, so the records a
+      # writer holding the old file appends can be delivered until the old
+      # file is read to the end. Those reads advance only the
+      # MemoryPositionEntry installed here, because the renamed file no
+      # longer matches `path` and its offset must not be persisted.
+      #
+      # The returned entry keeps belonging to `path` and is handed over to
+      # the new TailWatcher (see TailInput#update_watcher_raw), so the new
+      # file's offset is the one that advances in the pos file. The new
+      # watcher rebinds the entry to the new inode before seeking, hence a
+      # restart never applies the old file's offset to the new file.
       def swap_state(pe)
         # Use MemoryPositionEntry for rotated file temporary
         mpe = MemoryPositionEntry.new

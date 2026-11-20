@@ -240,6 +240,10 @@ module Fluent::Plugin
       end
     end
 
+    # Position entry which is never persisted. A TailWatcher whose file was
+    # renamed away from `path` keeps reading its open file description with
+    # this entry, so those final reads never overwrite the pos file entry
+    # that the new file's watcher owns.
     class MemoryPositionEntry
       def initialize
         @pos = 0

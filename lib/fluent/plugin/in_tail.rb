@@ -542,6 +542,14 @@ module Fluent::Plugin
           @tails[path].on_notify
         end
       else
+        # The persistent position entry of `path` belongs to the new
+        # watcher from here on; the old watcher keeps its reader on the
+        # renamed inode together with a memory-only entry (see
+        # TailWatcher#swap_state), so it can still deliver the old file's
+        # last records during rotate_wait without touching the pos file.
+        # The new watcher rebinds the entry to the new inode in on_rotate,
+        # so the new file's offset advances in the pos file and a restart
+        # resumes the new file instead of seeking the old offset inside it.
         @tails[path] = setup_watcher(new_target_info, pe)
         @tails[path].ready_to_shutdown(@shutdown_start_time) if @shutdown_start_time
         @tails[path].on_notify

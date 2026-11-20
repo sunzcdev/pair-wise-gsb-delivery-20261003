@@ -1870,6 +1870,159 @@ class TailInputTest < Test::Unit::TestCase
     end
   end
 
+  sub_test_case "rotation by rename and create" do
+    # A log writer renames the current file and immediately creates a new
+    # file with the same name, while its old open handle may still append
+    # to the renamed file. These tests pin down who owns the reader and
+    # the position entries after such a rotation: the old watcher keeps
+    # its reader on the renamed inode with a memory-only position entry,
+    # and the new watcher owns the persistent position entry, so the new
+    # file's offset advances in the pos file and a restart never applies
+    # the old offset to the new file.
+    def create_rotation_driver(overrides = {})
+      config = config_element("ROOT", "", {
+                                "path" => "#{@tmp_dir}/tail.txt",
+                                "pos_file" => "#{@tmp_dir}/tail.pos",
+                                "tag" => "t1",
+                                "read_from_head" => "true",
+                                # No periodic refresh interferes with the scripted rotation.
+                                "refresh_interval" => "1h",
+                                "enable_stat_watcher" => "false",
+                                # rotate_wait is expired manually, under the test's control.
+                                "rotate_wait" => "1h",
+                              }.merge(overrides)) + SINGLE_LINE_CONFIG
+      Fluent::Test::Driver::Input.new(Fluent::Plugin::TailInput).configure(config)
+    end
+
+    def rotation_target_path
+      "#{@tmp_dir}/tail.txt"
+    end
+
+    def rotated_path
+      "#{@tmp_dir}/tail.txt.1"
+    end
+
+    # Rename the current file, create a same-named new file, and append
+    # to the renamed file like a writer holding the old file does.
+    def simulate_rename_and_create_rotation(new_lines:, old_lines:)
+      FileUtils.mv(rotation_target_path, rotated_path, force: true)
+      old_holder = File.open(rotated_path, "ab")
+      begin
+        File.open(rotation_target_path, "wb") { |f| new_lines.each { |line| f.puts line } }
+        old_lines.each { |line| old_holder.puts line }
+        old_holder.flush
+      ensure
+        old_holder.close
+      end
+    end
+
+    def test_rotation_hands_persistent_entry_to_new_file_and_drains_old_file
+      path = rotation_target_path
+      File.open(path, "wb") { |f| f.puts "old1"; f.puts "old2" }
+
+      d = create_rotation_driver
+      old_ino = nil
+      new_ino = nil
+      d.run(expect_records: 4, timeout: 15) do
+        plugin = d.instance
+        waiting(5) { sleep 0.1 until d.events.size == 2 && !plugin.instance_variable_get(:@startup) }
+
+        old_watcher = plugin.instance_variable_get(:@tails)[path]
+        old_ino = Fluent::FileWrapper.stat(path).ino
+
+        simulate_rename_and_create_rotation(new_lines: ["new1"], old_lines: ["old3"])
+        new_ino = Fluent::FileWrapper.stat(path).ino
+        assert_not_equal old_ino, new_ino
+
+        rotate_wait = plugin.instance_variable_get(:@tails_rotate_wait)
+        waiting(10) { sleep 0.1 until d.events.size == 4 && rotate_wait.key?(old_watcher) }
+
+        # The reader of the renamed inode stays with the old watcher,
+        # together with a memory-only position entry: its final reads are
+        # never written to the pos file.
+        assert_equal Fluent::Plugin::TailInput::MemoryPositionEntry, old_watcher.pe.class
+        assert_equal old_ino, old_watcher.pe.read_inode
+        assert_true old_watcher.instance_variable_get(:@io_handler).opened?
+
+        # The persistent position entry belongs to the new watcher, so
+        # the new file's offset advances in the pos file.
+        new_watcher = plugin.instance_variable_get(:@tails)[path]
+        assert_not_same old_watcher, new_watcher
+        assert_equal Fluent::Plugin::TailInput::FilePositionEntry, new_watcher.pe.class
+        assert_equal new_ino, new_watcher.pe.read_inode
+        assert_equal "new1\n".bytesize, new_watcher.pe.read_pos
+
+        # Expire rotate_wait under the test's control instead of sleeping.
+        rotation = rotate_wait[old_watcher]
+        plugin.event_loop_detach(rotation[:timer])
+        rotation[:timer].on_timer
+        assert_empty plugin.instance_variable_get(:@tails_rotate_wait)
+      end
+
+      # Both files are collected exactly once.
+      assert_equal %w[old1 old2 new1 old3].sort, d.events.map { |event| event[2]["message"] }.sort
+
+      # The pos file belongs to the new file only.
+      pos_entries = File.readlines("#{@tmp_dir}/tail.pos", chomp: true).map { |line| line.split("\t") }
+      assert_equal [[path, "%016x" % "new1\n".bytesize, "%016x" % new_ino]], pos_entries
+
+      # After a restart, the old offset is not applied to the new file:
+      # reading resumes from the persisted offset of the new file.
+      d2 = create_rotation_driver
+      d2.run(expect_records: 1, timeout: 15) do
+        waiting(5) { sleep 0.1 until !d2.instance.instance_variable_get(:@startup) }
+        File.open(path, "ab") { |f| f.puts "new2" }
+        waiting(5) { sleep 0.1 until d2.events.size == 1 }
+      end
+      assert_equal ["new2"], d2.events.map { |event| event[2]["message"] }
+    end
+
+    def test_old_file_is_fully_read_before_detach_with_controlled_clock
+      path = rotation_target_path
+      File.open(path, "wb") { |f| f.puts "old1" }
+
+      # read_bytes_limit_per_second selects the rotate_wait path which
+      # waits for the old file to be read to the end, using Fluent::Clock.
+      d = create_rotation_driver(
+        "read_bytes_limit_per_second" => "1m",
+        "rotate_wait" => "30s",
+      )
+      d.run(expect_records: 3, timeout: 15) do
+        plugin = d.instance
+        waiting(5) { sleep 0.1 until d.events.size == 1 && !plugin.instance_variable_get(:@startup) }
+
+        old_watcher = plugin.instance_variable_get(:@tails)[path]
+
+        frozen_base = Fluent::Clock.now_raw
+        Fluent::Clock.freeze(frozen_base)
+        begin
+          simulate_rename_and_create_rotation(new_lines: ["new1"], old_lines: ["old2"])
+
+          rotate_wait = plugin.instance_variable_get(:@tails_rotate_wait)
+          waiting(10) { sleep 0.1 until rotate_wait.key?(old_watcher) }
+          waiting(10) { sleep 0.1 until d.events.size == 3 && old_watcher.eof? }
+
+          # The clock stands still, so rotate_wait never elapses: the old
+          # watcher is kept even though its timer fires.
+          rotation = rotate_wait[old_watcher]
+          rotation[:timer].on_timer
+          assert_include rotate_wait, old_watcher
+
+          # Advancing the clock beyond rotate_wait lets the next timer
+          # tick detach the drained watcher.
+          Fluent::Clock.return
+          Fluent::Clock.freeze(frozen_base + 31)
+          waiting(5) { sleep 0.1 until rotate_wait.empty? }
+          assert_not_include rotate_wait, old_watcher
+        ensure
+          Fluent::Clock.return
+        end
+      end
+
+      assert_equal %w[old1 old2 new1].sort, d.events.map { |event| event[2]["message"] }.sort
+    end
+  end
+
   def test_truncate_file
     config = SINGLE_LINE_CONFIG
     Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") {|f|
