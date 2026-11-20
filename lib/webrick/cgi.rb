@@ -130,14 +130,19 @@ module WEBrick
           Apache.request.status = res.status
           table = Apache.request.headers_out
           res.header.each{|key, val|
-            case key
-            when /^content-encoding$/i
-              Apache::request.content_encoding = val
-            when /^content-type$/i
-              Apache::request.content_type = val
-            else
-              table[key] = val.to_s
-            end
+            values = val.is_a?(Array) ? val : [val]
+            values.each{|value|
+              case key
+              when /^content-encoding$/i
+                Apache::request.content_encoding = value
+              when /^content-type$/i
+                Apache::request.content_type = value
+              when /^set-cookie$/i
+                table.add(key, value)
+              else
+                table[key] = value.to_s
+              end
+            }
           }
           res.cookies.each{|cookie|
             table.add("Set-Cookie", cookie.to_s)

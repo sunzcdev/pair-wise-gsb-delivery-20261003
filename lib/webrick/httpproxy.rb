@@ -65,6 +65,20 @@ module WEBrick
   #
   #   proxy =
   #     WEBrick::HTTPProxyServer.new Port: 8000, ProxyContentHandler: handler
+  #
+  # == Proxied Set-Cookie headers
+  #
+  # An upstream response may contain more than one Set-Cookie field.  Each
+  # of them is sent to the client as its own Set-Cookie field line, in the
+  # order the upstream server sent them.  The field values are never
+  # combined with commas, because a comma may be part of a value (an
+  # Expires attribute contains one, for example).  Other header fields keep
+  # the usual behavior: their values may be combined into a single field
+  # line with ", ".
+  #
+  # Proxied cookies are kept in the response header rather than in
+  # HTTPResponse#cookies, so a +:ProxyContentHandler+ can read them with
+  # <code>res.get_fields('set-cookie')</code> or <code>res['set-cookie']</code>.
 
   class HTTPProxyServer < HTTPServer
 
@@ -248,22 +262,26 @@ module WEBrick
       }
     end
 
-    # Net::HTTP is stupid about the multiple header fields.
-    # Here is workaround:
+    # Set-Cookie fields are handled separately from choose_header, because
+    # their values may contain a comma, for example in an Expires
+    # attribute:
+    #
+    #   Set-Cookie: sid=abc; Expires=Wed, 21 Oct 2026 07:28:00 GMT
+    #
+    # Net::HTTP joins the field lines of a response header with ", ", so
+    # splitting the joined value again would change the meaning.  Instead
+    # the original field lines are read with #get_fields and each of them
+    # is passed to the client as its own Set-Cookie field line, in the
+    # same order the upstream server sent them.  HTTPResponse does not
+    # combine the values of such fields (see HTTPResponse::MultiValueHeaders).
+    #
+    # The proxied cookies are stored in the response header, not in
+    # #cookies, so a :ProxyContentHandler should use
+    # <code>res.get_fields('set-cookie')</code> or
+    # <code>res['set-cookie']</code> to read or replace them.
     def set_cookie(src, dst)
-      if str = src['set-cookie']
-        cookies = []
-        str.split(/,\s*/).each{|token|
-          if /^[^=]+;/o =~ token
-            cookies[-1] << ", " << token
-          elsif /=/o =~ token
-            cookies << token
-          else
-            cookies[-1] << ", " << token
-          end
-        }
-        dst.cookies.replace(cookies)
-      end
+      cookies = src.get_fields('set-cookie')
+      dst['set-cookie'] = cookies if cookies && !cookies.empty?
     end
 
     def set_via(h)

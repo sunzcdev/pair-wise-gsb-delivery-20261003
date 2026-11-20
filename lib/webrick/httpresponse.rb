@@ -26,6 +26,18 @@ module WEBrick
     end
 
     ##
+    # Header fields which may have multiple values that must be sent as
+    # separate field lines.  Their values are never combined with commas,
+    # because a comma may be part of a field value.  For example an
+    # Expires attribute of a Set-Cookie field contains a comma:
+    #
+    #   Set-Cookie: sid=abc; Expires=Wed, 21 Oct 2026 07:28:00 GMT
+    #
+    # All other header fields may be combined with ", " as before.
+
+    MultiValueHeaders = %w(set-cookie).freeze
+
+    ##
     # HTTP Response version
 
     attr_reader :http_version
@@ -36,7 +48,9 @@ module WEBrick
     attr_reader :status
 
     ##
-    # Response header
+    # Response header.  The values of MultiValueHeaders fields are stored
+    # as an Array of Strings, one entry per field line, while all other
+    # fields are stored as a single String.
 
     attr_reader :header
 
@@ -150,18 +164,55 @@ module WEBrick
     end
 
     ##
-    # Retrieves the response header +field+
+    # Retrieves the response header +field+.
+    #
+    # Fields listed in MultiValueHeaders are joined with ", " for this
+    # accessor only; use #get_fields to retrieve their values separately.
 
     def [](field)
-      @header[field.downcase]
+      value = @header[field.downcase]
+      value.is_a?(Array) ? value.join(', ') : value
     end
 
     ##
-    # Sets the response header +field+ to +value+
+    # Retrieves the values of the response header +field+ as an Array, or
+    # +nil+ if the field is not set.
+    #
+    # For fields in MultiValueHeaders the Array contains one entry per
+    # field line, in the order they will be sent.  Other fields have a
+    # single value and are returned as a one-element Array.
+
+    def get_fields(field)
+      value = @header[field.downcase]
+      return nil if value.nil?
+      value.is_a?(Array) ? value.dup : [value]
+    end
+
+    ##
+    # Sets the response header +field+ to +value+.
+    #
+    # An Array +value+ is sent as one field line per element for the
+    # fields in MultiValueHeaders.  For any other field an Array is
+    # combined into a single field line with ", ".
+    #
+    # Fields in MultiValueHeaders are never combined, because their
+    # values may contain commas (a Set-Cookie Expires attribute does):
+    #
+    #   res['set-cookie'] = [
+    #     'sid=abc; Expires=Wed, 21 Oct 2026 07:28:00 GMT',
+    #     'theme=dark',
+    #   ]
 
     def []=(field, value)
-      @chunked = value.to_s.downcase == 'chunked' if field.downcase == 'transfer-encoding'
-      @header[field.downcase] = value.to_s
+      key = field.downcase
+      values = value.is_a?(Array) ? value.map(&:to_s) : value.to_s
+      if key == 'transfer-encoding'
+        @chunked = Array(values).any?{|v| v.to_s.downcase == 'chunked' }
+      end
+      if values.is_a?(Array) && !MultiValueHeaders.include?(key)
+        values = values.join(', ')
+      end
+      @header[key] = values
     end
 
     ##
@@ -195,10 +246,19 @@ module WEBrick
     end
 
     ##
-    # Iterates over each header in the response
+    # Iterates over each header in the response.
+    #
+    # Fields in MultiValueHeaders are yielded once per field line, so
+    # each yielded pair corresponds to exactly one line on the wire.
 
     def each
-      @header.each{|field, value|  yield(field, value) }
+      @header.each{|field, value|
+        if value.is_a?(Array)
+          value.each{|v| yield(field, v) }
+        else
+          yield(field, value)
+        end
+      }
     end
 
     ##
@@ -355,9 +415,12 @@ module WEBrick
     def send_header(socket) # :nodoc:
       if @http_version.major > 0
         data = status_line().dup
-        @header.each{|key, value|
+        @header.each{|key, values|
           tmp = key.gsub(/\bwww|^te$|\b\w/){ $&.upcase }
-          data << "#{tmp}: #{check_header(value)}" << CRLF
+          values = [values] unless values.is_a?(Array)
+          values.each{|value|
+            data << "#{tmp}: #{check_header(value)}" << CRLF
+          }
         }
         @cookies.each{|cookie|
           data << "Set-Cookie: " << check_header(cookie.to_s) << CRLF

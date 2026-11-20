@@ -300,6 +300,68 @@ module WEBrick
       assert_empty logger.messages
     end
 
+    def test_multiple_set_cookie_values_are_sent_as_separate_fields
+      cookies = [
+        'sid=abc; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/',
+        'theme=dark; Expires=Thu, 01 Jan 2026 00:00:00 GMT',
+      ]
+      res['set-cookie'] = cookies
+
+      io = StringIO.new
+      res.send_response io
+      header_lines = io.string.split("\r\n\r\n", 2).first.split("\r\n")
+
+      assert_equal cookies.map {|c| "Set-Cookie: #{c}" },
+                   header_lines.grep(/\ASet-Cookie: /)
+    end
+
+    def test_multiple_set_cookie_values_keep_order_and_are_available
+      cookies = ['a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT', 'b=2']
+      res['set-cookie'] = cookies
+
+      assert_equal cookies, res.get_fields('set-cookie')
+      assert_equal cookies.join(', '), res['set-cookie']
+      assert_nil res.get_fields('nosuch')
+    end
+
+    def test_combinable_header_value_is_joined_into_one_field
+      res['x-multi'] = %w(one two)
+
+      assert_equal ['one, two'], res.get_fields('x-multi')
+
+      io = StringIO.new
+      res.send_response io
+      header_lines = io.string.split("\r\n\r\n", 2).first.split("\r\n")
+
+      assert_equal ['X-Multi: one, two'], header_lines.grep(/\AX-Multi: /)
+    end
+
+    def test_each_yields_one_pair_per_field_line
+      res['set-cookie'] = %w(a=1 b=2)
+      res['x-multi'] = %w(one two)
+
+      pairs = []
+      res.each {|field, value| pairs << [field, value] }
+
+      assert_equal [['set-cookie', 'a=1'],
+                    ['set-cookie', 'b=2'],
+                    ['x-multi', 'one, two']], pairs
+    end
+
+    def test_prevent_response_splitting_multiple_set_cookie_values_crlf
+      res['set-cookie'] = [
+        'a=1',
+        "b=2; Path=/\r\nCookie: cracked_indicator_for_test",
+      ]
+      io = StringIO.new
+      res.send_response io
+      io.rewind
+      res = Net::HTTPResponse.read_new(Net::BufferedIO.new(io))
+
+      assert_equal '500', res.code
+      refute_match 'cracked_indicator_for_test', io.string
+    end
+
     def test_set_error
       status = 400
       message = 'missing attribute'

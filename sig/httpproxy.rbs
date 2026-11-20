@@ -44,9 +44,9 @@ module WEBrick
 
     def choose_header: (untyped src, untyped dst) -> untyped
 
-    # Net::HTTP is stupid about the multiple header fields.
-    # Here is workaround:
-    def set_cookie: (untyped src, untyped dst) -> (untyped | nil)
+    # Set-Cookie fields are passed on as separate field lines, in the
+    # order the upstream server sent them.
+    def set_cookie: (untyped src, untyped dst) -> ::Array[String]?
 
     def set_via: (untyped h) -> (untyped | nil)
 

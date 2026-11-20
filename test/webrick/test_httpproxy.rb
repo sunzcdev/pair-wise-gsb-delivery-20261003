@@ -26,6 +26,166 @@ class TestWEBrickHTTPProxy < Test::Unit::TestCase
     assert_raise(NoMethodError){ WEBrick::FakeProxyURI.foo }
   end
 
+  def start_raw_upstream(response)
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.addr[1]
+    thread = Thread.new do
+      begin
+        while sock = server.accept
+          begin
+            while (line = sock.gets) && line != "\r\n"
+            end
+            sock.write(response)
+          ensure
+            sock.close
+          end
+        end
+      rescue IOError, Errno::EBADF
+        # server was closed by the test
+      end
+    end
+    thread.report_on_exception = false if thread.respond_to?(:report_on_exception=)
+    begin
+      yield port
+    ensure
+      server.close rescue nil
+      thread.join(1)
+    end
+  end
+
+  def raw_response(status_line, header_lines, body)
+    ([status_line] + header_lines +
+     ["Content-Length: #{body.bytesize}", "Connection: close", ""]).join("\r\n") +
+      "\r\n" + body
+  end
+
+  def test_proxy_multiple_set_cookie_fields
+    # An upstream response with a Set-Cookie field per cookie.  The Expires
+    # attributes contain a comma, so joining the field values with ", " and
+    # splitting them again would change their meaning.  Each field line
+    # must be passed to the client as its own Set-Cookie line, in the
+    # order the upstream server sent it.
+    cookies = [
+      "sid=abc; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/",
+      "theme=dark; Expires=Thu, 01 Jan 2026 00:00:00 GMT",
+    ]
+    upstream_response = raw_response(
+      "HTTP/1.1 200 OK",
+      ["Content-Type: text/plain",
+       "X-Multi: one",
+       "X-Multi: two"] +
+      cookies.map{|cookie| "Set-Cookie: #{cookie}" },
+      "ok"
+    )
+
+    start_raw_upstream(upstream_response){|upstream_port|
+      TestWEBrick.start_httpproxy{|server, addr, port, log|
+        TCPSocket.open(addr, port){|sock|
+          sock.write "GET http://127.0.0.1:#{upstream_port}/ HTTP/1.1\r\n" \
+                     "Host: 127.0.0.1:#{upstream_port}\r\n" \
+                     "Connection: close\r\n\r\n"
+          response = sock.read
+          head = response.split("\r\n\r\n", 2).first
+          header_lines = head.split("\r\n")
+
+          assert_equal "HTTP/1.1 200 OK", header_lines.first, log.call
+          # A field whose values may be combined keeps the existing form.
+          assert_equal ["X-Multi: one, two"],
+                       header_lines.grep(/\AX-Multi: /), log.call
+          # Set-Cookie keeps one line per cookie and keeps their order.
+          assert_equal cookies.map{|cookie| "Set-Cookie: #{cookie}" },
+                       header_lines.grep(/\ASet-Cookie: /), log.call
+          assert_equal "ok", response.split("\r\n\r\n", 2).last, log.call
+        }
+      }
+    }
+  end
+
+  def test_proxy_set_cookie_value_with_comma_is_not_split
+    # A comma may appear inside a Set-Cookie value, not only in an Expires
+    # attribute.  Joining the upstream field lines and splitting the
+    # result on commas would split this single cookie into two.
+    cookies = [
+      'comment="a, b=c"; Path=/',
+      "theme=dark",
+    ]
+    upstream_response = raw_response(
+      "HTTP/1.1 200 OK",
+      ["Content-Type: text/plain"] +
+      cookies.map{|cookie| "Set-Cookie: #{cookie}" },
+      "ok"
+    )
+
+    start_raw_upstream(upstream_response){|upstream_port|
+      TestWEBrick.start_httpproxy{|server, addr, port, log|
+        TCPSocket.open(addr, port){|sock|
+          sock.write "GET http://127.0.0.1:#{upstream_port}/ HTTP/1.1\r\n" \
+                     "Host: 127.0.0.1:#{upstream_port}\r\n" \
+                     "Connection: close\r\n\r\n"
+          header_lines = sock.read.split("\r\n\r\n", 2).first.split("\r\n")
+
+          assert_equal cookies.map{|cookie| "Set-Cookie: #{cookie}" },
+                       header_lines.grep(/\ASet-Cookie: /), log.call
+        }
+      }
+    }
+  end
+
+  def test_proxy_multiple_set_cookie_fields_via_net_http
+    cookies = [
+      "sid=abc; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/",
+      "theme=dark; Expires=Thu, 01 Jan 2026 00:00:00 GMT",
+    ]
+    upstream_response = raw_response(
+      "HTTP/1.1 200 OK",
+      ["Content-Type: text/plain"] +
+      cookies.map{|cookie| "Set-Cookie: #{cookie}" },
+      "ok"
+    )
+
+    start_raw_upstream(upstream_response){|upstream_port|
+      TestWEBrick.start_httpproxy{|server, addr, port, log|
+        http = Net::HTTP.new("127.0.0.1", upstream_port, addr, port)
+        http.request(Net::HTTP::Get.new("/")){|res|
+          assert_equal "200", res.code, log.call
+          assert_equal cookies, res.get_fields("set-cookie"), log.call
+          assert_equal "ok", res.body, log.call
+        }
+      }
+    }
+  end
+
+  def test_proxy_passes_upstream_error_status_and_set_cookie
+    # The upstream status is passed through unchanged, and the Set-Cookie
+    # fields of an error response are still sent as separate field lines.
+    cookies = ["sid=expired; Expires=Thu, 01 Jan 1970 00:00:00 GMT", "b=2"]
+    upstream_response = raw_response(
+      "HTTP/1.1 500 Internal Server Error",
+      ["Content-Type: text/plain"] +
+      cookies.map{|cookie| "Set-Cookie: #{cookie}" },
+      "upstream failed"
+    )
+
+    start_raw_upstream(upstream_response){|upstream_port|
+      TestWEBrick.start_httpproxy{|server, addr, port, log|
+        TCPSocket.open(addr, port){|sock|
+          sock.write "GET http://127.0.0.1:#{upstream_port}/ HTTP/1.1\r\n" \
+                     "Host: 127.0.0.1:#{upstream_port}\r\n" \
+                     "Connection: close\r\n\r\n"
+          response = sock.read
+          header_lines = response.split("\r\n\r\n", 2).first.split("\r\n")
+
+          assert_equal "HTTP/1.1 500 Internal Server Error", header_lines.first,
+                       log.call
+          assert_equal cookies.map{|cookie| "Set-Cookie: #{cookie}" },
+                       header_lines.grep(/\ASet-Cookie: /), log.call
+          assert_equal "upstream failed", response.split("\r\n\r\n", 2).last,
+                       log.call
+        }
+      }
+    }
+  end
+
   def test_proxy
     # Testing GET or POST to the proxy server
     # Note that the proxy server works as the origin server.

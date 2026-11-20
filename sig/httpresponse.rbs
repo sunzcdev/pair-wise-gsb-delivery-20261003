@@ -11,11 +11,15 @@ module WEBrick
     class InvalidHeader < StandardError
     end
 
+    # Header fields which may have multiple values that must be sent as
+    # separate field lines.
+    MultiValueHeaders: ::Array[String]
+
     attr_reader http_version: HTTPVersion
 
     attr_reader status: Integer
 
-    attr_reader header: Hash[String, String]
+    attr_reader header: Hash[String, String | ::Array[String]]
 
     attr_reader cookies: Array[Cookie]
 
@@ -51,7 +55,9 @@ module WEBrick
 
     def []: (String field) -> String?
 
-    def []=: (String field, _ToS value) -> _ToS
+    def get_fields: (String field) -> ::Array[String]?
+
+    def []=: (String field, _ToS | ::Array[_ToS] value) -> (_ToS | ::Array[_ToS])
 
     def content_length: () -> Integer?
 
