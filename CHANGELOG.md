@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
+- Apply HTTP/2 read timeouts as per-stream idle timeouts. The deadline is calculated from the most recent activity on each stream, so a stalled stream times out even if other streams on the same connection are still transferring data. A read timeout now only fails the stalled request, leaving the connection usable for other streams.
 
 ## Version 1.0.9 (April 24th, 2025)
 

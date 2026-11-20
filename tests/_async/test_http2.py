@@ -1,8 +1,66 @@
+import time
+import typing
+
 import hpack
 import hyperframe.frame
 import pytest
 
 import httpcore
+
+
+class FakeClock:
+    """
+    A fake clock, allowing tests to control the progression of time.
+    """
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def monotonic(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+class ScheduledStream(httpcore.AsyncNetworkStream):
+    """
+    A fake network stream that returns data according to a fixed schedule
+    of `(due, data)` tuples, driven by a fake clock.
+
+    Reads return any scheduled data that is due before the read deadline,
+    advancing the clock as required. If no data is scheduled before the
+    deadline, then the clock is advanced to the deadline, and a
+    `ReadTimeout` is raised.
+    """
+
+    def __init__(
+        self, clock: FakeClock, schedule: typing.List[typing.Tuple[float, bytes]]
+    ) -> None:
+        self._clock = clock
+        self._schedule = list(schedule)
+
+    async def read(
+        self, max_bytes: int, timeout: typing.Optional[float] = None
+    ) -> bytes:
+        now = self._clock.monotonic()
+        if self._schedule:
+            due, data = self._schedule[0]
+            if timeout is None or due <= now + timeout:
+                self._clock.advance(max(due - now, 0.0))
+                self._schedule.pop(0)
+                return data
+        assert timeout is not None
+        self._clock.advance(timeout)
+        raise httpcore.ReadTimeout("Read timed out.")
+
+    async def write(
+        self, buffer: bytes, timeout: typing.Optional[float] = None
+    ) -> None:
+        pass
+
+    async def aclose(self) -> None:
+        pass
 
 
 @pytest.mark.anyio
@@ -380,3 +438,142 @@ async def test_http2_remote_max_streams_update():
                         conn._h2_state.local_settings.max_concurrent_streams,
                     )
                 i += 1
+
+
+def server_settings() -> bytes:
+    return hyperframe.frame.SettingsFrame(
+        settings={hyperframe.frame.SettingsFrame.MAX_CONCURRENT_STREAMS: 1000}
+    ).serialize()
+
+
+def response_headers(stream_id: int) -> bytes:
+    return hyperframe.frame.HeadersFrame(
+        stream_id=stream_id,
+        data=hpack.Encoder().encode(
+            [
+                (b":status", b"200"),
+                (b"content-type", b"plain/text"),
+            ]
+        ),
+        flags=["END_HEADERS"],
+    ).serialize()
+
+
+def response_data(stream_id: int, data: bytes, end_stream: bool = False) -> bytes:
+    return hyperframe.frame.DataFrame(
+        stream_id=stream_id, data=data, flags=["END_STREAM"] if end_stream else []
+    ).serialize()
+
+
+@pytest.mark.anyio
+async def test_http2_read_timeout_is_a_per_stream_idle_timeout(monkeypatch):
+    """
+    The read timeout on an HTTP/2 connection is applied as a per-stream
+    idle timeout, calculated from the most recent activity on each stream.
+
+    A stream that is not making progress times out, even if other streams
+    on the same connection are still transferring data. The timeout only
+    fails the idle request, and the connection remains usable.
+    """
+    clock = FakeClock()
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ScheduledStream(
+        clock,
+        schedule=[
+            (0.0, server_settings()),
+            (1.0, response_headers(stream_id=1)),
+            (2.0, response_headers(stream_id=3)),
+            (3.0, response_data(stream_id=1, data=b"Hello, ")),
+            (4.0, response_data(stream_id=1, data=b"world!", end_stream=True)),
+            # The response body for stream 3 never arrives.
+            # A final response is included to demonstrate that the
+            # connection remains usable after the read timeout.
+            (8.0, response_headers(stream_id=5)),
+            (9.0, response_data(stream_id=5, data=b"Again.", end_stream=True)),
+        ],
+    )
+    async with httpcore.AsyncHTTP2Connection(origin=origin, stream=stream) as conn:
+        async with conn.stream(
+            "GET",
+            "https://example.com/fast",
+            extensions={"timeout": {"read": 5.0}},
+        ) as fast_response:
+            async with conn.stream(
+                "GET",
+                "https://example.com/slow",
+                extensions={"timeout": {"read": 5.0}},
+            ) as slow_response:
+                # The slow stream sees no further activity after its response
+                # headers arrive at t=2. The connection reads at t=3 and t=4
+                # are woken by data for the fast stream, but the idle deadline
+                # for the slow stream is still calculated from its own most
+                # recent activity, so it times out at t=2+5=7.
+                with pytest.raises(httpcore.ReadTimeout):
+                    await slow_response.aread()
+                assert clock.monotonic() == 7.0
+
+                # The fast stream is unaffected, and reads to completion.
+                assert await fast_response.aread() == b"Hello, world!"
+
+        # A per-stream read timeout does not indicate a connection failure.
+        assert conn.is_available()
+        assert not conn.is_closed()
+
+        # The connection remains usable for any further requests.
+        response = await conn.request(
+            "GET",
+            "https://example.com/afterwards",
+            extensions={"timeout": {"read": 5.0}},
+        )
+        assert response.status == 200
+        assert response.content == b"Again."
+
+
+@pytest.mark.anyio
+async def test_http2_read_timeout_not_reset_by_other_streams(monkeypatch):
+    """
+    The deadline for a per-stream read timeout is calculated from the most
+    recent activity on that stream. Connection reads that are woken by
+    activity on other streams do not reset the deadline.
+    """
+    clock = FakeClock()
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ScheduledStream(
+        clock,
+        schedule=[
+            (0.0, server_settings()),
+            (1.0, response_headers(stream_id=1)),
+            (2.0, response_headers(stream_id=3)),
+            (3.0, response_data(stream_id=1, data=b"a")),
+            (4.0, response_data(stream_id=1, data=b"b")),
+            (5.0, response_data(stream_id=1, data=b"c")),
+            (6.0, response_data(stream_id=1, data=b"d")),
+            (7.0, response_data(stream_id=1, data=b"e", end_stream=True)),
+            # The response body for stream 3 never arrives.
+        ],
+    )
+    async with httpcore.AsyncHTTP2Connection(origin=origin, stream=stream) as conn:
+        async with conn.stream(
+            "GET",
+            "https://example.com/fast",
+            extensions={"timeout": {"read": 5.0}},
+        ) as fast_response:
+            async with conn.stream(
+                "GET",
+                "https://example.com/slow",
+                extensions={"timeout": {"read": 5.0}},
+            ) as slow_response:
+                # Each connection read up until t=7 is woken by activity on
+                # the fast stream. Once the slow stream has been idle for the
+                # full 5 second read timeout it fails immediately, at t=2+5=7,
+                # without requiring any further network activity.
+                with pytest.raises(httpcore.ReadTimeout):
+                    await slow_response.aread()
+                assert clock.monotonic() == 7.0
+
+                # The fast stream is unaffected, and reads to completion.
+                assert await fast_response.aread() == b"abcde"

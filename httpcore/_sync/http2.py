@@ -16,6 +16,7 @@ from .._backends.base import NetworkStream
 from .._exceptions import (
     ConnectionNotAvailable,
     LocalProtocolError,
+    ReadTimeout,
     RemoteProtocolError,
 )
 from .._models import Origin, Request, Response
@@ -75,6 +76,11 @@ class HTTP2Connection(ConnectionInterface):
             ],
         ] = {}
 
+        # Mapping from stream ID to the most recent time at which the
+        # stream made any read progress. Used to apply the read timeout
+        # as a per-stream idle timeout.
+        self._stream_activity: dict[int, float] = {}
+
         # Connection terminated events are stored as state since
         # we need to handle them for all streams.
         self._connection_terminated: h2.events.ConnectionTerminated | None = None
@@ -133,6 +139,7 @@ class HTTP2Connection(ConnectionInterface):
         try:
             stream_id = self._h2_state.get_next_available_stream_id()
             self._events[stream_id] = []
+            self._stream_activity[stream_id] = time.monotonic()
         except h2.exceptions.NoAvailableStreamIDError:  # pragma: nocover
             self._used_all_stream_ids = True
             self._request_count -= 1
@@ -361,7 +368,23 @@ class HTTP2Connection(ConnectionInterface):
             # block until we've available flow control, event when we have events
             # pending for the stream ID we're attempting to send on.
             if stream_id is None or not self._events.get(stream_id):
-                events = self._read_incoming_data(request)
+                timeouts = request.extensions.get("timeout", {})
+                timeout = timeouts.get("read", None)
+                if stream_id is not None and timeout is not None:
+                    # The read timeout is applied as a per-stream idle timeout,
+                    # with the deadline calculated from the most recent activity
+                    # on the stream. This ensures that a stream which is not
+                    # making any progress will time out, even if other streams
+                    # on the connection are still transferring data.
+                    last_activity = self._stream_activity[stream_id]
+                    elapsed = time.monotonic() - last_activity
+                    if elapsed >= timeout:
+                        raise ReadTimeout(
+                            f"Stream {stream_id} has been idle "
+                            f"for over {timeout} seconds."
+                        )
+                    timeout = timeout - elapsed
+                events = self._read_incoming_data(request, timeout)
                 for event in events:
                     if isinstance(event, h2.events.RemoteSettingsChanged):
                         with Trace(
@@ -381,6 +404,7 @@ class HTTP2Connection(ConnectionInterface):
                     ):
                         if event.stream_id in self._events:
                             self._events[event.stream_id].append(event)
+                            self._stream_activity[event.stream_id] = time.monotonic()
 
                     elif isinstance(event, h2.events.ConnectionTerminated):
                         self._connection_terminated = event
@@ -409,6 +433,7 @@ class HTTP2Connection(ConnectionInterface):
     def _response_closed(self, stream_id: int) -> None:
         self._max_streams_semaphore.release()
         del self._events[stream_id]
+        del self._stream_activity[stream_id]
         with self._state_lock:
             if self._connection_terminated and not self._events:
                 self.close()
@@ -430,10 +455,9 @@ class HTTP2Connection(ConnectionInterface):
 
     # Wrappers around network read/write operations...
 
-    def _read_incoming_data(self, request: Request) -> list[h2.events.Event]:
-        timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("read", None)
-
+    def _read_incoming_data(
+        self, request: Request, timeout: float | None = None
+    ) -> list[h2.events.Event]:
         if self._read_exception is not None:
             raise self._read_exception  # pragma: nocover
 
@@ -441,13 +465,20 @@ class HTTP2Connection(ConnectionInterface):
             data = self._network_stream.read(self.READ_NUM_BYTES, timeout)
             if data == b"":
                 raise RemoteProtocolError("Server disconnected")
+        except ReadTimeout:
+            # A read timeout on an HTTP/2 connection indicates that an
+            # individual stream has been idle for too long. It only fails
+            # the request that was waiting on this read, and does not
+            # indicate a connection-level failure, so the connection
+            # remains usable for any other streams.
+            raise
         except Exception as exc:
             # If we get a network error we should:
             #
             # 1. Save the exception and just raise it immediately on any future reads.
-            #    (For example, this means that a single read timeout or disconnect will
-            #    immediately close all pending streams. Without requiring multiple
-            #    sequential timeouts.)
+            #    (For example, this means that a single network failure or disconnect
+            #    will immediately close all pending streams. Without requiring multiple
+            #    sequential failures.)
             # 2. Mark the connection as errored, so that we don't accept any other
             #    incoming requests.
             self._read_exception = exc

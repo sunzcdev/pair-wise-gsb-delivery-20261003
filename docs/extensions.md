@@ -86,6 +86,13 @@ r = httpcore.request(
 )
 ```
 
+On HTTP/2 connections the `'read'` timeout is applied as a per-stream idle
+timeout, with the deadline calculated from the most recent activity on each
+stream. A stream that is not making any progress will time out, even if other
+streams on the same connection are still transferring data. The timeout only
+fails the stalled request, and the connection remains usable for any other
+streams.
+
 ### `"trace"`
 
 The trace extension allows a callback handler to be installed to monitor the internal
