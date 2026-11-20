@@ -504,4 +504,98 @@ class TestThreadPool < PumaTest
     mutex.unlock if mutex.owned?
     pool.shutdown(1)
   end
+
+  # Two collectors, one peak: the legacy reset-based reader drains
+  # backlog_max, but the windowed reader must still observe the same peak
+  # from its own trailing window.
+  def test_backlog_stats_window_two_readers_see_same_peak
+    now = 0.0
+    clock = -> { now }
+    options = {
+      min_threads: 0,
+      max_threads: 0, # nothing is processed, the backlog only grows
+      stats_clock: clock,
+    }
+    @pool = Puma::ThreadPool.new("tst", options) { }
+
+    # t = 1: a peak of 3 queued items
+    now = 1.0
+    @pool << 1 << 2 << 3
+
+    # Reader A uses the legacy reset-based stats and drains the peak...
+    now = 2.0
+    assert_equal 3, @pool.stats[:backlog_max]
+    @pool.reset_max
+    # ...so a second legacy read sees nothing
+    assert_equal 0, @pool.stats[:backlog_max]
+
+    # Reader B, using its own trailing window, still sees the same peak,
+    # with the current backlog taken from the same pool snapshot.
+    now = 3.0
+    stats = @pool.backlog_stats(5)
+    assert_equal 3, stats[:backlog_max]
+    assert_equal 3, stats[:backlog]
+    assert_equal 5.0, stats[:backlog_max_window]
+    assert_equal 0, stats[:backlog_max_expired]
+    assert_equal true, stats[:backlog_max_complete]
+
+    # Interleave: A resets again, B re-queries with a narrow window that
+    # excludes the peak, then a wide window that includes it. Neither
+    # query disturbs the other reader's data.
+    now = 10.0
+    @pool.reset_max
+
+    narrow = @pool.backlog_stats(2)
+    assert_equal 0, narrow[:backlog_max]
+    assert_equal 3, narrow[:backlog] # the work is still queued
+
+    wide = @pool.backlog_stats(60)
+    assert_equal 3, wide[:backlog_max]
+    assert_equal 3, wide[:backlog]
+
+    # Windowed reads never reset the legacy counter: queue a new item so
+    # the legacy peak rises again, query a window, and the legacy reader
+    # still observes the new peak afterwards.
+    now = 11.0
+    @pool << 4
+    @pool.backlog_stats(5)
+    assert_equal 4, @pool.stats[:backlog_max]
+  end
+
+  # The history has an explicit capacity; once full, the oldest samples
+  # expire and readers get feedback that their window may not be covered.
+  def test_backlog_stats_history_capacity_and_expiry_feedback
+    now = 0.0
+    clock = -> { now }
+    options = {
+      min_threads: 0,
+      max_threads: 0,
+      stats_clock: clock,
+      stats_history_capacity: 4,
+    }
+    @pool = Puma::ThreadPool.new("tst", options) { }
+
+    # Six samples into a capacity-4 history: the two oldest expire
+    now = 1.0
+    @pool << 1 << 2 # backlog 1, 2
+    now = 2.0
+    @pool << 3 << 4 # backlog 3, 4
+    now = 3.0
+    @pool << 5 << 6 # backlog 5, 6 — expires the t=1 samples
+
+    stats = @pool.backlog_stats(60)
+    assert_equal 6, stats[:backlog_max]
+    assert_equal 6, stats[:backlog]
+    assert_equal 2, stats[:backlog_max_expired]
+    # samples expired and the retained history starts at t=2, which does
+    # not reach back over the whole 60s window
+    assert_equal false, stats[:backlog_max_complete]
+
+    # A window fully covered by the retained history (oldest sample at
+    # t=2, cutoff at t=2) is reported as complete, despite the expiries
+    covered = @pool.backlog_stats(1)
+    assert_equal 6, covered[:backlog_max]
+    assert_equal 2, covered[:backlog_max_expired]
+    assert_equal true, covered[:backlog_max_complete]
+  end
 end

@@ -801,6 +801,15 @@ module Puma
       @thread_pool&.reset_max
     end
 
+    # Time-windowed backlog stats for readers that must not disturb other
+    # readers. Unlike #stats, this never resets the legacy `backlog_max`
+    # counter, so multiple collectors can each query their own trailing
+    # window and still observe the same peak. See ThreadPool#backlog_stats.
+    # @return [Hash] hash containing windowed backlog stat info from `ThreadPool`
+    def backlog_stats(window)
+      @thread_pool&.backlog_stats(window) || {}
+    end
+
     # below are 'delegations' to binder
     # remove in Puma 7?
 

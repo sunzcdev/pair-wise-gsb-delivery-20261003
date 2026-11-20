@@ -74,6 +74,11 @@ module Puma
     # up its work before leaving the thread to die on the vine.
     SHUTDOWN_GRACE_TIME = 5 # seconds
 
+    # Default number of backlog samples retained for time-windowed stats
+    # (see #backlog_stats). Once the history is full, the oldest samples
+    # expire (are evicted) as new ones are recorded.
+    STATS_HISTORY_CAPACITY = 1024
+
     attr_reader :out_of_band_running
 
     # Maintain a minimum of +min+ and maximum of +max+ threads
@@ -93,6 +98,19 @@ module Puma
       @backlog_max = 0
       @spawned = 0
       @waiting = 0
+
+      # Time-windowed backlog history. Each entry is
+      # `[monotonic_timestamp, backlog_size]`, recorded when work is queued.
+      # The history is bounded by @backlog_history_capacity; when full, the
+      # oldest sample expires and @backlog_history_expired is incremented so
+      # readers of #backlog_stats can tell their window may not be fully
+      # covered. `options[:stats_clock]` may inject a callable clock
+      # (used by tests); it must return monotonic seconds.
+      @stats_clock = options[:stats_clock] ||
+        -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+      @backlog_history_capacity = Integer(options[:stats_history_capacity] || STATS_HISTORY_CAPACITY)
+      @backlog_history = []
+      @backlog_history_expired = 0
 
       @name = name
       @min = Integer(options[:min_threads])
@@ -155,6 +173,47 @@ module Puma
 
     def reset_max
       with_mutex { @backlog_max = 0 }
+    end
+
+    # Time-windowed backlog stats, for readers that must not disturb other
+    # readers. Unlike #stats and #reset_max, this never resets @backlog_max
+    # and never discards history, so any number of collectors can each query
+    # their own trailing window and still observe the same peak.
+    #
+    # The peak and the current backlog are taken from a single mutex-held
+    # snapshot of the pool, so they are consistent with each other.
+    #
+    # @param window [Numeric] trailing window length in seconds
+    # @return [Hash]
+    #   * +:backlog+ - current backlog size
+    #   * +:backlog_max+ - peak backlog observed within the window
+    #   * +:backlog_max_window+ - the window used, in seconds
+    #   * +:backlog_max_expired+ - number of history samples that have
+    #     expired (evicted because the bounded history was full). When
+    #     positive, samples may be missing from the window.
+    #   * +:backlog_max_complete+ - true when the retained history is known
+    #     to cover the whole window, so +:backlog_max+ is exact; false when
+    #     expired samples may have fallen inside the window, in which case
+    #     +:backlog_max+ may understate the true peak.
+    def backlog_stats(window)
+      window = Float(window)
+      with_mutex do
+        cutoff = @stats_clock.call - window
+        peak = 0
+        oldest = nil
+        @backlog_history.each do |timestamp, size|
+          oldest ||= timestamp
+          peak = size if timestamp >= cutoff && size > peak
+        end
+        complete = @backlog_history_expired == 0 || (oldest && oldest <= cutoff) || false
+        {
+          backlog: @todo.size,
+          backlog_max: peak,
+          backlog_max_window: window,
+          backlog_max_expired: @backlog_history_expired,
+          backlog_max_complete: complete,
+        }
+      end
     end
 
     # How many objects have yet to be processed by the pool?
@@ -342,6 +401,23 @@ module Puma
       (@spawned - io_processors_count) < (@max - extra_io_processors_count)
     end
 
+    # :nodoc:
+    #
+    # Must be called with @mutex held!
+    #
+    # Appends a backlog sample to the bounded history. When the history is
+    # full the oldest sample expires, which is counted so #backlog_stats can
+    # report that its window may no longer be fully covered.
+    def record_backlog_sample(size)
+      if @backlog_history.size >= @backlog_history_capacity
+        @backlog_history.shift
+        @backlog_history_expired += 1
+      end
+      @backlog_history << [@stats_clock.call, size]
+    end
+
+    private :record_backlog_sample
+
     # Add +work+ to the todo list for a Thread to pickup and process.
     def <<(work)
       with_mutex do
@@ -352,6 +428,7 @@ module Puma
         @todo << work
         t = @todo.size
         @backlog_max = t if t > @backlog_max
+        record_backlog_sample(t)
 
         if @waiting < @todo.size and can_spawn_processor?
           spawn_thread
