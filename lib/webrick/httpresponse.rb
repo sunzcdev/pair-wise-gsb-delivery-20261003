@@ -536,8 +536,14 @@ module WEBrick
       if @request_method == "HEAD"
         # do nothing
       elsif chunked?
-        @body.call(ChunkedWrapper.new(socket, self))
-        socket.write("0#{CRLF}#{CRLF}")
+        wrapper = ChunkedWrapper.new(socket, self, @config[:ChunkedBufferSize])
+        begin
+          @body.call(wrapper)
+        ensure
+          # Settle the stream even when the body proc raises: flush any
+          # buffered data and emit the terminating chunk exactly once.
+          wrapper.finish
+        end
       else
         if @bodytempfile
           @bodytempfile.rewind
@@ -552,27 +558,65 @@ module WEBrick
       end
     end
 
+    # Wraps the client socket passed to a chunked response body proc.
+    #
+    # Short writes are coalesced into a small buffer so that a proc which
+    # emits the body a few characters at a time does not produce one socket
+    # write (and one chunk) per character.  The buffer is flushed once it
+    # reaches +buffer_size+ bytes, when the proc calls #flush explicitly, or
+    # when the response is settled.  The terminating zero-length chunk is
+    # written at most once, even if the proc raises or calls #close itself.
     class ChunkedWrapper
-      def initialize(socket, resp)
+      def initialize(socket, resp, buffer_size)
         @socket = socket
         @resp = resp
+        # A nil or non-positive window disables coalescing: every non-empty
+        # write is sent on its own, matching the historical behavior.
+        @buffer_size = buffer_size && buffer_size > 0 ? buffer_size : 0
+        @buffer = +''
+        @finished = false
       end
 
+      # Appends +buf+ to the response body.  The data is held in the
+      # coalescing buffer until the window fills up; writing an empty string
+      # is a no-op and never produces a chunk.  Returns the number of bytes
+      # accepted from +buf+, matching the IO#write contract.
       def write(buf)
-        return 0 if buf.empty?
-        socket = @socket
-        @resp.instance_eval {
-          size = buf.bytesize
-          data = +"#{size.to_s(16)}#{CRLF}#{buf}#{CRLF}"
-          socket.write(data)
-          data.clear
-          @sent_size += size
-          size
-        }
+        return 0 if buf.nil? || buf.empty?
+        @buffer << buf
+        flush if @buffer.bytesize >= @buffer_size
+        buf.bytesize
       end
 
-      def <<(*buf)
+      # Forwards the argument to #write, mimicking IO#<<.
+      def <<(buf)
         write(buf)
+        self
+      end
+
+      # Sends any buffered data immediately as a single chunk.  Calling it
+      # with an empty buffer does not write anything, so an explicit flush
+      # boundary is preserved without emitting empty chunks.
+      def flush
+        unless @buffer.empty?
+          @resp.send(:_write_chunk, @socket, @buffer)
+          @buffer.clear
+        end
+        self
+      end
+
+      # Flushes pending data and writes the terminating chunk.  Idempotent:
+      # safe to call from the proc and again while settling the response.
+      def close
+        finish
+      end
+
+      # :nodoc:
+      def finish
+        return if @finished
+        @finished = true
+        flush
+        @socket.write("0#{CRLF}#{CRLF}")
         self
       end
     end
@@ -581,6 +625,16 @@ module WEBrick
     def _write_data(socket, data)
       socket << data
     end
+
+    # Writes a single chunked-transfer chunk for +data+ on +socket+ and
+    # accounts for its bytes.  Used by ChunkedWrapper when its buffer drains.
+    def _write_chunk(socket, data)
+      size = data.bytesize
+      socket.write("#{size.to_s(16)}#{CRLF}#{data}#{CRLF}")
+      @sent_size += size
+      size
+    end
+    private :_write_chunk
 
     # :startdoc:
   end

@@ -58,6 +58,7 @@ module WEBrick
       :ServerAlias    => nil,
       :InputBufferSize  => 65536, # input buffer size in reading request body
       :OutputBufferSize => 65536, # output buffer size in sending File or IO
+      :ChunkedBufferSize => 1024, # buffer size for coalescing short chunks of a proc body
 
       # for HTTPProxyServer
       :ProxyAuthProc  => nil,

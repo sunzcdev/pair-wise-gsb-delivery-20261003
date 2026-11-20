@@ -17,12 +17,27 @@ module WEBrick
       end
     end
 
+    # Counts the number of actual socket writes so coalescing can be checked.
+    class CountingIO < StringIO
+      attr_reader :write_count
+
+      def initialize(*)
+        super
+        @write_count = 0
+      end
+
+      def write(data)
+        @write_count += 1
+        super
+      end
+    end
+
     attr_reader :config, :logger, :res
 
     def setup
       super
       @logger          = FakeLogger.new
-      @config          = Config::HTTP
+      @config          = Config::HTTP.dup
       @config[:Logger] = logger
       @res             = HTTPResponse.new config
       @res.keep_alive  = true
@@ -263,6 +278,133 @@ module WEBrick
         assert_equal "5\r\nhello\r\n0\r\n\r\n", r.read
       end
       assert_equal 0, logger.messages.length
+    end
+
+    def test_send_body_proc_chunked_coalesces_short_writes
+      config[:ChunkedBufferSize] = 16
+      @res.chunked = true
+      @res.body = Proc.new do |out|
+        out.write('a')
+        out.write('b')
+        out.write('c')
+        out.write('d')
+      end
+
+      io = CountingIO.new
+      @res.send_body(io)
+
+      # Four short writes are coalesced into one data chunk plus the
+      # terminating chunk: two socket writes instead of five.
+      assert_equal 2, io.write_count
+      assert_equal "4\r\nabcd\r\n0\r\n\r\n", io.string
+      assert_equal 4, @res.sent_size
+    end
+
+    def test_send_body_proc_chunked_flushes_when_window_fills
+      config[:ChunkedBufferSize] = 4
+      @res.chunked = true
+      @res.body = Proc.new do |out|
+        out.write('ab')
+        out.write('cd') # fills the window and drains it immediately
+        out.write('ef')
+      end
+
+      io = CountingIO.new
+      @res.send_body(io)
+
+      # One chunk for the full window, one for the remainder, one terminator.
+      assert_equal 3, io.write_count
+      assert_equal "4\r\nabcd\r\n2\r\nef\r\n0\r\n\r\n", io.string
+      assert_equal 6, @res.sent_size
+    end
+
+    def test_send_body_proc_chunked_explicit_flush_boundary
+      config[:ChunkedBufferSize] = 1024
+      @res.chunked = true
+      @res.body = Proc.new do |out|
+        out.write('ab')
+        out.flush
+        out.write('cd')
+      end
+
+      io = CountingIO.new
+      @res.send_body(io)
+
+      # The explicit flush drains the buffer before the window fills, so the
+      # boundary is preserved as its own chunk.
+      assert_equal "2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n", io.string
+      assert_equal 4, @res.sent_size
+    end
+
+    def test_send_body_proc_chunked_empty_write_is_noop
+      config[:ChunkedBufferSize] = 1024
+      @res.chunked = true
+      @res.body = Proc.new do |out|
+        assert_equal 0, out.write('')
+        out.write('data')
+        out.flush
+        assert_equal 0, out.write('') # flushing an empty buffer writes nothing
+      end
+
+      io = CountingIO.new
+      @res.send_body(io)
+
+      assert_equal "4\r\ndata\r\n0\r\n\r\n", io.string
+      assert_equal 4, @res.sent_size
+    end
+
+    def test_send_body_proc_chunked_settles_when_proc_raises
+      config[:ChunkedBufferSize] = 1024
+      @res.chunked = true
+      boom = Class.new(StandardError)
+      @res.body = Proc.new do |out|
+        out.write('buffered')
+        raise boom, 'boom'
+      end
+
+      io = CountingIO.new
+      assert_raise(boom) do
+        @res.send_body(io)
+      end
+
+      # The buffered data is still flushed and the terminating chunk is
+      # written exactly once despite the raised exception.
+      assert_equal "8\r\nbuffered\r\n0\r\n\r\n", io.string
+      assert_equal 8, @res.sent_size
+      assert_equal 1, io.string.scan(/\r\n0\r\n\r\n\z/).length
+    end
+
+    def test_send_body_proc_chunked_close_is_idempotent
+      config[:ChunkedBufferSize] = 1024
+      @res.chunked = true
+      @res.body = Proc.new do |out|
+        out.write('data')
+        out.close
+      end
+
+      io = CountingIO.new
+      @res.send_body(io)
+
+      # The proc closes the wrapper itself; settling must not terminate twice.
+      assert_equal "4\r\ndata\r\n0\r\n\r\n", io.string
+      assert_equal 1, io.string.scan("0#{WEBrick::CRLF}#{WEBrick::CRLF}").length
+      assert_equal 4, @res.sent_size
+    end
+
+    def test_send_body_proc_chunked_disabled_coalescing
+      config[:ChunkedBufferSize] = nil
+      @res.chunked = true
+      @res.body = Proc.new do |out|
+        out.write('a')
+        out.write('b')
+      end
+
+      io = CountingIO.new
+      @res.send_body(io)
+
+      # With the window disabled every non-empty write becomes its own chunk.
+      assert_equal "1\r\na\r\n1\r\nb\r\n0\r\n\r\n", io.string
+      assert_equal 2, @res.sent_size
     end
 
     def test_send_body_proc_upgrade
