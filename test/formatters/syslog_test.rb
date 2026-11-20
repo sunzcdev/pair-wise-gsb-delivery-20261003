@@ -1,0 +1,347 @@
+require_relative "../test_helper"
+require "syslog"
+
+module SemanticLogger
+  module Formatters
+    class SyslogTest < Minitest::Test
+      describe SemanticLogger::Formatters::Syslog do
+        let(:log_time) do
+          Time.utc(2017, 1, 14, 8, 32, 5.375276)
+        end
+
+        let(:log) do
+          log         = SemanticLogger::Log.new("SyslogFormatterTest", :info)
+          log.time    = log_time
+          log.message = "hello world"
+          log
+        end
+
+        let(:appender) do
+          SemanticLogger::Appender::Syslog.new(formatter: :syslog)
+        end
+
+        let(:formatter) do
+          formatter          = appender.formatter
+          formatter.max_size = appender.max_size
+          formatter
+        end
+
+        describe "constants" do
+          # The formatter defines these itself so that remote syslog works without the syslog gem.
+          it "match the values of the ::Syslog constants" do
+            names = %i[LOG_CRIT LOG_ERR LOG_WARNING LOG_NOTICE LOG_INFO LOG_DEBUG
+                       LOG_KERN LOG_USER LOG_MAIL LOG_DAEMON LOG_AUTH LOG_SYSLOG LOG_LPR LOG_NEWS
+                       LOG_UUCP LOG_CRON LOG_AUTHPRIV LOG_FTP] + (0..7).map { |i| :"LOG_LOCAL#{i}" }
+
+            names.each do |name|
+              assert_equal ::Syslog.const_get(name), SemanticLogger::Formatters::Syslog.const_get(name), name
+            end
+          end
+        end
+
+        describe ".require_syslog_protocol" do
+          it "explains how to add the gem when it is missing" do
+            missing = ->(_name) { raise LoadError, "cannot load such file -- syslog_protocol" }
+            error   = SemanticLogger::Formatters::Syslog.stub(:require, missing) do
+              assert_raises(LoadError) { SemanticLogger::Formatters::Syslog.require_syslog_protocol }
+            end
+
+            assert_includes error.message, 'gem "syslog_protocol"'
+          end
+
+          it "is called by both syslog formatters" do
+            called = 0
+            SemanticLogger::Formatters::Syslog.stub(:require_syslog_protocol, -> { called += 1 }) do
+              SemanticLogger::Formatters::Syslog.new
+              SemanticLogger::Formatters::SyslogCee.new
+            end
+
+            assert_equal 2, called
+          end
+        end
+
+        describe "#initialize" do
+          it "defaults the facility to LOG_USER" do
+            assert_equal ::Syslog::LOG_USER, SemanticLogger::Formatters::Syslog.new.facility
+          end
+
+          it "uses a default LevelMap" do
+            assert_instance_of SemanticLogger::Formatters::Syslog::LevelMap, formatter.level_map
+          end
+
+          it "converts a level_map hash into a LevelMap" do
+            mapped = SemanticLogger::Formatters::Syslog.new(level_map: {warn: ::Syslog::LOG_NOTICE})
+
+            assert_instance_of SemanticLogger::Formatters::Syslog::LevelMap, mapped.level_map
+            assert_equal ::Syslog::LOG_NOTICE, mapped.level_map[:warn]
+            # Unspecified levels keep their defaults.
+            assert_equal ::Syslog::LOG_CRIT, mapped.level_map[:fatal]
+          end
+
+          it "accepts a LevelMap instance" do
+            level_map = SemanticLogger::Formatters::Syslog::LevelMap.new(info: ::Syslog::LOG_ALERT)
+            mapped    = SemanticLogger::Formatters::Syslog.new(level_map: level_map)
+
+            assert_same level_map, mapped.level_map
+          end
+
+          it "rejects an invalid facility set after creation" do
+            formatter = SemanticLogger::Formatters::Syslog.new
+
+            assert_raises(ArgumentError) { formatter.facility = 1 }
+            assert_equal ::Syslog::LOG_USER, formatter.facility
+          end
+
+          it "sends a facility set after creation" do
+            formatter.facility = ::Syslog::LOG_LOCAL0
+
+            # local0 (16) and severity notice (5): 16 * 8 + 5
+            assert_match(/\A<133>/, formatter.call(log, appender.logger))
+          end
+
+          it "escapes control characters by default" do
+            assert SemanticLogger::Formatters::Syslog.new.escape_control_chars
+          end
+
+          it "allows escaping to be disabled" do
+            refute SemanticLogger::Formatters::Syslog.new(escape_control_chars: false).escape_control_chars
+          end
+        end
+
+        describe "control characters" do
+          it "escapes embedded newlines in the packet so records cannot be forged" do
+            log.message = "hello\nFORGED record"
+            packet      = formatter.call(log, appender.logger)
+
+            assert_includes packet, "hello\\nFORGED record"
+            refute_includes packet, "hello\nFORGED record"
+          end
+
+          it "keeps a record with an exception and its causes on a single line" do
+            forged = "<34>Oct  3 12:00:00 web1 sshd: Accepted password for root"
+            begin
+              begin
+                raise ArgumentError, "x\n#{forged}"
+              rescue ArgumentError
+                raise "wrapped"
+              end
+            rescue StandardError => e
+              # Short backtraces, so that the cause fits within the syslog packet size.
+              e.set_backtrace(["app.rb:2"])
+              e.cause.set_backtrace(["app.rb:1"])
+              log.exception = e
+            end
+            log.message = "failed"
+            packet      = formatter.call(log, appender.logger)
+
+            refute_includes packet, "\n"
+            assert_includes packet, "Cause: ArgumentError: x\\n#{forged}"
+          end
+
+          it "ends the record at an exception without a backtrace" do
+            log.exception = RuntimeError.new("Not found")
+            packet        = formatter.call(log, appender.logger)
+
+            assert_match(/-- Exception: RuntimeError: Not found\z/, packet)
+          end
+
+          it "puts the cause right after an exception without a backtrace" do
+            begin
+              begin
+                raise ArgumentError, "inner"
+              rescue ArgumentError
+                raise RuntimeError, "outer", []
+              end
+            rescue StandardError => e
+              e.cause.set_backtrace(["app.rb:1"])
+              log.exception = e
+            end
+            packet = formatter.call(log, appender.logger)
+
+            assert_match(/-- Exception: RuntimeError: outer\\nCause: ArgumentError: inner\\napp\.rb:1\z/, packet)
+          end
+
+          it "keeps a record whose cause has invalid UTF-8 in its message" do
+            begin
+              begin
+                raise ArgumentError, "bad \xff input"
+              rescue ArgumentError
+                raise "wrapped"
+              end
+            rescue StandardError => e
+              e.set_backtrace(["app.rb:2"])
+              e.cause.set_backtrace(["app.rb:1"])
+              log.exception = e
+            end
+            packet = formatter.call(log, appender.logger)
+
+            assert_includes packet, "Cause: ArgumentError: bad  input"
+          end
+
+          it "keeps a record whose message has invalid UTF-8" do
+            log.message = "bad \xff\ninput"
+            packet      = formatter.call(log, appender.logger)
+
+            assert_includes packet, "bad \\ninput"
+          end
+
+          it "preserves embedded newlines when escaping is disabled" do
+            appender.formatter = SemanticLogger::Formatters::Syslog.new(escape_control_chars: false)
+            formatter          = appender.formatter
+            formatter.max_size = appender.max_size
+            log.message        = "hello\nworld"
+
+            assert_includes formatter.call(log, appender.logger), "hello\nworld"
+          end
+        end
+
+        describe SemanticLogger::Formatters::Syslog::LevelMap do
+          it "maps the default semantic levels to syslog levels" do
+            map = SemanticLogger::Formatters::Syslog::LevelMap.new
+
+            assert_equal ::Syslog::LOG_DEBUG,   map[:trace]
+            assert_equal ::Syslog::LOG_INFO,    map[:debug]
+            assert_equal ::Syslog::LOG_NOTICE,  map[:info]
+            assert_equal ::Syslog::LOG_WARNING, map[:warn]
+            assert_equal ::Syslog::LOG_ERR,     map[:error]
+            assert_equal ::Syslog::LOG_CRIT,    map[:fatal]
+          end
+
+          it "allows individual levels to be overridden" do
+            map = SemanticLogger::Formatters::Syslog::LevelMap.new(warn: ::Syslog::LOG_NOTICE)
+
+            assert_equal ::Syslog::LOG_NOTICE, map[:warn]
+            assert_equal ::Syslog::LOG_ERR,    map[:error]
+          end
+        end
+
+        describe "#time" do
+          it "returns nil since the time is part of the syslog packet" do
+            assert_nil formatter.time
+          end
+        end
+
+        describe ".facility_number" do
+          it "converts each ::Syslog facility constant to its facility number" do
+            assert_equal 0, SemanticLogger::Formatters::Syslog.facility_number(::Syslog::LOG_KERN)
+            assert_equal 1, SemanticLogger::Formatters::Syslog.facility_number(::Syslog::LOG_USER)
+            assert_equal 16, SemanticLogger::Formatters::Syslog.facility_number(::Syslog::LOG_LOCAL0)
+            assert_equal 23, SemanticLogger::Formatters::Syslog.facility_number(::Syslog::LOG_LOCAL7)
+          end
+
+          it "rejects a value that is not a ::Syslog facility constant" do
+            [1, 13, 23 << 4, "user", nil].each do |facility|
+              assert_raises(ArgumentError) { SemanticLogger::Formatters::Syslog.facility_number(facility) }
+            end
+          end
+
+          it "rejects an invalid facility when the formatter is created" do
+            assert_raises(ArgumentError) { SemanticLogger::Formatters::Syslog.new(facility: 1) }
+          end
+        end
+
+        # syslog_protocol raises for a host or application name with any character outside
+        # printable ASCII, or an application name over 32 characters.
+        describe "header names" do
+          def packet_for(host:, application:)
+            logger = SemanticLogger::Appender::IO.new(StringIO.new, host: host, application: application)
+            SemanticLogger::Formatters::Syslog.new.call(log, logger)
+          end
+
+          it "leaves out the characters of the host and application names outside printable ASCII" do
+            packet = packet_for(host: "café.example.com", application: "Café Résumé\tApp")
+
+            assert_includes packet, " caf.example.com CafRsumApp: "
+          end
+
+          it "cuts the application name to 32 characters" do
+            packet = packet_for(host: "app1", application: "#{'a' * 40} b")
+
+            assert_includes packet, " app1 #{'a' * 32}: "
+          end
+
+          it "notices a host that is not a String changed in place" do
+            host = Struct.new(:name) { def to_s = name }.new("web1")
+            formatter = SemanticLogger::Formatters::Syslog.new
+            logger    = SemanticLogger::Appender::IO.new(StringIO.new, host: host, application: "App")
+
+            assert_includes formatter.call(log, logger), " web1 App: "
+            host.name = "web2"
+
+            assert_includes formatter.call(log, logger), " web2 App: "
+          end
+
+          it "writes localhost and SemanticLogger for names with no character left" do
+            packet = packet_for(host: "サーバー", application: "アプリ")
+
+            assert_includes packet, " localhost SemanticLogger: "
+          end
+
+          it "works the names out again only when they change" do
+            formatter   = SemanticLogger::Formatters::Syslog.new
+            application = +"My App"
+            host        = +"web 1"
+            logger      = SemanticLogger::Appender::IO.new(StringIO.new, host: host, application: application)
+
+            assert_includes formatter.call(log, logger), " web1 MyApp: "
+            assert_same formatter.send(:syslog_tag, application), formatter.send(:syslog_tag, application)
+
+            logger.application = +"Other App"
+
+            assert_includes formatter.call(log, logger), " web1 OtherApp: "
+
+            logger.application << " Two"
+            host << "x"
+
+            assert_includes formatter.call(log, logger), " web1x OtherAppTwo: "
+          end
+        end
+
+        describe "max_size" do
+          it "defaults to 1024 bytes" do
+            assert_equal 1024, SemanticLogger::Formatters::Syslog.new.max_size
+          end
+
+          it "formats with the default when none is supplied" do
+            packet = SemanticLogger::Formatters::Syslog.new.call(log, appender.logger)
+
+            assert_includes packet, "hello world"
+          end
+
+          it "truncates a packet to max_size" do
+            log.message = "x" * 2000
+            packet      = SemanticLogger::Formatters::Syslog.new(max_size: 100).call(log, appender.logger)
+
+            assert_equal 100, packet.bytesize
+          end
+        end
+
+        describe "#call" do
+          # PRI is facility number * 8 + severity; info maps to LOG_NOTICE (5) by default.
+          it "sends the user facility by default" do
+            assert_match(/\A<13>/, formatter.call(log, appender.logger))
+          end
+
+          it "sends the supplied facility" do
+            local0 = SemanticLogger::Formatters::Syslog.new(facility: ::Syslog::LOG_LOCAL0, max_size: 1024)
+
+            assert_match(/\A<133>/, local0.call(log, appender.logger))
+          end
+
+          it "wraps the message in a syslog packet" do
+            packet = formatter.call(log, appender.logger)
+
+            assert_includes packet, "hello world"
+            assert_includes packet, appender.logger.host
+          end
+
+          it "uses the application name as the syslog tag without spaces" do
+            packet = formatter.call(log, appender.logger)
+
+            assert_includes packet, appender.logger.application.delete(" ")
+          end
+        end
+      end
+    end
+  end
+end

@@ -1,0 +1,170 @@
+require "json"
+module SemanticLogger
+  module Formatters
+    class Raw < Base
+      # Fields are added by populating this hash.
+      attr_accessor :hash, :time_key
+
+      # By default Raw formatter does not reformat the time
+      def initialize(time_format: :none, time_key: :time, **args)
+        @time_key = time_key
+        super(time_format: time_format, **args)
+      end
+
+      # Host name
+      def host
+        hash[:host] = logger.host if log_host && logger.host
+      end
+
+      # Application name
+      def application
+        hash[:application] = logger.application if log_application && logger&.application
+      end
+
+      # Environment
+      def environment
+        hash[:environment] = logger.environment if log_environment && logger&.environment
+      end
+
+      # Date & time
+      def time
+        hash[time_key] = format_time(log.time)
+      end
+
+      # Log level
+      def level
+        hash[:level]       = log.level
+        hash[:level_index] = log.level_index
+      end
+
+      # Process ID
+      def pid
+        hash[:pid] = super
+      end
+
+      # Name of the thread that logged the message.
+      def thread_name
+        hash[:thread] = log.thread_name
+      end
+
+      # Ruby file name and line number that logged the message, and the method when the entry has a
+      # call site (see SemanticLogger.call_site_level).
+      def file_name_and_line
+        file, line = log.file_name_and_line
+        return unless file
+
+        hash[:file]   = file
+        hash[:line]   = line.to_i
+        label         = log.call_site&.label
+        hash[:method] = label if label
+      end
+
+      # Tags
+      def tags
+        hash[:tags] = log.tags if log.tags && !log.tags.empty?
+      end
+
+      # Named Tags
+      def named_tags
+        hash[:named_tags] = log.named_tags if log.named_tags && !log.named_tags.empty?
+      end
+
+      # Duration
+      def duration
+        return unless log.duration
+
+        hash[:duration_ms] = log.duration
+        hash[:duration]    = log.duration_human
+      end
+
+      # Class / app name
+      def name
+        hash[:name] = log.name
+      end
+
+      # Log message
+      def message
+        hash[:message] = log.cleansed_message if log.message
+      end
+
+      # Payload
+      def payload
+        hash[:payload] = log.payload if log.payload.respond_to?(:empty?) && !log.payload.empty?
+      end
+
+      # Exception, with the stack trace of each exception cleaned by the backtrace cleaner (see
+      # Base#initialize).
+      #
+      # Each exception is named as Utils.exception_name names it, as every formatter does: as Ruby
+      # names its class, without asking the class, such as `#<Class:0x000...>` for an anonymous class,
+      # which has no name. Its message is read with Utils.exception_message, so that a #message
+      # that raises, or does not return a String, cannot lose the entry.
+      def exception
+        return unless log.exception
+
+        cleaner = active_backtrace_cleaner
+        root    = hash
+        log.each_exception do |exception, i|
+          name       = i.zero? ? :exception : :cause
+          root[name] = {name: Utils.exception_name(exception), message: Utils.exception_message(exception)}
+          details    = exception_details_for(exception)
+          root[name][:details]     = details if details
+          root[name][:stack_trace] = stack_trace_of(exception, cleaner)
+          root = root[name]
+        end
+      end
+
+      # Metric, its amount, and its dimensions
+      def metric
+        hash[:metric]        = log.metric if log.metric
+        hash[:metric_amount] = log.metric_amount if log.metric_amount
+        hash[:dimensions]    = log.dimensions if log.dimensions?
+      end
+
+      # Returns log messages in Hash format
+      def call(log, logger)
+        self.hash   = {}
+        self.log    = log
+        self.logger = logger
+
+        host
+        application
+        environment
+        time
+        level
+        pid
+        thread_name
+        file_name_and_line
+        duration
+        tags
+        named_tags
+        name
+        message
+        payload
+        exception
+        metric
+
+        hash
+      end
+
+      private
+
+      # Returns [Array<String>] the backtrace to write for the exception.
+      #
+      # A cleaned backtrace is frozen and shared with the other appenders (see Log#backtrace_of),
+      # so the Hash gets a copy that a subclass can change, as it could change the exception's own
+      # backtrace before cleaning.
+      def stack_trace_of(exception, cleaner)
+        backtrace = log.backtrace_of(exception, cleaner: cleaner)
+        cleaner && backtrace ? backtrace.map(&:dup) : backtrace
+      end
+
+      # Returns [String] the lines of a stack trace, such as the Hash's `stack_trace`, as one text, one
+      # per line, for a subclass that writes it as text, joined as Log#backtrace_to_s joins its lines
+      # (see Utils.join_lines). Lines that cannot be joined, such as a UTF-16 line, or a binary line
+      # next to a UTF-8 one, in a backtrace that the application set, are converted to valid UTF-8,
+      # rather than losing the entry.
+      def stack_trace(lines) = Utils.join_lines(lines)
+    end
+  end
+end

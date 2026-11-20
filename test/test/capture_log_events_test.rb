@@ -1,0 +1,132 @@
+require_relative "../test_helper"
+
+class CaptureLogEventsTest < Minitest::Test
+  class User
+    include SemanticLogger::Loggable
+
+    def enable!
+      logger.info("Hello World", metric: "User/enabled")
+    end
+
+    def disable!
+      logger.info(metric: "User/disabled")
+    end
+  end
+
+  describe "SemanticLogger::Test::CaptureLogEvents" do
+    let(:capture_logger) { SemanticLogger::Test::CaptureLogEvents.new }
+    let(:user) { User.new }
+
+    it "event" do
+      user.stub(:logger, capture_logger) do
+        user.enable!
+      end
+
+      assert_equal "Hello World", capture_logger.events.last.message
+      assert_equal :info, capture_logger.events.last.level
+      assert_equal "User/enabled", capture_logger.events.last.metric
+      refute_predicate capture_logger.events.last, :metric_only?
+    end
+
+    it "metric only event" do
+      user.stub(:logger, capture_logger) do
+        user.disable!
+      end
+
+      assert_equal :info, capture_logger.events.last.level
+      assert_equal "User/disabled", capture_logger.events.last.metric
+      assert_predicate capture_logger.events.last, :metric_only?
+    end
+
+    it "supports with_level when standing in for a logger" do
+      capture_logger.level = :info
+      capture_logger.with_level(:warn) do
+        capture_logger.info("dropped")
+        capture_logger.warn("kept")
+      end
+      capture_logger.info("after")
+
+      assert_equal %w[kept after], capture_logger.events.map(&:message)
+    end
+
+    it "clears the events array when clear is called" do
+      capture_logger.info "a message"
+
+      assert_equal(1, capture_logger.events.size)
+      capture_logger.clear
+
+      assert_equal(0, capture_logger.events.size)
+    end
+
+    it "captures a batch of log events" do
+      logs = %w[first second].map do |message|
+        log         = SemanticLogger::Log.new("Test", :info)
+        log.message = message
+        log
+      end
+
+      capture_logger.batch(logs)
+
+      assert_equal %w[first second], capture_logger.events.map(&:message)
+      assert_equal %i[info info], capture_logger.events.map(&:level)
+    end
+
+    describe "on_log subscribers" do
+      let(:calls) { [] }
+
+      before do
+        SemanticLogger.on_log { |log| calls << log.message }
+      end
+
+      after do
+        SemanticLogger::Logger.clear_subscribers
+      end
+
+      it "are called once when it stands in for a logger" do
+        user.stub(:logger, capture_logger) do
+          user.enable!
+        end
+
+        assert_equal 1, calls.count("Hello World")
+        assert_equal(1, capture_logger.events.count { |log| log.message == "Hello World" })
+      end
+
+      it "are called once for tagged and measured events when it stands in for a logger" do
+        capture_logger.tagged("tag") { capture_logger.info("tagged") }
+        capture_logger.measure_info("measured") { nil }
+
+        assert_equal %w[tagged measured], calls
+        assert_equal %w[tagged measured], capture_logger.events.map(&:message)
+      end
+
+      it "are called once by semantic_logger_events without a class" do
+        events = semantic_logger_events { user.enable! }
+
+        assert_equal 1, calls.count("Hello World")
+        assert_equal(1, events.count { |log| log.message == "Hello World" })
+      end
+
+      it "are called once when it stands in for the processor" do
+        SemanticLogger::Logger.stub(:processor, capture_logger) do
+          user.enable!
+        end
+
+        assert_equal 1, calls.count("Hello World")
+        assert_equal(1, capture_logger.events.count { |log| log.message == "Hello World" })
+      end
+
+      it "are called once when it is added as an appender" do
+        appender = SemanticLogger.add_appender(appender: capture_logger)
+        begin
+          user.enable!
+          SemanticLogger.flush
+        ensure
+          SemanticLogger.remove_appender(appender)
+        end
+
+        assert_equal 1, calls.count("Hello World")
+        assert_equal(1, capture_logger.events.count { |log| log.message == "Hello World" })
+      end
+    end
+  end
+end

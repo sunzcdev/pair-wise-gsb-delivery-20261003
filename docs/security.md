@@ -1,0 +1,314 @@
+---
+layout: default
+title: Security
+description: >-
+  Keeping logs trustworthy: log injection and forging, redacting sensitive
+  data, transport encryption, log file permissions, and the gem's dependency
+  footprint.
+---
+
+
+**Contents**
+
+* TOC
+{:toc}
+
+Logging frameworks sit on a sensitive boundary: they take data from all over an
+application, including data that originated from untrusted users, and write it to
+files, terminals, and centralized logging systems. This page describes the security
+properties of Semantic Logger and how to configure it when logging untrusted data.
+
+### Log injection and forging
+
+When a log message, tag, or exception message contains untrusted, attacker-controlled
+data (for example a user name, request parameter, or `User-Agent` header), control
+characters in that data can be abused:
+
+* A newline can forge an additional, fake log entry ("log forging"), or split one
+  record into two at a collector that frames records with a separator.
+* An ANSI escape sequence can spoof or hide terminal output when the log is viewed in
+  a terminal.
+* A Unicode line or paragraph separator (U+2028, U+2029) starts a new line in editors,
+  browsers, and some log viewers, and a bidirectional control, such as the right-to-left
+  override (U+202E), can make a forged entry, such as `user=admin`, read in another order
+  than it was written.
+
+The structured formatters, such as `:json`, are **not** affected, because JSON encoding
+always escapes control characters. They are the recommended choice when forwarding logs
+that may contain untrusted data to a centralized logging system.
+
+By design the human readable text formatters (`:default` and `:color`) preserve
+newlines and ANSI color codes, since multi-line and colorized output is useful when
+reading logs locally. When the text output may contain untrusted data, enable the
+`escape_control_chars` option to replace control characters with a printable, escaped
+form (for example a newline becomes `\n`, and the right-to-left override `\u202e`):
+
+~~~ruby
+SemanticLogger.add_appender(file_name: "production.log", formatter: {default: {escape_control_chars: true}})
+~~~
+
+See [Escaping Control Characters](config.html#escaping-control-characters) for
+details.
+
+The record-framed network appenders are already safe by default:
+
+* The **TCP** and **UDP** appenders default to the JSON formatter.
+* The **Syslog** formatters escape control characters by default, since syslog frames
+  each record.
+
+If you replace the formatter on any of these appenders with a text formatter, enable
+`escape_control_chars` as shown above.
+
+### Logging untrusted hashes
+
+A hash passed after the message is the payload, but a few of its keys are also log arguments:
+`duration`, `min_duration`, `metric`, `metric_amount`, `exception`, `log_exception`, and so on.
+That is convenient for code you write, but when the hash holds untrusted data, such as parsed
+request parameters or a webhook body with Symbol keys, it can set those arguments too. For
+example `{duration: 0, min_duration: 1}` would suppress the entry.
+
+Semantic Logger only uses such a key as an argument when its value is valid for it: for example
+`duration` must be a finite real number, `backtrace` an Array of Strings, and `on_exception_level` a
+valid level. Any other value stays in the payload as data, and a `nil` value is ignored, so an
+untrusted hash passed to a level method such as `info` can never make the logging call raise.
+A valid `backtrace` also sets where the entry is recorded as logged: its file name, line number, and,
+with [`call_site_level`](config.html#recording-where-each-entry-was-logged), its method. A
+`call_site` key can only leave out the recorded call site, with `false`: the values that set one are
+Ruby objects that parsed data cannot hold.
+
+To make sure none of its keys are treated as arguments, pass it as the explicit `payload:`. Any other
+keys supplied alongside an explicit `payload:` are merged into it, and win over the explicit
+payload's values of the same name, so that the untrusted data cannot replace a value your code
+supplies. A String key, as `JSON.parse` returns without `symbolize_names`, has the same name as the
+Symbol key it spells:
+
+~~~ruby
+# The hash is logged as-is, and none of its keys are interpreted. Its own account_id, if any,
+# cannot replace the one supplied here:
+logger.info("Webhook received", payload: JSON.parse(body, symbolize_names: true), account_id: account.id)
+~~~
+
+A hash returned from a logging block, such as
+`logger.debug("Webhook received") { JSON.parse(body, symbolize_names: true) }`, is checked the
+same way, and never replaces a value the log call supplied. A key is only used as an argument when
+its value is valid for it and the log entry does not have that argument yet: an empty `message`
+counts as none, and a backtrace captured at the `backtrace_level` counts as supplied. Its `payload`
+is only used when it is a Hash. Every other key, including an argument the entry already has, is
+added to the payload without replacing the log call's values, and wins over the block's own
+`payload` values of the same name. The caller's own payload Hash is left unchanged.
+
+The options of a `measure_*` call are checked the same way: an option with a value that is not valid
+for it is ignored, and its default is used. Keys that are not measure options are not logged at all,
+so pass untrusted data to a measure call as its `payload:` too. A measure call without a block still
+raises unless it is given a valid `:duration`.
+
+### Redacting sensitive data
+
+Semantic Logger logs the message and payload it is given. Avoid logging passwords, tokens, full
+credit card numbers, and similar values in the first place.
+
+When sensitive values can still reach the logs, for example in request headers or parameters that
+are logged as they are, name the sensitive keys once. The value of every matching key is replaced
+with `[FILTERED]` in every log entry, before any appender writes it:
+
+~~~ruby
+SemanticLogger.sensitive_keys = %i[passw secret token _key authorization cookie]
+~~~
+
+~~~ruby
+logger.info("Calling API", headers: {"Authorization" => "Bearer abc123", "Accept" => "application/json"})
+# Written with: headers: {"Authorization" => "[FILTERED]", "Accept" => "application/json"}
+~~~
+
+Rails applications that use [rails_semantic_logger](https://github.com/reidmorrison/rails_semantic_logger)
+get this from `config.filter_parameters`; see [With Rails](#with-rails) below.
+
+#### Naming the sensitive keys
+
+| Value | Sensitive keys |
+|-------|----------------|
+| An Array | Each Symbol or String matches any key whose name contains it, ignoring case, as in Rails' `config.filter_parameters`. Each Regexp matches as written. |
+| A Regexp | Keys whose names it matches. |
+| An `ActiveSupport::ParameterFilter` | Keys for which `filter_param(name, nil)` returns a value, which replaces the key's value, so a custom `mask:` is kept. Any object that responds to `#filter_param` works the same way. |
+| A Proc, or any object that responds to `#call` | Keys for which it returns true, given the key's name. |
+| `nil` | None: nothing is redacted. The default. |
+
+Keys are matched by name: the name of a Symbol key or a String key, both as written and in
+snake_case, which is lower case. So `:_key` above also matches `"X-Api-Key"` as `"x_api_key"`,
+`"apiKey"` and `"APIKey"` as `"api_key"`, and `"HTTP_X_API_KEY"` as `"http_x_api_key"`.
+
+Like the default `filter_parameters` of Rails, a name matches wherever it appears in a key, so it
+also matches some keys that are not secret: `:token` matches `max_tokens`, and `:_key` matches
+`cache_key`. To match whole words only, use a Regexp:
+
+~~~ruby
+SemanticLogger.sensitive_keys = [
+  # Anywhere in the key.
+  :passw, :secret, :token, :_key, :credential, :authorization, :cookie, :crypt, :certificate,
+  # Only as a whole word, so that "otp" does not match "footprint", nor "ssn" "business_name".
+  /(?<![a-z])(?:auth|pwd|otp|ssn|salt|cvv|cvc)(?![a-z])/
+]
+~~~
+
+The keys are read when they are assigned, so adding to the Array afterwards has no effect: assign
+the whole list again. The answer for each key name is remembered, so a Proc or object must always
+give the same answer for the same name. It is called on the thread that writes the entries, so it
+must be thread safe.
+
+#### What is redacted
+
+The payload, the named tags, the context that `on_log` subscribers add with `log.set_context`, and
+metric dimensions, at any depth: inside each Hash, including a key that is itself a Hash, and inside
+each Array, Set, Struct, Data, OpenStruct, and `ActionController::Parameters`. The value of a
+sensitive key is replaced whole, even when it is a Hash. A Struct, Data, or OpenStruct that holds a
+sensitive key is written as a Hash, and a Set as an Array, as the JSON formatters write them. A
+structure that holds itself is cut off with `[FILTERED: circular]`, and one nested more than 32
+levels deep is replaced with `[FILTERED: nested too deeply]`.
+
+The application's own Hashes are never changed: the entry is given a copy, and only when it holds a
+sensitive key, or a structure that holds itself or is nested too deeply. Other entries are written
+as they are.
+
+These are written as they are, so keep secrets out of them:
+
+* The message, and a value other than a Hash passed after it, such as `logger.info("Login", user)`,
+  which is added to the message: pass it as `payload: user` instead.
+* The tags, the message of the exception, and those of the exceptions that caused it.
+* Any other object, which is written the way the formatter writes it. For some objects that
+  includes all of their attributes: for example a JSON formatter writes an Active Record model with
+  `as_json`. Log a Hash of the values you need instead.
+
+To change text in messages, rewrite the message in a logger's `filter` or in an `on_log` subscriber;
+see [Filtering](config.html#filtering). Do not redact in an appender's `filter`: every appender writes
+the same log entry, so that only protects the appenders added after it, while the ones added before
+it have already written the secret.
+
+#### When it runs
+
+Each entry is redacted once, on the thread that writes entries to the appenders (the background
+thread, or with [synchronous logging](operations.html#synchronous-operation) the thread that logs),
+before any appender writes it or its `filter` reads it. That includes the appenders that send
+entries to error services, such as Sentry, Bugsnag, and Honeybadger, and appenders of your own. It
+costs a few microseconds for a typical payload, off the application's own threads.
+
+`on_log` subscribers and logger filters run earlier, on the thread that logs the entry, and receive it
+as it was logged. The [Rollbar](appenders.html#rollbar) integration is one: it sends `log.to_h`, so
+its entries are not redacted. So do the [testing helpers](testing.html), which capture entries as they
+were logged.
+
+When an entry cannot be redacted, for example because a Proc raises an error, the field is replaced
+with `{redaction_failed: "ErrorClass"}`, never written as it is. The error's class, and where it was
+raised, are reported to the internal logger, but not its message, which could hold the value.
+
+#### With Rails
+
+[rails_semantic_logger](https://github.com/reidmorrison/rails_semantic_logger) sets
+`SemanticLogger.sensitive_keys` from `config.filter_parameters` once the application has initialized,
+so that the keys Rails filters out of request parameters are filtered out of every log entry. To
+turn it off:
+
+~~~ruby
+config.rails_semantic_logger.redact_filter_parameters = false
+~~~
+
+To use other keys instead, set them in `config/application.rb`, and they are kept:
+
+~~~ruby
+config.semantic_logger.sensitive_keys = %i[passw secret token _key authorization cookie]
+~~~
+
+Setting `config.semantic_logger.sensitive_keys = nil` does not turn it off, since that cannot be told
+apart from never setting it; use `redact_filter_parameters = false`.
+
+Notes:
+
+* The default list of a new Rails application, in `config/initializers/filter_parameter_logging.rb`,
+  does not match the `Authorization` or `Cookie` header. Add them:
+  `Rails.application.config.filter_parameters += %i[authorization cookie]`.
+* That list includes `:email`, so an email address is filtered, including the `user_email` named tag
+  that the [Sentry](appenders.html#sentry) appender sends as the user's email. It also matches keys
+  that are not secret, such as `max_tokens` (`:token`) and `cache_key` (`:_key`).
+* A Proc in the list is left out, since it changes a value rather than naming a key. A dotted
+  filter, such as `"credit_card.code"`, only matches a key with that whole name, not `code` inside
+  `credit_card`.
+* Active Job `arguments` and Action Mailer `args` are logged as JSON text, which is not redacted. For
+  a job that takes a secret, leave its arguments out of the log with `self.log_arguments = false`.
+* Entries logged while the application starts, before the list is complete, may not be redacted.
+
+To set it yourself, for example without rails_semantic_logger, do the same once the application has
+initialized:
+
+~~~ruby
+Rails.application.config.after_initialize do
+  filters = Rails.application.config.filter_parameters.reject { |filter| filter.respond_to?(:call) }
+  SemanticLogger.sensitive_keys = ActiveSupport::ParameterFilter.new(filters)
+end
+~~~
+
+### Transport encryption
+
+Appenders that send logs over the network support TLS. The appenders built on the
+`:http` appender (`:http`, `:splunk_http`, `:elasticsearch_http`, and `:loki`) default to
+verifying the server certificate (`OpenSSL::SSL::VERIFY_PEER`) when an `https` URL is
+used. The `:tcp` appender, and the `:syslog` appender over TCP, verify both the certificate
+and the host name when `ssl:` is enabled.
+
+The deprecated `:splunk` appender is the exception: its `splunk-sdk-ruby` gem never verifies
+the certificate. Use `:splunk_http` instead.
+
+Do not disable certificate verification. Settings such as
+`ssl: {verify_mode: OpenSSL::SSL::VERIFY_NONE}` expose the connection to
+man-in-the-middle attacks. To connect to a server with a self-signed certificate, or one issued
+by a private certificate authority, trust that certificate instead, for example with
+`ssl: {ca_file: "/path/to/ca.pem"}`.
+
+Credentials can be supplied in the url of the HTTP based appenders, for example
+`https://user:password@host`, or as a query parameter. They are removed from the url
+written to the internal logger when the server rejects a request, and from the error raised
+for an invalid url. `#inspect` on any appender, for example when `SemanticLogger.appenders` is
+printed in a console, shows only what that appender says is safe, such as its url without
+credentials, and none of its passwords, tokens, keys, or client options.
+
+### Log file permissions
+
+Log files frequently contain sensitive information. By default the file appender
+creates files using the process umask, the standard Ruby behavior. To restrict access,
+supply the `permissions` option, which is applied both when the file is created and to
+an existing log file:
+
+~~~ruby
+# Owner read/write, group read, no access for others:
+SemanticLogger.add_appender(file_name: "production.log", permissions: 0o640)
+~~~
+
+With `permissions`, the log file is opened without following a symbolic link at its name, so a
+link planted in the log directory can neither create nor open the file it points at. The file must
+be a regular file owned by the process, with a single hard link, that the file name still names
+once it is open. Otherwise, or when the file cannot be opened, nothing is written to it:
+`add_appender` raises `IOError` giving the reason, with the error from opening the file, if any, as
+its `cause`. When a file only fails the check once it is reopened later, on a rotation or after a
+fork, the appender reports the reason once for each file, drops the log messages instead of
+raising, and tries the file again every few seconds and at the next scheduled reopen, so that
+logging resumes once the file is fixed. A symbolic link, hard link, or file planted in a shared log
+directory, for example under the name of tomorrow's log file, can therefore neither loosen the
+permissions of another file nor receive the log messages. A FIFO planted there fails to open
+instead of blocking the process.
+
+Without `permissions`, the file appender opens the log file the way Ruby's own `Logger` does,
+following symbolic links, so that a log file can for example be linked to `/dev/stdout`. Keep the
+log directory writable only by the application.
+
+### Dependencies and supply chain
+
+Semantic Logger has two runtime dependencies, `concurrent-ruby` and `logger` (part of
+Ruby's standard library until Ruby 4.0 moved it to the bundled gems). Appenders for
+third-party services (Kafka, MongoDB, Sentry, etc.) keep their backing gem optional: it
+is required lazily inside the appender only when that appender is used, and is never
+added to the gemspec. This keeps the dependency surface of an application that only uses
+the built-in file and IO appenders very small.
+
+Auditing the resolved dependency versions for known advisories is the responsibility of
+the consuming application, which should run a tool such as
+[bundler-audit](https://github.com/rubysec/bundler-audit) against its own
+`Gemfile.lock`. Pinning dependencies with a committed lockfile, and verifying it in CI
+with `bundle install --frozen`, prevents an unexpected dependency from being pulled in.

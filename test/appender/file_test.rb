@@ -1,0 +1,888 @@
+require_relative "../test_helper"
+require "timeout"
+require "tmpdir"
+
+module Appender
+  class FileTest < Minitest::Test
+    describe SemanticLogger::Appender::File do
+      let(:log_message) { "Hello World" }
+      let(:thread_name) { "Worker 001" }
+      let(:file_name) { ".quick_test.log" }
+      let(:appender) { SemanticLogger::Appender::File.new(file_name) }
+      let(:current_time) { Time.parse("2015-12-09 17:50:05") }
+
+      let :log do
+        log             = SemanticLogger::Log.new("User", :info)
+        log.message     = log_message
+        log.thread_name = thread_name
+        log
+      end
+
+      after do
+        FileUtils.rm_f(file_name)
+      end
+
+      describe "#initialize" do
+        it "opens the file on creation" do
+          appender
+
+          assert_path_exists file_name
+        end
+
+        it "raises immediately when the file cannot be opened" do
+          assert_raises Errno::ENOENT do
+            SemanticLogger::Appender::File.new("no_such_directory/test.log")
+          end
+        end
+
+        it "raises immediately when the file name is a directory" do
+          assert_raises ArgumentError do
+            SemanticLogger::Appender::File.new(__dir__)
+          end
+        end
+
+        it "raises immediately when the file name, once formatted, is a directory" do
+          Dir.mktmpdir do |dir|
+            Dir.mkdir(File.join(dir, "log-#{Process.pid}"))
+
+            assert_raises(ArgumentError) { SemanticLogger::Appender::File.new(File.join(dir, "log-%p")) }
+          end
+        end
+      end
+
+      describe "#log" do
+        it "logs output" do
+          assert appender.log(log)
+          assert_match(/\d+-\d+-\d+ \d+:\d+:\d+.\d+ I \[\d+:#{thread_name}\] User -- #{log_message}\n/,
+                       File.read(file_name))
+        end
+
+        it "does not reopen when not time to reopen" do
+          appender.log(log)
+
+          refute appender.send(:time_to_reopen?)
+          refute_file_reopened(appender) do
+            appender.stub(:time_to_reopen?, false) do
+              appender.log(log)
+            end
+          end
+        end
+
+        it "reopens when time to reopen" do
+          assert_file_reopened(appender) do
+            appender.stub(:time_to_reopen?, true) do
+              appender.log(log)
+            end
+          end
+        end
+
+        describe "a formatter that returns a String it does not own" do
+          it "takes a formatter's output that is not a String for the entry's error, without reopening" do
+            appender.formatter = ->(_log, _) {}
+            reopened           = 0
+
+            appender.stub(:reopen, -> { reopened += 1 }) do
+              error = assert_raises(SemanticLogger::Subscriber::FormatError) { appender.log(log) }
+
+              assert appender.message_error?(error)
+            end
+
+            assert_equal 0, reopened
+          end
+
+          it "leaves the String unchanged, and writes a frozen one" do
+            appender.formatter = ->(log, _) { log.message }
+            message            = +"Started"
+
+            appender.info(message)
+
+            assert appender.log(log.tap { |entry| entry.message = "Frozen".freeze })
+            assert_equal "Started", message
+            assert_equal "Started\nFrozen\n", File.read(file_name)
+          end
+        end
+
+        describe "retry_count" do
+          # The local file system writes the output to nowhere when the file is deleted.
+          # This logic is for shared file systems that return an exception when the file
+          # cannot be written to because it was deleted, etc.
+          it "Creates a new file when an exception is raised writing to the file" do
+            assert appender.log(log)
+            File.unlink(file_name)
+            assert_file_reopened(appender) do
+              appender.instance_variable_get(:@file).stub(:write, -> { raise(IOError, "Oh no") }) do
+                assert appender.log(log)
+              end
+              assert_equal 1, File.read(file_name).lines.count
+            end
+          end
+
+          it "does not reopen the file when the formatter fails, since that cannot fix the content" do
+            appender.instance_variable_set(:@formatter, ->(_log, _appender) { raise NoMethodError, "undefined method" })
+            reopened = 0
+
+            appender.stub(:reopen, -> { reopened += 1 }) do
+              assert_raises(SemanticLogger::Subscriber::FormatError) { appender.log(log) }
+            end
+
+            assert_equal 0, reopened
+          end
+
+          it "does not reopen the file for text that the file cannot take" do
+            reopened = 0
+
+            refuse = ->(_) { raise(Encoding::CompatibilityError, "no") }
+            appender.stub(:reopen, -> { reopened += 1 }) do
+              appender.instance_variable_get(:@file).stub(:write, refuse) do
+                error = assert_raises(Encoding::CompatibilityError) { appender.log(log) }
+
+                assert appender.message_error?(error)
+              end
+            end
+
+            assert_equal 0, reopened
+          end
+
+          it "writes text that the file's encoding refuses, converted" do
+            appender    = SemanticLogger::Appender::File.new(file_name, encoding: "UTF-16LE")
+            log.message = (+"bad \xFF byte").force_encoding(Encoding::UTF_8)
+
+            assert appender.log(log)
+            written = File.binread(file_name).force_encoding(Encoding::UTF_16LE).encode(Encoding::UTF_8)
+
+            assert_includes written, "bad  byte"
+          end
+
+          it "when retry is disabled" do
+            appender.retry_count = 0
+
+            assert appender.log(log)
+            File.unlink(file_name)
+
+            appender.instance_variable_get(:@file).stub(:write, ->(_) { raise(IOError, "Oh no") }) do
+              assert_raises IOError do
+                appender.log(log)
+              end
+            end
+            refute_path_exists file_name
+          end
+        end
+      end
+
+      describe "permissions" do
+        it "applies the supplied permissions when creating the file" do
+          FileUtils.rm_f(file_name)
+          appender = SemanticLogger::Appender::File.new(file_name, permissions: 0o640)
+          appender.log(log)
+
+          assert_equal "100640", format("%o", File.stat(file_name).mode)
+        end
+
+        it "applies the supplied permissions to an existing file" do
+          File.write(file_name, "existing\n")
+          File.chmod(0o666, file_name)
+          appender = SemanticLogger::Appender::File.new(file_name, permissions: 0o600)
+          appender.log(log)
+
+          assert_equal "100600", format("%o", File.stat(file_name).mode)
+        end
+
+        it "leaves permissions to the umask by default" do
+          FileUtils.rm_f(file_name)
+          appender.log(log)
+
+          refute_nil File.stat(file_name).mode
+        end
+
+        # Opens file_name with the permissions after the appender was created, as a rotation or a
+        # fork reopens it, capturing the appender's own log events.
+        def open_with_permissions(file_name, permissions)
+          appender             = SemanticLogger::Appender::File.new(file_name)
+          appender.logger      = SemanticLogger::Test::CaptureLogEvents.new
+          appender.permissions = permissions
+          appender.reopen
+          appender
+        end
+
+        def refusals(appender)
+          appender.logger.events.map(&:message).grep(/\ANot writing to the log file/)
+        end
+
+        it "raises when created for a file it cannot apply the permissions to" do
+          Dir.mktmpdir do |dir|
+            target = File.join(dir, "target.log")
+            File.write(target, "")
+            link = File.join(dir, "production.log")
+            File.symlink(target, link)
+
+            error = assert_raises(IOError) { SemanticLogger::Appender::File.new(link, permissions: 0o600) }
+
+            assert_equal "Not writing to the log file #{link}: it is a symbolic link", error.message
+          end
+        end
+
+        it "does not create the file that a dangling symbolic link points at" do
+          Dir.mktmpdir do |dir|
+            target = File.join(dir, "target.log")
+            link   = File.join(dir, "production.log")
+            File.symlink(target, link)
+
+            assert_raises(IOError) { SemanticLogger::Appender::File.new(link, permissions: 0o600) }
+
+            refute_path_exists target
+          end
+        end
+
+        it "neither changes the permissions of, nor writes to, a file reached through a symbolic link" do
+          Dir.mktmpdir do |dir|
+            target = File.join(dir, "id_rsa")
+            File.write(target, "secret\n")
+            File.chmod(0o600, target)
+            link = File.join(dir, "production.log")
+            File.symlink(target, link)
+
+            appender = open_with_permissions(link, 0o644)
+
+            refute appender.log(log)
+            assert_equal "100600", format("%o", File.stat(target).mode)
+            assert_equal "secret\n", File.read(target)
+            assert_equal ["Not writing to the log file #{link}: it is a symbolic link"], refusals(appender)
+          end
+        end
+
+        it "neither changes the permissions of, nor writes to, a file reached through a hard link" do
+          Dir.mktmpdir do |dir|
+            target = File.join(dir, "master.key")
+            File.write(target, "secret\n")
+            File.chmod(0o600, target)
+            link = File.join(dir, "production.log")
+            File.link(target, link)
+
+            appender = open_with_permissions(link, 0o644)
+
+            refute appender.log(log)
+            assert_equal "100600", format("%o", File.stat(target).mode)
+            assert_equal "secret\n", File.read(target)
+            assert_equal ["Not writing to the log file #{link}: it has more than one hard link"], refusals(appender)
+          end
+        end
+
+        it "does not write to a file that another user owns, which that user could read" do
+          File.write(file_name, "")
+          appender             = SemanticLogger::Appender::File.new(file_name)
+          appender.logger      = SemanticLogger::Test::CaptureLogEvents.new
+          appender.permissions = 0o600
+          Process.stub(:euid, Process.euid + 1) { appender.reopen }
+
+          refute appender.log(log)
+          assert_empty File.read(file_name)
+          assert_equal ["Not writing to the log file #{file_name}: it is not owned by this process"], refusals(appender)
+        end
+
+        it "does not change the permissions when the path no longer names the opened file" do
+          Dir.mktmpdir do |dir|
+            path        = File.join(dir, "production.log")
+            replacement = File.join(dir, "replacement.log")
+            File.write(path, "")
+            File.chmod(0o600, path)
+            File.write(replacement, "")
+            appender = SemanticLogger::Appender::File.new(path)
+            appender.logger      = SemanticLogger::Test::CaptureLogEvents.new
+            appender.permissions = 0o644
+
+            # Simulate the path being swapped for another file between opening and checking it.
+            File.stub(:lstat, File.lstat(replacement)) do
+              appender.reopen
+
+              refute appender.log(log)
+            end
+
+            assert_equal "100600", format("%o", File.stat(path).mode)
+            assert_equal ["Not writing to the log file #{path}: it changed after it was opened"], refusals(appender)
+          end
+        end
+
+        it "reports the refusal once, and resumes writing once the file can be secured" do
+          Dir.mktmpdir do |dir|
+            target = File.join(dir, "target.log")
+            link   = File.join(dir, "production.log")
+            File.write(target, "")
+            File.symlink(target, link)
+
+            appender = open_with_permissions(link, 0o600)
+
+            2.times { refute appender.log(log) }
+
+            assert_equal 1, refusals(appender).size
+
+            File.unlink(link)
+
+            appender.stub(:monotonic_time, Process.clock_gettime(Process::CLOCK_MONOTONIC) + 60) do
+              assert appender.log(log)
+            end
+            assert_includes File.read(link), log_message
+            assert_equal "100600", format("%o", File.stat(link).mode)
+            assert_empty File.read(target)
+          end
+        end
+
+        it "raises IOError, without blocking, for a FIFO planted at the path" do
+          Dir.mktmpdir do |dir|
+            fifo = File.join(dir, "production.log")
+            File.mkfifo(fifo)
+
+            error = Timeout.timeout(5) do
+              assert_raises(IOError) { SemanticLogger::Appender::File.new(fifo, permissions: 0o600) }
+            end
+
+            assert_match(/\ANot writing to the log file #{Regexp.escape(fifo)}: it could not be opened \(/,
+                         error.message)
+            assert_kind_of Errno::ENXIO, error.cause
+          end
+        end
+
+        # Raising from #log would make an async appender back off, and could block the application.
+        it "does not raise when a later reopen cannot open the file" do
+          Dir.mktmpdir do |dir|
+            path = File.join(dir, "production.log")
+            [-> { File.mkfifo(path) }, -> { Dir.mkdir(path) }].each do |plant|
+              appender        = SemanticLogger::Appender::File.new(path, permissions: 0o600)
+              appender.logger = SemanticLogger::Test::CaptureLogEvents.new
+              File.unlink(path)
+              plant.call
+
+              Timeout.timeout(5) { appender.reopen }
+
+              2.times { refute appender.log(log) }
+
+              assert_equal 1, refusals(appender).size
+              assert_match(/\ANot writing to the log file #{Regexp.escape(path)}: it could not be opened \(/,
+                           refusals(appender).first)
+              FileUtils.rm_rf(path)
+            end
+          end
+        end
+
+        it "opens a refused file again only every few seconds, and at the next scheduled reopen" do
+          Dir.mktmpdir do |dir|
+            target = File.join(dir, "target.log")
+            link   = File.join(dir, "production.log")
+            File.write(target, "")
+            File.symlink(target, link)
+            appender = open_with_permissions(link, 0o600)
+            reopen   = appender.method(:reopen)
+            reopens  = 0
+            counting_reopen = lambda do
+              reopens += 1
+              reopen.call
+            end
+
+            appender.stub(:reopen, counting_reopen) do
+              3.times { refute appender.log(log) }
+
+              assert_equal 0, reopens
+
+              appender.stub(:monotonic_time, Process.clock_gettime(Process::CLOCK_MONOTONIC) + 60) do
+                refute appender.log(log)
+              end
+
+              assert_equal 1, reopens
+
+              appender.send(:reopen_at=, Time.now - 1)
+
+              refute appender.log(log)
+
+              assert_equal 2, reopens
+            end
+          end
+        end
+
+        it "reports a refusal again for another file refused for the same reason" do
+          Dir.mktmpdir do |dir|
+            target = File.join(dir, "target.log")
+            File.write(target, "")
+            links = %w[production-1.log production-2.log].map { |name| File.join(dir, name) }
+            links.each { |link| File.symlink(target, link) }
+            appender = open_with_permissions(links.first, 0o600)
+
+            refute appender.log(log)
+
+            # As when a file name with a date is reopened the next day.
+            appender.file_name = links.last
+            appender.reopen
+
+            refute appender.log(log)
+
+            assert_equal(links.map { |link| "Not writing to the log file #{link}: it is a symbolic link" },
+                         refusals(appender))
+          end
+        end
+
+        it "writes to the file it read, even when another thread reopens the file meanwhile" do
+          appender   = SemanticLogger::Appender::File.new(file_name, permissions: 0o600, retry_count: 0)
+          format_log = appender.method(:format_log)
+          # Stands in for a reopen on another thread refusing the file between reading and writing it.
+          refuse_meanwhile = lambda do |log|
+            appender.instance_variable_set(:@file, nil)
+            format_log.call(log)
+          end
+
+          appender.stub(:format_log, refuse_meanwhile) { assert appender.log(log) }
+
+          assert_includes File.read(file_name), log_message
+        end
+
+        it "still writes through a symbolic link, for example to /dev/stdout" do
+          Dir.mktmpdir do |dir|
+            target = File.join(dir, "target.log")
+            link   = File.join(dir, "production.log")
+            File.write(target, "")
+            File.symlink(target, link)
+
+            SemanticLogger::Appender::File.new(link).log(log)
+
+            assert_includes File.read(target), log_message
+          end
+        end
+      end
+
+      describe "#reopen" do
+        it "Opens a new file" do
+          assert appender.log(log)
+          assert_file_reopened(appender) do
+            assert_equal 1, File.read(file_name).lines.count
+            assert appender.reopen
+            assert appender.log(log)
+            assert_equal 2, File.read(file_name).lines.count
+          end
+        end
+
+        it "Creates a new file on reopen" do
+          assert appender.log(log)
+          File.unlink(file_name)
+
+          assert appender.reopen
+          assert appender.log(log)
+          assert_equal 1, File.read(file_name).lines.count
+        end
+
+        it "reopens a log file that is removed while it is being reopened" do
+          appender
+          File.unlink(file_name)
+
+          # Simulate the file being removed after it was found to exist.
+          File.stub(:exist?, true) { assert appender.reopen }
+        end
+
+        it "exclusive_lock" do
+          appender.exclusive_lock = true
+
+          assert appender.reopen
+          assert appender.log(log)
+          assert_equal 1, File.read(file_name).lines.count
+          exception = assert_raises(ArgumentError) do
+            File.open("w+", file_name) { |file| file.write("Cannot share") }
+          end
+          assert_includes(exception.message, "invalid access mode")
+        end
+      end
+
+      describe "#close" do
+        it "closes the log file, and opens it again for a write after it" do
+          file = appender.instance_variable_get(:@file)
+          appender.close
+
+          assert_predicate file, :closed?
+          assert appender.log(log)
+          assert_equal 1, File.read(file_name).lines.count
+        ensure
+          appender.close
+        end
+
+        it "opens the log file again to write after it, and flushes, when retry is disabled" do
+          appender.retry_count = 0
+          appender.close
+          appender.flush
+
+          assert appender.log(log)
+          assert_equal 1, File.read(file_name).lines.count
+        ensure
+          appender.close
+        end
+
+        it "opens the log file again to write after it, without waiting to retry a refused one" do
+          Dir.mktmpdir do |dir|
+            link = File.join(dir, "production.log")
+            File.symlink(File.join(dir, "target.log"), link)
+            appender             = SemanticLogger::Appender::File.new(link)
+            appender.logger      = SemanticLogger::Test::CaptureLogEvents.new
+            appender.permissions = 0o600
+            appender.reopen
+
+            refute appender.log(log)
+
+            File.unlink(link)
+            appender.close
+
+            assert appender.log(log)
+            assert_includes File.read(link), log_message
+          ensure
+            appender&.close
+          end
+        end
+
+        it "reports an error closing the log file, rather than raising it, and forgets the file" do
+          appender.logger = SemanticLogger::Test::CaptureLogEvents.new
+          file            = appender.instance_variable_get(:@file)
+          file.stub(:close, -> { raise Errno::EIO }) { appender.close }
+          report = appender.logger.events.last
+
+          assert_equal :warn, report.level
+          assert_equal "Could not close the log file #{file_name}", report.message
+          assert_instance_of Errno::EIO, report.exception
+          assert_nil appender.instance_variable_get(:@file)
+        ensure
+          file&.close
+        end
+      end
+
+      describe "#flush" do
+        it "flushes the file opened on creation" do
+          assert appender.flush
+        end
+
+        it "flushes output after logging" do
+          appender.debug("Hello")
+
+          assert appender.flush
+        end
+      end
+
+      describe "#time_to_reopen?" do
+        it "not before anything is logged since the file is opened on creation" do
+          refute appender.send(:time_to_reopen?)
+        end
+
+        describe "reopen_count" do
+          let(:appender) { SemanticLogger::Appender::File.new(file_name, reopen_count: 10) }
+
+          it "opens a new log file after 10 log entries" do
+            assert_equal 0, appender.log_count
+            9.times { appender.info("Hello") }
+
+            assert_equal 9, appender.log_count
+
+            refute appender.send(:time_to_reopen?)
+            appender.info("Hello")
+
+            assert appender.send(:time_to_reopen?)
+            assert_equal 10, appender.log_count
+
+            appender.info("Hello")
+
+            assert_equal 1, appender.log_count
+          end
+        end
+
+        describe "reopen_size" do
+          let(:appender) { SemanticLogger::Appender::File.new(file_name, reopen_size: 250) }
+
+          it "opens a new log file after every 250 bytes written" do
+            assert_equal 0, appender.log_size
+            appender.info("Hello world how are you doing")
+
+            assert_operator appender.log_size, :>, 10
+            refute appender.send(:time_to_reopen?)
+            file_handle = appender.instance_variable_get(:@file).object_id
+            assert_file_reopened(appender) do
+              10.times { appender.info("Hello world how are you doing") }
+
+              refute_equal file_handle, appender.instance_variable_get(:@file).object_id
+            end
+          end
+
+          it "counts bytes, not characters" do
+            appender.info("日本語 ☕")
+
+            assert_equal File.size(file_name), appender.log_size
+          end
+
+          it "counts the bytes written in the file's encoding" do
+            appender = SemanticLogger::Appender::File.new(file_name, reopen_size: 1000, encoding: "UTF-16LE")
+            appender.info("Hello world")
+
+            assert_equal File.size(file_name), appender.log_size
+          end
+        end
+
+        describe "reopen_period" do
+          let(:appender) { SemanticLogger::Appender::File.new(file_name, reopen_period: "1m") }
+
+          it "sets the reopen time when the file is opened on creation" do
+            refute_nil appender.reopen_at
+          end
+
+          it "opens a new log file at the beginning of the next minute" do
+            # Construct the appender before stubbing Time.now: nested stubs of the
+            # same method break minitest's stub restore.
+            appender
+
+            Time.stub(:now, current_time) do
+              appender.reopen
+
+              assert_equal Time.parse("2015-12-09 17:51:00"), appender.reopen_at
+              appender.info("Hello world how are you doing")
+
+              refute appender.send(:time_to_reopen?)
+            end
+            assert appender.send(:time_to_reopen?)
+
+            assert_file_reopened(appender) do
+              appender.info("Hello world how are you doing")
+            end
+          end
+        end
+
+        describe "reopen_count and reopen_size" do
+          let(:appender) { SemanticLogger::Appender::File.new(file_name, reopen_count: 10, reopen_size: 1000) }
+
+          it "logs small messages" do
+            assert_equal 0, appender.log_count
+            9.times { appender.info("Hello") }
+
+            assert_equal 9, appender.log_count
+
+            refute appender.send(:time_to_reopen?)
+            appender.info("Hello")
+
+            assert appender.send(:time_to_reopen?)
+            assert_equal 10, appender.log_count
+
+            appender.info("Hello")
+
+            assert_equal 1, appender.log_count
+          end
+
+          it "logs large messages" do
+            assert_equal 0, appender.log_count
+            5.times { appender.info("Hello world how are you doing this time around with some larger messages?") }
+
+            assert_equal 5, appender.log_count
+
+            refute appender.send(:time_to_reopen?)
+            assert_file_reopened(appender) do
+              5.times { appender.info("Hello world how are you doing this time around with some larger messages?") }
+
+              refute_equal 10, appender.log_count
+            end
+          end
+        end
+      end
+
+      describe "#apply_format_directives" do
+        it "explicit %" do
+          file_name = "log/production-%%.log"
+          formatted = appender.send(:apply_format_directives, file_name)
+
+          assert_equal "log/production-%.log", formatted
+        end
+
+        it "short hostname" do
+          file_name = "log/production-%n.log"
+          formatted =
+            SemanticLogger.stub(:host, "myserver.domain.org") do
+              appender.send(:apply_format_directives, file_name)
+            end
+
+          assert_equal "log/production-myserver.log", formatted
+        end
+
+        it "long hostname" do
+          file_name = "log/production-%N.log"
+          formatted =
+            SemanticLogger.stub(:host, "myserver.domain.org") do
+              appender.send(:apply_format_directives, file_name)
+            end
+
+          assert_equal "log/production-myserver.domain.org.log", formatted
+        end
+
+        it "application" do
+          file_name = "log/production-%a.log"
+          formatted =
+            SemanticLogger.stub(:application, "my_app") do
+              appender.send(:apply_format_directives, file_name)
+            end
+
+          assert_equal "log/production-my_app.log", formatted
+        end
+
+        it "environment" do
+          file_name = "log/production-%e.log"
+          formatted =
+            SemanticLogger.stub(:environment, "this_environment") do
+              appender.send(:apply_format_directives, file_name)
+            end
+
+          assert_equal "log/production-this_environment.log", formatted
+        end
+
+        it "process id" do
+          file_name = "log/production-%p.log"
+          formatted = appender.send(:apply_format_directives, file_name)
+
+          assert_equal "log/production-#{$$}.log", formatted
+        end
+
+        it "date" do
+          file_name = "log/production-%D.log"
+          formatted = appender.send(:apply_format_directives, file_name)
+
+          assert_equal "log/production-#{Date.today.strftime('%Y%m%d')}.log", formatted
+        end
+
+        it "time" do
+          file_name = "log/production-%T.log"
+          time      = Time.parse("2015-12-09 17:50:05 UTC")
+          formatted =
+            Time.stub(:now, time) do
+              appender.send(:apply_format_directives, file_name)
+            end
+
+          assert_equal "log/production-#{time.strftime('%H%M%S')}.log", formatted
+        end
+
+        it "combination" do
+          file_name = "log/production-%%-%n-%p-%D-%T.log"
+          time      = Time.parse("2015-12-09 17:50:05 UTC")
+          formatted =
+            Time.stub(:now, time) do
+              SemanticLogger.stub(:host, "myserver.domain.org") do
+                appender.send(:apply_format_directives, file_name)
+              end
+            end
+
+          assert_equal "log/production-%-myserver-#{$$}-" \
+                       "#{Date.today.strftime('%Y%m%d')}-#{time.strftime('%H%M%S')}.log",
+                       formatted
+        end
+
+        it "custom time" do
+          file_name = "log/production-%H-%M-%S.log"
+          time      = Time.parse("2015-12-09 17:50:05 UTC")
+          formatted =
+            Time.stub(:now, time) do
+              appender.send(:apply_format_directives, file_name)
+            end
+
+          assert_equal "log/production-#{time.strftime('%H-%M-%S')}.log", formatted
+        end
+
+        it "custom date" do
+          file_name = "log/production-%Y-%C-%y-%m-%d-%j-%U-%W.log"
+          formatted = appender.send(:apply_format_directives, file_name)
+
+          assert_equal "log/production-#{Date.today.strftime('%Y-%C-%y-%m-%d-%j-%U-%W')}.log", formatted
+        end
+      end
+
+      describe "#next_reopen_period" do
+        it "returns the next reopen period" do
+          reopen_at =
+            Time.stub(:now, current_time) do
+              appender.send(:next_reopen_period, "1m")
+            end
+
+          assert_equal Time.parse("2015-12-09 17:51:00"), reopen_at
+        end
+
+        it "returns nil when no period" do
+          assert_nil appender.send(:next_reopen_period, nil)
+        end
+      end
+
+      describe "#parse_period" do
+        it "parses period" do
+          assert_equal [1, "m"], appender.send(:parse_period, "1m")
+          assert_equal [1, "h"], appender.send(:parse_period, "1h")
+          assert_equal [1, "d"], appender.send(:parse_period, "1d")
+        end
+
+        it "parses durations" do
+          assert_equal [30, "m"], appender.send(:parse_period, "30m")
+          assert_equal [12, "h"], appender.send(:parse_period, "12h")
+          assert_equal [3, "d"], appender.send(:parse_period, "3d")
+        end
+
+        it "ignores whitespace" do
+          assert_equal [245, "m"], appender.send(:parse_period, "   2 4 5 m    ")
+        end
+
+        it "converts float to integer" do
+          assert_equal [2, "m"], appender.send(:parse_period, "2.0m")
+        end
+
+        it "rejects bad periods" do
+          assert_raises(ArgumentError) { appender.send(:parse_period, nil) }
+          assert_raises(ArgumentError) { appender.send(:parse_period, "") }
+          assert_raises(ArgumentError) { appender.send(:parse_period, "    ") }
+          assert_raises(ArgumentError) { appender.send(:parse_period, "m") }
+          assert_raises(ArgumentError) { appender.send(:parse_period, "m2") }
+          assert_raises(ArgumentError) { appender.send(:parse_period, "2.0am") }
+        end
+      end
+
+      describe "#calculate_reopen_at" do
+        it "rounds off the next minute" do
+          reopen_at = appender.send(:calculate_reopen_at, 1, "m", current_time)
+
+          assert_equal Time.parse("2015-12-09 17:51:00"), reopen_at
+        end
+
+        it "rounds off multiple minutes" do
+          reopen_at = appender.send(:calculate_reopen_at, 10, "m", current_time)
+
+          assert_equal Time.parse("2015-12-09 18:00:00"), reopen_at
+        end
+
+        it "rounds off the next hour" do
+          reopen_at = appender.send(:calculate_reopen_at, 1, "h", current_time)
+
+          assert_equal Time.parse("2015-12-09 18:00:00"), reopen_at
+        end
+
+        it "rounds off multiple minutes" do
+          reopen_at = appender.send(:calculate_reopen_at, 10, "h", current_time)
+
+          assert_equal Time.parse("2015-12-10 03:00:00"), reopen_at
+        end
+
+        it "rounds off the next day" do
+          reopen_at = appender.send(:calculate_reopen_at, 1, "d", current_time)
+
+          assert_equal Time.parse("2015-12-10 00:00:00"), reopen_at
+        end
+
+        it "rounds off multiple days" do
+          reopen_at = appender.send(:calculate_reopen_at, 10, "d", current_time)
+
+          assert_equal Time.parse("2015-12-19 00:00:00"), reopen_at
+        end
+      end
+
+      def assert_file_reopened(appender)
+        before_log = appender.instance_variable_get(:@file)
+        yield
+
+        refute_same before_log, appender.instance_variable_get(:@file)
+      end
+
+      def refute_file_reopened(appender)
+        before_log = appender.instance_variable_get(:@file)
+        yield
+
+        assert_same before_log, appender.instance_variable_get(:@file)
+      end
+    end
+  end
+end

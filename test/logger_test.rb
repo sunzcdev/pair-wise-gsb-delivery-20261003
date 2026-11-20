@@ -1,0 +1,481 @@
+require_relative "test_helper"
+
+# Unit Test for SemanticLogger::Logger
+class LoggerTest < Minitest::Test
+  describe SemanticLogger::Logger do
+    let(:logger) { SemanticLogger::Test::CaptureLogEvents.new }
+
+    # Complex filters
+    module ComplexFilter
+      def self.call(log)
+        (/\AExclude/ =~ log.message).nil?
+      end
+    end
+
+    # Ensure that any log level can be logged
+    # SemanticLogger::LEVELS.each do |level|
+    [:debug].each do |level|
+      describe "##{level}" do
+        describe "#filter" do
+          it "Proc" do
+            logger.filter = ->(log) { (/\AExclude/ =~ log.message).nil? }
+            logger.send(level, "Exclude this log message", @hash) { "Calculations" }
+
+            assert_empty logger.events
+          end
+
+          it "Module" do
+            logger.filter = ComplexFilter
+            logger.send(level, "Exclude this log message", @hash) { "Calculations" }
+
+            assert_empty logger.events
+          end
+
+          it "RegExp" do
+            logger.filter = ->(log) { (/\AExclude/ =~ log.message).nil? }
+            logger.send(level, "Exclude this log message", @hash) { "Calculations" }
+
+            assert_empty logger.events
+          end
+        end
+      end
+    end
+
+    describe "a Regexp filter" do
+      let(:invalid_name) { (+"Caf\xC3 Orders").force_encoding(Encoding::UTF_8) }
+
+      # Returns the messages that a logger with the name and filter logs in the block.
+      def logged(name, filter)
+        logger = SemanticLogger::Logger.new(name, :trace, filter)
+        events = []
+        logger.stub(:log, ->(log, *) { events << log }) { yield logger }
+        events.map(&:message)
+      end
+
+      it "matches a logger name that is not valid UTF-8, instead of raising" do
+        assert_equal ["Kept"], logged(invalid_name, /Orders/) { |logger| logger.info("Kept") }
+      end
+
+      it "filters out a logger name that is not valid UTF-8 and does not match" do
+        assert_empty logged(invalid_name, /Payments/) { |logger| logger.info("Dropped") }
+      end
+
+      it "matches a logger name that is not ASCII-compatible, such as UTF-16" do
+        name = "Orders".encode(Encoding::UTF_16LE)
+
+        assert_equal ["Kept"], logged(name, /Orders/) { |logger| logger.info("Kept") }
+        assert_empty logged(name, /Payments/) { |logger| logger.info("Dropped") }
+      end
+
+      it "matches a name against a Regexp in another encoding, in that encoding" do
+        filter = Regexp.new("caf\xE9".dup.force_encoding(Encoding::ISO_8859_1))
+
+        assert_equal ["Kept"], logged("café", filter) { |logger| logger.info("Kept") }
+        assert_empty logged("thé", filter) { |logger| logger.info("Dropped") }
+      end
+
+      it "filters out a name that a Regexp in an encoding with no converter cannot match, instead of raising" do
+        filter = Regexp.new((+"caf").force_encoding(Encoding::EMACS_MULE), Regexp::FIXEDENCODING)
+
+        assert_empty logged("café", filter) { |logger| logger.info("Dropped") }
+      end
+
+      it "matches a name against a binary Regexp, as its bytes" do
+        filter = Regexp.new("caf\xC3\xA9".b)
+
+        assert_equal ["Kept"], logged("café", filter) { |logger| logger.info("Kept") }
+        assert_empty logged("thé", filter) { |logger| logger.info("Dropped") }
+      end
+
+      it "filters an appender's entries by a logger name that is not valid UTF-8" do
+        appender = SemanticLogger::Test::CaptureLogEvents.new
+        appender.filter = /Orders/
+        log = SemanticLogger::Log.new(invalid_name, :info)
+
+        assert appender.should_log?(log)
+        appender.filter = /Payments/
+
+        refute appender.should_log?(log)
+      end
+    end
+
+    describe "when level is too high" do
+      it "does not log" do
+        logger.level = :error
+        logger.info("Exclude this log message")
+
+        assert_empty logger.events
+      end
+    end
+
+    describe "logging an untrusted hash as the payload" do
+      [
+        {duration: 1, min_duration: nil},
+        {duration: 1, min_duration: "x"},
+        {duration: Complex(1, 1)},
+        {backtrace: [1, 2]},
+        {exception: "x", on_exception_level: 2**70},
+        {log_exception: "full", exception: "x"},
+        {dimensions: [], metric_amount: Float::NAN}
+      ].each do |untrusted|
+        it "does not raise for #{untrusted.inspect}" do
+          logger.info("Webhook", untrusted)
+
+          assert log = logger.events.first
+          assert_equal "Webhook", log.message
+        end
+      end
+
+      it "logs the application's value when the explicit payload has a key of the same name" do
+        logger.info("Webhook", payload: {account_id: 1, event: "refund"}, account_id: 42)
+
+        assert_equal({account_id: 42, event: "refund"}, logger.events.first.payload)
+      end
+
+      it "logs the application's value when the explicit payload has a String key of the same name" do
+        logger.info("Webhook", payload: JSON.parse('{"account_id":1,"event":"refund"}'), account_id: 42)
+
+        assert_equal({account_id: 42, "event" => "refund"}, logger.events.first.payload)
+      end
+
+      it "logs the application's value when a hash block result has a String key of the same name" do
+        logger.info("Webhook", account_id: 42) { JSON.parse('{"account_id":1,"event":"refund"}') }
+
+        assert_equal({account_id: 42, "event" => "refund"}, logger.events.first.payload)
+      end
+
+      it "does not drop a supplied exception for a nil log_exception" do
+        exception = RuntimeError.new("boom")
+        logger.error("Webhook", exception: exception, log_exception: nil)
+
+        assert_equal exception, logger.events.first.exception
+      end
+    end
+
+    describe "Compatibility" do
+      # Ensure that any log level can be logged
+      Logger::Severity.constants.each do |level|
+        it "log Ruby logger #{level} info" do
+          logger.level = Logger::Severity.const_get(level)
+          if level.to_s == "UNKNOWN"
+            assert_equal Logger::Severity.const_get("ERROR") + 1, logger.send(:level_index)
+          else
+            assert_equal Logger::Severity.const_get(level) + 1, logger.send(:level_index)
+          end
+        end
+      end
+    end
+
+    describe "#with_level" do
+      it "temporarily changes logging level during the execution of the given block" do
+        logger.level = :error
+
+        assert_equal :error, logger.level
+
+        logger.debug("not logged")
+
+        logger.with_level(:debug) do
+          assert_equal :debug, logger.level
+
+          logger.debug("logged")
+        end
+
+        assert_equal :error, logger.level
+
+        events = logger.events
+
+        assert_equal 1, events.size
+
+        event = events.first
+
+        assert_equal "logged", event.message
+        assert_equal :debug, event.level
+      end
+    end
+
+    describe "#level?" do
+      it "return true for debug? with :trace level" do
+        logger.level = :trace
+
+        assert_equal :trace, logger.level
+        assert_equal true, logger.debug?
+        assert_equal true, logger.trace?
+      end
+
+      it "return false for debug? with instance :debug level" do
+        logger.level = :debug
+
+        assert_equal :debug, logger.level, logger.inspect
+        assert_equal true, logger.debug?, logger.inspect
+        assert_equal false, logger.trace?, logger.inspect
+      end
+
+      it "return true for debug? with instance :info level" do
+        logger.level = :info
+
+        assert_equal :info, logger.level, logger.inspect
+        assert_equal false, logger.debug?, logger.inspect
+        assert_equal false, logger.trace?, logger.inspect
+      end
+    end
+
+    describe ".tagged" do
+      it "add tags to log entries" do
+        logger.tagged("12345", "DJHSFK") do
+          logger.info("hello world")
+
+          assert log = logger.events.first
+          assert_equal "hello world", log.message
+          assert_equal %w[12345 DJHSFK], log.tags
+        end
+      end
+
+      it "add embedded tags to log entries" do
+        logger.tagged("First Level", "tags") do
+          logger.tagged("Second Level") do
+            assert_equal ["First Level", "tags", "Second Level"], logger.tags
+            logger.info("hello world")
+
+            assert log = logger.events.first
+            assert_equal "hello world", log.message
+            assert_equal ["First Level", "tags", "Second Level"], log.tags
+          end
+          assert_equal ["First Level", "tags"], logger.tags
+        end
+      end
+
+      it "also supports named tagging" do
+        logger.tagged(level1: 1) do
+          assert_equal({level1: 1}, SemanticLogger.named_tags)
+          assert_equal({level1: 1}, logger.named_tags)
+          logger.tagged(level2: 2, more: "data") do
+            assert_equal({level1: 1, level2: 2, more: "data"}, SemanticLogger.named_tags)
+            assert_equal({level1: 1, level2: 2, more: "data"}, logger.named_tags)
+            logger.tagged(level3: 3) do
+              assert_equal({level1: 1, level2: 2, more: "data", level3: 3}, SemanticLogger.named_tags)
+              assert_equal({level1: 1, level2: 2, more: "data", level3: 3}, logger.named_tags)
+            end
+          end
+        end
+      end
+
+      it "is compatible with rails logging that uses arrays and nils" do
+        logger.tagged("", %w[12345 DJHSFK], nil) do
+          logger.info("hello world")
+
+          assert log = logger.events.first
+          assert_equal "hello world", log.message
+          assert_equal %w[12345 DJHSFK], log.tags
+        end
+      end
+
+      it "properly handles logs as an array with a single argument" do
+        logger.tagged(%w[first second]) do
+          logger.info("hello world")
+
+          assert log = logger.events.first
+          assert_equal "hello world", log.message
+          assert_equal %w[first second], log.tags
+        end
+      end
+
+      it "yields self to be compatible with rails tagged logger" do
+        logger.tagged("12345", "DJHSFK") do |yielded_logger|
+          assert_same logger, yielded_logger
+        end
+      end
+    end
+
+    describe "#tagged without a block (child logger)" do
+      it "returns a new logger instance, not self" do
+        child = logger.tagged(cart_id: 5)
+
+        refute_same logger, child
+        assert_kind_of logger.class, child
+      end
+
+      it "adds named instance tags to every entry from the child" do
+        child = logger.tagged(cart_id: 5)
+        child.info("hello")
+
+        assert log = child.events.last
+        assert_equal({cart_id: 5}, log.named_tags)
+      end
+
+      it "adds positional instance tags to every entry from the child" do
+        child = logger.tagged("service-a")
+        child.info("hello")
+
+        assert log = child.events.last
+        assert_equal ["service-a"], log.tags
+      end
+
+      it "supports mixing positional and named tags" do
+        child = logger.tagged("service-a", cart_id: 5)
+        child.info("hello")
+
+        assert log = child.events.last
+        assert_equal ["service-a"], log.tags
+        assert_equal({cart_id: 5}, log.named_tags)
+      end
+
+      it "does not add instance tags to the parent logger" do
+        logger.tagged(cart_id: 5)
+        logger.info("hello")
+
+        assert log = logger.events.last
+        assert_empty log.named_tags
+        assert_empty logger.instance_named_tags
+      end
+
+      it "does not add instance tags to other loggers within a thread block" do
+        another = SemanticLogger::Test::CaptureLogEvents.new
+        child   = logger.tagged(cart_id: 5)
+
+        SemanticLogger.tagged("request-1") do
+          child.info("from child")
+          another.info("from another")
+        end
+
+        assert_equal ["request-1"], child.events.last.tags
+        assert_equal({cart_id: 5}, child.events.last.named_tags)
+        assert_equal ["request-1"], another.events.last.tags
+        assert_empty another.events.last.named_tags
+      end
+
+      it "layers thread context with instance tags, instance named tags winning on conflict" do
+        child = logger.tagged("instance-pos", scope: "instance")
+
+        SemanticLogger.named_tagged(scope: "thread", request_id: "123") do
+          SemanticLogger.tagged("thread-pos") do
+            child.info("hello")
+          end
+        end
+
+        assert log = child.events.last
+        assert_equal %w[thread-pos instance-pos], log.tags
+        assert_equal({scope: "instance", request_id: "123"}, log.named_tags)
+      end
+
+      it "merges tags cumulatively for nested child loggers" do
+        child      = logger.tagged("a", one: 1)
+        grandchild = child.tagged("b", two: 2)
+        grandchild.info("hello")
+
+        assert log = grandchild.events.last
+        assert_equal %w[a b], log.tags
+        assert_equal({one: 1, two: 2}, log.named_tags)
+      end
+
+      it "leaves the parent unchanged when building a grandchild" do
+        child = logger.tagged("a", one: 1)
+        child.tagged("b", two: 2)
+
+        assert_equal ["a"], child.instance_tags
+        assert_equal({one: 1}, child.instance_named_tags)
+      end
+
+      it "applies instance tags to measure entries" do
+        child = logger.tagged(cart_id: 5)
+        child.measure_info("timed") { :result }
+
+        assert log = child.events.last
+        assert_equal({cart_id: 5}, log.named_tags)
+      end
+
+      it "ignores blank positional tags for rails compatibility" do
+        child = logger.tagged("", nil, "real")
+        child.info("hello")
+
+        assert_equal ["real"], child.events.last.tags
+      end
+    end
+
+    describe "a negative metric_amount" do
+      # The deprecation is reported once per process, so each test starts as if it had not been yet.
+      before { SemanticLogger::Log.instance_variable_set(:@negative_metric_amount_reported, nil) }
+      after { SemanticLogger::Log.instance_variable_set(:@negative_metric_amount_reported, nil) }
+
+      it "is still logged, with a deprecation warning at the line of the log call" do
+        line = __LINE__ + 2
+        assert_deprecated(/#{Regexp.escape(__FILE__)}:#{line}: warning: .*negative metric_amount is deprecated/) do
+          logger.info("Item removed", metric: "cart/items", metric_amount: -1)
+        end
+
+        assert log = logger.events.last
+        assert_equal "cart/items", log.metric
+        assert_equal(-1, log.metric_amount)
+      end
+
+      it "is reported for a metric-only entry" do
+        assert_deprecated(/negative metric_amount is deprecated/) do
+          logger.info(metric: "cart/items", metric_amount: -5)
+        end
+
+        assert_equal(-5, logger.events.last.metric_amount)
+      end
+
+      it "is reported for a measure call" do
+        assert_deprecated(/negative metric_amount is deprecated/) do
+          logger.measure_info("Item removed", metric: "cart/items", metric_amount: -2) { :done }
+        end
+
+        assert_equal(-2, logger.events.last.metric_amount)
+      end
+
+      it "is not reported without a metric, and is still reported for a later one with a metric" do
+        refute_deprecated { logger.info("Balance", metric_amount: -10) }
+
+        assert_deprecated(/negative metric_amount is deprecated/) do
+          logger.info(metric: "cart/items", metric_amount: -1)
+        end
+      end
+
+      it "is reported for a Hash returned by the block" do
+        assert_deprecated(/negative metric_amount is deprecated/) do
+          logger.info("Item removed") { {metric: "cart/items", metric_amount: -3} }
+        end
+
+        assert_equal(-3, logger.events.last.metric_amount)
+      end
+
+      it "is reported only once, however many log calls give one" do
+        _, warnings = deprecations_of { 3.times { logger.info(metric: "cart/items", metric_amount: -1) } }
+
+        assert_equal 1, warnings.size
+        assert_equal 3, logger.events.size
+      end
+
+      it "is reported once deprecation warnings are turned on" do
+        enabled              = Warning[:deprecated]
+        Warning[:deprecated] = false
+        logger.info(metric: "cart/items", metric_amount: -1)
+        Warning[:deprecated] = enabled
+
+        assert_deprecated(/negative metric_amount is deprecated/) do
+          logger.info(metric: "cart/items", metric_amount: -1)
+        end
+      ensure
+        Warning[:deprecated] = enabled
+      end
+
+      it "is not reported for zero or a positive amount" do
+        refute_deprecated do
+          logger.info(metric: "cart/items", metric_amount: 0)
+          logger.info(metric: "cart/items", metric_amount: 0.0)
+          logger.info(metric: "cart/items", metric_amount: 2)
+          logger.info(metric: "cart/items")
+        end
+
+        assert_equal 4, logger.events.size
+      end
+
+      it "is not reported for an amount that is not a real number" do
+        refute_deprecated do
+          logger.backtrace(metric: "cart/items", metric_amount: "-1")
+          logger.info(metric: "cart/items", metric_amount: -Float::INFINITY)
+        end
+      end
+    end
+  end
+end

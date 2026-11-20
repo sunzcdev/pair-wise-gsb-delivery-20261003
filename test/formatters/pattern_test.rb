@@ -1,0 +1,558 @@
+require_relative "../test_helper"
+
+module SemanticLogger
+  module Formatters
+    class PatternTest < Minitest::Test
+      describe Pattern do
+        let(:log_time) do
+          Time.utc(2017, 1, 14, 8, 32, 5.375276)
+        end
+
+        let(:level) { :debug }
+
+        let(:backtrace) do
+          [
+            "test/formatters/pattern_test.rb:42:in `block (2 levels) in <class:PatternTest>'",
+            "lib/minitest/spec.rb:247:in `instance_eval'"
+          ]
+        end
+
+        # A minimal stand-in for an appender, which is what Pattern reads
+        # host / application / environment from.
+        let(:logger) do
+          Struct.new(:host, :application, :environment).new("myhost", "myapp", "myenv")
+        end
+
+        let(:log) do
+          log         = SemanticLogger::Log.new("PatternTest", level)
+          log.time    = log_time
+          log.message = "Hello World"
+          log
+        end
+
+        def formatted(pattern, log_entry = log, logger_entry = nil)
+          Pattern.new(pattern: pattern).call(log_entry, logger_entry)
+        end
+
+        describe "time" do
+          it "interpolates the formatted time" do
+            assert_equal "2017-01-14 08:32:05.375276", formatted("%{time}")
+          end
+
+          it "formats with a supplied strftime argument" do
+            assert_equal "2017-01-14T08:32:05", formatted("%{time:%Y-%m-%dT%H:%M:%S}")
+          end
+
+          it "preserves colons within the strftime argument" do
+            assert_equal "08:32:05", formatted("%{time:%H:%M:%S}")
+          end
+        end
+
+        describe "level" do
+          it "interpolates the full level name" do
+            assert_equal "debug", formatted("%{level}")
+          end
+        end
+
+        describe "level_short" do
+          it "interpolates the single character level" do
+            assert_equal "D", formatted("%{level_short}")
+          end
+        end
+
+        describe "name" do
+          it "interpolates the logger name" do
+            assert_equal "PatternTest", formatted("%{name}")
+          end
+        end
+
+        describe "message" do
+          it "interpolates the message" do
+            assert_equal "Hello World", formatted("%{message}")
+          end
+
+          it "is blank when there is no message" do
+            log.message = nil
+
+            assert_equal "", formatted("%{message}")
+          end
+        end
+
+        describe "payload" do
+          it "interpolates the payload" do
+            log.payload = {foo: "bar"}
+
+            assert_equal({foo: "bar"}.inspect, formatted("%{payload}"))
+          end
+
+          it "is blank when there is no payload" do
+            assert_equal "", formatted("%{payload}")
+          end
+        end
+
+        describe "exception" do
+          let(:log_with_exception) do
+            begin
+              raise "Oh no"
+            rescue StandardError => e
+              log.exception = e
+            end
+            log
+          end
+
+          it "interpolates the exception class" do
+            assert_equal "RuntimeError", formatted("%{exception_class}", log_with_exception)
+          end
+
+          it "interpolates the exception message" do
+            assert_equal "Oh no", formatted("%{exception_message}", log_with_exception)
+          end
+
+          it "interpolates the message the exception was raised with when its #message raises" do
+            log.exception = ExceptionFixtures::BrokenMessageError.new("Order 7")
+
+            assert_equal "ExceptionFixtures::BrokenMessageError: Order 7",
+                         formatted("%{exception_class}: %{exception_message}")
+          end
+
+          it "interpolates the class of an exception that names itself otherwise, or raises, as Ruby names it" do
+            log.exception = ExceptionFixtures::OtherwiseNamedError.new("declined")
+
+            assert_equal "ExceptionFixtures::OtherwiseNamedError", formatted("%{exception_class}")
+
+            log.exception = ExceptionFixtures::UnnameableError.new("declined")
+
+            assert_equal "ExceptionFixtures::UnnameableError", formatted("%{exception_class}")
+          end
+
+          it "interpolates the exception backtrace" do
+            assert_includes formatted("%{backtrace}", log_with_exception), "pattern_test.rb"
+          end
+
+          it "interpolates the exception details" do
+            user_name = "jack"
+            begin
+              user_name.upcas
+            rescue NoMethodError => e
+              log.exception = e
+            end
+
+            assert_match(/\ADid you mean\?  upcase/, formatted("%{exception_details}"))
+          end
+
+          it "is blank when the exception has no details" do
+            assert_equal "", formatted("%{exception_details}", log_with_exception)
+          end
+
+          it "is blank when there is no exception" do
+            assert_equal "", formatted("%{exception_class}")
+            assert_equal "", formatted("%{exception_message}")
+            assert_equal "", formatted("%{exception_details}")
+            assert_equal "", formatted("%{backtrace}")
+          end
+        end
+
+        describe "duration" do
+          it "renders a human readable duration without parentheses" do
+            log.duration = 1234.567
+
+            assert_equal "1.235s", formatted("%{duration}")
+          end
+
+          it "is blank when there is no duration" do
+            assert_equal "", formatted("%{duration}")
+          end
+        end
+
+        describe "duration_ms" do
+          it "renders the numeric duration in milliseconds" do
+            log.duration = 1234.567
+
+            assert_equal "1234.567", formatted("%{duration_ms}")
+          end
+        end
+
+        describe "thread_name" do
+          it "interpolates the thread name" do
+            log.thread_name = "worker-1"
+
+            assert_equal "worker-1", formatted("%{thread_name}")
+          end
+        end
+
+        describe "pid" do
+          it "interpolates the process id" do
+            assert_equal $$.to_s, formatted("%{pid}")
+          end
+        end
+
+        describe "file_name" do
+          it "interpolates the file name from the backtrace" do
+            log.backtrace = backtrace
+
+            assert_equal "pattern_test.rb", formatted("%{file_name}")
+          end
+
+          it "is blank without a backtrace" do
+            assert_equal "", formatted("%{file_name}")
+          end
+
+          it "escapes the file name of a supplied backtrace when escape_control_chars is enabled" do
+            log.backtrace = ["\e]0;owned\a\e[2J\rFAKE x.rb:1"]
+            output        = Pattern.new(pattern: "%{file_name}:%{line}", escape_control_chars: true).call(log, nil)
+
+            assert_equal "\\e]0;owned\\x07\\e[2J\\rFAKE x.rb:1", output
+          end
+        end
+
+        describe "method" do
+          it "interpolates the method of the call site" do
+            log.call_site = SemanticLogger::CallSite.new(path: "/app/models/order.rb", line: 42, label: "Order#submit")
+
+            assert_equal "order.rb:42 Order#submit", formatted("%{file_name}:%{line} %{method}")
+          end
+
+          it "is blank without a call site" do
+            log.backtrace = backtrace
+
+            assert_equal "", formatted("%{method}")
+          end
+
+          it "escapes the method when escape_control_chars is enabled" do
+            log.call_site = SemanticLogger::CallSite.new(path: "/app/order.rb", line: 1, label: "forged\e[2J")
+            output        = Pattern.new(pattern: "%{method}", escape_control_chars: true).call(log, nil)
+
+            assert_equal "forged\\e[2J", output
+          end
+
+          it "leaves the formatter's #method as Object#method" do
+            formatter = Pattern.new(pattern: "%{method}")
+
+            assert_kind_of Method, formatter.method(:call)
+          end
+        end
+
+        describe "line" do
+          it "interpolates the line number from the backtrace" do
+            log.backtrace = backtrace
+
+            assert_equal "42", formatted("%{line}")
+          end
+
+          it "is blank without a backtrace" do
+            assert_equal "", formatted("%{line}")
+          end
+        end
+
+        describe "tags" do
+          it "interpolates comma separated tags" do
+            log.tags = %w[alpha beta]
+
+            assert_equal "alpha, beta", formatted("%{tags}")
+          end
+
+          it "is blank when there are no tags" do
+            log.tags = []
+
+            assert_equal "", formatted("%{tags}")
+          end
+        end
+
+        describe "named_tags" do
+          before do
+            log.named_tags = {request_id: "abc123", user: "jack"}
+          end
+
+          it "interpolates a single named tag by key" do
+            assert_equal "abc123", formatted("%{named_tags:request_id}")
+          end
+
+          it "interpolates all named tags when no key is given" do
+            assert_equal "request_id: abc123, user: jack", formatted("%{named_tags}")
+          end
+
+          it "is blank when there are no named tags" do
+            log.named_tags = {}
+
+            assert_equal "", formatted("%{named_tags}")
+          end
+        end
+
+        describe "host" do
+          it "interpolates the appender host" do
+            assert_equal "myhost", formatted("%{host}", log, logger)
+          end
+        end
+
+        describe "application" do
+          it "interpolates the appender application" do
+            assert_equal "myapp", formatted("%{application}", log, logger)
+          end
+        end
+
+        describe "environment" do
+          it "interpolates the appender environment" do
+            assert_equal "myenv", formatted("%{environment}", log, logger)
+          end
+        end
+
+        describe "escape_control_chars" do
+          def escaped(pattern, log_entry = log)
+            Pattern.new(pattern: pattern, escape_control_chars: true).call(log_entry, nil)
+          end
+
+          it "preserves control characters by default" do
+            log.message = "line1\nline2"
+
+            assert_equal "line1\nline2", formatted("%{message}")
+          end
+
+          it "escapes control characters in the message when enabled" do
+            log.message = "line1\nline2"
+
+            assert_equal "line1\\nline2", escaped("%{message}")
+          end
+
+          it "escapes the ANSI escape in the message when enabled" do
+            log.message = "\e[31mred\e[0m"
+
+            assert_equal "\\e[31mred\\e[0m", escaped("%{message}")
+          end
+
+          it "escapes control characters in tags when enabled" do
+            log.tags = ["safe", "ev\nil"] # rubocop:disable Style/WordArray -- the second tag contains a newline
+
+            assert_equal "safe, ev\\nil", escaped("%{tags}")
+          end
+
+          it "escapes control characters in named tags when enabled" do
+            log.named_tags = {user: "ev\nil"}
+
+            assert_equal "user: ev\\nil", escaped("%{named_tags}")
+            assert_equal "ev\\nil", escaped("%{named_tags:user}")
+          end
+
+          it "escapes control characters in the exception message when enabled" do
+            begin
+              raise "first\nsecond"
+            rescue StandardError => e
+              log.exception = e
+            end
+
+            assert_equal "first\\nsecond", escaped("%{exception_message}")
+          end
+
+          it "escapes control characters in the message of each cause in the backtrace" do
+            begin
+              begin
+                raise ArgumentError, "inner\nforged"
+              rescue ArgumentError
+                raise "outer"
+              end
+            rescue StandardError => e
+              log.exception = e
+            end
+
+            assert_includes escaped("%{backtrace}"), "Cause: ArgumentError: inner\\nforged"
+          end
+
+          it "escapes control characters in each backtrace line when enabled" do
+            begin
+              raise "outer"
+            rescue StandardError => e
+              e.set_backtrace(["app.rb:1\nforged", "app.rb:2"])
+              log.exception = e
+            end
+
+            assert_equal "app.rb:1\\nforged\napp.rb:2", escaped("%{backtrace}")
+          end
+
+          it "escapes control characters in the logger name, thread name, and payload when enabled" do
+            log.name        = "Auth\nforged"
+            log.thread_name = "worker\e[2J"
+            log.payload     = Object.new.tap { |object| object.define_singleton_method(:inspect) { "bob\nforged" } }
+
+            assert_equal "Auth\\nforged worker\\e[2J bob\\nforged", escaped("%{name} %{thread_name} %{payload}")
+            assert_equal "Auth\nforged worker\e[2J bob\nforged", formatted("%{name} %{thread_name} %{payload}")
+          end
+        end
+
+        describe "combining directives" do
+          it "combines several directives with literal text" do
+            assert_equal "debug PatternTest -- Hello World",
+                         formatted("%{level} %{name} -- %{message}")
+          end
+        end
+
+        describe "escaping" do
+          it "emits a literal %{...} for %%{...}" do
+            assert_equal "%{message}", formatted("%%{message}")
+          end
+        end
+
+        describe "errors" do
+          it "raises on an unknown directive at construction time" do
+            assert_raises(ArgumentError) { Pattern.new(pattern: "%{nope}") }
+          end
+
+          it "raises when a non-parameterized directive is given an argument" do
+            assert_raises(ArgumentError) { Pattern.new(pattern: "%{message:foo}") }
+          end
+        end
+
+        describe "default pattern" do
+          it "produces output similar to the Default formatter" do
+            result = Pattern.new.call(log, nil)
+
+            assert_includes result, "debug"
+            assert_includes result, "PatternTest"
+            assert_includes result, "-- Hello World"
+          end
+        end
+
+        # Joining texts that both hold bytes outside ASCII, in incompatible encodings, raises
+        # Encoding::CompatibilityError, which used to lose the entry.
+        describe "text in encodings that cannot be joined" do
+          let(:binary) { "Grüße ☕".b }
+
+          def assert_utf8(output)
+            assert_predicate output, :valid_encoding?
+            assert_equal Encoding::UTF_8, output.encoding
+          end
+
+          it "writes a binary message after a non-ASCII logger name" do
+            log.name    = "Café::Commande"
+            log.message = binary
+            output      = formatted("%{name} -- %{message}")
+
+            assert_utf8 output
+            assert_equal "Café::Commande -- Grüße ☕", output
+          end
+
+          it "writes a UTF-8 message with a binary exception message and the binary message of its cause" do
+            log.message   = "Café"
+            log.exception =
+              begin
+                begin
+                  raise binary
+                rescue RuntimeError
+                  raise ArgumentError, binary
+                end
+              rescue ArgumentError => e
+                e
+              end
+            output = formatted("%{message} -- %{exception_class}: %{exception_message}\n%{backtrace}")
+
+            assert_utf8 output
+            assert_equal "Café -- ArgumentError: Grüße ☕", output.lines.first.chomp
+            assert_includes output, "\nCause: RuntimeError: Grüße ☕\n"
+          end
+
+          it "writes the ISO-8859-1 name of an exception's class with its UTF-8 message" do
+            log.exception = ExceptionFixtures::ISO_8859_1_NAMED_ERROR.new("Größe ungültig")
+            output        = formatted("%{exception_class}: %{exception_message}")
+
+            assert_utf8 output
+            assert_equal "ExceptionFixtures::FehlÄr: Größe ungültig", output
+          end
+
+          it "writes a pattern in another encoding with a message in that encoding" do
+            log.message = "Grüße".encode(Encoding::ISO_8859_1)
+            output      = formatted("Ünd %{time:%Y Ü} %{message}".encode(Encoding::ISO_8859_1))
+
+            assert_utf8 output
+            assert_equal "Ünd 2017 Ü Grüße", output
+          end
+
+          it "writes an application name in another encoding with a non-ASCII message" do
+            log.message = "Café"
+            # As read from the environment where no locale is set.
+            application = (+"Commandé").force_encoding(Encoding::US_ASCII)
+            app_logger  = Struct.new(:host, :application, :environment).new("hôst".b, application, "prod")
+            output      = formatted("%{host} %{application} %{environment} -- %{message}", log, app_logger)
+
+            assert_utf8 output
+            assert_equal "hôst Commandé prod -- Café", output
+          end
+
+          it "writes an ASCII application name in another encoding as it is" do
+            application = (+"orders").force_encoding(Encoding::US_ASCII)
+            formatter   = Pattern.new(pattern: "%{application}")
+            formatter.call(log, Struct.new(:host, :application, :environment).new("host", application, "prod"))
+
+            assert_same application, formatter.application
+          end
+
+          it "finds a named tag by a key written in the pattern's own encoding" do
+            key            = "Größe".encode(Encoding::ISO_8859_1)
+            log.named_tags = {key.to_sym => "42"}
+            output         = formatted("#{key}: %{named_tags:#{key}} %{message}")
+
+            assert_utf8 output
+            assert_equal "Größe: 42 Hello World", output
+          end
+
+          it "reads a pattern that holds UTF-8 as UTF-8, as read from a file where no locale is set" do
+            pattern = (+"%{level} → %{message}").force_encoding(Encoding::US_ASCII)
+
+            assert_equal "debug → Hello World", formatted(pattern)
+          end
+
+          it "converts a pattern in an encoding that is not ASCII-compatible" do
+            assert_equal "Hello World é", formatted("%{message} é".encode(Encoding::UTF_16LE))
+          end
+
+          it "finds a named tag by a key in a binary pattern, as read from the environment where no locale is set" do
+            log.named_tags = {Größe: "42"}
+
+            assert_equal "Größe=42", formatted("Größe=%{named_tags:Größe}".b)
+          end
+
+          it "raises when it is built from a pattern that is not valid in its own encoding" do
+            assert_raises(ArgumentError) { Pattern.new(pattern: "Caf\xE9: %{message}".dup.force_encoding(Encoding::Shift_JIS)) }
+          end
+
+          it "raises when it is built from a US-ASCII pattern that does not hold UTF-8" do
+            pattern = "Gr\xF6\xDFe=%{named_tags:Gr\xF6\xDFe}".dup.force_encoding(Encoding::US_ASCII)
+
+            assert_raises(ArgumentError) { Pattern.new(pattern: pattern) }
+          end
+
+          it "raises when it is built from a UTF-16 pattern without its byte order mark" do
+            pattern = "%{message}".encode(Encoding::UTF_16BE).force_encoding(Encoding::UTF_16)
+
+            assert_raises(Encoding::InvalidByteSequenceError) { Pattern.new(pattern: pattern) }
+          end
+
+          it "converts a UTF-16 pattern with its byte order mark" do
+            assert_equal "Hello World", formatted("%{message}".encode(Encoding::UTF_16))
+          end
+
+          it "raises when it is built from a pattern with a character that has no UTF-8 equivalent" do
+            pattern = "a\x81b %{message}".dup.force_encoding(Encoding::Windows_1252)
+
+            assert_raises(Encoding::UndefinedConversionError) { Pattern.new(pattern: pattern) }
+          end
+
+          it "accepts a binary pattern, replacing the bytes that are not UTF-8 so that it keeps its shape" do
+            assert_equal "caf\uFFFD Hello World", formatted("caf\xE9 %{message}".b)
+            assert_equal "100%\uFFFD{message}", formatted("100%\xFF{message}".b)
+          end
+
+          it "still raises when it is built from a pattern that is not valid UTF-8" do
+            assert_raises(ArgumentError) { Pattern.new(pattern: "Caf\xE9 %{message}".dup.force_encoding(Encoding::UTF_8)) }
+          end
+
+          it "writes tags and named tags in incompatible encodings" do
+            log.tags       = ["Café", binary]
+            log.named_tags = {city: "Zürich", greeting: binary}
+            output         = formatted("%{tags} %{named_tags} %{named_tags:greeting}")
+
+            assert_utf8 output
+            assert_equal "Café, Grüße ☕ city: Zürich, greeting: Grüße ☕ Grüße ☕", output
+          end
+        end
+      end
+    end
+  end
+end

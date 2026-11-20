@@ -1,0 +1,1141 @@
+require_relative "test_helper"
+require "json"
+require "timeout"
+
+module SemanticLogger
+  class UtilsTest < Minitest::Test
+    # A named Struct, so that the placeholder for one nested too deeply names its class.
+    DeepNode = Struct.new(:child)
+
+    include ExceptionFixtures
+
+    describe Utils do
+      describe ".constantize_symbol" do
+        it "resolves a built-in appender symbol" do
+          assert_equal SemanticLogger::Appender::File, SemanticLogger::Utils.constantize_symbol(:file)
+        end
+
+        it "resolves a symbol in a custom namespace" do
+          assert_equal SemanticLogger::Formatters::Json,
+                       SemanticLogger::Utils.constantize_symbol(:json, "SemanticLogger::Formatters")
+        end
+
+        it "raises a helpful error for an unknown symbol" do
+          error = assert_raises ArgumentError do
+            SemanticLogger::Utils.constantize_symbol(:does_not_exist)
+          end
+          assert_match(/Could not convert symbol/, error.message)
+        end
+
+        it "raises when the symbol resolves to a constant that is not a class" do
+          SemanticLogger::Utils.const_set(:NotAClass, 42)
+          error = assert_raises ArgumentError do
+            SemanticLogger::Utils.constantize_symbol(:not_a_class, "SemanticLogger::Utils")
+          end
+          assert_match(/is not a class/, error.message)
+        ensure
+          SemanticLogger::Utils.send(:remove_const, :NotAClass)
+        end
+      end
+
+      describe ".parse_url" do
+        it "returns the parsed url" do
+          assert_equal "host", SemanticLogger::Utils.parse_url("https://user:pw@host:8443/path").host
+        end
+
+        it "raises without the url, which can hold a password, in the message or as the cause" do
+          error = assert_raises(URI::InvalidURIError) do
+            SemanticLogger::Utils.parse_url("https://user:pa ss@host", option: ":proxy_url", hint: "Hint.")
+          end
+
+          assert_equal "Invalid :proxy_url, it is not a valid URI. Hint.", error.message
+          assert_nil error.cause
+        end
+      end
+
+      describe ".parse_url with nil" do
+        it "raises, rather than parsing an empty url" do
+          error = assert_raises(URI::InvalidURIError) { SemanticLogger::Utils.parse_url(nil) }
+
+          assert_equal "Invalid :url, it is not a valid URI.", error.message
+        end
+      end
+
+      describe ".without_url_in_errors" do
+        it "returns the result of the block" do
+          assert_equal(42, SemanticLogger::Utils.without_url_in_errors { 42 })
+        end
+
+        it "raises an error of the same class, without the url in the message or as the cause" do
+          error_class = Class.new(StandardError)
+          error       = assert_raises(error_class) do
+            SemanticLogger::Utils.without_url_in_errors(option: ":brokers", errors: [error_class]) do
+              raise error_class, "bad broker: user:s3cr3t@host"
+            end
+          end
+
+          assert_equal "Invalid :brokers, it is not a valid URI.", error.message
+          assert_nil error.cause
+        end
+
+        it "leaves other errors alone" do
+          assert_raises(ArgumentError) { SemanticLogger::Utils.without_url_in_errors { raise ArgumentError } }
+        end
+      end
+
+      describe ".redacted_url" do
+        it "keeps only the scheme, host, and a port that is not the default" do
+          assert_equal "https://host:8443", SemanticLogger::Utils.redacted_url("https://user:pw@host:8443/t0ken?api_key=k")
+          assert_equal "https://host", SemanticLogger::Utils.redacted_url("https://host:443/path")
+          assert_equal "udp://host:514", SemanticLogger::Utils.redacted_url("udp://host:514")
+        end
+
+        it "shows nothing of an invalid url" do
+          assert_equal "(invalid url)", SemanticLogger::Utils.redacted_url("https://user:pa ss@host")
+        end
+      end
+
+      describe ".camelize" do
+        it "camelizes a simple term" do
+          assert_equal "FooBar", SemanticLogger::Utils.camelize("foo_bar")
+        end
+
+        it "converts slashes to namespaces" do
+          assert_equal "Foo::BarBaz", SemanticLogger::Utils.camelize("foo/bar_baz")
+        end
+
+        it "handles a single word" do
+          assert_equal "Foo", SemanticLogger::Utils.camelize("foo")
+        end
+      end
+
+      describe ".extract_path?" do
+        it "is true for semantic logger paths" do
+          assert SemanticLogger::Utils.extract_path?("/gems/foo/lib/semantic_logger/logger.rb:10")
+        end
+
+        it "is false for application paths" do
+          refute SemanticLogger::Utils.extract_path?("/app/models/user.rb:10")
+        end
+      end
+
+      describe ".extract_backtrace" do
+        it "strips leading semantic logger entries" do
+          stack = [
+            "/gems/foo/lib/semantic_logger/logger.rb:10",
+            "/gems/foo/lib/semantic_logger/base.rb:20",
+            "/app/models/user.rb:30",
+            "/gems/foo/lib/semantic_logger/log.rb:40"
+          ]
+          result = SemanticLogger::Utils.extract_backtrace(stack)
+
+          assert_equal "/app/models/user.rb:30", result.first
+          # Trailing semantic_logger entries are left in place.
+          assert_includes result, "/gems/foo/lib/semantic_logger/log.rb:40"
+        end
+
+        it "does not modify the supplied stack" do
+          stack = ["/gems/foo/lib/semantic_logger/logger.rb:10", "/app/models/user.rb:30"]
+          SemanticLogger::Utils.extract_backtrace(stack)
+
+          assert_equal ["/gems/foo/lib/semantic_logger/logger.rb:10", "/app/models/user.rb:30"], stack
+        end
+      end
+
+      describe ".strip_path?" do
+        it "is true for gem paths" do
+          gem_path = "#{Gem.default_dir}/gems/foo/lib/foo.rb:10"
+
+          assert SemanticLogger::Utils.strip_path?(gem_path)
+        end
+
+        it "is false for application paths" do
+          refute SemanticLogger::Utils.strip_path?("/app/models/user.rb:10")
+        end
+      end
+
+      describe ".exception_name" do
+        it "returns the name of the exception's class" do
+          assert_equal "ExceptionFixtures::BrokenMessageError", SemanticLogger::Utils.exception_name(BrokenMessageError.new)
+        end
+
+        it "returns the class as Ruby writes it for an anonymous class, which has no name" do
+          error_class = Class.new(StandardError)
+
+          assert_equal error_class.to_s, SemanticLogger::Utils.exception_name(error_class.new)
+          assert_match(/\A#<Class:0x\h+>\z/, SemanticLogger::Utils.exception_name(error_class.new))
+        end
+
+        it "names a class that names itself otherwise as Ruby names it, as Exception#inspect does" do
+          [OtherwiseNamedError, Class.new(StandardError) { def self.name = "PaymentError" }].each do |error_class|
+            error = error_class.new("declined")
+
+            assert_equal "#<#{SemanticLogger::Utils.exception_name(error)}: declined>", error.inspect
+          end
+
+          assert_equal "ExceptionFixtures::OtherwiseNamedError", SemanticLogger::Utils.exception_name(OtherwiseNamedError.new)
+        end
+
+        it "does not ask a class for its name, which can raise" do
+          assert_equal "ExceptionFixtures::UnnameableError", SemanticLogger::Utils.exception_name(UnnameableError.new)
+        end
+
+        it "returns the name in UTF-8, whatever the encoding of the class's constant" do
+          name = SemanticLogger::Utils.exception_name(ISO_8859_1_NAMED_ERROR.new)
+
+          assert_equal "ExceptionFixtures::FehlÄr", name
+          assert_equal Encoding::UTF_8, name.encoding
+        end
+      end
+
+      describe ".exception_message" do
+        it "returns the exception's message" do
+          assert_equal "disk full", SemanticLogger::Utils.exception_message(IOError.new("disk full"))
+        end
+
+        it "returns the message the exception was raised with when its #message raises" do
+          assert_equal "Order 7", SemanticLogger::Utils.exception_message(BrokenMessageError.new("Order 7"))
+        end
+
+        it "returns the message the exception was raised with when its #message raises NotImplementedError" do
+          assert_equal "Order 7", SemanticLogger::Utils.exception_message(AbstractMessageError.new("Order 7"))
+        end
+
+        it "raises an error from #message that is neither a StandardError nor a ScriptError" do
+          exception = RuntimeError.new("disk full")
+          exception.define_singleton_method(:message) { raise Interrupt }
+
+          assert_raises(Interrupt) { SemanticLogger::Utils.exception_message(exception) }
+        end
+
+        it "returns the class name when #message raises and the exception was raised without a message" do
+          assert_equal BrokenMessageError.name, SemanticLogger::Utils.exception_message(BrokenMessageError.new)
+        end
+
+        it "converts a message that is not a String" do
+          exception = RuntimeError.new
+          exception.define_singleton_method(:message) { :disk_full }
+
+          assert_equal "disk_full", SemanticLogger::Utils.exception_message(exception)
+        end
+
+        it "returns the message the exception was raised with when its #message cannot be converted to a String" do
+          text = Object.new
+          text.define_singleton_method(:to_s) { nil }
+          exception = RuntimeError.new("disk full")
+          exception.define_singleton_method(:message) { text }
+
+          assert_equal "disk full", SemanticLogger::Utils.exception_message(exception)
+        end
+      end
+
+      describe ".raised_message" do
+        it "returns the message the exception was raised with, without what its class's #message adds" do
+          exception = RuntimeError.new("disk full")
+          exception.define_singleton_method(:message) { "#{super()} on /var" }
+
+          assert_equal "disk full", SemanticLogger::Utils.raised_message(exception)
+        end
+
+        it "returns the class name when the exception was raised without a message" do
+          assert_equal "IOError", SemanticLogger::Utils.raised_message(IOError.new)
+        end
+
+        it "returns the class name when the message it was raised with cannot be converted to a String" do
+          message = Object.new
+          message.define_singleton_method(:to_s) { raise NoMethodError, "undefined method 'id' for nil" }
+
+          assert_equal "IOError", SemanticLogger::Utils.raised_message(IOError.new(message))
+        end
+
+        it "returns the class name when converting the message it was raised with raises NotImplementedError" do
+          message = Object.new
+          message.define_singleton_method(:to_s) { raise NotImplementedError }
+
+          assert_equal "IOError", SemanticLogger::Utils.raised_message(IOError.new(message))
+        end
+      end
+
+      describe ".to_json" do
+        # A binary string holding a byte (0xE2) that is not valid UTF-8.
+        let(:binary_string) { "Bad: \xE2".b }
+
+        it "serializes valid data directly" do
+          assert_equal '{"a":1,"b":"x"}', SemanticLogger::Utils.to_json({a: 1, b: "x"})
+        end
+
+        it "repairs and serializes non UTF-8 data without raising" do
+          result = SemanticLogger::Utils.to_json(
+            {message: binary_string, list: [binary_string], "k\xE2".b => binary_string}
+          )
+
+          assert_equal({"message" => "Bad: ", "list" => ["Bad: "], "k" => "Bad: "}, JSON.parse(result))
+        end
+
+        it "only cleanses on failure, leaving valid strings identical" do
+          # The cleansing fallback drops invalid bytes; a direct serialization keeps
+          # everything. A multibyte UTF-8 string proves no lossy round-trip occurred.
+          assert_equal '"€ café"', SemanticLogger::Utils.to_json("€ café")
+        end
+
+        it "writes a Symbol key whose name is neither UTF-8 nor ASCII" do
+          # UTF-8 bytes tagged US-ASCII, which json refuses from 2.9. JRuby cannot make such a Symbol.
+          skip "JRuby cannot make a US-ASCII Symbol outside ASCII" if defined?(JRUBY_VERSION)
+
+          key = "Café ☕".dup.force_encoding(Encoding::US_ASCII).to_sym
+
+          assert_equal({"Café ☕" => 1}, JSON.parse(SemanticLogger::Utils.to_json({key => 1})))
+        end
+
+        it "writes an object whose own #to_json cannot serialize it as its #to_s" do
+          broken = Object.new
+          def broken.to_json(*) = raise(JSON::GeneratorError, "cannot serialize")
+          def broken.to_s = "broken \xFF".b
+
+          assert_equal '{"value":"broken "}', SemanticLogger::Utils.to_json({value: broken})
+        end
+
+        it "re-raises other errors from an object's own #to_json, which repairing cannot fix" do
+          broken = Object.new
+          def broken.to_json(*) = raise(ArgumentError, "bug in #to_json")
+
+          assert_raises(ArgumentError) { SemanticLogger::Utils.to_json({value: broken}) }
+        end
+
+        it "serializes Infinity and NaN as strings" do
+          result = SemanticLogger::Utils.to_json(
+            {amount: "1e400".to_f, loss: -Float::INFINITY, ratio: Float::NAN, ok: 1.5}
+          )
+
+          assert_equal({"amount" => "Infinity", "loss" => "-Infinity", "ratio" => "NaN", "ok" => 1.5},
+                       JSON.parse(result))
+        end
+
+        it "serializes a structure nested as deeply as JSON.parse accepts" do
+          # A request body that JSON.parse accepts, logged inside the payload as
+          # rails_semantic_logger logs request params, is nested past the generator limit.
+          body   = "#{'{"a":' * 99}1#{'}' * 99}"
+          result = SemanticLogger::Utils.to_json({payload: {params: JSON.parse(body)}})
+
+          assert_kind_of Hash, JSON.parse(result)
+        end
+
+        it "serializes a structure that references itself" do
+          looped = {name: "loop"}
+          looped[:self] = looped
+
+          assert_kind_of Hash, JSON.parse(SemanticLogger::Utils.to_json(looped))
+        end
+
+        it "replaces a structure nested too deeply with a placeholder naming its class" do
+          nested = {"leaf" => 1}
+          99.times { nested = {"a" => nested} }
+
+          parsed = JSON.parse(SemanticLogger::Utils.to_json({payload: [nested]}))
+          parsed = parsed["payload"].first
+          29.times { parsed = parsed["a"] }
+
+          assert_equal "#<Hash nested too deeply>", parsed["a"]
+        end
+
+        [2_000, 100_000].each do |depth|
+          it "serializes a structure #{depth} levels deep without exhausting the stack" do
+            # Built iteratively: a recursive walk of the full depth raises SystemStackError,
+            # an Exception that would stop an async appender's worker thread.
+            nested = 1
+            depth.times { nested = [nested] }
+
+            parsed = JSON.parse(SemanticLogger::Utils.to_json({payload: nested, amount: Float::NAN}))
+
+            assert_equal "NaN", parsed["amount"]
+            assert_includes JSON.generate(parsed["payload"], max_nesting: false), "#<Array nested too deeply>"
+          end
+        end
+
+        it "does not reveal the instance variables of an object nested too deeply" do
+          client = Class.new do
+            def initialize
+              @password = "secret"
+            end
+          end.new
+          nested = [client]
+          40.times { nested = [nested] }
+
+          result = SemanticLogger::Utils.to_json({payload: nested, amount: Float::NAN})
+
+          refute_includes result, "secret"
+        end
+
+        describe "Struct and Data" do
+          let(:client) do
+            Class.new do
+              def initialize
+                @password = "secret"
+              end
+
+              def to_s
+                "#<Client>"
+              end
+
+              # Like any object without a #to_s of its own, whose #inspect lists its instance variables.
+              def inspect
+                "#<Client @password=\"secret\">"
+              end
+            end.new
+          end
+
+          it "serializes a Struct as an object of its members" do
+            point = Struct.new(:x, :y).new(1, "two")
+
+            assert_equal '{"point":{"x":1,"y":"two"}}', SemanticLogger::Utils.to_json({point: point})
+          end
+
+          it "serializes a Data instance as an object of its members" do
+            point = Data.define(:x, :y).new(x: 1, y: "two")
+
+            assert_equal '{"point":{"x":1,"y":"two"}}', SemanticLogger::Utils.to_json({point: point})
+          end
+
+          it "serializes a Struct passed on its own" do
+            assert_equal '{"x":1}', SemanticLogger::Utils.to_json(Struct.new(:x).new(1))
+          end
+
+          it "writes a member with #to_s like any other value, not #inspect" do
+            account = Data.define(:id, :client).new(id: 7, client: client)
+            result  = SemanticLogger::Utils.to_json({account: account})
+
+            assert_equal '{"account":{"id":7,"client":"#<Client>"}}', result
+            refute_includes result, "secret"
+          end
+
+          it "repairs the members of a Struct" do
+            values = Struct.new(:ratio, :name).new(Float::NAN, "Bad: \xE2".b)
+
+            assert_equal '{"values":{"ratio":"NaN","name":"Bad: "}}', SemanticLogger::Utils.to_json({values: values})
+          end
+
+          it "serializes Structs nested within Structs, Hashes, and Arrays" do
+            node   = Struct.new(:name, :children)
+            tree   = node.new("root", [node.new("leaf", {size: 1})])
+            parsed = JSON.parse(SemanticLogger::Utils.to_json({tree: tree}))
+
+            assert_equal({"name" => "root", "children" => [{"name" => "leaf", "children" => {"size" => 1}}]},
+                         parsed["tree"])
+          end
+
+          it "leaves a String that looks like an inspected Struct unchanged" do
+            message = "#<struct Point x=1>"
+
+            assert_equal %({"message":"#{message}"}), SemanticLogger::Utils.to_json({message: message})
+          end
+
+          it "replaces a Struct nested too deeply with a placeholder naming its class" do
+            nested = DeepNode.new(1)
+            40.times { nested = DeepNode.new(nested) }
+
+            assert_includes SemanticLogger::Utils.to_json({payload: nested}),
+                            '"#<SemanticLogger::UtilsTest::DeepNode nested too deeply>"'
+          end
+
+          it "serializes Structs nested 100,000 levels deep on a thread without exhausting the stack" do
+            # The json gem writes a Struct through Struct#inspect, which has no depth limit
+            # and raises SystemStackError a few hundred levels deep on a thread's smaller
+            # stack. This is the only test that exhausts the stack: Ruby 3.2 can crash
+            # when a process does so a second time.
+            node   = Struct.new(:child)
+            nested = 1
+            100_000.times { nested = node.new(nested) }
+
+            result = Thread.new { SemanticLogger::Utils.to_json({payload: nested}) }.value
+
+            assert_includes result, "nested too deeply"
+          end
+
+          it "replaces a structure nested too deeply within a Struct with a placeholder" do
+            # A request body as deep as JSON.parse accepts, held by a Struct.
+            request = Struct.new(:body).new(JSON.parse("#{'{"a":' * 99}1#{'}' * 99}"))
+
+            assert_includes SemanticLogger::Utils.to_json({payload: request}), '"#<Hash nested too deeply>"'
+          end
+
+          it "ends the recursion when #to_h does not return a Hash" do
+            odd = Struct.new(:x) do
+              def to_h = self
+            end.new(1)
+
+            assert_includes SemanticLogger::Utils.to_json({odd: odd}), "nested too deeply"
+          end
+        end
+      end
+
+      describe ".to_json with a Set, OpenStruct, or Exception" do
+        let(:client) do
+          Class.new do
+            def initialize
+              @password = "hunter2"
+            end
+          end.new
+        end
+
+        it "writes a Set as an array, not its #inspect" do
+          result = SemanticLogger::Utils.to_json({clients: Set[client, 1]})
+
+          refute_includes result, "hunter2"
+          assert_equal 1, JSON.parse(result)["clients"].last
+        end
+
+        it "writes a Set of plain values as an array, on Ruby 4.0 too, where its #inspect has no #<" do
+          result = SemanticLogger::Utils.to_json({ids: Set[1, 2], nested: [Set[3]]})
+
+          assert_equal({"ids" => [1, 2], "nested" => [[3]]}, JSON.parse(result))
+        end
+
+        it "writes an OpenStruct as an object, not its #inspect" do
+          require "ostruct"
+          # An application's OpenStruct, as logged in a payload.
+          config = OpenStruct.new(name: "billing", api: client) # rubocop:disable Style/OpenStructUse
+          result = SemanticLogger::Utils.to_json({config: config})
+
+          refute_includes result, "hunter2"
+          assert_equal "billing", JSON.parse(result)["config"]["name"]
+        end
+
+        it "ends the recursion when an OpenStruct's #to_h does not return a Hash" do
+          require "ostruct"
+          odd = Class.new(OpenStruct) { def to_h = self }.new(a: 1) # rubocop:disable Style/OpenStructUse
+
+          assert_includes(Thread.new { SemanticLogger::Utils.to_json({odd: odd}) }.value, "nested too deeply")
+          assert(Thread.new { SemanticLogger::Utils.nested_too_deeply?(odd) }.value)
+        end
+
+        it "writes a structure used as a Hash key as its JSON, not its #inspect" do
+          result = SemanticLogger::Utils.to_json({Set[client] => 1, Struct.new(:api).new(client) => 2})
+
+          refute_includes result, "hunter2"
+          assert_equal [1, 2], JSON.parse(result).values
+        end
+
+        it "keeps a Struct's own #to_json when other text in the entry holds #<" do
+          point  = Struct.new(:x) { def to_json(*) = '{"custom":true}' }.new(1)
+          result = SemanticLogger::Utils.to_json({message: "undefined method 'x' for #<Foo>", point: point})
+
+          assert_equal({"custom" => true}, JSON.parse(result)["point"])
+        end
+
+        it "writes an Exception as its message, repairing invalid UTF-8" do
+          error = RuntimeError.new((+"bad \xFF input").force_encoding(Encoding::UTF_8))
+
+          assert_equal({"error" => "bad  input"}, JSON.parse(SemanticLogger::Utils.to_json({error: error})))
+        end
+      end
+
+      describe ".json_ready" do
+        it "returns the value itself when JSON can write it" do
+          value = {a: [1, "b"], c: {d: nil}}
+
+          assert_same value, SemanticLogger::Utils.json_ready(value)
+        end
+
+        it "returns a copy that JSON can write otherwise" do
+          assert_equal({amount: "Infinity"}, SemanticLogger::Utils.json_ready({amount: Float::INFINITY}))
+        end
+
+        it "returns a copy with a binary Symbol key converted to UTF-8" do
+          key = SemanticLogger::Utils.json_ready({"Café \xFF".b.to_sym => 1}).keys.first
+
+          assert_equal :"Café ", key
+          assert_equal Encoding::UTF_8, key.encoding
+        end
+      end
+
+      describe ".structure?" do
+        it "is true for the values json_safe writes as an object or array" do
+          [{}, [], Set[], Struct.new(:a).new(1), Data.define(:a).new(a: 1)].each do |value|
+            assert SemanticLogger::Utils.structure?(value), "for #{value.inspect}"
+          end
+        end
+
+        it "is false for other values" do
+          ["text", 1, :sym, nil, Object.new].each do |value|
+            refute SemanticLogger::Utils.structure?(value), "for #{value.inspect}"
+          end
+        end
+      end
+
+      describe ".json_array?" do
+        it "is true for an Array or a Set" do
+          [[], Set[], Class.new(Array).new].each do |value|
+            assert SemanticLogger::Utils.json_array?(value), "for #{value.inspect}"
+          end
+        end
+
+        it "is false for any other value, even a structure" do
+          [{}, Struct.new(:a).new(1), Data.define(:a).new(a: 1), "text", nil].each do |value|
+            refute SemanticLogger::Utils.json_array?(value), "for #{value.inspect}"
+          end
+        end
+      end
+
+      describe ".structure_members" do
+        it "returns a Hash or an Array as it is" do
+          hash  = {a: 1}
+          array = [1]
+
+          assert_same hash, SemanticLogger::Utils.structure_members(hash)
+          assert_same array, SemanticLogger::Utils.structure_members(array)
+        end
+
+        it "returns the elements of a Set as an Array" do
+          assert_equal [1, 2], SemanticLogger::Utils.structure_members(Set[1, 2])
+        end
+
+        it "returns the #to_h of a Struct, Data, or OpenStruct" do
+          require "ostruct"
+          open_struct = OpenStruct.new(a: 1) # rubocop:disable Style/OpenStructUse
+
+          [Struct.new(:a).new(1), Data.define(:a).new(a: 1), open_struct].each do |value|
+            assert_equal({a: 1}, SemanticLogger::Utils.structure_members(value), value.inspect)
+          end
+        end
+
+        it "returns what #to_h returns, even when it is not a Hash" do
+          struct_class = Struct.new(:a) do
+            def to_h = [1]
+          end
+
+          assert_equal [1], SemanticLogger::Utils.structure_members(struct_class.new(1))
+        end
+      end
+
+      describe ".safe_inspect" do
+        it "returns #inspect for a value that can be inspected" do
+          assert_equal({a: [1, "b"]}.inspect, SemanticLogger::Utils.safe_inspect({a: [1, "b"]}))
+        end
+
+        it "renders a structure too deep for #inspect, cut off with a placeholder, on a thread" do
+          nested = "leaf"
+          5_000.times { nested = {a: nested} }
+
+          text = Thread.new { SemanticLogger::Utils.safe_inspect(nested) }.value
+
+          assert_includes text, "#<Hash nested too deeply>"
+          refute_includes text, "leaf"
+        end
+
+        it "renders with the block instead of #inspect, from the cut-off copy when too deep" do
+          nested = "leaf"
+          5_000.times { nested = {a: nested} }
+
+          assert_equal "1 entries", SemanticLogger::Utils.safe_inspect({a: 1}) { |value| "#{value.size} entries" }
+          assert_includes(Thread.new { SemanticLogger::Utils.safe_inspect(nested, &:to_s) }.value,
+                          "#<Hash nested too deeply>")
+        end
+
+        it "renders a structure that holds itself more than once, without copying it exponentially" do
+          looped     = {}
+          looped[:a] = looped
+          looped[:b] = looped
+
+          text = Timeout.timeout(5) { SemanticLogger::Utils.safe_inspect(looped) }
+
+          assert_equal({a: "#<Hash nested too deeply>", b: "#<Hash nested too deeply>"}.inspect, text)
+        end
+
+        it "renders the same structure repeatedly on one thread, without overflowing the stack" do
+          nested = "leaf"
+          5_000.times { nested = [nested] }
+
+          texts = Thread.new { Array.new(3) { SemanticLogger::Utils.safe_inspect({body: nested}) } }.value
+
+          assert_equal 1, texts.uniq.size
+          assert_includes texts.first, "#<Array nested too deeply>"
+        end
+      end
+
+      describe ".nested_too_deeply?" do
+        def chain(levels, &wrap)
+          levels.times.reduce("leaf") { |inner, _| wrap.call(inner) }
+        end
+
+        it "is false up to the depth that json_safe keeps, and true beyond it" do
+          depth = SemanticLogger::Utils::MAX_JSON_SAFE_DEPTH
+
+          refute SemanticLogger::Utils.nested_too_deeply?(chain(depth) { |inner| {a: inner} })
+          assert SemanticLogger::Utils.nested_too_deeply?(chain(depth + 1) { |inner| {a: inner} })
+          assert SemanticLogger::Utils.nested_too_deeply?(chain(depth + 1) { |inner| [inner] })
+        end
+
+        it "looks inside Hash keys, Structs, and Data" do
+          depth  = SemanticLogger::Utils::MAX_JSON_SAFE_DEPTH + 1
+          member = Struct.new(:inner)
+          value  = Data.define(:inner)
+
+          assert SemanticLogger::Utils.nested_too_deeply?({chain(depth) { |inner| [inner] } => 1})
+          assert SemanticLogger::Utils.nested_too_deeply?(chain(depth) { |inner| member.new(inner) })
+          assert SemanticLogger::Utils.nested_too_deeply?(chain(depth) { |inner| value.new(inner: inner) })
+        end
+
+        it "is false for values that are not structures" do
+          ["text", 1, nil, Object.new].each do |value|
+            refute SemanticLogger::Utils.nested_too_deeply?(value)
+          end
+        end
+
+        it "ends a structure that references itself" do
+          looped        = {}
+          looped[:self] = looped
+
+          assert SemanticLogger::Utils.nested_too_deeply?(looped)
+        end
+
+        it "ends the recursion when #to_h does not return a Hash, as json_safe does" do
+          odd = Struct.new(:x) { def to_h = self }.new(1)
+
+          assert(Thread.new { SemanticLogger::Utils.nested_too_deeply?({odd: odd}) }.value)
+          assert_includes(Thread.new { SemanticLogger::Utils.safe_inspect({odd: odd}) }.value, "nested too deeply")
+        end
+      end
+
+      describe ".encode_utf8" do
+        # A binary string holding a byte (0xE2) that is not valid UTF-8.
+        # This is the exact failure mode reported in issue #180.
+        let(:binary_string) { "Bad: \xE2".b }
+
+        # A string tagged as UTF-8 but containing an invalid byte sequence.
+        let(:invalid_utf8) { (+"Bad: \xE2").force_encoding(Encoding::UTF_8) }
+
+        it "returns a valid UTF-8 string unchanged" do
+          string = "Héllo"
+          result = SemanticLogger::Utils.encode_utf8(string)
+
+          assert_same string, result
+          assert_predicate result, :valid_encoding?
+        end
+
+        it "drops invalid bytes from a binary string" do
+          result = SemanticLogger::Utils.encode_utf8(binary_string)
+
+          assert_equal "Bad: ", result
+          assert_equal Encoding::UTF_8, result.encoding
+          assert_predicate result, :valid_encoding?
+        end
+
+        it "scrubs an invalid UTF-8 string" do
+          result = SemanticLogger::Utils.encode_utf8(invalid_utf8)
+
+          assert_equal "Bad: ", result
+          assert_equal Encoding::UTF_8, result.encoding
+          assert_predicate result, :valid_encoding?
+        end
+
+        it "transcodes a non UTF-8 encoding, preserving representable characters" do
+          result = SemanticLogger::Utils.encode_utf8("café".encode(Encoding::ISO_8859_1))
+
+          assert_equal "café", result
+          assert_equal Encoding::UTF_8, result.encoding
+        end
+
+        it "produces a string that can be serialized to JSON" do
+          result = SemanticLogger::Utils.encode_utf8(binary_string)
+
+          assert_equal '"Bad: "', result.to_json
+        end
+
+        it "recurses through nested hashes, cleansing keys and values" do
+          result = SemanticLogger::Utils.encode_utf8(
+            binary_string => {"inner\xE2".b => binary_string}
+          )
+
+          assert_equal({"Bad: " => {"inner" => "Bad: "}}, result)
+
+          all_strings = result.flat_map { |key, value| [key, *value.keys, *value.values] }
+
+          all_strings.each { |string| assert_predicate string, :valid_encoding? }
+        end
+
+        it "recurses through arrays" do
+          result = SemanticLogger::Utils.encode_utf8([binary_string, ["nested\xE2".b]])
+
+          assert_equal ["Bad: ", ["nested"]], result
+        end
+
+        it "leaves non-string scalars untouched" do
+          assert_equal 42, SemanticLogger::Utils.encode_utf8(42)
+          assert_equal :sym, SemanticLogger::Utils.encode_utf8(:sym)
+          assert_nil SemanticLogger::Utils.encode_utf8(nil)
+        end
+
+        it "returns a UTF-8 or ASCII Symbol unchanged" do
+          assert_same :café, SemanticLogger::Utils.encode_utf8(:café)
+          assert_same :plain, SemanticLogger::Utils.encode_utf8("plain".b.to_sym)
+        end
+
+        it "converts the name of a Symbol made from binary text, keeping its UTF-8 characters" do
+          result = SemanticLogger::Utils.encode_utf8("Café \xFF☕".b.to_sym)
+
+          assert_equal :"Café ☕", result
+          assert_equal Encoding::UTF_8, result.encoding
+        end
+
+        it "converts the name of a Symbol in another encoding" do
+          assert_equal :café, SemanticLogger::Utils.encode_utf8("café".encode(Encoding::ISO_8859_1).to_sym)
+          assert_equal :café, SemanticLogger::Utils.encode_utf8("café".encode(Encoding::UTF_16LE).to_sym)
+        end
+
+        it "replaces a structure nested too deeply with a placeholder, converting the rest" do
+          nested = {"leaf" => 1}
+          40.times { nested = {"a" => nested} }
+
+          result = SemanticLogger::Utils.encode_utf8({"body" => "Café".b, "tree" => nested})
+          tree   = result["tree"]
+          31.times { tree = tree["a"] }
+
+          assert_equal "Café", result["body"]
+          assert_equal "#<Hash nested too deeply>", tree
+        end
+
+        it "replaces a structure that holds itself with a placeholder where it repeats" do
+          looped         = {"name" => "Café".b}
+          looped["self"] = looped
+          looped["list"] = [looped]
+
+          result = SemanticLogger::Utils.encode_utf8(looped)
+
+          assert_equal "Café", result["name"]
+          assert_equal "#<Hash nested too deeply>", result["self"]
+          assert_equal ["#<Hash nested too deeply>"], result["list"]
+        end
+
+        it "leaves any other object as it is, without looking inside it" do
+          member = Struct.new(:text).new("Café".b)
+
+          assert_same member, SemanticLogger::Utils.encode_utf8([member]).first
+        end
+
+        it "converts Symbol keys" do
+          assert_equal({clé: 1}, SemanticLogger::Utils.encode_utf8({"clé".b.to_sym => 1}))
+        end
+      end
+
+      describe ".encode_utf8_string" do
+        it "keeps the UTF-8 characters of a binary string" do
+          result = Utils.encode_utf8_string("Café ☕".b)
+
+          assert_equal "Café ☕", result
+          assert_equal Encoding::UTF_8, result.encoding
+        end
+
+        it "keeps the UTF-8 characters of a binary string, dropping its invalid bytes" do
+          assert_equal "Café ☕", Utils.encode_utf8_string("Café \xFF☕".b)
+        end
+
+        it "drops the bytes of a binary string that are not UTF-8" do
+          assert_equal "caf", Utils.encode_utf8_string("caf\xE9".b)
+        end
+
+        it "keeps the UTF-8 characters of a US-ASCII string, as read where no locale is set" do
+          result = Utils.encode_utf8_string((+"Café").force_encoding(Encoding::US_ASCII))
+
+          assert_equal "Café", result
+          assert_equal Encoding::UTF_8, result.encoding
+        end
+
+        it "converts a string in another encoding" do
+          assert_equal "Grüße", Utils.encode_utf8_string("Gr\xFC\xDFe".dup.force_encoding(Encoding::ISO_8859_1))
+        end
+
+        it "reads a frozen binary string without changing it" do
+          string = "Café".b.freeze
+
+          assert_equal "Café", Utils.encode_utf8_string(string)
+          assert_equal Encoding::BINARY, string.encoding
+        end
+
+        # UTF-16 and UTF-32 say their byte order with a byte order mark; Unicode reads text without
+        # one as big-endian.
+        it "reads UTF-16 and UTF-32 text without a byte order mark as big-endian" do
+          utf16 = "Café ☕".encode(Encoding::UTF_16BE).force_encoding(Encoding::UTF_16)
+          utf32 = "Café ☕".encode(Encoding::UTF_32BE).force_encoding(Encoding::UTF_32)
+
+          assert_equal "Café ☕", Utils.encode_utf8_string(utf16)
+          assert_equal "Café ☕", Utils.encode_utf8_string(utf32)
+          assert_equal Encoding::UTF_16, utf16.encoding
+        end
+
+        it "reads UTF-16 and UTF-32 text in the byte order that its byte order mark says" do
+          little16 = ("\xFF\xFE".b + "Café".encode(Encoding::UTF_16LE).b).force_encoding(Encoding::UTF_16)
+          little32 = ("\xFF\xFE\x00\x00".b + "Café".encode(Encoding::UTF_32LE).b).force_encoding(Encoding::UTF_32)
+
+          assert_equal "Café", Utils.encode_utf8_string(little16)
+          assert_equal "Café", Utils.encode_utf8_string(little32)
+          assert_equal "Café", Utils.encode_utf8_string("Café".encode(Encoding::UTF_16))
+        end
+      end
+
+      describe ".serializing_log_data?" do
+        # Records whether Utils is serializing log data when it is asked for its JSON or message.
+        let(:probe) do
+          Class.new do
+            attr_reader :serializing
+
+            def to_json(*)
+              @serializing = SemanticLogger::Utils.serializing_log_data?
+              "{}"
+            end
+          end.new
+        end
+
+        it "is true for an object's own #to_json, called to serialize log data" do
+          Utils.to_json({payload: probe})
+
+          assert probe.serializing
+        end
+
+        it "is true however deep the object is, under others whose #to_json serializes a Hash" do
+          node = Struct.new(:child) { def to_json(*args) = {child: child}.to_json(*args) }
+          Utils.to_json((1..40).reduce(probe) { |child, _| node.new(child) })
+
+          assert probe.serializing
+        end
+
+        it "is true in each of the methods that serialize, when the data has to be repaired" do
+          answers = []
+          probe   = Class.new { define_method(:to_json) { |*| (answers << Utils.serializing_log_data?) && "{}" } }.new
+          # NaN takes the repair path, which asks .json_safe_object for the probe's JSON, serializes
+          # a Hash key that is itself a structure in .json_safe_members, and serializes the repaired
+          # copy in .to_json.
+          Utils.to_json({nan: Float::NAN, payload: probe, {key: probe} => 1})
+
+          assert_operator answers.size, :>=, 3
+          assert_predicate answers, :all?, "answers: #{answers.inspect}"
+        end
+
+        it "names only methods of Utils" do
+          (Utils::SERIALIZERS - ["to_json"]).each { |name| assert_respond_to Utils, name, include_all: true }
+        end
+
+        it "is true while readying data for a writer that serializes it" do
+          Utils.json_ready({payload: probe})
+
+          assert probe.serializing
+        end
+
+        it "is false for an exception's own #message, though Utils called it" do
+          serializing = :not_asked
+          error       = Class.new(StandardError) do
+            define_method(:message) { (serializing = Utils.serializing_log_data?) && "failed" }
+          end
+
+          Utils.exception_message(error.new)
+
+          refute serializing
+        end
+
+        it "is false outside Utils" do
+          refute_predicate Utils, :serializing_log_data?
+        end
+      end
+
+      describe ".join_texts" do
+        let(:latin1) { "Gr\xFC\xDFe".dup.force_encoding(Encoding::ISO_8859_1) }
+
+        # Like ActiveSupport::SafeBuffer: #to_s returns itself and #+ escapes the text added to it.
+        let(:safe_buffer_class) do
+          Class.new(String) do
+            def to_s = self
+            def +(other) = self.class.new(super(other.to_s.gsub("<", "&lt;")))
+          end
+        end
+
+        it "joins the texts" do
+          assert_equal "Boom -- Exception: RuntimeError: failed",
+                       Utils.join_texts("Boom", " -- Exception: ", RuntimeError, ": ", "failed")
+        end
+
+        it "joins values that are not Strings by their text" do
+          assert_equal " -- 42", Utils.join_texts(nil, " -- ", 42)
+        end
+
+        it "joins UTF-8 texts into a new String, leaving any invalid bytes as they are" do
+          message = "Caf\xC3".dup.force_encoding(Encoding::UTF_8)
+          result  = Utils.join_texts(message, " -- ", "Grüße")
+
+          assert_equal "Caf\xC3 -- Grüße".dup.force_encoding(Encoding::UTF_8), result
+          assert_equal Encoding::UTF_8, result.encoding
+          refute_same message, Utils.join_texts(message)
+        end
+
+        it "joins UTF-8 texts without the separator that Array#join adds by default" do
+          separator = $,
+          # Assigning $, warns that it is deprecated, when deprecation warnings are on.
+          capture_io { $, = "," }
+
+          assert_equal "Café -- x", Utils.join_texts("Café", " -- ", "x")
+        ensure
+          capture_io { $, = separator }
+        end
+
+        it "leaves text in another encoding as it is when the texts can be joined" do
+          result = Utils.join_texts(latin1, " -- ", "failed")
+
+          assert_equal Encoding::ISO_8859_1, result.encoding
+          assert_equal "Grüße -- failed", result.encode(Encoding::UTF_8)
+        end
+
+        it "converts a UTF-8 text and a binary one that holds other bytes to valid UTF-8" do
+          result = Utils.join_texts("Grüße", " -- ", "Datei \xFC kaputt".b)
+
+          assert_equal "Grüße -- Datei  kaputt", result
+          assert_predicate result, :valid_encoding?
+        end
+
+        it "converts an ASCII text and a binary one that holds other bytes to valid UTF-8" do
+          result = Utils.join_texts("Boom", " -- ", "Datei \xFC kaputt".b)
+
+          assert_equal "Boom -- Datei  kaputt", result
+          assert_equal Encoding::UTF_8, result.encoding
+        end
+
+        it "converts texts in other encodings that cannot be joined to UTF-8" do
+          assert_equal "Grüße -- Fehler ü", Utils.join_texts(latin1, " -- ", "Fehler ü")
+        end
+
+        it "keeps the UTF-8 characters of a binary text that it converts" do
+          result = Utils.join_texts("Calling API", " -- ", "Failed: エラー".b)
+
+          assert_equal "Calling API -- Failed: エラー", result
+          assert_predicate result, :valid_encoding?
+        end
+
+        it "keeps the UTF-8 characters of a binary text joined with a UTF-8 one" do
+          assert_equal "Grüße -- Fehler ü", Utils.join_texts("Grüße".b, " -- ", "Fehler ü")
+        end
+
+        it "keeps the UTF-8 characters of a US-ASCII text that it converts" do
+          text = (+"Fehler ü").force_encoding(Encoding::US_ASCII)
+
+          assert_equal "Grüße -- Fehler ü", Utils.join_texts("Grüße", " -- ", text)
+        end
+
+        it "leaves text in another encoding joined to an ASCII text as it is" do
+          result = Utils.join_texts("Import", " -- ", latin1)
+
+          assert_equal Encoding::ISO_8859_1, result.encoding
+          assert_equal "Import -- Grüße", result.encode(Encoding::UTF_8)
+        end
+
+        it "leaves a binary text joined with ASCII texts as it is" do
+          result = Utils.join_texts("Grüße".b, " -- ", "failed")
+
+          assert_equal Encoding::BINARY, result.encoding
+          assert_equal "Grüße -- failed".b, result
+        end
+
+        it "joins an object whose #to_s does not return a String" do
+          object = Object.new
+          object.define_singleton_method(:to_s) { nil }
+
+          assert_match(/\ABoom -- #<Object:0x\h+>\z/, Utils.join_texts("Boom", " -- ", object))
+        end
+
+        it "joins a String subclass as plain text" do
+          result = Utils.join_texts(safe_buffer_class.new("Loaded <rows>"), " -- ", "<z>")
+
+          assert_equal "Loaded <rows> -- <z>", result
+          assert_instance_of String, result
+        end
+      end
+
+      describe ".join_lines" do
+        let(:latin1) { "Gr\xFC\xDFe".dup.force_encoding(Encoding::ISO_8859_1) }
+
+        it "puts each line on a line of its own" do
+          assert_equal "app/a.rb:1\napp/b.rb:2", Utils.join_lines(["app/a.rb:1", "app/b.rb:2"])
+        end
+
+        it "returns an empty String for no lines" do
+          assert_equal "", Utils.join_lines([])
+        end
+
+        it "leaves lines in another encoding as they are when they can be joined" do
+          result = Utils.join_lines([latin1, "app/b.rb:2"])
+
+          assert_equal Encoding::ISO_8859_1, result.encoding
+          assert_equal "Grüße\napp/b.rb:2", result.encode(Encoding::UTF_8)
+        end
+
+        it "converts lines in encodings that cannot be joined to UTF-8" do
+          result = Utils.join_lines(["app/naïve.rb:1", latin1, "app/b.rb:2"])
+
+          assert_equal "app/naïve.rb:1\nGrüße\napp/b.rb:2", result
+          assert_equal Encoding::UTF_8, result.encoding
+        end
+
+        it "keeps the UTF-8 characters of a binary line joined with a UTF-8 one" do
+          assert_equal "app/naïve.rb:1\napp/café.rb:2", Utils.join_lines(["app/naïve.rb:1", "app/café.rb:2".b])
+        end
+
+        it "converts a binary line joined with ASCII ones to UTF-8, which Array#join would join as binary" do
+          result = Utils.join_lines(["app/a.rb:1", "app/café.rb:2".b, "app/\xFFb.rb:3".b])
+
+          assert_equal "app/a.rb:1\napp/café.rb:2\napp/b.rb:3", result
+          assert_equal Encoding::UTF_8, result.encoding
+        end
+
+        it "converts binary lines that hold bytes outside ASCII to UTF-8, even when every line is binary" do
+          result = Utils.join_lines(["app/café.rb:1".b, "app/naïve.rb:2".b])
+
+          assert_equal "app/café.rb:1\napp/naïve.rb:2", result
+          assert_equal Encoding::UTF_8, result.encoding
+        end
+
+        it "converts a binary first line that holds bytes outside ASCII to UTF-8" do
+          result = Utils.join_lines(["app/café.rb:1".b, "app/a.rb:2"])
+
+          assert_equal "app/café.rb:1\napp/a.rb:2", result
+          assert_equal Encoding::UTF_8, result.encoding
+        end
+
+        it "converts to UTF-8 US-ASCII lines that hold bytes outside ASCII, as Ruby's own can with no locale set" do
+          lines  = ["/srv/café/app.rb:1:in 'boom'", "/srv/café/app.rb:2:in '<main>'", "app/\xFFb.rb:3"]
+          result = Utils.join_lines(lines.map { |line| line.dup.force_encoding(Encoding::US_ASCII) })
+
+          assert_equal "/srv/café/app.rb:1:in 'boom'\n/srv/café/app.rb:2:in '<main>'\napp/b.rb:3", result
+          assert_equal Encoding::UTF_8, result.encoding
+          assert_predicate result, :valid_encoding?
+        end
+
+        it "leaves ASCII-only binary and US-ASCII lines as they are" do
+          result = Utils.join_lines(["app/a.rb:1".dup.force_encoding(Encoding::US_ASCII), "app/b.rb:2".b])
+
+          assert_equal "app/a.rb:1\napp/b.rb:2", result
+          assert_equal Encoding::US_ASCII, result.encoding
+        end
+
+        it "drops the invalid bytes of a UTF-8 line joined with a line it converts" do
+          result = Utils.join_lines(["app/na\xFFïve.rb:1", latin1])
+
+          assert_equal "app/naïve.rb:1\nGrüße", result
+          assert_predicate result, :valid_encoding?
+        end
+
+        it "converts each of a few thousand lines in mixed encodings once, rather than the text joined so far" do
+          lines     = Array.new(4000) { |i| i.even? ? "app/naïve.rb:#{i}" : "app/café.rb:#{i}".b }
+          expected  = Array.new(4000) { |i| i.even? ? "app/naïve.rb:#{i}" : "app/café.rb:#{i}" }.join("\n")
+          converted = 0
+          encode    = Utils.method(:encode_utf8_string)
+          counting  = lambda do |text|
+            converted += text.bytesize
+            encode.call(text)
+          end
+
+          result = Utils.stub(:encode_utf8_string, counting) { Utils.join_lines(lines) }
+
+          assert_equal expected, result
+          assert_predicate converted, :positive?
+          assert_operator converted, :<=, lines.sum(&:bytesize)
+        end
+      end
+    end
+  end
+end

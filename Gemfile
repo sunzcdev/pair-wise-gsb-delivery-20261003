@@ -1,0 +1,61 @@
+source "https://rubygems.org"
+
+gemspec
+
+gem "amazing_print"
+gem "minitest", "~> 6.0"
+gem "minitest-mock"
+gem "minitest-reporters"
+gem "minitest-shared_description"
+gem "minitest-stub_any_instance"
+# OpenStruct, for the tests of how it is logged: a bundled gem since Ruby 4.0.
+gem "ostruct"
+gem "rake"
+gem "rspec"
+gem "simplecov", require: false
+gem "solargraph", require: false, platform: :ruby
+
+# [optional] Bugsnag appender
+gem "bugsnag"
+# [optional] Rabbitmq appender
+gem "bunny"
+# [optional] Elasticsearch appender
+# 7.14 has a breaking API change.
+gem "elasticsearch", "~>7.13.0"
+# [optional] OpenSearch appender
+gem "opensearch-ruby"
+# [optional] Graylog appender
+gem "gelf"
+# [optional] Honeybadger appender
+gem "honeybadger"
+# [optional] Kafka appender
+gem "ruby-kafka"
+# [optional] MongoDB appender
+gem "base64"
+gem "mongo"
+# [optional] NewRelic appender ( Tests use a mock class )
+# gem 'newrelic_rpm'
+# [optional] Open Telemetry appender
+gem "opentelemetry-logs-sdk"
+# [optional] Net::TCP appender
+gem "net_tcp_client"
+# [optional] Splunk appender
+gem "nokogiri"
+gem "splunk-sdk-ruby"
+# [optional] Statsd metrics
+gem "statsd-ruby"
+# [optional] legacy Sentry appender
+gem "sentry-raven"
+# [optional] new Sentry appender
+gem "sentry-ruby"
+# [optional] Syslog appender: syslog for a local syslog daemon (a bundled gem since Ruby 3.4),
+# syslog_protocol for a remote syslogd over TCP or UDP
+gem "syslog"
+gem "syslog_protocol"
+# [optional] CloudWatch Logs appender
+gem "aws-sdk-cloudwatchlogs"
+
+gem "rubocop", "~> 1.79.0", require: false
+gem "rubocop-minitest", require: false
+gem "rubocop-rake", require: false
+gem "rubocop-rspec", require: false

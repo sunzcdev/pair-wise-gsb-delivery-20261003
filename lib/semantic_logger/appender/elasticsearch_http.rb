@@ -1,0 +1,102 @@
+require "date"
+# Forward all log messages to Elasticsearch one at a time via a HTTP post.
+#
+# Note:
+# * Other than in very low volume environments it is recommended to rather use the Elasticsearch appender,
+#   since it supports bulk logging. This appender cannot be batched: with `batch: true`, add_appender raises
+#   ArgumentError (see #batch_refusal).
+#
+# Example:
+#   SemanticLogger.add_appender(
+#     appender: :elasticsearch_http,
+#     url:      'http://localhost:9200'
+#   )
+module SemanticLogger
+  module Appender
+    class ElasticsearchHttp < SemanticLogger::Appender::Http
+      attr_accessor :index
+
+      # Create Elasticsearch appender over persistent HTTP(S)
+      #
+      # Parameters:
+      #   index: [String]
+      #     Prefix of the index to store the logs in Elasticsearch.
+      #     The final index appends the date so that indexes are used per day.
+      #       I.e. The final index will look like 'semantic_logger-YYYY.MM.DD'
+      #     Default: 'semantic_logger'
+      #
+      #   type: [String]
+      #     Deprecated and ignored. Document `_type` has been unused since
+      #     Elasticsearch 7. Passing it logs a deprecation warning; it will be
+      #     removed in v6.
+      #
+      #   level: [:trace | :debug | :info | :warn | :error | :fatal]
+      #     Override the log level for this appender.
+      #     Default: none (:trace), so it writes every entry that a logger emits; each logger
+      #     filters by its own level.
+      #
+      #   formatter: [Object|Proc|Symbol|Hash]
+      #     An instance of a class that implements #call, or a Proc to be used to format
+      #     the output from this appender
+      #     Default: Use the built-in formatter (See: #call)
+      #
+      #   filter: [Regexp|Proc]
+      #     RegExp: Only include log messages where the class name matches the supplied.
+      #     regular expression. All other messages will be ignored.
+      #     Proc: Only include log messages where the supplied Proc returns true
+      #           The Proc must return true or false.
+      #
+      #   host: [String]
+      #     Name of this host to appear in log messages.
+      #     Default: SemanticLogger.host
+      #
+      #   application: [String]
+      #     Name of this application to appear in log messages.
+      #     Default: SemanticLogger.application
+      def initialize(index: "semantic_logger",
+                     type: nil,
+                     url: "http://localhost:9200",
+                     **http_args,
+                     &)
+        if type
+          Deprecation.warn(
+            "The Elasticsearch/OpenSearch appender `type:` parameter is deprecated and will be removed in v6. " \
+            "Document `_type` has been unused since Elasticsearch 7 and is ignored by OpenSearch."
+          )
+        end
+
+        @index = index
+        super(url: url, **http_args, &)
+
+        @request_path = "#{@path.end_with?('/') ? @path : "#{@path}/"}#{@index}-%Y.%m.%d"
+        @logging_path = "#{@request_path}/_doc"
+      end
+
+      # Log to the index for today.
+      def log(log)
+        post(format_log(log), log.time.strftime(@logging_path))
+      end
+
+      # Deletes all log data captured for a day.
+      def delete_all(date = Date.today)
+        delete(date.strftime(@request_path))
+      end
+
+      # Elasticsearch indexes a batch of documents only through its bulk API, which the :elasticsearch
+      # appender uses. The #batch inherited from Appender::Http posts the batch as a JSON array to the
+      # url's own path, such as `/`, which Elasticsearch rejects, so add_appender refuses to batch it.
+      #
+      # Answers only while that #batch is the one in use (see Subscriber#batch_defined_by?), so that a
+      # subclass with a #batch of its own, such as one that posts the batch to the bulk API, is batched
+      # as before. One whose #batch calls super still posts a JSON array, so it defines its own
+      # #batch_refusal.
+      def batch_refusal
+        return unless batch_defined_by?(Http)
+
+        "Elasticsearch indexes a batch of entries only through its bulk API, which this appender does not " \
+          "use. Use appender: :elasticsearch to send the entries in batches, or add this appender without " \
+          "batch: true."
+      end
+    end
+  end
+end

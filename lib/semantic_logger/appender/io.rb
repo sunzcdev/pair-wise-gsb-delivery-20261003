@@ -1,0 +1,77 @@
+# Loaded now rather than autoloaded, since #log writes with it on the calling thread when this is the
+# internal logger, which can be in a signal trap, where Ruby does not allow a require.
+require "semantic_logger/appender/text_output"
+
+# File appender
+#
+#   Writes log messages to a file or open iostream
+#
+module SemanticLogger
+  module Appender
+    class IO < SemanticLogger::Subscriber
+      # Create a Stream Logger appender instance.
+      #
+      # Parameters
+      #  io [IO]
+      #    An IO stream to which to write the log messages to.
+      #
+      #  :level [:trace | :debug | :info | :warn | :error | :fatal]
+      #    Override the log level for this appender.
+      #    Default: none (:trace), so it writes every entry that a logger emits; each logger
+      #    filters by its own level.
+      #
+      #  :formatter: [Object|Proc]
+      #    An instance of a class that implements #call, or a Proc to be used to format
+      #    the output from this appender
+      #    Default: Use the built-in formatter (See: #call)
+      #
+      #  :filter [Regexp|Proc]
+      #    RegExp: Only include log messages where the class name matches the supplied
+      #    regular expression. All other messages will be ignored.
+      #    Proc: Only include log messages where the supplied Proc returns true
+      #          The Proc must return true or false.
+      #
+      # Example
+      #    require "semantic_logger"
+      #
+      #    # Log :info and above
+      #    SemanticLogger.default_level = :info
+      #
+      #    # Log to screen
+      #    SemanticLogger.add_appender(io: $stdout, formatter: :color)
+      #
+      #    logger = SemanticLogger['test']
+      #    logger.info 'Hello World'
+      def initialize(io, **args, &)
+        @io = io
+        unless @io.respond_to?(:write)
+          raise(ArgumentError, "SemanticLogging::Appender::IO io is not a valid IO instance: #{io.inspect}")
+        end
+
+        super(**args, &)
+      end
+
+      def log(log)
+        # Since only one appender thread writes to the IO at a time, it is not necessary to protect
+        # access to it. The line is made as part of the formatting, so that a formatter's output that
+        # cannot be one, such as nil, is taken for the entry's error.
+        TextOutput.write(@io, format_log(log) { |text| TextOutput.line(text) })
+        true
+      end
+
+      # Flush all pending logs to disk.
+      #  Waits for all sent documents to be written to disk
+      def flush
+        @io.flush if @io.respond_to?(:flush)
+      end
+
+      def console_stream
+        if @io.equal?($stdout)
+          :stdout
+        elsif @io.equal?($stderr)
+          :stderr
+        end
+      end
+    end
+  end
+end

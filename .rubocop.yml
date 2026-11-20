@@ -1,0 +1,129 @@
+inherit_from: .rubocop_todo.yml
+
+plugins:
+  - rubocop-minitest
+  - rubocop-rake
+  - rubocop-rspec
+
+AllCops:
+  Exclude:
+    - ".git/**/*"
+    - "docs/**/*"
+    # CI installs gems into vendor/bundle via bundler-cache; don't lint them.
+    - "vendor/**/*"
+  NewCops: enable
+  TargetRubyVersion: 3.2
+
+#
+# RuboCop built-in settings.
+#   For documentation on all settings see: https://docs.rubocop.org/en/stable
+#
+
+# Trailing periods.
+Layout/DotPosition:
+  EnforcedStyle: trailing
+
+# Turn on auto-correction of equals alignment.
+Layout/EndAlignment:
+  AutoCorrect: true
+
+# Prevent accidental windows line endings
+Layout/EndOfLine:
+  EnforcedStyle: lf
+
+# Standard 120 column limit
+Layout/LineLength:
+  Max: 120
+
+# Use a table layout for hashes
+Layout/HashAlignment:
+  EnforcedHashRocketStyle: table
+  EnforcedColonStyle: table
+
+# Match existing layout
+Layout/SpaceInsideHashLiteralBraces:
+  EnforcedStyle: no_space
+
+# Allow several expectations per example; specs commonly assert on multiple
+# attributes of a captured log event in one example.
+RSpec/MultipleExpectations:
+  Enabled: false
+
+# Support long block lengths for tests
+Metrics/BlockLength:
+  Exclude:
+    - "test/**/*"
+    - "spec/**/*"
+    - "**/*/cli.rb"
+
+# Soften limits
+Metrics/ClassLength:
+  Max: 275
+  Exclude:
+    - "test/**/*"
+    - "spec/**/*"
+    # Large abstract base class shared by Logger and Subscriber.
+    - "lib/semantic_logger/base.rb"
+
+# Soften limits
+Metrics/MethodLength:
+  Max: 50
+
+# Soften limits
+Metrics/ModuleLength:
+  Max: 250
+
+Metrics/ParameterLists:
+  CountKeywordArgs: false
+
+# Initialization Vector abbreviation
+Naming/MethodParameterName:
+  AllowedNames: ['iv', '_', 'io', 'ap', 'on']
+
+# Loggable is a mixin: it memoizes into @semantic_logger rather than @logger so
+# that it never clashes with an @logger instance variable in the including class.
+Naming/MemoizedInstanceVariableName:
+  Exclude:
+    - "lib/semantic_logger/loggable.rb"
+
+# Does not allow Symbols to load
+Security/YAMLLoad:
+  AutoCorrect: false
+
+# Needed for testing DateTime
+Style/DateTime:
+  Exclude: ["test/**/*"]
+
+# TODO: Soften Limits for phase 1 only
+Style/Documentation:
+  Enabled: false
+
+# One line methods
+Style/EmptyMethod:
+  EnforcedStyle: expanded
+
+# Ruby 3 compatibility feature
+Style/FrozenStringLiteralComment:
+  Enabled: false
+
+Style/NumericPredicate:
+  AutoCorrect: true
+
+# Incorrectly changes job.fail to job.raise
+Style/SignalException:
+  Enabled: false
+
+# Since English may not be loaded, cannot force its use.
+Style/SpecialGlobalVars:
+  Enabled: false
+
+# Make it easier for developers to move between Elixir and Ruby.
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+# The Pattern formatter uses %{...} template tokens as its own pattern syntax,
+# not as Ruby format strings, so the annotated-token preference does not apply.
+Style/FormatStringToken:
+  Exclude:
+    - "lib/semantic_logger/formatters/pattern.rb"
+    - "test/formatters/pattern_test.rb"

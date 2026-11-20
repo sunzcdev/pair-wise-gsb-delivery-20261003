@@ -1,0 +1,166 @@
+require_relative "../test_helper"
+require "syslog"
+
+module SemanticLogger
+  module Formatters
+    class SyslogCeeTest < Minitest::Test
+      describe SyslogCee do
+        let(:log_time) do
+          Time.utc(2017, 1, 14, 8, 32, 5.375276)
+        end
+
+        let(:level) do
+          :debug
+        end
+
+        let(:log) do
+          # :level, :thread_name, :name, :message, :payload, :time, :duration, :tags, :level_index,
+          # :exception, :metric, :backtrace, :metric_amount, :named_tags
+          log      = SemanticLogger::Log.new("SyslogCeeTest", level)
+          log.time = log_time
+          log
+        end
+
+        let(:expected_time) do
+          SemanticLogger::Formatters::Base::PRECISION == 3 ? "2017-01-14 08:32:05.375" : "2017-01-14 08:32:05.375276"
+        end
+
+        let(:set_exception) do
+          raise "Oh no"
+        rescue Exception => e
+          log.exception = e
+        end
+
+        let(:backtrace) do
+          [
+            "test/formatters/default_test.rb:99:in `block (2 levels) in <class:DefaultTest>'",
+            "gems/ruby-2.3.3/gems/minitest-5.10.1/lib/minitest/spec.rb:247:in `instance_eval'",
+            "gems/ruby-2.3.3/gems/minitest-5.10.1/lib/minitest/spec.rb:247:in `block (2 levels) in let'",
+            "gems/ruby-2.3.3/gems/minitest-5.10.1/lib/minitest/spec.rb:247:in `fetch'",
+            "ruby-2.3.3/gems/minitest-5.10.1/lib/minitest/spec.rb:247:in `block in let'",
+            "test/formatters/default_test.rb:65:in `block (3 levels) in <class:DefaultTest>'",
+            "ruby-2.3.3/gems/minitest-5.10.1/lib/minitest/test.rb:105:in `block (3 levels) in run'"
+          ]
+        end
+
+        let(:appender) do
+          SemanticLogger::Appender::Syslog.new(formatter: :syslog_cee)
+        end
+
+        let(:formatter) do
+          formatter = appender.formatter
+          formatter.max_size = appender.max_size
+          # We need to use logger to test this formatter
+          formatter.call(log, appender.logger)
+          formatter
+        end
+
+        describe "header names" do
+          it "leaves out the characters outside printable ASCII, and cuts the application name to 32" do
+            logger = SemanticLogger::Appender::IO.new(StringIO.new, host: "café 1", application: "Café #{'a' * 40}")
+            packet = SemanticLogger::Formatters::SyslogCee.new.call(log, logger)
+
+            assert_includes packet, " caf1 Caf#{'a' * 29}: @cee: "
+          end
+        end
+
+        describe "name" do
+          it "logs name" do
+            assert_equal "SyslogCeeTest", formatter.name
+          end
+        end
+
+        describe "call" do
+          # PRI is facility number * 8 + severity: user (1) and debug, which maps to LOG_INFO (6).
+          it "sends the user facility by default" do
+            assert_match(/\A<14>/, formatter.call(log, appender.logger))
+          end
+
+          it "converts a level_map hash into a LevelMap" do
+            mapped = SyslogCee.new(level_map: {warn: SemanticLogger::Formatters::Syslog::LOG_NOTICE})
+
+            assert_equal SemanticLogger::Formatters::Syslog::LOG_NOTICE, mapped.level_map[:warn]
+            assert_equal SemanticLogger::Formatters::Syslog::LOG_CRIT, mapped.level_map[:fatal]
+          end
+
+          it "rejects an invalid facility set after creation" do
+            assert_raises(ArgumentError) { SyslogCee.new.facility = 1 }
+          end
+
+          it "rejects an invalid facility when the formatter is created" do
+            assert_raises(ArgumentError) { SemanticLogger::Formatters::SyslogCee.new(facility: 1) }
+          end
+
+          it "formats with the default max_size of 1024 bytes when none is supplied" do
+            formatter = SemanticLogger::Formatters::SyslogCee.new
+
+            assert_equal 1024, formatter.max_size
+            assert_match(/@cee:/, formatter.call(log, appender.logger))
+          end
+
+          it "uses CEE format" do
+            assert_match(/@cee:/, formatter.call(log, appender.logger))
+          end
+
+          it "accepts the options of the raw formatter" do
+            formatter = SemanticLogger::Formatters::SyslogCee.new(log_host: false, log_application: false)
+            output    = formatter.call(log, appender.logger)
+
+            refute_match(/"host":/, output)
+            refute_match(/"application":/, output)
+          end
+
+          it "accepts the options of the raw formatter given to the syslog appender" do
+            appender = SemanticLogger::Appender::Syslog.new(url: "udp://127.0.0.1:514", max_size: 2048,
+                                                            formatter: {syslog_cee: {log_host: false}})
+
+            assert_equal 2048, appender.formatter.max_size
+            refute_match(/"host":/, appender.formatter.call(log, appender.logger))
+          end
+
+          it "process log with payload" do
+            log.payload = {is_test: true}
+
+            assert_match(/"is_test":true/, formatter.call(log, appender.logger))
+          end
+
+          it "includes host name" do
+            formatted_log = formatter.call(log, appender.logger)
+
+            assert_equal true, formatted_log.include?(appender.logger.host)
+          end
+
+          it "includes application name" do
+            formatted_log = formatter.call(log, appender.logger)
+
+            assert_equal true, formatted_log.include?(appender.logger.application)
+          end
+
+          it "includes environment" do
+            formatted_log = formatter.call(log, appender.logger)
+
+            assert_equal true, formatted_log.include?(appender.logger.environment)
+          end
+
+          it "includes correct log level" do
+            assert_match(/"level":"debug"/, formatter.call(log, appender.logger))
+          end
+
+          describe "when exception was raised" do
+            it "logs exception name" do
+              set_exception
+
+              assert_match(/"name":"RuntimeError"/, formatter.call(log, appender.logger))
+            end
+
+            it "logs exception message" do
+              set_exception
+
+              assert_match(/"message":"Oh no"/, formatter.call(log, appender.logger))
+            end
+          end
+        end
+      end
+    end
+  end
+end

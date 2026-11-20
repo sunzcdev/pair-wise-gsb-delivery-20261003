@@ -1,0 +1,147 @@
+# Semantic Logger
+[![Gem Version](https://img.shields.io/gem/v/semantic_logger.svg)](https://rubygems.org/gems/semantic_logger) [![Build Status](https://github.com/reidmorrison/semantic_logger/workflows/build/badge.svg)](https://github.com/reidmorrison/semantic_logger/actions?query=workflow%3Abuild) [![Downloads](https://img.shields.io/gem/dt/semantic_logger.svg)](https://rubygems.org/gems/semantic_logger) [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/reidmorrison/semantic_logger/badges/coverage.json)](https://github.com/reidmorrison/semantic_logger/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-Apache%202.0-brightgreen.svg)](http://opensource.org/licenses/Apache-2.0) ![](https://img.shields.io/badge/status-Production%20Ready-blue.svg)
+
+Semantic Logger is a high-performance, asynchronous structured logging framework for Ruby
+and Rails.
+
+It differs from ordinary loggers in two important ways:
+
+1. **It logs structured data, not just strings.** Along with the text message, each log entry can
+   carry a payload (any Hash), an exception, a duration, metrics, and tags. That data is preserved
+   all the way to the destination, so it stays searchable instead of being flattened into text.
+2. **It logs asynchronously.** Log events are pushed onto an in-memory queue and written to their
+   destinations by a separate background thread, so your application is not blocked while logs are
+   written. Semantic Logger can log thousands of lines per second without slowing the application
+   down.
+
+```ruby
+require "semantic_logger"
+
+SemanticLogger.default_level = :info
+SemanticLogger.add_appender(io: $stdout, formatter: :color)
+
+logger = SemanticLogger["MyApp"]
+
+# A plain message, plus structured data that stays searchable
+logger.info("Queried users table", duration: 54, result: :ok, table: "users")
+
+# Log an exception with its full backtrace, plus context
+logger.error("Failed to process order", exception: exception, order_id: 42)
+
+# Measure and log how long a block takes to run
+logger.measure_info("Reindexing users") { reindex_users }
+```
+
+When running Rails, use
+[rails_semantic_logger](https://github.com/reidmorrison/rails_semantic_logger) instead, since it
+replaces the Rails default logger with Semantic Logger automatically.
+
+## Documentation
+
+Start with the [Introduction](https://logger.reidmorrison.com/), then the
+[Programmer's Guide](https://logger.reidmorrison.com/api.html).
+
+* Full guide: [https://logger.reidmorrison.com/](https://logger.reidmorrison.com/)
+* For AI assistants: [llms.txt](https://logger.reidmorrison.com/llms.txt) (documentation index) and
+  [llms-full.txt](https://logger.reidmorrison.com/llms-full.txt) (complete documentation in one file).
+  The same pages are also included as markdown in the installed gem, under `docs/`.
+
+## Logging Destinations
+
+Logging to the following destinations are all supported "out-of-the-box":
+
+* File
+* Screen
+* ElasticSearch. (Use with Kibana for Dashboards and Visualizations)
+* Graylog
+* BugSnag
+* NewRelic
+* Splunk
+* MongoDB
+* Honeybadger (exceptions and events)
+* Sentry (both with legacy `sentry-raven` and modern `sentry-ruby` gem)
+* HTTP
+* TCP
+* UDP
+* Syslog
+* CloudWatch Logs
+* OpenTelemetry
+* Add any existing Ruby logger as another destination.
+* Roll-your-own
+
+Semantic Logger is capable of logging thousands of lines per second without slowing
+down the application. Traditional logging systems make the application wait while
+the log information is being saved. Semantic Logger avoids this slowdown by pushing
+log events to an in-memory queue that is serviced by a separate thread that only
+handles saving log information to multiple destinations / appenders.
+
+## Rails
+
+When running Rails, use [rails_semantic_logger](http://github.com/reidmorrison/rails_semantic_logger)
+instead of Semantic Logger directly since it will automatically replace the Rails default logger with Semantic Logger.
+
+## Rocket Job
+
+Checkout the sister project [Rocket Job](https://rocketjob.reidmorrison.com): Ruby's missing batch system.
+
+Fully supports Semantic Logger when running jobs in the background. Complete support for job metrics
+sent via Semantic Logger to your favorite dashboards.
+
+## Optional Dependencies
+
+The following gems are only required when their corresponding appenders are being used,
+and are therefore not automatically included by this gem:
+- Bugsnag Appender: gem 'bugsnag'
+- MongoDB Appender: gem 'mongo' 1.9.2 or above
+- Honeybadger Appender: gem 'honeybadger'
+- HoneybadgerInsights Appender: gem 'honeybadger'
+- NewRelic Appender: gem 'newrelic_rpm'
+- NewRelicLogs Appender: gem 'newrelic_rpm'
+- Syslog Appender to a local syslog daemon: gem 'syslog' (a bundled gem since Ruby 3.4)
+- Syslog Appender to a remote syslog server over TCP or UDP: gem 'syslog_protocol' 0.9.2 or above
+- Syslog Appender to a remote syslog server over TCP: gem 'net_tcp_client'
+- Splunk Appender (deprecated, use the Splunk HTTP appender): gem 'splunk-sdk-ruby'
+- Elasticsearch Appender: gem 'elasticsearch'
+- OpenSearch Appender: gem 'opensearch-ruby'
+- Kafka Appender: gem 'ruby-kafka'
+- Legacy Sentry Appender: gem 'sentry-raven' (deprecated)
+- Sentry Appender: gem 'sentry-ruby'
+- OpenTelemetry Appender: gem 'opentelemetry-logs-sdk' (plus an exporter, e.g. 'opentelemetry-exporter-otlp-logs')
+
+## Upgrading
+
+See the [Upgrading Guide](https://logger.reidmorrison.com/upgrading.html) for instructions on
+upgrading between major versions.
+
+## Install
+
+    gem install semantic_logger
+
+To configure a stand-alone application for Semantic Logger:
+
+~~~ruby
+require 'semantic_logger'
+
+# Set the global default log level
+SemanticLogger.default_level = :trace
+
+# Log to a file, and use the colorized formatter
+SemanticLogger.add_appender(file_name: 'development.log', formatter: :color)
+~~~
+
+If running rails, see: [Semantic Logger Rails](https://logger.reidmorrison.com/rails.html)
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to set up the project, run the
+tests, and an overview of the architecture, including a class diagram.
+
+## Author
+
+[Reid Morrison](https://github.com/reidmorrison)
+
+[Contributors](https://github.com/reidmorrison/semantic_logger/graphs/contributors)
+
+## Versioning
+
+This project uses [Semantic Versioning](http://semver.org/).
