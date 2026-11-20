@@ -457,4 +457,143 @@ RSpec.describe Faraday::Adapter::Test do
       expect(stubs).to be_empty
     end
   end
+
+  describe Faraday::Adapter::Test::Stream do
+    # Middleware that records whether the response reached the completed stage.
+    class CompletionTracker < Faraday::Middleware
+      def initialize(app, sink)
+        super(app)
+        @sink = sink
+      end
+
+      def on_complete(_env)
+        @sink.call
+      end
+    end
+
+    let(:adapter_class) { Faraday::Adapter::Test }
+    let(:stream_stubs) { adapter_class::Stubs.new }
+    let(:stream_connection) do
+      Faraday.new do |builder|
+        builder.adapter :test, stream_stubs
+      end
+    end
+
+    # The same consumer is used for every stub: it records each chunk and keeps
+    # the running cumulative length reported by Env's on_data callback.
+    let(:received) { [] }
+    let(:consumer) do
+      proc do |chunk, cumulative_size, _env|
+        received << [chunk, cumulative_size]
+      end
+    end
+
+    def request(path)
+      stream_connection.get(path) do |req|
+        req.options.on_data = consumer
+      end
+    end
+
+    let(:headers) { { 'Content-Type' => 'text/plain' } }
+
+    describe 'driving Env streaming callbacks' do
+      let!(:chunked) do
+        stream = adapter_class::Stream.new(200, headers, %w[hel lo world])
+        stream_stubs.get('/chunked') { stream }
+        stream
+      end
+
+      let!(:empty) do
+        stream = adapter_class::Stream.new(200, headers, [])
+        stream_stubs.get('/empty') { stream }
+        stream
+      end
+
+      let!(:broken) do
+        error = Faraday::ConnectionFailed.new('boom mid-stream')
+        stream = adapter_class::Stream.new(200, headers, ['first', error, 'never'])
+        stream_stubs.get('/broken') { stream }
+        stream
+      end
+
+      it 'delivers every chunk in order with cumulative byte sizes' do
+        response = request('/chunked')
+
+        expect(received).to eq([
+                                 ['hel', 3],
+                                 ['lo', 5],
+                                 ['world', 10]
+                               ])
+        # Streaming responses finish with an empty aggregated body.
+        expect(response.body).to eq('')
+        expect(response.status).to eq(200)
+        expect(response.headers['Content-Type']).to eq('text/plain')
+
+        expect(chunked.delivered).to eq(%w[hel lo world])
+        expect(chunked.chunks_delivered).to eq(3)
+        expect(chunked.bytes_delivered).to eq(10)
+        expect(chunked).to be_finished
+        expect(chunked.error).to be_nil
+      end
+
+      it 'observes an empty stream as a single empty chunk at size zero' do
+        response = request('/empty')
+
+        expect(received).to eq([['', 0]])
+        expect(response.body).to eq('')
+        expect(response.status).to eq(200)
+        expect(response.headers['Content-Type']).to eq('text/plain')
+
+        expect(empty.delivered).to eq([])
+        expect(empty.chunks_delivered).to eq(0)
+        expect(empty.bytes_delivered).to eq(0)
+        expect(empty).to be_finished
+        expect(empty.error).to be_nil
+      end
+
+      it 'breaks mid-stream and keeps the earlier chunks observable' do
+        expect { request('/broken') }.to raise_error(Faraday::ConnectionFailed, 'boom mid-stream')
+
+        # The consumer only sees the chunks delivered before the break.
+        expect(received).to eq([['first', 5]])
+
+        expect(broken.delivered).to eq(['first'])
+        expect(broken.chunks_delivered).to eq(1)
+        expect(broken.bytes_delivered).to eq(5)
+        expect(broken).not_to be_finished
+        expect(broken.error).to be_a(Faraday::ConnectionFailed)
+        expect(broken.error.message).to eq('boom mid-stream')
+      end
+
+      it 'does not finish the response or fire on_complete when the stream breaks' do
+        completed = false
+        connection_with_callback = Faraday.new do |builder|
+          builder.use CompletionTracker, -> { completed = true }
+          builder.adapter :test, stream_stubs
+        end
+
+        expect do
+          connection_with_callback.get('/broken') do |req|
+            req.options.on_data = consumer
+          end
+        end.to raise_error(Faraday::ConnectionFailed)
+
+        expect(completed).to be(false)
+      end
+    end
+
+    describe 'without an on_data callback' do
+      it 'concatenates the chunks into a normal response body' do
+        stream_stubs.get('/plain') do
+          adapter_class::Stream.new(201, headers, %w[ab cd])
+        end
+
+        response = stream_connection.get('/plain')
+
+        expect(response.status).to eq(201)
+        expect(response.headers['Content-Type']).to eq('text/plain')
+        expect(response.body).to eq('abcd')
+      end
+    end
+  end
 end

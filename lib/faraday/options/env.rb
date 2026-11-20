@@ -169,13 +169,19 @@ module Faraday
     def stream_response(&block)
       size = 0
       yielded = false
-      block_result = block.call do |chunk|
+      writer = proc do |chunk|
         if chunk.bytesize.positive? || size.positive?
           yielded = true
           size += chunk.bytesize
           request.on_data.call(chunk, size, self)
         end
       end
+      # Pass the writer both as a positional argument and as a block so that
+      # consumers written as `stream_response { |writer| ... }` and ones that
+      # capture it as a block (`stream_response { |&on_data| ... }`, used by the
+      # Net::HTTP adapter) both work. On Ruby 4, a block attached to `Proc#call`
+      # is no longer delivered as a positional argument.
+      block_result = block.call(writer, &writer)
       request.on_data.call(+'', 0, self) unless yielded
       block_result
     end

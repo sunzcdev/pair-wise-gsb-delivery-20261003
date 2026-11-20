@@ -59,8 +59,112 @@ module Faraday
     #
     #   resp = test.post '/foo', JSON.dump(name: 'YK', created_at: Time.now)
     #   resp.status # => 200
+    #
+    # A stub can also return a {Faraday::Adapter::Test::Stream} to describe the
+    # response body as an ordered list of chunks. When the request sets
+    # `req.options.on_data`, each chunk is delivered through Env's streaming
+    # callback in order, while status and ordinary response headers are still
+    # saved up front.
+    #
+    #   stub.get '/stream' do
+    #     Faraday::Adapter::Test::Stream.new(
+    #       200,
+    #       { 'Content-Type' => 'text/plain' },
+    #       ['hel', 'lo ', 'world']
+    #     )
+    #   end
+    #
+    # Pass an error instead of a chunk to break the stream mid-way and surface
+    # that error to the caller through the normal adapter error path.
     class Test < Faraday::Adapter
       attr_accessor :stubs
+
+      # Explicit, ordered description of a streamed response body.
+      #
+      # Return a Stream from a stub block (instead of the status/headers/body
+      # triple) to drive the request's `on_data` callback chunk by chunk. An
+      # element that is an Exception breaks the stream at that point and is
+      # raised through the adapter, leaving the chunks delivered before it
+      # observable.
+      #
+      # @example three chunks
+      #   Stream.new(200, { 'Content-Type' => 'text/plain' }, %w[hel lo world])
+      #
+      # @example an empty stream
+      #   Stream.new(200, {}, [])
+      #
+      # @example break after the first chunk
+      #   Stream.new(200, {}, ['first', Faraday::ConnectionFailed.new('boom')])
+      class Stream
+        # @return [Integer] HTTP response status code.
+        attr_reader :status
+
+        # @return [Hash] ordinary response headers, saved before streaming.
+        attr_reader :headers
+
+        # @return [Array<String, Exception>] ordered chunks; an Exception
+        #   element breaks the stream when it is reached.
+        attr_reader :chunks
+
+        # @return [Array<String>] chunks already delivered to the callback.
+        attr_reader :delivered
+
+        # @return [Exception, nil] the Exception chunk that broke the stream,
+        #   or nil when the stream has not errored.
+        attr_reader :error
+
+        # @param status [Integer] HTTP response status code.
+        # @param headers [Hash] response headers.
+        # @param chunks [Array<String, Exception>] ordered body chunks.
+        def initialize(status, headers = {}, chunks = [])
+          @status = status
+          @headers = headers
+          @chunks = chunks
+          @delivered = []
+          @error = nil
+          @finished = false
+        end
+
+        # Drives Env's streaming callback with each chunk in order. Headers and
+        # status are already saved by the adapter. If an Exception chunk is
+        # reached, it is recorded and re-raised so the adapter's error path is
+        # exercised.
+        #
+        # @param env [Faraday::Env] the current request environment.
+        # @yield [chunk] block expected by {Env#stream_response}.
+        # @return [void]
+        def each_chunk(env)
+          env.stream_response do |writer|
+            chunks.each do |chunk|
+              if chunk.is_a?(Exception)
+                @error = chunk
+                raise chunk
+              end
+
+              writer.call(chunk)
+              @delivered << chunk
+            end
+          end
+        ensure
+          @finished = error.nil?
+        end
+
+        # @return [Boolean] true once every chunk has been delivered without
+        #   an error.
+        def finished?
+          @finished
+        end
+
+        # @return [Integer] number of chunks delivered so far.
+        def chunks_delivered
+          @delivered.length
+        end
+
+        # @return [Integer] total number of bytes delivered so far.
+        def bytes_delivered
+          @delivered.sum(0) { |chunk| chunk.bytesize }
+        end
+      end
 
       # A stack of Stubs
       class Stubs
@@ -296,7 +400,7 @@ module Faraday
         timeout = request_timeout(:open, env[:request])
         timeout ||= request_timeout(:read, env[:request])
 
-        status, headers, body =
+        result =
           if timeout
             ::Timeout.timeout(timeout, Faraday::TimeoutError) do
               stub.block.call(*params)
@@ -305,12 +409,42 @@ module Faraday
             stub.block.call(*params)
           end
 
-        # We need to explicitly pass `reason_phrase = nil` here to avoid keyword args conflicts.
-        #   See https://github.com/lostisland/faraday/issues/1444
-        # TODO: remove `nil` explicit reason_phrase once Ruby 3.0 becomes minimum req. version
-        save_response(env, status, body, headers, nil)
+        if result.is_a?(Stream)
+          handle_stream(env, result)
+        else
+          status, headers, body = result
+          # We need to explicitly pass `reason_phrase = nil` here to avoid keyword args conflicts.
+          #   See https://github.com/lostisland/faraday/issues/1444
+          # TODO: remove `nil` explicit reason_phrase once Ruby 3.0 becomes minimum req. version
+          save_response(env, status, body, headers, nil)
+        end
 
         @app.call(env)
+      end
+
+      private
+
+      # Streams a {Stream} stub response. When the request registered an
+      # `on_data` callback we mirror a real streaming adapter: save status and
+      # headers without finishing the response, push the chunks through Env's
+      # streaming callback, then finish it. Without a callback the chunks are
+      # concatenated and the response is saved normally, so Stream stubs also
+      # work for ordinary (non-streaming) requests.
+      #
+      # @param env [Faraday::Env]
+      # @param stream [Stream]
+      def handle_stream(env, stream)
+        if env.stream_response?
+          # Save status and headers up front but leave the response unfinished
+          # until every chunk has been delivered, matching real adapters.
+          save_response(env, stream.status, nil, stream.headers, nil, finished: false)
+          stream.each_chunk(env)
+          env.response_body = +''
+          env.response.finish(env)
+        else
+          body = stream.chunks.reject { |chunk| chunk.is_a?(Exception) }.join
+          save_response(env, stream.status, body, stream.headers, nil)
+        end
       end
     end
   end

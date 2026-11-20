@@ -73,4 +73,45 @@ RSpec.describe Faraday::Env do
       end
     end
   end
+
+  describe '#stream_response' do
+    subject(:env) do
+      env = described_class.new
+      env.request = Faraday::RequestOptions.new
+      env.request.on_data = on_data
+      env
+    end
+
+    let(:streamed) { [] }
+    let(:on_data) do
+      proc { |chunk, size, block_env| streamed << [chunk, size, block_env] }
+    end
+
+    it 'passes a writer to a positional block argument' do
+      env.stream_response do |writer|
+        writer.call('ab')
+        writer.call('cde')
+      end
+
+      expect(streamed.map { |chunk, size, _| [chunk, size] }).to eq([
+        ['ab', 2],
+        ['cde', 5]
+      ])
+      expect(streamed.map { |_, _, block_env| block_env }.uniq).to eq([env])
+    end
+
+    it 'passes the writer to a block-capturing argument (&on_data style)' do
+      env.stream_response do |&writer|
+        writer.call('xyz')
+      end
+
+      expect(streamed.map { |chunk, size, _| [chunk, size] }).to eq([['xyz', 3]])
+    end
+
+    it 'invokes on_data once with an empty chunk when nothing is streamed' do
+      env.stream_response { |writer| writer.call('') }
+
+      expect(streamed).to eq([['', 0, env]])
+    end
+  end
 end
