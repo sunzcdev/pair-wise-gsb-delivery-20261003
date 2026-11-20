@@ -401,6 +401,77 @@ class NetInstanceTest < Test::Unit::TestCase
   end
 end
 
+# Net::HTTP::Tunnel is added by this working tree, so a signature shipped by
+# an installed net-http gem does not know it.  These tests therefore load this
+# repository's own signature (plus the libraries it depends on) so the type
+# assertions exercise the code under development.
+module LocalNetHTTPSignature
+  def env
+    @env ||= begin
+      loader = RBS::EnvironmentLoader.new
+      %w[net-protocol uri timeout].each { |lib| loader.add(library: lib, version: nil) }
+      loader.add(path: Pathname(__dir__).parent + "sig")
+      RBS::Environment.from_loader(loader).resolve_type_names
+    end
+  end
+end
+
+# The tunnel entry point lives in this working tree.  When a packaged
+# net-http gem is what got required instead, there is nothing under test, so
+# these cases report an omission rather than a spurious failure.
+if defined?(Net::HTTP::Tunnel)
+  class TestNetHTTPTunnelConstructor < Test::Unit::TestCase
+    include RBS::UnitTest::TypeAssertions
+    extend LocalNetHTTPSignature
+
+    library "net-http"
+    testing "singleton(::Net::HTTP::Tunnel)"
+
+    def test_tunnel_constructor
+      reader, writer = IO.pipe
+      begin
+        response = Net::HTTPOK.new("1.1", "200", "OK")
+        assert_send_type "(IO, Net::HTTPResponse) -> Net::HTTP::Tunnel",
+                         Net::HTTP::Tunnel, :new, reader, response
+      ensure
+        reader.close unless reader.closed?
+        writer.close unless writer.closed?
+      end
+    end
+  end
+
+  class TestNetHTTPTunnelInstance < Test::Unit::TestCase
+    include RBS::UnitTest::TypeAssertions
+    extend LocalNetHTTPSignature
+
+    library "net-http"
+    testing "::Net::HTTP::Tunnel"
+
+    def test_tunnel_api
+      reader, writer = IO.pipe
+      begin
+        response = Net::HTTPOK.new("1.1", "200", "OK")
+        tunnel = Net::HTTP::Tunnel.new(reader, response)
+        assert_send_type "() -> IO", tunnel, :socket
+        assert_send_type "() -> Net::HTTPResponse", tunnel, :response
+        assert_send_type "() -> String", tunnel, :prefix
+        assert_send_type "() -> bool", tunnel, :closed?
+        assert_send_type "() -> String", tunnel, :inspect
+        assert_send_type "() -> nil", tunnel, :close
+      ensure
+        reader.close unless reader.closed?
+        writer.close unless writer.closed?
+      end
+    end
+  end
+else
+  class TestNetHTTPTunnelSignature < Test::Unit::TestCase
+    def test_local_tunnel_is_under_test
+      omit 'Net::HTTP::Tunnel is not defined: the packaged net-http was loaded'
+    end
+  end
+end
+
 class TestHTTPRequest < Test::Unit::TestCase
   include RBS::UnitTest::TypeAssertions
   include WithServer

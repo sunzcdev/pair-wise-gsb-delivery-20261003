@@ -1481,6 +1481,17 @@ module Net
     #
     def finish: () -> void
 
+    # Opens an explicit CONNECT tunnel to `#address`:`#port` through the
+    # configured proxy and returns it as a `Net::HTTP::Tunnel`.  The returned
+    # tunnel owns the underlying socket and is responsible for closing it.  A
+    # non-success proxy reply is read as a normal HTTP response and raised as
+    # the matching exception; it is never handed over as a tunnel.
+    #
+    # Raises `Net::HTTPError` when no proxy is configured and `IOError` when a
+    # session is already open.
+    #
+    def connect: () -> Net::HTTP::Tunnel
+
     # <!--
     #   rdoc-file=lib/net/http.rb
     #   - Proxy(p_addr = :ENV, p_port = nil, p_user = nil, p_pass = nil)
@@ -2056,6 +2067,38 @@ module Net
     #     #<Net::HTTPOK 200 OK readbody=false>
     #
     def request: (Net::HTTPRequest req, ?String? body) ?{ (Net::HTTPResponse response) -> void } -> Net::HTTPResponse
+
+    # A successfully established explicit CONNECT tunnel, as returned by
+    # `Net::HTTP#connect`.
+    #
+    # The tunnel owns its socket and is responsible for closing it; it is not
+    # part of an HTTP session, is not reused by `Net::HTTP#request`, and never
+    # enters the keep-alive pool.
+    class Tunnel
+      # The tunneled connection: a plain TCP socket, or the proxy's TLS socket
+      # when the proxy itself was reached over TLS.
+      attr_reader socket: IO
+
+      # The proxy's reply to the CONNECT request (a success response).
+      attr_reader response: Net::HTTPResponse
+
+      # Tunnel bytes already read off the connection while parsing the proxy's
+      # reply.  They are the first bytes of the tunneled stream and must be
+      # consumed before reading from #socket; usually an empty string.
+      attr_reader prefix: String
+
+      # :nodoc:
+      def initialize: (IO socket, Net::HTTPResponse response, ?String prefix) -> void
+
+      # Returns true once the tunneled socket has been closed.
+      def closed?: () -> bool
+
+      # Closes the tunneled socket.  Idempotent: only the first call closes the
+      # socket, later calls are no-ops returning `nil`.
+      def close: () -> nil
+
+      def inspect: () -> String
+    end
   end
 
   # <!-- rdoc-file=lib/net/http/generic_request.rb -->

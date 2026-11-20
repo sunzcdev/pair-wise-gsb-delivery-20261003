@@ -483,6 +483,12 @@ module Net   #:nodoc:
   # - {#start}[rdoc-ref:Net::HTTP#start]:
   #   Begins a new session in an existing \Net::HTTP object (+self+).
   #
+  # === Tunnels
+  #
+  # - {#connect}[rdoc-ref:Net::HTTP#connect]:
+  #   Opens an explicit +CONNECT+ tunnel and returns it as a
+  #   {Net::HTTP::Tunnel}[rdoc-ref:Net::HTTP::Tunnel].
+  #
   # === Connections
   #
   # - {:continue_timeout}[rdoc-ref:Net::HTTP#continue_timeout]:
@@ -1676,68 +1682,123 @@ module Net   #:nodoc:
       do_finish
     end
 
+    # :call-seq:
+    #   http.connect -> tunnel
+    #
+    # Opens an explicit +CONNECT+ tunnel to #address:#port through the
+    # configured proxy server, and returns the established tunnel as a
+    # Net::HTTP::Tunnel handle.
+    #
+    # The returned handle owns the connection and is responsible for closing
+    # it (see Net::HTTP::Tunnel#close).  It carries:
+    #
+    # - Net::HTTP::Tunnel#socket: the raw tunneled connection -- the TCP
+    #   socket when the proxy is a plain \HTTP proxy, or the proxy's TLS
+    #   socket when the proxy itself was reached over TLS.  No TLS handshake
+    #   with the destination, and no other protocol inside the tunnel, is
+    #   performed; the caller speaks whatever protocol it needs.
+    # - Net::HTTP::Tunnel#prefix: the tunnel bytes that had already been read
+    #   off the connection while parsing the proxy's reply.  They are the
+    #   first bytes of the tunneled stream and must be consumed before
+    #   reading from Net::HTTP::Tunnel#socket.
+    # - Net::HTTP::Tunnel#response: the proxy's reply.
+    #
+    # A successful (+2xx+) reply is not an \HTTP message with a body: its
+    # header ends at the first empty line and everything after it belongs to
+    # the tunnel.  It is therefore never parsed as a normal response body.
+    #
+    # A non-success reply is read as a normal \HTTP response -- status line,
+    # headers and body are all read and exposed -- and then raised as the
+    # matching Net::HTTPClientException, Net::HTTPFatalError, or
+    # Net::HTTPRetriableError (see Net::HTTPResponse#value).  In that case no
+    # tunnel is handed over, and the connection is closed rather than cached
+    # as a usable tunnel.
+    #
+    # The tunnel is never registered with the \Net::HTTP object: #started?
+    # stays +false+, #socket stays +nil+, and the connection is not reused by
+    # #request nor kept alive; it can only be reached through the returned
+    # handle.  Any error, timeout or interruption while the tunnel is being
+    # established closes the connection before propagating.
+    #
+    # Raises IOError if an \HTTP session is already open, and Net::HTTPError
+    # if no proxy is configured (an explicit +CONNECT+ tunnel needs one).
+    def connect
+      raise IOError, 'HTTP session already opened' if started?
+      unless proxy?
+        raise Net::HTTPError.new('CONNECT requires an HTTP proxy', nil)
+      end
+
+      socket = nil
+      transport = nil
+      begin
+        socket = open_tcp_connection
+        proxy_io, transport = wrap_proxy_socket(socket)
+        response = send_connect(proxy_io)
+        if response.kind_of?(Net::HTTPSuccess)
+          # A successful CONNECT reply has no body: its header ends at the
+          # first empty line and everything after it belongs to the tunnel.
+          # Record that without reading a single byte, so no tunnel data is
+          # mistaken for an HTTP body.
+          response.reading_body(proxy_io, false) { }
+        else
+          # Not a tunnel: the reply still is a normal HTTP response, so read
+          # its body like any other response and then let #value raise the
+          # matching exception.  #ensure closes the connection; it is never
+          # cached as a usable tunnel.
+          response.reading_body(proxy_io, response.class.body_permitted?) { }
+          response.value
+        end
+        tunnel = Tunnel.new(transport, response, buffered_tunnel_prefix(proxy_io))
+        debug 'CONNECT succeeded, tunnel established'
+        # The tunnel now owns the connection; do not close it below.
+        socket = transport = nil
+        tunnel
+      rescue => exception
+        debug "Conn close because of connect error #{exception}"
+        raise
+      ensure
+        # Unwind on any failure (error, timeout, cancellation): close the
+        # outermost layer this call opened, without masking the real error if
+        # closing itself fails.  When it is a proxy TLS socket, its
+        # +sync_close+ closes the TCP socket underneath.
+        if transport
+          close_quietly(transport)
+        elsif socket
+          close_quietly(socket)
+        end
+      end
+    end
+
     # :stopdoc:
     def do_start
-      connect
+      open_connection
       @started = true
     end
     private :do_start
 
-    def connect
+    # Opens the connection used by an \HTTP session (#start, and the implicit
+    # session of #request).  This is not the explicit CONNECT tunnel entry
+    # point; see #connect.  When a proxy and SSL are both configured, the
+    # proxy CONNECT is consumed here and the connection is immediately
+    # upgraded to TLS towards the destination.
+    def open_connection
       if use_ssl?
         # reference early to load OpenSSL before connecting,
         # as OpenSSL may take time to load.
         @ssl_context = OpenSSL::SSL::SSLContext.new
       end
 
-      if proxy? then
-        conn_addr = proxy_address
-        conn_port = proxy_port
-      else
-        conn_addr = conn_address
-        conn_port = port
-      end
-
-      debug "opening connection to #{conn_addr}:#{conn_port}..."
-      begin
-        s = timeouted_connect(conn_addr, conn_port)
-      rescue => e
-        if (defined?(IO::TimeoutError) && e.is_a?(IO::TimeoutError)) || e.is_a?(Errno::ETIMEDOUT)  # for compatibility with previous versions
-          e = Net::OpenTimeout.new(e)
-        end
-        raise e, "Failed to open TCP connection to " +
-          "#{conn_addr}:#{conn_port} (#{e.message})"
-      end
-      s.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
-      debug "opened"
+      conn_addr, conn_port = connection_endpoint
+      s = open_tcp_connection
       if use_ssl?
         if proxy?
-          if @proxy_use_ssl
-            proxy_sock = OpenSSL::SSL::SSLSocket.new(s)
-            ssl_socket_connect(proxy_sock, @open_timeout)
-          else
-            proxy_sock = s
-          end
-          proxy_sock = BufferedIO.new(proxy_sock, read_timeout: @read_timeout,
-                                      write_timeout: @write_timeout,
-                                      continue_timeout: @continue_timeout,
-                                      debug_output: @debug_output)
-          if /[\r\n]/.match?("#{conn_address}:#{@port}")
-            raise ArgumentError, "address and port cannot include CR/LF"
-          end
-          if /[\r\n]/.match?(@address)
-            raise ArgumentError, "address cannot include CR/LF"
-          end
-          buf = +"CONNECT #{conn_address}:#{@port} HTTP/#{HTTPVersion}\r\n" \
-            "Host: #{@address}:#{@port}\r\n"
-          if proxy_user
-            credential = ["#{proxy_user}:#{proxy_pass}"].pack('m0')
-            buf << "Proxy-Authorization: Basic #{credential}\r\n"
-          end
-          buf << "\r\n"
-          proxy_sock.write(buf)
-          HTTPResponse.read_new(proxy_sock).value
-          # assuming nothing left in buffers after successful CONNECT response
+          proxy_io, _transport = wrap_proxy_socket(s)
+          response = send_connect(proxy_io)
+          # A non-success reply raises here; the rescue below closes the
+          # socket.  A successful reply has no body of its own, and any bytes
+          # past its header belong to the tunnel that the destination TLS
+          # handshake starts immediately below.
+          response.value
         end
 
         ssl_parameters = Hash.new
@@ -1800,11 +1861,145 @@ module Net   #:nodoc:
     rescue => exception
       if s
         debug "Conn close because of connect error #{exception}"
-        s.close
+        close_quietly(s)
       end
       raise
     end
-    private :connect
+    private :open_connection
+
+    # Closes +io+ on a failure path, ignoring an already-closed socket and
+    # swallowing a close error so that the original failure is what propagates.
+    def close_quietly(io)
+      io.close unless io.closed?
+    rescue StandardError
+      nil
+    end
+    private :close_quietly
+
+    # The host and port the TCP connection is opened to: the proxy when one
+    # is configured, otherwise the destination host.
+    def connection_endpoint
+      if proxy? then
+        [proxy_address, proxy_port]
+      else
+        [conn_address, port]
+      end
+    end
+    private :connection_endpoint
+
+    # Opens a TCP connection to #connection_endpoint with TCP_NODELAY set,
+    # translating connection timeouts into Net::OpenTimeout and annotating
+    # failures with the endpoint that could not be reached.
+    def open_tcp_connection
+      conn_addr, conn_port = connection_endpoint
+
+      debug "opening connection to #{conn_addr}:#{conn_port}..."
+      begin
+        s = timeouted_connect(conn_addr, conn_port)
+      rescue => e
+        if (defined?(IO::TimeoutError) && e.is_a?(IO::TimeoutError)) || e.is_a?(Errno::ETIMEDOUT)  # for compatibility with previous versions
+          e = Net::OpenTimeout.new(e)
+        end
+        raise e, "Failed to open TCP connection to " +
+          "#{conn_addr}:#{conn_port} (#{e.message})"
+      end
+      s.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+      debug "opened"
+      s
+    end
+    private :open_tcp_connection
+
+    # Wraps +s+ so that HTTP can be spoken to the proxy over it.  Returns a
+    # pair: the Net::BufferedIO used for the proxy exchange, and the transport
+    # socket that carries the tunnel once CONNECT succeeds -- the proxy's TLS
+    # socket when the proxy itself is reached over TLS (+@proxy_use_ssl+),
+    # otherwise +s+ itself.
+    def wrap_proxy_socket(s)
+      if @proxy_use_ssl
+        proxy_sock = OpenSSL::SSL::SSLSocket.new(s)
+        proxy_sock.sync_close = true
+        begin
+          ssl_socket_connect(proxy_sock, @open_timeout)
+        rescue StandardError
+          close_quietly(proxy_sock)
+          raise
+        end
+        transport = proxy_sock
+      else
+        transport = s
+      end
+      buffered = BufferedIO.new(transport, read_timeout: @read_timeout,
+                                write_timeout: @write_timeout,
+                                continue_timeout: @continue_timeout,
+                                debug_output: @debug_output)
+      [buffered, transport]
+    end
+    private :wrap_proxy_socket
+
+    # The authority (host and port) placed in the CONNECT request target.
+    # An IPv6 literal address is bracketed, as required by RFC 3986 / RFC
+    # 9110, so the proxy does not mistake its colons for the port separator.
+    def connect_authority
+      host = conn_address
+      host = "[#{host}]" if host.include?(":")
+      "#{host}:#{@port}"
+    end
+    private :connect_authority
+
+    # Writes the CONNECT request for #address:#port to the proxy over
+    # +proxy_io+.  Nothing is read here.
+    def write_connect_request(proxy_io)
+      authority = connect_authority
+      if /[\r\n]/.match?(authority)
+        raise ArgumentError, "address and port cannot include CR/LF"
+      end
+      if /[\r\n]/.match?(@address)
+        raise ArgumentError, "address cannot include CR/LF"
+      end
+      buf = +"CONNECT #{authority} HTTP/#{HTTPVersion}\r\n" \
+        "Host: #{@address}:#{@port}\r\n"
+      if proxy_user
+        credential = ["#{proxy_user}:#{proxy_pass}"].pack('m0')
+        buf << "Proxy-Authorization: Basic #{credential}\r\n"
+      end
+      buf << "\r\n"
+      proxy_io.write(buf)
+    end
+    private :write_connect_request
+
+    # Sends a CONNECT request over +proxy_io+ and returns the final response.
+    # Interim +1xx+ replies are consumed here.  No tunnel byte is consumed:
+    # for a success reply the header ends at the first empty line and the
+    # rest of the connection belongs to the tunnel; for a failure reply the
+    # body is left on +proxy_io+ to be read as a normal HTTP body.
+    def send_connect(proxy_io)
+      write_connect_request(proxy_io)
+      informational_count = 0
+      begin
+        response = HTTPResponse.read_new(proxy_io)
+        if response.kind_of?(HTTPInformation)
+          informational_count += 1
+          if informational_count > HTTPResponse::MAX_INFORMATIONAL_RESPONSES
+            raise HTTPBadResponse, 'too many informational responses'
+          end
+        end
+      end while response.kind_of?(HTTPInformation)
+      response
+    end
+    private :send_connect
+
+    # Returns the tunnel bytes that had already been read off the connection
+    # while parsing the CONNECT reply.  They live in +proxy_io+'s read buffer,
+    # because Net::BufferedIO over-reads from the wire; they belong to the
+    # tunneled stream, not to any HTTP message, and are removed from that
+    # buffer so that they are handed over exactly once.
+    #
+    # Anything the transport still holds unread stays readable through
+    # Net::HTTP::Tunnel#socket, so no tunnel byte is lost either way.
+    def buffered_tunnel_prefix(proxy_io)
+      proxy_io.__send__(:rbuf_consume) || +''.b
+    end
+    private :buffered_tunnel_prefix
 
     tcp_socket_parameters = TCPSocket.instance_method(:initialize).parameters
     TCP_SOCKET_NEW_HAS_OPEN_TIMEOUT = if tcp_socket_parameters != [[:rest]]
@@ -2576,16 +2771,16 @@ module Net   #:nodoc:
 
     def begin_transport(req)
       if @socket.closed?
-        connect
+        open_connection
       elsif @last_communicated
         if @last_communicated + @keep_alive_timeout < Process.clock_gettime(Process::CLOCK_MONOTONIC)
           debug 'Conn close because of keep_alive_timeout'
           @socket.close
-          connect
+          open_connection
         elsif @socket.io.to_io.wait_readable(0) && @socket.eof?
           debug "Conn close because of EOF"
           @socket.close
-          connect
+          open_connection
         end
       end
 
@@ -2672,6 +2867,59 @@ module Net   #:nodoc:
     end
 
     alias_method :D, :debug
+
+    # A successfully established explicit CONNECT tunnel, as returned by
+    # Net::HTTP#connect.
+    #
+    # A Tunnel is a bare transport handle.  Net::HTTP established the tunnel
+    # and takes no part in whatever protocol is spoken inside it; that
+    # protocol belongs to the caller.  The Tunnel owns the underlying socket
+    # and is the party responsible for closing it (see #close).  The socket is
+    # never registered with the \Net::HTTP object that created the tunnel, is
+    # not reused by Net::HTTP#request, and never enters the keep-alive pool.
+    class Tunnel
+      # The tunneled connection: a plain TCPSocket when the proxy is a plain
+      # \HTTP proxy, or the proxy's OpenSSL::SSL::SSLSocket when the proxy
+      # itself was reached over TLS.
+      attr_reader :socket
+
+      # The proxy's reply to the CONNECT request (a success response).
+      attr_reader :response
+
+      # The tunnel bytes that had already been read off the connection while
+      # parsing the proxy's reply.  They are the first bytes of the tunneled
+      # stream and must be consumed by the caller before reading from
+      # #socket.  Usually an empty string.
+      attr_reader :prefix
+
+      def initialize(socket, response, prefix = +''.b) # :nodoc:
+        @socket = socket
+        @response = response
+        @prefix = prefix
+        @closed = false
+      end
+
+      # Returns +true+ once this tunnel has closed its socket.
+      def closed?
+        @closed || @socket.closed?
+      end
+
+      # Closes the tunneled socket.  This tunnel already owned the socket, so
+      # no ownership is transferred.  Idempotent: once the socket is closed,
+      # later calls are no-ops that return +nil+.  A close that itself fails is
+      # not recorded, so #closed? keeps reporting the real state and a retry
+      # can still settle it.
+      def close
+        return if closed?
+        @socket.close
+        @closed = true
+        nil
+      end
+
+      def inspect # :nodoc:
+        "#<#{self.class} socket=#{@socket.inspect} closed=#{closed?}>"
+      end
+    end
   end
 
   # for backward compatibility until Ruby 4.0
