@@ -5,8 +5,9 @@ from functools import partial
 import pytest
 
 import dask
-from dask._task_spec import Alias, Task, TaskRef, convert_legacy_graph
+from dask._task_spec import Alias, DataNode, Task, TaskRef, convert_legacy_graph
 from dask.core import get_dependencies
+from dask.highlevelgraph import HighLevelGraph, MaterializedLayer
 from dask.optimization import (
     cull,
     functions_of,
@@ -14,6 +15,7 @@ from dask.optimization import (
     fuse_linear,
     inline,
     inline_functions,
+    overlay_persisted_values,
 )
 from dask.utils_test import add, inc
 
@@ -33,6 +35,67 @@ def test_cull():
     assert cull(d, ["out", "z"])[0] == d
     assert cull(d, [["out"], ["z"]]) == cull(d, ["out", "z"])
     pytest.raises(KeyError, lambda: cull(d, "badkey"))
+
+
+def test_overlay_persisted_values_plain_graph():
+    dsk = {"x": 1, "y": (inc, "x"), "z": (inc, "x")}
+    out = overlay_persisted_values(dsk, {"y": 42})
+
+    # The persisted key is now a value, the others keep their tasks.
+    assert out["y"] == DataNode("y", 42)
+    assert out["x"] == 1
+    assert out["z"] == (inc, "x")
+
+
+def test_overlay_persisted_values_none_stays_materialized():
+    dsk = {"x": 1, "y": (inc, "x")}
+    out = overlay_persisted_values(dsk, {"y": None})
+    assert isinstance(out["y"], DataNode)
+    assert out["y"].value is None
+
+
+def test_overlay_persisted_values_keeps_shared_dependencies():
+    dsk = {"x": 1, "y": (inc, "x"), "z": (inc, "x")}
+    out = overlay_persisted_values(dsk, {"y": None})
+    assert out["x"] == 1
+    assert out["z"] == (inc, "x")
+
+
+def test_overlay_persisted_values_high_level_graph():
+    layers = {"data": MaterializedLayer({"x": 1, "y": (inc, "x")})}
+    hlg = HighLevelGraph(layers, {"data": set()})
+
+    out = overlay_persisted_values(hlg, {"y": 42})
+    assert isinstance(out, HighLevelGraph)
+    assert out.layers["data"].mapping["y"] == DataNode("y", 42)
+    assert out.layers["data"].mapping["x"] == 1
+
+
+def test_overlay_persisted_values_is_a_noop_without_values():
+    dsk = {"x": 1, "y": (inc, "x")}
+    assert overlay_persisted_values(dsk, {}) is dsk
+
+
+def test_overlay_persisted_values_keeps_graph_valid():
+    def combine(a, b):
+        return a + b
+
+    layers = {
+        "left": MaterializedLayer({"a": 1, "b": (inc, "a")}),
+        "right": MaterializedLayer({"c": 2, "d": (inc, "c")}),
+        "combine": MaterializedLayer({"out": (combine, "b", "d")}),
+    }
+    deps = {"left": set(), "right": set(), "combine": {"left", "right"}}
+    hlg = HighLevelGraph(layers, deps)
+
+    out = overlay_persisted_values(hlg, {"b": 10, "d": 20})
+    out.validate()
+    assert dask.get(out, "out") == 30
+
+    # ``combine`` still reads ``b`` and ``d`` from their layers, they just hold
+    # the persisted values now.
+    assert out.layers["left"].mapping["b"] == DataNode("b", 10)
+    assert out.dependencies["combine"] == {"left", "right"}
 
 
 def fuse2(*args, **kwargs):

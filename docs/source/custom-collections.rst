@@ -200,6 +200,30 @@ created. It too has three stages:
    for its respective results.
 
 
+Persist only some keys
+~~~~~~~~~~~~~~~~~~~~~~
+
+:func:`dask.persist_keys` (and the matching ``collection.persist_keys`` method)
+persists a *selection* of a collection's output keys instead of all of them.
+This is useful to pin the few partitions of a large collection that are read
+repeatedly while leaving the rest lazy.
+
+It relies on the same ``__dask_postpersist__`` protocol as ``persist``, so any
+collection that supports ``persist`` supports ``persist_keys`` as well. The
+difference is in the graph that is handed to ``rebuild``: rather than a graph
+containing only the output keys, it is the collection's original graph with the
+selected keys replaced by already computed values (stored as
+:class:`~dask._task_spec.DataNode` entries). Unselected keys keep their lazy
+tasks and the dependencies shared between the selected and unselected keys are
+preserved, so the returned collection can still be sliced and computed and only
+the missing keys are executed.
+
+A value of ``None`` is stored like any other value; materialization is signalled
+by the presence of a key in the graph, not by the truthiness of its result. If
+one of the selected keys fails to compute, the exception propagates unchanged
+and no partially persisted collection is returned.
+
+
 Optimize
 ~~~~~~~~
 

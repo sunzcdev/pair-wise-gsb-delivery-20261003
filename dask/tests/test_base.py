@@ -33,10 +33,13 @@ from dask.base import (
     unpack_collections,
     visualize,
 )
+from dask.blockwise import Blockwise
+from dask.callbacks import Callback
+from dask._task_spec import DataNode
 from dask.core import validate_key
 from dask.delayed import Delayed, delayed
 from dask.diagnostics import Profiler
-from dask.highlevelgraph import HighLevelGraph
+from dask.highlevelgraph import HighLevelGraph, MaterializedLayer
 from dask.utils import key_split, tmpdir, tmpfile
 from dask.utils_test import dec, import_or_none, inc
 
@@ -823,6 +826,308 @@ def test_persist_item_change_name():
     assert isinstance(b, db.Item)
     assert b.__dask_keys__() == ["x"]
     db.utils.assert_eq(b, 4)
+
+
+def _chunked_tracking_array(nchunks=4, chunk=(1, 2, 3)):
+    """Stack one delayed chunk per row, recording which chunks were computed"""
+    calls = []
+
+    def make(i):
+        def f():
+            calls.append(i)
+            return np.array(chunk) + i
+
+        return f
+
+    blocks = [
+        da.from_delayed(delayed(make(i))(), shape=(len(chunk),), dtype=int)
+        for i in range(nchunks)
+    ]
+    array = da.stack(blocks, axis=0)
+    expected = np.stack([np.array(chunk) + i for i in range(nchunks)])
+    return array, expected, calls
+
+
+@pytest.mark.skipif("not da")
+def test_persist_keys_only_computes_selected_keys():
+    x, expected, calls = _chunked_tracking_array()
+    keys = x.__dask_keys__()
+
+    pinned = dask.persist_keys(x, [keys[1], keys[2]], scheduler="sync")
+
+    # Only the two requested chunks ran; nothing else was touched.
+    assert sorted(calls) == [1, 2]
+
+    # The returned collection keeps the metadata of the original one...
+    assert isinstance(pinned, da.Array)
+    assert pinned.name == x.name
+    assert pinned.chunks == x.chunks
+    assert pinned.dtype == x.dtype
+
+    # ...still supports the usual operations, and computing it only fills in
+    # the chunks that are still missing.
+    da.utils.assert_eq(pinned, expected)
+    assert sorted(calls) == [0, 1, 2, 3]
+
+
+@pytest.mark.skipif("not da")
+def test_persist_keys_reuses_already_persisted_chunks():
+    x, expected, calls = _chunked_tracking_array()
+    keys = x.__dask_keys__()
+
+    first = dask.persist_keys(x, [keys[0]], scheduler="sync")
+    assert sorted(calls) == [0]
+
+    # Extending the pinned selection must not recompute the pinned chunk.
+    second = dask.persist_keys(first, [keys[0], keys[3]], scheduler="sync")
+    assert sorted(calls) == [0, 3]
+
+    # Neither does asking for the same key twice.
+    third = dask.persist_keys(second, [keys[0]], scheduler="sync")
+    assert sorted(calls) == [0, 3]
+
+    # No key ends up stored more than once in the resulting graph.
+    stored = [
+        key
+        for layer in third.dask.layers.values()
+        for key, node in getattr(layer, "mapping", {}).items()
+        if isinstance(node, DataNode)
+    ]
+    assert len(stored) == len(set(stored))
+
+    da.utils.assert_eq(third, expected)
+    assert sorted(calls) == [0, 1, 2, 3]
+
+
+@pytest.mark.skipif("not da")
+def test_persist_keys_none_is_a_value():
+    calls = []
+
+    @delayed(pure=True)
+    def produce():
+        calls.append(1)
+        return None
+
+    d = produce()
+    pinned = dask.persist_keys(d, [d.key], scheduler="sync")
+    assert len(calls) == 1
+    assert pinned.compute(scheduler="sync") is None
+
+    # ``None`` counts as materialized; computing again does not rerun it.
+    assert len(calls) == 1
+
+    # Nor does re-persisting treat the stored ``None`` as "not computed".
+    repinned = dask.persist_keys(pinned, [d.key], scheduler="sync")
+    assert len(calls) == 1
+    assert repinned.compute(scheduler="sync") is None
+
+
+@pytest.mark.skipif("not da")
+def test_persist_keys_failure_propagates_unchanged():
+    class Boom(Exception):
+        pass
+
+    def make(i):
+        def f():
+            if i == 2:
+                raise Boom("chunk 2")
+            return np.array([i])
+
+        return f
+
+    blocks = [
+        da.from_delayed(delayed(make(i))(), shape=(1,), dtype=int) for i in range(4)
+    ]
+    x = da.stack(blocks, axis=0)
+    keys = x.__dask_keys__()
+
+    with pytest.raises(Boom, match="chunk 2"):
+        dask.persist_keys(x, [keys[0], keys[2]], scheduler="sync")
+
+    # A failing but unselected chunk must not disturb the partial persist.
+    pinned = dask.persist_keys(x, [keys[0], keys[1]], scheduler="sync")
+    da.utils.assert_eq(pinned[0:2], np.array([[0], [1]]))
+
+    # The original collection is untouched and still lazy for the other chunks.
+    da.utils.assert_eq(x[3:4], np.array([[3]]))
+
+
+@pytest.mark.skipif("not da")
+def test_persist_keys_keeps_blockwise_layers_symbolic():
+    calls = []
+
+    def bump(block, block_info=None):
+        calls.append(block_info[0]["chunk-location"])
+        return block + 1
+
+    x = da.map_blocks(bump, da.ones((20, 20), chunks=(5, 5)), dtype=float)
+    keys = x.__dask_keys__()
+
+    pinned = dask.persist_keys(x, [keys[0][0], keys[1][1]], scheduler="sync")
+    assert sorted(calls) == [(0, 0), (1, 1)]
+
+    # Only the two pinned blocks were materialized; the rest stays blockwise.
+    top_layer = pinned.dask.layers[x.name]
+    assert isinstance(top_layer, Blockwise)
+    assert len(top_layer) == 16 - 2
+    stored = [
+        key
+        for layer in pinned.dask.layers.values()
+        if isinstance(layer, MaterializedLayer)
+        for key, node in layer.mapping.items()
+        if isinstance(node, DataNode)
+    ]
+    assert len(stored) == 2
+
+    # Computing the whole array fills in the remaining blocks exactly once,
+    # without recomputing the two blocks that are already pinned.
+    calls.clear()
+    da.utils.assert_eq(pinned, np.full((20, 20), 2.0))
+    assert sorted(calls) == sorted(
+        (i, j) for i in range(4) for j in range(4) if (i, j) not in {(0, 0), (1, 1)}
+    )
+
+
+@pytest.mark.skipif("not da")
+def test_persist_keys_all_blocks_of_blockwise_layer():
+    x = da.ones((10, 10), chunks=(5, 5)) + 1
+    keys = [key for row in x.__dask_keys__() for key in row]
+
+    pinned = dask.persist_keys(x, keys, scheduler="sync")
+    # Every layer name referenced in ``dependencies`` still exists.
+    assert set(pinned.dask.dependencies) == set(pinned.dask.layers)
+    for deps in pinned.dask.dependencies.values():
+        assert deps <= set(pinned.dask.layers)
+    assert pinned.__dask_keys__() == x.__dask_keys__()
+    da.utils.assert_eq(pinned, np.full((10, 10), 2.0))
+
+
+@pytest.mark.skipif("not da")
+def test_persist_keys_result_is_still_a_lazy_collection():
+    x, expected, calls = _chunked_tracking_array()
+    keys = x.__dask_keys__()
+
+    pinned = dask.persist_keys(x, [keys[1], keys[2]], scheduler="sync")
+    del calls[:]
+
+    # Slicing a pinned chunk runs no producing task at all.
+    da.utils.assert_eq(pinned[1:3], expected[1:3])
+    assert calls == []
+
+    # Arithmetic on top of a partially pinned collection works as usual and
+    # only touches the chunks that are still lazy.
+    da.utils.assert_eq(pinned + 1, expected + 1)
+    assert sorted(calls) == [0, 3]
+
+    # Slicing a lazy chunk computes just that chunk.
+    del calls[:]
+    da.utils.assert_eq(pinned[0:1], expected[0:1])
+    assert sorted(calls) == [0]
+
+
+@pytest.mark.skipif("not da")
+def test_persist_keys_validation():
+    x = da.ones(4, chunks=2)
+
+    with pytest.raises(TypeError, match="Dask collection"):
+        dask.persist_keys([1, 2, 3], [0])
+    with pytest.raises(ValueError, match="not output keys"):
+        dask.persist_keys(x, [("not-a-key", 0)])
+    # An empty selection is a no-op that returns the same collection.
+    assert dask.persist_keys(x, []) is x
+    assert x.persist_keys([]) is x
+
+
+@pytest.mark.skipif("not da")
+@pytest.mark.parametrize(
+    "select",
+    [
+        lambda keys: keys[0],
+        lambda keys: [keys[0]],
+        lambda keys: keys[:2],
+        lambda keys: tuple(keys[:2]),
+        lambda keys: [keys[:2]],
+    ],
+)
+def test_persist_keys_accepts_several_selection_shapes(select):
+    x, expected, calls = _chunked_tracking_array()
+    keys = x.__dask_keys__()
+
+    pinned = dask.persist_keys(x, select(keys), scheduler="sync")
+    assert sorted(calls) in ([0], [0, 1])
+    da.utils.assert_eq(pinned, expected)
+
+
+@pytest.mark.skipif("not da")
+def test_persist_keys_method_matches_function():
+    x, expected, calls = _chunked_tracking_array(nchunks=2)
+    keys = x.__dask_keys__()
+
+    pinned = x.persist_keys([keys[0]], scheduler="sync")
+    assert sorted(calls) == [0]
+    assert pinned.__dask_keys__() == x.__dask_keys__()
+    da.utils.assert_eq(pinned, expected)
+
+
+@pytest.mark.skipif("not da")
+def test_persist_keys_delayed_and_bag():
+    calls = []
+
+    @delayed(pure=True)
+    def value():
+        calls.append("value")
+        return {"a": 1}
+
+    d = value()
+    pinned = dask.persist_keys(d, d.__dask_keys__(), scheduler="sync")
+    assert isinstance(pinned, Delayed)
+    assert pinned.compute(scheduler="sync") == {"a": 1}
+    assert calls == ["value"]
+
+    part_calls = []
+
+    @delayed(pure=True)
+    def part(i):
+        part_calls.append(i)
+        return list(range(i * 3, i * 3 + 3))
+
+    b = db.from_delayed([delayed(list)(part(i)) for i in range(3)])
+    pinned_bag = dask.persist_keys(b, [b.__dask_keys__()[0]], scheduler="sync")
+    assert isinstance(pinned_bag, db.Bag)
+    assert sorted(part_calls) == [0]
+    assert list(pinned_bag.compute(scheduler="sync")) == list(range(9))
+    assert sorted(part_calls) == [0, 1, 2]
+
+
+@pytest.mark.skipif("not da")
+def test_persist_keys_does_not_schedule_more_than_selected():
+    """Use a task counter to observe which group of tasks runs on each access.
+
+    Pinning a couple of chunks must only advance those chunks. A later compute
+    of the whole collection must only advance the remaining ones, and slicing
+    the pinned collection must not advance anything that is already stored.
+    """
+    x, expected, calls = _chunked_tracking_array()
+    keys = x.__dask_keys__()
+
+    # 1. Pin chunks 1 and 2.
+    pinned = dask.persist_keys(x, [keys[1], keys[2]], scheduler="sync")
+    assert sorted(calls) == [1, 2]
+
+    # 2. Compute the whole collection: only chunks 0 and 3 are still missing.
+    del calls[:]
+    executed = []
+    with Callback(pretask=lambda key, *args, **kwargs: executed.append(key)):
+        da.utils.assert_eq(pinned, expected)
+    assert sorted(calls) == [0, 3]
+
+    # 3. Slicing the pinned chunks executes no producing function at all.
+    del calls[:]
+    executed = []
+    with Callback(pretask=lambda key, *args, **kwargs: executed.append(key)):
+        da.utils.assert_eq(pinned[1:3], expected[1:3])
+    assert calls == []
+    assert all(not str(key).startswith("f-") for key in executed)
 
 
 def test_optimize_globals():

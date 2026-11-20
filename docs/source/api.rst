@@ -31,6 +31,7 @@ These more general Dask functions are described below:
    is_dask_collection
    optimize
    persist
+   persist_keys
    visualize
 
 .. currentmodule:: dask.tokenize
@@ -61,6 +62,7 @@ This more advanced API is available in the `Dask distributed documentation
 .. autofunction:: is_dask_collection
 .. autofunction:: optimize
 .. autofunction:: persist
+.. autofunction:: persist_keys
 .. autofunction:: visualize
 
 Datasets

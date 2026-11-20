@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import math
 import numbers
+import uuid
+from collections.abc import Mapping
 from enum import Enum
+from typing import Any
 
 from dask import config, utils
 from dask._task_spec import GraphNode
@@ -66,6 +69,225 @@ def cull(dsk, keys):
         work = new_work
 
     return out, dependencies
+
+
+def _layer_output_keys(layer) -> set:
+    """Output keys of ``layer`` without materializing it when possible"""
+    try:
+        return set(layer.get_output_keys())
+    except (AttributeError, TypeError):  # pragma: no cover - defensive
+        return set(layer)
+
+
+def _owned_keys(layer, keys: set) -> set:
+    """Subset of ``keys`` produced by ``layer``, without needless materializing"""
+    if not keys:
+        return set()
+    from dask.blockwise import Blockwise
+    from dask.highlevelgraph import MaterializedLayer
+
+    if isinstance(layer, MaterializedLayer):
+        return keys & layer.mapping.keys()
+    if isinstance(layer, Blockwise):
+        return keys & _layer_output_keys(layer)
+    return keys & set(layer)
+
+
+def _layer_dependencies(layer, all_keys, layer_names, owner, self_name):
+    """Names of the layers a single layer depends on.
+
+    ``all_keys`` are all keys of the graph, ``layer_names`` the names of its
+    layers and ``owner`` maps a key to the name of the layer that produces it.
+    Blockwise layers are handled through their symbolic ``indices`` so that this
+    never materializes them, which matters for the large arrays this is used
+    with.
+    """
+    from dask.blockwise import Blockwise
+    from dask.core import keys_in_tasks
+    from dask.highlevelgraph import MaterializedLayer
+
+    if isinstance(layer, Blockwise):
+        names = {
+            dep
+            for dep, ind in layer.indices
+            if ind is not None and isinstance(dep, str) and dep in layer_names
+        }
+        names.update(
+            found
+            for found in (owner(key) for key in layer.task.dependencies)
+            if found is not None
+        )
+        # ``numblocks`` may name layers that ended up not being referenced by
+        # any index; only real layers matter here.
+        names &= layer_names
+    else:
+        if isinstance(layer, MaterializedLayer):
+            own, values = set(layer.mapping), layer.mapping.values()
+        else:
+            own, values = set(layer), layer
+        # Mirror ``compute_layer_dependencies``: only keys that this layer does
+        # not produce itself can be dependencies of the layer.
+        candidates = all_keys - own
+        names = {
+            found
+            for found in (owner(key) for key in keys_in_tasks(candidates, values))
+            if found is not None
+        }
+    names.discard(self_name)
+    return names
+
+
+def overlay_persisted_values(dsk: Mapping, values: Mapping) -> Mapping:
+    """Return ``dsk`` with the already computed ``values`` inlined for their keys
+
+    The result is equivalent to ``dsk`` for every key whose value is not in
+    ``values``: those keys keep their original (lazy) tasks and the dependencies
+    they share with the persisted keys are preserved. Only the keys in ``values``
+    get replaced by in-memory :class:`~dask._task_spec.DataNode` entries, so a
+    subsequent compute only has to run whatever is still missing.
+
+    For materialized layers the entry is replaced in place. For blockwise layers
+    - the common case for arrays - the pinned blocks are removed symbolically and
+    the values are collected in a single dedicated layer, so pinning a couple of
+    blocks of a very large array never materializes the rest of its graph.
+
+    ``values`` is keyed by output key and may contain ``None``; the *presence*
+    of a key - never the truthiness of its value - is what marks it as
+    materialized.
+
+    Examples
+    --------
+    >>> def inc(x):
+    ...     return x + 1
+    >>> dsk = {"x": 1, "y": (inc, "x"), "z": (inc, "x")}
+    >>> overlay_persisted_values(dsk, {"y": 42})["y"]
+    DataNode(42)
+    >>> overlay_persisted_values(dsk, {"y": 42})["z"]  # doctest: +ELLIPSIS
+    (<function inc at ...>, 'x')
+    """
+    from dask._task_spec import data_nodes
+    from dask.blockwise import Blockwise
+    from dask.highlevelgraph import HighLevelGraph, MaterializedLayer
+
+    nodes = data_nodes(dict(values))
+    if not nodes:
+        return dsk
+
+    if not isinstance(dsk, HighLevelGraph):
+        merged = dict(dsk)
+        merged.update(nodes)
+        return merged
+
+    layers: dict[str, Any] = {}
+    stored: dict = {}
+    rewritten: set[str] = set()
+    unplaced = set(nodes)
+
+    for name, layer in dsk.layers.items():
+        owned = _owned_keys(layer, unplaced)
+        unplaced -= owned
+        if not owned:
+            layers[name] = layer
+            continue
+
+        if type(layer) is MaterializedLayer:
+            # Cheapest case: swap the entry in place. The layer keeps all of
+            # its keys, but the tasks that used to compute the pinned ones are
+            # gone, so the layer's own dependencies have to be recomputed.
+            mapping = dict(layer.mapping)
+            mapping.update({key: nodes[key] for key in owned})
+            layers[name] = MaterializedLayer(
+                mapping,
+                annotations=layer.annotations,
+                collection_annotations=layer.collection_annotations,
+            )
+            rewritten.add(name)
+            continue
+
+        if isinstance(layer, Blockwise):
+            # Output blocks of a Blockwise layer do not depend on each other,
+            # so the pinned blocks can be dropped without disturbing the rest.
+            all_keys = _layer_output_keys(layer)
+            keep = all_keys - owned
+            if keep:
+                layers[name] = layer.cull(keep, all_keys)[0]
+            else:
+                # Keep the layer name (and hence the dependency structure) but
+                # leave it without tasks; every block is persisted now.
+                layers[name] = MaterializedLayer(
+                    {},
+                    annotations=layer.annotations,
+                    collection_annotations=layer.collection_annotations,
+                )
+            stored.update({key: nodes[key] for key in owned})
+            rewritten.add(name)
+            continue
+
+        # Any other layer type keeps its keys but is reshaped through a
+        # materialized mapping so the pinned entries can be dropped in.
+        mapping = dict(layer)
+        mapping.update({key: nodes[key] for key in owned})
+        layers[name] = MaterializedLayer(
+            mapping,
+            annotations=layer.annotations,
+            collection_annotations=layer.collection_annotations,
+        )
+        rewritten.add(name)
+
+    if unplaced:  # pragma: no cover - output keys are always in some layer
+        stored.update({key: nodes[key] for key in unplaced})
+
+    persisted_name: str | None = None
+    if stored:
+        persisted_name = f"persisted-{uuid.uuid4().hex}"
+        layers[persisted_name] = MaterializedLayer(stored)
+
+    return HighLevelGraph(
+        layers, _overlay_layer_dependencies(dsk, layers, rewritten, persisted_name)
+    )
+
+
+def _overlay_layer_dependencies(dsk, layers, rewritten, persisted_name):
+    """Re-wire the layer dependencies affected by the persisted values.
+
+    Rewriting a layer changes the keys it references, so the declared
+    dependencies of that layer - and of the layers that used to depend on it -
+    have to be brought back in line with what the tasks actually use. Otherwise
+    the graph fails ``HighLevelGraph.validate()``, and culling could drop the
+    persisted values. Every other declaration is preserved verbatim, which also
+    keeps the rest of the graph unmaterialized.
+    """
+    dependencies = {
+        name: {dep for dep in deps if dep in layers}
+        for name, deps in dsk.dependencies.items()
+    }
+    for name in layers:
+        dependencies.setdefault(name, set())
+    if persisted_name is not None:
+        dependencies[persisted_name] = set()
+
+    if not rewritten:
+        return dependencies
+
+    affected = set(rewritten)
+    affected.update(
+        name for name, deps in dependencies.items() if deps & set(rewritten)
+    )
+    affected.discard(persisted_name)
+
+    # Map every output key of the graph to the layer that produces it. This
+    # stays symbolic for blockwise layers.
+    owners: dict = {}
+    for name, layer in layers.items():
+        for key in _layer_output_keys(layer):
+            owners.setdefault(key, name)
+    all_keys = set(owners)
+
+    for name in affected:
+        dependencies[name] = _layer_dependencies(
+            layers[name], all_keys, set(layers), owners.get, name
+        )
+    return dependencies
 
 
 def default_fused_linear_keys_renamer(keys):

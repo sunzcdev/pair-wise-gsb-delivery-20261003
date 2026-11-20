@@ -54,6 +54,7 @@ __all__ = (
     "is_dask_collection",
     "compute",
     "persist",
+    "persist_keys",
     "optimize",
     "visualize",
     "tokenize",
@@ -364,6 +365,42 @@ class DaskMethodsMixin:
         """
         (result,) = persist(self, traverse=False, **kwargs)
         return result
+
+    def persist_keys(self, keys, **kwargs):
+        """Persist only the given output keys of this dask collection
+
+        This is a partial version of :meth:`persist`. The returned collection
+        has the same metadata (name, chunks, dtype, ...) as this one and can
+        still be sliced and computed normally, but the results for ``keys`` are
+        already materialized. All other keys stay lazy, so the rest of a large
+        collection is never computed up front.
+
+        Keys that are already materialized are reused instead of being
+        recomputed, which makes it possible to pin additional chunks over time
+        by chaining calls. ``None`` is a valid result and is stored like any
+        other value. If computing one of the selected keys raises, the
+        exception propagates unchanged.
+
+        Parameters
+        ----------
+        keys : key, list of keys or nested list of keys
+            The output keys that should be materialized. See
+            ``self.__dask_keys__()`` for the available output keys.
+        **kwargs
+            Forwarded to :func:`dask.persist_keys`, e.g. ``scheduler`` or
+            ``optimize_graph``.
+
+        Returns
+        -------
+        A new collection of the same type as this one, with ``keys`` backed by
+        in-memory data.
+
+        See Also
+        --------
+        dask.persist_keys
+        dask.persist
+        """
+        return persist_keys(self, keys, **kwargs)
 
     def compute(self, **kwargs):
         """Compute this dask collection
@@ -1137,6 +1174,167 @@ def persist(*args, traverse=True, optimize_graph=True, scheduler=None, **kwargs)
         else:
             results2.append(rebuild({k: d[k] for k in a_keys}, *state))
     return repack(results2)
+
+
+def _rebuild_with_persisted_values(collection, values):
+    """Rebuild ``collection`` so that the results in ``values`` are reused.
+
+    Unlike :func:`persist`, this does not throw the original graph away: the
+    returned collection keeps its metadata *and* the lazy tasks of every key
+    that is not in ``values``, so it can still be sliced and computed.
+    """
+    from dask.optimization import overlay_persisted_values
+
+    rebuild, state = collection.__dask_postpersist__()
+    graph = overlay_persisted_values(collection.__dask_graph__(), values)
+    return rebuild(graph, *state)
+
+
+def _expand_selected_keys(keys, output_keys):
+    """Flatten a (possibly nested) selection of keys into a flat key list
+
+    Keys are tuples themselves, so a selection may be a single key, a list of
+    keys, a nested list shaped like ``collection.__dask_keys__()`` or a tuple of
+    keys. A container is only unpacked when it is not an output key itself,
+    which keeps keys intact.
+    """
+    try:
+        is_key = keys in output_keys
+    except TypeError:  # unhashable, hence definitely not a key
+        is_key = False
+    if is_key:
+        return [keys]
+    if isinstance(keys, (list, tuple)):
+        out = []
+        for item in keys:
+            out.extend(_expand_selected_keys(item, output_keys))
+        return out
+    return [keys]
+
+
+def _normalize_persist_keys(collection, keys):
+    """Validate ``keys`` against the output keys of ``collection``"""
+    output_keys = set(flatten(collection.__dask_keys__()))
+    # Drop duplicates but keep the order the user asked for.
+    selected = list(dict.fromkeys(_expand_selected_keys(keys, output_keys)))
+    unknown = [key for key in selected if key not in output_keys]
+    if unknown:
+        raise ValueError(
+            f"{unknown!r} are not output keys of this collection. "
+            "Available output keys are given by collection.__dask_keys__()."
+        )
+    return selected
+
+
+def persist_keys(
+    collection, keys, *, scheduler=None, optimize_graph=True, **kwargs
+):
+    """Persist only a selection of the output keys of a collection
+
+    This is a partial :func:`persist`. The returned collection has the same
+    metadata (name, chunks, dtype, ...) as the input one and can still be
+    sliced and computed normally, but the tasks backing ``keys`` no longer have
+    to run: their results are stored in memory. Every other key keeps its
+    original, lazy tasks, so the rest of a large collection is never computed
+    up front.
+
+    Only the subgraph required by ``keys`` is scheduled, which makes this
+    suitable for pinning the few chunks that are read over and over (for
+    example in a loop) while leaving the rest of the array lazy. Asking for
+    several keys at once shares their common upstream, so it is computed only
+    once.
+
+    Keys that are already materialized in ``collection`` - for instance because
+    it is itself the result of an earlier ``persist_keys`` call - are reused
+    as-is and are not scheduled again.
+
+    A result of ``None`` is a perfectly valid value and is stored like any
+    other value; it is never mistaken for "not computed yet".
+
+    If one of the selected keys fails to compute, the exception is raised
+    unchanged and no partially persisted collection is returned.
+
+    Parameters
+    ----------
+    collection : Dask collection
+        The collection to partially persist.
+    keys : key, list of keys or nested list of keys
+        The output keys of ``collection`` that should be materialized. Use
+        ``collection.__dask_keys__()`` to see the available output keys.
+    scheduler : string, optional
+        Which scheduler to use like "threads", "synchronous" or "processes".
+        If not provided, the default is to check the global settings first,
+        and then fall back to the collection defaults.
+    optimize_graph : bool, optional
+        If True [default], the graph is optimized before computation.
+        Otherwise the graph is run as is. This can be useful for debugging.
+    **kwargs
+        Extra keywords to forward to the scheduler function.
+
+    Returns
+    -------
+    A new collection of the same type as ``collection``, with ``keys`` backed
+    by in-memory data.
+
+    See Also
+    --------
+    dask.persist
+
+    Examples
+    --------
+    >>> import dask
+    >>> import dask.array as da
+    >>> x = da.arange(10, chunks=2)
+    >>> x.npartitions
+    5
+    >>> # Pin the first two chunks; the other three stay lazy.
+    >>> pinned = dask.persist_keys(
+    ...     x, x.__dask_keys__()[:2], scheduler="single-threaded"
+    ... )
+    >>> # The returned collection has the same metadata...
+    >>> (pinned.name, pinned.chunks) == (x.name, x.chunks)
+    True
+    >>> # ...and still computes normally, only filling in the missing chunks.
+    >>> pinned.compute(scheduler="single-threaded")
+    array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    >>> pinned[0:4].compute(scheduler="single-threaded")
+    array([0, 1, 2, 3])
+    """
+    if not is_dask_collection(collection):
+        raise TypeError(f"Expected a Dask collection; got {type(collection)}")
+
+    selected = _normalize_persist_keys(collection, keys)
+    if not selected:
+        return collection
+
+    from dask._task_spec import materialized_values
+
+    # Reuse whatever was already persisted instead of recomputing it. ``None``
+    # shows up here as a real value, so it is not rescheduled either.
+    values = materialized_values(collection.__dask_graph__(), selected)
+    missing = [key for key in selected if key not in values]
+
+    if missing:
+        schedule = get_scheduler(scheduler=scheduler, collections=[collection])
+        graph = _selected_subgraph(collection, missing, optimize_graph)
+        with shorten_traceback():
+            results = schedule(graph, missing, **kwargs)
+        values.update(zip(missing, results, strict=True))
+
+    return _rebuild_with_persisted_values(collection, values)
+
+
+def _selected_subgraph(collection, keys, optimize_graph):
+    """Graph for ``collection`` culled down to ``keys``.
+
+    Only the selected outputs are handed to the optimizer, so pinning a few
+    chunks of a very large collection never walks the rest of its task graph.
+    """
+    graph = collection.__dask_graph__()
+    optimizer = getattr(collection, "__dask_optimize__", None)
+    if optimize_graph and optimizer is not None:
+        graph = optimizer(graph, keys)
+    return graph
 
 
 def _colorize(t):

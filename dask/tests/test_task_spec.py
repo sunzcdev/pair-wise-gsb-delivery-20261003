@@ -20,8 +20,10 @@ from dask._task_spec import (
     Tuple,
     _get_dependencies,
     convert_legacy_graph,
+    data_nodes,
     execute_graph,
     fuse_linear_task_spec,
+    materialized_values,
     parse_input,
     resolve_aliases,
 )
@@ -1143,3 +1145,32 @@ def test_substitute_subclasses():
     t2 = t.substitute({"b": "c"})
     assert t2.custom_kwarg_only == "foo"
     assert t2({"a": "a", "c": "b"}) == t({"a": "a", "b": "b"})
+
+
+def test_data_nodes():
+    nodes = data_nodes({"x": 1, "y": None})
+    assert nodes["x"] == DataNode("x", 1)
+    assert nodes["y"] == DataNode("y", None)
+    # ``None`` is a value, not a missing key.
+    assert nodes["y"]() is None
+
+
+def test_materialized_values():
+    dsk = {"x": DataNode("x", 1), "y": DataNode("y", None), "z": Task("z", func, "x")}
+    assert materialized_values(dsk, ["x", "y", "z", "missing"]) == {
+        "x": 1,
+        "y": None,
+    }
+    assert materialized_values(dsk, []) == {}
+
+
+def test_materialized_values_high_level_graph():
+    from dask.highlevelgraph import HighLevelGraph, MaterializedLayer
+
+    layers = {
+        "data": MaterializedLayer({"x": DataNode("x", 1), "y": DataNode("y", None)}),
+    }
+    hlg = HighLevelGraph(layers, {"data": set()})
+    assert materialized_values(hlg, ["x", "y"]) == {"x": 1, "y": None}
+    # Keys that are not in the graph are simply not reported.
+    assert materialized_values(hlg, ["missing"]) == {}

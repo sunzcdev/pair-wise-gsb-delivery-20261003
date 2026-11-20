@@ -1185,6 +1185,83 @@ def fuse_linear_task_spec(dsk, keys):
     return result
 
 
+def data_nodes(values: Mapping[KeyType, Any]) -> dict[KeyType, DataNode]:
+    """Wrap already computed ``values`` into :class:`DataNode` tasks.
+
+    ``DataNode`` is used instead of the bare value on purpose: a computed result
+    is allowed to be ``None`` (or any other falsy object) and still has to be
+    distinguishable from a key that was never computed. The *presence* of a key
+    in the returned mapping marks it as materialized - never the truthiness of
+    the value.
+
+    Examples
+    --------
+    >>> data_nodes({"x": None})
+    {'x': DataNode(None)}
+    """
+    return {key: DataNode(key, value) for key, value in values.items()}
+
+
+def materialized_values(
+    dsk: Mapping[KeyType, Any], keys: Iterable[KeyType]
+) -> dict[KeyType, Any]:
+    """Collect the values of ``keys`` that are already materialized in ``dsk``.
+
+    A key counts as materialized when its graph entry is a :class:`DataNode`,
+    i.e. when its value is already available and does not have to be computed.
+    Values are returned untouched, so a stored ``None`` is reported as ``None``
+    instead of being mistaken for a key that is not there. Keys that are absent
+    from the graph are ignored.
+
+    ``dsk`` may be a plain mapping or a
+    :class:`~dask.highlevelgraph.HighLevelGraph`. For a high level graph only
+    the layers that are already materialized are inspected, which avoids
+    triggering the materialization of symbolic layers (e.g. ``Blockwise``)
+    while still finding the values stored by an earlier (partial) persist.
+
+    Examples
+    --------
+    >>> dsk = {"x": DataNode("x", 1), "y": DataNode("y", None)}
+    >>> materialized_values(dsk, ["x", "y", "z"])
+    {'x': 1, 'y': None}
+    """
+    keys = list(dict.fromkeys(keys))
+    if not keys:
+        return {}
+    out: dict[KeyType, Any] = {}
+    layers = getattr(dsk, "layers", None)
+    if layers is None:
+        for key in keys:
+            try:
+                node = dsk[key]
+            except KeyError:
+                continue
+            if isinstance(node, DataNode):
+                out[key] = node.value
+        return out
+
+    from dask.highlevelgraph import MaterializedLayer
+
+    # Later layers take precedence over earlier ones (the same way
+    # ``ensure_dict`` merges a HighLevelGraph), so walk them backwards.
+    for layer in reversed(list(layers.values())):
+        if not isinstance(layer, MaterializedLayer):
+            continue
+        mapping = layer.mapping
+        for key in keys:
+            if key in out:
+                continue
+            try:
+                node = mapping[key]
+            except (KeyError, IndexError, TypeError):
+                continue
+            if isinstance(node, DataNode):
+                out[key] = node.value
+        if len(out) == len(keys):
+            break
+    return out
+
+
 def cull(
     dsk: dict[KeyType, GraphNode], keys: Iterable[KeyType]
 ) -> dict[KeyType, GraphNode]:

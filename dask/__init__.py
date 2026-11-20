@@ -29,6 +29,7 @@ from dask.base import (
     is_dask_collection,
     optimize,
     persist,
+    persist_keys,
     visualize,
 )
 from dask.core import istask
