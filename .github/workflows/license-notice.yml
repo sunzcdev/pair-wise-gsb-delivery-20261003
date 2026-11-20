@@ -1,0 +1,73 @@
+name: License Change Notice
+
+# The project is transitioning from LGPL-2.1 to Apache 2.0 and may keep
+# LGPL-2.1-or-later as an OR option for GPL-2.0-only consumers
+# (https://github.com/python-zeroconf/python-zeroconf/issues/1835).
+# Every newly opened pull request gets a comment stating that opening
+# it means agreeing to license the contribution under both licenses.
+# If the pull request author replies that they do not agree, the pull
+# request is closed.
+
+on:
+  pull_request_target:
+    types:
+      - opened
+  issue_comment:
+    types:
+      - created
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  notice:
+    name: Post license notice
+    if: >
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: [
+                "Thanks for contributing! A quick note: this project is in the process of moving from LGPL-2.1 to Apache 2.0, and may keep LGPL-2.1-or-later as an OR option so GPL-2.0-only projects can keep using the library, see #1835.",
+                "",
+                "By continuing with this pull request you agree that this new contribution is offered under both Apache 2.0 and LGPL-2.1-or-later, so it is covered under either outcome.",
+                "",
+                "This notice does not affect your previous contributions. If you would like to consent to relicensing those as well, please post the consent statement on #1835; silence is never treated as consent for past work.",
+                "",
+                "If offering this contribution under these licenses does not work for you, no hard feelings; reply with the exact phrase `I do not agree to the Apache 2.0 license` or simply close this pull request.",
+              ].join("\n"),
+            });
+
+  objection:
+    name: Close on objection
+    if: >
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.comment.user.login == github.event.issue.user.login &&
+      contains(github.event.comment.body, 'I do not agree to the Apache 2.0 license')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const number = context.payload.issue.number;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: number,
+              body: "Closing as requested; this contribution is not offered under the Apache 2.0 license change.",
+            });
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: number,
+              state: "closed",
+            });

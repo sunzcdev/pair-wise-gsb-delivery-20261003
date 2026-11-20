@@ -1,0 +1,505 @@
+"""Unit tests for zeroconf._listener"""
+
+from __future__ import annotations
+
+import logging
+import unittest
+import unittest.mock
+from typing import cast
+from unittest.mock import MagicMock, patch
+
+import zeroconf as r
+from zeroconf import (
+    ServiceInfo,
+    Zeroconf,
+    _engine,
+    _listener,
+    const,
+    current_time_millis,
+)
+from zeroconf._protocol import outgoing
+from zeroconf._protocol.incoming import DNSIncoming
+
+from . import QuestionHistoryWithoutSuppression, aaaa_response_packet
+
+log = logging.getLogger("zeroconf")
+original_logging_level = logging.NOTSET
+
+
+def setup_module():
+    global original_logging_level
+    original_logging_level = log.level
+    log.setLevel(logging.DEBUG)
+
+
+def teardown_module():
+    if original_logging_level != logging.NOTSET:
+        log.setLevel(original_logging_level)
+
+
+def test_guard_against_oversized_packets():
+    """Ensure we do not process oversized packets.
+
+    These packets can quickly overwhelm the system.
+    """
+    zc = Zeroconf(interfaces=["127.0.0.1"])
+
+    generated = r.DNSOutgoing(const._FLAGS_QR_RESPONSE)
+
+    for _i in range(5000):
+        generated.add_answer_at_time(
+            r.DNSText(
+                "packet{i}.local.",
+                const._TYPE_TXT,
+                const._CLASS_IN | const._CLASS_UNIQUE,
+                500,
+                b"path=/healthz/",
+            ),
+            0,
+        )
+
+    try:
+        # We are patching to generate an oversized packet
+        with (
+            patch.object(outgoing, "_MAX_MSG_ABSOLUTE", 100000),
+            patch.object(outgoing, "_MAX_MSG_TYPICAL", 100000),
+        ):
+            over_sized_packet = generated.packets()[0]
+            assert len(over_sized_packet) > const._MAX_MSG_ABSOLUTE
+    except AttributeError:
+        # cannot patch with cython
+        zc.close()
+        return
+
+    generated = r.DNSOutgoing(const._FLAGS_QR_RESPONSE)
+    okpacket_record = r.DNSText(
+        "okpacket.local.",
+        const._TYPE_TXT,
+        const._CLASS_IN | const._CLASS_UNIQUE,
+        500,
+        b"path=/healthz/",
+    )
+
+    generated.add_answer_at_time(
+        okpacket_record,
+        0,
+    )
+    ok_packet = generated.packets()[0]
+
+    # We cannot test though the network interface as some operating systems
+    # will guard against the oversized packet and we won't see it.
+    listener = _listener.AsyncListener(zc)
+    listener.transport = unittest.mock.MagicMock()
+
+    listener.datagram_received(ok_packet, ("127.0.0.1", const._MDNS_PORT))
+    assert zc.cache.async_get_unique(okpacket_record) is not None
+
+    listener.datagram_received(over_sized_packet, ("127.0.0.1", const._MDNS_PORT))
+    assert (
+        zc.cache.async_get_unique(
+            r.DNSText(
+                "packet0.local.",
+                const._TYPE_TXT,
+                const._CLASS_IN | const._CLASS_UNIQUE,
+                500,
+                b"path=/healthz/",
+            )
+        )
+        is None
+    )
+
+    logging.getLogger("zeroconf").setLevel(logging.INFO)
+
+    listener.datagram_received(over_sized_packet, ("::1", const._MDNS_PORT, 1, 1))
+    assert (
+        zc.cache.async_get_unique(
+            r.DNSText(
+                "packet0.local.",
+                const._TYPE_TXT,
+                const._CLASS_IN | const._CLASS_UNIQUE,
+                500,
+                b"path=/healthz/",
+            )
+        )
+        is None
+    )
+
+    zc.close()
+
+
+def test_guard_against_duplicate_packets(zc: Zeroconf) -> None:
+    """Ensure we do not process duplicate packets.
+    These packets can quickly overwhelm the system.
+    """
+    zc.registry.async_add(
+        ServiceInfo(
+            "_http._tcp.local.",
+            "Test._http._tcp.local.",
+            server="Test._http._tcp.local.",
+            port=4,
+        )
+    )
+    zc.question_history = QuestionHistoryWithoutSuppression()
+
+    class SubListener(_listener.AsyncListener):
+        def handle_query_or_defer(
+            self,
+            msg: DNSIncoming,
+            addr: str,
+            port: int,
+            transport: _engine._WrappedTransport,
+            v6_flow_scope: tuple[()] | tuple[int, int] = (),
+        ) -> None:
+            """Handle a query or defer it for later processing."""
+            super().handle_query_or_defer(msg, addr, port, transport, v6_flow_scope)
+
+    listener = SubListener(zc)
+    listener.transport = MagicMock()
+
+    query = r.DNSOutgoing(const._FLAGS_QR_QUERY, multicast=True)
+    question = r.DNSQuestion("x._http._tcp.local.", const._TYPE_PTR, const._CLASS_IN)
+    query.add_question(question)
+    packet_with_qm_question = query.packets()[0]
+
+    query3 = r.DNSOutgoing(const._FLAGS_QR_QUERY, multicast=True)
+    question3 = r.DNSQuestion("x._ay._tcp.local.", const._TYPE_PTR, const._CLASS_IN)
+    query3.add_question(question3)
+    packet_with_qm_question2 = query3.packets()[0]
+
+    query2 = r.DNSOutgoing(const._FLAGS_QR_QUERY, multicast=True)
+    question2 = r.DNSQuestion("x._http._tcp.local.", const._TYPE_PTR, const._CLASS_IN)
+    question2.unicast = True
+    query2.add_question(question2)
+    packet_with_qu_question = query2.packets()[0]
+
+    addrs = ("1.2.3.4", 43)
+
+    with patch.object(listener, "handle_query_or_defer") as _handle_query_or_defer:
+        start_time = current_time_millis()
+
+        listener._process_datagram_at_time(
+            False,
+            len(packet_with_qm_question),
+            start_time,
+            packet_with_qm_question,
+            addrs,
+        )
+        _handle_query_or_defer.assert_called_once()
+        _handle_query_or_defer.reset_mock()
+
+        # Now call with the same packet again and handle_query_or_defer should not fire
+        listener._process_datagram_at_time(
+            False,
+            len(packet_with_qm_question),
+            start_time,
+            packet_with_qm_question,
+            addrs,
+        )
+        _handle_query_or_defer.assert_not_called()
+        _handle_query_or_defer.reset_mock()
+
+        # Now walk time forward 1100 milliseconds
+        new_time = start_time + 1100
+        # Now call with the same packet again and handle_query_or_defer should fire
+        listener._process_datagram_at_time(
+            False,
+            len(packet_with_qm_question),
+            new_time,
+            packet_with_qm_question,
+            addrs,
+        )
+        _handle_query_or_defer.assert_called_once()
+        _handle_query_or_defer.reset_mock()
+
+        # Now call with the different packet and handle_query_or_defer should fire
+        listener._process_datagram_at_time(
+            False,
+            len(packet_with_qm_question2),
+            new_time,
+            packet_with_qm_question2,
+            addrs,
+        )
+        _handle_query_or_defer.assert_called_once()
+        _handle_query_or_defer.reset_mock()
+
+        # Replay the first packet — the recency window remembers more than
+        # just the most recent payload, so this is a duplicate.
+        listener._process_datagram_at_time(
+            False,
+            len(packet_with_qm_question),
+            new_time,
+            packet_with_qm_question,
+            addrs,
+        )
+        _handle_query_or_defer.assert_not_called()
+        _handle_query_or_defer.reset_mock()
+
+        # Now call with the different packet with qu question and handle_query_or_defer should fire
+        listener._process_datagram_at_time(
+            False,
+            len(packet_with_qu_question),
+            new_time,
+            packet_with_qu_question,
+            addrs,
+        )
+        _handle_query_or_defer.assert_called_once()
+        _handle_query_or_defer.reset_mock()
+
+        # Now call again with the same packet that has a qu question and handle_query_or_defer should fire
+        listener._process_datagram_at_time(
+            False,
+            len(packet_with_qu_question),
+            new_time,
+            packet_with_qu_question,
+            addrs,
+        )
+        _handle_query_or_defer.assert_called_once()
+        _handle_query_or_defer.reset_mock()
+
+        log.setLevel(logging.WARNING)
+
+        # Replay the QM packet with debug disabled — suppression must hold
+        # off the debug-log path too.
+        listener._process_datagram_at_time(
+            False,
+            len(packet_with_qm_question),
+            new_time,
+            packet_with_qm_question,
+            addrs,
+        )
+        _handle_query_or_defer.assert_not_called()
+        _handle_query_or_defer.reset_mock()
+
+        # Now call with garbage
+        listener._process_datagram_at_time(False, len(b"garbage"), new_time, b"garbage", addrs)
+        _handle_query_or_defer.assert_not_called()
+        _handle_query_or_defer.reset_mock()
+
+
+def test_guard_against_duplicate_packets_per_sender_scope(zc: Zeroconf) -> None:
+    """A scoped copy of a response follows an unscoped one, and suppresses later copies from any sender."""
+    listener = _listener.AsyncListener(zc)
+    listener.transport = MagicMock()
+    packet = aaaa_response_packet("peer.local.")
+    other_packet = aaaa_response_packet("other.local.")
+    v4_mapped = ("::ffff:192.0.2.1", 5353, 0, 0)
+    v6_link_local = ("fe80::2", 5353, 0, 2)
+
+    now = current_time_millis()
+    listener._process_datagram_at_time(False, len(packet), now, packet, v4_mapped)
+    listener._process_datagram_at_time(False, len(packet), now, packet, v6_link_local)
+    (record,) = zc.cache.async_all_by_details("peer.local.", const._TYPE_AAAA, const._CLASS_IN)
+    assert cast(r.DNSAddress, record).scope_id == 2
+
+    listener._process_datagram_at_time(False, len(other_packet), now, other_packet, v4_mapped)
+    processed = listener.last_message
+    for addrs in (v4_mapped, v6_link_local, ("fe80::2", 5353, 0, 15)):
+        listener._process_datagram_at_time(False, len(packet), now, packet, addrs)
+    assert listener.last_message is processed
+
+
+def test_guard_against_duplicate_queries_across_sender_scopes(zc: Zeroconf) -> None:
+    """The scoped copy of a query is still suppressed as a duplicate of the unscoped one."""
+    zc.registry.async_add(
+        ServiceInfo(
+            "_http._tcp.local.",
+            "Test._http._tcp.local.",
+            server="Test._http._tcp.local.",
+            port=4,
+        )
+    )
+    handled: list[tuple[str, int]] = []
+
+    class SubListener(_listener.AsyncListener):
+        def handle_query_or_defer(
+            self,
+            msg: DNSIncoming,
+            addr: str,
+            port: int,
+            transport: _engine._WrappedTransport,
+            v6_flow_scope: tuple[()] | tuple[int, int] = (),
+        ) -> None:
+            handled.append((addr, port))
+
+    listener = SubListener(zc)
+    listener.transport = MagicMock()
+
+    query = r.DNSOutgoing(const._FLAGS_QR_QUERY)
+    query.add_question(r.DNSQuestion("peer.local.", const._TYPE_AAAA, const._CLASS_IN))
+    packet = query.packets()[0]
+
+    now = current_time_millis()
+    listener._process_datagram_at_time(False, len(packet), now, packet, ("::ffff:192.0.2.1", 5353, 0, 0))
+    listener._process_datagram_at_time(False, len(packet), now, packet, ("fe80::2", 5353, 0, 2))
+    assert handled == [("::ffff:192.0.2.1", 5353)]
+
+
+def test_guard_against_alternating_duplicate_packets(zc: Zeroconf) -> None:
+    """Alternating two distinct payloads must not bypass duplicate suppression."""
+    zc.registry.async_add(
+        ServiceInfo(
+            "_http._tcp.local.",
+            "Test._http._tcp.local.",
+            server="Test._http._tcp.local.",
+            port=4,
+        )
+    )
+    zc.question_history = QuestionHistoryWithoutSuppression()
+
+    class SubListener(_listener.AsyncListener):
+        def handle_query_or_defer(
+            self,
+            msg: DNSIncoming,
+            addr: str,
+            port: int,
+            transport: _engine._WrappedTransport,
+            v6_flow_scope: tuple[()] | tuple[int, int] = (),
+        ) -> None:
+            super().handle_query_or_defer(msg, addr, port, transport, v6_flow_scope)
+
+    listener = SubListener(zc)
+    listener.transport = MagicMock()
+
+    query_a = r.DNSOutgoing(const._FLAGS_QR_QUERY, multicast=True)
+    query_a.add_question(r.DNSQuestion("a._http._tcp.local.", const._TYPE_PTR, const._CLASS_IN))
+    packet_a = query_a.packets()[0]
+
+    query_b = r.DNSOutgoing(const._FLAGS_QR_QUERY, multicast=True)
+    query_b.add_question(r.DNSQuestion("b._http._tcp.local.", const._TYPE_PTR, const._CLASS_IN))
+    packet_b = query_b.packets()[0]
+
+    assert packet_a != packet_b
+
+    addrs = ("1.2.3.4", 43)
+
+    with patch.object(listener, "handle_query_or_defer") as _handle_query_or_defer:
+        now = current_time_millis()
+
+        # Prime both payloads.
+        listener._process_datagram_at_time(False, len(packet_a), now, packet_a, addrs)
+        listener._process_datagram_at_time(False, len(packet_b), now, packet_b, addrs)
+        assert _handle_query_or_defer.call_count == 2
+        _handle_query_or_defer.reset_mock()
+
+        for _ in range(4):
+            listener._process_datagram_at_time(False, len(packet_a), now, packet_a, addrs)
+            listener._process_datagram_at_time(False, len(packet_b), now, packet_b, addrs)
+        _handle_query_or_defer.assert_not_called()
+
+
+def test_recent_packets_window_is_bounded(zc: Zeroconf) -> None:
+    """Distinct payloads beyond the recency window evict oldest entries."""
+    zc.registry.async_add(
+        ServiceInfo(
+            "_http._tcp.local.",
+            "Test._http._tcp.local.",
+            server="Test._http._tcp.local.",
+            port=4,
+        )
+    )
+    zc.question_history = QuestionHistoryWithoutSuppression()
+
+    class SubListener(_listener.AsyncListener):
+        def handle_query_or_defer(
+            self,
+            msg: DNSIncoming,
+            addr: str,
+            port: int,
+            transport: _engine._WrappedTransport,
+            v6_flow_scope: tuple[()] | tuple[int, int] = (),
+        ) -> None:
+            super().handle_query_or_defer(msg, addr, port, transport, v6_flow_scope)
+
+    listener = SubListener(zc)
+    listener.transport = MagicMock()
+
+    addrs = ("1.2.3.4", 43)
+    now = current_time_millis()
+
+    packets = []
+    for i in range(const._RECENT_PACKETS_MAX + 4):
+        query = r.DNSOutgoing(const._FLAGS_QR_QUERY, multicast=True)
+        query.add_question(r.DNSQuestion(f"n{i}._http._tcp.local.", const._TYPE_PTR, const._CLASS_IN))
+        packets.append(query.packets()[0])
+
+    with patch.object(listener, "handle_query_or_defer") as _handle_query_or_defer:
+        for packet in packets:
+            listener._process_datagram_at_time(False, len(packet), now, packet, addrs)
+        assert _handle_query_or_defer.call_count == len(packets)
+        _handle_query_or_defer.reset_mock()
+
+        # The newest _RECENT_PACKETS_MAX entries are still in the
+        # window; replaying them must be suppressed. Checked before
+        # replaying the evicted ones below since that would mutate the
+        # window and could mask an off-by-one in eviction.
+        kept = packets[-const._RECENT_PACKETS_MAX :]
+        for packet in kept:
+            listener._process_datagram_at_time(False, len(packet), now, packet, addrs)
+        _handle_query_or_defer.assert_not_called()
+
+        # The oldest packets should have been evicted and now replay.
+        evicted = packets[: len(packets) - const._RECENT_PACKETS_MAX]
+        for packet in evicted:
+            listener._process_datagram_at_time(False, len(packet), now, packet, addrs)
+        assert _handle_query_or_defer.call_count == len(evicted)
+
+
+def test_recent_packets_miss_with_small_now_is_not_suppressed(zc: Zeroconf) -> None:
+    """A cache miss must not trigger suppression when `now` is below the suppression interval."""
+    # time.monotonic() can start near zero on freshly booted systems, so
+    # `now - _DUPLICATE_PACKET_SUPPRESSION_INTERVAL` is negative for the
+    # first interval of process lifetime. A 0.0 default on the recency
+    # dict would let any negative `now - INTERVAL` satisfy the compare
+    # and suppress legitimate traffic.
+    zc.registry.async_add(
+        ServiceInfo(
+            "_http._tcp.local.",
+            "Test._http._tcp.local.",
+            server="Test._http._tcp.local.",
+            port=4,
+        )
+    )
+    zc.question_history = QuestionHistoryWithoutSuppression()
+
+    class SubListener(_listener.AsyncListener):
+        def handle_query_or_defer(
+            self,
+            msg: DNSIncoming,
+            addr: str,
+            port: int,
+            transport: _engine._WrappedTransport,
+            v6_flow_scope: tuple[()] | tuple[int, int] = (),
+        ) -> None:
+            super().handle_query_or_defer(msg, addr, port, transport, v6_flow_scope)
+
+    listener = SubListener(zc)
+    listener.transport = MagicMock()
+
+    query = r.DNSOutgoing(const._FLAGS_QR_QUERY, multicast=True)
+    query.add_question(r.DNSQuestion("a._http._tcp.local.", const._TYPE_PTR, const._CLASS_IN))
+    packet = query.packets()[0]
+
+    addrs = ("1.2.3.4", 43)
+
+    with patch.object(listener, "handle_query_or_defer") as _handle_query_or_defer:
+        listener._process_datagram_at_time(False, len(packet), 0.0, packet, addrs)
+        _handle_query_or_defer.assert_called_once()
+
+
+def test_repeated_announcement_under_one_second_is_processed(zc: Zeroconf) -> None:
+    """An announcement repeated a little under a second later is not dropped as a duplicate."""
+    listener = _listener.AsyncListener(zc)
+    listener.transport = MagicMock()
+    response = r.DNSOutgoing(const._FLAGS_QR_RESPONSE | const._FLAGS_AA)
+    response.add_answer_at_time(
+        r.DNSAddress("device.local.", const._TYPE_A, const._CLASS_IN, 120, b"\x7f\x00\x00\x01"), 0
+    )
+    packet = response.packets()[0]
+    addrs = ("1.2.3.4", 5353)
+
+    now = current_time_millis()
+    listener._process_datagram_at_time(False, len(packet), now, packet, addrs)
+    listener._process_datagram_at_time(False, len(packet), now + 5, packet, addrs)
+    assert listener.last_time == now
+    listener._process_datagram_at_time(False, len(packet), now + 926, packet, addrs)
+    assert listener.last_time == now + 926

@@ -1,0 +1,405 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - release-0.x
+  pull_request:
+
+concurrency:
+  group: ${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  POETRY_VIRTUALENVS_IN_PROJECT: "true"
+  UV_PYTHON_PREFERENCE: only-managed  # avoid ancient system Python
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: "3.12"
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+
+  # Make sure the PR title follows the conventional commits convention:
+  # https://www.conventionalcommits.org
+  # PRs are squash-merged, so the PR title becomes the commit on master and
+  # drives python-semantic-release's version bump.
+  pr-title:
+    name: Lint PR Title
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          subjectPattern: ^(?![A-Z]).+$
+          subjectPatternError: |
+            The subject "{subject}" found in the pull request title "{title}"
+            didn't match the configured pattern. Please ensure that the subject
+            starts with a lowercase character.
+
+  # The ASan fuzz workflow only runs on manual dispatch; this gate keeps a
+  # failed run from rotting silently by blocking CI until it is green again.
+  asan-status:
+    name: Last ASan fuzz run
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Fail if the most recent ASan fuzz run on master failed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          conclusion=$(gh api \
+            "repos/${{ github.repository }}/actions/workflows/asan.yml/runs?branch=master&status=completed&per_page=1" \
+            --jq '.workflow_runs[0].conclusion // "none"')
+          echo "Most recent ASan fuzz run on master: $conclusion"
+          if [ "$conclusion" = "failure" ]; then
+            echo "The most recent ASan fuzz run failed; fix the regression or re-run the workflow." >&2
+            exit 1
+          fi
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+          - "3.14t"
+          - "3.15"
+          - "3.15t"
+          - "pypy-3.11"
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        extension:
+          - "skip_cython"
+          - "use_cython"
+        exclude:
+          - os: macos-latest
+            extension: use_cython
+          - os: windows-latest
+            extension: use_cython
+          - os: windows-latest
+            python-version: "pypy-3.11"
+          - os: macos-latest
+            python-version: "pypy-3.11"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+      - name: Install poetry
+        run: uv tool install poetry
+      - name: Set up Python
+        id: setup-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "poetry"
+          allow-prereleases: true
+      - name: Cache poetry venv
+        id: cache-venv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .venv
+            src/zeroconf/**/*.so
+          key: venv-v1-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ matrix.extension }}-${{ hashFiles('poetry.lock', 'pyproject.toml', 'build_ext.py', 'src/zeroconf/**/*.py', 'src/zeroconf/**/*.pxd') }}
+      - name: Install Dependencies no cython
+        if: ${{ matrix.extension == 'skip_cython' && steps.cache-venv.outputs.cache-hit != 'true' }}
+        env:
+          SKIP_CYTHON: 1
+        run: poetry install --only=main,dev
+      - name: Install Dependencies with cython
+        if: ${{ matrix.extension != 'skip_cython' && steps.cache-venv.outputs.cache-hit != 'true' }}
+        env:
+          REQUIRE_CYTHON: 1
+        run: poetry install --only=main,dev
+      - name: Test with Pytest
+        run: poetry run pytest --durations=20 --timeout=60 -v --cov=zeroconf --cov-branch --cov-report xml --cov-report html --cov-report term-missing tests
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  benchmark:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - name: Setup Python 3.13
+        id: setup-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: 3.13
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+      - name: Install poetry
+        run: uv tool install poetry
+      - name: Cache poetry venv
+        id: cache-venv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .venv
+            src/zeroconf/**/*.so
+          key: venv-v1-${{ runner.os }}-benchmark-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('poetry.lock', 'pyproject.toml', 'build_ext.py', 'src/zeroconf/**/*.py', 'src/zeroconf/**/*.pxd') }}
+      - name: Install Dependencies
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          REQUIRE_CYTHON=1 poetry install --only=main,dev
+        shell: bash
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@373d6868929f444bc08d901fd0eb0ad52a8875ea # v3
+        with:
+          token: ${{ secrets.CODSPEED_TOKEN }}
+          run: poetry run pytest --no-cov -vvvvv --codspeed tests/benchmarks
+          mode: simulation
+
+  # Dry run on PRs and non-master pushes. No environment, no publish
+  # permissions, no OIDC, so PR runs carry no release blast radius.
+  release-dry-run:
+    needs:
+      - test
+      - lint
+    if: github.ref_name != 'master' && github.repository_owner == 'python-zeroconf'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Switch to the head branch
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: git switch -C "$BRANCH"
+
+      - name: Test release
+        uses: python-semantic-release/python-semantic-release@b700dbeb1f431a0fcc30a79f3f0869407fe07278 # v10.7.0
+        with:
+          no_operation_mode: true
+
+  # Real release, only on master. The release environment and write/OIDC
+  # permissions are scoped to this job so they never apply to PR runs.
+  release:
+    needs:
+      - test
+      - lint
+    if: github.ref_name == 'master' && github.repository_owner == 'python-zeroconf'
+    runs-on: ubuntu-latest
+    environment: release
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: write
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      newest_release_tag: ${{ steps.release.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Switch to the head branch
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: git switch -C "$BRANCH"
+
+      - name: Release
+        uses: python-semantic-release/python-semantic-release@b700dbeb1f431a0fcc30a79f3f0869407fe07278 # v10.7.0
+        id: release
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        if: steps.release.outputs.released == 'true'
+
+      - name: Publish package distributions to GitHub Releases
+        uses: python-semantic-release/publish-action@99d4062dd393b5a7a62c5fe9ed78fb364b5674f2 # v10.7.0
+        if: steps.release.outputs.released == 'true'
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  build_wheels:
+    needs: [release]
+    if: needs.release.outputs.released == 'true'
+
+    name: Wheels for ${{ matrix.os }} (${{ matrix.musl == 'musllinux' && 'musllinux' || 'manylinux' }}) ${{ matrix.qemu }} ${{ matrix.pyver }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          [
+            ubuntu-24.04-arm,
+            ubuntu-latest,
+            windows-latest,
+            windows-11-arm,
+            macos-latest,
+          ]
+        qemu: [""]
+        musl: [""]
+        pyver: [""]
+        include:
+          - os: ubuntu-latest
+            musl: "musllinux"
+          - os: ubuntu-24.04-arm
+            musl: "musllinux"
+          # qemu is slow, make a single
+          # runner per Python version
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: "musllinux"
+            pyver: cp311
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: "musllinux"
+            pyver: cp312
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: "musllinux"
+            pyver: cp313
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: "musllinux"
+            pyver: cp314
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: "musllinux"
+            pyver: cp314t
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: "musllinux"
+            pyver: cp315
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: "musllinux"
+            pyver: cp315t
+          # qemu is slow, make a single
+          # runner per Python version
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: ""
+            pyver: cp311
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: ""
+            pyver: cp312
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: ""
+            pyver: cp313
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: ""
+            pyver: cp314
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: ""
+            pyver: cp314t
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: ""
+            pyver: cp315
+          - os: ubuntu-24.04-arm
+            qemu: armv7l
+            musl: ""
+            pyver: cp315t
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          fetch-depth: 0
+          ref: "master"
+      # Used to host cibuildwheel
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: "3.12"
+      - name: Set up QEMU
+        if: ${{ matrix.qemu }}
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: all
+          # This should be temporary
+          # xref https://github.com/docker/setup-qemu-action/issues/188
+          # xref https://github.com/tonistiigi/binfmt/issues/215
+          image: tonistiigi/binfmt:qemu-v8.1.5
+        id: qemu
+      - name: Prepare emulation
+        if: ${{ matrix.qemu }}
+        run: |
+          if [[ -n "${{ matrix.qemu }}" ]]; then
+            # Build emulated architectures only if QEMU is set,
+            # use default "auto" otherwise
+            echo "CIBW_ARCHS_LINUX=${{ matrix.qemu }}" >> $GITHUB_ENV
+          fi
+      - name: Limit to a specific Python version on slow QEMU
+        if: ${{ matrix.pyver }}
+        run: |
+          if [[ -n "${{ matrix.pyver }}" ]]; then
+            echo "CIBW_BUILD=${{ matrix.pyver }}*" >> $GITHUB_ENV
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ needs.release.outputs.newest_release_tag }}
+          fetch-depth: 0
+
+      - name: Build wheels ${{ matrix.musl }} (${{ matrix.qemu }})
+        uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae # v4.2.1
+        # to supply options, put them in 'env', like:
+        env:
+          CIBW_SKIP: cp38-* cp39-* cp310-* pp38-* pp39-* pp310-* ${{ matrix.musl == 'musllinux' && '*manylinux*' || '*musllinux*' }}
+          CIBW_BEFORE_ALL_LINUX: apt install -y gcc || yum install -y gcc || apk add gcc
+          CIBW_ARCHS_MACOS: arm64
+          REQUIRE_CYTHON: 1
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          path: ./wheelhouse/*.whl
+          name: wheels-${{ matrix.os }}-${{ matrix.musl }}-${{ matrix.qemu }}-${{ matrix.pyver }}
+
+  upload_pypi:
+    needs: [build_wheels]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write # IMPORTANT: this permission is mandatory for trusted publishing
+
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          # unpacks default artifact into dist/
+          # if `name: artifact` is omitted, the action will create extra parent dir
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+
+      - uses:
+          pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          skip-existing: true
