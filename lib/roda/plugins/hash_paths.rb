@@ -106,7 +106,7 @@ class Roda
         def hash_path(namespace='', path, &block)
           routes = hash_paths[namespace] ||= {}
           if block
-            routes[path] = define_roda_method(routes[path] || "hash_path_#{namespace}_#{path}", 1, &convert_route_block(block))
+            routes[path] = define_roda_method(routes[path] || "hash_path_#{namespace}_#{path}", 1, &convert_route_block_for_namespace(block, namespace))
           elsif meth = routes.delete(path)
             remove_method(meth)
           end

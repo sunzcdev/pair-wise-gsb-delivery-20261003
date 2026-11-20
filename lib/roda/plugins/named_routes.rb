@@ -146,7 +146,7 @@ class Roda
           if name
             routes = namespaced_routes[namespace] ||= {}
             if block
-              routes[name] = define_roda_method(routes[name] || "named_routes_#{namespace}_#{name}", 1, &convert_route_block(block))
+              routes[name] = define_roda_method(routes[name] || "named_routes_#{namespace}_#{name}", 1, &convert_route_block_for_namespace(block, namespace))
             elsif meth = routes.delete(name)
               remove_method(meth)
             end

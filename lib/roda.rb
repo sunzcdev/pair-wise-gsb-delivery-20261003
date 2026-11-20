@@ -433,6 +433,29 @@ class Roda
           block
         end
 
+        # Convert the route block for a block registered under the given namespace
+        # (such as a named route, hash branch, or hash path).  This makes the
+        # namespace available to convert_route_block overrides via
+        # converting_route_block_namespace, and then delegates to convert_route_block.
+        #
+        # The namespace is passed out-of-band instead of as an additional argument
+        # so that plugins overriding convert_route_block with the previous one
+        # argument signature continue to compose correctly regardless of load order.
+        def convert_route_block_for_namespace(block, namespace)
+          prev = @converting_route_block_namespace
+          @converting_route_block_namespace = namespace
+          convert_route_block(block)
+        ensure
+          @converting_route_block_namespace = prev
+        end
+
+        # The namespace of the route block currently being converted via
+        # convert_route_block_for_namespace, or nil if no namespaced route block
+        # is being converted.  Only meaningful inside convert_route_block.
+        def converting_route_block_namespace
+          @converting_route_block_namespace
+        end
+
         # Build a _roda_before method that calls each _roda_before_* method
         # in order, if any _roda_before_* methods are defined. Also, rebuild
         # the route block if a _roda_before method is defined.

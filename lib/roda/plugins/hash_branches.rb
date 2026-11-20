@@ -112,7 +112,7 @@ class Roda
           segment = "/#{segment}"
           routes = hash_branches[namespace] ||= {}
           if block
-            routes[segment] = define_roda_method(routes[segment] || "hash_branch_#{namespace}_#{segment}", 1, &convert_route_block(block))
+            routes[segment] = define_roda_method(routes[segment] || "hash_branch_#{namespace}_#{segment}", 1, &convert_route_block_for_namespace(block, namespace))
           elsif meth = routes.delete(segment)
             remove_method(meth)
           end

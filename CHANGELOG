@@ -2,6 +2,8 @@
 
 * Add keyword arguments and deprecate positional hash for json_parser plugin (jeremyevans)
 
+* Add support to the route_block_args plugin for different route block arguments per named route, hash branch, and hash path namespace, computed lazily and cached per request (jeremyevans)
+
 * Deprecate the indifferent_params plugin, switch to typecast_params instead (jeremyevans)
 
 * Add keyword arguments and deprecate positional hash for hsts plugin (jeremyevans)

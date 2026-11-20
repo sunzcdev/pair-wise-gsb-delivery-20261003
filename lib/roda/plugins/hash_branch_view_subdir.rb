@@ -58,7 +58,7 @@ class Roda
           meths = hash_branch_view_subdir_methods[namespace] ||= {}
 
           if block
-            meth = meths[segment] = define_roda_method(meths[segment] || "_hash_branch_view_subdir_#{namespace}_#{segment}", 1, &convert_route_block(block))
+            meth = meths[segment] = define_roda_method(meths[segment] || "_hash_branch_view_subdir_#{namespace}_#{segment}", 1, &convert_route_block_for_namespace(block, namespace))
             super do |*_|
               append_view_subdir(segment)
               send(meth, @_request)
