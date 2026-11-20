@@ -236,6 +236,18 @@ class MockServer:
         assert not self._running, "responses cannot be set on running server"
         self._server.mock.side_effect = responses
 
+    def set_responder(self, responder: "WSGIApplication") -> None:
+        """Install a single WSGI application to handle every request.
+
+        Unlike ``set_responses`` the responder is not consumed after one call,
+        so a stateful application (e.g. one whose served file changes between
+        requests) can keep answering for the whole lifetime of the server.
+        """
+        assert not self._running, "responses cannot be set on running server"
+        # The WSGI adapter invokes the mock to obtain a responder and then
+        # invokes that responder itself, hence the wrapping factory.
+        self._server.mock.side_effect = lambda environ, start_response: responder
+
     def start(self) -> None:
         assert not self._running, "running server cannot be started"
         self.context.enter_context(server_running(self._server))
