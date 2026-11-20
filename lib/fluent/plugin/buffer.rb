@@ -588,12 +588,22 @@ module Fluent
         end
       end
 
+      # If a block is given, dequeues the first chunk for which the block returns
+      # a truthy value, keeping the order of the rest of the queue untouched.
+      # Chunks skipped by the block stay in the queue in their original order.
       def dequeue_chunk
         return nil if @queue.empty?
         log.on_trace { log.trace "dequeueing a chunk", instance: self.object_id }
 
         synchronize do
-          chunk = @queue.shift
+          chunk = if block_given?
+                    index = @queue.index { |queued_chunk| yield queued_chunk }
+                    # no chunk matches the condition right now
+                    return nil unless index
+                    @queue.delete_at(index)
+                  else
+                    @queue.shift
+                  end
 
           # this buffer is dequeued by other thread just before "synchronize" in this thread
           return nil unless chunk
@@ -656,17 +666,28 @@ module Fluent
         nil
       end
 
+      # If a block is given, only the chunks for which the block returns a
+      # truthy value are cleared, and the other chunks stay in the queue
+      # in their original order.
       def clear_queue!
         log.on_trace { log.trace "clearing queue", instance: self.object_id }
 
         evacuate_budget = nil
         skipped_num = 0
         skipped_bytesize = 0
+        purged_bytesize = 0
 
         synchronize do
-          until @queue.empty?
+          loop do
+            q = if block_given?
+                  index = @queue.index { |queued_chunk| yield queued_chunk }
+                  break unless index
+                  @queue.delete_at(index)
+                else
+                  break if @queue.empty?
+                  @queue.shift
+                end
             begin
-              q = @queue.shift
               if @evacuate_limit_size.nil?
                 evacuate_chunk(q)
               elsif @evacuate_limit_size > 0
@@ -680,13 +701,29 @@ module Fluent
                 end
               end
               log.trace("purging a chunk in queue"){ {id: dump_unique_id_hex(q.unique_id), bytesize: q.bytesize, size: q.size} }
+              purged_bytesize += q.bytesize
               q.purge
+              if block_given?
+                queued_num = @queued_num[q.metadata]
+                if queued_num
+                  queued_num -= 1
+                  if queued_num < 1
+                    @queued_num.delete(q.metadata)
+                  else
+                    @queued_num[q.metadata] = queued_num
+                  end
+                end
+              end
             rescue => e
               log.error "unexpected error while clearing buffer queue", error_class: e.class, error: e
               log.error_backtrace
             end
           end
-          @queue_size_metrics.set(0)
+          if block_given?
+            @queue_size_metrics.sub(purged_bytesize)
+          else
+            @queue_size_metrics.set(0)
+          end
         end
 
         if skipped_num > 0

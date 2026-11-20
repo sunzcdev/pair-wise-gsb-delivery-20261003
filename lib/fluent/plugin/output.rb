@@ -115,6 +115,9 @@ module Fluent
         config_param :retry_max_interval, :time, default: nil, desc: 'The maximum interval seconds for exponential backoff between retries while failing.'
 
         config_param :retry_randomize, :bool, default: true, desc: 'If true, output plugin will retry after randomized interval not to do burst retries.'
+
+        desc 'If true, retry backoff is isolated for each chunk key group (chunk keys except "time"), so that a group which keeps failing does not delay flushes of other groups. The order of chunks in the same group is kept.'
+        config_param :retry_group_isolation, :bool, default: false
       end
 
       config_section :secondary, param_name: :secondary_config, required: false, multi: false, final: true do
@@ -173,6 +176,9 @@ module Fluent
 
       # Internal states
       FlushThreadState = Struct.new(:thread, :next_clock, :mutex, :cond_var)
+      # Group key for chunks whose group cannot be identified anymore (e.g. a
+      # plugin rolled back a chunk which was not dequeued by this plugin)
+      UNKNOWN_RETRY_GROUP = Object.new
       DequeuedChunkInfo = Struct.new(:chunk_id, :time, :timeout) do
         def expired?
           time + timeout < Time.now
@@ -225,6 +231,10 @@ module Fluent
         @buffer = nil
         @secondary = nil
         @retry = nil
+        @retry_group_isolation = false
+        @retry_states = nil
+        @dequeued_chunk_groups = nil
+        @retry_group_all_blocked = false
         @dequeued_chunks = nil
         @dequeued_chunks_mutex = nil
         @output_enqueue_thread = nil
@@ -359,6 +369,8 @@ module Fluent
 
           # no chunk keys or only tags (chunking can be done without iterating event stream)
           @simple_chunking = !@chunk_key_time && @chunk_keys.empty?
+
+          @retry_group_isolation = @buffer_config.retry_group_isolation
 
           @flush_mode = @buffer_config.flush_mode
           if @flush_mode == :default
@@ -500,6 +512,9 @@ module Fluent
         if @buffering && !@as_secondary
           @retry = nil
           @retry_mutex = Mutex.new
+          @retry_states = {}
+          @dequeued_chunk_groups = {}
+          @retry_group_all_blocked = false
 
           @buffer.start
 
@@ -1162,7 +1177,17 @@ module Fluent
         @buffer.purge_chunk(chunk_id)
 
         @retry_mutex.synchronize do
-          if @retry # success to flush chunks in retries
+          if @retry_group_isolation
+            group = @dequeued_chunk_groups.delete(chunk_id) { UNKNOWN_RETRY_GROUP }
+            if group != UNKNOWN_RETRY_GROUP && @retry_states.key?(group)
+              if secondary
+                log.warn "retry succeeded by secondary.", chunk_id: dump_unique_id_hex(chunk_id)
+              else
+                log.warn "retry succeeded.", chunk_id: dump_unique_id_hex(chunk_id)
+              end
+              @retry_states.delete(group)
+            end
+          elsif @retry # success to flush chunks in retries
             if secondary
               log.warn "retry succeeded by secondary.", chunk_id: dump_unique_id_hex(chunk_id)
             else
@@ -1186,14 +1211,25 @@ module Fluent
         # in many cases, false can be just ignored
         if @buffer.takeback_chunk(chunk_id)
           @rollback_count_metrics.inc
+          primary = @as_secondary ? @primary_instance : self
           if update_retry
-            primary = @as_secondary ? @primary_instance : self
             primary.update_retry_state(chunk_id, @as_secondary)
+          else
+            primary.forget_dequeued_chunk_group(chunk_id)
           end
           true
         else
+          primary = @as_secondary ? @primary_instance : self
+          primary.forget_dequeued_chunk_group(chunk_id)
           false
         end
+      end
+
+      # Drops the chunk_id => retry group mapping for chunks which will never
+      # be reported to #update_retry_state (only used with retry_group_isolation)
+      def forget_dequeued_chunk_group(chunk_id)
+        return unless @retry_group_isolation && @retry_mutex
+        @retry_mutex.synchronize { @dequeued_chunk_groups.delete(chunk_id) }
       end
 
       def try_rollback_write
@@ -1228,7 +1264,18 @@ module Fluent
       def next_flush_time
         if @buffer.queued?
           @retry_mutex.synchronize do
-            @retry ? @retry.next_time : Time.now + @buffer_config.flush_thread_burst_interval
+            if @retry_group_isolation
+              if @retry_states.empty?
+                Time.now + @buffer_config.flush_thread_burst_interval
+              elsif @retry_group_all_blocked
+                # all queued chunks belong to groups in backoff: wait for the nearest retry time
+                @retry_states.values.map(&:next_time).min
+              else
+                Time.now + @buffer_config.flush_thread_burst_interval
+              end
+            else
+              @retry ? @retry.next_time : Time.now + @buffer_config.flush_thread_burst_interval
+            end
           end
         else
           Time.now + @buffer_config.flush_thread_interval
@@ -1238,14 +1285,42 @@ module Fluent
       UNRECOVERABLE_ERRORS = [Fluent::UnrecoverableError, TypeError, ArgumentError, NoMethodError, MessagePack::UnpackError, EncodingError, JSON::GeneratorError]
 
       def try_flush
-        chunk = @buffer.dequeue_chunk
+        if @retry_group_isolation
+          # Snapshot the groups in backoff BEFORE taking the buffer lock, not to
+          # nest the buffer lock inside @retry_mutex (the reverse order is used
+          # in #update_retry_state).
+          blocked_groups = @retry_mutex.synchronize do
+            now = Time.now
+            @retry_states.each_with_object({}) do |(group, state), blocked|
+              blocked[group] = true if state.next_time > now
+            end
+          end
+          # Chunks of groups in backoff are skipped and stay in the queue in
+          # their original order, so the order of chunks in the same group is kept.
+          chunk = @buffer.dequeue_chunk { |queued_chunk| !blocked_groups[retry_group_key(queued_chunk.metadata)] }
+          queued = @buffer.queued?(nil, optimistic: true)
+          @retry_mutex.synchronize do
+            @retry_group_all_blocked = chunk.nil? && queued
+          end
+        else
+          chunk = @buffer.dequeue_chunk
+        end
         return unless chunk
 
         log.on_trace { log.trace "trying flush for a chunk", chunk: dump_unique_id_hex(chunk.unique_id) }
 
         output = self
         using_secondary = false
-        if @retry_mutex.synchronize{ @retry && @retry.secondary? }
+        if @retry_group_isolation
+          group = retry_group_key(chunk.metadata)
+          @retry_mutex.synchronize do
+            @dequeued_chunk_groups[chunk.unique_id] = group
+            if (state = @retry_states[group]) && state.secondary?
+              output = @secondary
+              using_secondary = true
+            end
+          end
+        elsif @retry_mutex.synchronize{ @retry && @retry.secondary? }
           output = @secondary
           using_secondary = true
         end
@@ -1370,13 +1445,31 @@ module Fluent
           @num_errors_metrics.inc
           chunk_id_hex = dump_unique_id_hex(chunk_id)
 
+          if @retry_group_isolation
+            group = @dequeued_chunk_groups.delete(chunk_id) { UNKNOWN_RETRY_GROUP }
+            state = @retry_states[group]
+            if state
+              step_retry_state(state)
+            else
+              state = @retry_states[group] = retry_state(@buffer_config.retry_randomize)
+            end
+
+            if state.limit?
+              handle_group_limit_reached(group, state, error)
+            elsif error
+              log_retry_error(state, error, chunk_id_hex, using_secondary)
+            end
+
+            return
+          end
+
           unless @retry
             @retry = retry_state(@buffer_config.retry_randomize)
 
             if @retry.limit?
               handle_limit_reached(error)
             elsif error
-              log_retry_error(error, chunk_id_hex, using_secondary)
+              log_retry_error(@retry, error, chunk_id_hex, using_secondary)
             end
 
             return
@@ -1384,30 +1477,34 @@ module Fluent
 
           # @retry exists
 
-          # Ensure that the current time is greater than or equal to @retry.next_time to avoid the situation when
-          # @retry.step is called almost as many times as the number of flush threads in a short time.
-          if Time.now >= @retry.next_time
-            @retry.step
-          else
-            @retry.recalc_next_time # to prevent all flush threads from retrying at the same time
-          end
+          step_retry_state(@retry)
 
           if @retry.limit?
             handle_limit_reached(error)
           elsif error
-            log_retry_error(error, chunk_id_hex, using_secondary)
+            log_retry_error(@retry, error, chunk_id_hex, using_secondary)
           end
         end
       end
 
-      def log_retry_error(error, chunk_id_hex, using_secondary)
+      # Ensure that the current time is greater than or equal to state.next_time to avoid the situation when
+      # state.step is called almost as many times as the number of flush threads in a short time.
+      def step_retry_state(state)
+        if Time.now >= state.next_time
+          state.step
+        else
+          state.recalc_next_time # to prevent all flush threads from retrying at the same time
+        end
+      end
+
+      def log_retry_error(state, error, chunk_id_hex, using_secondary)
         return unless error
         if using_secondary
           msg = "failed to flush the buffer with secondary output."
         else
           msg = "failed to flush the buffer."
         end
-        log.warn(msg, retry_times: @retry.steps, next_retry_time: @retry.next_time.round, chunk: chunk_id_hex, error: error)
+        log.warn(msg, retry_times: state.steps, next_retry_time: state.next_time.round, chunk: chunk_id_hex, error: error)
         log.warn_backtrace(error.backtrace)
       end
 
@@ -1421,6 +1518,31 @@ module Fluent
         @buffer.clear_queue!
         log.debug "buffer queue cleared"
         @retry = nil
+      end
+
+      def handle_group_limit_reached(group, state, error)
+        if error
+          records = @buffer.queued_records
+          msg = "Hit limit for retries. dropping chunks of the failed group in the buffer queue."
+          log.error msg, retry_times: state.steps, records: records, group: group.inspect, error: error
+          log.error_backtrace error.backtrace
+        end
+        if group == UNKNOWN_RETRY_GROUP
+          @buffer.clear_queue!
+        else
+          # only the chunks of the failed group are dropped: chunks of the other
+          # groups stay in the queue in their original order
+          @buffer.clear_queue! { |chunk| retry_group_key(chunk.metadata) == group }
+        end
+        log.debug "buffer queue cleared for the failed group"
+        @retry_states.delete(group)
+      end
+
+      # The key to identify the group of a chunk for retry group isolation.
+      # The group is identified by the chunk keys except "time" (timekey is
+      # excluded so that a group stays the same across time windows).
+      def retry_group_key(metadata)
+        [metadata.tag, metadata.variables]
       end
 
       def retry_state(randomize)
@@ -1467,7 +1589,16 @@ module Fluent
 
       def submit_flush_all
         return unless @buffer_config.flush_thread_count > 0
+        if @retry_group_isolation
+          # reset the stale flag to let flush threads re-check the queue at least once
+          @retry_mutex.synchronize { @retry_group_all_blocked = false }
+        end
         while !@retry && @buffer.queued?
+          if @retry_group_isolation
+            # stop submitting when all queued chunks belong to groups in backoff:
+            # they will be flushed when the retry time of each group comes
+            break if @retry_mutex.synchronize { @retry_group_all_blocked }
+          end
           submit_flush_once
           sleep @buffer_config.flush_thread_burst_interval
         end

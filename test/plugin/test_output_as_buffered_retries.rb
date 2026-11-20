@@ -963,4 +963,125 @@ class BufferedOutputRetryTest < Test::Unit::TestCase
       assert(@i.num_errors > 1)
     end
   end
+
+  sub_test_case 'buffered output retries with group isolation' do
+    def event_stream_of(id)
+      Fluent::ArrayEventStream.new([[event_time('2016-04-13 18:33:00'), {'id' => id}]])
+    end
+
+    def configure_grouped_output(hash, fail_times)
+      attempts = Hash.new(0) # tag => number of write attempts
+      arrivals = [] # [tag, id] of successfully written records, in arrival order
+
+      @i.configure(config_element('ROOT','',{},[config_element('buffer','tag',hash)]))
+      @i.register(:prefer_buffered_processing){ true }
+      @i.register(:format){|tag,time,record| [tag,time.to_i,record].to_json + "\n" }
+      @i.register(:write) do |chunk|
+        tag = chunk.metadata.tag
+        attempts[tag] += 1
+        if fail_times[tag] && fail_times[tag] > 0
+          fail_times[tag] -= 1
+          raise "yay, your #write must fail"
+        end
+        chunk.read.split("\n").each do |line|
+          _tag, _time, record = JSON.parse(line)
+          arrivals << [tag, record['id']]
+        end
+      end
+      @i.start
+      @i.after_start
+
+      return attempts, arrivals
+    end
+
+    test 'retry backoff is isolated per group, keeping the order of chunks in the failed group' do
+      # the group of 'test.fail' fails explicitly twice, and recovers after that
+      attempts, arrivals = configure_grouped_output(
+        {
+          'flush_mode' => 'immediate',
+          'flush_thread_interval' => 0.1,
+          'flush_thread_burst_interval' => 0.1,
+          'retry_randomize' => false,
+          'retry_wait' => 1,
+          'retry_group_isolation' => true,
+        },
+        { 'test.fail' => 2 },
+      )
+
+      now = Time.parse('2016-04-13 18:33:30 -0700')
+      Timecop.freeze( now )
+
+      # two groups of on-memory data: the failing group (f1, f2) and the healthy group (g1, g2)
+      @i.emit_events('test.fail', event_stream_of('f1'))
+      @i.emit_events('test.fail', event_stream_of('f2'))
+      @i.emit_events('test.ok', event_stream_of('g1'))
+      @i.emit_events('test.ok', event_stream_of('g2'))
+
+      # the first flush of the failing group fails explicitly (1st failure)
+      waiting(4){ Thread.pass until attempts['test.fail'] >= 1 }
+
+      # the healthy group arrives without waiting for the backoff of the failing group,
+      # even though the retry time of the failing group (now + 1) has not come yet
+      waiting(4){ Thread.pass until arrivals.size >= 2 }
+
+      assert_equal [['test.ok', 'g1'], ['test.ok', 'g2']], arrivals.dup
+      assert_equal 1, attempts['test.fail'] # the failing group is in backoff: not retried yet
+      assert_nil @i.retry # the global retry state is not used with retry_group_isolation
+
+      retry_states = @i.instance_variable_get(:@retry_states)
+      assert_equal [['test.fail', nil]], retry_states.keys # only the failed group has a retry state
+
+      # the 2nd explicit failure of the failing group, after its 1st backoff
+      Timecop.freeze( now + 1.5 )
+      @i.flush_thread_wakeup
+      waiting(4){ Thread.pass until attempts['test.fail'] >= 2 }
+
+      assert_equal [['test.ok', 'g1'], ['test.ok', 'g2']], arrivals.dup
+
+      # the failing group recovers after its 2nd backoff (retry_wait * 2 ** 1)
+      Timecop.freeze( now + 4 )
+      @i.flush_thread_wakeup
+      waiting(4){ Thread.pass until arrivals.size >= 4 }
+
+      # the failed group arrives in its original order after recovery
+      assert_equal [['test.ok', 'g1'], ['test.ok', 'g2'], ['test.fail', 'f1'], ['test.fail', 'f2']], arrivals.dup
+      assert_equal 4, attempts['test.fail'] # f1: 2 failures + 1 success, f2: 1 success
+      assert_equal [], @i.instance_variable_get(:@retry_states).keys # retry states are cleared on success
+    end
+
+    test 'retry backoff is shared by all groups without retry_group_isolation' do
+      # the group of 'test.fail' fails explicitly once, and recovers after that
+      attempts, arrivals = configure_grouped_output(
+        {
+          'flush_mode' => 'immediate',
+          'flush_thread_interval' => 0.1,
+          'flush_thread_burst_interval' => 0.1,
+          'retry_randomize' => false,
+          'retry_wait' => 1,
+        },
+        { 'test.fail' => 1 },
+      )
+
+      now = Time.parse('2016-04-13 18:33:30 -0700')
+      Timecop.freeze( now )
+
+      @i.emit_events('test.fail', event_stream_of('f1'))
+      @i.emit_events('test.ok', event_stream_of('g1'))
+
+      # the first flush of the failing group fails explicitly
+      waiting(4){ Thread.pass until attempts['test.fail'] >= 1 }
+
+      # the healthy group is also blocked by the shared retry backoff (existing behavior)
+      sleep 0.5
+      assert_equal [], arrivals.dup
+      assert_not_nil @i.retry
+
+      # after the shared backoff, the failed chunk is retried first and the healthy group follows
+      Timecop.freeze( now + 1.5 )
+      @i.flush_thread_wakeup
+      waiting(4){ Thread.pass until arrivals.size >= 2 }
+
+      assert_equal [['test.fail', 'f1'], ['test.ok', 'g1']], arrivals.dup
+    end
+  end
 end
