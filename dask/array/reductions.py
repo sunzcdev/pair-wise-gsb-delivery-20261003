@@ -748,7 +748,44 @@ def nanstd(
     return result
 
 
-def _arg_combine(data, axis, argfunc, keepdims=False):
+def _tied_mask(vals, extreme):
+    """Boolean mask of entries tied with the extreme value.
+
+    NaN never compares equal, so NaN entries are tied explicitly with a NaN
+    extreme to preserve the NaN handling conventions of the arg-reductions.
+    """
+    tied = vals == extreme
+    if vals.dtype.kind in "fc":
+        tied = tied | (np.isnan(vals) & np.isnan(extreme))
+    return tied
+
+
+def _last_tied_local_args(vals, arg, argfunc, axis, keepdims):
+    """Local indices of the *last* occurrence of the extreme value.
+
+    Ties are broken by the largest global index stored in ``arg``, so the
+    result is the true global last occurrence regardless of how the
+    reduction tree grouped the blocks.
+    """
+    if axis is None:
+        flat_vals = vals.ravel()
+        extreme = flat_vals[argfunc(vals, axis=None)]
+        tied = _tied_mask(flat_vals, extreme)
+        pick = np.argmax(np.where(tied, arg.ravel(), -1))
+        if keepdims:
+            # Match the ``keepdims=True`` convention of the plain argfunc
+            # call: one length-1 axis per dimension of the input.
+            return np.full((1,) * vals.ndim, pick, dtype=np.intp)
+        return pick
+    local_args = argfunc(vals, axis=axis)
+    inds = list(np.ogrid[tuple(map(slice, local_args.shape))])
+    inds.insert(axis, local_args)
+    extreme = vals[tuple(inds)]
+    tied = _tied_mask(vals, np.expand_dims(extreme, axis))
+    return np.argmax(np.where(tied, arg, -1), axis=axis)
+
+
+def _arg_combine(data, axis, argfunc, keepdims=False, tie_break="first"):
     """Merge intermediate results from ``arg_*`` functions"""
     if isinstance(data, dict):
         # Array type doesn't support structured arrays (e.g., CuPy),
@@ -765,11 +802,17 @@ def _arg_combine(data, axis, argfunc, keepdims=False):
     vals = data["vals"]
     arg = data["arg"]
     if axis is None:
-        local_args = argfunc(vals, axis=axis, keepdims=keepdims)
+        if tie_break == "last":
+            local_args = _last_tied_local_args(vals, arg, argfunc, None, keepdims)
+        else:
+            local_args = argfunc(vals, axis=axis, keepdims=keepdims)
         vals = vals.ravel()[local_args]
         arg = arg.ravel()[local_args]
     else:
-        local_args = argfunc(vals, axis=axis)
+        if tie_break == "last":
+            local_args = _last_tied_local_args(vals, arg, argfunc, axis, keepdims)
+        else:
+            local_args = argfunc(vals, axis=axis)
         inds = list(np.ogrid[tuple(map(slice, local_args.shape))])
         inds.insert(axis, local_args)
         inds = tuple(inds)
@@ -814,8 +857,8 @@ def arg_chunk(func, argfunc, x, axis, offset_info):
     return result
 
 
-def arg_combine(argfunc, data, axis=None, **kwargs):
-    arg, vals = _arg_combine(data, axis, argfunc, keepdims=True)
+def arg_combine(argfunc, data, axis=None, tie_break="first", **kwargs):
+    arg, vals = _arg_combine(data, axis, argfunc, keepdims=True, tie_break=tie_break)
 
     try:
         result = np.empty_like(
@@ -830,15 +873,58 @@ def arg_combine(argfunc, data, axis=None, **kwargs):
     return result
 
 
-def arg_agg(argfunc, data, axis=None, keepdims=False, **kwargs):
-    return _arg_combine(data, axis, argfunc, keepdims=keepdims)[0]
+def arg_agg(argfunc, data, axis=None, keepdims=False, tie_break="first", **kwargs):
+    return _arg_combine(data, axis, argfunc, keepdims=keepdims, tie_break=tie_break)[0]
 
 
-def nanarg_agg(argfunc, data, axis=None, keepdims=False, **kwargs):
-    arg, vals = _arg_combine(data, axis, argfunc, keepdims=keepdims)
+def nanarg_agg(argfunc, data, axis=None, keepdims=False, tie_break="first", **kwargs):
+    arg, vals = _arg_combine(
+        data, axis, argfunc, keepdims=keepdims, tie_break=tie_break
+    )
     if np.any(np.isnan(vals)):
         raise ValueError("All NaN slice encountered")
     return arg
+
+
+def _arg_last(argfunc, x, axis, **kwargs):
+    """Index of the *last* occurrence of the extreme value along ``axis``.
+
+    Works by reversing ``x`` along ``axis`` and delegating to ``argfunc``
+    (which returns the first occurrence), then mapping the result back to
+    the original ordering. Slicing is used for the reversal so that it
+    works for any ndarray-like (e.g., CuPy or masked arrays).
+    """
+    if axis is None:
+        xf = x.ravel()[::-1]
+        keepdims = kwargs.pop("keepdims", False)
+        result = xf.size - 1 - argfunc(xf, axis=None, **kwargs)
+        if keepdims:
+            # Match the ``keepdims=True`` convention of the non-reversed
+            # call: one length-1 axis per dimension of the original input.
+            result = np.reshape(result, (1,) * x.ndim)
+        return result
+    n = x.shape[axis]
+    index = [slice(None)] * x.ndim
+    index[axis] = slice(None, None, -1)
+    xf = x[tuple(index)]
+    return n - 1 - argfunc(xf, axis=axis, **kwargs)
+
+
+def _argmax_last(x, axis=None, **kwargs):
+    return _arg_last(chunk.argmax, x, axis, **kwargs)
+
+
+def _argmin_last(x, axis=None, **kwargs):
+    return _arg_last(chunk.argmin, x, axis, **kwargs)
+
+
+def _tie_break_argfunc(first_func, last_func, tie_break):
+    """Select the arg function implementing the requested tie-break strategy."""
+    if tie_break == "first":
+        return first_func
+    elif tie_break == "last":
+        return last_func
+    raise ValueError(f"tie_break must be 'first' or 'last', got {tie_break!r}")
 
 
 def arg_reduction(
@@ -932,13 +1018,30 @@ def _nanargmax(x, axis, **kwargs):
         return chunk.nanargmax(np.where(np.isnan(x), -np.inf, x), axis, **kwargs)
 
 
+def _nanargmin_last(x, axis=None, **kwargs):
+    return _arg_last(_nanargmin, x, axis, **kwargs)
+
+
+def _nanargmax_last(x, axis=None, **kwargs):
+    return _arg_last(_nanargmax, x, axis, **kwargs)
+
+
 @derived_from(np)
-def argmax(a, axis=None, keepdims=False, split_every=None, out=None):
+def argmax(a, axis=None, keepdims=False, split_every=None, out=None, tie_break="first"):
+    """
+    tie_break : {"first", "last"}, optional
+        Which occurrence to return when the maximum value appears multiple
+        times: ``"first"`` (the default, matching NumPy) returns the smallest
+        index, while ``"last"`` returns the largest index. The strategy is
+        applied consistently within blocks and across the reduction tree, so
+        the result does not depend on the chunking.
+    """
+    argfunc = _tie_break_argfunc(chunk.argmax, _argmax_last, tie_break)
     return arg_reduction(
         a,
-        partial(arg_chunk, chunk.max, chunk.argmax),
-        partial(arg_combine, chunk.argmax),
-        partial(arg_agg, chunk.argmax),
+        partial(arg_chunk, chunk.max, argfunc),
+        partial(arg_combine, chunk.argmax, tie_break=tie_break),
+        partial(arg_agg, chunk.argmax, tie_break=tie_break),
         axis=axis,
         keepdims=keepdims,
         split_every=split_every,
@@ -947,12 +1050,21 @@ def argmax(a, axis=None, keepdims=False, split_every=None, out=None):
 
 
 @derived_from(np)
-def argmin(a, axis=None, keepdims=False, split_every=None, out=None):
+def argmin(a, axis=None, keepdims=False, split_every=None, out=None, tie_break="first"):
+    """
+    tie_break : {"first", "last"}, optional
+        Which occurrence to return when the minimum value appears multiple
+        times: ``"first"`` (the default, matching NumPy) returns the smallest
+        index, while ``"last"`` returns the largest index. The strategy is
+        applied consistently within blocks and across the reduction tree, so
+        the result does not depend on the chunking.
+    """
+    argfunc = _tie_break_argfunc(chunk.argmin, _argmin_last, tie_break)
     return arg_reduction(
         a,
-        partial(arg_chunk, chunk.min, chunk.argmin),
-        partial(arg_combine, chunk.argmin),
-        partial(arg_agg, chunk.argmin),
+        partial(arg_chunk, chunk.min, argfunc),
+        partial(arg_combine, chunk.argmin, tie_break=tie_break),
+        partial(arg_agg, chunk.argmin, tie_break=tie_break),
         axis=axis,
         keepdims=keepdims,
         split_every=split_every,
@@ -961,12 +1073,23 @@ def argmin(a, axis=None, keepdims=False, split_every=None, out=None):
 
 
 @derived_from(np)
-def nanargmax(a, axis=None, keepdims=False, split_every=None, out=None):
+def nanargmax(
+    a, axis=None, keepdims=False, split_every=None, out=None, tie_break="first"
+):
+    """
+    tie_break : {"first", "last"}, optional
+        Which occurrence to return when the maximum value appears multiple
+        times: ``"first"`` (the default, matching NumPy) returns the smallest
+        index, while ``"last"`` returns the largest index. The strategy is
+        applied consistently within blocks and across the reduction tree, so
+        the result does not depend on the chunking.
+    """
+    argfunc = _tie_break_argfunc(_nanargmax, _nanargmax_last, tie_break)
     return arg_reduction(
         a,
-        partial(arg_chunk, chunk.nanmax, _nanargmax),
-        partial(arg_combine, _nanargmax),
-        partial(nanarg_agg, _nanargmax),
+        partial(arg_chunk, chunk.nanmax, argfunc),
+        partial(arg_combine, _nanargmax, tie_break=tie_break),
+        partial(nanarg_agg, _nanargmax, tie_break=tie_break),
         axis=axis,
         keepdims=keepdims,
         split_every=split_every,
@@ -975,12 +1098,23 @@ def nanargmax(a, axis=None, keepdims=False, split_every=None, out=None):
 
 
 @derived_from(np)
-def nanargmin(a, axis=None, keepdims=False, split_every=None, out=None):
+def nanargmin(
+    a, axis=None, keepdims=False, split_every=None, out=None, tie_break="first"
+):
+    """
+    tie_break : {"first", "last"}, optional
+        Which occurrence to return when the minimum value appears multiple
+        times: ``"first"`` (the default, matching NumPy) returns the smallest
+        index, while ``"last"`` returns the largest index. The strategy is
+        applied consistently within blocks and across the reduction tree, so
+        the result does not depend on the chunking.
+    """
+    argfunc = _tie_break_argfunc(_nanargmin, _nanargmin_last, tie_break)
     return arg_reduction(
         a,
-        partial(arg_chunk, chunk.nanmin, _nanargmin),
-        partial(arg_combine, _nanargmin),
-        partial(nanarg_agg, _nanargmin),
+        partial(arg_chunk, chunk.nanmin, argfunc),
+        partial(arg_combine, _nanargmin, tie_break=tie_break),
+        partial(nanarg_agg, _nanargmin, tie_break=tie_break),
         axis=axis,
         keepdims=keepdims,
         split_every=split_every,

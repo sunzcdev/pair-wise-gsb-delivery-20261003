@@ -2551,7 +2551,15 @@ class Array(DaskMethodsMixin):
 
         return max(self, axis=axis, keepdims=keepdims, split_every=split_every, out=out)
 
-    def argmin(self, axis=None, *, keepdims=False, split_every=None, out=None):
+    def argmin(
+        self,
+        axis=None,
+        *,
+        keepdims=False,
+        split_every=None,
+        out=None,
+        tie_break="first",
+    ):
         """Return indices of the minimum values along the given axis.
 
         Refer to :func:`dask.array.argmin` for full documentation.
@@ -2563,10 +2571,23 @@ class Array(DaskMethodsMixin):
         from dask.array.reductions import argmin
 
         return argmin(
-            self, axis=axis, keepdims=keepdims, split_every=split_every, out=out
+            self,
+            axis=axis,
+            keepdims=keepdims,
+            split_every=split_every,
+            out=out,
+            tie_break=tie_break,
         )
 
-    def argmax(self, axis=None, *, keepdims=False, split_every=None, out=None):
+    def argmax(
+        self,
+        axis=None,
+        *,
+        keepdims=False,
+        split_every=None,
+        out=None,
+        tie_break="first",
+    ):
         """Return indices of the maximum values along the given axis.
 
         Refer to :func:`dask.array.argmax` for full documentation.
@@ -2578,7 +2599,12 @@ class Array(DaskMethodsMixin):
         from dask.array.reductions import argmax
 
         return argmax(
-            self, axis=axis, keepdims=keepdims, split_every=split_every, out=out
+            self,
+            axis=axis,
+            keepdims=keepdims,
+            split_every=split_every,
+            out=out,
+            tie_break=tie_break,
         )
 
     def sum(self, axis=None, dtype=None, keepdims=False, split_every=None, out=None):

@@ -317,6 +317,107 @@ def test_arg_reductions(dfunc, func):
     assert_eq(dfunc(a3), func(x3))
 
 
+def _arg_last_expected(func, x, axis=None):
+    """Reference index of the *last* occurrence of the extreme value."""
+    if axis is None:
+        return x.size - 1 - func(x.ravel()[::-1])
+    return x.shape[axis] - 1 - func(np.flip(x, axis), axis=axis)
+
+
+@pytest.mark.parametrize(
+    ["dfunc", "func"],
+    [
+        (da.argmin, np.argmin),
+        (da.argmax, np.argmax),
+        (da.nanargmin, np.nanargmin),
+        (da.nanargmax, np.nanargmax),
+    ],
+)
+@pytest.mark.parametrize("chunks", [(3,), (4,)])
+def test_arg_reductions_tie_break_1d(dfunc, func, chunks):
+    # Repeated extrema so that ties fall on different chunks in each chunking
+    x = np.array([1.0, 9.0, 9.0, 2.0, 9.0, 0.0, 0.0, 3.0, 9.0, 0.0, 2.0])
+    if "nan" in func.__name__:
+        x[4] = np.nan
+        x[7] = np.nan
+    a = da.from_array(x, chunks=chunks)
+
+    expected_first = func(x)
+    expected_last = _arg_last_expected(func, x)
+    assert expected_first != expected_last  # ties actually occur
+
+    # Default strategy matches NumPy (first occurrence)
+    assert_eq(dfunc(a), expected_first)
+    assert_eq(dfunc(a, tie_break="first"), expected_first)
+    # Last-occurrence strategy is stable across chunkings
+    assert_eq(dfunc(a, tie_break="last"), expected_last)
+    assert_eq(dfunc(a, tie_break="last", split_every=2), expected_last)
+
+
+@pytest.mark.parametrize(
+    ["dfunc", "func"],
+    [
+        (da.argmin, np.argmin),
+        (da.argmax, np.argmax),
+        (da.nanargmin, np.nanargmin),
+        (da.nanargmax, np.nanargmax),
+    ],
+)
+@pytest.mark.parametrize("chunks", [(2, 3), (3, 2)])
+@pytest.mark.parametrize("axis", [None, 0, 1])
+def test_arg_reductions_tie_break_2d(dfunc, func, chunks, axis):
+    x = np.array(
+        [
+            [5.0, 1.0, 5.0, 2.0],
+            [0.0, 5.0, 3.0, 5.0],
+            [5.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    if "nan" in func.__name__:
+        x[1, 2] = np.nan
+    a = da.from_array(x, chunks=chunks)
+
+    expected_first = func(x, axis=axis)
+    expected_last = _arg_last_expected(func, x, axis=axis)
+
+    assert_eq(dfunc(a, axis=axis), expected_first)
+    assert_eq(dfunc(a, axis=axis, tie_break="last"), expected_last)
+    assert_eq(
+        dfunc(a, axis=axis, tie_break="last", split_every=2), expected_last
+    )
+
+    # keepdims convention is preserved for both strategies
+    if axis is None:
+        shape = (1,) * x.ndim
+    else:
+        shape = list(expected_last.shape)
+        shape.insert(axis, 1)
+        shape = tuple(shape)
+    assert_eq(
+        dfunc(a, axis=axis, tie_break="last", keepdims=True),
+        np.asarray(expected_last).reshape(shape),
+    )
+    assert_eq(
+        dfunc(a, axis=axis, keepdims=True),
+        np.asarray(expected_first).reshape(shape),
+    )
+
+
+def test_arg_reductions_tie_break_method():
+    x = np.array([1.0, 9.0, 9.0, 1.0, 9.0])
+    a = da.from_array(x, chunks=2)
+    assert_eq(a.argmax(tie_break="last"), 4)
+    assert_eq(a.argmin(tie_break="last"), 3)
+    assert_eq(a.argmax(), np.argmax(x))
+
+
+def test_arg_reductions_tie_break_invalid():
+    a = da.ones(10, chunks=5)
+    for func in [da.argmax, da.argmin, da.nanargmax, da.nanargmin]:
+        with pytest.raises(ValueError, match="tie_break"):
+            func(a, tie_break="middle")
+
+
 @pytest.mark.parametrize(
     ["dfunc", "func"], [(da.nanmin, np.nanmin), (da.nanmax, np.nanmax)]
 )
