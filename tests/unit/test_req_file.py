@@ -385,16 +385,165 @@ class TestProcessLine:
             # Just name since they are in the same folder
             f"-r {req_files[req_file_count - 2].name}"
         )
-        with pytest.raises(
-            RequirementsFileParseError,
-            match=(
-                f"{re.escape(str(req_files[req_file_count - 2]))} recursively"
-                " references itself in"
-                f" {re.escape(str(req_files[req_file_count - 1]))} and again in"
-                f" {re.escape(str(req_files[req_file_count - 3]))}"
-            ),
-        ):
+        with pytest.raises(RequirementsFileParseError) as exc_info:
             list(parse_requirements(filename=str(req_files[0]), session=session))
+        message = str(exc_info.value)
+        # The error names the file closing the loop and where it was referenced
+        assert message.startswith(
+            f"{req_files[req_file_count - 2]} recursively references itself in "
+            f"{req_files[req_file_count - 1]} (line 1)\n"
+        )
+        # ... and reports every hop of the chain with its reference location
+        assert f"  {req_files[0]}\n" in message
+        for i in range(1, req_file_count):
+            assert f"  {req_files[i]} (from -r {req_files[i - 1]} (line 1))\n" in (
+                message + "\n"
+            )
+        assert message.rstrip().endswith(
+            f"  {req_files[req_file_count - 2]} "
+            f"(from -r {req_files[req_file_count - 1]} (line 1))"
+        )
+
+    def test_shared_constraint_in_diamond_not_skipped(
+        self, tmp_path: Path, session: PipSession
+    ) -> None:
+        # Two entry points both include the same constraint file (a
+        # "diamond"); the shared file must be parsed once per entry point,
+        # not treated as a recursion and skipped.
+        tmp_path.joinpath("root.txt").write_text(
+            "-r sub_a/a.txt\n-r sub_b/b.txt\n"
+        )
+        tmp_path.joinpath("sub_a").mkdir()
+        tmp_path.joinpath("sub_a/a.txt").write_text(
+            "-c ../shared/constraints.txt\nrequests\n"
+        )
+        tmp_path.joinpath("sub_b").mkdir()
+        tmp_path.joinpath("sub_b/b.txt").write_text(
+            "-c ../shared/constraints.txt\nflask\n"
+        )
+        tmp_path.joinpath("shared").mkdir()
+        tmp_path.joinpath("shared/constraints.txt").write_text("setuptools\n")
+
+        parsed = list(
+            parse_requirements(
+                filename=os.fspath(tmp_path / "root.txt"), session=session
+            )
+        )
+        assert [(r.requirement, r.constraint) for r in parsed] == [
+            ("setuptools", True),
+            ("requests", False),
+            ("setuptools", True),
+            ("flask", False),
+        ]
+
+    def test_back_edge_in_diamond_is_diagnosed(
+        self, tmp_path: Path, session: PipSession
+    ) -> None:
+        # Same diamond as above, but the shared constraint file gains a real
+        # back edge to the root file: only now must parsing abort, and the
+        # error must show every hop of the reference chain.
+        tmp_path.joinpath("root.txt").write_text(
+            "-r sub_a/a.txt\n-r sub_b/b.txt\n"
+        )
+        tmp_path.joinpath("sub_a").mkdir()
+        tmp_path.joinpath("sub_a/a.txt").write_text(
+            "-c ../shared/constraints.txt\nrequests\n"
+        )
+        tmp_path.joinpath("sub_b").mkdir()
+        tmp_path.joinpath("sub_b/b.txt").write_text(
+            "-c ../shared/constraints.txt\nflask\n"
+        )
+        tmp_path.joinpath("shared").mkdir()
+        tmp_path.joinpath("shared/constraints.txt").write_text(
+            "setuptools\n-r ../root.txt\n"
+        )
+
+        with pytest.raises(RequirementsFileParseError) as exc_info:
+            list(
+                parse_requirements(
+                    filename=os.fspath(tmp_path / "root.txt"), session=session
+                )
+            )
+        message = str(exc_info.value)
+        root = os.path.abspath(os.fspath(tmp_path / "root.txt"))
+        sub_a = os.path.abspath(os.fspath(tmp_path / "sub_a" / "a.txt"))
+        shared = os.path.abspath(os.fspath(tmp_path / "shared" / "constraints.txt"))
+        assert message.startswith(
+            f"{root} recursively references itself in {shared} (line 2)\n"
+        )
+        # Each hop of the chain is reported with its actual reference
+        # location (file and line number).
+        assert f"  {root}\n" in message
+        assert f"  {sub_a} (from -r {root} (line 1))\n" in message
+        assert f"  {shared} (from -c {sub_a} (line 1))\n" in message
+        assert message.rstrip().endswith(f"  {root} (from -r {shared} (line 2))")
+
+    def test_recursive_http_requirements_file(
+        self, session: PipSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A remote requirements file that (transitively) references back to
+        # an ancestor URL must be detected; URLs are resolved with urljoin
+        # and must not be canonicalized with os.path.abspath.
+        req_file = "http://me.com/me/req_file.txt"
+        nested_req_file = "http://me.com/me/nested/reqs.txt"
+
+        def get_file_content(
+            filename: str, *args: Any, **kwargs: Any
+        ) -> tuple[None, str]:
+            if filename == req_file:
+                return None, "-r nested/reqs.txt"
+            elif filename == nested_req_file:
+                # relative reference back to the root file
+                return None, "-r ../req_file.txt"
+            pytest.fail(f"Unexpected file requested {filename}")
+
+        monkeypatch.setattr(
+            pip._internal.req.req_file, "get_file_content", get_file_content
+        )
+
+        with pytest.raises(RequirementsFileParseError) as exc_info:
+            list(parse_requirements(filename=req_file, session=session))
+        message = str(exc_info.value)
+        assert message.startswith(
+            f"{req_file} recursively references itself in "
+            f"{nested_req_file} (line 1)\n"
+        )
+        assert f"  {req_file}\n" in message
+        assert f"  {nested_req_file} (from -r {req_file} (line 1))\n" in message
+        assert message.rstrip().endswith(
+            f"  {req_file} (from -r {nested_req_file} (line 1))"
+        )
+
+    def test_shared_http_constraint_in_diamond_not_skipped(
+        self, session: PipSession, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The same URL included through two different branches is a diamond,
+        # not a cycle, and must be parsed once per branch.
+        contents = {
+            "http://me.com/root.txt": "-r a/reqs.txt\n-r b/reqs.txt\n",
+            "http://me.com/a/reqs.txt": "-c ../shared/constraints.txt\nrequests\n",
+            "http://me.com/b/reqs.txt": "-c ../shared/constraints.txt\nflask\n",
+            "http://me.com/shared/constraints.txt": "setuptools\n",
+        }
+
+        def get_file_content(
+            filename: str, *args: Any, **kwargs: Any
+        ) -> tuple[None, str]:
+            return None, contents[filename]
+
+        monkeypatch.setattr(
+            pip._internal.req.req_file, "get_file_content", get_file_content
+        )
+
+        parsed = list(
+            parse_requirements(filename="http://me.com/root.txt", session=session)
+        )
+        assert [(r.requirement, r.constraint) for r in parsed] == [
+            ("setuptools", True),
+            ("requests", False),
+            ("setuptools", True),
+            ("flask", False),
+        ]
 
     def test_recursive_relative_requirements_file(
         self, tmpdir: Path, session: PipSession

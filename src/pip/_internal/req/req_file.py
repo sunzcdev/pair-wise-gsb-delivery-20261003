@@ -18,6 +18,7 @@ from optparse import Values
 from typing import (
     TYPE_CHECKING,
     Any,
+    NamedTuple,
     NoReturn,
 )
 
@@ -330,6 +331,45 @@ def handle_line(
         return None
 
 
+class _Reference(NamedTuple):
+    """One hop in the chain of nested ``-r``/``-c`` includes."""
+
+    filename: str
+    """Canonical path or URL of the referenced file."""
+    comes_from: str | None
+    """Where the file was referenced, e.g. ``-r parent.txt (line 2)``.
+
+    ``None`` for the file parsing started from.
+    """
+
+
+def _canonicalize_req_file_location(filename: str) -> str:
+    """Return the canonical form of a requirements file location, used as
+    the identity of the file when detecting recursive references.
+
+    Local paths are made absolute so that different relative spellings of
+    the same file compare equal.  URLs are returned unchanged: relative
+    references have already been resolved against their base with
+    ``urljoin``, and ``os.path.abspath`` would mangle them into bogus
+    local paths.
+    """
+    if SCHEME_RE.search(filename):
+        return filename
+    return os.path.abspath(filename)
+
+
+def _format_reference_chain(ref_chain: list[_Reference]) -> str:
+    """Render a chain of nested references, one hop per line, each with the
+    location where the reference was made."""
+    lines = []
+    for ref in ref_chain:
+        if ref.comes_from is None:
+            lines.append(f"  {ref.filename}")
+        else:
+            lines.append(f"  {ref.filename} (from {ref.comes_from})")
+    return "\n".join(lines)
+
+
 class RequirementsFileParser:
     def __init__(
         self,
@@ -344,14 +384,16 @@ class RequirementsFileParser:
     ) -> Generator[ParsedLine, None, None]:
         """Parse a given file, yielding parsed lines."""
         yield from self._parse_and_recurse(
-            filename, constraint, [{os.path.abspath(filename): None}]
+            filename,
+            constraint,
+            [_Reference(_canonicalize_req_file_location(filename), None)],
         )
 
     def _parse_and_recurse(
         self,
         filename: str,
         constraint: bool,
-        parsed_files_stack: list[dict[str, str | None]],
+        ref_chain: list[_Reference],
     ) -> Generator[ParsedLine, None, None]:
         for line in self._parse_file(filename, constraint):
             if line.requirement is None and (
@@ -361,9 +403,11 @@ class RequirementsFileParser:
                 if line.opts.requirements:
                     req_path = line.opts.requirements[0]
                     nested_constraint = False
+                    ref_flag = "-r"
                 else:
                     req_path = line.opts.constraints[0]
                     nested_constraint = True
+                    ref_flag = "-c"
 
                 # original file is over http
                 if SCHEME_RE.search(filename):
@@ -372,29 +416,33 @@ class RequirementsFileParser:
                 # original file and nested file are paths
                 elif not SCHEME_RE.search(req_path):
                     # do a join so relative paths work
-                    # and then abspath so that we can identify recursive references
-                    req_path = os.path.abspath(
-                        os.path.join(
-                            os.path.dirname(filename),
-                            req_path,
-                        )
+                    req_path = os.path.join(
+                        os.path.dirname(filename),
+                        req_path,
                     )
-                parsed_files = parsed_files_stack[0]
-                if req_path in parsed_files:
-                    initial_file = parsed_files[req_path]
-                    tail = (
-                        f" and again in {initial_file}"
-                        if initial_file is not None
-                        else ""
-                    )
+                req_path = _canonicalize_req_file_location(req_path)
+
+                # The location of this hop, reported if a cycle is found.
+                comes_from = f"{ref_flag} {line.filename} (line {line.lineno})"
+                if any(req_path == ref.filename for ref in ref_chain):
+                    # The reference points back at a file that is already
+                    # being parsed higher up the chain: following it would
+                    # recurse forever.  Files that were merely included
+                    # before via a different branch (a "diamond") are not in
+                    # the chain and remain allowed.
+                    closing_chain = [*ref_chain, _Reference(req_path, comes_from)]
                     raise RequirementsFileParseError(
-                        f"{req_path} recursively references itself in {filename}{tail}"
+                        f"{req_path} recursively references itself in "
+                        f"{line.filename} (line {line.lineno})\n"
+                        "Chain of nested -r/-c references "
+                        "(the last hop closes the loop):\n"
+                        f"{_format_reference_chain(closing_chain)}"
                     )
-                # Keeping a track where was each file first included in
-                new_parsed_files = parsed_files.copy()
-                new_parsed_files[req_path] = filename
+                # Keeping a track where each file was included from
                 yield from self._parse_and_recurse(
-                    req_path, nested_constraint, [new_parsed_files, *parsed_files_stack]
+                    req_path,
+                    nested_constraint,
+                    [*ref_chain, _Reference(req_path, comes_from)],
                 )
             else:
                 yield line
