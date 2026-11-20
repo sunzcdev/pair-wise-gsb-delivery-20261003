@@ -2,6 +2,7 @@
 
 require_relative "helper"
 require "rubygems/commands/pristine_command"
+require "rubygems/ext"
 
 class TestGemCommandsPristineCommand < Gem::TestCase
   def setup
@@ -228,6 +229,7 @@ class TestGemCommandsPristineCommand < Gem::TestCase
     out = @ui.output.split "\n"
 
     assert_equal "Restoring gems to pristine condition...", out.shift
+    assert_equal "Restoring extensions for Ruby ABI #{Gem.ruby_abi}", out.shift
     assert_equal "Building native extensions. This could take a while...",
                  out.shift
     assert_equal "Restored #{a.full_name}", out.shift
@@ -284,8 +286,143 @@ class TestGemCommandsPristineCommand < Gem::TestCase
       refute_includes @ui.output, "Restored #{b.full_name}"
       assert_includes @ui.output, "No gems with missing extensions to restore"
     else
+      assert_includes @ui.output, "Restoring extensions for Ruby ABI #{Gem.ruby_abi} (only missing)"
       assert_includes @ui.output, "Restored #{b.full_name}"
     end
+  end
+
+  def test_execute_extensions_scoped_to_current_ruby_abi
+    a = util_spec_with_unbuilt_extension "a"
+
+    # Another Ruby on the same runner left its own native build of the
+    # same gem behind, in the extension directory of its own ABI.
+    other_extension_dir = File.join(
+      @gemhome, "extensions", Gem::Platform.local.to_s, "0.0.0-other", a.full_name
+    )
+    FileUtils.mkdir_p other_extension_dir
+    FileUtils.touch File.join(other_extension_dir, "gem.build_complete")
+    FileUtils.touch File.join(other_extension_dir, "a.so")
+
+    built_dirs = []
+
+    @cmd.options[:args] = %w[a]
+
+    Gem::Ext::Builder.stub(:new, recording_builder_factory(built_dirs)) do
+      use_ui @ui do
+        @cmd.execute
+      end
+    end
+
+    # Only the current Ruby ABI's extension directory was written
+    assert_equal [a.extension_dir], built_dirs
+    assert_path_exist a.gem_build_complete_path
+
+    # The other Ruby's extension directory was left untouched
+    assert_equal %w[a.so gem.build_complete], Dir.children(other_extension_dir).sort
+
+    out = @ui.output.split "\n"
+
+    assert_equal "Restoring gems to pristine condition...", out.shift
+    assert_equal "Restoring extensions for Ruby ABI #{Gem.ruby_abi}", out.shift
+    assert_equal "Restored #{a.full_name}", out.shift
+    assert_empty out, out.inspect
+  end
+
+  def test_execute_extensions_with_current_ruby_abi_option
+    a = util_spec_with_unbuilt_extension "a"
+
+    built_dirs = []
+
+    @cmd.handle_options ["a", "--ruby-abi", Gem.ruby_abi]
+
+    Gem::Ext::Builder.stub(:new, recording_builder_factory(built_dirs)) do
+      use_ui @ui do
+        @cmd.execute
+      end
+    end
+
+    assert_equal [a.extension_dir], built_dirs
+    assert_path_exist a.gem_build_complete_path
+
+    assert_includes @ui.output, "Restoring extensions for Ruby ABI #{Gem.ruby_abi}"
+    assert_includes @ui.output, "Restored #{a.full_name}"
+  end
+
+  def test_execute_extensions_with_other_ruby_abi_is_skipped
+    a = util_spec_with_unbuilt_extension "a"
+
+    other_abi = Gem.ruby_abi == "9.9" ? "8.8" : "9.9"
+
+    built_dirs = []
+
+    @cmd.handle_options ["a", "--ruby-abi", other_abi]
+
+    Gem::Ext::Builder.stub(:new, recording_builder_factory(built_dirs)) do
+      use_ui @ui do
+        @cmd.execute
+      end
+    end
+
+    # Nothing was built: the gem's extensions belong to the running Ruby,
+    # not to the ABI chosen on the command line
+    assert_empty built_dirs
+    assert_path_not_exist a.gem_build_complete_path
+
+    out = @ui.output.split "\n"
+
+    assert_equal "Restoring gems to pristine condition...", out.shift
+    assert_equal "Restoring extensions for Ruby ABI #{other_abi}", out.shift
+    assert_equal "Skipped #{a.full_name}, its extensions belong to Ruby ABI #{Gem.ruby_abi}",
+                 out.shift
+    assert_empty out, out.inspect
+  end
+
+  def test_execute_only_missing_extensions_scoped_to_current_ruby_abi
+    a = util_spec_with_unbuilt_extension "a"
+    b = util_spec_with_unbuilt_extension "b"
+
+    # b's artifacts for the current ABI are present, a's are missing
+    FileUtils.mkdir_p b.extension_dir
+    FileUtils.touch b.gem_build_complete_path
+
+    built_dirs = []
+
+    @cmd.options[:only_missing_extensions] = true
+    @cmd.options[:args] = []
+
+    Gem::Ext::Builder.stub(:new, recording_builder_factory(built_dirs)) do
+      use_ui @ui do
+        @cmd.execute
+      end
+    end
+
+    assert_equal [a.extension_dir], built_dirs
+    assert_path_exist a.gem_build_complete_path
+    assert_path_exist b.gem_build_complete_path
+
+    assert_includes @ui.output,
+                    "Restoring extensions for Ruby ABI #{Gem.ruby_abi} (only missing)"
+    assert_includes @ui.output, "Restored #{a.full_name}"
+    refute_includes @ui.output, "Restored #{b.full_name}"
+  end
+
+  def test_execute_failed_extension_build_leaves_no_build_complete
+    a = util_spec_with_unbuilt_extension "a"
+
+    @cmd.options[:args] = %w[a]
+
+    Gem::Ext::Builder.stub(:new, failing_builder_factory) do
+      use_ui @ui do
+        assert_raise(Gem::Ext::BuildError) do
+          @cmd.execute
+        end
+      end
+    end
+
+    # A failed build must not leave the "extensions are built" marker
+    # behind, nor may the gem be reported as restored
+    assert_path_not_exist a.gem_build_complete_path
+    refute_includes @ui.output, "Restored #{a.full_name}"
   end
 
   def test_execute_no_extension
@@ -344,6 +481,7 @@ class TestGemCommandsPristineCommand < Gem::TestCase
     out = @ui.output.split "\n"
 
     assert_equal "Restoring gems to pristine condition...", out.shift
+    assert_equal "Restoring extensions for Ruby ABI #{Gem.ruby_abi}", out.shift
     assert_equal "Building native extensions with: '--with-awesome=true --sweet'", out.shift
     assert_equal "This could take a while...", out.shift
     assert_equal "Restored #{a.full_name}", out.shift
@@ -769,6 +907,7 @@ class TestGemCommandsPristineCommand < Gem::TestCase
     out = @ui.output.split "\n"
 
     assert_equal "Restoring gems to pristine condition...", out.shift
+    assert_equal "Restoring extensions for Ruby ABI #{Gem.ruby_abi}", out.shift
     assert_equal "Building native extensions. This could take a while...",
                  out.shift
     assert_equal "Restored #{a.full_name}", out.shift
@@ -791,5 +930,72 @@ class TestGemCommandsPristineCommand < Gem::TestCase
 
     assert @cmd.options[:extensions]
     assert @cmd.options[:extensions_set]
+  end
+
+  def test_handle_options_ruby_abi
+    @cmd.handle_options ["--ruby-abi", Gem.ruby_abi]
+
+    assert_equal Gem.ruby_abi, @cmd.options[:ruby_abi]
+  end
+
+  def test_handle_options_ruby_abi_invalid
+    e = assert_raise Gem::OptionParser::InvalidArgument do
+      @cmd.handle_options ["--ruby-abi", "1"]
+    end
+
+    assert_match(/Ruby ABI must be in X.Y format/, e.message)
+  end
+
+  private
+
+  ##
+  # Installs +name+ with a native extension into the temporary gem home
+  # without building it, like a gem whose artifacts for the running Ruby's
+  # ABI were never produced on this machine.
+
+  def util_spec_with_unbuilt_extension(name)
+    spec = util_spec name do |s|
+      s.extensions << "ext/#{name}/extconf.rb"
+    end
+
+    write_file File.join(@tempdir, "ext", name, "extconf.rb") do |io|
+      io.write "# extconf.rb\n"
+    end
+
+    install_gem spec, build_extension: false
+
+    spec
+  end
+
+  ##
+  # A controllable stand-in for Gem::Ext::Builder: records the extension
+  # directory each build writes into +built_dirs+ and marks the build
+  # complete, like a successful build would. Returns a replacement for
+  # Gem::Ext::Builder.new.
+
+  def recording_builder_factory(built_dirs)
+    lambda do |spec, *|
+      fake = Object.new
+      fake.define_singleton_method(:build_extensions) do
+        built_dirs << spec.extension_dir
+
+        FileUtils.mkdir_p spec.extension_dir
+        FileUtils.touch spec.gem_build_complete_path
+      end
+      fake
+    end
+  end
+
+  ##
+  # A controllable stand-in for Gem::Ext::Builder whose build always fails.
+
+  def failing_builder_factory
+    lambda do |*_|
+      fake = Object.new
+      fake.define_singleton_method(:build_extensions) do
+        raise Gem::Ext::BuildError, "ERROR: Failed to build gem native extension."
+      end
+      fake
+    end
   end
 end

@@ -345,6 +345,10 @@ EOF
       build_extension extension, dest_path
     end
 
+    # The gem.build_complete marker is only written once every extension
+    # built successfully.  A failed build raises before this point and must
+    # not leave the marker behind, so the gem keeps being reported as
+    # missing its extensions (see Gem::Specification#missing_extensions?).
     FileUtils.touch @spec.gem_build_complete_path
   end
 

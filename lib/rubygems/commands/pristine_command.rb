@@ -40,6 +40,8 @@ class Gem::Commands::PristineCommand < Gem::Command
       options[:only_missing_extensions] = value
     end
 
+    add_ruby_abi_option("restore extensions for")
+
     add_option("--only-executables",
                "Only restore executables") do |value, options|
       options[:only_executables] = value
@@ -99,6 +101,13 @@ with an extension.
 
 If --extensions is given (but not --all or gem names) only gems with
 extensions will be restored.
+
+Extensions are only ever restored for a single Ruby ABI, so a gem home
+shared by multiple Rubies (for example on a CI runner) keeps each Ruby's
+native extensions untouched.  The ABI defaults to the running Ruby's and
+can be chosen explicitly with --ruby-abi; gems whose extensions belong to
+a different ABI are skipped.  With --only-missing-extensions only gems
+whose extension artifacts for that ABI are missing are restored.
     EOF
   end
 
@@ -110,6 +119,12 @@ extensions will be restored.
     install_dir = options[:install_dir]
 
     specification_record = install_dir ? Gem::SpecificationRecord.from_path(install_dir) : Gem::Specification.specification_record
+
+    # Extensions are restored for a single Ruby ABI only: the one chosen
+    # with --ruby-abi, defaulting to the running Ruby's.  A gem home shared
+    # by several Rubies keeps one extension directory per ABI, and only the
+    # directory owned by this ABI is repaired here.
+    ruby_abi = options[:ruby_abi] || Gem.ruby_abi
 
     specs = if options[:all]
       specification_record.map
@@ -143,6 +158,16 @@ extensions will be restored.
 
     say "Restoring gems to pristine condition..."
 
+    restoring_extensions =
+      !options[:only_executables] && !options[:only_plugins] &&
+      options[:extensions] && specs.any? {|spec| !spec.extensions.empty? }
+
+    if restoring_extensions
+      scope = "Restoring extensions for Ruby ABI #{ruby_abi}"
+      scope += " (only missing)" if options[:only_missing_extensions]
+      say scope
+    end
+
     specs.group_by(&:full_name_with_location).values.each do |grouped_specs|
       spec = grouped_specs.find {|s| !s.default_gem? } || grouped_specs.first
 
@@ -166,6 +191,16 @@ extensions will be restored.
       unless spec.extensions.empty? || options[:extensions] || only_executables || only_plugins
         say "Skipped #{spec.full_name_with_location}, it needs to compile an extension"
         next
+      end
+
+      if !only_executables && !only_plugins && options[:extensions] &&
+         !spec.extensions.empty?
+        owner_abi = extension_owner_abi(spec)
+
+        unless owner_abi == ruby_abi
+          say "Skipped #{spec.full_name_with_location}, its extensions belong to Ruby ABI #{owner_abi}"
+          next
+        end
       end
 
       gem = spec.cache_file
@@ -218,6 +253,19 @@ extensions will be restored.
       end
 
       say "Restored #{spec.full_name_with_location}"
+    end
+  end
+
+  ##
+  # The Ruby ABI that owns +spec+'s built extensions.  Content-addressed
+  # gems carry their own ABI; every other gem's extensions belong to the
+  # running Ruby, whose extension directory they are built into.
+
+  def extension_owner_abi(spec) # :nodoc:
+    if Gem::ContentAddress.content_addressed?(spec)
+      spec.ruby_abi
+    else
+      Gem.ruby_abi
     end
   end
 end

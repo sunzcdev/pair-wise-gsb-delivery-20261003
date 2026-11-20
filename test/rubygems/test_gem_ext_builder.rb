@@ -231,6 +231,44 @@ install:
     assert_equal "false\n", results.last
   end
 
+  def test_build_extensions_failure_leaves_no_gem_build_complete
+    @spec.extensions << "ext/extconf.rb"
+
+    # A marker left by a previous successful build is removed up front
+    FileUtils.mkdir_p @spec.extension_dir
+    FileUtils.touch @spec.gem_build_complete_path
+
+    # Controllable build that fails
+    def @builder.build_extension(*)
+      raise Gem::Ext::BuildError, "failed"
+    end
+
+    use_ui @ui do
+      assert_raise(Gem::Ext::BuildError) do
+        @builder.build_extensions
+      end
+    end
+
+    # A failed build must not leave the "extensions are built" marker behind
+    assert_path_not_exist @spec.gem_build_complete_path
+  end
+
+  def test_build_extensions_success_writes_gem_build_complete
+    @spec.extensions << "ext/extconf.rb"
+
+    # Controllable build that creates its destination directory like a
+    # real build does
+    def @builder.build_extension(_, dest_path)
+      FileUtils.mkdir_p dest_path
+    end
+
+    use_ui @ui do
+      @builder.build_extensions
+    end
+
+    assert_path_exist @spec.gem_build_complete_path
+  end
+
   def test_build_extensions
     pend "terminates on mswin" if vc_windows? && ruby_repo?
 
