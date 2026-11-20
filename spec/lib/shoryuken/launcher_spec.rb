@@ -1,0 +1,437 @@
+# frozen_string_literal: true
+
+RSpec.describe Shoryuken::Launcher do
+  let(:executor) do
+    # We can't use Concurrent.global_io_executor in these tests since once you
+    # shut down a thread pool, you can't start it back up. Instead, we create
+    # one new thread pool executor for each spec. We use a new
+    # CachedThreadPool, since that most closely resembles
+    # Concurrent.global_io_executor
+    Concurrent::CachedThreadPool.new auto_terminate: true
+  end
+
+  let(:first_group_manager) { double(:first_group_manager, group: 'first_group') }
+  let(:second_group_manager) { double(:second_group_manager, group: 'second_group') }
+  let(:first_queue) { "launcher_spec_#{SecureRandom.uuid}" }
+  let(:second_queue) { "launcher_spec_#{SecureRandom.uuid}" }
+
+  before do
+    Shoryuken.add_group('first_group', 1)
+    Shoryuken.add_group('second_group', 1)
+    Shoryuken.add_queue(first_queue, 1, 'first_group')
+    Shoryuken.add_queue(second_queue, 1, 'second_group')
+    allow(Shoryuken).to receive(:launcher_executor).and_return(executor)
+    allow(Shoryuken::Manager).to receive(:new).with('first_group', any_args).and_return(first_group_manager)
+    allow(Shoryuken::Manager).to receive(:new).with('second_group', any_args).and_return(second_group_manager)
+    allow(first_group_manager).to receive(:running?).and_return(true)
+    allow(second_group_manager).to receive(:running?).and_return(true)
+  end
+
+  describe '#healthy?' do
+    context 'when all groups have managers' do
+      context 'when all managers are running' do
+        it 'returns true' do
+          expect(subject.healthy?).to be true
+        end
+      end
+
+      context 'when one manager is not running' do
+        before do
+          allow(second_group_manager).to receive(:running?).and_return(false)
+        end
+
+        it 'returns false' do
+          expect(subject.healthy?).to be false
+        end
+      end
+    end
+
+    context 'when all groups do not have managers' do
+      before do
+        allow(second_group_manager).to receive(:group).and_return('some_random_group')
+      end
+
+      it 'returns false' do
+        expect(subject.healthy?).to be false
+      end
+    end
+  end
+
+  describe '#failed?' do
+    before do
+      allow(first_group_manager).to receive(:failed?).and_return(false)
+      allow(second_group_manager).to receive(:failed?).and_return(false)
+    end
+
+    it 'returns false when no manager failed' do
+      expect(subject.failed?).to be false
+    end
+
+    it 'returns true when a manager failed' do
+      allow(second_group_manager).to receive(:failed?).and_return(true)
+
+      expect(subject.failed?).to be true
+    end
+  end
+
+  describe '#stop' do
+    before do
+      allow(first_group_manager).to receive(:stop_new_dispatching)
+      allow(first_group_manager).to receive(:await_dispatching_in_progress)
+      allow(second_group_manager).to receive(:stop_new_dispatching)
+      allow(second_group_manager).to receive(:await_dispatching_in_progress)
+    end
+
+    it 'fires quiet, shutdown and stopped event' do
+      allow(subject).to receive(:fire_event)
+      subject.stop
+      expect(subject).to have_received(:fire_event).with(:quiet, true)
+      expect(subject).to have_received(:fire_event).with(:shutdown, true)
+      expect(subject).to have_received(:fire_event).with(:stopped)
+    end
+
+    it 'does nothing once a stop has completed' do
+      subject.stop
+      allow(subject).to receive(:fire_event)
+
+      subject.stop
+
+      expect(subject).not_to have_received(:fire_event)
+      expect(first_group_manager).to have_received(:stop_new_dispatching).once
+    end
+
+    it 'stops the managers' do
+      subject.stop
+      expect(first_group_manager).to have_received(:stop_new_dispatching)
+      expect(second_group_manager).to have_received(:stop_new_dispatching)
+    end
+
+    it 'bounds the wait for termination by the configured timeout' do
+      allow(executor).to receive(:shutdown)
+      expect(executor).to receive(:wait_for_termination).with(Shoryuken.options[:timeout]).and_return(true)
+      expect(executor).not_to receive(:kill)
+
+      subject.stop
+    end
+
+    it 'kills the executor when workers do not finish within the timeout' do
+      allow(executor).to receive(:shutdown)
+      allow(executor).to receive(:wait_for_termination).and_return(false)
+      expect(executor).to receive(:kill)
+
+      subject.stop
+    end
+
+    context 'when stop_callback raises' do
+      before do
+        allow(Shoryuken).to receive(:stop_callback).and_return(-> { raise 'stop_callback failure' })
+        allow(Shoryuken.logger).to receive(:error)
+      end
+
+      it 'still stops the managers, shuts the executor down and fires the remaining events' do
+        allow(subject).to receive(:fire_event)
+
+        expect { subject.stop }.not_to raise_error
+
+        expect(first_group_manager).to have_received(:stop_new_dispatching)
+        expect(second_group_manager).to have_received(:await_dispatching_in_progress)
+        expect(executor).to be_shutdown
+        expect(subject).to have_received(:fire_event).with(:shutdown, true)
+        expect(subject).to have_received(:fire_event).with(:stopped)
+      end
+
+      it 'logs the error' do
+        subject.stop
+
+        expect(Shoryuken.logger).to have_received(:error) do |&block|
+          expect(block.call).to include('stop_callback', 'RuntimeError: stop_callback failure')
+        end
+      end
+    end
+
+    context 'when a manager fails to stop dispatching' do
+      before do
+        allow(first_group_manager).to receive(:stop_new_dispatching).and_raise('stop failure')
+        allow(Shoryuken.logger).to receive(:error)
+      end
+
+      it 'still stops the other managers and shuts the executor down' do
+        expect { subject.stop }.not_to raise_error
+
+        expect(second_group_manager).to have_received(:stop_new_dispatching)
+        expect(executor).to be_shutdown
+      end
+
+      it 'does not await the manager that failed to stop dispatching' do
+        subject.stop
+
+        expect(first_group_manager).not_to have_received(:await_dispatching_in_progress)
+        expect(second_group_manager).to have_received(:await_dispatching_in_progress)
+      end
+
+      it 'does not hang when that manager never releases its waiters' do
+        # Like a real manager whose stop failed before closing its release signal
+        allow(first_group_manager).to receive(:await_dispatching_in_progress) { ::Queue.new.pop }
+        allow(subject).to receive(:fire_event)
+
+        stopper = Thread.new { subject.stop }
+
+        expect(stopper.join(2)).to eq(stopper)
+        expect(executor).to be_shutdown
+        expect(subject).to have_received(:fire_event).with(:stopped)
+      ensure
+        stopper&.kill
+      end
+    end
+
+    context 'when awaiting a manager dispatch raises' do
+      before do
+        allow(first_group_manager).to receive(:await_dispatching_in_progress).and_raise('await failure')
+        allow(Shoryuken.logger).to receive(:error)
+      end
+
+      it 'still awaits the other managers and shuts the executor down' do
+        expect { subject.stop }.not_to raise_error
+
+        expect(second_group_manager).to have_received(:await_dispatching_in_progress)
+        expect(executor).to be_shutdown
+      end
+    end
+
+    context 'when the executor shutdown raises' do
+      before do
+        allow(executor).to receive(:shutdown).and_raise('executor failure')
+        allow(Shoryuken.logger).to receive(:error)
+      end
+
+      it 'still fires the stopped event' do
+        allow(subject).to receive(:fire_event)
+
+        expect { subject.stop }.not_to raise_error
+
+        expect(subject).to have_received(:fire_event).with(:stopped)
+      end
+    end
+  end
+
+  describe '#stop!' do
+    before do
+      allow(first_group_manager).to receive(:stop_new_dispatching)
+      allow(first_group_manager).to receive(:await_dispatching_in_progress)
+      allow(second_group_manager).to receive(:stop_new_dispatching)
+      allow(second_group_manager).to receive(:await_dispatching_in_progress)
+    end
+
+    it 'fires shutdown and stopped event' do
+      allow(subject).to receive(:fire_event)
+      subject.stop!
+      expect(subject).to have_received(:fire_event).with(:shutdown, true)
+      expect(subject).to have_received(:fire_event).with(:stopped)
+    end
+
+    it 'does nothing once a graceful stop has completed' do
+      subject.stop
+      allow(subject).to receive(:fire_event)
+
+      subject.stop!
+
+      expect(subject).not_to have_received(:fire_event)
+      expect(first_group_manager).to have_received(:stop_new_dispatching).once
+    end
+
+    it 'makes a later stop or stop! do nothing once it has completed' do
+      subject.stop!
+      allow(subject).to receive(:fire_event)
+
+      subject.stop
+      subject.stop!
+
+      expect(subject).not_to have_received(:fire_event)
+      expect(first_group_manager).to have_received(:stop_new_dispatching).once
+    end
+
+    it 'stops the managers' do
+      subject.stop!
+      expect(first_group_manager).to have_received(:stop_new_dispatching)
+      expect(second_group_manager).to have_received(:stop_new_dispatching)
+    end
+
+    context 'when stop_callback raises' do
+      before do
+        allow(Shoryuken).to receive(:stop_callback).and_return(-> { raise 'stop_callback failure' })
+        allow(Shoryuken.logger).to receive(:error)
+      end
+
+      it 'still stops the managers, shuts the executor down and fires the stopped event' do
+        allow(subject).to receive(:fire_event)
+
+        expect { subject.stop! }.not_to raise_error
+
+        expect(first_group_manager).to have_received(:stop_new_dispatching)
+        expect(second_group_manager).to have_received(:stop_new_dispatching)
+        expect(executor).to be_shutdown
+        expect(subject).to have_received(:fire_event).with(:stopped)
+      end
+    end
+
+    context 'when a manager fails to stop dispatching' do
+      before do
+        allow(first_group_manager).to receive(:stop_new_dispatching).and_raise('stop failure')
+        allow(Shoryuken.logger).to receive(:error)
+      end
+
+      it 'still stops the other managers and shuts the executor down' do
+        expect { subject.stop! }.not_to raise_error
+
+        expect(second_group_manager).to have_received(:stop_new_dispatching)
+        expect(executor).to be_shutdown
+      end
+    end
+  end
+
+  describe 'draining in-flight ActiveJob sends on shutdown' do
+    let(:adapter) { double('queue_adapter') }
+
+    before do
+      allow(first_group_manager).to receive(:stop_new_dispatching)
+      allow(first_group_manager).to receive(:await_dispatching_in_progress)
+      allow(second_group_manager).to receive(:stop_new_dispatching)
+      allow(second_group_manager).to receive(:await_dispatching_in_progress)
+
+      # Make ActiveJob present and point its adapter at our double, regardless of
+      # whether active_job happens to be loaded by another spec.
+      stub_const('ActiveJob::Base', Class.new)
+      allow(ActiveJob::Base).to receive(:queue_adapter).and_return(adapter)
+      allow(ActiveJob::Base).to receive(:descendants).and_return([])
+    end
+
+    let(:remaining_timeout) { a_value_within(1).of(Shoryuken.options[:timeout]) }
+
+    it 'drains pending sends on graceful stop when the adapter supports it' do
+      expect(adapter).to receive(:wait_for_pending_sends).with(remaining_timeout).and_return(true)
+
+      subject.stop
+    end
+
+    it 'drains pending sends on immediate stop! when the adapter supports it' do
+      expect(adapter).to receive(:wait_for_pending_sends).with(remaining_timeout).and_return(true)
+
+      subject.stop!
+    end
+
+    it 'drains an adapter set on a single job class' do
+      job_adapter = double('job_queue_adapter')
+      job_class = Class.new(ActiveJob::Base)
+      allow(job_class).to receive(:queue_adapter).and_return(job_adapter)
+      allow(ActiveJob::Base).to receive(:descendants).and_return([job_class])
+
+      expect(job_adapter).to receive(:wait_for_pending_sends).with(remaining_timeout).and_return(true)
+
+      subject.stop
+    end
+
+    it 'drains a shared adapter once' do
+      job_class = Class.new(ActiveJob::Base)
+      allow(job_class).to receive(:queue_adapter).and_return(adapter)
+      allow(ActiveJob::Base).to receive(:descendants).and_return([job_class])
+
+      expect(adapter).to receive(:wait_for_pending_sends).once.and_return(true)
+
+      subject.stop
+    end
+
+    it 'gives the drain only the part of the timeout the executor shutdown left' do
+      Shoryuken.options[:timeout] = 1
+      executor.post { sleep 3 }
+
+      expect(adapter).to receive(:wait_for_pending_sends).with(0).and_return(false)
+
+      subject.stop!
+    end
+
+    context 'when the timeout is nil' do
+      before { Shoryuken.options[:timeout] = nil }
+
+      it 'drains without a deadline on graceful stop' do
+        allow(subject).to receive(:fire_event)
+        expect(adapter).to receive(:wait_for_pending_sends).with(nil).and_return(true)
+
+        subject.stop
+
+        expect(executor).to be_shutdown
+        expect(subject).to have_received(:fire_event).with(:stopped)
+      end
+
+      it 'drains without a deadline on immediate stop!' do
+        allow(subject).to receive(:fire_event)
+        expect(adapter).to receive(:wait_for_pending_sends).with(nil).and_return(true)
+
+        subject.stop!
+
+        expect(executor).to be_shutdown
+        expect(subject).to have_received(:fire_event).with(:stopped)
+      end
+    end
+
+    it 'is a no-op when the adapter does not support draining' do
+      # adapter is a plain double, so it does not respond to wait_for_pending_sends
+      expect { subject.stop }.not_to raise_error
+    end
+
+    it 'does not break shutdown when draining raises' do
+      allow(adapter).to receive(:wait_for_pending_sends).and_raise('drain boom')
+
+      expect { subject.stop }.not_to raise_error
+    end
+
+    it 'completes shutdown even if draining times out' do
+      allow(adapter).to receive(:wait_for_pending_sends).and_return(false)
+
+      expect { subject.stop }.not_to raise_error
+    end
+  end
+
+  describe 'executor ownership' do
+    context 'when no launcher_executor is configured' do
+      before { allow(Shoryuken).to receive(:launcher_executor).and_return(nil) }
+
+      it 'uses a dedicated executor rather than the process-global IO executor' do
+        expect(subject.send(:executor)).not_to be(Concurrent.global_io_executor)
+      end
+
+      it 'does not shut down or kill the global IO executor on stop!' do
+        allow(first_group_manager).to receive(:stop_new_dispatching)
+        allow(second_group_manager).to receive(:stop_new_dispatching)
+
+        subject.stop!
+
+        # Verify by inspecting state after the call rather than mocking methods
+        # on the process-global singleton: RSpec proxies on a singleton used by
+        # background concurrent-ruby threads can deadlock on Ruby 3.2.
+        expect(Concurrent.global_io_executor).to be_running
+      end
+    end
+  end
+
+  describe '#stopping?' do
+    it 'returns false by default' do
+      expect(subject.stopping?).to be false
+    end
+
+    it 'returns true after stop is called' do
+      allow(first_group_manager).to receive(:stop_new_dispatching)
+      allow(first_group_manager).to receive(:await_dispatching_in_progress)
+      allow(second_group_manager).to receive(:stop_new_dispatching)
+      allow(second_group_manager).to receive(:await_dispatching_in_progress)
+
+      expect { subject.stop }.to change { subject.stopping? }.from(false).to(true)
+    end
+
+    it 'returns true after stop! is called' do
+      allow(first_group_manager).to receive(:stop_new_dispatching)
+      allow(second_group_manager).to receive(:stop_new_dispatching)
+
+      expect { subject.stop! }.to change { subject.stopping? }.from(false).to(true)
+    end
+  end
+end

@@ -1,0 +1,14 @@
+source 'https://rubygems.org'
+
+# Specify your gem's dependencies in shoryuken.gemspec
+gemspec
+
+group :test do
+  gem 'activejob'
+  gem 'simplecov'
+  gem 'warning'
+end
+
+group :development do
+  gem 'pry-byebug'
+end

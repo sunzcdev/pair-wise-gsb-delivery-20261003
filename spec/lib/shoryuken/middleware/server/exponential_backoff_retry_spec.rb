@@ -1,0 +1,307 @@
+# frozen_string_literal: true
+
+# rubocop:disable /BlockLength, Metrics/
+RSpec.describe Shoryuken::Middleware::Server::ExponentialBackoffRetry do
+  let(:queue)     { 'default' }
+  let(:sqs_queue) { double Shoryuken::Queue }
+  let(:sqs_msg)   {
+    double(
+      Shoryuken::Message, queue_url: queue, body: 'test', receipt_handle: SecureRandom.uuid,
+      attributes: { 'ApproximateReceiveCount' => 1 }, message_id: SecureRandom.uuid
+    )
+  }
+
+  before do
+    allow(Shoryuken::Client).to receive(:queues).with(queue).and_return(sqs_queue)
+  end
+
+  context 'when batch worker' do
+    it 'yields' do
+      expect { |b| subject.call(TestWorker.new, nil, [], nil, &b) }.to yield_control
+    end
+
+    it 'does not mask the original error when the batch raises' do
+      TestWorker.get_shoryuken_options['retry_intervals'] = [300]
+
+      # Use a logger that actually evaluates lazy log blocks (StringIO, not
+      # IO::NULL which skips them), as the default production level does - so a
+      # stray message_id/attributes call on the batch Array would surface.
+      # Batches aren't backoff-retried, so the original error must propagate
+      # rather than a NoMethodError from calling message APIs on the Array.
+      allow(subject).to receive(:logger).and_return(Logger.new(StringIO.new, level: Logger::DEBUG))
+
+      expect {
+        subject.call(TestWorker.new, nil, [sqs_msg], nil) { raise 'original batch error' }
+      }.to raise_error(RuntimeError, 'original batch error')
+    end
+  end
+
+  context 'when batch worker with retry_intervals' do
+    let(:batch_worker_class) do
+      Class.new do
+        include Shoryuken::Worker
+
+        shoryuken_options queue: 'batch', batch: true, retry_intervals: [300]
+
+        def perform(sqs_msgs, bodies); end
+      end
+    end
+
+    it 'warns once per worker class and does not retry the batches' do
+      warnings = []
+      allow(Shoryuken.logger).to receive(:warn) { |&block| warnings << block.call }
+      expect(sqs_msg).not_to receive(:change_visibility)
+
+      2.times do
+        expect {
+          subject.call(batch_worker_class.new, queue, [sqs_msg], nil) { raise 'batch error' }
+        }.to raise_error(RuntimeError, 'batch error')
+      end
+
+      expect(warnings).to eq(
+        ["Exponential backoff isn't supported for batch workers, skipping it for #{batch_worker_class}"]
+      )
+    end
+
+    it 'warns again for another worker class' do
+      other_worker_class = Class.new(batch_worker_class)
+      warnings = []
+      allow(Shoryuken.logger).to receive(:warn) { |&block| warnings << block.call }
+
+      subject.call(batch_worker_class.new, queue, [sqs_msg], nil) {}
+      subject.call(other_worker_class.new, queue, [sqs_msg], nil) {}
+
+      expect(warnings.size).to eq(2)
+    end
+
+    it 'warns once for a worker class defined again under the same name' do
+      warnings = []
+      allow(Shoryuken.logger).to receive(:warn) { |&block| warnings << block.call }
+
+      %w[batch-1 batch-2].each do |batch_queue|
+        stub_const(
+          'BatchBackoffReloadedWorker',
+          Class.new do
+            include Shoryuken::Worker
+
+            shoryuken_options queue: batch_queue, batch: true, retry_intervals: [300]
+
+            def perform(sqs_msgs, bodies); end
+          end
+        )
+
+        subject.call(BatchBackoffReloadedWorker.new, queue, [sqs_msg], nil) {}
+      end
+
+      expect(warnings.size).to eq(1)
+    end
+  end
+
+  context 'when no exception' do
+    it 'does not retry' do
+      TestWorker.get_shoryuken_options['retry_intervals'] = [300, 1800]
+
+      expect(sqs_msg).not_to receive(:change_visibility)
+
+      subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) {}
+    end
+  end
+
+  context 'when an error' do
+    context "and retry_intervals isn't set" do
+      it 'does not retry' do
+        expect(sqs_msg).not_to receive(:change_visibility)
+
+        expect {
+          subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'Error' }
+        }.to raise_error(RuntimeError, 'Error')
+      end
+    end
+
+    context 'and retry_intervals is a lambda' do
+      it 'retries' do
+        TestWorker.get_shoryuken_options['retry_intervals'] = ->(_attempts) { 500 }
+
+        allow(sqs_msg).to receive(:queue) { sqs_queue }
+        expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: 500)
+
+        expect { subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'failed' } }.not_to raise_error
+      end
+    end
+
+    context 'and retry_intervals is an Integer' do
+      it 'uses it for every attempt' do
+        TestWorker.get_shoryuken_options['retry_intervals'] = 2
+
+        allow(sqs_msg).to receive(:attributes) { { 'ApproximateReceiveCount' => 3 } }
+        allow(sqs_msg).to receive(:queue) { sqs_queue }
+        expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: 2)
+
+        expect { subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'failed' } }.not_to raise_error
+      end
+    end
+
+    context 'and retry_intervals is a lambda that returns nil' do
+      it 'does not retry' do
+        TestWorker.get_shoryuken_options['retry_intervals'] = ->(_attempts) {}
+
+        expect(sqs_msg).not_to receive(:change_visibility)
+
+        expect {
+          subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'Error' }
+        }.to raise_error(RuntimeError, 'Error')
+      end
+    end
+
+    context 'and retry_intervals is a lambda that raises' do
+      it 'logs the failure and re-raises the original error' do
+        TestWorker.get_shoryuken_options['retry_intervals'] = ->(_attempts) { raise 'interval boom' }
+
+        log = StringIO.new
+        allow(subject).to receive(:logger).and_return(Logger.new(log))
+        expect(sqs_msg).not_to receive(:change_visibility)
+
+        expect {
+          subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'original worker error' }
+        }.to raise_error(RuntimeError, 'original worker error')
+        expect(log.string).to include("retry_intervals raised for #{sqs_msg.message_id}: RuntimeError: interval boom")
+        expect(log.string).not_to include('Failed to set backoff visibility timeout')
+      end
+    end
+
+    context 'and retry_intervals is empty' do
+      it 'does not retry' do
+        TestWorker.get_shoryuken_options['retry_intervals'] = []
+
+        expect(sqs_msg).not_to receive(:change_visibility)
+
+        expect {
+          subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'Error' }
+        }.to raise_error(RuntimeError, 'Error')
+      end
+    end
+
+    it 'uses first interval ' do
+      TestWorker.get_shoryuken_options['retry_intervals'] = [300, 1800]
+
+      allow(sqs_msg).to receive(:queue) { sqs_queue }
+      expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: 300)
+
+      expect { subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'failed' } }.not_to raise_error
+    end
+
+    it 'uses matching interval' do
+      TestWorker.get_shoryuken_options['retry_intervals'] = [300, 1800]
+
+      allow(sqs_msg).to receive(:attributes) { { 'ApproximateReceiveCount' => 2 } }
+      allow(sqs_msg).to receive(:queue) { sqs_queue }
+      expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: 1800)
+
+      expect { subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'failed' } }.not_to raise_error
+    end
+
+    context 'when attempts exceeds retry_intervals' do
+      it 'uses last interval' do
+        TestWorker.get_shoryuken_options['retry_intervals'] = [300, 1800]
+
+        allow(sqs_msg).to receive(:attributes) { { 'ApproximateReceiveCount' => 3 } }
+        allow(sqs_msg).to receive(:queue) { sqs_queue }
+        expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: 1800)
+
+        expect { subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'failed' } }.not_to raise_error
+      end
+
+      it 'keeps reusing the last interval for far-later attempts (does not give up)' do
+        TestWorker.get_shoryuken_options['retry_intervals'] = [300, 1800]
+
+        allow(sqs_msg).to receive(:attributes) { { 'ApproximateReceiveCount' => 10 } }
+        allow(sqs_msg).to receive(:queue) { sqs_queue }
+        expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: 1800)
+
+        expect { subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'failed' } }.not_to raise_error
+      end
+    end
+
+    context 'and the exception is non-retryable' do
+      it 're-raises so NonRetryableException can delete the message' do
+        TestWorker.get_shoryuken_options['retry_intervals'] = [300, 1800]
+        TestWorker.get_shoryuken_options['non_retryable_exceptions'] = [ArgumentError]
+
+        expect(sqs_msg).not_to receive(:change_visibility)
+
+        expect {
+          subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise ArgumentError, 'permanently invalid' }
+        }.to raise_error(ArgumentError, 'permanently invalid')
+      end
+
+      it 're-raises when a non_retryable_exceptions lambda returns true' do
+        TestWorker.get_shoryuken_options['retry_intervals'] = [300, 1800]
+        TestWorker.get_shoryuken_options['non_retryable_exceptions'] = ->(e) { e.message.include?('permanent') }
+
+        expect(sqs_msg).not_to receive(:change_visibility)
+
+        expect {
+          subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'permanent failure' }
+        }.to raise_error(RuntimeError, 'permanent failure')
+      end
+
+      it 'still retries when a non_retryable_exceptions lambda returns false' do
+        TestWorker.get_shoryuken_options['retry_intervals'] = [300, 1800]
+        TestWorker.get_shoryuken_options['non_retryable_exceptions'] = ->(e) { e.message.include?('permanent') }
+
+        allow(sqs_msg).to receive(:queue) { sqs_queue }
+        expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: 300)
+
+        expect { subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'transient failure' } }
+          .not_to raise_error
+      end
+
+      it 'still retries exceptions not in the non-retryable list' do
+        TestWorker.get_shoryuken_options['retry_intervals'] = [300, 1800]
+        TestWorker.get_shoryuken_options['non_retryable_exceptions'] = [ArgumentError]
+
+        allow(sqs_msg).to receive(:queue) { sqs_queue }
+        expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: 300)
+
+        expect { subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'transient failure' } }
+          .not_to raise_error
+      end
+    end
+
+    it 'limits the visibility timeout to 12 hours' do
+      TestWorker.get_shoryuken_options['retry_intervals'] = [86_400]
+
+      allow(sqs_msg).to receive(:queue) { sqs_queue }
+      expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: 43_198)
+
+      expect { subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'failed' } }.not_to raise_error
+    end
+
+    it 'never sets a negative visibility timeout for jobs longer than the SQS ceiling' do
+      TestWorker.get_shoryuken_options['retry_intervals'] = [300]
+      started_at = Time.now
+      # the job runs longer than the 12h SQS maximum
+      allow(Time).to receive(:now).and_return(started_at, started_at + 43_300)
+
+      expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: 0)
+
+      expect { subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'failed' } }.not_to raise_error
+    end
+
+    it 'logs the failed visibility change and re-raises the original error' do
+      TestWorker.get_shoryuken_options['retry_intervals'] = [300]
+
+      # e.g. an expired receipt handle - change_visibility raises
+      allow(sqs_msg).to receive(:change_visibility).and_raise(StandardError, 'visibility boom')
+
+      log = StringIO.new
+      allow(subject).to receive(:logger).and_return(Logger.new(log))
+
+      expect {
+        subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'original worker error' }
+      }.to raise_error(RuntimeError, 'original worker error')
+      expect(log.string).to include("Failed to set backoff visibility timeout for #{sqs_msg.message_id}: visibility boom")
+      expect(log.string).not_to include('retry_intervals raised')
+    end
+  end
+end

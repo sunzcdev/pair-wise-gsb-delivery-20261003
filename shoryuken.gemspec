@@ -1,0 +1,40 @@
+lib = File.expand_path('lib', __dir__)
+$LOAD_PATH.unshift(lib) unless $LOAD_PATH.include?(lib)
+require 'shoryuken/version'
+
+Gem::Specification.new do |spec|
+  spec.name          = 'shoryuken'
+  spec.version       = Shoryuken::VERSION
+  spec.authors       = ['Pablo Cantero']
+  spec.email         = ['pablo@pablocantero.com']
+  spec.description = spec.summary = 'Shoryuken is a super efficient AWS SQS thread based message processor'
+  spec.homepage      = 'https://github.com/ruby-shoryuken/shoryuken'
+  spec.license       = 'LGPL-3.0'
+
+  spec.metadata = {
+    'homepage_uri' => spec.homepage,
+    'source_code_uri' => spec.homepage,
+    'changelog_uri' => "#{spec.homepage}/blob/main/CHANGELOG.md",
+    'bug_tracker_uri' => "#{spec.homepage}/issues",
+    'documentation_uri' => spec.homepage,
+    'rubygems_mfa_required' => 'true'
+  }
+
+  spec.files = `git ls-files -z`.split("\x0").select do |file|
+    file.start_with?('lib/', 'bin/cli/', 'config/locales/') ||
+      %w[bin/shoryuken README.md CHANGELOG.md LICENSE].include?(file)
+  end
+  spec.executables   = %w[shoryuken]
+  spec.require_paths = ['lib']
+
+  spec.add_dependency 'aws-sdk-sqs', '>= 1.66.0'
+  spec.add_dependency 'concurrent-ruby', '>= 1.3.7'
+  spec.add_dependency 'thor'
+  spec.add_dependency 'zeitwerk', '~> 2.6'
+
+  spec.add_development_dependency 'rake'
+  spec.add_development_dependency 'rspec'
+  spec.add_development_dependency 'warning'
+
+  spec.required_ruby_version = '>= 3.3.0'
+end

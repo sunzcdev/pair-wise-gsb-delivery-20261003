@@ -1,0 +1,639 @@
+require 'active_job'
+require 'active_job/extensions'
+
+# Stand-in for a job class specified by the user
+class TestJob < ActiveJob::Base; end
+
+# rubocop:disable Metrics/BlockLength
+RSpec.shared_examples 'active_job_adapters' do
+  let(:job_sqs_send_message_parameters) { {} }
+  let(:job) do
+    job = TestJob.new
+    job.sqs_send_message_parameters = job_sqs_send_message_parameters
+    job
+  end
+  let(:fifo) { false }
+  let(:queue) { double 'Queue', fifo?: fifo }
+
+  before do
+    allow(Shoryuken::Client).to receive(:queues).with(job.queue_name).and_return(queue)
+  end
+
+  describe '#enqueue' do
+    specify do
+      expect(queue).to receive(:send_message) do |hash|
+        expect(hash[:message_deduplication_id]).to_not be
+        expect(hash[:message_attributes]['shoryuken_class'][:string_value]).to eq(Shoryuken::ActiveJob::JobWrapper.to_s)
+        expect(hash[:message_attributes]['shoryuken_class'][:data_type]).to eq('String')
+        expect(hash[:message_attributes].keys).to eq(['shoryuken_class'])
+      end
+      expect(Shoryuken).to receive(:register_worker).with(job.queue_name, Shoryuken::ActiveJob::JobWrapper)
+
+      subject.enqueue(job)
+    end
+
+    it "should mutate the job's sqs_send_message_parameters reference to match those sent to the queue" do
+      expect(queue).to receive(:send_message) do |options|
+        expect(options).to be(job.sqs_send_message_parameters)
+      end
+      subject.enqueue(job)
+    end
+
+    context 'when fifo' do
+      let(:fifo) { true }
+
+      it 'does not include job_id and enqueued_at in the deduplication_id' do
+        expect(queue).to receive(:send_message) do |hash|
+          message_deduplication_id = Digest::SHA256.hexdigest(
+            JSON.dump(job.serialize.except('job_id', 'enqueued_at'))
+          )
+
+          expect(hash[:message_deduplication_id]).to eq(message_deduplication_id)
+        end
+        expect(Shoryuken).to receive(:register_worker).with(job.queue_name, Shoryuken::ActiveJob::JobWrapper)
+
+        subject.enqueue(job)
+      end
+
+      context 'when active_job_fifo_message_deduplication is disabled' do
+        before { Shoryuken.active_job_fifo_message_deduplication = false }
+
+        it 'does not set an auto-generated message_deduplication_id' do
+          expect(queue).to receive(:send_message) do |hash|
+            expect(hash).not_to have_key(:message_deduplication_id)
+          end
+          subject.enqueue(job)
+        end
+
+        it 'still honors an explicit message_deduplication_id' do
+          expect(queue).to receive(:send_message) do |hash|
+            expect(hash[:message_deduplication_id]).to eq('explicit-id')
+          end
+          subject.enqueue(job, message_deduplication_id: 'explicit-id')
+        end
+      end
+
+      context 'with message_deduplication_id' do
+        context 'when message_deduplication_id is specified in options' do
+          it 'should enqueue a message with the deduplication_id specified in options' do
+            expect(queue).to receive(:send_message) do |hash|
+              expect(hash[:message_deduplication_id]).to eq('options-dedupe-id')
+            end
+            subject.enqueue(job, message_deduplication_id: 'options-dedupe-id')
+          end
+        end
+
+        context 'when message_deduplication_id is specified on the job' do
+          let(:job_sqs_send_message_parameters) { { message_deduplication_id: 'job-dedupe-id' } }
+
+          it 'should enqueue a message with the deduplication_id specified on the job' do
+            expect(queue).to receive(:send_message) do |hash|
+              expect(hash[:message_deduplication_id]).to eq('job-dedupe-id')
+            end
+            subject.enqueue job
+          end
+        end
+
+        context 'when message_deduplication_id is specified on the job and also in options' do
+          let(:job_sqs_send_message_parameters) { { message_deduplication_id: 'job-dedupe-id' } }
+
+          it 'should enqueue a message with the deduplication_id specified in options' do
+            expect(queue).to receive(:send_message) do |hash|
+              expect(hash[:message_deduplication_id]).to eq('options-dedupe-id')
+            end
+            subject.enqueue(job, message_deduplication_id: 'options-dedupe-id')
+          end
+        end
+      end
+    end
+
+    context 'with message_group_id' do
+      context 'when message_group_id is specified in options' do
+        it 'should enqueue a message with the group_id specified in options' do
+          expect(queue).to receive(:send_message) do |hash|
+            expect(hash[:message_group_id]).to eq('options-group-id')
+          end
+          subject.enqueue(job, message_group_id: 'options-group-id')
+        end
+      end
+
+      context 'when message_group_id is specified on the job' do
+        let(:job_sqs_send_message_parameters) { { message_group_id: 'job-group-id' } }
+
+        it 'should enqueue a message with the group_id specified on the job' do
+          expect(queue).to receive(:send_message) do |hash|
+            expect(hash[:message_group_id]).to eq('job-group-id')
+          end
+          subject.enqueue job
+        end
+      end
+
+      context 'when message_group_id is specified on the job and also in options' do
+        let(:job_sqs_send_message_parameters) { { message_group_id: 'job-group-id' } }
+
+        it 'should enqueue a message with the group_id specified in options' do
+          expect(queue).to receive(:send_message) do |hash|
+            expect(hash[:message_group_id]).to eq('options-group-id')
+          end
+          subject.enqueue(job, message_group_id: 'options-group-id')
+        end
+      end
+    end
+
+    context 'with additional message attributes' do
+      it 'should combine with activejob attributes' do
+        custom_message_attributes = {
+          'tracer_id' => {
+            string_value: SecureRandom.hex,
+            data_type: 'String'
+          }
+        }
+
+        expect(queue).to receive(:send_message) do |hash|
+          expect(hash[:message_attributes]['shoryuken_class'][:string_value]).to eq(Shoryuken::ActiveJob::JobWrapper.to_s)
+          expect(hash[:message_attributes]['shoryuken_class'][:data_type]).to eq('String')
+          expect(hash[:message_attributes]['tracer_id'][:string_value]).to eq(
+            custom_message_attributes['tracer_id'][:string_value]
+          )
+          expect(hash[:message_attributes]['tracer_id'][:data_type]).to eq('String')
+        end
+        expect(Shoryuken).to receive(:register_worker).with(job.queue_name, Shoryuken::ActiveJob::JobWrapper)
+
+        subject.enqueue(job, message_attributes: custom_message_attributes)
+      end
+
+      context 'when message_attributes are specified on the job' do
+        let(:job_sqs_send_message_parameters) do
+          {
+            message_attributes: {
+              'tracer_id' => {
+                data_type: 'String',
+                string_value: 'job-value'
+              }
+            }
+          }
+        end
+
+        it 'should enqueue a message with the message_attributes specified on the job' do
+          expect(queue).to receive(:send_message) do |hash|
+            expect(hash[:message_attributes]['tracer_id']).to eq({ data_type: 'String', string_value: 'job-value' })
+            expect(hash[:message_attributes]['shoryuken_class']).to eq(
+              { data_type: 'String', string_value: Shoryuken::ActiveJob::JobWrapper.to_s }
+            )
+          end
+          subject.enqueue job
+        end
+      end
+
+      context 'when message_attributes are specified on the job and also in options' do
+        let(:job_sqs_send_message_parameters) do
+          {
+            message_attributes: {
+              'tracer_id' => {
+                data_type: 'String',
+                string_value: 'job-value'
+              }
+            }
+          }
+        end
+
+        it 'should enqueue a message with the message_attributes speficied in options' do
+          custom_message_attributes = {
+            'options_tracer_id' => {
+              string_value: 'options-value',
+              data_type: 'String'
+            }
+          }
+
+          expect(queue).to receive(:send_message) do |hash|
+            expect(hash[:message_attributes]['tracer_id']).to be_nil
+            expect(hash[:message_attributes]['options_tracer_id']).to eq(
+              { data_type: 'String', string_value: 'options-value' }
+            )
+            expect(hash[:message_attributes]['shoryuken_class']).to eq(
+              { data_type: 'String', string_value: Shoryuken::ActiveJob::JobWrapper.to_s }
+            )
+          end
+          subject.enqueue job, message_attributes: custom_message_attributes
+        end
+      end
+    end
+  end
+
+  context 'with message_system_attributes' do
+    context 'when message_system_attributes are specified in options' do
+      it 'should enqueue a message with message_system_attributes specified in options' do
+        system_attributes = {
+          'AWSTraceHeader' => {
+            string_value: 'trace_id',
+            data_type: 'String'
+          }
+        }
+        expect(queue).to receive(:send_message) do |hash|
+          expect(hash[:message_system_attributes]['AWSTraceHeader'][:string_value]).to eq('trace_id')
+          expect(hash[:message_system_attributes]['AWSTraceHeader'][:data_type]).to eq('String')
+        end
+        subject.enqueue(job, message_system_attributes: system_attributes)
+      end
+    end
+
+    context 'when message_system_attributes are specified on the job' do
+      let(:job_sqs_send_message_parameters) do
+        {
+          message_system_attributes: {
+            'AWSTraceHeader' => {
+              string_value: 'job-value',
+              data_type: 'String'
+            }
+          }
+        }
+      end
+
+      it 'should enqueue a message with the message_system_attributes specified on the job' do
+        expect(queue).to receive(:send_message) do |hash|
+          expect(hash[:message_system_attributes]['AWSTraceHeader']).to eq(
+            { data_type: 'String', string_value: 'job-value' }
+          )
+        end
+        subject.enqueue job
+      end
+    end
+
+    context 'when message_system_attributes are specified on the job and also in options' do
+      let(:job_sqs_send_message_parameters) do
+        {
+          message_system_attributes: {
+            'job_trace_header' => {
+              string_value: 'job-value',
+              data_type: 'String'
+            }
+          }
+        }
+      end
+
+      it 'should enqueue a message with the message_system_attributes speficied in options' do
+        custom_message_attributes = {
+          'options_trace_header' => {
+            string_value: 'options-value',
+            data_type: 'String'
+          }
+        }
+
+        expect(queue).to receive(:send_message) do |hash|
+          expect(hash[:message_system_attributes]['job_trace_header']).to be_nil
+          expect(hash[:message_system_attributes]['options_trace_header']).to eq(
+            { data_type: 'String', string_value: 'options-value' }
+          )
+        end
+        subject.enqueue job, message_system_attributes: custom_message_attributes
+      end
+    end
+  end
+
+  describe '#enqueue_at' do
+    specify do
+      delay = 1
+
+      expect(queue).to receive(:send_message) do |hash|
+        expect(hash[:message_deduplication_id]).to_not be
+        expect(hash[:delay_seconds]).to eq(delay)
+      end
+
+      expect(Shoryuken).to receive(:register_worker).with(job.queue_name, Shoryuken::ActiveJob::JobWrapper)
+
+      # need to figure out what to require Time.current and N.minutes to remove the stub
+      allow(subject).to receive(:calculate_delay).and_return(delay)
+
+      subject.enqueue_at(job, nil)
+    end
+
+    it 'sends delay_seconds 0 for a timestamp in the past' do
+      expect(queue).to receive(:send_message).with(hash_including(delay_seconds: 0))
+
+      subject.enqueue_at(job, Time.current.to_f - 30)
+    end
+
+    it 'sends delay_seconds 900 for a delay of exactly 15 minutes' do
+      expect(queue).to receive(:send_message).with(hash_including(delay_seconds: 900))
+
+      subject.enqueue_at(job, Time.now.to_f + 900)
+    end
+
+    it 'raises InvalidDelayError for a delay over 15 minutes' do
+      expect(queue).not_to receive(:send_message)
+
+      expect { subject.enqueue_at(job, Time.current.to_f + 901) }.to raise_error(
+        Shoryuken::Errors::InvalidDelayError, 'The maximum allowed delay is 15 minutes'
+      )
+    end
+
+    context 'when fifo' do
+      let(:fifo) { true }
+
+      it 'raises FifoDelayNotSupportedError when delay is positive' do
+        allow(subject).to receive(:calculate_delay).and_return(3)
+        allow(queue).to receive(:name).and_return('test.fifo')
+        expect(queue).not_to receive(:send_message)
+
+        expect { subject.enqueue_at(job, nil) }.to raise_error(
+          Shoryuken::Errors::FifoDelayNotSupportedError, /FIFO queue.*does not support per-message delays/
+        )
+      end
+
+      it 'does not raise when delay is zero' do
+        allow(subject).to receive(:calculate_delay).and_return(0)
+        expect(queue).to receive(:send_message).with(hash_including(delay_seconds: 0))
+        expect { subject.enqueue_at(job, nil) }.not_to raise_error
+      end
+
+      it 'sends delay_seconds 0 for a timestamp in the past' do
+        expect(queue).to receive(:send_message).with(hash_including(delay_seconds: 0))
+
+        subject.enqueue_at(job, Time.current.to_f - 30)
+      end
+    end
+  end
+
+  describe '#enqueue_all' do
+    let(:batches) { [] }
+
+    before do
+      allow(queue).to receive(:send_messages) do |params|
+        batches << params[:entries]
+        double(successful: params[:entries].map { |entry| double(id: entry[:id]) })
+      end
+    end
+
+    it 'sends delay_seconds for a scheduled job and none for the others' do
+      jobs = [TestJob.new(1), TestJob.new(2).set(wait: 10.seconds)]
+
+      expect(subject.enqueue_all(jobs)).to eq(2)
+
+      expect(batches.flatten.map { |entry| entry[:delay_seconds] }).to eq([nil, 10])
+    end
+
+    it 'sends delay_seconds 0 for a job scheduled in the past' do
+      subject.enqueue_all([TestJob.new.set(wait_until: 30.seconds.ago)])
+
+      expect(batches.flatten.first[:delay_seconds]).to eq(0)
+    end
+
+    it 'sends delay_seconds 900 for a job scheduled exactly 15 minutes ahead' do
+      subject.enqueue_all([TestJob.new.set(wait: 900.seconds)])
+
+      expect(batches.flatten.first[:delay_seconds]).to eq(900)
+    end
+
+    it 'raises InvalidDelayError for a delay over 15 minutes before any send' do
+      jobs = [TestJob.new, TestJob.new.set(wait: 901.seconds)]
+
+      expect { subject.enqueue_all(jobs) }.to raise_error(
+        Shoryuken::Errors::InvalidDelayError, 'The maximum allowed delay is 15 minutes'
+      )
+      expect(batches).to be_empty
+    end
+
+    it 'splits the jobs into batches of 10 messages' do
+      subject.enqueue_all(Array.new(25) { TestJob.new })
+
+      expect(batches.map(&:size)).to eq([10, 10, 5])
+      expect(batches.last.map { |entry| entry[:id] }).to eq(%w[0 1 2 3 4])
+    end
+
+    it 'splits the jobs into batches of up to 1 MiB in total' do
+      jobs = Array.new(10) { TestJob.new('a' * 200_000) }
+
+      expect(subject.enqueue_all(jobs)).to eq(10)
+
+      expect(batches.map(&:size)).to eq([5, 5])
+      batches.each do |batch|
+        expect(batch.sum { |entry| entry[:message_body].bytesize }).to be <= 1024 * 1024
+      end
+    end
+
+    it 'counts the message attributes in the batch size' do
+      attributes = { 'big' => { string_value: 'a' * 300_000, data_type: 'String' } }
+      jobs = Array.new(4) do
+        job = TestJob.new('a' * 100_000)
+        job.sqs_send_message_parameters = { message_attributes: attributes }
+        job
+      end
+
+      subject.enqueue_all(jobs)
+
+      expect(batches.map(&:size)).to eq([2, 2])
+    end
+
+    it 'sends a message over 1 MiB in a batch of its own' do
+      jobs = [TestJob.new('a'), TestJob.new('a' * 1_100_000), TestJob.new('a')]
+
+      subject.enqueue_all(jobs)
+
+      expect(batches.map(&:size)).to eq([1, 1, 1])
+    end
+
+    it 'sends a first message over 1 MiB in a batch of its own' do
+      subject.enqueue_all([TestJob.new('a' * 1_100_000), TestJob.new('a')])
+
+      expect(batches.map(&:size)).to eq([1, 1])
+    end
+
+    it 'raises a delay error of a job after 10 valid ones before any send' do
+      jobs = Array.new(12) { TestJob.new } + [TestJob.new.set(wait: 901.seconds)]
+
+      expect { subject.enqueue_all(jobs) }.to raise_error(Shoryuken::Errors::InvalidDelayError)
+      expect(batches).to be_empty
+    end
+
+    context 'with jobs of exactly 1 MiB in total' do
+      let(:default_attributes_size) do
+        'shoryuken_class'.bytesize + 'String'.bytesize + 'Shoryuken::ActiveJob::JobWrapper'.bytesize
+      end
+      let(:overhead) { JSON.dump(TestJob.new('').serialize).bytesize + default_attributes_size }
+      let(:attributes) do
+        {
+          'tracer' => { string_value: 'abc', data_type: 'String' },
+          'blob' => { binary_value: 'xyz', data_type: 'Binary' }
+        }
+      end
+      let(:attributes_size) { 'tracer'.bytesize + 'String'.bytesize + 3 + 'blob'.bytesize + 'Binary'.bytesize + 3 }
+
+      it 'sends them in one batch' do
+        first = (1024 * 1024 / 2) - overhead
+
+        subject.enqueue_all([TestJob.new('a' * first), TestJob.new('a' * first)])
+
+        expect(batches.map(&:size)).to eq([2])
+      end
+
+      it 'sends one byte more in two batches' do
+        first = (1024 * 1024 / 2) - overhead
+
+        subject.enqueue_all([TestJob.new('a' * first), TestJob.new('a' * (first + 1))])
+
+        expect(batches.map(&:size)).to eq([1, 1])
+      end
+
+      it 'counts string and binary attribute names, types and values' do
+        first = (1024 * 1024 / 2) - overhead - attributes_size
+
+        [[first, first], [first, first + 1]].each do |sizes|
+          jobs = sizes.map do |size|
+            job = TestJob.new('a' * size)
+            job.sqs_send_message_parameters = { message_attributes: attributes }
+            job
+          end
+          subject.enqueue_all(jobs)
+        end
+
+        expect(batches.map(&:size)).to eq([2, 1, 1])
+      end
+    end
+
+    it 'marks only the jobs SQS accepted as enqueued' do
+      allow(queue).to receive(:send_messages).and_return(double(successful: [double(id: '1')]))
+      jobs = [TestJob.new, TestJob.new]
+
+      expect(subject.enqueue_all(jobs)).to eq(1)
+      expect(jobs.map(&:successfully_enqueued?)).to eq([false, true])
+    end
+
+    context 'when fifo' do
+      let(:fifo) { true }
+      let(:standard_queue) { double('Queue', fifo?: false, send_messages: double(successful: [])) }
+
+      before { allow(queue).to receive(:name).and_return('test.fifo') }
+
+      it 'raises FifoDelayNotSupportedError for a delayed job before any send' do
+        jobs = [TestJob.new, TestJob.new.set(wait: 10.seconds)]
+
+        expect { subject.enqueue_all(jobs) }.to raise_error(
+          Shoryuken::Errors::FifoDelayNotSupportedError, /FIFO queue.*does not support per-message delays/
+        )
+        expect(batches).to be_empty
+      end
+
+      it 'raises FifoDelayNotSupportedError before sending the jobs of other queues' do
+        allow(Shoryuken::Client).to receive(:queues).with('standard').and_return(standard_queue)
+        jobs = [TestJob.new.set(queue: 'standard'), TestJob.new.set(wait: 10.seconds)]
+
+        expect { subject.enqueue_all(jobs) }.to raise_error(Shoryuken::Errors::FifoDelayNotSupportedError)
+        expect(standard_queue).not_to have_received(:send_messages)
+      end
+
+      it 'sends delay_seconds 0 for a job scheduled in the past' do
+        subject.enqueue_all([TestJob.new.set(wait_until: 30.seconds.ago)])
+
+        expect(batches.flatten.first[:delay_seconds]).to eq(0)
+      end
+    end
+  end
+
+  describe 'enqueueing the same job instance twice' do
+    let(:sent) { [] }
+    let(:job) { TestJob.new(1) }
+
+    before do
+      # Like Shoryuken::Queue#send_message, which changes the parameters it is given
+      allow(queue).to receive(:send_message) do |params|
+        params[:message_body] = JSON.dump(params[:message_body])
+        if fifo
+          params[:message_group_id] ||= Shoryuken::Queue::MESSAGE_GROUP_ID
+          params[:message_deduplication_id] ||= Digest::SHA256.hexdigest(params[:message_body])
+        end
+        sent << params.dup
+      end
+      allow(job).to receive(:queue_adapter).and_return(subject)
+    end
+
+    def sent_arguments
+      JSON.parse(sent.last[:message_body])['arguments']
+    end
+
+    it 'sends the current body and no delay when the job is no longer scheduled' do
+      job.enqueue(wait: 60)
+      job.arguments = [2]
+      job.scheduled_at = nil
+      job.enqueue
+
+      expect(sent_arguments).to eq([2])
+      expect(sent.last).not_to have_key(:delay_seconds)
+    end
+
+    it 'keeps the parameters set on the job' do
+      job.enqueue(message_attributes: { 'tracer' => { string_value: 'abc', data_type: 'String' } })
+      job.arguments = [2]
+      job.enqueue
+
+      expect(sent.last[:message_attributes].keys).to contain_exactly('tracer', 'shoryuken_class')
+    end
+
+    it 'sends the current body when the job is bulk enqueued again' do
+      entries = []
+      allow(queue).to receive(:send_messages) do |params|
+        entries.concat(params[:entries])
+        double(successful: [double(id: '0')])
+      end
+      subject.enqueue_all([job])
+      job.arguments = [2]
+      subject.enqueue_all([job])
+
+      expect(JSON.parse(entries.last[:message_body])['arguments']).to eq([2])
+    end
+
+    context 'when fifo' do
+      let(:fifo) { true }
+
+      it 'sends a deduplication id of the current body and keeps the message group id set on the job' do
+        job.enqueue(message_group_id: 'group')
+        job.arguments = [2]
+        job.enqueue
+
+        expect(sent.last[:message_deduplication_id]).to eq(
+          Digest::SHA256.hexdigest(JSON.dump(JSON.parse(sent.last[:message_body]).except('job_id', 'enqueued_at')))
+        )
+        expect(sent.last[:message_deduplication_id]).not_to eq(sent.first[:message_deduplication_id])
+        expect(sent.last[:message_group_id]).to eq('group')
+      end
+
+      it 'sends the queue deduplication id of the current body when the adapter does not set one' do
+        Shoryuken.active_job_fifo_message_deduplication = false
+        job.enqueue
+        job.arguments = [2]
+        job.enqueue
+
+        expect(sent.last[:message_deduplication_id]).to eq(Digest::SHA256.hexdigest(sent.last[:message_body]))
+      end
+
+      it 'keeps a deduplication id set on the job' do
+        job.enqueue(message_deduplication_id: 'dedup')
+        job.arguments = [2]
+        job.enqueue
+
+        expect(sent.last[:message_deduplication_id]).to eq('dedup')
+      end
+
+      it 'applies a parameter changed on the job after the previous send' do
+        job.enqueue(message_group_id: 'group1')
+        job.sqs_send_message_parameters[:message_group_id] = 'group2'
+        job.arguments = [2]
+        job.enqueue
+
+        expect(sent.last[:message_group_id]).to eq('group2')
+        expect(sent_arguments).to eq([2])
+      end
+
+      it 'keeps the message group id set on the job after a bulk enqueue' do
+        allow(queue).to receive(:send_messages).and_return(double(successful: [double(id: '0')]))
+        job.sqs_send_message_parameters = { message_group_id: 'group' }
+        subject.enqueue_all([job])
+        job.arguments = [2]
+        job.enqueue
+
+        expect(sent.last[:message_group_id]).to eq('group')
+        expect(sent_arguments).to eq([2])
+      end
+    end
+  end
+end
+# rubocop:enable Metrics/BlockLength

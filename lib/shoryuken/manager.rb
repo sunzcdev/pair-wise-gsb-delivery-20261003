@@ -1,0 +1,317 @@
+# frozen_string_literal: true
+
+module Shoryuken
+  # Manages message dispatching and processing for a single processing group.
+  # Coordinates between the fetcher, polling strategy, and processor.
+  class Manager
+    include Util
+
+    # Maximum number of messages to fetch in a single batch request
+    BATCH_LIMIT = 10
+
+    # Minimum interval between dispatch cycles
+    # @see https://github.com/ruby-shoryuken/shoryuken/issues/348#issuecomment-292847028
+    MIN_DISPATCH_INTERVAL = 0.1
+
+    # @return [String] the processing group name
+    attr_reader :group
+
+    # Initializes a new Manager for a processing group
+    #
+    # @param group [String] the processing group name
+    # @param fetcher [Shoryuken::Fetcher] the message fetcher
+    # @param polling_strategy [Shoryuken::Polling::BaseStrategy] the polling strategy
+    # @param concurrency [Integer] the maximum number of concurrent processors
+    # @param executor [#post, #running?] the executor for async operations (see {Shoryuken::Options#launcher_executor})
+    def initialize(group, fetcher, polling_strategy, concurrency, executor)
+      @group                      = group
+      @fetcher                    = fetcher
+      @polling_strategy           = polling_strategy
+      @max_processors             = concurrency
+      @busy_processors            = Shoryuken::Helpers::AtomicCounter.new(0)
+      @executor                   = executor
+      @running                    = Shoryuken::Helpers::AtomicBoolean.new(true)
+      @stop_new_dispatching       = Shoryuken::Helpers::AtomicBoolean.new(false)
+      @dispatch_started           = Shoryuken::Helpers::AtomicBoolean.new(false)
+      @dispatching_release_signal = ::Queue.new
+    end
+
+    # Starts the dispatch loop
+    #
+    # @return [void]
+    def start
+      fire_utilization_update_event
+      dispatch_loop
+    end
+
+    # Signals the manager to stop dispatching new messages
+    #
+    # @return [void]
+    def stop_new_dispatching
+      @stop_new_dispatching.make_true
+
+      # If the dispatch loop never ran (e.g. a stop arrives before the start
+      # Future is scheduled, or in an embedded host whose executor is
+      # saturated), there is no loop to observe the flag and close the release
+      # signal, so await_dispatching_in_progress would block forever. Close it
+      # here in that case. Queue#close is idempotent, so a dispatch_loop that
+      # does start later and closes it again is harmless.
+      @dispatching_release_signal.close unless @dispatch_started.true?
+    end
+
+    # Waits for any in-progress dispatching to complete
+    #
+    # @return [void]
+    def await_dispatching_in_progress
+      # There might still be a dispatching on-going, as the response from SQS could take some time
+      # We don't want to stop the process before processing incoming messages, as they would stay "in-flight" for some
+      # time on SQS
+      # We use a queue, as the dispatch_loop is running on another thread, and this is a efficient way of communicating
+      # between threads.
+      # The dispatch loop closes the queue when it observes the stop flag; pop on a closed queue
+      # returns immediately, so this stays safe when stop is requested more than once
+      # (e.g. a second Launcher#stop while the first is still waiting).
+      @dispatching_release_signal.pop
+    end
+
+    # Checks if the manager is still running
+    #
+    # @return [Boolean] true if the manager is running
+    def running?
+      @running.true? && @executor.running?
+    end
+
+    # Checks if the manager stopped because of a fatal dispatch error
+    #
+    # @return [Boolean] true if a fatal dispatch error stopped the manager
+    def failed?
+      @running.false?
+    end
+
+    private
+
+    # The main dispatch loop
+    #
+    # @return [void]
+    def dispatch_loop
+      # Mark that the loop has run at least once so stop_new_dispatching knows
+      # it can rely on the loop to close the release signal (and otherwise
+      # closes it itself to avoid a deadlock).
+      @dispatch_started.make_true
+
+      if @stop_new_dispatching.true? || !running?
+        # Close (instead of push) so every pending and future
+        # await_dispatching_in_progress call returns, not just the first one
+        @dispatching_release_signal.close
+        return
+      end
+
+      @executor.post { dispatch }
+    rescue Concurrent::RejectedExecutionError
+      # The executor was shut down between the running? check and the post
+      # (e.g. a hard stop racing the dispatch loop); release any waiters as
+      # the dispatch chain ends here
+      @dispatching_release_signal.close
+    rescue StandardError
+      # Unexpected error from post (e.g. ThreadError if the OS thread limit is
+      # hit); the dispatch chain ends here so release waiters before re-raising
+      @dispatching_release_signal.close
+      raise
+    end
+
+    # Dispatches messages from a queue
+    #
+    # @return [void]
+    def dispatch
+      return unless running?
+
+      if ready <= 0 || (queue = @polling_strategy.next_queue).nil?
+        return sleep(MIN_DISPATCH_INTERVAL)
+      end
+
+      fire_event(:dispatch, false, queue_name: queue.name)
+
+      logger.debug { "Ready: #{ready}, Busy: #{busy}, Active Queues: #{@polling_strategy.active_queues}" }
+
+      batched_queue?(queue) ? dispatch_batch(queue) : dispatch_single_messages(queue)
+    rescue => e
+      handle_dispatch_error(e)
+    ensure
+      dispatch_loop
+    end
+
+    # Returns the count of busy processors
+    #
+    # @return [Integer] the number of busy processors
+    def busy
+      @busy_processors.value
+    end
+
+    # Returns the count of ready processors
+    #
+    # @return [Integer] the number of available processors
+    def ready
+      @max_processors - busy
+    end
+
+    # Handles completion of processor work
+    #
+    # @param queue [String] the queue name
+    # @return [void]
+    def processor_done(queue)
+      @busy_processors.decrement
+      fire_utilization_update_event
+
+      client_queue = Shoryuken::Client.queues(queue)
+      return unless client_queue.fifo?
+      return unless @polling_strategy.respond_to?(:message_processed)
+
+      @polling_strategy.message_processed(queue)
+    rescue => e
+      # Swallow (but log) failures from the SQS lookups or the strategy callback:
+      # the busy counter was already decremented above and the caller's ensure
+      # must not run completion twice
+      logger.error { "Processor completion failed for #{queue}: #{e.message}" }
+      logger.debug { e.backtrace.join("\n") } unless e.backtrace.nil?
+    end
+
+    # Assigns a message to a processor
+    #
+    # @param queue_name [String] the queue name
+    # @param sqs_msg [Aws::SQS::Types::Message, Array<Aws::SQS::Types::Message>] the message or batch
+    # @return [void]
+    def assign(queue_name, sqs_msg)
+      unless running?
+        release(sqs_msg)
+        return
+      end
+
+      logger.debug { "Assigning #{sqs_msg.message_id}" }
+
+      @busy_processors.increment
+      fire_utilization_update_event
+
+      # Completion runs in an ensure so it executes exactly once whether
+      # processing succeeds or raises. The previous `.then { processor_done }
+      # .rescue { processor_done }` chain ran completion twice when
+      # processor_done itself raised, double decrementing the busy counter
+      # and silently breaking the concurrency limit
+      @executor.post do
+        original_priority = Thread.current.priority
+        begin
+          Thread.current.priority = Shoryuken.thread_priority
+          Processor.process(queue_name, sqs_msg)
+        ensure
+          Thread.current.priority = original_priority
+          processor_done(queue_name)
+        end
+      rescue Exception
+        # Processor.process already passed the error to the exception handlers. A custom
+        # launcher_executor may not guard its threads against it
+        nil
+      end
+    rescue Concurrent::RejectedExecutionError
+      # The executor was shut down (or a bounded custom launcher_executor is
+      # saturated) between the running? check above and the post. The posted
+      # block - and therefore processor_done - never ran, so roll back the
+      # increment here. Leaking it would permanently shrink `ready`
+      # (@max_processors - busy) until dispatch stalls and the group stops
+      # processing. The message was never processed, so we must not run the
+      # FIFO message_processed callback - decrement directly instead.
+      @busy_processors.decrement
+      fire_utilization_update_event
+      release(sqs_msg)
+      nil
+    end
+
+    # Makes fetched but never started messages visible again, so another consumer can receive them at once instead of
+    # after the visibility timeout. A failed release is logged, not raised, so it cannot break dispatch or shutdown
+    #
+    # @param sqs_msg [Shoryuken::Message, Array<Shoryuken::Message>] the message or batch
+    # @return [void]
+    def release(sqs_msg)
+      (sqs_msg.is_a?(Array) ? sqs_msg : [sqs_msg]).each do |message|
+        message.visibility_timeout = 0
+      rescue => e
+        logger.error { "Failed to release message #{message.message_id}: #{e.message}" }
+      end
+    end
+
+    # Dispatches a batch of messages from a queue
+    #
+    # @param queue [Shoryuken::Polling::QueueConfiguration] the queue configuration
+    # @return [void]
+    def dispatch_batch(queue)
+      batch = @fetcher.fetch(queue, BATCH_LIMIT)
+      @polling_strategy.messages_found(queue.name, batch.size)
+      assign(queue.name, patch_batch!(batch)) if batch.any?
+    end
+
+    # Dispatches individual messages from a queue
+    #
+    # @param queue [Shoryuken::Polling::QueueConfiguration] the queue configuration
+    # @return [void]
+    def dispatch_single_messages(queue)
+      messages = @fetcher.fetch(queue, ready)
+      @polling_strategy.messages_found(queue.name, messages.size)
+      messages.each { |message| assign(queue.name, message) }
+    end
+
+    # Checks if a queue uses batch message processing
+    #
+    # @param queue [Shoryuken::Polling::QueueConfiguration] the queue configuration
+    # @return [Boolean] true if the queue is configured for batch processing
+    def batched_queue?(queue)
+      Shoryuken.worker_registry.batch_receive_messages?(queue.name)
+    end
+
+    # Patches a batch array with a message_id method
+    #
+    # @param sqs_msgs [Array<Aws::SQS::Types::Message>] the batch of messages
+    # @return [Array<Aws::SQS::Types::Message>] the patched batch
+    def patch_batch!(sqs_msgs)
+      sqs_msgs.instance_eval do
+        def message_id
+          "batch-with-#{size}-messages"
+        end
+      end
+
+      sqs_msgs
+    end
+
+    # Handles errors during dispatch
+    #
+    # @param error [Exception] the exception that occurred
+    # @return [void]
+    def handle_dispatch_error(error)
+      logger.error { "Manager failed: #{error.message}" }
+      logger.error { error.backtrace.join("\n") } unless error.backtrace.nil?
+
+      # Stop this manager first so Launcher#healthy? surfaces the failure to
+      # whoever is supervising us (the CLI Runner, or an embedding application).
+      @running.make_false
+
+      # In server (CLI) mode the Runner traps USR1 and turns it into a graceful
+      # shutdown of the whole process. Launcher#failed? makes it exit non-zero,
+      # so a process supervisor restarts us.
+      # When embedded (no Runner), USR1 keeps its default disposition and would
+      # terminate the host process - and any in-flight workers - so we must not
+      # send it. The stopped manager above is enough for Launcher#healthy? to
+      # report the failure to the embedding application.
+      Process.kill('USR1', Process.pid) if Shoryuken.server?
+    end
+
+    # Fires a utilization update event
+    #
+    # @return [void]
+    def fire_utilization_update_event
+      fire_event(
+        :utilization_update, false, {
+          group: @group,
+          max_processors: @max_processors,
+          busy_processors: busy
+        }
+      )
+    end
+  end
+end

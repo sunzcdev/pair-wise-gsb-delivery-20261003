@@ -1,0 +1,455 @@
+# frozen_string_literal: true
+
+RSpec::Matchers.define :queue_config_of do |expected|
+  match do |actual|
+    actual.name == expected
+  end
+end
+
+RSpec.describe Shoryuken::Manager do
+  let(:queue) { 'default' }
+  let(:queues) { [queue] }
+  let(:polling_strategy) { Shoryuken::Polling::WeightedRoundRobin.new(queues) }
+  let(:fetcher) { double Shoryuken::Fetcher }
+  let(:concurrency) { 1 }
+  let(:executor) { Concurrent::ImmediateExecutor.new }
+
+  subject { Shoryuken::Manager.new('default', fetcher, polling_strategy, concurrency, executor) }
+
+  before do
+    allow(fetcher).to receive(:fetch).and_return([])
+  end
+
+  after do
+    Shoryuken.options[:concurrency] = 1
+    TestWorker.get_shoryuken_options['batch'] = false
+  end
+
+  describe '#stop' do
+    specify do
+      allow(subject).to receive(:running?).and_return(true, true, false)
+      expect(subject).to receive(:dispatch).once.and_call_original
+      expect(subject).to receive(:dispatch_loop).twice.and_call_original
+      subject.start
+    end
+  end
+
+  describe '#await_dispatching_in_progress' do
+    it 'returns for repeated graceful stops (e.g. TSTP followed by USR1)' do
+      subject.stop_new_dispatching
+      # The dispatch loop observes the stop flag and releases all waiters
+      subject.start
+
+      waiter = Thread.new do
+        subject.await_dispatching_in_progress
+        subject.await_dispatching_in_progress
+      end
+
+      expect(waiter.join(5)).to eq(waiter), 'await_dispatching_in_progress deadlocked on a repeated stop'
+    end
+
+    it 'returns when stopped before the dispatch loop ever runs' do
+      # No #start here: the dispatch loop never runs, so there is nothing to
+      # observe the stop flag and close the signal - stop_new_dispatching must
+      # release waiters itself.
+      subject.stop_new_dispatching
+
+      waiter = Thread.new { subject.await_dispatching_in_progress }
+
+      expect(waiter.join(5)).to eq(waiter), 'await_dispatching_in_progress deadlocked when start never ran'
+    end
+
+    context 'when the executor rejects the dispatch post' do
+      let(:executor) do
+        double('executor', running?: true).tap do |rejecting_executor|
+          allow(rejecting_executor).to receive(:post).and_raise(Concurrent::RejectedExecutionError)
+        end
+      end
+
+      it 'releases waiters instead of leaving the signal queue unsignaled' do
+        # A hard stop can shut the executor down between the running? check and
+        # the post; the dispatch chain must still release stop waiters
+        subject.start
+
+        waiter = Thread.new { subject.await_dispatching_in_progress }
+
+        expect(waiter.join(5)).to eq(waiter), 'await_dispatching_in_progress deadlocked after a rejected post'
+      end
+    end
+  end
+
+  describe '#start' do
+    before do
+      # prevent dispatch loop
+      allow(subject).to receive(:running?).and_return(true, true, false)
+    end
+
+    it 'pauses when there are no active queues' do
+      expect(polling_strategy).to receive(:next_queue).and_return(nil)
+      expect(subject).to receive(:dispatch).and_call_original
+      subject.start
+    end
+
+    it 'calls dispatch_batch if worker wants batches' do
+      TestWorker.get_shoryuken_options['batch'] = true
+      expect(subject).to receive(:dispatch_batch).with(queue_config_of(queue))
+      subject.start
+    end
+
+    it 'calls dispatch_single_messages if worker wants single messages' do
+      expect(subject).to receive(:dispatch_single_messages).with(queue_config_of(queue))
+      subject.start
+    end
+  end
+
+  describe '#dispatch' do
+    before do
+      allow(subject).to receive(:running?).and_return(true, true, false)
+    end
+
+    specify do
+      message  = ['test1']
+      messages = [message]
+      q = Shoryuken::Polling::QueueConfiguration.new(queue, {})
+
+      expect(fetcher).to receive(:fetch).with(q, concurrency).and_return(messages)
+      expect(subject).to receive(:fire_event).with(:dispatch, false, queue_name: q.name)
+      expect(subject).to receive(:fire_event).with(
+        :utilization_update,
+        false,
+        {
+          group: 'default',
+          busy_processors: 1,
+          max_processors: 1
+        }
+      )
+      expect(Shoryuken::Processor).to receive(:process).with(q, message)
+      expect(Shoryuken.logger).to receive(:info).never
+
+      subject.send(:dispatch)
+    end
+
+    context 'and there are no messages in the queue' do
+      specify do
+        messages = %w[]
+        q = Shoryuken::Polling::QueueConfiguration.new(queue, {})
+
+        expect(fetcher).to receive(:fetch).with(q, concurrency).and_return(messages)
+        expect(subject).to receive(:fire_event).with(:dispatch, false, queue_name: q.name)
+        expect(polling_strategy).to receive(:messages_found).with(q.name, 0)
+        expect(Shoryuken.logger).to receive(:info).never
+        expect(Shoryuken::Processor).to receive(:process).never
+        expect_any_instance_of(described_class).to receive(:assign).never
+
+        subject.send(:dispatch)
+      end
+    end
+
+    context 'when batch' do
+      specify do
+        messages = %w[test1 test2 test3]
+        q = Shoryuken::Polling::QueueConfiguration.new(queue, {})
+
+        expect(fetcher).to receive(:fetch).with(q, described_class::BATCH_LIMIT).and_return(messages)
+        expect(subject).to receive(:fire_event).with(
+          :utilization_update,
+          false,
+          {
+            group: 'default',
+            busy_processors: 1,
+            max_processors: 1
+          }
+        )
+        expect(subject).to receive(:fire_event).with(:dispatch, false, queue_name: q.name)
+        allow(subject).to receive(:batched_queue?).with(q).and_return(true)
+        expect(Shoryuken::Processor).to receive(:process).with(q, messages)
+        expect(Shoryuken.logger).to receive(:info).never
+
+        subject.send(:dispatch)
+      end
+
+      context 'and there are no messages in the queue' do
+        specify do
+          messages = %w[]
+          q = Shoryuken::Polling::QueueConfiguration.new(queue, {})
+
+          expect(fetcher).to receive(:fetch).with(q, described_class::BATCH_LIMIT).and_return(messages)
+          expect(subject).to receive(:fire_event).with(:dispatch, false, queue_name: q.name)
+          allow(subject).to receive(:batched_queue?).with(q).and_return(true)
+          expect(polling_strategy).to receive(:messages_found).with(q.name, 0)
+          expect(Shoryuken.logger).to receive(:info).never
+          expect(Shoryuken::Processor).to receive(:process).never
+          expect_any_instance_of(described_class).to receive(:assign).never
+
+          subject.send(:dispatch)
+        end
+      end
+    end
+  end
+
+  describe '#dispatch_single_messages' do
+    let(:concurrency) { 3 }
+
+    it 'assings messages from batch one by one' do
+      q = polling_strategy.next_queue
+      messages = [1, 2, 3]
+      expect(fetcher).to receive(:fetch).with(q, concurrency).and_return(messages)
+      expect_any_instance_of(described_class).to receive(:assign).with(q.name, 1)
+      expect_any_instance_of(described_class).to receive(:assign).with(q.name, 2)
+      expect_any_instance_of(described_class).to receive(:assign).with(q.name, 3)
+      subject.send(:dispatch_single_messages, q)
+    end
+  end
+
+  context 'with an executor that is not a concurrent-ruby one' do
+    let(:executor) do
+      Class.new do
+        attr_reader :posted
+
+        def initialize
+          @posted = []
+        end
+
+        def post(&block)
+          @posted << block
+          true
+        end
+
+        def running?
+          true
+        end
+      end.new
+    end
+    let(:sqs_msg) { double(Shoryuken::Message, message_id: SecureRandom.uuid) }
+
+    before do
+      allow(fetcher).to receive(:fetch).and_return([sqs_msg])
+      allow(Shoryuken::Client).to receive(:queues).with(queue).and_return(double(Shoryuken::Queue, fifo?: false))
+      allow(Shoryuken::Processor).to receive(:process)
+
+      subject.start
+      # Runs the posted dispatch, which posts the processing of the fetched message first
+      executor.posted.shift.call
+    end
+
+    it 'processes the fetched message on it' do
+      executor.posted.shift.call
+
+      expect(Shoryuken::Processor).to have_received(:process).with(queue, sqs_msg)
+    end
+
+    it 'does not raise a processing error into it' do
+      allow(Shoryuken::Processor).to receive(:process).and_raise('processing failed')
+
+      expect { executor.posted.shift.call }.not_to raise_error
+    end
+  end
+
+  describe '#assign' do
+    let(:sqs_msg) { double(Shoryuken::Message, message_id: SecureRandom.uuid, 'visibility_timeout=': nil) }
+    let(:sqs_queue) { double(Shoryuken::Queue, fifo?: false) }
+
+    before do
+      allow(Shoryuken::Client).to receive(:queues).with(queue).and_return(sqs_queue)
+      allow(Shoryuken::Processor).to receive(:process)
+    end
+
+    it 'runs completion exactly once on success' do
+      expect(subject).to receive(:processor_done).with(queue).once.and_call_original
+
+      subject.send(:assign, queue, sqs_msg)
+
+      expect(subject.send(:busy)).to eq(0)
+    end
+
+    it 'runs completion exactly once when processing raises' do
+      allow(Shoryuken::Processor).to receive(:process).and_raise('processing failed')
+
+      expect(subject).to receive(:processor_done).with(queue).once.and_call_original
+
+      subject.send(:assign, queue, sqs_msg)
+
+      expect(subject.send(:busy)).to eq(0)
+    end
+
+    it 'does not release a message it processes' do
+      subject.send(:assign, queue, sqs_msg)
+
+      expect(sqs_msg).not_to have_received(:visibility_timeout=)
+    end
+
+    context 'when the manager is not running' do
+      before { allow(subject).to receive(:running?).and_return(false) }
+
+      it 'releases the message by setting its visibility timeout to 0' do
+        expect(subject.send(:assign, queue, sqs_msg)).to be_nil
+
+        expect(sqs_msg).to have_received(:visibility_timeout=).with(0)
+        expect(Shoryuken::Processor).not_to have_received(:process)
+      end
+
+      it 'releases every message of a batch' do
+        other_msg = double(Shoryuken::Message, message_id: SecureRandom.uuid, 'visibility_timeout=': nil)
+
+        subject.send(:assign, queue, [sqs_msg, other_msg])
+
+        expect(sqs_msg).to have_received(:visibility_timeout=).with(0)
+        expect(other_msg).to have_received(:visibility_timeout=).with(0)
+      end
+
+      it 'logs a failed release and still releases the rest of the batch' do
+        other_msg = double(Shoryuken::Message, message_id: SecureRandom.uuid, 'visibility_timeout=': nil)
+        allow(sqs_msg).to receive(:visibility_timeout=).and_raise('change visibility failed')
+        allow(Shoryuken.logger).to receive(:error)
+
+        expect { subject.send(:assign, queue, [sqs_msg, other_msg]) }.not_to raise_error
+
+        expect(other_msg).to have_received(:visibility_timeout=).with(0)
+        expect(Shoryuken.logger).to have_received(:error)
+      end
+    end
+
+    it 'does not double decrement the busy counter when completion raises' do
+      allow(sqs_queue).to receive(:fifo?).and_return(true)
+      allow(polling_strategy).to receive(:message_processed).and_raise('callback failed')
+
+      subject.send(:assign, queue, sqs_msg)
+
+      expect(polling_strategy).to have_received(:message_processed).once
+      expect(subject.send(:busy)).to eq(0)
+    end
+
+    context 'when the executor rejects the worker post' do
+      # running? true so #assign proceeds past its guard and post rejecting -
+      # exactly the shutdown race / saturated bounded launcher_executor case
+      let(:executor) do
+        double('executor', running?: true).tap do |rejecting_executor|
+          allow(rejecting_executor).to receive(:post).and_raise(Concurrent::RejectedExecutionError)
+        end
+      end
+
+      it 'rolls back the busy counter and does not leak it' do
+        # The posted block never runs, so completion must not run either
+        # (decrement directly, and no FIFO message_processed callback).
+        expect(subject).not_to receive(:processor_done)
+
+        expect { subject.send(:assign, queue, sqs_msg) }.not_to raise_error
+
+        expect(subject.send(:busy)).to eq(0)
+      end
+
+      it 'does not run the FIFO message_processed callback' do
+        # The message was never processed, so the rejection rollback must
+        # decrement directly and never reach the FIFO bookkeeping - even for a
+        # FIFO queue. Guards against a refactor routing rollback through
+        # processor_done.
+        allow(sqs_queue).to receive(:fifo?).and_return(true)
+        expect(polling_strategy).not_to receive(:message_processed)
+
+        subject.send(:assign, queue, sqs_msg)
+
+        expect(subject.send(:busy)).to eq(0)
+      end
+
+      it 'releases the message by setting its visibility timeout to 0' do
+        subject.send(:assign, queue, sqs_msg)
+
+        expect(sqs_msg).to have_received(:visibility_timeout=).with(0)
+      end
+
+      it 'does not raise when the release fails' do
+        allow(sqs_msg).to receive(:visibility_timeout=).and_raise('change visibility failed')
+        allow(Shoryuken.logger).to receive(:error)
+
+        expect { subject.send(:assign, queue, sqs_msg) }.not_to raise_error
+
+        expect(subject.send(:busy)).to eq(0)
+      end
+    end
+  end
+
+  describe '#processor_done' do
+    let(:sqs_queue)         { double Shoryuken::Queue }
+
+    before do
+      allow(Shoryuken::Client).to receive(:queues).with(queue).and_return(sqs_queue)
+    end
+
+    context 'when queue.fifo? is true' do
+      it 'calls message_processed on strategy' do
+        expect(sqs_queue).to receive(:fifo?).and_return(true)
+        expect(polling_strategy).to receive(:message_processed).with(queue)
+        subject.send(:processor_done, queue)
+      end
+    end
+
+    context 'when queue.fifo? is false' do
+      it 'does not call message_processed on strategy' do
+        expect(sqs_queue).to receive(:fifo?).and_return(false)
+        expect(polling_strategy).to_not receive(:message_processed)
+        subject.send(:processor_done, queue)
+      end
+    end
+  end
+
+  describe '#handle_dispatch_error' do
+    let(:error) { StandardError.new('boom') }
+
+    context 'when running under the CLI (server mode)' do
+      before { allow(Shoryuken).to receive(:server?).and_return(true) }
+
+      it 'stops the manager and signals the process to shut down' do
+        expect(Process).to receive(:kill).with('USR1', Process.pid)
+
+        subject.send(:handle_dispatch_error, error)
+
+        expect(subject.running?).to be false
+        expect(subject.failed?).to be true
+      end
+    end
+
+    context 'when embedded (no Runner)' do
+      before { allow(Shoryuken).to receive(:server?).and_return(false) }
+
+      it 'stops the manager without signalling the process' do
+        expect(Process).not_to receive(:kill)
+
+        subject.send(:handle_dispatch_error, error)
+
+        expect(subject.running?).to be false
+        expect(subject.failed?).to be true
+      end
+    end
+  end
+
+  describe '#failed?' do
+    it 'returns false when the manager is stopped without a dispatch error' do
+      allow(executor).to receive(:running?).and_return(false)
+      subject.stop_new_dispatching
+
+      expect(subject.failed?).to be false
+    end
+  end
+
+  describe '#running?' do
+    context 'when the executor is running' do
+      before do
+        allow(executor).to receive(:running?).and_return(true)
+      end
+
+      it 'returns true' do
+        expect(subject.running?).to be true
+      end
+    end
+
+    context 'when the executor is not running' do
+      before do
+        allow(executor).to receive(:running?).and_return(false)
+      end
+
+      it 'returns false' do
+        expect(subject.running?).to be false
+      end
+    end
+  end
+end

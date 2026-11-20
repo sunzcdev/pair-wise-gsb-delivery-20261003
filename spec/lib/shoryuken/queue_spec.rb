@@ -1,0 +1,495 @@
+# frozen_string_literal: true
+
+RSpec.describe Shoryuken::Queue do
+  let(:credentials) { Aws::Credentials.new('access_key_id', 'secret_access_key') }
+  let(:sqs) { Aws::SQS::Client.new(stub_responses: true, credentials: credentials) }
+  let(:queue_name) { 'shoryuken' }
+  let(:queue_url) { "https://sqs.eu-west-1.amazonaws.com:6059/0123456789/#{queue_name}" }
+
+  subject { described_class.new(sqs, queue_name) }
+
+  before do
+    # Required as Aws::SQS::Client.get_queue_url returns 'String' when responses are stubbed,
+    # which is not accepted by Aws::SQS::Client.get_queue_attributes for :queue_name parameter.
+    allow(subject).to receive(:url).and_return(queue_url)
+  end
+
+  describe '#new' do
+    context 'when queue URL supplied' do
+      it 'instantiates by URL and validate the URL' do
+        expect_any_instance_of(described_class).to receive(:fifo?).and_return(false)
+
+        subject = described_class.new(sqs, queue_url)
+
+        expect(subject.name).to eq(queue_name)
+      end
+    end
+
+    context 'when a non SQS queue URL' do
+      let(:queue_url) { "http://localhost:4576/queue/#{queue_name}" }
+
+      it 'instantiates by URL and validate the URL' do
+        # See https://github.com/ruby-shoryuken/shoryuken/pull/551
+        expect_any_instance_of(described_class).to receive(:fifo?).and_return(false)
+
+        subject = described_class.new(sqs, queue_url)
+
+        expect(subject.name).to eq(queue_name)
+      end
+    end
+
+    context 'when queue ARN supplied' do
+      let(:queue_arn) { 'arn:aws:sqs:ap-southeast-2:000000000000:queue-name' }
+
+      it 'initializes by URL and validate the URL' do
+        subject = described_class.new(sqs, queue_arn)
+
+        expect(subject.name).to eq('queue-name')
+        expect(subject.url).to eq('https://sqs.ap-southeast-2.amazonaws.com/000000000000/queue-name')
+      end
+    end
+
+    context 'when invalid queue ARN supplied' do
+      let(:queue_arn) { 'arn:aws:sqs::000000000000:queue-name' }
+
+      it 'raises an error' do
+        expect do
+          described_class.new(sqs, queue_arn)
+        end.to raise_error(
+          'Invalid ARN: arn:aws:sqs::000000000000:queue-name. A valid ARN must include: region, account_id and resource.'
+        )
+      end
+    end
+
+    context 'when queue name supplied' do
+      subject { described_class.new(sqs, queue_name) }
+
+      specify do
+        expect(subject.name).to eq(queue_name)
+      end
+    end
+  end
+
+  describe '#delete_messages' do
+    let(:entries) do
+      [
+        { id: '1', receipt_handle:  '1' },
+        { id: '2', receipt_handle:  '2' }
+      ]
+    end
+
+    it 'deletes' do
+      expect(sqs).to receive(:delete_message_batch).with(
+        { entries: entries, queue_url: queue_url }
+      ).and_return(double(failed: []))
+
+      subject.delete_messages(entries: entries)
+    end
+
+    context 'when it fails' do
+      it 'logs the reason' do
+        failure = double(id: 'id', code: 'code', message: '...', sender_fault: false)
+        logger = double 'Logger'
+
+        expect(sqs).to(
+          receive(:delete_message_batch).with(
+            { entries: entries, queue_url: queue_url }
+          ).and_return(double(failed: [failure]))
+        )
+        expect(subject).to receive(:logger).and_return(logger)
+        expect(logger).to receive(:error)
+
+        subject.delete_messages(entries: entries)
+      end
+
+      it 'returns true' do
+        failure = double(id: 'id', code: 'code', message: '...', sender_fault: false)
+        allow(sqs).to receive(:delete_message_batch).and_return(double(failed: [failure]))
+        allow(subject).to receive(:logger).and_return(double('Logger', error: nil))
+
+        expect(subject.delete_messages(entries: entries)).to be true
+      end
+    end
+
+    context 'when several deletes fail' do
+      let(:failures) do
+        [
+          double(id: '1', code: 'c1', message: 'm1', sender_fault: false),
+          double(id: '2', code: 'c2', message: 'm2', sender_fault: true)
+        ]
+      end
+
+      it 'logs every failure, not just the first' do
+        logger = double('Logger')
+        allow(sqs).to receive(:delete_message_batch).and_return(double(failed: failures))
+        allow(subject).to receive(:logger).and_return(logger)
+
+        # Real Logger#error returns true; that truthy return made the old `any?`
+        # short-circuit after the first failure, so the rest went unlogged.
+        expect(logger).to receive(:error).twice.and_return(true)
+
+        subject.delete_messages(entries: entries)
+      end
+    end
+
+    context 'when all deletes succeed' do
+      it 'returns false' do
+        allow(sqs).to receive(:delete_message_batch).and_return(double(failed: []))
+
+        expect(subject.delete_messages(entries: entries)).to be false
+      end
+    end
+  end
+
+  describe '#send_message' do
+    before { allow(subject).to receive(:fifo?).and_return(false) }
+
+    it 'accepts SQS request parameters' do
+      # https://docs.aws.amazon.com/sdkforruby/api/Aws/SQS/Client.html#send_message-instance_method
+      expect(sqs).to receive(:send_message).with(hash_including(message_body: 'msg1'))
+
+      subject.send_message(message_body: 'msg1')
+    end
+
+    it 'accepts a string' do
+      expect(sqs).to receive(:send_message).with(hash_including(message_body: 'msg1'))
+
+      subject.send_message('msg1')
+    end
+
+    context 'when a client middleware' do
+      let(:client_middleware) do
+        Class.new do
+          def call(options)
+            options[:message_body] = 'changed'
+
+            yield
+          end
+        end
+      end
+
+      before do
+        allow(Shoryuken).to receive(:server?).and_return(false)
+        Shoryuken.configure_client do |config|
+          config.client_middleware do |chain|
+            chain.add client_middleware
+          end
+        end
+      end
+
+      after do
+        Shoryuken.configure_client do |config|
+          config.client_middleware do |chain|
+            chain.remove client_middleware
+          end
+        end
+      end
+
+      it 'invokes the client middleware' do
+        expect(sqs).to receive(:send_message).with(hash_including(message_body: 'changed'))
+
+        subject.send_message(message_body: 'original')
+      end
+    end
+
+    context 'when FIFO' do
+      before { allow(subject).to receive(:fifo?).and_return(true) }
+
+      it 'auto-generates message_group_id and message_deduplication_id by default' do
+        expect(sqs).to receive(:send_message) do |arg|
+          expect(arg[:message_group_id]).to eq described_class::MESSAGE_GROUP_ID
+          expect(arg[:message_deduplication_id]).to be
+        end
+
+        subject.send_message(message_body: 'msg1')
+      end
+
+      context 'and Shoryuken.fifo_message_deduplication is disabled' do
+        before { Shoryuken.fifo_message_deduplication = false }
+
+        it 'does not auto-generate a message_deduplication_id' do
+          expect(sqs).to receive(:send_message) do |arg|
+            expect(arg[:message_group_id]).to eq described_class::MESSAGE_GROUP_ID
+            expect(arg).not_to have_key(:message_deduplication_id)
+          end
+
+          subject.send_message(message_body: 'msg1')
+        end
+      end
+    end
+  end
+
+  describe '#send_messages' do
+    before { allow(subject).to receive(:fifo?).and_return(false) }
+
+    it 'accepts SQS request parameters' do
+      # https://docs.aws.amazon.com/sdkforruby/api/Aws/SQS/Client.html#send_message_batch-instance_method
+      expect(sqs).to(
+        receive(:send_message_batch).with(
+          hash_including(
+            entries: [{ id: '0', message_body: 'msg1' }, { id: '1', message_body: 'msg2' }]
+          )
+        )
+      )
+
+      subject.send_messages(entries: [{ id: '0', message_body: 'msg1' }, { id: '1', message_body: 'msg2' }])
+    end
+
+    it 'accepts an array of messages' do
+      options = { entries: [
+        { id: '0', message_body: 'msg1', delay_seconds: 1, message_attributes: { attr: 'attr1' } },
+        { id: '1', message_body: 'msg2', delay_seconds: 1, message_attributes: { attr: 'attr2' } }
+      ] }
+      expect(sqs).to receive(:send_message_batch).with(hash_including(options))
+
+      subject.send_messages(
+        [
+          { message_body: 'msg1', delay_seconds: 1, message_attributes: { attr: 'attr1' } },
+          { message_body: 'msg2', delay_seconds: 1, message_attributes: { attr: 'attr2' } }
+        ]
+      )
+    end
+
+    context 'when FIFO' do
+      before do
+        allow(subject).to receive(:fifo?).and_return(true)
+      end
+
+      context 'and message_group_id and message_deduplication_id are absent' do
+        it 'sets default values' do
+          expect(sqs).to receive(:send_message_batch) do |arg|
+            first_entry = arg[:entries].first
+
+            expect(first_entry[:message_group_id]).to eq described_class::MESSAGE_GROUP_ID
+            expect(first_entry[:message_deduplication_id]).to be
+          end
+
+          subject.send_messages([{ message_body: 'msg1', message_attributes: { attr: 'attr1' } }])
+        end
+
+        it 'derives the id from the full body, so bodies differing only in an embedded id are not deduplicated' do
+          # Guards the ActiveJob opt-out path: when the adapter omits its own id
+          # (active_job dedup disabled), this fallback still hashes the full body
+          # - which for ActiveJob includes the per-enqueue job_id - so distinct
+          # enqueues get distinct ids and are NOT silently collapsed by SQS.
+          expect(sqs).to receive(:send_message_batch) do |arg|
+            ids = arg[:entries].map { |e| e[:message_deduplication_id] }
+
+            expect(ids).to all(be)
+            expect(ids.uniq.length).to eq(2)
+          end
+
+          subject.send_messages(
+            [
+              { message_body: JSON.dump('job_id' => 'a', 'arguments' => ['same']) },
+              { message_body: JSON.dump('job_id' => 'b', 'arguments' => ['same']) }
+            ]
+          )
+        end
+      end
+
+      context 'and message_group_id and message_deduplication_id are present' do
+        it 'preserves existing values' do
+          expect(sqs).to receive(:send_message_batch) do |arg|
+            first_entry = arg[:entries].first
+
+            expect(first_entry[:message_group_id]).to eq 'my group'
+            expect(first_entry[:message_deduplication_id]).to eq 'my id'
+          end
+
+          subject.send_messages(
+            [
+              { message_body: 'msg1',
+                message_attributes: { attr: 'attr1' },
+                message_group_id: 'my group',
+                message_deduplication_id: 'my id' }
+            ]
+          )
+        end
+      end
+
+      context 'and Shoryuken.fifo_message_deduplication is disabled' do
+        before { Shoryuken.fifo_message_deduplication = false }
+
+        it 'does not auto-generate a message_deduplication_id' do
+          expect(sqs).to receive(:send_message_batch) do |arg|
+            first_entry = arg[:entries].first
+
+            expect(first_entry[:message_group_id]).to eq described_class::MESSAGE_GROUP_ID
+            expect(first_entry).not_to have_key(:message_deduplication_id)
+          end
+
+          subject.send_messages([{ message_body: 'msg1', message_attributes: { attr: 'attr1' } }])
+        end
+
+        it 'still honors an explicit message_deduplication_id' do
+          expect(sqs).to receive(:send_message_batch) do |arg|
+            first_entry = arg[:entries].first
+
+            expect(first_entry[:message_deduplication_id]).to eq 'my id'
+          end
+
+          subject.send_messages(
+            [{ message_body: 'msg1', message_attributes: { attr: 'attr1' }, message_deduplication_id: 'my id' }]
+          )
+        end
+      end
+    end
+
+    it 'accepts an array of string' do
+      expect(sqs).to(
+        receive(:send_message_batch).with(
+          hash_including(entries: [{ id: '0', message_body: 'msg1' }, { id: '1', message_body: 'msg2' }])
+        )
+      )
+
+      subject.send_messages(%w[msg1 msg2])
+    end
+
+    context 'when some sends fail' do
+      it 'logs each failure (so bulk/enqueue_all drops are not silent)' do
+        failure = double(id: '1', code: 'code', message: '...', sender_fault: false)
+        logger = double('Logger')
+        allow(sqs).to receive(:send_message_batch).and_return(double(failed: [failure]))
+        allow(subject).to receive(:logger).and_return(logger)
+
+        expect(logger).to receive(:error)
+
+        subject.send_messages(entries: [{ id: '0', message_body: 'msg1' }])
+      end
+    end
+  end
+
+  describe '#fifo?' do
+    let(:attribute_response) { double 'Aws::SQS::Types::GetQueueAttributesResponse' }
+    before do
+      allow(attribute_response).to(
+        receive(:attributes).and_return('FifoQueue' => fifo.to_s, 'ContentBasedDeduplication' => 'true')
+      )
+      allow(subject).to receive(:url).and_return(queue_url)
+      allow(sqs).to(
+        receive(:get_queue_attributes).with(queue_url: queue_url, attribute_names: ['All']).and_return(attribute_response)
+      )
+    end
+
+    context 'when queue is FIFO' do
+      let(:fifo) { true }
+
+      specify { expect(subject.fifo?).to be }
+
+      it 'memoizes response' do
+        expect(sqs).to(
+          receive(:get_queue_attributes).with(queue_url: queue_url, attribute_names: ['All']).and_return(attribute_response)
+        ).exactly(1).times
+
+        subject.fifo?
+        subject.fifo?
+      end
+    end
+
+    context 'when queue is not FIFO' do
+      let(:fifo) { false }
+
+      specify { expect(subject.fifo?).to_not be }
+
+      it 'memoizes response' do
+        expect(sqs).to(
+          receive(:get_queue_attributes).with(queue_url: queue_url, attribute_names: ['All']).and_return(attribute_response)
+        ).exactly(1).times
+
+        subject.fifo?
+        subject.fifo?
+      end
+    end
+  end
+
+  describe '#max_receive_count' do
+    let(:attribute_response) { double 'Aws::SQS::Types::GetQueueAttributesResponse' }
+
+    before do
+      allow(attribute_response).to receive(:attributes).and_return(attributes)
+      allow(sqs).to(
+        receive(:get_queue_attributes).with(queue_url: queue_url, attribute_names: ['All']).and_return(attribute_response)
+      )
+    end
+
+    context 'when the queue has a redrive policy' do
+      let(:attributes) do
+        {
+          'RedrivePolicy' => {
+            deadLetterTargetArn: 'arn:aws:sqs:eu-west-1:0123456789:dlq',
+            maxReceiveCount: '5'
+          }.to_json
+        }
+      end
+
+      specify { expect(subject.max_receive_count).to eq(5) }
+
+      it 'memoizes response' do
+        expect(sqs).to(
+          receive(:get_queue_attributes).with(queue_url: queue_url, attribute_names: ['All']).and_return(attribute_response)
+        ).exactly(1).times
+
+        subject.max_receive_count
+        subject.max_receive_count
+      end
+    end
+
+    context 'when the queue has no redrive policy' do
+      let(:attributes) { { 'VisibilityTimeout' => '30' } }
+
+      specify { expect(subject.max_receive_count).to be_nil }
+
+      it 'memoizes response' do
+        expect(sqs).to(
+          receive(:get_queue_attributes).with(queue_url: queue_url, attribute_names: ['All']).and_return(attribute_response)
+        ).exactly(1).times
+
+        subject.max_receive_count
+        subject.max_receive_count
+      end
+    end
+  end
+
+  describe '#visibility_timeout' do
+    let(:attribute_response) { double 'Aws::SQS::Types::GetQueueAttributesResponse' }
+
+    before do
+      allow(attribute_response).to(
+        receive(:attributes).and_return('VisibilityTimeout' => 30)
+      )
+      allow(subject).to receive(:url).and_return(queue_url)
+    end
+
+    context 'when cache is disabled' do
+      specify do
+        Shoryuken.cache_visibility_timeout = false
+
+        expect(sqs).to(
+          receive(:get_queue_attributes).with(
+            queue_url: queue_url,
+            attribute_names: ['All']
+          ).and_return(attribute_response).exactly(3).times
+        )
+        expect(subject.visibility_timeout).to eq(30)
+        expect(subject.visibility_timeout).to eq(30)
+        expect(subject.visibility_timeout).to eq(30)
+      end
+    end
+
+    context 'when cache is enabled' do
+      it 'memoizes response' do
+        Shoryuken.cache_visibility_timeout = true
+
+        expect(sqs).to(
+          receive(:get_queue_attributes).with(
+            { queue_url: queue_url, attribute_names: ['All'] }
+          ).and_return(attribute_response).once
+        )
+        expect(subject.visibility_timeout).to eq(30)
+        expect(subject.visibility_timeout).to eq(30)
+        expect(subject.visibility_timeout).to eq(30)
+      end
+    end
+  end
+end

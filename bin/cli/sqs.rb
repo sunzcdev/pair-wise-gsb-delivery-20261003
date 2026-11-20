@@ -1,0 +1,493 @@
+# frozen_string_literal: true
+
+require 'date'
+require 'securerandom'
+
+# rubocop:disable Metrics/BlockLength
+module Shoryuken
+  module CLI
+    # SQS command line interface for queue management operations.
+    # Provides commands for listing, creating, deleting, moving, and dumping queue messages.
+    class SQS < Base
+      # Maximum batch size in bytes for SQS batch operations
+      # @see https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-messages.html
+      MAX_BATCH_SIZE = 1024 * 1024
+
+      # Long-poll wait (seconds) used when draining a queue in find_all, so a
+      # short-poll empty batch doesn't end dump/mv prematurely.
+      FIND_ALL_WAIT_SECONDS = 1
+
+      # Number of consecutive empty long-poll batches before find_all concludes
+      # the queue is drained.
+      FIND_ALL_MAX_EMPTY_BATCHES = 3
+
+      namespace :sqs
+      class_option :endpoint, aliases: '-e', type: :string, default: ENV['SHORYUKEN_SQS_ENDPOINT'], desc: 'Endpoint URL'
+
+      class << self
+        protected
+
+        # Fails when class options come before the command (`sqs -e URL ls`), which Thor would take for `help`
+        #
+        # @param meth [String, nil] the command name Thor found
+        # @param given_args [Array<String>] the arguments before the first option
+        # @param given_opts [Array<String>, nil] the options and everything after them
+        # @param config [Hash] the Thor config
+        # @return [void]
+        # @raise [Thor::Error] when a known command follows the leading class options
+        def dispatch(meth, given_args, given_opts, config)
+          if meth.nil? && given_args.empty? && given_opts&.any?
+            parser = Thor::Options.new(class_options, {}, true, true)
+            parser.parse(given_opts)
+            rest = parser.remaining
+
+            if rest.any? && !rest.first.start_with?('-') && find_command_possibilities(rest.first).one?
+              leading = given_opts.first(given_opts.size - rest.size)
+
+              raise Thor::Error, "Options must follow the command: shoryuken sqs #{(rest + leading).join(' ')}"
+            end
+          end
+
+          super
+        end
+      end
+
+      no_commands do
+        # Converts a received message to a hash for the dump file, with Binary attribute values in base64
+        #
+        # @param message [Aws::SQS::Types::Message] the received message
+        # @return [Hash] the message hash
+        def dump_message(message)
+          message.to_h.tap do |hash|
+            hash[:message_attributes]&.each_value do |value|
+              next unless value[:binary_value]
+
+              value[:binary_value] = [value[:binary_value]].pack('m0')
+              value[:binary_value_encoding] = 'base64'
+            end
+          end
+        end
+
+        # Normalizes a dump message for requeuing
+        #
+        # @param message [Hash] the dumped message hash
+        # @return [Hash] the normalized message
+        def normalize_dump_message(message)
+          # symbolize_keys is needed for keeping it compatible with `requeue`
+          attributes = message[:attributes].transform_keys(&:to_sym)
+
+          # See https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_MessageAttributeValue.html
+          # The `string_list_values` and `binary_list_values` are not implemented. Reserved for future use.
+          message_attributes = message[:message_attributes].each_with_object({}) do |(k, v), result|
+            result[k] = v.slice(:data_type, :string_value, :binary_value)
+            # Dumps written before binary_value_encoding hold the raw value
+            result[k][:binary_value] = v[:binary_value].unpack1('m0') if v[:binary_value_encoding] == 'base64'
+          end
+
+          {
+            id: message[:message_id],
+            message_body: message[:body],
+            message_attributes: message_attributes,
+            # SQS drops a FIFO message whose deduplication id it saw in the last 5 minutes
+            message_deduplication_id: (SecureRandom.uuid if attributes[:MessageDeduplicationId]),
+            message_group_id: attributes[:MessageGroupId]
+          }
+        end
+
+        # Returns the SQS client options based on CLI options
+        #
+        # @return [Hash] the client options hash
+        def client_options
+          endpoint = options[:endpoint]
+          {}.tap do |hash|
+            hash[:endpoint] = endpoint unless endpoint.to_s.empty?
+          end
+        end
+
+        # Returns the SQS client instance
+        #
+        # @return [Aws::SQS::Client] the SQS client
+        def sqs
+          @_sqs ||= Aws::SQS::Client.new(client_options)
+        end
+
+        # Finds the URL for a queue by name
+        #
+        # @param queue_name [String] the queue name
+        # @return [String] the queue URL
+        def find_queue_url(queue_name)
+          sqs.get_queue_url(queue_name: queue_name).queue_url
+        rescue Aws::SQS::Errors::NonExistentQueue, Aws::SQS::Errors::QueueDoesNotExist
+          fail_task "The specified queue #{queue_name} does not exist"
+        end
+
+        # Batch deletes messages from a queue
+        #
+        # @param url [String] the queue URL
+        # @param messages [Array<Aws::SQS::Types::Message>] the messages to delete
+        # @return [Array<Aws::SQS::Types::BatchResultErrorEntry>] the entries SQS did not delete
+        def batch_delete(url, messages)
+          messages.to_a.flatten.each_slice(10).flat_map do |batch|
+            failed = sqs.delete_message_batch(
+              queue_url: url,
+              entries: batch.map { |message| { id: message.message_id, receipt_handle: message.receipt_handle } }
+            ).failed
+
+            failed.each do |failure|
+              say(
+                "Could not delete #{failure.id}, code: #{failure.code}, message: #{failure.message}, " \
+                "sender_fault: #{failure.sender_fault}",
+                :yellow
+              )
+            end
+          end
+        end
+
+        # Batch sends messages to a queue
+        #
+        # @param url [String] the queue URL
+        # @param messages [Array<Hash>] the messages to send
+        # @param max_batch_size [Integer] maximum messages per batch
+        # @return [Array<Aws::SQS::Types::BatchResultErrorEntry>] the entries SQS did not accept
+        def batch_send(url, messages, max_batch_size = 10)
+          messages = messages.to_a.flatten.map(&method(:normalize_dump_message))
+          batch_send_normalized_messages url, messages, max_batch_size
+        end
+
+        # Batch sends normalized messages to a queue
+        #
+        # @param url [String] the queue URL
+        # @param messages [Array<Hash>] the normalized messages
+        # @param max_batch_size [Integer] maximum messages per batch
+        # @return [Array<Aws::SQS::Types::BatchResultErrorEntry>] the entries SQS did not accept
+        def batch_send_normalized_messages(url, messages, max_batch_size)
+          failed = []
+
+          # Repeatedly take the longest prefix of messages such that
+          # 1. The number of messages is less than or equal to max_batch_size
+          # 2. The total message payload size is less than or equal to the
+          #    batch payload limit
+          while messages.size.positive?
+            batch_size = max_batch_size
+            loop do
+              batch = messages.take batch_size
+
+              unless batch.size == 1 || batch_payload_size(batch) <= MAX_BATCH_SIZE
+                batch_size = batch.size - 1
+                next
+              end
+
+              sqs.send_message_batch(queue_url: url, entries: batch).failed.each do |failure|
+                say "Could not requeue #{failure.id}, code: #{failure.code}", :yellow
+                failed << failure
+              end
+              messages = messages.drop batch.size
+              break
+            end
+          end
+
+          failed
+        end
+
+        # Calculates the total payload size of a batch
+        #
+        # @param messages [Array<Hash>] the messages
+        # @return [Integer] total size in bytes
+        def batch_payload_size(messages)
+          messages.sum(&method(:message_size))
+        end
+
+        # Calculates the size of a single message
+        #
+        # @param message [Hash] the message
+        # @return [Integer] size in bytes
+        def message_size(message)
+          attribute_size = (message[:message_attributes] || []).sum do |name, value|
+            name_size = name.to_s.bytesize
+            data_type_size = value[:data_type].bytesize
+            value_size = if value[:string_value]
+                           value[:string_value].bytesize
+                         elsif value[:binary_value]
+                           value[:binary_value].bytesize
+                         else
+                           # List-type attributes (string_list_values /
+                           # binary_list_values) carry no scalar value here and
+                           # are intentionally not requeued (see
+                           # normalize_dump_message). Size them as 0 rather than
+                           # crashing the whole batch with `nil + Integer`.
+                           0
+                         end
+            name_size + data_type_size + value_size
+          end
+
+          body_size = message[:message_body].bytesize
+
+          attribute_size + body_size
+        end
+
+        # Receives all messages from a queue up to a limit
+        #
+        # @param url [String] the queue URL
+        # @param limit [Integer, Float] maximum messages to receive
+        # @yield [Aws::SQS::Types::Message] yields each received message
+        # @return [Integer] the number of messages received
+        def find_all(url, limit, &block)
+          count = 0
+          empty_batches = 0
+          # Callers (dump/mv) collect messages and only delete them after this
+          # method returns (so a failed dump/mv deletes nothing), which means
+          # nothing is removed from the queue during the drain. Two consequences:
+          #
+          #   1. A large drain can outlast the queue's visibility timeout, at
+          #      which point already-received messages become visible again and
+          #      are handed back on a later receive. `seen` maps message id to
+          #      the first yielded message so those re-reads are not yielded,
+          #      counted, or dumped/moved twice - but the newest receipt handle
+          #      is copied onto that message, because SQS only honors the most
+          #      recently received handle for deletion (an older one can report
+          #      success yet leave the message in the queue).
+          #   2. Because messages stay in flight until the caller deletes them,
+          #      a queue larger than SQS's in-flight limit (~120k standard /
+          #      ~20k FIFO) cannot be drained in a single pass: once the limit
+          #      is reached receive returns empty and find_all stops. No message
+          #      is lost - re-run dump/mv to drain the remainder.
+          seen = {}
+          batch_size = limit > 10 ? 10 : limit
+
+          loop do
+            n = limit - count
+            batch_size = n if n < batch_size
+
+            messages = sqs.receive_message(
+              queue_url: url,
+              max_number_of_messages: batch_size,
+              # Long poll: short polling (the default wait_time_seconds: 0)
+              # samples only a subset of SQS hosts and routinely returns an empty
+              # batch even when the queue still has messages, which made dump/mv
+              # stop early and miss messages on real (distributed) SQS.
+              wait_time_seconds: FIND_ALL_WAIT_SECONDS,
+              attribute_names: ['All'],
+              message_attribute_names: ['All']
+            ).messages || []
+
+            # Split first-time messages from re-reads (same id handed back after
+            # the visibility timeout lapsed). A batch of only re-reads counts as
+            # empty so the drain still terminates.
+            fresh = []
+            messages.each do |message|
+              if (previous = seen[message.message_id])
+                # Keep the newest receipt handle on the already-yielded message
+                # so the caller's deferred batch_delete targets a handle SQS
+                # still accepts.
+                previous.receipt_handle = message.receipt_handle
+              else
+                seen[message.message_id] = message
+                fresh << message
+              end
+            end
+
+            fresh.each(&block)
+
+            count += fresh.size
+
+            break if count >= limit
+
+            # Even with long polling an occasional empty batch is possible while
+            # messages remain, so only give up after several consecutive batches
+            # that yielded no new messages.
+            if fresh.empty?
+              empty_batches += 1
+              break if empty_batches >= FIND_ALL_MAX_EMPTY_BATCHES
+            else
+              empty_batches = 0
+            end
+          end
+
+          count
+        end
+
+        # Lists queues and prints their attributes as a table
+        #
+        # @param urls [Array<String>] the queue URLs
+        # @return [void]
+        def list_and_print_queues(urls)
+          attrs = %w[QueueArn ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible LastModifiedTimestamp]
+
+          entries = urls.map { |u| sqs.get_queue_attributes(queue_url: u, attribute_names: attrs).attributes }.map do |q|
+            [
+              q['QueueArn'].split(':').last,
+              q['ApproximateNumberOfMessages'],
+              q['ApproximateNumberOfMessagesNotVisible'],
+              Time.at(q['LastModifiedTimestamp'].to_i)
+            ]
+          end
+
+          entries.unshift(['Queue', 'Messages Available', 'Messages Inflight', 'Last Modified'])
+
+          print_table(entries)
+        end
+
+        # Generates the dump file path for a queue
+        #
+        # @param path [String] the directory path
+        # @param queue_name [String] the queue name
+        # @return [String] the full file path
+        def dump_file(path, queue_name)
+          File.join(path, "#{queue_name}-#{Date.today}.jsonl")
+        end
+
+        # Fails the task unless the number of messages option is at least 1
+        #
+        # @return [void]
+        def validate_number_option
+          fail_task "Number of messages must be at least 1, got #{options[:number]}" if options[:number] < 1
+        end
+      end
+
+      desc 'ls [QUEUE-NAME-PREFIX]', 'Lists queues'
+      method_option :watch,    aliases: '-w', type: :boolean, desc: 'watch queues'
+      method_option :interval, aliases: '-n', type: :numeric, default: 2, desc: 'watch interval in seconds'
+      def ls(queue_name_prefix = '')
+        trap('SIGINT', 'EXIT') # expect ctrl-c from loop
+
+        urls = sqs.list_queues(queue_name_prefix: queue_name_prefix).queue_urls
+
+        loop do
+          list_and_print_queues(urls)
+
+          break unless options[:watch]
+
+          sleep options[:interval]
+          puts
+        end
+      end
+
+      desc 'dump QUEUE-NAME', 'Dumps messages from a queue into a JSON lines file'
+      method_option :number, aliases: '-n', type: :numeric, default: Float::INFINITY, desc: 'number of messages to dump'
+      method_option :path,   aliases: '-p', type: :string,  default: './',            desc: 'path to save the dump file'
+      method_option :delete, aliases: '-d', type: :boolean, default: true,            desc: 'delete from the queue'
+      def dump(queue_name)
+        validate_number_option
+
+        fail_task "Path #{options[:path]} is not a directory" unless File.directory?(options[:path])
+        unless File.writable?(options[:path]) && File.executable?(options[:path])
+          fail_task "Path #{options[:path]} is not writable"
+        end
+
+        path = dump_file(options[:path], queue_name)
+
+        fail_task "File #{path} already exists" if File.exist?(path)
+
+        url = find_queue_url(queue_name)
+
+        messages = []
+
+        file = nil
+
+        begin
+          count = find_all(url, options[:number]) do |m|
+            file ||= File.open(path, 'w')
+
+            file.puts(JSON.dump(dump_message(m)))
+
+            messages << m if options[:delete]
+          end
+        ensure
+          # A file left by a failed dump would block every later dump of the queue that day
+          if file && count.nil?
+            file.close
+            File.delete(path)
+          end
+        end
+
+        not_deleted = options[:delete] ? batch_delete(url, messages) : []
+
+        if count.zero?
+          say "Queue #{queue_name} is empty", :yellow
+        else
+          say "Dump saved in #{path} with #{count} messages", :green
+        end
+
+        fail_task "Could not delete #{not_deleted.size} dumped messages from #{queue_name}" unless not_deleted.empty?
+      ensure
+        file&.close
+      end
+
+      desc 'requeue QUEUE-NAME PATH', 'Requeues messages from a dump file'
+      method_option(
+        :batch_size, aliases: '-n', type: :numeric, default: 10,
+        desc: 'maximum number of messages per batch to send'
+      )
+      def requeue(queue_name, path)
+        fail_task "Path #{path} not found" unless File.exist?(path)
+
+        messages = File.readlines(path).map { |line| JSON.parse(line, symbolize_names: true) }
+
+        failed = batch_send(find_queue_url(queue_name), messages, options[:batch_size])
+
+        say "Requeued #{messages.size - failed.size} messages from #{path} to #{queue_name}", :green
+
+        fail_task "Could not requeue #{failed.size} messages from #{path} to #{queue_name}" unless failed.empty?
+      end
+
+      desc 'mv QUEUE-NAME-SOURCE QUEUE-NAME-TARGET', 'Moves messages from one queue (source) to another (target)'
+      method_option :number, aliases: '-n', type: :numeric, default: Float::INFINITY, desc: 'number of messages to move'
+      method_option :delete, aliases: '-d', type: :boolean, default: true,            desc: 'delete from the queue'
+      def mv(queue_name_source, queue_name_target)
+        validate_number_option
+
+        url_source = find_queue_url(queue_name_source)
+        url_target = find_queue_url(queue_name_target)
+        messages = []
+
+        count = find_all(url_source, options[:number]) do |m|
+          messages << m
+        end
+
+        failed_ids = batch_send(url_target, messages.map(&:to_h)).to_set(&:id)
+        moved = messages.reject { |m| failed_ids.include?(m.message_id) }
+        not_deleted = options[:delete] ? batch_delete(url_source, moved) : []
+
+        if count.zero?
+          say "Queue #{queue_name_source} is empty", :yellow
+        else
+          say "Moved #{moved.size} messages from #{queue_name_source} to #{queue_name_target}", :green
+        end
+
+        unless failed_ids.empty?
+          fail_task "Could not move #{failed_ids.size} messages, they stay in #{queue_name_source}", quit: false
+        end
+        unless not_deleted.empty?
+          fail_task "Could not delete #{not_deleted.size} moved messages from #{queue_name_source}", quit: false
+        end
+        exit(1) unless failed_ids.empty? && not_deleted.empty?
+      end
+
+      desc 'purge QUEUE-NAME', 'Deletes the messages in a queue'
+      def purge(queue_name)
+        sqs.purge_queue(queue_url: find_queue_url(queue_name))
+
+        say "Purge request sent for #{queue_name}. The message deletion process takes up to 60 seconds", :yellow
+      end
+
+      desc 'create QUEUE-NAME', 'Create a queue'
+      method_option :attributes, aliases: '-a', type: :hash, default: {}, desc: 'queue attributes'
+      def create(queue_name)
+        attributes = options[:attributes]
+        attributes['FifoQueue'] ||= 'true' if queue_name.end_with?('.fifo')
+
+        queue_url = sqs.create_queue(queue_name: queue_name, attributes: attributes).queue_url
+
+        say "Queue #{queue_name} was successfully created. Queue URL #{queue_url}", :green
+      end
+
+      desc 'delete QUEUE-NAME', 'delete a queue'
+      def delete(queue_name)
+        sqs.delete_queue(queue_url: find_queue_url(queue_name))
+
+        say "Queue #{queue_name} was successfully deleted", :green
+      end
+    end
+  end
+end
+# rubocop:enable Metrics/BlockLength
