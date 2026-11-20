@@ -15,6 +15,8 @@ module WEBrick
       def make_partial_content: (HTTPRequest req, HTTPResponse res, String filename, Integer filesize) -> void
 
       def prepare_range: (Range[Integer] range, Integer filesize) -> [Numeric, Numeric]
+
+      def coalesce_ranges: (Array[Range[Integer]] ranges, Integer filesize) -> Array[Range[Integer]]
     end
 
     class FileHandler < AbstractServlet

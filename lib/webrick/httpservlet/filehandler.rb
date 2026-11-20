@@ -28,6 +28,13 @@ module WEBrick
     #                '/path/to/my_page.txt')
     #
     # This servlet handles If-Modified-Since and Range requests.
+    #
+    # When the server-level +:CoalesceRanges+ option is true, multiple byte
+    # ranges which overlap (or are adjacent) are merged into the ordered,
+    # disjoint ranges actually sent.  A request that coalesces down to a
+    # single range is answered with a single-part response instead of a
+    # multipart/byteranges one, and a request whose ranges are all
+    # unsatisfiable is answered with 416 Request Range Not Satisfiable.
 
     class DefaultFileHandler < AbstractServlet
 
@@ -121,6 +128,10 @@ module WEBrick
           raise HTTPStatus::BadRequest,
             "Unrecognized range-spec: \"#{req['range']}\""
         end
+        if @config[:CoalesceRanges]
+          ranges = coalesce_ranges(ranges, filesize)
+          raise HTTPStatus::RequestRangeNotSatisfiable if ranges.empty?
+        end
         File.open(filename, "rb"){|io|
           if ranges.size > 1
             time = Time.now
@@ -158,6 +169,29 @@ module WEBrick
         last = range.last < 0 ? filesize + range.last : range.last
         last = filesize - 1 if last >= filesize
         return first, last
+      end
+
+      # Normalizes the requested byte ranges into the ordered, disjoint
+      # ranges that can actually be served from a file of +filesize+ bytes.
+      # Ranges which do not intersect the file are dropped, and overlapping
+      # or adjacent ranges are merged.  Returns an Array of Range objects
+      # with non-negative, inclusive bounds; an empty Array means that none
+      # of the requested ranges is satisfiable.  The satisfiability rules
+      # follow prepare_range, so a suffix larger than the whole file is
+      # treated as unsatisfiable just as in the non-coalescing path.
+      def coalesce_ranges(ranges, filesize)
+        prepared = ranges.filter_map do |range|
+          first, last = prepare_range(range, filesize)
+          (first..last) if first >= 0
+        end
+        prepared.sort_by!(&:first)
+        prepared.each_with_object([]) do |range, merged|
+          if merged.empty? || range.first > merged[-1].last + 1
+            merged << range
+          else
+            merged[-1] = (merged[-1].first..[merged[-1].last, range.last].max)
+          end
+        end
       end
 
       # :startdoc:

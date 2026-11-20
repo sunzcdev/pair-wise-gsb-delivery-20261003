@@ -69,6 +69,11 @@ module WEBrick
       :CGIInterpreter => nil,
       :CGIPathEnv     => nil,
 
+      # When true, overlapping byte ranges in a Range request for a static
+      # file are normalized into the ordered, disjoint ranges that are
+      # actually sent.  See WEBrick::HTTPServlet::DefaultFileHandler.
+      :CoalesceRanges => false,
+
       # workaround: if Request-URIs contain 8bit chars,
       # they should be escaped before calling of URI::parse().
       :Escape8bitURI  => false
