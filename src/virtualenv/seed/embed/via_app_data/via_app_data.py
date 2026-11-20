@@ -9,6 +9,7 @@ __lazy_modules__ = [
     "traceback",
     "virtualenv.info",
     "virtualenv.seed.wheels",
+    "virtualenv.seed.wheels.manifest",
     f"{__spec__.parent}.pip_install.copy",  # ty: ignore[missing-union-attribute]  # imported modules have a spec
     f"{__spec__.parent}.pip_install.symlink",  # ty: ignore[missing-union-attribute]  # imported modules have a spec
 ]
@@ -25,6 +26,7 @@ from typing import TYPE_CHECKING, Final
 from virtualenv.info import fs_supports_symlink
 from virtualenv.seed.embed.base_embed import BaseEmbed
 from virtualenv.seed.wheels import get_wheel
+from virtualenv.seed.wheels.manifest import SeedManifestError
 
 from .pip_install.copy import CopyPipInstall
 from .pip_install.symlink import SymlinkPipInstall
@@ -136,10 +138,31 @@ class FromAppData(BaseEmbed):
     # the wheel lookup and its image build share one context, splitting it passes the lock around
     def _get_seed_wheels(self, creator: Creator) -> Generator[dict[str, Wheel], None, None]:  # ruff:ignore[complex-structure]
         name_to_whl, lock, fail = {}, Lock(), {}
+        distributions = self.distribution_to_versions()
+        self.check_strict_manifest(distributions)
 
         def _get(distribution: str, version: str | None) -> None:
             for_py_version = creator.interpreter.version_release_str
             failure, result = None, None
+            try:
+                manifest_wheel = self.select_seed_wheel(distribution, version, for_py_version)
+            except Exception as exception:  # ruff:ignore[blind-except]
+                # a strict manifest failure is collected like any other seed failure and raised once the threads join
+                LOGGER.error(str(exception))
+                with lock:
+                    fail[distribution] = exception
+                return
+            if manifest_wheel is not None:
+                with lock:
+                    name_to_whl[distribution] = manifest_wheel
+                return
+            # in strict mode an unmatched entry already raised; a None here only happens in loose mode
+            if self.seed_manifest is not None and self.seed_manifest.strict:
+                with lock:
+                    fail[distribution] = SeedManifestError(
+                        f"strict seed manifest {self.seed_manifest.path} returned no wheel for {distribution}"
+                    )
+                return
             # fallback to download in case the exact version is not available
             for download in [True] if self.download else [False, True]:
                 failure = None
@@ -172,20 +195,24 @@ class FromAppData(BaseEmbed):
                     msg = repr(failure)
                 LOGGER.error(msg)
                 with lock:
-                    fail[distribution] = version
+                    fail[distribution] = failure
             else:
                 with lock:
                     name_to_whl[distribution] = result
 
         threads = [
             Thread(target=_get, args=(distribution, version))
-            for distribution, version in self.distribution_to_versions().items()
+            for distribution, version in distributions.items()
         ]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
         if fail:
+            manifest_failures = [error for error in fail.values() if isinstance(error, SeedManifestError)]
+            if manifest_failures:
+                # surface the manifest reason verbatim instead of the generic "failed to download" wording
+                raise SeedManifestError("; ".join(str(error) for error in manifest_failures))
             msg = f"seed failed due to failing to download wheels {', '.join(fail.keys())}"
             raise RuntimeError(msg)
         yield name_to_whl

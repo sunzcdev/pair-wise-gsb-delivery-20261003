@@ -426,6 +426,42 @@ Repeat the option to search more than one directory, in the given order:
 
     $ virtualenv venv --extra-search-dir /path/to/wheels --extra-search-dir /path/to/other/wheels
 
+Pin seed packages with a manifest
+=================================
+
+A fixed runner can name the exact seed wheels it accepts with a JSON manifest, so adding another wheel version to an
+``--extra-search-dir`` cannot change what gets seeded. Each entry pins the distribution, its exact version, the
+SHA-256 digest of the wheel file and, optionally, the exact wheel file name. A wheel is accepted only when every pin
+matches and its ``Requires-Python`` admits the target interpreter. The search directories are checked first, then the
+wheel bundled with virtualenv is used as a built-in fallback when it matches the entry.
+
+.. code-block:: json
+
+    {
+      "schema_version": 1,
+      "strict": true,
+      "packages": [
+        {
+          "distribution": "pip",
+          "version": "26.3",
+          "sha256": "f3b60b20ffaadd4415ed7957212a38ac63fa4c5fa375bd0f4a797777940fad13",
+          "filename": "pip-26.3-py3-none-any.whl"
+        }
+      ]
+    }
+
+Pass the manifest with ``--seed-manifest``:
+
+.. code-block:: console
+
+    $ virtualenv venv --extra-search-dir /path/to/wheels --seed-manifest /path/to/seed-manifest.json
+
+With ``--strict-seed-manifest`` (or ``"strict": true`` inside the file) virtualenv only seeds packages the manifest
+names, plus the bundled wheel when it matches an entry; an unmatched distribution or a wheel that fails the version,
+digest or interpreter check stops the run with an error. Without strict mode the same checks run, but an unmatched
+entry logs a warning and falls back to the regular seed selection. The option also reads ``VIRTUALENV_SEED_MANIFEST``
+and the ``seed_manifest`` configuration file key.
+
 Download latest from PyPI
 =========================
 

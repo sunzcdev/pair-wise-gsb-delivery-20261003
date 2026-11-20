@@ -13,6 +13,7 @@ __lazy_modules__ = [
     "tempfile",
     "virtualenv.seed.wheels",
     "virtualenv.seed.wheels.acquire",
+    "virtualenv.seed.wheels.manifest",
     "virtualenv.seed.wheels.util",
     "virtualenv.util.path",
     "virtualenv.util.subprocess",
@@ -107,8 +108,11 @@ class PipInvoke(BaseEmbed):
         # Only the selected archives may participate in pip's filename-based selection.
         with TemporaryDirectory(prefix="virtualenv-seed-") as folder:
             cmd.extend(["--find-links", folder])
-            for dist, version in self.distribution_to_versions().items():
-                wheel: Final = get_wheel(
+            distributions = self.distribution_to_versions()
+            self.check_strict_manifest(distributions)
+            for dist, version in distributions.items():
+                manifest_wheel = self.select_seed_wheel(dist, version, for_py_version)
+                wheel: Final = manifest_wheel or get_wheel(
                     distribution=dist,
                     version=version,
                     for_py_version=for_py_version,

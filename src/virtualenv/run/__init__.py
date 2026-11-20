@@ -179,6 +179,7 @@ def _validate_option_values(args: list[str] | None) -> None:
         "--seeder",
         "--activators",
         "--extra-search-dir",
+        "--seed-manifest",
         "--pip",
         "--setuptools",
         "--wheel",

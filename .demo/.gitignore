@@ -1,0 +1,7 @@
+# demo outputs: only the scripts, README and generated manifests/wheelhouse sources are kept
+__pycache__/
+base-env/
+env-*/
+wheelhouse/
+virtualenv.ini
+seed-manifest*.json

@@ -6,6 +6,8 @@ __lazy_modules__ = [
     "virtualenv.config.cli.parser",
     "virtualenv.seed.wheels",
     "virtualenv.seed.wheels.embed",
+    "virtualenv.seed.wheels.manifest",
+    "virtualenv.seed.wheels.util",
 ]
 
 import logging
@@ -18,6 +20,7 @@ from virtualenv.config.cli.parser import ExtendAction
 from virtualenv.seed.seeder import Seeder
 from virtualenv.seed.wheels import Version
 from virtualenv.seed.wheels.embed import MIN, OLDEST_SUPPORTED
+from virtualenv.seed.wheels.manifest import SeedManifest, SeedManifestError
 
 if TYPE_CHECKING:
     from argparse import ArgumentParser
@@ -26,6 +29,7 @@ if TYPE_CHECKING:
 
     from virtualenv.app_data.base import AppData
     from virtualenv.config.cli.parser import VirtualEnvOptions
+    from virtualenv.seed.wheels.util import Wheel
 
 LOGGER: Final[logging.Logger] = logging.getLogger(__name__)  # simplint: ignore[module-variable-prefix]  # existing name
 #: Whether the bundled wheels are updated periodically when ``--no-periodic-update`` is not passed. Distributions
@@ -40,6 +44,7 @@ class BaseEmbed(Seeder, ABC):
 
     :var download: ``True`` to download the newest versions from PyPI when no bundled wheel is used
     :var extra_search_dir: the folders searched for extra wheels
+    :var seed_manifest: the pinned seed package manifest, or ``None`` when none was configured
     :var pip_version: the pip version to seed, ``None`` when not wanted
     :var setuptools_version: the setuptools version to seed, ``None`` when not wanted
     :var wheel_version: the wheel version to seed, ``None`` when not wanted
@@ -57,6 +62,7 @@ class BaseEmbed(Seeder, ABC):
 
         self.download = options.download is True  # unset means no download
         self.extra_search_dir = [i.resolve() for i in options.extra_search_dir if i.exists()]
+        self.seed_manifest = self._load_seed_manifest(options)
 
         self.pip_version = options.pip
         self.setuptools_version = options.setuptools
@@ -77,8 +83,12 @@ class BaseEmbed(Seeder, ABC):
             )
         self.no_wheel = True
 
-        if not self.distribution_to_versions():
+        distributions = self.distribution_to_versions()
+        if not distributions:
             self.enabled = False
+        elif self.seed_manifest is not None and self.seed_manifest.strict:
+            # fail before the environment is created rather than halfway through seeding
+            self.check_strict_manifest(distributions)
 
     def distribution_to_versions(self) -> dict[str, str]:
         """The versions of the distributions to seed, keyed by distribution name.
@@ -91,6 +101,47 @@ class BaseEmbed(Seeder, ABC):
             for distribution in self.distributions()
             if getattr(self, f"no_{distribution}", None) is False and getattr(self, f"{distribution}_version") != "none"
         }
+
+    @staticmethod
+    def _load_seed_manifest(options: VirtualEnvOptions) -> SeedManifest | None:
+        manifest_path = getattr(options, "seed_manifest", None)
+        if manifest_path is None:
+            return None
+        return SeedManifest.load(manifest_path, options.strict_seed_manifest)
+
+    def select_seed_wheel(self, distribution: str, version: str | None, for_py_version: str) -> Wheel | None:
+        """Return the wheel the seed manifest pins for a distribution, or ``None`` to use regular selection.
+
+        :param distribution: the distribution to seed
+        :param version: the version option the regular selection would use
+        :param for_py_version: the Python version the wheel must support, as ``major.minor``
+
+        :returns: the manifest-selected wheel, or ``None`` when no manifest entry covers the distribution
+
+        :raises SeedManifestError: in strict mode when a manifest entry cannot be satisfied
+
+        """
+        if self.seed_manifest is None or self.seed_manifest.entry_for(distribution) is None:
+            return None
+        return self.seed_manifest.select(distribution, for_py_version, self.extra_search_dir, self.app_data)
+
+    def check_strict_manifest(self, distributions: dict[str, str]) -> None:
+        """Ensure every distribution to seed has a manifest entry when running in strict mode.
+
+        :param distributions: the distributions and version options that would be seeded
+
+        :raises SeedManifestError: when a distribution lacks a manifest entry in strict mode
+
+        """
+        if self.seed_manifest is None or not self.seed_manifest.strict:
+            return
+        missing = [name for name in distributions if self.seed_manifest.entry_for(name) is None]
+        if missing:
+            msg = (
+                f"strict seed manifest {self.seed_manifest.path} does not name {', '.join(sorted(missing))}; "
+                "only manifest entries and the bundled fallback may seed in strict mode"
+            )
+            raise SeedManifestError(msg)
 
     @classmethod
     def distributions(cls) -> dict[str, str]:
@@ -181,6 +232,20 @@ class BaseEmbed(Seeder, ABC):
             action=ExtendAction,
             help="a path containing wheels to extend the internal wheel list (can be set 1+ times)",
             default=[],
+        )
+        parser.add_argument(
+            "--seed-manifest",
+            metavar="path",
+            type=Path,
+            help="JSON manifest pinning the seed packages (distribution, version, sha256) accepted from the search dirs",
+            default=None,
+        )
+        parser.add_argument(
+            "--strict-seed-manifest",
+            dest="strict_seed_manifest",
+            action="store_true",
+            help="only accept seed packages named by --seed-manifest, plus the bundled wheel when it matches an entry",
+            default=False,
         )
         for distribution, default in cls.distributions().items():
             help_ = f"version of {distribution} to install as seed: embed, bundle, none or exact version"
