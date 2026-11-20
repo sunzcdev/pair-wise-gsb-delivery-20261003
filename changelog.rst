@@ -10,6 +10,7 @@ Changelog
 
 **Other Changes**
 
+- [polling] Add optional shared scanning to ``PollingObserver`` via ``share_scans=True``: watches that resolve to the same directory -- including different Windows spellings of it -- share one snapshot collection per poll, reference-counted so unscheduling one subscription never stops the others. Events are still distributed per watch, spelled with the watch's own path and limited to its recursive scope and event filter; directories that merely share a name are never merged. ``PollingObserverVFS`` accepts ``share_scans`` as well.
 - [dirsnapshot] Detect replacements at the same path when an inode is reused but the entry type or available birth time changes, instead of missing the replacement or reporting it as a modification. (`#1464 <https://github.com/gorakhargosh/watchdog/pull/1464>`__, thanks to @anticipate218)
 - [inotify] Report lost events: after a kernel queue overflow, each watch gets an ``EventsLostEvent`` for its directory or file, dispatched to the new ``FileSystemEventHandler.on_events_lost()`` once the watches are repaired. Pattern and regex handlers (and so tricks) receive it only through ``on_events_lost()``. (`#1440 <https://github.com/gorakhargosh/watchdog/issues/1440>`__, thanks to @fstrasz)
 - [kqueue] Stop the emitter with a ``DirDeletedEvent`` when the watched directory is removed or moved, instead of letting its thread die with ``FileNotFoundError``. The kevents read in the same batch are still reported. (`#1436 <https://github.com/gorakhargosh/watchdog/issues/1436>`__, thanks to @karolyi)

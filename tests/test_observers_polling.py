@@ -21,9 +21,11 @@ from watchdog.events import (
     FileDeletedEvent,
     FileModifiedEvent,
     FileMovedEvent,
+    FileSystemEventHandler,
 )
 from watchdog.observers.api import ObservedWatch
 from watchdog.observers.polling import PollingEmitter as Emitter
+from watchdog.observers.polling import PollingObserver, SharedPollingEmitter
 from watchdog.utils import platform
 from watchdog.utils.dirsnapshot import EmptyDirectorySnapshot
 
@@ -336,3 +338,166 @@ def test_reused_inode_replacement_emits_delete_and_create(p, event_queue, was_di
             events.add(event)
 
     assert events == {deleted_cls(path), created_cls(path)}
+
+
+def _drain_events(event_queue):
+    events = {}
+    while True:
+        try:
+            event, watch = event_queue.get_nowait()
+        except Empty:
+            break
+        events.setdefault(watch, set()).add(event)
+    return events
+
+
+@pytest.mark.skipif(not platform.is_windows(), reason="Windows-specific path spellings")
+def test_shared_scan_merges_windows_path_spellings(tmp_path):
+    # Two schedules that spell the same directory differently must share one
+    # scan; unscheduling the first subscription must not stop the second.
+    root = str(tmp_path)
+    alt = root.replace(os.sep, "/")
+    assert alt != root
+
+    reads = []
+
+    def counting_listdir(path):
+        reads.append(path)
+        return os.scandir(path)
+
+    observer = PollingObserver(timeout=0.1, share_scans=True, listdir=counting_listdir)
+    try:
+        watch1 = observer.schedule(FileSystemEventHandler(), root, recursive=True)
+        watch2 = observer.schedule(FileSystemEventHandler(), alt, recursive=True)
+
+        # Two logical entries, one shared collection.
+        assert len(observer.emitters) == 1
+        (emitter,) = observer.emitters
+        assert isinstance(emitter, SharedPollingEmitter)
+        assert emitter.reader_count == 2
+
+        emitter.on_thread_start()
+        touch(os.path.join(root, "first"))
+
+        reads.clear()
+        emitter.queue_events(0)
+        # Both watches were served by a single read of the tree.
+        assert reads == [emitter.root]
+
+        events = _drain_events(observer.event_queue)
+        assert FileCreatedEvent(os.path.join(root, "first")) in events[watch1]
+        # Each watch gets events spelled with its own logical root.
+        assert FileCreatedEvent(os.path.join(alt, "first")) in events[watch2]
+
+        # Unscheduling the first subscription keeps the second one polling.
+        observer.unschedule(watch1)
+        assert emitter.reader_count == 1
+        assert emitter.should_keep_running()
+
+        touch(os.path.join(root, "second"))
+        reads.clear()
+        emitter.queue_events(0)
+        assert reads == [emitter.root]
+
+        events = _drain_events(observer.event_queue)
+        assert watch1 not in events
+        assert FileCreatedEvent(os.path.join(alt, "second")) in events[watch2]
+
+        # Unscheduling the last subscription stops the shared emitter.
+        observer.unschedule(watch2)
+        assert not observer.emitters
+        assert not emitter.should_keep_running()
+    finally:
+        observer.unschedule_all()
+
+
+def test_shared_scan_does_not_merge_same_named_directories(tmp_path):
+    # Directories that merely happen to share a name are different scans.
+    first = tmp_path / "a" / "same"
+    second = tmp_path / "b" / "same"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+
+    observer = PollingObserver(share_scans=True)
+    try:
+        observer.schedule(FileSystemEventHandler(), str(first))
+        observer.schedule(FileSystemEventHandler(), str(second))
+        assert len(observer.emitters) == 2
+    finally:
+        observer.unschedule_all()
+
+
+def test_shared_scan_distributes_per_scope_and_filter(tmp_path):
+    root = str(tmp_path)
+    sub = os.path.join(root, "sub")
+    mkdir(sub)
+
+    observer = PollingObserver(share_scans=True)
+    try:
+        deep = observer.schedule(FileSystemEventHandler(), root, recursive=True)
+        flat = observer.schedule(FileSystemEventHandler(), root, recursive=False)
+        created_only = observer.schedule(
+            FileSystemEventHandler(), root, recursive=True, event_filter=[FileCreatedEvent]
+        )
+
+        assert len(observer.emitters) == 1
+        (emitter,) = observer.emitters
+        assert emitter.reader_count == 3
+
+        emitter.on_thread_start()
+        touch(os.path.join(sub, "nested"))
+        touch(os.path.join(root, "top"))
+        emitter.queue_events(0)
+        events = _drain_events(observer.event_queue)
+
+        # Recursive scope sees the nested file; the flat watch does not.
+        assert FileCreatedEvent(os.path.join(sub, "nested")) in events[deep]
+        assert FileCreatedEvent(os.path.join(sub, "nested")) not in events[flat]
+        assert FileCreatedEvent(os.path.join(root, "top")) in events[flat]
+        # The filtered watch only receives the event types it asked for.
+        assert events[created_only] == {
+            FileCreatedEvent(os.path.join(sub, "nested")),
+            FileCreatedEvent(os.path.join(root, "top")),
+        }
+    finally:
+        observer.unschedule_all()
+
+
+@pytest.mark.flaky(max_runs=3, min_passes=1)
+def test_shared_scan_threaded(p):
+    class Sink(FileSystemEventHandler):
+        def __init__(self):
+            self.events = []
+
+        def on_any_event(self, event):
+            self.events.append(event)
+
+    def received(sink, event, timeout=5):
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            if event in sink.events:
+                return True
+            sleep(0.05)
+        return False
+
+    sink1, sink2 = Sink(), Sink()
+    observer = PollingObserver(timeout=0.1, share_scans=True)
+    watch1 = observer.schedule(sink1, p(), recursive=True)
+    # A trailing separator spells the same directory differently.
+    observer.schedule(sink2, p(""), recursive=True)
+    assert len(observer.emitters) == 1
+
+    observer.start()
+    try:
+        touch(p("one"))
+        assert received(sink1, FileCreatedEvent(p("one")))
+        assert received(sink2, FileCreatedEvent(p("one")))
+
+        observer.unschedule(watch1)
+        assert len(observer.emitters) == 1
+
+        touch(p("two"))
+        assert received(sink2, FileCreatedEvent(p("two")))
+    finally:
+        observer.stop()
+        observer.join(5)
