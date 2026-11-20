@@ -4,6 +4,7 @@ import functools
 import socket
 import ssl
 import sys
+import time
 import typing
 
 from .._exceptions import (
@@ -17,7 +18,13 @@ from .._exceptions import (
     map_exceptions,
 )
 from .._utils import is_socket_readable
-from .base import SOCKET_OPTION, NetworkBackend, NetworkStream
+from .base import (
+    CONNECT_CANDIDATE,
+    SOCKET_OPTION,
+    NetworkBackend,
+    NetworkStream,
+    candidate_addresses,
+)
 
 
 class TLSinTLSStream(NetworkStream):  # pragma: no cover
@@ -192,28 +199,51 @@ class SyncBackend(NetworkBackend):
         timeout: float | None = None,
         local_address: str | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+        candidates: typing.Sequence[CONNECT_CANDIDATE] | None = None,
     ) -> NetworkStream:
         # Note that we automatically include `TCP_NODELAY`
         # in addition to any other custom socket options.
         if socket_options is None:
             socket_options = []  # pragma: no cover
-        address = (host, port)
         source_address = None if local_address is None else (local_address, 0)
         exc_map: ExceptionMapping = {
             socket.timeout: ConnectTimeout,
             OSError: ConnectError,
         }
 
+        # Candidates are attempted in the order they are given, with the
+        # `timeout` budget shared across all of them.
+        addresses = candidate_addresses(host, port, candidates)
+        deadline = None if timeout is None else time.monotonic() + timeout
+
         with map_exceptions(exc_map):
-            sock = socket.create_connection(
-                address,
-                timeout,
-                source_address=source_address,
-            )
-            for option in socket_options:
-                sock.setsockopt(*option)  # pragma: no cover
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        return SyncStream(sock)
+            for index, address in enumerate(addresses):
+                attempt_timeout = timeout
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ConnectTimeout(
+                            "Timed out while attempting candidate addresses."
+                        )
+                    attempt_timeout = remaining
+
+                try:
+                    sock = socket.create_connection(
+                        address,
+                        attempt_timeout,
+                        source_address=source_address,
+                    )
+                except (socket.timeout, OSError):
+                    if index == len(addresses) - 1:
+                        raise
+                    continue
+
+                for option in socket_options:
+                    sock.setsockopt(*option)  # pragma: no cover
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                return SyncStream(sock)
+
+        raise AssertionError("unreachable")  # pragma: nocover
 
     def connect_unix_socket(
         self,

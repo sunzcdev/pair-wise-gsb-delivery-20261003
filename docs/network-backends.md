@@ -173,6 +173,30 @@ You can use this to provide advanced networking functionality such as:
 * In-depth debug tooling.
 * Handling non-standard SSL or DNS requirements.
 
+The `connect_tcp()` method also accepts an optional `candidates` argument. This
+is a sequence of pre-resolved addresses, which should be attempted in order, and
+is used when a request includes the
+[`"connect_candidates"` extension](extensions.md#connect_candidates). The
+`timeout` budget applies to the attempts as a whole.
+
+```python
+def connect_tcp(
+    self,
+    host,
+    port,
+    timeout=None,
+    local_address=None,
+    socket_options=None,
+    candidates=None,
+):
+    ...
+```
+
+Backends that were written before `candidates` was supported do not need to
+change: `httpcore` detects that the argument is not accepted, attempts each
+candidate address itself, and then upgrades the resulting stream using the
+original hostname.
+
 Here's an example that records the network response to a file on disk:
 
 ```python
@@ -225,6 +249,7 @@ class RecordingNetworkBackend(httpcore.NetworkBackend):
         timeout=None,
         local_address=None,
         socket_options=None,
+        candidates=None,
     ):
         # Note that we're only using a single record file here,
         # so even if multiple connections are opened the network
@@ -237,7 +262,8 @@ class RecordingNetworkBackend(httpcore.NetworkBackend):
             port,
             timeout=timeout,
             local_address=local_address,
-            socket_options=socket_options
+            socket_options=socket_options,
+            candidates=candidates,
         )
         return RecordingNetworkStream(self.record_file, stream)
 

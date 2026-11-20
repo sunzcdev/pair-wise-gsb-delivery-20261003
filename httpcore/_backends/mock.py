@@ -5,11 +5,13 @@ import typing
 
 from .._exceptions import ReadError
 from .base import (
+    CONNECT_CANDIDATE,
     SOCKET_OPTION,
     AsyncNetworkBackend,
     AsyncNetworkStream,
     NetworkBackend,
     NetworkStream,
+    candidate_addresses,
 )
 
 
@@ -26,6 +28,10 @@ class MockStream(NetworkStream):
         self._buffer = buffer
         self._http2 = http2
         self._closed = False
+        # Recorded so that tests can inspect which hostname was used for the
+        # TLS handshake, and which address the connection was made against.
+        self.tls_server_hostname: str | None = None
+        self.connect_address: tuple[str, int] | None = None
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         if self._closed:
@@ -46,6 +52,7 @@ class MockStream(NetworkStream):
         server_hostname: str | None = None,
         timeout: float | None = None,
     ) -> NetworkStream:
+        self.tls_server_hostname = server_hostname
         return self
 
     def get_extra_info(self, info: str) -> typing.Any:
@@ -59,6 +66,10 @@ class MockBackend(NetworkBackend):
     def __init__(self, buffer: list[bytes], http2: bool = False) -> None:
         self._buffer = buffer
         self._http2 = http2
+        # Record of the addresses that connections were attempted against,
+        # allowing tests to verify candidate address handling.
+        self.connect_calls: list[tuple[str, int]] = []
+        self.streams: list[MockStream] = []
 
     def connect_tcp(
         self,
@@ -67,8 +78,16 @@ class MockBackend(NetworkBackend):
         timeout: float | None = None,
         local_address: str | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+        candidates: typing.Sequence[CONNECT_CANDIDATE] | None = None,
     ) -> NetworkStream:
-        return MockStream(list(self._buffer), http2=self._http2)
+        # The mock backend always connects successfully, so any candidates are
+        # reduced to the first address that would have been attempted.
+        address = candidate_addresses(host, port, candidates)[0]
+        self.connect_calls.append(address)
+        stream = MockStream(list(self._buffer), http2=self._http2)
+        stream.connect_address = address
+        self.streams.append(stream)
+        return stream
 
     def connect_unix_socket(
         self,
@@ -87,6 +106,10 @@ class AsyncMockStream(AsyncNetworkStream):
         self._buffer = buffer
         self._http2 = http2
         self._closed = False
+        # Recorded so that tests can inspect which hostname was used for the
+        # TLS handshake, and which address the connection was made against.
+        self.tls_server_hostname: str | None = None
+        self.connect_address: tuple[str, int] | None = None
 
     async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         if self._closed:
@@ -107,6 +130,7 @@ class AsyncMockStream(AsyncNetworkStream):
         server_hostname: str | None = None,
         timeout: float | None = None,
     ) -> AsyncNetworkStream:
+        self.tls_server_hostname = server_hostname
         return self
 
     def get_extra_info(self, info: str) -> typing.Any:
@@ -120,6 +144,10 @@ class AsyncMockBackend(AsyncNetworkBackend):
     def __init__(self, buffer: list[bytes], http2: bool = False) -> None:
         self._buffer = buffer
         self._http2 = http2
+        # Record of the addresses that connections were attempted against,
+        # allowing tests to verify candidate address handling.
+        self.connect_calls: list[tuple[str, int]] = []
+        self.streams: list[AsyncMockStream] = []
 
     async def connect_tcp(
         self,
@@ -128,8 +156,16 @@ class AsyncMockBackend(AsyncNetworkBackend):
         timeout: float | None = None,
         local_address: str | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+        candidates: typing.Sequence[CONNECT_CANDIDATE] | None = None,
     ) -> AsyncNetworkStream:
-        return AsyncMockStream(list(self._buffer), http2=self._http2)
+        # The mock backend always connects successfully, so any candidates are
+        # reduced to the first address that would have been attempted.
+        address = candidate_addresses(host, port, candidates)[0]
+        self.connect_calls.append(address)
+        stream = AsyncMockStream(list(self._buffer), http2=self._http2)
+        stream.connect_address = address
+        self.streams.append(stream)
+        return stream
 
     async def connect_unix_socket(
         self,

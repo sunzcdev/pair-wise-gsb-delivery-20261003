@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import inspect
 import itertools
 import logging
 import ssl
+import time
 import types
 import typing
 
 from .._backends.sync import SyncBackend
-from .._backends.base import SOCKET_OPTION, NetworkBackend, NetworkStream
+from .._backends.base import (
+    CONNECT_CANDIDATE,
+    SOCKET_OPTION,
+    NetworkBackend,
+    NetworkStream,
+    candidate_addresses,
+)
 from .._exceptions import ConnectError, ConnectTimeout
 from .._models import Origin, Request, Response
 from .._ssl import default_ssl_context
@@ -33,6 +41,28 @@ def exponential_backoff(factor: float) -> typing.Iterator[float]:
     yield 0
     for n in itertools.count():
         yield factor * 2**n
+
+
+def backend_supports_candidates(connect_tcp: typing.Any) -> bool:
+    """
+    Determine if a `connect_tcp` implementation is able to handle the
+    `candidates` keyword argument.
+
+    Network backends that pre-date candidate address support do not accept the
+    argument, in which case `httpcore` falls back to attempting each address
+    itself, and continues to work unchanged.
+    """
+    try:
+        parameters = inspect.signature(connect_tcp).parameters
+    except (TypeError, ValueError):  # pragma: nocover
+        return False
+
+    if "candidates" in parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 class HTTPConnection(ConnectionInterface):
@@ -105,6 +135,7 @@ class HTTPConnection(ConnectionInterface):
     def _connect(self, request: Request) -> NetworkStream:
         timeouts = request.extensions.get("timeout", {})
         sni_hostname = request.extensions.get("sni_hostname", None)
+        candidates = request.extensions.get("connect_candidates", None)
         timeout = timeouts.get("connect", None)
 
         retries_left = self._retries
@@ -120,8 +151,10 @@ class HTTPConnection(ConnectionInterface):
                         "timeout": timeout,
                         "socket_options": self._socket_options,
                     }
+                    if candidates:
+                        kwargs["candidates"] = candidates
                     with Trace("connect_tcp", logger, request, kwargs) as trace:
-                        stream = self._network_backend.connect_tcp(**kwargs)
+                        stream = self._connect_tcp(**kwargs)
                         trace.return_value = stream
                 else:
                     kwargs = {
@@ -146,6 +179,9 @@ class HTTPConnection(ConnectionInterface):
                     alpn_protocols = ["http/1.1", "h2"] if self._http2 else ["http/1.1"]
                     ssl_context.set_alpn_protocols(alpn_protocols)
 
+                    # Note that the *original* hostname is always used for the
+                    # TLS handshake and certificate verification. Candidate
+                    # addresses only determine where the TCP connect is made.
                     kwargs = {
                         "ssl_context": ssl_context,
                         "server_hostname": sni_hostname
@@ -163,6 +199,62 @@ class HTTPConnection(ConnectionInterface):
                 delay = next(delays)
                 with Trace("retry", logger, request, kwargs) as trace:
                     self._network_backend.sleep(delay)
+
+    def _connect_tcp(
+        self,
+        host: str,
+        port: int,
+        local_address: str | None = None,
+        timeout: float | None = None,
+        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+        candidates: typing.Sequence[CONNECT_CANDIDATE] | None = None,
+    ) -> NetworkStream:
+        connect_tcp = self._network_backend.connect_tcp
+
+        if not candidates or backend_supports_candidates(connect_tcp):
+            # Either there are no candidate addresses to consider, or the
+            # network backend is able to handle them itself.
+            kwargs: dict[str, typing.Any] = {
+                "host": host,
+                "port": port,
+                "local_address": local_address,
+                "timeout": timeout,
+                "socket_options": socket_options,
+            }
+            if candidates:
+                kwargs["candidates"] = candidates
+            return connect_tcp(**kwargs)
+
+        # The network backend does not accept the `candidates` argument, which
+        # is the case for backends that were written before candidate address
+        # support was added. Attempt each address in turn instead, sharing the
+        # single connect timeout budget across the attempts.
+        addresses = candidate_addresses(host, port, candidates)
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        for index, (address_host, address_port) in enumerate(addresses):
+            attempt_timeout = timeout
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ConnectTimeout(
+                        "Timed out while attempting candidate addresses."
+                    )
+                attempt_timeout = remaining
+
+            try:
+                return connect_tcp(
+                    host=address_host,
+                    port=address_port,
+                    local_address=local_address,
+                    timeout=attempt_timeout,
+                    socket_options=socket_options,
+                )
+            except (ConnectError, ConnectTimeout):
+                if index == len(addresses) - 1:
+                    raise
+
+        raise AssertionError("unreachable")  # pragma: nocover
 
     def can_handle_request(self, origin: Origin) -> bool:
         return origin == self._origin

@@ -15,7 +15,13 @@ from .._exceptions import (
     map_exceptions,
 )
 from .._utils import is_socket_readable
-from .base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
+from .base import (
+    CONNECT_CANDIDATE,
+    SOCKET_OPTION,
+    AsyncNetworkBackend,
+    AsyncNetworkStream,
+    candidate_addresses,
+)
 
 
 class AnyIOStream(AsyncNetworkStream):
@@ -102,6 +108,7 @@ class AnyIOBackend(AsyncNetworkBackend):
         timeout: float | None = None,
         local_address: str | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+        candidates: typing.Sequence[CONNECT_CANDIDATE] | None = None,
     ) -> AsyncNetworkStream:  # pragma: nocover
         if socket_options is None:
             socket_options = []
@@ -110,17 +117,41 @@ class AnyIOBackend(AsyncNetworkBackend):
             OSError: ConnectError,
             anyio.BrokenResourceError: ConnectError,
         }
+
+        # Candidates are attempted in the order they are given, with the
+        # `timeout` budget shared across all of them.
+        addresses = candidate_addresses(host, port, candidates)
+        deadline = None if timeout is None else anyio.current_time() + timeout
+
         with map_exceptions(exc_map):
-            with anyio.fail_after(timeout):
-                stream: anyio.abc.ByteStream = await anyio.connect_tcp(
-                    remote_host=host,
-                    remote_port=port,
-                    local_host=local_address,
-                )
+            for index, (address_host, address_port) in enumerate(addresses):
+                attempt_timeout = timeout
+                if deadline is not None:
+                    remaining = deadline - anyio.current_time()
+                    if remaining <= 0:
+                        raise ConnectTimeout(
+                            "Timed out while attempting candidate addresses."
+                        )
+                    attempt_timeout = remaining
+
+                try:
+                    with anyio.fail_after(attempt_timeout):
+                        stream: anyio.abc.ByteStream = await anyio.connect_tcp(
+                            remote_host=address_host,
+                            remote_port=address_port,
+                            local_host=local_address,
+                        )
+                except (TimeoutError, OSError, anyio.BrokenResourceError):
+                    if index == len(addresses) - 1:
+                        raise
+                    continue
+
                 # By default TCP sockets opened in `asyncio` include TCP_NODELAY.
                 for option in socket_options:
                     stream._raw_socket.setsockopt(*option)  # type: ignore[attr-defined] # pragma: no cover
-        return AnyIOStream(stream)
+                return AnyIOStream(stream)
+
+        raise AssertionError("unreachable")  # pragma: nocover
 
     async def connect_unix_socket(
         self,

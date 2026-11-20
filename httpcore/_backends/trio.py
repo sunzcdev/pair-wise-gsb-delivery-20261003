@@ -15,7 +15,13 @@ from .._exceptions import (
     WriteTimeout,
     map_exceptions,
 )
-from .base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
+from .base import (
+    CONNECT_CANDIDATE,
+    SOCKET_OPTION,
+    AsyncNetworkBackend,
+    AsyncNetworkStream,
+    candidate_addresses,
+)
 
 
 class TrioStream(AsyncNetworkStream):
@@ -114,25 +120,52 @@ class TrioBackend(AsyncNetworkBackend):
         timeout: float | None = None,
         local_address: str | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+        candidates: typing.Sequence[CONNECT_CANDIDATE] | None = None,
     ) -> AsyncNetworkStream:
         # By default for TCP sockets, trio enables TCP_NODELAY.
         # https://trio.readthedocs.io/en/stable/reference-io.html#trio.SocketStream
         if socket_options is None:
             socket_options = []  # pragma: no cover
-        timeout_or_inf = float("inf") if timeout is None else timeout
         exc_map: ExceptionMapping = {
             trio.TooSlowError: ConnectTimeout,
             trio.BrokenResourceError: ConnectError,
             OSError: ConnectError,
         }
+
+        # Candidates are attempted in the order they are given, with the
+        # `timeout` budget shared across all of them.
+        addresses = candidate_addresses(host, port, candidates)
+        deadline = None if timeout is None else trio.current_time() + timeout
+
         with map_exceptions(exc_map):
-            with trio.fail_after(timeout_or_inf):
-                stream: trio.abc.Stream = await trio.open_tcp_stream(
-                    host=host, port=port, local_address=local_address
-                )
+            for index, (address_host, address_port) in enumerate(addresses):
+                if deadline is None:
+                    attempt_timeout = float("inf")
+                else:
+                    remaining = deadline - trio.current_time()
+                    if remaining <= 0:
+                        raise ConnectTimeout(
+                            "Timed out while attempting candidate addresses."
+                        )
+                    attempt_timeout = remaining
+
+                try:
+                    with trio.fail_after(attempt_timeout):
+                        stream: trio.abc.Stream = await trio.open_tcp_stream(
+                            host=address_host,
+                            port=address_port,
+                            local_address=local_address,
+                        )
+                except (trio.TooSlowError, trio.BrokenResourceError, OSError):
+                    if index == len(addresses) - 1:
+                        raise
+                    continue
+
                 for option in socket_options:
                     stream.setsockopt(*option)  # type: ignore[attr-defined] # pragma: no cover
-        return TrioStream(stream)
+                return TrioStream(stream)
+
+        raise AssertionError("unreachable")  # pragma: nocover
 
     async def connect_unix_socket(
         self,

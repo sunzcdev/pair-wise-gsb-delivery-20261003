@@ -9,6 +9,7 @@ from ._async import (
     AsyncSOCKSProxy,
 )
 from ._backends.base import (
+    CONNECT_CANDIDATE,
     SOCKET_OPTION,
     AsyncNetworkBackend,
     AsyncNetworkStream,
@@ -113,6 +114,7 @@ __all__ = [
     # util
     "default_ssl_context",
     "SOCKET_OPTION",
+    "CONNECT_CANDIDATE",
     # exceptions
     "ConnectionNotAvailable",
     "ProxyError",
@@ -136,6 +138,7 @@ __version__ = "1.0.9"
 
 __locals = locals()
 for __name in __all__:
-    # Exclude SOCKET_OPTION, it causes AttributeError on Python 3.14
-    if not __name.startswith(("__", "SOCKET_OPTION")):
+    # Exclude SOCKET_OPTION and CONNECT_CANDIDATE, they cause AttributeError
+    # on Python 3.14, as typing aliases do not allow attribute assignment.
+    if not __name.startswith(("__", "SOCKET_OPTION", "CONNECT_CANDIDATE")):
         setattr(__locals[__name], "__module__", "httpcore")  # noqa

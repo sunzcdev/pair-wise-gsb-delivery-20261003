@@ -835,3 +835,107 @@ async def test_http11_upgrade_connection():
         "http11.response_closed.started",
         "http11.response_closed.complete",
     ]
+
+
+class CandidateBackend(httpcore.AsyncMockBackend):
+    """
+    A network backend that accepts `candidates`, refusing the addresses in
+    `refuse`.
+    """
+
+    def __init__(self, buffer, refuse=()):
+        super().__init__(buffer)
+        self.refuse = set(refuse)
+        self.candidates_seen = []
+
+    async def connect_tcp(
+        self,
+        host,
+        port,
+        timeout=None,
+        local_address=None,
+        socket_options=None,
+        candidates=None,
+    ):
+        self.candidates_seen.append((host, list(candidates or [])))
+
+        addresses = []
+        for candidate in candidates or [host]:
+            if isinstance(candidate, str):
+                addresses.append((candidate, port))
+            else:
+                addresses.append((candidate[0], candidate[1] or port))
+
+        for address in addresses:
+            if address in self.refuse:
+                continue
+            self.connect_calls.append(address)
+            stream = httpcore.AsyncMockStream(list(self._buffer), http2=self._http2)
+            stream.connect_address = address
+            self.streams.append(stream)
+            return stream
+
+        raise httpcore.ConnectError("All candidate addresses refused")
+
+
+@pytest.mark.anyio
+async def test_connection_pool_uses_candidate_addresses():
+    """
+    Candidate addresses determine where the TCP connection is made, but the
+    pooled connection identity remains that of the original request origin.
+    """
+    network_backend = CandidateBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ],
+        refuse={("10.0.0.1", 443)},
+    )
+
+    async with httpcore.AsyncConnectionPool(
+        network_backend=network_backend
+    ) as pool:
+        async with pool.stream(
+            "GET",
+            "https://example.com/",
+            extensions={"connect_candidates": ["10.0.0.1", "10.0.0.2"]},
+        ) as response:
+            assert response.status == 200
+            info = [repr(c) for c in pool.connections]
+            assert info == [
+                "<AsyncHTTPConnection ['https://example.com:443', HTTP/1.1, ACTIVE, Request Count: 1]>"
+            ]
+
+            stream = network_backend.streams[-1]
+            assert stream.connect_address == ("10.0.0.2", 443)
+            assert stream.tls_server_hostname == "example.com"
+
+            await response.aread()
+
+        assert response.content == b"Hello, world!"
+
+        # A second request to the same origin reuses the connection, and is not
+        # keyed by whichever candidate address happened to be used.
+        async with pool.stream(
+            "GET",
+            "https://example.com/",
+            extensions={"connect_candidates": ["10.0.0.9"]},
+        ) as response:
+            assert response.status == 200
+            info = [repr(c) for c in pool.connections]
+            assert info == [
+                "<AsyncHTTPConnection ['https://example.com:443', HTTP/1.1, ACTIVE, Request Count: 2]>"
+            ]
+            await response.aread()
+
+    # Only the initial connection was made, the second request reused it.
+    assert network_backend.connect_calls == [("10.0.0.2", 443)]
+

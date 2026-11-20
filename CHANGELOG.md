@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
+- Add the `"connect_candidates"` request extension, allowing a set of pre-resolved
+  addresses to be used for the TCP connection. Candidates share the `"connect"`
+  timeout budget, and TLS/SNI and pooled connection identity continue to use the
+  hostname from the request URL.
 
 ## Version 1.0.9 (April 24th, 2025)
 

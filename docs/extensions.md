@@ -166,6 +166,37 @@ response = httpcore.request(
 )
 ```
 
+### `"connect_candidates"`
+
+A sequence of pre-resolved addresses to connect to, in place of resolving the
+hostname used in the request URL.
+
+This is useful when service discovery already provides the addresses for an
+internal host. Addresses are attempted in the order that they are given, with
+the `"connect"` timeout budget shared across all of the attempts.
+
+Each candidate is either a host, or a `(host, port)` pair. A candidate without
+an explicit port uses the port from the request URL.
+
+```python
+response = httpcore.request(
+    "GET",
+    "https://internal.example/",
+    extensions={"connect_candidates": ["10.0.0.1", ("10.0.0.2", 443)]},
+)
+```
+
+The candidates only determine *where* the TCP connection is made. The TLS
+handshake and certificate verification continue to use the hostname from the
+request URL (or the `"sni_hostname"` extension if it is set), and pooled
+connections remain keyed by the original URL origin, rather than by the
+individual address that was used.
+
+Network backends that accept `candidates` in `connect_tcp()` are given the full
+list, and are responsible for attempting them. Backends that predate this
+argument continue to work unchanged: `httpcore` attempts each candidate address
+itself, then upgrades the established stream using the original hostname.
+
 ### `"target"`
 
 The target that is used as [the HTTP target instead of the URL path](https://datatracker.ietf.org/doc/html/rfc2616#section-5.1.2).

@@ -379,3 +379,354 @@ def test_uds_connections():
     ) as conn:
         response = conn.request("GET", "https://example.com/")
         assert response.status == 200
+
+
+CONTENT = [
+    b"HTTP/1.1 200 OK\r\n",
+    b"Content-Type: plain/text\r\n",
+    b"Content-Length: 13\r\n",
+    b"\r\n",
+    b"Hello, world!",
+]
+
+
+class CandidateAwareBackend(MockBackend):
+    """
+    A network backend that understands the `candidates` argument, and attempts
+    each address itself.
+    """
+
+    def __init__(
+        self,
+        buffer: typing.List[bytes],
+        refuse: typing.Iterable[typing.Tuple[str, int]] = (),
+    ) -> None:
+        super().__init__(buffer)
+        self.refuse = set(refuse)
+        self.candidates_seen: typing.List[typing.Any] = []
+        self.timeouts: typing.List[typing.Optional[float]] = []
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: typing.Optional[float] = None,
+        local_address: typing.Optional[str] = None,
+        socket_options: typing.Optional[typing.Iterable[SOCKET_OPTION]] = None,
+        candidates: typing.Optional[typing.Sequence[typing.Any]] = None,
+    ) -> NetworkStream:
+        self.candidates_seen.append(candidates)
+        self.timeouts.append(timeout)
+
+        addresses = []
+        for candidate in candidates or [host]:
+            if isinstance(candidate, str):
+                addresses.append((candidate, port))
+            else:
+                addresses.append((candidate[0], candidate[1] or port))
+
+        for address in addresses:
+            if address in self.refuse:
+                continue
+            self.connect_calls.append(address)
+            stream = MockStream(list(self._buffer), http2=self._http2)
+            stream.connect_address = address
+            self.streams.append(stream)
+            return stream
+
+        raise ConnectError("All candidate addresses refused")
+
+
+class LegacyBackend(MockBackend):
+    """
+    A network backend written before candidate addresses were supported, and
+    which therefore does not accept a `candidates` argument.
+    """
+
+    def __init__(self, buffer: typing.List[bytes], refuse: str = "") -> None:
+        super().__init__(buffer)
+        self.refuse = refuse
+        self.attempts: typing.List[typing.Tuple[str, int]] = []
+        self.timeouts: typing.List[typing.Optional[float]] = []
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: typing.Optional[float] = None,
+        local_address: typing.Optional[str] = None,
+        socket_options: typing.Optional[typing.Iterable[SOCKET_OPTION]] = None,
+    ) -> NetworkStream:
+        self.attempts.append((host, port))
+        self.timeouts.append(timeout)
+        if host == self.refuse:
+            raise ConnectError("Connection refused")
+        stream = MockStream(list(self._buffer), http2=self._http2)
+        stream.connect_address = (host, port)
+        self.streams.append(stream)
+        return stream
+
+
+
+def test_connect_candidates_are_handled_by_backend():
+    """
+    Network backends that accept the `candidates` argument are given the full
+    set of addresses, so that they can handle the fallback themselves. The TLS
+    handshake still uses the hostname from the original request URL.
+    """
+    origin = Origin(b"https", b"example.com", 443)
+    network_backend = CandidateAwareBackend(
+        list(CONTENT), refuse={("10.0.0.1", 443)}
+    )
+
+    called = []
+
+    def trace(name, kwargs):
+        called.append((name, kwargs))
+
+    with HTTPConnection(
+        origin=origin, network_backend=network_backend
+    ) as conn:
+        response = conn.request(
+            "GET",
+            "https://example.com/",
+            extensions={
+                "connect_candidates": ["10.0.0.1", "10.0.0.2"],
+                "trace": trace,
+            },
+        )
+        assert response.status == 200
+
+        assert network_backend.candidates_seen == [["10.0.0.1", "10.0.0.2"]]
+        assert len(network_backend.timeouts) == 1
+
+        stream = network_backend.streams[-1]
+        assert stream.connect_address == ("10.0.0.2", 443)
+        assert stream.tls_server_hostname == "example.com"
+
+        # The connection identity remains that of the original origin.
+        assert (
+            repr(conn)
+            == "<HTTPConnection ['https://example.com:443', HTTP/1.1, IDLE, Request Count: 1]>"
+        )
+
+    started = [kwargs for name, kwargs in called if name == "connection.connect_tcp.started"]
+    assert started == [
+        {
+            "host": "example.com",
+            "port": 443,
+            "local_address": None,
+            "timeout": None,
+            "socket_options": None,
+            "candidates": ["10.0.0.1", "10.0.0.2"],
+        }
+    ]
+
+
+
+def test_connect_candidates_with_legacy_backend():
+    """
+    Backends that predate candidate address support continue to work unchanged.
+    `httpcore` attempts each candidate address in turn, then upgrades the
+    established stream using the original hostname.
+    """
+    origin = Origin(b"https", b"example.com", 443)
+    network_backend = LegacyBackend(list(CONTENT), refuse="10.0.0.1")
+
+    with HTTPConnection(
+        origin=origin, network_backend=network_backend
+    ) as conn:
+        response = conn.request(
+            "GET",
+            "https://example.com/",
+            extensions={
+                "connect_candidates": ["10.0.0.1", "10.0.0.2"],
+                "timeout": {"connect": 10.0},
+            },
+        )
+        assert response.status == 200
+
+        assert network_backend.attempts == [("10.0.0.1", 443), ("10.0.0.2", 443)]
+        # The connect timeout budget is shared across the attempts.
+        first, second = network_backend.timeouts
+        assert first == 10.0
+        assert 0 < second <= 10.0
+
+        stream = network_backend.streams[-1]
+        assert stream.connect_address == ("10.0.0.2", 443)
+        assert stream.tls_server_hostname == "example.com"
+        assert (
+            repr(conn)
+            == "<HTTPConnection ['https://example.com:443', HTTP/1.1, IDLE, Request Count: 1]>"
+        )
+
+
+
+def test_connect_candidates_with_legacy_backend_all_refused():
+    origin = Origin(b"https", b"example.com", 443)
+    network_backend = LegacyBackend(list(CONTENT), refuse="10.0.0.1")
+
+    with HTTPConnection(
+        origin=origin, network_backend=network_backend
+    ) as conn:
+        with pytest.raises(ConnectError):
+            conn.request(
+                "GET",
+                "https://example.com/",
+                extensions={"connect_candidates": ["10.0.0.1"]},
+            )
+        assert repr(conn) == "<HTTPConnection [CONNECTION FAILED]>"
+
+
+
+def test_legacy_backend_without_candidates_is_unchanged():
+    """
+    When no candidates are provided, the original `host`/`port` are used, and
+    the backend is called exactly once with the original arguments.
+    """
+    origin = Origin(b"https", b"example.com", 443)
+    network_backend = LegacyBackend(list(CONTENT))
+
+    with HTTPConnection(
+        origin=origin, network_backend=network_backend
+    ) as conn:
+        response = conn.request(
+            "GET",
+            "https://example.com/",
+            extensions={"timeout": {"connect": 5.0}},
+        )
+        assert response.status == 200
+
+    assert network_backend.attempts == [("example.com", 443)]
+    assert network_backend.timeouts == [5.0]
+
+
+
+def test_connect_candidates_do_not_override_sni_hostname():
+    """
+    The `sni_hostname` extension still takes precedence over the request URL
+    hostname, even when candidate addresses are in use.
+    """
+    origin = Origin(b"https", b"example.com", 443)
+    network_backend = MockBackend(list(CONTENT))
+
+    with HTTPConnection(
+        origin=origin, network_backend=network_backend
+    ) as conn:
+        response = conn.request(
+            "GET",
+            "https://example.com/",
+            extensions={
+                "connect_candidates": ["10.0.0.2"],
+                "sni_hostname": "internal.example",
+            },
+        )
+        assert response.status == 200
+
+        stream = network_backend.streams[-1]
+        assert stream.connect_address == ("10.0.0.2", 443)
+        assert stream.tls_server_hostname == "internal.example"
+        assert (
+            repr(conn)
+            == "<HTTPConnection ['https://example.com:443', HTTP/1.1, IDLE, Request Count: 1]>"
+        )
+
+
+
+def test_connect_candidates_with_real_tls_handshake():
+    """
+    End-to-end check against a real TLS server: the first candidate address is
+    refused, the second one accepts, and the handshake still presents the
+    hostname taken from the original request URL rather than the address.
+    """
+    import socket
+    import threading
+
+    import trustme
+
+    ca = trustme.CA()
+    cert = ca.issue_cert("internal.example")
+
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    cert.configure_cert(server_context)
+
+    handshake_names: typing.List[typing.Optional[str]] = []
+
+    def sni_callback(
+        ssl_object: ssl.SSLObject, server_name: str, context: ssl.SSLContext
+    ) -> None:
+        handshake_names.append(server_name)
+
+    server_context.sni_callback = sni_callback
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(10)
+    port = listener.getsockname()[1]
+
+    received: typing.List[bytes] = []
+
+    def serve() -> None:
+        try:
+            conn, _ = listener.accept()
+            tls_conn = server_context.wrap_socket(conn, server_side=True)
+            try:
+                received.append(tls_conn.recv(4096))
+                tls_conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+                )
+            finally:
+                tls_conn.close()
+        except OSError:  # pragma: nocover
+            pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+
+    # Find a port that nothing is listening on, to act as a refused address.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    refused_port = probe.getsockname()[1]
+    probe.close()
+
+    client_context = ssl.create_default_context()
+    ca.configure_trust(client_context)
+
+    origin = Origin(b"https", b"internal.example", port)
+    try:
+        with HTTPConnection(
+            origin=origin, ssl_context=client_context
+        ) as conn:
+            response = conn.request(
+                "GET",
+                "https://internal.example:%d/" % port,
+                extensions={
+                    "connect_candidates": [
+                        ("127.0.0.1", refused_port),
+                        ("127.0.0.1", port),
+                    ],
+                    "timeout": {"connect": 10.0},
+                },
+            )
+            assert response.status == 200
+            assert response.content == b"OK"
+
+            # The TLS handshake used the hostname from the request URL, and the
+            # connection is pooled under that original host identity.
+            assert handshake_names == ["internal.example"]
+            assert (
+                repr(conn)
+                == f"<HTTPConnection ['https://internal.example:{port}', "
+                "HTTP/1.1, IDLE, Request Count: 1]>"
+            )
+    finally:
+        listener.close()
+        thread.join(timeout=10)
+
+    assert received
+    assert received[0].startswith(b"GET / HTTP/1.1\r\n")
+    assert b"Host: internal.example:%d" % port in received[0]
+
+
