@@ -13,6 +13,15 @@
     the snapshot diff will represent file/directory movement as
     created and deleted events.
 
+.. NOTE:: Hard links
+
+    One inode may be reachable through several names. A move is only
+    reported when an identity loses exactly one name and gains exactly
+    one other, so the source and destination path are unambiguous.
+    Adding or removing a link while other links survive is reported as
+    a creation or deletion, and changes involving several names of the
+    same identity are never paired arbitrarily.
+
 Classes
 -------
 .. autoclass:: DirectorySnapshot
@@ -42,8 +51,27 @@ from watchdog.utils import platform
 from watchdog.utils.statx import get_statx_birthtime_ns, is_statx_available
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
     from typing import Any
+
+
+def _sort_key(path: bytes | str) -> tuple[bool, bytes | str]:
+    """Ordering key that also keeps ``bytes`` and ``str`` paths comparable."""
+    return (isinstance(path, bytes), path)
+
+
+def _sorted_paths(paths: Iterable[bytes | str]) -> list[bytes | str]:
+    """Return paths in a deterministic order.
+
+    Diff results are exposed as lists, so derive them from sets in a stable
+    order to keep repeated runs (and hard-link reports) reproducible.
+    """
+    return sorted(paths, key=_sort_key)
+
+
+def _sorted_moves(moves: Iterable[tuple[bytes | str, bytes | str]]) -> list[tuple[bytes | str, bytes | str]]:
+    """Return moves ordered by source path, then destination path."""
+    return sorted(moves, key=lambda move: (_sort_key(move[0]), _sort_key(move[1])))
 
 
 class DirectorySnapshotDiff:
@@ -81,6 +109,8 @@ class DirectorySnapshotDiff:
         created = snapshot.paths - ref.paths
         deleted = ref.paths - snapshot.paths
 
+        # A file's identity is its inode together with its device, unless the
+        # caller explicitly ignores the device id.
         if ignore_device:
 
             def get_inode(directory: DirectorySnapshot, full_path: bytes | str) -> int | tuple[int, int]:
@@ -90,21 +120,6 @@ class DirectorySnapshotDiff:
 
             def get_inode(directory: DirectorySnapshot, full_path: bytes | str) -> int | tuple[int, int]:
                 return directory.inode(full_path)
-
-        if ignore_device:
-            # Retain each snapshot's canonical path when hard links share an inode.
-            ref_paths = {ref.inode(path)[0]: ref.path(ref.inode(path)) for path in ref.paths}
-            snapshot_paths = {snapshot.inode(path)[0]: snapshot.path(snapshot.inode(path)) for path in snapshot.paths}
-
-            def get_ref_path(uid: tuple[int, int]) -> bytes | str | None:
-                return ref.path(uid) or ref_paths.get(uid[0])
-
-            def get_snapshot_path(uid: tuple[int, int]) -> bytes | str | None:
-                return snapshot.path(uid) or snapshot_paths.get(uid[0])
-
-        else:
-            get_ref_path = ref.path
-            get_snapshot_path = snapshot.path
 
         def is_same_entry(ref_path: bytes | str, new_path: bytes | str) -> bool:
             # A file cannot be renamed into a directory or vice versa (#303).
@@ -129,44 +144,43 @@ class DirectorySnapshotDiff:
                 created.add(path)
                 deleted.add(path)
 
+        # A single inode can be reachable through several names (hard links,
+        # or symlinks that ``stat`` follows), so ``path(uid)`` alone cannot
+        # describe where an entry went. Group every name by file identity
+        # instead: the identity is ``(inode, device)``, or the inode alone when
+        # ``ignore_device`` is set. Cross-device changes therefore keep their
+        # existing boundary behavior and remain create/delete pairs.
+        ref_names: dict[int | tuple[int, int], set[bytes | str]] = {}
+        for path in ref.paths:
+            ref_names.setdefault(get_inode(ref, path), set()).add(path)
+
+        snapshot_names: dict[int | tuple[int, int], set[bytes | str]] = {}
+        for path in snapshot.paths:
+            snapshot_names.setdefault(get_inode(snapshot, path), set()).add(path)
+
         # find moved paths
         moved: set[tuple[bytes | str, bytes | str]] = set()
-        for path in set(deleted):
-            inode = ref.inode(path)
-            new_path = get_snapshot_path(inode)
-            # Only treat this as a move if the inode is now reachable through a
-            # genuinely new path. A symlink (or hard link) shares its target's
-            # inode, so ``new_path`` may still point at the unchanged target,
-            # which is not a move.
-            if (
-                new_path
-                and (new_path not in ref.paths or ref.inode(new_path) != inode)
-                and is_same_entry(path, new_path)
-            ):
+        for identity, old_names in ref_names.items():
+            new_names = snapshot_names.get(identity, set())
+            gone = old_names - new_names
+            appeared = new_names - old_names
+
+            # Only a single vanished name paired with a single new name for the
+            # same identity is an unambiguous rename. Adding or removing one of
+            # several hard links leaves no pair to report, and when several
+            # names change at once there is no way to tell which source became
+            # which destination; such names stay separate deletions/creations
+            # instead of an arbitrary move.
+            if len(gone) != 1 or len(appeared) != 1:
+                continue
+
+            old_path = gone.pop()
+            new_path = appeared.pop()
+            if old_path in deleted and new_path in created and is_same_entry(old_path, new_path):
                 # file is not deleted but moved
-                deleted.remove(path)
-                moved.add((path, new_path))
-
-        for path in set(created):
-            inode = snapshot.inode(path)
-            old_path = get_ref_path(inode)
-            # Only treat this as a move if the inode's previous path is really
-            # gone. A symlink (or hard link) shares its target's inode, so
-            # ``old_path`` may still exist with that inode, which means this is a
-            # creation, not a move.
-            if (
-                old_path
-                and (old_path not in snapshot.paths or snapshot.inode(old_path) != inode)
-                and is_same_entry(old_path, path)
-            ):
-                created.remove(path)
-                moved.add((old_path, path))
-
-        # A hard link can make the two inode lookups select different paths.
-        # A move found in either pass must not also remain a create or delete.
-        for old_path, new_path in moved:
-            deleted.discard(old_path)
-            created.discard(new_path)
+                deleted.discard(old_path)
+                created.discard(new_path)
+                moved.add((old_path, new_path))
 
         # find modified paths
         # first check paths that have not moved
@@ -185,17 +199,23 @@ class DirectorySnapshotDiff:
             if self.is_attrib_modified(ref.stat_info(old_path), snapshot.stat_info(new_path)):
                 attrib.add(old_path)
 
-        self._dirs_created = [path for path in created if snapshot.isdir(path)]
-        self._dirs_deleted = [path for path in deleted if ref.isdir(path)]
-        self._dirs_modified = [path for path in modified if ref.isdir(path)]
-        self._dirs_moved = [(frm, to) for (frm, to) in moved if ref.isdir(frm)]
-        self._dirs_attrib = [path for path in attrib if ref.isdir(path)]
+        self._dirs_created = _sorted_paths(path for path in created if snapshot.isdir(path))
+        self._dirs_deleted = _sorted_paths(path for path in deleted if ref.isdir(path))
+        self._dirs_modified = _sorted_paths(path for path in modified if ref.isdir(path))
+        self._dirs_moved = _sorted_moves((frm, to) for (frm, to) in moved if ref.isdir(frm))
+        self._dirs_attrib = _sorted_paths(path for path in attrib if ref.isdir(path))
 
-        self._files_created = list(created - set(self._dirs_created))
-        self._files_deleted = list(deleted - set(self._dirs_deleted))
-        self._files_modified = list(modified - set(self._dirs_modified))
-        self._files_moved = list(moved - set(self._dirs_moved))
-        self._files_attrib = list(attrib - set(self._dirs_attrib))
+        dirs_created = set(self._dirs_created)
+        dirs_deleted = set(self._dirs_deleted)
+        dirs_modified = set(self._dirs_modified)
+        dirs_moved = set(self._dirs_moved)
+        dirs_attrib = set(self._dirs_attrib)
+
+        self._files_created = _sorted_paths(created - dirs_created)
+        self._files_deleted = _sorted_paths(deleted - dirs_deleted)
+        self._files_modified = _sorted_paths(modified - dirs_modified)
+        self._files_moved = _sorted_moves(moved - dirs_moved)
+        self._files_attrib = _sorted_paths(attrib - dirs_attrib)
 
     @staticmethod
     def is_attrib_modified(ref_stat: os.stat_result, snap_stat: os.stat_result) -> bool:

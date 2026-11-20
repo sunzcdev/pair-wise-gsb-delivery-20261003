@@ -608,3 +608,143 @@ def test_hard_link_rename_has_no_duplicate_create_or_delete(p, ignore_device, so
     assert diff.files_moved == [(p(source), p(destination))]
     assert diff.files_deleted == []
     assert diff.files_created == []
+
+
+def _link_pair(p, first="a", second="b"):
+    """Create one file and a second, surviving name for the same inode."""
+    touch(p(first))
+    try:
+        os.link(p(first), p(second))
+    except OSError as e:
+        pytest.skip(f"Hard links are unavailable: {e}")
+
+
+def _listdir_desc(path):
+    with os.scandir(path) as entries:
+        yield from sorted(entries, key=lambda entry: entry.name, reverse=True)
+
+
+@pytest.mark.parametrize("ignore_device", [False, True])
+@pytest.mark.parametrize("removed", ["a", "b"])
+def test_removing_one_of_several_hard_links_is_a_deletion(p, ignore_device, removed):
+    # One name of the inode is gone but another one still resolves it, so this
+    # is a link removal, never a rename onto the surviving name.
+    _link_pair(p)
+    ref = DirectorySnapshot(p(""))
+    rm(p(removed))
+    snapshot = DirectorySnapshot(p(""))
+    diff = DirectorySnapshotDiff(ref, snapshot, ignore_device=ignore_device)
+
+    assert diff.files_deleted == [p(removed)]
+    assert diff.files_created == []
+    assert diff.files_moved == []
+
+
+@pytest.mark.parametrize("ignore_device", [False, True])
+def test_adding_one_of_several_hard_links_is_a_creation(p, ignore_device):
+    # The identity keeps every old name and merely gains one, so no path
+    # vanished and there is nothing to report as a move.
+    _link_pair(p)
+    ref = DirectorySnapshot(p(""))
+    os.link(p("a"), p("c"))
+    snapshot = DirectorySnapshot(p(""))
+    diff = DirectorySnapshotDiff(ref, snapshot, ignore_device=ignore_device)
+
+    assert diff.files_created == [p("c")]
+    assert diff.files_deleted == []
+    assert diff.files_moved == []
+
+
+@pytest.mark.parametrize("ignore_device", [False, True])
+def test_unique_hard_link_rename_reports_exact_paths(p, ignore_device):
+    # Exactly one name disappears and exactly one appears, so the source and
+    # destination are unambiguous -- the surviving link must not be reported.
+    _link_pair(p)
+    ref = DirectorySnapshot(p(""))
+    mv(p("a"), p("c"))
+    snapshot = DirectorySnapshot(p(""))
+    diff = DirectorySnapshotDiff(ref, snapshot, ignore_device=ignore_device)
+
+    assert diff.files_moved == [(p("a"), p("c"))]
+    assert diff.files_deleted == []
+    assert diff.files_created == []
+    assert p("b") not in {path for move in diff.files_moved for path in move}
+
+
+@pytest.mark.parametrize("ignore_device", [False, True])
+def test_hard_link_changes_are_deterministic(p, ignore_device):
+    # Directory listing order must not leak into the reported paths.
+    _link_pair(p)
+    ref = DirectorySnapshot(p(""))
+    mv(p("a"), p("c"))
+
+    results = []
+    for _ in range(3):
+        snapshot = DirectorySnapshot(p(""), listdir=_listdir_desc)
+        diff = DirectorySnapshotDiff(ref, snapshot, ignore_device=ignore_device)
+        results.append((diff.files_moved, diff.files_deleted, diff.files_created))
+
+    assert results == [([(p("a"), p("c"))], [], [])] * len(results)
+
+
+def test_several_hard_link_renames_are_not_paired(p):
+    # Both names of the identity change at once; nothing tells which old name
+    # became which new one, so guessing a move would be arbitrary.
+    _link_pair(p)
+    ref = DirectorySnapshot(p(""))
+    rm(p("a"))
+    mv(p("b"), p("c"))
+    diff = DirectorySnapshotDiff(ref, DirectorySnapshot(p("")))
+
+    assert diff.files_moved == []
+    assert diff.files_deleted == [p("a"), p("b")]
+    assert diff.files_created == [p("c")]
+
+
+def test_rename_with_added_hard_link_is_not_paired(p):
+    # One name vanished but two appeared, so the destination is ambiguous.
+    touch(p("a"))
+    ref = DirectorySnapshot(p(""))
+    mv(p("a"), p("b"))
+    os.link(p("b"), p("c"))
+    diff = DirectorySnapshotDiff(ref, DirectorySnapshot(p("")))
+
+    assert diff.files_moved == []
+    assert diff.files_deleted == [p("a")]
+    assert diff.files_created == [p("b"), p("c")]
+
+
+@pytest.mark.parametrize("ignore_device", [False, True])
+def test_hard_link_rename_respects_device_boundary(p, ignore_device):
+    # A device change still breaks identity, so the rename degrades to a
+    # delete/create pair unless the caller ignores the device id.
+    _link_pair(p)
+    ref = DirectorySnapshot(p(""))
+    mv(p("a"), p("c"))
+    snapshot = DirectorySnapshot(p(""), stat=stat_with_changed_device)
+    diff = DirectorySnapshotDiff(ref, snapshot, ignore_device=ignore_device)
+
+    if ignore_device:
+        assert diff.files_moved == [(p("a"), p("c"))]
+        assert diff.files_deleted == []
+        assert diff.files_created == []
+    else:
+        assert diff.files_moved == []
+        assert p("a") in diff.files_deleted
+        assert p("c") in diff.files_created
+
+
+def test_hard_link_diff_results_are_sorted(p):
+    # Diff results are lists derived from sets; multi-link changes must still
+    # come back in a stable order.
+    touch(p("a"))
+    touch(p("c"))
+    ref = DirectorySnapshot(p(""))
+    rm(p("a"))
+    rm(p("c"))
+    touch(p("b"))
+    touch(p("d"))
+    diff = DirectorySnapshotDiff(ref, DirectorySnapshot(p("")))
+
+    assert diff.files_created == [p("b"), p("d")]
+    assert diff.files_deleted == [p("a"), p("c")]
