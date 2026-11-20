@@ -8,6 +8,7 @@ require 'opentelemetry/sdk/trace/samplers/decision'
 require 'opentelemetry/sdk/trace/samplers/result'
 require 'opentelemetry/sdk/trace/samplers/constant_sampler'
 require 'opentelemetry/sdk/trace/samplers/parent_based'
+require 'opentelemetry/sdk/trace/samplers/link_based'
 require 'opentelemetry/sdk/trace/samplers/trace_id_ratio_based'
 
 module OpenTelemetry
@@ -15,7 +16,7 @@ module OpenTelemetry
     module Trace
       # The Samplers module contains the sampling logic for OpenTelemetry. The
       # reference implementation provides a {TraceIdRatioBased}, {ALWAYS_ON},
-      # {ALWAYS_OFF}, and {ParentBased}.
+      # {ALWAYS_OFF}, {ParentBased}, and {LinkBased}.
       #
       # Custom samplers can be provided by SDK users. The required interface is:
       #
@@ -84,6 +85,32 @@ module OpenTelemetry
           raise ArgumentError, 'ratio must be in range [0.0, 1.0]' unless (0.0..1.0).cover?(ratio)
 
           TraceIdRatioBased.new(ratio)
+        end
+
+        # Returns a new root sampler that derives the sampling decision for a new
+        # root span from the sampled flags of the remote span contexts carried in
+        # its links. It is intended for batch jobs and similar operations that are
+        # triggered by multiple upstream spans and therefore cannot pick one of
+        # them as a parent.
+        #
+        # Only links with a remote? span context participate; local links are
+        # ignored. The decision is independent of the order of the links.
+        #
+        # The sampler only acts on root spans. To keep honoring parent-based
+        # sampling for spans that do have a parent, pass the result as the +root+
+        # of {parent_based}:
+        #
+        #   Samplers.parent_based(root: Samplers.link_based)
+        #
+        # @param [optional Symbol] policy How to combine the sampled flags of the
+        #   remote linked span contexts. +:any_sampled+ (the default) samples when
+        #   at least one remote link is sampled. +:all_sampled+ samples only when
+        #   every remote link is sampled.
+        # @param [optional Sampler] fallback The sampler delegated to for root
+        #   spans that have no remote links. Defaults to ALWAYS_ON.
+        # @raise [ArgumentError] if policy is not supported
+        def self.link_based(policy: :any_sampled, fallback: ALWAYS_ON)
+          LinkBased.new(policy: policy, fallback: fallback)
         end
       end
     end
