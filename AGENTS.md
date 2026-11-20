@@ -1,0 +1,89 @@
+# AGENTS.md — Guidelines for AI Agents working on anyio
+
+## Project Overview
+
+AnyIO is a high-level asynchronous concurrency and networking library for Python that works on top of both **asyncio** and **Trio**. Source code lives in `src/`, tests in `tests/`.
+
+## Building & Testing
+
+- **Python**: Check the minimum Python version by looking at the `requires-python` field in `pyproject.toml`.
+- **Install the project and test dependencies**: `pip install --group test -e .`.
+- **Run tests**: `pytest` (runs from the `tests/` directory automatically via `pyproject.toml` config). Tests run against all supported backends by default.
+- **Linting**: The project uses **pre-commit** for linting, formatting and static type checking. Run `pre-commit run -a` to check everything.
+
+## Code Style
+
+- Follow the existing code style — the project enforces it via Ruff (see `[tool.ruff]` in `pyproject.toml`).
+- Import order is managed by Ruff's isort integration; always add `from __future__ import annotations` as the first import (except in documentation snippets, see below).
+- Use the latest idioms supported by the minimum Python version (such as `X | Y` union syntax in annotations, etc.).
+- Always add a blank line after a control block ends, and there is more code to follow. Do not add blank lines between related parts of the same control block (e.g. `if...elif...else`).
+
+## Documentation Code Snippets
+
+- Complete Python examples in the docs live in `docs/snippets/<page>/<name>.py` (where `<page>` is the `.rst` file name) and are included with `.. literalinclude:: snippets/<page>/<name>.py`. Do not add complete examples inline in `.rst` files.
+- Snippets are linted, formatted and type checked (strict mypy) like the rest of the code base, so they must be fully annotated. Do not add `from __future__ import annotations` to them.
+- Only partial fragments (e.g. code that uses `await` outside a function or references undefined placeholder names) may stay inline.
+- When a snippet intentionally violates a lint rule or type check, disable it in `pyproject.toml` (per-file ignores / mypy overrides) rather than with inline `noqa` or `type: ignore` comments, which would show up in the rendered docs.
+
+## Pull Request Guidelines
+
+Important: Before making a pull request, check if anyone else has already made a PR that fixes the same issue or implements the same feature.
+If there is an existing PR that does what your PR would do, and your PR would not be substantially superior, then do not send it.
+Instead, collaborate with the original PR author to improve that one. Duplicate AI-generated PRs are grounds for a ban.
+
+Every pull request **must** follow the PR template in `.github/pull_request_template.md`. Do **not** erase or replace the template contents — PRs that do so will be closed without review.
+
+A properly filled-out PR contains:
+
+### 1. Changes section
+
+- Reference the related issue number, if applicable (e.g., `Fixes #123.`).
+- Provide a short description of what the PR changes and why. This should be a terse, information-dense summary of what problem was fixed or what feature was added, or otherwise what was changed.
+
+### 2. Checklist
+
+Complete the checklist where applicable:
+- **Tests** — Add or update tests in `tests/` that would fail without the patch.
+- **Documentation** — Update docs in `docs/` if behavior changes or new features are introduced.
+- **Changelog** — Add a news fragment in `changelog.d/` (see below).
+
+Trivial changes (typo fixes, code reformatting) may skip the checklist items.
+
+### 3. Changelog entry format
+
+Changelogs are generated with [Towncrier](https://towncrier.readthedocs.io/) at release time.
+Do **not** edit `docs/versionhistory.rst` directly; instead, add a news fragment file to `changelog.d/`.
+A news fragment contains only a brief summary of the change, without any issue link or author credit (those are generated on release from the file name and the pull request):
+
+```rst
+Fixed big bad boo-boo in task groups
+```
+
+If there is no linked issue, name the fragment after the pull request itself instead (add the fragment after the PR is created to get the PR number).
+
+### 4. News fragment naming
+
+Name the fragment `changelog.d/<issue or PR number>.<type>.rst` (e.g. `changelog.d/123.fixed.rst`), where `<type>` is one of:
+
+- `breaking`: backwards incompatible changes
+- `added`: new features (the text should start with the word `Added`)
+- `changed`: backwards compatible uncategorized but user-visible code changes (the text should start with the word `Changed`)
+- `fixed`: bug fixes (the text should start with the word `Fixed`)
+
+### 5. Good and bad examples
+
+Here is a good example of a PR that fixes a bug: https://github.com/agronholm/anyio/pull/1365
+Here is a bad example of a PR that overwrites the PR template and lacks tests and a changelog entry: https://github.com/agronholm/anyio/pull/1112
+
+## Repository Layout
+
+| Path                               | Description                        |
+|------------------------------------|------------------------------------|
+| `src/anyio/`                       | Main library source                |
+| `src/anyio/_backends/`             | Backend implementations            |
+| `tests/`                           | Test suite (pytest + anyio plugin) |
+| `docs/`                            | Sphinx documentation               |
+| `docs/snippets/`                   | Code examples included in the docs |
+| `docs/versionhistory.rst`          | Changelog (generated by Towncrier) |
+| `changelog.d/`                     | Changelog news fragments           |
+| `.github/pull_request_template.md` | PR template (must be respected)    |

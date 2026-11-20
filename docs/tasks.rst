@@ -1,0 +1,194 @@
+Creating and managing tasks
+===========================
+
+.. py:currentmodule:: anyio
+
+A *task* is a unit of execution that lets you do many things concurrently that need
+waiting on. This works so that while you can have any number of tasks, the asynchronous
+event loop can only run one of them at a time. When the task encounters an ``await``
+statement that requires the task to sleep until something happens, the event loop is
+then free to work on another task. When the thing the first task was waiting is
+complete, the event loop will resume the execution of that task on the first opportunity
+it gets.
+
+Task handling in AnyIO loosely follows the Trio_ model. Tasks can be created (*spawned*)
+using *task groups*. A task group is an asynchronous context manager that makes sure
+that all its child tasks are finished one way or another after the context block is
+exited. If a child task, or the code in the enclosed context block raises an exception,
+all child tasks are cancelled. Otherwise the context manager just waits until all child
+tasks have exited before proceeding.
+
+Here's a demonstration:
+
+.. literalinclude:: snippets/tasks/task_group.py
+
+.. _Trio: https://trio.readthedocs.io/en/latest/reference-core.html
+   #tasks-let-you-do-multiple-things-at-once
+
+Working with task handles
+-------------------------
+
+Both :meth:`~.abc.TaskGroup.start_soon` and :meth:`~.TaskGroup.create_task` return a
+:class:`~.TaskHandle`. This handle can be used to:
+
+#. Wait for the task to finish before exiting the task group
+#. Retrieve the task's return value or exception
+#. Cancel the task
+#. Check the task's status
+
+.. tabs::
+
+   .. tab:: create_task()
+
+      .. literalinclude:: snippets/tasks/create_task.py
+
+   .. tab:: start_soon()
+
+      .. literalinclude:: snippets/tasks/start_soon.py
+
+.. versionchanged:: 4.14.0
+    :meth:`~.abc.TaskGroup.start_soon` now returns a :class:`~.TaskHandle`.
+
+.. _start_initialize:
+
+Starting and initializing tasks
+-------------------------------
+
+Sometimes it is very useful to be able to wait until a task has successfully initialized
+itself. For example, when starting network services, you can have your task start the
+listener and then signal the caller that initialization is done. That way, the caller
+can now start another task that depends on that service being up and running. Also, if
+the socket bind fails or something else goes wrong during initialization, the exception
+will be propagated to the caller which can then catch and handle it.
+
+This can be done with :meth:`TaskGroup.start() <.abc.TaskGroup.start>`:
+
+.. literalinclude:: snippets/tasks/start.py
+
+The target coroutine function **must** call ``task_status.started()`` because the task
+that is calling with :meth:`TaskGroup.start() <.abc.TaskGroup.start>` will be blocked
+until then. If the spawned task never calls it, then the
+:meth:`TaskGroup.start() <.abc.TaskGroup.start>` call will raise a ``RuntimeError``.
+
+.. note:: Unlike :meth:`~.abc.TaskGroup.start_soon`, :meth:`~.abc.TaskGroup.start` needs
+   an ``await``.
+
+Getting a task handle from ``start()``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+By default, :meth:`TaskGroup.start() <.abc.TaskGroup.start>` returns the value passed to
+``task_status.started()``. If you also need a :class:`~.TaskHandle` for the started task
+(e.g. to cancel it or await its return value), pass ``return_handle=True``. In this
+mode, the method returns a :class:`~.TaskHandle` whose :attr:`~.TaskHandle.start_value`
+property contains the value passed to ``task_status.started()``:
+
+.. literalinclude:: snippets/tasks/start_task_handle.py
+
+.. versionadded:: 4.14.0
+    The ``return_handle`` parameter was added to
+    :meth:`TaskGroup.start() <.abc.TaskGroup.start>`.
+
+Handling multiple errors in a task group
+----------------------------------------
+
+It is possible for more than one task to raise an exception in a task group. This can
+happen when a task reacts to cancellation by entering either an exception handler block
+or a ``finally:`` block and raises an exception there. This raises the question: which
+exception is propagated from the task group context manager? The answer is "both". In
+practice this means that a special exception, :exc:`ExceptionGroup` (or
+:exc:`BaseExceptionGroup`) is raised which contains both exception objects.
+
+To catch such exceptions potentially nested in groups, you can use the ``except*``
+syntax to catch multiple exceptions::
+
+    from anyio import create_task_group
+
+    try:
+        async with create_task_group() as tg:
+            tg.start_soon(some_task)
+            tg.start_soon(another_task)
+    except* ValueError as excgroup:
+        for exc in excgroup.exceptions:
+            ...  # handle each ValueError
+    except* KeyError as excgroup:
+        for exc in excgroup.exceptions:
+            ...  # handle each KeyError
+
+Context propagation
+-------------------
+
+Whenever a new task is spawned, `context`_ will be copied to the new task. It is
+important to note *which* context will be copied to the newly spawned task. It is not
+the context of the task group's host task that will be copied, but the context of the
+task that calls :meth:`TaskGroup.start() <.abc.TaskGroup.start>` or
+:meth:`TaskGroup.start_soon() <.abc.TaskGroup.start_soon>`.
+
+If you need a task to run in a specific context, you can pass a
+:class:`~contextvars.Context` object to
+:meth:`TaskGroup.create_task() <.abc.TaskGroup.create_task>` via its ``context`` keyword
+argument. When provided, the task will run in the given context instead of inheriting a
+copy of the caller's context.
+
+.. _context: https://docs.python.org/3/library/contextvars.html
+
+Asyncio-specific notes
+----------------------
+
+Differences with asyncio.TaskGroup
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The :class:`asyncio.TaskGroup` class, added in Python 3.11, is very similar in design to
+the AnyIO :class:`~.abc.TaskGroup` class. The asyncio counterpart has some important
+differences in its semantics, however:
+
+* The task group itself is instantiated directly, rather than using a factory function
+* Tasks are spawned solely through :meth:`~asyncio.TaskGroup.create_task`; there is no
+  ``start()`` or ``start_soon()`` method
+* The :meth:`~asyncio.TaskGroup.create_task` method returns an :class:`asyncio.Task`,
+  while AnyIO's :meth:`~.TaskGroup.create_task` returns a :class:`~.TaskHandle`
+* When a task spawned via :meth:`~asyncio.TaskGroup.create_task` is cancelled before its
+  coroutine has started running, it will not get a chance to handle the cancellation
+  exception
+* :class:`asyncio.TaskGroup` does not allow starting new tasks after an exception in
+  one of the tasks has triggered a shutdown of the task group
+* Tasks spawned from :class:`asyncio.TaskGroup` use different cancellation semantics
+  (see the notes on :ref:`asyncio cancellation semantics <asyncio cancellation>`)
+
+Call graph introspection support
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: 4.12.0
+
+Python 3.14 added support for `call graph introspection`_ on asyncio which lets various
+tools display the tree of Tasks or Futures that are waiting for a specific Future. AnyIO
+supports this mechanism in its own task groups by adding and removing the task's
+"waiter" as appropriate, just like asyncio's own task group class does. Here's a small
+demonstration:
+
+.. literalinclude:: snippets/tasks/call_graph.py
+
+This results in an output like:
+
+.. code-block::
+
+    * Task(name='Nesting level 3', id=0x7f94f01c43f0)
+      + Call stack:
+      |   File '/usr/lib64/python3.14/asyncio/graph.py', line 276, in print_call_graph()
+      |   File '/tmp/foo.py', line 8, in async foo()
+      + Awaited by:
+        * Task(name='Nesting level 2', id=0x7f94f03334e0)
+          + Call stack:
+          |   File '/tmp/venv/lib64/python3.14/site-packages/anyio/_backends/_asyncio.py', line 755, in async TaskGroup.__aexit__()
+          |   File '/tmp/foo.py', line 11, in async foo()
+          + Awaited by:
+            * Task(name='Nesting level 1', id=0x7f94f03172f0)
+              + Call stack:
+              |   File '/tmp/venv/lib64/python3.14/site-packages/anyio/_backends/_asyncio.py', line 755, in async TaskGroup.__aexit__()
+              |   File '/tmp/foo.py', line 11, in async foo()
+              + Awaited by:
+                * Task(name='Task-1', id=0x7f94f0316f30)
+                  + Call stack:
+                  |   File '/tmp/venv/lib64/python3.14/site-packages/anyio/_backends/_asyncio.py', line 755, in async TaskGroup.__aexit__()
+                  |   File '/tmp/foo.py', line 11, in async foo()
+
+.. _call graph introspection: https://docs.python.org/3.14/library/asyncio-graph.html
