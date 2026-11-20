@@ -1,0 +1,300 @@
+require "test_helper"
+
+class SolidQueue::ReadyExecutionTest < ActiveSupport::TestCase
+  setup do
+    5.times do |i|
+      AddToBufferJob.set(queue: "backend", priority: 5 - i).perform_later(i)
+    end
+
+    @jobs = SolidQueue::Job.where(queue_name: "backend").order(:priority)
+  end
+
+  test "claim all jobs for existing queue" do
+    assert_claimed_jobs(@jobs.count) do
+      SolidQueue::ReadyExecution.claim("backend", @jobs.count + 1, 42)
+    end
+
+    @jobs.each(&:reload)
+    assert @jobs.none?(&:ready?)
+    assert @jobs.all?(&:claimed?)
+  end
+
+  test "claim jobs for queue without jobs at the moment" do
+    assert_no_difference [ -> { SolidQueue::ReadyExecution.count }, -> { SolidQueue::ClaimedExecution.count } ] do
+      SolidQueue::ReadyExecution.claim("some_non_existing_queue", 10, 42)
+    end
+  end
+
+  test "claim some jobs for existing queue" do
+    assert_claimed_jobs(2) do
+      SolidQueue::ReadyExecution.claim("backend", 2, 42)
+    end
+
+    @jobs.first(2).each do |job|
+      assert_not job.reload.ready?
+      assert job.claimed?
+    end
+
+    @jobs.order(:priority)[2..-1].each do |job|
+      assert job.reload.ready?
+      assert_not job.claimed?
+    end
+  end
+
+  test "claim jobs using a list of queues" do
+    AddToBufferJob.perform_later("hey")
+
+    assert_claimed_jobs(6) do
+      SolidQueue::ReadyExecution.claim(%w[ backend background ], SolidQueue::Job.count + 1, 42)
+    end
+  end
+
+  test "claim jobs using a wildcard" do
+    AddToBufferJob.perform_later("hey")
+
+    assert_claimed_jobs(6) do
+      SolidQueue::ReadyExecution.claim("*", SolidQueue::Job.count + 1, 42)
+    end
+  end
+
+  test "claim jobs using queue prefixes" do
+    AddToBufferJob.perform_later("hey")
+
+    assert_claimed_jobs(1) do
+      SolidQueue::ReadyExecution.claim("backgr*", SolidQueue::Job.count + 1, 42)
+    end
+
+    assert @jobs.none?(&:claimed?)
+  end
+
+  test "prefixes escape LIKE wildcards so only literal queue names match" do
+    AddToBufferJob.set(queue: "mailbox").perform_later(1)
+    AddToBufferJob.set(queue: "mail-ops").perform_later(1)
+
+    assert_claimed_jobs(0) do
+      SolidQueue::ReadyExecution.claim("mail_*", SolidQueue::Job.count + 1, 42)
+    end
+
+    AddToBufferJob.set(queue: "mail_ops").perform_later(1)
+    AddToBufferJob.set(queue: "100x_done").perform_later(1)
+
+    assert_claimed_jobs(1) do
+      SolidQueue::ReadyExecution.claim("mail_*", SolidQueue::Job.count + 1, 42)
+    end
+    assert_equal "mail_ops", SolidQueue::ClaimedExecution.last.job.queue_name
+
+    assert_claimed_jobs(0) do
+      SolidQueue::ReadyExecution.claim("100%_*", SolidQueue::Job.count + 1, 42)
+    end
+
+    AddToBufferJob.set(queue: "100%_done").perform_later(1)
+
+    assert_claimed_jobs(1) do
+      SolidQueue::ReadyExecution.claim("100%_*", 1, 42)
+    end
+    assert_equal "100%_done", SolidQueue::ClaimedExecution.last.job.queue_name
+  end
+
+  test "claim jobs using a wildcard and having paused queues" do
+    AddToBufferJob.perform_later("hey")
+
+    SolidQueue::Queue.find_by_name("backend").pause
+
+    assert_claimed_jobs(1) do
+      SolidQueue::ReadyExecution.claim("*", SolidQueue::Job.count + 1, 42)
+    end
+
+    @jobs.each(&:reload)
+    assert @jobs.none?(&:claimed?)
+  end
+
+  test "claim jobs using both exact names and a prefix" do
+    AddToBufferJob.perform_later("hey")
+
+    assert_claimed_jobs(6) do
+      SolidQueue::ReadyExecution.claim(%w[ backe* background ], SolidQueue::Job.count + 1, 42)
+    end
+  end
+
+  test "claim jobs for queue without jobs at the moment using prefixes" do
+    AddToBufferJob.perform_later("hey")
+
+    assert_claimed_jobs(0) do
+      SolidQueue::ReadyExecution.claim(%w[ none* ], SolidQueue::Job.count + 1, 42)
+    end
+  end
+
+  test "priority order is used when claiming jobs using a wildcard" do
+    AddToBufferJob.set(priority: 1).perform_later("hey")
+    job = SolidQueue::Job.last
+
+    assert_claimed_jobs(3) do
+      SolidQueue::ReadyExecution.claim("*", 3, 42)
+    end
+
+    assert job.reload.claimed?
+    @jobs.first(2).each do |job|
+      assert_not job.reload.ready?
+      assert job.claimed?
+    end
+  end
+
+  test "queue order and then priority is respected when using a list of queues" do
+    AddToBufferJob.perform_later("hey")
+    job = SolidQueue::Job.last
+    assert_equal "background", job.queue_name
+
+    assert_claimed_jobs(3) do
+      SolidQueue::ReadyExecution.claim(%w[ background backend ], 3, 42)
+    end
+
+    assert job.reload.claimed?
+    @jobs.first(2).each do |job|
+      assert_not job.reload.ready?
+      assert job.claimed?
+    end
+  end
+
+  test "queue order is respected when using prefixes" do
+    %w[ queue_b1 queue_b2 queue_a2 queue_a1 queue_b1 queue_a2 queue_b2 queue_a1 ].each do |queue_name|
+      AddToBufferJob.set(queue: queue_name).perform_later(1)
+    end
+
+    # Claim 8 jobs
+    claimed_jobs = []
+    4.times do
+      assert_claimed_jobs(2) do
+        SolidQueue::ReadyExecution.claim(%w[ queue_b* queue_a* ], 2, 42)
+      end
+
+      claimed_jobs += SolidQueue::ClaimedExecution.order(:id).last(2).map(&:job)
+    end
+
+    # Check claim order
+    assert_equal %w[ queue_b1 queue_b1 queue_b2 queue_b2 queue_a1 queue_a1 queue_a2 queue_a2 ],
+      claimed_jobs.map(&:queue_name)
+  end
+
+
+  test "queue order is respected when mixing exact names with prefixes" do
+    %w[ queue_b1 queue_b2 queue_a2 queue_c2 queue_a1 queue_c1 queue_b1 queue_a2 queue_b2 queue_a1 ].each do |queue_name|
+      AddToBufferJob.set(queue: queue_name).perform_later(1)
+    end
+
+    # Claim 10 jobs
+    claimed_jobs = []
+    5.times do
+      assert_claimed_jobs(2) do
+        SolidQueue::ReadyExecution.claim(%w[ queue_a2 queue_c1 queue_b* queue_c2 queue_a* ], 2, 42)
+      end
+
+      claimed_jobs += SolidQueue::ClaimedExecution.order(:id).last(2).map(&:job)
+    end
+
+    # Check claim order
+    assert_equal %w[ queue_a2 queue_a2 queue_c1 queue_b1 queue_b1 queue_b2 queue_b2 queue_c2 queue_a1 queue_a1 ],
+      claimed_jobs.map(&:queue_name)
+  end
+
+  test "queues matched by more than one entry in the list are selected once" do
+    AddToBufferJob.set(queue: "queue_b1").perform_later(1)
+
+    assert_equal 1, SolidQueue::ReadyExecution.aggregated_count_across(%w[ queue_* queue_b* ])
+    assert_equal 1, SolidQueue::ReadyExecution.aggregated_count_across(%w[ queue_b* queue_b1 ])
+  end
+
+  test "distinct_values_of returns all distinct queue names" do
+    AddToBufferJob.perform_later("hey") # goes to background queue
+
+    names = SolidQueue::ReadyExecution.distinct_values_of(:queue_name)
+    assert_includes names, "backend"
+    assert_includes names, "background"
+    assert_equal 2, names.size
+  end
+
+  test "distinct_values_of honors a chained where" do
+    AddToBufferJob.perform_later("hey") # background queue
+
+    names = SolidQueue::ReadyExecution.where("queue_name LIKE ?", "back%").distinct_values_of(:queue_name)
+    assert_includes names, "backend"
+    assert_includes names, "background"
+    assert_equal 2, names.size
+
+    names = SolidQueue::ReadyExecution.where("queue_name LIKE ?", "backe%").distinct_values_of(:queue_name)
+    assert_equal [ "backend" ], names
+  end
+
+  test "distinct_values_of returns empty array for no matches" do
+    names = SolidQueue::ReadyExecution.where("queue_name LIKE ?", "nonexistent%").distinct_values_of(:queue_name)
+    assert_equal [], names
+  end
+
+  test "distinct_values_of returns empty array on empty table" do
+    SolidQueue::ReadyExecution.delete_all
+    SolidQueue::Job.delete_all
+
+    names = SolidQueue::ReadyExecution.distinct_values_of(:queue_name)
+    assert_equal [], names
+  end
+
+  test "discard all" do
+    3.times { |i| AddToBufferJob.perform_later(i) }
+
+    assert_difference [ -> { SolidQueue::ReadyExecution.count }, -> { SolidQueue::Job.count } ], -8 do
+      SolidQueue::ReadyExecution.discard_all_in_batches
+    end
+  end
+
+  test "discard all by queue" do
+    3.times { |i| AddToBufferJob.perform_later(i) }
+
+    assert_difference [ -> { SolidQueue::ReadyExecution.count }, -> { SolidQueue::Job.count } ], -5 do
+      SolidQueue::ReadyExecution.queued_as(:backend).discard_all_in_batches
+    end
+
+    assert_no_difference [ -> { SolidQueue::ReadyExecution.count }, -> { SolidQueue::Job.count } ] do
+      SolidQueue::ReadyExecution.queued_as(:backend).discard_all_in_batches
+    end
+  end
+
+  test "bulk discard unblocks one job for each released concurrency slot" do
+    result = JobResult.create!
+    7.times { |i| ThrottledUpdateResultJob.perform_later(result, name: i.to_s) }
+    jobs = SolidQueue::Job.where(class_name: ThrottledUpdateResultJob.name).order(:id).to_a
+
+    assert_equal 4, SolidQueue::BlockedExecution.count
+
+    assert_difference -> { SolidQueue::Job.count } => -2, -> { SolidQueue::BlockedExecution.count } => -2 do
+      SolidQueue::ReadyExecution.discard_all_from_jobs(jobs.first(2))
+    end
+
+    assert_equal jobs[2..4].map(&:id), SolidQueue::ReadyExecution.where(job_id: jobs.map(&:id)).order(:job_id).pluck(:job_id)
+    assert jobs.last(2).all? { |job| job.reload.blocked? }
+    assert_equal 0, SolidQueue::Semaphore.find_by!(key: jobs.first.concurrency_key).value
+  end
+
+  test "discard in batches leaves newly unblocked jobs ready" do
+    blocked_jobs = 2.times.map do
+      result = JobResult.create!
+      NonOverlappingUpdateResultJob.perform_later(result, name: "ready")
+      NonOverlappingUpdateResultJob.perform_later(result, name: "blocked")
+      SolidQueue::Job.last
+    end
+
+    assert_difference -> { SolidQueue::Job.count }, -2 do
+      SolidQueue::ReadyExecution.queued_as("default").discard_all_in_batches(batch_size: 1)
+    end
+
+    assert_equal blocked_jobs.map(&:id), SolidQueue::Job.where(queue_name: "default").order(:id).pluck(:id)
+    assert blocked_jobs.all? { |job| job.reload.ready? }
+    assert_equal 0, SolidQueue::BlockedExecution.count
+    assert_equal [ 0, 0 ], SolidQueue::Semaphore.order(:id).pluck(:value)
+  end
+
+  private
+    def assert_claimed_jobs(count, &block)
+      assert_difference -> { SolidQueue::ClaimedExecution.count } => +count, -> { SolidQueue::ReadyExecution.count } => -count do
+        block.call
+      end
+    end
+end

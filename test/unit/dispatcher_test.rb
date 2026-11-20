@@ -1,0 +1,194 @@
+require "test_helper"
+require "active_support/testing/method_call_assertions"
+
+class DispatcherTest < ActiveSupport::TestCase
+  include ActiveSupport::Testing::MethodCallAssertions
+
+  self.use_transactional_tests = false
+
+  setup do
+    @dispatcher = SolidQueue::Dispatcher.new(polling_interval: 0.1, batch_size: 10)
+  end
+
+  teardown do
+    @dispatcher.stop
+  end
+
+  test "dispatcher is registered as process" do
+    @dispatcher.start
+    wait_for_registered_processes(1, timeout: 1.second)
+
+    process = SolidQueue::Process.first
+    assert_equal "Dispatcher", process.kind
+    assert_metadata process, { polling_interval: 0.1, batch_size: 10, concurrency_maintenance_interval: 600 }
+  end
+
+  test "concurrency maintenance is optional" do
+    no_concurrency_maintenance_dispatcher = SolidQueue::Dispatcher.new(polling_interval: 0.1, batch_size: 10, concurrency_maintenance: false)
+    no_concurrency_maintenance_dispatcher.start
+
+    wait_for_registered_processes(1, timeout: 1.second)
+
+    process = SolidQueue::Process.first
+    assert_equal "Dispatcher", process.kind
+    assert_metadata process, polling_interval: 0.1, batch_size: 10, batch_maintenance: true
+    assert_nil process.metadata["concurrency_maintenance_interval"]
+  ensure
+    no_concurrency_maintenance_dispatcher.stop
+  end
+
+  test "batch maintenance is optional" do
+    no_batch_maintenance_dispatcher = SolidQueue::Dispatcher.new(polling_interval: 0.1, batch_size: 10, batch_maintenance: false)
+    no_batch_maintenance_dispatcher.start
+
+    wait_for_registered_processes(1, timeout: 1.second)
+
+    process = SolidQueue::Process.first
+    assert_equal "Dispatcher", process.kind
+    assert_metadata process, concurrency_maintenance_interval: 600, batch_maintenance: false
+  ensure
+    no_batch_maintenance_dispatcher.stop
+  end
+
+  test "batch maintenance is skipped with a deprecation warning until the batches schema is migrated" do
+    SolidQueue::Batch.stubs(:migrated?).returns(false)
+    SolidQueue::Batch.expects(:sweep_stalled).never
+
+    maintenance = SolidQueue::Dispatcher::Maintenance.new(600, 10, concurrency: false, batches: true)
+
+    assert_deprecated(/pending database migrations/, SolidQueue.deprecator) do
+      maintenance.send(:sweep_stalled_batches)
+    end
+
+    assert_not_deprecated(SolidQueue.deprecator) do
+      maintenance.send(:sweep_stalled_batches)
+    end
+  end
+
+  test "ConcurrencyMaintenance remains constructible with its original signature" do
+    maintenance = SolidQueue::Dispatcher::ConcurrencyMaintenance.new(600, 100)
+
+    assert_equal 600, maintenance.interval
+    assert_equal 100, maintenance.batch_size
+    assert maintenance.concurrency?
+    assert_not maintenance.batches?
+  end
+
+  test "polling queries are logged" do
+    log = StringIO.new
+    polling_query = /SELECT .* FROM .solid_queue_scheduled_executions. WHERE/
+
+    with_active_record_logger(ActiveSupport::Logger.new(log)) do
+      with_polling(silence: false) do
+        rewind_io(log)
+        @dispatcher.start
+        wait_while_with_timeout(3.seconds) { !log.string.match?(polling_query) }
+      end
+    end
+
+    assert_match polling_query, log.string
+  end
+
+  test "polling queries can be silenced" do
+    log = StringIO.new
+    with_active_record_logger(ActiveSupport::Logger.new(log)) do
+      with_polling(silence: true) do
+        rewind_io(log)
+        @dispatcher.start
+        sleep 0.5.second
+      end
+    end
+
+    assert_no_match /SELECT .* FROM .solid_queue_scheduled_executions. WHERE/, log.string
+  end
+
+  test "silencing polling queries when there's no Active Record logger" do
+    with_active_record_logger(nil) do
+      with_polling(silence: true) do
+        @dispatcher.start
+        sleep 0.5.second
+      end
+    end
+
+    @dispatcher.stop
+    wait_for_registered_processes(0, timeout: 1.second)
+    assert_no_registered_processes
+  end
+
+  test "run more than one instance of the dispatcher" do
+    15.times do
+      AddToBufferJob.set(wait: 0.5.second).perform_later("I'm scheduled")
+    end
+    sleep 0.5.second
+    assert_equal 15, SolidQueue::ScheduledExecution.count
+
+    another_dispatcher = SolidQueue::Dispatcher.new(polling_interval: 0.1, batch_size: 10)
+
+    @dispatcher.start
+    another_dispatcher.start
+
+    wait_while_with_timeout(1.second) { SolidQueue::ScheduledExecution.any? }
+
+    skip_active_record_query_cache do
+      assert_equal 0, SolidQueue::ScheduledExecution.count
+      assert_equal 15, SolidQueue::ReadyExecution.count
+    end
+  ensure
+    another_dispatcher&.stop
+  end
+
+  test "sleeps `0.seconds` between polls if there are ready to dispatch jobs" do
+    dispatcher = SolidQueue::Dispatcher.new(polling_interval: 10, batch_size: 1)
+    dispatcher.expects(:interruptible_sleep).with(0.seconds).at_least(3)
+    dispatcher.expects(:interruptible_sleep).with(dispatcher.polling_interval).at_least_once
+    dispatcher.expects(:handle_thread_error).never
+
+    3.times { AddToBufferJob.set(wait: 0.5.second).perform_later("I'm scheduled") }
+    sleep 0.5.second
+    assert_equal 3, SolidQueue::ScheduledExecution.count
+
+    dispatcher.start
+    # Give the dispatcher thread enough margin to boot and run its first polls
+    # on a slow runner; the wait returns as soon as everything is dispatched.
+    wait_while_with_timeout(5.seconds) { SolidQueue::ScheduledExecution.any? }
+
+    skip_active_record_query_cache do
+      assert_equal 0, SolidQueue::ScheduledExecution.count
+      assert_equal 3, SolidQueue::ReadyExecution.count
+    end
+  ensure
+    dispatcher.stop
+  end
+
+  test "sleeps `polling_interval` between polls if there are no un-dispatched jobs" do
+    dispatcher = SolidQueue::Dispatcher.new(polling_interval: 10, batch_size: 1)
+    dispatcher.expects(:interruptible_sleep).with(0.seconds).never
+    dispatcher.expects(:interruptible_sleep).with(dispatcher.polling_interval).at_least_once
+    dispatcher.expects(:handle_thread_error).never
+
+    dispatcher.start
+    wait_while_with_timeout(1.second) { !SolidQueue::ScheduledExecution.exists? }
+  ensure
+    dispatcher.stop
+  end
+
+  private
+    def with_polling(silence:)
+      old_silence_polling, SolidQueue.silence_polling = SolidQueue.silence_polling, silence
+      yield
+    ensure
+      SolidQueue.silence_polling = old_silence_polling
+    end
+
+    def with_active_record_logger(logger)
+      old_logger, ActiveRecord::Base.logger = ActiveRecord::Base.logger, logger
+      yield
+    ensure
+      ActiveRecord::Base.logger = old_logger
+    end
+
+    def rewind_io(log)
+      log.truncate(0)
+      log.rewind
+    end
+end

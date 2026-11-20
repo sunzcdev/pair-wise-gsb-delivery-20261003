@@ -1,0 +1,111 @@
+# frozen_string_literal: true
+
+require "test_helper"
+require "solid_queue/cli"
+require "open3"
+
+class CliTest < ActiveSupport::TestCase
+  test "eager loading leaves the CLI to bin/jobs" do
+    script = <<~SCRIPT
+      require #{File.expand_path("../dummy/config/environment", __dir__).dump}
+      Zeitwerk::Loader.eager_load_all
+      print SolidQueue.autoload?(:Cli) ? "not loaded" : "loaded"
+    SCRIPT
+
+    out, err, status = Open3.capture3(RbConfig.ruby, "-e", script)
+
+    assert status.success?, err
+    assert_equal "not loaded", out
+  end
+
+  test "mode defaults to fork when no env var or option" do
+    with_env("SOLID_QUEUE_SUPERVISOR_MODE" => nil) do
+      config = configuration_from_cli
+
+      assert config.mode.fork?
+    end
+  end
+
+  test "mode respects SOLID_QUEUE_SUPERVISOR_MODE env var" do
+    with_env("SOLID_QUEUE_SUPERVISOR_MODE" => "async") do
+      config = configuration_from_cli
+
+      assert config.mode.async?
+    end
+  end
+
+  test "mode option overrides env var" do
+    with_env("SOLID_QUEUE_SUPERVISOR_MODE" => "async") do
+      config = configuration_from_cli(mode: "fork")
+
+      assert config.mode.fork?
+    end
+  end
+
+  test "mode option works without env var" do
+    with_env("SOLID_QUEUE_SUPERVISOR_MODE" => nil) do
+      config = configuration_from_cli(mode: "async")
+
+      assert config.mode.async?
+    end
+  end
+
+  test "only_recurring option runs just the scheduler" do
+    config = configuration_from_cli(only_recurring: true)
+
+    assert_equal 1, config.configured_processes.count
+    assert_equal :scheduler, config.configured_processes.first.kind
+  end
+
+  test "only_recurring respects SOLID_QUEUE_ONLY_RECURRING env var" do
+    with_env("SOLID_QUEUE_ONLY_RECURRING" => "true") do
+      config = configuration_from_cli
+
+      assert_equal 1, config.configured_processes.count
+      assert_equal :scheduler, config.configured_processes.first.kind
+    end
+  end
+
+  test "check exits 0 and prints OK message for a valid configuration" do
+    out, err = capture_io do
+      assert_nothing_raised { SolidQueue::Cli.start([ "check", "--skip-recurring" ]) }
+    end
+
+    assert_match "Solid Queue configuration is valid.", out
+    assert_empty err
+  end
+
+  test "check exits 1 and prints invalid recurring task errors" do
+    out, err, exit_status = capture_check_run(
+      "--recurring_schedule_file", config_file_path(:recurring_with_invalid).to_s
+    )
+
+    assert_equal 1, exit_status
+    assert_match "Solid Queue configuration is invalid", err
+    assert_match "periodic_invalid_class", err
+    assert_match "periodic_incorrect_schedule", err
+    assert_empty out
+  end
+
+  private
+    def configuration_from_cli(**cli_options)
+      cli = SolidQueue::Cli.new([], cli_options)
+      options = cli.options.symbolize_keys.compact
+
+      SolidQueue::Configuration.new(**options)
+    end
+
+    # capture_io re-raises SystemExit before returning the captured strings, so we
+    # swallow it inside the block and return its status alongside the captured IO.
+    def capture_check_run(*args)
+      status = nil
+      out, err = capture_io do
+        begin
+          SolidQueue::Cli.start([ "check", *args ])
+        rescue SystemExit => e
+          status = e.status
+        end
+      end
+      [ out, err, status ]
+    end
+end

@@ -1,0 +1,394 @@
+require "test_helper"
+
+class SolidQueue::RecurringTaskTest < ActiveSupport::TestCase
+  class JobWithoutArguments < ApplicationJob
+    def perform
+      JobBuffer.add "job_without_arguments"
+    end
+  end
+
+  class JobWithRegularHashArguments < ApplicationJob
+    def perform(value, options)
+      JobBuffer.add [ value, options[:value] ]
+    end
+  end
+
+  class JobWithKeywordArgument < ApplicationJob
+    def perform(value, value_kwarg:)
+      JobBuffer.add [ value, value_kwarg ]
+    end
+  end
+
+  class JobWithMultipleTypeArguments < ApplicationJob
+    def perform(value, options = {}, **kwargs)
+      JobBuffer.add [ value, options[:value], kwargs[:value_kwarg] ]
+    end
+  end
+
+  class JobWithPriority < ApplicationJob
+    queue_with_priority 10
+
+    def perform
+      JobBuffer.add "job_with_priority"
+    end
+  end
+
+  class JobUsingAsyncAdapter < ApplicationJob
+    self.queue_adapter = :async
+
+    def perform
+      JobBuffer.add "job_using_async_adapter"
+    end
+  end
+
+  class JobWithConcurrencyControlsAndDiscard < ApplicationJob
+    limits_concurrency key: -> { true }, on_conflict: :discard
+
+    def perform
+      JobBuffer.add "job_with_concurrency_controls"
+    end
+  end
+
+  test "job without arguments" do
+    task = recurring_task_with(class_name: "JobWithoutArguments")
+    enqueue_and_assert_performed_with_result task, "job_without_arguments"
+  end
+
+  test "job with regular hash argument" do
+    task = recurring_task_with(class_name: "JobWithRegularHashArguments", args: [ "regular_hash_argument", { value: 42, not_used: 24 } ])
+
+    enqueue_and_assert_performed_with_result task, [ "regular_hash_argument", 42 ]
+  end
+
+  test "job with keyword argument" do
+    task = recurring_task_with(class_name: "JobWithKeywordArgument", args: [ "keyword_argument", { value_kwarg: [ 42, 24 ] } ])
+    enqueue_and_assert_performed_with_result task, [ "keyword_argument", [ 42, 24 ] ]
+  end
+
+  test "job with arguments of multiple types" do
+    task = recurring_task_with(class_name: "JobWithMultipleTypeArguments", args:
+      [ "multiple_types", { value: "regular_hash_value", not_used: 28 }, value_kwarg: 42, not_used: 32 ])
+    enqueue_and_assert_performed_with_result task, [ "multiple_types", "regular_hash_value", 42 ]
+  end
+
+  test "job with arguments of multiple types ignoring optional regular hash" do
+    task = recurring_task_with(class_name: "JobWithMultipleTypeArguments", args:
+      [ "multiple_types", value: "regular_hash_value", value_kwarg: 42, not_used: 32 ])
+    enqueue_and_assert_performed_with_result task, [ "multiple_types", nil, 42 ]
+  end
+
+  test "job using a different adapter" do
+    task = recurring_task_with(class_name: "JobUsingAsyncAdapter")
+    previous_size = JobBuffer.size
+
+    task.enqueue(at: Time.now)
+    wait_while_with_timeout!(0.5.seconds) { JobBuffer.size == previous_size }
+
+    assert_equal "job_using_async_adapter", JobBuffer.last_value
+  end
+
+  test "error when enqueuing job before recording task" do
+    SolidQueue::Job.stubs(:create!).raises(ActiveRecord::Deadlocked)
+
+    task = recurring_task_with(class_name: "JobWithoutArguments")
+    assert_no_difference -> { SolidQueue::Job.count } do
+      task.enqueue(at: Time.now)
+    end
+  end
+
+  test "error when enqueuing job because of concurrency controls and discard" do
+    JobWithConcurrencyControlsAndDiscard.perform_later
+
+    task = recurring_task_with(class_name: "JobWithConcurrencyControlsAndDiscard")
+    assert_no_difference -> { SolidQueue::Job.count } do
+      task.enqueue(at: Time.now)
+    end
+
+    # Run the enqueued job that was preventing a new one from being enqueued
+    run_all_jobs_inline
+
+    enqueue_and_assert_performed_with_result task, "job_with_concurrency_controls"
+  end
+
+  test "error when enqueuing job using another adapter that raises ActiveJob::EnqueueError" do
+    ActiveJob::QueueAdapters::AsyncAdapter.any_instance.stubs(:enqueue).raises(ActiveJob::EnqueueError)
+    previous_size = JobBuffer.size
+
+    task = recurring_task_with(class_name: "JobUsingAsyncAdapter")
+    task.enqueue(at: Time.now)
+
+    wait_while_with_timeout(0.5.seconds) { JobBuffer.size == previous_size }
+
+    assert_equal previous_size, JobBuffer.size
+  end
+
+  test "valid and invalid schedules" do
+    assert_not recurring_task_with(class_name: "JobWithoutArguments", schedule: "once a year").valid?
+    assert_not recurring_task_with(class_name: "JobWithoutArguments", schedule: "tomorrow").valid?
+
+    task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every Thursday at 1 AM")
+    assert task.valid?
+    # At 1 AM on the 4th day of the week
+    assert task.to_s.ends_with? "[ 0 1 * * 4 ]"
+
+    task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every month")
+    assert task.valid?
+    # At 12:00 AM, on day 1 of the month
+    assert task.to_s.ends_with? "[ 0 0 1 * * ]"
+
+    task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every second")
+    assert task.valid?
+    assert task.to_s.ends_with? "[ * * * * * * ]"
+
+    # Empty schedule
+    assert_not SolidQueue::RecurringTask.new(key: "task-id", class_name: "SolidQueue::RecurringTaskTest::JobWithoutArguments").valid?
+
+    task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every day at 00:40")
+    assert task.valid?
+    assert task.to_s.ends_with? "[ 40 0 * * * ]"
+
+    task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "40 0 * * *")
+    assert task.valid?
+
+    # Single cron to represent both hours, as it's the same minute
+    task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every day at 00:40 and 15:40")
+    assert task.valid?
+    assert task.to_s.ends_with? "[ 40 0,15 * * * ]"
+
+    # Would need two cron tabs to reprenset the different hours and minutes
+    task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every day at 00:40 and 15:20")
+    assert_not task.valid?
+    error_message = task.errors[:schedule].first
+    assert_includes error_message, "generates multiple cron schedules"
+    assert_includes error_message, "Please use separate recurring tasks"
+  end
+
+  test "valid and invalid job class and command" do
+    # Command
+    assert recurring_task_with(command: "puts '¡hola!'").valid?
+    # Class
+    assert recurring_task_with(class_name: "JobWithPriority").valid?
+
+    # Invalid class name
+    assert_not recurring_task_with(class_name: "UnknownJob").valid?
+
+    # Empty class name and command
+    task = SolidQueue::RecurringTask.from_configuration("task-id", schedule: "every minute")
+    assert_not task.valid?
+    assert_includes task.errors[:base], "either command or class must be present"
+  end
+
+  test "task with custom queue and priority" do
+    task = recurring_task_with(class_name: "JobWithoutArguments", queue: "my_new_queue", priority: 4)
+    enqueue_and_assert_performed_with_result task, "job_without_arguments"
+
+    job = SolidQueue::Job.last
+    assert_equal "my_new_queue", job.queue_name
+    assert_equal 4, job.priority
+  end
+
+  test "overriding existing priority" do
+    task = recurring_task_with(class_name: "JobWithPriority", priority: nil).tap(&:save!)
+    enqueue_and_assert_performed_with_result task.reload, "job_with_priority"
+
+    job = SolidQueue::Job.last
+    assert_equal 10, job.priority
+
+    task.destroy
+
+    task = recurring_task_with(class_name: "JobWithPriority", priority: 4).tap(&:save!)
+    enqueue_and_assert_performed_with_result task.reload, "job_with_priority"
+
+    job = SolidQueue::Job.last
+    assert_equal 4, job.priority
+  end
+
+  test "next_time_after returns the next occurrence after the given time" do
+    task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every minute")
+
+    # next_time_after a time exactly on the minute boundary should return the following minute
+    time = Time.utc(2026, 3, 12, 1, 28, 0)
+    assert_equal Time.utc(2026, 3, 12, 1, 29, 0), task.next_time_after(time)
+
+    # next_time_after a time just before the boundary should return that boundary
+    time = Time.utc(2026, 3, 12, 1, 27, 59)
+    assert_equal Time.utc(2026, 3, 12, 1, 28, 0), task.next_time_after(time)
+  end
+
+  test "task configured with a command" do
+    task = recurring_task_with(command: "JobBuffer.add('from_a_command')")
+    enqueue_and_assert_performed_with_result(task, "from_a_command")
+
+    assert_equal "SolidQueue::RecurringJob", SolidQueue::Job.last.class_name
+  end
+
+  test "schedule recurring tasks dynamically" do
+    SolidQueue::RecurringTask.create_dynamic_task("test 1", command: "puts 1", schedule: "every hour")
+    SolidQueue::RecurringTask.create_dynamic_task("test 2", command: "puts 2", schedule: "every minute", static: true)
+
+    assert SolidQueue::RecurringTask.exists?(key: "test 1", command: "puts 1", schedule: "every hour", static: false)
+    assert SolidQueue::RecurringTask.exists?(key: "test 2", command: "puts 2", schedule: "every minute", static: false)
+  end
+
+  test "schedule recurring tasks dynamically with class and args (same keys as YAML config)" do
+    SolidQueue::RecurringTask.create_dynamic_task("test 3", class: "AddToBufferJob", args: [ 42 ], schedule: "every hour")
+
+    task = SolidQueue::RecurringTask.find_by!(key: "test 3")
+    assert_equal "AddToBufferJob", task.class_name
+    assert_equal [ 42 ], task.arguments
+    assert_not task.static
+  end
+
+  test "unschedule recurring tasks dynamically" do
+    dynamic_task = SolidQueue::RecurringTask.create!(
+      key: "dynamic", command: "puts 'd'", schedule: "every day", static: false
+    )
+
+    static_task = SolidQueue::RecurringTask.create!(
+      key: "static", command: "puts 's'", schedule: "every week", static: true
+    )
+
+    SolidQueue::RecurringTask.delete_dynamic_task(dynamic_task.key)
+
+    assert_raises(ActiveRecord::RecordNotFound) do
+      SolidQueue::RecurringTask.delete_dynamic_task(static_task.key)
+    end
+
+    assert_not SolidQueue::RecurringTask.exists?(key: "dynamic", static: false)
+    assert SolidQueue::RecurringTask.exists?(key: "static", static: true)
+  end
+
+  test "scheduling dynamic recurring task with duplicate key raises error" do
+    SolidQueue::RecurringTask.create_dynamic_task("duplicate_test", command: "puts 1", schedule: "every hour")
+
+    assert_raises(ActiveRecord::RecordNotUnique) do
+      SolidQueue::RecurringTask.create_dynamic_task("duplicate_test", command: "puts 2", schedule: "every minute")
+    end
+  end
+
+  test "unscheduling dynamic recurring task with nonexistent key raises RecordNotFound" do
+    assert_raises(ActiveRecord::RecordNotFound) do
+      SolidQueue::RecurringTask.delete_dynamic_task("nonexistent_key")
+    end
+  end
+
+  test "schedule without a time zone uses the configured default time zone" do
+    with_time_zone "America/New_York" do
+      task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every day at 9am")
+      assert_equal Fugit.parse("0 9 * * * America/New_York").next_time.utc, task.next_time
+    end
+  end
+
+  test "schedule with an explicit time zone ignores the configured default time zone" do
+    with_time_zone "America/New_York" do
+      task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "0 9 * * * Europe/Madrid")
+      assert_equal Fugit.parse("0 9 * * * Europe/Madrid").next_time.utc, task.next_time
+    end
+  end
+
+  test "schedule falls back to local time when no default time zone is configured" do
+    with_time_zone nil do
+      task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every day at 9am")
+      assert_equal Fugit.parse("0 9 * * *").next_time.utc, task.next_time
+    end
+  end
+
+  test "configured default time zone accepts Rails time zone names" do
+    with_time_zone "Eastern Time (US & Canada)" do
+      task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every day at 9am")
+      assert_equal Fugit.parse("0 9 * * * America/New_York").next_time.utc, task.next_time
+    end
+  end
+
+  test "default time zone doesn't change the displayed schedule" do
+    with_time_zone "America/New_York" do
+      task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every day at 9am")
+      assert task.to_s.ends_with? "[ 0 9 * * * ]"
+    end
+  end
+
+  test "reports Job::EnqueueError to Rails.error when enqueuing via Solid Queue" do
+    SolidQueue::Job.stubs(:create!).raises(ActiveRecord::Deadlocked)
+    subscriber = ErrorBuffer.new
+    at = Time.now
+
+    with_error_subscriber(subscriber) do
+      task = recurring_task_with(class_name: "JobWithoutArguments")
+      task.enqueue(at: at)
+    end
+
+    assert_equal 1, subscriber.errors.count
+    error, options = subscriber.errors.first
+    assert_kind_of SolidQueue::Job::EnqueueError, error
+    assert_match "ActiveRecord::Deadlocked", error.message
+    assert_equal true, options[:handled]
+    assert_equal "application.solid_queue", options[:source]
+    assert_equal "task-id", options[:context][:task]
+    assert_equal at, options[:context][:at]
+  end
+
+  test "reports enqueue error to Rails.error when using another adapter" do
+    ActiveJob::QueueAdapters::AsyncAdapter.any_instance.stubs(:enqueue).raises(ActiveJob::EnqueueError.new("All is broken"))
+    subscriber = ErrorBuffer.new
+    at = Time.now
+
+    with_error_subscriber(subscriber) do
+      task = recurring_task_with(class_name: "JobUsingAsyncAdapter")
+      task.enqueue(at: at)
+    end
+
+    assert_equal 1, subscriber.errors.count
+    error, options = subscriber.errors.first
+    assert_kind_of ActiveJob::EnqueueError, error
+    assert_equal "All is broken", error.message
+    assert_equal true, options[:handled]
+    assert_equal "application.solid_queue", options[:source]
+    assert_equal "task-id", options[:context][:task]
+    assert_equal at, options[:context][:at]
+  end
+
+  private
+    def with_time_zone(zone)
+      previous = SolidQueue.time_zone
+      SolidQueue.time_zone = zone
+      yield
+    ensure
+      SolidQueue.time_zone = previous
+    end
+
+    def enqueue_and_assert_performed_with_result(task, result)
+      assert_difference [ -> { SolidQueue::Job.count }, -> { SolidQueue::ReadyExecution.count } ], +1 do
+        task.enqueue(at: Time.now)
+      end
+
+      assert_difference -> { JobBuffer.size }, +1 do
+        run_all_jobs_inline
+      end
+
+      assert_equal result, JobBuffer.last_value
+    end
+
+    def recurring_task_with(class_name: nil, **options)
+      options = options.dup.with_defaults(schedule: "every hour")
+
+      if class_name.present?
+        options[:class] = "SolidQueue::RecurringTaskTest::#{class_name}"
+      end
+
+      SolidQueue::RecurringTask.from_configuration("task-id", **options)
+    end
+
+    def run_all_jobs_inline
+      SolidQueue::Worker.new(queues: "*").tap do |worker|
+        worker.mode = :inline
+        worker.start
+      end
+    end
+
+    def with_error_subscriber(subscriber)
+      Rails.error.subscribe(subscriber)
+      yield
+    ensure
+      Rails.error.unsubscribe(subscriber) if Rails.error.respond_to?(:unsubscribe)
+    end
+end
