@@ -83,7 +83,8 @@ class Session:
         self._create()
         self._seed()
         self._activate()
-        self.creator.pyenv_cfg.write()
+        # preserve text (comments, foreign keys) a runner added to an existing pyvenv.cfg
+        self.creator.pyenv_cfg.write(preserve=not self.creator.clear)
 
     def _create(self) -> None:
         LOGGER.info("create virtual environment via %s", self.creator)

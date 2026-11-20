@@ -1518,6 +1518,106 @@ def test_pyenv_cfg_write_logs_escaped_values(tmp_path: Path, caplog: pytest.LogC
     assert "\t'prompt = \"a\\x1bb\"'" in caplog.text
 
 
+def test_pyenv_cfg_preserve_keeps_foreign_text(tmp_path: Path) -> None:
+    path: Final = tmp_path / "pyvenv.cfg"
+    path.write_text("# runner marker\nrunner-key = keep\nhome = /old\n", encoding="utf-8")
+
+    PyEnvCfg(OrderedDict([("home", "/new"), ("version", "3.14.0")]), path).write(preserve=True)
+
+    assert path.read_text(encoding="utf-8") == "# runner marker\nrunner-key = keep\nhome = /new\nversion = 3.14.0\n"
+
+
+def test_pyenv_cfg_preserve_keeps_line_endings(tmp_path: Path) -> None:
+    path: Final = tmp_path / "pyvenv.cfg"
+    path.write_bytes(b"# note\r\nhome = /old\r\nrunner = 1\r\n")
+
+    PyEnvCfg(OrderedDict([("home", "/new"), ("version", "3.14")]), path).write(preserve=True)
+
+    assert path.read_bytes() == b"# note\r\nhome = /new\r\nrunner = 1\r\nversion = 3.14\r\n"
+
+
+def test_pyenv_cfg_preserve_keeps_byte_order_mark(tmp_path: Path) -> None:
+    path: Final = tmp_path / "pyvenv.cfg"
+    path.write_bytes(b"\xef\xbb\xbfhome = /old\n")
+
+    PyEnvCfg(OrderedDict([("home", "/new")]), path).write(preserve=True)
+
+    assert path.read_bytes() == b"\xef\xbb\xbfhome = /new\n"
+    assert PyEnvCfg.from_file(path).content == {"home": "/new"}
+
+
+def test_pyenv_cfg_preserve_refreshes_every_occurrence(tmp_path: Path) -> None:
+    # consumers disagree on duplicates: getpath adopts the last occurrence, the Windows venv launcher the first,
+    # so every occurrence of a held key is refreshed for the new value to actually take effect
+    path: Final = tmp_path / "pyvenv.cfg"
+    path.write_text("home = /shadowed\nhome = /old\n", encoding="utf-8")
+
+    PyEnvCfg(OrderedDict([("home", "/new")]), path).write(preserve=True)
+
+    assert path.read_text(encoding="utf-8") == "home = /new\nhome = /new\n"
+    assert PyEnvCfg.from_file(path).content["home"] == "/new"
+
+
+def test_pyenv_cfg_preserve_appends_after_missing_final_newline(tmp_path: Path) -> None:
+    path: Final = tmp_path / "pyvenv.cfg"
+    path.write_text("home = /old", encoding="utf-8")
+
+    PyEnvCfg(OrderedDict([("home", "/new"), ("version", "3.14")]), path).write(preserve=True)
+
+    assert path.read_text(encoding="utf-8") == "home = /new\nversion = 3.14\n"
+
+
+def test_pyenv_cfg_preserve_rejects_undecodable_file(tmp_path: Path) -> None:
+    original: Final = b"home = /old\nrunner = \xff\xfe\n"
+    path: Final = tmp_path / "pyvenv.cfg"
+    path.write_bytes(original)
+
+    with pytest.raises(ValueError, match="cannot reliably update"):
+        PyEnvCfg(OrderedDict([("home", "/new")]), path).write(preserve=True)
+
+    assert path.read_bytes() == original
+
+
+def test_pyenv_cfg_read_rejects_undecodable_file(tmp_path: Path) -> None:
+    original: Final = b"home = /old\nrunner = \xff\xfe\n"
+    path: Final = tmp_path / "pyvenv.cfg"
+    path.write_bytes(original)
+
+    with pytest.raises(ValueError, match="cannot reliably read"):
+        PyEnvCfg.from_file(path)
+
+    assert path.read_bytes() == original
+
+
+def test_recreate_preserves_pyenv_cfg_user_marks(tmp_path: Path) -> None:
+    dest: Final = tmp_path / "env"
+    args: Final = [str(dest), "--without-pip", "--activators", ""]
+    cli_run(args)
+    cfg_path: Final = dest / "pyvenv.cfg"
+    # a runner marks the file up: a BOM, a comment, an own key and a shadowing duplicate of home, all in CRLF
+    marked: Final = (
+        b"\xef\xbb\xbf# runner: do not touch\r\nrunner-marker = hand-written\r\nhome = C:\\shadowed\\duplicate\r\n"
+        + cfg_path.read_bytes().replace(b"\n", b"\r\n")
+    )
+    cfg_path.write_bytes(marked)
+
+    session: Final = cli_run(args)
+
+    raw: Final = cfg_path.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")
+    assert b"# runner: do not touch\r\n" in raw
+    assert b"runner-marker = hand-written\r\n" in raw
+    # every occurrence of a virtualenv key was refreshed, so no reader can adopt the shadowing duplicate
+    assert b"C:\\shadowed\\duplicate" not in raw
+    # the interpreter adopts the refreshed configuration: the environment is its prefix
+    out: Final = subprocess.check_output(
+        [str(session.creator.exe), "-c", "import sys; print(sys.prefix); print(sys.base_prefix)"],
+        text=True,
+    ).splitlines()
+    assert Path(out[0]) == dest
+    assert Path(out[1]) != dest
+
+
 @pytest.mark.skipif(not _CURRENT.has_venv, reason="requires interpreter with venv")
 @pytest.mark.skipif(_CURRENT.implementation != "CPython", reason="only CPython rejects an invalid PYTHONHOME")
 def test_venv_subprocess_respects_pythonhome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

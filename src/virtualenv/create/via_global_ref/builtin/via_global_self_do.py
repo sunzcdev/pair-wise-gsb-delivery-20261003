@@ -144,7 +144,7 @@ class ViaGlobalRefVirtualenvBuiltin(ViaGlobalRefApi, VirtualenvBuiltin, ABC):
             ensure_within(self.dest, directory)
 
         self.set_pyenv_cfg()
-        self.pyenv_cfg.write()
+        self.pyenv_cfg.write(preserve=not self.clear)
         true_system_site = self.enable_system_site_package
         try:
             self.enable_system_site_package = False
