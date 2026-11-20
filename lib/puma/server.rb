@@ -14,6 +14,7 @@ require_relative 'util'
 require_relative 'response'
 require_relative 'configuration'
 require_relative 'cluster_accept_loop_delay'
+require_relative 'tempfile_quota'
 
 require 'socket'
 require 'io/wait' unless Puma::HAS_NATIVE_IO_WAIT
@@ -47,6 +48,7 @@ module Puma
     attr_reader :events
     attr_reader :min_threads, :max_threads  # for #stats
     attr_reader :requests_count             # @version 5.0.0
+    attr_reader :tempfile_quota             # aggregate request body tempfile quota
 
     # @todo the following may be deprecated in the future
     attr_reader :auto_trim_time, :early_hints, :first_data_timeout,
@@ -109,6 +111,7 @@ module Puma
       @enable_keep_alives      &&= @queue_requests
       @io_selector_backend       = @options[:io_selector_backend]
       @http_content_length_limit = @options[:http_content_length_limit]
+      @tempfile_quota            = TempfileQuota.new(@options[:request_body_tempfile_quota])
       @continue_callback         = @options[:continue_callback]
       @allow_underscore_headers  = @options.fetch(:allow_underscore_headers, true)
       @cluster_accept_loop_delay = ClusterAcceptLoopDelay.new(
@@ -495,6 +498,7 @@ module Puma
       client.listener = sock
       client.env_set_http_version = @env_set_http_version
       client.http_content_length_limit = @http_content_length_limit
+      client.tempfile_quota = @tempfile_quota
       client.supported_http_methods = @supported_http_methods
       client.allow_underscore_headers = @allow_underscore_headers
       client.continue_callback = @continue_callback

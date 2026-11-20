@@ -1676,6 +1676,26 @@ module Puma
       @options[:http_content_length_limit] = limit
     end
 
+    # Specify the maximum aggregate size, in bytes, of request bodies held
+    # in tempfiles at any one time.  Bodies larger than
+    # `Puma::Const::MAX_BODY` are moved out of memory and into a tempfile
+    # while they are read; many concurrent large requests can fill the
+    # temporary directory even when each request is within
+    # `http_content_length_limit`.  When this quota is exhausted, further
+    # requests needing a tempfile are rejected with an HTTP 413 status
+    # code until earlier requests finish and release their disk space.
+    #
+    # Small requests that fit in memory are unaffected.
+    #
+    # The default is +nil+ (no aggregate limit).
+    #
+    # @example
+    #   request_body_tempfile_quota 1_000_000_000
+    #
+    def request_body_tempfile_quota(limit)
+      @options[:request_body_tempfile_quota] = limit
+    end
+
     # Supported http methods, which will replace `Puma::Const::SUPPORTED_HTTP_METHODS`.
     # The value of `:any` will allow all methods, otherwise, the value must be
     # an array of strings. Note that methods are all uppercase.

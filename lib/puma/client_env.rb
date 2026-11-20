@@ -111,6 +111,9 @@ module Puma
       @env[HIJACK] = method(:full_hijack).to_proc
 
       @env[RACK_INPUT] = @body || EmptyBody
+      # The request body tempfile is now held by the Rack app via
+      # `rack.input`; record the handoff so its holder can be verified.
+      @tempfile_quota&.hand_off(@tempfile_reservation, @env) if @tempfile_reservation
       @env[RACK_URL_SCHEME] ||= default_server_port == PORT_443 ? HTTPS : HTTP
     end
 

@@ -4,6 +4,7 @@ require_relative 'detect'
 require_relative 'io_buffer'
 require_relative 'client_env'
 require_relative 'null_io'
+require_relative 'tempfile_quota'
 require 'tempfile'
 
 if Puma::IS_JRUBY
@@ -88,10 +89,11 @@ module Puma
 
     attr_reader :env, :to_io, :body, :io, :timeout_at, :ready, :hijacked,
                 :tempfile, :io_buffer, :http_content_length_limit_exceeded,
-                :requests_served, :error_status_code, :bytes_read
+                :requests_served, :error_status_code, :bytes_read,
+                :tempfile_reservation
 
     attr_writer :peerip, :http_content_length_limit, :supported_http_methods,
-                :allow_underscore_headers, :continue_callback
+                :allow_underscore_headers, :continue_callback, :tempfile_quota
 
     attr_accessor :remote_addr_header, :listener, :env_set_http_version,
                   :reactor_error
@@ -121,6 +123,8 @@ module Puma
 
       @http_content_length_limit = nil
       @http_content_length_limit_exceeded = nil
+      @tempfile_quota = nil
+      @tempfile_reservation = nil
       @allow_underscore_headers = true
       @continue_callback = nil
       @error_status_code = nil
@@ -227,6 +231,8 @@ module Puma
       @tempfile = nil
       @body = nil
     rescue Errno::ENOENT, IOError
+    ensure
+      release_tempfile_reservation
     end
 
     # If necessary, read the PROXY protocol from the buffer. Returns
@@ -607,6 +613,7 @@ module Puma
       end
 
       if remain > MAX_BODY
+        reserve_tempfile_quota content_length
         @body = Tempfile.create(Const::PUMA_TMP_BASE)
         File.unlink @body.path unless IS_WINDOWS
         @body.binmode
@@ -711,6 +718,7 @@ module Puma
       @prev_chunk = ""
       @excess_cr = 0
 
+      reserve_tempfile_quota 0
       @body = Tempfile.create(Const::PUMA_TMP_BASE)
       File.unlink @body.path unless IS_WINDOWS
       @body.binmode
@@ -728,6 +736,8 @@ module Puma
       if @http_content_length_limit&.< @chunked_content_length + str.bytesize
         raise_above_http_content_limit
       end
+
+      charge_tempfile_quota str.bytesize
 
       @chunked_content_length += @body.write(str)
     end
@@ -885,6 +895,38 @@ module Puma
       @error_status_code = 413
       @env[HTTP_CONNECTION] = 'close'
       raise HttpParserError, "Payload Too Large"
+    end
+
+    # Reserves +bytes+ of the server-wide tempfile quota for this request
+    # body.  Small in-memory bodies never reserve.  Raises if the
+    # aggregate quota is exhausted, so the request is rejected with 413
+    # instead of filling the temporary directory.
+    def reserve_tempfile_quota(bytes)
+      return unless @tempfile_quota
+
+      @tempfile_reservation = @tempfile_quota.reserve(bytes, self)
+      raise_above_tempfile_quota unless @tempfile_reservation
+    end
+
+    # Charges a growing chunked body against the reservation made in
+    # +setup_chunked_body+.
+    def charge_tempfile_quota(bytes)
+      return unless @tempfile_reservation
+
+      raise_above_tempfile_quota unless @tempfile_quota.charge(@tempfile_reservation, bytes)
+    end
+
+    def release_tempfile_reservation
+      @tempfile_quota&.release(@tempfile_reservation)
+      @tempfile_reservation = nil
+    end
+
+    def raise_above_tempfile_quota
+      @buffer = nil
+      @body = EmptyBody
+      @error_status_code = 413
+      @env[HTTP_CONNECTION] = 'close'
+      raise HttpParserError, "Payload Too Large: request body tempfile quota exceeded"
     end
   end
 end

@@ -454,6 +454,128 @@ class TestPumaServer < PumaTest
     assert_equal ["connection: close", "content-length: 17"], response.headers
   end
 
+  # Bodies larger than MAX_BODY are moved to a tempfile.  A quota smaller
+  # than the body must reject the request with 413.  The reservation is
+  # checked right after the headers are parsed, so the 413 is sent before
+  # the (unneeded) body bytes arrive.
+  def test_request_body_tempfile_quota_rejects_when_exceeded
+    body_size = Puma::Const::MAX_BODY * 2
+    server_run(request_body_tempfile_quota: body_size - 1)
+
+    socket = send_http "POST / HTTP/1.1\r\nHost: test.com\r\nContent-Length: #{body_size}\r\n\r\n"
+
+    response = socket.read_response
+
+    assert_equal "HTTP/1.1 413 #{STATUS_CODES[413]}", response.status
+    assert_equal 0, @server.tempfile_quota.used
+    assert_empty @server.tempfile_quota.holders
+  end
+
+  # A zero quota rejects chunked bodies (which always use a tempfile) as
+  # soon as the first chunk is charged against the quota.
+  def test_request_body_tempfile_quota_rejects_chunked_when_exceeded
+    server_run(request_body_tempfile_quota: 0)
+
+    socket = send_http "POST / HTTP/1.1\r\nHost: test.com\r\nTransfer-Encoding: chunked\r\n\r\n"
+    socket << "5\r\nhello\r\n0\r\n\r\n"
+
+    response = socket.read_response
+
+    assert_equal "HTTP/1.1 413 #{STATUS_CODES[413]}", response.status
+    assert_equal 0, @server.tempfile_quota.used
+  end
+
+  # Small bodies stay in memory and are never subject to the tempfile
+  # quota, even with a zero quota.
+  def test_request_body_tempfile_quota_allows_small_in_memory_bodies
+    server_run(request_body_tempfile_quota: 0) do |env|
+      [200, {}, [env['rack.input'].class.to_s]]
+    end
+
+    small_body = 'y' * 1024
+    response = send_http_read_response "POST / HTTP/1.1\r\nHost: test.com\r\nContent-Length: #{small_body.bytesize}\r\n\r\n#{small_body}"
+
+    assert_equal "HTTP/1.1 200 OK", response.status
+    assert_equal 'StringIO', response.body
+    assert_equal 0, @server.tempfile_quota.used
+  end
+
+  # With a quota that fits exactly one tempfile-backed body: a second
+  # large request is rejected while the first is held by the Rack app,
+  # the reservation is released when the first request finishes, and the
+  # quota can then be reused.  While held, local file stats and the
+  # quota's holders show who owns the disk space.
+  def test_request_body_tempfile_quota_reject_close_and_reuse
+    body = 'x' * (Puma::Const::MAX_BODY * 2)
+    body_size = body.bytesize
+
+    entered = Queue.new      # app has the body, tempfile is held
+    release = Queue.new      # test allows the app to respond
+
+    server_run(request_body_tempfile_quota: body_size) do |env|
+      data = env['rack.input'].read
+      if env['PATH_INFO'] == '/hold'
+        entered << env
+        release.pop
+      end
+      [200, {}, [data.bytesize.to_s]]
+    end
+
+    quota = @server.tempfile_quota
+    holding = false
+
+    begin
+      # First request fills the quota and is held inside the Rack app.
+      socket1 = send_http "POST /hold HTTP/1.1\r\nHost: test.com\r\nContent-Length: #{body_size}\r\n\r\n#{body}"
+      env = entered.pop
+      holding = true
+
+      assert_equal body_size, quota.used
+
+      # The tempfile was handed off to Rack: the holder is the request env,
+      # the owner is a Puma::Client, and the file on disk holds the body.
+      holders = quota.holders
+      assert_equal 1, holders.length
+      owner, holder, bytes = holders.first
+      assert_kind_of Puma::Client, owner
+      assert_same env, holder
+      assert_equal body_size, bytes
+
+      rack_input = env['rack.input']
+      assert_kind_of File, rack_input # Tempfile.create returns a File
+      assert_equal body_size, rack_input.stat.size
+
+      # Second large request is rejected while the quota is exhausted.
+      # Only the headers are sent: the reservation is checked before the
+      # body is read, and not sending the body avoids a TCP reset when the
+      # server closes the connection.
+      socket2 = send_http "POST / HTTP/1.1\r\nHost: test.com\r\nContent-Length: #{body_size}\r\n\r\n"
+      response2 = socket2.read_response
+      assert_equal "HTTP/1.1 413 #{STATUS_CODES[413]}", response2.status
+      assert_equal body_size, quota.used
+
+      # Let the first request finish; its reservation is released (closed).
+      release << true
+      holding = false
+      response1 = socket1.read_response
+      assert_equal "HTTP/1.1 200 OK", response1.status
+      assert_equal body_size.to_s, response1.body
+
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+      sleep 0.01 until quota.used.zero? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      assert_equal 0, quota.used
+      assert_empty quota.holders
+
+      # The quota is available again: a third large request succeeds.
+      response3 = send_http_read_response "POST / HTTP/1.1\r\nHost: test.com\r\nContent-Length: #{body_size}\r\n\r\n#{body}"
+      assert_equal "HTTP/1.1 200 OK", response3.status
+      assert_equal body_size.to_s, response3.body
+      assert_equal 0, quota.used
+    ensure
+      release << true if holding # never leave the app thread blocked
+    end
+  end
+
   def test_GET_with_no_body_has_sane_chunking
     server_run { [200, {}, []] }
 
