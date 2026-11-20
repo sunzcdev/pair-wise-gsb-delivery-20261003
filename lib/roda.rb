@@ -412,11 +412,20 @@ class Roda
           end
         end
 
+        # The middleware to use when building the rack application, in the order
+        # they should be wrapped around the application. Plugins can override this
+        # method to change the order middleware are used in.  The returned sequence
+        # should be in the same order as the middleware is added via #use (outermost
+        # middleware first).
+        def middleware_for_rack_app
+          @middleware
+        end
+
         # Build the rack app to use
         def build_rack_app
           app = base_rack_app_callable(use_new_dispatch_api?)
 
-          @middleware.reverse_each do |args, bl|
+          middleware_for_rack_app.reverse_each do |args, bl|
             mid, *args = args
             app = mid.new(app, *args, &bl)
             app.freeze if opts[:freeze_middleware]
