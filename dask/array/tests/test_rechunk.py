@@ -759,6 +759,171 @@ def test_rechunk_unknown_raises():
         z.rechunk(((5, 3, 2, np.nan, np.nan), (5, 5)))
 
 
+@pytest.fixture
+def bool_filtered_array():
+    """A dask array whose first axis has unknown (nan) chunk sizes because it
+    was produced by a boolean selection, together with the equivalent numpy
+    array and the mask used for the selection.
+
+    The number of input blocks is countable even though their lengths are not
+    known until execution time.
+    """
+    rng = np.random.default_rng(42)
+    np_data = rng.standard_normal((20, 8))
+    x = da.from_array(np_data, chunks=(5, 4))
+    np_mask = np_data[:, 0] > 0
+    dask_mask = x[:, 0] > 0
+    filtered = x[dask_mask]
+    assert np.isnan(filtered.chunks[0]).all()
+    assert filtered.npartitions == x.npartitions
+    return filtered, np_data, np_mask
+
+
+def test_rechunk_unknown_axis_keeps_boundaries(bool_filtered_array):
+    """Rechunking the known axes must leave the unknown axis' chunk
+    boundaries (i.e. the number and ordering of blocks) untouched."""
+    x, np_data, np_mask = bool_filtered_array
+    unknown_axis = 0
+    n_old_blocks = len(x.chunks[unknown_axis])
+
+    for chunks in [{1: 8}, (None, 8), (None, 2), (None, (2, 2, 2, 2))]:
+        result = x.rechunk(chunks)
+        # The unknown axis keeps the same block count and remains unknown
+        assert len(result.chunks[unknown_axis]) == n_old_blocks
+        assert np.isnan(result.chunks[unknown_axis]).all()
+        assert_eq(result, np_data[np_mask])
+
+
+def test_rechunk_unknown_axis_no_compute_at_planning(bool_filtered_array):
+    """Building the rechunk graph must never trigger a computation to find
+    the unknown row counts."""
+    x, np_data, np_mask = bool_filtered_array
+
+    def fail_compute(*args, **kwargs):
+        raise AssertionError("rechunk must not compute unknown chunk sizes")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(da.Array, "compute", fail_compute)
+        mp.setattr(da.Array, "persist", fail_compute)
+        result = x.rechunk({1: 8})
+        # Graph is fully built without knowing row counts
+        assert np.isnan(result.chunks[0]).all()
+
+    # Only the explicit user compute() resolves the unknown lengths
+    assert_eq(result, np_data[np_mask])
+
+
+def test_rechunk_unknown_axis_graph_has_no_nan_slices(bool_filtered_array):
+    """Unknown lengths must be represented by open-ended slices (``None``
+    stops), never by slices carrying ``nan``, so the graph stays executable."""
+    x, np_data, np_mask = bool_filtered_array
+    result = x.rechunk({1: 2})
+
+    # Walk every materialized task and check its arguments recursively
+    def contains_nan(value):
+        if isinstance(value, float):
+            return np.isnan(value)
+        if isinstance(value, slice):
+            return contains_nan(value.start) or contains_nan(value.stop)
+        if isinstance(value, (list, tuple)):
+            return any(contains_nan(item) for item in value)
+        if hasattr(value, "args"):
+            return any(contains_nan(item) for item in value.args)
+        return False
+
+    graph = dict(result.dask)
+    assert not any(contains_nan(task) for task in graph.values())
+
+    assert_eq(result, np_data[np_mask])
+
+
+def test_rechunk_unknown_axis_block_combination_matches_numpy(bool_filtered_array):
+    """Before compute nothing has been counted; after compute, the blocks
+    recombine exactly as numpy would, including merges and splits on the
+    known axis while block boundaries of the unknown axis are preserved."""
+    x, np_data, np_mask = bool_filtered_array
+    expected = np_data[np_mask]
+    n_unknown_blocks = len(x.chunks[0])
+
+    # Merge along the known axis: 2 blocks -> 1 per unknown-axis block
+    merged = x.rechunk({1: 8})
+    assert len(merged.chunks[1]) == 1
+    assert merged.npartitions == n_unknown_blocks
+    assert np.array_equal(merged.compute(), expected)
+
+    # Split along the known axis: 2 blocks -> 4 per unknown-axis block
+    split = x.rechunk({1: 2})
+    assert len(split.chunks[1]) == 4
+    assert split.npartitions == n_unknown_blocks * 4
+    assert np.array_equal(split.compute(), expected)
+
+    # Each block along the unknown axis matches the corresponding numpy block
+    # obtained by applying the mask block-by-block. The block count (but not
+    # the row counts) was already known before execution.
+    block_counts = np_mask.reshape(n_unknown_blocks, -1).sum(axis=1)
+    starts = np.concatenate([[0], np.cumsum(block_counts[:-1])])
+    np_blocks = [
+        expected[start : start + count]
+        for start, count in zip(starts, block_counts, strict=True)
+    ]
+    merged_blocks = [merged.blocks[i, 0].compute() for i in range(n_unknown_blocks)]
+    assert len(merged_blocks) == len(np_blocks)
+    for dask_block, np_block in zip(merged_blocks, np_blocks, strict=True):
+        assert np.array_equal(dask_block, np_block)
+
+
+def test_rechunk_unknown_axis_splitting_raises_at_graph_build(
+    bool_filtered_array,
+):
+    """Asking to actually split/merge the *unknown* axis cannot be planned
+    without row counts, so a clear error is raised while building the graph,
+    before any execution."""
+    x, _, _ = bool_filtered_array
+    with pytest.raises(ValueError, match="Chunks must be unchanging"):
+        x.rechunk(((np.nan,) * (len(x.chunks[0]) + 1), (8,)))
+
+
+def test_rechunk_balance_preserves_unknown_axis(bool_filtered_array):
+    """``balance=True`` must not attempt to balance a dimension whose lengths
+    are unknown; it keeps the unknown boundaries and balances the rest."""
+    x, np_data, np_mask = bool_filtered_array
+    result = x.rechunk({1: 8}, balance=True)
+    assert result.chunks[0] == x.chunks[0]
+    assert result.chunks[1] == (8,)
+    assert_eq(result, np_data[np_mask])
+
+
+def test_rechunk_partially_unknown_axis_keeps_boundaries(bool_filtered_array):
+    """A dimension mixing known and unknown blocks must keep *all* its block
+    boundaries (known and unknown ones) when other axes are rechunked."""
+    x, np_data, np_mask = bool_filtered_array
+    head_np = np_data[:6]
+    head = da.from_array(head_np, chunks=(3, 4))
+    mixed = da.concatenate([head, x])
+    assert mixed.chunks[0] == (3, 3, np.nan, np.nan, np.nan, np.nan)
+
+    result = mixed.rechunk({1: 8})
+    assert result.chunks[0] == mixed.chunks[0]
+    assert result.chunks[1] == (8,)
+    assert_eq(result, np.concatenate([head_np, np_data[np_mask]]))
+
+    # And with balance=True, the unknown parts are still left untouched
+    balanced = mixed.rechunk({1: 8}, balance=True)
+    assert balanced.chunks[0] == mixed.chunks[0]
+    assert_eq(balanced, np.concatenate([head_np, np_data[np_mask]]))
+
+
+def test_balance_chunksizes_unknown_dimension():
+    from dask.array.rechunk import _balance_chunksizes
+
+    unknown = (np.nan, np.nan)
+    assert _balance_chunksizes(unknown) == unknown
+    partially_unknown = (3, 3, np.nan, np.nan)
+    assert _balance_chunksizes(partially_unknown) == partially_unknown
+    # Fully known dimensions are still balanced
+    assert _balance_chunksizes((100, 100, 20)) == (110, 110)
+
+
 def test_old_to_new_single():
     old = ((np.nan, np.nan), (8,))
     new = ((np.nan, np.nan), (4, 4))

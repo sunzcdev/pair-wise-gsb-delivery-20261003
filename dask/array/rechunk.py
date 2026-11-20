@@ -837,6 +837,10 @@ def _balance_chunksizes(chunks: tuple[int, ...]) -> tuple[int, ...]:
     """
     Balance the chunk sizes
 
+    Dimensions with unknown (``nan``) chunk sizes are returned unchanged:
+    balancing requires knowing the total length of the dimension, which is
+    only available at execution time for unknown chunks.
+
     Parameters
     ----------
     chunks : tuple[int, ...]
@@ -847,6 +851,12 @@ def _balance_chunksizes(chunks: tuple[int, ...]) -> tuple[int, ...]:
     new_chunks : tuple[int, ...]
         New chunks for Dask array with balanced sizes.
     """
+    if any(math.isnan(chunk) for chunk in chunks):
+        # The dimension length is unknown until the graph is executed, so it
+        # cannot be rebalanced without triggering a computation. Keep the
+        # existing (unknown) chunk boundaries untouched instead.
+        return tuple(chunks)
+
     median_len = np.median(chunks).astype(int)
     n_chunks = len(chunks)
     eps = median_len // 2
