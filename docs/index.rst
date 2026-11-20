@@ -369,6 +369,14 @@ often called with the same arguments:
       actual use case.  Providing a `condition` variable will mitigate
       these situations, but will incur a performance penalty.
 
+   Note that waiting for a pending call can never succeed if the
+   pending calls form a cycle, i.e. if two threads each wait for a
+   call computed by the other, or if a function waits for its own
+   pending call.  Such a wait raises :exc:`RuntimeError` instead of
+   blocking forever, and the pending calls are released, so that later
+   calls will compute their values again.  Recursion into different
+   keys is not affected and will still be cached.
+
    If no separate `lock` parameter is provided, `condition` must also
    implement the `context manager`_ protocol, and will also be used to
    guard access to the cache.
@@ -576,6 +584,12 @@ often called with the same arguments:
       underlying wrapped method in a multithreaded environment.
       Likewise, a condition variable returned by `condition(self)`
       must be associated with a lock returned by `lock(self)`.
+
+   As with :func:`cached`, waiting for a pending call that is part of
+   a cycle raises :exc:`RuntimeError` rather than blocking forever.
+   This also applies if multiple instances share the same cache, lock
+   and condition, e.g. when methods of different objects wait for each
+   other's pending calls.
 
    Similarly to the :func:`cached` function decorator, the `cache`,
    `key`, `lock` and `condition` parameters are also available as

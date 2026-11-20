@@ -1,3 +1,4 @@
+import functools
 import unittest
 from threading import Barrier, Condition, Event, Lock, Thread
 
@@ -176,6 +177,161 @@ class ThreadingTest(unittest.TestCase):
 
                 with self.assertRaises(RuntimeError):
                     Cached().method()
+
+    def test_cached_cond_cycle(self):
+        # Two threads computing mutually dependent keys each wait for
+        # the other's pending call, which can never complete, so the
+        # wait must be reported instead of blocking forever.
+        for info in (False, True):
+            with self.subTest(info=info):
+                cache = LRUCache(4)
+                lock = Lock()
+                cond = Condition(lock)
+                barrier = Barrier(2, timeout=self.TIMEOUT)
+                nested = [True]
+                calls = []
+                wrappers = {}
+
+                def func(key):
+                    calls.append(key)
+                    if not nested[0]:
+                        return key
+                    barrier.wait()
+                    return wrappers["b" if key == "a" else "a"]()
+
+                for key in ("a", "b"):
+                    wrappers[key] = cached(
+                        cache,
+                        key=lambda _key=key: _key,
+                        lock=lock,
+                        condition=cond,
+                        info=info,
+                    )(functools.partial(func, key))
+
+                self.run_cycle_test(wrappers, cache, nested, calls)
+
+    def test_cachedmethod_cond_cycle(self):
+        for info in (False, True):
+            with self.subTest(info=info):
+                cache = LRUCache(4)
+                lock = Lock()
+                cond = Condition(lock)
+                barrier = Barrier(2, timeout=self.TIMEOUT)
+                nested = [True]
+                calls = []
+
+                class Cached:
+                    @cachedmethod(
+                        lambda _: cache,
+                        lock=lambda _: lock,
+                        condition=lambda _: cond,
+                        info=info,
+                    )
+                    def method(self, key):
+                        calls.append(key)
+                        if not nested[0]:
+                            return key
+                        barrier.wait()
+                        return self.method("b" if key == "a" else "a")
+
+                obj = Cached()
+
+                self.run_cycle_test(
+                    {"a": lambda: obj.method("a"), "b": lambda: obj.method("b")},
+                    cache,
+                    nested,
+                    calls,
+                )
+
+    def test_cachedmethod_cond_cycle_shared_cache(self):
+        # two instances sharing the same cache, lock and condition
+        for info in (False, True):
+            with self.subTest(info=info):
+                cache = LRUCache(4)
+                lock = Lock()
+                cond = Condition(lock)
+                barrier = Barrier(2, timeout=self.TIMEOUT)
+                nested = [True]
+                calls = []
+
+                class Cached:
+                    @cachedmethod(
+                        lambda _: cache,
+                        lock=lambda _: lock,
+                        condition=lambda _: cond,
+                        info=info,
+                    )
+                    def method(self, other, key):
+                        calls.append(key)
+                        if not nested[0]:
+                            return key
+                        barrier.wait()
+                        return other.method(self, "b" if key == "a" else "a")
+
+                first, second = Cached(), Cached()
+
+                self.run_cycle_test(
+                    {
+                        "a": lambda: first.method(second, "a"),
+                        "b": lambda: second.method(first, "b"),
+                    },
+                    cache,
+                    nested,
+                    calls,
+                )
+
+    def test_cached_cond_nested_keys(self):
+        # Recursion into different keys must still work and be cached;
+        # waiting for a pending call that will complete is not a cycle.
+        for info in (False, True):
+            with self.subTest(info=info):
+                cache = LRUCache(16)
+                lock = Lock()
+                cond = Condition(lock)
+                calls = []
+
+                @cached(cache, lock=lock, condition=cond, info=info)
+                def fib(n):
+                    calls.append(n)
+                    return n if n < 2 else fib(n - 1) + fib(n - 2)
+
+                self.assertEqual(fib(10), 55)
+                self.assertEqual(len(cache), 11)
+                calls.clear()
+                self.assertEqual(fib(10), 55)
+                self.assertEqual(calls, [])
+
+    def run_cycle_test(self, wrappers, cache, nested, calls):
+        errors = {}
+
+        def run(name):
+            try:
+                wrappers[name]()
+            except RuntimeError as e:
+                errors[name] = e
+
+        threads = [
+            Thread(target=run, args=("a",)),
+            Thread(target=run, args=("b",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=self.TIMEOUT)
+            self.assertFalse(thread.is_alive())
+
+        # both callers must report the circular wait, nothing is cached
+        self.assertEqual(set(errors), {"a", "b"})
+        self.assertIn("deadlock", str(errors["a"]))
+        self.assertIn("deadlock", str(errors["b"]))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(cache), 0)
+
+        # the pending calls are released, so later calls complete
+        nested[0] = False
+        self.assertEqual(wrappers["a"](), "a")
+        self.assertEqual(wrappers["b"](), "b")
+        self.assertEqual(len(cache), 2)
 
     def run_cond_wait_test(self, func, cond, started, release, calls):
         results = [None] * 2

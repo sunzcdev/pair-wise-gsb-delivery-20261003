@@ -349,6 +349,42 @@ class MethodDecoratorTestMixin(SimplifiedTestCaseProtocol):
         self.assertEqual(cached.get_lock_cond_info(0), 0)
         self.assertEqual(cached.get_lock_cond_info.cache_info(), (0, 1, maxsize, 1))
 
+    def test_decorator_cond_cycle(self):
+        # A cached method that waits for its own pending call can never
+        # complete; this must be reported instead of waiting forever.
+        for info in (False, True):
+            with self.subTest(info=info):
+                cache = self.cache(2)
+                calls = []
+
+                class Recursive(Cached):
+                    @cachedmethod(
+                        lambda self: self.cache,
+                        condition=lambda self: self.cond,
+                        info=info,
+                    )
+                    def get_recursive(self, value):
+                        calls.append(value)
+                        return self.get_recursive(value)
+
+                rec = Recursive(cache)
+                with self.assertRaisesRegex(RuntimeError, "deadlock"):
+                    rec.get_recursive(0)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(rec.cond.wait_count, 0)
+                self.assertEqual(len(rec.cache), 0)
+
+                # the pending call is released, so the next call runs
+                calls.clear()
+                with self.assertRaisesRegex(RuntimeError, "deadlock"):
+                    rec.get_recursive(0)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(len(rec.cache), 0)
+
+                # other keys are unaffected
+                self.assertEqual(rec.get(0), 0)
+                self.assertEqual(len(rec.cache), 1)
+
     def test_decorator_cond_error(self):
         cached = Cached(self.cache(2))
 

@@ -128,6 +128,46 @@ class DecoratorTestMixin(SimplifiedTestCaseProtocol):
         self.assertEqual(cond.wait_count, 0)
         self.assertEqual(cond.notify_count, 2)
 
+    def test_decorator_cond_cycle(self):
+        # A cached function that waits for its own pending call can
+        # never complete; this must be reported instead of waiting.
+        for info in (False, True):
+            with self.subTest(info=info):
+                cache = self.cache(2)
+                cond = CountedCondition()
+                calls = []
+
+                @cachetools.cached(cache, condition=cond, info=info)
+                def func():
+                    calls.append(None)
+                    return func()
+
+                with self.assertRaisesRegex(RuntimeError, "deadlock"):
+                    func()
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(cond.wait_count, 0)
+                self.assertEqual(len(cache), 0)
+
+                # the pending call is released, so the next call runs
+                calls.clear()
+                with self.assertRaisesRegex(RuntimeError, "deadlock"):
+                    func()
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(len(cache), 0)
+
+    def test_decorator_cond_cycle_info(self):
+        cache = self.cache(2)
+        cond = CountedCondition()
+
+        @cachetools.cached(cache, condition=cond, info=True)
+        def func():
+            return func()
+
+        with self.assertRaisesRegex(RuntimeError, "deadlock"):
+            func()
+        self.assertEqual(func.cache_info().misses, 1)
+        self.assertEqual(len(cache), 0)
+
     def test_decorator_cond_error(self):
         cache = self.cache(2)
         lock = cond = CountedCondition()
