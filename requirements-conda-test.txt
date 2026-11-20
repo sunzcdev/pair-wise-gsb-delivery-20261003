@@ -1,0 +1,14 @@
+argcomplete >=1.9.4,<3.0
+attrs >=23.1
+colorlog >=6.6,<7.0.0
+coverage>=7.10.3
+dependency-groups >=1.1
+httpx
+humanize
+jinja2
+pbs-installer>=2025.1.6
+pytest
+pytest-xdist
+tox>=4.0.0
+virtualenv >=20.14.1
+zstandard

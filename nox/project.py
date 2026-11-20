@@ -1,0 +1,226 @@
+# Copyright 2016 Alethea Katherine Flowers
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+__lazy_modules__ = {
+    "dependency_groups",
+    "packaging.requirements",
+    "packaging.specifiers",
+    "packaging.version",
+    "pathlib",
+    "tomllib",
+}
+
+import re
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import packaging.requirements
+import packaging.specifiers
+import packaging.version
+from dependency_groups import resolve
+
+if TYPE_CHECKING:
+    import os
+    from typing import Any
+
+if sys.version_info < (3, 11):
+    import tomli as tomllib
+else:
+    import tomllib
+
+
+__all__ = ["dependency_groups", "load_toml", "python_versions"]
+
+
+def __dir__() -> list[str]:
+    return __all__
+
+
+# Note: the implementation (including this regex) taken from PEP 723
+# https://peps.python.org/pep-0723
+
+REGEX = re.compile(
+    r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$"
+)
+
+
+def load_toml(
+    filename: os.PathLike[str] | str = "pyproject.toml", *, missing_ok: bool = False
+) -> dict[str, Any]:
+    """
+    Load a toml file or a script with a PEP 723 script block.
+
+    The file must have a ``.toml`` extension to be considered a toml file or a
+    ``.py`` extension / no extension to be considered a script. Other file
+    extensions are not valid in this function. The default is ``"pyproject.toml"``.
+
+    If ``missing_ok``, this will return an empty dict if a script block was not
+    found, otherwise it will raise a error.
+
+    Example:
+
+    .. code-block:: python
+
+        @nox.session
+        def myscript(session):
+            myscript_options = nox.project.load_toml("myscript.py")
+            session.install(*myscript_options["dependencies"])
+    """
+    filepath = Path(filename)
+    match filepath.suffix:
+        case ".toml":
+            return _load_toml_file(filepath)
+        case ".py" | "":
+            return _load_script_block(filepath, missing_ok=missing_ok)
+        case suffix:
+            msg = f"Extension must be .py or .toml, got {suffix}"
+            raise ValueError(msg)
+
+
+def _load_toml_file(filepath: Path) -> dict[str, Any]:
+    with filepath.open("rb") as f:
+        return tomllib.load(f)
+
+
+def _load_script_block(filepath: Path, *, missing_ok: bool) -> dict[str, Any]:
+    name = "script"
+    try:
+        # Decode like Python does, skipping a UTF-8 BOM that would hide a block on the first line.
+        script = filepath.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        if missing_ok:
+            return {}
+        raise
+    matches = [m for m in REGEX.finditer(script) if m.group("type") == name]
+
+    if not matches:
+        if missing_ok:
+            return {}
+        msg = f"No {name} block found in {filepath}"
+        raise ValueError(msg)
+    if len(matches) > 1:
+        msg = f"Multiple {name} blocks found in {filepath}"
+        raise ValueError(msg)
+
+    content = "".join(
+        line[2:] if line.startswith("# ") else line[1:]
+        for line in matches[0].group("content").splitlines(keepends=True)
+    )
+    return tomllib.loads(content)
+
+
+def python_versions(
+    pyproject: dict[str, Any],
+    *,
+    max_version: str | None = None,
+    sort: bool = True,
+    free_threaded: bool | None = None,
+) -> list[str]:
+    """
+    Read a list of supported Python versions. Without ``max_version``, this
+    will read the trove classifiers (recommended). With a ``max_version``, it
+    will read the requires-python setting for a lower bound, and will use the
+    value of ``max_version`` as the upper bound. (Reminder: you should never
+    set an upper bound in ``requires-python``).
+
+    Classifier-derived versions are sorted by default. Set ``sort=False`` to
+    preserve classifier order.
+
+    If the project has a ``Programming Language :: Python :: Free Threading``
+    classifier, free-threaded versions (like ``"3.14t"``) are appended for
+    every version from 3.14 on. 3.13t is not included, as it was experimental.
+    Set ``free_threaded`` to force this on or off.
+
+    Example:
+
+    .. code-block:: python
+
+        import nox
+
+        PYPROJECT = nox.project.load_toml("pyproject.toml")
+        # From classifiers
+        PYTHON_VERSIONS = nox.project.python_versions(PYPROJECT)
+        # Or from requires-python
+        PYTHON_VERSIONS = nox.project.python_versions(PYPROJECT, max_version="3.13")
+    """
+    classifiers = pyproject.get("project", {}).get("classifiers", [])
+    if free_threaded is None:
+        free_threaded = any(
+            c.startswith("Programming Language :: Python :: Free Threading")
+            for c in classifiers
+        )
+
+    if max_version is None:
+        # Classifiers are a list of every Python version
+        from_classifiers = [
+            c.split()[-1]
+            for c in classifiers
+            if c.startswith("Programming Language :: Python :: 3.")
+        ]
+        if not from_classifiers:
+            msg = 'No Python version classifiers found in "project.classifiers"'
+            raise ValueError(msg)
+        if sort:
+            from_classifiers = sorted(from_classifiers, key=packaging.version.Version)
+        return _with_free_threaded(from_classifiers, free_threaded=free_threaded)
+
+    requires_python_str = pyproject.get("project", {}).get("requires-python", "")
+    if not requires_python_str:
+        msg = 'No "project.requires-python" value set'
+        raise ValueError(msg)
+
+    lower_bounds = [
+        packaging.version.Version(spec.version).release[:2]
+        for spec in packaging.specifiers.SpecifierSet(requires_python_str)
+        if spec.operator in {">", ">=", "~="}
+    ]
+    if not lower_bounds:
+        msg = 'No minimum version found in "project.requires-python"'
+        raise ValueError(msg)
+    min_version = max(lower_bounds)
+
+    max_minor_version = int(max_version.split(".")[1]) if "." in max_version else 0
+
+    versions = [f"3.{m}" for m in range(max_minor_version + 1) if (3, m) >= min_version]
+    return _with_free_threaded(versions, free_threaded=free_threaded)
+
+
+def _with_free_threaded(versions: list[str], *, free_threaded: bool) -> list[str]:
+    if not free_threaded:
+        return versions
+    return versions + [
+        f"{v}t"
+        for v in versions
+        if packaging.version.Version(v) >= packaging.version.Version("3.14")
+    ]
+
+
+def dependency_groups(pyproject: dict[str, Any], *groups: str) -> tuple[str, ...]:
+    """
+    Get a list of dependencies from a ``[dependency-groups]`` section(s).
+
+    Example:
+
+    .. code-block:: python
+
+        @nox.session
+        def test(session):
+            pyproject = nox.project.load_toml("pyproject.toml")
+            session.install(*nox.project.dependency_groups(pyproject, "dev"))
+    """
+    dep_groups = pyproject["dependency-groups"]
+    return resolve(dep_groups, *groups)

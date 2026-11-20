@@ -1,0 +1,1160 @@
+# Copyright 2016 Alethea Katherine Flowers
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+__lazy_modules__ = {
+    "contextlib",
+    "json",
+    "nox",
+    "nox.command",
+    "nox.logger",
+    "packaging",
+    "shutil",
+    "socket",
+    "subprocess",
+}
+
+import abc
+import contextlib
+import functools
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import sysconfig
+from pathlib import Path
+from socket import gethostbyname
+from typing import TYPE_CHECKING, Any, Literal
+
+from packaging import specifiers, version
+
+import nox
+import nox.command
+from nox import _rattler
+from nox.logger import logger
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping, Sequence
+
+    from python_discovery import DiskCache, PythonInfo
+
+    from nox._typing import Python
+
+    # These are implemented via the module-level __getattr__ below, so that
+    # uv detection (which spawns a subprocess) only runs when first needed.
+    HAS_UV: bool
+    UV: str
+    UV_VERSION: version.Version
+    OPTIONAL_VENVS: dict[str, bool]
+
+__all__ = [
+    "ALL_VENVS",
+    "HAS_UV",
+    "OPTIONAL_VENVS",
+    "UV",
+    "UV_VERSION",
+    "CondaEnv",
+    "InterpreterNotFound",
+    "PassthroughEnv",
+    "ProcessEnv",
+    "RattlerEnv",
+    "VirtualEnv",
+    "find_uv",
+    "get_virtualenv",
+    "pbs_install_python",
+    "uv_install_python",
+    "uv_version",
+]
+
+
+def __dir__() -> list[str]:
+    return __all__
+
+
+# Use for test mocking and to make mypy happy
+_PLATFORM = sys.platform
+_IS_MINGW = sysconfig.get_platform().startswith("mingw")
+
+
+# Problematic environment variables that are stripped from all commands inside
+# of a virtualenv. See https://github.com/theacodes/nox/issues/44
+_BLACKLISTED_ENV_VARS = frozenset(
+    [
+        "PIP_RESPECT_VIRTUALENV",
+        "PIP_REQUIRE_VIRTUALENV",
+        "PYTHONHOME",
+        "__PYVENV_LAUNCHER__",
+        "UV_SYSTEM_PYTHON",
+        "UV_PYTHON",
+    ]
+)
+
+NOX_PBS_PYTHONS = Path.home() / ".local" / "share" / "nox" / "pythons"
+
+
+@functools.cache
+def find_uv() -> tuple[bool, str, version.Version]:
+    uv_name = os.environ.get("UV", None)
+    uv_on_path = shutil.which(uv_name or "uv")
+
+    # Look for uv in Nox's environment, to handle `pipx install nox[uv]`.
+    if uv_name is None:
+        with contextlib.suppress(ImportError, FileNotFoundError):
+            from uv import find_uv_bin  # noqa: PLC0415
+
+            uv_bin = find_uv_bin()
+
+            uv_vers = uv_version(uv_bin)
+            if uv_vers > version.Version("0"):
+                # If the returned value is the same as calling "uv" already, don't
+                # expand (simpler logging)
+                if uv_on_path and Path(uv_bin).samefile(uv_on_path):
+                    return True, "uv", uv_vers
+
+                return True, uv_bin, uv_vers
+
+    # Fall back to PATH.
+    uv_vers = uv_version(uv_name or "uv")
+    return (
+        uv_on_path is not None and uv_vers > version.Version("0"),
+        uv_name or "uv",
+        uv_vers,
+    )
+
+
+@functools.cache
+def _get_python_discovery_cache() -> DiskCache | None:
+    """Return a python-discovery disk cache, or ``None`` if it can't be created.
+
+    Stored under the user cache directory (``~/Library/Caches/nox`` on macOS,
+    ``%LOCALAPPDATA%\\nox`` on Windows, ``$XDG_CACHE_HOME``/``~/.cache/nox`` on
+    Linux). python-discovery validates interpreter mtime + hash before reusing
+    an entry, so stale data is not a concern. Degrades to no cache on a
+    read-only home.
+    """
+    import platformdirs  # noqa: PLC0415
+    from python_discovery import DiskCache  # noqa: PLC0415
+
+    try:
+        root = Path(platformdirs.user_cache_dir("nox")) / "python-discovery"
+        return DiskCache(root=root)
+    except OSError:
+        return None
+
+
+def _discover_interpreter(spec: str) -> PythonInfo | None:
+    """Locate an interpreter matching *spec* using python-discovery.
+
+    Accepts any python-discovery spec: a concrete version (``3.12``), a name
+    (``python3.12``, ``pypy3.11``), a free-threaded build (``3.13t``), a PEP 440
+    version range (``>=3.14``), or an absolute path. python-discovery searches
+    ``PATH``, version managers (pyenv/mise/asdf/uv), and the Windows registry
+    (PEP 514). Returns ``None`` when nothing matches.
+
+    This is the single seam tests mock to avoid probing the real system.
+    """
+    from python_discovery import get_interpreter  # noqa: PLC0415
+
+    spec, free_threaded = _split_free_threaded(spec)
+    kwargs: dict[str, Any] = {}
+    if free_threaded:
+        kwargs["predicate"] = lambda info: info.free_threaded
+
+    cache = _get_python_discovery_cache()
+    if cache is None:
+        return get_interpreter(spec, **kwargs)
+    try:
+        return get_interpreter(spec, cache=cache, **kwargs)
+    except OSError:
+        # The cache dir exists but isn't writable (e.g. a read-only home):
+        # DiskCache touches the filesystem only lazily, so the failure surfaces
+        # here. Degrade to uncached discovery instead of aborting resolution.
+        logger.debug("python-discovery cache is not writable; discovering without it.")
+        return get_interpreter(spec, **kwargs)
+
+
+_RANGE_SPEC = re.compile(r"^[A-Za-z]*\s*[<>=!~]")
+_RANGE_FREE_THREADED = re.compile(r"(?<=\d)t(?=\s*(?:,|$))")
+
+
+def _split_free_threaded(spec: str) -> tuple[str, bool]:
+    """Strip the free-threaded ``t`` suffix from a range spec.
+
+    python-discovery reads a range like ``>=3.13t`` as a path, so the suffix is
+    removed (``>=3.13``) and returned as a flag for the caller to apply.
+    """
+    if not _RANGE_SPEC.match(spec):
+        return spec, False
+    stripped, count = _RANGE_FREE_THREADED.subn("", spec)
+    return stripped, count > 0
+
+
+@functools.cache
+def _find_python(interpreter: str) -> str | None:
+    """Return the path to an interpreter matching *interpreter*, or ``None``.
+
+    Cached because discovery is pure (read-only) and would otherwise repeat for
+    every session using the same spec.
+    """
+    try:
+        info = _discover_interpreter(interpreter)
+    except ValueError:
+        # python-discovery after 1.6.7 raises on a range it can't parse (``<3.12.``).
+        return None
+    return info.executable if info is not None else None
+
+
+def _highest_under_upper_bound(
+    operator: str, version_str: str
+) -> tuple[int, int] | None:
+    """Return the highest ``(major, minor)`` fully below a ``<``/``<=`` clause.
+
+    Installers resolve ``X.Y`` to its latest patch release, so the pick must
+    allow *every* ``X.Y`` patch; that is always the minor below the bound's:
+    ``<3.12`` -> ``3.11``, ``<=3.12`` -> ``3.11``, ``<3.12.4`` -> ``3.11``
+    (``3.12`` would install a patch that may exceed ``3.12.4``). Returns
+    ``None`` for other operators or when no minor version can be picked
+    (``<4``, ``<3.0``).
+    """
+    if operator not in {"<", "<="}:
+        return None
+    try:
+        release = version.Version(version_str).release
+    except version.InvalidVersion:  # pragma: no cover (python-discovery<1.6.6)
+        return None
+    if len(release) < 2:
+        return None
+    major, minor = release[0], release[1] - 1
+    if minor < 0:
+        return None
+    return major, minor
+
+
+def _concrete_install_target(interpreter: str) -> str | None:
+    """Return a concrete version to hand to an installer, or ``None``.
+
+    Non-range specs (names, concrete versions, paths) are returned unchanged.
+    For a PEP 440 range (``>=3.14``) the floor of the first lower-bound clause
+    is returned (``3.14``) so a concrete interpreter can be downloaded. Without
+    a lower bound, the highest version under the tightest upper bound that the
+    other clauses allow is used instead (``<3.12`` -> ``3.11``,
+    ``<3.14,!=3.13.*`` -> ``3.12``). A non-CPython implementation prefix is
+    preserved (``pypy>=3.10`` -> ``pypy3.10``) so the right flavor is installed,
+    and so is a free-threaded ``t`` suffix (``>=3.13t`` -> ``3.13t``). Ranges
+    with no usable bound (``!=3.12``, ``<4``, ``<3.12.``) return ``None``.
+    """
+    from python_discovery import PythonSpec  # noqa: PLC0415
+
+    stripped, free_threaded = _split_free_threaded(interpreter)
+    try:
+        spec = PythonSpec.from_string_spec(stripped)
+    except ValueError:
+        # python-discovery after 1.6.7 raises on a range it can't parse (``<3.12.``).
+        return None
+    if spec.version_specifier is None:
+        # 1.6.6 and 1.6.7 read a range they can't parse as a path instead.
+        return None if _RANGE_SPEC.match(interpreter) else interpreter
+    impl = spec.implementation
+    prefix = impl if impl and impl != "cpython" else ""
+    suffix = "t" if free_threaded else ""
+    for specifier in spec.version_specifier.specifiers:
+        if specifier.operator in {">=", "==", "~=", ">"}:
+            return f"{prefix}{specifier.version_str}{suffix}"
+
+    clauses = [(s.operator, s.version_str) for s in spec.version_specifier.specifiers]
+    candidates = [
+        candidate
+        for op, ver in clauses
+        if (candidate := _highest_under_upper_bound(op, ver)) is not None
+    ]
+    if not candidates:
+        return None
+    try:
+        allowed = specifiers.SpecifierSet(",".join(f"{op}{ver}" for op, ver in clauses))
+    except specifiers.InvalidSpecifier:  # pragma: no cover (python-discovery<1.6.6)
+        return None
+    # The tightest upper bound wins, but another clause (an "!=") can exclude
+    # the pick, so step down through the minors until one clears the whole set.
+    major, top_minor = min(candidates)
+    for minor in range(top_minor, -1, -1):
+        if allowed.contains(f"{major}.{minor}"):
+            return f"{prefix}{major}.{minor}{suffix}"
+    return None
+
+
+def uv_version(uv_bin: str) -> version.Version:
+    """Returns uv's version defaulting to 0.0 if uv is not available"""
+    try:
+        ret = subprocess.run(
+            [uv_bin, "self", "version", "--output-format", "json"],
+            check=False,
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+        )
+    except (FileNotFoundError, PermissionError):
+        logger.info("uv binary not found.")
+        return version.Version("0.0")
+
+    if ret.returncode == 2:
+        # uv < 0.7
+        ret = subprocess.run(
+            [uv_bin, "version", "--output-format", "json"],
+            check=False,
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+        )
+
+    if ret.returncode == 0 and ret.stdout:
+        return version.Version(json.loads(ret.stdout).get("version"))
+
+    logger.info("Failed to establish uv's version.")
+    return version.Version("0.0")
+
+
+def uv_install_python(python_version: str) -> bool:
+    """Attempts to install a given python version with uv"""
+    _, uv, _ = _uv_state()
+    # Do not write python3.X shims to ~/.local/bin (uv >= 0.8 default); an
+    # explicit user setting still wins. See #1139.
+    env = {"UV_PYTHON_INSTALL_BIN": "0", **os.environ}
+    ret = subprocess.run(
+        [uv, "python", "install", python_version],
+        check=False,
+        env=env,
+    )
+    return ret.returncode == 0
+
+
+def _find_pbs_python(implementation: str, version: str) -> str | None:
+    """Check for an existing pbs-installer installation
+    by default it creates dirs with this format:
+    "pypy@3.8.16", "cpython@3.13.3" """
+    executable = "python.exe" if _PLATFORM.startswith("win") else "bin/python"
+
+    if NOX_PBS_PYTHONS.exists():
+        for path in NOX_PBS_PYTHONS.iterdir():
+            if path.is_dir() and (
+                path.name == f"{implementation}@{version}"
+                or path.name.startswith(f"{implementation}@{version}.")
+            ):
+                python_exe = path / executable
+                if python_exe.exists():
+                    return str(python_exe)
+    return None
+
+
+def pbs_install_python(python_version: str) -> str | None:
+    """Attempts to install a given python version with pbs-installer.
+
+    Returns the full path to the installed executable, or None if installation failed.
+    """
+
+    # separate implementation / xyz version
+    match = re.match(
+        r"^(?P<impl>pypy|cpython|python)?[-_\.]?(?P<xyz_ver>\d(\.\d+)?(\.\d+))?$",
+        python_version,
+        re.IGNORECASE,
+    )
+
+    if not match or match["xyz_ver"] is None:
+        logger.warning(f"{python_version=} is not a valid version to install with pbs")
+        return None
+
+    # A bare version with no implementation prefix means CPython.
+    impl = match["impl"] or "cpython"
+    implementation: Literal["cpython", "pypy"] = (
+        "pypy" if impl.lower() == "pypy" else "cpython"
+    )
+    xyz_ver: str = match["xyz_ver"]
+
+    if python_exe := _find_pbs_python(implementation, xyz_ver):
+        return python_exe
+
+    # Requires the [pbs] extra to make it past here
+    try:
+        import pbs_installer  # noqa: PLC0415
+    except ModuleNotFoundError:  # pragma: nocover
+        logger.warning(
+            "Nox was installed without the `[pbs]` extra, can't download Python"
+        )
+        return None
+
+    try:
+        pbs_installer.install(
+            xyz_ver,
+            destination=NOX_PBS_PYTHONS,
+            version_dir=True,
+            implementation=implementation,
+        )
+    except Exception as err:  # noqa: BLE001
+        logger.warning(f"Failed to install a pbs version for {python_version=}: {err}")
+        return None
+
+    return _find_pbs_python(implementation, xyz_ver)
+
+
+def _uv_state() -> tuple[bool, str, version.Version]:
+    """Read ``(HAS_UV, UV, UV_VERSION)``, respecting monkeypatched values."""
+    mod = sys.modules[__name__]
+    has_uv: bool = mod.HAS_UV
+    uv: str = mod.UV
+    uv_ver: version.Version = mod.UV_VERSION
+    return has_uv, uv, uv_ver
+
+
+def uvx_path(uv: str) -> str:
+    """Return the uvx path next to ``uv``, keeping a ``.exe`` suffix last."""
+    if uv[-4:].lower() == ".exe":
+        return f"{uv[:-4]}x{uv[-4:]}"
+    return f"{uv}x"
+
+
+def _optional_venvs() -> dict[str, bool]:
+    """Read ``OPTIONAL_VENVS``, respecting monkeypatched values."""
+    optional_venvs: dict[str, bool] = sys.modules[__name__].OPTIONAL_VENVS
+    return optional_venvs
+
+
+def __getattr__(name: str) -> Any:
+    """Compute uv detection lazily; importing this module must not run uv."""
+    if name in {"HAS_UV", "UV", "UV_VERSION"}:
+        has_uv, uv, uv_ver = find_uv()
+        return {"HAS_UV": has_uv, "UV": uv, "UV_VERSION": uv_ver}[name]
+    if name == "OPTIONAL_VENVS":
+        # Any environment in this dict could be missing, and is only available
+        # if the value is True. If an environment is always available, it
+        # should not be in this dict. "virtualenv" is not considered optional
+        # since it's a dependency of nox.
+        return {
+            "conda": shutil.which("conda") is not None,
+            "mamba": shutil.which("mamba") is not None,
+            "micromamba": shutil.which("micromamba") is not None,
+            "rattler": _rattler.is_available(),
+            "uv": _uv_state()[0],
+        }
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)
+
+
+def _ensure_gitignore(envdir: Path) -> None:
+    """Ensure the shared environment directory has a broad gitignore."""
+    envdir.mkdir(parents=True, exist_ok=True)
+
+    gitignore = envdir.joinpath(".gitignore")
+    if gitignore.exists():
+        return
+
+    try:
+        gitignore.write_text("*\n", encoding="utf-8")
+    except OSError:  # pragma: no cover
+        logger.debug(f"Failed to write {gitignore!s}")
+
+
+def _ensure_cachedir_tag(envdir: Path) -> None:
+    """Ensure the shared environment directory has a CACHEDIR.TAG"""
+    envdir.mkdir(parents=True, exist_ok=True)
+
+    cachedir_tag = envdir.joinpath("CACHEDIR.TAG")
+    if cachedir_tag.exists():
+        return
+
+    try:
+        cachedir_tag.write_text(
+            "Signature: 8a477f597d28d172789f06886806bc55\n", encoding="utf-8"
+        )
+    except OSError:  # pragma: no cover
+        logger.debug(f"Failed to write {cachedir_tag!s}")
+
+
+class InterpreterNotFound(OSError):
+    def __init__(self, interpreter: str) -> None:
+        super().__init__(f"Python interpreter {interpreter} not found")
+        self.interpreter = interpreter
+
+
+class ProcessEnv(abc.ABC):
+    """An environment with a 'bin' directory and a set of 'env' vars."""
+
+    location: str
+
+    # Does this environment provide any process isolation?
+    is_sandboxed = False
+
+    @property
+    def allowed_globals(self) -> tuple[str, ...]:
+        """Special programs that aren't included in the environment."""
+        return ()
+
+    def __init__(
+        self,
+        bin_paths: Sequence[str] | None = None,
+        env: Mapping[str, str | None] | None = None,
+    ) -> None:
+        self._bin_paths = None if bin_paths is None else list(bin_paths)
+        self._reused = False
+
+        # .command's env supports None, meaning don't include value even if in parent
+        self.env = {**dict.fromkeys(_BLACKLISTED_ENV_VARS), **(env or {})}
+
+    @property
+    def bin_paths(self) -> list[str] | None:
+        return self._bin_paths
+
+    @property
+    def bin(self) -> str:
+        """The first bin directory for the virtualenv."""
+        paths = self.bin_paths
+        if paths is None:
+            msg = "The environment does not have a bin directory."
+            raise ValueError(msg)
+        return paths[0]
+
+    @abc.abstractmethod
+    def create(self) -> bool:
+        """Create a new environment.
+
+        Returns True if the environment is new, and False if it was reused.
+        """
+
+    @property
+    @abc.abstractmethod
+    def venv_backend(self) -> str:
+        """
+        Returns the string used to select this environment.
+        """
+
+    def _get_env(
+        self,
+        /,
+        env: Mapping[str, str | None],
+        *,
+        include_outer_env: bool = True,
+    ) -> dict[str, str | None]:
+        """
+        Get the computed environment, with bin paths added.  You can request
+        the outer environment be excluded. The initial env can be empty.
+        """
+
+        computed_env = {**self.env, **env}
+        if include_outer_env:
+            computed_env = {**os.environ, **computed_env}
+        if self.bin_paths:
+            path_parts = [*self.bin_paths]
+            prior_path = computed_env.get("PATH")
+            if prior_path:
+                path_parts.append(prior_path)
+            computed_env["PATH"] = os.pathsep.join(path_parts)
+        return computed_env
+
+
+class PassthroughEnv(ProcessEnv):
+    """Represents the environment used to run Nox itself
+
+    For now, this class is empty but it might contain tools to grasp some
+    hints about the actual env.
+    """
+
+    conda_cmd = "conda"
+
+    @staticmethod
+    def is_offline() -> bool:
+        """As of now this is only used in conda_install"""
+        return CondaEnv.is_offline()  # pragma: no cover
+
+    def create(self) -> bool:
+        """Does nothing, since this is an existing environment. Always returns
+        False since it's always reused."""
+        return False
+
+    @property
+    def venv_backend(self) -> str:
+        return "none"
+
+
+class CondaEnv(ProcessEnv):
+    """Conda environment management class.
+
+    Args:
+        location (str): The location on the filesystem where the conda environment
+            should be created.
+        interpreter (Optional[str]): The desired Python version. Of the form
+
+            * ``X.Y``, e.g. ``3.5``
+            * ``X.Y-32``. For example, a usage of the Windows Launcher might
+              be ``py -3.6-32``
+            * ``X.Y.Z``, e.g. ``3.4.9``
+            * ``pythonX.Y``, e.g. ``python2.7``
+            * A path in the filesystem to a Python executable
+            * A PEP 440 range, e.g. ``>=3.10``, passed to conda as a
+              version spec
+
+            If not specified, this will use the currently running Python.
+        reuse_existing (Optional[bool]): Flag indicating if the conda environment
+            should be reused if it already exists at ``location``.
+        conda_cmd (str): The name of the command, can be "conda" (default) or "mamba".
+    """
+
+    is_sandboxed = True
+
+    @property
+    def allowed_globals(self) -> tuple[str, ...]:
+        """Conda-family launchers are allowed, even if not in the environment."""
+        return ("conda", "mamba", "micromamba")
+
+    def __init__(
+        self,
+        location: str,
+        interpreter: str | None = None,
+        *,
+        reuse_existing: bool = False,
+        venv_params: Sequence[str] = (),
+        conda_cmd: str = "conda",
+        **kwargs: Any,
+    ) -> None:
+        self.location_name = location
+        self.location = os.path.abspath(location)
+        self.interpreter = interpreter
+        self.reuse_existing = reuse_existing
+        self.venv_params = list(venv_params)
+        self.conda_cmd = conda_cmd
+        super().__init__(env={"CONDA_PREFIX": self.location, "VIRTUAL_ENV": None})
+
+    def _clean_location(self) -> bool:
+        """Deletes existing conda environment"""
+        is_conda = os.path.isdir(os.path.join(self.location, "conda-meta"))
+        if os.path.exists(self.location):
+            if self.reuse_existing and is_conda:
+                return False
+            if is_conda:
+                self._remove_env()
+            # Make sure that location is clean
+            shutil.rmtree(self.location, ignore_errors=True)
+
+        return True
+
+    def _remove_env(self) -> None:
+        cmd = [self.conda_cmd, "remove", "--yes", "--prefix", self.location, "--all"]
+        nox.command.run(cmd, silent=True, log=False)
+
+    @property
+    def bin_paths(self) -> list[str]:
+        """Returns the location of the conda env's bin folder."""
+        # see https://github.com/conda/conda/blob/f60f0f1643af04ed9a51da3dd4fa242de81e32f4/conda/activate.py#L563-L572
+        if _PLATFORM.startswith("win"):
+            return [
+                self.location,
+                os.path.join(self.location, "Library", "mingw-w64", "bin"),
+                os.path.join(self.location, "Library", "usr", "bin"),
+                os.path.join(self.location, "Library", "bin"),
+                os.path.join(self.location, "Scripts"),
+                os.path.join(self.location, "bin"),
+            ]
+
+        return [os.path.join(self.location, "bin")]
+
+    def create(self) -> bool:
+        """Create the conda env."""
+        nox_dir = Path(self.location).parent
+        _ensure_gitignore(nox_dir)
+        _ensure_cachedir_tag(nox_dir)
+
+        if not self._clean_location():
+            logger.debug(f"Reusing existing conda env at {self.location_name}.")
+
+            self._reused = True
+
+            return False
+
+        python_dep = self._python_spec()
+        logger.info(
+            f"Creating {self.venv_backend} env in {self.location_name} with {python_dep}"
+        )
+        self._create_env(python_dep)
+        return True
+
+    def _create_env(self, python_dep: str) -> None:
+        cmd = [self.conda_cmd, "create", "--yes", "--prefix", self.location]
+        if self.conda_cmd == "micromamba" and not any(
+            v.startswith(("--channel=", "-c")) or v == "--channel"
+            for v in self.venv_params
+        ):
+            # Micromamba doesn't have any default channels
+            cmd.append("--channel=conda-forge")
+
+        cmd.extend(self.venv_params)
+
+        # Ensure the pip package is installed.
+        cmd.extend(["pip", python_dep])
+        nox.command.run(cmd, silent=True, log=nox.options.verbose or False)
+
+    def _python_spec(self) -> str:
+        """Conda spec for the requested interpreter.
+
+        Conda understands PEP 440 range operators (e.g. ">=3.10,<4") directly;
+        only a bare version needs "=".
+        """
+        if not self.interpreter:
+            return "python"
+        spec = self.interpreter.replace(" ", "")
+        prefix = "" if spec[0] in "<>!~=" else "="
+        return f"python{prefix}{spec}"
+
+    @staticmethod
+    def is_offline() -> bool:
+        """Return `True` if we are sure that the user is not able to connect to https://repo.anaconda.com.
+
+        Since an HTTP proxy might be correctly configured for `conda` using the `.condarc` `proxy_servers` section,
+        while not being correctly configured in the OS environment variables used by all other tools including python
+        `urllib` or `requests`, we are basically not able to do much more than testing the DNS resolution.
+
+        See details in this explanation: https://stackoverflow.com/a/62486343/7262247
+        """
+        try:
+            # DNS resolution to detect situation (1) or (2).
+            gethostbyname("repo.anaconda.com")
+        except OSError:  # pragma: no cover
+            return True
+        return False
+
+    @property
+    def venv_backend(self) -> str:
+        return self.conda_cmd
+
+
+def _parse_conda_args(args: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Split conda-style args into channels and specs, expanding ``--file``.
+
+    Only ``-c``/``--channel`` and ``--file`` are accepted; any other option
+    raises ``ValueError``.
+    """
+    channels: list[str] = []
+    specs: list[str] = []
+    params = iter(args)
+    for param in params:
+        opt, _, value = param.partition("=")
+        if opt in {"-c", "--channel", "--file"} and not value:
+            value = next(params)
+        if opt in {"-c", "--channel"}:
+            channels.append(value)
+        elif opt == "--file":
+            specs.extend(_rattler.read_spec_file(value))
+        elif param.startswith("-"):
+            msg = f"The rattler backend does not support the {param!r} option."
+            raise ValueError(msg)
+        else:
+            specs.append(param)
+    return channels, specs
+
+
+class RattlerEnv(CondaEnv):
+    """Conda environment created in-process with py-rattler.
+
+    Needs the ``[rattler]`` extra. Only ``--channel``/``-c`` and package specs
+    are accepted in ``venv_params``; the channels default to ``conda-forge``.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        channels, self._extra_specs = _parse_conda_args(self.venv_params)
+        self.channels = channels or ["conda-forge"]
+
+    @property
+    def allowed_globals(self) -> tuple[str, ...]:
+        return ()
+
+    @property
+    def venv_backend(self) -> str:
+        return "rattler"
+
+    def _remove_env(self) -> None:
+        """Nothing to do: the caller removes the prefix."""
+
+    def _create_env(self, python_dep: str) -> None:
+        self.install("pip", python_dep, *self._extra_specs)
+
+    def install(
+        self, *args: str, channel: Sequence[str] = (), offline: bool = False
+    ) -> None:
+        """Install conda specs into the environment.
+
+        Accepts specs, ``--channel`` and ``--file <path>`` like ``conda
+        install``. Channels given here take priority over the environment's.
+        """
+        arg_channels, specs = _parse_conda_args(args)
+        channels = list(dict.fromkeys([*channel, *arg_channels, *self.channels]))
+        _rattler.sync(self.location, specs, channels, offline=offline)
+
+
+class VirtualEnv(ProcessEnv):
+    """Virtualenv management class.
+
+    Args:
+        location (str): The location on the filesystem where the virtual environment
+            should be created.
+        interpreter (Optional[str]): The desired Python version. Of the form
+
+            * ``X.Y``, e.g. ``3.5``
+            * ``X.Y-32``. For example, a usage of the Windows Launcher might
+              be ``py -3.6-32``
+            * ``X.Y.Z``, e.g. ``3.4.9``
+            * ``pythonX.Y``, e.g. ``python2.7``
+            * ``pypyX.Y``, e.g. ``pypy3.10`` (also ``pypy-3.10`` allowed)
+            * A path in the filesystem to a Python executable
+
+            If not specified, this will use the currently running Python.
+        reuse_existing (Optional[bool]): Flag indicating if the virtual environment
+            should be reused if it already exists at ``location``.
+    """
+
+    is_sandboxed = True
+
+    @property
+    def allowed_globals(self) -> tuple[str, ...]:
+        """uv/uvx are allowed, even if not in the environment."""
+        _, uv, _ = _uv_state()
+        return (uv, uvx_path(uv))
+
+    def __init__(
+        self,
+        location: str,
+        interpreter: str | None = None,
+        *,
+        download_python: Literal["auto", "never", "always"] = "auto",
+        reuse_existing: bool = False,
+        venv_backend: str = "virtualenv",
+        venv_params: Sequence[str] = (),
+    ) -> None:
+        # "pypy-" -> "pypy"
+        if interpreter and interpreter.startswith("pypy-"):
+            interpreter = interpreter[:4] + interpreter[5:]
+
+        self.location_name = location
+        self.location = os.path.abspath(location)
+        self.interpreter = interpreter
+        self._resolved: str | InterpreterNotFound | None = None
+        self.reuse_existing = reuse_existing
+        self._venv_backend = venv_backend
+        self.venv_params = list(venv_params)
+        self.download_python = download_python
+        if venv_backend not in {"virtualenv", "venv", "uv"}:
+            msg = f"venv_backend {venv_backend!r} not recognized"
+            raise ValueError(msg)
+        env = {"VIRTUAL_ENV": self.location, "CONDA_PREFIX": None}
+        if self._venv_backend == "uv":
+            env["UV_PROJECT_ENVIRONMENT"] = self.location
+            env["UV_PYTHON"] = self.location
+        super().__init__(env=env)
+
+    def _clean_location(self) -> bool:
+        """Deletes any existing virtual environment"""
+        if os.path.exists(self.location):
+            if (
+                self.reuse_existing
+                and self._check_reused_environment_type()
+                and self._check_reused_environment_links()
+                and self._check_reused_environment_interpreter()
+            ):
+                return False
+            # uv clears it for us, and it balks at files left around
+            if self.venv_backend != "uv":
+                shutil.rmtree(self.location, ignore_errors=True)
+        return True
+
+    def _check_reused_environment_links(self) -> bool:
+        """Check that interpreter links in the reused environment are not broken."""
+        bin_dir = self.bin
+        names = (
+            ["python.exe"]
+            if _PLATFORM.startswith("win") and not _IS_MINGW
+            else ["python", "python3"]
+        )
+
+        for name in names:
+            path = os.path.join(bin_dir, name)
+            # ``lexists`` catches broken symlinks, ``exists`` verifies the target.
+            if os.path.lexists(path) and not os.path.exists(path):
+                return False
+
+        return True
+
+    def _read_pyvenv_cfg(self) -> dict[str, str] | None:
+        """Read a pyvenv.cfg file into dict, returns None if missing."""
+        path = os.path.join(self.location, "pyvenv.cfg")
+        with contextlib.suppress(FileNotFoundError), open(path, encoding="utf-8") as fp:
+            parts = (x.partition("=") for x in fp if "=" in x)
+            return {k.strip(): v.strip() for k, _, v in parts}
+        return None
+
+    def _check_reused_environment_type(self) -> bool:
+        """Check if reused environment type is the same or equivalent."""
+
+        config = self._read_pyvenv_cfg()
+        # virtualenv < 20.0 does not create pyvenv.cfg
+        if config is None:
+            old_env = "virtualenv"
+        elif "uv" in config or "gourgeist" in config:
+            old_env = "uv"
+        elif "virtualenv" in config:
+            old_env = "virtualenv"
+        else:
+            old_env = "venv"
+
+        # Can't detect mamba separately, but shouldn't matter
+        if os.path.isdir(os.path.join(self.location, "conda-meta")):
+            return False
+
+        # Matching is always true
+        if old_env == self.venv_backend:
+            return True
+
+        # venv family with pip installed
+        if {old_env, self.venv_backend} <= {"virtualenv", "venv"}:
+            return True
+
+        # Switching to "uv" is safe, but not the other direction (no pip)
+        if old_env in {"virtualenv", "venv"} and self.venv_backend == "uv":  # noqa: SIM103
+            return True
+
+        return False
+
+    def _check_reused_environment_interpreter(self) -> bool:
+        """
+        Check if reused environment interpreter is the same. Currently only checks if
+        NOX_ENABLE_STALENESS_CHECK is set in the environment. See
+
+        * https://github.com/wntrblm/nox/issues/449#issuecomment-860030890
+        * https://github.com/wntrblm/nox/issues/441
+        * https://github.com/pypa/virtualenv/issues/2130
+        """
+        if not os.environ.get("NOX_ENABLE_STALENESS_CHECK", ""):
+            return True
+
+        config = self._read_pyvenv_cfg() or {}
+        original = config.get("base-prefix", None)
+
+        program = (
+            "import sys; sys.stdout.write(getattr(sys, 'real_prefix', sys.base_prefix))"
+        )
+
+        if original is None:
+            output = nox.command.run(
+                [self._resolved_interpreter, "-c", program], silent=True, log=False
+            )
+            assert isinstance(output, str)
+            original = output
+
+        created = nox.command.run(
+            ["python", "-c", program], silent=True, log=False, paths=self.bin_paths
+        )
+
+        return (
+            os.path.exists(original)
+            and os.path.exists(created)
+            and os.path.samefile(original, created)
+        )
+
+    @property
+    def _resolved_interpreter(self) -> str:
+        """Return the interpreter, appropriately resolved for the platform.
+
+        Based heavily on tox's implementation (tox/interpreters.py).
+        """
+        # If there is no assigned interpreter, then use the same one used by
+        # Nox.
+        if isinstance(self._resolved, Exception):
+            raise self._resolved
+
+        if self._resolved is not None:
+            return self._resolved
+
+        if self.interpreter is None:
+            self._resolved = sys.executable
+            return self._resolved
+
+        # python-discovery accepts every spec form directly: "3", "3.12",
+        # "3.12.1", "3.13t", "python3.12", "pypy3.11", "3.6-32", PEP 440 ranges
+        # like ">=3.14", and absolute paths.
+        match self.download_python:
+            # never -> check for interpreters
+            case "never":
+                if resolved := _find_python(self.interpreter):
+                    self._resolved = resolved
+                    return self._resolved
+
+            # always -> skip check, always install
+            case "always":
+                if resolved := self._install_python(self.interpreter):
+                    self._resolved = resolved
+                    return self._resolved
+
+            case _:
+                # auto -> check interpreters -> fallback to installing
+                if resolved := _find_python(self.interpreter) or self._install_python(
+                    self.interpreter
+                ):
+                    self._resolved = resolved
+                    return self._resolved
+
+        self._resolved = InterpreterNotFound(self.interpreter)
+        raise self._resolved
+
+    def _install_python(self, interpreter: str) -> str | None:
+        """Install the requested interpreter for this backend, if possible.
+
+        For a version range a concrete version is installed (e.g. ``>=3.14`` ->
+        ``3.14``, ``<3.12`` -> ``3.11``); ranges with no usable bound return
+        ``None``. Returns the resolved interpreter on success, or ``None`` on
+        failure.
+        """
+        target = _concrete_install_target(interpreter)
+        if target is None:
+            return None
+
+        # Installers want the "pythonX.Y[t]" form for bare versions; names,
+        # pypy, and paths are passed through unchanged.
+        match = re.match(r"^(?P<xy_ver>\d(\.\d+)?)(\.\d+)?(?P<t>t?)$", target)
+        cleaned_interpreter = (
+            f"python{match.group('xy_ver')}{match.group('t')}" if match else target
+        )
+
+        if self.venv_backend == "uv":
+            has_uv, _, uv_ver = _uv_state()
+            if (
+                has_uv
+                and version.Version("0.4.16") <= uv_ver
+                and uv_install_python(cleaned_interpreter)
+            ):
+                return cleaned_interpreter
+            return None
+        return pbs_install_python(cleaned_interpreter)
+
+    @property
+    def bin_paths(self) -> list[str]:
+        """Returns the location of the virtualenv's bin folder."""
+        if _PLATFORM.startswith("win") and not _IS_MINGW:
+            return [os.path.join(self.location, "Scripts")]
+        return [os.path.join(self.location, "bin")]
+
+    def create(self) -> bool:
+        """Create the virtualenv or venv."""
+        nox_dir = Path(self.location).parent
+        _ensure_gitignore(nox_dir)
+        _ensure_cachedir_tag(nox_dir)
+
+        if not self._clean_location():
+            logger.debug(
+                f"Reusing existing virtual environment at {self.location_name}."
+            )
+
+            self._reused = True
+
+            return False
+
+        match self.venv_backend:
+            case "virtualenv":
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "virtualenv",
+                    self.location,
+                    "--no-periodic-update",
+                ]
+                if self.interpreter:
+                    cmd.extend(["-p", self._resolved_interpreter])
+            case "uv":
+                _, uv, uv_ver = _uv_state()
+                cmd = [
+                    uv,
+                    "venv",
+                    "-p",
+                    self._resolved_interpreter if self.interpreter else sys.executable,
+                    self.location,
+                ]
+                if version.Version("0.8") <= uv_ver:
+                    cmd += ["--clear"]
+            case _:
+                cmd = [self._resolved_interpreter, "-m", "venv", self.location]
+        cmd.extend(self.venv_params)
+
+        resolved_interpreter_name = os.path.basename(self._resolved_interpreter)
+
+        logger.info(
+            f"Creating virtual environment ({self.venv_backend}) using"
+            f" {resolved_interpreter_name} in {self.location_name}"
+        )
+        nox.command.run(cmd, silent=True, log=nox.options.verbose or False)
+
+        return True
+
+    @property
+    def venv_backend(self) -> str:
+        return self._venv_backend
+
+
+ALL_VENVS: dict[str, Callable[..., ProcessEnv]] = {
+    "conda": functools.partial(CondaEnv, conda_cmd="conda"),
+    "mamba": functools.partial(CondaEnv, conda_cmd="mamba"),
+    "micromamba": functools.partial(CondaEnv, conda_cmd="micromamba"),
+    "rattler": RattlerEnv,
+    "virtualenv": functools.partial(VirtualEnv, venv_backend="virtualenv"),
+    "venv": functools.partial(VirtualEnv, venv_backend="venv"),
+    "uv": functools.partial(VirtualEnv, venv_backend="uv"),
+    "none": PassthroughEnv,
+}
+
+
+def get_virtualenv(
+    *backends: str,
+    download_python: Literal["auto", "never", "always"],
+    envdir: str,
+    reuse_existing: bool,
+    interpreter: Python = None,
+    venv_params: Sequence[str] = (),
+) -> ProcessEnv:
+    # Support fallback backends
+    for bk in backends:
+        if bk not in ALL_VENVS:
+            msg = f"Expected venv_backend one of {sorted(ALL_VENVS)!r}, but got {bk!r}."
+            raise ValueError(msg)
+
+    optional_venvs = _optional_venvs()
+
+    for bk in backends[:-1]:
+        if bk not in optional_venvs:
+            msg = f"Only optional backends ({sorted(optional_venvs)!r}) may have a fallback, {bk!r} is not optional."
+            raise ValueError(msg)
+
+    for bk in backends:
+        if optional_venvs.get(bk, True):
+            backend = bk
+            break
+    else:
+        msg = f"No backends present, looked for {backends!r}."
+        raise ValueError(msg)
+
+    if backend == "none" or interpreter is False:
+        return ALL_VENVS["none"]()
+
+    return ALL_VENVS[backend](
+        envdir,
+        download_python=download_python,
+        interpreter=interpreter,
+        reuse_existing=reuse_existing,
+        venv_params=venv_params,
+    )

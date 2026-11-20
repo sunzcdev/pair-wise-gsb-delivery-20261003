@@ -1,0 +1,81 @@
+name: Setup Nox
+description: "Prepares all python versions for nox"
+inputs:
+  python-versions:
+    description: "comma-separated list of python versions to install"
+    required: false
+    default: "3.11, 3.12, 3.13, 3.14, 3.15"
+branding:
+  icon: package
+  color: blue
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      id: localpython
+      with:
+        python-version: "3.10 - 3.15"
+        update-environment: false
+
+    - name: "Validate input"
+      id: helper
+      run: >
+        "${STEPS_LOCALPYTHON_OUTPUTS_PYTHON_PATH}" "${{ github.action_path }}/.github/action_helper.py" "${INPUTS_PYTHON_VERSIONS}" >> "${GITHUB_OUTPUT}"
+      shell: bash
+      env:
+        STEPS_LOCALPYTHON_OUTPUTS_PYTHON_PATH: ${{ steps.localpython.outputs.python-path }}
+        INPUTS_PYTHON_VERSIONS: ${{ inputs.python-versions }}
+
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      id: allpython
+      with:
+        python-version: "${{ join(fromJSON(steps.helper.outputs.interpreters), '\n') }}"
+        allow-prereleases: true
+
+    - name: "Install nox"
+      run: |
+        import os
+        import shutil
+        import sys
+        import venv
+
+        from pathlib import Path
+        from subprocess import run
+
+
+        class EnvBuilder(venv.EnvBuilder):
+            def __init__(self):
+                super().__init__()
+
+            def setup_scripts(self, context):
+                pass
+
+            def post_setup(self, context):
+                super().post_setup(context)
+                self.bin_path = Path(context.env_exe).parent
+                if shutil.which("uv") is None:
+                    run([sys.executable, "-m", "pip", "--python", context.env_exe, "install", r"${{ github.action_path }}"], check=True)
+                else:
+                    run(["uv", "pip", "install", "--python", context.env_exe, r"${{ github.action_path }}"], check=True)
+
+
+        print("::group::Install nox")
+        nox_bin_path = Path(r"${{ runner.temp }}") / "nox"
+        if nox_bin_path.exists():
+            shutil.rmtree(nox_bin_path)
+        venv_path = Path(r"${{ runner.temp }}") / "nox-venv"
+        if venv_path.exists():
+            shutil.rmtree(venv_path)
+        builder = EnvBuilder()
+        builder.create(venv_path)
+        nox_path = [path for path in builder.bin_path.glob("nox*") if path.stem == "nox"][0]
+        nox_bin_path.mkdir()
+        try:
+            os.symlink(nox_path, nox_bin_path / nox_path.name)
+        except OSError:
+            shutil.copyfile(nox_path, nox_bin_path / nox_path.name)
+        with open(os.environ["GITHUB_PATH"], "at") as f:
+            f.write(f"{nox_bin_path}\n")
+        print("::endgroup::")
+      shell: "${{ steps.allpython.outputs.python-path }} -u {0}"

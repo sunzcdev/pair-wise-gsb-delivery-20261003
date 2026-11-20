@@ -1,0 +1,246 @@
+import re
+
+import pytest
+
+from nox.project import dependency_groups, python_versions
+
+
+def test_classifiers() -> None:
+    pyproject = {
+        "project": {
+            "classifiers": [
+                "Programming Language :: Python :: 3.10",
+                "Programming Language :: Python :: 3.11",
+                "Programming Language :: Python :: 3.12",
+                "Programming Language :: Python",
+                "Programming Language :: Python :: 3 :: Only",
+                "Topic :: Software Development :: Testing",
+            ],
+            "requires-python": ">=3.10",
+        }
+    }
+
+    assert python_versions(pyproject) == ["3.10", "3.11", "3.12"]
+
+
+def test_classifiers_are_sorted_by_default() -> None:
+    pyproject = {
+        "project": {
+            "classifiers": [
+                "Programming Language :: Python :: 3.12",
+                "Programming Language :: Python :: 3.10",
+                "Programming Language :: Python :: 3.11",
+            ],
+        }
+    }
+
+    assert python_versions(pyproject) == ["3.10", "3.11", "3.12"]
+
+
+def test_classifiers_can_preserve_order() -> None:
+    pyproject = {
+        "project": {
+            "classifiers": [
+                "Programming Language :: Python :: 3.12",
+                "Programming Language :: Python :: 3.10",
+                "Programming Language :: Python :: 3.11",
+            ],
+        }
+    }
+
+    assert python_versions(pyproject, sort=False) == ["3.12", "3.10", "3.11"]
+
+
+def test_classifiers_free_threaded() -> None:
+    pyproject = {
+        "project": {
+            "classifiers": [
+                "Programming Language :: Python :: 3.15",
+                "Programming Language :: Python :: 3.12",
+                "Programming Language :: Python :: 3.14",
+                "Programming Language :: Python :: 3.13",
+                "Programming Language :: Python :: Free Threading :: 3 - Stable",
+            ],
+        }
+    }
+
+    assert python_versions(pyproject) == [
+        "3.12",
+        "3.13",
+        "3.14",
+        "3.15",
+        "3.14t",
+        "3.15t",
+    ]
+    assert python_versions(pyproject, free_threaded=False) == [
+        "3.12",
+        "3.13",
+        "3.14",
+        "3.15",
+    ]
+
+
+def test_classifiers_free_threaded_unsorted() -> None:
+    pyproject = {
+        "project": {
+            "classifiers": [
+                "Programming Language :: Python :: Free Threading :: 1 - Unstable",
+                "Programming Language :: Python :: 3.15",
+                "Programming Language :: Python :: 3.14",
+            ],
+        }
+    }
+
+    assert python_versions(pyproject, sort=False) == ["3.15", "3.14", "3.15t", "3.14t"]
+
+
+def test_classifiers_free_threaded_explicit() -> None:
+    pyproject = {
+        "project": {
+            "classifiers": [
+                "Programming Language :: Python :: 3.13",
+                "Programming Language :: Python :: 3.14",
+            ],
+        }
+    }
+
+    assert python_versions(pyproject) == ["3.13", "3.14"]
+    assert python_versions(pyproject, free_threaded=True) == ["3.13", "3.14", "3.14t"]
+
+
+def test_python_range_free_threaded() -> None:
+    pyproject = {
+        "project": {
+            "classifiers": ["Programming Language :: Python :: Free Threading"],
+            "requires-python": ">=3.13",
+        }
+    }
+
+    assert python_versions(pyproject, max_version="3.15") == [
+        "3.13",
+        "3.14",
+        "3.15",
+        "3.14t",
+        "3.15t",
+    ]
+    assert python_versions(pyproject, max_version="3.13") == ["3.13"]
+
+
+def test_no_classifiers() -> None:
+    pyproject = {"project": {"requires-python": ">=3.10"}}
+    with pytest.raises(ValueError, match="No Python version classifiers"):
+        python_versions(pyproject)
+
+
+def test_no_requires_python() -> None:
+    pyproject = {"project": {"classifiers": ["Programming Language :: Python :: 3.12"]}}
+    with pytest.raises(
+        ValueError, match=re.escape('No "project.requires-python" value set')
+    ):
+        python_versions(pyproject, max_version="3.13")
+
+
+def test_python_range() -> None:
+    pyproject = {
+        "project": {
+            "classifiers": [
+                "Programming Language :: Python :: 3.10",
+                "Programming Language :: Python :: 3.11",
+                "Programming Language :: Python :: 3.12",
+                "Programming Language :: Python",
+                "Programming Language :: Python :: 3 :: Only",
+                "Topic :: Software Development :: Testing",
+            ],
+            "requires-python": ">=3.10",
+        }
+    }
+
+    assert python_versions(pyproject, max_version="3.12") == ["3.10", "3.11", "3.12"]
+    assert python_versions(pyproject, max_version="3.11") == ["3.10", "3.11"]
+
+
+def test_python_range_gt() -> None:
+    pyproject = {"project": {"requires-python": ">3.2.1,<3.3"}}
+
+    assert python_versions(pyproject, max_version="3.4") == ["3.2", "3.3", "3.4"]
+
+
+def test_python_range_no_min() -> None:
+    pyproject = {"project": {"requires-python": "==3.3.1"}}
+
+    with pytest.raises(ValueError, match="No minimum version found"):
+        python_versions(pyproject, max_version="3.5")
+
+
+def test_python_range_major_only() -> None:
+    # ">=3" is equivalent to ">=3.0" (PEP 440); a major-only version has an
+    # implicit minor version of 0 and must not crash.
+    pyproject = {"project": {"requires-python": ">=3"}}
+
+    assert python_versions(pyproject, max_version="3.2") == ["3.0", "3.1", "3.2"]
+
+
+def test_python_range_major_only_max_version() -> None:
+    # A major-only max_version ("3" == "3.0" per PEP 440) has an implicit minor
+    # version of 0 and must not crash, mirroring the requires-python handling.
+    pyproject = {"project": {"requires-python": ">=3"}}
+
+    assert python_versions(pyproject, max_version="3") == ["3.0"]
+
+
+@pytest.mark.parametrize("requires_python", [">=2.7", ">2.7", "~=2.7", ">=2"])
+def test_python_range_python2_lower_bound(requires_python: str) -> None:
+    # A lower bound below Python 3 allows every 3.x version, so the range
+    # starts at 3.0 (">=2.7" used to give 3.7 because only the minor was read).
+    pyproject = {"project": {"requires-python": requires_python}}
+
+    assert python_versions(pyproject, max_version="3.2") == ["3.0", "3.1", "3.2"]
+
+
+def test_python_range_python2_and_python3_lower_bounds() -> None:
+    # The largest lower bound still wins when one of them is below Python 3.
+    pyproject = {"project": {"requires-python": ">=2.7,>=3.9"}}
+
+    assert python_versions(pyproject, max_version="3.11") == ["3.9", "3.10", "3.11"]
+
+
+def test_python_range_multiple_lower_bounds() -> None:
+    # With several lower-bound specifiers the effective minimum is the largest
+    # one, regardless of the order they appear in.
+    assert python_versions(
+        {"project": {"requires-python": ">=3.8,>=3.10"}}, max_version="3.12"
+    ) == ["3.10", "3.11", "3.12"]
+    assert python_versions(
+        {"project": {"requires-python": ">=3.10,>=3.8"}}, max_version="3.12"
+    ) == ["3.10", "3.11", "3.12"]
+
+
+def test_dependency_groups() -> None:
+    example = {
+        "dependency-groups": {
+            "test": ["pytest", "coverage"],
+            "docs": ["sphinx", "sphinx-rtd-theme"],
+            "typing": ["mypy", "types-requests"],
+            "typing-test": [
+                {"include-group": "typing"},
+                {"include-group": "test"},
+                "useful-types",
+            ],
+        }
+    }
+
+    assert dependency_groups(example, "test") == ("pytest", "coverage")
+    assert dependency_groups(example, "typing-test") == (
+        "mypy",
+        "types-requests",
+        "pytest",
+        "coverage",
+        "useful-types",
+    )
+    assert dependency_groups(example, "typing_test") == (
+        "mypy",
+        "types-requests",
+        "pytest",
+        "coverage",
+        "useful-types",
+    )
