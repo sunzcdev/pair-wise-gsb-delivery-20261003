@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .base import PluginLoader
+from .base import PluginChoices, PluginLoader
 
 if TYPE_CHECKING:
     from virtualenv.config.cli.parser import VirtualEnvConfigParser
@@ -25,14 +25,20 @@ def get_discover(parser: VirtualEnvConfigParser, args: list[str] | None) -> Disc
         title="discovery",
         description="discover and provide a target interpreter",
     )
-    choices = _get_default_discovery(discover_types)
+    usable = _get_default_discovery(discover_types)
     # prefer the builtin if present, otherwise fallback to first defined type
-    choices = sorted(choices, key=lambda name: 0 if name == "builtin" else 1)
+    usable = sorted(usable, key=lambda name: 0 if name == "builtin" else 1)
+    load_errors = Discovery.load_errors_for("virtualenv.discovery")
     try:
-        default_discovery = next(iter(choices))
+        default_discovery = next(iter(usable))
     except StopIteration as error:
+        # a discovery plugin that is installed but failed to load is the reason no interpreter can be found
+        if load_errors:
+            raise RuntimeError("\n".join(str(failure) for failure in load_errors.values())) from error
         msg = "No discovery plugin found. Try reinstalling virtualenv to fix this issue."
         raise RuntimeError(msg) from error
+    # the plugins that failed to load stay selectable, so naming one reports its own error rather than an invalid choice
+    choices = PluginChoices(usable, list(load_errors))
     discovery_parser.add_argument(
         "--discovery",
         choices=choices,
@@ -43,6 +49,9 @@ def get_discover(parser: VirtualEnvConfigParser, args: list[str] | None) -> Disc
     options, _ = parser.parse_known_args(args)
     discovery = options.discovery
     if discovery not in discover_types:
+        if (load_error := load_errors.get(discovery)) is not None:
+            # the plugin is installed but a dependency is missing, which is a different layer than a typo
+            raise RuntimeError(str(load_error)) from load_error.error
         available = ", ".join(sorted(discover_types))
         msg = (
             f"discovery {discovery!r} is not available. "

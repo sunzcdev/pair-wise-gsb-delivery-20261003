@@ -23,6 +23,22 @@ entry points in their own package metadata.
 When a package with virtualenv plugins is installed in the same environment as virtualenv, the plugins become
 immediately available without additional configuration.
 
+**********************
+ Plugins that fail
+**********************
+
+An entry point can be registered while the plugin itself cannot be imported, most often because a dependency of the
+plugin package is not installed. Loading one such plugin must not hide the ones that do load, so virtualenv records the
+failure, logs it as a warning, and keeps going with the remaining plugins:
+
+- ``virtualenv --help`` lists only the plugins that loaded.
+- Automatic selection never picks a plugin that failed to load, and falls back to a compatible implementation.
+- An explicit ``--creator``, ``--seeder``, ``--discovery`` or ``--activators`` naming the broken plugin fails with the
+  original error and its cause, instead of silently using another implementation.
+
+A plugin that loads but does not support the target interpreter is a different case: selection reports that the plugin
+does not support the interpreter, rather than a load error, so the two failure layers stay distinguishable.
+
 ******************
  Plugin lifecycle
 ******************

@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from virtualenv.config.cli.parser import VirtualEnvConfigParser, VirtualEnvOptions
     from virtualenv.create.creator import Creator, CreatorMeta
 
+    from .base import PluginLoadError
+
 
 class CreatorSelector(ComponentBuilder):
     """Select the creator of the environment from the creators that can handle the interpreter.
@@ -35,11 +37,13 @@ class CreatorSelector(ComponentBuilder):
 
     """
 
+    entry_point_group = "virtualenv.create"
+
     def __init__(self, interpreter: PythonInfo, parser: VirtualEnvConfigParser) -> None:
         self._parser = parser
-        creators, self.key_to_meta, self.describe, self.builtin_key = self.for_interpreter(interpreter)
+        creators, self.key_to_meta, self.describe, self.builtin_key, unsupported = self.for_interpreter(interpreter)
         # for_interpreter returns dict[str, type[Creator]], the builder types it as dict[str, type]
-        super().__init__(interpreter, parser, "creator", creators)  # ty: ignore[invalid-argument-type]
+        super().__init__(interpreter, parser, "creator", creators, unsupported)  # ty: ignore[invalid-argument-type]
 
     @classmethod
     def for_interpreter(cls, interpreter: PythonInfo) -> CreatorInfo:
@@ -47,13 +51,14 @@ class CreatorSelector(ComponentBuilder):
 
         :param interpreter: the interpreter the environment is created from
 
-        :returns: the creators and their metadata
+        :returns: the creators, their metadata, and the ones that cannot serve this interpreter with the reason why
 
         :raises RuntimeError: when a creator uses the reserved builtin name or no creator can handle the interpreter
 
         """
         key_to_class, key_to_meta, builtin_key, describe = OrderedDict(), {}, None, None
         errors = defaultdict(list)
+        unsupported: dict[str, str] = {}
         for key, creator_class in cls.options("virtualenv.create").items():
             if key == "builtin":
                 msg = "builtin creator is a reserved name"
@@ -63,17 +68,23 @@ class CreatorSelector(ComponentBuilder):
             if meta:
                 if meta.error:
                     errors[meta.error].append(creator_class)
+                    unsupported[key] = meta.error
                 elif cls._add_creator(key, creator_class, meta, key_to_class, key_to_meta):
                     builtin_key = key
+            else:
+                # the plugin loaded, it just does not cover this interpreter - a different failure layer than a
+                # plugin whose import failed
+                unsupported[key] = "does not support this interpreter"
             if describe is None and issubclass(creator_class, Describe) and creator_class.can_describe(interpreter):
                 describe = creator_class
         if not key_to_meta:
-            cls._raise_no_creator(interpreter, errors)
+            cls._raise_no_creator(interpreter, errors, cls.load_errors_for("virtualenv.create"))
         return CreatorInfo(
             key_to_class=key_to_class,
             key_to_meta=key_to_meta,
             describe=describe,
             builtin_key=builtin_key or "",
+            unsupported=unsupported,
         )
 
     @staticmethod
@@ -93,26 +104,34 @@ class CreatorSelector(ComponentBuilder):
         return first_builtin
 
     @staticmethod
-    def _raise_no_creator(interpreter: PythonInfo, errors: defaultdict[str, list[type[Creator]]]) -> NoReturn:
-        if errors:
-            rows = [f"{k} for creators {', '.join(i.__name__ for i in v)}" for k, v in errors.items()]
+    def _raise_no_creator(
+        interpreter: PythonInfo,
+        errors: defaultdict[str, list[type[Creator]]],
+        load_errors: dict[str, PluginLoadError],
+    ) -> NoReturn:
+        # the capability errors name the classes, while the load errors name the plugin and the import that failed
+        rows = [f"{k} for creators {', '.join(i.__name__ for i in v)}" for k, v in errors.items()]
+        rows.extend(str(error) for error in load_errors.values())
+        if rows:
             raise RuntimeError("\n".join(rows))
         msg = f"No virtualenv implementation for {interpreter}"
         raise RuntimeError(msg)
 
     def add_selector_arg_parse(self, name: str, choices: Sequence[str]) -> None:
-        # prefer the built-in venv if present, otherwise fallback to first defined type
         """Add the creator option, with the builtin creator first when it is among the choices.
 
+        Only the creators that can handle this interpreter are listed in the help and used as the default, but the ones
+        that loaded yet cannot serve it, or failed to load, stay accepted so naming one reports why it cannot create.
+
         :param name: the option name
-        :param choices: the creator names to choose from
+        :param choices: the creator names that can create for this interpreter
 
         """
-        choices = sorted(choices, key=lambda name: 0 if name == "builtin" else 1)
-        default_value = self._get_default(choices)
+        ordered = sorted(choices, key=lambda item: 0 if item == "builtin" else 1)
+        default_value = self._get_default(ordered)
         self.parser.add_argument(
             f"--{name}",
-            choices=choices,
+            choices=self.choices,
             default=default_value,
             required=False,
             help=f"create environment via{'' if self.builtin_key is None else f' (builtin = {self.builtin_key})'}",
@@ -167,6 +186,7 @@ class CreatorInfo(NamedTuple):
     :param key_to_meta: the capability metadata of each creator, keyed by name
     :param describe: the describer class, ``None`` when no describer applies
     :param builtin_key: the name of the builtin creator
+    :param unsupported: the creators that cannot serve the interpreter, with the reason why, keyed by name
 
     """
 
@@ -174,6 +194,8 @@ class CreatorInfo(NamedTuple):
     key_to_meta: dict[str, CreatorMeta]
     describe: type[Describe] | None
     builtin_key: str
+    # a default keeps the constructor compatible with the callers that predate the field
+    unsupported: dict[str, str] = {}  # ruff:ignore[mutable-class-default]  # read-only, never mutated in place
 
 
 __all__ = [

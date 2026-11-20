@@ -21,6 +21,8 @@ class SeederSelector(ComponentBuilder):
 
     """
 
+    entry_point_group = "virtualenv.seed"
+
     def __init__(self, interpreter: PythonInfo, parser: VirtualEnvConfigParser) -> None:
         super().__init__(interpreter, parser, "seeder", self.options("virtualenv.seed"))
 
@@ -28,13 +30,13 @@ class SeederSelector(ComponentBuilder):
         """Add the seeder option, with the names as the choices.
 
         :param name: the option name
-        :param choices: the seeder names to choose from
+        :param choices: the seeder names that can run here
 
         """
         self.parser.add_argument(
             f"--{name}",
-            choices=choices,
-            default=self._get_default(),
+            choices=self.choices,
+            default=self._get_default(choices),
             required=False,
             help="seed packages install method",
         )
@@ -47,8 +49,12 @@ class SeederSelector(ComponentBuilder):
         )
 
     @staticmethod
-    def _get_default() -> str:
-        return "app-data"
+    def _get_default(choices: Sequence[str]) -> str:
+        # prefer the bundled app-data seeder; a seeder whose dependency is missing must not make selection fall over, so
+        # any other seeder that did load serves as the default instead
+        if "app-data" in choices or not choices:
+            return "app-data"
+        return next(iter(choices))
 
     def handle_selected_arg_parse(self, options: VirtualEnvOptions) -> str:
         """Validate the selected seeder name and return it.

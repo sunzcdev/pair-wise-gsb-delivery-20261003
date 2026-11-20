@@ -100,6 +100,12 @@ Register the entry point using a naming pattern that matches platform and Python
     cpython3-posix = virtualenv.create.via_global_ref.builtin.cpython.cpython3:CPython3Posix
     cpython3-win = virtualenv.create.via_global_ref.builtin.cpython.cpython3:CPython3Windows
 
+Automatic selection only chooses a creator that ``can_create`` returns metadata for. Return ``None`` for an
+interpreter your creator does not cover, so the selection falls through to another creator instead of failing. When a
+user names your creator explicitly for an uncovered interpreter, virtualenv reports that it does not support that
+interpreter; when your package is installed but one of its dependencies is missing, the original import error is
+reported instead.
+
 ************************
  Create a seeder plugin
 ************************

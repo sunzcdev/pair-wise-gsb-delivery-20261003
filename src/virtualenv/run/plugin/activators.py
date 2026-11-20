@@ -35,15 +35,20 @@ class ActivationSelector(ComponentBuilder):
 
     """
 
+    entry_point_group = "virtualenv.activate"
+
     def __init__(self, interpreter: PythonInfo, parser: VirtualEnvConfigParser) -> None:
         self.default = None
-        possible = OrderedDict(
-            (k, v)
-            for k, v in self.options("virtualenv.activate").items()
+        possible = OrderedDict()
+        unsupported: dict[str, str] = {}
+        for key, activator_class in self.options("virtualenv.activate").items():
             # plugin classes come from entry points, which ty sees as type
-            if v.supports(interpreter)  # ty: ignore[missing-attribute]
-        )
-        super().__init__(interpreter, parser, "activators", possible)
+            if activator_class.supports(interpreter):  # ty: ignore[missing-attribute]
+                possible[key] = activator_class
+            else:
+                # the plugin loaded, the interpreter is what it cannot serve - a different layer than a load failure
+                unsupported[key] = "does not support this interpreter"
+        super().__init__(interpreter, parser, "activators", possible, unsupported)
         self.parser.description = "options for activation scripts"
         self.active = None
 
@@ -68,7 +73,9 @@ class ActivationSelector(ComponentBuilder):
         # a config file or environment variable may also list the activators on separate lines
         elements = [name for e in ",".join(entered_str.splitlines()).split(",") if (name := e.strip())]
         if missing := [e for e in elements if e not in self.possible]:
-            msg = f"the following activators are not available {','.join(missing)}"
+            # naming an activator reports why it cannot run: a failed load or an interpreter it does not support
+            reasons = [f"{e} ({self.unavailable[e]})" if e in self.unavailable else e for e in missing]
+            msg = f"the following activators are not available {','.join(reasons)}"
             raise ArgumentTypeError(msg)
         return elements
 
