@@ -757,4 +757,77 @@ class AssociationRouteSchemaChangeTest < ActiveRecord::TestCase
   ensure
     connection&.drop_table(:route_schema_references, if_exists: true)
   end
+
+  def test_polymorphic_preload_keeps_the_sti_type_condition_when_the_scope_removes_it
+    connection = main_ractor_connection(ActiveRecord::Base.lease_connection)
+    connection.create_table(:route_sti_targets, force: true) do |t|
+      t.string :type
+      t.integer :external_id
+      t.string :name
+      t.boolean :active, default: true
+    end
+    connection.create_table(:route_sti_references, force: true) do |t|
+      t.integer :target_external_id
+      t.string :target_type
+    end
+
+    target_model = Class.new(ActiveRecord::Base) do
+      self.table_name = "route_sti_targets"
+    end
+    Object.const_set(:RouteStiTarget, target_model)
+    target_a = Class.new(target_model)
+    Object.const_set(:RouteStiTargetA, target_a)
+    target_b = Class.new(target_model)
+    Object.const_set(:RouteStiTargetB, target_b)
+
+    # The association scope drops the STI type condition. Without re-applying it,
+    # preloading the two target types together raises SubclassNotFound (each
+    # query instantiates the other type's rows) or hands an owner a same-key
+    # record belonging to the other type.
+    reference_model = Class.new(ActiveRecord::Base) do
+      self.table_name = "route_sti_references"
+      belongs_to :target, -> { unscope(where: :type).where(active: true) },
+        polymorphic: true, primary_key: :external_id,
+        foreign_key: :target_external_id, foreign_type: :target_type
+    end
+    Object.const_set(:RouteStiReference, reference_model)
+
+    target_a.create!(external_id: 100, name: "A-record")
+    target_b.create!(external_id: 100, name: "B-record")
+    reference_a = reference_model.create!(target_external_id: 100, target_type: "RouteStiTargetA")
+    reference_b = reference_model.create!(target_external_id: 100, target_type: "RouteStiTargetB")
+
+    # Reverse the order so the B-typed owner's loader is built first.
+    references = [reference_b, reference_a].map { |r| reference_model.find(r.id) }
+
+    queries = []
+    type_binds = []
+    subscriber = ->(_name, _started, _finished, _id, payload) do
+      if payload[:sql] =~ /route_sti_targets/ && payload[:name] != "SCHEMA"
+        queries << payload[:sql]
+        type_binds << payload[:binds].select { |bind| bind.respond_to?(:name) && bind.name == "type" }.map(&:value)
+      end
+    end
+    ActiveSupport::Notifications.subscribed(subscriber, "sql.active_record") do
+      ActiveRecord::Associations::Preloader.new(records: references, associations: :target).call
+    end
+
+    assert_instance_of target_a, references.last.target
+    assert_equal "A-record", references.last.target.name
+    assert_instance_of target_b, references.first.target
+    assert_equal "B-record", references.first.target.name
+
+    # One query per distinct target type: the batches that should merge still do,
+    # but the two types are never batched into an untyped query.
+    assert_equal 2, queries.size
+    assert_equal [["RouteStiTargetB"], ["RouteStiTargetA"]], type_binds
+    assert(queries.all? { |sql| sql.include?("external_id") })
+  ensure
+    connection&.drop_table(:route_sti_references, if_exists: true)
+    connection&.drop_table(:route_sti_targets, if_exists: true)
+    Object.send(:remove_const, :RouteStiReference) if Object.const_defined?(:RouteStiReference)
+    Object.send(:remove_const, :RouteStiTargetB) if Object.const_defined?(:RouteStiTargetB)
+    Object.send(:remove_const, :RouteStiTargetA) if Object.const_defined?(:RouteStiTargetA)
+    Object.send(:remove_const, :RouteStiTarget) if Object.const_defined?(:RouteStiTarget)
+  end
 end

@@ -303,9 +303,17 @@ module ActiveRecord
               fixed_clause = scope.where_clause - where_clause
             end
 
+            # A polymorphic association can target several classes that share a
+            # table (e.g. STI). The klass's type condition ties the query to the
+            # owner's declared target type. Remember it so an association scope
+            # using +unscope+ / +rewhere+ cannot drop it and let same-key rows of
+            # another type leak into this loader's owners.
+            type_clause = sti_type_clause
+
             unless reflection_scope.empty_scope?
               scope.merge!(reflection_scope)
               reflection.keep_owner_conditions(scope, Relation::WhereClause.empty, fixed_clause) if fixed_clause
+              restore_sti_type_clause!(scope, type_clause) if type_clause
             end
             scope.default_order!(reflection.options[:default_order]) if reflection.options[:default_order].present?
 
@@ -314,6 +322,19 @@ module ActiveRecord
             end
 
             cascade_strict_loading(scope)
+          end
+
+          # Returns the where clause fragment that restricts the query to the
+          # loader's STI target class, or nil when the klass does not need one.
+          def sti_type_clause
+            return nil unless reflection.polymorphic? && klass.finder_needs_type_condition?
+
+            Relation::WhereClause.new([klass.send(:type_condition, klass.arel_table)])
+          end
+
+          def restore_sti_type_clause!(scope, type_clause)
+            removed = type_clause - scope.where_clause
+            scope.where_clause += removed unless removed.empty?
           end
 
           def cascade_strict_loading(scope)
