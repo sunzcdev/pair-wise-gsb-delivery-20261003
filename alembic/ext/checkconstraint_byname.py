@@ -77,9 +77,9 @@ def _compare_check_constraints(
     )
 
     try:
-        conn_ck_list = _InspectorConv(inspector).get_check_constraints(
-            tname, schema=schema
-        )
+        conn_ck_list = _InspectorConv(
+            inspector, autogen_context.table_renames
+        ).get_check_constraints(tname, schema=schema)
     except NotImplementedError:
         return PriorityDispatchResult.CONTINUE
 

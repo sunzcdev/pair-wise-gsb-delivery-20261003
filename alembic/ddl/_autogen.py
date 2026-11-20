@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from collections.abc import Sequence
 from typing import Any
 from typing import ClassVar
@@ -123,6 +124,18 @@ class _constraint_sig(Generic[_C]):
         # someone else might do it too, so play it safe.
         sig = _clsreg[constraint.__visit_name__](is_metadata, impl, constraint)
         return sig
+
+    def translate_table_names(
+        self, translate: Callable[[tuple[Any, ...]], tuple[Any, ...]]
+    ) -> None:
+        """Rewrite the table names within this signature.
+
+        Used by the explicit table rename feature so that a reflected
+        construct that refers to (or is owned by) a table being renamed
+        compares equal to its metadata counterpart.  The default
+        implementation has nothing to translate.
+
+        """
 
     def md_name_to_sql_name(self, context: AutogenContext) -> str | None:
         return sqla_compat._get_constraint_final_name(
@@ -313,6 +326,21 @@ class _fk_constraint_sig(_constraint_sig[ForeignKeyConstraint]):
             self.target_table,
             tuple(self.target_columns),
         )
+
+    def translate_table_names(
+        self, translate: Callable[[tuple[Any, ...]], tuple[Any, ...]]
+    ) -> None:
+        self._sig = translate(self._sig)
+        (
+            self.source_schema,
+            self.source_table,
+            _source_columns,
+            self.target_schema,
+            self.target_table,
+            _target_columns,
+        ) = self._sig[0:6]
+        self.__dict__.pop("unnamed", None)
+        self.__dict__.pop("unnamed_no_options", None)
 
 
 class _ck_constraint_sig(_constraint_sig[CheckConstraint]):

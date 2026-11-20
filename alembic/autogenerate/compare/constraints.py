@@ -87,11 +87,15 @@ def _compare_indexes_and_uniques(
         )
         conn_indexes_reflected: Collection[ReflectedIndex] = frozenset()
 
+        inspector_conv = _InspectorConv(
+            inspector, autogen_context.table_renames
+        )
+
         # 1b. ... and from connection, if the table exists
         try:
-            conn_uniques_reflected = _InspectorConv(
-                inspector
-            ).get_unique_constraints(tname, schema=schema)
+            conn_uniques_reflected = inspector_conv.get_unique_constraints(
+                tname, schema=schema
+            )
 
             supports_unique_constraints = True
         except NotImplementedError:
@@ -115,7 +119,7 @@ def _compare_indexes_and_uniques(
                 if uq.get("duplicates_index"):
                     unique_constraints_duplicate_unique_indexes = True
         try:
-            conn_indexes_reflected = _InspectorConv(inspector).get_indexes(
+            conn_indexes_reflected = inspector_conv.get_indexes(
                 tname, schema=schema
             )
         except NotImplementedError:
@@ -637,6 +641,8 @@ def _compare_foreign_keys(
         return PriorityDispatchResult.CONTINUE
 
     inspector = autogen_context.inspector
+    renames = autogen_context.table_renames
+
     # fk constraints can be set on columns, but they appear also on
     # the table constraint list
     metadata_fks = {
@@ -647,7 +653,7 @@ def _compare_foreign_keys(
 
     conn_fks_list = [
         fk
-        for fk in _InspectorConv(inspector).get_foreign_keys(
+        for fk in _InspectorConv(inspector, renames).get_foreign_keys(
             tname, schema=schema
         )
         if autogen_context.run_name_filters(
@@ -676,6 +682,10 @@ def _compare_foreign_keys(
     conn_fks_sig = {
         impl._create_reflected_constraint_sig(fk) for fk in conn_fks
     }
+
+    if renames is not None:
+        for sig in conn_fks_sig:
+            renames.translate_reflected_fk_sig(sig)
 
     # check if reflected FKs include options, indicating the backend
     # can reflect FK options

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.schema import Table
 
     from ...autogenerate.api import AutogenContext
+    from ...autogenerate.compare.renames import TableKey
     from ...operations.ops import ModifyTableOps
     from ...operations.ops import UpgradeOps
     from ...runtime.plugins import Plugin
@@ -61,12 +62,64 @@ def _autogen_for_tables(
         conn_table_names.update((schema_name, tname) for tname in tablenames)
 
         inspector = autogen_context.inspector
-        insp = _InspectorConv(inspector)
+        insp = _InspectorConv(inspector, autogen_context.table_renames)
         insp.pre_cache_tables(schema_name, tablenames, available)
 
     metadata_table_names = OrderedSet(
         [(table.schema, table.name) for table in autogen_context.sorted_tables]
     ).difference([(version_table_schema, version_table)])
+
+    # explicit table rename support.  the connection-side names are
+    # translated to the names present in the target metadata, so that the
+    # remainder of the comparison sees a table that exists on both sides
+    # rather than a drop/add pair.
+    renamed: dict[TableKey, TableKey] = {}
+    renames = autogen_context.table_renames
+    if renames is not None:
+
+        def _include(key: TableKey) -> bool:
+            metadata_table = _metadata_table_for_key(autogen_context, key)
+            if metadata_table is None:
+                return True
+            return autogen_context.run_object_filters(
+                metadata_table, key[1], "table", False, None
+            )
+
+        applied = renames.resolve(
+            conn_table_names, metadata_table_names, include=_include
+        )
+        if applied:
+            conn_to_model = {
+                conn_key: md_key for md_key, conn_key in renames.pairs
+            }
+
+            for rename, (md_key, conn_key) in zip(applied, renames.pairs):
+                renamed[md_key] = conn_key
+                upgrade_ops.ops.append(
+                    ops.RenameTableOp(
+                        rename.old_name,
+                        rename.new_name,
+                        schema=(
+                            rename.old_schema
+                            if rename.old_schema is not None
+                            else rename.new_schema
+                        ),
+                    )
+                )
+
+                log.info(
+                    "Detected table rename %s -> %s",
+                    "%s.%s" % (conn_key[0], conn_key[1])
+                    if conn_key[0]
+                    else conn_key[1],
+                    "%s.%s" % (md_key[0], md_key[1])
+                    if md_key[0]
+                    else md_key[1],
+                )
+
+            conn_table_names = {
+                conn_to_model.get(key, key) for key in conn_table_names
+            }
 
     _compare_tables(
         conn_table_names,
@@ -74,9 +127,22 @@ def _autogen_for_tables(
         inspector,
         upgrade_ops,
         autogen_context,
+        renamed=renamed,
     )
 
     return PriorityDispatchResult.CONTINUE
+
+
+def _metadata_table_for_key(
+    autogen_context: AutogenContext, key: TableKey
+) -> Table | None:
+    """Return the target :class:`.Table` for a schema-qualified key."""
+
+    tables = autogen_context.table_key_to_table
+    table = tables.get(sa_schema._get_table_key(key[1], key[0]))
+    if table is None:
+        table = tables.get(key[1])
+    return table
 
 
 def _compare_tables(
@@ -85,7 +151,9 @@ def _compare_tables(
     inspector: Inspector,
     upgrade_ops: UpgradeOps,
     autogen_context: AutogenContext,
+    renamed: dict[TableKey, TableKey] | None = None,
 ) -> None:
+    renamed = renamed or {}
     default_schema = inspector.bind.dialect.default_schema_name
 
     # tables coming from the connection will not have "schema"
@@ -157,7 +225,9 @@ def _compare_tables(
                 (inspector),
                 # fmt: on
             )
-            _InspectorConv(inspector).reflect_table(t)
+            _InspectorConv(
+                inspector, autogen_context.table_renames
+            ).reflect_table(t)
         if autogen_context.run_object_filters(t, tname, "table", True, None):
             modify_table_ops = ops.ModifyTableOps(tname, [], schema=s)
 
@@ -174,13 +244,20 @@ def _compare_tables(
 
     existing_metadata = sa_schema.MetaData()
     conn_column_info = {}
+
+    def _conn_key(s: str | None, tname: str) -> tuple[str | None, str]:
+        # for a table that is being renamed, the names on the connection
+        # side are those of the existing database table
+        return renamed.get((s, tname), (s, tname))
+
     for s, tname in existing_tables:
-        name = sa_schema._get_table_key(tname, s)
+        conn_s, conn_tname = _conn_key(s, tname)
+        name = sa_schema._get_table_key(conn_tname, conn_s)
         exists = name in existing_metadata.tables
 
         # a name might be present already if a previous reflection pulled
         # this table in via foreign key constraint
-        t = sa_schema.Table(tname, existing_metadata, schema=s)
+        t = sa_schema.Table(conn_tname, existing_metadata, schema=conn_s)
         if not exists:
             event.listen(
                 t,
@@ -190,7 +267,9 @@ def _compare_tables(
                 _compat_autogen_column_reflect(inspector),
                 # fmt: on
             )
-            _InspectorConv(inspector).reflect_table(t)
+            _InspectorConv(
+                inspector, autogen_context.table_renames
+            ).reflect_table(t)
 
         conn_column_info[(s, tname)] = t
 
@@ -198,7 +277,10 @@ def _compare_tables(
         s = s or None
         name = "%s.%s" % (s, tname) if s else tname
         metadata_table = tname_to_table[(s, tname)]
-        conn_table = existing_metadata.tables[name]
+        conn_s, conn_tname = _conn_key(s, tname)
+        conn_table = existing_metadata.tables[
+            sa_schema._get_table_key(conn_tname, conn_s)
+        ]
 
         if autogen_context.run_object_filters(
             metadata_table, tname, "table", False, conn_table

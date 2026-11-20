@@ -145,6 +145,13 @@ def configure(
         | None
     ) = None,
     include_schemas: bool = False,
+    table_renames: (
+        Mapping[
+            str | tuple[str | None, str],
+            str | tuple[str | None, str],
+        ]
+        | None
+    ) = None,
     process_revision_directives: (
         None
         | Callable[

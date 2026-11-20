@@ -81,6 +81,21 @@ OnVersionApplyFn = Callable[
     None,
 ]
 
+TableRenameSpec = Union[str, tuple[Optional[str], str]]
+"""Individual "old" or "new" side of a table rename mapping."""
+
+TableRenamesOption = Union[
+    Mapping[TableRenameSpec, TableRenameSpec],
+    Sequence[tuple[TableRenameSpec, TableRenameSpec]],
+]
+"""The :paramref:`.EnvironmentContext.configure.table_renames` type.
+
+A mapping of old table names to new table names, or an equivalent sequence of
+``(old, new)`` pairs.  Each name may be given as a plain string, naming a
+table in the default schema, or as a ``(schema, name)`` pair.
+
+"""
+
 CompareServerDefault = Callable[
     [
         MigrationContext,
@@ -426,6 +441,7 @@ class EnvironmentContext(util.ModuleClsProxy):
         include_name: IncludeNameFn | None = None,
         include_object: IncludeObjectFn | None = None,
         include_schemas: bool = False,
+        table_renames: TableRenamesOption | None = None,
         process_revision_directives: None | (
             ProcessRevisionDirectiveFn
         ) = None,
@@ -734,6 +750,40 @@ class EnvironmentContext(util.ModuleClsProxy):
 
             :ref:`batch_migrations`
 
+        :param table_renames: an optional mapping of table names, stating
+         that a table present in the database has been renamed in the target
+         :class:`~sqlalchemy.schema.MetaData`.  Each key is the name of the
+         table as it exists in the database; each value is the name of the
+         table as it exists in the target metadata.  Names may be given either
+         as plain strings, naming a table in the default schema, or as
+         ``(schema, name)`` pairs for tables in other schemas::
+
+            context.configure(
+                # ...
+                table_renames={
+                    "user_account": "account",
+                    ("reporting", "orders"): ("reporting", "purchase_order"),
+                }
+            )
+
+         Autogenerate will then emit an :meth:`.Operations.rename_table`
+         directive that keeps the table's rows, in place of a drop/add pair,
+         and the matching :meth:`.Operations.rename_table` directive is
+         present in the downgrade stream.  The remaining contents of each
+         table continue to be compared as usual, and foreign key constraints
+         on other tables that point to a renamed table are not reported as
+         changed.
+
+         A declaration that cannot be resolved unambiguously against the
+         tables that really exist, such as one whose new name is already
+         present in the database alongside the old name, or that appears to
+         point at more than one table in the target metadata, raises
+         :class:`.CommandError` before the revision file is generated.
+
+         .. seealso::
+
+            :ref:`autogenerate_table_renames`
+
         :param include_schemas: If True, autogenerate will scan across
          all schemas located by the SQLAlchemy
          :meth:`~sqlalchemy.engine.reflection.Inspector.get_schema_names`
@@ -914,6 +964,7 @@ class EnvironmentContext(util.ModuleClsProxy):
         opts["include_name"] = include_name
         opts["include_object"] = include_object
         opts["include_schemas"] = include_schemas
+        opts["table_renames"] = table_renames
         opts["render_as_batch"] = render_as_batch
         opts["upgrade_token"] = upgrade_token
         opts["downgrade_token"] = downgrade_token

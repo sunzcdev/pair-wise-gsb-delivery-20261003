@@ -2682,3 +2682,149 @@ class AutogenPlaceholderTableTest(AutogenFixtureTest, TestBase):
         diffs = self._fixture(m1, m2, name_filters=include_name)
         eq_(len(diffs), 1)
         eq_(diffs[0][0], "remove_fk")
+
+
+class AutogenTableRenameTest(AutogenFixtureTest, TestBase):
+    """the explicit table rename mapping.
+
+    See :ref:`autogenerate_table_renames`.
+
+    """
+
+    __backend__ = True
+
+    def test_rename_emits_rename_op(self):
+        m1 = MetaData()
+        m2 = MetaData()
+
+        Table(
+            "user",
+            m1,
+            Column("id", Integer, primary_key=True),
+            Column("name", String(50), nullable=False),
+        )
+        Table(
+            "account",
+            m2,
+            Column("id", Integer, primary_key=True),
+            Column("name", String(50), nullable=False),
+        )
+
+        diffs = self._fixture(
+            m1, m2, opts={"table_renames": {"user": "account"}}
+        )
+        eq_(diffs, [("rename_table", None, "user", "account")])
+
+    def test_rename_downgrade_reverses(self):
+        m1 = MetaData()
+        m2 = MetaData()
+
+        Table("user", m1, Column("id", Integer, primary_key=True))
+        Table("account", m2, Column("id", Integer, primary_key=True))
+
+        uo = self._fixture(
+            m1,
+            m2,
+            opts={"table_renames": {"user": "account"}},
+            return_ops=True,
+        )
+        downgrade = uo.reverse()
+        eq_(
+            [op.to_diff_tuple() for op in downgrade.ops],
+            [("rename_table", None, "account", "user")],
+        )
+
+    def test_rename_leaves_other_diffs(self):
+        m1 = MetaData()
+        m2 = MetaData()
+
+        Table(
+            "user",
+            m1,
+            Column("id", Integer, primary_key=True),
+            Column("gone", Integer),
+        )
+        Table(
+            "account",
+            m2,
+            Column("id", Integer, primary_key=True),
+            Column("added", Integer),
+        )
+
+        diffs = self._fixture(
+            m1, m2, opts={"table_renames": {"user": "account"}}
+        )
+        eq_(diffs[0], ("rename_table", None, "user", "account"))
+        eq_(diffs[1][0], "add_column")
+        eq_(diffs[1][2], "account")
+        eq_(diffs[2][0], "remove_column")
+        eq_(diffs[2][2], "account")
+
+    def test_rename_follows_inbound_fk(self):
+        m1 = MetaData()
+        m2 = MetaData()
+
+        Table("user", m1, Column("id", Integer, primary_key=True))
+        Table(
+            "address",
+            m1,
+            Column("id", Integer, primary_key=True),
+            Column("user_id", Integer, ForeignKey("user.id")),
+        )
+
+        Table("account", m2, Column("id", Integer, primary_key=True))
+        Table(
+            "address",
+            m2,
+            Column("id", Integer, primary_key=True),
+            Column("user_id", Integer, ForeignKey("account.id")),
+        )
+
+        diffs = self._fixture(
+            m1, m2, opts={"table_renames": {"user": "account"}}
+        )
+        eq_(diffs, [("rename_table", None, "user", "account")])
+
+    def test_conflicting_target_present_raises(self):
+        m1 = MetaData()
+        m2 = MetaData()
+
+        Table("user", m1, Column("id", Integer, primary_key=True))
+        Table("account", m1, Column("id", Integer, primary_key=True))
+        Table("account", m2, Column("id", Integer, primary_key=True))
+
+        assert_raises_message(
+            CommandError,
+            "the new table account already exists in the database",
+            self._fixture,
+            m1,
+            m2,
+            opts={"table_renames": {"user": "account"}},
+        )
+
+    def test_mapping_onto_two_real_tables_raises(self):
+        m1 = MetaData()
+        m2 = MetaData()
+
+        Table("user", m1, Column("id", Integer, primary_key=True))
+        Table("user", m2, Column("id", Integer, primary_key=True))
+        Table("account", m2, Column("id", Integer, primary_key=True))
+
+        assert_raises_message(
+            CommandError,
+            "the mapping points at two tables that really exist",
+            self._fixture,
+            m1,
+            m2,
+            opts={"table_renames": {"user": "account"}},
+        )
+
+    def test_without_mapping_old_behaviour_preserved(self):
+        m1 = MetaData()
+        m2 = MetaData()
+
+        Table("user", m1, Column("id", Integer, primary_key=True))
+        Table("account", m2, Column("id", Integer, primary_key=True))
+
+        diffs = self._fixture(m1, m2)
+        eq_([diff[0] for diff in diffs], ["add_table", "remove_table"])

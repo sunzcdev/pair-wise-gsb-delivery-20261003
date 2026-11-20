@@ -162,7 +162,11 @@ Autogenerate can **optionally detect**:
 Autogenerate **can not detect**:
 
 * Changes of table name.   These will come out as an add/drop of two different
-  tables, and should be hand-edited into a name change instead.
+  tables, and should be hand-edited into a name change instead.  An explicit
+  mapping may be given using the
+  :paramref:`.EnvironmentContext.configure.table_renames` parameter, in which
+  case a :meth:`.Operations.rename_table` directive is generated in place of
+  the add/drop pair; see :ref:`autogenerate_table_renames`.
 * Changes of column name.  Like table name changes, these are detected as
   a column add/drop pair, which is not at all the same as a name change.
 * Anonymously named constraints.  Give your constraints a name,
@@ -276,6 +280,84 @@ Given the above, the feature is most appropriate for a schema in which all
 CHECK constraints are explicitly named, ideally via a naming convention (see
 :doc:`naming`).   As always, the candidate migrations that autogenerate
 produces must be reviewed by hand.
+
+.. _autogenerate_table_renames:
+
+Detecting Table Renames
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: 1.20.3
+
+Autogenerate does not, on its own, detect that a table has been renamed; a
+renamed table normally comes out as a :class:`.DropTableOp` of the old name
+together with a :class:`.CreateTableOp` of the new one, which loses the
+table's rows.  To have autogenerate emit a
+:meth:`.Operations.rename_table` directive that keeps the rows instead, pass
+the :paramref:`.EnvironmentContext.configure.table_renames` parameter,
+stating explicitly which table in the database corresponds to which table in
+the target metadata::
+
+    # in env.py
+
+    context.configure(
+        # ...
+        target_metadata=target_metadata,
+        table_renames={
+            "user_account": "account",
+            "user_address": "address",
+        },
+    )
+
+Each key is the table name as it exists in the database; each value is the
+name as it exists in the target :class:`~sqlalchemy.schema.MetaData`.  Names
+may also be given as ``(schema, name)`` pairs, in which case the mapping
+applies to that specific schema::
+
+    context.configure(
+        # ...
+        table_renames={
+            ("reporting", "orders"): ("reporting", "purchase_order"),
+        },
+    )
+
+A mapping is applied only when it still makes sense for the current state of
+the database: the old table must be present in the database and absent from
+the target metadata, and the new table must be present in the target metadata
+and absent from the database.  A mapping left in place after its rename has
+already been applied is therefore quietly ignored, and can stay in ``env.py``
+indefinitely.
+
+When a mapping applies, autogenerate emits
+``op.rename_table(<old name>, <new name>)`` at the point where the removed
+table would otherwise have been dropped, and the corresponding
+``op.rename_table(<new name>, <old name>)`` is present in the downgrade
+stream.  The remainder of the comparison carries on as usual, so any
+additional column, index, or constraint differences on the renamed table are
+reported alongside the rename.  Foreign key constraints on **other** tables
+that merely point at the renamed table are not reported as changed, since
+they follow the rename automatically.
+
+.. note::  A table rename changes only the table's name.  A mapping whose old
+   and new names live in different schemas is rejected, as
+   :meth:`.Operations.rename_table` cannot move a table between schemas.
+
+A mapping that cannot be resolved unambiguously against the tables that
+really exist is reported as a :class:`.CommandError` before the revision file
+is written.  This occurs when the new table name is already present in the
+database alongside the old one, or when a mapping points at more than one
+table that really exists, such as when a table with the same name remains in
+the target metadata::
+
+    alembic.util.exc.CommandError: Cannot apply table rename user -> account;
+    the new table account already exists in the database
+
+To resolve such a conflict, either remove the leftover table from the
+database or the target metadata, or qualify the mapping with an explicit
+schema name so that it can be matched to a single table.
+
+.. seealso::
+
+    :paramref:`.EnvironmentContext.configure.table_renames`
 
 Notable 3rd-party libraries that extend the built-in Alembic autogenerate functionality
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

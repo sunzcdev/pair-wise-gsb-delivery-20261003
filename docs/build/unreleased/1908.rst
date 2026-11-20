@@ -1,0 +1,26 @@
+.. change::
+    :tags: feature, autogenerate
+
+    Added the :paramref:`.EnvironmentContext.configure.table_renames`
+    parameter, which accepts an explicit mapping of table names stating that
+    a table present in the database has been renamed in the target
+    :class:`~sqlalchemy.schema.MetaData`.  Autogenerate then emits an
+    :meth:`.Operations.rename_table` directive that preserves the table's
+    rows, in place of the drop/add pair it would otherwise produce, with the
+    corresponding rename in the downgrade stream.  Each side of the mapping
+    may be given either as a plain table name, or as a ``(schema, name)``
+    pair for tables in a specific schema.
+
+    The rest of the comparison continues to run against the renamed table, so
+    that column, index and constraint differences are still reported, and
+    foreign key constraints on other tables that point at the renamed table
+    are not reported as changed.  A mapping that cannot be resolved against
+    the tables that really exist, such as one whose new name is already
+    present in the database alongside the old name, or one that appears to
+    point at more than one table in the target metadata, raises
+    :class:`.CommandError` before the revision file is generated.
+
+    .. seealso::
+
+        :ref:`autogenerate_table_renames`
+

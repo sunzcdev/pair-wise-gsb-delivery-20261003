@@ -312,6 +312,22 @@ def _render_dialect_kwargs_items(
     ]
 
 
+@renderers.dispatch_for(ops.RenameTableOp)
+def _rename_table(
+    autogen_context: AutogenContext, op: ops.RenameTableOp
+) -> str:
+    text = "%(prefix)srename_table(%(old)s, %(new)s" % {
+        "prefix": _alembic_autogenerate_prefix(autogen_context),
+        "old": "%r" % _ident(op.table_name),
+        "new": "%r" % _ident(op.new_table_name),
+    }
+    if op.schema:
+        text += ", schema=%r" % _ident(op.schema)
+
+    text += ")"
+    return text
+
+
 @renderers.dispatch_for(ops.CreateIndexOp)
 def _add_index(autogen_context: AutogenContext, op: ops.CreateIndexOp) -> str:
     index = op.to_index()

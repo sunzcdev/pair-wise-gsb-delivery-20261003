@@ -11,6 +11,7 @@ from sqlalchemy import inspect
 
 from . import compare
 from . import render
+from .compare.renames import TableRenames
 from .. import util
 from ..operations import ops
 from ..runtime.plugins import Plugin
@@ -408,6 +409,23 @@ class AutogenContext:
                 "AutogenContext has no database connection"
             )
         return inspect(self.connection)
+
+    @util.memoized_property
+    def table_renames(self) -> TableRenames | None:
+        """The explicit table rename mapping for this run, if any.
+
+        This is built from the
+        :paramref:`.EnvironmentContext.configure.table_renames` parameter;
+        see :ref:`autogenerate_table_renames`.
+
+        """
+        value = self.opts.get("table_renames", None)
+        if value is None:
+            return None
+        elif isinstance(value, TableRenames):
+            return value
+        else:
+            return TableRenames.from_option(value, self.dialect)
 
     @contextlib.contextmanager
     def _within_batch(self) -> Iterator[None]:

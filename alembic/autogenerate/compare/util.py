@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     from sqlalchemy.engine.interfaces import ReflectedUniqueConstraint
     from sqlalchemy.engine.reflection import _ReflectionInfo
 
+    from .renames import TableRenames
+
 _INSP_KEYS = (
     "columns",
     "pk_constraint",
@@ -37,10 +39,33 @@ _CONSTRAINT_INSP_KEYS = (
 
 
 class _InspectorConv:
-    __slots__ = ("inspector",)
+    __slots__ = ("inspector", "renames")
 
-    def __init__(self, inspector: Inspector):
+    def __init__(
+        self,
+        inspector: Inspector,
+        renames: TableRenames | None = None,
+    ):
         self.inspector = inspector
+        self.renames = renames
+
+    def _translate(
+        self, tname: str, schema: str | None
+    ) -> tuple[str, str | None]:
+        """Translate a metadata-side table name to its database-side name.
+
+        When an explicit table rename is in effect, the comparison refers to
+        the table by its metadata-side name while reflection must use the
+        name that actually exists in the database.
+
+        """
+
+        if self.renames is None:
+            return tname, schema
+        conn_key = self.renames.conn_key_for_model(schema, tname)
+        if conn_key is None:
+            return tname, schema
+        return conn_key[1], conn_key[0]
 
     def _pre_cache(
         self,
@@ -92,8 +117,13 @@ class _InspectorConv:
         inspector_method: Any,
         apply_constraint_conv: bool = False,
         optional=True,
+        translate: bool = True,
     ) -> Any:
         not_in_cache = object()
+
+        refl_tname, refl_schema = (
+            self._translate(tname, schema) if translate else (tname, schema)
+        )
 
         if info_key in self.inspector.info_cache:
             cache = self.inspector.info_cache[info_key]
@@ -106,7 +136,7 @@ class _InspectorConv:
                     # should not compare to DB elements
                     raise NotImplementedError()
 
-            individual = cache.get((schema, tname), not_in_cache)
+            individual = cache.get((refl_schema, refl_tname), not_in_cache)
 
             if individual is not not_in_cache:
                 if apply_constraint_conv and individual is not None:
@@ -115,7 +145,7 @@ class _InspectorConv:
                     return individual
 
         try:
-            data = inspector_method(tname, schema=schema)
+            data = inspector_method(refl_tname, schema=refl_schema)
         except NotImplementedError:
             if optional:
                 return {}
@@ -207,6 +237,7 @@ class _InspectorConv:
     ) -> _ReflectionInfo:
         from sqlalchemy.engine.reflection import _ReflectionInfo
 
+        # the given table is named using the database-side name already
         table_key = (schema, tname)
 
         return _ReflectionInfo(
@@ -219,6 +250,7 @@ class _InspectorConv:
                         f"alembic_{key}",
                         getattr(self.inspector, f"get_{key}"),
                         apply_constraint_conv=(key in _CONSTRAINT_INSP_KEYS),
+                        translate=False,
                     )
                 }
                 for key in _INSP_KEYS
