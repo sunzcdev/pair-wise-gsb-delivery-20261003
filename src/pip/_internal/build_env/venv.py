@@ -95,6 +95,9 @@ class VenvBuildEnvironment(BuildEnvironment):
 
         self._save_env: dict[str, str | None] = {}
         self._installer = installer
+        # Track which installation phases have completed, mirroring the
+        # per-prefix setup flag used by the virtual build environment.
+        self._setup_phases: set[str] = set()
 
         if not os.path.exists(self.python_executable):
             # This error is only likely on Windows due to interference from AV software.
@@ -136,10 +139,31 @@ class VenvBuildEnvironment(BuildEnvironment):
         kind: str,
         for_req: InstallRequirement | None = None,
     ) -> None:
+        assert prefix_as_string not in self._setup_phases
+        self._setup_phases.add(prefix_as_string)
         if not requirements:
             return
 
         # TODO: when better support for installing to arbitrary Python environments
         # is added, replace this prefix hack with that.
         prefix = Prefix(self._env_path, venv_executable=self.python_executable)
-        self._installer.install(requirements, prefix, kind=kind, for_req=for_req)
+        try:
+            self._installer.install(
+                requirements, prefix, kind=kind, for_req=for_req
+            )
+        except Exception:
+            # The installation did not complete. Roll back the recorded
+            # phase so that a subsequent build does not inherit an
+            # unfinished environment instead of performing the install again.
+            self.reset_install(prefix_as_string)
+            raise
+
+    def reset_install(self, prefix_as_string: str) -> None:
+        """Forget that a failed installation phase ever ran.
+
+        The virtual environment itself (and everything successfully installed
+        into it) is discarded wholesale when the build finishes, so on failure
+        we only clear the bookkeeping that would otherwise make a retry believe
+        the phase had already been performed.
+        """
+        self._setup_phases.discard(prefix_as_string)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import site
 import sys
 import textwrap
@@ -138,4 +139,31 @@ class VirtualBuildEnvironment(BuildEnvironment):
         prefix.setup = True
         if not requirements:
             return
-        self.installer.install(requirements, prefix, kind=kind, for_req=for_req)
+        try:
+            self.installer.install(
+                requirements, prefix, kind=kind, for_req=for_req
+            )
+        except Exception:
+            # The installation did not complete. Do not leave the prefix marked
+            # as set up, otherwise a subsequent build would inherit an
+            # unfinished environment instead of performing the install again.
+            self.reset_install(prefix_as_string)
+            raise
+
+    def reset_install(self, prefix_as_string: str) -> None:
+        """Remove anything a failed installation may have left behind.
+
+        The whole build environment is ephemeral and discarded at the end of
+        the build, so wiping the affected prefix is safe: the overlay phase is
+        untouched when a normal-phase install fails, and a failed overlay
+        install aborts the build before any backend call happens.
+        """
+        prefix = self._prefixes[prefix_as_string]
+        prefix.setup = False
+        for lib_dir in prefix.lib_dirs:
+            if os.path.isdir(lib_dir):
+                shutil.rmtree(lib_dir, ignore_errors=True)
+                os.makedirs(lib_dir, exist_ok=True)
+        if os.path.isdir(prefix.bin_dir):
+            shutil.rmtree(prefix.bin_dir, ignore_errors=True)
+            os.makedirs(prefix.bin_dir, exist_ok=True)

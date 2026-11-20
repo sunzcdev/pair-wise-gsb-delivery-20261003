@@ -93,7 +93,9 @@ class SourceDistribution(AbstractDistribution):
         self.req.configure_backend(self.req.build_env.python_executable)
 
     def _prepare_build_backend(self, build_isolation: BuildIsolationMode) -> None:
-        # Install the pyproject.toml declared build-time requirements.
+        # First phase ("overlay"): install the static build-time requirements
+        # declared in pyproject.toml. Nothing from the backend is available yet
+        # and these packages take priority over anything installed later.
         pyproject_requires = self.req.pyproject_requires
         assert pyproject_requires is not None
         assert not isinstance(self.req.build_env, NoOpBuildEnvironment)
@@ -106,11 +108,17 @@ class SourceDistribution(AbstractDistribution):
                 kind="build dependencies",
                 for_req=self.req,
             )
-        conflicting, missing = self.req.build_env.check_requirements(
-            self.req.requirements_to_check
+        # The overlay selection is now fixed. Verify the PEP 517/518
+        # requirements against it, naming the selected version on conflict.
+        conflicting, missing = self.req.build_env.check_requirements_for_phase(
+            self.req.requirements_to_check, phase="overlay"
         )
         if conflicting:
-            self._raise_conflicts("PEP 517/518 supported requirements", conflicting)
+            self._raise_conflicts(
+                "PEP 517/518 supported requirements",
+                conflicting,
+                phase="overlay",
+            )
         if missing:
             logger.warning(
                 "Missing build requirements in pyproject.toml for %s.",
@@ -146,7 +154,8 @@ class SourceDistribution(AbstractDistribution):
         build_isolation: BuildIsolationMode,
         allow_editables: bool,
     ) -> None:
-        # Install any extra build dependencies that the backend requests.
+        # Second phase ("normal"): install the extra build dependencies the
+        # backend now requests through its get_requires_for_build_* hooks.
         # This must be done in a second pass, as the pyproject.toml
         # dependencies must be installed before we can call the backend.
         if (
@@ -157,29 +166,53 @@ class SourceDistribution(AbstractDistribution):
             build_reqs = self._get_build_requires_editable()
         else:
             build_reqs = self._get_build_requires_wheel()
-        conflicting, missing = self.req.build_env.check_requirements(build_reqs)
+        # Check these new constraints against both phases' current selection
+        # (the overlay prefix has priority). A conflict names the already
+        # selected version and the new constraint, and conflicting
+        # requirements are never installed over the existing selection; only
+        # requirements that are still missing get installed.
+        conflicting, missing = self.req.build_env.check_requirements_for_phase(
+            build_reqs, phase="normal"
+        )
         if conflicting:
-            self._raise_conflicts("the backend dependencies", conflicting)
+            self._raise_conflicts(
+                "the backend dependencies", conflicting, phase="normal"
+            )
         context = self.req.build_env if build_isolation == "venv" else nullcontext()
         with context:
+            # install_requirements rolls back its phase state on failure, so a
+            # later build cannot inherit this attempt's half-finished prefix.
             self.req.build_env.install_requirements(
-                missing, "normal", kind="backend dependencies", for_req=self.req
+                missing,
+                "normal",
+                kind="backend dependencies",
+                for_req=self.req,
             )
 
     def _raise_conflicts(
-        self, conflicting_with: str, conflicting_reqs: set[tuple[str, str]]
+        self,
+        conflicting_with: str,
+        conflicting_reqs: set[tuple[str, str]],
+        *,
+        phase: str | None = None,
     ) -> None:
+        # ``phase`` identifies which installation phase detected the conflict
+        # ("overlay" for the static pyproject.toml requirements, "normal" for
+        # the backend-reported ones). The phase itself is logged at debug level
+        # by check_requirements_for_phase; the message here names both the
+        # already selected version and the clashing new constraint.
         format_string = (
             "Some build dependencies for {requirement} "
             "conflict with {conflicting_with}: {description}."
         )
+        description = ", ".join(
+            f"{installed} is incompatible with {wanted}"
+            for installed, wanted in sorted(conflicting_reqs)
+        )
         error_message = format_string.format(
             requirement=self.req,
             conflicting_with=conflicting_with,
-            description=", ".join(
-                f"{installed} is incompatible with {wanted}"
-                for installed, wanted in sorted(conflicting_reqs)
-            ),
+            description=description,
         )
         raise InstallationError(error_message)
 

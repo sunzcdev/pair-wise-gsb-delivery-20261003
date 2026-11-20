@@ -1,0 +1,1 @@
+Make the conflict check between the two PEP 517 build dependency installation phases explicit, naming both the already selected version and the clashing new constraint while preserving overlay priority. A failed build dependency installation now rolls back its phase state so a subsequent build cannot inherit the unfinished environment.
