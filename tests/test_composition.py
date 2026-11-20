@@ -6,7 +6,8 @@ from threading import Condition, Event
 import pytest
 
 import dramatiq
-from dramatiq import group, middleware, pipeline
+from dramatiq import Delegate, group, middleware, pipeline
+from dramatiq.composition import MAX_DELEGATE_DEPTH
 from dramatiq.middleware import GroupCallbacks
 from dramatiq.results import Results, ResultTimeout
 
@@ -507,3 +508,252 @@ def test_groups_of_pipelines_can_have_completion_callbacks(stub_broker, stub_wor
 
     # And the callback should run after all the messages
     assert sorted(do_nothing_times)[-1] <= finalize_times[0]
+
+
+def test_delegate_requires_a_non_empty_sub_chain(stub_broker):
+    # Given an actor
+    @dramatiq.actor
+    def do_nothing():
+        pass
+
+    # When I try to delegate to an empty sub-chain
+    # Then a ValueError should be raised
+    with pytest.raises(ValueError):
+        Delegate([])
+
+
+def test_pipeline_steps_can_delegate_to_sub_chains(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    calls = []
+
+    @dramatiq.actor(store_results=True)
+    def router(x):
+        return Delegate([double.message(x), increment.message()])
+
+    @dramatiq.actor
+    def double(x):
+        calls.append(("double", x))
+        return x * 2
+
+    @dramatiq.actor
+    def increment(x):
+        calls.append(("increment", x))
+        return x + 1
+
+    @dramatiq.actor(store_results=True)
+    def successor(x):
+        calls.append(("successor", x))
+        return x
+
+    # When I run a pipeline whose first step delegates to a two-step sub-chain
+    pipe = router.message(3) | successor.message()
+    pipe.run()
+    stub_broker.join(router.queue_name)
+    stub_worker.join()
+
+    # Then the sub-chain should run to completion before the original
+    # successor and the successor should be entered exactly once with
+    # the sub-chain's final result
+    assert calls == [("double", 3), ("increment", 6), ("successor", 7)]
+    assert pipe.get_result() == 7
+
+    # And the Delegate value itself should not be stored as business data
+    assert pipe.messages[0].get_result() is None
+
+
+def test_pipeline_steps_that_return_plain_values_still_pipe_them(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def router(x):
+        if x > 10:
+            return Delegate([double.message(x)])
+        return x + 1
+
+    @dramatiq.actor
+    def double(x):
+        return x * 2
+
+    @dramatiq.actor(store_results=True)
+    def successor(x):
+        return x
+
+    # When I run a pipeline whose first step returns a plain value
+    pipe = router.message(1) | successor.message()
+    pipe.run()
+    stub_broker.join(router.queue_name)
+    stub_worker.join()
+
+    # Then the plain value should be piped into the successor as business data
+    assert pipe.get_result() == 2
+
+    # When I run a pipeline whose first step delegates to a single-message sub-chain
+    pipe = router.message(11) | successor.message()
+    pipe.run()
+    stub_broker.join(router.queue_name)
+    stub_worker.join()
+
+    # Then the sub-chain's result should be piped into the successor instead
+    assert pipe.get_result() == 22
+
+
+def test_delegates_can_be_nested(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    calls = []
+
+    @dramatiq.actor
+    def outer(x):
+        calls.append(("outer", x))
+        return Delegate([inner_router.message(x), double.message()])
+
+    @dramatiq.actor
+    def inner_router(x):
+        calls.append(("inner_router", x))
+        return Delegate([increment.message(x)])
+
+    @dramatiq.actor
+    def increment(x):
+        calls.append(("increment", x))
+        return x + 1
+
+    @dramatiq.actor
+    def double(x):
+        calls.append(("double", x))
+        return x * 2
+
+    @dramatiq.actor(store_results=True)
+    def successor(x):
+        calls.append(("successor", x))
+        return x
+
+    # When I run a pipeline whose first step delegates to a sub-chain
+    # that itself delegates to another sub-chain
+    pipe = outer.message(1) | successor.message()
+    pipe.run()
+    stub_broker.join(outer.queue_name)
+    stub_worker.join()
+
+    # Then the nested sub-chains should run in order before the
+    # original successor, which should be entered exactly once
+    assert calls == [
+        ("outer", 1),
+        ("inner_router", 1),
+        ("increment", 1),
+        ("double", 2),
+        ("successor", 4),
+    ]
+    assert pipe.get_result() == 4
+
+
+def test_delegate_nesting_is_bounded(stub_broker, stub_worker):
+    # Given an actor that endlessly delegates to itself
+    calls = []
+
+    @dramatiq.actor(max_retries=0)
+    def loop():
+        calls.append("loop")
+        return Delegate([loop.message()])
+
+    @dramatiq.actor
+    def successor():
+        calls.append("successor")
+
+    # When I run a pipeline starting with that actor
+    pipe = loop.message() | successor.message()
+    pipe.run()
+    stub_broker.join(loop.queue_name)
+    stub_worker.join()
+
+    # Then the delegation should be dropped once the maximum delegate
+    # depth is exceeded and the successor should never run
+    assert calls == ["loop"] * (MAX_DELEGATE_DEPTH + 1)
+
+
+def test_delegated_sub_chain_failure_does_not_run_successor(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    calls = []
+
+    @dramatiq.actor
+    def router(x):
+        return Delegate([double.message(x), boom.message()])
+
+    @dramatiq.actor
+    def double(x):
+        calls.append(("double", x))
+        return x * 2
+
+    @dramatiq.actor(max_retries=0)
+    def boom(x):
+        calls.append("boom")
+        raise RuntimeError("boom")
+
+    @dramatiq.actor
+    def successor(x=None):
+        calls.append("successor")
+
+    # When I run a pipeline whose delegated sub-chain fails on its second step
+    pipe = router.message(3) | successor.message()
+    pipe.run()
+    stub_broker.join(router.queue_name, fail_fast=False)
+    stub_worker.join()
+
+    # Then the second step of the sub-chain should have failed and the
+    # original successor should never have been enqueued
+    assert calls == [("double", 3), "boom"]
+
+
+def test_delegated_sub_chain_retry_does_not_run_successor_early(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    calls = []
+    attempts = []
+
+    @dramatiq.actor
+    def router(x):
+        return Delegate([double.message(x), flaky.message()])
+
+    @dramatiq.actor
+    def double(x):
+        calls.append(("double", x))
+        return x * 2
+
+    @dramatiq.actor(min_backoff=1, max_backoff=10)
+    def flaky(x):
+        attempts.append(x)
+        if len(attempts) < 2:
+            raise RuntimeError("flaky")
+        calls.append(("flaky", x))
+        return x + 1
+
+    @dramatiq.actor(store_results=True)
+    def successor(x):
+        calls.append(("successor", x))
+        return x
+
+    # When I run a pipeline whose delegated sub-chain fails once on
+    # its second step and then succeeds on retry
+    pipe = router.message(3) | successor.message()
+    pipe.run()
+    stub_broker.join(router.queue_name, timeout=5000)
+    stub_worker.join()
+
+    # Then the second step should have been retried
+    assert attempts == [6, 6]
+
+    # And the successor should have run exactly once, only after the
+    # retried step finally succeeded
+    assert calls == [("double", 3), ("flaky", 6), ("successor", 7)]
+    assert pipe.get_result() == 7

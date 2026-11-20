@@ -27,6 +27,49 @@ from .results import ResultMissing
 if TYPE_CHECKING:
     from .message import Message
 
+#: The maximum number of times a pipeline may be delegated before the
+#: delegation is dropped.  This bounds how deeply Delegate values may
+#: be nested within one another.
+MAX_DELEGATE_DEPTH = 10
+
+
+class Delegate:
+    """An explicit control-flow value that actors in a pipeline may
+    return in order to delegate execution to a sub-chain of messages
+    before the pipeline resumes with its original successor.
+
+    Unlike regular return values, a ``Delegate`` is never passed down
+    the pipeline as business data: once the sub-chain finishes, the
+    result of its last message is piped into the original successor.
+
+    Parameters:
+      children(Message|pipeline|Iterable[Message|pipeline]): The
+        sub-chain to run before the original successor resumes.  Must
+        contain at least one message.
+      broker(Broker): The broker the sub-chain belongs to.  Defaults
+        to the current global broker.
+
+    Raises:
+      ValueError: If the sub-chain is empty.
+    """
+
+    messages: list[Message]
+
+    def __init__(self, children, *, broker=None):
+        from .message import Message
+
+        self.broker = broker or get_broker()
+        if isinstance(children, (Message, pipeline)):
+            children = [children]
+
+        self.messages = pipeline(children, broker=self.broker).messages
+        if not self.messages:
+            raise ValueError("Delegate requires a sub-chain of at least one message.")
+
+    def __len__(self):
+        """Returns the length of the delegated sub-chain."""
+        return len(self.messages)
+
 
 class pipeline:
     """Chain actors together, passing the result of one actor to the

@@ -92,6 +92,15 @@ class Results(Middleware):
             return False, 0
 
     def after_process_message(self, broker, message, *, result=None, exception=None):
+        # Imported at runtime to avoid a cyclic dependency from
+        # composition -> results -> middleware -> composition.
+        from ..composition import Delegate
+
+        # A Delegate is a control-flow value, not business data: it is
+        # never stored nor passed down the pipeline as a result.
+        if isinstance(result, Delegate):
+            result = None
+
         store_results, result_ttl = self._lookup_options(broker, message)
         if store_results and exception is None:
             self.backend.store_result(message, result, result_ttl)
