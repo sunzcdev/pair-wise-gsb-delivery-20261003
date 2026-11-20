@@ -1,0 +1,30 @@
+#!/bin/bash
+#/ Usage: server
+#/
+#/ Starts a server for perusing the UI locally.
+#/
+#/ Examples:
+#/
+#/   server
+#/
+
+set -e
+cd $(dirname "$0")/..
+
+[ "$1" = "--help" -o "$1" = "-h" -o "$1" = "help" ] && {
+    grep '^#/' <"$0"| cut -c4-
+    exit 0
+}
+
+# Activate mise if available so we use the correct ruby
+if command -v mise &> /dev/null; then
+  eval "$(mise activate bash)"
+fi
+
+# Port priority: CONDUCTOR_PORT > SUPERSET_WORKSPACE_NAME (derived) > 9999
+if [ -z "$CONDUCTOR_PORT" ] && [ -n "$SUPERSET_WORKSPACE_NAME" ]; then
+  _hash=$(printf '%s' "$SUPERSET_WORKSPACE_NAME" | cksum | awk '{print $1}')
+  CONDUCTOR_PORT=$(( ((_hash % 900) * 10) + 50000 ))
+fi
+PORT="${CONDUCTOR_PORT:-9999}"
+script/bootstrap && bundle exec rackup examples/ui/basic.ru -p "$PORT"

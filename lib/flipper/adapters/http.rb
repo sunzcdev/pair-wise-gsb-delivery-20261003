@@ -1,0 +1,255 @@
+require 'net/http'
+require 'uri'
+require 'json'
+require 'set'
+require 'digest'
+require 'flipper'
+require 'flipper/adapters/http/error'
+require 'flipper/adapters/http/client'
+
+module Flipper
+  module Adapters
+    class Http
+      include Flipper::Adapter
+
+      attr_reader :client
+
+      def initialize(options = {})
+        @client = Client.new(url: options.fetch(:url),
+                             headers: options[:headers],
+                             basic_auth_username: options[:basic_auth_username],
+                             basic_auth_password: options[:basic_auth_password],
+                             read_timeout: options[:read_timeout],
+                             open_timeout: options[:open_timeout],
+                             write_timeout: options[:write_timeout],
+                             max_retries: options[:max_retries],
+                             debug_output: options[:debug_output])
+        @last_get_all_etag = nil
+        @last_get_all_result = nil
+        @last_get_all_response = nil
+        @last_get_all_sync_version = nil
+        @get_all_mutex = Mutex.new
+        @sync_version_scope = sync_version_scope(options)
+      end
+
+      # Public: The Flipper::SyncVersion of the flags get_all last returned, or
+      # nil if the server didn't send one.
+      def sync_version
+        @get_all_mutex.synchronize { @last_get_all_sync_version }
+      end
+
+      def get(feature)
+        response = @client.get("/features/#{path_escape(feature.key)}")
+        if response.is_a?(Net::HTTPOK)
+          parsed_response = Typecast.from_json(response.body)
+          result_for_feature(feature, parsed_response.fetch('gates'))
+        elsif response.is_a?(Net::HTTPNotFound)
+          default_config
+        else
+          raise Error, response
+        end
+      end
+
+      def get_multi(features)
+        response = @client.get("/features?#{query_for_features(features)}")
+        raise Error, response unless response.is_a?(Net::HTTPOK)
+
+        parsed_response = Typecast.from_json(response.body)
+        parsed_features = parsed_response.fetch('features')
+        gates_by_key = parsed_features.each_with_object({}) do |parsed_feature, hash|
+          hash[parsed_feature['key']] = parsed_feature['gates']
+          hash
+        end
+
+        result = {}
+        features.each do |feature|
+          result[feature.key] = result_for_feature(feature, gates_by_key[feature.key])
+        end
+        result
+      end
+
+      def get_all(cache_bust: false)
+        options = {}
+        path = "/features?exclude_gate_names=true"
+        path += "&_cb=#{Time.now.to_i}" if cache_bust
+        etag = @get_all_mutex.synchronize { @last_get_all_etag }
+
+        if etag && !cache_bust
+          options[:headers] = { if_none_match: etag }
+        end
+
+        response = @client.get(path, options)
+        @get_all_mutex.synchronize { @last_get_all_response = response }
+
+        if response.is_a?(Net::HTTPNotModified)
+          cached_result = @get_all_mutex.synchronize { @last_get_all_result }
+
+          if cached_result
+            return cached_result
+          else
+            raise Error, response
+          end
+        end
+
+        raise Error, response unless response.is_a?(Net::HTTPOK)
+
+        parsed_response = response.body.empty? ? {} : Typecast.from_json(response.body)
+        parsed_features = parsed_response['features'] || []
+        gates_by_key = parsed_features.each_with_object({}) do |parsed_feature, hash|
+          hash[parsed_feature['key']] = parsed_feature['gates']
+          hash
+        end
+
+        result = {}
+        gates_by_key.each_key do |key|
+          feature = Feature.new(key, self)
+          result[feature.key] = result_for_feature(feature, gates_by_key[feature.key])
+        end
+
+        @get_all_mutex.synchronize do
+          @last_get_all_etag = response['etag'] if response['etag']
+          @last_get_all_result = result
+          @last_get_all_sync_version = SyncVersion.from_header(@sync_version_scope, response[SyncVersion::HEADER])
+        end
+
+        result
+      end
+
+      def last_get_all_response
+        @get_all_mutex.synchronize { @last_get_all_response }
+      end
+
+      def features
+        response = @client.get('/features?exclude_gate_names=true')
+        raise Error, response unless response.is_a?(Net::HTTPOK)
+
+        parsed_response = Typecast.from_json(response.body)
+        parsed_response['features'].map { |feature| feature['key'] }.to_set
+      end
+
+      def add(feature)
+        body = JSON.generate(name: feature.key)
+        response = @client.post('/features', body)
+        raise Error, response unless response.is_a?(Net::HTTPOK)
+        true
+      end
+
+      def remove(feature)
+        response = @client.delete("/features/#{path_escape(feature.key)}")
+        raise Error, response unless response.is_a?(Net::HTTPNoContent)
+        true
+      end
+
+      def enable(feature, gate, thing)
+        body = request_body_for_gate(gate, thing.value)
+        query_string = gate.key == :groups ? "?allow_unregistered_groups=true" : ""
+        response = @client.post("/features/#{path_escape(feature.key)}/#{path_escape(gate.key)}#{query_string}", body)
+        raise Error, response unless response.is_a?(Net::HTTPOK)
+        true
+      end
+
+      def disable(feature, gate, thing)
+        body = request_body_for_gate(gate, thing.value)
+        query_string = gate.key == :groups ? "?allow_unregistered_groups=true" : ""
+        response = case gate.key
+        when :percentage_of_actors, :percentage_of_time
+          @client.post("/features/#{path_escape(feature.key)}/#{path_escape(gate.key)}#{query_string}", body)
+        else
+          @client.delete("/features/#{path_escape(feature.key)}/#{path_escape(gate.key)}#{query_string}", body)
+        end
+        raise Error, response unless response.is_a?(Net::HTTPOK)
+        true
+      end
+
+      def clear(feature)
+        response = @client.delete("/features/#{path_escape(feature.key)}/clear")
+        raise Error, response unless response.is_a?(Net::HTTPNoContent)
+        true
+      end
+
+      def import(source)
+        adapter = self.class.from(source)
+        export = adapter.export(format: :json, version: 1)
+        response = @client.post("/import", export.contents)
+        raise Error, response unless response.is_a?(Net::HTTPNoContent)
+        true
+      end
+
+      private
+
+      # Versions only compare between responses from the same server and
+      # credentials, such as one Cloud environment's token.
+      def sync_version_scope(options)
+        headers = (options[:headers] || {}).map { |key, value| [key.to_s.downcase, value.to_s] }.sort
+        Digest::SHA256.hexdigest([options.fetch(:url).to_s, headers].inspect)[0, 16]
+      end
+
+      def path_escape(key)
+        URI::DEFAULT_PARSER.escape(key.to_s, /[^A-Za-z0-9_.~-]/)
+      end
+
+      def query_escape(key)
+        URI.encode_www_form_component(key.to_s)
+      end
+
+      def query_for_features(features)
+        if features.any? { |feature| feature.key.to_s.include?(',') }
+          URI.encode_www_form(features.map { |feature| ["keys[]", feature.key] } + [["exclude_gate_names", "true"]])
+        else
+          csv_keys = features.map { |feature| query_escape(feature.key) }.join(',')
+          "keys=#{csv_keys}&exclude_gate_names=true"
+        end
+      end
+
+      def request_body_for_gate(gate, value)
+        data = case gate.key
+        when :boolean
+          {}
+        when :groups
+          { name: value.to_s }
+        when :actors
+          { flipper_id: value.to_s }
+        when :percentage_of_actors, :percentage_of_time
+          { percentage: value.to_s }
+        when :expression
+          value
+        else
+          raise "#{gate.key} is not a valid flipper gate key"
+        end
+        JSON.generate(data)
+      end
+
+      def result_for_feature(feature, api_gates)
+        api_gates ||= []
+        result = default_config
+
+        feature.gates.each do |gate|
+          api_gate = api_gates.detect { |ag| ag['key'] == gate.key.to_s }
+          result[gate.key] = value_for_gate(gate, api_gate) if api_gate
+        end
+
+        result
+      end
+
+      def value_for_gate(gate, api_gate)
+        value = api_gate['value']
+        case gate.data_type
+        when :boolean, :integer
+          value ? value.to_s : value
+        when :json
+          value
+        when :set
+          value ? value.to_set : Set.new
+        else
+          unsupported_data_type gate.data_type
+        end
+      end
+
+      private
+
+      def unsupported_data_type(data_type)
+        raise "#{data_type} is not supported by this adapter"
+      end
+    end
+  end
+end

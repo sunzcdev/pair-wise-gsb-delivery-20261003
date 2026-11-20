@@ -1,0 +1,25 @@
+#!/bin/bash
+set -e
+cd "$(dirname "$0")/.."
+
+# Resolve workspace vars: prefer Superset, fall back to Conductor
+ROOT_PATH="${SUPERSET_ROOT_PATH:-$CONDUCTOR_ROOT_PATH}"
+
+if command -v mise &> /dev/null; then
+  # Copy .tool-versions from root workspace if it exists
+  if [ -n "$ROOT_PATH" ] && [ -f "$ROOT_PATH/.tool-versions" ]; then
+    ln -sf "$ROOT_PATH/.tool-versions" .tool-versions
+  fi
+
+  # Install ruby version from .tool-versions
+  mise install
+
+  # Activate mise so gem/bundle use the correct ruby
+  eval "$(mise activate bash)"
+fi
+
+# Install the required bundler version
+gem install bundler:4.0.6
+
+# Bundle install and setup binstubs
+script/bootstrap

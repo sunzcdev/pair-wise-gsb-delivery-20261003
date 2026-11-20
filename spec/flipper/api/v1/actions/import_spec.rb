@@ -1,0 +1,135 @@
+require 'flipper/adapters/read_only'
+
+RSpec.describe Flipper::Api::V1::Actions::Import do
+  let(:app) { build_api(flipper) }
+
+  describe 'post' do
+    let(:expression) { Flipper.property(:plan).eq("basic") }
+
+    context 'succesful request' do
+      before do
+        flipper.enable(:search)
+        flipper.disable(:adios)
+
+        source_flipper = build_flipper
+        source_flipper.disable(:search)
+        source_flipper.enable_actor(:google_analytics, Flipper::Actor.new("User;1"))
+        source_flipper.enable(:analytics, expression)
+
+        export = source_flipper.export
+
+        post '/import', export.contents, 'CONTENT_TYPE' => 'application/json'
+      end
+
+      it 'responds 204' do
+        expect(last_response.status).to eq(204)
+      end
+
+      it 'imports features' do
+        expect(flipper[:search].boolean_value).to be(false)
+        expect(flipper[:google_analytics].actors_value).to eq(Set["User;1"])
+        expect(flipper[:analytics].expression_value).to eq(expression.value)
+        expect(flipper.features.map(&:key)).to eq(["search", "google_analytics", "analytics"])
+      end
+    end
+
+    context 'empty request' do
+      before do
+        flipper.enable(:search)
+        flipper.disable(:adios)
+
+        source_flipper = build_flipper
+        export = source_flipper.export
+
+        post '/import', export.contents, 'CONTENT_TYPE' => 'application/json'
+      end
+
+      it 'responds 204' do
+        expect(last_response.status).to eq(204)
+      end
+
+      it 'removes all features' do
+        expect(flipper.features.map(&:key)).to eq([])
+      end
+    end
+
+    context 'bad request' do
+      before do
+        post '/import'
+      end
+
+      it 'returns correct status code' do
+        expect(last_response.status).to eq(422)
+      end
+
+      it 'returns formatted error' do
+        expected = {
+          'code' => 6,
+          'message' => 'Import invalid.',
+          'more_info' => api_error_code_reference_url,
+        }
+        expect(json_response).to eq(expected)
+      end
+    end
+
+    context 'request without rack.input' do
+      it 'responds like an empty body' do
+        flipper.enable(:search)
+
+        status, _headers, body = call_without_rack_input('/import', method: 'POST', 'CONTENT_TYPE' => 'application/json')
+
+        expect(status).to eq(422)
+        expect(JSON.parse(body)).to eq(
+          'code' => 6,
+          'message' => 'Import invalid.',
+          'more_info' => api_error_code_reference_url,
+        )
+        expect(flipper.features.map(&:key)).to eq(['search'])
+      end
+    end
+
+    context 'body larger than the max import size' do
+      before do
+        stub_const("Flipper::Exporters::Json::Export::MAX_BYTES", 1)
+
+        source_flipper = build_flipper
+        source_flipper.enable(:search)
+
+        post '/import', source_flipper.export.contents, 'CONTENT_TYPE' => 'application/json'
+      end
+
+      it 'returns correct status code' do
+        expect(last_response.status).to eq(422)
+      end
+
+      it 'returns formatted error' do
+        expected = {
+          'code' => 6,
+          'message' => 'Import invalid.',
+          'more_info' => api_error_code_reference_url,
+        }
+        expect(json_response).to eq(expected)
+      end
+
+      it 'does not import the features' do
+        expect(flipper.features.map(&:key)).to eq([])
+      end
+    end
+
+    context 'with a read-only adapter' do
+      let(:adapter) { build_memory_adapter }
+      let(:flipper) { build_flipper(Flipper::Adapters::ReadOnly.new(adapter)) }
+
+      it 'rejects the import without changing the wrapped adapter' do
+        adapter.add(Flipper::Feature.new(:existing, adapter))
+        source_flipper = build_flipper
+        source_flipper.enable(:replacement)
+
+        expect do
+          post '/import', source_flipper.export.contents, 'CONTENT_TYPE' => 'application/json'
+        end.to raise_error(Flipper::Adapters::ReadOnly::WriteAttempted)
+        expect(adapter.features).to eq(Set['existing'])
+      end
+    end
+  end
+end

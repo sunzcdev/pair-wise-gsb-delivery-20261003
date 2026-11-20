@@ -1,0 +1,327 @@
+RSpec.describe Flipper::UI::Actions::Features do
+  let(:token) do
+    if Rack::Protection::AuthenticityToken.respond_to?(:random_token)
+      Rack::Protection::AuthenticityToken.random_token
+    else
+      'a'
+    end
+  end
+  let(:session) do
+    { :csrf => token, 'csrf' => token, '_csrf_token' => token }
+  end
+
+  describe 'GET /features' do
+    context "when there are some features" do
+      before do
+        flipper[:stats].enable
+        flipper[:search].enable
+        get '/features'
+      end
+
+      it 'responds with success' do
+        expect(last_response.status).to be(200)
+      end
+
+      it 'renders template' do
+        expect(last_response.body).to include('stats')
+        expect(last_response.body).to include('search')
+      end
+    end
+
+    it "renders when Ruby's default external encoding is US-ASCII (LANG=C)" do
+      flipper[:search].enable
+      with_default_external(Encoding::US_ASCII) { get '/features' }
+
+      expect(last_response.status).to be(200)
+      expect(last_response.body).to include('search')
+    end
+
+    it "escapes keys that are junky" do
+      flipper.add("../../../../blah")
+      flipper.add("this that")
+      flipper.add("foo/bar")
+      flipper.add("can_do_stuff?")
+      get '/features'
+      expect(last_response.body).to include("..%2F..%2F..%2F..%2Fblah")
+      expect(last_response.body).to include("this+that")
+      expect(last_response.body).to include("foo%2Fbar")
+      expect(last_response.body).to include("can_do_stuff%3F")
+    end
+
+    it "escapes actor values in gate tooltip titles" do
+      flipper[:search].enable_actor Flipper::Actor.new('x" onmouseover="alert(document.domain)')
+
+      get '/features'
+
+      expect(last_response.body).to include('title="x&quot; onmouseover=&quot;alert(document.domain)"')
+      expect(last_response.body).not_to include('title="x" onmouseover="alert(document.domain)"')
+    end
+
+    context "when there are no features to list" do
+      before do
+        @original_fun_enabled = Flipper::UI.configuration.fun
+        Flipper::UI.configuration.fun = fun_mode
+      end
+
+      after do
+        Flipper::UI.configuration.fun = @original_fun_enabled
+      end
+
+      context "when fun mode is enabled" do
+        let(:fun_mode) { true }
+        before { get '/features' }
+
+        it 'responds with success' do
+          expect(last_response.status).to be(200)
+        end
+
+        it 'renders template' do
+          expect(last_response.body).to include('And I\'ll flip your features.')
+        end
+      end
+
+      context "when fun mode is disabled" do
+        let(:fun_mode) { false }
+        before { get '/features' }
+
+        it 'responds with success' do
+          expect(last_response.status).to be(200)
+        end
+
+        it 'renders template' do
+          expect(last_response.body).to include('You have not added any features to configure yet.')
+        end
+      end
+    end
+
+    context "merch callout" do
+      before do
+        @original_fun_enabled = Flipper::UI.configuration.fun
+        Flipper::UI.configuration.fun = fun_mode
+        get '/features'
+      end
+
+      after do
+        Flipper::UI.configuration.fun = @original_fun_enabled
+      end
+
+      context "when fun mode is enabled" do
+        let(:fun_mode) { true }
+
+        it 'renders the shirt link' do
+          expect(last_response.body).to include('>Shirt</a>')
+          expect(last_response.body).to include('i-deploy-on-fridays-tee')
+        end
+      end
+
+      context "when fun mode is disabled" do
+        let(:fun_mode) { false }
+
+        it 'does not render the shirt link' do
+          expect(last_response.body).not_to include('>Shirt</a>')
+          expect(last_response.body).not_to include('i-deploy-on-fridays-tee')
+        end
+      end
+    end
+
+    context "when in read-only mode" do
+      before { allow(flipper).to receive(:read_only?) { true } }
+
+      before { get '/features' }
+
+      it 'responds with success' do
+        expect(last_response.status).to be(200)
+      end
+
+      it 'renders template with no button' do
+        expect(last_response.body).not_to include('<a class="btn btn-primary btn-sm" href="/features/new">Add Feature</a>')
+      end
+    end
+
+    context 'when descriptions have links' do
+      before do
+        Flipper::UI.configuration.show_feature_description_in_list = true
+        Flipper::UI.configuration.descriptions_source = lambda { |_keys|
+          { 'test_feature' => 'Check <a href="https://example.com">this link</a> for more info' }
+        }
+
+        flipper[:test_feature].enable
+      end
+
+      it 'strips anchor tags from descriptions to avoid nested links' do
+        get '/features'
+
+        expect(last_response.status).to eq(200)
+        expect(last_response.body).to include('Check this link for more info')
+        expect(last_response.body).not_to include('<a href="https://example.com">this link</a>')
+      end
+    end
+  end
+
+  describe 'POST /features' do
+    let(:feature_name) { 'notifications_next' }
+
+    before do
+      @original_feature_creation_enabled = Flipper::UI.configuration.feature_creation_enabled
+      Flipper::UI.configuration.feature_creation_enabled = feature_creation_enabled
+      post '/features',
+           { 'value' => feature_name, 'authenticity_token' => token },
+           'rack.session' => session
+    end
+
+    after do
+      Flipper::UI.configuration.feature_creation_enabled = @original_feature_creation_enabled
+    end
+
+    context 'feature_creation_enabled set to true' do
+      let(:feature_creation_enabled) { true }
+
+      it 'adds feature' do
+        expect(flipper.features.map(&:key)).to include('notifications_next')
+      end
+
+      it 'redirects to feature' do
+        expect(last_response.status).to be(302)
+        expect(last_response.headers['location']).to eq('/features/notifications_next')
+      end
+
+      context 'feature name has whitespace at beginning and end' do
+        let(:feature_name) { '  notifications_next   ' }
+
+        it 'adds feature without whitespace' do
+          expect(flipper.features.map(&:key)).to include('notifications_next')
+        end
+      end
+
+      context 'feature name contains space' do
+        let(:feature_name) { 'notifications next' }
+
+        it 'adds feature with space' do
+          expect(flipper.features.map(&:key)).to include('notifications next')
+        end
+
+        it 'redirects to feature' do
+          expect(last_response.status).to be(302)
+          expect(last_response.headers['location']).to eq('/features/notifications+next')
+        end
+      end
+
+      context 'feature name contains ../' do
+        let(:feature_name) { '../../../foo' }
+
+        it 'adds feature with space' do
+          expect(flipper.features.map(&:key)).to include(feature_name)
+        end
+
+        it 'redirects to feature' do
+          expect(last_response.status).to be(302)
+          expect(last_response.headers['location']).to eq('/features/..%2F..%2F..%2Ffoo')
+        end
+      end
+
+      context 'feature name contains question mark' do
+        let(:feature_name) { 'can_do_stuff?' }
+
+        it 'adds feature with question mark' do
+          expect(flipper.features.map(&:key)).to include('can_do_stuff?')
+        end
+
+        it 'redirects to feature with encoded question mark' do
+          expect(last_response.status).to be(302)
+          expect(last_response.headers['location']).to eq('/features/can_do_stuff%3F')
+        end
+      end
+
+      context 'feature name contains accented and invisible characters' do
+        let(:feature_name) { "f\u3164e\u115F\u00E1\u1160t\uFFA0u\u2800r\u17B4e" }
+
+        it 'adds feature with invisible characters removed and accent kept' do
+          expect(flipper.features.map(&:key)).to include("fe\u00E1ture")
+        end
+
+        it 'redirects to normalized feature' do
+          expect(last_response.status).to be(302)
+          expect(last_response.headers['location']).to eq('/features/fe%C3%A1ture')
+        end
+      end
+
+      context 'for an invalid feature name' do
+        context 'empty feature name' do
+          let(:feature_name) { '' }
+
+          it 'does not add feature' do
+            expect(flipper.features.map(&:key)).to eq([])
+          end
+
+          it 'redirects back to feature' do
+            expect(last_response.status).to be(302)
+            expect(last_response.headers['location']).to eq('/features/new?error=%22%22+is+not+a+valid+feature+name.')
+          end
+        end
+
+        context 'reserved feature name' do
+          let(:feature_name) { '__flipper_thing' }
+
+          it 'does not add feature' do
+            expect(flipper.features.map(&:key)).to eq([])
+          end
+
+          it 'redirects back with an error' do
+            expect(last_response.status).to be(302)
+            expect(last_response.headers['location']).to eq('/features/new?error=%22__flipper_thing%22+is+reserved+for+Flipper%27s+internal+use.')
+          end
+        end
+
+        context 'feature name that normalizes to empty' do
+          let(:feature_name) { "\u3164\u115F\u1160\uFFA0\u2800\u17B4" }
+
+          it 'does not add feature' do
+            expect(flipper.features.map(&:key)).to eq([])
+          end
+
+          it 'redirects back to feature' do
+            expect(last_response.status).to be(302)
+            expect(last_response.headers['location']).to eq('/features/new?error=%22%22+is+not+a+valid+feature+name.')
+          end
+        end
+
+        context 'nil feature name' do
+          let(:feature_name) { nil }
+
+          it 'does not add feature' do
+            expect(flipper.features.map(&:key)).to eq([])
+          end
+
+          it 'redirects back to feature' do
+            expect(last_response.status).to be(302)
+            expect(last_response.headers['location']).to eq('/features/new?error=%22%22+is+not+a+valid+feature+name.')
+          end
+        end
+      end
+    end
+
+    context 'feature_creation_enabled set to false' do
+      let(:feature_creation_enabled) { false }
+
+      it 'does not add feature' do
+        expect(flipper.features.map(&:key)).not_to include('notifications_next')
+      end
+
+      it 'returns 403' do
+        expect(last_response.status).to be(403)
+      end
+
+      it 'renders feature creation disabled template' do
+        expect(last_response.body).to include('Feature creation is disabled.')
+      end
+    end
+  end
+
+  def with_default_external(encoding)
+    original = Encoding.default_external
+    Encoding.default_external = encoding
+    yield
+  ensure
+    Encoding.default_external = original
+  end
+end

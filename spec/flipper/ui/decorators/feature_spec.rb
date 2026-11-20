@@ -1,0 +1,74 @@
+RSpec.describe Flipper::UI::Decorators::Feature do
+  let(:flipper) { build_flipper }
+  let(:feature) { flipper[:some_awesome_feature] }
+
+  subject do
+    described_class.new(feature)
+  end
+
+  describe '#initialize' do
+    it 'sets the feature' do
+      expect(subject.feature).to be(feature)
+    end
+  end
+
+  describe '#gates_in_words' do
+    it 'escapes actor values in the tooltip title' do
+      feature.enable_actor Flipper::Actor.new('x" onmouseover="alert(document.domain)')
+
+      expect(subject.gates_in_words).to include('title="x&quot; onmouseover=&quot;alert(document.domain)"')
+      expect(subject.gates_in_words).to include('>1 actor</span>')
+      expect(subject.gates_in_words).not_to include('title="x" onmouseover="alert(document.domain)"')
+    end
+
+    it 'mentions an expression' do
+      feature.enable_expression Flipper.property(:plan).eq("basic")
+
+      expect(subject.gates_in_words).to eq('an expression')
+    end
+
+    it 'lists an expression after the other gates' do
+      feature.enable_percentage_of_time 5
+      feature.enable_expression Flipper.property(:plan).eq("basic")
+
+      expect(subject.gates_in_words).to eq('5% of time and an expression')
+    end
+  end
+
+  describe '#<=>' do
+    let(:on) do
+      flipper.enable(:on_a)
+      described_class.new(flipper[:on_a])
+    end
+
+    let(:on_b) do
+      flipper.enable(:on_b)
+      described_class.new(flipper[:on_b])
+    end
+
+    let(:conditional) do
+      flipper.enable_percentage_of_time :conditional_a, 5
+      described_class.new(flipper[:conditional_a])
+    end
+
+    let(:off) do
+      described_class.new(flipper[:off_a])
+    end
+
+    it 'sorts :on before :conditional' do
+      expect((on <=> conditional)).to be(-1)
+    end
+
+    it 'sorts :on before :off' do
+      expect((on <=> off)).to be(-1)
+    end
+
+    it 'sorts :conditional before :off' do
+      expect((conditional <=> off)).to be(-1)
+    end
+
+    it 'sorts on key for identical states' do
+      expect((on <=> on_b)).to be(-1)
+    end
+  end
+end

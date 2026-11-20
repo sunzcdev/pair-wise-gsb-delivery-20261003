@@ -1,0 +1,87 @@
+require 'flipper/adapters/dual_write'
+require 'flipper/adapters/operation_logger'
+require 'active_support/notifications'
+
+RSpec.describe Flipper::Adapters::DualWrite do
+  let(:local_adapter) do
+    Flipper::Adapters::OperationLogger.new Flipper::Adapters::Memory.new
+  end
+  let(:remote_adapter) do
+    Flipper::Adapters::OperationLogger.new Flipper::Adapters::Memory.new
+  end
+  let(:sync) { Flipper.new(subject) }
+
+  subject do
+    described_class.new(local_adapter, remote_adapter)
+  end
+
+  it_should_behave_like 'a flipper adapter'
+  it_should_behave_like 'an adapter that stores its sync version'
+
+  it 'keeps the sync version in the local adapter only' do
+    subject.sync_version = Flipper::SyncVersion.new("scope", 10)
+    expect(local_adapter.sync_version).to eq(subject.sync_version)
+    expect(remote_adapter.sync_version).to be_nil
+  end
+
+  it 'only uses local for #features' do
+    subject.features
+  end
+
+  it 'only uses local for #get' do
+    subject.get sync[:search]
+  end
+
+  it 'only uses local for #get_multi' do
+    subject.get_multi [sync[:search]]
+  end
+
+  it 'only uses local for #get_all' do
+    subject.get_all
+  end
+
+  it 'updates remote and local for #add' do
+    subject.add sync[:search]
+    expect(remote_adapter.count(:add)).to be(1)
+    expect(local_adapter.count(:add)).to be(1)
+  end
+
+  it 'updates remote and local for #remove' do
+    subject.remove sync[:search]
+    expect(remote_adapter.count(:remove)).to be(1)
+    expect(local_adapter.count(:remove)).to be(1)
+  end
+
+  it 'updates remote and local for #clear' do
+    subject.clear sync[:search]
+    expect(remote_adapter.count(:clear)).to be(1)
+    expect(local_adapter.count(:clear)).to be(1)
+  end
+
+  it 'updates remote and local for #enable' do
+    feature = sync[:search]
+    subject.enable feature, feature.gate(:boolean), Flipper::Types::Boolean.new(true)
+    expect(remote_adapter.count(:enable)).to be(1)
+    expect(local_adapter.count(:enable)).to be(1)
+  end
+
+  it 'updates remote and local for #disable' do
+    feature = sync[:search]
+    subject.disable feature, feature.gate(:boolean), Flipper::Types::Boolean.new(false)
+    expect(remote_adapter.count(:disable)).to be(1)
+    expect(local_adapter.count(:disable)).to be(1)
+  end
+
+  describe '#adapter_stack' do
+    it 'returns the tree representation' do
+      expect(subject.adapter_stack).to eq("dual_write(local: operation_logger -> memory, remote: operation_logger -> memory)")
+    end
+
+    it 'shows nested adapters in the tree' do
+      memory = Flipper::Adapters::Memory.new
+      strict = Flipper::Adapters::Strict.new(Flipper::Adapters::Memory.new)
+      adapter = described_class.new(memory, strict)
+      expect(adapter.adapter_stack).to eq("dual_write(local: memory, remote: strict -> memory)")
+    end
+  end
+end

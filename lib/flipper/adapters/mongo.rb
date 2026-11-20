@@ -1,0 +1,236 @@
+require 'set'
+require 'flipper'
+require 'mongo'
+require 'concurrent/map'
+
+module Flipper
+  module Adapters
+    class Mongo
+      include ::Flipper::Adapter
+
+      # Public: The name of the collection storing the feature data.
+      attr_reader :collection
+
+      def initialize(collection)
+        @collection = collection
+        @features_key = :flipper_features
+      end
+
+      # Public: The set of known features.
+      def features
+        read_feature_keys
+      end
+
+      # Public: The Flipper::SyncVersion of the flags last synced into this
+      # adapter, shared by every process using the same collection.
+      def sync_version
+        SyncVersion.parse(find(SyncVersion::KEY)['value'])
+      end
+
+      # Public: Records the Flipper::SyncVersion of the flags just synced.
+      def sync_version=(version)
+        update SyncVersion::KEY, '$set' => { 'value' => version.to_s }
+      end
+
+      # Public: Adds a feature to the set of known features.
+      def add(feature)
+        ensure_not_reserved_key!(feature)
+        update @features_key, '$addToSet' => { 'features' => feature.key }
+        true
+      end
+
+      # Public: Removes a feature from the set of known features.
+      def remove(feature)
+        update @features_key, '$pull' => { 'features' => feature.key }
+        # Removing a reserved name left in the list must not delete the list.
+        clear feature unless reserved_key?(feature)
+        true
+      end
+
+      # Public: Clears all the gate values for a feature.
+      def clear(feature)
+        ensure_not_reserved_key!(feature)
+        delete feature.key
+        true
+      end
+
+      # Public: Gets the values for all gates for a given feature.
+      #
+      # Returns a Hash of Flipper::Gate#key => value.
+      def get(feature)
+        doc = find(feature.key)
+        result_for_feature(feature, doc)
+      end
+
+      def get_multi(features)
+        read_many_features(features)
+      end
+
+      def get_all(**kwargs)
+        features = read_feature_keys.map { |key| Flipper::Feature.new(key, self) }
+        read_many_features(features)
+      end
+
+      # Public: Enables a gate for a given thing.
+      #
+      # feature - The Flipper::Feature for the gate.
+      # gate - The Flipper::Gate to enable.
+      # thing - The Flipper::Type being enabled for the gate.
+      #
+      # Returns true.
+      def enable(feature, gate, thing)
+        ensure_not_reserved_key!(feature)
+        case gate.data_type
+        when :boolean
+          clear(feature)
+          update feature.key, '$set' => {
+            gate.key.to_s => thing.value.to_s,
+          }
+        when :integer
+          update feature.key, '$set' => {
+            gate.key.to_s => thing.value.to_s,
+          }
+        when :set
+          update feature.key, '$addToSet' => {
+            gate.key.to_s => thing.value.to_s,
+          }
+        when :json
+          update feature.key, '$set' => {
+            gate.key.to_s => Typecast.to_json(thing.value),
+          }
+        else
+          unsupported_data_type gate.data_type
+        end
+
+        true
+      end
+
+      # Public: Disables a gate for a given thing.
+      #
+      # feature - The Flipper::Feature for the gate.
+      # gate - The Flipper::Gate to disable.
+      # thing - The Flipper::Type being disabled for the gate.
+      #
+      # Returns true.
+      def disable(feature, gate, thing)
+        ensure_not_reserved_key!(feature)
+        case gate.data_type
+        when :boolean
+          delete feature.key
+        when :integer
+          update feature.key, '$set' => {
+            gate.key.to_s => thing.value.to_s,
+          }
+        when :set
+          update feature.key, '$pull' => {
+            gate.key.to_s => thing.value.to_s,
+          }
+        when :json
+          update feature.key, '$set' => {
+            gate.key.to_s => nil,
+          }
+        else
+          unsupported_data_type gate.data_type
+        end
+
+        true
+      end
+
+      private
+
+      # Private: The feature list and sync version live in documents next to
+      # the feature documents, so a feature with the same key would overwrite
+      # or delete them.
+      def reserved_key?(feature)
+        Flipper.reserved_key?(feature.key) || feature.key == @features_key.to_s
+      end
+
+      def ensure_not_reserved_key!(feature)
+        super
+        return unless feature.key == @features_key.to_s
+
+        raise ArgumentError, "#{feature.key.inspect} is reserved by the Mongo adapter and cannot be used as a feature name"
+      end
+
+      def read_feature_keys
+        find(@features_key).fetch('features') { Set.new }.to_set
+      end
+
+      def read_many_features(features)
+        docs = find_many(features.map(&:key))
+        result = {}
+        features.each do |feature|
+          result[feature.key] = result_for_feature(feature, docs.fetch(feature.key, {}))
+        end
+        result
+      end
+
+      # Private
+      def unsupported_data_type(data_type)
+        raise "#{data_type} is not supported by this adapter"
+      end
+
+      # Private
+      def find(key)
+        @collection.find(_id: key.to_s).limit(1).first || {}
+      end
+
+      def find_many(keys)
+        docs = @collection.find(_id: { '$in' => keys }).to_a
+        result = {}
+        docs.each do |doc|
+          result[doc['_id']] = doc
+        end
+        result
+      end
+
+      # Private
+      def update(key, updates)
+        options = { upsert: true }
+        @collection.find(_id: key.to_s).update_one(updates, options)
+      end
+
+      # Private
+      def delete(key)
+        @collection.find(_id: key.to_s).delete_one
+      end
+
+      def result_for_feature(feature, doc)
+        result = {}
+        feature.gates.each do |gate|
+          result[gate.key] =
+            case gate.data_type
+            when :boolean, :integer
+              doc[gate.key.to_s]
+            when :set
+              doc.fetch(gate.key.to_s) { Set.new }.to_set
+            when :json
+              value = doc[gate.key.to_s]
+              Typecast.from_json(value)
+            else
+              unsupported_data_type gate.data_type
+            end
+        end
+        result
+      end
+    end
+  end
+end
+
+Flipper.configure do |config|
+  # Each thread builds its own adapter. Mongo::Client is thread safe and pooled,
+  # so share one per process instead of leaving one open for every thread.
+  clients = Concurrent::Map.new
+
+  config.adapter do
+    url = ENV["FLIPPER_MONGO_URL"] || ENV["MONGO_URL"]
+    collection = ENV["FLIPPER_MONGO_COLLECTION"] || "flipper"
+
+    unless url
+      raise ArgumentError, "The MONGO_URL environment variable must be set. For example: mongodb://127.0.0.1:27017/flipper"
+    end
+
+    client = clients.compute_if_absent([Process.pid, url]) { Mongo::Client.new(url) }
+    Flipper::Adapters::Mongo.new(client[collection])
+  end
+end

@@ -1,0 +1,4 @@
+{
+  "setup": ["script/conductor-setup"],
+  "teardown": []
+}

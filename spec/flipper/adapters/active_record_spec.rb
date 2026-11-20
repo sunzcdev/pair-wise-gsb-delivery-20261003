@@ -1,0 +1,460 @@
+require "open3"
+SpecHelpers.silence { require 'flipper/adapters/active_record' }
+require 'active_record/connection_adapters/sqlite3_adapter'
+
+# Turn off migration logging for specs
+ActiveRecord::Migration.verbose = false
+ActiveRecord::Tasks::DatabaseTasks.root = File.dirname(__FILE__)
+
+RSpec.describe Flipper::Adapters::ActiveRecord do
+  subject { described_class.new }
+
+  before(:all) do
+    # Eval migration template so we can run migration against each database
+    template_path = File.join(File.dirname(__FILE__), '../../../lib/generators/flipper/templates/migration.erb')
+    migration = ERB.new(File.read(template_path))
+    migration_version = "[#{ActiveRecord::VERSION::MAJOR}.#{ActiveRecord::VERSION::MINOR}]"
+    eval migration.result_with_hash(migration_version: migration_version) # defines CreateFlipperTables
+  end
+
+  # Loading the adapter configures Flipper to use it. Clear that so the next
+  # spec's flipper_reset doesn't query a database that has been dropped.
+  after(:each) do
+    Flipper.instance = nil
+    Flipper.configuration = nil
+  end
+
+  [
+    {
+      "adapter" => "sqlite3",
+      "database" => ":memory:"
+    },
+
+    {
+      "adapter" => "mysql2",
+      "encoding" => "utf8mb4",
+      "host" => ENV["MYSQL_HOST"],
+      "username" => ENV["MYSQL_USER"] || "root",
+      "password" => ENV["MYSQL_PASSWORD"] || "",
+      "database" => ENV["MYSQL_DATABASE"] || "flipper_test",
+      "port" => ENV["DB_PORT"] || 3306
+    },
+
+    {
+      "adapter" => "postgresql",
+      "encoding" => "unicode",
+      "host" => ENV["POSTGRES_HOST"] || "127.0.0.1",
+      "username" => ENV["POSTGRES_USER"] || "",
+      "password" => ENV["POSTGRES_PASSWORD"] || "",
+      "database" => ENV["POSTGRES_DATABASE"] || "flipper_test",
+    }
+  ].each do |config|
+    context "with #{config['adapter']}" do
+      context "with tables created" do
+        before(:all) do
+          skip_on_error(ActiveRecord::ConnectionNotEstablished, "#{config['adapter']} not available") do
+            silence do
+              ActiveRecord::Tasks::DatabaseTasks.create(config)
+            end
+          end
+
+          Flipper.configuration = nil
+        end
+
+        before(:each) do
+          silence do
+            ActiveRecord::Tasks::DatabaseTasks.purge(config)
+            CreateFlipperTables.migrate(:up)
+          end
+
+          # Rails main caches columns per model, so drop columns cached
+          # from the previous database's adapter.
+          Flipper::Adapters::ActiveRecord::Feature.reset_column_information
+          Flipper::Adapters::ActiveRecord::Gate.reset_column_information
+        end
+
+        after(:all) do
+          silence { ActiveRecord::Tasks::DatabaseTasks.drop(config) } unless $skip
+        end
+
+        it_should_behave_like 'a flipper adapter'
+        it_should_behave_like 'an adapter that stores its sync version'
+        it_should_behave_like 'an adapter that protects its sync version key'
+
+        it "does not let another process sync older flags over newer ones" do
+          remote = lambda do |enabled, number|
+            adapter = Flipper::Adapters::Memory.new
+            Flipper.new(adapter).enable(:search) if enabled
+            adapter.sync_version = Flipper::SyncVersion.new("scope", number)
+            adapter
+          end
+
+          # Each process has its own adapter instance over the same tables.
+          process_a = described_class.new
+          process_b = described_class.new
+
+          Flipper::Adapters::Sync::Synchronizer.new(process_a, remote.call(true, 10)).call
+          Flipper::Adapters::Sync::Synchronizer.new(process_b, remote.call(false, 8)).call
+
+          expect(Flipper.new(described_class.new).enabled?(:search)).to be(true)
+          expect(described_class.new.sync_version.number).to eq(10)
+        end
+
+        it "should load actor ids fine" do
+          flipper.enable_percentage_of_time(:foo, 1)
+
+          Flipper::Adapters::ActiveRecord::Gate.create!(
+            feature_key: "foo",
+            key: "actors",
+            value: "Organization;4",
+          )
+
+          flipper = Flipper.new(subject)
+          flipper.preload([:foo])
+        end
+
+        it "ignores gate rows with unknown keys" do
+          flipper = Flipper.new(subject)
+          flipper.enable_actor(:foo, Flipper::Actor.new("User;1"))
+
+          Flipper::Adapters::ActiveRecord::Gate.create!(
+            feature_key: "foo",
+            key: "not_a_real_gate",
+            value: "junk",
+          )
+
+          expected = subject.default_config.merge(actors: Set["User;1"])
+          feature = flipper[:foo]
+          expect(subject.get(feature)).to eq(expected)
+          expect(subject.get_multi([feature])).to eq("foo" => expected)
+          expect(subject.get_all).to eq("foo" => expected)
+        end
+
+        it 'should not poison wrapping transactions' do
+          flipper = Flipper.new(subject)
+
+          actor = Struct.new(:flipper_id).new('flipper-id-123')
+          flipper.enable_actor(:foo, actor)
+
+          ActiveRecord::Base.transaction do
+            flipper.enable_actor(:foo, actor)
+            # any read on the next line is fine, just need to ensure that
+            # poisoned transaction isn't raised
+            expect(Flipper::Adapters::ActiveRecord::Gate.count).to eq(1)
+          end
+        end
+
+        it "warns once if the gates value column is not text" do
+          allow(Flipper::Adapters::ActiveRecord::Gate).
+            to receive(:column_for_attribute).
+            with(:value).
+            and_return(double(type: :string))
+
+          output = capture_output do
+            2.times { subject.features }
+          end
+
+          expect(output.scan("Your database needs to be migrated").size).to eq(1)
+        end
+
+        context "ActiveRecord connection_pool" do
+          before do
+            clear_active_connections!
+          end
+
+          context "#features" do
+            it "does not hold onto connections" do
+              expect(active_connections?).to be(false)
+              subject.features
+              expect(active_connections?).to be(false)
+            end
+
+            it "does not release previously held connection" do
+              ActiveRecord::Base.connection # establish a new connection
+              expect(active_connections?).to be(true)
+              subject.features
+              expect(active_connections?).to be(true)
+            end
+          end
+
+          context "#get_all" do
+            it "does not hold onto connections" do
+              expect(active_connections?).to be(false)
+              subject.get_all
+              expect(active_connections?).to be(false)
+            end
+
+            it "does not release previously held connection" do
+              ActiveRecord::Base.connection # establish a new connection
+              expect(active_connections?).to be(true)
+              subject.get_all
+              expect(active_connections?).to be(true)
+            end
+          end
+
+          context "#add / #remove / #clear" do
+            let(:feature) { Flipper::Feature.new(:search, subject) }
+
+            it "does not hold onto connections" do
+              expect(active_connections?).to be(false)
+              subject.add(feature)
+              expect(active_connections?).to be(false)
+              subject.remove(feature)
+              expect(active_connections?).to be(false)
+              subject.clear(feature)
+              expect(active_connections?).to be(false)
+            end
+
+            it "does not release previously held connection" do
+              ActiveRecord::Base.connection # establish a new connection
+              expect(active_connections?).to be(true)
+              subject.add(feature)
+              expect(active_connections?).to be(true)
+              subject.remove(feature)
+              expect(active_connections?).to be(true)
+              subject.clear(feature)
+              expect(active_connections?).to be(true)
+            end
+          end
+
+          context "#get_multi" do
+            let(:feature) { Flipper::Feature.new(:search, subject) }
+
+            it "does not hold onto connections" do
+              expect(active_connections?).to be(false)
+              subject.get_multi([feature])
+              expect(active_connections?).to be(false)
+            end
+
+            it "does not release previously held connection" do
+              ActiveRecord::Base.connection # establish a new connection
+              expect(active_connections?).to be(true)
+              subject.get_multi([feature])
+              expect(active_connections?).to be(true)
+            end
+          end
+
+          context "#enable/#disable boolean" do
+            let(:feature) { Flipper::Feature.new(:search, subject) }
+            let(:gate) { feature.gate(:boolean)}
+
+            it "does not hold onto connections" do
+              expect(active_connections?).to be(false)
+              subject.enable(feature, gate, gate.wrap(true))
+              expect(active_connections?).to be(false)
+              subject.disable(feature, gate, gate.wrap(false))
+              expect(active_connections?).to be(false)
+            end
+
+            it "does not release previously held connection" do
+              ActiveRecord::Base.connection # establish a new connection
+              expect(active_connections?).to be(true)
+              subject.enable(feature, gate, gate.wrap(true))
+              expect(active_connections?).to be(true)
+              subject.disable(feature, gate, gate.wrap(false))
+              expect(active_connections?).to be(true)
+            end
+          end
+
+          context "#enable/#disable set" do
+            let(:feature) { Flipper::Feature.new(:search, subject) }
+            let(:gate) { feature.gate(:group) }
+
+            it "does not hold onto connections" do
+              expect(active_connections?).to be(false)
+              subject.enable(feature, gate, gate.wrap(:admin))
+              expect(active_connections?).to be(false)
+              subject.disable(feature, gate, gate.wrap(:admin))
+              expect(active_connections?).to be(false)
+            end
+
+            it "does not release previously held connection" do
+              ActiveRecord::Base.connection # establish a new connection
+              expect(active_connections?).to be(true)
+              subject.enable(feature, gate, gate.wrap(:admin))
+              expect(active_connections?).to be(true)
+              subject.disable(feature, gate, gate.wrap(:admin))
+              expect(active_connections?).to be(true)
+            end
+          end
+        end
+
+        if ActiveRecord.version >= Gem::Version.new('7.1')
+          context 'with read/write roles' do
+            before do
+              skip "connected_to with roles is not supported on #{config['adapter']}" if config["adapter"] == "sqlite3"
+            end
+
+            let(:abstract_class) do
+              # Create a named abstract class (Rails requires names for connects_to)
+              klass = Class.new(ActiveRecord::Base) do
+                self.abstract_class = true
+              end
+              stub_const('TestApplicationRecord', klass)
+
+              # Now configure connects_to with the same database for both roles
+              # In production, these would be different (primary/replica)
+              klass.connects_to database: {
+                writing: config,
+                reading: config
+              }
+
+              klass
+            end
+
+            after do
+              # Disconnect role-based connections to avoid interfering with database cleanup
+              clear_all_connections!
+            end
+
+            let(:feature_class) do
+              klass = Class.new(abstract_class) do
+                self.table_name = 'flipper_features'
+                validates :key, presence: true
+              end
+              stub_const('TestFeature', klass)
+              klass
+            end
+
+            let(:gate_class) do
+              klass = Class.new(abstract_class) do
+                self.table_name = 'flipper_gates'
+              end
+              stub_const('TestGate', klass)
+              klass
+            end
+
+            let(:adapter_with_roles) do
+              described_class.new(
+                feature_class: feature_class,
+                gate_class: gate_class
+              )
+            end
+
+            it 'can perform write operations when forced to reading role' do
+              abstract_class.connected_to(role: :reading) do
+                flipper = Flipper.new(adapter_with_roles)
+
+                feature = flipper[:test_feature]
+                expect { feature.enable }.not_to raise_error
+                expect(feature.enabled?).to be(true)
+                expect { feature.disable }.not_to raise_error
+                expect(feature.enabled?).to be(false)
+
+                feature = flipper[:actor_test]
+                actor = Struct.new(:flipper_id).new(123)
+                expect { feature.enable_actor(actor) }.not_to raise_error
+                expect(feature.enabled?(actor)).to be(true)
+                expect { feature.disable_actor(actor) }.not_to raise_error
+                expect(feature.enabled?(actor)).to be(false)
+
+                feature = flipper[:gate_test]
+                expect { feature.enable_percentage_of_time(50) }.not_to raise_error
+                expect { feature.disable_percentage_of_time }.not_to raise_error
+                feature.enable
+                expect { feature.remove }.not_to raise_error
+
+                feature = flipper[:expression_test]
+                expression = Flipper.property(:plan).eq("premium")
+                expect { feature.enable_expression(expression) }.not_to raise_error
+                expect(feature.expression).to eq(expression)
+                expect { feature.disable_expression }.not_to raise_error
+                expect(feature.expression).to be_nil
+              end
+            end
+
+            it 'does not hold onto connections during write operations' do
+              clear_active_connections!
+
+              abstract_class.connected_to(role: :reading) do
+                flipper = Flipper.new(adapter_with_roles)
+                feature = flipper[:connection_test]
+
+                feature.enable
+                expect(active_connections?).to be(false)
+              end
+            end
+          end
+        end
+
+        context 'requiring "flipper-active_record"' do
+          before do
+            Flipper.configuration = nil
+            Flipper.instance = nil
+
+            silence { load 'flipper/adapters/active_record.rb' }
+          end
+
+          it 'configures itself' do
+            expect(Flipper.adapter.adapter).to be_a(Flipper::Adapters::ActiveRecord)
+          end
+        end
+      end
+
+      context "without tables created" do
+        before(:all) do
+          skip_on_error(ActiveRecord::ConnectionNotEstablished, "#{config['adapter']} not available") do
+            silence do
+              ActiveRecord::Tasks::DatabaseTasks.create(config)
+            end
+          end
+
+          Flipper.configuration = nil
+        end
+
+        before(:each) do
+          ActiveRecord::Base.establish_connection(config)
+        end
+
+        after(:each) do
+          ActiveRecord::Base.connection.close
+        end
+
+        after(:all) do
+          silence { ActiveRecord::Tasks::DatabaseTasks.drop(config) } unless $skip
+        end
+
+        it "does not raise an error" do
+          Flipper.configuration = nil
+          Flipper.instance = nil
+
+          silence do
+            expect {
+              load 'flipper/adapters/active_record.rb'
+              Flipper::Adapters::ActiveRecord.new
+            }.not_to raise_error
+          end
+        end
+      end
+    end
+  end
+
+  it "builds before anything else has loaded ActiveRecord::Base" do
+    script = <<~RUBY
+      require "active_record"
+      require "flipper/adapters/active_record"
+      abort "requiring the adapter loaded ActiveRecord::Base" unless ActiveRecord.autoload?(:Base)
+
+      Flipper::Adapters::ActiveRecord.new
+    RUBY
+
+    _, stderr, status = Open3.capture3(RbConfig.ruby, "-Ilib", "-e", script, chdir: FlipperRoot.to_s)
+
+    expect(status).to be_success, stderr
+  end
+
+  def active_connections?
+    method = ActiveRecord::Base.connection_handler.method(:active_connections?)
+    method.arity == 0 ? method.call : method.call(:all)
+  end
+
+  def clear_active_connections!
+    method = ActiveRecord::Base.connection_handler.method(:clear_active_connections!)
+    method.arity == 0 ? method.call : method.call(:all)
+  end
+
+  def clear_all_connections!
+    method = ActiveRecord::Base.connection_handler.method(:clear_all_connections!)
+    method.arity == 0 ? method.call : method.call(:all)
+  end
+end

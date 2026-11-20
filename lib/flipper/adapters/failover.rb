@@ -1,0 +1,100 @@
+module Flipper
+  module Adapters
+    class Failover
+      include ::Flipper::Adapter
+
+      # Public: Build a new failover instance.
+      #
+      # primary   - The primary flipper adapter.
+      # secondary - The secondary flipper adapter which services reads when
+      #             the primary adapter is unavailable.
+      # options   - Hash of options:
+      #             :dual_write - Boolean, whether to update secondary when
+      #                           primary is updated
+      #             :errors - Array of exception types for which to failover
+
+      attr_reader :primary, :secondary
+
+      def initialize(primary, secondary, options = {})
+        @primary = primary
+        @secondary = secondary
+
+        @dual_write = options.fetch(:dual_write, false)
+        @errors = options.fetch(:errors, [ StandardError ])
+      end
+
+      def adapter_stack
+        "#{name}(primary: #{@primary.adapter_stack}, secondary: #{@secondary.adapter_stack})"
+      end
+
+      def read_only?
+        @primary.read_only? || (@dual_write && @secondary.read_only?)
+      end
+
+      def features
+        @primary.features
+      rescue *@errors
+        @secondary.features
+      end
+
+      def get(feature)
+        @primary.get(feature)
+      rescue *@errors
+        @secondary.get(feature)
+      end
+
+      def get_multi(features)
+        @primary.get_multi(features)
+      rescue *@errors
+        @secondary.get_multi(features)
+      end
+
+      def get_all(**kwargs)
+        @primary.get_all(**kwargs)
+      rescue *@errors
+        @secondary.get_all(**kwargs)
+      end
+
+      def sync_version
+        @primary.sync_version
+      rescue *@errors
+        @secondary.sync_version
+      end
+
+      def sync_version=(version)
+        @primary.sync_version = version
+        @secondary.sync_version = version if @dual_write
+      end
+
+      def add(feature)
+        @primary.add(feature).tap do
+          @secondary.add(feature) if @dual_write
+        end
+      end
+
+      def remove(feature)
+        @primary.remove(feature).tap do
+          @secondary.remove(feature) if @dual_write
+        end
+      end
+
+      def clear(feature)
+        @primary.clear(feature).tap do
+          @secondary.clear(feature) if @dual_write
+        end
+      end
+
+      def enable(feature, gate, thing)
+        @primary.enable(feature, gate, thing).tap do
+          @secondary.enable(feature, gate, thing) if @dual_write
+        end
+      end
+
+      def disable(feature, gate, thing)
+        @primary.disable(feature, gate, thing).tap do
+          @secondary.disable(feature, gate, thing) if @dual_write
+        end
+      end
+    end
+  end
+end

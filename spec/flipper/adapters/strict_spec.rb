@@ -1,0 +1,126 @@
+RSpec.describe Flipper::Adapters::Strict do
+  let(:flipper) { Flipper.new(subject) }
+  let(:feature) { flipper[:unknown] }
+
+  it_should_behave_like 'a flipper adapter' do
+    subject { described_class.new(Flipper::Adapters::Memory.new, :noop) }
+  end
+
+  it_should_behave_like 'an adapter that stores its sync version' do
+    subject { described_class.new(Flipper::Adapters::Memory.new, :noop) }
+  end
+
+  [true, :raise].each do |handler|
+    context "handler = #{handler}" do
+      subject { described_class.new(Flipper::Adapters::Memory.new, handler) }
+
+      context "#get" do
+        it "raises an error for unknown feature" do
+          expect { subject.get(feature) }.to raise_error(Flipper::Adapters::Strict::NotFound)
+        end
+      end
+
+      context "#get_multi" do
+        it "raises an error for unknown feature" do
+          expect { subject.get_multi([feature]) }.to raise_error(Flipper::Adapters::Strict::NotFound)
+        end
+      end
+
+      context "#add" do
+        it "raises an error for unknown feature" do
+          expect { subject.add(feature) }.to raise_error(Flipper::Adapters::Strict::NotFound)
+        end
+      end
+    end
+  end
+
+  context "handler = :warn" do
+    subject { described_class.new(Flipper::Adapters::Memory.new, :warn) }
+
+    context "#get" do
+      it "warns for unknown feature" do
+        expect(capture_output { subject.get(feature) }).to match(/Could not find feature "unknown"/)
+      end
+    end
+
+    context "#get_multi" do
+      it "warns for unknown feature" do
+        expect(capture_output { subject.get_multi([feature]) }).to match(/Could not find feature "unknown"/)
+      end
+    end
+
+    context "#add" do
+      it "warns for unknown feature" do
+        expect(capture_output { subject.add(feature) }).to match(/Could not find feature "unknown"/)
+      end
+    end
+  end
+
+  context "handler = Block" do
+    let(:unknown_features) { [] }
+    subject do
+      described_class.new(Flipper::Adapters::Memory.new) { |feature| unknown_features << feature.key}
+    end
+
+
+    context "#get" do
+      it "calls block for unknown feature" do
+        subject.get(feature)
+        expect(unknown_features).to eq(["unknown"])
+      end
+    end
+
+    context "#get_multi" do
+      it "calls block for unknown feature" do
+        subject.get_multi([flipper[:foo], flipper[:bar]])
+        expect(unknown_features).to eq(["foo", "bar"])
+      end
+    end
+
+    context "#add" do
+      it "calls block for unknown feature" do
+        subject.add(feature)
+        expect(unknown_features).to eq(["unknown"])
+      end
+    end
+  end
+
+  describe ".with_sync_mode" do
+    subject { described_class.new(Flipper::Adapters::Memory.new, :raise) }
+
+    it "bypasses strict checks for add" do
+      described_class.with_sync_mode do
+        expect { subject.add(feature) }.not_to raise_error
+      end
+    end
+
+    it "bypasses strict checks for get" do
+      described_class.with_sync_mode do
+        expect { subject.get(feature) }.not_to raise_error
+      end
+    end
+
+    it "bypasses strict checks for get_multi" do
+      described_class.with_sync_mode do
+        expect { subject.get_multi([feature]) }.not_to raise_error
+      end
+    end
+
+    it "restores previous sync mode after block" do
+      described_class.with_sync_mode do
+        # inside sync mode
+      end
+      expect { subject.add(feature) }.to raise_error(Flipper::Adapters::Strict::NotFound)
+    end
+
+    it "restores previous sync mode even on error" do
+      begin
+        described_class.with_sync_mode do
+          raise "boom"
+        end
+      rescue RuntimeError
+      end
+      expect { subject.add(feature) }.to raise_error(Flipper::Adapters::Strict::NotFound)
+    end
+  end
+end

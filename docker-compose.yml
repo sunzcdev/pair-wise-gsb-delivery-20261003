@@ -1,0 +1,68 @@
+# Service versions match CI (.github/workflows/ci.yml).
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 30
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-proot"]
+      interval: 2s
+      retries: 30
+  redis:
+    image: redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 30
+  mongo:
+    # CI asks for `mongodb-version: 4.0`, which YAML reads as 4, so CI gets mongo:4 (4.4).
+    image: mongo:4.4
+    healthcheck:
+      test: ["CMD", "mongo", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 2s
+      retries: 30
+  memcached:
+    image: memcached
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/11211"]
+      interval: 2s
+      retries: 30
+  app:
+    build: .
+    volumes:
+      - .:/srv/app
+      - bundle_cache:/bundle_cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      memcached:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - MONGODB_HOST=mongo
+      - MONGO_URL=mongodb://mongo:27017/testing
+      - MEMCACHED_URL=memcached:11211
+      - MYSQL_HOST=mysql
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=root
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+
+volumes:
+  bundle_cache:

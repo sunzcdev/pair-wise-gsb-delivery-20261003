@@ -1,0 +1,17 @@
+#!/bin/sh
+#/ Usage: release
+#/
+#/ Manual fallback for releasing gems locally.
+#/ Prefer pushing a version tag (e.g. git tag v1.4.0 && git push origin v1.4.0)
+#/ to trigger the automated GitHub Actions release workflow.
+#/
+
+set -e
+cd $(dirname "$0")/..
+
+[ "$1" = "--help" -o "$1" = "-h" -o "$1" = "help" ] && {
+    grep '^#/' <"$0"| cut -c4-
+    exit 0
+}
+
+script/bootstrap && bundle exec rake release
