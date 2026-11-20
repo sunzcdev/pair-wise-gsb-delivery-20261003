@@ -205,18 +205,52 @@ module HTTPX
       super
     end
 
-    REQUEST_BODY_IVARS = %i[headers].freeze
+    # options which only describe how a request (or its response) is processed, and therefore
+    # don't have to be equal for two connections to be considered the same connection-level
+    # contract (and thus eligible for HTTP/2 connection coalescing / reuse).
+    #
+    # anything not listed here is treated as a connection-level convention, i.e. it influences
+    # how the socket is opened (routing, transport), the TLS identity (:ssl) or the wire/parser
+    # behavior, and must therefore match for the connections to be coalesced.
+    #
+    # the groups below are, in order:
+    # * request routing and metadata (:origin, :base_path, :headers),
+    # * per-request observability (:debug, :debug_level, :debug_redact),
+    # * per-request deadlines and keep-alive bookkeeping (:timeout),
+    # * request/response payload handling (compression and response limits),
+    # * session lifecycle, which is irrelevant to an already open socket (:persistent, :close_on_fork),
+    # * an externally provided socket, which never goes through the pool/coalescing logic (:io).
+    REQUEST_OPTIONS_IVARS = %i[
+      origin base_path headers
+      debug debug_level debug_redact
+      timeout
+      supported_compression_formats compress_request_body decompress_response_body
+      max_response_body_size max_response_headers max_response_header_value_size
+      body_threshold_size
+      persistent close_on_fork
+      io
+    ].freeze
 
-    # checks whether +other+ matches the same connection-level options
+    # checks whether +other+ matches the same connection-level options.
+    #
+    # two sets of options describe the same connection-level contract when every option which
+    # influences how the connection is established and how data is exchanged on the wire is
+    # equal. request-scoped options (see REQUEST_OPTIONS_IVARS), such as the request headers,
+    # per-request timeouts or response handling limits, are deliberately ignored: changing them
+    # only affects the request being sent, and therefore must not defeat connection coalescing.
+    #
+    # conversely, options which define the TLS identity (:ssl) or the routing/transport
+    # conventions (:transport, :addresses, :proxy, ...) are still compared, so that requests
+    # relying on a different identity or route get their own usable connection instead of being
+    # misdirected over an incompatible one.
     def connection_options_match?(other, ignore_ivars = nil)
       return true if self == other
 
-      # headers and other request options do not play a role, as they are
-      # relevant only for the request.
-      ivars = self.class.options_names.reject { |iv| REQUEST_BODY_IVARS.include?(iv) }
+      # request-scoped options are ignored, as they are relevant only for the request.
+      ivars = self.class.options_names.reject { |iv| REQUEST_OPTIONS_IVARS.include?(iv) }
       ivars = ivars.reject { |iv| ignore_ivars.include?(iv) } if ignore_ivars
 
-      other_ivars = other.class.options_names.reject { |iv| REQUEST_BODY_IVARS.include?(iv) }
+      other_ivars = other.class.options_names.reject { |iv| REQUEST_OPTIONS_IVARS.include?(iv) }
       other_ivars = other_ivars.reject { |iv| ignore_ivars.include?(iv) } if ignore_ivars
 
       return false if ivars.size != other_ivars.size

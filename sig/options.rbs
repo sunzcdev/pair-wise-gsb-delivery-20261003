@@ -17,7 +17,7 @@ module HTTPX
     SET_TEMPORARY_NAME: ^(Class klass, ?Symbol pl) -> void
 
     DEFAULT_OPTIONS: Hash[Symbol, untyped]
-    REQUEST_BODY_IVARS: Array[Symbol]
+    REQUEST_OPTIONS_IVARS: Array[Symbol]
     RESOLVER_IVARS: Array[Symbol]
     RESOLVER_TYPES: Array[Symbol]
     USER_AGENT: String

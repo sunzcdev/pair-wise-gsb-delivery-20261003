@@ -225,7 +225,54 @@ class OptionsTest < Minitest::Test
     opts = Options.new(origin: "http://example.com")
     assert opts.connection_options_match?(Options.new(origin: "http://example.com"))
     assert Options.new(origin: "http://example.com", headers: { "foo" => "bar" }).connection_options_match?(Options.new(origin: "http://example.com"))
-    assert !opts.connection_options_match?(Options.new(origin: "http://example2.com"))
+    # the :origin option only completes relative request URIs; the connection is matched
+    # against the actual request URI, so it doesn't participate in connection-level matching.
+    assert opts.connection_options_match?(Options.new(origin: "http://example2.com"))
+  end
+
+  def test_connection_options_match_ignores_request_level_options
+    opts = Options.new(origin: "http://example.com")
+
+    request_level_overrides = [
+      { headers: { "foo" => "bar" } },
+      { timeout: { read_timeout: 3, write_timeout: 5 } },
+      { base_path: "/v2" },
+      { origin: "http://other.example.com" },
+      { decompress_response_body: false },
+      { compress_request_body: false },
+      { max_response_body_size: 1024 },
+      { max_response_headers: 10 },
+      { body_threshold_size: 1 },
+      { persistent: true },
+      { close_on_fork: true },
+    ]
+
+    request_level_overrides.each do |overrides|
+      assert opts.connection_options_match?(Options.new(overrides)),
+             "expected request-level option #{overrides.keys.inspect} to be ignored when matching connections"
+    end
+  end
+
+  def test_connection_options_match_requires_connection_level_options_to_match
+    opts = Options.new(origin: "http://example.com")
+
+    connection_level_overrides = [
+      { ssl: { verify_mode: OpenSSL::SSL::VERIFY_NONE } },
+      { http2_settings: { max_concurrent_streams: 2 } },
+      { fallback_protocol: "h2" },
+      { transport: "unix" },
+      { addresses: ["127.0.0.1"] },
+      { ip_families: [Socket::AF_INET] },
+      { resolver_class: :system },
+      { max_requests: 10 },
+      { window_size: 4096 },
+      { buffer_size: 1024 },
+    ]
+
+    connection_level_overrides.each do |overrides|
+      refute opts.connection_options_match?(Options.new(overrides)),
+             "expected connection-level option #{overrides.keys.inspect} to prevent matching connections"
+    end
   end
 
   def test_resolver_options_match
