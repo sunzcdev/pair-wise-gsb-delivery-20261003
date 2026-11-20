@@ -1,0 +1,108 @@
+# frozen_string_literal: true
+
+module Bunny
+  # Wraps [AMQ::Protocol::Basic::Deliver] to
+  # provide access to the delivery properties as immutable hash as
+  # well as methods. Hash representation is created lazily.
+  class DeliveryInfo
+
+    #
+    # Behaviors
+    #
+
+    include Enumerable
+
+    #
+    # API
+    #
+
+    # @return [Bunny::Consumer] Consumer this delivery is for
+    attr_reader :consumer
+    # @return [Bunny::Channel] Channel this delivery is on
+    attr_reader :channel
+
+    # @private
+    def initialize(basic_deliver, consumer, channel, delivery_tag = basic_deliver.delivery_tag)
+      @basic_deliver = basic_deliver
+      @consumer      = consumer
+      @channel       = channel
+      @delivery_tag  = delivery_tag
+    end
+
+    # Iterates over delivery properties
+    # @see Enumerable#each
+    def each(*args, &block)
+      to_hash.each(*args, &block)
+    end
+
+    # Accesses delivery properties by key
+    # @see Hash#[]
+    def [](k)
+      case k
+      when :consumer_tag then @basic_deliver.consumer_tag
+      when :delivery_tag then @delivery_tag
+      when :redelivered  then @basic_deliver.redelivered
+      when :exchange     then @basic_deliver.exchange
+      when :routing_key  then @basic_deliver.routing_key
+      when :consumer     then @consumer
+      when :channel      then @channel
+      else nil
+      end
+    end
+
+    # @return [Hash] Hash representation of this delivery info
+    def to_hash
+      @hash ||= {
+        consumer_tag: @basic_deliver.consumer_tag,
+        delivery_tag: @delivery_tag,
+        redelivered:  @basic_deliver.redelivered,
+        exchange:     @basic_deliver.exchange,
+        routing_key:  @basic_deliver.routing_key,
+        consumer:     @consumer,
+        channel:      @channel
+      }
+    end
+
+    # @private
+    def to_s
+      printable_hash.to_s
+    end
+
+    # @private
+    def inspect
+      printable_hash.inspect
+    end
+
+    # @return [String] Consumer tag this delivery is for
+    def consumer_tag
+      @basic_deliver.consumer_tag
+    end
+
+    # @return [String] Delivery identifier that is used to acknowledge, reject and nack deliveries
+    def delivery_tag
+      @delivery_tag
+    end
+
+    # @return [Boolean] true if this delivery is a redelivery (the message was requeued at least once)
+    def redelivered
+      @basic_deliver.redelivered
+    end
+    alias redelivered? redelivered
+
+    # @return [String] Name of the exchange this message was published to
+    def exchange
+      @basic_deliver.exchange
+    end
+
+    # @return [String] Routing key this message was published with
+    def routing_key
+      @basic_deliver.routing_key
+    end
+
+    private
+
+    def printable_hash
+      to_hash.merge(consumer: @consumer&.consumer_tag, channel: @channel&.number)
+    end
+  end
+end
