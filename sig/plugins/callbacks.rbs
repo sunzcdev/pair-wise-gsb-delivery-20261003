@@ -1,6 +1,10 @@
 module HTTPX
   module Plugins
     module Callbacks
+      CALLBACKS: Array[Symbol]
+      REQUEST_CALLBACKS: Array[Symbol]
+      REQUEST_CALLBACK_EVENTS: Hash[Symbol, Symbol]
+
       class CallbackError < Exception
       end
 
@@ -29,7 +33,27 @@ module HTTPX
 
         private
 
-        def emit_or_callback_error: (*untyped) -> void
+        def set_request_callbacks: (Request request) -> void
+
+        def emit_or_callback_error: (Symbol type, *untyped) -> void
+
+        def emit_on_request: (Symbol type, *untyped) -> void
+      end
+
+      module RequestMethods
+        def on_request_error: (?local: bool) { (Request request, StandardError error) -> void } -> self
+
+        def on_request_started: (?local: bool) { (Request request) -> void } -> self
+
+        def on_request_body_chunk: (?local: bool) { (Request request, String chunk) -> void } -> self
+
+        def on_request_completed: (?local: bool) { (Request request) -> void } -> self
+
+        def on_response_started: (?local: bool) { (Request request, Response response) -> void } -> self
+
+        def on_response_body_chunk: (?local: bool) { (Request request, Response response, String chunk) -> void } -> self
+
+        def on_response_completed: (?local: bool) { (Request request, response response) -> void } -> self
       end
 
       module ConnectionMethods

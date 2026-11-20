@@ -15,6 +15,20 @@ module HTTPX
         response_started response_body_chunk response_completed
       ].freeze
 
+      # subset of callbacks which are emitted with the corresponding request as the
+      # first argument. Those can also be registered on a request, and be scoped to
+      # its current execution (see HTTPX::Callbacks#on with <tt>local: true</tt>).
+      REQUEST_CALLBACKS = %i[
+        request_error
+        request_started request_body_chunk request_completed
+        response_started response_body_chunk response_completed
+      ].freeze
+
+      # request-level registrations are kept under a private event name, to avoid
+      # clashing with the request's own internal events (i.e. +:response_started+),
+      # which are emitted with a different set of arguments.
+      REQUEST_CALLBACK_EVENTS = REQUEST_CALLBACKS.to_h { |cb| [cb, :"callback_#{cb}"] }.freeze
+
       # connection closed user-space errors happen after errors can be surfaced to requests,
       # so they need to pierce through the scheduler, which is only possible by simulating an
       # interrupt.
@@ -39,7 +53,7 @@ module HTTPX
             CALLBACKS.each do |cb|
               next unless callbacks_for?(cb)
 
-              sess.callbacks(cb).concat(callbacks(cb))
+              sess.callbacks(cb).concat(persistent_callbacks(cb))
             end
 
             sess.wrap(&blk) if blk
@@ -59,7 +73,7 @@ module HTTPX
             CALLBACKS.each do |cb|
               next unless callbacks_for?(cb)
 
-              sess.callbacks(cb).concat(callbacks(cb))
+              sess.callbacks(cb).concat(persistent_callbacks(cb))
             end
             sess.wrap(&blk) if blk
           end
@@ -109,12 +123,34 @@ module HTTPX
           end
         end
 
-        def emit_or_callback_error(*args)
-          emit(*args)
+        def emit_or_callback_error(type, *args)
+          emit(type, *args)
+          emit_on_request(type, *args)
         rescue StandardError => e
           ex = CallbackError.new(e.message)
           ex.set_backtrace(e.backtrace)
           raise ex
+        end
+
+        # emits the request-level +type+ callback (see the RequestMethods submodule),
+        # when +request+ has any such registration. This gets called in addition to the
+        # session-level callback, for every internal attempt of the request execution.
+        def emit_on_request(type, *args)
+          event = REQUEST_CALLBACK_EVENTS[type]
+
+          return unless event
+
+          request = args.first
+
+          return unless request.is_a?(Request)
+
+          # a redirect request is an internal attempt of the execution started by the
+          # original request, and shall see the callbacks registered on it.
+          request = request.root_request if request.respond_to?(:root_request) && request.root_request
+
+          return unless request.callbacks_for?(event)
+
+          request.emit(event, *args)
         end
 
         def receive_requests(*)
@@ -125,6 +161,26 @@ module HTTPX
       end
 
       module RequestMethods
+        # request-scoped versions of the callbacks which are emitted with the request as
+        # the first argument. By default the registration is scoped to the current
+        # execution of the request: it lasts until the request finishes (with a response
+        # or an error), including all internal attempts (i.e. retries), and is dropped
+        # afterwards, so that reusing the request doesn't trigger it again.
+        # Pass <tt>local: false</tt> to keep it for every execution of the request.
+        #
+        #   request = session.build_request(:get, uri)
+        #   request.on_response_completed { |res| ... } # only for the next execution
+        REQUEST_CALLBACKS.each do |meth|
+          event = REQUEST_CALLBACK_EVENTS[meth]
+
+          class_eval(<<-MOD, __FILE__, __LINE__ + 1)
+            def on_#{meth}(local: true, &blk)        # def on_request_started(local: true, &blk)
+              on(:#{event}, local: local, &blk)      #   on(:callback_request_started, local: local, &blk)
+              self                                   #   self
+            end                                      # end
+          MOD
+        end
+
         def drain_body
           super.tap do |chunk|
             emit(:body_chunk, chunk) if chunk

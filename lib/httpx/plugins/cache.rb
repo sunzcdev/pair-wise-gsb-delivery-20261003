@@ -182,6 +182,16 @@ module HTTPX
 
           call[self]
         end
+
+        private
+
+        # a request reused for a subsequent execution shall not re-use the cached
+        # response looked up for the previous execution.
+        def reset_execution_state
+          super
+
+          @cached_response = nil
+        end
       end
 
       module ResponseMethods

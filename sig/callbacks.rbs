@@ -5,12 +5,25 @@ module HTTPX
 
   module Callbacks
     @callbacks: Hash[Symbol, Array[_Callable]]?
-    def on: (Symbol) { (*untyped) -> void } -> ^(*untyped) -> void
-    def once: (Symbol) { (*untyped) -> void } -> ^(*untyped) -> void
+    @local_callbacks: Hash[Symbol, Array[_Callable]]?
+    @execution_depth: Integer?
+
+    def on: (Symbol, ?local: bool) { (*untyped) -> void } -> ^(*untyped) -> void
+    def once: (Symbol, ?local: bool) { (*untyped) -> void } -> ^(*untyped) -> void
     def emit: (Symbol, *untyped) -> void
 
     def callbacks_for?: (Symbol) -> boolish
+    def local_callbacks_for?: (?Symbol) -> boolish
+
+    def start_execution: () -> void
+    def finish_execution: () -> void
+    def in_execution?: () -> bool
+    def clear_local_callbacks: () -> void
+
     def callbacks: () -> Hash[Symbol, Array[_Callable]]
                   | (Symbol) -> Array[_Callable]
+
+    def local_callbacks: () -> Hash[Symbol, Array[_Callable]]
+                        | (Symbol) -> Array[_Callable]
   end
 end

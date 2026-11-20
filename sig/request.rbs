@@ -36,6 +36,8 @@ module HTTPX
 
     def initialize: (Symbol | String verb, generic_uri uri, Options options, ?request_params params) -> untyped
 
+    def start_execution: () -> void
+
     def complete!: (?response response) -> bool
 
     def started?: () -> bool

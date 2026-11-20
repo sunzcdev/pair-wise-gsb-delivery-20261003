@@ -284,6 +284,16 @@ module HTTPX
 
           super
         end
+
+        private
+
+        # a request reused for a subsequent execution gets a new set of retries.
+        def reset_execution_state
+          super
+
+          @retries = @options.max_retries
+          @partial_response = nil
+        end
       end
 
       module ResponseMethods

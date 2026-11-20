@@ -99,10 +99,21 @@ module HTTPX
       raise ArgumentError, "must perform at least one request" if args.empty?
 
       requests = args.first.is_a?(Request) ? args : build_requests(*args, params)
-      responses = send_requests(*requests)
-      return responses.first if responses.size == 1
 
-      responses
+      # requests being sent from within an ongoing execution (i.e. a callback sending
+      # the same request through another session) belong to that execution, and shall
+      # not have their per-execution callbacks dropped when this call returns.
+      executions = requests.reject(&:in_execution?).uniq
+      executions.each(&:start_execution)
+
+      begin
+        responses = send_requests(*requests)
+        return responses.first if responses.size == 1
+
+        responses
+      ensure
+        executions.each(&:finish_execution)
+      end
     end
 
     # returns a HTTP::Request instance built from the HTTP +verb+, the request +uri+, and

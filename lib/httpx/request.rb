@@ -105,9 +105,9 @@ module HTTPX
 
       @state = :idle
       @connection = @response =
-        @drainer = @peer_address = @callbacks =
+        @drainer = @peer_address = @callbacks = @local_callbacks =
                      @informational_status = @on_response_arrived = nil
-      @ping = @started = @complete = false
+      @ping = @started = @complete = @execution_finished = false
       @persistent = @options.persistent
       @active_timeouts = []
     end
@@ -118,6 +118,30 @@ module HTTPX
       @headers = orig.instance_variable_get(:@headers).dup
       @body = orig.instance_variable_get(:@body).dup
       @active_timeouts = orig.instance_variable_get(:@active_timeouts).dup
+    end
+
+    # marks the beginning of an execution of this request.
+    #
+    # a request can be reused for a subsequent execution: if it went through one before,
+    # its state is rewound here, so that it can be sent again. Callbacks registered for
+    # a previous execution only (see HTTPX::Callbacks#on with <tt>local: true</tt>) are
+    # dropped when that execution ends, and therefore never leak into this one.
+    def start_execution
+      reused = @execution_finished
+
+      super
+
+      return unless reused && execution_depth == 1
+
+      @execution_finished = false
+
+      reset_execution_state
+    end
+
+    def finish_execution
+      super
+
+      @execution_finished = true if execution_depth.zero?
     end
 
     def complete!(response = @response)
@@ -370,6 +394,18 @@ module HTTPX
     end
 
     private
+
+    # rewinds the request to a state where it can be sent again, i.e. when the same
+    # request object is reused for a subsequent execution.
+    def reset_execution_state
+      reset_timers(true)
+
+      @body.rewind
+
+      @state = :idle
+      @ping = @complete = @started = false
+      @response = @drainer = @informational_status = @connection = @drain_error = @on_response_arrived = nil
+    end
 
     def reset_timers(reset_total_request_timers)
       timers = @active_timeouts
