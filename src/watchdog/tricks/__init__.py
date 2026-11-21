@@ -204,6 +204,11 @@ class AutoRestartTrick(Trick):
     :param debounce_interval:
         After a file change, wait until the specified interval
         passes with no file changes, and only then restart (default: 0.0).
+    :param max_batch_age:
+        Maximum time a batch of file changes may be held back by the debouncer
+        when files keep changing. Once reached, the subprocess is restarted even
+        without a quiet interval, and later changes start a new batch. Defaults
+        to ``debounce_interval``.
     :param restart_on_command_exit:
         Auto-restart the command after it exits (default: True).
     :param debounce_interval_seconds:
@@ -220,6 +225,7 @@ class AutoRestartTrick(Trick):
         stop_signal: signal.Signals | int = signal.SIGINT,
         kill_after: Seconds = 10,
         debounce_interval: Seconds | None = None,
+        max_batch_age: Seconds | None = None,
         restart_on_command_exit: bool = True,
         debounce_interval_seconds: Seconds | None = None,
     ):
@@ -237,6 +243,9 @@ class AutoRestartTrick(Trick):
         if debounce_interval < 0:
             error = "debounce_interval must be non-negative."
             raise ValueError(error)
+        if max_batch_age is not None and max_batch_age < 0:
+            error = "max_batch_age must be non-negative."
+            raise ValueError(error)
 
         super().__init__(
             patterns=patterns,
@@ -248,6 +257,7 @@ class AutoRestartTrick(Trick):
         self.stop_signal = stop_signal.value if isinstance(stop_signal, signal.Signals) else stop_signal
         self.kill_after = kill_after
         self.debounce_interval = debounce_interval
+        self.max_batch_age = max_batch_age
         self.restart_on_command_exit = restart_on_command_exit
 
         self.process: subprocess.Popen[bytes] | None = None
@@ -269,6 +279,7 @@ class AutoRestartTrick(Trick):
         if self.debounce_interval:
             self.event_debouncer = EventDebouncer(
                 debounce_interval=self.debounce_interval,
+                max_batch_age=self.max_batch_age,
                 events_callback=lambda events: self._restart_process(),
             )
             self.event_debouncer.start()
@@ -283,7 +294,9 @@ class AutoRestartTrick(Trick):
 
         process_watcher = self.process_watcher
         if self.event_debouncer is not None:
-            self.event_debouncer.stop()
+            # Do not let changes still pending at shutdown restart a process we
+            # are tearing down.
+            self.event_debouncer.stop(flush=False)
         self._stop_process()
 
         # Don't leak threads: Wait for background threads to stop.

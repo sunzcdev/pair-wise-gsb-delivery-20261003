@@ -351,6 +351,44 @@ def test_auto_restart_negative_debounce_interval():
         AutoRestartTrick(["true"], debounce_interval_seconds=-1)
 
 
+def test_auto_restart_max_batch_age_passed_to_debouncer():
+    command = [sys.executable, "-c", "import time; time.sleep(30)"]
+    trick = AutoRestartTrick(command, debounce_interval=0.5, max_batch_age=0.1)
+    assert trick.max_batch_age == 0.1
+    trick.start()
+    try:
+        assert trick.event_debouncer is not None
+        assert trick.event_debouncer.max_batch_age == 0.1
+    finally:
+        trick.stop()
+
+
+def test_auto_restart_max_batch_age_defaults_to_none():
+    assert AutoRestartTrick(["true"], debounce_interval=0.5).max_batch_age is None
+
+
+def test_auto_restart_negative_max_batch_age():
+    with pytest.raises(ValueError, match="max_batch_age must be non-negative"):
+        AutoRestartTrick(["true"], debounce_interval=0.5, max_batch_age=-1)
+
+
+@pytest.mark.flaky(max_runs=3, min_passes=1)
+def test_auto_restart_stop_discards_pending_debounced_events(tmpdir, capfd):
+    """Events still pending in the debouncer when the trick stops must not
+    trigger a last restart while the subprocess is being torn down."""
+    script = make_dummy_script(tmpdir, n=10)
+    trick = AutoRestartTrick([sys.executable, script], debounce_interval=60.0)
+    trick.start()
+    assert wait_for_marker_count(capfd, [], "+++++ 0", 1), "initial process never started"
+    trick.on_any_event(FileModifiedEvent("foo/bar.baz"))
+    # Give the debouncer time to enqueue the event and start debouncing.
+    time.sleep(0.2)
+    trick.stop()
+    assert trick.event_debouncer is not None
+    assert not trick.event_debouncer.is_alive()
+    assert trick.restart_count == 0
+
+
 @pytest.mark.flaky(max_runs=5, min_passes=1)
 @pytest.mark.parametrize("restart_on_command_exit", [True, False])
 def test_auto_restart_subprocess_termination(tmpdir, capfd, restart_on_command_exit):
