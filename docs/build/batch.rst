@@ -100,6 +100,73 @@ The reflection process may also be bypassed entirely by sending a
 pre-fabricated :class:`~sqlalchemy.schema.Table` object; see
 :ref:`batch_offline_mode` for an example.
 
+.. _batch_add_column_existing_rows:
+
+Adding a Non-Nullable Column to a Table That Already Has Rows
+------------------------------------------------------------
+
+When a column that does not allow NULL values is added to a table
+that already contains rows, the "move and copy" procedure has to
+supply a value for every existing row; otherwise the NOT NULL
+constraint (or any other constraint the new value happens to
+violate) will fail the entire migration.
+
+While a ``server_default`` can supply a *single* constant for all
+existing rows as well as for rows inserted later, a value that is
+computed from the row's existing data is requested using the
+:paramref:`.BatchOperations.add_column.backfill` parameter.  The
+expression given is rendered as part of the "INSERT from SELECT"
+statement that copies the table's data, so it may refer to any of
+the table's existing columns::
+
+    with op.batch_alter_table("account") as batch_op:
+        batch_op.add_column(
+            sa.Column("token", sa.String(40), nullable=False),
+            backfill=func.substr(sa.column("email"), 1, 4),
+        )
+
+In the above example, each existing row's new ``token`` value is
+taken from the first four characters of its ``email`` column.
+
+The expression applies **only** to the rows that are being copied;
+it does not become a default for the column.  Rows that are inserted
+after the migration runs use the column's own ``server_default``, if
+one was given::
+
+    with op.batch_alter_table("account") as batch_op:
+        batch_op.add_column(
+            sa.Column(
+                "token", sa.String(40), nullable=False,
+                server_default="unknown",
+            ),
+            backfill=func.substr(sa.column("email"), 1, 4),
+        )
+
+Above, existing rows compute ``token`` from ``email``, while later
+inserts that don't mention ``token`` receive ``"unknown"``.
+
+.. versionadded:: 1.21.0 Added the
+   :paramref:`.BatchOperations.add_column.backfill` parameter.
+
+The :paramref:`.BatchOperations.add_column.backfill` parameter
+requires the "move and copy" procedure, and is therefore not
+available when batch mode is invoked with ``recreate="never"``; it
+also forces the recreate procedure on SQLite, which would otherwise
+implement a plain ``ADD COLUMN`` for a single column addition.
+
+If the backfill expression produces a value that violates a
+constraint on the new table, the migration fails and raises the
+database's error as usual; the original table, its data, and any
+foreign keys that refer to it are left unchanged, and no temporary
+table is left behind that would block a subsequent attempt.  This
+means that a mistake in the expression can be corrected and the same
+migration re-run.
+
+On SQLite, the ``CREATE TABLE`` and the copy statement for a "move
+and copy" migration are executed within a SAVEPOINT so that they
+behave as a single atomic unit; this is needed because the pysqlite
+driver does not otherwise begin a transaction around DDL statements.
+
 .. _sqlite_batch_constraints:
 
 Dealing with Constraints

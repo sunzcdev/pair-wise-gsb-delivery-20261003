@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy import Table
 from sqlalchemy import types as sqltypes
 from sqlalchemy.sql import visitors
+from sqlalchemy.sql.elements import ColumnClause
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.elements import TextClause
 from sqlalchemy.sql.schema import SchemaEventTarget
@@ -46,7 +47,6 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from sqlalchemy.engine import Dialect
-    from sqlalchemy.sql.elements import ColumnClause
     from sqlalchemy.sql.elements import quoted_name
     from sqlalchemy.sql.schema import Constraint
     from sqlalchemy.sql.type_api import TypeEngine
@@ -109,8 +109,27 @@ class BatchOperationsImpl:
         else:
             return False
 
+    def _has_backfill(self) -> bool:
+        return any(
+            opname == "add_column" and kw.get("backfill", None) is not None
+            for opname, arg, kw in self.batch
+        )
+
     def flush(self) -> None:
         should_recreate = self._should_recreate()
+
+        if self._has_backfill() and not should_recreate:
+            # the "backfill" argument supplies an expression used to
+            # populate existing rows.  This can only be applied by the
+            # "move and copy" procedure; a plain "ALTER TABLE ... ADD
+            # COLUMN" can at most supply a single constant default for
+            # the entire column.
+            raise exc.CommandError(
+                "The 'backfill' argument accepted by add_column() requires "
+                "that the table be recreated so that the expression may be "
+                "applied to existing rows; please specify "
+                "recreate='always' (this is the default for SQLite)."
+            )
 
         with _ensure_scope_for_ddl(self.impl.connection):
             if not should_recreate:
@@ -505,41 +524,50 @@ class ApplyBatchImpl:
 
         op_impl.prep_table_for_batch(self, self.table)
         assert self.new_table is not None
-        op_impl.create_table(self.new_table)
 
-        try:
-            op_impl._exec(
-                self.new_table.insert()
-                .inline()
-                .from_select(
-                    list(
-                        k
-                        for k, transfer in self.column_transfers.items()
-                        if "expr" in transfer
-                    ),
-                    select(
-                        *[
-                            transfer["expr"]
-                            for transfer in self.column_transfers.values()
-                            if "expr" in transfer
-                        ]
-                    ),
-                )
-            )
-            op_impl.drop_table(self.table)
-        except:
-            op_impl.drop_table(self.new_table)
-            raise
-        else:
-            op_impl.rename_table(
-                self.temp_table_name, self.table.name, schema=self.table.schema
-            )
-            self.new_table.name = self.table.name
+        with op_impl.batch_recreate_scope(self.table):
             try:
-                for idx in self._gather_indexes_from_both_tables():
-                    op_impl.create_index(idx)
-            finally:
-                self.new_table.name = self.temp_table_name
+                op_impl.create_table(self.new_table)
+                op_impl._exec(
+                    self.new_table.insert()
+                    .inline()
+                    .from_select(
+                        list(
+                            k
+                            for k, transfer in self.column_transfers.items()
+                            if "expr" in transfer
+                        ),
+                        select(
+                            *[
+                                transfer["expr"]
+                                for transfer in self.column_transfers.values()
+                                if "expr" in transfer
+                            ]
+                        ),
+                    )
+                )
+                op_impl.drop_table(self.table)
+            except:
+                # remove the temporary table so that a subsequent attempt
+                # at the same migration is not blocked by its presence.
+                # the original exception is preserved, even if this
+                # cleanup step itself fails.
+                op_impl.cleanup_failed_batch_recreate(
+                    self.new_table, self.table
+                )
+                raise
+            else:
+                op_impl.rename_table(
+                    self.temp_table_name,
+                    self.table.name,
+                    schema=self.table.schema,
+                )
+                self.new_table.name = self.table.name
+                try:
+                    for idx in self._gather_indexes_from_both_tables():
+                        op_impl.create_index(idx)
+                finally:
+                    self.new_table.name = self.temp_table_name
 
     def alter_column(
         self,
@@ -670,6 +698,7 @@ class ApplyBatchImpl:
         column: Column[Any],
         insert_before: str | None = None,
         insert_after: str | None = None,
+        backfill: ColumnElement[Any] | None = None,
         **kw,
     ) -> None:
         self._setup_dependencies_for_add_column(
@@ -690,7 +719,51 @@ class ApplyBatchImpl:
             ) = False
 
         self.columns[column.name] = col_copy
-        self.column_transfers[column.name] = {}
+
+        if backfill is not None:
+            # the expression is used only to populate the "INSERT from
+            # SELECT" statement that copies existing rows into the new
+            # table.  The column's own server_default, if any, continues
+            # to apply to rows inserted after the migration.
+            self.column_transfers[column.name] = {
+                "expr": self._resolve_backfill_expression(backfill)
+            }
+        else:
+            self.column_transfers[column.name] = {}
+
+    def _resolve_backfill_expression(
+        self, backfill: ColumnElement[Any]
+    ) -> ColumnElement[Any]:
+        """Return the expression to be used in the batch "INSERT from
+        SELECT" statement for an existing-row value.
+
+        The expression is written against the *existing* table, so
+        columns may refer to any column present on the table being
+        copied.  SQL expressions formed from
+        :func:`~sqlalchemy.sql.expression.column` or a
+        :class:`~sqlalchemy.schema.Column` (whether or not it is
+        already attached to a :class:`~sqlalchemy.schema.Table`) are
+        re-bound to the existing table where possible, so that a
+        simple ``column("x") + 1`` as well as a full ``select(...)``
+        expression may be given.
+
+        """
+        existing_table = self.table
+
+        def replace(col: Any) -> Column[Any] | None:
+            if isinstance(col, Column) and col.table is not None:
+                if col.table is existing_table:
+                    return None
+                if col.name in existing_table.c:
+                    return existing_table.c[col.name]
+            elif isinstance(col, ColumnClause) and col.table is None:
+                if col.name in existing_table.c:
+                    return existing_table.c[col.name]
+            return None
+
+        return visitors.replacement_traverse(  # type: ignore[call-overload]
+            backfill, {}, replace
+        )
 
     def drop_column(
         self,

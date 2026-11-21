@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
+from contextlib import contextmanager
 import logging
 import re
 from typing import Any
@@ -101,6 +103,9 @@ class DefaultImpl(metaclass=ImplMeta):
 
     transactional_ddl = False
     command_terminator = ";"
+    # set by dialects that wrap the batch recreate in a SAVEPOINT; see
+    # :meth:`.DefaultImpl.batch_recreate_scope`
+    _batch_recreate_savepoint: Any = None
     type_synonyms: tuple[set[str], ...] = ({"NUMERIC", "DECIMAL"},)
     type_arg_extract: Sequence[str] = ()
     # These attributes are deprecated in SQLAlchemy via #10247. They need to
@@ -201,6 +206,48 @@ class DefaultImpl(metaclass=ImplMeta):
         before the new one uses those same names.
 
         """
+
+    @contextmanager
+    def batch_recreate_scope(self, table: Table) -> Iterator[None]:
+        """Provide a scope around the create / copy / drop / rename
+        sequence of a batch "move and copy" operation.
+
+        A dialect may override this to make the whole sequence atomic,
+        so that a failure partway through (for example, a backfill
+        expression that violates a constraint) leaves both the original
+        table and any temporary table in a predictable state.
+
+        The default implementation emits no additional statements;
+        transactional DDL is either present natively or is handled by
+        the batch "copy" procedure's own cleanup steps.
+
+        """
+        yield
+
+    def cleanup_failed_batch_recreate(
+        self, temp_table: Table, original_table: Table
+    ) -> None:
+        """Remove the temporary table left over from a batch "move and
+        copy" operation that failed.
+
+        This is invoked while the exception that caused the failure is
+        being propagated; the method must therefore not replace that
+        exception with one of its own, e.g. if the ``CREATE TABLE``
+        statement itself failed.
+
+        Dialects that make the whole recreate sequence atomic through
+        :meth:`.DefaultImpl.batch_recreate_scope` override this to do
+        nothing, as the rollback removes the temporary table as well.
+
+        """
+        if self.as_sql:
+            # in "offline" mode the statements are only being rendered
+            # to a buffer; do not append a cleanup statement to it
+            return
+        try:
+            self.drop_table(temp_table)
+        except Exception:
+            pass
 
     @property
     def bind(self) -> Connection | None:

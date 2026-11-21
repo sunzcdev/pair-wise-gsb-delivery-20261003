@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import re
 from typing import Any
 from typing import TYPE_CHECKING
@@ -57,6 +59,10 @@ class SQLiteImpl(DefaultImpl):
         for op in batch_op.batch:
             if op[0] == "add_column":
                 col = op[1][1]
+                if op[2].get("backfill", None) is not None:
+                    # the expression used to populate existing rows can
+                    # only be applied by the "move and copy" procedure
+                    return True
                 if isinstance(
                     col.server_default, schema.DefaultClause
                 ) and isinstance(col.server_default.arg, sql.ClauseElement):
@@ -70,6 +76,62 @@ class SQLiteImpl(DefaultImpl):
                 return True
         else:
             return False
+
+    @contextmanager
+    def batch_recreate_scope(self, table: Table) -> Iterator[None]:
+        """Make the SQLite "move and copy" sequence atomic.
+
+        The pysqlite driver does not begin a transaction for DDL
+        statements, so a failure midway through the recreate (for
+        instance, the "INSERT from SELECT" statement that backfills new
+        columns) would otherwise leave the temporary table behind and
+        the original table intact in an ambiguous state.  A SAVEPOINT
+        does open a transaction on the driver side, causing the
+        ``CREATE TABLE`` and the copy statement to participate in the
+        same transaction; a failure then rolls back both.
+
+        """
+        connection = self.connection
+        if connection is None or self.as_sql:
+            yield
+            return
+
+        savepoint: Any
+        if connection.in_transaction():
+            savepoint = connection.begin_nested()
+        else:
+            savepoint = None
+
+        self._batch_recreate_savepoint = savepoint
+        try:
+            yield
+        except BaseException:
+            if savepoint is not None and savepoint.is_active:
+                savepoint.rollback()
+            raise
+        else:
+            if savepoint is not None and savepoint.is_active:
+                savepoint.commit()
+        finally:
+            self._batch_recreate_savepoint = None
+
+    def cleanup_failed_batch_recreate(
+        self, temp_table: Table, original_table: Table
+    ) -> None:
+        """SQLite rolls back the temporary table via the savepoint
+        established by :meth:`.SQLiteImpl.batch_recreate_scope`; the
+        cleanup step is therefore only required when no such savepoint
+        was established, such as when running in "offline" mode or
+        against a mock connection.
+
+        """
+        if self._batch_recreate_savepoint is not None:
+            # the SAVEPOINT rollback removes the temporary table
+            return
+        try:
+            self.drop_table(temp_table)
+        except Exception:
+            pass
 
     def add_constraint(self, const: Constraint, **kw: Any):
         # attempt to distinguish between an

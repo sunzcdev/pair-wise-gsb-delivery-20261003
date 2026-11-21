@@ -1727,9 +1727,40 @@ class BatchOperations(AbstractOperations):
             if_not_exists: bool | None = None,
             inline_references: bool | None = None,
             inline_primary_key: bool | None = None,
+            backfill: ColumnElement[Any] | TextClause | None = None,
         ) -> None:
             """Issue an "add column" instruction using the current
             batch migration context.
+
+            In addition to the parameters accepted by
+            :meth:`.Operations.add_column`, the following option is
+            available:
+
+            :param backfill: a SQL expression which will be used to
+             populate the new column for rows that already exist in the
+             table, when the table is recreated using the "move and copy"
+             procedure.  The expression is rendered within the "INSERT
+             from SELECT" statement that copies the table's data, and may
+             refer to any of the table's existing columns; for example::
+
+                with op.batch_alter_table("account") as batch_op:
+                    batch_op.add_column(
+                        Column("token", String(40), nullable=False),
+                        backfill=func.substr(column("email"), 1, 4),
+                    )
+
+             The expression is used **only** for the copy operation; the
+             column's ``server_default`` is unaffected and continues to
+             apply to rows inserted after the migration runs.  If the
+             expression produces values that violate a constraint on the
+             new table, the migration fails and the original table is
+             left intact.
+
+             .. versionadded:: 1.21.0
+
+             .. seealso::
+
+                :ref:`batch_add_column_existing_rows`
 
             .. seealso::
 

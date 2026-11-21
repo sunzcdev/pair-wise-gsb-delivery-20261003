@@ -652,6 +652,70 @@ class BatchApplyTest(TestBase):
         )
         eq_(new_table.c.g.name, "g")
 
+    def _backfill_sql(self, impl, column_name="q"):
+        expr = impl.column_transfers[column_name]["expr"]
+        return re.sub(
+            r"\s+",
+            " ",
+            str(
+                select(expr).compile(
+                    dialect=self.impl.dialect,
+                    compile_kwargs={"literal_binds": True},
+                )
+            ),
+        ).strip()
+
+    def test_add_col_backfill_expression(self):
+        impl = self._simple_fixture()
+        impl.add_column(
+            "tname",
+            Column("q", Integer, nullable=False),
+            backfill=column("x") + 5,
+        )
+
+        # the expression used to populate existing rows is bound to the
+        # table being copied, so that a plain column() reference renders
+        # as "tname.x"
+        eq_(
+            self._backfill_sql(impl),
+            "SELECT tname.x + 5 AS anon_1 FROM tname",
+        )
+
+        # the new column itself is not given a server default; the
+        # backfill expression applies only to the copy operation
+        impl._transfer_elements_to_new_table()
+        assert impl.new_table is not None
+        eq_(impl.new_table.c.q.server_default, None)
+
+    def test_add_col_backfill_with_copied_column(self):
+        """a Column that's already attached to some Table is re-bound
+        against the table being copied."""
+
+        other = MetaData()
+        source = Table("other", other, Column("x", Integer))
+        impl = self._simple_fixture()
+        impl.add_column(
+            "tname",
+            Column("q", Integer, nullable=False),
+            backfill=source.c.x + 5,
+        )
+        eq_(
+            self._backfill_sql(impl),
+            "SELECT tname.x + 5 AS anon_1 FROM tname",
+        )
+
+    def test_add_col_backfill_select_expression(self):
+        impl = self._simple_fixture()
+        impl.add_column(
+            "tname",
+            Column("q", Integer, nullable=False),
+            backfill=select(column("x")).scalar_subquery() + 5,
+        )
+        eq_(
+            self._backfill_sql(impl),
+            "SELECT (SELECT tname.x FROM tname) + 5 AS anon_1",
+        )
+
     def test_add_server_default(self):
         impl = self._simple_fixture()
         impl.alter_column("tname", "y", server_default="10")
@@ -976,6 +1040,20 @@ class BatchAPITest(TestBase):
             in batch.impl.operations.impl.mock_calls
         )
 
+    def test_add_col_backfill_requires_recreate(self):
+        column = Column("w", String(50))
+
+        def go():
+            with self._fixture() as batch:
+                batch.add_column(column, backfill="x + 1")
+
+        assert_raises_message(
+            alembic_exc.CommandError,
+            "The 'backfill' argument accepted by add_column\\(\\) requires "
+            "that the table be recreated",
+            go,
+        )
+
     def test_create_fk(self):
         with self._fixture() as batch:
             batch.create_foreign_key("myfk", "user", ["x"], ["y"])
@@ -1250,6 +1328,51 @@ class CopyFromTest(TestBase):
             "CONSTRAINT ck1 CHECK (y IN (0, 1)))",
             "INSERT INTO _alembic_tmp_foo (id, data, x, y) SELECT foo.id, "
             "foo.data, foo.x, CAST(foo.y AS BOOLEAN) AS y FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_add_column_backfill_expression(self):
+        context = self._fixture()
+        with self.op.batch_alter_table(
+            "foo", copy_from=self.table
+        ) as batch_op:
+            batch_op.add_column(
+                Column(
+                    "token", String(20), nullable=False, server_default="x"
+                ),
+                backfill=func.substr(column("data"), 1, 2),
+            )
+
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "data VARCHAR(50), x INTEGER, token VARCHAR(20) "
+            "DEFAULT 'x' NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, data, x, token) "
+            "SELECT foo.id, foo.data, foo.x, "
+            "substr(foo.data, ?, ?) AS substr_1 FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_add_column_backfill_expression_literal_binds(self):
+        context = self._fixture()
+        context.opts["literal_binds"] = True
+        context.impl.literal_binds = True
+        with self.op.batch_alter_table(
+            "foo", copy_from=self.table
+        ) as batch_op:
+            batch_op.add_column(
+                Column("token", Integer, nullable=False),
+                backfill=column("x") * 2,
+            )
+
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "data VARCHAR(50), x INTEGER, token INTEGER NOT NULL, "
+            "PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, data, x, token) "
+            "SELECT foo.id, foo.data, foo.x, foo.x * 2 AS anon_1 FROM foo",
             "DROP TABLE foo",
             "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
         )
@@ -2428,6 +2551,208 @@ class BatchRoundTripTest(_BatchRoundTripBase, TestBase):
         eq_(
             [col["name"] for col in inspect(connection).get_columns("foo")],
             ["id", "data", "x", "data2"],
+        )
+
+    def test_add_column_backfill(self, connection):
+        """existing rows receive a value computed from existing columns,
+        while rows inserted afterwards use the column's server default."""
+
+        with self.op.batch_alter_table("foo") as batch_op:
+            batch_op.add_column(
+                Column(
+                    "token",
+                    String(20),
+                    nullable=False,
+                    server_default="default",
+                ),
+                backfill=func.substr(column("data"), 1, 1),
+            )
+
+        self._assert_data(
+            connection,
+            [
+                {"id": 1, "data": "d1", "x": 5, "token": "d"},
+                {"id": 2, "data": "22", "x": 6, "token": "2"},
+                {"id": 3, "data": "8.5", "x": 7, "token": "8"},
+                {"id": 4, "data": "9.46", "x": 8, "token": "9"},
+                {"id": 5, "data": "d5", "x": 9, "token": "d"},
+            ],
+        )
+
+        # a plain insert, i.e. one that does not provide "token", gets
+        # the column's server default, not the backfill expression
+        _safe_commit_connection_transaction(connection)
+        with connection.begin():
+            connection.execute(
+                text("INSERT INTO foo (id, data, x) VALUES (6, 'd6', 10)")
+            )
+        self._assert_data(
+            connection,
+            [
+                {"id": 1, "data": "d1", "x": 5, "token": "d"},
+                {"id": 2, "data": "22", "x": 6, "token": "2"},
+                {"id": 3, "data": "8.5", "x": 7, "token": "8"},
+                {"id": 4, "data": "9.46", "x": 8, "token": "9"},
+                {"id": 5, "data": "d5", "x": 9, "token": "d"},
+                {"id": 6, "data": "d6", "x": 10, "token": "default"},
+            ],
+        )
+        eq_(
+            [col["name"] for col in inspect(connection).get_columns("foo")],
+            ["id", "data", "x", "token"],
+        )
+
+    def test_add_column_backfill_expression(self, connection):
+        """the backfill expression may use functions as well as plain
+        column references against the table being copied."""
+
+        with self.op.batch_alter_table("foo") as batch_op:
+            batch_op.add_column(
+                Column("data2", String(50), nullable=False),
+                backfill=func.substr(column("data"), 1, 4) + "-x",
+            )
+
+        self._assert_data(
+            connection,
+            [
+                {"id": 1, "data": "d1", "x": 5, "data2": "d1-x"},
+                {"id": 2, "data": "22", "x": 6, "data2": "22-x"},
+                {"id": 3, "data": "8.5", "x": 7, "data2": "8.5-x"},
+                {"id": 4, "data": "9.46", "x": 8, "data2": "9.46-x"},
+                {"id": 5, "data": "d5", "x": 9, "data2": "d5-x"},
+            ],
+        )
+
+    def test_add_column_backfill_requires_recreate_w_never(self, connection):
+        def go():
+            with self.op.batch_alter_table(
+                "foo", recreate="never"
+            ) as batch_op:
+                batch_op.add_column(
+                    Column("token", String(20)), backfill=column("data")
+                )
+
+        assert_raises_message(
+            alembic_exc.CommandError,
+            "The 'backfill' argument accepted by add_column\\(\\) requires "
+            "that the table be recreated",
+            go,
+        )
+
+    def test_add_column_backfill_failure_keeps_original(
+        self, connection, metadata
+    ):
+        """if the backfill expression violates a constraint, the
+        original table remains fully usable, including its foreign key,
+        and the leftover temporary table does not block another attempt
+        at the same migration."""
+
+        bar = Table(
+            "bar",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("foo_id", Integer, ForeignKey("foo.id")),
+            Column("data", String(50)),
+            mysql_engine="InnoDB",
+        )
+        with connection.begin():
+            bar.create(connection)
+            connection.execute(
+                bar.insert(),
+                [
+                    {"id": 1, "foo_id": 3, "data": "abc"},
+                    {"id": 2, "foo_id": 5, "data": "de"},
+                ],
+            )
+
+        # "de" has only two characters, so a backfill requiring at least
+        # three characters fails on that row
+        with expect_raises_message(
+            sqla_exc.IntegrityError, "CHECK constraint failed"
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                table_args=(
+                    CheckConstraint("length(token) >= 3", name="ck_token"),
+                ),
+            ) as batch_op:
+                batch_op.add_column(
+                    Column("token", String(20), nullable=False),
+                    backfill=column("data"),
+                )
+
+        # original table and its rows are untouched
+        self._assert_data(
+            connection,
+            [
+                {"id": 1, "data": "d1", "x": 5},
+                {"id": 2, "data": "22", "x": 6},
+                {"id": 3, "data": "8.5", "x": 7},
+                {"id": 4, "data": "9.46", "x": 8},
+                {"id": 5, "data": "d5", "x": 9},
+            ],
+        )
+        # ... and the referring foreign key is intact
+        insp = inspect(connection)
+        eq_(
+            [
+                (
+                    key["referred_table"],
+                    key["referred_columns"],
+                    key["constrained_columns"],
+                )
+                for key in insp.get_foreign_keys("bar")
+            ],
+            [("foo", ["id"], ["foo_id"])],
+        )
+        _safe_commit_connection_transaction(connection)
+        with connection.begin():
+            connection.execute(bar.delete().where(bar.c.id == 1))
+        # the remaining referring row still satisfies the intact
+        # foreign key
+        eq_(
+            connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall(),
+            [],
+        )
+        # no temporary table was left behind
+        eq_(
+            [t for t in insp.get_table_names() if t.startswith("_alembic")],
+            [],
+        )
+
+        # the corrected expression now succeeds, without needing to
+        # clean anything up first
+        with self.op.batch_alter_table(
+            "foo",
+            table_args=(
+                CheckConstraint("length(token) >= 2", name="ck_token"),
+            ),
+        ) as batch_op:
+            batch_op.add_column(
+                Column("token", String(20), nullable=False),
+                backfill=column("data"),
+            )
+
+        self._assert_data(
+            connection,
+            [
+                {"id": 1, "data": "d1", "x": 5, "token": "d1"},
+                {"id": 2, "data": "22", "x": 6, "token": "22"},
+                {"id": 3, "data": "8.5", "x": 7, "token": "8.5"},
+                {"id": 4, "data": "9.46", "x": 8, "token": "9.46"},
+                {"id": 5, "data": "d5", "x": 9, "token": "d5"},
+            ],
+        )
+        eq_(
+            [col["name"] for col in inspect(connection).get_columns("foo")],
+            ["id", "data", "x", "token"],
+        )
+        eq_(
+            [
+                (ck["name"], ck["sqltext"])
+                for ck in insp.get_check_constraints("foo")
+            ],
+            [("ck_token", "length(token) >= 2")],
         )
 
     def test_create_drop_index(self, connection):
