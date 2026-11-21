@@ -5,12 +5,13 @@ import gc
 import inspect
 import logging
 import weakref
+from contextlib import contextmanager
 from threading import Event, Thread, get_ident
 from unittest import mock
 
 import pytest
 
-from dramatiq import actor, threading
+from dramatiq import Worker, actor, threading
 from dramatiq.asyncio import (
     EventLoopThread,
     async_to_sync,
@@ -23,7 +24,15 @@ from dramatiq.logging import get_logger
 from dramatiq.middleware import CurrentMessage
 from dramatiq.middleware.asyncio import AsyncIO
 
-from ..common import worker
+
+@contextmanager
+def worker(*args, **kwargs):
+    try:
+        worker = Worker(*args, **kwargs)
+        worker.start()
+        yield worker
+    finally:
+        worker.stop()
 
 
 @pytest.fixture
@@ -241,6 +250,63 @@ def test_anyio_currrent_message_middleware_exposes_the_current_message(stub_brok
         # When I try to access the current message from a non-worker thread
         # Then I should get back None
         assert CurrentMessage.get_current_message() is None
+
+
+def test_asyncio_middleware_multiple_workers_in_same_process():
+    """Test that two workers running in the same process each dispatch
+    to their own event loop, and that shutting one worker down doesn't
+    break the other worker's event loop.
+    """
+    # Given two brokers, each with their own AsyncIO middleware
+    broker_1 = StubBroker()
+    broker_1.add_middleware(AsyncIO())
+    broker_1.emit_after("process_boot")
+    broker_2 = StubBroker()
+    broker_2.add_middleware(AsyncIO())
+    broker_2.emit_after("process_boot")
+
+    # And an actor on each broker that records the loop it runs on
+    loops_1 = []
+    loops_2 = []
+
+    @actor(broker=broker_1)
+    async def record_loop_1():
+        loops_1.append(asyncio.get_running_loop())
+
+    @actor(broker=broker_2)
+    async def record_loop_2():
+        loops_2.append(asyncio.get_running_loop())
+
+    try:
+        with worker(broker_2, worker_timeout=100, worker_threads=1) as worker_2:
+            with worker(broker_1, worker_timeout=100, worker_threads=1) as worker_1:
+                # When I send a message to each actor
+                record_loop_1.send()
+                record_loop_2.send()
+                broker_1.join(record_loop_1.queue_name)
+                broker_2.join(record_loop_2.queue_name)
+                worker_1.join()
+                worker_2.join()
+
+                # Then each actor ran on the event loop owned by its
+                # own worker, not the loop of the worker that started
+                # last
+                assert len(loops_1) == 1
+                assert len(loops_2) == 1
+                assert loops_1[0] is not loops_2[0]
+
+            # And when the first worker has been shut down, the second
+            # worker can still process messages on its own event loop
+            record_loop_2.send()
+            broker_2.join(record_loop_2.queue_name)
+            worker_2.join()
+            assert len(loops_2) == 2
+            assert loops_2[1] is loops_2[0]
+    finally:
+        broker_1.flush_all()
+        broker_1.close()
+        broker_2.flush_all()
+        broker_2.close()
 
 
 def test_exception_from_async_actor_doesnt_leak(

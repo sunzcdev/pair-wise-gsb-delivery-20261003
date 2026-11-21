@@ -28,6 +28,7 @@ from .threading import Interrupt
 __all__ = [
     "EventLoopThread",
     "async_to_sync",
+    "bind_event_loop_thread",
     "get_event_loop_thread",
     "set_event_loop_thread",
 ]
@@ -36,21 +37,41 @@ R = TypeVar("R")
 P = ParamSpec("P")
 
 _event_loop_thread = None
+_thread_state = threading.local()
 
 
 def get_event_loop_thread() -> Optional[EventLoopThread]:
-    """Get the global event loop thread.
+    """Get the event loop thread for the current thread.
+
+    If the current thread has been bound to a specific event loop
+    thread (see :func:`bind_event_loop_thread`), that thread is
+    returned.  Otherwise, the global event loop thread is returned.
 
     Returns:
-      EventLoopThread: The global EventLoopThread.
+      EventLoopThread: The EventLoopThread for the current thread.
     """
-    return _event_loop_thread
+    thread = getattr(_thread_state, "event_loop_thread", None)
+    if thread is None:
+        thread = _event_loop_thread
+    return thread
 
 
 def set_event_loop_thread(thread: Optional[EventLoopThread]) -> None:
     """Set the global event loop thread."""
     global _event_loop_thread
     _event_loop_thread = thread
+
+
+def bind_event_loop_thread(thread: Optional[EventLoopThread]) -> None:
+    """Bind the current thread to a specific event loop thread.
+
+    The binding takes precedence over the global event loop thread for
+    code running on the current thread.  This is used by the AsyncIO
+    middleware to ensure that each worker dispatches messages to its
+    own event loop, even when multiple workers run in the same
+    process.  Pass ``None`` to remove the binding.
+    """
+    _thread_state.event_loop_thread = thread
 
 
 def async_to_sync(async_fn: Callable[P, Awaitable[R]]) -> Callable[P, R]:
