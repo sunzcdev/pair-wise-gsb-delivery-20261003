@@ -11,6 +11,12 @@ module Dry
 
     FrozenConfigError = Class.new(Error)
 
+    # Raised when derived setting defaults (see `depends_on:`) form a dependency
+    # cycle. The error message lists the traversed setting path.
+    #
+    # @api public
+    CyclicDependencyError = Class.new(Error)
+
     AlreadyIncludedError = Class.new(Error)
     deprecate_constant(
       :AlreadyIncludedError,

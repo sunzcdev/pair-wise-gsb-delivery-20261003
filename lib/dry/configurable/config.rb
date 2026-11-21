@@ -23,6 +23,7 @@ module Dry
         @_settings = settings
         @_values = values
         @_configured = Set.new
+        @_resolving = []
       end
 
       # @api private
@@ -30,6 +31,7 @@ module Dry
         super
         @_values = source.__send__(:dup_values)
         @_configured = source._configured.dup
+        @_resolving = []
       end
 
       # @api private
@@ -47,6 +49,12 @@ module Dry
 
         unless (setting = _settings[name])
           raise ArgumentError, "+#{name}+ is not a setting name"
+        end
+
+        # Derived defaults are (re)evaluated at read time from their declared
+        # dependencies, unless the setting was explicitly configured
+        if setting.derived? && !_configured.include?(name)
+          return _values.fetch(name) { resolve_derived(setting) }
         end
 
         _values.fetch(name) {
@@ -76,6 +84,8 @@ module Dry
         _configured.add(name)
 
         _values[name] = setting.constructor.(value)
+
+        invalidate_dependents(name)
       end
 
       # Update config with new values
@@ -223,6 +233,56 @@ module Dry
       end
 
       private
+
+      # Evaluates a derived setting's default against the current values of its
+      # declared dependencies, validating the result through the setting's
+      # constructor, and caches it until a dependency changes.
+      #
+      # @api private
+      def resolve_derived(setting)
+        name = setting.name
+
+        if (index = @_resolving.index(name))
+          path = (@_resolving[index..] + [name]).join(" -> ")
+          raise CyclicDependencyError,
+            "Cyclic dependency in derived setting defaults: #{path}"
+        end
+
+        @_resolving.push(name)
+        begin
+          dependencies = setting.dependencies.to_h { |dep| [dep, self[dep]] }
+          _values[name] = setting.constructor.(setting.default.(**dependencies))
+        ensure
+          @_resolving.pop
+        end
+      end
+
+      # Drops the cached values of derived settings that (transitively) depend
+      # on the changed setting, so they are re-evaluated on next read.
+      # Explicitly configured settings keep their assigned value and act as a
+      # boundary: their own dependents are unaffected by the change.
+      #
+      # @api private
+      def invalidate_dependents(name)
+        queue = [name]
+        visited = Set[name]
+
+        until queue.empty?
+          current = queue.shift
+
+          _settings.each do |setting|
+            next unless setting.derived?
+            next if visited.include?(setting.name)
+            next unless setting.dependencies.include?(current)
+
+            visited << setting.name
+            next if _configured.include?(setting.name)
+
+            _values.delete(setting.name)
+            queue << setting.name
+          end
+        end
+      end
 
       def to_data_attrs
         _values.each_with_object({}) do |(name, value), hsh|

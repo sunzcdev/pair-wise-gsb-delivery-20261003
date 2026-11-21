@@ -8,7 +8,7 @@ module Dry
     class Setting
       include Dry::Equalizer(:name, :default, :constructor, :children, :options, inspect: false)
 
-      OPTIONS = %i[default reader constructor mutable cloneable settings config_class].freeze
+      OPTIONS = %i[default reader constructor mutable cloneable settings config_class depends_on].freeze
 
       DEFAULT_CONSTRUCTOR = -> v { v }.freeze
 
@@ -28,6 +28,11 @@ module Dry
 
       # @api public
       attr_reader :children
+
+      # Names of the sibling settings this setting's derived default depends on
+      #
+      # @api public
+      attr_reader :dependencies
 
       # @api public
       attr_reader :options
@@ -54,6 +59,12 @@ module Dry
         @constructor = constructor
         @children = children
         @options = options
+        @dependencies = Array(options[:depends_on]).map(&:to_sym).freeze
+
+        if derived? && !default.respond_to?(:call)
+          raise ArgumentError,
+            "Default for +#{name}+ must be callable when +depends_on+ is given"
+        end
       end
 
       # @api private
@@ -66,6 +77,14 @@ module Dry
         mutable
       end
       alias_method :cloneable?, :mutable?
+
+      # Returns true when the setting's default is derived from other settings
+      # (declared via `depends_on:`) and must be evaluated at read time.
+      #
+      # @api private
+      def derived?
+        dependencies.any?
+      end
 
       # @api private
       def to_value

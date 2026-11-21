@@ -57,6 +57,24 @@ RSpec.describe Dry::Configurable::DSL do
     expect(setting.constructor.("sqlite")).to eq("jdbc:sqlite")
   end
 
+  it "compiles a setting with a derived default declaring its dependencies" do
+    setting = dsl.setting(
+      :queue_capacity,
+      default: ->(max_threads:) { max_threads * 2 },
+      depends_on: %i[max_threads]
+    )
+
+    expect(setting.name).to be(:queue_capacity)
+    expect(setting).to be_derived
+    expect(setting.dependencies).to eq %i[max_threads]
+  end
+
+  it "rejects a non-callable default when dependencies are declared" do
+    expect {
+      dsl.setting(:queue_capacity, default: 8, depends_on: %i[max_threads])
+    }.to raise_error(ArgumentError, /must be callable/)
+  end
+
   it "rejects setting names that conflict with Data instance methods" do
     expect { dsl.setting :hash }.to raise_error(
       ArgumentError,
