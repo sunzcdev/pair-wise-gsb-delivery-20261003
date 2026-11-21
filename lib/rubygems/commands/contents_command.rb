@@ -104,9 +104,13 @@ prefix or only the files that are requireable.
       glob = "**/*"
     end
 
-    Dir.glob(glob, base: gem_path).map do |file|
+    files = Dir.glob(glob, base: gem_path).map do |file|
       [gem_path, file]
     end
+
+    report_missing_files(spec, files, gem_path) unless options[:lib_only]
+
+    files
   end
 
   def files_in_default_gem(spec)
@@ -123,7 +127,11 @@ prefix or only the files that are requireable.
         requirable_part = file.delete_prefix("#{require_path}/")
 
         resolve = $LOAD_PATH.resolve_feature_path(requirable_part)&.last
-        next unless resolve
+        unless resolve
+          alert_warning "#{spec.full_name}: #{file} is declared in the gemspec " \
+                        "but cannot be found on the load path"
+          next
+        end
 
         [resolve.delete_suffix(requirable_part), requirable_part]
       end
@@ -131,13 +139,23 @@ prefix or only the files that are requireable.
   end
 
   def gem_contents(name)
-    spec = spec_for name
+    specs = specs_for name
 
-    return false unless spec
+    return false if specs.empty?
 
-    files = files_in spec
+    specs.each_with_index do |spec, index|
+      # The same name and version can be installed under more than one Gem
+      # home. When that happens, label each section with its actual source so
+      # every reported path can be traced back to the tree it came from.
+      if specs.length > 1
+        say if index > 0
+        say source_label spec
+      end
 
-    show_files files
+      files = files_in spec
+
+      show_files files
+    end
 
     true
   end
@@ -154,7 +172,7 @@ prefix or only the files that are requireable.
 
   def gem_names # :nodoc:
     if options[:all]
-      Gem::Specification.map(&:name)
+      Gem::Specification.map(&:name).uniq
     else
       get_all_gem_names
     end
@@ -181,10 +199,40 @@ prefix or only the files that are requireable.
     end
   end
 
-  def spec_for(name)
-    spec = Gem::Specification.find_all_by_name(name, @version).first
+  # Where the spec's files are actually read from. Default gems keep their
+  # code outside the Gem home (typically the Ruby load path), so callers can
+  # distinguish a real install tree from a default gem location.
 
-    return spec if spec
+  def source_label(spec)
+    label = "#{spec.full_name} in #{spec.base_dir}"
+    label = "#{label} (default gem)" if spec.default_gem?
+    label
+  end
+
+  # Warns about files declared by the gemspec that are not present in the
+  # install tree. Globbed listings silently drop these, which makes a broken
+  # install look identical to a complete one.
+
+  def report_missing_files(spec, files, gem_path)
+    present = files.map(&:last)
+
+    spec.files.each do |declared|
+      next if present.include?(declared)
+      next if File.exist?(File.join(gem_path, declared))
+
+      alert_warning "#{spec.full_name}: #{declared} is declared in the gemspec " \
+                    "but missing from #{gem_path}"
+    end
+  end
+
+  def spec_for(name)
+    specs_for(name).first
+  end
+
+  def specs_for(name)
+    specs = Gem::Specification.find_all_by_name(name, @version)
+
+    return specs unless specs.empty?
 
     say "Unable to find gem '#{name}' in #{@path_kind}"
 
@@ -193,7 +241,7 @@ prefix or only the files that are requireable.
       @spec_dirs.sort.each {|dir| say dir }
     end
 
-    nil
+    []
   end
 
   def specification_directories # :nodoc:

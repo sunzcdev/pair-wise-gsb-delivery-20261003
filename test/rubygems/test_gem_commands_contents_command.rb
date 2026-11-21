@@ -301,6 +301,203 @@ lib/foo.rb
     assert_equal "", @ui.error
   end
 
+  def test_execute_same_name_and_version_in_multiple_gem_homes
+    install_duplicate_gem @gemhome, "home1.rb"
+    gemhome2 = File.join @tempdir, "gemhome2"
+    Gem.ensure_gem_subdirectories gemhome2
+    install_duplicate_gem gemhome2, "home2.rb"
+
+    Gem.use_paths @gemhome, gemhome2
+    Gem::Specification.reset
+
+    @cmd.options[:args] = %w[dup]
+
+    use_ui @ui do
+      @cmd.execute
+    end
+
+    output = @ui.output
+
+    assert_includes output, "dup-1 in #{@gemhome}"
+    assert_includes output, "dup-1 in #{gemhome2}"
+    assert_includes output, File.join(@gemhome, "gems", "dup-1", "lib", "dup", "home1.rb")
+    assert_includes output, File.join(gemhome2, "gems", "dup-1", "lib", "dup", "home2.rb")
+    assert_equal "", @ui.error
+  end
+
+  def test_execute_multiple_gem_homes_with_version_option
+    install_duplicate_gem @gemhome, "home1.rb"
+    gemhome2 = File.join @tempdir, "gemhome2"
+    Gem.ensure_gem_subdirectories gemhome2
+    install_duplicate_gem gemhome2, "home2.rb"
+
+    Gem.use_paths @gemhome, gemhome2
+    Gem::Specification.reset
+
+    @cmd.options[:args] = %w[dup]
+    @cmd.options[:version] = Gem::Requirement.new "= 1"
+
+    use_ui @ui do
+      @cmd.execute
+    end
+
+    assert_includes @ui.output, "dup-1 in #{@gemhome}"
+    assert_includes @ui.output, "dup-1 in #{gemhome2}"
+    assert_equal "", @ui.error
+  end
+
+  def test_execute_all_dedupes_names_shared_between_gem_homes
+    install_duplicate_gem @gemhome, "home1.rb"
+    gemhome2 = File.join @tempdir, "gemhome2"
+    Gem.ensure_gem_subdirectories gemhome2
+    install_duplicate_gem gemhome2, "home2.rb"
+
+    Gem.use_paths @gemhome, gemhome2
+    Gem::Specification.reset
+
+    @cmd.options[:all] = true
+
+    use_ui @ui do
+      @cmd.execute
+    end
+
+    assert_equal 1, @ui.output.scan(/dup-1 in #{Regexp.escape @gemhome}$/).length
+    assert_equal 1, @ui.output.scan(/dup-1 in #{Regexp.escape gemhome2}$/).length
+    assert_equal "", @ui.error
+  end
+
+  def test_execute_labels_default_gem_source_separately_from_regular_gem
+    default_gem_spec = new_default_spec("shared", "1.0.0", nil, "shared.rb")
+    install_default_gems(default_gem_spec)
+
+    regular_spec = util_spec "shared", 1 do |s|
+      s.files = %w[lib/shared.rb lib/shared/extra.rb]
+    end
+    regular_spec.loaded_from = File.join @gemhome, "specifications", regular_spec.spec_name
+    write_file File.join("gems", regular_spec.full_name, "lib", "shared.rb")
+    write_file File.join("gems", regular_spec.full_name, "lib", "shared", "extra.rb")
+    File.write regular_spec.loaded_from, ruby_gemspec("shared", "1", regular_spec.files)
+    Gem::Specification.reset
+
+    @cmd.options[:args] = %w[shared]
+
+    use_ui @ui do
+      @cmd.execute
+    end
+
+    assert_includes @ui.output, "shared-1.0.0 in #{default_gem_spec.base_dir} (default gem)"
+    assert_includes @ui.output, "shared-1 in #{@gemhome}"
+    assert_includes @ui.output, File.join(@gemhome, "gems", "shared-1", "lib", "shared", "extra.rb")
+  end
+
+  def test_execute_reports_files_declared_but_missing_from_gem_dir
+    spec = util_spec "broken", 1 do |s|
+      s.files = %w[lib/broken.rb Rakefile]
+    end
+    spec.loaded_from = File.join @gemhome, "specifications", spec.spec_name
+
+    write_file File.join("gems", spec.full_name, "lib", "broken.rb")
+    # Rakefile is declared in the gemspec but never written to disk.
+    File.write spec.loaded_from, ruby_gemspec("broken", "1", spec.files)
+
+    Gem::Specification.reset
+
+    @cmd.options[:args] = %w[broken]
+
+    use_ui @ui do
+      @cmd.execute
+    end
+
+    assert_includes @ui.output, File.join(spec.full_gem_path, "lib", "broken.rb")
+    refute_includes @ui.output, "Rakefile"
+    assert_match(
+      "broken-1: Rakefile is declared in the gemspec but missing from #{spec.full_gem_path}",
+      @ui.error
+    )
+  end
+
+  def test_execute_missing_file_warning_not_emitted_for_lib_only
+    spec = util_spec "broken", 1 do |s|
+      s.files = %w[lib/broken.rb Rakefile]
+    end
+    spec.loaded_from = File.join @gemhome, "specifications", spec.spec_name
+
+    write_file File.join("gems", spec.full_name, "lib", "broken.rb")
+    File.write spec.loaded_from, ruby_gemspec("broken", "1", spec.files)
+
+    Gem::Specification.reset
+
+    @cmd.options[:args] = %w[broken]
+    @cmd.options[:lib_only] = true
+
+    use_ui @ui do
+      @cmd.execute
+    end
+
+    assert_includes @ui.output, File.join(spec.full_gem_path, "lib", "broken.rb")
+    assert_equal "", @ui.error
+  end
+
+  def test_files_in_default_gem_warns_about_undeclared_load_path_file
+    default_gem_spec = new_default_spec("default", "2.0.0.0",
+                                        nil, "default/gem.rb", "default/missing.rb")
+    install_default_gems(default_gem_spec)
+
+    # The gemspec still declares default/missing.rb, but the file it points at
+    # on the load path has been removed, mimicking a broken default gem.
+    FileUtils.rm_f File.join(@tempdir, "default_gems", "lib", "default", "missing.rb")
+
+    files = use_ui(@ui) { @cmd.files_in_default_gem default_gem_spec }
+
+    assert_equal 1, files.length
+    assert_equal "default/gem.rb", files.first.last
+    assert_path_exist File.join(files.first.first, files.first.last)
+    assert_match "default-2.0.0.0: default/missing.rb is declared in the gemspec", @ui.error
+  end
+
+  def test_execute_single_gem_keeps_original_output_without_header
+    @cmd.options[:args] = %w[foo]
+
+    gem "foo"
+
+    use_ui @ui do
+      @cmd.execute
+    end
+
+    refute_includes @ui.output, "foo-2 in "
+    assert_match %r{lib/foo\.rb}, @ui.output
+    assert_equal "", @ui.error
+  end
+
+  def ruby_gemspec(name, version, files)
+    <<-GEMSPEC
+Gem::Specification.new do |s|
+  s.name = #{name.inspect}
+  s.version = #{version.inspect}
+  s.summary = "x"
+  s.authors = ["A User"]
+  s.files = #{files.inspect}
+end
+    GEMSPEC
+  end
+
+  # Installs a "dup-1" gem tree under +gemhome+ with a file unique to that
+  # tree, so two Gem homes can carry the same name and version while their
+  # on-disk contents stay distinguishable.
+
+  def install_duplicate_gem(gemhome, unique_file)
+    full_name = "dup-1"
+    files = %W[lib/dup.rb lib/dup/#{unique_file}]
+
+    gem_dir = File.join gemhome, "gems", full_name
+    FileUtils.mkdir_p File.join(gem_dir, "lib", "dup")
+    File.write File.join(gem_dir, "lib", "dup.rb"), "# #{unique_file}"
+    File.write File.join(gem_dir, "lib", "dup", unique_file), "# #{unique_file}"
+
+    spec_path = File.join gemhome, "specifications", "dup-1.gemspec"
+    File.write spec_path, ruby_gemspec("dup", "1", files)
+  end
+
   def test_handle_options
     refute @cmd.options[:lib_only]
     assert @cmd.options[:prefix]
@@ -324,3 +521,4 @@ lib/foo.rb
     assert @cmd.options[:show_install_dir]
   end
 end
+
