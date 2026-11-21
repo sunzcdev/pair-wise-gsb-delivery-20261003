@@ -2,9 +2,13 @@ import importlib.util
 from pathlib import Path
 import sys
 
+from sqlalchemy import create_engine
+
 from alembic import command
 from alembic import testing
 from alembic import util
+from alembic.operations import ops
+from alembic.script import ScriptDirectory
 from alembic.script import write_hooks
 from alembic.testing import assert_raises_message
 from alembic.testing import combinations
@@ -654,3 +658,229 @@ black.cwd = /path/to/cwd
         self._run_black_module_with_config(
             input_config, expected_additional_arguments_fn, cwd="/path/to/cwd"
         )
+
+
+class MultiRevisionHookTransactionTest(TestBase):
+    """Test that a batch of revisions generated in one run is finalized
+    atomically: a post write hook failure on a later revision rolls back
+    every file written earlier in the batch, and keeps them out of the
+    revision map until the whole group succeeds."""
+
+    rev_id_a = "batchreva"
+    rev_id_b = "batchrevb"
+
+    def setUp(self):
+        self.env = staging_env()
+        self.cfg = _no_sql_testing_config(
+            directives=(
+                "\n[post_write_hooks]\n"
+                "hooks=batch_hook\n"
+                "batch_hook.type=batch_hook\n"
+            )
+        )
+        self.cfg.set_main_option("revision_environment", "true")
+
+        # hook state: while True, the hook raises when it sees the second
+        # revision of the batch.
+        self.fail_on_second = True
+        self.hook_calls: list[str] = []
+
+        @write_hooks.register("batch_hook")
+        def batch_hook(path, options):
+            # the hook must keep receiving the real path of the generated
+            # revision file, unchanged by the batching machinery.
+            self.hook_calls.append(path)
+            if self.fail_on_second and Path(path).name.startswith(
+                self.rev_id_b
+            ):
+                raise RuntimeError("simulated second-file hook failure")
+
+        self._batch_hook = batch_hook
+        self.engine = create_engine("sqlite://")
+
+    def tearDown(self):
+        write_hooks._registry.pop("batch_hook", None)
+        clear_staging_env()
+
+    def _env_fixture(self, fn):
+        def run_env(self_):
+            from alembic import context
+
+            with self.engine.connect() as connection:
+                context.configure(
+                    connection=connection,
+                    process_revision_directives=fn,
+                )
+                with context.begin_transaction():
+                    context.run_migrations()
+
+        return mock.patch(
+            "alembic.script.base.ScriptDirectory.run_env", run_env
+        )
+
+    def _two_revision_directives(self, context, revision, directives):
+        directives[:] = [
+            ops.MigrationScript(
+                self.rev_id_a,
+                ops.UpgradeOps(),
+                ops.DowngradeOps(),
+                message="first",
+            ),
+            ops.MigrationScript(
+                self.rev_id_b,
+                ops.UpgradeOps(),
+                ops.DowngradeOps(),
+                message="second",
+            ),
+        ]
+
+    def _version_dir(self):
+        return Path(_get_staging_directory(), "scripts", "versions")
+
+    def test_hook_failure_rolls_back_whole_batch_then_rerun_succeeds(self):
+        # first run: the hook fails on the second revision file
+        with self._env_fixture(self._two_revision_directives):
+            assert_raises_message(
+                RuntimeError,
+                "simulated second-file hook failure",
+                command.revision,
+                self.cfg,
+                message="batch",
+            )
+
+        # nothing from the failed batch may remain on disk ...
+        remaining = sorted(p.name for p in self._version_dir().glob("*.py"))
+        eq_(remaining, [])
+
+        # ... nor in a freshly loaded revision map
+        rolled_back = ScriptDirectory.from_config(self.cfg)
+        eq_(rolled_back.get_heads(), [])
+        for missing_rev_id in (self.rev_id_a, self.rev_id_b):
+            assert_raises_message(
+                util.CommandError,
+                "Can't locate revision identified by '%s'" % missing_rev_id,
+                rolled_back.get_revision,
+                missing_rev_id,
+            )
+
+        # the first file's hook did run with its real path before the second
+        # file's hook failed
+        eq_(len(self.hook_calls), 2)
+        assert Path(self.hook_calls[0]).name.startswith(self.rev_id_a)
+        assert Path(self.hook_calls[1]).name.startswith(self.rev_id_b)
+
+        # recover: same revision ids, hook now succeeds
+        self.fail_on_second = False
+        with self._env_fixture(self._two_revision_directives):
+            revs = command.revision(self.cfg, message="batch")
+        eq_([r.revision for r in revs], [self.rev_id_a, self.rev_id_b])
+
+        # exactly one group of files is present on disk
+        remaining = sorted(p.name for p in self._version_dir().glob("*.py"))
+        eq_(len(remaining), 2)
+        assert remaining[0].startswith(self.rev_id_a)
+        assert remaining[1].startswith(self.rev_id_b)
+
+        # exactly one group is present in the revision graph, with the second
+        # revision chained onto the first
+        script = ScriptDirectory.from_config(self.cfg)
+        eq_(
+            sorted(script.get_heads()),
+            [self.rev_id_b],
+        )
+        rev_a = script.get_revision(self.rev_id_a)
+        rev_b = script.get_revision(self.rev_id_b)
+        eq_(rev_b.down_revision, self.rev_id_a)
+        eq_(rev_a.nextrev, {self.rev_id_b})
+
+        # the hooks were invoked once per regenerated file with real paths
+        eq_(len(self.hook_calls), 4)
+
+    def test_rollback_does_not_remove_pre_existing_file(self):
+        # place a pre-existing, valid revision file whose name does not
+        # collide with the generated files.  Rollback of the failed batch
+        # must leave this file untouched.
+        pre_existing_rev_id = "preexist0"
+        version_dir = self._version_dir()
+        version_dir.mkdir(parents=True, exist_ok=True)
+        pre_existing_name = "%s_keepme.py" % pre_existing_rev_id
+        pre_existing = version_dir / pre_existing_name
+        pre_existing.write_text(
+            '"""pre-existing user revision"""\n'
+            "revision = %r\n"
+            "down_revision = None\n"
+            "branch_labels = None\n"
+            "depends_on = None\n\n"
+            "def upgrade():\n"
+            "    pass\n\n"
+            "def downgrade():\n"
+            "    pass\n" % pre_existing_rev_id
+        )
+
+        with self._env_fixture(self._two_revision_directives):
+            assert_raises_message(
+                RuntimeError,
+                "simulated second-file hook failure",
+                command.revision,
+                self.cfg,
+                message="batch",
+            )
+
+        # both files created by the failed batch are removed ...
+        remaining = sorted(p.name for p in version_dir.glob("*.py"))
+        eq_(remaining, [pre_existing_name])
+
+        # ... while the pre-existing file survives
+        assert pre_existing.exists()
+
+        # the revision map reflects only the pre-existing revision; the
+        # revisions of the failed batch are absent
+        rolled_back = ScriptDirectory.from_config(self.cfg)
+        eq_(rolled_back.get_heads(), [pre_existing_rev_id])
+        for missing_rev_id in (self.rev_id_a, self.rev_id_b):
+            assert_raises_message(
+                util.CommandError,
+                "Can't locate revision identified by '%s'" % missing_rev_id,
+                rolled_back.get_revision,
+                missing_rev_id,
+            )
+
+    def test_rollback_keeps_same_named_pre_existing_file(self):
+        # a file that already exists at the target path of a generated
+        # revision must never be deleted by rollback, even though its
+        # contents are overwritten by template generation.  The pre-existing
+        # file uses its own revision id (only the filename collides) and
+        # serves as the head the batch generates against.
+        pre_existing_rev_id = "preexist0"
+        version_dir = self._version_dir()
+        version_dir.mkdir(parents=True, exist_ok=True)
+        collision_name = "%s_first.py" % self.rev_id_a
+        collision_path = version_dir / collision_name
+        collision_path.write_text(
+            '"""user owned revision, do not delete"""\n'
+            "revision = %r\n"
+            "down_revision = None\n"
+            "branch_labels = None\n"
+            "depends_on = None\n\n"
+            "def upgrade():\n"
+            "    pass\n\n"
+            "def downgrade():\n"
+            "    pass\n" % pre_existing_rev_id
+        )
+
+        with self._env_fixture(self._two_revision_directives):
+            assert_raises_message(
+                RuntimeError,
+                "simulated second-file hook failure",
+                command.revision,
+                self.cfg,
+                message="batch",
+            )
+
+        # the second, newly created file is gone ...
+        assert not (
+            version_dir / ("%s_second.py" % self.rev_id_b)
+        ).exists()
+        # ... but the same-named pre-existing path is preserved
+        assert collision_path.exists()
+

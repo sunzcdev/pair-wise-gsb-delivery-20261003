@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from collections.abc import Sequence
+import contextlib
 from contextlib import contextmanager
 import datetime
 import os
@@ -94,6 +95,11 @@ class ScriptDirectory:
         self.hooks = hooks
         self.recursive_version_locations = recursive_version_locations
         self.messaging_opts = messaging_opts
+
+        # stack of in-progress revision generation batches; each entry
+        # collects the revision files created within the batch so that they
+        # can be removed together if the batch fails.
+        self._revision_generation_batches: list[list[Path]] = []
 
         if not os.access(dir, os.F_OK):
             raise util.CommandError(
@@ -613,6 +619,60 @@ class ScriptDirectory:
             create_date = datetime.datetime.now()
         return create_date
 
+    @contextmanager
+    def _revision_generation_context(self) -> Iterator[None]:
+        """Track the revision files written by a group of
+        :meth:`.generate_revision` calls.
+
+        Revision files are written and their post write hooks are invoked as
+        usual, and the revisions also remain visible to the in-memory
+        :class:`.RevisionMap` while the batch is in progress so that later
+        revisions in the same batch can build upon earlier ones.  If any part
+        of the batch fails, every file created by the batch is removed again
+        and the :class:`.RevisionMap` is reloaded from disk, ensuring that a
+        partially written group of revisions can never be observed.
+
+        Only files that did not exist before they were written by the batch
+        are removed, so pre-existing files sharing a name with a generated
+        file are never deleted.
+
+        """
+        batch: list[Path] = []
+        self._revision_generation_batches.append(batch)
+        try:
+            yield
+        except BaseException:
+            self._rollback_revision_generation(batch)
+            raise
+        finally:
+            discarded = self._revision_generation_batches.pop()
+            assert discarded is batch
+
+    def _rollback_revision_generation(self, batch: list[Path]) -> None:
+        """Remove revision files created by a failed generation batch and
+        reset the revision map so that the rolled back revisions are no
+        longer visible."""
+
+        for path in reversed(batch):
+            # only remove files that this batch actually created; this
+            # preserves any pre-existing file that happened to share the
+            # target path.
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+
+        # the memoized map and its derived head/base caches now describe a
+        # state that no longer exists on disk; drop them so that they are
+        # rebuilt from the remaining files on the next access.
+        revision_map = self.revision_map
+        for attr_name in (
+            "_revision_map",
+            "heads",
+            "bases",
+            "_real_heads",
+            "_real_bases",
+        ):
+            revision_map.__dict__.pop(attr_name, None)
+
     def generate_revision(
         self,
         revid: str,
@@ -729,6 +789,7 @@ class ScriptDirectory:
         else:
             resolved_depends_on = None
 
+        path_existed = path.exists()
         self._generate_template(
             Path(self.dir, "script.py.mako"),
             path,
@@ -743,6 +804,13 @@ class ScriptDirectory:
             message=message if message is not None else ("empty message"),
             **kw,
         )
+
+        # register the newly written file with the active generation batch,
+        # if any, so that a later failure (including a post write hook
+        # failure) removes it again.  A file that already existed before this
+        # call is left alone on rollback.
+        if not path_existed and self._revision_generation_batches:
+            self._revision_generation_batches[-1].append(path)
 
         post_write_hooks = self.hooks
         if post_write_hooks:

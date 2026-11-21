@@ -656,5 +656,12 @@ class RevisionContext:
         return op
 
     def generate_scripts(self) -> Iterator[Script | None]:
-        for generated_revision in self.generated_revisions:
-            yield self._to_script(generated_revision)
+        # all of the revisions produced in this run are written out as a
+        # single group: if writing any file, or one of its post write hooks,
+        # fails, the files created earlier in the group are removed and the
+        # revision map is rolled back so that a partial group can never be
+        # observed.  A fresh run can then regenerate the whole group using the
+        # same revision ids.
+        with self.script_directory._revision_generation_context():
+            for generated_revision in self.generated_revisions:
+                yield self._to_script(generated_revision)
