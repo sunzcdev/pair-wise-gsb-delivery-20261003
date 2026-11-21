@@ -437,6 +437,48 @@ If this trigger is created on 2022-06-07 at 09:00:00, its first run times would 
 
 Notably, 2022-08-07 is skipped because it falls on a Sunday.
 
+Excluding time ranges from combined triggers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Both :class:`~triggers.combining.AndTrigger` and
+:class:`~triggers.combining.OrTrigger` accept an ``exclusion_windows`` argument.
+Each window is a half-open (``[start, end)``) interval defined with an
+:class:`~triggers.combining.ExclusionWindow`: any candidate fire time that falls
+on or after the window start but before its end is skipped. The windows may be
+adjacent to or overlap with each other, and their endpoints are compared by the
+same absolute instant even when they are expressed in different time zones.
+
+This is useful for declaring maintenance freezes on top of an otherwise regular
+schedule, for example a monthly maintenance job that must not run during two
+freeze periods::
+
+    from datetime import datetime
+    from apscheduler.triggers.calendarinterval import CalendarIntervalTrigger
+    from apscheduler.triggers.combining import ExclusionWindow, OrTrigger
+
+    trigger = OrTrigger(
+        [CalendarIntervalTrigger(months=1, hour=9)],
+        exclusion_windows=[
+            ExclusionWindow(
+                datetime(2026, 11, 14),
+                datetime(2026, 11, 16),
+            ),
+            ExclusionWindow(
+                datetime(2026, 12, 1),
+                datetime(2027, 1, 2),
+            ),
+        ],
+    )
+
+If every remaining candidate is covered by an exclusion window, the trigger
+keeps advancing until an uncovered fire time is found or all the enclosed
+triggers are exhausted. The number of consecutive skipped candidates is bounded
+by ``max_iterations`` (10000 by default); reaching it raises
+:class:`~apscheduler.MaxIterationsReached` so that a misconfigured schedule can
+never loop forever. Exclusion windows are serialized together with the trigger,
+so schedules persisted before a freeze period resume with the same windows
+intact.
+
 Removing schedules
 ------------------
 

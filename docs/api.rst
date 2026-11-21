@@ -67,6 +67,7 @@ Triggers
 .. autoclass:: apscheduler.triggers.date.DateTrigger
 .. autoclass:: apscheduler.triggers.interval.IntervalTrigger
 .. autoclass:: apscheduler.triggers.calendarinterval.CalendarIntervalTrigger
+.. autoclass:: apscheduler.triggers.combining.ExclusionWindow
 .. autoclass:: apscheduler.triggers.combining.AndTrigger
 .. autoclass:: apscheduler.triggers.combining.OrTrigger
 .. autoclass:: apscheduler.triggers.cron.CronTrigger

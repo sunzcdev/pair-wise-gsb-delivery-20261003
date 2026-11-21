@@ -8,6 +8,11 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
+- Added support for declarative exclusion windows to ``AndTrigger`` and
+  ``OrTrigger`` via the new ``exclusion_windows`` parameter and the
+  ``ExclusionWindow`` class; candidate fire times falling within any of the
+  half-open (``[start, end)``) windows are skipped, and the windows are
+  serialized together with the trigger state
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+
 - Dropped support for Python 3.9 and 3.10
 - Fixed an issue where ``CronTrigger`` does not convert ``start_time`` to ``self.timezone``
