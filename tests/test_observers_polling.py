@@ -5,6 +5,7 @@ import logging
 import os
 import stat
 import threading
+from collections import Counter
 from queue import Empty, Queue
 from time import monotonic, sleep
 
@@ -21,9 +22,11 @@ from watchdog.events import (
     FileDeletedEvent,
     FileModifiedEvent,
     FileMovedEvent,
+    FileSystemEventHandler,
 )
 from watchdog.observers.api import ObservedWatch
 from watchdog.observers.polling import PollingEmitter as Emitter
+from watchdog.observers.polling import PollingObserverVFS
 from watchdog.utils import platform
 from watchdog.utils.dirsnapshot import EmptyDirectorySnapshot
 
@@ -336,3 +339,174 @@ def test_reused_inode_replacement_emits_delete_and_create(p, event_queue, was_di
             events.add(event)
 
     assert events == {deleted_cls(path), created_cls(path)}
+
+
+def test_adaptive_interval_backs_off_and_recovers(event_queue, p):
+    emitter = Emitter(
+        event_queue,
+        ObservedWatch(p(), recursive=True),
+        timeout=0.1,
+        max_polling_interval=0.8,
+        polling_backoff_factor=2.0,
+    )
+    # A watch starts on its shortest interval.
+    assert emitter.current_polling_interval == 0.1
+
+    # Consecutive idle polls stretch the interval up to the cap.
+    for expected in (0.2, 0.4, 0.8, 0.8):
+        emitter._note_poll_idle()  # noqa: SLF001
+        assert emitter.current_polling_interval == expected
+
+    # Activity restores the shortest interval immediately.
+    emitter._note_poll_activity()  # noqa: SLF001
+    assert emitter.current_polling_interval == 0.1
+
+    # A read failure is not silence: it must not stretch the interval.
+    emitter._note_poll_failure()  # noqa: SLF001
+    assert emitter.current_polling_interval == 0.1
+
+
+def test_adaptive_interval_without_cap_stays_fixed(event_queue, p):
+    emitter = Emitter(event_queue, ObservedWatch(p(), recursive=True), timeout=0.1)
+    emitter._note_poll_idle()  # noqa: SLF001
+    assert emitter.current_polling_interval == 0.1
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"timeout": 1.0, "max_polling_interval": 0.5}, "max_polling_interval"),
+        ({"timeout": 0.1, "polling_backoff_factor": 0.5}, "polling_backoff_factor"),
+    ],
+)
+def test_adaptive_interval_invalid_options(event_queue, p, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        Emitter(event_queue, ObservedWatch(p(), recursive=True), **kwargs)
+
+
+def test_failed_poll_is_not_treated_as_silence(p, event_queue):
+    # Idle polls back the interval off; a failing poll must reset it to the
+    # shortest interval instead of stretching it further.
+    watch = ObservedWatch(p(), recursive=True)
+    outage = threading.Event()
+
+    def flaky_stat(path):
+        if outage.is_set():
+            raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+        return os.stat(path)
+
+    emitter = Emitter(
+        event_queue,
+        watch,
+        timeout=0.1,
+        max_polling_interval=0.8,
+        polling_backoff_factor=2.0,
+        stat=flaky_stat,
+    )
+    emitter.on_thread_start()
+
+    emitter.queue_events(0)
+    emitter.queue_events(0)
+    assert emitter.current_polling_interval == pytest.approx(0.4)
+
+    outage.set()
+    emitter.queue_events(0)
+    assert emitter.current_polling_interval == 0.1
+    assert emitter.should_keep_running()
+
+
+def test_new_watch_establishes_baseline_immediately(p, event_queue):
+    # Even with a long polling interval, the baseline snapshot is taken as
+    # soon as the emitter starts, not after the first interval elapses, and
+    # pre-existing content produces no events.
+    touch(p("preexisting"))
+    emitter = Emitter(
+        event_queue,
+        ObservedWatch(p(), recursive=True),
+        timeout=5.0,
+        max_polling_interval=30.0,
+    )
+    emitter.start()
+    try:
+        deadline = monotonic() + 2
+        while isinstance(emitter._snapshot, EmptyDirectorySnapshot) and monotonic() < deadline:  # noqa: SLF001
+            sleep(0.01)
+        assert not isinstance(emitter._snapshot, EmptyDirectorySnapshot)  # noqa: SLF001
+        assert event_queue.empty()
+    finally:
+        emitter.stop()
+        emitter.join(5)
+
+
+@pytest.mark.flaky(max_runs=3, min_passes=1)
+def test_adaptive_polling_quiet_dir_delivers_within_cap(tmp_path):
+    # One hot and one quiet directory watched through a counting scanner:
+    # the quiet watch backs off (fewer scans) but a late change is still
+    # delivered within the configured cap.
+    hot = tmp_path / "hot"
+    quiet = tmp_path / "quiet"
+    hot.mkdir()
+    quiet.mkdir()
+
+    min_interval = 0.1
+    max_interval = 0.6
+    scans = Counter()
+    scans_lock = threading.Lock()
+
+    def counting_listdir(path):
+        with scans_lock:
+            scans[path] += 1
+        return os.scandir(path)
+
+    quiet_changed = threading.Event()
+
+    class Handler(FileSystemEventHandler):
+        def on_any_event(self, event):
+            if str(quiet) in event.src_path:
+                quiet_changed.set()
+
+    observer = PollingObserverVFS(
+        os.stat,
+        counting_listdir,
+        polling_interval=min_interval,
+        max_polling_interval=max_interval,
+    )
+    handler = Handler()
+    observer.schedule(handler, str(hot))
+    observer.schedule(handler, str(quiet))
+
+    stop_churn = threading.Event()
+    churn = threading.Thread(
+        target=lambda: _churn(hot, stop_churn),
+        name="test-adaptive-polling-churn",
+        daemon=True,
+    )
+
+    observer.start()
+    try:
+        churn.start()
+        # Let the quiet watch back off all the way to the cap while the hot
+        # watch keeps polling at the shortest interval.
+        sleep(2.0)
+        with scans_lock:
+            hot_scans = scans[str(hot)]
+            quiet_scans = scans[str(quiet)]
+        assert quiet_scans * 2 < hot_scans
+
+        started = monotonic()
+        (quiet / "late.txt").touch()
+        assert quiet_changed.wait(timeout=max_interval + 5)
+        assert monotonic() - started <= max_interval + 2.0
+    finally:
+        stop_churn.set()
+        churn.join(5)
+        observer.stop()
+        observer.join(5)
+
+
+def _churn(directory, stop):
+    n = 0
+    while not stop.is_set():
+        (directory / f"churn_{n}").touch()
+        n += 1
+        stop.wait(0.05)
