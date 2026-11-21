@@ -42,6 +42,7 @@ from apscheduler import (
     JobReleased,
     RunState,
     ScheduleAdded,
+    ScheduleHandoff,
     ScheduleLookupError,
     Scheduler,
     ScheduleRemoved,
@@ -1263,6 +1264,134 @@ class TestAsyncScheduler:
             # Check that the job outcome was set to "cancelled"
             result = await scheduler.get_job_result(job_id)
             assert result.outcome is JobOutcome.cancelled
+
+    async def test_handoff_schedule_while_parked(
+        self, raw_datastore: DataStore
+    ) -> None:
+        """
+        Test that a schedule parked between job production and lease release can be
+        explicitly handed over to a second scheduler sharing the same data store.
+        The new scheduler must continue from the same position without producing the
+        already generated jobs again, and both sides must agree on the job IDs.
+
+        """
+        gate_reached = anyio.Event()
+        release_gate = anyio.Event()
+
+        def gate(schedule: Schedule) -> Any:
+            if schedule.id == "handoff-me":
+                gate_reached.set()
+                return release_gate.wait()
+
+            return None
+
+        old_scheduler = AsyncScheduler(
+            data_store=raw_datastore,
+            identity="old",
+            lease_duration=timedelta(hours=1),
+        )
+        old_scheduler._schedule_handoff_gate = gate
+        new_scheduler = AsyncScheduler(
+            data_store=raw_datastore,
+            identity="new",
+            role=SchedulerRole.scheduler,
+            lease_duration=timedelta(hours=1),
+        )
+
+        async with old_scheduler, new_scheduler:
+            await old_scheduler.add_schedule(
+                dummy_async_job,
+                IntervalTrigger(seconds=1),
+                id="handoff-me",
+            )
+            await old_scheduler.start_in_background()
+
+            # Wait until the old scheduler has produced the job but is parked
+            # before releasing the schedule lease
+            with fail_after(5):
+                await gate_reached.wait()
+
+            inflight = old_scheduler._inflight_schedules["handoff-me"]
+            assert inflight.result is not None
+            continuation = inflight.result.next_fire_time
+            produced_before = set(inflight.produced_job_ids)
+            assert produced_before
+
+            # The produced jobs are already visible in the shared store while parked
+            stored_jobs = await raw_datastore.get_jobs()
+            assert {job.id for job in stored_jobs} == produced_before
+
+            # Perform the explicit handover from the parked position
+            handoff = await old_scheduler.handoff_schedule("handoff-me")
+            assert isinstance(handoff, ScheduleHandoff)
+            assert inflight.handed_over is True
+
+            # Both ends agree on the IDs of the produced, not yet settled jobs
+            assert handoff.job_ids == produced_before
+            pending_ids = {job.id for job in handoff.pending_jobs}
+            retained_ids = {job.id for job in handoff.retained_jobs}
+            assert pending_ids | retained_ids == produced_before
+
+            # The old scheduler's own worker may already have picked the job up.
+            # In that case the job is retained (the old scheduler settles it);
+            # otherwise it is pending for the new processor to pick up.
+            assert pending_ids.isdisjoint(retained_ids)
+            assert handoff.next_fire_time == continuation
+
+            # The old scheduler no longer holds the lease and the continuation
+            # position has been persisted
+            stored = await old_scheduler.get_schedule("handoff-me")
+            assert stored.acquired_by is None
+            assert stored.acquired_until is None
+            assert stored.next_fire_time == continuation
+
+            # Let the old scheduler finish its processing round. It must not
+            # release the lease again nor produce any additional jobs.
+            release_gate.set()
+            await sleep(0.2)
+            remaining = {job.id for job in await raw_datastore.get_jobs()}
+            assert remaining <= produced_before
+
+        # The new scheduler takes over the same schedule from the same position once
+        # the continuation fire time becomes due
+        async with new_scheduler:
+            await new_scheduler.start_in_background()
+            with fail_after(5):
+                while not (
+                    new_ids := {
+                        job.id
+                        for job in await raw_datastore.get_jobs()
+                    }
+                    - produced_before
+                ):
+                    await sleep(0.05)
+
+            # The newly produced jobs must not duplicate any of the old ones
+            assert new_ids
+            assert new_ids.isdisjoint(produced_before)
+
+            # Wait until the new scheduler has finished the processing round so the
+            # next fire time has advanced past the handoff position
+            with fail_after(5):
+                while True:
+                    stored = await new_scheduler.get_schedule("handoff-me")
+                    if stored.acquired_by is None and (
+                        stored.next_fire_time is None
+                        or stored.next_fire_time > continuation
+                    ):
+                        break
+
+                    await sleep(0.05)
+
+    async def test_handoff_schedule_not_owned(self) -> None:
+        """Handoff must fail if the scheduler does not hold the schedule lease."""
+        scheduler = AsyncScheduler(identity="lonely")
+        async with scheduler:
+            await scheduler.add_schedule(
+                dummy_async_job, IntervalTrigger(seconds=60), id="stranger"
+            )
+            with pytest.raises(ScheduleLookupError):
+                await scheduler.handoff_schedule("stranger")
 
 
 class TestSyncScheduler:

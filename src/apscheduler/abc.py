@@ -11,7 +11,14 @@ from uuid import UUID
 if TYPE_CHECKING:
     from ._enums import ConflictPolicy
     from ._events import Event, T_Event
-    from ._structures import Job, JobResult, Schedule, ScheduleResult, Task
+    from ._structures import (
+        Job,
+        JobResult,
+        Schedule,
+        ScheduleHandoff,
+        ScheduleResult,
+        Task,
+    )
 
 
 class Trigger(Iterator[datetime], metaclass=ABCMeta):
@@ -285,6 +292,45 @@ class DataStore(metaclass=ABCMeta):
         """
 
     @abstractmethod
+    async def handoff_schedule(
+        self, scheduler_id: str, result: ScheduleResult
+    ) -> ScheduleHandoff:
+        """
+        Hand over a schedule that is currently being processed by the given
+        scheduler to another processor.
+
+        This method provides an explicit handover point for situations where two
+        schedulers share the same data store and one of them is being upgraded or
+        decommissioned. It atomically:
+
+        * Persists the continuation position of the schedule (``last_fire_time``,
+          ``next_fire_time`` and the advanced ``trigger`` from ``result``), so the
+          new processor continues exactly where the old one left off
+        * Releases the old scheduler's claim on the schedule (``acquired_by`` and
+          ``acquired_until`` are set to ``None``), making it immediately acquirable
+          by another scheduler
+        * Collects the jobs already produced from the schedule that have not yet
+          been settled, splitting them into jobs still claimed by the old processor
+          (which the old scheduler remains responsible for settling) and unclaimed
+          jobs that the new processor should pick up
+
+        Because the continuation position is persisted before the claim is
+        released, the receiving scheduler will never produce the already generated
+        jobs a second time.
+
+        :param scheduler_id: unique identifier of the scheduler that currently
+            holds the claim on the schedule
+        :param result: the schedule processing result, containing the advanced
+            trigger state and the fire time boundary up to which jobs have already
+            been produced
+        :return: a :class:`~apscheduler.ScheduleHandoff` describing the handover
+            point, including the produced but unsettled jobs and the continuation
+            position
+        :raises ScheduleLookupError: if no schedule matching
+            ``result.schedule_id`` is found
+        """
+
+    @abstractmethod
     async def get_next_schedule_run_time(self) -> datetime | None:
         """
         Return the earliest upcoming run time of all the schedules in the store, or
@@ -293,6 +339,11 @@ class DataStore(metaclass=ABCMeta):
 
     @abstractmethod
     async def add_job(self, job: Job) -> None:
+        """
+        Add a job to be executed by an eligible scheduler.
+
+        :param job: the job object
+        """
         """
         Add a job to be executed by an eligible scheduler.
 

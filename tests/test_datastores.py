@@ -11,6 +11,7 @@ from unittest.mock import Mock
 from urllib.parse import unquote
 
 import anyio
+import attrs
 import pytest
 from anyio import CancelScope
 from pytest_mock.plugin import MockerFixture
@@ -25,6 +26,8 @@ from apscheduler import (
     JobResult,
     Schedule,
     ScheduleAdded,
+    ScheduleHandoff,
+    ScheduleLookupError,
     ScheduleRemoved,
     ScheduleUpdated,
     Task,
@@ -364,6 +367,112 @@ async def test_release_two_schedules_at_once(datastore: DataStore) -> None:
 
     remaining = await datastore.get_schedules({s.id for s in schedules})
     assert len(remaining) == 2
+
+
+async def test_handoff_schedule(
+    datastore: DataStore, time_machine: TimeMachineFixture
+) -> None:
+    """
+    Test that handing off a schedule persists the continuation position, releases
+    the old scheduler's claim and reports the produced but unsettled jobs split into
+    pending and retained ones.
+
+    """
+    from apscheduler.triggers.interval import IntervalTrigger
+
+    time_machine.move_to(datetime(2020, 9, 13, tzinfo=UTC))
+
+    await datastore.add_task(
+        Task(id="task1", func="builtins:print", job_executor="async")
+    )
+    trigger = IntervalTrigger(minutes=1)
+    schedule = Schedule(
+        id="s1", task_id="task1", job_executor="async", trigger=trigger
+    )
+    schedule.next_fire_time = trigger.next()
+    await datastore.add_schedule(schedule, ConflictPolicy.exception)
+
+    # The old scheduler acquires the schedule and produces two jobs from it (one
+    # still unclaimed, one that the old scheduler has already started running)
+    acquired = await datastore.acquire_schedules("old", timedelta(seconds=30), 1)
+    assert [s.id for s in acquired] == ["s1"]
+
+    pending_job = Job(task_id="task1", executor="async", schedule_id="s1")
+    await datastore.add_job(pending_job)
+    retained_job = Job(task_id="task1", executor="async", schedule_id="s1")
+    await datastore.add_job(retained_job)
+    acquired_jobs = await datastore.acquire_jobs("old", timedelta(seconds=30), 1)
+    assert [job.id for job in acquired_jobs] == [pending_job.id]
+
+    # Build the processing result the way the scheduler would (advanced trigger)
+    acquired_schedule = acquired[0]
+    next_fire_time = acquired_schedule.trigger.next()
+    result = ScheduleResult(
+        schedule_id="s1",
+        task_id="task1",
+        trigger=acquired_schedule.trigger,
+        last_fire_time=acquired_schedule.next_fire_time,
+        next_fire_time=next_fire_time,
+    )
+
+    async with capture_events(datastore, 1, {ScheduleUpdated}) as events:
+        handoff = await datastore.handoff_schedule("old", result)
+
+    # The handover point exposes the continuation position and the produced jobs
+    assert isinstance(handoff, ScheduleHandoff)
+    assert handoff.schedule_id == "s1"
+    assert handoff.task_id == "task1"
+    assert handoff.last_fire_time == datetime(2020, 9, 13, tzinfo=UTC)
+    assert handoff.next_fire_time == next_fire_time
+    assert [job.id for job in handoff.pending_jobs] == [retained_job.id]
+    assert [job.id for job in handoff.retained_jobs] == [pending_job.id]
+    assert handoff.job_ids == {pending_job.id, retained_job.id}
+
+    # The schedule is now unclaimed and carries the persisted continuation position
+    stored = (await datastore.get_schedules({"s1"}))[0]
+    assert stored.acquired_by is None
+    assert stored.acquired_until is None
+    assert stored.next_fire_time == next_fire_time
+    assert stored.last_fire_time == datetime(2020, 9, 13, tzinfo=UTC)
+
+    # The new scheduler can acquire the schedule once the continuation point is due
+    time_machine.shift(70)
+    reacquired = await datastore.acquire_schedules("new", timedelta(seconds=30), 1)
+    assert [s.id for s in reacquired] == ["s1"]
+    assert reacquired[0].next_fire_time == next_fire_time
+
+    # A ScheduleUpdated event was published with the new continuation position
+    assert len(events) == 1
+    assert isinstance(events[0], ScheduleUpdated)
+    assert events[0].schedule_id == "s1"
+    assert events[0].next_fire_time == next_fire_time
+
+
+async def test_handoff_schedule_unknown_or_not_owned(datastore: DataStore) -> None:
+    """Handoff must fail if the schedule is missing or not held by the caller."""
+    from apscheduler.triggers.date import DateTrigger as _DateTrigger
+
+    trigger = _DateTrigger(datetime(2020, 9, 13, tzinfo=UTC))
+    schedule = Schedule(
+        id="s1", task_id="task1", job_executor="async", trigger=trigger
+    )
+    schedule.next_fire_time = trigger.next()
+    await datastore.add_schedule(schedule, ConflictPolicy.exception)
+
+    result = ScheduleResult(
+        schedule_id="missing",
+        task_id="task1",
+        trigger=trigger,
+        last_fire_time=datetime(2020, 9, 13, tzinfo=UTC),
+        next_fire_time=None,
+    )
+    with pytest.raises(ScheduleLookupError):
+        await datastore.handoff_schedule("old", result)
+
+    # The schedule exists but has not been acquired by "old"
+    result = attrs.evolve(result, schedule_id="s1")
+    with pytest.raises(ScheduleLookupError):
+        await datastore.handoff_schedule("old", result)
 
 
 @pytest.mark.skipif(

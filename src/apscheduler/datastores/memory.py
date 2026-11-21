@@ -22,8 +22,15 @@ from .._events import (
     TaskRemoved,
     TaskUpdated,
 )
-from .._exceptions import ConflictingIdError, TaskLookupError
-from .._structures import Job, JobResult, Schedule, ScheduleResult, Task
+from .._exceptions import ConflictingIdError, ScheduleLookupError, TaskLookupError
+from .._structures import (
+    Job,
+    JobResult,
+    Schedule,
+    ScheduleHandoff,
+    ScheduleResult,
+    Task,
+)
 from .._utils import create_repr
 from .base import BaseDataStore
 
@@ -194,6 +201,60 @@ class MemoryDataStore(BaseDataStore):
                 next_fire_time=result.next_fire_time,
             )
             await self._event_broker.publish(event)
+
+    async def handoff_schedule(
+        self, scheduler_id: str, result: ScheduleResult
+    ) -> ScheduleHandoff:
+        schedule = self._schedules_by_id.get(result.schedule_id)
+        if schedule is None or schedule.acquired_by != scheduler_id:
+            raise ScheduleLookupError(result.schedule_id)
+
+        # Persist the continuation position and release the old scheduler's claim
+        index = self._find_schedule_index(schedule)
+        del self._schedules[index]
+        self._schedules_by_id.pop(schedule.id, None)
+        self._schedules_by_task_id[schedule.task_id].remove(schedule)
+        schedule = attrs.evolve(
+            schedule,
+            trigger=result.trigger,
+            last_fire_time=result.last_fire_time,
+            next_fire_time=result.next_fire_time,
+            acquired_by=None,
+            acquired_until=None,
+        )
+        self._schedules_by_id[schedule.id] = schedule
+        self._schedules_by_task_id[schedule.task_id].add(schedule)
+        insort_right(self._schedules, schedule)
+
+        # Split the produced, not yet settled jobs into ones the new processor can
+        # pick up (unclaimed) and ones still owned by the old processor (retained)
+        pending_jobs: list[Job] = []
+        retained_jobs: list[Job] = []
+        for job in self._jobs_by_schedule_id.get(result.schedule_id, set()):
+            if job.acquired_by is None:
+                pending_jobs.append(job)
+            else:
+                retained_jobs.append(job)
+
+        pending_jobs.sort(key=lambda job: (job.created_at, job.id))
+        retained_jobs.sort(key=lambda job: (job.created_at, job.id))
+
+        await self._event_broker.publish(
+            ScheduleUpdated(
+                schedule_id=schedule.id,
+                task_id=schedule.task_id,
+                next_fire_time=result.next_fire_time,
+            )
+        )
+
+        return ScheduleHandoff(
+            schedule_id=schedule.id,
+            task_id=schedule.task_id,
+            last_fire_time=result.last_fire_time,
+            next_fire_time=result.next_fire_time,
+            pending_jobs=tuple(pending_jobs),
+            retained_jobs=tuple(retained_jobs),
+        )
 
     async def get_next_schedule_run_time(self) -> datetime | None:
         for schedule in self._schedules:

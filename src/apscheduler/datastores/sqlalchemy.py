@@ -72,10 +72,18 @@ from .._events import (
 from .._exceptions import (
     ConflictingIdError,
     DeserializationError,
+    ScheduleLookupError,
     SerializationError,
     TaskLookupError,
 )
-from .._structures import Job, JobResult, Schedule, ScheduleResult, Task
+from .._structures import (
+    Job,
+    JobResult,
+    Schedule,
+    ScheduleHandoff,
+    ScheduleResult,
+    Task,
+)
 from .._utils import create_repr, current_async_library
 from ..abc import EventBroker
 from .base import BaseExternalDataStore
@@ -810,6 +818,69 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     finished=True,
                 )
             )
+
+    async def handoff_schedule(
+        self, scheduler_id: str, result: ScheduleResult
+    ) -> ScheduleHandoff:
+        async for attempt in self._retry():
+            with attempt:
+                async with self._begin_transaction() as conn:
+                    # Persist the continuation position and release the old
+                    # scheduler's claim on the schedule, but only if it still holds
+                    # it
+                    serialized_trigger = self.serializer.serialize(result.trigger)
+                    values: dict[str, Any] = {
+                        "trigger": serialized_trigger,
+                        "last_fire_time": result.last_fire_time,
+                        "next_fire_time": result.next_fire_time,
+                        "acquired_by": None,
+                        "acquired_until": None,
+                    }
+                    if not self._supports_tzaware_timestamps:
+                        values = self._convert_outgoing_fire_times(values)
+
+                    update = (
+                        self._t_schedules.update()
+                        .where(
+                            and_(
+                                self._t_schedules.c.id == result.schedule_id,
+                                self._t_schedules.c.acquired_by == scheduler_id,
+                            )
+                        )
+                        .values(**values)
+                    )
+                    update_result = await self._execute(conn, update)
+                    if update_result.rowcount == 0:
+                        raise ScheduleLookupError(result.schedule_id)
+
+                    # Collect the produced, not yet settled jobs for this schedule
+                    query = (
+                        self._t_jobs.select()
+                        .where(self._t_jobs.c.schedule_id == result.schedule_id)
+                        .order_by(self._t_jobs.c.created_at, self._t_jobs.c.id)
+                    )
+                    job_rows = await self._execute(conn, query)
+                    jobs = await self._deserialize_jobs(job_rows)
+
+        pending_jobs = tuple(job for job in jobs if job.acquired_by is None)
+        retained_jobs = tuple(job for job in jobs if job.acquired_by is not None)
+
+        await self._event_broker.publish(
+            ScheduleUpdated(
+                schedule_id=result.schedule_id,
+                task_id=result.task_id,
+                next_fire_time=result.next_fire_time,
+            )
+        )
+
+        return ScheduleHandoff(
+            schedule_id=result.schedule_id,
+            task_id=result.task_id,
+            last_fire_time=result.last_fire_time,
+            next_fire_time=result.next_fire_time,
+            pending_jobs=pending_jobs,
+            retained_jobs=retained_jobs,
+        )
 
     async def get_next_schedule_run_time(self) -> datetime | None:
         columns = [self._t_schedules.c.next_fire_time]

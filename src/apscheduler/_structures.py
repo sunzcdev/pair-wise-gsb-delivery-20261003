@@ -258,6 +258,49 @@ class ScheduleResult:
     next_fire_time: datetime | None
 
 
+@attrs.define(kw_only=True, frozen=True)
+class ScheduleHandoff:
+    """
+    Represents an explicit handover point of a schedule from one scheduler to
+    another.
+
+    This object is returned by :meth:`~apscheduler.abc.DataStore.handoff_schedule`
+    (and the corresponding scheduler level helpers) when a schedule is transferred
+    while it is being processed. It gives the receiving side everything it needs to
+    continue from the exact same position without producing the already generated
+    jobs again.
+
+    :var str schedule_id: ID of the schedule that was handed over
+    :var str task_id: ID of the task bound to the schedule
+    :var ~datetime.datetime last_fire_time: the last fire time that was processed
+        (the position up to which jobs have already been produced)
+    :var ~datetime.datetime | None next_fire_time: the continuation position – the
+        first fire time the new processor should act on (``None`` if the schedule is
+        exhausted)
+    :var tuple[~apscheduler.Job, ...] pending_jobs: jobs already produced from this
+        schedule that have not yet been settled (no result recorded) and are not
+        claimed by any scheduler. The new processor should pick these up instead of
+        recreating them.
+    :var tuple[~apscheduler.Job, ...] retained_jobs: jobs already produced from this
+        schedule that are still claimed by the old processor. Settling these remains
+        the responsibility of the old scheduler.
+    """
+
+    schedule_id: str
+    task_id: str
+    last_fire_time: datetime
+    next_fire_time: datetime | None
+    pending_jobs: tuple[Job, ...] = ()
+    retained_jobs: tuple[Job, ...] = ()
+
+    @property
+    def job_ids(self) -> frozenset[UUID]:
+        """Identifiers of every produced, not yet settled job for this schedule."""
+        return frozenset(
+            job.id for job in (*self.pending_jobs, *self.retained_jobs)
+        )
+
+
 @attrs.define(kw_only=True, order=False)
 class Job:
     """

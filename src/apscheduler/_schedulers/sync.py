@@ -18,7 +18,15 @@ from anyio.from_thread import BlockingPortal, start_blocking_portal
 from .. import current_scheduler
 from .._enums import CoalescePolicy, ConflictPolicy, RunState, SchedulerRole
 from .._events import Event, T_Event
-from .._structures import Job, JobResult, MetadataType, Schedule, Task, TaskDefaults
+from .._structures import (
+    Job,
+    JobResult,
+    MetadataType,
+    Schedule,
+    ScheduleHandoff,
+    Task,
+    TaskDefaults,
+)
 from .._utils import UnsetValue, create_repr, unset
 from ..abc import DataStore, EventBroker, JobExecutor, Subscription, Trigger
 from .async_ import AsyncScheduler, TaskType
@@ -325,6 +333,10 @@ class Scheduler:
                 resume_from=resume_from,
             )
         )
+
+    def handoff_schedule(self, id: str) -> ScheduleHandoff:
+        portal = self._ensure_services_ready()
+        return portal.call(self._async_scheduler.handoff_schedule, id)
 
     def add_job(
         self,

@@ -40,10 +40,18 @@ from .._events import (
 from .._exceptions import (
     ConflictingIdError,
     DeserializationError,
+    ScheduleLookupError,
     SerializationError,
     TaskLookupError,
 )
-from .._structures import Job, JobResult, Schedule, ScheduleResult, Task
+from .._structures import (
+    Job,
+    JobResult,
+    Schedule,
+    ScheduleHandoff,
+    ScheduleResult,
+    Task,
+)
 from .._utils import create_repr
 from ..abc import EventBroker
 from .base import BaseExternalDataStore
@@ -478,6 +486,85 @@ class MongoDBDataStore(BaseExternalDataStore):
                     finished=True,
                 )
             )
+
+    async def handoff_schedule(
+        self, scheduler_id: str, result: ScheduleResult
+    ) -> ScheduleHandoff:
+        async for attempt in self._retry():
+            with attempt:
+                async with self._client.start_session() as session:
+                    # Persist the continuation position and release the old
+                    # scheduler's claim on the schedule, but only if it still holds
+                    # it
+                    serialized_trigger = self.serializer.serialize(result.trigger)
+                    update = {
+                        "$unset": {
+                            "acquired_by": True,
+                            "acquired_until": True,
+                            "acquired_until_utcoffset": True,
+                        },
+                        "$set": {
+                            "trigger": serialized_trigger,
+                            **marshal_timestamp(
+                                result.last_fire_time, "last_fire_time"
+                            ),
+                            **marshal_timestamp(
+                                result.next_fire_time, "next_fire_time"
+                            ),
+                        },
+                    }
+                    update_result = await self._schedules.update_one(
+                        {
+                            "_id": result.schedule_id,
+                            "acquired_by": scheduler_id,
+                        },
+                        update,
+                        session=session,
+                    )
+                    if update_result.matched_count == 0:
+                        raise ScheduleLookupError(result.schedule_id)
+
+                    # Collect the produced, not yet settled jobs for this schedule
+                    jobs: list[Job] = []
+                    async with self._jobs.find(
+                        {"schedule_id": result.schedule_id},
+                        sort=[("created_at", ASCENDING)],
+                        session=session,
+                    ) as cursor:
+                        async for document in cursor:
+                            document["id"] = document.pop("_id")
+                            unmarshal_timestamps(document)
+                            try:
+                                jobs.append(
+                                    Job.unmarshal(self.serializer, document)
+                                )
+                            except DeserializationError:
+                                self._logger.warning(
+                                    "Failed to deserialize job %r during handoff of "
+                                    "schedule %r",
+                                    document["id"],
+                                    result.schedule_id,
+                                )
+
+        pending_jobs = tuple(job for job in jobs if job.acquired_by is None)
+        retained_jobs = tuple(job for job in jobs if job.acquired_by is not None)
+
+        await self._event_broker.publish(
+            ScheduleUpdated(
+                schedule_id=result.schedule_id,
+                task_id=result.task_id,
+                next_fire_time=result.next_fire_time,
+            )
+        )
+
+        return ScheduleHandoff(
+            schedule_id=result.schedule_id,
+            task_id=result.task_id,
+            last_fire_time=result.last_fire_time,
+            next_fire_time=result.next_fire_time,
+            pending_jobs=pending_jobs,
+            retained_jobs=retained_jobs,
+        )
 
     async def get_next_schedule_run_time(self) -> datetime | None:
         async for attempt in self._retry():

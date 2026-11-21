@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequenc
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from functools import partial
-from inspect import isbuiltin, isclass, ismethod, ismodule
+from inspect import isawaitable, isbuiltin, isclass, ismethod, ismodule
 from logging import Logger, getLogger
 from types import TracebackType
 from typing import Any, Literal, Self, TypeAlias, TypeVar, cast, overload
@@ -54,6 +54,7 @@ from .._structures import (
     JobResult,
     MetadataType,
     Schedule,
+    ScheduleHandoff,
     ScheduleResult,
     Task,
     TaskDefaults,
@@ -72,6 +73,30 @@ _zero_timedelta = timedelta()
 
 TaskType: TypeAlias = "Task | str | Callable[..., Any]"
 T = TypeVar("T")
+
+
+@attrs.define(eq=False)
+class _InFlightSchedule:
+    """
+    Bookkeeping for a schedule that is currently being processed by the scheduler.
+
+    A schedule is considered in flight between its acquisition
+    (:meth:`~apscheduler.abc.DataStore.acquire_schedules`) and the release of its
+    lease (:meth:`~apscheduler.abc.DataStore.release_schedules`).
+
+    :var schedule: the acquired schedule as returned by the data store
+    :var result: the processing result (advanced trigger state and fire time
+        boundary), populated once the jobs for the current run have been produced
+    :var produced_job_ids: identifiers of the jobs produced from the schedule during
+        the current processing round
+    :var handed_over: ``True`` once the schedule has been explicitly handed off, so
+        that the processing loop skips the normal lease release
+    """
+
+    schedule: Schedule
+    result: ScheduleResult | None = attrs.field(default=None)
+    produced_job_ids: set[UUID] = attrs.field(factory=set)
+    handed_over: bool = attrs.field(default=False)
 
 
 @attrs.define(eq=False, repr=False)
@@ -136,6 +161,16 @@ class AsyncScheduler:
     _scheduler_cancel_scope: CancelScope | None = attrs.field(init=False, default=None)
     _running_jobs: set[Job] = attrs.field(init=False, factory=set)
     _task_callables: dict[str, Callable] = attrs.field(init=False, factory=dict)
+    # Tracks schedules currently being processed (between acquisition and release),
+    # keyed by schedule ID. This is what makes an explicit schedule handoff possible.
+    _inflight_schedules: dict[str, _InFlightSchedule] = attrs.field(
+        init=False, factory=dict
+    )
+    # Optional gate that is awaited after a schedule's jobs have been produced but
+    # before its lease is released. Primarily intended for testing handoff scenarios.
+    _schedule_handoff_gate: Callable[[Schedule], Any] | None = attrs.field(
+        init=False, default=None
+    )
 
     def __attrs_post_init__(self) -> None:
         if not self.identity:
@@ -645,6 +680,66 @@ class AsyncScheduler:
             conflict_policy=ConflictPolicy.replace,
         )
 
+    async def handoff_schedule(self, id: str) -> ScheduleHandoff:
+        """
+        Hand over a schedule currently being processed by this scheduler so that
+        another scheduler sharing the same data store can take it over.
+
+        This is the explicit handover point used when upgrading or decommissioning a
+        scheduler while other schedules keep running. The returned
+        :class:`~apscheduler.ScheduleHandoff` contains:
+
+        * the jobs already produced from the schedule that have not been settled yet,
+          split into unclaimed jobs (``pending_jobs``) that the new processor should
+          pick up and jobs still claimed by this scheduler (``retained_jobs``) whose
+          settlement remains this scheduler's responsibility
+        * the continuation position (``last_fire_time`` / ``next_fire_time``) from
+          which the new scheduler continues, guaranteeing that the already produced
+          jobs are not generated again
+
+        The schedule must be currently acquired by this scheduler. If its processing
+        is in flight (jobs already produced, lease not yet released), the in-flight
+        state is used and the normal lease release for it is suppressed.
+
+        :param id: identifier of the schedule to hand over
+        :return: the handover point describing produced jobs and the continuation
+            position
+        :raises ScheduleLookupError: if the schedule is not currently acquired by
+            this scheduler
+        """
+        self._check_initialized()
+        inflight = self._inflight_schedules.get(id)
+        if inflight is not None and inflight.result is not None:
+            # The schedule is parked between job production and lease release.
+            result = inflight.result
+        else:
+            # The schedule is acquired by this scheduler but is not in the middle of
+            # processing – build a result from its current stored state.
+            schedule = await self.get_schedule(id)
+            if schedule.acquired_by != self.identity:
+                raise ScheduleLookupError(id)
+
+            result = ScheduleResult(
+                schedule_id=schedule.id,
+                task_id=schedule.task_id,
+                trigger=schedule.trigger,
+                last_fire_time=schedule.last_fire_time or schedule.next_fire_time,
+                next_fire_time=schedule.next_fire_time,
+            )
+
+        handoff = await self.data_store.handoff_schedule(self.identity, result)
+        if inflight is not None:
+            # Make sure the processing loop does not release the lease again.
+            inflight.handed_over = True
+
+        self.logger.info(
+            "Handed over schedule %r with %d pending and %d retained jobs",
+            id,
+            len(handoff.pending_jobs),
+            len(handoff.retained_jobs),
+        )
+        return handoff
+
     async def add_job(
         self,
         func_or_task_id: TaskType,
@@ -967,95 +1062,117 @@ class AsyncScheduler:
                     now = datetime.now(UTC)
                     results: list[ScheduleResult] = []
                     for schedule in schedules:
-                        # Calculate a next fire time for the schedule, if possible
-                        fire_times = [schedule.next_fire_time]
-                        next_fire_time: datetime | None = None
-                        calculate_next = schedule.trigger.next
-                        while True:
-                            try:
-                                fire_time = calculate_next()
-                            except Exception:
-                                self.logger.exception(
-                                    "Error computing next fire time for schedule %r of "
-                                    "task %r – removing schedule",
-                                    schedule.id,
-                                    schedule.task_id,
-                                )
-                                break
+                        inflight = _InFlightSchedule(schedule=schedule)
+                        self._inflight_schedules[schedule.id] = inflight
+                        try:
+                            # Calculate a next fire time for the schedule, if possible
+                            fire_times = [schedule.next_fire_time]
+                            next_fire_time: datetime | None = None
+                            calculate_next = schedule.trigger.next
+                            while True:
+                                try:
+                                    fire_time = calculate_next()
+                                except Exception:
+                                    self.logger.exception(
+                                        "Error computing next fire time for schedule %r "
+                                        "of task %r – removing schedule",
+                                        schedule.id,
+                                        schedule.task_id,
+                                    )
+                                    break
 
-                            # Stop if the calculated fire time is in the future
-                            if fire_time is None or fire_time > now:
-                                next_fire_time = fire_time
-                                break
+                                # Stop if the calculated fire time is in the future
+                                if fire_time is None or fire_time > now:
+                                    next_fire_time = fire_time
+                                    break
 
-                            # Only keep all the fire times if coalesce policy = "all"
-                            if schedule.coalesce is CoalescePolicy.all:
-                                fire_times.append(fire_time)
-                            elif schedule.coalesce is CoalescePolicy.latest:
-                                fire_times[0] = fire_time
+                                # Only keep all the fire times if coalesce policy = "all"
+                                if schedule.coalesce is CoalescePolicy.all:
+                                    fire_times.append(fire_time)
+                                elif schedule.coalesce is CoalescePolicy.latest:
+                                    fire_times[0] = fire_time
 
-                        # Add one or more jobs to the job queue
-                        max_jitter = (
-                            schedule.max_jitter.total_seconds()
-                            if schedule.max_jitter
-                            else 0
-                        )
-                        for i, fire_time in enumerate(fire_times):
-                            # Calculate a jitter if max_jitter > 0
-                            jitter = _zero_timedelta
-                            if max_jitter:
-                                if i + 1 < len(fire_times):
-                                    following_fire_time = fire_times[i + 1]
+                            # Add one or more jobs to the job queue
+                            max_jitter = (
+                                schedule.max_jitter.total_seconds()
+                                if schedule.max_jitter
+                                else 0
+                            )
+                            for i, fire_time in enumerate(fire_times):
+                                # Calculate a jitter if max_jitter > 0
+                                jitter = _zero_timedelta
+                                if max_jitter:
+                                    if i + 1 < len(fire_times):
+                                        following_fire_time = fire_times[i + 1]
+                                    else:
+                                        following_fire_time = next_fire_time
+
+                                    if following_fire_time is not None:
+                                        # Jitter must never be so high that it would
+                                        # cause a fire time to equal or exceed the next
+                                        # fire time
+                                        max_jitter = min(
+                                            [
+                                                max_jitter,
+                                                (
+                                                    following_fire_time
+                                                    - fire_time
+                                                    - _microsecond_delta
+                                                ).total_seconds(),
+                                            ]
+                                        )
+
+                                    jitter = timedelta(
+                                        seconds=random.uniform(0, max_jitter)
+                                    )
+                                    fire_time += jitter
+
+                                if schedule.misfire_grace_time is None:
+                                    start_deadline: datetime | None = None
                                 else:
-                                    following_fire_time = next_fire_time
-
-                                if following_fire_time is not None:
-                                    # Jitter must never be so high that it would cause a
-                                    # fire time to equal or exceed the next fire time
-                                    max_jitter = min(
-                                        [
-                                            max_jitter,
-                                            (
-                                                following_fire_time
-                                                - fire_time
-                                                - _microsecond_delta
-                                            ).total_seconds(),
-                                        ]
+                                    start_deadline = (
+                                        fire_time + schedule.misfire_grace_time
                                     )
 
-                                jitter = timedelta(
-                                    seconds=random.uniform(0, max_jitter)
+                                job = Job(
+                                    task_id=schedule.task_id,
+                                    args=schedule.args,
+                                    kwargs=schedule.kwargs,
+                                    schedule_id=schedule.id,
+                                    scheduled_fire_time=fire_time,
+                                    jitter=jitter,
+                                    start_deadline=start_deadline,
+                                    executor=schedule.job_executor,
+                                    result_expiration_time=(
+                                        schedule.job_result_expiration_time
+                                    ),
+                                    metadata=schedule.metadata.copy(),
                                 )
-                                fire_time += jitter
+                                await self.data_store.add_job(job)
+                                inflight.produced_job_ids.add(job.id)
 
-                            if schedule.misfire_grace_time is None:
-                                start_deadline: datetime | None = None
-                            else:
-                                start_deadline = fire_time + schedule.misfire_grace_time
-
-                            job = Job(
-                                task_id=schedule.task_id,
-                                args=schedule.args,
-                                kwargs=schedule.kwargs,
-                                schedule_id=schedule.id,
-                                scheduled_fire_time=fire_time,
-                                jitter=jitter,
-                                start_deadline=start_deadline,
-                                executor=schedule.job_executor,
-                                result_expiration_time=schedule.job_result_expiration_time,
-                                metadata=schedule.metadata.copy(),
-                            )
-                            await self.data_store.add_job(job)
-
-                        results.append(
-                            ScheduleResult(
+                            result = ScheduleResult(
                                 schedule_id=schedule.id,
                                 task_id=schedule.task_id,
                                 trigger=schedule.trigger,
                                 last_fire_time=fire_times[-1],
                                 next_fire_time=next_fire_time,
                             )
-                        )
+                            inflight.result = result
+
+                            # Allow an external caller (typically an upgrade or test
+                            # harness) to park the schedule here – after its jobs have
+                            # been produced but before its lease is released – and
+                            # hand it over to another scheduler.
+                            if self._schedule_handoff_gate is not None:
+                                gate_result = self._schedule_handoff_gate(schedule)
+                                if isawaitable(gate_result):
+                                    await gate_result
+                        finally:
+                            self._inflight_schedules.pop(schedule.id, None)
+
+                        if not inflight.handed_over and inflight.result is not None:
+                            results.append(inflight.result)
 
                 # Update the schedules (and release the scheduler's claim on them)
                 await self.data_store.release_schedules(self.identity, results)
