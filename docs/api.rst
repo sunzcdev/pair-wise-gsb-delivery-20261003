@@ -71,6 +71,18 @@ Triggers
 .. autoclass:: apscheduler.triggers.combining.OrTrigger
 .. autoclass:: apscheduler.triggers.cron.CronTrigger
 
+Time zone migration previews
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. autofunction:: apscheduler.triggers.migration.preview_timezone_migration
+.. autoclass:: apscheduler.triggers.migration.TimezoneMigrationPreview
+.. autoclass:: apscheduler.triggers.migration.FireTime
+.. autoclass:: apscheduler.triggers.migration.SkippedLocalTime
+.. autoclass:: apscheduler.triggers.migration.LocalTimeRule
+    :members:
+.. autoclass:: apscheduler.triggers.migration.LocalTimeResolution
+    :members:
+
 Events
 ------
 

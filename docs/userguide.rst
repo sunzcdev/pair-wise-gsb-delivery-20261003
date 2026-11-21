@@ -437,6 +437,51 @@ If this trigger is created on 2022-06-07 at 09:00:00, its first run times would 
 
 Notably, 2022-08-07 is skipped because it falls on a Sunday.
 
+Migrating triggers between time zones
+-------------------------------------
+
+When moving a schedule from the host's time zone to a business time zone, the
+wall clock time of day can usually be preserved, but daylight saving time
+transitions may cause some intended fire times to not exist or to be repeated
+in the target time zone.  To see exactly which fire instants would move before
+changing anything, use
+:func:`~apscheduler.triggers.migration.preview_timezone_migration`::
+
+    from zoneinfo import ZoneInfo
+
+    from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.migration import preview_timezone_migration
+
+    trigger = CronTrigger(day=1, hour=6, timezone=ZoneInfo("Europe/Berlin"))
+    preview = preview_timezone_migration(
+        trigger,
+        ZoneInfo("America/Nuuk"),
+        range_start=...,
+        range_end=...,
+    )
+
+The preview is strictly read-only: it works on deep copies of the trigger, so
+the schedule's next fire time afterwards is still the same as before.  The
+returned :class:`~apscheduler.triggers.migration.TimezoneMigrationPreview`
+contains:
+
+* the original (``old_fire_times``) and migrated (``new_fire_times``)
+  sequences, each entry carrying both the local time and its UTC instant
+* ``skipped_local_times``: intended local fire times that do not exist in the
+  target time zone because of a forward DST shift, together with the resolution
+  the existing trigger applies (a
+  :class:`~apscheduler.triggers.cron.CronTrigger` skips to the next matching
+  local time, while a
+  :class:`~apscheduler.triggers.calendarinterval.CalendarIntervalTrigger`
+  discards the whole calendar date)
+* repeated local times are reported with the trigger's resolution, which is
+  always the earlier of the two instances (``fold=0``)
+
+By default the migrated sequence starts at the original trigger's current next
+fire instant, used as a boundary.  Pass ``start_at_current_next=False`` to
+start it at the migrated trigger's own natural start boundary (``start_time``
+or ``start_date``) instead.
+
 Removing schedules
 ------------------
 
