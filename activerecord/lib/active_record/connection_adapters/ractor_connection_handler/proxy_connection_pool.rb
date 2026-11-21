@@ -257,7 +257,7 @@ module ActiveRecord
         def prepare_query_cache(cache) # :nodoc:
           cache.enabled = QueryCache.enabled_by_default && db_config&.query_cache != false
           cache.dirties = true
-          cache.clear
+          cache.purge
         end
 
         def pool_transaction_isolation_level

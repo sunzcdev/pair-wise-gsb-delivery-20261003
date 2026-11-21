@@ -122,6 +122,7 @@ module ActiveRecord
       def open?; false; end
       def joinable?; false; end
       def isolation; nil; end
+      def savepoint_name; end
       def add_record(record, _ = true); end
       def restartable?; false; end
       def dirty?; false; end
@@ -188,6 +189,11 @@ module ActiveRecord
           else
             TransactionInstrumenter.new(connection: connection, transaction: @user_transaction)
           end
+
+        # Register right away, not when materialized: a write performed before
+        # the transaction materializes must already be checkpointed against it,
+        # so rolling it back can restore the enclosing view.
+        connection.query_cache&.begin_scope(self)
       end
 
       def dirty!
@@ -357,6 +363,12 @@ module ActiveRecord
         end
 
       private
+        # The connection's query cache, which keeps track of the visibility of
+        # results cached by this transaction so it can undo them on rollback.
+        def query_cache
+          connection.query_cache
+        end
+
         def unique_records
           records.uniq(&:__id__)
         end
@@ -415,11 +427,13 @@ module ActiveRecord
 
       def rollback
         @state.rollback!
+        query_cache&.rollback_scope(self)
         @parent.restart
       end
 
       def commit
         @state.commit!
+        query_cache&.commit_scope(self)
       end
 
       def full_rollback?; false; end
@@ -462,6 +476,7 @@ module ActiveRecord
         @instrumenter.start
 
         connection.rollback_to_savepoint(savepoint_name)
+        query_cache&.restart_scope(self)
       end
 
       def rollback
@@ -469,12 +484,14 @@ module ActiveRecord
           connection.rollback_savepoint_transaction(savepoint_name) if materialized?
         end
         @state.rollback!
+        query_cache&.rollback_scope(self)
         @instrumenter.finish(:rollback) if materialized?
       end
 
       def commit
         connection.commit_savepoint_transaction(savepoint_name) if materialized?
         @state.commit!
+        query_cache&.commit_scope(self)
         @instrumenter.finish(:commit) if materialized?
       end
 
@@ -510,6 +527,7 @@ module ActiveRecord
           connection.rollback_db_transaction
           materialize!
         end
+        query_cache&.restart_scope(self)
       end
 
       def rollback
@@ -518,6 +536,7 @@ module ActiveRecord
           connection.reset_isolation_level if isolation_level
         end
         @state.full_rollback!
+        query_cache&.rollback_scope(self)
         @instrumenter.finish(:rollback) if materialized?
       end
 
@@ -527,6 +546,7 @@ module ActiveRecord
           connection.reset_isolation_level if isolation_level
         end
         @state.full_commit!
+        query_cache&.commit_scope(self)
         @instrumenter.finish(:commit) if materialized?
       end
     end

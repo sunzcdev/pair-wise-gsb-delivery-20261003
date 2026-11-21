@@ -1,3 +1,18 @@
+*   Keep the query cache usable across a rolled back savepoint.
+
+    A write inside a `requires_new: true` transaction invalidated the whole
+    query cache. If that savepoint was rolled back, results that were still
+    valid for the enclosing transaction had to be queried again, and worse, a
+    result cached inside the savepoint could answer the same query afterwards.
+
+    The query cache now tracks which transaction or savepoint produced each
+    cached result. Rolled back savepoints give back the enclosing transaction's
+    view instead of dropping every entry, and committed ones keep their results
+    visible to the enclosing transaction. Cache hits report where they came from
+    through the `:cached_in` key of the `sql.active_record` notification payload.
+
+    *Your Name*
+
 *   Log source location when scoped order is ignored in batching.
 
     *fatkodima*

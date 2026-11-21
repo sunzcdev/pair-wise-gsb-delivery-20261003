@@ -41,7 +41,8 @@ module ActiveRecord
       #
       # It has an internal hash whose keys are either SQL strings, or arrays of
       # two elements [SQL string, binds], if there are binds. The hash values
-      # are their corresponding ActiveRecord::Result objects.
+      # are Entry objects, which pair their corresponding ActiveRecord::Result
+      # with the transaction scope that produced it.
       #
       # Keeping the hash size under max size is achieved with LRU eviction.
       #
@@ -49,7 +50,41 @@ module ActiveRecord
       # cache stores of a given connection pool (see ConnectionPoolConfiguration
       # down below). The version value may be externally changed as a way to
       # signal cache invalidation, that is why all methods have a guard for it.
+      #
+      # Transaction visibility
+      # ---------------------
+      #
+      # A cached result is only reusable while the transaction scope that
+      # produced it is still part of the connection's view. Every transaction
+      # and savepoint registers itself as a scope (#begin_scope). Writes
+      # invalidate the current view (#clear), checkpointing it against each open
+      # scope first. Rolling a scope back therefore restores what the enclosing
+      # scope was seeing (#rollback_scope) instead of dropping the whole cache,
+      # and committing one adopts the entries it produced for the enclosing
+      # scope while discarding its checkpoint (#commit_scope).
       class Store # :nodoc:
+        # Describes where a cached result was produced: the statement that
+        # originally ran and the transaction or savepoint it ran in, if any.
+        class Provenance # :nodoc:
+          attr_accessor :scope
+          attr_reader :sql, :name, :savepoint, :transaction_uuid
+
+          def initialize(sql, name, scope, savepoint, transaction_uuid)
+            @sql = sql
+            @name = name
+            @scope = scope
+            @savepoint = savepoint
+            @transaction_uuid = transaction_uuid
+          end
+
+          def to_h
+            { sql: sql, name: name, savepoint: savepoint, transaction_uuid: transaction_uuid }
+          end
+        end
+
+        Entry = Struct.new(:result, :provenance) # :nodoc:
+        Scope = Struct.new(:token, :snapshot) # :nodoc:
+
         attr_accessor :enabled, :dirties
         alias_method :enabled?, :enabled
         alias_method :dirties?, :dirties
@@ -61,6 +96,7 @@ module ActiveRecord
           @max_size = max_size
           @enabled = false
           @dirties = true
+          @scopes = []
         end
 
         def size
@@ -73,40 +109,179 @@ module ActiveRecord
           @map.empty?
         end
 
+        # Returns the cached ActiveRecord::Result for +key+, or nil.
         def [](key)
+          lookup(key)&.result
+        end
+
+        # Returns the Entry for +key+, or nil.
+        #
+        # Entries are served in LRU order, but only when the transaction scope
+        # that produced them is still visible.
+        def lookup(key)
           check_version
           return unless @enabled
 
-          if entry = @map.delete(key)
-            @map[key] = entry
+          entry = @map.delete(key)
+          return unless entry && visible?(entry)
+
+          @map[key] = entry
+        end
+
+        # Returns a two element array with the Entry for +key+ and whether it was
+        # a hit. The block must return the Entry to cache.
+        def fetch(key)
+          check_version
+
+          if entry = lookup(key)
+            [entry, true]
+          else
+            [store(key, yield), false]
           end
         end
 
+        # Returns the cached ActiveRecord::Result for +key+, computing it with the
+        # given block unless a visible one is already cached.
         def compute_if_absent(key)
           check_version
 
-          return yield unless @enabled
-
-          if entry = @map.delete(key)
-            return @map[key] = entry
+          if (entry = lookup(key))
+            entry.result
+          else
+            store(key, Entry.new(yield)).result
           end
-
-          if @max_size && @map.size >= @max_size
-            @map.shift # evict the oldest entry
-          end
-
-          @map[key] = yield
         end
 
-        def clear
-          @map.clear
+        # Stores +entry+ under +key+. It's a no-op when the cache is disabled.
+        def store(key, entry)
+          check_version
+          return entry unless @enabled
+
+          @map.delete(key)
+          @map.shift if @max_size && @map.size >= @max_size # evict the oldest entry
+          @map[key] = entry
+        end
+
+        # The transaction scope that results cached right now belong to, if any.
+        def current_scope
+          @scopes.last&.token
+        end
+
+        # Registers +token+ as the innermost open transaction scope.
+        #
+        # The checkpoint itself is captured lazily, the first time any open scope
+        # invalidates the cache (see #clear). At that point the cache still holds
+        # exactly what that scope was seeing, which is what a rollback of the
+        # scope has to give back.
+        def begin_scope(token)
+          check_version
+          @scopes.push(Scope.new(token, nil)) unless scope_index(token)
           self
         end
 
+        # The scope was committed: the view it leaves behind is still the
+        # correct one for the enclosing scope, so its entries are adopted and
+        # the checkpoint is dropped.
+        def commit_scope(token)
+          check_version
+          if (index = scope_index(token))
+            adopt_scopes_from(index)
+            drop_scopes_from(index)
+          end
+          self
+        end
+
+        # The scope was rolled back: the enclosing scope's view is visible
+        # again, so the checkpoint is restored. Anything cached by the rolled
+        # back scope itself is meaningless now, whether or not it invalidated
+        # the cache first.
+        def rollback_scope(token)
+          check_version
+          if (index = scope_index(token))
+            dropped = @scopes[index..].map(&:token)
+            restore(@scopes[index])
+            @map.delete_if { |_, entry| dropped.any? { |scope| scope.equal?(entry.provenance&.scope) } }
+            drop_scopes_from(index)
+          end
+          self
+        end
+
+        # The scope's work was discarded but the scope itself is still open, as
+        # when the parent transaction is restarted. The enclosing view is
+        # restored and the checkpoint dropped, so later writes can track a fresh
+        # one for the scope's eventual outcome.
+        def restart_scope(token)
+          check_version
+          if (index = scope_index(token))
+            restore(@scopes[index])
+            @scopes[index].snapshot = nil
+          end
+          self
+        end
+
+        # Invalidates the current view, whether because of a write or an
+        # explicit #clear_query_cache.
+        #
+        # Every open scope that hasn't got a checkpoint yet takes one now, since
+        # the entries about to be dropped are still what that scope could see.
+        # A later rollback of any of them can then restore its own view instead
+        # of leaving the whole cache unusable.
+        def clear
+          @scopes.each { |scope| scope.snapshot ||= @map.dup }
+          reset
+        end
+
+        # Discards everything, including the registered scopes. Used when their
+        # transactions were abandoned without a decision, so no later rollback
+        # can resurrect entries.
+        def purge
+          @scopes.clear
+          reset
+        end
+
         private
+          def visible?(entry)
+            scope = entry.provenance&.scope
+            scope.nil? || !scope_index(scope).nil?
+          end
+
+          def restore(scope)
+            @map = scope.snapshot.dup if scope.snapshot
+            self
+          end
+
+          # Entries cached by the committed scope become part of the enclosing
+          # scope's view. Without this they would be treated as orphaned once
+          # their scope disappears.
+          def adopt_scopes_from(index)
+            adopting = index.zero? ? nil : @scopes[index - 1].token
+            dropped = @scopes[index..].map(&:token)
+            @map.each_value do |entry|
+              provenance = entry.provenance
+              provenance.scope = adopting if provenance && dropped.any? { |token| token.equal?(provenance.scope) }
+            end
+          end
+
+          def scope_index(token)
+            @scopes.rindex { |scope| scope.token.equal?(token) }
+          end
+
+          def drop_scopes_from(index)
+            @scopes.slice!(index, @scopes.size - index)
+          end
+
+          def reset
+            @map.clear
+            self
+          end
+
+          # Another thread sharing this cache invalidated it, so no view we kept
+          # describes it anymore. The open scopes themselves are still valid
+          # though, they just need to checkpoint again on their next write.
           def check_version
             if @current_version != @version.value
-              @map.clear
+              reset
+              @scopes.each { |scope| scope.snapshot = nil }
               @current_version = @version.value
             end
           end
@@ -198,7 +373,7 @@ module ActiveRecord
         def prepare_query_cache(cache) # :nodoc:
           cache.enabled = QueryCache.enabled_by_default && db_config&.query_cache != false
           cache.dirties = true
-          cache.clear
+          cache.purge
         end
       end
 
@@ -283,46 +458,56 @@ module ActiveRecord
         def lookup_sql_cache(sql, name, binds)
           key = binds.empty? ? sql : [sql, binds]
 
-          result = nil
+          entry = nil
           @lock.synchronize do
-            result = query_cache[key]
+            entry = query_cache.lookup(key)
           end
 
-          if result
+          if entry
             ActiveSupport::Notifications.instrument(
               "sql.active_record",
-              cache_notification_info_result(sql, name, binds, result)
+              cache_notification_info_result(sql, name, binds, entry)
             )
           end
 
-          result
+          entry&.result
         end
 
         def cache_sql(sql, name, binds)
           key = binds.empty? ? sql : [sql, binds]
-          result = nil
+          entry = nil
           hit = true
 
           @lock.synchronize do
-            result = query_cache.compute_if_absent(key) do
-              hit = false
-              yield
+            entry, hit = query_cache.fetch(key) do
+              result = yield
+              Store::Entry.new(result, cache_provenance(sql, name))
             end
           end
 
           if hit
             ActiveSupport::Notifications.instrument(
               "sql.active_record",
-              cache_notification_info_result(sql, name, binds, result)
+              cache_notification_info_result(sql, name, binds, entry)
             )
           end
 
-          result.dup
+          entry.result.dup
         end
 
-        def cache_notification_info_result(sql, name, binds, result)
+        # Describes where a cached result came from, so cache hits can report the
+        # statement that actually produced them and the transaction view it was
+        # produced in. Must be called while holding the connection lock, so the
+        # scope matches the one the store files the entry under.
+        def cache_provenance(sql, name)
+          current = current_transaction
+          Store::Provenance.new(sql, name, query_cache.current_scope, current.savepoint_name, current.user_transaction.uuid)
+        end
+
+        def cache_notification_info_result(sql, name, binds, entry)
           payload = cache_notification_info(sql, name, binds)
-          payload[:row_count] = result.length
+          payload[:row_count] = entry.result.length
+          payload[:cached_in] = entry.provenance.to_h if entry.provenance
           payload
         end
 

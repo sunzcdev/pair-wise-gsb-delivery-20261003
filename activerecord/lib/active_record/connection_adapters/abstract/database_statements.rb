@@ -562,6 +562,12 @@ module ActiveRecord
         # Store the existing transaction state to the side
         old_state = @transaction_manager if restore && @transaction_manager&.restorable?
 
+        unless old_state
+          # Those transactions are gone without a decision, so nothing they
+          # cached can be attributed to them anymore.
+          query_cache&.purge
+        end
+
         @transaction_manager = ConnectionAdapters::TransactionManager.new(self)
 
         if block_given?

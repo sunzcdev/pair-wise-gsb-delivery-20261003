@@ -626,6 +626,192 @@ class QueryCacheTest < ActiveRecord::TestCase
     end
   end
 
+  def test_query_cache_doesnt_leak_cached_results_of_rolled_back_savepoint
+    ActiveRecord::Base.lease_connection.enable_query_cache!
+    post = Post.first
+    original_title = post.title
+    titles = -> { Post.where(id: post.id).pluck(:title) }
+
+    Post.transaction do
+      post.update!(title: "outer")
+
+      # The outer transaction's uncommitted write is visible, and gets cached.
+      assert_equal ["outer"], titles.call
+
+      Post.transaction(requires_new: true) do
+        post.update!(title: "inner")
+
+        # The savepoint sees its own write, and caches that view.
+        assert_equal ["inner"], titles.call
+        assert_equal ["inner"], titles.call
+
+        raise ActiveRecord::Rollback
+      end
+
+      # The savepoint's temporary value is gone, so the outer transaction's
+      # uncommitted value must be what the same query returns again.
+      assert_equal ["outer"], titles.call
+      assert_equal ["outer"], titles.call
+
+      raise ActiveRecord::Rollback
+    end
+
+    assert_equal [original_title], titles.call
+  end
+
+  def test_query_cache_keeps_the_outer_view_cached_across_a_savepoint_rollback
+    ActiveRecord::Base.lease_connection.enable_query_cache!
+    post = Post.first
+    titles = -> { Post.where(id: post.id).pluck(:title) }
+
+    Post.transaction do
+      post.update!(title: "outer")
+
+      # Cache the outer transaction's view of the row.
+      assert_equal ["outer"], titles.call
+
+      Post.transaction(requires_new: true) do
+        post.update!(title: "inner")
+        assert_equal ["inner"], titles.call
+        raise ActiveRecord::Rollback
+      end
+
+      # The same query is answerable from the outer transaction's cache entry
+      # again, so rolling the savepoint back doesn't disable the whole cache.
+      assert_no_queries { assert_equal ["outer"], titles.call }
+
+      raise ActiveRecord::Rollback
+    end
+  end
+
+  def test_query_cache_keeps_results_cached_in_a_committed_savepoint
+    ActiveRecord::Base.lease_connection.enable_query_cache!
+    post = Post.first
+    titles = -> { Post.where(id: post.id).pluck(:title) }
+
+    Post.transaction do
+      post.update!(title: "outer")
+
+      Post.transaction(requires_new: true) do
+        post.update!(title: "inner")
+        assert_equal ["inner"], titles.call
+      end
+
+      # The savepoint committed, so its value is visible to the outer
+      # transaction and the cached result stays a hit.
+      assert_no_queries { assert_equal ["inner"], titles.call }
+      assert_no_queries { assert_equal ["inner"], titles.call }
+
+      raise ActiveRecord::Rollback
+    end
+  end
+
+  def test_query_cache_is_not_shared_between_savepoint_views
+    ActiveRecord::Base.lease_connection.enable_query_cache!
+    post = Post.first
+    titles = -> { Post.where(id: post.id).pluck(:title) }
+
+    Post.transaction do
+      post.update!(title: "outer")
+      outer_titles = titles.call
+
+      Post.transaction(requires_new: true) do
+        post.update!(title: "temporary")
+
+        # The outer transaction's cached result must not answer the savepoint's
+        # query, which sees the uncommitted value written inside of it.
+        assert_queries_count(1) { assert_equal ["temporary"], titles.call }
+
+        raise ActiveRecord::Rollback
+      end
+
+      # And the savepoint's result must not answer the outer query.
+      assert_no_queries { assert_equal outer_titles, titles.call }
+
+      raise ActiveRecord::Rollback
+    end
+  end
+
+  def test_query_cache_doesnt_leak_results_cached_with_dirties_false_in_a_savepoint
+    ActiveRecord::Base.lease_connection.enable_query_cache!
+    post = Post.first
+
+    Post.transaction do
+      post.update!(title: "outer")
+      Post.where(title: "hidden-in-savepoint").to_a
+
+      Post.transaction(requires_new: true) do
+        Post.uncached(dirties: false) { post.update!(title: "hidden-in-savepoint") }
+        assert_equal 1, Post.where(title: "hidden-in-savepoint").count
+        raise ActiveRecord::Rollback
+      end
+
+      # The row is back to the outer transaction's value, so the empty result
+      # cached before the savepoint is valid again.
+      assert_equal 0, Post.where(title: "hidden-in-savepoint").count
+      assert_no_queries { assert_equal 0, Post.where(title: "hidden-in-savepoint").count }
+
+      raise ActiveRecord::Rollback
+    end
+  end
+
+  def test_query_cache_handles_nested_savepoints_independently
+    ActiveRecord::Base.lease_connection.enable_query_cache!
+    post = Post.first
+    titles = -> { Post.where(id: post.id).pluck(:title) }
+
+    Post.transaction do
+      post.update!(title: "outer")
+      assert_equal ["outer"], titles.call
+
+      Post.transaction(requires_new: true) do
+        post.update!(title: "middle")
+        assert_equal ["middle"], titles.call
+
+        Post.transaction(requires_new: true) do
+          post.update!(title: "inner")
+          assert_equal ["inner"], titles.call
+          raise ActiveRecord::Rollback
+        end
+
+        # Only the innermost savepoint rolled back.
+        assert_no_queries { assert_equal ["middle"], titles.call }
+
+        raise ActiveRecord::Rollback
+      end
+
+      # Now only the outer transaction's view is left.
+      assert_no_queries { assert_equal ["outer"], titles.call }
+
+      raise ActiveRecord::Rollback
+    end
+  end
+
+  def test_query_cache_reports_where_cached_results_were_produced
+    ActiveRecord::Base.lease_connection.enable_query_cache!
+    post = Post.first
+
+    notifications = capture_notifications("sql.active_record") do
+      Post.transaction do
+        post.update!(title: "outer")
+
+        Post.transaction(requires_new: true) do
+          post.update!(title: "inner")
+          Post.pluck(:title)
+          Post.pluck(:title)
+        end
+        raise ActiveRecord::Rollback
+      end
+    end
+
+    hits = notifications.select { |notification| notification.payload[:cached] }
+
+    assert_equal 1, hits.size
+    assert_match(/SELECT .*"posts"\."title".*FROM .*"posts"/i, hits.first.payload[:cached_in][:sql])
+    assert_equal "active_record_1", hits.first.payload[:cached_in][:savepoint]
+    assert hits.first.payload[:cached_in][:transaction_uuid]
+  end
+
   def test_query_cached_even_when_types_are_reset
     Task.cache do
       # Warm the cache
