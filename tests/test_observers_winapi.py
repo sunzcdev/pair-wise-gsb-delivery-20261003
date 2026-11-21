@@ -16,9 +16,13 @@ import pytest
 
 from watchdog.events import (
     DirCreatedEvent,
+    DirDeletedEvent,
     DirMovedEvent,
     EventsLostEvent,
     FileAttribEvent,
+    FileCreatedEvent,
+    FileDeletedEvent,
+    FileModifiedEvent,
     FileMovedEvent,
     FileSystemEventHandler,
 )
@@ -392,6 +396,165 @@ def test_rename_split_across_two_batches_keeps_the_source_path(event_queue, emit
     event, _ = event_queue.get_nowait()
 
     assert event == FileMovedEvent(p("old_name"), p("new_name"))
+
+
+class _VirtualBatches:
+    """A reader that replays one virtual ``ReadDirectoryChangesW`` batch per call.
+
+    Each item of ``batches`` stands for the records a single read returned, so an
+    empty list models a read that timed out with nothing to report.
+    """
+
+    def __init__(self, *batches: list[WinAPINativeEvent]) -> None:
+        self.batches = [list(batch) for batch in batches]
+
+    def get_events(self, timeout):
+        return self.batches.pop(0) if self.batches else []
+
+    def stop(self):
+        pass
+
+
+def _drain(event_queue) -> list:
+    events = []
+    while True:
+        try:
+            event, _ = event_queue.get_nowait()
+        except Empty:
+            return events
+        else:
+            events.append(event)
+
+
+def test_rename_pair_and_stale_old_name_across_batches(event_queue, emitter):
+    """One rename completes across the batch boundary; another old name never does.
+
+    ``ReadDirectoryChangesW`` reports the two halves of a rename back to back, but
+    its buffer can end in between, which is the only reason to carry the old half
+    into the next read. An old half with no new half after a whole quiet read went
+    out of the watch: all that is observable is that the name is gone, which the
+    other observers report as a deletion and a rescan of the watch would confirm.
+    It must not linger and pair with the new half of a later rename.
+    """
+
+    emitter._reader = _VirtualBatches(  # noqa: SLF001
+        [WinAPINativeEvent(FILE_ACTION_RENAMED_OLD_NAME, "old_name")],
+        [WinAPINativeEvent(FILE_ACTION_RENAMED_NEW_NAME, "new_name")],
+        [WinAPINativeEvent(FILE_ACTION_RENAMED_OLD_NAME, "moved_out_name")],
+        [],
+        [WinAPINativeEvent(FILE_ACTION_RENAMED_NEW_NAME, "moved_in_name")],
+    )
+
+    for _ in range(5):
+        emitter.queue_events(emitter.timeout)
+
+    assert _drain(event_queue) == [
+        FileMovedEvent(p("old_name"), p("new_name")),
+        FileDeletedEvent(p("moved_out_name")),
+        FileCreatedEvent(p("moved_in_name")),
+    ]
+
+
+def test_rename_into_the_watch_is_a_creation(event_queue, emitter):
+    """A new name with no old half was renamed in from outside the watched tree."""
+    emitter._reader = _VirtualBatches(  # noqa: SLF001
+        [WinAPINativeEvent(FILE_ACTION_RENAMED_NEW_NAME, "incoming")],
+    )
+
+    emitter.queue_events(emitter.timeout)
+
+    assert _drain(event_queue) == [FileCreatedEvent(p("incoming"))]
+
+
+def test_stale_old_name_does_not_pair_with_a_later_record_same_batch(event_queue, emitter):
+    """An old half followed by an unrelated record in one batch is never paired."""
+    emitter._reader = _VirtualBatches(  # noqa: SLF001
+        [
+            WinAPINativeEvent(FILE_ACTION_RENAMED_OLD_NAME, "old_name"),
+            WinAPINativeEvent(FILE_ACTION_MODIFIED, "other"),
+        ],
+        [WinAPINativeEvent(FILE_ACTION_RENAMED_NEW_NAME, "new_name")],
+    )
+
+    emitter.queue_events(emitter.timeout)
+    emitter.queue_events(emitter.timeout)
+
+    assert _drain(event_queue) == [
+        FileDeletedEvent(p("old_name")),
+        FileModifiedEvent(p("other")),
+        FileCreatedEvent(p("new_name")),
+    ]
+
+
+def test_directory_rename_reports_the_moved_directory():
+    """A paired rename of an existing directory is a directory move.
+
+    This builds its own directory instead of using the ``emitter`` fixture,
+    because ``test_root_deleted`` removes ``temp_dir``.
+    """
+    watched = mkdtemp()
+    moved_dir = os.path.join(watched, "renamed_dir")
+    os.makedirs(moved_dir)
+    event_queue = Queue()
+    emitter = WindowsApiEmitter(event_queue, ObservedWatch(watched, recursive=False), timeout=0.2)
+    emitter._reader = _VirtualBatches(  # noqa: SLF001
+        [WinAPINativeEvent(FILE_ACTION_RENAMED_OLD_NAME, "before")],
+        [WinAPINativeEvent(FILE_ACTION_RENAMED_NEW_NAME, "renamed_dir")],
+    )
+
+    emitter.queue_events(emitter.timeout)
+    emitter.queue_events(emitter.timeout)
+
+    assert _drain(event_queue) == [DirMovedEvent(os.path.join(watched, "before"), moved_dir)]
+
+
+def test_root_deletion_settles_the_stale_old_name():
+    """The watched directory going away is reported once, not as its pending name.
+
+    This builds its own directory instead of using the ``emitter`` fixture,
+    because ``test_root_deleted`` removes ``temp_dir``.
+    """
+    watched = mkdtemp()
+    event_queue = Queue()
+    emitter = WindowsApiEmitter(event_queue, ObservedWatch(watched, recursive=False), timeout=0.2)
+    emitter._reader = _VirtualBatches(  # noqa: SLF001
+        [WinAPINativeEvent(FILE_ACTION_RENAMED_OLD_NAME, "old_name")],
+        [WinAPINativeEvent(FILE_ACTION_DELETED_SELF, ".")],
+    )
+
+    try:
+        emitter.queue_events(emitter.timeout)
+        emitter.queue_events(emitter.timeout)
+
+        assert _drain(event_queue) == [DirDeletedEvent(watched)]
+        assert not emitter.should_keep_running()
+    finally:
+        emitter.stop()
+
+
+def test_overflow_drops_the_stale_old_name():
+    """A lost new half is not re-paired with the new name of a later rename.
+
+    This builds its own directory instead of using the ``emitter`` fixture,
+    because ``test_root_deleted`` removes ``temp_dir``.
+    """
+    watched = mkdtemp()
+    event_queue = Queue()
+    emitter = WindowsApiEmitter(event_queue, ObservedWatch(watched, recursive=False), timeout=0.2)
+    emitter._reader = _VirtualBatches(  # noqa: SLF001
+        [WinAPINativeEvent(FILE_ACTION_RENAMED_OLD_NAME, "old_name")],
+        [WinAPINativeEvent(FILE_ACTION_OVERFLOW, ".")],
+        [WinAPINativeEvent(FILE_ACTION_RENAMED_NEW_NAME, "unrelated")],
+    )
+
+    emitter.queue_events(emitter.timeout)
+    emitter.queue_events(emitter.timeout)
+    emitter.queue_events(emitter.timeout)
+
+    assert _drain(event_queue) == [
+        EventsLostEvent(watched, is_directory=True),
+        FileCreatedEvent(os.path.join(watched, "unrelated")),
+    ]
 
 
 @pytest.mark.parametrize("is_file", [False, True])
