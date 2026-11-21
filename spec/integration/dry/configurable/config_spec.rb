@@ -120,6 +120,122 @@ RSpec.describe Dry::Configurable::Config do
     end
   end
 
+  describe "#update_all" do
+    it "applies the whole group only after every value is constructed" do
+      klass.setting :connect_timeout, default: 5, constructor: ->(v) { Integer(v) }
+      klass.setting :read_timeout, default: 10, constructor: ->(v) { Integer(v) }
+      klass.setting :max_connections, default: 100, constructor: ->(v) { Integer(v) }
+
+      # Another reader holding the config before the failed update
+      reader = klass.config
+
+      expect {
+        klass.config.update_all(
+          connect_timeout: "2",
+          read_timeout: "not-a-number",
+          max_connections: "50"
+        )
+      }.to raise_error(ArgumentError)
+
+      # The second constructor raised, so nothing from the group is visible
+      expect(reader.connect_timeout).to eql(5)
+      expect(reader.read_timeout).to eql(10)
+      expect(reader.max_connections).to eql(100)
+      expect(reader.configured?(:connect_timeout)).to be false
+
+      klass.config.update_all(
+        connect_timeout: "2",
+        read_timeout: "20",
+        max_connections: "50"
+      )
+
+      expect(reader.connect_timeout).to eql(2)
+      expect(reader.read_timeout).to eql(20)
+      expect(reader.max_connections).to eql(50)
+      expect(reader.configured?(:connect_timeout)).to be true
+    end
+
+    it "supports checking constraints across the group's constructed values" do
+      klass.setting :connect_timeout, default: 5, constructor: ->(v) { Integer(v) }
+      klass.setting :read_timeout, default: 10, constructor: ->(v) { Integer(v) }
+
+      expect {
+        klass.config.update_all(connect_timeout: "30", read_timeout: "10") { |values|
+          if values[:read_timeout] < values[:connect_timeout]
+            raise ArgumentError, "read_timeout must be >= connect_timeout"
+          end
+        }
+      }.to raise_error(ArgumentError, "read_timeout must be >= connect_timeout")
+
+      expect(klass.config.connect_timeout).to eql(5)
+      expect(klass.config.read_timeout).to eql(10)
+
+      klass.config.update_all(connect_timeout: "30", read_timeout: "60") { |values|
+        raise ArgumentError if values[:read_timeout] < values[:connect_timeout]
+      }
+
+      expect(klass.config.connect_timeout).to eql(30)
+      expect(klass.config.read_timeout).to eql(60)
+    end
+
+    it "keeps explicit nil values and marks them as configured" do
+      klass.setting :read_timeout, default: 10, constructor: ->(v) { v.nil? ? nil : Integer(v) }
+
+      klass.config.update_all(read_timeout: nil)
+
+      expect(klass.config.read_timeout).to be_nil
+      expect(klass.config.configured?(:read_timeout)).to be true
+    end
+
+    it "applies nested groups atomically" do
+      klass.setting :timeouts do
+        setting :connect, default: 5, constructor: ->(v) { Integer(v) }
+        setting :read, default: 10, constructor: ->(v) { Integer(v) }
+      end
+
+      nested_reader = klass.config.timeouts
+
+      expect {
+        klass.config.update_all(timeouts: {connect: "2", read: "bad"})
+      }.to raise_error(ArgumentError)
+
+      expect(nested_reader.connect).to eql(5)
+      expect(nested_reader.read).to eql(10)
+
+      klass.config.update_all(timeouts: {connect: "2", read: "20"})
+
+      expect(klass.config.timeouts.connect).to eql(2)
+      expect(klass.config.timeouts.read).to eql(20)
+    end
+
+    it "raises ArgumentError when a nested value is not a Hash" do
+      klass.setting :db do
+        setting :user
+      end
+
+      expect { klass.config.update_all(db: "string") }
+        .to raise_error(ArgumentError, '"string" is not a valid setting value')
+    end
+
+    it "raises ArgumentError when name is not valid and applies nothing" do
+      klass.setting :db, default: "sqlite"
+
+      expect { klass.config.update_all(db: "postgres", hello: "world") }
+        .to raise_error(ArgumentError, /hello/)
+
+      expect(klass.config.db).to eql("sqlite")
+      expect(klass.config.configured?(:db)).to be false
+    end
+
+    it "raises FrozenConfigError when the config is frozen" do
+      klass.setting :db, default: "sqlite"
+      klass.config.finalize!
+
+      expect { klass.config.update_all(db: "postgres") }
+        .to raise_error(Dry::Configurable::FrozenConfigError)
+    end
+  end
+
   describe "#to_h" do
     before do
       klass.setting :db do

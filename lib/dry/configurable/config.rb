@@ -100,6 +100,64 @@ module Dry
         self
       end
 
+      # Update config with a group of new values, applied atomically.
+      #
+      # Unlike {#update}, which assigns each value as it goes (leaving earlier
+      # values in place if a later constructor fails), this first builds every
+      # value using its setting's constructor — nested settings are prepared
+      # recursively on a copy — and only then makes the whole group visible.
+      # If any constructor (or nested update) raises, the config is left
+      # untouched and other readers keep seeing the previous values.
+      #
+      # If a block is given, it is called with the hash of constructed values
+      # (keyed by setting name) after construction and before application, so
+      # constraints across the group's values can be checked. Raising from the
+      # block aborts the update and leaves the config untouched.
+      #
+      # Explicit nil values are stored as-is (passed through their
+      # constructors) and mark their settings as configured, exactly like #[]=.
+      #
+      # @param values [Hash, #to_hash] A hash with new values
+      #
+      # @yield [Hash] the group's constructed values, before they are applied
+      #
+      # @return [Config]
+      #
+      # @api public
+      def update_all(values)
+        raise FrozenConfigError, "Cannot modify frozen config" if frozen?
+
+        prepared = values.each_with_object({}) do |(key, value), hsh|
+          key = key.to_sym
+
+          unless (setting = _settings[key])
+            raise ArgumentError, "+#{key}+ is not a setting name"
+          end
+
+          hsh[key] =
+            if setting.children.any?
+              unless value.respond_to?(:to_hash)
+                raise ArgumentError, "#{value.inspect} is not a valid setting value"
+              end
+
+              # Prepare the nested update on a copy so a failure partway
+              # through leaves the currently visible nested config intact
+              self[key].dup.update_all(value.to_hash)
+            else
+              setting.constructor.(value)
+            end
+        end
+
+        yield prepared if block_given?
+
+        prepared.each do |key, value|
+          _configured.add(key)
+          _values[key] = value
+        end
+
+        self
+      end
+
       # Returns true if the value for the given key has been set on this config.
       #
       # For simple values, this returns true if the value has been explicitly assigned.
