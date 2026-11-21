@@ -1212,6 +1212,14 @@ def _can_fuse_annotations(a: dict | None, b: dict | None) -> bool:
     """
     Treat the special annotation keys, as fusable since we can apply simple
     rules to capture their intent in a fused layer.
+
+    Per-task annotations -- callables that are evaluated lazily for each
+    individual task key -- can only be carried through fusion when both
+    layers agree on exactly the same annotations (handled by the ``a == b``
+    check).  Fusion renames the output keys of a layer, so merging differing
+    per-task annotations would either drop the constraints or apply them to
+    the wrong keys.  Instead, the layers are kept apart so that the
+    scheduling boundary between them is preserved.
     """
     if a == b:
         return True
@@ -1220,9 +1228,20 @@ def _can_fuse_annotations(a: dict | None, b: dict | None) -> bool:
         return False
 
     fusable = {"retries", "priority", "resources", "workers", "allow_other_workers"}
-    return (not a or all(k in fusable for k in a)) and (
-        not b or all(k in fusable for k in b)
-    )
+    if not (
+        (not a or all(k in fusable for k in a))
+        and (not b or all(k in fusable for k in b))
+    ):
+        return False
+
+    # Differing per-task (callable) annotations cannot be reconciled by the
+    # simple merging rules in ``_fuse_annotations``; keep a scheduling
+    # boundary so that no resource constraint is lost.
+    if (a and any(callable(v) for v in a.values())) or (
+        b and any(callable(v) for v in b.values())
+    ):
+        return False
+    return True
 
 
 def _fuse_annotations(*args: dict) -> dict:
@@ -1230,6 +1249,13 @@ def _fuse_annotations(*args: dict) -> dict:
     Given an iterable of annotations dictionaries, fuse them according
     to some simple rules.
     """
+    # If all layers carry exactly the same annotations -- e.g. the same
+    # per-task callables captured from a single ``dask.annotate`` context --
+    # the fused layer simply inherits them unchanged.  This also covers
+    # callable values, which the merging rules below cannot combine.
+    if args and all(a == args[0] for a in args):
+        return dict(args[0])
+
     # First, do a basic dict merge -- we are presuming that these have already
     # been gated by `_can_fuse_annotations`.
     annotations = toolz.merge(*args)

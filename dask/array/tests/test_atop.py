@@ -495,6 +495,125 @@ def test_optimize_blockwise_custom_annotations():
     assert annotations[(("qux", "foo"),)] == 1
 
 
+def _per_task_annotations(hlg):
+    """Expand layer annotations to individual task keys.
+
+    Mirrors the expansion performed by ``Expr.__dask_annotations__`` when the
+    annotations are communicated to the scheduler.
+    """
+    out = {}
+    for layer in hlg.layers.values():
+        if layer.annotations:
+            for annot_type, value in layer.annotations.items():
+                out.setdefault(annot_type, {}).update(
+                    {k: (value(k) if callable(value) else value) for k in layer}
+                )
+    return out
+
+
+def test_optimize_blockwise_identical_callable_annotations():
+    # Layers created under the same ``dask.annotate`` context share the same
+    # per-task annotations and can be fused as usual
+    a = da.ones(10, chunks=(5,))
+    with dask.annotate(resources=lambda key: {"GPU": 1}):
+        b = a + 1
+        c = b * 2
+
+    dsk = da.optimization.optimize_blockwise(c.dask)
+
+    assert len(dsk.layers) == 2  # fused layer + the ``ones`` IO layer
+    (layer,) = [layer for layer in dsk.layers.values() if layer.annotations]
+    assert isinstance(layer, Blockwise)
+    assert not layer.is_materialized()  # fusion must not expand the layer
+    resources = layer.annotations["resources"]
+    assert callable(resources)
+    # The per-task resource constraints survive fusion
+    assert all(
+        v == {"GPU": 1} for v in _per_task_annotations(dsk)["resources"].values()
+    )
+    assert_eq(da.Array(dsk, c.name, c.chunks, c.dtype), c)
+
+
+def test_optimize_blockwise_conflicting_callable_annotations():
+    # Differing per-task annotations cannot be merged; the affected layers
+    # must keep a scheduling boundary while everything else still fuses
+    a = da.ones(10, chunks=(5,))
+
+    with dask.annotate(resources=lambda key: {"GPU": 1}):
+        b = a + 1
+
+    c = (b * 2) + 3  # unannotated layers should still fuse together
+
+    with dask.annotate(resources=lambda key: {"GPU": 2}):
+        d = c + 4
+
+    dsk = da.optimization.optimize_blockwise(d.dask)
+
+    # fused (b*2)+3 layer, the two annotated layers, and the IO layer
+    assert len(dsk.layers) == 4
+    annotated = [
+        layer.annotations["resources"]
+        for layer in dsk.layers.values()
+        if layer.annotations
+    ]
+    assert len(annotated) == 2
+    assert all(callable(r) for r in annotated)
+    # The original per-task resource constraints are all still visible
+    resources = _per_task_annotations(dsk)["resources"]
+    assert sorted(v["GPU"] for v in resources.values()) == [1, 1, 2, 2]
+    assert_eq(da.Array(dsk, d.name, d.chunks, d.dtype), d)
+
+
+def test_optimize_blockwise_mixed_static_and_callable_annotations():
+    # A static and a callable annotation for the same key conflict and must
+    # keep a scheduling boundary
+    a = da.ones(10, chunks=(5,))
+
+    with dask.annotate(resources=lambda key: {"GPU": 1}):
+        b = a + 1
+
+    with dask.annotate(resources={"GPU": 1}):
+        c = b * 2
+
+    dsk = da.optimization.optimize_blockwise(c.dask)
+
+    assert len(dsk.layers) == 3  # two annotated layers + the IO layer
+    resources = _per_task_annotations(dsk)["resources"]
+    assert len(resources) == 4
+    assert all(v == {"GPU": 1} for v in resources.values())
+    assert_eq(da.Array(dsk, c.name, c.chunks, c.dtype), c)
+
+
+@pytest.mark.parametrize("use_callable", [False, True])
+def test_optimize_blockwise_per_task_resources_static_and_callable(use_callable):
+    # The same graph annotated with static and with callable (per-task)
+    # resources: after optimization the original resource constraints must be
+    # inspectable for each individual task and the results must agree
+    if use_callable:
+        resources = lambda key: {"GPU": 1}  # noqa: E731
+    else:
+        resources = {"GPU": 1}
+
+    a = da.ones(10, chunks=(2,)) + 1
+    with dask.annotate(resources=resources):
+        b = a * 2
+    c = b + 5
+
+    dsk = da.optimization.optimize_blockwise(c.dask)
+
+    # Layers are still symbolic blockwise layers, not expanded materializations
+    assert all(
+        not isinstance(layer, Blockwise) or not layer.is_materialized()
+        for layer in dsk.layers.values()
+    )
+    # Every annotated task carries the original resource constraint
+    per_task = _per_task_annotations(dsk)["resources"]
+    assert len(per_task) == 5
+    assert all(v == {"GPU": 1} for v in per_task.values())
+
+    assert_eq(da.Array(dsk, c.name, c.chunks, c.dtype), c)
+
+
 def test_blockwise_diamond_fusion():
     x = da.ones(10, chunks=(5,))
     y = ((x + 1) + 2) + 3
