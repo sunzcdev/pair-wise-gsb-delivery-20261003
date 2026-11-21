@@ -261,6 +261,7 @@ class Route(BaseRoute):
                 path_params.update(matched_params)
                 child_scope = {"endpoint": self.endpoint, "path_params": path_params}
                 if self.methods and scope["method"] not in self.methods:
+                    child_scope["methods"] = self.methods
                     return Match.PARTIAL, child_scope
                 else:
                     return Match.FULL, child_scope
@@ -279,7 +280,7 @@ class Route(BaseRoute):
 
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
         if self.methods and scope["method"] not in self.methods:
-            headers = {"Allow": ", ".join(self.methods)}
+            headers = {"Allow": ", ".join(sorted(self.methods))}
             if "app" in scope:
                 raise HTTPException(status_code=405, headers=headers)
             else:
@@ -430,6 +431,19 @@ class Mount(BaseRoute):
                     "root_path": root_path + matched_path,
                     "endpoint": self.app,
                 }
+                if scope["type"] == "http" and isinstance(self._base_app, Router):
+                    # Delegate the routing decision to the mounted router so that
+                    # method-only mismatches surface as partial matches instead of
+                    # being swallowed behind the mount's full match. A request the
+                    # mounted router cannot resolve at all still fully matches the
+                    # mount itself; the mounted router remains in charge of its own
+                    # 404 responses and trailing-slash redirects.
+                    inner_scope = dict(scope)
+                    inner_scope["root_path"] = child_scope["root_path"]
+                    inner_match, inner_child_scope = self._base_app.matches(inner_scope)
+                    if inner_match is Match.PARTIAL:
+                        child_scope["methods"] = inner_child_scope["methods"]
+                        return Match.PARTIAL, child_scope
                 return Match.FULL, child_scope
         return Match.NONE, {}
 
@@ -641,6 +655,50 @@ class Router:
             response = PlainTextResponse("Not Found", status_code=404)
         await response(scope, receive, send)
 
+    def matches(self, scope: Scope) -> tuple[Match, Scope]:
+        """
+        Resolve the incoming scope against the routes of this router.
+
+        A full match always takes precedence over any partial match. All of the
+        partial matches (typically routes whose path fits but whose methods do
+        not) are inspected so that the allowed methods can be aggregated into a
+        single decision instead of only considering the first one.
+        """
+        partial_scope: Scope | None = None
+        methods: set[str] = set()
+
+        for route in self.routes:
+            match, child_scope = route.matches(scope)
+            if match is Match.FULL:
+                return Match.FULL, child_scope
+            if match is Match.PARTIAL:
+                if partial_scope is None:
+                    partial_scope = child_scope
+                methods.update(child_scope.get("methods", set()))
+
+        if partial_scope is not None:
+            partial_scope = dict(partial_scope)
+            partial_scope["methods"] = methods
+            return Match.PARTIAL, partial_scope
+
+        route_path = get_route_path(scope)
+        if scope["type"] == "http" and self.redirect_slashes and route_path != "/":
+            redirect_scope = dict(scope)
+            if route_path.endswith("/"):
+                redirect_scope["path"] = redirect_scope["path"].rstrip("/")
+            else:
+                redirect_scope["path"] = redirect_scope["path"] + "/"
+
+            for route in self.routes:
+                match, child_scope = route.matches(redirect_scope)
+                if match is not Match.NONE:
+                    # The mounted router keeps performing the actual redirect
+                    # when the request is handled; here we only need to signal
+                    # that the mount fully matches instead of returning NONE.
+                    return Match.FULL, {}
+
+        return Match.NONE, {}
+
     def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
         for route in self.routes:
             try:
@@ -693,6 +751,8 @@ class Router:
             return
 
         partial = None
+        partial_scope: Scope | None = None
+        partial_methods: set[str] = set()
 
         for route in self.routes:
             # Determine if any route matches the incoming scope,
@@ -703,17 +763,22 @@ class Router:
                 scope.update(child_scope)
                 await route.handle(scope, receive, send)
                 return
-            elif match is Match.PARTIAL and partial is None:
-                partial = route
-                partial_scope = child_scope
+            elif match is Match.PARTIAL:
+                # Keep inspecting the remaining routes: a full match on a later
+                # route still wins, and every partial match contributes its
+                # allowed methods to the aggregated "405 Method Not Allowed".
+                partial_methods.update(child_scope.get("methods", set()))
+                if partial is None:
+                    partial = route
+                    partial_scope = child_scope
 
-        if partial is not None:
+        if partial is not None and partial_scope is not None:
             #  Handle partial matches. These are cases where an endpoint is
             # able to handle the request, but is not a preferred option.
             # We use this in particular to deal with "405 Method Not Allowed".
             scope["route"] = partial
             scope.update(partial_scope)
-            await partial.handle(scope, receive, send)
+            await self.method_not_allowed(partial_methods, scope, receive, send)
             return
 
         route_path = get_route_path(scope)
@@ -733,6 +798,21 @@ class Router:
                     return
 
         await self.default(scope, receive, send)
+
+    async def method_not_allowed(
+        self,
+        methods: Collection[str],
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        # The methods are deduplicated (a "GET" route implicitly adds "HEAD",
+        # but "HEAD" must only appear once) and reported in a stable order.
+        headers = {"Allow": ", ".join(sorted(set(methods)))}
+        if "app" in scope:
+            raise HTTPException(status_code=405, headers=headers)
+        response = PlainTextResponse("Method Not Allowed", status_code=405, headers=headers)
+        await response(scope, receive, send)
 
     def __eq__(self, other: Any) -> bool:
         return isinstance(other, Router) and self.routes == other.routes

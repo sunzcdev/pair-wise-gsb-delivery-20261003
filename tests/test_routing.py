@@ -14,7 +14,7 @@ from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
-from starlette.routing import Host, Mount, NoMatchFound, Route, Router, WebSocketRoute
+from starlette.routing import Host, Match, Mount, NoMatchFound, Route, Router, WebSocketRoute
 from starlette.testclient import TestClient
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -1264,3 +1264,207 @@ def test_host_routing_is_case_insensitive(test_client_factory: TestClientFactory
     response = test_client_factory(router).get("/", headers={"host": "Sub.example.ORG"})
     assert response.status_code == 200
     assert response.text == "sub"
+
+
+class _AllMethodsEndpoint:
+    """An ASGI endpoint that accepts every HTTP method (``methods=None``)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        self.calls += 1
+        await PlainTextResponse("any method")(scope, receive, send)
+
+
+def test_router_aggregates_allowed_methods(
+    test_client_factory: TestClientFactory,
+) -> None:
+    """
+    A single route table covers:
+      * two routes declaring different methods on the same path,
+      * an endpoint that accepts every method,
+      * an unknown path and a trailing-slash redirect inside a mount.
+
+    None of the endpoints are invoked while the 405/404/redirect cases are
+    being decided.
+    """
+    calls: list[str] = []
+
+    def make_endpoint(label: str) -> Callable[[Request], Response]:
+        def endpoint(request: Request) -> Response:
+            calls.append(label)
+            return PlainTextResponse(label)
+
+        return endpoint
+
+    all_methods_endpoint = _AllMethodsEndpoint()
+
+    routes = [
+        # Two declarations on the same path, each with its own method.
+        Route("/dup", make_endpoint("dup_get"), methods=["GET"]),
+        Route("/dup", make_endpoint("dup_post"), methods=["POST"]),
+        # An endpoint accepting every HTTP method must never yield a 405.
+        Route("/any", all_methods_endpoint, methods=None),
+        # A mounted sub-router used for the method mismatch and the
+        # trailing-slash redirect cases.
+        Mount(
+            "/api",
+            routes=[
+                Route("/item", make_endpoint("api_get"), methods=["GET"]),
+            ],
+        ),
+    ]
+
+    client = test_client_factory(Starlette(routes=routes))
+    calls.clear()
+
+    # Same path, different methods: every allowed method is reported, with the
+    # implicit "HEAD" (added by the GET route) appearing only once and in a
+    # stable, sorted order.
+    response = client.patch("/dup")
+    assert response.status_code == 405
+    assert response.headers["allow"] == "GET, HEAD, POST"
+    assert calls == []
+
+    # A full match still wins over the partial match of the sibling route.
+    assert client.get("/dup").status_code == 200
+    assert client.post("/dup").status_code == 200
+    assert calls == ["dup_get", "dup_post"]
+    calls.clear()
+
+    # The all-methods endpoint fully matches any method instead of returning
+    # a 405, so it is actually invoked.
+    for method in ("GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"):
+        assert client.request(method, "/any").status_code == 200
+    assert all_methods_endpoint.calls == 6
+
+    # An unknown path falls through to the default 404 handler without
+    # invoking any endpoint.
+    response = client.get("/does-not-exist")
+    assert response.status_code == 404
+    assert calls == []
+
+    # A method mismatch inside the mount reports the sub-route's methods.
+    response = client.post("/api/item")
+    assert response.status_code == 405
+    assert response.headers["allow"] == "GET, HEAD"
+    assert calls == []
+
+    # A path only known without a trailing slash triggers a redirect, still
+    # without invoking the target endpoint.
+    response = client.get("/api/item/", follow_redirects=False)
+    assert response.status_code in (302, 307)
+    assert response.headers["location"] == "http://testserver/api/item"
+    assert calls == []
+
+
+def test_same_url_top_level_and_mounted_methods_are_merged(
+    test_client_factory: TestClientFactory,
+) -> None:
+    """A method declared on a top-level route and another one declared on a
+    sub-route resolving to the same URL are both offered in the 405 Allow
+    header, while each declaration remains reachable through its own method."""
+    calls: list[str] = []
+
+    def make_endpoint(label: str) -> Callable[[Request], Response]:
+        def endpoint(request: Request) -> Response:
+            calls.append(label)
+            return PlainTextResponse(label)
+
+        return endpoint
+
+    # A root mount makes the sub-route resolve to the same URL as the
+    # top-level route.
+    client = test_client_factory(
+        Starlette(
+            routes=[
+                Route("/shared", make_endpoint("shared_get"), methods=["GET"]),
+                Mount(
+                    "/",
+                    routes=[
+                        Route("/shared", make_endpoint("shared_put"), methods=["PUT"]),
+                    ],
+                ),
+            ]
+        )
+    )
+
+    response = client.delete("/shared")
+    assert response.status_code == 405
+    assert response.headers["allow"] == "GET, HEAD, PUT"
+    assert calls == []
+
+    assert client.get("/shared").status_code == 200
+    assert client.put("/shared").status_code == 200
+    assert calls == ["shared_get", "shared_put"]
+
+
+def test_mount_propagates_partial_match_allowed_methods(
+    test_client_factory: TestClientFactory,
+) -> None:
+    """A method mismatch inside a mount surfaces as a 405 carrying the
+    sub-route's allowed methods, while unknown sub-paths stay 404."""
+    calls: list[str] = []
+
+    def endpoint(request: Request) -> Response:
+        calls.append("mounted")
+        return PlainTextResponse("mounted")
+
+    client = test_client_factory(
+        Starlette(
+            routes=[
+                Mount(
+                    "/api",
+                    routes=[Route("/item", endpoint, methods=["GET"])],
+                )
+            ]
+        )
+    )
+
+    response = client.post("/api/item")
+    assert response.status_code == 405
+    assert response.headers["allow"] == "GET, HEAD"
+    assert calls == []
+
+    assert client.get("/api/item").status_code == 200
+    assert calls == ["mounted"]
+
+    assert client.get("/api/missing").status_code == 404
+
+
+def test_router_matches_aggregates_partial_methods() -> None:
+    """The low-level routing decision aggregates the methods of every partial
+    match while a full match always takes precedence."""
+    def endpoint(request: Request) -> Response:  # pragma: no cover
+        return PlainTextResponse("ok")
+
+    router = Router(
+        [
+            Route("/things", endpoint, methods=["POST"]),
+            Route("/things", endpoint, methods=["GET"]),
+        ]
+    )
+
+    scope: Scope = {"type": "http", "method": "DELETE", "path": "/things", "headers": []}
+    match, child_scope = router.matches(dict(scope))
+    assert match is Match.PARTIAL
+    assert child_scope["methods"] == {"GET", "HEAD", "POST"}
+
+    # A supported method produces a full match regardless of declaration order.
+    for method in ("GET", "POST"):
+        match, _ = router.matches({**scope, "method": method})
+        assert match is Match.FULL
+
+
+def test_router_matches_unknown_path_is_none() -> None:
+    def endpoint(request: Request) -> Response:  # pragma: no cover
+        return PlainTextResponse("ok")
+
+    router = Router([Route("/things", endpoint, methods=["GET"])])
+
+    scope: Scope = {"type": "http", "method": "GET", "path": "/other", "headers": []}
+    match, child_scope = router.matches(scope)
+    assert match is Match.NONE
+    assert child_scope == {}
+
