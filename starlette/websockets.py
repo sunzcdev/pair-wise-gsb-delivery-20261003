@@ -37,6 +37,7 @@ class WebSocket(HTTPConnection[StateT]):
         self._send = send
         self.client_state = WebSocketState.CONNECTING
         self.application_state = WebSocketState.CONNECTING
+        self.accepted_subprotocol: str | None = None
 
     async def receive(self) -> Message:
         """
@@ -113,6 +114,7 @@ class WebSocket(HTTPConnection[StateT]):
         if self.client_state == WebSocketState.CONNECTING:  # pragma: no branch
             # If we haven't yet seen the 'connect' message, then wait for it first.
             await self.receive()
+        self.accepted_subprotocol = subprotocol
         await self.send({"type": "websocket.accept", "subprotocol": subprotocol, "headers": headers})
 
     def _raise_on_disconnect(self, message: Message) -> None:

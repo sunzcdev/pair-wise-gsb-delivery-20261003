@@ -1,15 +1,16 @@
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
 from starlette import status
-from starlette.endpoints import HTTPEndpoint, WebSocketEndpoint
+from starlette.endpoints import HTTPEndpoint, WebSocketDecodeError, WebSocketEndpoint
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route, Router
 from starlette.testclient import TestClient
 from starlette.types import Message, Scope
-from starlette.websockets import WebSocket
+from starlette.websockets import WebSocket, WebSocketDisconnect
 from tests.types import TestClientFactory
 
 
@@ -293,3 +294,115 @@ def test_websocket_endpoint_on_disconnect(
     client = test_client_factory(WebSocketApp)
     with client.websocket_connect("/ws") as websocket:
         websocket.close(code=1001)
+
+
+def test_websocket_endpoint_subprotocol_encodings_per_connection(
+    test_client_factory: TestClientFactory,
+) -> None:
+    # One endpoint serving both JSON-speaking old nodes ("json-v1") and
+    # binary-frame new nodes ("bin-v2"), selected by negotiated subprotocol.
+    disconnects: list[tuple[str | None, int]] = []
+
+    class WebSocketApp(WebSocketEndpoint):
+        subprotocol_encodings = {"json-v1": "json", "bin-v2": "bytes"}
+
+        async def on_connect(self, websocket: WebSocket) -> None:
+            for subprotocol in ("json-v1", "bin-v2"):
+                if subprotocol in websocket["subprotocols"]:
+                    await websocket.accept(subprotocol=subprotocol)
+                    return
+            await websocket.accept()
+
+        async def on_receive(self, websocket: WebSocket, data: Any) -> None:
+            if isinstance(data, bytes):
+                await websocket.send_bytes(b"bin: " + data)
+            else:
+                await websocket.send_json({"echo": data})
+
+        async def on_disconnect(self, websocket: WebSocket, close_code: int) -> None:
+            disconnects.append((websocket.accepted_subprotocol, close_code))
+
+    client = test_client_factory(WebSocketApp)
+
+    with client.websocket_connect("/ws", subprotocols=["json-v1"]) as json_ws:
+        assert json_ws.accepted_subprotocol == "json-v1"
+        json_ws.send_json({"hello": "world"})
+        assert json_ws.receive_json() == {"echo": {"hello": "world"}}
+
+        # Open a second, concurrent connection using binary frames.
+        with pytest.raises(WebSocketDecodeError, match="Expected bytes websocket messages, but got text"):
+            with client.websocket_connect("/ws", subprotocols=["bin-v2"]) as bin_ws:
+                assert bin_ws.accepted_subprotocol == "bin-v2"
+                bin_ws.send_bytes(b"\x00\x01")
+                assert bin_ws.receive_bytes() == b"bin: \x00\x01"
+                # The subprotocol negotiated fine, but the frame type is wrong
+                # for this connection's encoding: closed with 1003.
+                bin_ws.send_text("not binary")
+                with pytest.raises(WebSocketDisconnect) as exc_info:
+                    bin_ws.receive_bytes()
+                assert exc_info.value.code == status.WS_1003_UNSUPPORTED_DATA
+
+        # The misbehaving connection was closed, but the JSON connection is
+        # unaffected and keeps working.
+        json_ws.send_json({"still": "alive"})
+        assert json_ws.receive_json() == {"echo": {"still": "alive"}}
+
+    # The class-level encoding was never mutated: each connection used its own.
+    assert WebSocketApp.encoding is None
+    assert disconnects == [
+        ("bin-v2", status.WS_1003_UNSUPPORTED_DATA),
+        ("json-v1", status.WS_1000_NORMAL_CLOSURE),
+    ]
+
+
+def test_websocket_endpoint_subprotocol_not_negotiated(
+    test_client_factory: TestClientFactory,
+) -> None:
+    # Failing to negotiate a subprotocol is distinct from receiving a wrong
+    # message type: the connection is closed with 1002, not 1003, and
+    # `on_disconnect` observes that code.
+    disconnects: list[int] = []
+
+    class WebSocketApp(WebSocketEndpoint):
+        subprotocol_encodings = {"json-v1": "json", "bin-v2": "bytes"}
+
+        async def on_disconnect(self, websocket: WebSocket, close_code: int) -> None:
+            disconnects.append(close_code)
+
+    client = test_client_factory(WebSocketApp)
+
+    # The client offers no subprotocols, so none can be negotiated.
+    with pytest.raises(WebSocketDecodeError, match="no subprotocol was negotiated"):
+        with client.websocket_connect("/ws") as websocket:
+            assert websocket.accepted_subprotocol is None
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                websocket.receive_text()
+            assert exc_info.value.code == status.WS_1002_PROTOCOL_ERROR
+
+    assert disconnects == [status.WS_1002_PROTOCOL_ERROR]
+
+
+def test_websocket_endpoint_unknown_subprotocol(
+    test_client_factory: TestClientFactory,
+) -> None:
+    disconnects: list[int] = []
+
+    class WebSocketApp(WebSocketEndpoint):
+        subprotocol_encodings = {"json-v1": "json"}
+
+        async def on_connect(self, websocket: WebSocket) -> None:
+            await websocket.accept(subprotocol="unknown-proto")
+
+        async def on_disconnect(self, websocket: WebSocket, close_code: int) -> None:
+            disconnects.append(close_code)
+
+    client = test_client_factory(WebSocketApp)
+
+    with pytest.raises(WebSocketDecodeError, match="no encoding configured for subprotocol 'unknown-proto'"):
+        with client.websocket_connect("/ws", subprotocols=["unknown-proto"]) as websocket:
+            assert websocket.accepted_subprotocol == "unknown-proto"
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                websocket.receive_text()
+            assert exc_info.value.code == status.WS_1002_PROTOCOL_ERROR
+
+    assert disconnects == [status.WS_1002_PROTOCOL_ERROR]

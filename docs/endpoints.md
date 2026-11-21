@@ -72,6 +72,9 @@ There are three overridable methods for handling specific ASGI websocket message
 * `async def on_receive(websocket, data)`
 * `async def on_disconnect(websocket, close_code)`
 
+An additional hook, `async def select_encoding(websocket)`, controls how
+incoming messages are decoded, as described below.
+
 ```python
 from starlette.endpoints import WebSocketEndpoint
 
@@ -88,6 +91,47 @@ class App(WebSocketEndpoint):
     async def on_disconnect(self, websocket, close_code):
         pass
 ```
+
+#### Selecting the encoding per connection
+
+A single endpoint can serve connections that use different message formats by
+setting `subprotocol_encodings`, which maps the negotiated subprotocol to an
+encoding. The encoding is selected once per connection — after `on_connect()`
+has run — and is then fixed for the lifetime of that connection, without
+mutating the class-level `encoding` attribute shared with other connections.
+
+The negotiated subprotocol is available as `websocket.accepted_subprotocol`
+once `websocket.accept()` has been called. If no subprotocol was negotiated, or
+the negotiated subprotocol is not present in `subprotocol_encodings`, the
+connection is closed with a 1002 (protocol error) close code. A connection that
+did negotiate but then receives a frame of the wrong type is closed with a 1003
+(unsupported data) close code instead, and `on_disconnect` receives the
+corresponding close code in each case.
+
+```python
+from starlette.endpoints import WebSocketEndpoint
+
+
+class App(WebSocketEndpoint):
+    subprotocol_encodings = {"json-v1": "json", "bin-v2": "bytes"}
+
+    async def on_connect(self, websocket):
+        for subprotocol in ("json-v1", "bin-v2"):
+            if subprotocol in websocket["subprotocols"]:
+                await websocket.accept(subprotocol=subprotocol)
+                return
+        await websocket.accept()
+
+    async def on_receive(self, websocket, data):
+        if isinstance(data, bytes):
+            await websocket.send_bytes(b"Message: " + data)
+        else:
+            await websocket.send_json({"message": data})
+```
+
+For full control over how the encoding is chosen, override
+`async def select_encoding(websocket)`, which is called exactly once per
+connection and must return one of `'json'`, `'bytes'`, `'text'` or `None`.
 
 The `WebSocketEndpoint` can also be used with the `Starlette` application class:
 
