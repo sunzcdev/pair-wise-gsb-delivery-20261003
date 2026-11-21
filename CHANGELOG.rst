@@ -1,3 +1,13 @@
+Unreleased
+==========
+
+- Add optional ``touch`` argument to ``TLRUCache``: when enabled,
+  cache hits renew an item's expiration time, recomputed via ``ttu``.
+  Membership tests and iteration do not renew items, and a ``ttu``
+  result that is not in the future is ignored on renewal, so reading
+  an item never evicts it.
+
+
 v8.0.2 (2026-11-18)
 ===================
 

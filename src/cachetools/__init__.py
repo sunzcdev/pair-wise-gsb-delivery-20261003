@@ -706,11 +706,14 @@ class TLRUCache(_TimedCache):
         def __lt__(self, other):
             return self.expires < other.expires
 
-    def __init__(self, maxsize, ttu, timer=time.monotonic, getsizeof=None):
+    def __init__(
+        self, maxsize, ttu, timer=time.monotonic, getsizeof=None, touch=False
+    ):
         _TimedCache.__init__(self, maxsize, timer, getsizeof)
         self.__items = collections.OrderedDict()
         self.__order = []
         self.__ttu = ttu
+        self.__touch = touch
 
     def __contains__(self, key):
         try:
@@ -728,7 +731,10 @@ class TLRUCache(_TimedCache):
             return cache_getitem(self, key)
         items.move_to_end(key)
         if self.timer() < item.expires:
-            return cache_getitem(self, key)
+            value = cache_getitem(self, key)
+            if self.__touch:
+                self.__renew(key, value)
+            return value
         else:
             return self.__missing__(key)
 
@@ -788,6 +794,11 @@ class TLRUCache(_TimedCache):
         """The time-to-use function used by the cache."""
         return self.__ttu
 
+    @property
+    def touch(self):
+        """Whether cache hits renew the expiration time of items."""
+        return self.__touch
+
     def expire(self, time=None):
         """Remove expired items from the cache and return an iterable of the
         expired `(key, value)` pairs.
@@ -842,6 +853,25 @@ class TLRUCache(_TimedCache):
             pass
         else:
             cache_delitem(self, key)
+
+    def __renew(self, key, value):
+        # Renew the expiration time of an item on a cache hit.  Like
+        # __setitem__, the current heap entry is only marked as removed
+        # and a new one is pushed, so as not to break the heap
+        # structure; stale entries are compacted by expire().
+        with self.timer as time:
+            expires = self.__ttu(key, value, time)
+            if not (time < expires):
+                # A ttu() result that is not in the future is ignored
+                # here: reading an item must not evict it, so the item
+                # keeps its current expiration time.
+                return
+            item = self.__items.get(key)
+            if item is None or not (time < item.expires):
+                return  # item expired or was removed concurrently
+            item.removed = True
+            self.__items[key] = item = TLRUCache._Item(key, expires)
+            heapq.heappush(self.__order, item)
 
 
 class CacheInfo(collections.namedtuple("CacheInfo", "hits misses maxsize currsize")):

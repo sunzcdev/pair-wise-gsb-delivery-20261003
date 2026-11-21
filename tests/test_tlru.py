@@ -490,3 +490,139 @@ class TLRUCacheTest(unittest.TestCase, CacheTestMixin):
             cache.clear()
         self.assertEqual([1], keys)
         self.assertEqual([], list(cache))
+
+    def test_touch_renews_on_hit(self):
+        cache = TLRUCache[int, int, int](
+            maxsize=2, ttu=lambda _k, _v, t: t + 2, timer=Timer(), touch=True
+        )
+        self.assertEqual(True, cache.touch)
+
+        cache[1] = 1  # expires at t=2
+        cache.timer.tick()  # t=1
+        self.assertEqual(1, cache[1])  # hit, renewed to expire at t=3
+
+        cache.timer.tick()  # t=2, past the original deadline
+        self.assertEqual(1, cache[1])  # still a hit, renewed to t=4
+        self.assertIn(1, cache)
+        self.assertEqual(1, len(cache))
+
+        cache.timer.tick()  # t=3
+        self.assertEqual(1, cache[1])  # still a hit, renewed to t=5
+
+        cache.timer.tick()  # t=4
+        cache.timer.tick()  # t=5, past the last renewal
+        self.assertNotIn(1, cache)
+        with self.assertRaises(KeyError):
+            cache[1]
+        self.assertEqual(0, len(cache))
+
+    def test_touch_disabled_by_default(self):
+        cache = TLRUCache[int, int, int](
+            maxsize=2, ttu=lambda _k, _v, t: t + 2, timer=Timer()
+        )
+        self.assertEqual(False, cache.touch)
+
+        cache[1] = 1  # expires at t=2
+        cache.timer.tick()  # t=1
+        self.assertEqual(1, cache[1])  # hit, but no renewal
+
+        cache.timer.tick()  # t=2, original deadline
+        self.assertNotIn(1, cache)
+        with self.assertRaises(KeyError):
+            cache[1]
+
+    def test_touch_not_on_contains_or_iter(self):
+        cache = TLRUCache[int, int, int](
+            maxsize=2, ttu=lambda _k, _v, t: t + 2, timer=Timer(), touch=True
+        )
+        cache[1] = 1  # expires at t=2
+        cache.timer.tick()  # t=1
+
+        # membership tests and iteration must not renew the item
+        self.assertIn(1, cache)
+        self.assertEqual([1], list(cache))
+        self.assertEqual(1, len(cache))
+
+        cache.timer.tick()  # t=2, original deadline
+        self.assertNotIn(1, cache)
+        with self.assertRaises(KeyError):
+            cache[1]
+
+    def test_touch_get_setdefault_renew(self):
+        # methods that read via __getitem__ renew on a hit, too
+        cache = TLRUCache[int, int, int](
+            maxsize=2, ttu=lambda _k, _v, t: t + 2, timer=Timer(), touch=True
+        )
+        cache[1] = 1  # expires at t=2
+        cache.timer.tick()  # t=1
+        self.assertEqual(1, cache.get(1))  # hit, renewed to t=3
+        cache.timer.tick()  # t=2
+        self.assertEqual(1, cache.setdefault(1))  # hit, renewed to t=4
+        cache.timer.tick()  # t=3
+        self.assertIn(1, cache)
+        cache.timer.tick()  # t=4
+        self.assertNotIn(1, cache)
+
+    def test_touch_expired_hit_is_miss(self):
+        cache = TLRUCache[int, int, int](
+            maxsize=2, ttu=lambda _k, _v, t: t + 1, timer=Timer(), touch=True
+        )
+        cache[1] = 1  # expires at t=1
+        cache.timer.tick()  # t=1, expired
+        with self.assertRaises(KeyError):
+            cache[1]  # miss: no renewal of expired items
+        self.assertNotIn(1, cache)
+
+    def test_touch_stale_ttu_ignored(self):
+        # a ttu() result that is not in the future is ignored on
+        # renewal: the item keeps its current expiration time and is
+        # not evicted by the read
+        calls = []
+
+        def ttu(_k, _v, t):
+            calls.append(t)
+            return t + 3 if len(calls) == 1 else t  # stale on renewal
+
+        cache = TLRUCache[int, int, int](maxsize=2, ttu=ttu, timer=Timer(), touch=True)
+        cache[1] = 1  # expires at t=3
+        cache.timer.tick()  # t=1
+        self.assertEqual(1, cache[1])  # hit, stale renewal ignored
+        self.assertEqual(2, len(calls))
+
+        cache.timer.tick()  # t=2
+        self.assertEqual(1, cache[1])  # still a hit, still expiring at t=3
+
+        cache.timer.tick()  # t=3, original deadline
+        self.assertNotIn(1, cache)
+
+    def test_touch_heap_cleanup(self):
+        # each renewal pushes a new heap entry and marks the previous
+        # one as removed; expire() must compact the internal heap so
+        # stale entries do not pile up
+        timer = Timer()
+        cache = TLRUCache[int, int, int](
+            maxsize=2, ttu=lambda _k, _v, t: t + 100, timer=timer, touch=True
+        )
+        cache[1] = 1
+        cache[2] = 2
+
+        for _ in range(10):
+            self.assertEqual(1, cache[1])
+            self.assertEqual(2, cache[2])
+
+        heap = cache._TLRUCache__order
+        self.assertGreater(len(heap), 2 * len(cache))  # stale entries piled up
+
+        expired = cache.expire()  # triggers heap compaction
+        self.assertEqual([], expired)
+        heap = cache._TLRUCache__order
+        self.assertLessEqual(len(heap), 2 * len(cache))
+        self.assertEqual(2, sum(not item.removed for item in heap))
+
+        # cache is fully functional after cleanup
+        self.assertEqual(2, len(cache))
+        self.assertEqual(1, cache[1])
+        self.assertEqual(2, cache[2])
+        timer.time = 100  # advance the underlying timer
+        self.assertEqual({(1, 1), (2, 2)}, set(cache.expire()))
+        self.assertEqual(0, len(cache))

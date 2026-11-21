@@ -172,8 +172,8 @@ inserted into the cache.
 
       :returns: An iterable of expired `(key, value)` pairs.
 
-.. autoclass:: TLRUCache(maxsize, ttu, timer=time.monotonic, getsizeof=None)
-   :members: popitem, timer, ttu
+.. autoclass:: TLRUCache(maxsize, ttu, timer=time.monotonic, getsizeof=None, touch=False)
+   :members: popitem, timer, ttu, touch
 
    Similar to :class:`TTLCache`, this class also associates an
    expiration time with each item.  However, for :class:`TLRUCache`
@@ -211,6 +211,16 @@ inserted into the cache.
    no longer be accessible, and will be removed eventually.  If no
    expired items are there to remove, the least recently used items
    will be discarded first to make space when necessary.
+
+   If `touch` is true, accessing an item that has not expired yet
+   renews its expiration time, which is then recomputed as
+   `ttu(key, value, timer())`, just as when the item was inserted.
+   Only actual cache hits renew an item: membership tests with the
+   ``in`` operator and iteration over the cache do not, and neither
+   does accessing an item that has already expired.  If `ttu` returns
+   a time that is not in the future when an item is renewed, the
+   renewal is ignored and the item keeps its current expiration time,
+   i.e. reading an item never evicts it.
 
    .. method:: expire(self, time=None)
 

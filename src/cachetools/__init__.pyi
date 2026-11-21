@@ -126,6 +126,7 @@ class TLRUCache(_TimedCache[_KT, _VT, _TT]):
         ttu: Callable[[_KT, _VT, float], float],
         *,
         getsizeof: Callable[[_VT], float] | None = None,
+        touch: bool = ...,
     ) -> None: ...
     @overload
     def __init__(
@@ -134,9 +135,12 @@ class TLRUCache(_TimedCache[_KT, _VT, _TT]):
         ttu: Callable[[_KT, _VT, _TT], _TT],
         timer: Callable[[], _TT],
         getsizeof: Callable[[_VT], float] | None = None,
+        touch: bool = ...,
     ) -> None: ...
     @property
     def ttu(self) -> Callable[[_KT, _VT, _TT], _TT]: ...
+    @property
+    def touch(self) -> bool: ...
     def expire(self, time: _TT | None = None) -> list[tuple[_KT, _VT]]: ...
 
 class CacheInfo(NamedTuple):
