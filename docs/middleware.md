@@ -446,6 +446,48 @@ Currently, the `BaseHTTPMiddleware` has some known limitations:
 
 To overcome these limitations, use [pure ASGI middleware](#pure-asgi-middleware), as shown below.
 
+### Returning `ContextVar` values from the endpoint
+
+`BaseHTTPMiddleware` runs the downstream application in its own task. That task gets a copy of the context, which is what keeps requests isolated from each other, but it also means that a `ContextVar` your endpoint sets cannot be read back in `dispatch()` after `call_next()` returns.
+
+If you need a small, explicit exception to that isolation, register the variables you care about with `register_context_vars()`. The middleware then gets their values handed back when the response starts.
+
+```python
+from contextvars import ContextVar
+
+from starlette.middleware.base import BaseHTTPMiddleware, register_context_vars
+from starlette.requests import Request
+
+audit_user: ContextVar[str] = ContextVar("audit_user")
+
+class AuditMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        register_context_vars(audit_user)
+        response = await call_next(request)
+        # The endpoint's value is visible here.
+        log_audit(request.url.path, user=audit_user.get("anonymous"))
+        return response
+```
+
+The same registration can be passed to the constructor, which is handy when the class does not override `dispatch()` or when the variables are fixed for the whole application:
+
+```python
+from starlette.middleware import Middleware
+
+middleware = [Middleware(AuditMiddleware, context_vars=[audit_user])]
+```
+
+The visibility and lifetime rules are:
+
+* Values are captured in the downstream task immediately before it sends `http.response.start`, and written into the middleware's task before `call_next()` returns. `dispatch()` can therefore read them as soon as `call_next()` returns, and anything the middleware sends afterwards, including `http.response.start` itself, sees them.
+* A value set after `http.response.start`, for example while streaming the body, is not returned.
+* Only registered variables are returned. Everything else keeps the normal task isolation, and a registered variable that the downstream application never set is left untouched in the middleware.
+* If the downstream application raises instead of sending a response, no values are applied and the exception propagates unchanged.
+* When the response finishes, all applied values are reset, so a value never leaks into a later request handled by the same task.
+* With several `BaseHTTPMiddleware` layers, each layer returns only the variables it registered. A value captured for one request never appears in the record of another request, even when the two requests interleave inside the endpoint.
+
+Synchronous endpoints run in a worker thread, and their `ContextVar` changes are not visible in any async context, so there is nothing for the return channel to pick up.
+
 ## Pure ASGI Middleware
 
 The [ASGI spec](https://asgi.readthedocs.io/en/latest/) makes it possible to implement ASGI middleware using the ASGI interface directly, as a chain of ASGI applications that call into the next one. In fact, this is how middleware classes shipped with Starlette are implemented.
