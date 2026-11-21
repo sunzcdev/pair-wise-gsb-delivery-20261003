@@ -869,11 +869,17 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         return await self._deserialize_jobs(result)
 
     async def acquire_jobs(
-        self, scheduler_id: str, lease_duration: timedelta, limit: int | None = None
+        self,
+        scheduler_id: str,
+        lease_duration: timedelta,
+        limit: int | None = None,
+        *,
+        executor_slots: Mapping[str, int] | None = None,
     ) -> list[Job]:
         events: list[JobAcquired | JobReleased] = []
         async for attempt in self._retry():
             with attempt:
+                executor_slots_left = dict(executor_slots) if executor_slots else None
                 async with self._begin_transaction() as conn:
                     now = datetime.now(UTC)
                     acquired_until = now + lease_duration
@@ -901,8 +907,14 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                 self._t_jobs.c.acquired_until,
                             ],
                         )
-                        .limit(limit)
                     )
+
+                    # When per-executor slot limits are in effect, rows skipped due to
+                    # those limits must not prevent eligible jobs further back in the
+                    # queue from being acquired, so the limit is enforced in Python
+                    # instead of in the query
+                    if executor_slots_left is None:
+                        query = query.limit(limit)
 
                     result = await self._execute(conn, query)
                     if not result:
@@ -969,6 +981,22 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             )
                             continue
 
+                        # Skip the job if its executor has no free slots left
+                        if (
+                            executor_slots_left is not None
+                            and job.executor in executor_slots_left
+                        ):
+                            if not executor_slots_left[job.executor]:
+                                self._logger.debug(
+                                    "Skipping job %s because executor %r has no free "
+                                    "job slots left",
+                                    job.id,
+                                    job.executor,
+                                )
+                                continue
+
+                            executor_slots_left[job.executor] -= 1
+
                         task_job_slots_left[job.task_id] -= 1
                         running_job_count_increments[job.task_id] += 1
                         job.acquired_by = scheduler_id
@@ -977,6 +1005,10 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         events.append(
                             JobAcquired.from_job(job, scheduler_id=scheduler_id)
                         )
+
+                        # Exit the loop if enough jobs have been acquired
+                        if limit is not None and len(acquired_jobs) == limit:
+                            break
 
                     if acquired_jobs:
                         # Mark the acquired jobs as acquired by this worker

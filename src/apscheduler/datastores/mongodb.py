@@ -534,17 +534,27 @@ class MongoDBDataStore(BaseExternalDataStore):
         return jobs
 
     async def acquire_jobs(
-        self, scheduler_id: str, lease_duration: timedelta, limit: int | None = None
+        self,
+        scheduler_id: str,
+        lease_duration: timedelta,
+        limit: int | None = None,
+        *,
+        executor_slots: Mapping[str, int] | None = None,
     ) -> list[Job]:
         events: list[JobAcquired | JobReleased] = []
         async for attempt in self._retry():
             async with AsyncExitStack() as exit_stack:
                 exit_stack.enter_context(attempt)
+                executor_slots_left = dict(executor_slots) if executor_slots else None
                 session = await exit_stack.enter_async_context(
                     self._client.start_session()
                 )
 
                 # Fetch up to {limit} jobs
+                # When per-executor slot limits are in effect, jobs skipped due to
+                # those limits must not prevent eligible jobs further back in the
+                # queue from being acquired, so the limit is enforced in Python
+                # instead of in the query
                 now = datetime.now(UTC)
                 documents = await self._jobs.find(
                     {
@@ -554,7 +564,7 @@ class MongoDBDataStore(BaseExternalDataStore):
                         ]
                     },
                     sort=[("created_at", ASCENDING)],
-                    limit=limit,
+                    limit=limit if executor_slots_left is None else 0,
                     session=session,
                 ).to_list()
 
@@ -596,7 +606,7 @@ class MongoDBDataStore(BaseExternalDataStore):
 
                 acquired_jobs: list[Job] = []
                 skipped_job_ids: list[UUID] = []
-                for doc in documents:
+                for index, doc in enumerate(documents):
                     # Deserialize the job
                     doc["id"] = doc.pop("_id")
                     unmarshal_timestamps(doc)
@@ -646,6 +656,23 @@ class MongoDBDataStore(BaseExternalDataStore):
                         )
                         continue
 
+                    # Skip the job if its executor has no free slots left
+                    if (
+                        executor_slots_left is not None
+                        and job.executor in executor_slots_left
+                    ):
+                        if not executor_slots_left[job.executor]:
+                            self._logger.debug(
+                                "Skipping job %s because executor %r has no free job "
+                                "slots left",
+                                job.id,
+                                job.executor,
+                            )
+                            skipped_job_ids.append(job.id)
+                            continue
+
+                        executor_slots_left[job.executor] -= 1
+
                     # Try to increment the task's running jobs count
                     update_task_result = await self._tasks.update_one(
                         {
@@ -679,6 +706,15 @@ class MongoDBDataStore(BaseExternalDataStore):
                     job.acquired_until = now + lease_duration
                     acquired_jobs.append(job)
                     events.append(JobAcquired.from_job(job, scheduler_id=scheduler_id))
+
+                    # Exit the loop if enough jobs have been acquired
+                    if limit is not None and len(acquired_jobs) == limit:
+                        # The remaining documents were already marked as acquired, so
+                        # they need to be released too
+                        skipped_job_ids.extend(
+                            doc["_id"] for doc in documents[index + 1 :]
+                        )
+                        break
 
                 # Release jobs skipped due to max job slots being reached
                 if skipped_job_ids:

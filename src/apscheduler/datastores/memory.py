@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right, insort_right
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import MAXYEAR, UTC, datetime, timedelta
 from functools import partial
 from uuid import UUID
@@ -234,10 +234,16 @@ class MemoryDataStore(BaseDataStore):
         ]
 
     async def acquire_jobs(
-        self, scheduler_id: str, lease_duration: timedelta, limit: int | None = None
+        self,
+        scheduler_id: str,
+        lease_duration: timedelta,
+        limit: int | None = None,
+        *,
+        executor_slots: Mapping[str, int] | None = None,
     ) -> list[Job]:
         now = datetime.now(UTC)
         acquired_until = now + lease_duration
+        executor_slots_left = dict(executor_slots) if executor_slots else None
         jobs: list[Job] = []
         job_results: dict[Job, JobResult] = {}
         for job in self._jobs_by_id.values():
@@ -273,6 +279,19 @@ class MemoryDataStore(BaseDataStore):
                     task.running_jobs,
                 )
                 continue
+
+            # Skip the job if its executor has no free slots left
+            if executor_slots_left is not None and job.executor in executor_slots_left:
+                if not executor_slots_left[job.executor]:
+                    self._logger.debug(
+                        "Skipping job %s because executor %r has no free job slots "
+                        "left",
+                        job.id,
+                        job.executor,
+                    )
+                    continue
+
+                executor_slots_left[job.executor] -= 1
 
             # Mark the job as acquired by this worker
             jobs.append(job)

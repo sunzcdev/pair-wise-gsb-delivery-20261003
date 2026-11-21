@@ -653,6 +653,79 @@ async def test_acquire_jobs_max_number_exceeded(datastore: DataStore) -> None:
     assert (await datastore.get_task("task1")).running_jobs == 2
 
 
+async def test_acquire_jobs_executor_slots(datastore: DataStore) -> None:
+    await datastore.add_task(
+        Task(
+            id="task1",
+            func="contextlib:asynccontextmanager",
+            job_executor="threadpool",
+            max_running_jobs=None,
+        )
+    )
+    await datastore.add_task(
+        Task(
+            id="task2",
+            func="contextlib:asynccontextmanager",
+            job_executor="async",
+            max_running_jobs=None,
+        )
+    )
+    threadpool_jobs = [Job(task_id="task1", executor="threadpool") for _ in range(3)]
+    async_jobs = [Job(task_id="task2", executor="async") for _ in range(2)]
+    for job in threadpool_jobs + async_jobs:
+        await datastore.add_job(job)
+
+    # Only 2 slots are available for the "threadpool" executor, so the third
+    # thread pool job is skipped, but the async jobs queued behind it should still
+    # be acquired
+    acquired_jobs = await datastore.acquire_jobs(
+        "worker1", timedelta(seconds=30), 10, executor_slots={"threadpool": 2}
+    )
+    assert [job.id for job in acquired_jobs] == [
+        job.id for job in threadpool_jobs[:2] + async_jobs
+    ]
+
+    # With no free slots for the "threadpool" executor, the remaining job is not
+    # acquired
+    assert not await datastore.acquire_jobs(
+        "worker2", timedelta(seconds=30), 10, executor_slots={"threadpool": 0}
+    )
+
+    # Without any executor slot limits, the remaining job is acquired
+    acquired_jobs = await datastore.acquire_jobs("worker2", timedelta(seconds=30), 10)
+    assert [job.id for job in acquired_jobs] == [threadpool_jobs[2].id]
+
+
+async def test_acquire_jobs_executor_slots_start_deadline_passed(
+    datastore: DataStore,
+) -> None:
+    await datastore.add_task(
+        Task(
+            id="task1",
+            func="contextlib:asynccontextmanager",
+            job_executor="threadpool",
+            max_running_jobs=None,
+        )
+    )
+    job = Job(
+        task_id="task1",
+        executor="threadpool",
+        start_deadline=datetime.now(UTC) - timedelta(seconds=1),
+        result_expiration_time=timedelta(minutes=1),
+    )
+    await datastore.add_job(job)
+
+    # Even though the executor has no free slots, the job whose start deadline has
+    # passed must be finalized with the "missed_start_deadline" outcome
+    acquired_jobs = await datastore.acquire_jobs(
+        "worker1", timedelta(seconds=30), 1, executor_slots={"threadpool": 0}
+    )
+    assert not acquired_jobs
+    result = await datastore.get_job_result(job.id)
+    assert result
+    assert result.outcome is JobOutcome.missed_start_deadline
+
+
 async def test_add_get_task(datastore: DataStore) -> None:
     with pytest.raises(TaskLookupError):
         await datastore.get_task("dummyid")

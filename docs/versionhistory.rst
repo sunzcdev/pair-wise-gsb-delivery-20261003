@@ -8,6 +8,11 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
+- Added the ``max_running_jobs`` option to job executors which limits the number of
+  jobs the scheduler will have in flight on a given executor at once; when the limit
+  has been reached, the scheduler refrains from acquiring more jobs bound for that
+  executor until some of its jobs have finished (jobs bound for other executors are
+  not affected)
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+
 - Dropped support for Python 3.9 and 3.10
 - Fixed an issue where ``CronTrigger`` does not convert ``start_time`` to ``self.timezone``

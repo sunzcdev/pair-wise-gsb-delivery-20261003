@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABCMeta, abstractmethod
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AsyncExitStack
 from datetime import datetime, timedelta
 from logging import Logger
@@ -311,7 +311,12 @@ class DataStore(metaclass=ABCMeta):
 
     @abstractmethod
     async def acquire_jobs(
-        self, scheduler_id: str, lease_duration: timedelta, limit: int | None = None
+        self,
+        scheduler_id: str,
+        lease_duration: timedelta,
+        limit: int | None = None,
+        *,
+        executor_slots: Mapping[str, int] | None = None,
     ) -> list[Job]:
         """
         Acquire unclaimed jobs for execution.
@@ -323,6 +328,9 @@ class DataStore(metaclass=ABCMeta):
         :param lease_duration: the duration of the lease, after which the jobs will be
             considered to be dead if the scheduler doesn't extend the lease duration
         :param limit: maximum number of jobs to claim and return
+        :param executor_slots: maximum number of additional jobs to claim for each
+            named job executor (jobs bound for executors not present in the mapping
+            are not affected); jobs whose executor has no free slots left are skipped
         :return: the list of claimed jobs
         """
 
@@ -404,6 +412,18 @@ class DataStore(metaclass=ABCMeta):
 
 
 class JobExecutor(metaclass=ABCMeta):
+    """
+    Interface for job executors.
+
+    :ivar max_running_jobs: maximum number of jobs the scheduler is allowed to have
+        in flight (acquired but not yet finished) on this executor at any given time,
+        or ``None`` for no limit; when the limit has been reached, the scheduler
+        refrains from acquiring more jobs bound for this executor until some of its
+        jobs have finished
+    """
+
+    max_running_jobs: int | None = None
+
     async def start(self, exit_stack: AsyncExitStack) -> None:  # noqa: B027
         """
         Start the job executor.

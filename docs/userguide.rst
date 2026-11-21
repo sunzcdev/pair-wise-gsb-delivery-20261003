@@ -269,6 +269,29 @@ still running, the later job is terminated with the outcome of
 To allow more jobs to be concurrently running for a task, pass the desired maximum
 number as the ``max_running_jobs`` keyword argument to :meth:`~Scheduler.add_schedule`.
 
+Limiting the number of concurrently executing jobs per executor
+---------------------------------------------------------------
+
+**Option**: ``max_running_jobs`` (on the job executor)
+
+A job executor can be configured with its own ``max_running_jobs`` limit which
+restricts the number of jobs the scheduler is allowed to have in flight (acquired but
+not yet finished) on that executor at any given time. When an executor has reached
+this limit, the scheduler refrains from acquiring more jobs bound for that executor
+until some of its jobs have finished, while jobs bound for other executors can still
+be acquired and run::
+
+    from apscheduler import AsyncScheduler
+    from apscheduler.executors.thread import ThreadPoolJobExecutor
+
+    scheduler = AsyncScheduler(
+        job_executors={"threadpool": ThreadPoolJobExecutor(max_running_jobs=5)}
+    )
+
+This is useful for executors with limited capacity (such as thread or process pools),
+as jobs waiting for a free worker would otherwise count towards the scheduler's own
+``max_concurrent_jobs`` quota while idling in the executor's internal queue.
+
 .. _controlling-how-much-a-job-can-be-started-late:
 
 Controlling how much a job can be started late

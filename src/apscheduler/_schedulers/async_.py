@@ -1150,8 +1150,30 @@ class AsyncScheduler:
             while self._state is RunState.started:
                 limit = self.max_concurrent_jobs - len(self._running_jobs)
                 if limit > 0:
+                    # Compute the number of free in-flight slots for each executor
+                    # that has a maximum number of running jobs configured
+                    executor_slots: dict[str, int] | None = None
+                    limited_executors = {
+                        name: executor.max_running_jobs
+                        for name, executor in self.job_executors.items()
+                        if executor.max_running_jobs is not None
+                    }
+                    if limited_executors:
+                        running_jobs = dict.fromkeys(limited_executors, 0)
+                        for job in self._running_jobs:
+                            if job.executor in running_jobs:
+                                running_jobs[job.executor] += 1
+
+                        executor_slots = {
+                            name: max(max_jobs - running_jobs[name], 0)
+                            for name, max_jobs in limited_executors.items()
+                        }
+
                     jobs = await self.data_store.acquire_jobs(
-                        self.identity, self.lease_duration, limit
+                        self.identity,
+                        self.lease_duration,
+                        limit,
+                        executor_slots=executor_slots,
                     )
                     for job in jobs:
                         task = await self.data_store.get_task(job.task_id)

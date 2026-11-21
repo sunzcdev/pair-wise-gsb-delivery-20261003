@@ -1030,6 +1030,160 @@ class TestAsyncScheduler:
                 await scheduler.add_job("dummyjob")
                 await scheduler.run_until_stopped()
 
+    async def test_job_executor_max_running_jobs(self) -> None:
+        """
+        Test that when a job executor has reached its maximum number of in-flight
+        jobs, the scheduler refrains from acquiring more jobs bound for that
+        executor, while jobs bound for other executors are still acquired and run.
+
+        """
+        block_event = threading.Event()
+        threads_started = threading.Event()
+        started_lock = threading.Lock()
+        started_count = 0
+        completed_async_jobs = 0
+
+        def blocking_job() -> None:
+            nonlocal started_count
+            with started_lock:
+                started_count += 1
+                if started_count == 2:
+                    threads_started.set()
+
+            block_event.wait(10)
+
+        async def async_job() -> None:
+            nonlocal completed_async_jobs
+            completed_async_jobs += 1
+
+        scheduler = AsyncScheduler(
+            max_concurrent_jobs=4,
+            job_executors={
+                "async": AsyncJobExecutor(),
+                "threadpool": ThreadPoolJobExecutor(max_running_jobs=2),
+            },
+        )
+        with fail_after(10):
+            async with scheduler:
+                await scheduler.configure_task(
+                    "blocking",
+                    func=blocking_job,
+                    job_executor="threadpool",
+                    max_running_jobs=None,
+                )
+                await scheduler.configure_task(
+                    "async",
+                    func=async_job,
+                    job_executor="async",
+                    max_running_jobs=None,
+                )
+                await scheduler.start_in_background()
+
+                # Queue three blocking thread pool jobs; only two of them should be
+                # acquired while the executor is at capacity
+                blocking_job_ids = [
+                    await scheduler.add_job(
+                        "blocking", result_expiration_time=timedelta(minutes=1)
+                    )
+                    for _ in range(3)
+                ]
+
+                # Queue two async jobs behind them in the same queue
+                async_job_ids = [
+                    await scheduler.add_job(
+                        "async", result_expiration_time=timedelta(minutes=1)
+                    )
+                    for _ in range(2)
+                ]
+
+                # Wait for the thread pool to fill up
+                await anyio.to_thread.run_sync(threads_started.wait)
+
+                # The async jobs should complete even though the thread pool jobs
+                # are still blocked, freeing up their share of the scheduler's
+                # concurrent job quota
+                for job_id in async_job_ids:
+                    result = await scheduler.get_job_result(job_id)
+                    assert result is not None
+                    assert result.outcome is JobOutcome.success
+
+                assert completed_async_jobs == 2
+
+                # The third blocking job should still be in the queue, and only the
+                # two blocked jobs should be occupying the scheduler's job quota
+                unacquired_jobs = [
+                    job.id
+                    for job in await scheduler.get_jobs()
+                    if job.acquired_by is None
+                ]
+                assert unacquired_jobs == [blocking_job_ids[2]]
+                assert len(scheduler._running_jobs) == 2
+
+                # Unblock the thread pool jobs and wait for all of them to finish
+                block_event.set()
+                for job_id in blocking_job_ids:
+                    result = await scheduler.get_job_result(job_id)
+                    assert result is not None
+                    assert result.outcome is JobOutcome.success
+
+                assert not await scheduler.get_jobs()
+                await scheduler.stop()
+
+    async def test_job_executor_max_running_jobs_missed_deadline(self) -> None:
+        """
+        Test that jobs whose start deadlines pass while their executor is at
+        capacity are finalized with the "missed_start_deadline" outcome.
+
+        """
+        block_event = threading.Event()
+        job_started = threading.Event()
+
+        def blocking_job() -> None:
+            job_started.set()
+            block_event.wait(10)
+
+        scheduler = AsyncScheduler(
+            job_executors={
+                "threadpool": ThreadPoolJobExecutor(max_running_jobs=1),
+            },
+        )
+        with fail_after(10):
+            async with scheduler:
+                send, receive = create_memory_object_stream[Event](10)
+                async with send, receive:
+                    scheduler.subscribe(send.send, {JobReleased})
+                    await scheduler.configure_task(
+                        "blocking",
+                        func=blocking_job,
+                        job_executor="threadpool",
+                        max_running_jobs=None,
+                        misfire_grace_time=timedelta(seconds=0.2),
+                    )
+                    await scheduler.start_in_background()
+
+                    # The first job occupies the only executor slot
+                    await scheduler.add_job("blocking")
+                    await anyio.to_thread.run_sync(job_started.wait)
+
+                    # The scheduled job cannot be acquired until the first one
+                    # finishes, and its start deadline passes before that
+                    schedule_id = await scheduler.add_schedule(
+                        "blocking",
+                        DateTrigger(datetime.now(UTC)),
+                        misfire_grace_time=timedelta(seconds=0.2),
+                    )
+                    await sleep(0.5)
+                    block_event.set()
+
+                    # Wait for the scheduled job to be finalized
+                    async for event in receive:
+                        assert isinstance(event, JobReleased)
+                        if event.outcome is JobOutcome.missed_start_deadline:
+                            break
+
+                    await scheduler.remove_schedule(schedule_id)
+                    await scheduler.stop()
+
     @pytest.mark.parametrize(
         "trigger_type, run_job",
         [
