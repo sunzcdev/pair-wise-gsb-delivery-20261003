@@ -78,4 +78,10 @@ class ReadError(NetworkError):
 
 
 class WriteError(NetworkError):
-    pass
+    # When a request fails partway through being written to the transport,
+    # the HTTP/1.1 connection annotates the error with the number of request
+    # bytes that had already been handed to the transport, and whether or not
+    # a valid response was read from the server. This allows the caller to
+    # decide for themselves if the request is safe to retry.
+    request_bytes_sent: typing.Optional[int] = None
+    response_received: bool = False

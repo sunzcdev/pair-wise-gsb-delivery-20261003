@@ -14,7 +14,6 @@ from httpcore import (
     ConnectError,
     ConnectionNotAvailable,
     Origin,
-    RemoteProtocolError,
     WriteError,
 )
 
@@ -146,7 +145,9 @@ async def test_write_error_with_response_sent():
 async def test_write_error_without_response_sent():
     """
     If a server fully closes the connection while the client is sending
-    the request, then client should raise an error.
+    the request, then the client should raise a `WriteError`, including
+    the number of request bytes that had already been handed to the
+    transport, and indicating that no valid response was read.
 
     See also the `test_write_error_with_response_sent` test above.
     """
@@ -182,9 +183,11 @@ async def test_write_error_without_response_sent():
         origin=origin, network_backend=network_backend, keepalive_expiry=5.0
     ) as conn:
         content = b"x" * 10_000_000
-        with pytest.raises(RemoteProtocolError) as exc_info:
+        with pytest.raises(WriteError) as exc_info:
             await conn.request("POST", "https://example.com/", content=content)
-        assert str(exc_info.value) == "Server disconnected without sending a response."
+        assert exc_info.value.request_bytes_sent is not None
+        assert 0 < exc_info.value.request_bytes_sent < 10_000_000
+        assert exc_info.value.response_received is False
 
 
 @pytest.mark.anyio

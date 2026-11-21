@@ -57,6 +57,7 @@ class HTTP11Connection(ConnectionInterface):
         self._state = HTTPConnectionState.NEW
         self._state_lock = Lock()
         self._request_count = 0
+        self._request_bytes_sent = 0
         self._h11_state = h11.Connection(
             our_role=h11.CLIENT,
             max_incomplete_event_size=self.MAX_INCOMPLETE_EVENT_SIZE,
@@ -79,6 +80,8 @@ class HTTP11Connection(ConnectionInterface):
 
         try:
             kwargs = {"request": request}
+            self._request_bytes_sent = 0
+            write_error: WriteError | None = None
             try:
                 with Trace(
                     "send_request_headers", logger, request, kwargs
@@ -86,30 +89,43 @@ class HTTP11Connection(ConnectionInterface):
                     self._send_request_headers(**kwargs)
                 with Trace("send_request_body", logger, request, kwargs) as trace:
                     self._send_request_body(**kwargs)
-            except WriteError:
+            except WriteError as exc:
                 # If we get a write error while we're writing the request,
                 # then we supress this error and move on to attempting to
                 # read the response. Servers can sometimes close the request
                 # pre-emptively and then respond with a well formed HTTP
                 # error response.
-                pass
+                write_error = exc
 
-            with Trace(
-                "receive_response_headers", logger, request, kwargs
-            ) as trace:
-                (
-                    http_version,
-                    status,
-                    reason_phrase,
-                    headers,
-                    trailing_data,
-                ) = self._receive_response_headers(**kwargs)
-                trace.return_value = (
-                    http_version,
-                    status,
-                    reason_phrase,
-                    headers,
-                )
+            try:
+                with Trace(
+                    "receive_response_headers", logger, request, kwargs
+                ) as trace:
+                    (
+                        http_version,
+                        status,
+                        reason_phrase,
+                        headers,
+                        trailing_data,
+                    ) = self._receive_response_headers(**kwargs)
+                    trace.return_value = (
+                        http_version,
+                        status,
+                        reason_phrase,
+                        headers,
+                    )
+            except Exception:
+                if write_error is not None:
+                    # The request could not be fully written, and no valid
+                    # response could be read either. Re-raise the original
+                    # `WriteError`, annotated with the number of request
+                    # bytes that had already been handed to the transport.
+                    # We don't make any retry decision on behalf of the
+                    # caller.
+                    write_error.request_bytes_sent = self._request_bytes_sent
+                    write_error.response_received = False
+                    raise write_error
+                raise
 
             network_stream = self._network_stream
 
@@ -119,15 +135,25 @@ class HTTP11Connection(ConnectionInterface):
             ):
                 network_stream = HTTP11UpgradeStream(network_stream, trailing_data)
 
+            extensions: dict[str, typing.Any] = {
+                "http_version": http_version,
+                "reason_phrase": reason_phrase,
+                "network_stream": network_stream,
+            }
+            if write_error is not None:
+                # The server sent a final response and closed the write
+                # direction before we had finished uploading the request
+                # body. Surface how many request bytes had already been
+                # handed to the transport, and that a valid response was
+                # read, so that the caller can decide how to proceed.
+                extensions["request_bytes_sent"] = self._request_bytes_sent
+                extensions["response_received"] = True
+
             return Response(
                 status=status,
                 headers=headers,
                 content=HTTP11ConnectionByteStream(self, request),
-                extensions={
-                    "http_version": http_version,
-                    "reason_phrase": reason_phrase,
-                    "network_stream": network_stream,
-                },
+                extensions=extensions,
             )
         except BaseException as exc:
             with ShieldCancellation():
@@ -164,6 +190,7 @@ class HTTP11Connection(ConnectionInterface):
         bytes_to_send = self._h11_state.send(event)
         if bytes_to_send is not None:
             self._network_stream.write(bytes_to_send, timeout=timeout)
+            self._request_bytes_sent += len(bytes_to_send)
 
     # Receiving the response...
 

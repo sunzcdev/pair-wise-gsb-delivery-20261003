@@ -206,6 +206,15 @@ HTTP/2 onwards does not include a reason phrase on the wire.
 
 When no key is included, a default based on the status code may be used.
 
+### `"request_bytes_sent"` and `"response_received"`
+
+When using HTTP/1.1, a server may send a final response and close the write direction while the client is still streaming the request body, for example when rejecting an upload early. In this case the response is returned as usual, and these two additional extensions are included:
+
+* `"request_bytes_sent"`: The number of request bytes that had already been handed to the transport before the write failed, as an `int`.
+* `"response_received"`: Always `True`. Confirms that a valid response was read from the server.
+
+If the request cannot be written to completion and no valid response can be read either, then a `httpcore.WriteError` is raised instead, including the same information as its `request_bytes_sent` and `response_received` attributes. This allows the caller to decide for themselves if the request is safe to retry. `httpcore` does not make any retry decision on behalf of the caller.
+
 ### `"stream_id"`
 
 When HTTP/2 is being used the `"stream_id"` response extension can be accessed to determine the ID of the data stream that the response was sent on.

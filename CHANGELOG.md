@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
+- HTTP/1.1 responses now include `"request_bytes_sent"` and `"response_received"` extensions when the server responds before the request body has been fully written. If the write fails and no response can be read, a `WriteError` annotated with the same information is raised instead of a `RemoteProtocolError`.
 
 ## Version 1.0.9 (April 24th, 2025)
 

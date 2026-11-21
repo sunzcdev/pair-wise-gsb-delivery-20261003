@@ -378,3 +378,102 @@ def test_http11_header_sub_100kb():
         response = conn.request("GET", "https://example.com/")
         assert response.status == 200
         assert response.content == b""
+
+
+class WriteFailureStream(httpcore.MockStream):
+    """
+    A controllable network stream that allows a fixed number of writes
+    to succeed, and then fails any subsequent write with a `WriteError`.
+    """
+
+    def __init__(self, buffer, fail_on_write):
+        super().__init__(buffer)
+        self._fail_on_write = fail_on_write
+        self._write_count = 0
+        self.bytes_written = b""
+
+    def write(self, buffer, timeout=None):
+        self._write_count += 1
+        if self._write_count >= self._fail_on_write:
+            raise httpcore.WriteError("Simulated write failure")
+        self.bytes_written += buffer
+
+
+def streaming_body():
+    yield b"chunk one"
+    yield b"chunk two"
+    yield b"chunk three"  # The write of this chunk will fail.
+    yield b"chunk four"
+
+
+
+def test_http11_connection_write_error_with_final_response():
+    """
+    If the server sends a final response and closes the write direction
+    while the request body is still being streamed, then that response is
+    returned. The response extensions include the number of request bytes
+    that had already been handed to the transport, and confirm that a
+    valid response was read.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = WriteFailureStream(
+        [
+            b"HTTP/1.1 403 Forbidden\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ],
+        # The request headers and the first two body chunks are written
+        # successfully. The write of the third chunk fails.
+        fail_on_write=4,
+    )
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        response = conn.request(
+            "POST", "https://example.com/", content=streaming_body()
+        )
+        assert response.status == 403
+        assert response.content == b"Hello, world!"
+
+        # The response extensions include the number of request bytes that
+        # had already been handed to the transport before the write failed,
+        # and confirm that a valid response was read.
+        assert response.extensions["request_bytes_sent"] > 0
+        assert response.extensions["request_bytes_sent"] == len(stream.bytes_written)
+        assert response.extensions["response_received"] is True
+
+        # The request was not written to completion,
+        # so the connection cannot be reused.
+        assert not conn.is_idle()
+        assert conn.is_closed()
+
+
+
+def test_http11_connection_write_error_without_response():
+    """
+    If the request body cannot be written to completion and the server
+    disconnects without sending a response, then the original `WriteError`
+    is raised, annotated with the number of request bytes that had already
+    been handed to the transport. No retry decision is made on behalf of
+    the caller.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = WriteFailureStream(
+        [],
+        # The request headers and the first two body chunks are written
+        # successfully. The write of the third chunk fails.
+        fail_on_write=4,
+    )
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        with pytest.raises(httpcore.WriteError) as exc_info:
+            conn.request(
+                "POST", "https://example.com/", content=streaming_body()
+            )
+
+        assert exc_info.value.request_bytes_sent is not None
+        assert exc_info.value.request_bytes_sent > 0
+        assert exc_info.value.request_bytes_sent == len(stream.bytes_written)
+        assert exc_info.value.response_received is False
+
+        assert not conn.is_idle()
+        assert conn.is_closed()
