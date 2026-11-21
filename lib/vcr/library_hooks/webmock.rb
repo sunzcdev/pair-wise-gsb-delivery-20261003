@@ -31,6 +31,58 @@ module VCR
         Thread.current[:_vcr_webmock_disabled_requests] ||= []
       end
 
+      # Interactions reserved while WebMock builds a stubbed response are
+      # attached to the request signature WebMock itself carries from stub
+      # resolution to its callbacks. Those callbacks run when WebMock is ready
+      # to deliver the response, so the reservation is settled there: committed
+      # when the callbacks complete, released when one of them raises (so a
+      # retry can still replay it).
+      #
+      # Attaching the reservation to the signature (rather than keeping a
+      # registry) scopes its lifetime to the request and keeps identical
+      # concurrent requests from sharing ownership of an interaction.
+      #
+      # @private
+      PLAYBACK_IVAR = :@__vcr_playback
+
+      # @private
+      def register_pending_playback(request_signature, playback)
+        previous = request_signature.instance_variable_get(PLAYBACK_IVAR)
+        # A signature can be reused across attempts (redirects, retries). A
+        # reservation still pending at that point never reached delivery.
+        previous.release! if previous
+        request_signature.instance_variable_set(PLAYBACK_IVAR, playback)
+      end
+
+      # @private
+      def pending_playback_for?(request_signature)
+        request_signature.instance_variable_defined?(PLAYBACK_IVAR)
+      end
+
+      # @private
+      def settle_pending_playback(request_signature, delivered)
+        return unless request_signature.instance_variable_defined?(PLAYBACK_IVAR)
+        playback = request_signature.send(:remove_instance_variable, PLAYBACK_IVAR)
+        delivered ? playback.commit! : playback.release!
+      end
+
+      # Settles a pending playback at WebMock's delivery boundary.
+      #
+      # @private
+      module DeliveryTracking
+        def invoke_callbacks(options, request_signature, response)
+          track = VCR::LibraryHooks::WebMock.pending_playback_for?(request_signature)
+          delivered = false
+          result = super
+          delivered = true
+          result
+        ensure
+          VCR::LibraryHooks::WebMock.settle_pending_playback(request_signature, delivered) if track
+        end
+      end
+
+      ::WebMock::CallbackRegistry.singleton_class.prepend(DeliveryTracking)
+
       # @private
       module Helpers
         def vcr_request_for(webmock_request)
@@ -94,6 +146,14 @@ module VCR
 
       private
 
+        # WebMock asks us for a stubbed response and then goes on to build the
+        # library-specific response object and hand it to the test. That
+        # second step can still fail, so the interaction is only consumed once
+        # WebMock reaches its callback/delivery boundary (see DeliveryTracking).
+        def defer_playback_commit?
+          ::WebMock::CallbackRegistry.any_callbacks?
+        end
+
         def externally_stubbed?
           # prevent infinite recursion...
           VCR::LibraryHooks::WebMock.with_global_hook_disabled(request) do
@@ -121,11 +181,17 @@ module VCR
         end
 
         def on_stubbed_by_vcr_request
-          {
+          response = {
             body:    stubbed_response.body.dup, # Excon mutates the body, so we must dup it :-(
             status:  [stubbed_response.status.code.to_i, stubbed_response.status.message],
             headers: stubbed_response.headers
           }
+
+          if playback && defer_playback_commit?
+            VCR::LibraryHooks::WebMock.register_pending_playback(request, playback)
+          end
+
+          response
         end
       end
 

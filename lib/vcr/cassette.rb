@@ -76,6 +76,11 @@ module VCR
     # @param (see VCR#eject_casssette)
     # @see VCR#eject_cassette
     def eject(options = {})
+      # A reservation that was never settled (e.g. the adapter never got as far
+      # as delivering the response) is not a playback: return it before writing
+      # or checking which interactions were used.
+      release_reserved_playbacks
+
       write_recorded_interactions_to_disk if should_write_recorded_interactions_to_disk?
 
       if should_assert_no_unused_interactions? && !options[:skip_no_unused_interactions_assertion]
@@ -110,6 +115,14 @@ module VCR
           @parent_list,
           log_prefix
       end
+    end
+
+    # @private
+    # Returns any interaction that was reserved but never delivered, so that it
+    # is written back (or reported as unused) rather than silently lost.
+    def release_reserved_playbacks
+      list = @mutex.synchronize { @http_interactions }
+      list.release_reserved_playbacks! if list
     end
 
     # @private

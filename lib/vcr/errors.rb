@@ -316,7 +316,13 @@ module VCR
         num_remaining_interactions = current_cassettes.inject(0) { |sum, c|
           sum + c.http_interactions.remaining_unused_interaction_count
         }
+        num_reserved_interactions = current_cassettes.inject(0) { |sum, c|
+          sum + c.http_interactions.remaining_reserved_interaction_count
+        }
 
+        # Interactions reserved by another in-flight request are not something a
+        # matcher change could fix, so only count the genuinely unmatched ones.
+        num_remaining_interactions -= num_reserved_interactions
         return [] if num_remaining_interactions.zero?
 
         interaction_description = if num_remaining_interactions == 1

@@ -3,6 +3,7 @@ Changelog
 
 ## Unreleased
 
+- [fix] An interaction matched for playback is now reserved rather than consumed, and only consumed once the response was actually delivered. If the library adapter raises before handing the response back (or the cassette is ejected first), the interaction is released and a retry can replay it. Concurrent requests can no longer take the same non-repeatable interaction, and `allow_playback_repeats` still lets them share it.
 - [fix] `uri_without_params` ignores percent-encoded query params given by their decoded name, e.g. `uri_without_params('date[gte]')` now ignores `date%5Bgte%5D` (#633)
 - [fix] Leave the Content-Length header of HEAD and 304 responses untouched when `update_content_length_header` is enabled (#779)
 
