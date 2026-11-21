@@ -49,14 +49,16 @@ module Dry
           raise ArgumentError, "+#{name}+ is not a setting name"
         end
 
-        _values.fetch(name) {
-          # Mutable settings may be configured after read
-          _configured.add(name) if setting.cloneable?
+        return _values[name] if _values.key?(name)
 
-          setting.to_value.tap { |value|
-            _values[name] = value
-          }
-        }
+        # Build the value before recording anything, so a failing constructor (or nested
+        # config initializer) leaves this config untouched and retryable.
+        value = setting.to_value(config_class: self.class)
+
+        # Mutable settings may be configured after read
+        _configured.add(name) if setting.cloneable?
+
+        _values[name] = value
       end
 
       # Set config value.
@@ -73,12 +75,19 @@ module Dry
           raise ArgumentError, "+#{name}+ is not a setting name"
         end
 
-        _configured.add(name)
+        # Construct before touching any state, so a failing constructor leaves this config
+        # (and its `configured?` bookkeeping) exactly as it was.
+        constructed = setting.construct(value)
 
-        _values[name] = setting.constructor.(value)
+        _values[name] = constructed
+        _configured.add(name)
       end
 
       # Update config with new values
+      #
+      # Nested settings are updated recursively. Nested configs are matched by their shared
+      # {Config} base class, so settings whose nested `config_class` differs from the parent
+      # config's class are updated in place too.
       #
       # @param values [Hash, #to_hash] A hash with new values
       #
@@ -87,7 +96,7 @@ module Dry
       # @api public
       def update(values)
         values.each do |key, value|
-          if self[key].is_a?(self.class)
+          if self[key].is_a?(Config)
             unless value.respond_to?(:to_hash)
               raise ArgumentError, "#{value.inspect} is not a valid setting value"
             end
@@ -113,7 +122,7 @@ module Dry
       # @api public
       def configured?(key)
         if _configured.include?(key) && _settings[key].cloneable?
-          return _values[key] != _settings[key].to_value
+          return _values[key] != _settings[key].to_value(config_class: self.class)
         end
 
         _configured.include?(key)
@@ -140,7 +149,7 @@ module Dry
       #
       # @api public
       def to_h
-        values.transform_values { |value| value.is_a?(self.class) ? value.to_h : value }
+        values.transform_values { |value| value.is_a?(Config) ? value.to_h : value }
       end
 
       # @api private
@@ -200,7 +209,7 @@ module Dry
         return self if frozen?
 
         values.each_value do |value|
-          if value.is_a?(self.class)
+          if value.is_a?(Config)
             value.finalize!(freeze_values: freeze_values)
           elsif freeze_values
             value.freeze
@@ -226,7 +235,7 @@ module Dry
 
       def to_data_attrs
         _values.each_with_object({}) do |(name, value), hsh|
-          hsh[name] = value.is_a?(self.class) ? value.to_data : value
+          hsh[name] = value.is_a?(Config) ? value.to_data : value
         end
       end
 

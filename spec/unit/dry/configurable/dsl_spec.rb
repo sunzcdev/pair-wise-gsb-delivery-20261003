@@ -91,4 +91,62 @@ RSpec.describe Dry::Configurable::DSL do
     expect(setting.children.to_a[0].children.to_a[0].name).to be(:user)
     expect(setting.children.to_a[0].children.to_a[1].name).to be(:pass)
   end
+
+  it "records the full dotted path of each nested setting" do
+    setting =
+      dsl.setting(:db) do
+        setting(:cred) do
+          setting(:user)
+          setting(:pass)
+        end
+      end
+
+    cred = setting.children.to_a[0]
+
+    expect(setting.path).to eq([:db])
+    expect(cred.path).to eq([:db, :cred])
+    expect(cred.children.to_a.map(&:path)).to eq([[:db, :cred, :user], [:db, :cred, :pass]])
+    expect(cred.children.to_a.map(&:full_name)).to eq(["db.cred.user", "db.cred.pass"])
+  end
+
+  it "does not register a setting that fails to compile" do
+    expect { dsl.setting(:db) { setting(:"not valid") } }.to raise_error(
+      ArgumentError, /not a valid/
+    )
+
+    expect(dsl.ast).to be_empty
+  end
+
+  it "does not register a setting when the nested DSL block raises" do
+    expect { dsl.setting(:db) { raise "boom" } }.to raise_error("boom")
+
+    expect(dsl.ast).to be_empty
+  end
+
+  context "with a configurable owner" do
+    let(:owner) do
+      Class.new do
+        extend Dry::Configurable
+      end
+    end
+
+    subject(:dsl) do
+      owner.__config_dsl__
+    end
+
+    it "attributes compiled settings to the owner" do
+      setting =
+        dsl.setting(:db) do
+          setting(:cred) do
+            setting(:user)
+          end
+        end
+
+      user = setting.children.to_a[0].children.to_a[0]
+
+      expect(user.owner).to be(owner)
+      expect(user.path).to eq([:db, :cred, :user])
+      expect(user.description).to include("db.cred.user")
+    end
+  end
 end

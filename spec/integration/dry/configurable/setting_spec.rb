@@ -129,6 +129,41 @@ RSpec.describe Dry::Configurable, ".setting" do
           object.config.failable = 12
         }.to raise_error(NoMethodError, /undefined method (`|')to_sym'/)
       end
+
+      it "names the field and declaring class when the constructor fails" do
+        failable_klass = Class.new do
+          extend Dry::Configurable
+
+          class << self
+            def name = "FailablePlugin"
+          end
+
+          setting :connection do
+            setting :timeout, default: "10", constructor: ->(value) { Integer(value) }
+          end
+        end
+
+        expect { failable_klass.config.connection.timeout = "soon" }.to raise_error(
+          ArgumentError, /setting "connection\.timeout" for FailablePlugin .*soon/
+        )
+
+        expect { failable_klass.config.update(connection: {timeout: "later"}) }.to raise_error(
+          ArgumentError, /setting "connection\.timeout" for FailablePlugin .*later/
+        )
+      end
+
+      it "leaves the setting untouched when its constructor fails" do
+        klass.setting(:timeout, default: "10", constructor: ->(value) { Integer(value) })
+
+        expect { object.config.timeout = "soon" }.to raise_error(ArgumentError)
+
+        expect(object.config.timeout).to be(10)
+        expect(object.config.configured?(:timeout)).to be(false)
+
+        object.config.timeout = "11"
+        expect(object.config.timeout).to be(11)
+        expect(object.config.configured?(:timeout)).to be(true)
+      end
     end
 
     context "with reader: true" do
@@ -332,6 +367,141 @@ RSpec.describe Dry::Configurable, ".setting" do
           expect(klass.config.database.dsn).to be_instance_of(Test::Config)
           expect(klass.config.database.dsn.pool).to be(5)
         end
+
+        it "applies the custom config class to every nested level below it" do
+          Test::Config = Class.new(Dry::Configurable::Config)
+
+          klass = Class.new do
+            extend Dry::Configurable
+
+            setting :database do
+              setting :dsn, config_class: Test::Config do
+                setting :pool do
+                  setting :size, default: 5
+                end
+              end
+            end
+          end
+
+          expect(klass.config.database.dsn).to be_instance_of(Test::Config)
+          expect(klass.config.database.dsn.pool).to be_instance_of(Test::Config)
+          expect(klass.config.database.dsn.pool.size).to be(5)
+        end
+
+        it "updates and converts nested settings that override the parent config class" do
+          Test::Config = Class.new(Dry::Configurable::Config)
+
+          klass = Class.new do
+            extend Dry::Configurable
+
+            setting :database do
+              setting :dsn, config_class: Test::Config do
+                setting :pool, default: 5
+              end
+            end
+          end
+
+          klass.config.update(database: {dsn: {pool: 9}})
+
+          expect(klass.config.database.dsn.pool).to be(9)
+          expect(klass.config.to_h).to eq(database: {dsn: {pool: 9}})
+
+          klass.finalize!
+
+          expect(klass.config.database.dsn).to be_frozen
+          expect(klass.config.to_data.database.dsn.pool).to be(9)
+        end
+      end
+    end
+
+    context "with two plugins sharing the same nested setting DSL" do
+      let(:shared_dsl) do
+        proc do
+          setting :throttle, reader: true do
+            setting :limit, default: "10", constructor: ->(value) { Integer(value) }
+            setting :burst, default: "20", constructor: ->(value) { Integer(value) }
+          end
+        end
+      end
+
+      before do
+        Test::PluginConfig = Class.new(Dry::Configurable::Config)
+
+        shared = shared_dsl
+
+        Test::Alpha = Class.new do
+          extend Dry::Configurable(config_class: Test::PluginConfig)
+          class_exec(&shared)
+        end
+
+        Test::Beta = Class.new do
+          extend Dry::Configurable
+          class_exec(&shared)
+        end
+      end
+
+      it "builds each plugin's nested config with its own config class" do
+        expect(Test::Alpha.config).to be_instance_of(Test::PluginConfig)
+        expect(Test::Alpha.config.throttle).to be_instance_of(Test::PluginConfig)
+
+        expect(Test::Beta.config).to be_instance_of(Dry::Configurable::Config)
+        expect(Test::Beta.config.throttle).to be_instance_of(Dry::Configurable::Config)
+      end
+
+      it "runs each plugin's own constructors for the same field" do
+        Test::Alpha.setting :probe, default: "1", constructor: ->(value) { [:alpha, Integer(value)] }
+        Test::Beta.setting :probe, default: "1", constructor: ->(value) { [:beta, Integer(value)] }
+
+        expect(Test::Alpha.config.probe).to eq([:alpha, 1])
+        expect(Test::Beta.config.probe).to eq([:beta, 1])
+      end
+
+      it "names the plugin and field when a nested constructor fails" do
+        expect { Test::Alpha.throttle.limit = "not-a-number" }.to raise_error(
+          ArgumentError, /setting "throttle\.limit" for Test::Alpha .*not-a-number/
+        )
+
+        expect { Test::Beta.config.throttle.burst = Object.new }.to raise_error(
+          TypeError, /setting "throttle\.burst" for Test::Beta /
+        )
+      end
+
+      it "leaves the other plugin configurable after one plugin's conversion fails" do
+        expect { Test::Alpha.throttle.limit = "not-a-number" }.to raise_error(ArgumentError)
+
+        # The failing plugin is unchanged and remains configurable
+        expect(Test::Alpha.throttle.limit).to be(10)
+        expect(Test::Alpha.config.throttle.configured?(:limit)).to be(false)
+        Test::Alpha.throttle.limit = "11"
+        expect(Test::Alpha.throttle.limit).to be(11)
+
+        # And the other plugin was never affected
+        expect(Test::Beta.throttle.limit).to be(10)
+        Test::Beta.throttle.burst = "25"
+        expect(Test::Beta.throttle.burst).to be(25)
+      end
+
+      it "keeps config values and conversion failures separate per plugin" do
+        Test::Alpha.config.update(throttle: {limit: "30"})
+
+        expect(Test::Alpha.config.to_h).to eq(throttle: {limit: 30, burst: 20})
+        expect(Test::Beta.config.to_h).to eq(throttle: {limit: 10, burst: 20})
+      end
+
+      it "does not register a setting whose nested definition fails" do
+        expect {
+          Test::Beta.setting :broken do
+            setting :ok, default: true
+            setting :"not valid", default: false
+          end
+        }.to raise_error(ArgumentError, /not a valid/)
+
+        expect(Test::Beta.settings.map(&:name)).to eq([:throttle])
+        expect(Test::Beta.config).not_to respond_to(:broken)
+
+        # The plugin that shares the DSL is unaffected
+        expect(Test::Alpha.throttle.limit).to be(10)
+        expect(Test::Alpha.config.throttle).to be_instance_of(Test::PluginConfig)
       end
     end
   end

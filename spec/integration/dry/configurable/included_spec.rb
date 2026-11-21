@@ -164,5 +164,75 @@ RSpec.describe Dry::Configurable, ".included" do
       obj = subclass_l3.new
       expect(obj.config.db).to eq "l2_db!!"
     end
+
+    it "rebuilds nested configs with a subclass's newly chosen config class" do
+      base_config_class = Class.new(Dry::Configurable::Config) do
+        def flavor = :base
+      end
+
+      subclass_config_class = Class.new(Dry::Configurable::Config) do
+        def flavor = :subclass
+      end
+
+      base = Class.new(configurable_class) do
+        include Dry::Configurable(config_class: base_config_class)
+
+        setting :db do
+          setting :user, default: "root"
+        end
+      end
+
+      subclass = Class.new(base) do
+        include Dry::Configurable(config_class: subclass_config_class)
+      end
+
+      expect(subclass.new.config).to be_instance_of(subclass_config_class)
+      expect(subclass.new.config.db).to be_instance_of(subclass_config_class)
+      expect(subclass.new.config.db.flavor).to be(:subclass)
+
+      # The parent keeps using its own config class
+      expect(base.new.config).to be_instance_of(base_config_class)
+      expect(base.new.config.db).to be_instance_of(base_config_class)
+      expect(base.new.config.db.flavor).to be(:base)
+    end
+
+    it "also rebuilds nested configs when extending a subclass with a new config class" do
+      base_config_class = Class.new(Dry::Configurable::Config)
+      subclass_config_class = Class.new(Dry::Configurable::Config)
+
+      base = Class.new do
+        extend Dry::Configurable(config_class: base_config_class)
+
+        setting :db do
+          setting :user, default: "root"
+        end
+      end
+
+      subclass = Class.new(base) do
+        extend Dry::Configurable(config_class: subclass_config_class)
+      end
+
+      expect(subclass.config).to be_instance_of(subclass_config_class)
+      expect(subclass.config.db).to be_instance_of(subclass_config_class)
+
+      expect(base.config).to be_instance_of(base_config_class)
+      expect(base.config.db).to be_instance_of(base_config_class)
+    end
+
+    it "keeps inherited values when a subclass reapplies the same extension" do
+      base = Class.new do
+        extend Dry::Configurable
+
+        setting :db
+      end
+
+      base.config.db = "sqlite"
+
+      subclass = Class.new(base) do
+        extend Dry::Configurable
+      end
+
+      expect(subclass.config.db).to eq("sqlite")
+    end
   end
 end

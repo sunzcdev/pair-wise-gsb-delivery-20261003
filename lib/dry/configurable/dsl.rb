@@ -16,16 +16,31 @@ module Dry
 
       attr_reader :ast
 
-      attr_reader :options
+      # The configurable class that owns the settings declared through this DSL.
+      #
+      # @api private
+      attr_reader :owner
 
-      def initialize(**options, &block)
+      # The path of the enclosing nested settings, e.g. `[:db, :cred]` for settings declared
+      # inside `setting :db { setting :cred { ... } }`.
+      #
+      # @api private
+      attr_reader :path
+
+      def initialize(default_undefined: false, owner: nil, path: EMPTY_ARRAY, &block)
         @compiler = Compiler.new
         @ast = []
-        @options = options
+        @default_undefined = default_undefined
+        @owner = owner
+        @path = path
         instance_exec(&block) if block
       end
 
       # Registers a new setting node and compile it into a setting object
+      #
+      # Compilation happens before the node is added to the AST, so a setting that fails to
+      # compile is never registered. This keeps a failed definition from leaving a partial
+      # setting (or a partially built nested schema) behind for the owning class.
       #
       # @see ClassMethods.setting
       # @api private
@@ -35,7 +50,9 @@ module Dry
           raise ArgumentError, "#{name} is not a valid setting name"
         end
 
-        if DATA_RESERVED_NAMES.include?(name.to_sym)
+        name = name.to_sym
+
+        if DATA_RESERVED_NAMES.include?(name)
           raise ArgumentError,
             "#{name.inspect} is not a valid setting name: it conflicts with a Data " \
             "instance method, which would break Config#to_data"
@@ -43,28 +60,44 @@ module Dry
 
         ensure_valid_options(options)
 
-        options = {default: default, config_class: config_class, **options}
+        node = [:setting, [name, setting_options(name, options)]]
 
-        node = [:setting, [name.to_sym, options]]
+        node = [:nested, [node, nested_ast(name, &block)]] if block
 
-        if block
-          ast << [:nested, [node, DSL.new(**@options, &block).ast]]
-        else
-          ast << node
-        end
+        compiled = compiler.visit(node)
 
-        compiler.visit(ast.last)
-      end
+        ast << node
 
-      def config_class
-        options[:config_class]
+        compiled
       end
 
       def default
-        options[:default_undefined] ? Undefined : nil
+        @default_undefined ? Undefined : nil
       end
 
       private
+
+      # Assembles the options handed to {Setting#initialize}, recording the owner and the
+      # full path so failures can name both the plugin and the field.
+      def setting_options(name, options)
+        {
+          default: options.fetch(:default) { default },
+          owner: owner,
+          path: [*path, name].freeze,
+          **options
+        }
+      end
+
+      # Builds the AST for a nested setting's block, carrying the owner and accumulated path
+      # into the child DSL.
+      def nested_ast(name, &block)
+        DSL.new(
+          default_undefined: @default_undefined,
+          owner: owner,
+          path: [*path, name].freeze,
+          &block
+        ).ast
+      end
 
       def ensure_valid_options(options)
         return if options.none?

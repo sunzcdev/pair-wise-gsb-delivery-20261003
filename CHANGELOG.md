@@ -17,6 +17,12 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Fixed
 
+- Nested settings now use the config class of the class that owns them, including when that class was configured with `config_class:` through `Dry::Configurable(...)`. Previously, nested configs were always built with the config class of the config object they were read from, so classes sharing setting definitions but using different config classes could leak into each other; `Config#update`, `#to_h`, `#finalize!` and `#to_data` now handle nested configs whose class differs from the parent's.
+
+- Constructor and nested-config failures now identify the declaring class and the full setting path (e.g. `setting "connection.timeout" for MyPlugin`). The original error class and backtrace are preserved.
+
+- A setting whose definition fails to compile is no longer registered, and a failed constructor no longer marks the setting as configured or overwrites the previously resolved value.
+
 ### Security
 
 [Unreleased]: https://github.com/dry-rb/dry-configurable/compare/v1.4.0...main
