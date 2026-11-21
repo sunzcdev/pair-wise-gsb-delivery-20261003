@@ -5,6 +5,7 @@ import importlib.util
 import os
 import stat
 from email.utils import parsedate
+from mimetypes import guess_type
 from typing import Union
 
 import anyio
@@ -18,6 +19,7 @@ from starlette.types import Receive, Scope, Send
 from starlette.websockets import WebSocketClose
 
 PathLike = Union[str, "os.PathLike[str]"]
+Precompressed = dict[str, str]
 
 
 class NotModifiedResponse(Response):
@@ -46,6 +48,7 @@ class StaticFiles:
         html: bool = False,
         check_dir: bool = True,
         follow_symlink: bool = False,
+        precompressed: Precompressed | None = None,
     ) -> None:
         self.directory = directory
         self.packages = packages
@@ -53,6 +56,7 @@ class StaticFiles:
         self.html = html
         self.config_checked = False
         self.follow_symlink = follow_symlink
+        self.precompressed = precompressed
         if check_dir and directory is not None and not os.path.isdir(directory):
             raise RuntimeError(f"Directory '{directory}' does not exist")
 
@@ -135,7 +139,7 @@ class StaticFiles:
 
         if stat_result and stat.S_ISREG(stat_result.st_mode):
             # We have a static file to serve.
-            return self.file_response(full_path, stat_result, scope)
+            return await self.file_response(full_path, stat_result, scope)
 
         elif stat_result and stat.S_ISDIR(stat_result.st_mode) and self.html:
             # We're in HTML mode, and have got a directory URL.
@@ -148,13 +152,16 @@ class StaticFiles:
                     url = URL(scope=scope)
                     url = url.replace(path=url.path + "/")
                     return RedirectResponse(url=url)
-                return self.file_response(full_path, stat_result, scope)
+                return await self.file_response(full_path, stat_result, scope)
 
         if self.html:
             # Check for '404.html' if we're in HTML mode.
             full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, "404.html")
             if stat_result and stat.S_ISREG(stat_result.st_mode):
-                return FileResponse(full_path, stat_result=stat_result, status_code=404)
+                response = FileResponse(full_path, stat_result=stat_result, status_code=404)
+                if self.precompressed is not None:
+                    response.headers.add_vary_header("accept-encoding")
+                return response
         raise HTTPException(status_code=404)
 
     def lookup_path(self, path: str) -> tuple[str, os.stat_result | None]:
@@ -178,7 +185,91 @@ class StaticFiles:
                 continue
         return "", None
 
-    def file_response(
+    def lookup_precompressed_path(
+        self, full_path: PathLike, encoding: str
+    ) -> tuple[str, os.stat_result | None]:
+        """
+        Given the resolved path of a regular file and a selected content
+        encoding, return the path and stat result of the precompressed
+        representation sitting next to it, or `("", None)` if it does not
+        exist or is not a regular file.
+        """
+        candidate = f"{full_path}{self.precompressed[encoding]}"
+        try:
+            stat_result = os.stat(candidate)
+        except (FileNotFoundError, NotADirectoryError):
+            return "", None
+        if not stat.S_ISREG(stat_result.st_mode):
+            return "", None
+        return candidate, stat_result
+
+    @staticmethod
+    def _parse_accept_encoding(accept_encoding: str) -> list[tuple[str, float]]:
+        """
+        Parse an `Accept-Encoding` header into a list of `(encoding, weight)`
+        pairs, preserving the order in which the encodings were sent.
+        """
+        encodings: list[tuple[str, float]] = []
+        for item in accept_encoding.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            coding, _, params = item.partition(";")
+            coding = coding.strip().lower()
+            weight = 1.0
+            for param in params.split(";"):
+                param = param.strip()
+                if param.lower().startswith("q="):
+                    try:
+                        weight = float(param[2:])
+                    except ValueError:
+                        weight = 0.0
+            encodings.append((coding, weight))
+        return encodings
+
+    def _get_acceptable_encodings(self, request_headers: Headers) -> list[str]:
+        """
+        Return the configured precompressed encodings that the client accepts,
+        ordered by preference (highest `Accept-Encoding` weight first, ties
+        broken by the client's header order). An empty list means the client
+        only accepts the unencoded representation (or precompressed files are
+        disabled).
+        """
+        if not self.precompressed:
+            return []
+
+        accept_encoding = request_headers.get("accept-encoding")
+        if accept_encoding is None:
+            # RFC 9110: without an Accept-Encoding header, any content coding
+            # is considered acceptable.
+            return list(self.precompressed)
+
+        accepted = self._parse_accept_encoding(accept_encoding)
+        weights = dict(accepted)
+        wildcard_weight = weights.get("*")
+        header_order = {coding: index for index, (coding, _) in enumerate(accepted)}
+        fallback_order = len(accepted)
+
+        candidates: list[tuple[float, int, str]] = []
+        for encoding in self.precompressed:
+            if encoding in weights:
+                weight = weights[encoding]
+                order = header_order[encoding]
+            elif wildcard_weight is not None:
+                weight = wildcard_weight
+                order = fallback_order
+            else:
+                # An encoding that is neither advertised nor covered by a
+                # wildcard must not be sent.
+                continue
+            if weight > 0:
+                candidates.append((weight, order, encoding))
+
+        # Highest weight wins; ties are broken by the client's header order.
+        candidates.sort(key=lambda candidate: (-candidate[0], candidate[1]))
+        return [encoding for _, _, encoding in candidates]
+
+    async def file_response(
         self,
         full_path: PathLike,
         stat_result: os.stat_result,
@@ -187,7 +278,34 @@ class StaticFiles:
     ) -> Response:
         request_headers = Headers(scope=scope)
 
-        response = FileResponse(full_path, status_code=status_code, stat_result=stat_result)
+        # The media type always describes the original resource, even when the
+        # bytes that are actually sent come from a precompressed representation.
+        media_type = guess_type(full_path)[0] or "application/octet-stream"
+        content_encoding: str | None = None
+
+        for encoding in self._get_acceptable_encodings(request_headers):
+            precompressed_path, precompressed_stat = await anyio.to_thread.run_sync(
+                self.lookup_precompressed_path, os.fspath(full_path), encoding
+            )
+            if precompressed_stat is not None:
+                full_path = precompressed_path
+                stat_result = precompressed_stat
+                content_encoding = encoding
+                break
+
+        response = FileResponse(
+            full_path,
+            status_code=status_code,
+            stat_result=stat_result,
+            media_type=media_type,
+        )
+        if content_encoding is not None:
+            response.headers["content-encoding"] = content_encoding
+        if self.precompressed is not None:
+            # The representation varies with Accept-Encoding whenever
+            # precompressed files may be used.
+            response.headers.add_vary_header("accept-encoding")
+
         if self.is_not_modified(response.headers, request_headers):
             return NotModifiedResponse(response.headers)
         return response

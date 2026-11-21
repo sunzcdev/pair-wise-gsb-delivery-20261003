@@ -2,6 +2,12 @@
 toc_depth: 2
 ---
 
+## Unreleased
+
+#### Added
+
+* Add a `precompressed` option to `StaticFiles` for serving precompressed files stored next to the originals, selected from the request's `Accept-Encoding` weights. The `Content-Type` always describes the original resource while `Content-Length`, `ETag`, `Last-Modified` and ranges describe the representation that is sent, and `Vary: Accept-Encoding` is added to keep cached representations apart.
+
 ## 1.10.0 (October 24, 2026)
 
 #### Changed

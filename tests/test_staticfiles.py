@@ -1,3 +1,4 @@
+import gzip
 import os
 import stat
 import tempfile
@@ -682,3 +683,358 @@ def test_staticfiles_relative_directory_symlinks(test_client_factory: TestClient
     response = client.get("/example.txt")
     assert response.status_code == 200
     assert response.text == "123\n"
+
+
+def _write_precompressed(tmpdir: Path, name: str = "example.txt") -> tuple[Path, Path, Path, bytes]:
+    original = tmpdir / name
+    gzip_path = tmpdir / f"{name}.gz"
+    brotli_path = tmpdir / f"{name}.br"
+    payload = b"<file content>" * 10
+    original.write_bytes(payload)
+    # A real gzip representation: the TestClient transparently decodes gzip,
+    # so it must contain valid gzip data.
+    gzip_path.write_bytes(gzip.compress(payload))
+    # "br" isn't auto-decoded in this environment, so plain bytes are enough.
+    brotli_path.write_bytes(b"<brotli representation>")
+    return original, gzip_path, brotli_path, payload
+
+
+def test_staticfiles_precompressed_sends_configured_representation(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    _write_precompressed(tmp_path)
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+
+    # "br" isn't transparently decoded by the TestClient in this environment.
+    response = client.get("/example.txt", headers={"accept-encoding": "br"})
+    assert response.status_code == 200
+    # The actual precompressed representation is sent.
+    assert response.content == b"<brotli representation>"
+    assert response.headers["content-encoding"] == "br"
+    # Content-Type still describes the original resource.
+    assert response.headers["content-type"] == "text/plain; charset=utf-8"
+    # Content length belongs to the representation that is sent.
+    assert response.headers["content-length"] == str(len(b"<brotli representation>"))
+    assert response.headers["vary"] == "accept-encoding"
+    assert response.headers["accept-ranges"] == "bytes"
+
+
+def test_staticfiles_precompressed_preserves_original_media_type(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "example.css").write_text("body {}", encoding="utf-8")
+    (tmp_path / "example.css.br").write_bytes(b"css-br")
+
+    app = StaticFiles(directory=tmp_path, precompressed={"br": ".br"})
+    client = test_client_factory(app)
+
+    response = client.get("/example.css", headers={"accept-encoding": "br"})
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/css; charset=utf-8"
+    assert response.headers["content-encoding"] == "br"
+
+
+def test_staticfiles_precompressed_etag_and_length_belong_to_representation(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    _, _, _, payload = _write_precompressed(tmp_path)
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+
+    compressed_response = client.get("/example.txt", headers={"accept-encoding": "br"})
+    identity_response = client.get("/example.txt", headers={"accept-encoding": "identity"})
+
+    assert compressed_response.headers["etag"] != identity_response.headers["etag"]
+    assert compressed_response.headers["content-length"] != identity_response.headers["content-length"]
+    assert compressed_response.headers["content-length"] == str(len(b"<brotli representation>"))
+    assert identity_response.headers["content-length"] == str(len(payload))
+    assert "content-encoding" not in identity_response.headers
+
+
+def test_staticfiles_precompressed_does_not_304_with_foreign_etag(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    _, _, _, payload = _write_precompressed(tmp_path)
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+
+    compressed_response = client.get("/example.txt", headers={"accept-encoding": "br"})
+    compressed_etag = compressed_response.headers["etag"]
+
+    # The client reuses the compressed ETag while requesting the original
+    # representation: this must not produce a 304.
+    response = client.get(
+        "/example.txt",
+        headers={"accept-encoding": "identity", "if-none-match": compressed_etag},
+    )
+    assert response.status_code == 200
+    assert response.content == payload
+
+    # The same ETag still validates the matching representation.
+    matching = client.get(
+        "/example.txt",
+        headers={"accept-encoding": "br", "if-none-match": compressed_etag},
+    )
+    assert matching.status_code == 304
+    assert matching.content == b""
+    # The 304 keeps the representation's caching headers.
+    assert matching.headers["etag"] == compressed_etag
+    assert matching.headers["vary"] == "accept-encoding"
+
+
+def test_staticfiles_precompressed_304_with_last_modified(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    original, gzip_path, brotli_path, _ = _write_precompressed(tmp_path)
+    modified_time = time.mktime(time.strptime("2013-10-10 23:40:00", "%Y-%m-%d %H:%M:%S"))
+    os.utime(brotli_path, (modified_time, modified_time))
+
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+
+    response = client.get("/example.txt", headers={"accept-encoding": "br"})
+    last_modified = response.headers["last-modified"]
+
+    cached = client.get(
+        "/example.txt",
+        headers={"accept-encoding": "br", "if-modified-since": last_modified},
+    )
+    assert cached.status_code == 304
+
+    # The original file's timestamp must not be used for the compressed one.
+    stale = client.get(
+        "/example.txt",
+        headers={
+            "accept-encoding": "br",
+            "if-modified-since": "Thu, 20 Feb 2012 15:30:19 GMT",
+        },
+    )
+    assert stale.status_code == 200
+    assert stale.content == b"<brotli representation>"
+
+
+@pytest.mark.parametrize(
+    ("accept_encoding", "expected"),
+    [
+        ("gzip, br", "gzip"),
+        ("br, gzip", "br"),
+        ("gzip;q=0.5, br;q=0.9", "br"),
+        ("br;q=0.9, gzip", "gzip"),
+        ("gzip;q=0, br;q=0", None),
+        ("identity", None),
+        ("*", "gzip"),
+        ("*;q=0", None),
+        ("br;q=0, *;q=0.5", "gzip"),
+    ],
+)
+def test_staticfiles_precompressed_encoding_negotiation(
+    tmp_path: Path,
+    test_client_factory: TestClientFactory,
+    accept_encoding: str,
+    expected: str | None,
+) -> None:
+    _write_precompressed(tmp_path)
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+
+    response = client.get("/example.txt", headers={"accept-encoding": accept_encoding})
+    assert response.headers.get("content-encoding") == expected
+
+
+def test_staticfiles_precompressed_without_accept_encoding_uses_first(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    _write_precompressed(tmp_path)
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+
+    response = client.get("/example.txt")
+    assert response.status_code == 200
+    assert response.headers["content-encoding"] == "gzip"
+
+
+def test_staticfiles_precompressed_falls_back_to_next_encoding(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    _write_precompressed(tmp_path)
+    (tmp_path / "example.txt.br").unlink()
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+
+    response = client.get("/example.txt", headers={"accept-encoding": "br, gzip"})
+    assert response.status_code == 200
+    assert response.headers["content-encoding"] == "gzip"
+    # The TestClient transparently decodes the real gzip payload.
+    assert response.content == b"<file content>" * 10
+
+
+def test_staticfiles_precompressed_missing_files_serves_original(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    payload = b"<file content>" * 10
+    (tmp_path / "example.txt").write_bytes(payload)
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+
+    response = client.get("/example.txt", headers={"accept-encoding": "gzip, br"})
+    assert response.status_code == 200
+    assert response.content == payload
+    assert "content-encoding" not in response.headers
+    # The response still varies because negotiation is enabled.
+    assert response.headers["vary"] == "accept-encoding"
+
+
+def test_staticfiles_precompressed_disabled_keeps_original_behavior(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "example.txt").write_bytes(b"<file content>")
+    (tmp_path / "example.txt.gz").write_bytes(b"<gzip representation>")
+    app = StaticFiles(directory=tmp_path)
+    client = test_client_factory(app)
+
+    response = client.get("/example.txt", headers={"accept-encoding": "gzip"})
+    assert response.status_code == 200
+    assert response.content == b"<file content>"
+    assert "content-encoding" not in response.headers
+    assert "vary" not in response.headers
+
+
+def test_staticfiles_precompressed_range_uses_representation_size(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    _write_precompressed(tmp_path)
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+    headers = {"accept-encoding": "br"}
+
+    full = client.get("/example.txt", headers=headers)
+    representation_size = len(b"<brotli representation>")
+    assert int(full.headers["content-length"]) == representation_size
+
+    ranged = client.get("/example.txt", headers={**headers, "range": "bytes=0-4"})
+    assert ranged.status_code == 206
+    assert ranged.content == b"<brot"
+    assert ranged.headers["content-range"] == f"bytes 0-4/{representation_size}"
+    assert ranged.headers["content-length"] == "5"
+    assert ranged.headers["content-encoding"] == "br"
+    assert ranged.headers["content-type"] == "text/plain; charset=utf-8"
+
+
+def test_staticfiles_precompressed_if_range_matching_etag(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    _write_precompressed(tmp_path)
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+
+    full = client.get("/example.txt", headers={"accept-encoding": "br"})
+    etag = full.headers["etag"]
+
+    matched = client.get(
+        "/example.txt",
+        headers={
+            "accept-encoding": "br",
+            "range": "bytes=0-4",
+            "if-range": etag,
+        },
+    )
+    assert matched.status_code == 206
+    assert matched.headers["etag"] == etag
+    assert matched.headers["content-encoding"] == "br"
+
+
+def test_staticfiles_precompressed_if_range_foreign_etag_ignores_range(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    _write_precompressed(tmp_path)
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+
+    identity = client.get("/example.txt", headers={"accept-encoding": "identity"})
+
+    mismatched = client.get(
+        "/example.txt",
+        headers={
+            "accept-encoding": "br",
+            "range": "bytes=0-4",
+            "if-range": identity.headers["etag"],
+        },
+    )
+    assert mismatched.status_code == 200
+    assert "content-range" not in mismatched.headers
+    assert mismatched.content == b"<brotli representation>"
+
+
+def test_staticfiles_precompressed_head_matches_get_headers(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    _write_precompressed(tmp_path)
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+    headers = {"accept-encoding": "br"}
+
+    get_response = client.get("/example.txt", headers=headers)
+    head_response = client.head("/example.txt", headers=headers)
+
+    assert head_response.status_code == 200
+    assert head_response.content == b""
+    for header in ("etag", "last-modified", "content-length", "content-encoding", "content-type", "vary"):
+        assert head_response.headers[header] == get_response.headers[header]
+
+
+def test_staticfiles_precompressed_head_range_matches_get_range(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    _write_precompressed(tmp_path)
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+
+    full = client.get("/example.txt", headers={"accept-encoding": "br"})
+    request_headers = {"accept-encoding": "br", "range": "bytes=0-4", "if-range": full.headers["etag"]}
+    head_ranged = client.head("/example.txt", headers=request_headers)
+    get_ranged = client.get("/example.txt", headers=request_headers)
+
+    assert head_ranged.status_code == get_ranged.status_code == 206
+    for header in ("etag", "content-range", "content-length", "content-encoding", "vary"):
+        assert head_ranged.headers[header] == get_ranged.headers[header]
+    assert head_ranged.content == b""
+
+
+def test_staticfiles_precompressed_html_mode_index(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    directory = tmp_path / "dir"
+    directory.mkdir()
+    (directory / "index.html").write_text("<h1>Hello</h1>", encoding="utf-8")
+    (directory / "index.html.br").write_bytes(b"<brotli html>")
+
+    app = StaticFiles(directory=tmp_path, html=True, precompressed={"gzip": ".gz", "br": ".br"})
+    client = test_client_factory(app)
+
+    response = client.get("/dir/", headers={"accept-encoding": "br"})
+    assert response.status_code == 200
+    assert response.content == b"<brotli html>"
+    assert response.headers["content-encoding"] == "br"
+    assert response.headers["content-type"] == "text/html; charset=utf-8"
+    assert response.headers["vary"] == "accept-encoding"
+
+
+def test_staticfiles_precompressed_round_trips_real_gzip(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    payload = b"<file content>" * 50
+    (tmp_path / "example.txt").write_bytes(payload)
+    (tmp_path / "example.txt.gz").write_bytes(gzip.compress(payload))
+
+    app = StaticFiles(directory=tmp_path, precompressed={"gzip": ".gz"})
+    # Disable the client's automatic content decoding to inspect the raw bytes.
+    client = test_client_factory(app)
+    response = client.get(
+        "/example.txt",
+        headers={"accept-encoding": "gzip"},
+    )
+    # TestClient/httpx transparently decompresses gzip responses.
+    assert response.content == payload
+    assert response.headers["content-encoding"] == "gzip"
+
