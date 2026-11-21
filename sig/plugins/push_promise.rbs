@@ -1,6 +1,8 @@
 module HTTPX
   module Plugins
     module PushPromise
+      REPRESENTATION_HEADERS: Array[String]
+
       module ResponseMethods
         @__pushed: bool?
 
@@ -13,6 +15,9 @@ module HTTPX
         private
 
         def promise_headers: () -> Hash[::HTTP2::Stream, Request]
+        def find_promised_request: (Connection::HTTP2, String, String, Headers) -> Request?
+        def promised_request_match?: (Request, String, String, Headers) -> bool
+        def __release_promised_request_stream: (Connection::HTTP2, Request) -> void
         def __on_promise_request: (Connection::HTTP2, ::HTTP2::Stream, headers_input) -> void
         def __on_promise_response: (Connection::HTTP2, ::HTTP2::Stream, headers_input) -> void
       end

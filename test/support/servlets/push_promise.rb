@@ -5,9 +5,9 @@ require_relative "test"
 class PushPromiseServer < TestHTTP2Server
   using HTTPX::URIExtensions
 
-  def initialize(num_promises: 1, **kw)
+  def initialize(num_promises: 1, promises: nil, **kw)
     super(**kw)
-    @num_promises = num_promises
+    @promises = promises || num_promises.times.map { |i| { ":path" => "/#{i}" } }
   end
 
   private
@@ -24,11 +24,10 @@ class PushPromiseServer < TestHTTP2Server
 
     authority = URI(origin).authority
     push_streams = []
-    @num_promises.times do |i|
+    @promises.each_with_index do |extra, i|
       head = { ":method" => "GET",
                ":scheme" => "https",
-               ":path" => "/#{i}",
-               ":authority" => authority }
+               ":authority" => authority }.merge(extra)
 
       stream.promise(head) do |push|
         child_response = "CHILD #{i}"
