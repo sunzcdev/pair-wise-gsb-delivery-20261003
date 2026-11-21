@@ -144,6 +144,10 @@ class Schedule:
         processing
     :var str | None acquired_until: the time after which other schedulers are free to
         acquire the schedule for processing even if it is still marked as acquired
+    :var str token: an opaque identifier for the current version of the schedule; the
+        data store assigns a new token whenever the schedule is (re)placed in the
+        store, and uses it to reject stale updates from schedulers that acquired a
+        previous version of the schedule
     """
 
     id: str = attrs.field(validator=[instance_of(str), min_len(1)], on_setattr=frozen)
@@ -195,6 +199,9 @@ class Schedule:
     acquired_until: datetime | None = attrs.field(
         converter=as_aware_datetime, default=None
     )
+    token: str = attrs.field(
+        factory=lambda: uuid4().hex, validator=instance_of(str), repr=False
+    )
 
     def marshal(self, serializer: Serializer) -> dict[str, Any]:
         marshalled = attrs.asdict(self, recurse=False, value_serializer=serialize)
@@ -204,6 +211,10 @@ class Schedule:
         if not self.acquired_by:
             del marshalled["acquired_by"]
             del marshalled["acquired_until"]
+
+        # The token is assigned by, and only meaningful to, the data store currently
+        # holding the schedule, so it is not (de)serialized
+        del marshalled["token"]
 
         return marshalled
 
@@ -249,6 +260,8 @@ class ScheduleResult:
     :ivar trigger: the schedule's trigger
     :ivar last_fire_time: the schedule's trigger
     :ivar next_fire_time: the next
+    :ivar str | None token: the token of the schedule version this result was computed
+        from, or ``None`` to have the data store apply the result unconditionally
     """
 
     schedule_id: str
@@ -256,6 +269,7 @@ class ScheduleResult:
     trigger: Trigger
     last_fire_time: datetime
     next_fire_time: datetime | None
+    token: str | None = None
 
 
 @attrs.define(kw_only=True, order=False)

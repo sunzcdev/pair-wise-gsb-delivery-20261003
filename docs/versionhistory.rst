@@ -6,6 +6,13 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **UNRELEASED**
 
+- **BREAKING** Added a version ``token`` to schedules. Data stores assign a new token
+  whenever a schedule is (re)placed in the store, and ``release_schedules()`` now only
+  applies results whose token still matches the stored schedule, returning the IDs of
+  the schedules whose results were applied. This prevents a scheduler that acquired a
+  schedule before it was replaced (``ConflictPolicy.replace``) from writing stale
+  trigger state back over the new version of the schedule. Token validation is
+  currently enforced by the memory data store.
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+

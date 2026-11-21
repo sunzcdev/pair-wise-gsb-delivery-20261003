@@ -5,7 +5,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import MAXYEAR, UTC, datetime, timedelta
 from functools import partial
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import attrs
 
@@ -107,6 +107,11 @@ class MemoryDataStore(BaseDataStore):
             del self._schedules[index]
             self._schedules_by_task_id[old_schedule.task_id].remove(old_schedule)
 
+        # Assign a new token to mark this as a new version of the schedule. This
+        # establishes a clear replacement boundary: any scheduler still holding a
+        # previously acquired version of this schedule will not be able to write
+        # its stale state back over this version.
+        schedule.token = uuid4().hex
         self._schedules_by_id[schedule.id] = schedule
         self._schedules_by_task_id[schedule.task_id].add(schedule)
         insort_right(self._schedules, schedule)
@@ -174,11 +179,29 @@ class MemoryDataStore(BaseDataStore):
 
     async def release_schedules(
         self, scheduler_id: str, results: Sequence[ScheduleResult]
-    ) -> None:
+    ) -> set[str]:
         # Send update events for schedules
+        released_schedule_ids: set[str] = set()
         for result in results:
+            schedule = self._schedules_by_id.get(result.schedule_id)
+            if schedule is None:
+                self._logger.debug(
+                    "Not releasing schedule %r: it no longer exists in the data "
+                    "store",
+                    result.schedule_id,
+                )
+                continue
+
+            if result.token is not None and schedule.token != result.token:
+                self._logger.info(
+                    "Not releasing schedule %r: it was replaced while it was being "
+                    "processed by scheduler %r",
+                    result.schedule_id,
+                    scheduler_id,
+                )
+                continue
+
             # Remove the schedule
-            schedule = self._schedules_by_id[result.schedule_id]
             index = self._find_schedule_index(schedule)
             del self._schedules[index]
 
@@ -188,12 +211,15 @@ class MemoryDataStore(BaseDataStore):
             schedule.acquired_by = None
             schedule.acquired_until = None
             insort_right(self._schedules, schedule)
+            released_schedule_ids.add(result.schedule_id)
             event = ScheduleUpdated(
                 schedule_id=result.schedule_id,
                 task_id=schedule.task_id,
                 next_fire_time=result.next_fire_time,
             )
             await self._event_broker.publish(event)
+
+        return released_schedule_ids
 
     async def get_next_schedule_run_time(self) -> datetime | None:
         for schedule in self._schedules:

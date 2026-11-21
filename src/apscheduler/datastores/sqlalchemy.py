@@ -700,11 +700,12 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
 
     async def release_schedules(
         self, scheduler_id: str, results: Sequence[ScheduleResult]
-    ) -> None:
+    ) -> set[str]:
         task_ids = {result.schedule_id: result.task_id for result in results}
         next_fire_times = {
             result.schedule_id: result.next_fire_time for result in results
         }
+        released_schedule_ids: set[str] = set()
         async for attempt in self._retry():
             with attempt:
                 async with self._begin_transaction() as conn:
@@ -783,6 +784,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                         # TODO: actually check which rows were updated?
                         await self._execute(conn, update, update_args)
                         updated_ids = list(next_fire_times)
+                        released_schedule_ids.update(updated_ids)
 
                         for schedule_id in updated_ids:
                             event = ScheduleUpdated(
@@ -798,6 +800,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             self._t_schedules.c.id.in_(finished_schedule_ids)
                         )
                         await self._execute(conn, delete)
+                        released_schedule_ids.update(finished_schedule_ids)
 
         for event in update_events:
             await self._event_broker.publish(event)
@@ -810,6 +813,8 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                     finished=True,
                 )
             )
+
+        return released_schedule_ids
 
     async def get_next_schedule_run_time(self) -> datetime | None:
         columns = [self._t_schedules.c.next_fire_time]

@@ -420,7 +420,7 @@ class MongoDBDataStore(BaseExternalDataStore):
 
     async def release_schedules(
         self, scheduler_id: str, results: Sequence[ScheduleResult]
-    ) -> None:
+    ) -> set[str]:
         updated_schedules: list[tuple[str, datetime | None]] = []
         finished_schedule_ids: list[str] = []
         task_ids = {result.schedule_id: result.task_id for result in results}
@@ -478,6 +478,10 @@ class MongoDBDataStore(BaseExternalDataStore):
                     finished=True,
                 )
             )
+
+        return {schedule_id for schedule_id, _ in updated_schedules} | set(
+            finished_schedule_ids
+        )
 
     async def get_next_schedule_run_time(self) -> datetime | None:
         async for attempt in self._retry():

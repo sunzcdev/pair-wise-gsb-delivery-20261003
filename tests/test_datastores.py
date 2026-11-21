@@ -261,6 +261,7 @@ async def test_acquire_release_schedules(
                 trigger=schedules1[0].trigger,
                 last_fire_time=datetime(2020, 9, 14, tzinfo=UTC),
                 next_fire_time=None,
+                token=schedules1[0].token,
             )
         )
         results2.append(
@@ -270,12 +271,15 @@ async def test_acquire_release_schedules(
                 trigger=schedules1[0].trigger,
                 last_fire_time=datetime(2020, 9, 14, tzinfo=UTC),
                 next_fire_time=datetime(2020, 9, 15, tzinfo=UTC),
+                token=schedules2[0].token,
             )
         )
 
         # Release all the schedules
-        await datastore.release_schedules("dummy-id1", results1)
-        await datastore.release_schedules("dummy-id2", results2)
+        released1 = await datastore.release_schedules("dummy-id1", results1)
+        released2 = await datastore.release_schedules("dummy-id2", results2)
+        assert released1 == {"s1"}
+        assert released2 == {"s2"}
 
         # Check that the first schedule has its next fire time nullified
         schedules = await datastore.get_schedules()
@@ -303,6 +307,115 @@ async def test_acquire_release_schedules(
     assert received_event.next_fire_time == datetime(2020, 9, 15, tzinfo=UTC)
 
     assert not events
+
+
+async def test_release_schedule_replaced_while_acquired(
+    local_broker: EventBroker, logger: Logger
+) -> None:
+    """
+    Test that when a schedule is replaced (ConflictPolicy.replace) while a scheduler
+    is processing a previously acquired version of it, the stale processing result
+    is not written back over the new version of the schedule, and the stale
+    scheduler can tell that its write-back was rejected.
+    """
+    async with AsyncExitStack() as exit_stack:
+        await local_broker.start(exit_stack, logger)
+        datastore = MemoryDataStore()
+        await datastore.start(exit_stack, local_broker, logger)
+
+        # Add the initial version of the schedule
+        trigger = DateTrigger(datetime(2020, 9, 13, tzinfo=UTC))
+        schedule = Schedule(
+            id="s1",
+            task_id="task1",
+            job_executor="async",
+            trigger=trigger,
+            args=("old",),
+        )
+        schedule.next_fire_time = trigger.next()
+        await datastore.add_schedule(schedule, ConflictPolicy.exception)
+
+        # The first scheduling loop acquires the schedule (and is then "stopped"
+        # before it can release it)
+        acquired = await datastore.acquire_schedules(
+            "scheduler-1", timedelta(seconds=30), 10
+        )
+        assert len(acquired) == 1
+        old_token = acquired[0].token
+
+        # Operations replaces the schedule with a new trigger and new arguments
+        new_trigger = DateTrigger(datetime(2020, 9, 20, tzinfo=UTC))
+        new_schedule = Schedule(
+            id="s1",
+            task_id="task1",
+            job_executor="async",
+            trigger=new_trigger,
+            args=("new",),
+        )
+        new_schedule.next_fire_time = new_trigger.next()
+        await datastore.add_schedule(new_schedule, ConflictPolicy.replace)
+
+        # The replacement must have been assigned a new token
+        schedules = await datastore.get_schedules()
+        assert len(schedules) == 1
+        assert schedules[0].token != old_token
+
+        # The second scheduling loop takes over the new version of the schedule
+        acquired2 = await datastore.acquire_schedules(
+            "scheduler-2", timedelta(seconds=30), 10
+        )
+        assert len(acquired2) == 1
+        assert acquired2[0].next_fire_time == datetime(2020, 9, 20, tzinfo=UTC)
+        assert acquired2[0].args == ("new",)
+
+        # The old processor must not be able to extend the lease of the new version
+        acquired_until = acquired2[0].acquired_until
+        await datastore.extend_acquired_schedule_leases(
+            "scheduler-1", {"s1"}, timedelta(days=365)
+        )
+        schedules = await datastore.get_schedules()
+        assert schedules[0].acquired_by == "scheduler-2"
+        assert schedules[0].acquired_until == acquired_until
+
+        # The old processor's write-back must be rejected, and it must be able to
+        # tell that from the return value
+        old_result = ScheduleResult(
+            schedule_id="s1",
+            task_id="task1",
+            trigger=trigger,
+            last_fire_time=datetime(2020, 9, 13, tzinfo=UTC),
+            next_fire_time=datetime(2020, 9, 14, tzinfo=UTC),
+            token=old_token,
+        )
+        released = await datastore.release_schedules("scheduler-1", [old_result])
+        assert released == set()
+
+        # The stored schedule must still reflect the new plan, untouched by the
+        # stale result
+        schedules = await datastore.get_schedules()
+        assert len(schedules) == 1
+        assert schedules[0].last_fire_time is None
+        assert schedules[0].next_fire_time == datetime(2020, 9, 20, tzinfo=UTC)
+        assert schedules[0].args == ("new",)
+        assert schedules[0].acquired_by == "scheduler-2"
+
+        # The new processor's write-back is accepted
+        new_result = ScheduleResult(
+            schedule_id="s1",
+            task_id="task1",
+            trigger=new_trigger,
+            last_fire_time=datetime(2020, 9, 20, tzinfo=UTC),
+            next_fire_time=None,
+            token=acquired2[0].token,
+        )
+        released = await datastore.release_schedules("scheduler-2", [new_result])
+        assert released == {"s1"}
+
+        schedules = await datastore.get_schedules()
+        assert len(schedules) == 1
+        assert schedules[0].last_fire_time == datetime(2020, 9, 20, tzinfo=UTC)
+        assert schedules[0].next_fire_time is None
+        assert schedules[0].acquired_by is None
 
 
 async def test_release_schedule_two_identical_fire_times(datastore: DataStore) -> None:

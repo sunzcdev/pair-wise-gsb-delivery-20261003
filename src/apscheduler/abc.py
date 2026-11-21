@@ -227,6 +227,10 @@ class DataStore(metaclass=ABCMeta):
         """
         Add or update the given schedule in the data store.
 
+        Whenever a schedule is placed in the store (whether added or replaced), the
+        data store assigns it a new token, thus invalidating any previously acquired
+        version of the same schedule.
+
         :param schedule: schedule to be added
         :param conflict_policy: policy that determines what to do if there is an
             existing schedule with the same ID
@@ -267,7 +271,7 @@ class DataStore(metaclass=ABCMeta):
     @abstractmethod
     async def release_schedules(
         self, scheduler_id: str, results: Sequence[ScheduleResult]
-    ) -> None:
+    ) -> set[str]:
         """
         Release the claims on the given schedules and update them on the store.
 
@@ -280,8 +284,15 @@ class DataStore(metaclass=ABCMeta):
         * ``acquired_by`` (must beset to ``None``)
         * ``acquired_until`` (must be set to ``None``)
 
+        If a result carries a token, the data store must only apply it if the stored
+        schedule still has the same token. If the schedule has been replaced (or
+        removed) since it was acquired, the result must be silently discarded, so
+        that stale state from the old version of the schedule is never written onto
+        the new one.
+
         :param scheduler_id: unique identifier of the scheduler
         :param results: list of schedule processing results
+        :return: the IDs of the schedules whose results were applied
         """
 
     @abstractmethod

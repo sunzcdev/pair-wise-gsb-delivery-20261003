@@ -1054,11 +1054,22 @@ class AsyncScheduler:
                                 trigger=schedule.trigger,
                                 last_fire_time=fire_times[-1],
                                 next_fire_time=next_fire_time,
+                                token=schedule.token,
                             )
                         )
 
                 # Update the schedules (and release the scheduler's claim on them)
-                await self.data_store.release_schedules(self.identity, results)
+                released_schedule_ids = await self.data_store.release_schedules(
+                    self.identity, results
+                )
+                for result in results:
+                    if result.schedule_id not in released_schedule_ids:
+                        self.logger.info(
+                            "The result for schedule %r was not applied because the "
+                            "schedule was replaced or removed while it was being "
+                            "processed",
+                            result.schedule_id,
+                        )
 
                 # If we received fewer schedules than the maximum amount, sleep
                 # until the next schedule is due or the scheduler is explicitly
