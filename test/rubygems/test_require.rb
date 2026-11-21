@@ -316,6 +316,93 @@ class TestGemRequire < Gem::TestCase
     assert_equal %w[a-1], loaded_spec_names
   end
 
+  # A registered default gem only says Ruby ships it. Until one of its files
+  # is required, another version can be selected by the usual version rules.
+
+  def test_registered_default_gem_does_not_block_selecting_another_version
+    default_gem_spec = new_default_spec "shared", "1.0", nil, "shared.rb"
+    install_default_gems default_gem_spec
+
+    Gem::Specification.reset
+
+    # Only registered, nothing loaded yet.
+    refute_predicate default_gem_spec, :files_loaded?
+    assert_nil default_gem_spec.loaded_files_description
+
+    normal_gem_spec = util_spec "shared", "2.0", nil, "lib/shared.rb"
+    install_specs normal_gem_spec
+
+    assert_require "shared"
+    assert_equal %w[shared-2.0], loaded_spec_names
+    refute Gem.loaded_specs["shared"].default_gem?
+  end
+
+  def test_loaded_default_gem_reports_which_version_served_the_files
+    default_gem_spec = new_default_spec "shared", "1.0", nil, "shared.rb"
+    install_default_gems default_gem_spec
+
+    Gem::Specification.reset
+
+    assert_require "shared"
+    assert_equal %w[shared-1.0], loaded_spec_names
+
+    loaded = Gem.loaded_specs["shared"]
+    assert_predicate loaded, :files_loaded?
+    assert_includes loaded.loaded_files_description, "shared-1.0"
+
+    normal_gem_spec = util_spec "shared", "2.0", nil, "lib/shared.rb"
+    install_specs normal_gem_spec
+
+    e = assert_raise Gem::LoadError do
+      gem "shared", "= 2.0"
+    end
+
+    assert_includes e.message, "already activated shared-1.0"
+    assert_includes e.message, "files already loaded from shared-1.0"
+    assert_equal "shared-1.0", Gem.loaded_specs["shared"].full_name
+  end
+
+  def test_requiring_a_file_only_the_default_gem_has_does_not_mix_versions
+    default_gem_spec = new_default_spec "shared", "1.0", nil, "shared.rb", "shared/extra.rb"
+    install_default_gems default_gem_spec
+
+    normal_gem_spec = util_spec "shared", "2.0", nil, "lib/shared.rb"
+    install_specs normal_gem_spec
+
+    Gem::Specification.reset
+
+    gem "shared", "= 2.0"
+    assert_require "shared"
+    assert_equal %w[shared-2.0], loaded_spec_names
+
+    e = assert_raise Gem::LoadError do
+      require "shared/extra"
+    end
+
+    assert_includes e.message, "shared-1.0"
+    assert_includes e.message, "shared-2.0"
+    assert_equal %w[shared-2.0], loaded_spec_names
+    refute_includes $LOADED_FEATURES, File.join(default_gem_spec.full_gem_path, "lib", "shared/extra.rb")
+  end
+
+  def test_requiring_a_file_both_versions_have_goes_to_the_activated_version
+    default_gem_spec = new_default_spec "shared", "1.0", nil, "shared.rb"
+    install_default_gems default_gem_spec
+
+    normal_gem_spec = util_spec "shared", "2.0", nil, "lib/shared.rb"
+    install_specs normal_gem_spec
+
+    Gem::Specification.reset
+
+    gem "shared", "= 2.0"
+    assert_require "shared"
+
+    assert_equal %w[shared-2.0], loaded_spec_names
+    loaded = $LOADED_FEATURES.grep(%r{/shared\.rb$}).map {|feature| File.expand_path(feature) }
+    assert_includes loaded, File.join(normal_gem_spec.full_gem_path, "lib", "shared.rb")
+    refute_includes loaded, File.join(default_gem_spec.full_gem_path, "lib", "shared.rb")
+  end
+
   def test_already_activated_direct_conflict
     a1 = util_spec "a", "1", { "b" => "> 0" }
     b1 = util_spec "b", "1", { "c" => ">= 1" }, "lib/ib.rb"
@@ -518,6 +605,110 @@ class TestGemRequire < Gem::TestCase
     # Make sure only files from the newer json gem are loaded, and no files from the default json gem
     assert_equal ["#{@gemhome}/gems/json-999.99.9/lib/json.rb"], output.lines.grep(%r{/gems/json-}).map(&:chomp)
     assert Process.last_status.success?
+  end
+
+  # The two orders a CI launcher can meet: the project's constraint first, or
+  # the shipped file first. Each runs in its own short Ruby process.
+
+  def test_realworld_default_gem_file_provenance_constraint_first
+    omit "this test can't work under ruby-core setup" if ruby_repo?
+    omit "JRuby on Windows does not register json as a default gem the same way" if Gem.win_platform? && Gem.java_platform?
+
+    newer_json = util_spec("json", "999.99.9", nil, ["lib/json.rb"])
+    install_gem newer_json
+
+    code = <<-'RUBY'
+      $stderr = $stdout
+      raise "no default json" unless Gem.find_default_spec("json")
+
+      # The project declares the newer gem before anything is required.
+      gem "json", "= 999.99.9"
+      require "json"
+
+      puts "spec=#{Gem.loaded_specs["json"].full_name}"
+      puts "loaded=#{$LOADED_FEATURES.grep(%r{/json(\.rb|/)}).sort.inspect}"
+
+      # A file only the shipped copy has must not be pulled in now that the
+      # newer version runs.
+      begin
+        require "json/add/core"
+        puts "extra=no_error"
+      rescue Gem::LoadError => e
+        puts "extra=#{e.message}"
+      end
+
+      puts "mixed=#{$LOADED_FEATURES.any? {|feature| feature.include?("json/add/core") }}"
+    RUBY
+    output = Gem::Util.popen({ "GEM_HOME" => @gemhome }, *ruby_with_rubygems_in_load_path, "-e", code).strip
+    assert Process.last_status.success?, "subprocess failed: #{output}"
+
+    lines = output.lines.map(&:chomp)
+    assert_equal "spec=json-999.99.9", lines.find {|line| line.start_with?("spec=") }
+
+    loaded = lines.find {|line| line.start_with?("loaded=") }
+    assert_includes loaded, "#{@gemhome}/gems/json-999.99.9/lib/json.rb"
+    refute_includes loaded, "ruby/4.0.0/json"
+
+    extra = lines.find {|line| line.start_with?("extra=") }
+    assert_includes extra, "can't load 'json/add/core'"
+    assert_includes extra, "json-999.99.9 is already activated"
+    assert_equal "mixed=false", lines.find {|line| line.start_with?("mixed=") }
+  end
+
+  def test_realworld_default_gem_file_provenance_loaded_first
+    omit "this test can't work under ruby-core setup" if ruby_repo?
+    omit "JRuby on Windows does not register json as a default gem the same way" if Gem.win_platform? && Gem.java_platform?
+
+    newer_json = util_spec("json", "999.99.9", nil, ["lib/json.rb"])
+    install_gem newer_json
+
+    code = <<-'RUBY'
+      $stderr = $stdout
+      default = Gem.find_default_spec("json")
+      raise "no default json" unless default
+
+      # The launcher used the shipped copy, so its files really ran.
+      gem "json", "= #{default.version}"
+      require "json"
+      puts "loaded_spec=#{Gem.loaded_specs["json"].full_name}"
+      puts "provenance=#{Gem.loaded_specs["json"].loaded_files_description}"
+
+      begin
+        gem "json", "= 999.99.9"
+        puts "activation=no_error"
+      rescue Gem::LoadError => e
+        puts "activation=#{e.message}"
+      end
+
+      # Loading another file of the same shipped version is still fine.
+      puts "same_version=#{require("json/version").inspect}"
+
+      puts "final=#{Gem.loaded_specs["json"].full_name}"
+    RUBY
+    output = Gem::Util.popen({ "GEM_HOME" => @gemhome }, *ruby_with_rubygems_in_load_path, "-e", code).strip
+    assert Process.last_status.success?, "subprocess failed: #{output}"
+
+    lines = output.lines.map(&:chomp)
+    loaded_spec = lines.find {|line| line.start_with?("loaded_spec=") }
+    provenance = lines.find {|line| line.start_with?("provenance=") }
+    activation = lines.find {|line| line.start_with?("activation=") }
+    final = lines.find {|line| line.start_with?("final=") }
+
+    refute_nil loaded_spec, "missing loaded_spec in #{output}"
+    default_full_name = loaded_spec.sub("loaded_spec=", "")
+    refute_equal "json-999.99.9", default_full_name
+
+    # The report must say which version served the loaded files.
+    refute_nil provenance, "missing provenance in #{output}"
+    assert_includes provenance, default_full_name
+    assert_includes provenance, "json.rb"
+
+    # Activating the other version is refused and points at the loaded files.
+    refute_nil activation, "missing activation in #{output}"
+    assert_includes activation, "already activated #{default_full_name}"
+    assert_includes activation, "files already loaded from #{default_full_name}"
+
+    assert_equal "final=#{default_full_name}", final
   end
 
   def test_default_gem_and_normal_gem

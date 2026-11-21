@@ -1289,6 +1289,35 @@ class TestGem < Gem::TestCase
     end
   end
 
+  # Both require entry points must make the same decision when a default
+  # gem's file is asked for after another version of it is already running.
+
+  def test_try_activate_refuses_a_file_only_the_default_gem_has
+    default_gem_spec = new_default_spec "mix", "1.0", nil, "mix.rb", "mix/extra.rb"
+    install_default_gems default_gem_spec
+
+    # Give the default gem a real file where a lookup by path will find it.
+    write_file File.join(default_gem_spec.full_gem_path, "lib", "mix", "extra.rb")
+
+    newer_spec = util_spec "mix", "2.0", nil, "lib/mix.rb"
+    install_specs newer_spec
+
+    Gem::Specification.reset
+
+    gem "mix", "= 2.0"
+
+    from_try_activate = assert_raise Gem::LoadError do
+      Gem.try_activate("mix/extra")
+    end
+    from_require = assert_raise Gem::LoadError do
+      require "mix/extra"
+    end
+
+    assert_equal from_require.message, from_try_activate.message
+    assert_includes from_require.message, "mix-2.0 is already activated"
+    assert_equal "mix-2.0", Gem.loaded_specs["mix"].full_name
+  end
+
   def test_spec_order_is_consistent
     b1 = util_spec "b", "1.0"
     b2 = util_spec "b", "2.0"
@@ -1817,6 +1846,92 @@ class TestGem < Gem::TestCase
     Gem.register_default_spec old_style
 
     assert_equal old_style, Gem.find_unresolved_default_spec("foo.rb")
+  end
+
+  # Registering a default gem says Ruby ships it. It must not claim the gem's
+  # files ran, because that is what forbids picking another version later.
+
+  def test_registered_default_spec_reports_no_loaded_files
+    default_gem_spec = new_default_spec "unused", "1.0", nil, "unused.rb"
+    install_default_gems default_gem_spec
+
+    Gem::Specification.reset
+
+    spec = Gem::Specification.find_by_name("unused")
+    assert_predicate spec, :default_gem?
+    assert_empty spec.loaded_files
+    refute_predicate spec, :files_loaded?
+    assert_nil spec.loaded_files_description
+  end
+
+  def test_default_spec_reports_the_files_loaded_from_it
+    default_gem_spec = new_default_spec "used", "1.0", nil, "used.rb"
+    install_default_gems default_gem_spec
+
+    Gem::Specification.reset
+
+    assert require("used")
+
+    loaded_feature = $LOADED_FEATURES.find {|feature| feature.end_with?("/used.rb") }
+    spec = Gem.loaded_specs["used"]
+    assert_equal [loaded_feature], spec.loaded_files
+    assert_predicate spec, :files_loaded?
+    assert_includes spec.loaded_files_description, "used-1.0"
+    assert_includes spec.loaded_files_description, "used.rb"
+  end
+
+  def test_normal_spec_reports_the_files_loaded_from_it
+    normal_gem_spec = util_spec "loaded", "1.0", nil, "lib/loaded.rb"
+    install_specs normal_gem_spec
+
+    assert require("loaded")
+
+    spec = Gem.loaded_specs["loaded"]
+    assert_includes spec.loaded_files, File.join(normal_gem_spec.full_gem_path, "lib", "loaded.rb")
+    assert_predicate spec, :files_loaded?
+  end
+
+  # The loaded-file lookup remembers what it already scanned, so it must still
+  # answer correctly when $LOADED_FEATURES changes underneath it.
+
+  def test_loaded_files_follows_changes_to_loaded_features
+    normal_gem_spec = util_spec "followed", "1.0", nil, "lib/followed.rb"
+    install_specs normal_gem_spec
+
+    spec = Gem.loaded_specs["followed"] || normal_gem_spec
+    fresh_feature = File.join(normal_gem_spec.full_gem_path, "lib", "followed.rb")
+
+    assert_empty spec.loaded_files
+
+    $LOADED_FEATURES << fresh_feature
+    begin
+      assert_includes spec.loaded_files, fresh_feature
+      assert_predicate spec, :files_loaded?
+    ensure
+      $LOADED_FEATURES.delete(fresh_feature)
+    end
+
+    refute_predicate spec, :files_loaded?
+
+    saved = $LOADED_FEATURES.dup
+    $LOADED_FEATURES.replace([])
+    begin
+      assert_empty spec.loaded_files
+    ensure
+      $LOADED_FEATURES.replace(saved)
+    end
+  end
+
+  def test_provides_file_uses_require_paths_not_the_default_install_layout
+    default_gem_spec = new_default_spec "provider", "1.0", nil, "provider.rb", "provider/part.rb"
+    install_default_gems default_gem_spec
+
+    Gem::Specification.reset
+
+    spec = Gem::Specification.find_by_name("provider")
+    assert spec.provides_file?("provider"), "expected provider.rb to be provided"
+    assert spec.provides_file?("provider/part"), "expected provider/part.rb to be provided"
+    refute spec.provides_file?("provider/missing"), "expected provider/missing.rb not to be provided"
   end
 
   def test_operating_system_defaults

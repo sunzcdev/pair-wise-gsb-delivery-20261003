@@ -190,6 +190,16 @@ module Gem
     return false unless spec
     return true if spec.activated?
 
+    if default_spec = find_default_spec(path)
+      activated = loaded_specs[default_spec.name]
+      if activated && activated.version != default_spec.version &&
+         !provides_file_for_require?(activated, path)
+        # Taking this file from the default gem would mix it with the version
+        # that already ran. Fail the same way Kernel#require does.
+        raise default_gem_version_mix_error(default_spec, activated, path)
+      end
+    end
+
     begin
       spec.activate
     rescue Gem::LoadError => e # this could fail due to gem dep collisions, go lax
@@ -1426,12 +1436,190 @@ An Array (#{env.inspect}) was passed in from #{caller[3]}
 
     attr_reader :pre_uninstall_hooks
 
+    ##
+    # The files from <tt>$LOADED_FEATURES</tt> that were really loaded by
+    # +spec+.
+    #
+    # For a default gem, being registered only means Ruby ships it: none of
+    # its code needs to have run. Non-default gems are matched by their
+    # require paths.
+
+    def loaded_files_for(spec)
+      files = loaded_files_in(spec.full_require_paths)
+      files |= default_gem_loaded_files(spec) if spec.default_gem?
+      files
+    end
+
+    ##
+    # Whether the default gem named +name+ lists +file+ as one of its files.
+
+    def default_gem_registers_file?(name, file)
+      spec = find_default_spec(file) || find_default_spec(file.sub(suffix_regexp, ""))
+      !spec.nil? && spec.name == name
+    end
+
+    ##
+    # Whether the gem that is already active (+spec+) can serve +path+, so that
+    # requiring it keeps everything in one version.
+
+    def provides_file_for_require?(spec, path) # :nodoc:
+      return spec.provides_file?(path) if spec.respond_to?(:provides_file?)
+      return spec.contains_requirable_file?(path) if spec.respond_to?(:contains_requirable_file?)
+
+      false
+    end
+
+    ##
+    # Build the error raised when loading a file from a default gem would mix
+    # two versions of the same gem in one process.
+
+    def default_gem_version_mix_error(default_spec, loaded_spec, path) # :nodoc:
+      message = "can't load '#{path}' from #{default_spec.full_name}, because " \
+                "#{loaded_spec.full_name} is already activated"
+
+      if loaded_spec.respond_to?(:loaded_files_description) &&
+         (description = loaded_spec.loaded_files_description)
+        message += " (#{description})"
+      end
+
+      e = Gem::LoadError.new message
+      e.name = default_spec.name
+      e.requirement = Gem::Requirement.new("= #{default_spec.version}")
+      e
+    end
+
     private
 
     def already_loaded?(file)
       $LOADED_FEATURES.any? do |feature_path|
         feature_path.end_with?(file) && default_gem_load_paths.any? {|load_path_entry| feature_path == "#{load_path_entry}/#{file}" }
       end
+    end
+
+    def loaded_files_in(require_paths) # :nodoc:
+      prefixes = require_paths.filter_map do |require_path|
+        next if require_path.nil?
+
+        normalize_feature_path(require_path) + "/"
+      end
+      return [] if prefixes.empty?
+
+      scan_loaded_features(prefixes)
+    end
+
+    ##
+    # The entries of <tt>$LOADED_FEATURES</tt> under any of +prefixes+.
+    #
+    # Requires only append to that array, so results are kept in an index and
+    # each call only looks at what was appended since the previous one. The
+    # index is rebuilt if the array was replaced or truncated, which happens
+    # in tests that reset it.
+
+    def scan_loaded_features(prefixes) # :nodoc:
+      features = $LOADED_FEATURES
+      @loaded_feature_scans ||= {}
+      key = prefixes.join("\0")
+      scan = @loaded_feature_scans[key]
+
+      reusable = scan && scan[:features].equal?(features) && scan[:scanned] <= features.size &&
+        (scan[:scanned].zero? || features[scan[:scanned] - 1] == scan[:last])
+
+      scan = @loaded_feature_scans[key] = {features: features, scanned: 0, matches: []} unless reusable
+
+      features[scan[:scanned]..].each do |feature_path|
+        normalized = normalize_feature_path(feature_path)
+        scan[:matches] << feature_path if prefixes.any? {|prefix| normalized.start_with?(prefix) }
+      end
+      scan[:scanned] = features.size
+      scan[:last] = features.last
+
+      scan[:matches].dup
+    end
+
+    def default_gem_loaded_files(spec) # :nodoc:
+      prefixes = default_gem_load_path_prefixes
+      return [] if prefixes.empty?
+
+      $LOADED_FEATURES.filter_map do |feature_path|
+        relative = default_gem_relative_feature(feature_path, prefixes)
+        next unless relative
+
+        owner = find_default_spec(relative) || find_default_spec(relative.sub(suffix_regexp, ""))
+        next unless owner && owner.name == spec.name && owner.version == spec.version
+
+        feature_path
+      end
+    end
+
+    ##
+    # The default gem load paths as normalized prefixes ending in a separator,
+    # longest first so the most specific one wins.
+
+    def default_gem_load_path_prefixes # :nodoc:
+      load_paths = default_gem_load_paths
+      return @default_gem_load_path_prefixes if @default_gem_load_path_prefixes_source.equal?(load_paths)
+
+      @default_gem_load_path_prefixes_source = load_paths
+      @default_gem_load_path_prefixes = load_paths.filter_map do |load_path|
+        next if load_path.nil?
+
+        normalize_feature_path(load_path).delete_suffix("/") + "/"
+      end.sort_by {|prefix| -prefix.length }
+    end
+
+    ##
+    # Map a loaded feature back to the require name a default gem registered
+    # it under (for example "json/version.rb"), or nil when it does not come
+    # from one of the default gem load paths.
+    #
+    # <tt>$LOADED_FEATURES</tt> only grows, so every answer is cached. The
+    # cache is thrown away when the default gem load paths change.
+
+    def default_gem_relative_feature(feature_path, prefixes) # :nodoc:
+      if !@default_gem_relative_features || !@default_gem_relative_features_prefixes.equal?(prefixes)
+        @default_gem_relative_features = {}
+        @default_gem_relative_features_prefixes = prefixes
+      end
+
+      cache = @default_gem_relative_features
+      return cache[feature_path] if cache.key?(feature_path)
+
+      normalized = normalize_feature_path(feature_path)
+      prefix = prefixes.find {|candidate| normalized.start_with?(candidate)}
+      return cache[feature_path] = nil unless prefix
+
+      # Prefer slicing the original path so the require name keeps the case
+      # the gem registered it under. Only do that when normalizing did not
+      # change the length, which would shift the tail.
+      if normalized.length == feature_path.length
+        cache[feature_path] = feature_path[prefix.length..]
+      else
+        cache[feature_path] = normalized[prefix.length..]
+      end
+    end
+
+    ##
+    # Compare paths the way the platform does. Loaded features can carry
+    # different separators or letter case than the configured load paths,
+    # especially on Windows.
+    #
+    # <tt>$LOADED_FEATURES</tt> is walked on every require of a default gem
+    # file, and File.expand_path is slow on Windows, so results are cached per
+    # path. Loaded features are never removed.
+
+    def normalize_feature_path(path) # :nodoc:
+      # Relative paths depend on the current working directory, which callers
+      # can change at any time, so only absolute paths are cached.
+      cache = absolute_path?(path) ? (@normalized_feature_paths ||= {}) : {}
+      normalized = cache[path]
+      return normalized if normalized
+
+      expanded = File.expand_path(path).tr("\\", "/")
+      cache[path] = Gem.win_platform? ? expanded.downcase : expanded
+    end
+
+    def absolute_path?(path) # :nodoc:
+      File.absolute_path?(path)
     end
 
     def default_gem_load_paths

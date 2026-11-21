@@ -95,6 +95,58 @@ class Gem::BasicSpecification
   end
 
   ##
+  # The files from <tt>$LOADED_FEATURES</tt> that were loaded from this gem.
+  #
+  # A default gem is registered when RubyGems starts, and that registration
+  # only says Ruby ships it: none of its code needs to have run. This returns
+  # the files that really came from it, so an empty result means "RubyGems
+  # knows this gem exists" rather than "this gem's code is loaded".
+  #
+  # The result is not memoized because <tt>$LOADED_FEATURES</tt> grows over
+  # time; the lookup itself is cached on the RubyGems side.
+
+  def loaded_files
+    Gem.loaded_files_for(self)
+  end
+
+  ##
+  # Whether any file of this gem has been loaded, regardless of whether the
+  # gem itself has been activated.
+
+  def files_loaded?
+    !loaded_files.empty?
+  end
+
+  ##
+  # Describe the files loaded from this gem, including the version they came
+  # from, so that a version conflict can point at the code that already ran.
+  # Returns nil when no file has been loaded from this gem.
+
+  def loaded_files_description # :nodoc:
+    files = loaded_files
+    return if files.empty?
+
+    names = files.map {|file| File.basename(file) }.uniq.sort
+    shown = names.first(5)
+    shown << "#{names.size - shown.size} more" if names.size > shown.size
+    "files already loaded from #{full_name}: #{shown.join(", ")}"
+  end
+
+  ##
+  # Whether +file+ can be required from this gem. Unlike
+  # #contains_requirable_file?, this looks at #full_require_paths, so it also
+  # answers correctly for gems whose full path does not follow the default
+  # install layout, such as git gems or gems registered as default gems.
+
+  def provides_file?(file) # :nodoc:
+    return true if default_gem? && Gem.default_gem_registers_file?(name, file)
+
+    Gem.suffixes.any? do |suffix|
+      full_require_paths.any? {|dir| File.file?("#{dir}/#{file}#{suffix}") }
+    end
+  end
+
+  ##
   # Regular gems take precedence over default gems
 
   def default_gem_priority

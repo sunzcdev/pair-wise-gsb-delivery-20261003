@@ -22,6 +22,48 @@ class TestGemKernel < Gem::TestCase
     assert_equal @a2, Gem.loaded_specs["a"]
   end
 
+  # A default gem that is only registered because Ruby ships it does not stop
+  # `gem` from selecting another version by the usual rules.
+
+  def test_gem_replaces_registered_default_gem
+    default_gem_spec = new_default_spec "d", "1.0", nil, "d.rb"
+    install_default_gems default_gem_spec
+
+    Gem::Specification.reset
+
+    refute_predicate default_gem_spec, :files_loaded?
+
+    normal_gem_spec = util_spec "d", "2.0", nil, "lib/d.rb"
+    install_specs normal_gem_spec
+
+    assert gem("d", "= 2.0"), "a registered default gem is not an activation conflict"
+    assert_equal normal_gem_spec.full_name, Gem.loaded_specs["d"].full_name
+    refute Gem.loaded_specs["d"].default_gem?
+  end
+
+  def test_gem_conflicts_with_loaded_default_gem_and_names_its_files
+    default_gem_spec = new_default_spec "d", "1.0", nil, "d.rb"
+    install_default_gems default_gem_spec
+
+    Gem::Specification.reset
+
+    assert require("d"), "'d' should load from the registered default gem"
+    assert_equal default_gem_spec.full_name, Gem.loaded_specs["d"].full_name
+
+    normal_gem_spec = util_spec "d", "2.0", nil, "lib/d.rb"
+    install_specs normal_gem_spec
+
+    ex = assert_raise Gem::LoadError do
+      gem "d", "= 2.0"
+    end
+
+    assert_includes ex.message, "can't activate d-2.0, already activated d-1.0"
+    assert_includes ex.message, "files already loaded from d-1.0"
+    assert_includes ex.message, "d.rb"
+    assert_equal "d", ex.name
+    assert_equal default_gem_spec.full_name, Gem.loaded_specs["d"].full_name
+  end
+
   def test_gem_default_re_gem
     assert gem("a", "=1")
 

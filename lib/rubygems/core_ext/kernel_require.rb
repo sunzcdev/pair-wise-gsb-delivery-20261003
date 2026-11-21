@@ -44,8 +44,18 @@ module Kernel
 
       if spec = Gem.find_default_spec(path)
         name = spec.name
+        activated = Gem.loaded_specs[name]
 
-        next if Gem.loaded_specs[name]
+        if activated && activated.version != spec.version
+          # A different version is active. If it also has the file, let the
+          # normal require load it from there. Otherwise requiring the default
+          # gem's copy would put two versions of one gem in the process.
+          next if Gem.provides_file_for_require?(activated, path)
+
+          raise Gem.default_gem_version_mix_error(spec, activated, path)
+        end
+
+        next if activated
 
         # Ensure -I beats a default gem
         resolved_path = begin

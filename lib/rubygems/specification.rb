@@ -1417,8 +1417,15 @@ class Gem::Specification < Gem::BasicSpecification
   def activate
     other = Gem.loaded_specs[name]
     if other
-      check_version_conflict other
-      return false
+      if replaceable_default_gem?(other)
+        # The other version never ran; it was only registered because Ruby
+        # ships it. Picking a different version is a normal version selection,
+        # so drop the registration and activate this spec instead.
+        release_default_gem(other)
+      else
+        check_version_conflict other
+        return false
+      end
     end
 
     raise_if_conflicts
@@ -2213,6 +2220,11 @@ class Gem::Specification < Gem::BasicSpecification
 
     msg = "can't activate #{full_name}, already activated #{other.full_name}"
 
+    if other.respond_to?(:loaded_files_description) &&
+       (description = other.loaded_files_description)
+      msg += " (#{description})"
+    end
+
     e = Gem::LoadError.new msg
     e.name = name
 
@@ -2220,6 +2232,33 @@ class Gem::Specification < Gem::BasicSpecification
   end
 
   private :check_version_conflict
+
+  ##
+  # Whether +other+, the currently registered spec for this name, was only
+  # registered because Ruby ships it, without any of its files being loaded.
+  # Such a spec can be replaced: nothing has run yet, so choosing another
+  # version is ordinary version selection rather than mixing two versions.
+
+  def replaceable_default_gem?(other) # :nodoc:
+    return false unless other.respond_to?(:default_gem?) && other.default_gem?
+    return false unless other.respond_to?(:files_loaded?)
+    return false if other.files_loaded?
+
+    true
+  end
+
+  private :replaceable_default_gem?
+
+  ##
+  # Forget a default gem registration that is being replaced by another
+  # version of the same gem.
+
+  def release_default_gem(other) # :nodoc:
+    other.activated = false if other.respond_to?(:activated=)
+    Gem.loaded_specs.delete(name) if Gem.loaded_specs[name].equal?(other)
+  end
+
+  private :release_default_gem
 
   ##
   # Check the spec for possible conflicts and freak out if there are any.
