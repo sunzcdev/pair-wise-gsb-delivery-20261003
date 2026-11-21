@@ -517,6 +517,84 @@ class Gem::RequestSet
     @specs ||= @requests.map(&:full_spec)
   end
 
+  ##
+  # The specifications this process has actually activated, one per gem name,
+  # sorted by name.
+  #
+  # These come from Gem.loaded_specs, so a gem that is installed but has not
+  # been activated is deliberately absent: it is not part of what this
+  # environment runs.
+
+  def activated_specs
+    Gem.loaded_specs.values
+      .uniq(&:name)
+      .sort_by(&:name)
+  end
+
+  ##
+  # Exports Gem::RequestSet::LockEntry objects for the gems that were actually
+  # activated, paired with the local specifications of the same name.
+  #
+  # +specs+ defaults to #activated_specs.  Any Gem::Specification or resolver
+  # specification may be given, for example the requests returned by
+  # #resolve_current or by #resolve.  An ActivationRequest is unwrapped to the
+  # resolver specification it activates, so a path or git source survives.
+  #
+  # When an activated Gem::Specification is given and this set has been
+  # resolved, the corresponding request supplies the source the resolver
+  # selected.  The activated spec itself records neither a remote nor a
+  # repository, so without that pairing an installed gem's origin would be
+  # reported as unknown.
+  #
+  # The entries keep the real platform and source of each activated gem.
+  # Other installed versions of the same gem are recorded on the entry (see
+  # Gem::RequestSet::LockEntry#other_installed_versions) but never become
+  # entries of their own.
+
+  def lock_entries(specs = nil)
+    specs ||= activated_specs
+
+    sources_by_name = resolved_specs_by_name
+
+    specs.map do |spec|
+      Gem::RequestSet::LockEntry.from_spec spec,
+        local_specs: local_specs_for(spec.name),
+        source_spec: sources_by_name[spec.name]
+    end
+  end
+
+  ##
+  # Builds a Gem::RequestSet::Lockfile from activated entries instead of
+  # resolving.  +entries+ defaults to #lock_entries.  The dependency map
+  # defaults to pinning each entry to the version that was activated.
+
+  def lockfile_from_activated(gem_deps_file, entries = nil, dependencies = nil)
+    entries ||= lock_entries
+    Gem::RequestSet::Lockfile.from_entries entries, gem_deps_file, dependencies
+  end
+
+  ##
+  # Every local specification with the given +name+, including versions and
+  # platforms that do not match the running platform and default gems.  Used
+  # to locate the install directory of an activated gem and to report the
+  # versions that were not activated.
+
+  def local_specs_for(name)
+    Gem::Specification.specification_record.specs_for name
+  end
+
+  ##
+  # The resolver specifications this set resolved, indexed by gem name.  Empty
+  # before #resolve is called.
+
+  def resolved_specs_by_name # :nodoc:
+    return {} if @requests.nil? || @requests.empty?
+
+    @requests.each_with_object({}) do |request, by_name|
+      by_name[request.name] ||= request.spec
+    end
+  end
+
   def specs_in(dir)
     Gem::SpecificationRecord.dirs_from([dir]).flat_map do |spec_dir|
       Gem::Util.glob_files_in_dir("*.gemspec", spec_dir).map do |g|
@@ -550,4 +628,5 @@ class Gem::RequestSet
 end
 
 require_relative "request_set/gem_dependency_api"
+require_relative "request_set/lock_entry"
 require_relative "request_set/lockfile"

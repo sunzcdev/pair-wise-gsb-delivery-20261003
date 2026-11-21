@@ -47,6 +47,41 @@ class Gem::RequestSet::Lockfile
     new request_set, gem_deps_file, dependencies
   end
 
+  ##
+  # Creates a Lockfile from Gem::RequestSet::LockEntry objects, bypassing
+  # resolution entirely.  Use this to record the gems a process actually
+  # activated in an environment that is already installed, where asking an
+  # index for versions would describe what could be installed instead of what
+  # is running.
+  #
+  # +dependencies+ defaults to pinning every entry to the exact version it was
+  # activated at, so replaying the lock cannot float to another installed
+  # version.  Path and git entries keep the +!+ marker.
+
+  def self.from_entries(entries, gem_deps_file, dependencies = nil)
+    dependencies ||= entries_to_deps entries
+    lockfile = new nil, gem_deps_file, dependencies
+    lockfile.entries = entries
+    lockfile.built_from_entries = true
+    lockfile.platforms.replace entries.map(&:platform).uniq.sort_by(&:to_s)
+    lockfile
+  end
+
+  ##
+  # The dependencies map used when a lockfile is built from activated entries.
+  # Every entry is pinned to the version it was activated at.
+
+  def self.entries_to_deps(entries) # :nodoc:
+    entries.each_with_object({}) do |entry, deps|
+      deps[entry.name] =
+        if entry.source_set?
+          Gem::Requirement.source_set
+        else
+          Gem::Requirement.new "= #{entry.version}"
+        end
+    end
+  end
+
   def self.requests_to_deps(requests) # :nodoc:
     deps = {}
 
@@ -71,12 +106,32 @@ class Gem::RequestSet::Lockfile
 
   attr_reader :platforms
 
+  ##
+  # The Gem::RequestSet::LockEntry objects this lockfile was built from.  Empty
+  # for a lockfile built by resolving a RequestSet.
+
+  attr_reader :entries
+
+  attr_writer :entries # :nodoc:
+
+  ##
+  # True when this lockfile was built from entries rather than by resolving a
+  # RequestSet.
+
+  attr_writer :built_from_entries # :nodoc:
+
+  def built_from_entries? # :nodoc:
+    !!@built_from_entries
+  end
+
   def initialize(request_set, gem_deps_file, dependencies)
     @set           = request_set
     @dependencies  = dependencies
     @gem_deps_file = File.expand_path(gem_deps_file)
     @gem_deps_dir  = File.dirname(@gem_deps_file)
+    @built_from_entries = false
     @platforms = []
+    @entries   = []
   end
 
   def add_DEPENDENCIES(out) # :nodoc:
@@ -194,20 +249,150 @@ class Gem::RequestSet::Lockfile
   end
 
   ##
+  # Writes a GEM section for entries whose source is a remote, or whose origin
+  # is unknown.  Entries with a known remote are grouped by it.
+  #
+  # An activated gem that is installed locally but whose origin was never
+  # recorded gets a GEM section with no +remote:+ line and a comment saying
+  # the remote is unknown.  That keeps the lock loadable while showing the gap
+  # instead of inventing a source; #missing_information reports the same fact
+  # in a structured way.
+
+  def add_GEM_entries(out, entries) # :nodoc:
+    return if entries.empty?
+
+    remote_groups = entries.group_by(&:remote)
+    unknown       = remote_groups.delete(nil) { [] }
+
+    remote_groups.sort_by {|remote, _| remote.to_s }.each do |remote, grouped|
+      out << "GEM"
+      out << "  remote: #{remote}"
+      add_entry_specs out, grouped
+    end
+
+    unless unknown.empty?
+      out << "GEM"
+      out << "  # remote: unknown"
+      add_entry_specs out, unknown
+    end
+  end
+
+  def add_entry_specs(out, entries) # :nodoc:
+    out << "  specs:"
+
+    entries.sort_by {|entry| [entry.name, entry.version, entry.platform.to_s] }.each do |entry|
+      out << "    #{entry.name} (#{entry.version}#{entry.platform_suffix})"
+
+      entry.dependencies.each do |dependency|
+        out << "      #{dependency.name}#{dependency.requirement.for_lockfile}"
+      end
+    end
+
+    out << nil
+  end
+
+  ##
+  # Writes a PATH section per directory for entries that came from a path
+  # source.  Entries without a usable directory are reported under an unknown
+  # remote rather than silently dropped.
+
+  def add_PATH_entries(out, entries) # :nodoc:
+    return if entries.empty?
+
+    by_directory = entries.group_by(&:path)
+
+    by_directory.sort_by {|directory, _| directory.to_s }.each do |directory, grouped|
+      out << "PATH"
+
+      if directory.to_s.empty?
+        out << "  # remote: unknown"
+      else
+        out << "  remote: #{relative_path_from directory, @gem_deps_dir}"
+      end
+
+      add_entry_specs out, grouped
+    end
+  end
+
+  ##
+  # Writes a GIT section per repository and revision for entries that came
+  # from a git source.  A missing revision is reported instead of being
+  # guessed from a moving branch.
+
+  def add_GIT_entries(out, entries) # :nodoc:
+    return if entries.empty?
+
+    by_repository_revision = entries.group_by {|entry| [entry.repository, entry.revision] }
+    sorted = by_repository_revision.sort_by do |(repository, revision), _|
+      [repository.to_s, revision.to_s]
+    end
+
+    sorted.each do |(repository, revision), grouped|
+      out << "GIT"
+      out << (repository.to_s.empty? ? "  # remote: unknown" : "  remote: #{repository}")
+      out << (revision.to_s.empty? ? "  # revision: unknown" : "  revision: #{revision}")
+      add_entry_specs out, grouped
+    end
+  end
+
+  ##
+  # The PLATFORMS section for a lockfile built from entries.  The real
+  # platform of each activated spec is written, so a native gem is not
+  # disguised as the ruby platform.
+
+  def add_ENTRY_PLATFORMS(out) # :nodoc:
+    out << "PLATFORMS"
+
+    @entries.map(&:platform).uniq.sort_by(&:to_s).each do |platform|
+      out << "  #{platform}"
+    end
+
+    out << nil
+  end
+
+  ##
+  # Per-gem report of versions that are installed but were not the activated
+  # one.  Empty when every activated version is the only installed version.
+
+  def divergences
+    @entries.filter_map(&:divergence)
+  end
+
+  ##
+  # The names and versions of entries whose source could not be fully
+  # determined.
+
+  def missing_information
+    @entries.select(&:missing?).map do |entry|
+      { name: entry.name, version: entry.version, missing: entry.missing }
+    end
+  end
+
+  ##
   # The contents of the lock file.
 
   def to_s
     out = []
 
-    groups = spec_groups
+    if built_from_entries?
+      add_PATH_entries out, @entries.select {|entry| entry.source_type == :path }
 
-    add_PATH out, groups.delete(Gem::Resolver::VendorSpecification) { [] }
+      add_GIT_entries out, @entries.select {|entry| entry.source_type == :git }
 
-    add_GIT out, groups.delete(Gem::Resolver::GitSpecification) { [] }
+      add_GEM_entries out, @entries.select {|entry| entry.source_type != :path && entry.source_type != :git }
 
-    add_GEM out, groups
+      add_ENTRY_PLATFORMS out
+    else
+      groups = spec_groups
 
-    add_PLATFORMS out
+      add_PATH out, groups.delete(Gem::Resolver::VendorSpecification) { [] }
+
+      add_GIT out, groups.delete(Gem::Resolver::GitSpecification) { [] }
+
+      add_GEM out, groups
+
+      add_PLATFORMS out
+    end
 
     add_DEPENDENCIES out
 

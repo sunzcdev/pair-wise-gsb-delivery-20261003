@@ -111,6 +111,26 @@ module Gem
     end
 
     ##
+    # Returns every local specification named +name+, including versions and
+    # platforms that do not match Gem.platforms.  Default gems are included.
+    #
+    # This is the unfiltered counterpart of #stubs_for, for callers that need
+    # to report what is installed next to the version that is actually
+    # activated.  When the full stub list is already loaded it is reused;
+    # otherwise only the matching gemspecs are read.
+
+    def specs_for(name)
+      candidates =
+        if @stubs
+          @stubs.select {|stub| stub.name == name }
+        else
+          stubs_for_pattern("#{name}-*.gemspec", false).select {|stub| stub.name == name }
+        end
+
+      candidates.map(&:to_spec).compact
+    end
+
+    ##
     # Adds +spec+ to the record, keeping the collection properly sorted.
 
     def add_spec(spec)
