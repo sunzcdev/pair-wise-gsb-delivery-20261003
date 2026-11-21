@@ -12,7 +12,7 @@ import pytest
 
 import pip._internal.req.req_uninstall
 from pip._internal.exceptions import BlockedImportError
-from pip._internal.metadata import get_environment
+from pip._internal.metadata import BaseDistribution, get_environment
 from pip._internal.req.req_uninstall import (
     StashedUninstallPathSet,
     UninstallPathSet,
@@ -146,6 +146,168 @@ def test_compact_keeps_literal_trailing_star_paths(tmpdir: Path) -> None:
     star = os.path.join(tmpdir, "pkg*")
 
     assert compact([plain, star]) == {plain, star}
+
+
+def _record_dist(
+    location: Path,
+    name: str,
+    version: str,
+    entries: list[str],
+) -> BaseDistribution:
+    """Create an installed .dist-info with a RECORD listing ``entries``."""
+    info = location / f"{name}-{version}.dist-info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "METADATA").write_text(f"Name: {name}\nVersion: {version}\n")
+    record_text = "\n".join(f"{entry},," for entry in [*entries, f"{info.name}/RECORD"])
+    (info / "RECORD").write_text(record_text + "\n")
+    dist = get_environment([str(location)]).get_distribution(name)
+    assert dist is not None
+    return dist
+
+
+class TestSharedRecordOwnership:
+    def test_shared_entries_are_protected_and_reported(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Files another RECORD also claims survive uninstall and get reported."""
+        site_packages = tmp_path / "site-packages"
+        site_packages.mkdir()
+        package = site_packages / "pkg"
+        package.mkdir()
+        # Two files both distributions claim, plus each dist's exclusive file.
+        shared = package / "shared.py"
+        init = package / "__init__.py"
+        alpha_only = package / "alpha_only.py"
+        beta_only = package / "beta_only.py"
+        for path in (shared, init, alpha_only, beta_only):
+            path.write_text(path.name)
+
+        alpha = _record_dist(
+            site_packages,
+            "alpha",
+            "1.0",
+            ["pkg/__init__.py", "pkg/shared.py", "pkg/alpha_only.py"],
+        )
+        beta = _record_dist(
+            site_packages,
+            "beta",
+            "1.0",
+            ["pkg/__init__.py", "pkg/shared.py", "pkg/beta_only.py"],
+        )
+        environment = Mock()
+        environment.iter_all_distributions.return_value = [alpha, beta]
+        monkeypatch.setattr(
+            pip._internal.req.req_uninstall,
+            "get_default_environment",
+            Mock(return_value=environment),
+        )
+        monkeypatch.setattr(UninstallPathSet, "_permitted", mock_permitted)
+
+        pathset = UninstallPathSet(alpha)
+        for path in uninstallation_paths(alpha):
+            pathset.add(path)
+        # RECORD lists its own dist-info entries; add the directory itself as
+        # from_dist() does so removal covers the whole metadata directory.
+        pathset.add(str(site_packages / "alpha-1.0.dist-info"))
+        caplog.set_level("INFO", logger=pip._internal.req.req_uninstall.logger.name)
+        caplog.clear()
+        pathset.protect_shared_files()
+
+        planned = {os.path.normcase(p) for p in pathset._paths}
+        assert os.path.normcase(str(shared)) not in planned
+        assert os.path.normcase(str(init)) not in planned
+        assert os.path.normcase(str(alpha_only)) in planned
+        # Beta's exclusive file was never part of alpha's plan.
+        assert os.path.normcase(str(beta_only)) not in planned
+
+        assert pathset._shared == {
+            os.path.normcase(str(shared)): ["beta"],
+            os.path.normcase(str(init)): ["beta"],
+        }
+        assert os.path.normcase(str(shared)) in caplog.text
+        assert "beta" in caplog.text
+
+        pathset.remove(auto_confirm=True)
+
+        # Shared data and beta's exclusive data remain; alpha's data is gone.
+        assert shared.exists()
+        assert init.exists()
+        assert beta_only.exists()
+        assert not alpha_only.exists()
+        assert not (site_packages / "alpha-1.0.dist-info").exists()
+        assert (site_packages / "beta-1.0.dist-info").exists()
+
+    def test_adjacent_lookalike_paths_are_not_confused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only exact RECORD paths match; similarly named neighbours stay removable."""
+        site_packages = tmp_path / "site-packages"
+        site_packages.mkdir()
+        package = site_packages / "pkg"
+        package.mkdir()
+        shared = package / "shared.py"
+        lookalike = package / "shared_extra.py"
+        shared.write_text("shared")
+        lookalike.write_text("extra")
+
+        alpha = _record_dist(
+            site_packages, "alpha", "1.0", ["pkg/shared.py", "pkg/shared_extra.py"]
+        )
+        beta = _record_dist(site_packages, "beta", "1.0", ["pkg/shared.py"])
+        environment = Mock()
+        environment.iter_all_distributions.return_value = [alpha, beta]
+        monkeypatch.setattr(
+            pip._internal.req.req_uninstall,
+            "get_default_environment",
+            Mock(return_value=environment),
+        )
+        monkeypatch.setattr(UninstallPathSet, "_permitted", mock_permitted)
+
+        pathset = UninstallPathSet(alpha)
+        for path in uninstallation_paths(alpha):
+            pathset.add(path)
+        pathset.protect_shared_files()
+
+        planned = {os.path.normcase(p) for p in pathset._paths}
+        assert os.path.normcase(str(lookalike)) in planned
+        assert os.path.normcase(str(shared)) not in planned
+        assert list(pathset._shared) == [os.path.normcase(str(shared))]
+
+    def test_exclusive_files_are_removed_without_other_records(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no other distribution claiming files, the plan is unchanged."""
+        site_packages = tmp_path / "site-packages"
+        site_packages.mkdir()
+        package = site_packages / "pkg"
+        package.mkdir()
+        only = package / "only.py"
+        only.write_text("only")
+
+        alpha = _record_dist(site_packages, "alpha", "1.0", ["pkg/only.py"])
+        environment = Mock()
+        environment.iter_all_distributions.return_value = [alpha]
+        monkeypatch.setattr(
+            pip._internal.req.req_uninstall,
+            "get_default_environment",
+            Mock(return_value=environment),
+        )
+        monkeypatch.setattr(UninstallPathSet, "_permitted", mock_permitted)
+
+        pathset = UninstallPathSet(alpha)
+        for path in uninstallation_paths(alpha):
+            pathset.add(path)
+        before = set(pathset._paths)
+        pathset.protect_shared_files()
+
+        assert pathset._paths == before
+        assert pathset._shared == {}
+
+        pathset.remove(auto_confirm=True)
+        assert not only.exists()
 
 
 class TestUninstallPathSet:

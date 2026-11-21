@@ -15,7 +15,7 @@ from pip._internal.exceptions import (
     UninstallMissingRecord,
 )
 from pip._internal.locations import get_bin_prefix, get_bin_user
-from pip._internal.metadata import BaseDistribution
+from pip._internal.metadata import BaseDistribution, get_default_environment
 from pip._internal.utils.compat import WINDOWS
 from pip._internal.utils.egg_link import egg_link_path_from_location
 from pip._internal.utils.logging import getLogger, indent_log
@@ -91,6 +91,75 @@ def uninstallation_paths(dist: BaseDistribution) -> Generator[str, None, None]:
             yield path
             path = os.path.join(dn, base + ".pyo")
             yield path
+
+
+def _declared_installed_path(location: str, entry: str) -> str:
+    """Build the on-disk path of a RECORD entry using RECORD path semantics.
+
+    RECORD entries are relative to the distribution's install location and use
+    ``/`` as the separator regardless of platform (PEP 376). The entry is
+    joined with :func:`os.path.join` and normalized for comparison with the
+    paths produced while planning the uninstall.
+    """
+    return os.path.normcase(os.path.join(normalize_path(location), entry))
+
+
+def _iter_foreign_record_claims(
+    dist: BaseDistribution,
+) -> Generator[tuple[str, BaseDistribution], None, None]:
+    """Yield (path, owner) for files other installed distributions claim in RECORD.
+
+    Only distributions that ship a RECORD can make ownership claims, and the
+    distribution being uninstalled is skipped so its own entries do not
+    protect its files from removal.
+    """
+    for other in get_default_environment().iter_all_distributions():
+        if other is dist:
+            continue
+        if (
+            other.info_location is not None
+            and dist.info_location is not None
+            and os.path.normcase(other.info_location)
+            == os.path.normcase(dist.info_location)
+        ):
+            # The two metadata backends may wrap the same distribution twice.
+            continue
+        location = other.location
+        if location is None:
+            continue
+        entries = other.iter_declared_entries()
+        if entries is None:
+            continue
+        for entry in entries:
+            yield _declared_installed_path(location, entry), other
+
+
+def _protect_shared_paths(
+    dist: BaseDistribution,
+    paths: set[str],
+) -> tuple[set[str], dict[str, list[str]]]:
+    """Split planned uninstall paths by RECORD ownership.
+
+    Paths that another installed distribution's RECORD also declares are kept
+    on disk and reported together with the distributions that claim them.
+    Paths exclusive to the distribution being uninstalled remain removable.
+
+    Comparison uses the exact paths declared by the packager, so adjacent but
+    distinct files are never treated as the same path.
+    """
+    claims: dict[str, set[str]] = {}
+    for path, owner in _iter_foreign_record_claims(dist):
+        claims.setdefault(path, set()).add(owner.raw_name)
+
+    protected: set[str] = set()
+    for path in paths:
+        if claims.get(os.path.normcase(path)):
+            protected.add(path)
+
+    reported = {
+        path: sorted(claims[os.path.normcase(path)]) for path in protected
+    }
+    return paths - protected, reported
 
 
 def compact(paths: Iterable[str]) -> set[str]:
@@ -368,6 +437,9 @@ class UninstallPathSet:
         self._pth: dict[str, UninstallPthEntries] = {}
         self._dist = dist
         self._moved_paths = StashedUninstallPathSet()
+        # Files kept because another installed distribution's RECORD also
+        # declares them, mapped to the names of the distributions claiming them.
+        self._shared: dict[str, list[str]] = {}
         # Create local cache of normalize_path results. Creating an UninstallPathSet
         # can result in hundreds/thousands of redundant calls to normalize_path with
         # the same args, which hurts performance.
@@ -411,6 +483,29 @@ class UninstallPathSet:
             self._pth[pth_file].add(entry)
         else:
             self._refuse.add(pth_file)
+
+    def protect_shared_files(self) -> None:
+        """Keep files that another installed distribution's RECORD also claims.
+
+        Historical wheels may have installed into the same locations, so the
+        two distributions share some files. Removing such a file while
+        uninstalling one of them would break the other. Shared paths are moved
+        out of the removal plan and retained together with a report of the
+        distributions still depending on them.
+        """
+        if not self._paths:
+            return
+        removable, shared = _protect_shared_paths(self._dist, self._paths)
+        if not shared:
+            return
+        self._paths = removable
+        self._shared.update(shared)
+        for path in sorted(shared):
+            logger.info(
+                "Not removing %s, also required by %s",
+                path,
+                ", ".join(shared[path]),
+            )
 
     def remove(self, auto_confirm: bool = False, verbose: bool = False) -> None:
         """Remove paths in ``self._paths`` with confirmation (unless
@@ -472,6 +567,10 @@ class UninstallPathSet:
         _display("Would remove:", will_remove)
         _display("Would not remove (might be manually added):", will_skip)
         _display("Would not remove (outside of prefix):", self._refuse)
+        _display(
+            "Would not remove (also declared by another distribution):",
+            set(self._shared),
+        )
         if verbose:
             _display("Will actually move:", compress_for_rename(self._paths))
 
@@ -656,6 +755,11 @@ class UninstallPathSet:
 
         for s in iter_scripts_to_remove(dist, bin_dir):
             paths_to_remove.add(s)
+
+        # Two historical wheels may share installed paths. Do not let this
+        # uninstall delete files that another distribution's RECORD still
+        # declares, or the remaining distribution would lose its data.
+        paths_to_remove.protect_shared_files()
 
         return paths_to_remove
 

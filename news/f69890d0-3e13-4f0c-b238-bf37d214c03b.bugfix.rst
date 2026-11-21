@@ -1,0 +1,4 @@
+Keep files that another installed distribution's `RECORD` also declares when
+uninstalling a package, instead of deleting data the remaining distribution
+still needs. The retained files and the distributions claiming them are
+reported during uninstallation.
