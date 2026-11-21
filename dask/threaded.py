@@ -81,6 +81,9 @@ def get(
     cache: dict-like (optional)
         Temporary storage of results
 
+    Additional keyword arguments are forwarded to ``dask.local.get_async``,
+    e.g. ``retry`` and ``max_retries`` for optional per-task retries.
+
     Examples
     --------
     >>> inc = lambda x: x + 1

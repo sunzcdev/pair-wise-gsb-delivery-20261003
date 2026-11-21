@@ -392,6 +392,16 @@ class GraphNode:
         return False
 
     @property
+    def has_side_effects(self) -> bool:
+        """Whether this task performs side effects when executed.
+
+        Tasks with side effects must not be retried by schedulers since
+        re-executing them may not be idempotent. Errors raised by such tasks
+        are propagated directly.
+        """
+        return False
+
+    @property
     def dependencies(self) -> frozenset:
         return self._dependencies
 
@@ -493,6 +503,7 @@ class GraphNode:
             external_deps,
             *(TaskRef(k) for k in external_deps),
             _data_producer=any(t.data_producer for t in tasks),
+            _has_side_effects=any(t.has_side_effects for t in tasks),
         )
 
     @classmethod
@@ -638,6 +649,7 @@ class Task(GraphNode):
     args: tuple
     kwargs: dict
     _data_producer: bool
+    _has_side_effects: bool
     _token: str | None
     _is_coro: bool | None
     _repr: str | None
@@ -651,6 +663,7 @@ class Task(GraphNode):
         /,
         *args: Any,
         _data_producer: bool = False,
+        _has_side_effects: bool = False,
         **kwargs: Any,
     ):
         self.key = key
@@ -680,10 +693,15 @@ class Task(GraphNode):
         self._token = None
         self._repr = None
         self._data_producer = _data_producer
+        self._has_side_effects = _has_side_effects
 
     @property
     def data_producer(self) -> bool:
         return self._data_producer
+
+    @property
+    def has_side_effects(self) -> bool:
+        return self._has_side_effects
 
     def has_subgraph(self) -> bool:
         return self.func == _execute_subgraph
@@ -693,6 +711,7 @@ class Task(GraphNode):
             self.key,
             self.func,
             *self.args,
+            _has_side_effects=self._has_side_effects,
             **self.kwargs,
         )
 

@@ -309,7 +309,7 @@ def test_pickle_size():
     t2 = Task("key-2", func, TaskRef("key-1"), "c")
     assert len(pickle.dumps(t2)) < 140
 
-    assert len(pickle.dumps((t1, t2))) < 170
+    assert len(pickle.dumps((t1, t2))) < 172
 
     l = List(t1, t2)
     assert len(pickle.dumps(l)) <= 272
@@ -327,7 +327,7 @@ def test_pickle_size():
     # If this breaks, something cannot be memoized. That's very concerning
     assert len(growth) == 1
     # If this goes up, that's not great but not a disaster
-    assert growth.pop() <= 32
+    assert growth.pop() <= 33
 
 
 def test_tokenize():

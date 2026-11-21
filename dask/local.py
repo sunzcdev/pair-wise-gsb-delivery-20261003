@@ -110,6 +110,7 @@ See the function ``inline_functions`` for more information.
 from __future__ import annotations
 
 import os
+import sys
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Executor, Future
@@ -360,6 +361,30 @@ def identity(x):
     return x
 
 
+def _normalize_retry_policy(retry):
+    """Normalize the ``retry`` argument into a ``key -> bool`` predicate
+
+    Accepts
+    -------
+    None or False
+        No task is eligible for retries (the default).
+    True
+        Every task without side effects is eligible for retries.
+    A container of keys
+        Only tasks whose key is in the container are eligible.
+    A callable
+        Only tasks for which ``retry(key)`` returns True are eligible.
+    """
+    if retry is None or retry is False:
+        return None
+    if retry is True:
+        return lambda key: True
+    if callable(retry):
+        return retry
+    keys = set(retry)
+    return keys.__contains__
+
+
 """
 Task Selection
 --------------
@@ -393,6 +418,8 @@ def get_async(
     dumps=identity,
     loads=identity,
     chunksize=None,
+    retry=None,
+    max_retries=1,
     **kwargs,
 ):
     """Asynchronous get function
@@ -438,6 +465,17 @@ def get_async(
     chunksize: int, optional
         Size of chunks to use when dispatching work. Defaults to 1.
         If -1, will be computed to evenly divide ready work across workers.
+    retry: None, bool, container of keys, or callable, optional
+        Which tasks are eligible for per-task retries upon failure. Retries
+        are disabled by default (``None``). Pass ``True`` to allow every task
+        without side effects to be retried, a container of keys to only allow
+        those tasks to be retried, or a callable ``key -> bool``. Tasks that
+        declare side effects (``Task(..., _has_side_effects=True)``) are never
+        retried; their exceptions are propagated directly.
+    max_retries: int, optional
+        Maximum number of times an eligible task is retried after its first
+        failure. Defaults to 1. A failed attempt neither wakes up downstream
+        tasks nor releases the dependencies needed for the next attempt.
 
     See Also
     --------
@@ -481,6 +519,16 @@ def get_async(
 
             if rerun_exceptions_locally is None:
                 rerun_exceptions_locally = config.get("rerun_exceptions_locally", False)
+
+            retry_predicate = _normalize_retry_policy(retry)
+            retry_attempts: dict = defaultdict(int)
+
+            if retry_predicate is not None and pack_exception is default_pack_exception:
+                # Exceptions must be reported back to the scheduler (instead
+                # of being raised in the worker) so that eligible tasks can
+                # be requeued and retried.
+                def pack_exception(e, dumps):  # noqa: F811
+                    return dumps((e, sys.exc_info()[2]))
 
             if state["waiting"] and not state["ready"]:
                 raise ValueError("Found no accessible jobs in dask")
@@ -536,6 +584,21 @@ def get_async(
                 for key, res_info, failed in queue_get(queue).result():
                     if failed:
                         exc, tb = loads(res_info)
+                        if (
+                            retry_predicate is not None
+                            and retry_attempts[key] < max_retries
+                            and not getattr(dsk[key], "has_side_effects", False)
+                            and retry_predicate(key)
+                        ):
+                            # Requeue the task for another attempt. We
+                            # deliberately do not call ``finish_task`` here:
+                            # a failed attempt must neither wake up downstream
+                            # tasks nor release the dependency data that the
+                            # next attempt still needs.
+                            retry_attempts[key] += 1
+                            state["running"].discard(key)
+                            state["ready"].append(key)
+                            continue
                         if rerun_exceptions_locally:
                             data = {
                                 dep: state["cache"][dep]
@@ -587,7 +650,9 @@ synchronous_executor = SynchronousExecutor()
 def get_sync(dsk: Mapping, keys: Sequence[Key] | Key, **kwargs):
     """A naive synchronous version of get_async
 
-    Can be useful for debugging.
+    Can be useful for debugging. Accepts the same keyword arguments as
+    ``get_async``, including ``retry`` and ``max_retries`` for optional
+    per-task retries.
     """
     kwargs.pop("num_workers", None)  # if num_workers present, remove it
     return get_async(

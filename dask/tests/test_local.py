@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections import defaultdict
+
 import pytest
 
 import dask
 from dask._task_spec import Task, TaskRef
 from dask.local import finish_task, get_sync, sortkey, start_state_from_dask
 from dask.order import order
+from dask.threaded import get as get_threaded
 from dask.utils_test import GetFunctionTestMixin, add, inc
 
 fib_dask = {"f0": 0, "f1": 1, "f2": 1, "f3": 2, "f4": 3, "f5": 5, "f6": 8}
@@ -220,3 +223,131 @@ def test_detect_malformed_graph():
     with pytest.raises(ValueError, match="Missing dependency"):
         get_sync(dsk, "y")
     assert get_sync(dsk, "y", cache={"x": 1}) == 1
+
+
+class TransientReadError(OSError):
+    """Simulates a temporary read error of a pure compute chunk."""
+
+
+def _two_branch_graph(calls):
+    """Two call-counted sibling branches joined by a sum."""
+
+    def flaky_read():
+        calls["flaky"] += 1
+        if calls["flaky"] == 1:
+            raise TransientReadError("temporary read error")
+        return 1
+
+    def stable_branch():
+        calls["stable"] += 1
+        return 2
+
+    return {
+        "flaky": Task("flaky", flaky_read),
+        "stable": Task("stable", stable_branch),
+        "total": Task("total", add, TaskRef("flaky"), TaskRef("stable")),
+    }
+
+
+@pytest.mark.parametrize("get", [get_sync, get_threaded], ids=["sync", "threads"])
+def test_retry_only_marked_task(get):
+    calls = defaultdict(int)
+    dsk = _two_branch_graph(calls)
+    assert get(dsk, "total", retry={"flaky"}, max_retries=1) == 3
+    # Only the marked, flaky branch was re-executed
+    assert calls["flaky"] == 2
+    assert calls["stable"] == 1
+
+
+@pytest.mark.parametrize("get", [get_sync, get_threaded], ids=["sync", "threads"])
+def test_retry_disabled_by_default(get):
+    calls = defaultdict(int)
+    dsk = _two_branch_graph(calls)
+    with pytest.raises(TransientReadError):
+        get(dsk, "total")
+    assert calls["flaky"] == 1
+
+
+@pytest.mark.parametrize("get", [get_sync, get_threaded], ids=["sync", "threads"])
+def test_retry_unmarked_task_propagates(get):
+    calls = defaultdict(int)
+    dsk = _two_branch_graph(calls)
+    # Only the stable branch is marked retryable; the flaky one is not
+    with pytest.raises(TransientReadError):
+        get(dsk, "total", retry={"stable"}, max_retries=2)
+    assert calls["flaky"] == 1
+
+
+@pytest.mark.parametrize("get", [get_sync, get_threaded], ids=["sync", "threads"])
+def test_retry_keeps_dependencies_and_delays_downstream(get):
+    calls = defaultdict(int)
+
+    def source():
+        calls["source"] += 1
+        return 40
+
+    def flaky_inc(x):
+        calls["flaky"] += 1
+        if calls["flaky"] == 1:
+            raise TransientReadError("temporary read error")
+        return x + 1
+
+    def downstream(x):
+        calls["downstream"] += 1
+        return x * 2
+
+    dsk = {
+        "source": Task("source", source),
+        "flaky": Task("flaky", flaky_inc, TaskRef("source")),
+        "out": Task("out", downstream, TaskRef("flaky")),
+    }
+    # The retry needs the "source" result again: it must not have been
+    # released after the first failed attempt. The downstream task must only
+    # run once the retry succeeded.
+    assert get(dsk, "out", retry={"flaky"}, max_retries=2) == 82
+    assert dict(calls) == {"source": 1, "flaky": 2, "downstream": 1}
+
+
+@pytest.mark.parametrize("get", [get_sync, get_threaded], ids=["sync", "threads"])
+def test_retry_exhausted_propagates(get):
+    calls = defaultdict(int)
+
+    def always_fails():
+        calls["flaky"] += 1
+        raise TransientReadError("temporary read error")
+
+    dsk = {"flaky": Task("flaky", always_fails)}
+    with pytest.raises(TransientReadError):
+        get(dsk, "flaky", retry={"flaky"}, max_retries=2)
+    assert calls["flaky"] == 3
+
+
+@pytest.mark.parametrize("get", [get_sync, get_threaded], ids=["sync", "threads"])
+def test_side_effect_task_propagates_without_retry(get):
+    calls = defaultdict(int)
+
+    def flaky_read():
+        calls["flaky"] += 1
+        if calls["flaky"] == 1:
+            raise TransientReadError("temporary read error")
+        return 1
+
+    def side_effecting(x):
+        calls["side-effect"] += 1
+        raise TransientReadError("temporary read error")
+
+    dsk = {
+        "flaky": Task("flaky", flaky_read),
+        # The side-effect task depends on the flaky one so that the retry of
+        # "flaky" has completed deterministically before it runs
+        "side-effect": Task(
+            "side-effect", side_effecting, TaskRef("flaky"), _has_side_effects=True
+        ),
+    }
+    # retry=True retries everything retryable, but the task declared as
+    # having side effects propagates the same error directly
+    with pytest.raises(TransientReadError):
+        get(dsk, "side-effect", retry=True, max_retries=3)
+    assert calls["side-effect"] == 1
+    # The retryable sibling was still retried
+    assert calls["flaky"] == 2
