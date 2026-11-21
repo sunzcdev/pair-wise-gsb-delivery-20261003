@@ -1,0 +1,6 @@
+Retain provenance for requirements expanded from ``--group`` dependency
+groups. Each expanded requirement now records the selected ``pyproject.toml``,
+the chain of ``include-group`` references followed to reach it, and the
+effective environment marker. When constraints from different groups or from a
+mix of groups and requirements files conflict, resolver errors show which
+pyproject, group layer and marker each conflicting requirement came from.

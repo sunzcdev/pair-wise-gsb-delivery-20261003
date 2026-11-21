@@ -428,7 +428,7 @@ def install_req_from_line(
 
 def install_req_from_req_string(
     req_string: str,
-    comes_from: InstallRequirement | None = None,
+    comes_from: InstallRequirement | str | None = None,
     isolated: bool = False,
     user_supplied: bool = False,
 ) -> InstallRequirement:

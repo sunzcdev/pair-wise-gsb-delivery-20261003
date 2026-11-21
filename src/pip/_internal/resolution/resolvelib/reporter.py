@@ -8,6 +8,7 @@ from typing import Any
 from pip._vendor.resolvelib.reporters import BaseReporter
 
 from .base import Candidate, Constraint, Requirement
+from .factory import _format_root_requirement
 
 logger = getLogger(__name__)
 
@@ -56,9 +57,10 @@ class PipReporter(BaseReporter[Requirement, Candidate, str]):
             msg += "\n    "
             if parent:
                 msg += f"{parent.name} {parent.version} depends on "
+                msg += req.format_for_error()
             else:
                 msg += "The user requested "
-            msg += req.format_for_error()
+                msg += _format_root_requirement(req)
 
         # Add any relevant constraints
         if self._constraints:

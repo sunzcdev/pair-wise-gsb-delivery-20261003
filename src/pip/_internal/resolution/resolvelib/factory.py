@@ -81,6 +81,22 @@ C = TypeVar("C")
 Cache = dict[Link, C]
 
 
+def _format_root_requirement(req: Requirement) -> str:
+    """Format a root (parentless) requirement for conflict output.
+
+    A root requirement expanded from a dependency group carries its provenance
+    (pyproject file, group include chain and effective marker) on the backing
+    InstallRequirement's ``comes_from``.  Surface it here so that conflicting
+    constraints sourced from different groups show which layer each one came
+    from, instead of only printing the flattened requirement strings.
+    """
+    text = req.format_for_error()
+    _, ireq = req.get_candidate_lookup()
+    if ireq is not None and isinstance(ireq.comes_from, str):
+        text += f" (from {ireq.comes_from})"
+    return text
+
+
 class CollectedRootRequirements(NamedTuple):
     requirements: list[Requirement]
     constraints: dict[str, Constraint]
@@ -692,7 +708,12 @@ class Factory:
             req_str = str(requirement_without_marker(ireq.req))
         else:
             req_str = str(req)
-        req_disp = req_str if parent is None else f"{req_str} (from {parent.name})"
+        if parent is None:
+            req_disp = req_str
+            if ireq is not None and isinstance(ireq.comes_from, str):
+                req_disp += f" (from {ireq.comes_from})"
+        else:
+            req_disp = f"{req_str} (from {parent.name})"
         cands = self._finder.find_all_candidates(req.project_name)
         skipped_by_requires_python = self._finder.requires_python_skipped_reasons()
 
@@ -836,7 +857,7 @@ class Factory:
         for req, parent in e.causes:
             if parent is None:
                 # This is a root requirement, so we can report it directly
-                trigger = req.format_for_error()
+                trigger = _format_root_requirement(req)
             else:
                 trigger = describe_trigger(parent)
             triggers.add(trigger)
@@ -860,9 +881,10 @@ class Factory:
             msg = msg + "\n    "
             if parent:
                 msg = msg + f"{parent.name} {parent.version} depends on "
+                msg = msg + req.format_for_error()
             else:
                 msg = msg + "The user requested "
-            msg = msg + req.format_for_error()
+                msg = msg + _format_root_requirement(req)
         for key in relevant_constraints:
             constraint_text = f"{key}{constraints[key].format_for_error()}"
             msg += f"\n    The user requested (constraint) {constraint_text}"

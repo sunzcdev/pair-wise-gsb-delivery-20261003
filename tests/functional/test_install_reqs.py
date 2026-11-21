@@ -140,6 +140,133 @@ def test_multiple_dependency_groups(script: PipTestEnvironment) -> None:
     script.assert_installed(**{"simple.dist": "0.1", "simplewheel": "1.0"})
 
 
+def test_dependency_group_include_chain_provenance(
+    script: PipTestEnvironment, data: TestData
+) -> None:
+    """
+    A requirement reached through an include-group still installs, and its
+    provenance (selected group -> included group) is shown while processing.
+    """
+    script.temporary_multiline_file(
+        "pyproject.toml",
+        """\
+            [dependency-groups]
+            dev = [
+                {include-group = "test"},
+            ]
+            test = [
+                "simple.dist==0.1",
+            ]
+            """,
+    )
+    result = script.pip(
+        "install",
+        "--no-index",
+        "-f",
+        data.find_links,
+        "--group",
+        "dev",
+    )
+    script.assert_installed(**{"simple.dist": "0.1"})
+    assert (
+        "from dependency group 'dev' from 'pyproject.toml' "
+        "(included via 'dev -> test')"
+    ) in result.stdout
+
+
+def test_conflicting_dependency_groups_report_each_layer(
+    script: PipTestEnvironment, data: TestData
+) -> None:
+    """
+    Two conflicting constraints sourced from different pyproject files (both
+    using a group named 'test', one reached through an include chain) must each
+    report the layer they came from in the resolver error.
+    """
+    project_a = script.scratch_path / "proj_a"
+    project_b = script.scratch_path / "proj_b"
+    project_a.mkdir()
+    project_b.mkdir()
+    (project_a / "pyproject.toml").write_text(textwrap.dedent("""\
+            [dependency-groups]
+            test = [
+                "simplewheel==1.0",
+                {include-group = "shared"},
+            ]
+            shared = ["simple.dist==0.1"]
+            """))
+    (project_b / "pyproject.toml").write_text(textwrap.dedent("""\
+            [dependency-groups]
+            test = ["simplewheel==2.0"]
+            """))
+
+    result = script.pip(
+        "install",
+        "--no-index",
+        "-f",
+        data.find_links,
+        "--group",
+        "proj_a/pyproject.toml:test",
+        "--group",
+        "proj_b/pyproject.toml:test",
+        expect_error=True,
+    )
+
+    # Each conflicting pin identifies the pyproject and group it came from.
+    assert (
+        "The user requested simplewheel==1.0 (from dependency group 'test' "
+        "from 'proj_a/pyproject.toml')"
+    ) in result.stdout, str(result)
+    assert (
+        "The user requested simplewheel==2.0 (from dependency group 'test' "
+        "from 'proj_b/pyproject.toml')"
+    ) in result.stdout, str(result)
+
+
+def test_dependency_group_provenance_distinguishes_from_requirements_file(
+    script: PipTestEnvironment, data: TestData
+) -> None:
+    """
+    When plain requirements and group requirements conflict, the error output
+    keeps the two root sources distinguishable.
+    """
+    script.scratch_path.joinpath("reqs.txt").write_text("simplewheel==2.0\n")
+    script.temporary_multiline_file(
+        "pyproject.toml",
+        """\
+            [dependency-groups]
+            test = [
+                {include-group = "pinned"},
+            ]
+            pinned = [
+                'simplewheel==1.0; python_version >= "3.0"',
+            ]
+            """,
+    )
+
+    result = script.pip(
+        "install",
+        "--no-index",
+        "-f",
+        data.find_links,
+        "-r",
+        script.scratch_path / "reqs.txt",
+        "--group",
+        "test",
+        expect_error=True,
+    )
+
+    # The group entry shows the include chain and the effective marker.
+    assert (
+        "The user requested simplewheel==1.0; python_version >= \"3.0\" "
+        "(from dependency group 'test' from 'pyproject.toml' "
+        "(included via 'test -> pinned'); marker 'python_version >= \"3.0\"')"
+    ) in result.stdout, str(result)
+    # The requirements-file entry keeps its own, separate provenance.
+    assert (
+        "The user requested simplewheel==2.0 (from -r reqs.txt (line 1))"
+    ) in result.stdout, str(result)
+
+
 def test_dependency_group_with_non_normalized_name(script: PipTestEnvironment) -> None:
     """
     Test installing from a dependency group with a non-normalized name, verifying that

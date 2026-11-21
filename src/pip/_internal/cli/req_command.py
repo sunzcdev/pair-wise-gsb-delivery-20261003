@@ -414,9 +414,10 @@ class RequirementCommand(IndexGroupCommand):
             requirements.append(req_to_add)
 
         if project_groups:
-            for req in parse_dependency_groups(project_groups):
+            for resolved in parse_dependency_groups(project_groups):
                 req_to_add = install_req_from_req_string(
-                    req,
+                    resolved.requirement,
+                    comes_from=resolved.provenance.comes_from(),
                     isolated=options.isolated_mode,
                     user_supplied=True,
                 )
