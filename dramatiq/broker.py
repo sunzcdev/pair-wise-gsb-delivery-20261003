@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import enum
 import warnings
 from typing import TYPE_CHECKING, Any, Iterable, Optional, Self, cast
 
@@ -76,6 +77,32 @@ def set_broker(broker: Broker) -> None:
     """
     global global_broker
     global_broker = broker
+
+
+class MessageStatus(str, enum.Enum):
+    """The delivery status of a message as it moves through a worker.
+
+    The status makes the phases of a delivery explicitly observable
+    and, in particular, separates the *processing outcome* (the actor
+    has finished running and its result or exception is known) from
+    the *broker settlement* (the ack or nack has been delivered to the
+    broker).  A message whose actor has finished but whose ack has not
+    gone through yet (e.g. because the ack is being retried after a
+    connection error) is observable as :attr:`processed`.
+    """
+
+    #: The message has been picked up off of the broker but the actor
+    #: has not finished running yet.
+    RECEIVED = "received"
+    #: The actor has finished running and the outcome (result or
+    #: exception) is known, but the message has not been settled with
+    #: the broker yet: its ack or nack may still be in flight or being
+    #: retried.
+    PROCESSED = "processed"
+    #: The message has been acknowledged; the broker has settled it.
+    ACKNOWLEDGED = "acknowledged"
+    #: The message has been rejected; the broker has settled it.
+    REJECTED = "rejected"
 
 
 class Broker:
@@ -401,6 +428,24 @@ class MessageProxy:
         self.failed = False
         self._message = message
         self._exception: Optional[BaseException] = None
+        self._status = MessageStatus.RECEIVED
+        # Settlement notifications (before_ack/before_nack) are sent at
+        # most once per delivery.  Acknowledging a delivery may be
+        # retried (e.g. after a connection error) and the notification
+        # must not be re-sent on every attempt.
+        self._ack_notified = False
+        self._nack_notified = False
+
+    @property
+    def status(self) -> MessageStatus:
+        """The current delivery status of this message.
+
+        This separates the processing outcome (``processed``: the
+        actor has finished and the result is known) from the broker
+        settlement (``acknowledged``/``rejected``: the ack or nack has
+        been delivered to the broker).
+        """
+        return self._status
 
     def stuff_exception(self, exception: BaseException) -> None:
         """Stuff an exception into this message."""

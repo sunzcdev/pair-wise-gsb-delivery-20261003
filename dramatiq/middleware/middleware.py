@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from ..actor import Actor
-    from ..broker import Broker, MessageProxy
+    from ..broker import Broker, MessageProxy, MessageStatus
     from ..message import Message
     from ..worker import ConsumerThread, Worker, WorkerThread
 
@@ -105,6 +105,29 @@ class Middleware:
           SkipMessage: If the current message should be skipped.  When
             this is raised, ``after_skip_message`` is emitted instead
             of ``after_process_message``.
+        """
+
+    def after_message_status_change(
+        self,
+        broker: Broker,
+        message: MessageProxy,
+        *,
+        status: MessageStatus,
+        previous_status: MessageStatus,
+    ) -> None:
+        """Called after the delivery status of a message has changed.
+
+        This makes the phases of a delivery explicitly observable: a
+        message becomes ``processed`` as soon as its processing outcome
+        is known, and ``acknowledged``/``rejected`` only once the ack
+        or nack has actually been delivered to the broker.
+
+        Parameters:
+          broker(Broker)
+          message(MessageProxy)
+          status(MessageStatus): The new status of the message.
+          previous_status(MessageStatus): The status the message had
+            before the transition.
         """
 
     def after_process_message(

@@ -26,7 +26,7 @@ from queue import Empty, PriorityQueue
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Iterable, Optional, Union
 
-from .broker import Broker, Consumer, MessageProxy
+from .broker import Broker, Consumer, MessageProxy, MessageStatus
 from .common import current_millis, iter_queue, join_all, q_name
 from .errors import ActorNotFound, BrokerConnectionError, RateLimitExceeded, Retry
 from .logging import get_logger
@@ -408,14 +408,26 @@ class ConsumerThread(Thread):
             try:
                 if message.failed:
                     self.logger.debug("Rejecting message %r.", message.message_id)
-                    self.broker.emit_before("nack", message)
+                    if not message._nack_notified:
+                        # The rejection notification is sent at most
+                        # once per delivery, even if the nack itself
+                        # has to be retried below.
+                        message._nack_notified = True
+                        self.broker.emit_before("nack", message)
                     self.consumer.nack(message)
+                    _update_message_status(self.broker, message, MessageStatus.REJECTED)
                     self.broker.emit_after("nack", message)
 
                 else:
                     self.logger.debug("Acknowledging message %r.", message.message_id)
-                    self.broker.emit_before("ack", message)
+                    if not message._ack_notified:
+                        # The success notification is sent at most once
+                        # per delivery, even if the ack itself has to
+                        # be retried below.
+                        message._ack_notified = True
+                        self.broker.emit_before("ack", message)
                     self.consumer.ack(message)
+                    _update_message_status(self.broker, message, MessageStatus.ACKNOWLEDGED)
                     self.broker.emit_after("ack", message)
 
                 return
@@ -570,12 +582,14 @@ class WorkerThread(Thread):
                         "result into another actor." % actor.actor_name
                     )
 
+            _update_message_status(self.broker, message, MessageStatus.PROCESSED)
             self.broker.emit_after("process_message", message, result=res)
 
         except SkipMessage as e:
             if message.failed:
                 message.stuff_exception(e)
             self.logger.warning("Message %s was skipped.", message)
+            _update_message_status(self.broker, message, MessageStatus.PROCESSED)
             self.broker.emit_after("skip_message", message)
 
         except BaseException as e:
@@ -597,6 +611,7 @@ class WorkerThread(Thread):
                     exc_info=True,
                 )
 
+            _update_message_status(self.broker, message, MessageStatus.PROCESSED)
             self.broker.emit_after("process_message", message, exception=e)
 
         finally:
@@ -635,6 +650,20 @@ class WorkerThread(Thread):
 @lru_cache(maxsize=128)
 def has_results_middleware(broker: Broker) -> bool:
     return any(type(m) is Results for m in broker.middleware)
+
+
+def _update_message_status(broker: Broker, message: MessageProxy, status: MessageStatus) -> None:
+    """Transition a message to a new delivery status and notify middleware.
+
+    This is a no-op if the message is already in the given status, so
+    the notification is emitted at most once per phase transition.
+    """
+    previous_status = message.status
+    if previous_status is status:
+        return
+
+    message._status = status
+    broker.emit_after("message_status_change", message, status=status, previous_status=previous_status)
 
 
 _ConsumerThread = ConsumerThread

@@ -20,7 +20,7 @@ from __future__ import annotations
 import warnings
 
 from .actor import Actor, actor
-from .broker import Broker, Consumer, MessageProxy, get_broker, set_broker
+from .broker import Broker, Consumer, MessageProxy, MessageStatus, get_broker, set_broker
 from .composition import group, pipeline
 from .encoder import Encoder, JSONEncoder, PickleEncoder
 from .errors import (
@@ -76,6 +76,7 @@ __all__ = [
     "get_logger",
     # Messages
     "Message",
+    "MessageStatus",
     "get_encoder",
     "set_encoder",
     # Middlware
