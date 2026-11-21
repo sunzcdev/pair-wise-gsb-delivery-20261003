@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
+import time
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
 import pytest
 
-from watchdog.events import FileModifiedEvent, FileSystemEventHandler
+from watchdog.events import FileModifiedEvent, FileReplacedEvent, FileSystemEventHandler
+from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver, EventEmitter
 
 if TYPE_CHECKING:
@@ -178,6 +181,96 @@ def test_schedule_failure_does_not_keep_handler(observer, running, emitter_metho
 
     accepted_handler.dispatch.assert_called_once_with(event)
     rejected_handler.dispatch.assert_not_called()
+
+
+def test_single_file_track_by_path_atomic_save(tmp_path):
+    """A path-tracking file watch survives atomic-save replacements.
+
+    Editors save by writing a temporary file in the same directory and renaming
+    it over the original. A single-file watch scheduled with track_by_path=True
+    keeps watching the target path across two such replacements, reporting each
+    takeover as a FileReplacedEvent and a later in-place edit as a plain
+    FileModifiedEvent, while events for a sibling file never reach the handler.
+    """
+    target = tmp_path / "config.ini"
+    target.write_text("one")
+    other = tmp_path / "other.ini"
+    other.write_text("other")
+
+    received = []
+    received_lock = threading.Lock()
+
+    class Handler(FileSystemEventHandler):
+        def on_any_event(self, event):
+            with received_lock:
+                received.append(event)
+
+    observer = Observer()
+    observer.schedule(Handler(), str(target), track_by_path=True)
+    observer.start()
+    try:
+        # Wait until the emitter thread runs before making changes.
+        deadline = time.monotonic() + 5
+        while not any(emitter.is_alive() for emitter in observer.emitters) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.5)
+
+        def atomic_save(contents):
+            temp = tmp_path / "config.ini.tmp"
+            temp.write_text(contents)
+            os.replace(temp, target)
+
+        def replaced_count(events):
+            return sum(isinstance(e, FileReplacedEvent) for e in events)
+
+        def wait_for(predicate, timeout=10):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                with received_lock:
+                    if predicate(list(received)):
+                        return
+                time.sleep(0.05)
+            msg = "timed out waiting for expected events"
+            raise AssertionError(msg)
+
+        atomic_save("two")
+        wait_for(lambda events: replaced_count(events) >= 1)
+        other.write_text("other-two")  # sibling noise: must not leak in
+
+        atomic_save("three")
+        wait_for(lambda events: replaced_count(events) >= 2)
+        other.write_text("other-three")
+
+        target.write_text("four")  # in-place modification
+        wait_for(
+            lambda events: any(
+                isinstance(e, FileModifiedEvent) and not isinstance(e, FileReplacedEvent) for e in events
+            )
+        )
+
+        time.sleep(1)  # grace period for straggler events
+    finally:
+        observer.stop()
+        observer.join()
+
+    with received_lock:
+        events = list(received)
+
+    target_path = os.path.abspath(str(target))
+    # Nothing about the sibling file or the temporary file may leak in.
+    for event in events:
+        assert os.path.abspath(event.src_path) == target_path
+        assert not event.dest_path
+
+    # Each replacement was reported exactly once, as a replacement.
+    replaced = [i for i, e in enumerate(events) if isinstance(e, FileReplacedEvent)]
+    assert len(replaced) == 2
+
+    # The in-place edit is a plain modification, reported after the replacements.
+    first_modified = next(
+        i for i, e in enumerate(events) if isinstance(e, FileModifiedEvent) and not isinstance(e, FileReplacedEvent)
+    )
+    assert first_modified > replaced[-1]
 
 
 def test_context_manager_starts_observer():

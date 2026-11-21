@@ -13,6 +13,7 @@ from watchdog.events import (
     EVENT_TYPE_MODIFIED,
     EVENT_TYPE_MOVED,
     EVENT_TYPE_OPENED,
+    EVENT_TYPE_REPLACED,
     DirAttribEvent,
     DirCreatedEvent,
     DirDeletedEvent,
@@ -27,6 +28,7 @@ from watchdog.events import (
     FileModifiedEvent,
     FileMovedEvent,
     FileOpenedEvent,
+    FileReplacedEvent,
     FileSystemEventHandler,
     generate_sub_moved_events,
 )
@@ -63,6 +65,37 @@ def test_file_modified_event_is_directory():
     event = FileModifiedEvent(path_1)
     assert not event.is_directory
     assert not event.is_synthetic
+
+
+def test_file_replaced_event():
+    event = FileReplacedEvent(path_1)
+    assert path_1 == event.src_path
+    assert event.event_type == EVENT_TYPE_REPLACED
+    assert not event.is_directory
+    assert not event.is_synthetic
+    # A replacement is a kind of modification for filtering purposes.
+    assert isinstance(event, FileModifiedEvent)
+    assert event != FileModifiedEvent(path_1)
+
+
+def test_file_replaced_event_dispatch():
+    calls = []
+
+    class Handler(FileSystemEventHandler):
+        def on_any_event(self, event):
+            calls.append(("any", event))
+
+        def on_replaced(self, event):
+            calls.append(("replaced", event))
+
+        def on_modified(self, event):
+            calls.append(("modified", event))
+
+    event = FileReplacedEvent(path_1)
+    Handler().dispatch(event)
+    FileSystemEventHandler().dispatch(event)
+
+    assert calls == [("any", event), ("replaced", event)]
 
 
 def test_file_created_event():

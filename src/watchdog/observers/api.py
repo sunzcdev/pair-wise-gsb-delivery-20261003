@@ -8,7 +8,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from watchdog.events import FileSystemMovedEvent
+from watchdog.events import FileDeletedEvent, FileMovedEvent, FileReplacedEvent, FileSystemMovedEvent
 from watchdog.utils import BaseThread
 from watchdog.utils.bricks import SkipRepeatsQueue
 
@@ -56,6 +56,17 @@ class ObservedWatch:
         ``True`` if symlinks are followed; ``False`` otherwise.
     :type follow_symlink:
         ``bool``
+    :param track_by_path:
+        Only meaningful when ``path`` is a single file. ``True`` keeps watching
+        the file's *path* when the file is replaced by another one (the
+        write-temporary-then-rename save pattern of editors): the replacement is
+        reported as :class:`watchdog.events.FileReplacedEvent`, a rename of the
+        file away from the path as :class:`watchdog.events.FileDeletedEvent`,
+        and later changes to whatever file sits at the path keep being reported.
+        ``False`` (default) observes the file object as-is, reporting moves
+        involving the path unchanged.
+    :type track_by_path:
+        ``bool``
     """
 
     def __init__(
@@ -65,10 +76,12 @@ class ObservedWatch:
         recursive: bool,
         event_filter: list[type[FileSystemEvent]] | None = None,
         follow_symlink: bool = False,
+        track_by_path: bool = False,
     ):
         raw_path = str(path) if isinstance(path, Path) else path
         self.raw_path = raw_path
         self.follow_symlink = follow_symlink
+        self.track_by_path = track_by_path
         self.event_filter = frozenset(event_filter) if event_filter is not None else None
 
         self.is_file = os.path.isfile(raw_path)
@@ -84,9 +97,9 @@ class ObservedWatch:
             self.is_recursive = recursive
 
     @property
-    def key(self) -> tuple[str, bool, frozenset[type[FileSystemEvent]] | None, bool]:
-        """A tuple key identifying the watch (raw_path, recursive, event_filter, follow_symlink)."""
-        return self.raw_path, self.is_recursive, self.event_filter, self.follow_symlink
+    def key(self) -> tuple[str, bool, frozenset[type[FileSystemEvent]] | None, bool, bool]:
+        """A tuple key identifying the watch (raw_path, recursive, event_filter, follow_symlink, track_by_path)."""
+        return self.raw_path, self.is_recursive, self.event_filter, self.follow_symlink, self.track_by_path
 
     def __eq__(self, watch: object) -> bool:
         if not isinstance(watch, ObservedWatch):
@@ -107,7 +120,11 @@ class ObservedWatch:
             event_filter_str = f", event_filter={event_filter_str}"
         else:
             event_filter_str = ""
-        return f"<{type(self).__name__}: path={self.path!r}, is_recursive={self.is_recursive}{event_filter_str}>"
+        track_by_path_str = ", track_by_path=True" if self.track_by_path else ""
+        return (
+            f"<{type(self).__name__}: path={self.path!r}, is_recursive={self.is_recursive}"
+            f"{event_filter_str}{track_by_path_str}>"
+        )
 
 
 # Observer classes
@@ -357,6 +374,7 @@ class BaseObserver(EventDispatcher):
         recursive: bool = False,
         event_filter: list[type[FileSystemEvent]] | None = None,
         follow_symlink: bool = False,
+        track_by_path: bool = False,
     ) -> ObservedWatch:
         """Schedules watching a path and calls appropriate methods specified
         in the given event handler in response to file system events.
@@ -384,12 +402,30 @@ class BaseObserver(EventDispatcher):
             ``True`` if symlinks should be followed; ``False`` otherwise.
         :type follow_symlink:
             ``bool``
+        :param track_by_path:
+            Only meaningful when ``path`` is a single file. ``True`` keeps
+            watching the file's *path* when a save replaces the file with
+            another one (editors commonly write a temporary file in the same
+            directory and rename it over the original): the replacement is
+            dispatched as :class:`watchdog.events.FileReplacedEvent`
+            (``on_replaced()``), a rename of the file away from the path as
+            :class:`watchdog.events.FileDeletedEvent`, and changes to whatever
+            file sits at the path keep being reported. ``False`` (default)
+            observes the file object as-is. Ignored for directory watches.
+        :type track_by_path:
+            ``bool``
         :return:
             An :class:`ObservedWatch` object instance representing
             a watch.
         """
         with self._lock:
-            watch = ObservedWatch(path, recursive=recursive, event_filter=event_filter, follow_symlink=follow_symlink)
+            watch = ObservedWatch(
+                path,
+                recursive=recursive,
+                event_filter=event_filter,
+                follow_symlink=follow_symlink,
+                track_by_path=track_by_path,
+            )
 
             # If we don't have an emitter for this watch already, create it.
             if watch not in self._emitter_for_watch:
@@ -496,6 +532,17 @@ class BaseObserver(EventDispatcher):
             if src_path != target and dest_path != target:
                 event_queue.task_done()
                 return
+
+            if watch.track_by_path and isinstance(event, FileMovedEvent):
+                if dest_path == target and src_path != target:
+                    # Another file was renamed over the watched path (e.g. an
+                    # editor's atomic save): the path now denotes a different
+                    # file. Keep watching the path and report a replacement.
+                    event = FileReplacedEvent(event.dest_path, is_synthetic=event.is_synthetic)
+                elif src_path == target and dest_path != target:
+                    # The file was renamed away from the watched path: the path
+                    # itself no longer exists, but the watch keeps following it.
+                    event = FileDeletedEvent(event.src_path, is_synthetic=event.is_synthetic)
 
         # To allow unschedule/stop and safe removal of event handlers
         # within event handlers itself, check if the handler is still

@@ -8,9 +8,12 @@ from threading import Event
 import pytest
 
 from watchdog.events import (
+    FileCreatedEvent,
+    FileDeletedEvent,
     FileModifiedEvent,
     FileMovedEvent,
     FileOpenedEvent,
+    FileReplacedEvent,
     FileSystemEventHandler,
     LoggingEventHandler,
 )
@@ -86,6 +89,36 @@ def test_observer_schedule_respects_second_follow_symlink():
     assert observer._emitter_for_watch[watch_follow].watch.follow_symlink  # noqa: SLF001
 
 
+def test_observer__eq__ignores_track_by_path():
+    """Two watches that differ only in ``track_by_path`` must not compare equal.
+
+    ``track_by_path`` changes what a single-file watch reports for renames, so
+    scheduling the same file once with and once without it must create two
+    independent watches, the same treatment ``follow_symlink`` gets.
+    """
+    watch_by_object = ObservedWatch("/foobar", recursive=False, track_by_path=False)
+    watch_by_path = ObservedWatch("/foobar", recursive=False, track_by_path=True)
+
+    assert watch_by_object != watch_by_path
+    assert hash(watch_by_object) != hash(watch_by_path)
+
+
+def test_observer_schedule_respects_second_track_by_path(tmp_path: Path):
+    """A second ``schedule()`` for the same file must honor its own track_by_path."""
+    file_path = tmp_path / "watched.txt"
+    file_path.write_text("content")
+
+    observer = BaseObserver(EventEmitter)
+    handler = LoggingEventHandler()
+
+    watch_by_object = observer.schedule(handler, file_path)
+    watch_by_path = observer.schedule(handler, file_path, track_by_path=True)
+
+    assert len(observer.emitters) == 2
+    assert not observer._emitter_for_watch[watch_by_object].watch.track_by_path  # noqa: SLF001
+    assert observer._emitter_for_watch[watch_by_path].watch.track_by_path  # noqa: SLF001
+
+
 def test_observer__repr__():
     observed_watch = ObservedWatch("/foobar", recursive=True)
     repr_str = "<ObservedWatch: path='/foobar', is_recursive=True>"
@@ -94,6 +127,11 @@ def test_observer__repr__():
 
     observed_watch = ObservedWatch("/foobar", recursive=False, event_filter=[FileOpenedEvent, FileModifiedEvent])
     repr_str = "<ObservedWatch: path='/foobar', is_recursive=False, event_filter=FileModifiedEvent|FileOpenedEvent>"
+    assert observed_watch.__repr__() == repr(observed_watch)
+    assert repr(observed_watch) == repr_str
+
+    observed_watch = ObservedWatch("/foobar", recursive=False, track_by_path=True)
+    repr_str = "<ObservedWatch: path='/foobar', is_recursive=False, track_by_path=True>"
     assert observed_watch.__repr__() == repr(observed_watch)
     assert repr(observed_watch) == repr_str
 
@@ -312,6 +350,115 @@ def test_single_file_dispatch_events(tmp_path: Path):
     observer.dispatch_events(observer.event_queue)
 
     assert events == [mod_event, move_event]
+
+
+def test_single_file_track_by_path_dispatch_events(tmp_path: Path):
+    """A track_by_path file watch reports replacements and rename-aways as path events.
+
+    Another file renamed over the watched path becomes a FileReplacedEvent, a
+    rename of the watched file away becomes a FileDeletedEvent, in-place
+    modifications and creations pass through unchanged, and events for other
+    files in the same directory stay filtered out.
+    """
+    file_a = tmp_path / "a.txt"
+    file_a.write_text("a")
+    file_b = tmp_path / "b.txt"
+    temp = tmp_path / ".a.txt.tmp"
+    other = tmp_path / "other.txt"
+    other.write_text("o")
+
+    events = []
+
+    class Handler(LoggingEventHandler):
+        def dispatch(self, event):
+            events.append(event)
+
+    observer = BaseObserver(EventEmitter)
+    watch_a = observer.schedule(Handler(), file_a, track_by_path=True)
+    assert watch_a.track_by_path
+
+    # Another file renamed over the watched path -> FileReplacedEvent
+    observer.event_queue.put((FileMovedEvent(str(temp), str(file_a)), watch_a))
+    # Unrelated file modified -> filtered out
+    observer.event_queue.put((FileModifiedEvent(str(other)), watch_a))
+    # Unrelated file renamed onto another unrelated path -> filtered out
+    observer.event_queue.put((FileMovedEvent(str(other), str(temp)), watch_a))
+    # Watched file renamed away -> FileDeletedEvent
+    observer.event_queue.put((FileMovedEvent(str(file_a), str(file_b)), watch_a))
+    # In-place modification -> passed through unchanged
+    mod_event = FileModifiedEvent(str(file_a))
+    observer.event_queue.put((mod_event, watch_a))
+    # A new file appearing at the watched path -> passed through unchanged
+    created_event = FileCreatedEvent(str(file_a))
+    observer.event_queue.put((created_event, watch_a))
+
+    for _ in range(6):
+        observer.dispatch_events(observer.event_queue)
+
+    assert len(events) == 4
+
+    replaced_event = events[0]
+    assert isinstance(replaced_event, FileReplacedEvent)
+    assert replaced_event.event_type == "replaced"
+    assert replaced_event.src_path == str(file_a)
+    assert not replaced_event.dest_path
+
+    deleted_event = events[1]
+    assert isinstance(deleted_event, FileDeletedEvent)
+    assert deleted_event.src_path == str(file_a)
+
+    assert events[2] is mod_event
+    assert events[3] is created_event
+
+
+def test_single_file_track_by_path_handler_distinguishes_replace_from_modify(tmp_path: Path):
+    """on_replaced() and on_modified() let the handler tell a replacement apart."""
+    file_a = tmp_path / "a.txt"
+    file_a.write_text("a")
+    temp = tmp_path / "temp.txt"
+
+    calls = []
+
+    class Handler(FileSystemEventHandler):
+        def on_replaced(self, event):
+            calls.append(("replaced", event.src_path))
+
+        def on_modified(self, event):
+            calls.append(("modified", event.src_path))
+
+    observer = BaseObserver(EventEmitter)
+    watch_a = observer.schedule(Handler(), file_a, track_by_path=True)
+
+    observer.event_queue.put((FileMovedEvent(str(temp), str(file_a)), watch_a))
+    observer.event_queue.put((FileModifiedEvent(str(file_a)), watch_a))
+
+    observer.dispatch_events(observer.event_queue)
+    observer.dispatch_events(observer.event_queue)
+
+    assert calls == [("replaced", str(file_a)), ("modified", str(file_a))]
+
+
+def test_single_file_track_by_path_default_watch_untouched(tmp_path: Path):
+    """Without track_by_path, moves involving the watched file pass through as-is."""
+    file_a = tmp_path / "a.txt"
+    file_a.write_text("a")
+    temp = tmp_path / "temp.txt"
+
+    events = []
+
+    class Handler(LoggingEventHandler):
+        def dispatch(self, event):
+            events.append(event)
+
+    observer = BaseObserver(EventEmitter)
+    watch_a = observer.schedule(Handler(), file_a)
+    assert not watch_a.track_by_path
+
+    move_onto = FileMovedEvent(str(temp), str(file_a))
+    observer.event_queue.put((move_onto, watch_a))
+    observer.dispatch_events(observer.event_queue)
+
+    assert events == [move_onto]
 
 
 def test_symlinked_directory_not_treated_as_file(tmp_path: Path):

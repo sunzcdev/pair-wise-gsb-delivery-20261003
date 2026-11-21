@@ -59,6 +59,32 @@ Observers watch directories, not individual files. To monitor one file, schedule
    :language: python
    :linenos:
 
+Alternatively, schedule the file path itself: :meth:`~watchdog.observers.api.BaseObserver.schedule` accepts a single file and only dispatches events for it. Editors commonly save by writing a temporary file in the same directory and renaming it over the original; pass ``track_by_path=True`` to keep following the file's *path* across such replacements. The takeover is then reported as :class:`~watchdog.events.FileReplacedEvent` (``on_replaced()``) instead of a moved event, while an in-place edit stays a :class:`~watchdog.events.FileModifiedEvent` (``on_modified()``), so the handler can tell the two apart::
+
+    import time
+
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+
+
+    class ConfigHandler(FileSystemEventHandler):
+        def on_modified(self, event):
+            print(f"edited in place: {event.src_path}")
+
+        def on_replaced(self, event):
+            print(f"replaced by another file: {event.src_path}")
+
+
+    observer = Observer()
+    observer.schedule(ConfigHandler(), "/path/to/config.ini", track_by_path=True)
+    observer.start()
+    try:
+        while True:
+            time.sleep(1)
+    finally:
+        observer.stop()
+        observer.join()
+
 Logging Trick
 -------------
 Watchdog also includes built-in "tricks" (pre-implemented event handlers). For instance, the :class:`watchdog.tricks.LoggerTrick` automatically logs events. Here is how you can use it:

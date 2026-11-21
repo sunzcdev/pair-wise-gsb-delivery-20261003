@@ -26,6 +26,10 @@ Event Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: FileReplacedEvent
+   :members:
+   :show-inheritance:
+
 .. autoclass:: DirModifiedEvent
    :members:
    :show-inheritance:
@@ -123,6 +127,7 @@ EVENT_TYPE_CLOSED_NO_WRITE = "closed_no_write"
 EVENT_TYPE_OPENED = "opened"
 EVENT_TYPE_ATTRIB = "attrib"
 EVENT_TYPE_EVENTS_LOST = "events_lost"
+EVENT_TYPE_REPLACED = "replaced"
 
 
 @dataclass(unsafe_hash=True)
@@ -167,6 +172,25 @@ class FileModifiedEvent(FileSystemEvent):
     """File system event representing file modification on the file system."""
 
     event_type = EVENT_TYPE_MODIFIED
+
+
+class FileReplacedEvent(FileModifiedEvent):
+    """File system event representing the replacement of a watched file by another file.
+
+    Emitted only for a single-file watch scheduled with ``track_by_path=True``
+    (see :meth:`watchdog.observers.api.BaseObserver.schedule`). Editors often
+    save by writing a temporary file in the same directory and renaming it over
+    the original; such a watch keeps following the file's *path* and reports the
+    takeover with this event instead of a :class:`FileMovedEvent`. An in-place
+    modification of the file is still reported as :class:`FileModifiedEvent`, so
+    a handler can tell the two apart by implementing ``on_replaced()`` and
+    ``on_modified()``.
+
+    It subclasses :class:`FileModifiedEvent` so that an ``event_filter`` that
+    admits modifications also admits replacements.
+    """
+
+    event_type = EVENT_TYPE_REPLACED
 
 
 class FileAttribEvent(FileSystemEvent):
@@ -342,6 +366,18 @@ class FileSystemEventHandler:
             Event representing file/directory modification.
         :type event:
             :class:`watchdog.events.DirModifiedEvent` or :class:`watchdog.events.FileModifiedEvent`
+        """
+
+    def on_replaced(self, event: FileReplacedEvent) -> None:
+        """Called when the file of a path-tracking single-file watch is replaced
+        by another file, e.g. by an editor's atomic save.
+
+        Emitted only for a single-file watch scheduled with ``track_by_path=True``.
+
+        :param event:
+            Event representing the replacement.
+        :type event:
+            :class:`watchdog.events.FileReplacedEvent`
         """
 
     def on_attrib(self, event: DirAttribEvent | FileAttribEvent) -> None:
@@ -692,6 +728,11 @@ class LoggingEventHandler(FileSystemEventHandler):
 
         what = "directory" if event.is_directory else "file"
         self.logger.info("Modified %s: %s", what, event.src_path)
+
+    def on_replaced(self, event: FileReplacedEvent) -> None:
+        super().on_replaced(event)
+
+        self.logger.info("Replaced file: %s", event.src_path)
 
     def on_attrib(self, event: DirAttribEvent | FileAttribEvent) -> None:
         super().on_attrib(event)
