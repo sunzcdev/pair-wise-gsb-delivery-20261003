@@ -10,6 +10,7 @@ childen, because we don't need that for our use-case.
 """
 
 import threading
+import time
 from types import TracebackType
 from typing import Any, Callable, List, Optional, Type
 
@@ -39,3 +40,13 @@ class Nursery:
 
 def open_nursery() -> Nursery:
     return Nursery()
+
+
+# Mirrors `trio.Event`, so code written against the `concurrency` abstraction
+# can wait on a gate in both the async (trio) and thread-synchronous variants.
+Event = threading.Event
+
+
+def sleep(seconds: float) -> None:
+    # Mirrors `trio.sleep` for the thread-synchronous variant.
+    time.sleep(seconds)

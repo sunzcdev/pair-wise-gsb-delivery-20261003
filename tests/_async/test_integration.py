@@ -13,6 +13,31 @@ async def test_request(httpbin):
 
 
 @pytest.mark.anyio
+async def test_warmup_then_request(httpbin):
+    async with httpcore.AsyncConnectionPool() as pool:
+        # Warming up establishes a real connection ahead of the first request.
+        await pool.awarmup(httpbin.url)
+        assert len(pool.connections) == 1
+
+        response = await pool.request("GET", httpbin.url)
+        assert response.status == 200
+
+
+@pytest.mark.anyio
+async def test_warmup_https_then_request(httpbin_secure):
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    async with httpcore.AsyncConnectionPool(ssl_context=ssl_context) as pool:
+        # Warming up performs the real TLS handshake without sending a request.
+        await pool.awarmup(httpbin_secure.url)
+        assert len(pool.connections) == 1
+
+        response = await pool.request("GET", httpbin_secure.url)
+        assert response.status == 200
+
+
+@pytest.mark.anyio
 async def test_ssl_request(httpbin_secure):
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False

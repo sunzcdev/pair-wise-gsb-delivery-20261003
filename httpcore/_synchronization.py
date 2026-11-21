@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 import types
 
@@ -17,6 +18,27 @@ try:
     import anyio
 except ImportError:  # pragma: nocover
     anyio = None  # type: ignore
+
+
+def is_cancelled(exc: BaseException) -> bool:
+    """
+    Return `True` if the exception represents the cancellation of an
+    async task, under either the asyncio or trio backends.
+    """
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    if trio is not None and isinstance(exc, trio.Cancelled):
+        return True
+    return False
+
+
+def is_never_cancelled(exc: BaseException) -> bool:
+    """
+    The thread-synchronous implementation has no cancellation semantics,
+    so this always returns `False`. It mirrors `is_cancelled` for the
+    unasync-generated synchronous code paths.
+    """
+    return False
 
 
 def current_async_library() -> str:

@@ -11,7 +11,7 @@ from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStr
 from .._exceptions import ConnectError, ConnectTimeout
 from .._models import Origin, Request, Response
 from .._ssl import default_ssl_context
-from .._synchronization import AsyncLock
+from .._synchronization import AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
 from .http11 import AsyncHTTP11Connection
 from .interfaces import AsyncConnectionInterface
@@ -66,16 +66,77 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         self._request_lock = AsyncLock()
         self._socket_options = socket_options
 
+    async def aconnect(self, timeout: float | None = None) -> None:
+        """
+        Establish the underlying socket connection and any TLS handshake,
+        and (for HTTP/2) initialize the connection state.
+
+        No HTTP request bytes are ever sent to the remote side, so the
+        connection is ready to service its first request without the
+        latency of establishing a new connection.
+
+        The connection is not re-established if it is already connected,
+        and a previously failed connection is not retried here.
+        """
+        async with self._request_lock:
+            if self._connection is not None:
+                # The connection is already established, so there's nothing
+                # further to do.
+                return
+            if self._connect_failed:
+                # A previous attempt to connect failed. Leave the connection
+                # in place, so that a subsequent request may apply its own
+                # retry policy.
+                return
+
+            stream: AsyncNetworkStream | None = None
+            try:
+                stream = await self._open_stream(timeout=timeout)
+
+                ssl_object = stream.get_extra_info("ssl_object")
+                http2_negotiated = (
+                    ssl_object is not None
+                    and ssl_object.selected_alpn_protocol() == "h2"
+                )
+                if http2_negotiated or (self._http2 and not self._http1):
+                    from .http2 import AsyncHTTP2Connection
+
+                    self._connection = AsyncHTTP2Connection(
+                        origin=self._origin,
+                        stream=stream,
+                        keepalive_expiry=self._keepalive_expiry,
+                    )
+                else:
+                    self._connection = AsyncHTTP11Connection(
+                        origin=self._origin,
+                        stream=stream,
+                        keepalive_expiry=self._keepalive_expiry,
+                    )
+            except BaseException as exc:
+                self._connect_failed = True
+                with AsyncShieldCancellation():
+                    if stream is not None:
+                        await stream.aclose()
+                raise exc
+
     async def handle_async_request(self, request: Request) -> Response:
         if not self.can_handle_request(request.url.origin):
             raise RuntimeError(
                 f"Attempted to send request to {request.url.origin} on connection to {self._origin}"
             )
 
+        timeouts = request.extensions.get("timeout", {})
+        timeout = timeouts.get("connect", None)
+        sni_hostname = request.extensions.get("sni_hostname", None)
+
         try:
             async with self._request_lock:
                 if self._connection is None:
-                    stream = await self._connect(request)
+                    stream = await self._open_stream(
+                        timeout=timeout,
+                        sni_hostname=sni_hostname,
+                        request=request,
+                    )
 
                     ssl_object = stream.get_extra_info("ssl_object")
                     http2_negotiated = (
@@ -102,11 +163,12 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
 
         return await self._connection.handle_async_request(request)
 
-    async def _connect(self, request: Request) -> AsyncNetworkStream:
-        timeouts = request.extensions.get("timeout", {})
-        sni_hostname = request.extensions.get("sni_hostname", None)
-        timeout = timeouts.get("connect", None)
-
+    async def _open_stream(
+        self,
+        timeout: float | None = None,
+        sni_hostname: str | None = None,
+        request: Request | None = None,
+    ) -> AsyncNetworkStream:
         retries_left = self._retries
         delays = exponential_backoff(factor=RETRIES_BACKOFF_FACTOR)
 

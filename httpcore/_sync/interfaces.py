@@ -85,6 +85,16 @@ class RequestInterface:
 
 
 class ConnectionInterface(RequestInterface):
+    def connect(self, timeout: float | None = None) -> None:
+        """
+        Establish the network connection and perform any required handshake,
+        without sending an HTTP request.
+
+        Once awaited, the connection should be ready to handle its first
+        real request without incurring the connection establishment cost.
+        """
+        raise NotImplementedError()  # pragma: nocover
+
     def close(self) -> None:
         raise NotImplementedError()  # pragma: nocover
 

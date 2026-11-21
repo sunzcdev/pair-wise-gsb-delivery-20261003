@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+- Add `ConnectionPool.warmup()` and `AsyncConnectionPool.awarmup()` for establishing and negotiating upstream connections ahead of the first request, without sending any HTTP bytes. Warmups are deduplicated per origin and respect the pool's connection capacity.
+- Add `HTTPConnection.connect()` and `AsyncHTTPConnection.aconnect()` for warming up a connection instance directly.
+- Treat HTTP/1.1 connections in the `NEW` state (connected but not yet used) as available, so a warmed-up connection can service its first request.
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
 
 ## Version 1.0.9 (April 24th, 2025)

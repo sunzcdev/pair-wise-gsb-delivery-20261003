@@ -85,6 +85,16 @@ class AsyncRequestInterface:
 
 
 class AsyncConnectionInterface(AsyncRequestInterface):
+    async def aconnect(self, timeout: float | None = None) -> None:
+        """
+        Establish the network connection and perform any required handshake,
+        without sending an HTTP request.
+
+        Once awaited, the connection should be ready to handle its first
+        real request without incurring the connection establishment cost.
+        """
+        raise NotImplementedError()  # pragma: nocover
+
     async def aclose(self) -> None:
         raise NotImplementedError()  # pragma: nocover
 

@@ -265,11 +265,12 @@ class HTTP11Connection(ConnectionInterface):
         return origin == self._origin
 
     def is_available(self) -> bool:
-        # Note that HTTP/1.1 connections in the "NEW" state are not treated as
-        # being "available". The control flow which created the connection will
-        # be able to send an outgoing request, but the connection will not be
-        # acquired from the connection pool for any other request.
-        return self._state == HTTPConnectionState.IDLE
+        # HTTP/1.1 connections in the "NEW" state have had their underlying
+        # socket established (for example by a connection pool warmup) but
+        # have not yet serviced a request. They are available to be acquired
+        # for that first request, which will move the connection into the
+        # "ACTIVE" and then "IDLE" states as usual.
+        return self._state in (HTTPConnectionState.NEW, HTTPConnectionState.IDLE)
 
     def has_expired(self) -> bool:
         now = time.monotonic()

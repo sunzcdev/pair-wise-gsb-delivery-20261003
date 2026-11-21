@@ -45,6 +45,46 @@ The output *should* demonstrate the initial request as being substantially slowe
 
 This is to be expected. Once we've established a connection to `"www.example.com"` we're able to reuse it for following requests.
 
+## Warming up connections
+
+Sometimes a process wants to establish its upstream connections *before* it
+reports that it is ready to serve traffic. The `.warmup()` method (and its
+async counterpart `.awarmup()`) opens the socket and performs any TLS
+handshake (and HTTP/2 initialization) without sending a single HTTP request:
+
+```python
+import httpcore
+
+# Synchronous...
+http = httpcore.ConnectionPool()
+http.warmup("https://www.example.com/")
+
+# ...or asynchronous.
+async with httpcore.AsyncConnectionPool() as pool:
+    await pool.awarmup("https://www.example.com/")
+```
+
+The first real request to the warmed-up origin then reuses the connection
+that is already established, rather than paying the connection cost on the
+critical path.
+
+Warmups are coordinated per origin. A warmup for an origin that is already
+connected is a no-op, and concurrent warmups for the same origin join a
+single in-flight connection rather than opening duplicates. The pool's
+`max_connections` capacity is always respected; when the pool is full an
+idle connection may be closed to make room, otherwise the warmup waits for a
+free slot subject to the `pool` timeout.
+
+A timeout can be supplied through the request extensions, using the same
+keys as a regular request:
+
+```python
+await pool.awarmup(
+    "https://www.example.com/",
+    extensions={"timeout": {"connect": 5.0, "pool": 5.0}},
+)
+```
+
 ## Configuration
 
 The connection pool instance is also the main point of configuration. Let's take a look at the various options that it provides:

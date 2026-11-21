@@ -13,6 +13,31 @@ def test_request(httpbin):
 
 
 
+def test_warmup_then_request(httpbin):
+    with httpcore.ConnectionPool() as pool:
+        # Warming up establishes a real connection ahead of the first request.
+        pool.warmup(httpbin.url)
+        assert len(pool.connections) == 1
+
+        response = pool.request("GET", httpbin.url)
+        assert response.status == 200
+
+
+
+def test_warmup_https_then_request(httpbin_secure):
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    with httpcore.ConnectionPool(ssl_context=ssl_context) as pool:
+        # Warming up performs the real TLS handshake without sending a request.
+        pool.warmup(httpbin_secure.url)
+        assert len(pool.connections) == 1
+
+        response = pool.request("GET", httpbin_secure.url)
+        assert response.status == 200
+
+
+
 def test_ssl_request(httpbin_secure):
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False

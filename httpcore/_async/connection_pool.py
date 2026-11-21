@@ -7,9 +7,14 @@ import typing
 
 from .._backends.auto import AutoBackend
 from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend
-from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
-from .._models import Origin, Proxy, Request, Response
-from .._synchronization import AsyncEvent, AsyncShieldCancellation, AsyncThreadLock
+from .._exceptions import ConnectionNotAvailable, PoolTimeout, UnsupportedProtocol
+from .._models import Origin, Proxy, Request, Response, URL, enforce_url
+from .._synchronization import (
+    AsyncEvent,
+    AsyncShieldCancellation,
+    AsyncThreadLock,
+    is_cancelled,
+)
 from .connection import AsyncHTTPConnection
 from .interfaces import AsyncConnectionInterface, AsyncRequestInterface
 
@@ -38,6 +43,30 @@ class AsyncPoolRequest:
 
     def is_queued(self) -> bool:
         return self.connection is None
+
+
+class AsyncWarmup:
+    """
+    Coordinates an in-flight connection warmup for a single origin.
+
+    Only one warmup per origin is performed at a time. Any further warmup
+    calls (or incoming requests) for the same origin join the in-flight
+    warmup rather than opening a duplicate connection.
+    """
+
+    def __init__(self, origin: Origin) -> None:
+        self.origin = origin
+        self._completed = AsyncEvent()
+        self.exception: BaseException | None = None
+
+    def set_exception(self, exc: BaseException) -> None:
+        self.exception = exc
+
+    def complete(self) -> None:
+        self._completed.set()
+
+    async def wait(self, timeout: float | None = None) -> None:
+        await self._completed.wait(timeout=timeout)
 
 
 class AsyncConnectionPool(AsyncRequestInterface):
@@ -120,6 +149,15 @@ class AsyncConnectionPool(AsyncRequestInterface):
         self._connections: list[AsyncConnectionInterface] = []
         self._requests: list[AsyncPoolRequest] = []
 
+        # In-flight warmups, keyed by the origin they are establishing a
+        # connection to. This allows concurrent warmups and incoming requests
+        # to join an existing warmup instead of racing to open duplicates.
+        self._warmups: dict[Origin, AsyncWarmup] = {}
+
+        # Events for warmups that are blocked waiting for pool capacity.
+        # They are signalled whenever a connection leaves the pool.
+        self._capacity_waiters: list[AsyncEvent] = []
+
         # We only mutate the state of the connection pool within an 'optional_thread_lock'
         # context. This holds a threading lock unless we're running in async mode,
         # in which case it is a no-op.
@@ -196,6 +234,180 @@ class AsyncConnectionPool(AsyncRequestInterface):
         """
         return list(self._connections)
 
+    async def awarmup(
+        self,
+        url: URL | bytes | str,
+        *,
+        extensions: typing.MutableMapping[str, typing.Any] | None = None,
+    ) -> None:
+        """
+        Warm up a connection to the given origin.
+
+        This establishes the socket connection and performs the TLS handshake
+        (and HTTP/2 initialization, where applicable) without sending any HTTP
+        request bytes. Once warmed up, the first real request to the origin can
+        be serviced immediately over the ready connection.
+
+        Warmups are coordinated per origin:
+
+        * If an existing connection can already service the origin, the call
+          returns without doing anything.
+        * If a warmup to the origin is already in flight, concurrent callers
+          join that warmup instead of opening another connection.
+        * The pool's `max_connections` capacity is always respected. When the
+          pool is full, an idle connection may be closed to make room; if all
+          the connections are busy the call waits until one becomes available,
+          subject to the `pool` timeout.
+
+        Cancelling a joined warmup only cancels the caller's wait; the
+        connection being established by the warmup owner continues. Cancelling
+        the warmup owner aborts the establishment and removes the partially
+        opened connection from the pool.
+        """
+        url = enforce_url(url, name="url")
+        scheme = url.scheme.decode()
+        if scheme == "":
+            raise UnsupportedProtocol(
+                "Request URL is missing an 'http://' or 'https://' protocol."
+            )
+        if scheme not in ("http", "https", "ws", "wss"):
+            raise UnsupportedProtocol(
+                f"Request URL has an unsupported protocol '{scheme}://'."
+            )
+
+        origin = url.origin
+        extensions = {} if extensions is None else extensions
+        timeouts = extensions.get("timeout", {})
+        connect_timeout = timeouts.get("connect", None)
+        pool_timeout = timeouts.get("pool", None)
+
+        with self._optional_thread_lock:
+            # An existing connection that can handle this origin means there
+            # is nothing further to warm up.
+            existing = [
+                connection
+                for connection in self._connections
+                if connection.can_handle_request(origin)
+                and not connection.is_closed()
+                and not connection.has_expired()
+            ]
+            if existing:
+                return
+
+            # Join an in-flight warmup for this origin rather than opening
+            # a duplicate connection.
+            warmup = self._warmups.get(origin)
+            if warmup is None:
+                warmup = AsyncWarmup(origin)
+                self._warmups[origin] = warmup
+                is_owner = True
+            else:
+                is_owner = False
+
+        if not is_owner:
+            # Waiting joiners never raise the owner's failure. If the warmup
+            # fails they simply fall through and may open their own connection
+            # through the regular request flow.
+            try:
+                await warmup.wait(timeout=pool_timeout)
+            except (PoolTimeout, ConnectionNotAvailable):
+                raise
+            except Exception:
+                pass
+            return
+
+        connection: AsyncConnectionInterface | None = None
+        try:
+            # Wait until the pool has capacity for an additional connection,
+            # closing an idle connection to make room where possible.
+            await self._acquire_warmup_capacity(warmup, timeout=pool_timeout)
+
+            with self._optional_thread_lock:
+                connection = self.create_connection(origin)
+                self._connections.append(connection)
+
+            # Perform the actual connect + handshake. No HTTP request is sent.
+            await connection.aconnect(timeout=connect_timeout)
+        except BaseException as exc:
+            # The owner's cancellation aborts the warmup. Joined callers are
+            # woken but do not inherit the cancellation.
+            if is_cancelled(exc):
+                warmup.set_exception(ConnectionNotAvailable("Warmup cancelled."))
+            else:
+                warmup.set_exception(exc)
+
+            with self._optional_thread_lock:
+                if connection is not None and connection in self._connections:
+                    self._connections.remove(connection)
+                self._warmups.pop(origin, None)
+                warmup.complete()
+
+            if connection is not None:
+                with AsyncShieldCancellation():
+                    await connection.aclose()
+            raise
+        else:
+            with self._optional_thread_lock:
+                self._warmups.pop(origin, None)
+                warmup.complete()
+
+    async def _acquire_warmup_capacity(
+        self, warmup: AsyncWarmup, timeout: float | None
+    ) -> None:
+        """
+        Block until the pool has room for another connection, respecting
+        `max_connections`.
+
+        Idle connections to other origins may be closed to reclaim a slot.
+        If every connection is busy the call waits until one is released
+        back to (or removed from) the pool, subject to the pool timeout.
+        """
+        while True:
+            with self._optional_thread_lock:
+                if len(self._connections) < self._max_connections:
+                    return
+
+                idle_connections = [
+                    connection
+                    for connection in self._connections
+                    if connection.is_idle()
+                    and not connection.can_handle_request(warmup.origin)
+                ]
+                if idle_connections:
+                    # Reclaim a slot by closing a surplus idle connection.
+                    connection = idle_connections[0]
+                    self._connections.remove(connection)
+                    closing = [connection]
+                    waiter: AsyncEvent | None = None
+                else:
+                    # Every connection is busy. Register interest in a
+                    # freed slot and wait for it outside of the thread lock.
+                    closing = []
+                    waiter = AsyncEvent()
+                    self._capacity_waiters.append(waiter)
+
+            if closing:
+                await self._close_connections(closing)
+                continue
+
+            try:
+                await waiter.wait(timeout=timeout)
+            except BaseException:
+                with self._optional_thread_lock:
+                    if waiter in self._capacity_waiters:
+                        self._capacity_waiters.remove(waiter)
+                raise
+
+    def _notify_capacity_waiters(self) -> None:
+        """
+        Wake up any warmups blocked waiting for pool capacity. Called
+        whenever a connection is removed from the pool.
+        """
+        waiters = self._capacity_waiters
+        self._capacity_waiters = []
+        for waiter in waiters:
+            waiter.set()
+
     async def handle_async_request(self, request: Request) -> Response:
         """
         Send an HTTP request, and return an HTTP response.
@@ -214,6 +426,19 @@ class AsyncConnectionPool(AsyncRequestInterface):
 
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("pool", None)
+
+        # If a warmup for this origin is in flight then join it, so that the
+        # request benefits from the connection being established rather than
+        # racing to open a second one. A failed or cancelled warmup does not
+        # fail the request: it proceeds with the normal request flow instead.
+        warmup = self._warmups.get(request.url.origin)
+        if warmup is not None:
+            try:
+                await warmup.wait(timeout=timeout)
+            except (PoolTimeout, ConnectionNotAvailable):
+                raise
+            except Exception:
+                pass
 
         with self._optional_thread_lock:
             # Add the incoming request to our request queue.
@@ -285,10 +510,12 @@ class AsyncConnectionPool(AsyncRequestInterface):
             if connection.is_closed():
                 # log: "removing closed connection"
                 self._connections.remove(connection)
+                self._notify_capacity_waiters()
             elif connection.has_expired():
                 # log: "closing expired connection"
                 self._connections.remove(connection)
                 closing_connections.append(connection)
+                self._notify_capacity_waiters()
             elif (
                 connection.is_idle()
                 and sum(connection.is_idle() for connection in self._connections)
@@ -297,6 +524,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 # log: "closing idle connection"
                 self._connections.remove(connection)
                 closing_connections.append(connection)
+                self._notify_capacity_waiters()
 
         # Assign queued requests to connections.
         queued_requests = [request for request in self._requests if request.is_queued()]
@@ -331,6 +559,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 connection = idle_connections[0]
                 self._connections.remove(connection)
                 closing_connections.append(connection)
+                self._notify_capacity_waiters()
                 # log: "creating new connection"
                 connection = self.create_connection(origin)
                 self._connections.append(connection)
@@ -350,6 +579,8 @@ class AsyncConnectionPool(AsyncRequestInterface):
         with self._optional_thread_lock:
             closing_connections = list(self._connections)
             self._connections = []
+            self._warmups = {}
+            self._notify_capacity_waiters()
         await self._close_connections(closing_connections)
 
     async def __aenter__(self) -> AsyncConnectionPool:
