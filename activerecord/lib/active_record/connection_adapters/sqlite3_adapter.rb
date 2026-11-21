@@ -10,6 +10,7 @@ require "active_record/connection_adapters/sqlite3/schema_creation"
 require "active_record/connection_adapters/sqlite3/schema_definitions"
 require "active_record/connection_adapters/sqlite3/schema_dumper"
 require "active_record/connection_adapters/sqlite3/schema_statements"
+require "active_record/connection_adapters/sqlite3/statement_dependencies"
 
 gem "sqlite3", ">= 2.1"
 require "sqlite3"
@@ -107,6 +108,7 @@ module ActiveRecord
       include SQLite3::Quoting
       include SQLite3::SchemaStatements
       include SQLite3::DatabaseStatements
+      include SQLite3::StatementDependencies
 
       def ractor_connection_capabilities # :nodoc:
         super.merge(supports_insert_on_conflict?: supports_insert_on_conflict?)

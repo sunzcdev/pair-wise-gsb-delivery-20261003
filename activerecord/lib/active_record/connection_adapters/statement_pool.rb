@@ -9,6 +9,7 @@ module ActiveRecord
 
       def initialize(statement_limit = nil)
         @cache = Hash.new { |h, pid| h[pid] = {} }
+        @metadata = Hash.new { |h, pid| h[pid] = {} }
         @statement_limit = statement_limit || DEFAULT_STATEMENT_LIMIT
       end
 
@@ -28,11 +29,29 @@ module ActiveRecord
         cache.length
       end
 
+      # The adapter specific bookkeeping attached to +sql+ (for example the set
+      # of schema objects a prepared statement depends on, or +nil+ when the
+      # adapter could not explain the dependencies). Interpreted only by the
+      # adapter that stored it.
+      def metadata(sql)
+        metadata_cache[sql]
+      end
+
       def []=(sql, stmt)
         while @statement_limit <= cache.size
-          dealloc(cache.shift.last)
+          evicted_sql, evicted_stmt = cache.shift
+          metadata_cache.delete(evicted_sql)
+          dealloc(evicted_stmt)
         end
         cache[sql] = stmt
+      end
+
+      # Caches +stmt+ for +sql+, together with the bookkeeping the adapter needs
+      # to decide later whether the statement is still valid.
+      def store(sql, stmt, metadata = nil)
+        self[sql] = stmt
+        metadata_cache[sql] = metadata
+        stmt
       end
 
       def clear
@@ -40,6 +59,7 @@ module ActiveRecord
           dealloc stmt
         end
         cache.clear
+        metadata_cache.clear
       end
 
       # Clear the pool without deallocating; this is only safe when we
@@ -47,9 +67,11 @@ module ActiveRecord
       # (e.g. due to a reconnect, or a DISCARD ALL)
       def reset
         cache.clear
+        metadata_cache.clear
       end
 
       def delete(key)
+        metadata_cache.delete(key)
         if stmt = cache.delete(key)
           dealloc(stmt)
         end
@@ -59,6 +81,10 @@ module ActiveRecord
       private
         def cache
           @cache[Process.pid]
+        end
+
+        def metadata_cache
+          @metadata[Process.pid]
         end
 
         def dealloc(stmt)

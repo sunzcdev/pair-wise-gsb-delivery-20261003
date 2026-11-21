@@ -117,8 +117,9 @@ module ActiveRecord
               raw_connection.execute_batch2(intent.processed_sql)
             else
               stmt = if intent.prepare
-                @statements[intent.processed_sql] ||= raw_connection.prepare(intent.processed_sql)
-                @statements[intent.processed_sql].reset!
+                statement, rebuilt = cached_prepared_statement(raw_connection, intent.processed_sql)
+                mark_statement_rebuilt(intent) if rebuilt
+                statement
               else
                 # Don't cache statements if they are not prepared.
                 raw_connection.prepare(intent.processed_sql)

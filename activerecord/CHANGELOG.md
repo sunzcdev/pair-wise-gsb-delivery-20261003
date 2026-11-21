@@ -2,6 +2,39 @@
 
     *fatkodima*
 
+*   Invalidate SQLite prepared statements per table instead of clearing the
+    whole statement pool on every schema change.
+
+    SQLite recompiles a cached prepared statement after a schema change but
+    keeps reporting the column names it was first compiled with, so reusing it
+    could return a newly added column's value under the old column list. Active
+    Record now records which tables each prepared statement reads, along with a
+    fingerprint of those tables' definitions, and only rebuilds statements whose
+    tables actually changed. Statements on other tables keep their cache entry.
+
+    The schema fingerprint is read per connection, so a change committed by
+    another connection (a migration worker, say) is picked up on the next reuse.
+    Because the live schema is compared rather than just a version counter, DDL
+    that is rolled back inside a transaction also rebuilds the affected
+    statements again for the reverted schema. Statements that can't be
+    attributed to particular tables -- PRAGMAs, reads of `sqlite_master`, table
+    valued pragma functions, virtual tables -- are rebuilt whenever any watched
+    schema version changes.
+
+    A rebuilt statement is marked with `statement_rebuilt: true` in the
+    `sql.active_record` instrumentation payload so it can be observed.
+
+    ```ruby
+    Topic.lease_connection.create_table(:posts) { |t| t.string :title }
+    post_statement = "SELECT * FROM posts WHERE id = ?"
+    2.times { Topic.lease_connection.select_all(post_statement, preparable: true) }
+
+    # Changing another table leaves the posts statement alone.
+    Topic.lease_connection.create_table(:comments) { |t| t.text :body }
+    ```
+
+    *Your Name*
+
 *   Add `config.active_record.association_scope_keeps_owner_conditions` to
     always apply the conditions tying the records of an association to the
     owner, and deprecate removing them with the association scope.
