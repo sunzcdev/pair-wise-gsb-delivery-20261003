@@ -115,6 +115,7 @@ class AsyncSOCKSProxy(AsyncConnectionPool):  # pragma: nocover
         max_connections: int | None = 10,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = None,
+        keepalive_hints: bool = False,
         http1: bool = True,
         http2: bool = False,
         retries: int = 0,
@@ -136,6 +137,8 @@ class AsyncSOCKSProxy(AsyncConnectionPool):  # pragma: nocover
                 that will be maintained in the pool.
             keepalive_expiry: The duration in seconds that an idle HTTP connection
                 may be maintained for before being expired from the pool.
+            keepalive_hints: A boolean indicating if the `Keep-Alive` header on
+                HTTP/1 responses should be honoured. Defaults to False.
             http1: A boolean indicating if HTTP/1.1 requests should be supported
                 by the connection pool. Defaults to True.
             http2: A boolean indicating if HTTP/2 requests should be supported by
@@ -155,6 +158,7 @@ class AsyncSOCKSProxy(AsyncConnectionPool):  # pragma: nocover
             max_connections=max_connections,
             max_keepalive_connections=max_keepalive_connections,
             keepalive_expiry=keepalive_expiry,
+            keepalive_hints=keepalive_hints,
             http1=http1,
             http2=http2,
             network_backend=network_backend,
@@ -180,6 +184,7 @@ class AsyncSOCKSProxy(AsyncConnectionPool):  # pragma: nocover
             proxy_auth=self._proxy_auth,
             ssl_context=self._ssl_context,
             keepalive_expiry=self._keepalive_expiry,
+            keepalive_hints=self._keepalive_hints,
             http1=self._http1,
             http2=self._http2,
             network_backend=self._network_backend,
@@ -194,6 +199,7 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
         proxy_auth: tuple[bytes, bytes] | None = None,
         ssl_context: ssl.SSLContext | None = None,
         keepalive_expiry: float | None = None,
+        keepalive_hints: bool = False,
         http1: bool = True,
         http2: bool = False,
         network_backend: AsyncNetworkBackend | None = None,
@@ -203,6 +209,7 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
         self._proxy_auth = proxy_auth
         self._ssl_context = ssl_context
         self._keepalive_expiry = keepalive_expiry
+        self._keepalive_hints = keepalive_hints
         self._http1 = http1
         self._http2 = http2
 
@@ -289,6 +296,7 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
                             origin=self._remote_origin,
                             stream=stream,
                             keepalive_expiry=self._keepalive_expiry,
+                            keepalive_hints=self._keepalive_hints,
                         )
                 except Exception as exc:
                     self._connect_failed = True

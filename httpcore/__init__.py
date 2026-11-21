@@ -45,6 +45,7 @@ from ._sync import (
     HTTPProxy,
     SOCKSProxy,
 )
+from ._utils import KeepAliveHint, parse_keep_alive_header
 
 # The 'httpcore.AnyIOBackend' class is conditional on 'anyio' being installed.
 try:
@@ -113,6 +114,8 @@ __all__ = [
     # util
     "default_ssl_context",
     "SOCKET_OPTION",
+    "KeepAliveHint",
+    "parse_keep_alive_header",
     # exceptions
     "ConnectionNotAvailable",
     "ProxyError",

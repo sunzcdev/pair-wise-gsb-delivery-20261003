@@ -41,6 +41,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         origin: Origin,
         ssl_context: ssl.SSLContext | None = None,
         keepalive_expiry: float | None = None,
+        keepalive_hints: bool = False,
         http1: bool = True,
         http2: bool = False,
         retries: int = 0,
@@ -52,6 +53,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         self._origin = origin
         self._ssl_context = ssl_context
         self._keepalive_expiry = keepalive_expiry
+        self._keepalive_hints = keepalive_hints
         self._http1 = http1
         self._http2 = http2
         self._retries = retries
@@ -95,6 +97,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
                             origin=self._origin,
                             stream=stream,
                             keepalive_expiry=self._keepalive_expiry,
+                            keepalive_hints=self._keepalive_hints,
                         )
         except BaseException as exc:
             self._connect_failed = True

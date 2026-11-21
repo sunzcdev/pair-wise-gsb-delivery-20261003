@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+- Add an opt-in `keepalive_hints` option that honours the `timeout` and `max` parameters of HTTP/1 `Keep-Alive` response headers, applying the stricter of the backend's advertised limits and the local pool configuration.
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
 
 ## Version 1.0.9 (April 24th, 2025)

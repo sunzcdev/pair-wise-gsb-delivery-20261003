@@ -20,6 +20,7 @@ from .._exceptions import (
 from .._models import Origin, Request, Response
 from .._synchronization import AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
+from .._utils import KeepAliveHint, parse_keep_alive_header
 from .interfaces import AsyncConnectionInterface
 
 logger = logging.getLogger("httpcore.http11")
@@ -49,14 +50,20 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         origin: Origin,
         stream: AsyncNetworkStream,
         keepalive_expiry: float | None = None,
+        keepalive_hints: bool = False,
     ) -> None:
         self._origin = origin
         self._network_stream = stream
         self._keepalive_expiry: float | None = keepalive_expiry
+        self._keepalive_hints = keepalive_hints
         self._expire_at: float | None = None
         self._state = HTTPConnectionState.NEW
         self._state_lock = AsyncLock()
         self._request_count = 0
+        # Limits advertised by the backend in a `Keep-Alive` response header.
+        # These apply to a single keep-alive round, so they are refreshed on
+        # each response rather than carried over from earlier ones.
+        self._keepalive_hint = KeepAliveHint()
         self._h11_state = h11.Connection(
             our_role=h11.CLIENT,
             max_incomplete_event_size=self.MAX_INCOMPLETE_EVENT_SIZE,
@@ -118,6 +125,15 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
                 (request.method == b"CONNECT") and (200 <= status < 300)
             ):
                 network_stream = AsyncHTTP11UpgradeStream(network_stream, trailing_data)
+
+            # Optionally take the backend's `Keep-Alive` limits into account.
+            # The hint is scoped to this response's keep-alive round, so it is
+            # recorded here and only acted upon once the response is released.
+            self._keepalive_hint = (
+                parse_keep_alive_header(headers)
+                if self._keepalive_hints
+                else KeepAliveHint()
+            )
 
             return Response(
                 status=status,
@@ -237,15 +253,39 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
 
     async def _response_closed(self) -> None:
         async with self._state_lock:
-            if (
+            # A `Connection: close` response leaves the h11 state machine in a
+            # MUST_CLOSE state rather than DONE/DONE, so it is rejected here
+            # before any keep-alive hint is considered.
+            reusable = (
                 self._h11_state.our_state is h11.DONE
                 and self._h11_state.their_state is h11.DONE
-            ):
+            )
+
+            # Apply the backend's `Keep-Alive` hints, if the response carried
+            # them and the client opted in. An advertised `max` limits how many
+            # requests this connection may service before it must be closed.
+            if reusable:
+                max_requests = self._keepalive_hint.max_requests
+                if max_requests is not None and self._request_count >= max_requests:
+                    reusable = False
+
+            if reusable:
                 self._state = HTTPConnectionState.IDLE
                 self._h11_state.start_next_cycle()
-                if self._keepalive_expiry is not None:
+                # The idle timer starts now, when the response is actually
+                # released, and honours the stricter of the local pool expiry
+                # and the backend's advertised timeout.
+                keepalive_expiry = self._keepalive_expiry
+                hint_timeout = self._keepalive_hint.timeout
+                if hint_timeout is not None:
+                    keepalive_expiry = (
+                        hint_timeout
+                        if keepalive_expiry is None
+                        else min(keepalive_expiry, hint_timeout)
+                    )
+                if keepalive_expiry is not None:
                     now = time.monotonic()
-                    self._expire_at = now + self._keepalive_expiry
+                    self._expire_at = now + keepalive_expiry
             else:
                 await self.aclose()
 

@@ -52,6 +52,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
         max_connections: int | None = 10,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = None,
+        keepalive_hints: bool = False,
         http1: bool = True,
         http2: bool = False,
         retries: int = 0,
@@ -74,6 +75,10 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 that will be maintained in the pool.
             keepalive_expiry: The duration in seconds that an idle HTTP connection
                 may be maintained for before being expired from the pool.
+            keepalive_hints: A boolean indicating if the `Keep-Alive` header on
+                HTTP/1 responses should be honoured. When enabled, the connection
+                applies the stricter of the backend's advertised limits and the
+                local pool configuration. Defaults to False.
             http1: A boolean indicating if HTTP/1.1 requests should be supported
                 by the connection pool. Defaults to True.
             http2: A boolean indicating if HTTP/2 requests should be supported by
@@ -104,6 +109,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
         )
 
         self._keepalive_expiry = keepalive_expiry
+        self._keepalive_hints = keepalive_hints
         self._http1 = http1
         self._http2 = http2
         self._retries = retries
@@ -136,6 +142,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                     remote_origin=origin,
                     ssl_context=self._ssl_context,
                     keepalive_expiry=self._keepalive_expiry,
+                    keepalive_hints=self._keepalive_hints,
                     http1=self._http1,
                     http2=self._http2,
                     network_backend=self._network_backend,
@@ -149,6 +156,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                     proxy_ssl_context=self._proxy.ssl_context,
                     remote_origin=origin,
                     keepalive_expiry=self._keepalive_expiry,
+                    keepalive_hints=self._keepalive_hints,
                     network_backend=self._network_backend,
                 )
             from .http_proxy import AsyncTunnelHTTPConnection
@@ -160,6 +168,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 remote_origin=origin,
                 ssl_context=self._ssl_context,
                 keepalive_expiry=self._keepalive_expiry,
+                keepalive_hints=self._keepalive_hints,
                 http1=self._http1,
                 http2=self._http2,
                 network_backend=self._network_backend,
@@ -169,6 +178,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
             origin=origin,
             ssl_context=self._ssl_context,
             keepalive_expiry=self._keepalive_expiry,
+            keepalive_hints=self._keepalive_hints,
             http1=self._http1,
             http2=self._http2,
             retries=self._retries,

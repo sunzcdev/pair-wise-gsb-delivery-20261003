@@ -64,6 +64,31 @@ The connection pool instance is also the main point of configuration. Let's take
                                be maintained in the pool.
 * `keepalive_expiry`: The duration in seconds that an idle HTTP connection may be
                       maintained for before being expired from the pool.
+* `keepalive_hints`: A boolean indicating if the `Keep-Alive` header on HTTP/1
+                     responses should be honoured. Defaults to `False`.
+
+### Backend keep-alive hints
+
+Some HTTP/1 backends advertise how long an idle connection will remain open, and
+how many requests it will service, using the `Keep-Alive` response header:
+
+```
+Keep-Alive: timeout=5, max=100
+```
+
+Set `keepalive_hints=True` on the pool (or on an `HTTP11Connection`/`HTTPConnection`)
+to take these hints into account. When enabled the client applies the stricter of the
+backend's advertised limits and the local pool configuration:
+
+* The `timeout` parameter is combined with the local `keepalive_expiry` by taking the
+  smaller value. The idle timer starts when each response is released back to the pool,
+  and each round is counted independently.
+* The `max` parameter limits how many requests may be sent on the connection before it
+  is closed instead of being returned to the pool.
+
+A `Connection: close` response header always takes precedence and closes the connection
+regardless of any `Keep-Alive` hint. Parameters that cannot be parsed are ignored,
+leaving the local keep-alive policy in charge.
 
 ### HTTP version support
 
