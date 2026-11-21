@@ -152,3 +152,4 @@ For advanced TLS scenarios that the flags above don't cover (e.g., mutual TLS, c
 
 * `--timeout-keep-alive <int>` - Close Keep-Alive connections if no new data is received within this timeout (in seconds). **Default:** *5*.
 * `--timeout-graceful-shutdown <int>` - Maximum number of seconds to wait for graceful shutdown. After this timeout, the server will start terminating requests.
+* `--timeout-lifespan-startup <float>` - Maximum number of seconds to wait for the application to reply to the `lifespan.startup` event. When an application has taken over the startup event but never replies, Uvicorn reports a startup failure (and exits instead of entering the listening phase), rather than treating it as an application without a lifespan implementation. The application task is cancelled so it can run its cleanup. Leave unset to wait indefinitely. **Default:** *no timeout*.

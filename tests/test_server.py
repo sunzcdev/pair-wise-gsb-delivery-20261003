@@ -122,6 +122,45 @@ async def test_shutdown_on_early_exit_during_startup(unused_tcp_port: int):
     assert shutdown_complete, "lifespan.shutdown was not called despite startup completing"
 
 
+async def test_startup_timeout_aborts_before_listening(unused_tcp_port: int):
+    """A lifespan that never replies to startup aborts with the failure code.
+
+    The server must report a startup failure (even under ``lifespan="auto"``),
+    cancel the application task, and never reach the listening phase.
+    """
+    cancelled = False
+
+    async def hanging_app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        nonlocal cancelled
+        if scope["type"] != "lifespan":
+            return
+        await receive()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    config = Config(
+        app=hanging_app,
+        lifespan="auto",
+        port=unused_tcp_port,
+        timeout_lifespan_startup=0.1,
+    )
+    server = Server(config=config)
+
+    with pytest.raises(SystemExit) as exc_info:
+        await server.serve()
+
+    assert exc_info.value.code == STARTUP_FAILURE
+    assert server.lifespan.startup_timeout is True
+    assert server.lifespan.should_exit is True
+    assert cancelled is True
+    # The startup failed before the socket listeners were created.
+    assert server.started is False
+    assert not hasattr(server, "servers")
+
+
 def test_run_exits_with_startup_failure_on_unloadable_app() -> None:
     """A server exits with the dedicated startup-failure code when the app can't load.
 

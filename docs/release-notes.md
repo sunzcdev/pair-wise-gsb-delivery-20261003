@@ -2,6 +2,12 @@
 toc_depth: 2
 ---
 
+## Unreleased
+
+### Added
+
+* Add the `timeout_lifespan_startup` setting / `--timeout-lifespan-startup` option to bound how long Uvicorn waits for an application to reply to the `lifespan.startup` event. An application that takes over the startup event but never replies now fails startup (and cancels the lifespan task so it can clean up) instead of hanging forever, including under `lifespan="auto"`; shutdown is not entered a second time after this cancellation.
+
 ## 0.54.0 (September 24, 2026)
 
 HTTP/2 support remains experimental. Install `zttp>=0.0.34` and enable it with `--http zttp --http2`.

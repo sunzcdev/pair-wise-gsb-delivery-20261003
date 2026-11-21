@@ -311,6 +311,14 @@ def _parse_headers(ctx: click.Context, param: click.Parameter, value: tuple[str,
     help="Maximum number of seconds to wait for graceful shutdown.",
 )
 @click.option(
+    "--timeout-lifespan-startup",
+    type=float,
+    default=None,
+    help="Maximum number of seconds to wait for the lifespan startup event. "
+    "An application that received the startup event but never replies is treated "
+    "as a startup failure, instead of running without a lifespan.",
+)
+@click.option(
     "--timeout-worker-healthcheck",
     type=int,
     default=5,
@@ -441,6 +449,7 @@ def main(
     limit_max_requests_jitter: int,
     timeout_keep_alive: int,
     timeout_graceful_shutdown: int | None,
+    timeout_lifespan_startup: float | None,
     timeout_worker_healthcheck: int,
     ssl_keyfile: str,
     ssl_certfile: str,
@@ -494,6 +503,7 @@ def main(
         limit_max_requests_jitter=limit_max_requests_jitter,
         timeout_keep_alive=timeout_keep_alive,
         timeout_graceful_shutdown=timeout_graceful_shutdown,
+        timeout_lifespan_startup=timeout_lifespan_startup,
         timeout_worker_healthcheck=timeout_worker_healthcheck,
         ssl_keyfile=ssl_keyfile,
         ssl_certfile=ssl_certfile,
@@ -550,6 +560,7 @@ def run(
     limit_max_requests_jitter: int = 0,
     timeout_keep_alive: int = 5,
     timeout_graceful_shutdown: int | None = None,
+    timeout_lifespan_startup: float | None = None,
     timeout_worker_healthcheck: int = 5,
     ssl_keyfile: str | os.PathLike[str] | None = None,
     ssl_certfile: str | os.PathLike[str] | None = None,
@@ -607,6 +618,7 @@ def run(
         limit_max_requests_jitter=limit_max_requests_jitter,
         timeout_keep_alive=timeout_keep_alive,
         timeout_graceful_shutdown=timeout_graceful_shutdown,
+        timeout_lifespan_startup=timeout_lifespan_startup,
         timeout_worker_healthcheck=timeout_worker_healthcheck,
         ssl_keyfile=ssl_keyfile,
         ssl_certfile=ssl_certfile,

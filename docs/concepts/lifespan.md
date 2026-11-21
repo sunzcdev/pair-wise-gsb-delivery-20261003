@@ -107,3 +107,29 @@ uvicorn main:app --lifespan off
 ```
 
 By default, Uvicorn will automatically enable the lifespan protocol if the application supports it.
+
+## Startup Timeout
+
+An application that implements the lifespan protocol is expected to reply to the `lifespan.startup` event with either
+`lifespan.startup.complete` or `lifespan.startup.failed`. A buggy application may instead accept the startup event and
+never reply. Without protection, Uvicorn would stay alive but never reach the listening phase, appearing healthy while
+serving no traffic.
+
+Use `timeout_lifespan_startup` (or `--timeout-lifespan-startup`) to bound how long Uvicorn waits for that reply:
+
+```bash
+uvicorn main:app --timeout-lifespan-startup 30
+```
+
+If the timeout expires after the application has already taken over the startup event, Uvicorn:
+
+1. reports a startup failure and exits with the startup-failure code, instead of opening any listener;
+2. does **not** fall back to treating the application as one without a lifespan (this applies even with
+   `lifespan="auto"`, since the application clearly implements the protocol);
+3. cancels the application lifespan task so it receives a clear `CancelledError` and can run any cleanup it has
+   registered; and
+4. does not enter the shutdown phase a second time, since the cancelled lifespan is already being torn down.
+
+An application that rejects the lifespan scope immediately (the classic signal that it does not implement the
+lifespan protocol) is still handled by `lifespan="auto"` as before, and is unaffected by this timeout. When the option
+is left unset, Uvicorn waits indefinitely, matching the historical behavior.

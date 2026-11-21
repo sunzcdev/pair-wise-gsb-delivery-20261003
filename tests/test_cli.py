@@ -182,6 +182,30 @@ def test_cli_http2() -> None:
     assert mock_run.call_args[1]["http2"] is True
 
 
+def test_cli_lifespan_startup_timeout() -> None:
+    runner = CliRunner()
+
+    with mock.patch.object(main, "run") as mock_run:
+        result = runner.invoke(cli, ["tests.test_cli:App", "--timeout-lifespan-startup", "2.5"])
+
+    assert result.output == ""
+    assert result.exit_code == 0
+    mock_run.assert_called_once()
+    assert mock_run.call_args[1]["timeout_lifespan_startup"] == 2.5
+
+
+def test_cli_lifespan_startup_timeout_defaults_to_none() -> None:
+    runner = CliRunner()
+
+    with mock.patch.object(main, "run") as mock_run:
+        result = runner.invoke(cli, ["tests.test_cli:App"])
+
+    assert result.output == ""
+    assert result.exit_code == 0
+    mock_run.assert_called_once()
+    assert mock_run.call_args[1]["timeout_lifespan_startup"] is None
+
+
 @pytest.mark.parametrize("http_protocol", ["h11", "httptools"])
 def test_env_variables(http_protocol: str):
     with load_env_var("UVICORN_HTTP", http_protocol):
