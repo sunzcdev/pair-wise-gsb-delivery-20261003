@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import pickle
+
 import pytest
 
 import dask
 from dask._task_spec import Task, TaskRef
-from dask.local import finish_task, get_sync, sortkey, start_state_from_dask
+from dask.local import (
+    annotate_batch_exception,
+    annotate_exception,
+    batch_execute_tasks,
+    finish_task,
+    get_sync,
+    preserve_exception_chain,
+    restore_exception_chain,
+    sortkey,
+    start_state_from_dask,
+)
 from dask.order import order
 from dask.utils_test import GetFunctionTestMixin, add, inc
 
@@ -220,3 +232,104 @@ def test_detect_malformed_graph():
     with pytest.raises(ValueError, match="Missing dependency"):
         get_sync(dsk, "y")
     assert get_sync(dsk, "y", cache={"x": 1}) == 1
+
+
+def _pack(exc, dumps):
+    """``pack_exception`` that serializes like the multiprocessing scheduler"""
+    return dumps((exc, "traceback-body"))
+
+
+def _raise_zero_division(data):
+    return 1 / 0
+
+
+def _return_corrupt(data):
+    return "corrupt"
+
+
+def _corrupting_loads(data):
+    value = pickle.loads(data)
+    if isinstance(value, tuple) and value and value[0] == "corrupt":
+        raise ValueError("cannot decode result payload")
+    return value
+
+
+class TestStageAttribution:
+    def _run(self, key, task_info, dumps=pickle.dumps, loads=pickle.loads):
+        return batch_execute_tasks(
+            [(key, task_info, dumps, loads, int, _pack)]
+        )[0]
+
+    def test_execute_stage(self):
+        key, result, failed = self._run(
+            "x", pickle.dumps((_raise_zero_division, {}))
+        )
+        assert failed
+        exc, tb = pickle.loads(result)
+        assert key == "x"
+        assert isinstance(exc, ZeroDivisionError)
+        assert exc.dask_stage == "execute"
+        assert exc.dask_task_key == "x"
+
+    def test_deserialize_task_stage(self):
+        # The task payload is unreadable
+        key, result, failed = self._run("x", b"not a pickle")
+        assert failed
+        exc, tb = pickle.loads(result)
+        assert exc.dask_stage == "deserialize-task"
+        assert exc.dask_task_key == "x"
+
+    def test_deserialize_result_stage(self):
+        # ``dumps`` worked but the payload cannot be read back on the
+        # scheduler side (this happens in ``get_async``, not in the worker)
+        with pytest.raises(ValueError, match="cannot decode result payload") as e:
+            get_sync(
+                {"x": (_return_corrupt, 1)},
+                "x",
+                dumps=pickle.dumps,
+                loads=_corrupting_loads,
+            )
+        assert e.value.dask_stage == "deserialize-result"
+        assert e.value.dask_task_key == "x"
+
+    def test_annotate_exception_adds_note(self):
+        exc = ValueError("boom")
+        annotate_exception(exc, "execute", "x")
+        assert exc.dask_stage == "execute"
+        assert exc.dask_task_key == "x"
+        assert any("'x'" in note and "'execute'" in note for note in exc.__notes__)
+
+    def test_annotate_batch_exception(self):
+        exc = ValueError("boom")
+        annotate_batch_exception(exc, ["a", "b"])
+        assert exc.dask_stage == "batch"
+        assert exc.dask_task_keys == ("a", "b")
+        assert not hasattr(exc, "dask_task_key")
+
+    def test_annotate_batch_exception_keeps_task_attribution(self):
+        exc = annotate_exception(ValueError("boom"), "execute", "a")
+        annotate_batch_exception(exc, ["a", "b"])
+        assert exc.dask_stage == "execute"
+        assert exc.dask_task_key == "a"
+        assert not hasattr(exc, "dask_task_keys")
+
+    def test_exception_chain_survives_pickle(self):
+        root = KeyError("root-cause")
+        wrapper = RuntimeError("wrapped")
+        wrapper.__cause__ = root
+
+        preserve_exception_chain(wrapper)
+        unpickled = pickle.loads(pickle.dumps(wrapper))
+        # pickle drops ``__cause__`` but keeps the serialized reference
+        assert unpickled.__cause__ is None
+        restore_exception_chain(unpickled)
+        assert isinstance(unpickled.__cause__, KeyError)
+        assert "root-cause" in str(unpickled.__cause__)
+        assert "dask_cause" not in unpickled.__dict__
+
+    def test_sync_stage_attribution(self):
+        """The same staging applies through the synchronous scheduler"""
+        with pytest.raises(ZeroDivisionError) as e:
+            get_sync({"x": (_raise_zero_division, 1)}, "x")
+        assert e.value.dask_stage == "execute"
+        assert e.value.dask_task_key == "x"

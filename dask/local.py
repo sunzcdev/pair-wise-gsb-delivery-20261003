@@ -240,24 +240,178 @@ When we execute tasks we both
 
 1.  Perform the actual work of collecting the appropriate data and calling the function
 2.  Manage administrative state to coordinate with the scheduler
+
+Stage attribution
+-----------------
+
+A batch of tasks is dispatched to a worker in a single call when
+``chunksize > 1`` (see ``get_async``).  An exception escaping such a batch, or
+an exception that is not raised by the task function itself, would otherwise
+only be attributable to the whole batch.  Every task therefore runs through
+:func:`execute_task`, which records the stage that was executing when the
+exception occurred and annotates the exception with:
+
+``dask_stage``
+    One of ``serialize-task``, ``deserialize-task``, ``execute``,
+    ``serialize-result`` or ``deserialize-result`` (or ``batch`` when the
+    failure can only be attributed to the batch as a whole).
+``dask_task_key``
+    The key of the task that failed, when it is known.
+``dask_task_keys``
+    The keys of the batch, if the failure could not be narrowed down to a
+    single task.
+
+The exception that reaches the user keeps its original type and traceback (in
+the multiprocessing scheduler it is still wrapped in ``RemoteException``, whose
+attribute access forwards to the original exception).  The exception chain is
+stored in the exception's state before it is serialized and restored on the
+scheduler side, since ``pickle`` only transfers ``__dict__`` and would otherwise
+drop ``__cause__``/``__context__``.
 """
+
+#: Stages a task can fail in.  These are attached to the exception raised by
+#: the scheduler as the ``dask_stage`` attribute.
+TASK_SERIALIZE_TASK = "serialize-task"
+TASK_DESERIALIZE_TASK = "deserialize-task"
+TASK_EXECUTE = "execute"
+TASK_SERIALIZE_RESULT = "serialize-result"
+TASK_DESERIALIZE_RESULT = "deserialize-result"
+TASK_BATCH = "batch"
+
+#: Attributes used to transfer the exception chain through serialization.
+_CHAIN_ATTRS = {"dask_cause": "__cause__", "dask_context": "__context__"}
+
+
+def _set_exception_attr(exc, name, value):
+    try:
+        setattr(exc, name, value)
+    except (AttributeError, TypeError):  # pragma: no cover - exotic exceptions
+        pass
+
+
+def _add_exception_note(exc, note):
+    # PEP 678 notes are rendered by the traceback module, which makes the
+    # attribution visible to the user without altering ``str(exc)``.
+    add_note = getattr(exc, "add_note", None)
+    if add_note is not None:
+        try:
+            add_note(note)
+        except Exception:  # pragma: no cover - exotic exceptions
+            pass
+
+
+def annotate_exception(exc, stage, key=None):
+    """Annotate *exc* with the execution stage (and task key) that failed.
+
+    Returns the exception so that it can be used inline, e.g.
+    ``raise annotate_exception(err, TASK_EXECUTE, key)``.
+    """
+    if key is not None:
+        _set_exception_attr(exc, "dask_task_key", key)
+        _add_exception_note(exc, f"Task {key!r} failed during the {stage!r} stage")
+    else:
+        _add_exception_note(exc, f"Task failed during the {stage!r} stage")
+    _set_exception_attr(exc, "dask_stage", stage)
+    return exc
+
+
+def preserve_exception_chain(exc):
+    """Store ``__cause__``/``__context__`` in the exception state.
+
+    ``pickle`` (and therefore most executors) only transfers ``__dict__``, so an
+    explicit ``raise ... from ...`` chain is lost between the worker and the
+    scheduler.  Call this right before serializing an exception, so that
+    :func:`restore_exception_chain` can rebuild the chain on the other side.
+
+    This is only needed when the exception actually crosses a process boundary;
+    in-process schedulers raise the original exception object, chain included.
+    """
+    seen = set()
+    stack = [exc]
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        state = getattr(current, "__dict__", None)
+        if not isinstance(state, dict):
+            continue
+        for src, dst in _CHAIN_ATTRS.items():
+            linked = getattr(current, dst, None)
+            if linked is not None and src not in state:
+                try:
+                    state[src] = linked
+                    stack.append(linked)
+                except Exception:  # pragma: no cover - exotic exceptions
+                    pass
+    return exc
+
+
+def restore_exception_chain(exc):
+    """Reverse of :func:`preserve_exception_chain`.
+
+    Restores ``__cause__``/``__context__`` after deserialization so that the
+    re-raised exception still shows the original chain.
+    """
+    state = getattr(exc, "__dict__", None)
+    if not isinstance(state, dict):
+        return exc
+    for src, dst in _CHAIN_ATTRS.items():
+        linked = state.pop(src, None)
+        if linked is not None and getattr(exc, dst, None) is None:
+            try:
+                setattr(exc, dst, linked)
+            except (AttributeError, TypeError):  # pragma: no cover
+                pass
+    return exc
+
+
+def annotate_batch_exception(exc, keys):
+    """Attribute an exception that escaped a whole batch of tasks to that batch.
+
+    Exceptions raised by an individual task are annotated by
+    :func:`execute_task` before they travel back to the scheduler.  Anything
+    else - e.g. a worker process dying - only carries batch level information,
+    so all keys of the batch are attached instead.
+    """
+    if getattr(exc, "dask_task_key", None) is not None:
+        # Already pinpointed to a single task by execute_task
+        return exc
+    keys = tuple(keys)
+    if keys:
+        _set_exception_attr(exc, "dask_task_keys", keys)
+        _set_exception_attr(exc, "dask_stage", TASK_BATCH)
+        _add_exception_note(
+            exc,
+            f"Task batch failed as a whole, the failing task is one of {list(keys)!r}",
+        )
+    return exc
 
 
 def execute_task(key, task_info, dumps, loads, get_id, pack_exception):
     """
     Compute task and handle all administration
 
+    The stage that failed is annotated on the exception (see
+    :func:`annotate_exception`) before it is passed to ``pack_exception``, so
+    that the scheduler can tell "the task could not be sent", "the function
+    raised" and "the result could not be unpickled" apart.
+
     See Also
     --------
     _execute_task : actually execute task
     """
+    stage = TASK_DESERIALIZE_TASK
     try:
         task, data = loads(task_info)
+        stage = TASK_EXECUTE
         result = task(data)
+        stage = TASK_SERIALIZE_RESULT
         id = get_id()
         result = dumps((result, id))
         failed = False
     except BaseException as e:
+        annotate_exception(e, stage, key)
         result = pack_exception(e, dumps)
         failed = True
     return key, result, failed
@@ -485,6 +639,16 @@ def get_async(
             if state["waiting"] and not state["ready"]:
                 raise ValueError("Found no accessible jobs in dask")
 
+            # Maps an in-flight submission to the keys it contains, so that a
+            # failure which is only attributable to the batch as a whole (e.g. a
+            # worker process dying) can still name the tasks involved.
+            pending_batches: dict[Future, tuple[Key, ...]] = {}
+
+            def queue_batch_results(batch):
+                fut = Future()
+                fut.set_result(batch)
+                queue.put(fut)
+
             def fire_tasks(chunksize):
                 """Fire off a task to the thread pool"""
                 # Determine chunksize and/or number of tasks to submit
@@ -497,8 +661,11 @@ def get_async(
                     avail_workers = max(num_workers - used_workers, 0)
                     ntasks = min(nready, chunksize * avail_workers)
 
-                # Prep all ready tasks for submission
+                # Prep all ready tasks for submission. Tasks whose input cannot
+                # be serialized are attributed here; they must not take down the
+                # rest of the batch.
                 args = []
+                failed_args = []
                 for _ in range(ntasks):
                     # Get the next task to compute (most recently added)
                     key = state["ready"].pop()
@@ -511,45 +678,99 @@ def get_async(
                     data = {
                         dep: state["cache"][dep] for dep in state["dependencies"][key]
                     }
-                    args.append(
-                        (
-                            key,
-                            dumps((dsk[key], data)),
-                            dumps,
-                            loads,
-                            get_id,
-                            pack_exception,
+                    try:
+                        task_info = dumps((dsk[key], data))
+                    except BaseException as e:
+                        annotate_exception(e, TASK_SERIALIZE_TASK, key)
+                        failed_args.append((key, pack_exception(e, dumps), True))
+                    else:
+                        args.append(
+                            (key, task_info, dumps, loads, get_id, pack_exception)
                         )
-                    )
 
                 # Batch submit
                 for i in range(-(len(args) // -chunksize)):
                     each_args = args[i * chunksize : (i + 1) * chunksize]
                     if not each_args:
                         break
-                    fut = submit(batch_execute_tasks, each_args)
+                    each_keys = tuple(a[0] for a in each_args)
+                    try:
+                        fut = submit(batch_execute_tasks, each_args)
+                    except BaseException as e:
+                        # The batch never made it to a worker at all
+                        annotate_batch_exception(e, each_keys)
+                        raise
+                    pending_batches[fut] = each_keys
                     fut.add_done_callback(queue.put)
+
+                if failed_args:
+                    # Queued after the dispatchable work so that its results are
+                    # handled first.
+                    queue_batch_results(failed_args)
 
             # Main loop, wait on tasks to finish, insert new ones
             while state["waiting"] or state["ready"] or state["running"]:
                 fire_tasks(chunksize)
-                for key, res_info, failed in queue_get(queue).result():
+                fut = queue_get(queue)
+                batch_keys = pending_batches.pop(fut, ())
+                try:
+                    batch = fut.result()
+                except BaseException as e:
+                    # Nothing came back from the worker, so the failure can
+                    # only be attributed to the batch as a whole.
+                    annotate_batch_exception(e, batch_keys)
+                    raise
+
+                failure = None
+                for key, res_info, failed in batch:
                     if failed:
-                        exc, tb = loads(res_info)
-                        if rerun_exceptions_locally:
-                            data = {
-                                dep: state["cache"][dep]
-                                for dep in get_dependencies(dsk, key)
-                            }
-                            task = dsk[key]
-                            task(data)  # Re-execute locally
-                        else:
-                            raise_exception(exc, tb)
-                    res, worker_id = loads(res_info)
+                        try:
+                            exc, tb = loads(res_info)
+                        except BaseException as e:
+                            # The packed exception itself is unreadable
+                            annotate_exception(e, TASK_DESERIALIZE_TASK, key)
+                            state["running"].discard(key)
+                            if failure is None:
+                                failure = (key, e, None, None)
+                            continue
+                        restore_exception_chain(exc)
+                        state["running"].discard(key)
+                        if failure is None:
+                            # Snapshot the inputs now; later tasks in this batch
+                            # may release them.
+                            data = None
+                            if rerun_exceptions_locally and tb is not None:
+                                data = {
+                                    dep: state["cache"][dep]
+                                    for dep in get_dependencies(dsk, key)
+                                }
+                            failure = (key, exc, tb, data)
+                        continue
+
+                    try:
+                        res, worker_id = loads(res_info)
+                    except BaseException as e:
+                        annotate_exception(e, TASK_DESERIALIZE_RESULT, key)
+                        state["running"].discard(key)
+                        if failure is None:
+                            failure = (key, e, None, None)
+                        continue
+
                     state["cache"][key] = res
                     finish_task(dsk, key, state, results, keyorder.get)
                     for f in posttask_cbs:
                         f(key, res, dsk, state, worker_id)
+
+                if failure is not None:
+                    # Every other task in the batch has been accounted for
+                    # according to how it actually finished above, including
+                    # releasing its dependencies, before raising.
+                    key, exc, tb, data = failure
+                    if tb is None:
+                        raise exc
+                    if data is not None:
+                        dsk[key](data)  # Re-execute locally
+                    raise_exception(exc, tb)
 
             succeeded = True
 

@@ -78,6 +78,165 @@ def test_errors_propagate():
     assert "12345" in str(e.value)
 
 
+class Unserializable:
+    """Object that fails to serialize, i.e. in the scheduler process"""
+
+    def __reduce__(self):
+        raise TypeError("I cannot be serialized")
+
+
+def returns_unserializable():
+    """Task that fails while its result is serialized, i.e. in the worker"""
+
+    class Unpicklable:
+        def __reduce__(self):
+            raise TypeError("my result cannot be serialized")
+
+    return Unpicklable()
+
+
+def chained_failure():
+    try:
+        raise KeyError("root-cause")
+    except KeyError as exc:
+        raise RuntimeError("wrapped failure") from exc
+
+
+def inc_one(x):
+    return x + 1
+
+
+def test_batch_failure_serialize_input():
+    """An unserializable input is attributed to its own key, not the batch"""
+    dsk = {
+        "ok-1": (inc_one, 1),
+        "ok-2": (inc_one, 2),
+        "bad": (bool, Unserializable()),
+    }
+    with pytest.raises(TypeError) as e:
+        get(dsk, ["ok-1", "ok-2", "bad"], num_workers=4, chunksize=3)
+
+    assert "I cannot be serialized" in str(e.value)
+    assert e.value.dask_stage == "serialize-task"
+    assert e.value.dask_task_key == "bad"
+    assert getattr(e.value, "dask_task_keys", None) is None
+
+
+def test_batch_failure_execute():
+    """An exception raised by the task function is reported as such"""
+    dsk = {
+        "ok-1": (inc_one, 1),
+        "ok-2": (inc_one, 2),
+        "bad": (bad,),
+    }
+    with pytest.raises(ValueError) as e:
+        get(dsk, ["ok-1", "ok-2", "bad"], num_workers=4, chunksize=3)
+
+    assert "12345" in str(e.value)
+    assert e.value.dask_stage == "execute"
+    assert e.value.dask_task_key == "bad"
+    assert getattr(e.value, "dask_task_keys", None) is None
+
+
+def test_batch_failure_serialize_result():
+    """A result that cannot be serialized in the worker is reported as such"""
+    dsk = {"ok": (inc_one, 1), "bad": (returns_unserializable,)}
+    with pytest.raises(TypeError) as e:
+        get(dsk, ["ok", "bad"], num_workers=4, chunksize=2)
+
+    assert e.value.dask_stage == "serialize-result"
+    assert e.value.dask_task_key == "bad"
+
+
+def corrupting_loads(data):
+    """``func_loads`` that fails for one specific payload, in the scheduler"""
+    value = pickle.loads(data)
+    if isinstance(value, tuple) and value and value[0] == "corrupt":
+        raise ValueError("cannot decode result payload")
+    return value
+
+
+def corrupt():
+    return "corrupt"
+
+
+def test_batch_failure_deserialize_result():
+    """A result that cannot be deserialized in the scheduler is reported as such"""
+    dsk = {"ok": (inc_one, 1), "bad": (corrupt,)}
+    with dask.config.set(func_loads=corrupting_loads):
+        with pytest.raises(ValueError) as e:
+            get(dsk, ["ok", "bad"], num_workers=4, chunksize=2)
+
+    assert "cannot decode result payload" in str(e.value)
+    assert e.value.dask_stage == "deserialize-result"
+    assert e.value.dask_task_key == "bad"
+
+
+def test_batch_exception_chain_is_preserved():
+    """``raise ... from ...`` survives the trip through the worker process"""
+    with pytest.raises(RuntimeError) as e:
+        get({"bad": (chained_failure,)}, "bad", num_workers=2)
+
+    assert e.value.dask_stage == "execute"
+    assert e.value.dask_task_key == "bad"
+    assert isinstance(e.value.__cause__, KeyError)
+    assert "root-cause" in str(e.value.__cause__)
+
+
+def test_batch_successes_are_accounted_for():
+    """Other tasks in the batch are processed according to their real outcome"""
+    from dask.callbacks import Callback
+
+    dsk = {
+        "ok-1": (inc_one, 1),
+        "ok-2": (inc_one, 2),
+        "ok-3": (inc_one, 3),
+        "bad": (bad,),
+    }
+    finished = []
+
+    with Callback(posttask=lambda key, *args: finished.append(key)):
+        with pytest.raises(ValueError) as e:
+            get(dsk, list(dsk), num_workers=4, chunksize=4)
+
+    assert e.value.dask_task_key == "bad"
+    assert sorted(finished) == ["ok-1", "ok-2", "ok-3"]
+
+
+def test_compute_after_batch_failure():
+    """A failing batch leaves the scheduler usable for further computations"""
+    dsk = {"ok": (inc_one, 1), "bad": (bad,)}
+    for _ in range(2):
+        with pytest.raises(ValueError):
+            get(dsk, ["ok", "bad"], num_workers=2, chunksize=2)
+
+    assert get({"x": (inc_one, 41)}, "x", num_workers=2) == 42
+    assert get({"x": (inc_one, 1), "y": (inc_one, 2)}, ["x", "y"], num_workers=2) == (
+        2,
+        3,
+    )
+
+
+class UnserializableException(Exception):
+    def __reduce__(self):
+        raise TypeError("this exception refuses to be serialized")
+
+
+def raises_unserializable_exception():
+    raise UnserializableException()
+
+
+def test_unserializable_exception_still_reports_task_error():
+    """Bookkeeping on the exception must not mask the task's own error"""
+    with pytest.raises(TypeError) as e:
+        get({"x": (raises_unserializable_exception,)}, "x", num_workers=2)
+
+    # The exception itself could not be shipped, so the serialization error is
+    # reported - but the task attribution survives.
+    assert e.value.dask_task_key == "x"
+    assert e.value.dask_stage == "execute"
+
+
 def test_remote_exception():
     e = TypeError("hello")
     a = remote_exception(e, "traceback-body")
@@ -88,6 +247,16 @@ def test_remote_exception():
     assert "hello" in str(a)
     assert "Traceback" in str(a)
     assert "traceback-body" in str(a)
+
+
+def test_remote_exception_exposes_annotations():
+    e = ValueError("hello")
+    e.dask_stage = "execute"
+    e.dask_task_key = ("x", 1)
+    a = remote_exception(e, "traceback-body")
+
+    assert a.dask_stage == "execute"
+    assert a.dask_task_key == ("x", 1)
 
 
 def test_lambda_with_cloudpickle():

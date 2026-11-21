@@ -15,7 +15,12 @@ from warnings import warn
 import cloudpickle
 
 from dask import config
-from dask.local import MultiprocessingPoolExecutor, get_async, reraise
+from dask.local import (
+    MultiprocessingPoolExecutor,
+    get_async,
+    preserve_exception_chain,
+    reraise,
+)
 from dask.optimization import cull, fuse
 from dask.system import CPU_COUNT
 from dask.typing import Key
@@ -54,6 +59,10 @@ class RemoteException(Exception):
     """Remote Exception
 
     Contains the exception and traceback from a remotely run task
+
+    Attribute access is delegated to the wrapped exception, so annotations made
+    by the worker (e.g. ``dask_stage``, ``dask_task_key`` and ``__notes__``)
+    stay visible on the re-raised exception.
     """
 
     def __init__(self, exception, traceback):
@@ -94,6 +103,24 @@ def remote_exception(exc: Exception, tb) -> Exception:
             return exc
 
 
+def _copy_chain(exc: BaseException, target: BaseException) -> BaseException:
+    """Copy the explicit ``raise ... from ...`` chain of ``exc`` onto ``target``.
+
+    ``RemoteException`` wraps the original exception, which would otherwise hide
+    the cause that the task built.  ``__context__`` is deliberately left alone:
+    the wrapper is raised inside our own ``except`` block, so the implicit
+    context would only add noise.
+    """
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and getattr(target, "__cause__", None) is None:
+        try:
+            target.__cause__ = cause
+            target.__suppress_context__ = exc.__suppress_context__
+        except (AttributeError, TypeError):  # pragma: no cover
+            pass
+    return target
+
+
 try:
     import tblib.pickling_support
 
@@ -108,20 +135,54 @@ except ImportError:
         return "".join(traceback.format_tb(tb))
 
     def reraise(exc, tb=None):
-        exc = remote_exception(exc, tb)
-        raise exc
+        raise _copy_chain(exc, remote_exception(exc, tb))
+
+
+_BOOKKEEPING_ATTRS = ("dask_cause", "dask_context")
+
+
+def _strip_exception_chain(exc):
+    """Drop the chain references that :func:`dask.local.preserve_exception_chain` added."""
+    state = getattr(exc, "__dict__", None)
+    if isinstance(state, dict):
+        for name in _BOOKKEEPING_ATTRS:
+            state.pop(name, None)
+
+
+def _copy_annotations(source, target):
+    """Carry stage/key attribution over to the exception that is reported instead."""
+    for name in ("dask_stage", "dask_task_key"):
+        value = getattr(source, name, None)
+        if value is not None and getattr(target, name, None) is None:
+            try:
+                setattr(target, name, value)
+            except (AttributeError, TypeError):  # pragma: no cover
+                pass
+    return target
 
 
 def pack_exception(e, dumps):
-    exc_type, exc_value, exc_traceback = sys.exc_info()
+    _, _, exc_traceback = sys.exc_info()
     tb = _pack_traceback(exc_traceback)
+    # pickle only transfers __dict__ (plus __notes__), so record the explicit
+    # ``raise ... from ...`` chain in the exception state to carry it over.
+    preserve_exception_chain(e)
     try:
-        result = dumps((e, tb))
-    except Exception as e:
-        exc_type, exc_value, exc_traceback = sys.exc_info()
-        tb = _pack_traceback(exc_traceback)
-        result = dumps((e, tb))
-    return result
+        return dumps((e, tb))
+    except Exception:
+        pass
+    # The exception (or one of its attributes) could not be serialized. Retry
+    # without the chain references we attached, so that the task's own error is
+    # still reported instead of a complaint about our bookkeeping.
+    _strip_exception_chain(e)
+    try:
+        return dumps((e, tb))
+    except Exception:
+        # The exception itself is not serializable; report the serialization
+        # failure but keep the stage/key annotation of the original error.
+        _, failure, exc_traceback = sys.exc_info()
+        _copy_annotations(e, failure)
+        return dumps((failure, _pack_traceback(exc_traceback)))
 
 
 _CONTEXT_UNSUPPORTED = """\
