@@ -1,9 +1,15 @@
+import datetime
+import io
+
 from sqlalchemy import Column
+from sqlalchemy import create_engine
+from sqlalchemy import Date
 from sqlalchemy import Integer
 from sqlalchemy import MetaData
 from sqlalchemy import String
 from sqlalchemy import Table
 from sqlalchemy import text
+from sqlalchemy.exc import CompileError
 from sqlalchemy.sql import column
 from sqlalchemy.sql import table
 from sqlalchemy.types import TypeEngine
@@ -217,6 +223,139 @@ class BulkInsertTest(TestBase):
             "(2, 'row v2', 'row v6')",
         )
 
+    def test_bulk_insert_as_sql_nulls_dates_inline_literal(self):
+        context = op_fixture("sqlite", True)
+
+        class MyType(TypeEngine):
+            pass
+
+        t1 = table(
+            "ins_table",
+            column("id", Integer),
+            column("v1", String()),
+            column("d", Date),
+            column("custom", MyType()),
+        )
+        op.bulk_insert(
+            t1,
+            [
+                {
+                    "id": 1,
+                    "v1": "row v1",
+                    "d": datetime.date(2026, 11, 22),
+                    "custom": None,
+                },
+                {"id": 2, "v1": None, "d": None, "custom": None},
+                {
+                    "id": 3,
+                    "v1": op.inline_literal("lit v3"),
+                    "d": op.inline_literal("2020-01-01"),
+                    "custom": op.inline_literal("c-lit"),
+                },
+            ],
+        )
+        context.assert_(
+            "INSERT INTO ins_table (id, v1, d, custom) "
+            "VALUES (1, 'row v1', '2026-11-22', NULL)",
+            "INSERT INTO ins_table (id, v1, d, custom) "
+            "VALUES (2, NULL, NULL, NULL)",
+            "INSERT INTO ins_table (id, v1, d, custom) "
+            "VALUES (3, 'lit v3', '2020-01-01', 'c-lit')",
+        )
+
+    def test_bulk_insert_as_sql_unrenderable_reports_row_and_column(self):
+        class MyType(TypeEngine):
+            pass
+
+        class Weird:
+            def __repr__(self):
+                return "Weird()"
+
+        t1 = table(
+            "ins_table",
+            column("id", Integer),
+            column("custom", MyType()),
+        )
+        # the bad value is on row 2 / column "custom"; rows 1 and 3 are
+        # otherwise fine
+        rows = [
+            {"id": 1, "custom": None},
+            {"id": 2, "custom": Weird()},
+            {"id": 3, "custom": None},
+        ]
+        for dialect in ("sqlite", "postgresql", "mssql"):
+            context = op_fixture(dialect, True)
+            assert_raises_message(
+                CompileError,
+                r"Could not render value for row 2, column 'custom' in "
+                r"bulk_insert\(\) against table ins_table",
+                op.bulk_insert,
+                t1,
+                rows,
+            )
+
+    def test_bulk_insert_as_sql_unrenderable_in_inline_literal(self):
+        class MyType(TypeEngine):
+            pass
+
+        class Weird:
+            def __repr__(self):
+                return "Weird()"
+
+        context = op_fixture("sqlite", True)
+        t1 = table(
+            "ins_table", column("id", Integer), column("custom", MyType())
+        )
+        assert_raises_message(
+            CompileError,
+            r"Could not render value for row 1, column 'custom' in "
+            r"bulk_insert\(\) against table ins_table",
+            op.bulk_insert,
+            t1,
+            [{"id": 1, "custom": op.inline_literal(Weird())}],
+        )
+
+    def test_bulk_insert_as_sql_failure_emits_nothing(self):
+        class MyType(TypeEngine):
+            pass
+
+        class Weird:
+            def __repr__(self):
+                return "Weird()"
+
+        t1 = table(
+            "ins_table",
+            column("id", Integer),
+            column("v1", String()),
+            column("custom", MyType()),
+        )
+        rows = [
+            {"id": 1, "v1": "good row", "custom": None},
+            {"id": 2, "v1": "bad row", "custom": Weird()},
+            {"id": 3, "v1": "good row", "custom": None},
+        ]
+        # default dialect: no partial INSERT may be written
+        context = op_fixture("sqlite", True)
+        assert_raises_message(
+            CompileError,
+            r"Could not render value for row 2, column 'custom'",
+            op.bulk_insert,
+            t1,
+            rows,
+        )
+        context.assert_()
+
+        # mssql: not even the SET IDENTITY_INSERT bookends may leak
+        context = op_fixture("mssql", True)
+        assert_raises_message(
+            CompileError,
+            r"Could not render value for row 2, column 'custom'",
+            op.bulk_insert,
+            t1,
+            rows,
+        )
+        context.assert_()
+
     def test_invalid_format(self):
         context, t1 = self._table_fixture("sqlite", False)
         assert_raises_message(
@@ -319,4 +458,99 @@ class RoundTripTest(TestBase):
                 text("select id, v1, v2 from ins_table order by id")
             ).fetchall(),
             [(1, "row v1", "row v5"), (2, "row v2", "row v6")],
+        )
+
+    def test_offline_sql_matches_online_context(self):
+        """The same batch, rendered as offline SQL and executed against a
+        scratch SQLite database, must produce the same rows as running the
+        batch through an online MigrationContext."""
+
+        def _table():
+            return Table(
+                "roundtrip_t",
+                MetaData(),
+                Column("id", Integer, primary_key=True),
+                Column("name", String(50)),
+                Column("d", Date),
+                Column("custom", String(50)),
+            )
+
+        rows = [
+            {
+                "id": 1,
+                "name": "alice",
+                "d": datetime.date(2026, 11, 22),
+                "custom": None,
+            },
+            {"id": 2, "name": None, "d": None, "custom": None},
+            {
+                "id": 3,
+                "name": self.op.inline_literal("carol"),
+                "d": self.op.inline_literal("2020-01-01"),
+                "custom": self.op.inline_literal("inline value"),
+            },
+            {
+                "id": 4,
+                "name": "dave",
+                "d": datetime.date(1999, 12, 31),
+                "custom": "plain bound",
+            },
+        ]
+
+        # --- offline path: generate literal SQL with an as_sql context ---
+        buffer = io.StringIO()
+        offline_ctx = MigrationContext.configure(
+            dialect_name="sqlite",
+            opts={"as_sql": True, "output_buffer": buffer},
+        )
+        offline_op = op.Operations(offline_ctx)
+        # table construct usable for both paths; recreate per context to
+        # avoid any shared compile state
+        offline_table = _table()
+        offline_op.bulk_insert(offline_table, rows, multiinsert=False)
+        offline_sql = buffer.getvalue()
+
+        # sanity check: every row got its own INSERT, fully inlined
+        eq_(offline_sql.count("INSERT INTO roundtrip_t"), len(rows))
+
+        # --- apply the offline SQL to a scratch in-memory SQLite engine ---
+        offline_engine = create_engine("sqlite:///:memory:")
+        with offline_engine.begin() as conn:
+            _table().create(conn)
+            for statement in offline_sql.split(";"):
+                statement = statement.strip()
+                if statement:
+                    conn.execute(text(statement))
+            offline_rows = conn.execute(
+                text(
+                    "select id, name, d, custom from roundtrip_t "
+                    "order by id"
+                )
+            ).fetchall()
+
+        # --- online path: ordinary connected MigrationContext ---
+        online_engine = create_engine("sqlite:///:memory:")
+        with online_engine.begin() as conn:
+            _table().create(conn)
+            online_ctx = MigrationContext.configure(conn)
+            online_op = op.Operations(online_ctx)
+            online_table = _table()
+            online_op.bulk_insert(online_table, rows, multiinsert=False)
+            online_rows = conn.execute(
+                text(
+                    "select id, name, d, custom from roundtrip_t "
+                    "order by id"
+                )
+            ).fetchall()
+
+        eq_(offline_rows, online_rows)
+        # explicit expectation, including NULL handling and inlined values
+        eq_(
+            offline_rows,
+            [
+                (1, "alice", "2026-11-22", None),
+                (2, None, None, None),
+                (3, "carol", "2020-01-01", "inline value"),
+                (4, "dave", "1999-12-31", "plain bound"),
+            ],
         )

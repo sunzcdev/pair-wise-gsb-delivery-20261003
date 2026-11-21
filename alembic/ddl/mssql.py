@@ -193,15 +193,44 @@ class MSSQLImpl(DefaultImpl):
         self, table: TableClause | Table, rows: list[dict], **kw: Any
     ) -> None:
         if self.as_sql:
-            self._exec(
-                "SET IDENTITY_INSERT %s ON"
-                % self.dialect.identifier_preparer.format_table(table)
-            )
-            super().bulk_insert(table, rows, **kw)
-            self._exec(
-                "SET IDENTITY_INSERT %s OFF"
-                % self.dialect.identifier_preparer.format_table(table)
-            )
+            # The base implementation compiles every row's INSERT before
+            # emitting any of them, but the IDENTITY_INSERT bookends below
+            # are emitted directly.  Redirect output into a recording buffer
+            # for the whole block so that an unrenderable value in any row
+            # aborts the batch without leaving a half-written script; replay
+            # the recorded write calls in order only on full success.
+            original_buffer = self.output_buffer
+
+            class _Buffer:
+                def __init__(self) -> None:
+                    self.messages: list[str] = []
+
+                def write(self, msg: str) -> None:
+                    self.messages.append(msg)
+
+                def flush(self) -> None:
+                    pass
+
+            self.output_buffer = _Buffer()
+            try:
+                self._exec(
+                    "SET IDENTITY_INSERT %s ON"
+                    % self.dialect.identifier_preparer.format_table(table)
+                )
+                super().bulk_insert(table, rows, **kw)
+                self._exec(
+                    "SET IDENTITY_INSERT %s OFF"
+                    % self.dialect.identifier_preparer.format_table(table)
+                )
+            except BaseException:
+                self.output_buffer = original_buffer
+                raise
+            else:
+                buffered = self.output_buffer
+                self.output_buffer = original_buffer
+                for msg in buffered.messages:
+                    original_buffer.write(msg)
+                original_buffer.flush()
         else:
             super().bulk_insert(table, rows, **kw)
 

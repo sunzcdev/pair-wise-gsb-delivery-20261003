@@ -21,6 +21,7 @@ from sqlalchemy import schema
 from sqlalchemy import String
 from sqlalchemy import Table
 from sqlalchemy import text
+from sqlalchemy.exc import CompileError
 
 from . import _autogen
 from . import base
@@ -485,25 +486,49 @@ class DefaultImpl(metaclass=ImplMeta):
         elif rows and not isinstance(rows[0], dict):
             raise TypeError("List of dictionaries expected")
         if self.as_sql:
-            for row in rows:
-                self._exec(
-                    table.insert()
-                    .inline()
-                    .values(
-                        **{
-                            k: (
-                                sqla_compat._literal_bindparam(
-                                    k, v, type_=table.c[k].type
-                                )
-                                if not isinstance(
-                                    v, sqla_compat._literal_bindparam
-                                )
-                                else v
+            # Phase 1: compile every row's INSERT up front so that a value
+            # which can't be rendered as a literal never leaves the batch
+            # half emitted.  Either the full batch of SQL is written out in
+            # phase 2, or no INSERT statement is emitted at all.
+            compiled_statements: list[str] = []
+            for row_idx, row in enumerate(rows):
+                insert = table.insert().inline().values(
+                    **{
+                        k: (
+                            sqla_compat._literal_bindparam(
+                                k, v, type_=table.c[k].type
                             )
-                            for k, v in row.items()
-                        }
-                    )
+                            if not isinstance(
+                                v, sqla_compat._literal_bindparam
+                            )
+                            else v
+                        )
+                        for k, v in row.items()
+                    }
                 )
+                try:
+                    compiled = insert.compile(dialect=self.dialect)
+                except CompileError as err:
+                    # identify the specific cell that cannot be rendered
+                    bad_col = self._find_unrenderable_column(table, row)
+                    raise CompileError(
+                        "Could not render value for row %d, column %r in "
+                        "bulk_insert() against table %s: %s"
+                        % (
+                            row_idx + 1,
+                            bad_col,
+                            table.name,
+                            err,
+                        )
+                    ) from err
+                compiled_statements.append(
+                    str(compiled).replace("\t", "    ").strip()
+                )
+            # Phase 2: all rows are renderable.  Go through _exec so that
+            # dialect-specific output (e.g. MSSQL's "GO" batch separator)
+            # is preserved exactly as before.
+            for statement in compiled_statements:
+                self._exec(statement)
         else:
             if rows:
                 if multiinsert:
@@ -511,6 +536,26 @@ class DefaultImpl(metaclass=ImplMeta):
                 else:
                     for row in rows:
                         self._exec(table.insert().inline().values(**row))
+
+    def _find_unrenderable_column(
+        self, table: TableClause | Table, row: dict
+    ) -> str | None:
+        """Re-render each cell of *row* individually to locate the column
+        whose value has no literal representation."""
+
+        for k, v in row.items():
+            value = (
+                v
+                if isinstance(v, sqla_compat._literal_bindparam)
+                else sqla_compat._literal_bindparam(
+                    k, v, type_=table.c[k].type
+                )
+            )
+            try:
+                value.compile(dialect=self.dialect)
+            except CompileError:
+                return k
+        return None
 
     def _tokenize_column_type(self, column: Column) -> Params:
         definition: str
