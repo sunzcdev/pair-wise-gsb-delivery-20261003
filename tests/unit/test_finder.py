@@ -1,5 +1,6 @@
 import datetime
 import logging
+import pathlib
 from collections.abc import Iterable
 from unittest.mock import Mock, patch
 
@@ -23,6 +24,7 @@ from pip._internal.models.target_python import TargetPython
 from pip._internal.req.constructors import install_req_from_line
 
 from tests.lib import TestData, make_test_finder
+from tests.lib.wheel import make_wheel
 
 
 def test_no_mpkg(data: TestData) -> None:
@@ -421,6 +423,74 @@ def test_finder_records_requires_python_skips_without_debug_logging(
         "2.6.0 Requires-Python <2.7",
         "2.7.0 Requires-Python <3,>=2.7",
     ]
+
+
+def test_finder_records_skips_per_project(data: TestData) -> None:
+    """Skipped links are attributed to the project they were evaluated for."""
+    finder = make_test_finder(index_urls=[data.index_url("datarequire")])
+
+    finder.find_all_candidates("fakepackage")
+
+    skips = finder.skipped_reasons("fakepackage")
+    assert skips[LinkType.requires_python_mismatch] == [
+        "2.6.0 Requires-Python <2.7",
+        "2.7.0 Requires-Python <3,>=2.7",
+    ]
+    # A project the finder never looked at inherits no skips.
+    assert finder.skipped_reasons("other-package") == {}
+
+
+def test_finder_records_local_wheel_requires_python_skip(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Requires-Python from a local wheel's metadata is recorded as a skip.
+
+    The wheel itself stays in the candidate set: the resolver still runs the
+    authoritative Requires-Python check through its Python requirement.
+    """
+    wheel = make_wheel(
+        name="localpkg",
+        version="1.0",
+        metadata_updates={"Requires-Python": "<0.1"},
+    )
+    wheel.save_to_dir(tmp_path)
+
+    finder = make_test_finder(find_links=[str(tmp_path)])
+    candidates = finder.find_all_candidates("localpkg")
+
+    assert [str(candidate.version) for candidate in candidates] == ["1.0"]
+    assert finder.skipped_reasons("localpkg") == {
+        LinkType.requires_python_mismatch: ["1.0 Requires-Python <0.1"]
+    }
+    assert finder.requires_python_skipped_reasons() == ["1.0 Requires-Python <0.1"]
+
+
+def test_finder_local_wheel_platform_mismatch_is_not_python_skip(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A platform-tag mismatch is recorded separately from Requires-Python.
+
+    The wheel also declares an impossible Requires-Python; because it is
+    rejected for its platform first, it must not be blamed on Python.
+    """
+    wheel = make_wheel(
+        name="localpkg",
+        version="1.0",
+        metadata_updates={"Requires-Python": "<0.1"},
+        wheel_metadata_updates={"Tag": ["py3-none-fakeplat"]},
+    )
+    # The filename determines the tags the finder checks, so use a filename
+    # with the incompatible platform rather than the default universal one.
+    wheel.save_to(tmp_path / "localpkg-1.0-py3-none-fakeplat.whl")
+
+    finder = make_test_finder(find_links=[str(tmp_path)])
+    candidates = finder.find_all_candidates("localpkg")
+
+    assert [str(candidate.version) for candidate in candidates] == []
+    skips = finder.skipped_reasons("localpkg")
+    assert LinkType.requires_python_mismatch not in skips
+    assert LinkType.platform_mismatch in skips
+    assert "compatible" in skips[LinkType.platform_mismatch][0]
 
 
 def test_finder_installs_pre_releases(data: TestData) -> None:

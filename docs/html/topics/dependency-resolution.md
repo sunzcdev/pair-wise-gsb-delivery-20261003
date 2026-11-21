@@ -184,8 +184,30 @@ ERROR: Cannot install package_coffee==0.44.1 and package_tea==4.3.0 because thes
 
 The conflict is caused by:
     package_coffee 0.44.1 depends on package_water<3.0.0,>=2.4.2
+    The user requested package_coffee==0.44.1
     package_tea 4.3.0 depends on package_water==2.3.1
+    The user requested package_tea==4.3.0
 ```
+
+Each conflicting requirement is followed by its parent dependency chain,
+ending with the request that pulled it in. This makes it clear which of
+your top-level requirements each side of the conflict came from.
+
+Releases that were set aside only because their `Requires-Python` excludes
+the interpreter pip is running under are reported separately, so that they
+are not mistaken for versions that do not exist:
+
+```
+The following versions were ignored because they require a different Python version:
+    package_water: 3.0.0 Requires-Python <3.11
+```
+
+Releases rejected for other reasons -- for example, wheels whose platform
+tags do not match the current environment -- are not part of the
+explanation: they were never candidates here, so they cannot be the cause
+of the conflict. Likewise, dependencies of extras you did not request, and
+dependencies whose environment markers do not match, are not evaluated and
+so never appear in the chain.
 
 In this example, pip cannot install the packages you have requested,
 because they each depend on different versions of the same package

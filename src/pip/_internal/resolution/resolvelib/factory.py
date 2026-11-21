@@ -30,7 +30,7 @@ from pip._internal.exceptions import (
     UnsupportedPythonVersion,
     UnsupportedWheel,
 )
-from pip._internal.index.package_finder import PackageFinder
+from pip._internal.index.package_finder import LinkType, PackageFinder
 from pip._internal.metadata import BaseDistribution, get_default_environment
 from pip._internal.models.link import Link
 from pip._internal.models.wheel import Wheel
@@ -770,17 +770,15 @@ class Factory:
     def _has_any_candidates(self, project_name: str) -> bool:
         """
         Check if there are any candidates available for the project name.
+
+        The finder already applies the environment-level filters (platform
+        tags, Requires-Python, and so on), so ask it directly. Routing this
+        through the resolver's candidate factory would re-apply the currently
+        active specifiers, making a package that merely has no version
+        satisfying the conflicting requirements look like it has no
+        distribution at all.
         """
-        return any(
-            self.find_candidates(
-                project_name,
-                requirements={project_name: []},
-                incompatibilities={},
-                constraint=Constraint.empty(),
-                prefers_installed=True,
-                is_satisfied_by=lambda r, c: True,
-            )
-        )
+        return bool(self._finder.find_all_candidates(project_name))
 
     def get_installation_error(
         self,
@@ -857,22 +855,20 @@ class Factory:
         for req, parent in e.causes:
             if req.name in constraints:
                 relevant_constraints.add(req.name)
-            msg = msg + "\n    "
-            if parent:
-                msg = msg + f"{parent.name} {parent.version} depends on "
-            else:
-                msg = msg + "The user requested "
-            msg = msg + req.format_for_error()
+            for line in self._iter_conflict_chain_lines(req, parent):
+                msg += "\n    " + line
         for key in relevant_constraints:
             constraint_text = f"{key}{constraints[key].format_for_error()}"
             msg += f"\n    The user requested (constraint) {constraint_text}"
 
-        # Check for causes that had no candidates
-        causes = set()
-        for req, _ in e.causes:
-            causes.add(req.name)
+        # Check for causes that had no candidates. Look projects up by their
+        # base name: an identifier carrying extras (``pkg[extra]``) is not a
+        # project the finder can answer for.
+        conflicted_projects = {req.project_name for req, _ in e.causes}
 
-        no_candidates = {c for c in causes if not self._has_any_candidates(c)}
+        no_candidates = {
+            c for c in conflicted_projects if not self._has_any_candidates(c)
+        }
         if no_candidates:
             msg = (
                 msg
@@ -882,6 +878,22 @@ class Factory:
                 + "\n    "
                 + "\n    ".join(sorted(no_candidates))
             )
+
+        # Releases that exist but were discarded only because their
+        # Requires-Python excludes the running interpreter get their own
+        # section: they are real, published versions, so calling them
+        # "missing" would send users hunting for something that is not
+        # absent. Platform-tag mismatches and other rejections stay out of
+        # this section; such a wheel is not a usable candidate here at all,
+        # so it does not explain the conflict.
+        python_skips = self._collect_requires_python_skips(conflicted_projects)
+        if python_skips:
+            msg += (
+                "\n\nThe following versions were ignored because they require "
+                "a different Python version:"
+            )
+            for project_name in sorted(python_skips):
+                msg += f"\n    {project_name}: " + "; ".join(python_skips[project_name])
 
         msg = (
             msg
@@ -899,3 +911,77 @@ class Factory:
             "https://pip.pypa.io/en/latest/topics/dependency-resolution/"
             "#dealing-with-dependency-conflicts"
         )
+
+    def _iter_conflict_chain_lines(
+        self, req: Requirement, parent: Candidate | None
+    ) -> Iterator[str]:
+        """Yield the lines explaining one unsatisfiable requirement.
+
+        The first line names the constraint that could not be met; the rest
+        walk the parent dependency chain back to the root requirement that
+        pulled it in, so a reader can see which request each side of a
+        conflict came from.
+
+        Only requirements that actually reached the resolver appear here.
+        Requirements whose markers did not match are dropped while the
+        dependency is created, and extras that were never requested never
+        have their dependencies evaluated, so neither can show up in the
+        chain.
+        """
+        requirement_text = req.format_for_error()
+        if parent is None:
+            # A root requirement has no parent chain to explain.
+            yield f"The user requested {requirement_text}"
+            return
+
+        yield f"{parent.name} {parent.version} depends on {requirement_text}"
+
+        _, ireq = req.get_candidate_lookup()
+        if ireq is None:
+            return
+
+        seen: set[int] = set()
+        current: InstallRequirement | str | None = ireq.comes_from
+        while isinstance(current, InstallRequirement):
+            if id(current) in seen:
+                # Defensive guard against a pathological cyclic chain.
+                break
+            seen.add(id(current))
+
+            up = current.comes_from
+            if current.req is None or current.name is None:
+                current = up
+                continue
+
+            constraint = requirement_without_marker(current.req)
+            if isinstance(up, InstallRequirement) and up.name:
+                yield f"{up.name} depends on {constraint}"
+            elif isinstance(up, InstallRequirement):
+                yield f"requires {constraint}"
+            elif up is not None:
+                # ``comes_from`` may be a requirements-file path.
+                yield f"{up} requires {constraint}"
+            else:
+                # The top of the chain is a user-supplied requirement.
+                yield f"The user requested {constraint}"
+            current = up
+
+    def _collect_requires_python_skips(
+        self, project_names: Iterable[str]
+    ) -> dict[str, list[str]]:
+        """Collect Requires-Python-only rejections for the conflicted projects.
+
+        Only projects involved in the conflict are considered, and only links
+        rejected because of ``LinkType.requires_python_mismatch``. Platform
+        mismatches, unsupported formats and similar skips are deliberately
+        excluded: those links were never viable for this environment, so they
+        do not explain the conflict.
+        """
+        skips_by_project: dict[str, list[str]] = {}
+        for name in project_names:
+            skips = self._finder.skipped_reasons(name).get(
+                LinkType.requires_python_mismatch
+            )
+            if skips:
+                skips_by_project[name] = skips
+        return skips_by_project

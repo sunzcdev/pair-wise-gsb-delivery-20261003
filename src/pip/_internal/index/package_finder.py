@@ -8,8 +8,10 @@ import functools
 import itertools
 import logging
 import re
+import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass
+from email.parser import Parser
 from typing import (
     TYPE_CHECKING,
 )
@@ -45,6 +47,7 @@ from pip._internal.utils.logging import indent_log
 from pip._internal.utils.misc import build_netloc
 from pip._internal.utils.packaging import check_requires_python
 from pip._internal.utils.unpacking import SUPPORTED_EXTENSIONS
+from pip._internal.utils.wheel import wheel_dist_info_dir
 
 if TYPE_CHECKING:
     from typing import TypeGuard
@@ -166,6 +169,10 @@ class LinkEvaluator:
         self._uploaded_prior_to = uploaded_prior_to
 
         self.project_name = project_name
+
+    @property
+    def canonical_name(self) -> NormalizedName:
+        return self._canonical_name
 
     def evaluate_link(self, link: Link) -> tuple[LinkType, str]:
         """
@@ -655,6 +662,14 @@ class PackageFinder:
         # the error message when resolution fails.
         self._requires_python_skipped: set[str] = set()
 
+        # Per-project record of links that were considered but rejected. Keys
+        # are canonical project names, values map the rejection reason to the
+        # human-readable details of the affected links. Recording the project
+        # alongside the reason lets conflict reports attribute a rejection to
+        # the right package (and to the right cause, e.g. a Requires-Python
+        # mismatch versus a platform-tag mismatch).
+        self._skipped_links: dict[NormalizedName, dict[LinkType, set[str]]] = {}
+
         # Cache of the result of finding candidates
         self._all_candidates: dict[str, list[InstallationCandidate]] = {}
         self._best_candidates: dict[
@@ -777,6 +792,18 @@ class PackageFinder:
     def requires_python_skipped_reasons(self) -> list[str]:
         return sorted(self._requires_python_skipped)
 
+    def skipped_reasons(self, project_name: str) -> dict[LinkType, list[str]]:
+        """Return the recorded reasons why links were rejected for a project.
+
+        The result maps each :class:`LinkType` that caused a link to be
+        discarded while looking for ``project_name`` to the sorted,
+        de-duplicated detail strings for the affected links. Projects that
+        were never evaluated (or whose links were all usable) return an empty
+        mapping.
+        """
+        skips = self._skipped_links.get(canonicalize_name(project_name), {})
+        return {link_type: sorted(details) for link_type, details in skips.items()}
+
     def make_link_evaluator(self, project_name: str) -> LinkEvaluator:
         canonical_name = canonicalize_name(project_name)
         formats = self.format_control.get_allowed_formats(canonical_name)
@@ -807,12 +834,82 @@ class PackageFinder:
                     no_eggs.append(link)
         return no_eggs + eggs
 
-    def _log_skipped_link(self, link: Link, result: LinkType, detail: str) -> None:
+    def _log_skipped_link(
+        self,
+        link_evaluator: LinkEvaluator,
+        link: Link,
+        result: LinkType,
+        detail: str,
+    ) -> None:
         # Put the link at the end so the reason is more visible and because
         # the link string is usually very long.
         logger.debug("Skipping link: %s: %s", detail, link)
         if result == LinkType.requires_python_mismatch:
             self._requires_python_skipped.add(detail)
+        # Attribute the rejection to the project the link was evaluated for,
+        # so conflict reports can explain why individual releases were not
+        # eligible without leaking skips across unrelated projects.
+        project_skips = self._skipped_links.setdefault(
+            link_evaluator.canonical_name, {}
+        )
+        project_skips.setdefault(result, set()).add(detail)
+
+    def _record_local_wheel_requires_python_skip(
+        self, link: Link, canonical_name: NormalizedName
+    ) -> None:
+        """Note a local wheel whose metadata Requires-Python does not match.
+
+        Local wheels carry no PEP 503 ``data-requires-python`` attribute, so
+        link evaluation cannot see their Requires-Python value. Reading it
+        here lets a later conflict report distinguish "this release exists but
+        needs another Python" from "this release does not exist".
+
+        The rejection is recorded for reporting only; the wheel stays in the
+        candidate set because the resolver performs the authoritative
+        Requires-Python check through its special Python requirement.
+        """
+        requires_python = self._read_local_wheel_requires_python(link, canonical_name)
+        if not requires_python:
+            return
+
+        try:
+            is_compatible = check_requires_python(
+                requires_python,
+                version_info=self._target_python.py_version_info,
+            )
+        except specifiers.InvalidSpecifier:
+            return
+        if is_compatible or self._ignore_requires_python:
+            return
+
+        try:
+            version = Wheel(link.filename).version
+        except InvalidWheelFilename:
+            return
+        detail = f"{version} Requires-Python {requires_python}"
+        self._requires_python_skipped.add(detail)
+        project_skips = self._skipped_links.setdefault(canonical_name, {})
+        project_skips.setdefault(LinkType.requires_python_mismatch, set()).add(detail)
+
+    def _read_local_wheel_requires_python(
+        self, link: Link, canonical_name: NormalizedName
+    ) -> str | None:
+        """Read ``Requires-Python`` from a local wheel's METADATA, if any.
+
+        Only the small METADATA member is read; the wheel is neither unpacked
+        nor built. Returns ``None`` when the value is absent or unreadable, in
+        which case evaluation proceeds as if no Requires-Python were declared.
+        """
+        try:
+            with zipfile.ZipFile(link.file_path) as wheel_zip:
+                info_dir = wheel_dist_info_dir(wheel_zip, str(canonical_name))
+                metadata = wheel_zip.read(f"{info_dir}/METADATA")
+        except (OSError, zipfile.BadZipFile, UnsupportedWheel, KeyError):
+            return None
+
+        message = Parser().parsestr(metadata.decode("utf-8", "replace"))
+        value = message.get("Requires-Python")
+        return value.strip() if value else None
 
     def get_install_candidate(
         self, link_evaluator: LinkEvaluator, link: Link
@@ -827,8 +924,18 @@ class PackageFinder:
             # when --uploaded-prior-to is specified
             raise InstallationError(detail)
         if result != LinkType.candidate:
-            self._log_skipped_link(link, result, detail)
+            self._log_skipped_link(link_evaluator, link, result, detail)
             return None
+
+        # The link itself is usable here, so a Requires-Python mismatch found
+        # in a local wheel's metadata describes a release that was rejected
+        # for that reason alone. Record it for conflict reporting; only links
+        # that got this far are considered, so a wheel rejected for its
+        # platform is never attributed to Python compatibility.
+        if not link.requires_python and link.is_file and link.is_wheel:
+            self._record_local_wheel_requires_python_skip(
+                link, link_evaluator.canonical_name
+            )
 
         try:
             return InstallationCandidate(
