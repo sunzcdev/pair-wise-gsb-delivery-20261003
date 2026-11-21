@@ -40,6 +40,32 @@ class HTTPConnectionState(enum.IntEnum):
     CLOSED = 3
 
 
+def _response_body_remaining(
+    request: Request, status_code: int, headers: list[tuple[bytes, bytes]]
+) -> int | None:
+    """
+    Determine the number of response body bytes that remain to be read,
+    if that amount is known up-front.
+
+    Returns `None` for responses with an unknown length, such as responses
+    using `Transfer-Encoding: chunked` or close-delimited bodies.
+    """
+    if (
+        request.method == b"HEAD"
+        or 100 <= status_code < 200
+        or status_code in (204, 304)
+        or (request.method == b"CONNECT" and 200 <= status_code < 300)
+    ):
+        # Responses that never include a message body.
+        return 0
+
+    for name, value in headers:
+        if name.lower() == b"content-length":
+            return int(value)
+
+    return None
+
+
 class HTTP11Connection(ConnectionInterface):
     READ_NUM_BYTES = 64 * 1024
     MAX_INCOMPLETE_EVENT_SIZE = 100 * 1024
@@ -57,6 +83,7 @@ class HTTP11Connection(ConnectionInterface):
         self._state = HTTPConnectionState.NEW
         self._state_lock = Lock()
         self._request_count = 0
+        self._response_bytes_remaining: int | None = None
         self._h11_state = h11.Connection(
             our_role=h11.CLIENT,
             max_incomplete_event_size=self.MAX_INCOMPLETE_EVENT_SIZE,
@@ -110,6 +137,10 @@ class HTTP11Connection(ConnectionInterface):
                     reason_phrase,
                     headers,
                 )
+
+            self._response_bytes_remaining = _response_body_remaining(
+                request, status, headers
+            )
 
             network_stream = self._network_stream
 
@@ -202,6 +233,8 @@ class HTTP11Connection(ConnectionInterface):
         while True:
             event = self._receive_event(timeout=timeout)
             if isinstance(event, h11.Data):
+                if self._response_bytes_remaining is not None:
+                    self._response_bytes_remaining -= len(event.data)
                 yield bytes(event.data)
             elif isinstance(event, (h11.EndOfMessage, h11.PAUSED)):
                 break
@@ -235,8 +268,26 @@ class HTTP11Connection(ConnectionInterface):
                 # mypy fails to narrow the type in the above if statement above
                 return event  # type: ignore[return-value]
 
-    def _response_closed(self) -> None:
+    def _response_closed(self, request: Request | None = None) -> None:
         with self._state_lock:
+            if not (
+                self._h11_state.our_state is h11.DONE
+                and self._h11_state.their_state is h11.DONE
+            ):
+                # The response was closed without being read to completion.
+                # Optionally attempt to drain a small remaining response body,
+                # so that the connection may be reused instead of closed.
+                if request is not None:
+                    try:
+                        self._drain_response_body(request)
+                    except BaseException:
+                        # If the caller is cancelled while draining, then the
+                        # connection cannot be reused. Close it, and allow the
+                        # cancellation to propagate as usual.
+                        with ShieldCancellation():
+                            self.close()
+                        raise
+
             if (
                 self._h11_state.our_state is h11.DONE
                 and self._h11_state.their_state is h11.DONE
@@ -248,6 +299,41 @@ class HTTP11Connection(ConnectionInterface):
                     self._expire_at = now + self._keepalive_expiry
             else:
                 self.close()
+
+    def _drain_response_body(self, request: Request) -> None:
+        """
+        Attempt to read any remaining response body to completion, so that
+        the connection can be reused for a subsequent request.
+
+        This is bounded by the optional 'drain_budget' request extension,
+        which sets the maximum number of unread bytes that may be drained.
+        Draining is only attempted when the remaining response body has a
+        known, sufficiently small `Content-Length`. In any other case, or if
+        the peer disconnects or the read times out partway through, we return
+        without draining, and the connection will be closed instead.
+        """
+        budget = request.extensions.get("drain_budget", 0)
+        remaining = self._response_bytes_remaining
+        if not budget or remaining is None or remaining > budget:
+            # Draining not enabled, an unknown response length,
+            # or a remaining body that exceeds the budget.
+            return
+
+        timeouts = request.extensions.get("timeout", {})
+        timeout = timeouts.get("read", None)
+
+        try:
+            while True:
+                event = self._receive_event(timeout=timeout)
+                if isinstance(event, h11.Data):
+                    remaining -= len(event.data)
+                    self._response_bytes_remaining = remaining
+                elif isinstance(event, (h11.EndOfMessage, h11.PAUSED)):
+                    break
+        except Exception:
+            # The peer disconnected early, sent a malformed response,
+            # or the read timed out. The connection cannot be reused.
+            pass
 
     # Once the connection is no longer required...
 
@@ -345,7 +431,7 @@ class HTTP11ConnectionByteStream:
         if not self._closed:
             self._closed = True
             with Trace("response_closed", logger, self._request):
-                self._connection._response_closed()
+                self._connection._response_closed(self._request)
 
 
 class HTTP11UpgradeStream(NetworkStream):

@@ -109,6 +109,227 @@ def test_connection_pool_with_keepalive():
         )
 
 
+# Note that breaking out of the response stream partway through leaves async
+# generators to be cleaned up by the garbage collector.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+
+def test_connection_pool_response_drain_reuses_connection():
+    """
+    Responses that are closed with a small amount of the response body
+    remaining may be drained within the 'drain_budget', allowing the
+    connection to be reused.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, ",
+            b"world!",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    with httpcore.ConnectionPool(network_backend=network_backend) as pool:
+        # Read only the first part of the response body, then close the response.
+        with pool.stream(
+            "GET", "https://example.com/", extensions={"drain_budget": 1024}
+        ) as response:
+            for chunk in response.iter_stream():
+                assert chunk == b"Hello, "
+                break
+
+        # The remaining 6 bytes were drained, so the connection is reusable.
+        info = [repr(c) for c in pool.connections]
+        assert info == [
+            "<HTTPConnection ['https://example.com:443', HTTP/1.1, IDLE, Request Count: 1]>"
+        ]
+
+        # The next request reuses the existing connection.
+        with pool.stream("GET", "https://example.com/") as response:
+            response.read()
+
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        info = [repr(c) for c in pool.connections]
+        assert info == [
+            "<HTTPConnection ['https://example.com:443', HTTP/1.1, IDLE, Request Count: 2]>"
+        ]
+
+
+# Note that breaking out of the response stream partway through leaves async
+# generators to be cleaned up by the garbage collector.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+
+def test_connection_pool_response_drain_budget_exceeded():
+    """
+    If the remaining response body exceeds the 'drain_budget', then the
+    response is closed promptly without draining, and the connection
+    is closed rather than reused.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, ",
+            b"world!",
+        ]
+    )
+
+    with httpcore.ConnectionPool(network_backend=network_backend) as pool:
+        with pool.stream(
+            "GET", "https://example.com/", extensions={"drain_budget": 4}
+        ) as response:
+            for chunk in response.iter_stream():
+                assert chunk == b"Hello, "
+                break
+
+        # The remaining 6 bytes exceed the 4 byte budget.
+        # The connection is closed rather than drained.
+        assert pool.connections == []
+
+        # The next request requires a new connection.
+        with pool.stream("GET", "https://example.com/") as response:
+            info = [repr(c) for c in pool.connections]
+            assert info == [
+                "<HTTPConnection ['https://example.com:443', HTTP/1.1, ACTIVE, Request Count: 1]>"
+            ]
+            response.read()
+
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+
+# Note that breaking out of the response stream partway through leaves async
+# generators to be cleaned up by the garbage collector.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+
+def test_connection_pool_response_drain_unknown_length():
+    """
+    Responses with an unknown content length cannot be drained within a
+    bounded budget, so the connection is closed rather than reused.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"\r\n",
+            b"Hello, ",
+            b"world!",
+        ]
+    )
+
+    with httpcore.ConnectionPool(network_backend=network_backend) as pool:
+        with pool.stream(
+            "GET", "https://example.com/", extensions={"drain_budget": 1024}
+        ) as response:
+            for chunk in response.iter_stream():
+                assert chunk == b"Hello, "
+                break
+
+        # The response length is unknown, so no drain is attempted.
+        # The connection is closed rather than reused.
+        assert pool.connections == []
+
+        # The next request requires a new connection.
+        with pool.stream("GET", "https://example.com/") as response:
+            info = [repr(c) for c in pool.connections]
+            assert info == [
+                "<HTTPConnection ['https://example.com:443', HTTP/1.1, ACTIVE, Request Count: 1]>"
+            ]
+            response.read()
+
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+
+# Note that breaking out of the response stream partway through leaves async
+# generators to be cleaned up by the garbage collector.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+
+def test_connection_pool_response_drain_disconnect():
+    """
+    If the peer disconnects while the remaining response body is being
+    drained, then the connection is closed rather than reused.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, ",
+            # The peer disconnects before sending the remaining 6 bytes.
+        ]
+    )
+
+    with httpcore.ConnectionPool(network_backend=network_backend) as pool:
+        with pool.stream(
+            "GET", "https://example.com/", extensions={"drain_budget": 1024}
+        ) as response:
+            for chunk in response.iter_stream():
+                assert chunk == b"Hello, "
+                break
+
+        # The peer disconnected while draining, so the connection is closed.
+        assert pool.connections == []
+
+        # The next request requires a new connection.
+        with pool.stream("GET", "https://example.com/") as response:
+            info = [repr(c) for c in pool.connections]
+            assert info == [
+                "<HTTPConnection ['https://example.com:443', HTTP/1.1, ACTIVE, Request Count: 1]>"
+            ]
+
+
+# Note that breaking out of the response stream partway through leaves async
+# generators to be cleaned up by the garbage collector.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+
+def test_connection_pool_partial_response_without_drain_budget():
+    """
+    By default, closing a response without reading it to completion
+    closes the connection rather than reusing it.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, ",
+            b"world!",
+        ]
+    )
+
+    with httpcore.ConnectionPool(network_backend=network_backend) as pool:
+        with pool.stream("GET", "https://example.com/") as response:
+            for chunk in response.iter_stream():
+                assert chunk == b"Hello, "
+                break
+
+        # No 'drain_budget' was included, so the connection is closed.
+        assert pool.connections == []
+
+        # The next request requires a new connection.
+        with pool.stream("GET", "https://example.com/") as response:
+            info = [repr(c) for c in pool.connections]
+            assert info == [
+                "<HTTPConnection ['https://example.com:443', HTTP/1.1, ACTIVE, Request Count: 1]>"
+            ]
+            response.read()
+
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+
 
 def test_connection_pool_with_close():
     """

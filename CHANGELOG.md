@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+- Add optional `"drain_budget"` request extension, allowing HTTP/1.1 connections to be reused when a response is closed with a small, known amount of the response body remaining unread.
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
 
 ## Version 1.0.9 (April 24th, 2025)

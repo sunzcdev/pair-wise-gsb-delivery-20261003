@@ -188,6 +188,23 @@ response = httpcore.request(
 )
 ```
 
+### `"drain_budget"`
+
+The maximum number of unread response body bytes that may be drained when a response is closed without being read to completion, allowing the HTTP/1.1 connection to be reused instead of closed.
+
+By default no draining is attempted, and closing a partially-read response will close the connection. Draining is only attempted when the remaining response body has a known `Content-Length` that does not exceed the budget. Responses with an unknown length, or connections where the peer disconnects or the read times out partway through draining, are closed as usual.
+
+For example:
+
+```python
+extensions = {"drain_budget": 4096}
+with httpcore.stream("GET", "https://www.example.com", extensions=extensions) as response:
+    for chunk in response.iter_stream():
+        break  # Read only the first chunk, then close the response.
+# If at most 4096 bytes remained unread, they have now been drained,
+# and the connection is available for reuse.
+```
+
 ## Response Extensions
 
 ### `"http_version"`
