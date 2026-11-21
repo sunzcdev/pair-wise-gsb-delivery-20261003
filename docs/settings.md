@@ -100,6 +100,8 @@ Using Uvicorn with watchfiles will enable the following options (which are other
 * `--ws-ping-interval <float>` - Set the WebSockets ping interval, in seconds. **Default:** *20.0*.
 * `--ws-ping-timeout <float>` - Set the WebSockets ping timeout, in seconds. **Default:** *20.0*.
 * `--ws-per-message-deflate <bool>` - Enable/disable WebSocket per-message-deflate compression. Only available with the `websockets` protocol. **Default:** *True*.
+* `--ws-receive-backlog-messages <int>` - Set the maximum number of WebSocket messages that may await consumption by the application before the connection is failed with close code 1009. Only available with the `websockets-sansio` protocol. **Default:** *None* (unlimited).
+* `--ws-receive-backlog-bytes <int>` - Set the maximum bytes of WebSocket message data (queued messages plus incomplete fragments) that may await consumption by the application before the connection is failed with close code 1009. Only available with the `websockets-sansio` protocol. **Default:** *None* (unlimited).
 * `--lifespan <str>` - Set the Lifespan protocol implementation. **Options:** *'auto', 'on', 'off'.* **Default:** *'auto'*.
 * `--h11-max-incomplete-event-size <int>` - Set the maximum number of bytes to buffer of an incomplete event. Only available for `h11` HTTP protocol implementation. **Default:** *16384* (16 KB).
 

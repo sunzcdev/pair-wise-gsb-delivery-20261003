@@ -6,6 +6,7 @@ import logging
 import random
 import struct
 from asyncio import TimerHandle
+from collections import deque
 from asyncio.transports import BaseTransport, Transport
 from http import HTTPStatus
 from typing import Any, Literal, assert_never, cast
@@ -119,6 +120,16 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
         self.frames: list[bytes] = []
         self.curr_msg_data_type: Literal["text", "bytes"] = "bytes"
 
+        # Receive backlog state: message data queued for (or being assembled for) the
+        # app, bounded by `ws_receive_backlog_messages` / `ws_receive_backlog_bytes`.
+        # Control frames and terminal events are not charged against these limits.
+        self.max_backlog_messages = config.ws_receive_backlog_messages
+        self.max_backlog_bytes = config.ws_receive_backlog_bytes
+        self.backlog_messages = 0
+        self.backlog_bytes = 0
+        self.backlog_sizes: deque[int] = deque()
+        self.backlog_exceeded = False
+
     def connection_made(self, transport: BaseTransport) -> None:
         """Called when a connection is made."""
         transport = cast(Transport, transport)
@@ -214,6 +225,7 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
                     self.handle_close(event)
                 else:
                     assert_never(event.opcode)  # pragma: no cover
+                self.check_backlog_limits()
 
     # Event handlers
 
@@ -267,18 +279,21 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
 
     def handle_cont(self, event: Frame) -> None:
         self.frames.append(event.data)  # type: ignore[arg-type]
+        self.backlog_bytes += len(event.data)
         if event.fin:
             self.send_receive_event_to_app()
 
     def handle_text(self, event: Frame) -> None:
         self.curr_msg_data_type = "text"
         self.frames = [event.data]  # type: ignore[list-item]
+        self.backlog_bytes += len(event.data)
         if event.fin:
             self.send_receive_event_to_app()
 
     def handle_bytes(self, event: Frame) -> None:
         self.curr_msg_data_type = "bytes"
         self.frames = [event.data]  # type: ignore[list-item]
+        self.backlog_bytes += len(event.data)
         if event.fin:
             self.send_receive_event_to_app()
 
@@ -288,17 +303,22 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
         if self.close_sent:
             # The app is past `websocket.close`: discard the message rather than queueing
             # it, so reads stay active until the peer's close reply arrives.
+            self.backlog_bytes -= len(data)
             return
         if self.curr_msg_data_type == "text":
             try:
-                self.queue.put_nowait({"type": "websocket.receive", "text": data.decode()})
+                text = data.decode()
             except UnicodeDecodeError:  # pragma: no cover
+                self.backlog_bytes -= len(data)
                 self.logger.exception("Invalid UTF-8 sequence received from client.")
                 self.conn.send_close(1007)
                 self.handle_parser_exception()
                 return
+            self.queue.put_nowait({"type": "websocket.receive", "text": text})
         else:
             self.queue.put_nowait({"type": "websocket.receive", "bytes": data})
+        self.backlog_messages += 1
+        self.backlog_sizes.append(len(data))
         if not self.read_paused:
             self.read_paused = True
             self.transport.pause_reading()
@@ -385,6 +405,43 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
             output = self.conn.data_to_send()
             self.transport.write(b"".join(output))
             self.transport.close()
+
+    def check_backlog_limits(self) -> None:
+        """Fail the connection when the receive backlog grows past the configured limits.
+
+        Only message data is charged against the limits: complete messages queued for
+        the app plus the bytes of a fragmented message still being assembled. Control
+        frames (ping/pong/close) and terminal events keep their usual handling and are
+        never blocked by the backlog.
+        """
+        if self.backlog_exceeded or self.close_sent or self.disconnected or self.transport.is_closing():
+            return
+        if self.max_backlog_messages is not None and self.backlog_messages > self.max_backlog_messages:
+            detail = "%d messages pending (limit %d)" % (self.backlog_messages, self.max_backlog_messages)
+        elif self.max_backlog_bytes is not None and self.backlog_bytes > self.max_backlog_bytes:
+            detail = "%d bytes pending (limit %d)" % (self.backlog_bytes, self.max_backlog_bytes)
+        else:
+            return
+        self.handle_backlog_exceeded(detail)
+
+    def handle_backlog_exceeded(self, detail: str) -> None:
+        # The app isn't draining the queue and the peer keeps sending: fail the
+        # connection with 1009 (message too big). Already queued messages stay in
+        # order ahead of the disconnect event, so the app can still drain them.
+        self.backlog_exceeded = True
+        if self.logger.level <= TRACE_LOG_LEVEL:
+            prefix = "%s:%d - " % self.client if self.client else ""
+            self.logger.log(TRACE_LOG_LEVEL, "%sWebSocket receive backlog exceeded: %s", prefix, detail)
+        self.conn.fail(1009, "receive backlog exceeded")
+        assert self.conn.close_sent is not None
+        code = self.conn.close_sent.code
+        reason = self.conn.close_sent.reason
+        self.queue.put_nowait({"type": "websocket.disconnect", "code": code, "reason": reason})
+
+        output = self.conn.data_to_send()
+        self.transport.write(b"".join(output))
+        self.close_sent = True
+        self.transport.close()
 
     def handle_parser_exception(self) -> None:  # pragma: no cover
         assert self.conn.close_sent is not None
@@ -558,6 +615,9 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
 
     async def receive(self) -> ASGIReceiveEvent:
         message = await self.queue.get()
+        if message["type"] == "websocket.receive":
+            self.backlog_messages -= 1
+            self.backlog_bytes -= self.backlog_sizes.popleft()
         if self.read_paused and self.queue.empty():
             self.read_paused = False
             self.transport.resume_reading()

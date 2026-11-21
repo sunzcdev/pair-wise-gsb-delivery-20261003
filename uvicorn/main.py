@@ -192,6 +192,21 @@ def _parse_headers(ctx: click.Context, param: click.Parameter, value: tuple[str,
     show_default=True,
 )
 @click.option(
+    "--ws-receive-backlog-messages",
+    type=int,
+    default=None,
+    help="Maximum number of WebSocket messages awaiting consumption by the application "
+    "before the connection is failed. Only available with the 'websockets-sansio' protocol.",
+)
+@click.option(
+    "--ws-receive-backlog-bytes",
+    type=int,
+    default=None,
+    help="Maximum bytes of WebSocket message data (queued messages and incomplete "
+    "fragments) awaiting consumption by the application before the connection is "
+    "failed. Only available with the 'websockets-sansio' protocol.",
+)
+@click.option(
     "--lifespan",
     type=LIFESPAN_CHOICES,
     default="auto",
@@ -418,6 +433,8 @@ def main(
     ws_ping_interval: float,
     ws_ping_timeout: float,
     ws_per_message_deflate: bool,
+    ws_receive_backlog_messages: int | None,
+    ws_receive_backlog_bytes: int | None,
     lifespan: LifespanType,
     interface: InterfaceType,
     reload: bool,
@@ -471,6 +488,8 @@ def main(
         ws_ping_interval=ws_ping_interval,
         ws_ping_timeout=ws_ping_timeout,
         ws_per_message_deflate=ws_per_message_deflate,
+        ws_receive_backlog_messages=ws_receive_backlog_messages,
+        ws_receive_backlog_bytes=ws_receive_backlog_bytes,
         lifespan=lifespan,
         env_file=env_file,
         log_config=LOGGING_CONFIG if log_config is None else log_config,
@@ -527,6 +546,8 @@ def run(
     ws_ping_interval: float | None = 20.0,
     ws_ping_timeout: float | None = 20.0,
     ws_per_message_deflate: bool = True,
+    ws_receive_backlog_messages: int | None = None,
+    ws_receive_backlog_bytes: int | None = None,
     lifespan: LifespanType = "auto",
     interface: InterfaceType = "auto",
     reload: bool = False,
@@ -584,6 +605,8 @@ def run(
         ws_ping_interval=ws_ping_interval,
         ws_ping_timeout=ws_ping_timeout,
         ws_per_message_deflate=ws_per_message_deflate,
+        ws_receive_backlog_messages=ws_receive_backlog_messages,
+        ws_receive_backlog_bytes=ws_receive_backlog_bytes,
         lifespan=lifespan,
         interface=interface,
         reload=reload,

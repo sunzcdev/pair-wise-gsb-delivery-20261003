@@ -208,6 +208,8 @@ class Config:
         ws_ping_interval: float | None = 20.0,
         ws_ping_timeout: float | None = 20.0,
         ws_per_message_deflate: bool = True,
+        ws_receive_backlog_messages: int | None = None,
+        ws_receive_backlog_bytes: int | None = None,
         lifespan: LifespanType = "auto",
         env_file: str | os.PathLike[str] | None = None,
         log_config: dict[str, Any] | str | os.PathLike[str] | RawConfigParser | IO[Any] | None = LOGGING_CONFIG,
@@ -262,6 +264,8 @@ class Config:
         self.ws_ping_interval = ws_ping_interval
         self.ws_ping_timeout = ws_ping_timeout
         self.ws_per_message_deflate = ws_per_message_deflate
+        self.ws_receive_backlog_messages = ws_receive_backlog_messages
+        self.ws_receive_backlog_bytes = ws_receive_backlog_bytes
         self.lifespan = lifespan
         self.log_config = log_config
         self.log_level = log_level

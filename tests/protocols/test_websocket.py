@@ -1541,8 +1541,9 @@ class MockWebSocketConnection:
         ws_protocol_cls: WSProtocol,
         http_protocol_cls: HTTPProtocol,
         close_timeout: float = 10.0,
+        **config_kwargs: Any,
     ) -> None:
-        config = Config(app=app, ws=ws_protocol_cls, http=http_protocol_cls, lifespan="off")
+        config = Config(app=app, ws=ws_protocol_cls, http=http_protocol_cls, lifespan="off", **config_kwargs)
         config.load()
         self._server_state = ServerState()
         self._protocol = ws_protocol_cls(config=config, server_state=self._server_state, app_state={})
@@ -1572,6 +1573,15 @@ class MockWebSocketConnection:
         self._read_response()
         self._client.send_text(text.encode())
         self._stage(flush)
+
+    def send_message(self, parts: list[bytes], data_type: str = "text", final: bool = True) -> None:
+        """Send a message as one or more fragments; `final=False` leaves it incomplete."""
+        self._read_response()
+        first_opcode = Opcode.TEXT if data_type == "text" else Opcode.BINARY
+        for index, part in enumerate(parts):
+            opcode = first_opcode if index == 0 else Opcode.CONT
+            self._client.send_frame(Frame(opcode, part, fin=final and index == len(parts) - 1))
+        self._stage(True)
 
     def send_ping(self, flush: bool = True) -> None:
         self._read_response()
@@ -1816,6 +1826,106 @@ async def test_shutdown_while_the_close_reply_is_pending(ws_protocol_cls: WSProt
         connection.shutdown()
         assert connection.transport_closed
         assert not connection.awaiting_close_reply
+
+
+async def test_receive_backlog_message_limit_fails_connection(
+    ws_protocol_cls: WSProtocol, http_protocol_cls: HTTPProtocol
+):
+    """Test that the connection fails with 1009 when queued messages exceed the limit.
+
+    Control frames stay unaffected, and queued messages keep their order ahead of
+    the disconnect event so the app can still drain them.
+    """
+    if ws_protocol_cls is not WebSocketsSansIOProtocol:
+        pytest.skip("Receive backlog limits are only implemented by WebSocketsSansIOProtocol.")
+
+    accepted = asyncio.Event()
+    resume = asyncio.Event()
+    received: list[ASGIReceiveEvent] = []
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
+        await receive()  # websocket.connect
+        await send({"type": "websocket.accept"})
+        accepted.set()
+        await resume.wait()  # pause consumption so the backlog builds up
+        while True:
+            event = await receive()
+            received.append(event)
+            if event["type"] == "websocket.disconnect":
+                break
+
+    async with MockWebSocketConnection(
+        app, ws_protocol_cls, http_protocol_cls, ws_receive_backlog_messages=1
+    ) as connection:
+        await accepted.wait()
+
+        connection.send_message([b"hel", b"lo"])  # fragmented, within the limit
+        connection.send_ping()  # control frames are still answered
+        connection.send_message([b"boom"])  # second pending message: over the limit
+
+        events = connection._read_server_output()
+        frames = [event for event in events if isinstance(event, Frame)]
+        assert any(frame.opcode == Opcode.PONG for frame in frames)
+        assert connection._client.close_rcvd is not None
+        assert connection._client.close_rcvd.code == 1009
+        assert connection.transport_closed
+
+        resume.set()
+        await connection.app_finished()
+
+    assert [event["type"] for event in received] == [
+        "websocket.receive",
+        "websocket.receive",
+        "websocket.disconnect",
+    ]
+    assert received[0].get("text") == "hello"  # reassembled from fragments, in order
+    assert received[1].get("text") == "boom"
+    disconnect = received[-1]
+    assert disconnect["type"] == "websocket.disconnect"
+    assert disconnect["code"] == 1009
+
+
+async def test_receive_backlog_byte_limit_counts_incomplete_fragments(
+    ws_protocol_cls: WSProtocol, http_protocol_cls: HTTPProtocol
+):
+    """Test that an incomplete fragmented message is charged by its actual footprint."""
+    if ws_protocol_cls is not WebSocketsSansIOProtocol:
+        pytest.skip("Receive backlog limits are only implemented by WebSocketsSansIOProtocol.")
+
+    accepted = asyncio.Event()
+    resume = asyncio.Event()
+    received: list[ASGIReceiveEvent] = []
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
+        await receive()  # websocket.connect
+        await send({"type": "websocket.accept"})
+        accepted.set()
+        await resume.wait()
+        while True:
+            event = await receive()
+            received.append(event)
+            if event["type"] == "websocket.disconnect":
+                break
+
+    async with MockWebSocketConnection(
+        app, ws_protocol_cls, http_protocol_cls, ws_receive_backlog_bytes=4
+    ) as connection:
+        await accepted.wait()
+
+        connection.send_message([b"hello"], final=False)  # 5 bytes pending, no FIN yet
+
+        connection._read_server_output()
+        assert connection._client.close_rcvd is not None
+        assert connection._client.close_rcvd.code == 1009
+        assert connection.transport_closed
+
+        resume.set()
+        await connection.app_finished()
+
+    assert [event["type"] for event in received] == ["websocket.disconnect"]
+    disconnect = received[0]
+    assert disconnect["type"] == "websocket.disconnect"
+    assert disconnect["code"] == 1009
 
 
 async def test_shutdown_during_denial_response(ws_protocol_cls: WSProtocol, http_protocol_cls: HTTPProtocol):
