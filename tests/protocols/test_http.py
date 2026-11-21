@@ -175,6 +175,7 @@ class MockTransport:
         self.peername = ("127.0.0.1", 8001) if peername is None else peername
         self.sslcontext = sslcontext
         self.closed = False
+        self.close_count = 0
         self.buffer = b""
         self.read_paused = False
         self.protocol: asyncio.Protocol | None = None
@@ -187,7 +188,13 @@ class MockTransport:
         self.buffer += data
 
     def close(self):
-        assert not self.closed
+        # Real transports tolerate repeated ``close()`` calls and do not invoke
+        # ``connection_lost`` synchronously: the loop delivers that callback on
+        # the next iteration. Tests trigger ``connection_lost`` explicitly to
+        # emulate that ordering.
+        if self.closed:
+            return
+        self.close_count += 1
         self.closed = True
 
     def pause_reading(self):
@@ -219,7 +226,10 @@ class MockTimerHandle:
     def cancel(self):
         if not self.cancelled:
             self.cancelled = True
-            self.loop_later_list.remove(self)
+            # A handle already fired by ``run_later`` is no longer in the list;
+            # ``TimerHandle.cancel`` is a no-op in that case too.
+            if self in self.loop_later_list:
+                self.loop_later_list.remove(self)
 
 
 class MockLoop:
@@ -1331,3 +1341,133 @@ async def test_header_upgrade_is_websocket_depend_not_installed(
     assert msg in caplog.text
     assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
     assert b"Hello, world" in protocol.transport.buffer
+
+
+class PausingResponse:
+    """ASGI app whose response-body sends can be held behind a paused transport."""
+
+    class CallState:
+        def __init__(self) -> None:
+            self.chunks_sent = 0
+            self.finished = asyncio.Event()
+            self.send_error: BaseException | None = None
+
+    def __init__(self) -> None:
+        self.calls: list[PausingResponse.CallState] = []
+
+    async def __call__(self, scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        state = PausingResponse.CallState()
+        self.calls.append(state)
+        try:
+            # The response start is itself an ASGI send, so it can park in the
+            # drain too and surface a write timeout: keep every send in scope.
+            await send({"type": "http.response.start", "status": 200})
+            for index, chunk in enumerate((b"first", b"second", b"third")):
+                await send({"type": "http.response.body", "body": chunk, "more_body": index < 2})
+                state.chunks_sent += 1
+        except BaseException as exc:  # the write timeout surfaces through send
+            state.send_error = exc
+            raise
+        finally:
+            state.finished.set()
+
+
+def get_connected_protocol_on_real_loop(
+    app: ASGIApplication, http_protocol_cls: type[HTTPProtocol], **kwargs: Any
+) -> MockProtocol:
+    config = Config(app=app, **kwargs)
+    server_state = ServerState()
+    protocol = http_protocol_cls(
+        config=config,
+        server_state=server_state,
+        app_state={},
+        _loop=asyncio.get_running_loop(),
+    )
+    transport = MockTransport()
+    transport.set_protocol(protocol)
+    protocol.connection_made(transport)  # type: ignore[arg-type]
+    return protocol  # type: ignore[return-value]
+
+
+async def test_write_pause_and_resume_completes_request(http_protocol_cls: type[HTTPProtocol]):
+    """A short pause followed by a resume lets the same request finish normally."""
+    app = PausingResponse()
+    protocol = get_connected_protocol_on_real_loop(app, http_protocol_cls, timeout_write=0.05)
+
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    protocol.pause_writing()
+    # Give the ASGI task time to run into the paused drain.
+    await asyncio.sleep(0.02)
+    assert protocol.flow.write_paused
+    assert not app.calls[0].finished.is_set()
+
+    protocol.resume_writing()
+    await asyncio.wait_for(app.calls[0].finished.wait(), timeout=1)
+
+    assert app.calls[0].send_error is None
+    assert app.calls[0].chunks_sent == 3
+    assert not protocol.transport.is_closing()
+    # A leaked write timer would fire after the budget and close the transport.
+    await asyncio.sleep(0.1)
+    assert not protocol.transport.is_closing()
+    assert protocol.tasks == set()
+
+
+async def test_write_timeout_closes_connection_and_ends_request(http_protocol_cls: type[HTTPProtocol]):
+    """A pause longer than the write timeout yields one definite request result."""
+    app = PausingResponse()
+    protocol = get_connected_protocol_on_real_loop(app, http_protocol_cls, timeout_write=0.05)
+
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    protocol.pause_writing()
+    await asyncio.sleep(0.02)
+    assert protocol.flow.write_paused
+
+    # Never resume: the write timeout closes the transport. The loop then
+    # delivers ``connection_lost`` (as it would for a real transport), which
+    # unblocks the drain so the request ends with a single result.
+    deadline = asyncio.get_running_loop().time() + 2
+    while not protocol.transport.is_closing() and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    assert protocol.transport.is_closing()
+    protocol.connection_lost(None)
+
+    await asyncio.wait_for(app.calls[0].finished.wait(), timeout=1)
+    assert isinstance(app.calls[0].send_error, TimeoutError)
+    assert protocol.transport.close_count == 1
+    # The ASGI task must not be left in flight after the request ended.
+    await asyncio.sleep(0.05)
+    assert protocol.tasks == set()
+
+
+async def test_pause_resume_then_pause_timeout_on_same_connection(http_protocol_cls: type[HTTPProtocol]):
+    """A brief pause and a fatal pause must both be reproducible on one transport."""
+    app = PausingResponse()
+    protocol = get_connected_protocol_on_real_loop(app, http_protocol_cls, timeout_write=0.05)
+
+    # First episode: a short pause recovers, and no timer survives the drain.
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    protocol.pause_writing()
+    await asyncio.sleep(0.02)
+    protocol.resume_writing()
+    await asyncio.wait_for(app.calls[0].finished.wait(), timeout=1)
+    assert app.calls[0].send_error is None
+    assert not protocol.transport.is_closing()
+    await asyncio.sleep(0.1)  # longer than the write budget
+    assert not protocol.transport.is_closing()
+
+    # Second episode on the same transport: an unbounded pause hits a freshly
+    # armed timeout rather than reusing the first episode's timer.
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    protocol.pause_writing()
+    deadline = asyncio.get_running_loop().time() + 2
+    while not protocol.transport.is_closing() and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    assert protocol.transport.is_closing()
+    protocol.connection_lost(None)
+
+    await asyncio.wait_for(app.calls[1].finished.wait(), timeout=1)
+    assert isinstance(app.calls[1].send_error, TimeoutError)
+    assert protocol.transport.close_count == 1
+    await asyncio.sleep(0.05)
+    assert protocol.tasks == set()

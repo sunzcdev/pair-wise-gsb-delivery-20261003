@@ -21,7 +21,12 @@ from uvicorn._types import (
 )
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
-from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT, FlowControl, service_unavailable
+from uvicorn.protocols.http.flow_control import (
+    HIGH_WATER_LIMIT,
+    FlowControl,
+    WriteTimeoutError,
+    service_unavailable,
+)
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
 from uvicorn.server import ServerState
 
@@ -84,7 +89,7 @@ class ZttpH2Protocol(asyncio.Protocol):
         self.connections.add(self)
 
         self.transport = transport
-        self.flow = FlowControl(transport)
+        self.flow = FlowControl(transport, write_timeout=self.config.timeout_write, loop=self.loop)
         self.server = get_local_addr(transport)
         self.client = get_remote_addr(transport)
         self.scheme = "https" if is_ssl(transport) else "http"
@@ -385,6 +390,10 @@ class RequestResponseCycle:
             result = await app(  # type: ignore[func-returns-value]
                 self.scope, self.receive, self.send
             )
+        except WriteTimeoutError:
+            # The drain already closed the transport; nothing more can be
+            # written to this stream, so end it here without a noisy traceback.
+            self.disconnected = True
         except BaseException as exc:
             msg = "Exception in ASGI application\n"
             self.logger.error(msg, exc_info=exc)

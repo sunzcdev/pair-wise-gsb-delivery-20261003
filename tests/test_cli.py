@@ -232,3 +232,27 @@ def test_set_app_via_environment_variable():
             args, _ = mock_run.call_args
             assert result.exit_code == 0
             assert args == (app_path,)
+
+
+def test_cli_write_timeout_defaults_to_none() -> None:
+    runner = CliRunner()
+
+    with mock.patch.object(main, "run") as mock_run:
+        result = runner.invoke(cli, ["tests.test_cli:App"])
+
+    assert result.exit_code == 0
+    assert result.output == ""
+    mock_run.assert_called_once()
+    assert mock_run.call_args[1]["timeout_write"] is None
+
+
+def test_cli_write_timeout_is_forwarded() -> None:
+    runner = CliRunner()
+
+    with mock.patch.object(main, "run") as mock_run:
+        result = runner.invoke(cli, ["tests.test_cli:App", "--timeout-write", "2.5"])
+
+    assert result.exit_code == 0
+    assert result.output == ""
+    mock_run.assert_called_once()
+    assert mock_run.call_args[1]["timeout_write"] == 2.5

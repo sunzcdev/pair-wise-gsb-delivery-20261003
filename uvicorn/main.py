@@ -311,6 +311,15 @@ def _parse_headers(ctx: click.Context, param: click.Parameter, value: tuple[str,
     help="Maximum number of seconds to wait for graceful shutdown.",
 )
 @click.option(
+    "--timeout-write",
+    type=float,
+    default=None,
+    help=(
+        "Maximum number of seconds to wait for a slow client to drain the write buffer before the connection is "
+        "closed. Only the time spent waiting for write permission counts; unset (wait indefinitely) by default."
+    ),
+)
+@click.option(
     "--timeout-worker-healthcheck",
     type=int,
     default=5,
@@ -442,6 +451,7 @@ def main(
     timeout_keep_alive: int,
     timeout_graceful_shutdown: int | None,
     timeout_worker_healthcheck: int,
+    timeout_write: float | None,
     ssl_keyfile: str,
     ssl_certfile: str,
     ssl_keyfile_password: str,
@@ -495,6 +505,7 @@ def main(
         timeout_keep_alive=timeout_keep_alive,
         timeout_graceful_shutdown=timeout_graceful_shutdown,
         timeout_worker_healthcheck=timeout_worker_healthcheck,
+        timeout_write=timeout_write,
         ssl_keyfile=ssl_keyfile,
         ssl_certfile=ssl_certfile,
         ssl_keyfile_password=ssl_keyfile_password,
@@ -551,6 +562,7 @@ def run(
     timeout_keep_alive: int = 5,
     timeout_graceful_shutdown: int | None = None,
     timeout_worker_healthcheck: int = 5,
+    timeout_write: float | None = None,
     ssl_keyfile: str | os.PathLike[str] | None = None,
     ssl_certfile: str | os.PathLike[str] | None = None,
     ssl_keyfile_password: str | None = None,
@@ -608,6 +620,7 @@ def run(
         timeout_keep_alive=timeout_keep_alive,
         timeout_graceful_shutdown=timeout_graceful_shutdown,
         timeout_worker_healthcheck=timeout_worker_healthcheck,
+        timeout_write=timeout_write,
         ssl_keyfile=ssl_keyfile,
         ssl_certfile=ssl_certfile,
         ssl_keyfile_password=ssl_keyfile_password,

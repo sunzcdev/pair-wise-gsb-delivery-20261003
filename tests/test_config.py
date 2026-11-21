@@ -694,3 +694,13 @@ def test_setup_event_loop_is_removed(caplog: pytest.LogCaptureFixture) -> None:
         AttributeError, match="The `setup_event_loop` method was replaced by `get_loop_factory` in uvicorn 0.36.0."
     ):
         config.setup_event_loop()
+
+
+def test_config_write_timeout_defaults_to_none() -> None:
+    config = Config(app=asgi_app)
+    assert config.timeout_write is None
+
+
+def test_config_write_timeout_is_stored() -> None:
+    config = Config(app=asgi_app, timeout_write=2.5)
+    assert config.timeout_write == 2.5

@@ -152,3 +152,4 @@ For advanced TLS scenarios that the flags above don't cover (e.g., mutual TLS, c
 
 * `--timeout-keep-alive <int>` - Close Keep-Alive connections if no new data is received within this timeout (in seconds). **Default:** *5*.
 * `--timeout-graceful-shutdown <int>` - Maximum number of seconds to wait for graceful shutdown. After this timeout, the server will start terminating requests.
+* `--timeout-write <float>` - Maximum number of seconds to wait for a slow client to drain the write buffer before the connection is closed. The clock only runs while the server is actually blocked waiting for write permission, so time the application spends producing the next chunk is not counted. Unset by default, which means the server waits indefinitely.
