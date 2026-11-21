@@ -6,6 +6,13 @@ APScheduler, see the :doc:`migration section <migration>`.
 
 **UNRELEASED**
 
+- Added a retained replay window to ``LocalEventBroker``: published events are
+  assigned monotonically increasing positions and the last
+  ``replay_buffer_size`` events are kept, allowing reconnecting receivers to
+  catch up via ``read_events()`` or ``stream_events()`` from their last seen
+  position. Positions that have expired from the window raise the new
+  ``ReplayPositionExpired`` exception to signal that the current state must be
+  fetched again
 - **BREAKING** Switched the MongoDB data store to use the asynchronous API in
   ``pymongo`` and bumped the minimum ``pymongo`` version to v4.13.0
 - Bumped up the CBOR serializer's ``cbor2`` dependency to v6.0+

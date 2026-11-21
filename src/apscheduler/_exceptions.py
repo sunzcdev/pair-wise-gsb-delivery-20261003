@@ -73,6 +73,21 @@ class DeserializationError(Exception):
     """Raised when a serializer fails to deserialize the given object."""
 
 
+class ReplayPositionExpired(Exception):
+    """
+    Raised when a replay position is no longer covered by the retained event window.
+
+    This signals to the receiver that one or more events were missed, and that the
+    current state should be fetched again before resuming event tracking.
+    """
+
+    def __init__(self, position: int, oldest_position: int):
+        super().__init__(
+            f"The replay position {position} has expired from the retained event "
+            f"window (oldest available position: {oldest_position})"
+        )
+
+
 class MaxIterationsReached(Exception):
     """
     Raised when a trigger has reached its maximum number of allowed computation

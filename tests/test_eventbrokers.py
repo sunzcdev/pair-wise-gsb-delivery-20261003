@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from logging import Logger
@@ -8,8 +10,9 @@ import pytest
 from _pytest.logging import LogCaptureFixture
 from anyio import CancelScope, create_memory_object_stream, fail_after
 
-from apscheduler import Event, ScheduleAdded
+from apscheduler import Event, ReplayPositionExpired, ScheduleAdded
 from apscheduler.abc import EventBroker
+from apscheduler.eventbrokers.local import LocalEventBroker
 
 pytestmark = pytest.mark.anyio
 
@@ -142,6 +145,167 @@ async def test_cancel_stop(raw_event_broker: EventBroker, logger: Logger) -> Non
         async with AsyncExitStack() as exit_stack:
             await raw_event_broker.start(exit_stack, logger)
             scope.cancel()
+
+
+@pytest.fixture
+async def started_local_broker(
+    logger: Logger,
+) -> AsyncGenerator[LocalEventBroker, None]:
+    async with AsyncExitStack() as exit_stack:
+        broker = LocalEventBroker(replay_buffer_size=3)
+        await broker.start(exit_stack, logger)
+        yield broker
+
+
+async def test_local_read_events(started_local_broker: LocalEventBroker) -> None:
+    broker = started_local_broker
+    assert broker.current_position == 0
+
+    events = [Event() for _ in range(3)]
+    for event in events:
+        await broker.publish(event)
+
+    assert broker.current_position == 3
+    position, replayed = broker.read_events(0)
+    assert position == 3
+    assert replayed == events
+
+    # Reading again from the returned position yields nothing new
+    position, replayed = broker.read_events(position)
+    assert position == 3
+    assert replayed == []
+
+
+async def test_local_read_events_expired(
+    started_local_broker: LocalEventBroker,
+) -> None:
+    broker = started_local_broker
+    for _ in range(5):
+        await broker.publish(Event())
+
+    # The buffer only retains the last 3 events (positions 3-5), so positions
+    # 0 and 1 have expired from the window
+    with pytest.raises(ReplayPositionExpired):
+        broker.read_events(0)
+
+    with pytest.raises(ReplayPositionExpired):
+        broker.read_events(1)
+
+    # Position 2 is still covered: events 3-5 are returned
+    position, replayed = broker.read_events(2)
+    assert position == 5
+    assert len(replayed) == 3
+
+
+async def test_local_read_events_position_in_future(
+    started_local_broker: LocalEventBroker,
+) -> None:
+    with pytest.raises(ValueError, match="ahead of the current position"):
+        started_local_broker.read_events(1)
+
+
+async def test_local_read_events_publish_sandwiched(
+    started_local_broker: LocalEventBroker,
+) -> None:
+    """Publishes sandwiched between read-backs must not go unnoticed."""
+    broker = started_local_broker
+    event1 = Event()
+    await broker.publish(event1)
+
+    position, replayed = broker.read_events(0)
+    assert replayed == [event1]
+
+    # Two publishes happen while the receiver is processing the first batch
+    event2, event3 = Event(), Event()
+    await broker.publish(event2)
+    await broker.publish(event3)
+
+    # The follow-up read returns exactly the sandwiched events, in order
+    position, replayed = broker.read_events(position)
+    assert position == 3
+    assert replayed == [event2, event3]
+
+    # If the window overflows before the next read, the gap is detectable
+    for _ in range(4):
+        await broker.publish(Event())
+
+    with pytest.raises(ReplayPositionExpired):
+        broker.read_events(position)
+
+
+async def test_local_stream_events(started_local_broker: LocalEventBroker) -> None:
+    """Catch-up and live events must be handed off in order, without duplicates."""
+    broker = started_local_broker
+    event1 = Event()
+    await broker.publish(event1)
+    token = broker.current_position
+
+    # Buffer the live events delivered through a regular subscription
+    send, receive = create_memory_object_stream[Event](math.inf)
+    with send, receive:
+        broker.subscribe(send.send_nowait)
+
+        received: list[Event] = []
+        stream = broker.stream_events(since=token)
+        # Two publishes sandwiched into the catch-up phase: they are in the
+        # replay window and also delivered to the live subscription
+        event2, event3 = Event(), Event()
+        await broker.publish(event2)
+        await broker.publish(event3)
+
+        async for event in stream:
+            received.append(event)
+            if len(received) == 2:
+                break
+
+        await stream.aclose()
+
+        # The stream yields the sandwiched events exactly once, in order
+        assert received == [event2, event3]
+
+        # The regular subscription received the two events independently
+        with fail_after(3):
+            assert [await receive.receive() for _ in range(2)] == [event2, event3]
+
+
+async def test_local_stream_events_expired(
+    started_local_broker: LocalEventBroker,
+) -> None:
+    broker = started_local_broker
+    for _ in range(4):
+        await broker.publish(Event())
+
+    with pytest.raises(ReplayPositionExpired):
+        broker.stream_events(since=0)
+
+
+async def test_local_stream_events_live_only(
+    started_local_broker: LocalEventBroker,
+) -> None:
+    broker = started_local_broker
+    await broker.publish(Event())
+
+    stream = broker.stream_events()
+    event = Event()
+    await broker.publish(event)
+    with fail_after(3):
+        assert await stream.__anext__() is event
+
+    await stream.aclose()
+
+
+async def test_local_replay_disabled(logger: Logger) -> None:
+    async with AsyncExitStack() as exit_stack:
+        broker = LocalEventBroker(replay_buffer_size=0)
+        await broker.start(exit_stack, logger)
+        await broker.publish(Event())
+
+        position, replayed = broker.read_events(broker.current_position)
+        assert position == 1
+        assert replayed == []
+
+        with pytest.raises(ReplayPositionExpired):
+            broker.read_events(0)
 
 
 def test_asyncpg_broker_from_async_engine() -> None:

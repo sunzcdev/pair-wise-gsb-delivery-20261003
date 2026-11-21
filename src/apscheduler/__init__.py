@@ -36,6 +36,7 @@ from ._exceptions import JobDeadlineMissed as JobDeadlineMissed
 from ._exceptions import JobLookupError as JobLookupError
 from ._exceptions import JobResultNotReady as JobResultNotReady
 from ._exceptions import MaxIterationsReached as MaxIterationsReached
+from ._exceptions import ReplayPositionExpired as ReplayPositionExpired
 from ._exceptions import ScheduleLookupError as ScheduleLookupError
 from ._exceptions import SerializationError as SerializationError
 from ._exceptions import TaskLookupError as TaskLookupError
