@@ -57,12 +57,25 @@ class Gem::Package
   class FormatError < Error
     attr_reader :path
 
-    def initialize(message, source = nil)
+    ##
+    # The read stage that failed, either +:metadata+ or +:data+, for packages
+    # backed by an IO or file source.  +nil+ when the stage is unknown.
+    #
+    # This lets a caller tell whether a truncated input was cut while the
+    # specification was being read or while the data archive was being read.
+
+    attr_reader :stage
+
+    def initialize(message, source = nil, stage: nil, detail: nil)
+      @stage = stage
+
       if source
         @path = source.is_a?(String) ? source : source.path
 
         message += " in #{path}" if path
       end
+
+      message += " (#{detail})" if detail
 
       super message
     end
@@ -111,8 +124,15 @@ class Gem::Package
   ##
   # The files in this package.  This is not the contents of the gem, just the
   # files in the top-level container.
+  #
+  # Building the list runs the data stage, so reading it after #spec verifies
+  # and replays the same package bytes.
 
-  attr_reader :files
+  def files
+    verify unless @verified || @spec_assigned
+
+    @files
+  end
 
   ##
   # Reference to the gem being packaged.
@@ -126,8 +146,14 @@ class Gem::Package
 
   ##
   # Sets the Gem::Specification to use to build this package.
+  #
+  # A package with an assigned spec is being built, not read, so its accessors
+  # do not verify a package that does not exist yet.
 
-  attr_writer :spec
+  def spec=(spec)
+    @spec = spec
+    @spec_assigned = true
+  end
 
   ##
   # Permission for directories
@@ -252,6 +278,8 @@ class Gem::Package
     @signatures      = {}
     @signer          = nil
     @spec            = nil
+    @spec_assigned   = false
+    @verified        = false
   end
 
   ##
@@ -424,7 +452,7 @@ EOM
   def contents
     return @contents if @contents
 
-    verify unless @spec
+    verify unless @verified || @spec_assigned
 
     @contents = []
 
@@ -444,7 +472,7 @@ EOM
       end
     end
   rescue Zlib::GzipFile::Error, EOFError, Gem::Package::TarInvalidError => e
-    raise Gem::Package::FormatError.new e.message, @gem
+    raise Gem::Package::FormatError.new e.message, @gem, stage: :data
   end
 
   ##
@@ -481,7 +509,7 @@ EOM
   # extracted.
 
   def extract_files(destination_dir, pattern = "*")
-    verify unless @spec
+    verify unless @verified || @spec_assigned
 
     FileUtils.mkdir_p destination_dir, mode: dir_mode && 0o755
 
@@ -497,7 +525,7 @@ EOM
       end
     end
   rescue Zlib::GzipFile::Error, EOFError, Gem::Package::TarInvalidError => e
-    raise Gem::Package::FormatError.new e.message, @gem
+    raise Gem::Package::FormatError.new e.message, @gem, stage: :data
   end
 
   ##
@@ -706,11 +734,65 @@ EOM
   # If this is a package for a built gem the spec is loaded from the
   # gem and returned.  If this is a package for a gem being built the provided
   # spec is returned.
+  #
+  # For a built gem this is the metadata stage: only +metadata+ or
+  # +metadata.gz+ is read, so a forward-only IO can be inspected before its
+  # data archive is unpacked.  Verification and extraction later replay the
+  # same bytes.  When a security policy is set the whole package is verified
+  # first, since the policy's guarantees cover the data archive too.
 
   def spec
-    verify unless @spec
+    # A security policy covers the whole package, so verify it before handing
+    # back a spec read from it.  A package being built already has its spec
+    # assigned and nothing to verify.
+    verify if @security_policy && !@verified && !@spec_assigned && !@spec
+    load_spec unless @spec
 
     @spec
+  end
+
+  ##
+  # Reads only the package metadata (+metadata+ or +metadata.gz+) and stores
+  # the resulting Gem::Specification.
+  #
+  # Raises Gem::Package::FormatError with +stage+ set to <tt>:metadata</tt>
+  # when the package is truncated or corrupt before that entry can be read.
+  # A forward-only source releases its temporary copy at that point, and later
+  # reads of this package report the same error rather than a partial package.
+
+  def load_spec(release_on_failure: true) # :nodoc:
+    @spec = nil
+    @verified = false
+
+    @gem.with_metadata_io do |io|
+      Gem::Package::TarReader.new io do |reader|
+        reader.each do |entry|
+          case entry.full_name
+          when "metadata", "metadata.gz"
+            load_spec_from_metadata entry
+            return @spec
+          end
+        end
+      end
+    end
+
+    raise Gem::Package::FormatError.new "package metadata is missing", @gem, stage: :metadata
+  rescue Gem::Package::FormatError => e
+    @spec = nil
+    release_source e if release_on_failure
+    raise
+  rescue Gem::Security::Exception
+    @spec = nil
+    raise
+  rescue Errno::ENOENT => e
+    @spec = nil
+    release_source if release_on_failure
+    raise Gem::Package::FormatError.new e.message, nil, stage: :metadata
+  rescue Zlib::GzipFile::Error, EOFError, Gem::Package::TarInvalidError => e
+    @spec = nil
+    error = Gem::Package::FormatError.new e.message, @gem, stage: :metadata
+    release_source error if release_on_failure
+    raise error
   end
 
   ##
@@ -722,10 +804,17 @@ EOM
   #
   # After verification the gem specification from the gem is available from
   # #spec
+  #
+  # The package is read in one pass.  A Gem::Package::FormatError raised here
+  # reports +stage+ as <tt>:metadata</tt> when the specification could not be
+  # read from the package, and <tt>:data</tt> when the specification was read
+  # but the rest of the package (the data archive, its digest, or a signature)
+  # failed.  That is what lets a truncated input be attributed to the metadata
+  # or to the body.
 
   def verify
-    @files     = []
-    @spec      = nil
+    @files      = []
+    @verified   = false
 
     @gem.with_read_io do |io|
       Gem::Package::TarReader.new io do |reader|
@@ -739,18 +828,92 @@ EOM
 
     @security_policy&.verify_signatures @spec, @digests, @signatures
 
+    @verified = true
+
     true
   rescue Gem::Security::Exception
     @spec = nil
     @files = []
+    @verified = false
+    release_source
     raise
+  rescue Gem::Package::FormatError => e
+    @verified = false
+    error =
+      if e.stage || source_failure?(e)
+        # Already attributed, or the source itself failed (for example while
+        # spooling); the metadata/body distinction does not apply.
+        e
+      else
+        Gem::Package::FormatError.new(e.message, nil, stage: stage_for_failure)
+      end
+    release_source error
+    raise error
   rescue Errno::ENOENT => e
-    raise Gem::Package::FormatError.new e.message
+    @verified = false
+    error = Gem::Package::FormatError.new e.message, nil, stage: :metadata
+    release_source error
+    raise error
   rescue Zlib::GzipFile::Error, EOFError, Gem::Package::TarInvalidError => e
-    raise Gem::Package::FormatError.new e.message, @gem
+    @verified = false
+    error = Gem::Package::FormatError.new e.message, @gem, stage: stage_for_failure
+    release_source error
+    raise error
   end
 
   private
+
+  ##
+  # Which read stage a failed verification belongs to.
+  #
+  # A loaded spec means the metadata entry was read, so the failure is in the
+  # body.  If verification failed before that (for example while seeking to
+  # checksums, which runs first), the metadata entry is probed on its own to
+  # tell a cut in the metadata from a cut later in the package.
+
+  def stage_for_failure
+    return :data if @spec
+
+    metadata_readable? ? :data : :metadata
+  end
+
+  ##
+  # Whether the package's metadata entry can be read on its own.  The probe
+  # must not release the source or change what the caller sees, so the spec
+  # and verification state are restored afterwards.
+
+  def metadata_readable?
+    spec = @spec
+    contents = @contents
+
+    load_spec release_on_failure: false
+    true
+  rescue Gem::Package::FormatError
+    false
+  ensure
+    @spec = spec
+    @contents = contents
+    @verified = false
+  end
+
+  ##
+  # Whether +error+ came from the source itself rather than from reading the
+  # package contents.
+
+  def source_failure?(error)
+    @gem.respond_to?(:failure) && @gem.failure.equal?(error)
+  end
+
+  ##
+  # Drops any temporary copy a forward-only source had to make, remembering
+  # +failure+ so a later stage of the same package fails the same way instead
+  # of reading a consumed input.
+
+  def release_source(failure = nil)
+    @gem.release(failure) if @gem.respond_to?(:release)
+  rescue StandardError
+    nil
+  end
 
   ##
   # The +required_rubygems_version+ for a content-addressable build: the
@@ -888,7 +1051,9 @@ EOM
       digest entry
     end
 
-    load_spec_from_metadata entry
+    # Keep an already loaded spec so the caller's object identity survives
+    # verifying the same bytes again.
+    load_spec_from_metadata entry unless @spec
   rescue StandardError
     warn "Exception while verifying #{@gem.path}"
     raise
@@ -903,12 +1068,12 @@ EOM
     end
 
     unless @spec
-      raise Gem::Package::FormatError.new "package metadata is missing", @gem
+      raise Gem::Package::FormatError.new "package metadata is missing", @gem, stage: :metadata
     end
 
     unless @files.include? "data.tar.gz"
       raise Gem::Package::FormatError.new \
-        "package content (data.tar.gz) is missing", @gem
+        "package content (data.tar.gz) is missing", @gem, stage: :data
     end
 
     if (duplicates = @files.group_by {|f| f }.select {|_k,v| v.size > 1 }.map(&:first)) && duplicates.any?

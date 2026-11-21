@@ -1951,4 +1951,291 @@ class TestGemPackage < Gem::Package::TarTestCase
     assert_match(/This gem may fail to install on Windows/, ui.error)
     assert_path_exist spec.file_name
   end
+
+  # A forward-only reader, like a socket or HTTP body: it can hand out the
+  # package bytes exactly once and then reports EOF.
+  class ForwardOnlyIO
+    attr_reader :bytes_read
+
+    def initialize(data)
+      @data = data.b
+      @pos = 0
+      @bytes_read = 0
+    end
+
+    def read(length = nil)
+      return nil if @pos >= @data.bytesize
+
+      chunk = if length.nil?
+        @data.byteslice(@pos, @data.bytesize - @pos)
+      else
+        @data.byteslice(@pos, length) || "".b
+      end
+
+      chunk = chunk.b
+      @pos += chunk.bytesize
+      @bytes_read += chunk.bytesize
+      chunk
+    end
+
+    def eof?
+      @pos >= @data.bytesize
+    end
+  end
+
+  # Fails the first spool attempt, so a test can check both the failure and
+  # that a later, complete package is still readable.
+  class FailingSpoolIOSource < Gem::Package::IOSource
+    class SpoolError < StandardError; end
+
+    private
+
+    def build_spool
+      unless @failed
+        @failed = true
+        raise SpoolError, "simulated spool failure"
+      end
+
+      super
+    end
+  end
+
+  # Returns [header_offset, data_offset, size] for the first entry named
+  # +name+ in the .gem bytes +data+.
+  def tar_entry_span(data, name)
+    pos = 0
+
+    while pos + 512 <= data.bytesize
+      header = data.byteslice(pos, 512)
+      break if header == "\0" * 512
+
+      entry_name = header.unpack1("A100")
+      size = header.byteslice(124, 12).to_i(8)
+      data_offset = pos + 512
+      return [pos, data_offset, size] if entry_name == name
+
+      pos = data_offset + ((size + 511) / 512) * 512
+    end
+
+    flunk "entry #{name.inspect} not found"
+  end
+
+  # Cuts the package bytes in the middle of the payload of +name+.
+  def truncate_inside(data, name)
+    _, data_offset, size = tar_entry_span(data, name)
+    flunk "entry #{name.inspect} has no room to truncate" if size < 20
+
+    data.byteslice(0, data_offset + size / 2)
+  end
+
+  def test_spec_reads_only_metadata_from_forward_only_io
+    data = Gem.read_binary @gem
+
+    # Cut the data archive away entirely: the metadata stage must still yield
+    # the spec, so a reviewer can inspect it before deciding to unpack.
+    truncated = truncate_inside data, "data.tar.gz"
+
+    package = Gem::Package.new ForwardOnlyIO.new(truncated)
+
+    assert_equal @spec.full_name, package.spec.full_name
+  end
+
+  def test_forward_only_io_spec_then_contents_then_extract
+    data = Gem.read_binary @gem
+    io = ForwardOnlyIO.new data
+
+    package = Gem::Package.new io
+
+    assert_equal @spec.full_name, package.spec.full_name
+    assert_equal %w[lib/code.rb], package.contents
+
+    package.extract_files @destination
+
+    assert_path_exist File.join @destination, "lib/code.rb"
+    assert_equal "# lib/code.rb\n", File.read(File.join(@destination, "lib", "code.rb"))
+  end
+
+  def test_forward_only_io_reads_its_input_once
+    data = Gem.read_binary @gem
+    io = ForwardOnlyIO.new data
+
+    package = Gem::Package.new io
+    package.spec
+    package.contents
+    package.extract_files @destination
+
+    assert_equal data.bytesize, io.bytes_read,
+                 "the package bytes must be read from the input exactly once"
+  end
+
+  def test_truncated_metadata_from_forward_only_io_is_located
+    data = Gem.read_binary @gem
+    truncated = truncate_inside data, "metadata.gz"
+
+    package = Gem::Package.new ForwardOnlyIO.new(truncated)
+
+    e = assert_raise Gem::Package::FormatError do
+      package.spec
+    end
+
+    assert_equal :metadata, e.stage
+  end
+
+  def test_truncated_body_from_forward_only_io_is_located
+    data = Gem.read_binary @gem
+    truncated = truncate_inside data, "data.tar.gz"
+
+    package = Gem::Package.new ForwardOnlyIO.new(truncated)
+
+    assert_equal @spec.full_name, package.spec.full_name,
+                 "metadata is intact, so the spec must still be readable"
+
+    e = assert_raise Gem::Package::FormatError do
+      package.verify
+    end
+
+    assert_equal :data, e.stage
+  end
+
+  def test_truncated_body_reports_data_stage_regardless_of_call_order
+    data = Gem.read_binary @gem
+    truncated = truncate_inside data, "data.tar.gz"
+
+    contents_first = Gem::Package.new ForwardOnlyIO.new(truncated)
+    e = assert_raise Gem::Package::FormatError do
+      contents_first.contents
+    end
+    assert_equal :data, e.stage
+
+    spec_then_verify = Gem::Package.new ForwardOnlyIO.new(truncated)
+    assert_equal @spec.full_name, spec_then_verify.spec.full_name
+    e = assert_raise Gem::Package::FormatError do
+      spec_then_verify.verify
+    end
+    assert_equal :data, e.stage
+  end
+
+  def test_truncated_metadata_is_located_for_file_source
+    data = Gem.read_binary @gem
+
+    File.binwrite "truncated.gem", truncate_inside(data, "metadata.gz")
+
+    e = assert_raise Gem::Package::FormatError do
+      Gem::Package.new("truncated.gem").spec
+    end
+    assert_equal :metadata, e.stage
+
+    e = assert_raise Gem::Package::FormatError do
+      Gem::Package.new("truncated.gem").verify
+    end
+    assert_equal :metadata, e.stage
+  end
+
+  def test_truncated_body_is_located_for_file_source
+    data = Gem.read_binary @gem
+
+    File.binwrite "truncated.gem", truncate_inside(data, "data.tar.gz")
+
+    package = Gem::Package.new "truncated.gem"
+
+    assert_equal @spec.full_name, package.spec.full_name
+
+    e = assert_raise Gem::Package::FormatError do
+      package.verify
+    end
+    assert_equal :data, e.stage
+  end
+
+  def test_verify_alone_attributes_truncation_to_metadata_or_body
+    data = Gem.read_binary @gem
+
+    File.binwrite "truncated.gem", truncate_inside(data, "metadata.gz")
+
+    e = assert_raise Gem::Package::FormatError do
+      Gem::Package.new("truncated.gem").verify
+    end
+    assert_equal :metadata, e.stage
+
+    File.binwrite "truncated.gem", truncate_inside(data, "data.tar.gz")
+
+    e = assert_raise Gem::Package::FormatError do
+      Gem::Package.new("truncated.gem").verify
+    end
+    assert_equal :data, e.stage
+
+    # A cut in a later entry (checksums) is still a body failure, because the
+    # metadata itself is intact.
+    File.binwrite "truncated.gem", truncate_inside(data, "checksums.yaml.gz")
+
+    e = assert_raise Gem::Package::FormatError do
+      Gem::Package.new("truncated.gem").verify
+    end
+    assert_equal :data, e.stage
+  end
+
+  def test_other_package_objects_remain_usable_after_truncation
+    data = Gem.read_binary @gem
+
+    File.binwrite "truncated.gem", truncate_inside(data, "data.tar.gz")
+
+    truncated = Gem::Package.new "truncated.gem"
+
+    assert_raise Gem::Package::FormatError do
+      truncated.verify
+    end
+
+    # A separate, complete package is unaffected by the earlier failure.
+    complete = Gem::Package.new @gem
+
+    assert_equal @spec, complete.spec
+    assert_equal %w[lib/code.rb], complete.contents
+    complete.extract_files @destination
+    assert_path_exist File.join @destination, "lib", "code.rb"
+  end
+
+  def test_spool_failure_is_reported_and_next_package_is_readable
+    data = Gem.read_binary @gem
+
+    failing_io = ForwardOnlyIO.new data
+    failing = Gem::Package.new FailingSpoolIOSource.new(failing_io)
+
+    e = assert_raise Gem::Package::FormatError do
+      failing.spec
+    end
+
+    assert_match(/could not spool package/, e.message)
+    assert_match(/simulated spool failure/, e.message)
+    assert_nil e.stage, "a spool failure is not a metadata or body truncation"
+
+    # The next, complete package reads normally.
+    complete_io = ForwardOnlyIO.new data
+    complete = Gem::Package.new complete_io
+
+    assert_equal @spec.full_name, complete.spec.full_name
+    assert_equal %w[lib/code.rb], complete.contents
+    complete.extract_files @destination
+    assert_path_exist File.join @destination, "lib", "code.rb"
+  end
+
+  def test_spool_failure_leaves_no_temporary_copy_behind
+    data = Gem.read_binary @gem
+
+    source = FailingSpoolIOSource.new(ForwardOnlyIO.new(data))
+    package = Gem::Package.new source
+
+    assert_raise Gem::Package::FormatError do
+      package.spec
+    end
+
+    spool = source.instance_variable_get(:@spool)
+    assert_nil spool, "a failed spool must not be retained"
+  end
+
+  def test_forward_only_io_is_not_writable
+    source = Gem::Package::IOSource.new ForwardOnlyIO.new(Gem.read_binary(@gem))
+
+    assert_raise Gem::Package::NonSeekableIO do
+      source.with_write_io {|io| io.write "nope" }
+    end
+  end
 end

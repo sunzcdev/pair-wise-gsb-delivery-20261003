@@ -104,6 +104,10 @@ class Gem::Package::TarHeader
     header = stream.read 512
     return EMPTY if header == EMPTY_HEADER
 
+    if header.nil?
+      raise Gem::Package::TarInvalidError, "tar is corrupt, header is missing"
+    end
+
     fields = header.unpack UNPACK_FORMAT
 
     new name: fields.shift,
