@@ -15,6 +15,7 @@ from sqlalchemy import String
 from sqlalchemy import Table
 from sqlalchemy import text
 from sqlalchemy import UniqueConstraint
+from sqlalchemy.dialects import sqlite
 from sqlalchemy.dialects.postgresql import DOUBLE_PRECISION
 from sqlalchemy.sql.expression import asc
 from sqlalchemy.sql.expression import column
@@ -23,10 +24,14 @@ from sqlalchemy.sql.expression import nullsfirst
 from sqlalchemy.sql.expression import nullslast
 
 from alembic import testing
+from alembic.autogenerate.compare.constraints import _make_index
+from alembic.ddl.impl import DefaultImpl
+from alembic.ddl.sqlite import SQLiteImpl
 from alembic.testing import combinations
 from alembic.testing import config
 from alembic.testing import eq_
 from alembic.testing import exclusions
+from alembic.testing import is_true
 from alembic.testing import resolve_lambda
 from alembic.testing import schemacompare
 from alembic.testing import TestBase
@@ -2132,3 +2137,141 @@ class TruncatedIdxTest(AutogenFixtureTest, TestBase):
 
         diffs = self._fixture(m1, m1)
         eq_(diffs, [])
+
+
+class IndexCompareUnitTest(TestBase):
+    """compare_indexes on the default and SQLite impls, using
+    reflection stand-ins so that no database connection is needed."""
+
+    def _table(self):
+        return Table(
+            "t",
+            MetaData(),
+            Column("id", Integer, primary_key=True),
+            Column("x", Integer),
+            Column("y", Integer),
+        )
+
+    def _reflected_index(self, impl, table, where=None):
+        """Build the Index that autogenerate would create from a
+        reflected index definition."""
+        params = {
+            "name": "idx",
+            "unique": False,
+            "column_names": ["y"],
+            "dialect_options": {},
+        }
+        if where is not None:
+            params["dialect_options"]["sqlite_where"] = text(where)
+        idx = _make_index(impl, params, table)
+        assert idx is not None
+        return idx
+
+    def test_direction_not_reflected_is_cannot_compare(self):
+        # the dialect does not reflect the ordering of index keys, so
+        # an index that uses explicit ordering can't be compared
+        impl = DefaultImpl(sqlite.dialect(), None, False, None, None, {})
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", t.c.y.desc()), self._reflected_index(impl, t)
+        )
+        is_true(result.is_skip, result.message)
+        is_true("direction" in result.message, result.message)
+
+    def test_where_not_reflected_is_cannot_compare(self):
+        # the dialect does not reflect index filter conditions, so an
+        # index that specifies one can't be compared
+        impl = DefaultImpl(sqlite.dialect(), None, False, None, None, {})
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", t.c.y, sqlite_where=text("x > 5")),
+            self._reflected_index(impl, t),
+        )
+        is_true(result.is_skip, result.message)
+        is_true("filter condition" in result.message, result.message)
+
+    def test_sqlite_where_equal(self):
+        impl = SQLiteImpl(sqlite.dialect(), None, False, None, None, {})
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", t.c.y, sqlite_where=text("x > 5")),
+            self._reflected_index(impl, t, where="x > 5"),
+        )
+        is_true(result.is_equal, result.message)
+
+    def test_sqlite_where_changed(self):
+        impl = SQLiteImpl(sqlite.dialect(), None, False, None, None, {})
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", t.c.y, sqlite_where=text("x > 5")),
+            self._reflected_index(impl, t, where="x > 10"),
+        )
+        is_true(result.is_different)
+        is_true("filter condition" in result.message, result.message)
+
+
+class AutogeneratePartialIndexTest(AutogenFixtureTest, TestBase):
+    """end to end comparison of the filter condition of partial
+    indexes; the migration ops produced are the usual remove/add
+    index pair."""
+
+    __backend__ = True
+    __only_on__ = "sqlite"
+
+    def _model(self, where):
+        m = MetaData()
+        if where is None:
+            idx = Index("idx", "y")
+        else:
+            idx = Index("idx", "y", sqlite_where=text(where))
+        Table(
+            "partial_idx",
+            m,
+            Column("id", Integer, primary_key=True),
+            Column("x", Integer),
+            Column("y", Integer),
+            idx,
+        )
+        return m, idx
+
+    def test_where_unchanged(self):
+        m1, _ = self._model("x > 5")
+        m2, _ = self._model("x > 5")
+        diffs = self._fixture(m1, m2)
+        eq_(diffs, [])
+
+    def test_where_changed(self):
+        m1, old_idx = self._model("x > 5")
+        m2, new_idx = self._model("x > 10")
+        diffs = self._fixture(m1, m2)
+        eq_(
+            diffs,
+            [
+                ("remove_index", schemacompare.CompareIndex(old_idx, True)),
+                ("add_index", schemacompare.CompareIndex(new_idx)),
+            ],
+        )
+
+    def test_where_removed(self):
+        m1, old_idx = self._model("x > 5")
+        m2, new_idx = self._model(None)
+        diffs = self._fixture(m1, m2)
+        eq_(
+            diffs,
+            [
+                ("remove_index", schemacompare.CompareIndex(old_idx, True)),
+                ("add_index", schemacompare.CompareIndex(new_idx)),
+            ],
+        )
+
+    def test_where_added(self):
+        m1, old_idx = self._model(None)
+        m2, new_idx = self._model("x > 5")
+        diffs = self._fixture(m1, m2)
+        eq_(
+            diffs,
+            [
+                ("remove_index", schemacompare.CompareIndex(old_idx, True)),
+                ("add_index", schemacompare.CompareIndex(new_idx)),
+            ],
+        )

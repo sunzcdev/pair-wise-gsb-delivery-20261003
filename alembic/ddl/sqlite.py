@@ -43,6 +43,8 @@ class SQLiteImpl(DefaultImpl):
     see: http://bugs.python.org/issue10740
     """
 
+    _reflects_index_where = True
+
     def requires_recreate_in_batch(
         self, batch_op: BatchOperationsImpl
     ) -> bool:

@@ -1,11 +1,13 @@
 import itertools
 from typing import Any
 
+from sqlalchemy import asc
 from sqlalchemy import BigInteger
 from sqlalchemy import Boolean
 from sqlalchemy import Column
 from sqlalchemy import Computed
 from sqlalchemy import DateTime
+from sqlalchemy import desc
 from sqlalchemy import exc
 from sqlalchemy import Float
 from sqlalchemy import func
@@ -15,6 +17,8 @@ from sqlalchemy import inspect
 from sqlalchemy import Integer
 from sqlalchemy import Interval
 from sqlalchemy import MetaData
+from sqlalchemy import nullsfirst
+from sqlalchemy import nullslast
 from sqlalchemy import Numeric
 from sqlalchemy import Sequence
 from sqlalchemy import String
@@ -23,6 +27,7 @@ from sqlalchemy import Text
 from sqlalchemy import text
 from sqlalchemy import types
 from sqlalchemy import UniqueConstraint
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import BYTEA
 from sqlalchemy.dialects.postgresql import CITEXT
@@ -45,7 +50,9 @@ from alembic import op
 from alembic import testing
 from alembic import util
 from alembic.autogenerate import api
+from alembic.autogenerate.compare.constraints import _make_index
 from alembic.autogenerate.compare.tables import _compare_tables
+from alembic.ddl.postgresql import PostgresqlImpl
 from alembic.migration import MigrationContext
 from alembic.operations import ops
 from alembic.script import ScriptDirectory
@@ -54,6 +61,7 @@ from alembic.testing import combinations
 from alembic.testing import config
 from alembic.testing import eq_
 from alembic.testing import eq_ignore_whitespace
+from alembic.testing import is_true
 from alembic.testing import mock
 from alembic.testing import provide_metadata
 from alembic.testing import resolve_lambda
@@ -1926,6 +1934,216 @@ class PGIndexAutogenerateTest(AutogenFixtureTest, TestBase):
             )
         else:
             eq_(diffs, [])
+
+
+class PGIndexCompareTest(TestBase):
+    """Unit tests for ``PostgresqlImpl.compare_indexes``, using
+    reflection stand-ins so that no database connection is needed."""
+
+    def _impl(self):
+        return PostgresqlImpl(
+            postgresql.dialect(), None, False, None, None, {}
+        )
+
+    def _table(self):
+        return Table(
+            "exp_index",
+            MetaData(),
+            Column("id", Integer, primary_key=True),
+            Column("x", String(50)),
+            Column("y", String(50)),
+            Column("z", Integer),
+            Column("XCol", String(50)),
+        )
+
+    def _reflected_index(
+        self, impl, table, keys, unique=False, sorting=None, where=None
+    ):
+        """Build the Index that autogenerate would create from a
+        reflected index definition."""
+        column_names = []
+        expressions = {}
+        for i, key in enumerate(keys):
+            if key in table.c:
+                column_names.append(key)
+            else:
+                column_names.append(None)
+                expressions[i] = key
+        params = {
+            "name": "idx",
+            "unique": unique,
+            "column_names": column_names,
+            "dialect_options": {},
+        }
+        if expressions:
+            params["expressions"] = expressions
+        if sorting:
+            params["column_sorting"] = sorting
+        if where is not None:
+            params["dialect_options"]["postgresql_where"] = where
+        idx = _make_index(impl, params, table)
+        assert idx is not None
+        return idx
+
+    def test_equal_keys_and_expression(self):
+        impl = self._impl()
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", t.c.x, func.lower(t.c.y)),
+            self._reflected_index(impl, t, ["x", "lower(y)"]),
+        )
+        is_true(result.is_equal, result.message)
+
+    @combinations(
+        ("coalesce(z, -1)", "coalesce(z,-1)"),
+        ("z + 1", "(z + 1)"),
+        ("((z + 1))", "z + 1"),
+        ("z + 1", "((z + 1))"),
+        argnames="meta_expr,reflected_expr",
+    )
+    def test_equal_expression_spelling_variants(
+        self, meta_expr, reflected_expr
+    ):
+        # whitespace and parenthesization differences that PostgreSQL
+        # considers equivalent are folded by the dialect
+        impl = self._impl()
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", text(meta_expr), _table=t),
+            self._reflected_index(impl, t, [reflected_expr]),
+        )
+        is_true(result.is_equal, result.message)
+
+    def test_quoted_identifier_not_folded(self):
+        # a quoted, case sensitive identifier is not the same thing as
+        # the unquoted name; the two must not be folded together
+        impl = self._impl()
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", func.lower(t.c.XCol)),
+            self._reflected_index(impl, t, ['lower("XCol")']),
+        )
+        is_true(result.is_equal, result.message)
+
+        result = impl.compare_indexes(
+            Index("idx", func.lower(t.c.XCol)),
+            self._reflected_index(impl, t, ["lower(xcol)"]),
+        )
+        is_true(result.is_different)
+        is_true("key #1" in result.message, result.message)
+
+    def test_uniqueness_conclusion(self):
+        impl = self._impl()
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", t.c.x, unique=True),
+            self._reflected_index(impl, t, ["x"]),
+        )
+        is_true(result.is_different)
+        is_true("uniqueness" in result.message, result.message)
+
+    @combinations(
+        (desc, ("desc",)),
+        (nullsfirst, ("nulls_first",)),
+        argnames="modifier,reflected_sorting",
+    )
+    def test_direction_conclusion(self, modifier, reflected_sorting):
+        impl = self._impl()
+        t = self._table()
+
+        # the reflected index does not report the modifier: the
+        # difference is reported as a direction change
+        result = impl.compare_indexes(
+            Index("idx", modifier(t.c.z)),
+            self._reflected_index(impl, t, ["z"]),
+        )
+        is_true(result.is_different)
+        is_true("direction of key #1" in result.message, result.message)
+
+        # the reflected index reports the same modifier: equal
+        result = impl.compare_indexes(
+            Index("idx", modifier(t.c.z)),
+            self._reflected_index(
+                impl, t, ["z"], sorting={"z": reflected_sorting}
+            ),
+        )
+        is_true(result.is_equal, result.message)
+
+    @combinations(asc, nullslast, argnames="modifier")
+    def test_default_directions_equal(self, modifier):
+        # asc and nulls last are the defaults on PostgreSQL, so an
+        # index that spells them out is equal to one that doesn't
+        impl = self._impl()
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", modifier(t.c.z)),
+            self._reflected_index(impl, t, ["z"]),
+        )
+        is_true(result.is_equal, result.message)
+
+    def test_filter_condition_equal(self):
+        impl = self._impl()
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", t.c.x, postgresql_where=text("z > 5")),
+            self._reflected_index(impl, t, ["x"], where="(z > 5)"),
+        )
+        is_true(result.is_equal, result.message)
+
+    def test_filter_condition_equal_with_cast(self):
+        # PostgreSQL adds casts to the reflected predicate
+        impl = self._impl()
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", t.c.x, postgresql_where=(t.c.y == "something")),
+            self._reflected_index(
+                impl, t, ["x"], where="(y = 'something'::character varying)"
+            ),
+        )
+        is_true(result.is_equal, result.message)
+
+    def test_filter_condition_changed(self):
+        impl = self._impl()
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", t.c.x, postgresql_where=text("z > 5")),
+            self._reflected_index(impl, t, ["x"], where="(z > 10)"),
+        )
+        is_true(result.is_different)
+        is_true("filter condition" in result.message, result.message)
+
+    def test_filter_condition_removed(self):
+        impl = self._impl()
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", t.c.x, postgresql_where=text("z > 5")),
+            self._reflected_index(impl, t, ["x"]),
+        )
+        is_true(result.is_different)
+        is_true("filter condition" in result.message, result.message)
+
+    def test_filter_condition_added(self):
+        impl = self._impl()
+        t = self._table()
+        result = impl.compare_indexes(
+            Index("idx", t.c.x),
+            self._reflected_index(impl, t, ["x"], where="(z > 5)"),
+        )
+        is_true(result.is_different)
+        is_true("filter condition" in result.message, result.message)
+
+    def test_operator_clause_cannot_compare(self):
+        impl = self._impl()
+        t = self._table()
+        with expect_warnings(
+            r"Expression #1 .+ in index 'idx' detected to include "
+            "an operator clause"
+        ):
+            result = impl.compare_indexes(
+                Index("idx", text("(y) varchar_pattern_ops"), _table=t),
+                self._reflected_index(impl, t, ["y varchar_pattern_ops"]),
+            )
+        is_true(result.is_skip, result.message)
 
 
 case = combinations(

@@ -36,6 +36,7 @@ from .base import format_table_name
 from .base import format_type
 from .base import IdentityColumnDefault
 from .base import RenameTable
+from .impl import _unwrap_full_parens
 from .impl import ComparisonResult
 from .impl import DefaultImpl
 from .. import util
@@ -80,6 +81,9 @@ class PostgresqlImpl(DefaultImpl):
     type_synonyms = DefaultImpl.type_synonyms + (
         {"FLOAT", "DOUBLE PRECISION"},
     )
+
+    _reflects_index_column_sorting = True
+    _reflects_index_where = True
 
     def create_index(self, index: Index, **kw: Any) -> None:
         # this likely defaults to None if not present, so get()
@@ -297,16 +301,22 @@ class PostgresqlImpl(DefaultImpl):
     )
 
     def _cleanup_index_expr(self, index: Index, expr: str) -> str:
-        expr = expr.lower().replace('"', "").replace("'", "")
+        # fold differences in spelling that PostgreSQL considers
+        # equivalent.  quoting is *not* folded away: a quoted identifier
+        # like "XCol" is case sensitive and is not the same as the
+        # unquoted name, and quotes around string literals are
+        # significant as well.
+        expr = expr.lower()
+
         if index.table is not None:
             # should not be needed, since include_table=False is in compile
             expr = expr.replace(f"{index.table.name.lower()}.", "")
+            expr = expr.replace(f'"{index.table.name.lower()}".', "")
 
         # strip :: cast. types can have spaces in them
         expr = self._cast_re.sub("", expr)
 
-        while expr and expr[0] == "(" and expr[-1] == ")":
-            expr = expr[1:-1]
+        expr = _unwrap_full_parens(expr)
 
         # NOTE: when parsing the connection expression this cleanup could
         # be skipped
@@ -316,8 +326,7 @@ class PostgresqlImpl(DefaultImpl):
                 expr = expr[:start] + expr[end:]
                 break
 
-        while expr and expr[0] == "(" and expr[-1] == ")":
-            expr = expr[1:-1]
+        expr = _unwrap_full_parens(expr)
 
         # strip CAST(expr AS type); repeat for nested casts
         n = 1
@@ -327,6 +336,19 @@ class PostgresqlImpl(DefaultImpl):
         # remove spaces
         expr = expr.replace(" ", "")
         return expr
+
+    def normalize_index_sql_expression(self, sqltext: str) -> str:
+        # PostgreSQL adds :: casts to reflected expressions, e.g.
+        # ``'english'::regconfig``; remove them, then fold the spelling
+        # differences that PostgreSQL considers equivalent.  Quoting is
+        # significant and is left in place.
+        expr = sqltext.lower()
+        expr = self._cast_re.sub("", expr)
+        n = 1
+        while n:
+            expr, n = self._cast_fn_re.subn(r"\1", expr)
+        expr = _unwrap_full_parens(expr)
+        return " ".join(expr.split())
 
     def _normalize_computed_default(self, sqltext: str) -> str:
         # PostgreSQL adds :: casts to the reflected expression, e.g.
@@ -347,25 +369,35 @@ class PostgresqlImpl(DefaultImpl):
             return ("nulls_not_distinct",)
         return ()
 
-    def compare_indexes(
-        self,
-        metadata_index: Index,
-        reflected_index: Index,
-    ) -> ComparisonResult:
-        msg = []
-        unique_msg = self._compare_index_unique(
-            metadata_index, reflected_index
-        )
-        if unique_msg:
-            msg.append(unique_msg)
+    # matches the ordering modifiers that may trail a cleaned up index
+    # key expression, after the default ones have been removed and spaces
+    # have been folded
+    _index_key_direction_re = re.compile(
+        r"((?:asc|desc|nullsfirst|nullslast)+)$"
+    )
+
+    def _split_key_direction(self, expr_text: str) -> tuple[str, str]:
+        """Split a cleaned up index key expression into the expression
+        itself and the ordering modifiers that follow it, if any."""
+        match = self._index_key_direction_re.search(expr_text)
+        if match:
+            return expr_text[: match.start()], match.group(1)
+        else:
+            return expr_text, ""
+
+    def _compare_index_keys(
+        self, metadata_index: Index, reflected_index: Index
+    ) -> ComparisonResult | None:
         m_exprs = metadata_index.expressions
         r_exprs = reflected_index.expressions
         if len(m_exprs) != len(r_exprs):
-            msg.append(f"expression number {len(r_exprs)} to {len(m_exprs)}")
-        if msg:
             # no point going further, return early
-            return ComparisonResult.Different(msg)
-        skip = []
+            return ComparisonResult.Different(
+                f"number of keys: {len(r_exprs)} to {len(m_exprs)}"
+            )
+
+        differences: list[str] = []
+        cannot_compare: list[str] = []
         for pos, (m_e, r_e) in enumerate(zip(m_exprs, r_exprs), 1):
             m_compile = self._compile_element(m_e)
             m_text = self._cleanup_index_expr(metadata_index, m_compile)
@@ -378,8 +410,8 @@ class PostgresqlImpl(DefaultImpl):
             elif m_compile.strip().endswith("_ops") and (
                 " " in m_compile or ")" in m_compile  # is an expression
             ):
-                skip.append(
-                    f"expression #{pos} {m_compile!r} detected "
+                cannot_compare.append(
+                    f"key #{pos} {m_compile!r} detected "
                     "as including operator clause."
                 )
                 util.warn(
@@ -392,20 +424,37 @@ class PostgresqlImpl(DefaultImpl):
                     "https://docs.sqlalchemy.org/en/latest/dialects/postgresql.html#operator-classes",  # noqa: E501
                 )
             else:
-                msg.append(f"expression #{pos} {r_compile!r} to {m_compile!r}")
+                m_base, _ = self._split_key_direction(m_text)
+                r_base, _ = self._split_key_direction(r_text)
+                if m_base == r_base:
+                    differences.append(
+                        f"direction of key #{pos}: "
+                        f"{r_compile!r} to {m_compile!r}"
+                    )
+                else:
+                    differences.append(
+                        f"key #{pos}: {r_compile!r} to {m_compile!r}"
+                    )
 
+        if differences:
+            return ComparisonResult.Different(differences)
+        elif cannot_compare:
+            # if there are other changes detected don't skip the index
+            return ComparisonResult.Skip(cannot_compare)
+        else:
+            return None
+
+    def _compare_index_dialect_options(
+        self, metadata_index: Index, reflected_index: Index
+    ) -> ComparisonResult | None:
         m_options = self._dialect_options(metadata_index)
         r_options = self._dialect_options(reflected_index)
         if m_options != r_options:
-            msg.extend(f"options {r_options} to {m_options}")
-
-        if msg:
-            return ComparisonResult.Different(msg)
-        elif skip:
-            # if there are other changes detected don't skip the index
-            return ComparisonResult.Skip(skip)
+            return ComparisonResult.Different(
+                f"options {r_options} to {m_options}"
+            )
         else:
-            return ComparisonResult.Equal()
+            return None
 
     def compare_unique_constraint(
         self,
