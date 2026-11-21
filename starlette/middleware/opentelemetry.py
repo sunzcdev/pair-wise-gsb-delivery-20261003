@@ -11,8 +11,28 @@ except ImportError:  # pragma: no cover
 
 from starlette import __version__
 from starlette.datastructures import URL
-from starlette.routing import Mount
+from starlette.routing import Match, Mount
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+
+def _route_path(scope: Scope) -> str | None:
+    """Return the matched route template, or `None` when no route fully matched.
+
+    A `Mount` only matches the mount prefix, so the mounted root path is used.
+    Partial matches (for example, a path match with the wrong HTTP method) and
+    requests that do not match any route are reported without a route template.
+    """
+    if scope.get("route_match") is not Match.FULL:
+        return None
+
+    route = scope.get("route")
+    if isinstance(route, Mount):
+        return scope.get("root_path") or "/"
+
+    path_format = getattr(route, "path_format", None)
+    if not isinstance(path_format, str):
+        return None
+    return scope.get("root_path", "").rstrip("/") + path_format or "/"
 
 
 class OpenTelemetryMiddleware:
@@ -93,9 +113,12 @@ class OpenTelemetryMiddleware:
                 kind=SpanKind.SERVER,
                 attributes=attributes,
             ) as span:
+                response_started = False
 
                 async def send_with_telemetry(message: Message) -> None:
+                    nonlocal response_started
                     if message["type"] == "http.response.start":
+                        response_started = True
                         status_code = message["status"]
                         span.set_attribute("http.response.status_code", status_code)
                         if status_code >= 500:
@@ -106,19 +129,20 @@ class OpenTelemetryMiddleware:
                 try:
                     await self.app(scope, receive, send_with_telemetry)
                 except Exception as exc:
-                    span.set_attribute("error.type", type(exc).__qualname__)
+                    # Once the response has started, the status code can no longer
+                    # be changed: keep the one already sent and just record the
+                    # failure. The original exception is still re-raised so the
+                    # existing error handling chain (for example the server error
+                    # middleware) keeps dealing with it.
+                    if not response_started or "error.type" not in span.attributes:
+                        span.set_attribute("error.type", type(exc).__qualname__)
+                    span.set_status(Status(StatusCode.ERROR))
                     raise
                 finally:
-                    route = scope.get("route")
-                    if isinstance(route, Mount):
-                        route_path = scope.get("root_path") or "/"
-                    else:
-                        path_format = getattr(route, "path_format", None)
-                        route_path = (
-                            scope.get("root_path", "").rstrip("/") + path_format or "/"
-                            if isinstance(path_format, str)
-                            else None
-                        )
+                    route_match = scope.get("route_match")
+                    if route_match is not None:
+                        span.set_attribute("starlette.route_match", route_match.name)
+                    route_path = _route_path(scope)
                     if route_path is not None:
                         span.update_name(f"{method} {route_path}")
                         span.set_attribute("http.route", route_path)

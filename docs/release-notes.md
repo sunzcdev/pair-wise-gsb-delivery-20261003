@@ -2,6 +2,17 @@
 toc_depth: 2
 ---
 
+## Unreleased
+
+#### Added
+
+* Expose the routing outcome through `scope["route_match"]` as a `Match` member (`FULL`, `PARTIAL`, or `NONE`), and set `scope["route"]` to `None` when no route matches, so a nested router no longer leaves the outer `Mount` in place for an unmatched request.
+
+#### Fixed
+
+* Stop attributing unmatched requests inside a `Mount` to the mount route in `OpenTelemetryMiddleware`. Only fully matched requests get the route template (including mount layers) as the span name and `http.route`; 405 responses keep the `PARTIAL` match marker, and unmatched requests are classified separately without a route.
+* In `OpenTelemetryMiddleware`, keep the status code already sent when an exception is raised after the response started, while still marking the span as failed and recording the error. The original exception is re-raised unchanged.
+
 ## 1.10.0 (October 24, 2026)
 
 #### Changed

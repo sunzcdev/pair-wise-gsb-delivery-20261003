@@ -700,6 +700,7 @@ class Router:
             match, child_scope = route.matches(scope)
             if match is Match.FULL:
                 scope["route"] = route
+                scope["route_match"] = Match.FULL
                 scope.update(child_scope)
                 await route.handle(scope, receive, send)
                 return
@@ -712,9 +713,17 @@ class Router:
             # able to handle the request, but is not a preferred option.
             # We use this in particular to deal with "405 Method Not Allowed".
             scope["route"] = partial
+            scope["route_match"] = Match.PARTIAL
             scope.update(partial_scope)
             await partial.handle(scope, receive, send)
             return
+
+        # No route matched. Reset any route inherited from an outer router (for
+        # example, a `Mount` whose nested application could not resolve the
+        # request), and record the outcome so downstream middleware can tell
+        # unmatched requests apart from handled ones.
+        scope["route"] = None
+        scope["route_match"] = Match.NONE
 
         route_path = get_route_path(scope)
         if scope["type"] == "http" and self.redirect_slashes and route_path != "/":

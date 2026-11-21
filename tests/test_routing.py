@@ -5,7 +5,7 @@ import functools
 import json
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator
-from typing import Never, TypedDict
+from typing import Any, Never, TypedDict
 
 import pytest
 
@@ -14,7 +14,7 @@ from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
-from starlette.routing import Host, Mount, NoMatchFound, Route, Router, WebSocketRoute
+from starlette.routing import Host, Match, Mount, NoMatchFound, Route, Router, WebSocketRoute
 from starlette.testclient import TestClient
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -1264,3 +1264,70 @@ def test_host_routing_is_case_insensitive(test_client_factory: TestClientFactory
     response = test_client_factory(router).get("/", headers={"host": "Sub.example.ORG"})
     assert response.status_code == 200
     assert response.text == "sub"
+
+
+class _ScopeProbe:
+    """ASGI middleware that records the routing state left in the scope."""
+
+    def __init__(self, app: ASGIApp, recorded: list[dict[str, Any]]) -> None:
+        self.app = app
+        self.recorded = recorded
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        await self.app(scope, receive, send)
+        self.recorded.append(
+            {
+                "route": scope.get("route"),
+                "route_match": scope.get("route_match"),
+            }
+        )
+
+
+def test_router_records_full_partial_and_none_route_matches(
+    test_client_factory: TestClientFactory,
+) -> None:
+    recorded: list[dict[str, Any]] = []
+    router = Router(
+        routes=[
+            Route("/users/{username}", homepage, methods=["POST"]),
+        ]
+    )
+    app = _ScopeProbe(router, recorded)
+    client = test_client_factory(app)
+
+    assert client.post("/users/marcelo").status_code == 200
+    assert recorded[-1]["route_match"] is Match.FULL
+    assert isinstance(recorded[-1]["route"], Route)
+
+    assert client.get("/users/marcelo").status_code == 405
+    assert recorded[-1]["route_match"] is Match.PARTIAL
+    assert isinstance(recorded[-1]["route"], Route)
+
+    assert client.get("/missing").status_code == 404
+    assert recorded[-1]["route_match"] is Match.NONE
+    assert recorded[-1]["route"] is None
+
+
+def test_nested_router_resets_mount_route_on_miss(test_client_factory: TestClientFactory) -> None:
+    recorded: list[dict[str, Any]] = []
+    router = Router(
+        routes=[
+            Mount(
+                "/api",
+                app=Router(routes=[Route("/users/{username}", homepage)]),
+            )
+        ]
+    )
+    app = _ScopeProbe(router, recorded)
+    client = test_client_factory(app)
+
+    assert client.get("/api/users/marcelo").status_code == 200
+    assert recorded[-1]["route_match"] is Match.FULL
+    assert isinstance(recorded[-1]["route"], Route)
+
+    # The `Mount` matches the prefix, but the nested router has no route for
+    # the remaining path. The outcome must be reported as an unmatched request
+    # rather than the inherited mount route.
+    assert client.get("/api/missing").status_code == 404
+    assert recorded[-1]["route_match"] is Match.NONE
+    assert recorded[-1]["route"] is None

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from unittest.mock import AsyncMock
 
 import httpx
@@ -15,7 +15,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.opentelemetry import OpenTelemetryMiddleware
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, StreamingResponse
 from starlette.routing import BaseRoute, Host, Match, Mount, Route, Router, WebSocketRoute
 from starlette.testclient import TestClient
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -227,6 +227,7 @@ def test_http_span_uses_nested_route(
     assert span.name == "GET /api/users/{username}"
     assert span.attributes is not None
     assert span.attributes["http.route"] == "/api/users/{username}"
+    assert span.attributes["starlette.route_match"] == "FULL"
 
 
 def test_mounted_starlette_app_does_not_create_duplicate_span(
@@ -327,7 +328,7 @@ def test_route_is_resolved_after_path_rewriting_middleware(
     assert span.attributes["http.route"] == "/target"
 
 
-def test_http_span_uses_mount_path_when_child_does_not_resolve(
+def test_http_span_omits_route_when_mounted_child_does_not_resolve(
     test_client_factory: TestClientFactory,
     tracer_provider: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
@@ -338,9 +339,48 @@ def test_http_span_uses_mount_path_when_child_does_not_resolve(
     assert test_client_factory(app).get("/api/missing").status_code == 404
 
     span = get_span(exporter)
-    assert span.name == "GET /api"
+    assert span.name == "GET"
     assert span.attributes is not None
-    assert span.attributes["http.route"] == "/api"
+    assert "http.route" not in span.attributes
+    assert span.attributes["starlette.route_match"] == "NONE"
+
+
+def test_http_span_keeps_partial_match_for_method_not_allowed(
+    test_client_factory: TestClientFactory,
+    tracer_provider: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    _, exporter = tracer_provider
+    routes = [Mount("/api", app=Router([Route("/users/{username}", homepage, methods=["POST"])]))]
+    app = Starlette(routes=routes, middleware=[Middleware(OpenTelemetryMiddleware)])
+
+    assert test_client_factory(app).get("/api/users/marcelo").status_code == 405
+
+    span = get_span(exporter)
+    assert span.name == "GET"
+    assert span.attributes is not None
+    assert "http.route" not in span.attributes
+    assert span.attributes["starlette.route_match"] == "PARTIAL"
+    assert span.attributes["http.response.status_code"] == 405
+
+
+def test_http_span_classifies_complete_miss_without_route(
+    test_client_factory: TestClientFactory,
+    tracer_provider: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    _, exporter = tracer_provider
+    app = Starlette(
+        routes=[Route("/users/{username}", homepage)],
+        middleware=[Middleware(OpenTelemetryMiddleware)],
+    )
+
+    assert test_client_factory(app).get("/missing").status_code == 404
+
+    span = get_span(exporter)
+    assert span.name == "GET"
+    assert span.attributes is not None
+    assert "http.route" not in span.attributes
+    assert span.attributes["starlette.route_match"] == "NONE"
+    assert span.attributes["http.response.status_code"] == 404
 
 
 def test_http_span_uses_mount_path_for_raw_asgi_app(
@@ -455,6 +495,64 @@ def test_http_span_records_server_error(
     assert [event.name for event in span.events] == ["exception"]
 
 
+def test_http_span_records_error_after_response_started(
+    test_client_factory: TestClientFactory,
+    tracer_provider: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    _, exporter = tracer_provider
+
+    async def broken_stream() -> AsyncGenerator[bytes, None]:
+        yield b"partial"
+        raise RuntimeError("stream broke")
+
+    app = Starlette(
+        routes=[Route("/stream", lambda request: StreamingResponse(broken_stream()))],
+        middleware=[Middleware(OpenTelemetryMiddleware)],
+    )
+
+    client = test_client_factory(app, raise_server_exceptions=False)
+    with client.stream("GET", "/stream") as response:
+        assert response.status_code == 200
+        assert response.read() == b"partial"
+
+    span = get_span(exporter)
+    # The response already started, so the sent status code is retained...
+    assert span.attributes is not None
+    assert span.attributes["http.response.status_code"] == 200
+    # ...while the failure is still recorded on the span.
+    assert span.attributes["error.type"] == "RuntimeError"
+    assert span.status.status_code == StatusCode.ERROR
+    assert [event.name for event in span.events] == ["exception"]
+
+
+def test_http_span_reraises_error_after_response_started(
+    test_client_factory: TestClientFactory,
+    tracer_provider: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    _, exporter = tracer_provider
+
+    async def broken_stream() -> AsyncGenerator[bytes, None]:
+        yield b"partial"
+        raise RuntimeError("stream broke")
+
+    app = Starlette(
+        routes=[Route("/stream", lambda request: StreamingResponse(broken_stream()))],
+        middleware=[Middleware(OpenTelemetryMiddleware)],
+    )
+
+    client = test_client_factory(app)
+    with pytest.raises(RuntimeError, match="stream broke"):
+        with client.stream("GET", "/stream") as response:
+            response.read()
+
+    span = get_span(exporter)
+    assert span.kind == SpanKind.SERVER
+    assert span.attributes is not None
+    assert span.attributes["http.response.status_code"] == 200
+    assert span.attributes["error.type"] == "RuntimeError"
+    assert span.status.status_code == StatusCode.ERROR
+
+
 def test_http_span_records_error_response(
     test_client_factory: TestClientFactory,
     tracer_provider: tuple[TracerProvider, InMemorySpanExporter],
@@ -471,6 +569,43 @@ def test_http_span_records_error_response(
     assert span.attributes is not None
     assert span.attributes["error.type"] == "503"
     assert span.status.status_code == StatusCode.ERROR
+
+
+def test_each_request_ends_exactly_one_server_span(
+    test_client_factory: TestClientFactory,
+    tracer_provider: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    _, exporter = tracer_provider
+
+    def raise_error(request: Request) -> PlainTextResponse:
+        raise RuntimeError("boom")
+
+    mounted_app = Starlette(
+        routes=[
+            Route("/users/{username}", homepage),
+            Route("/users/{username}/update", homepage, methods=["POST"]),
+        ],
+        middleware=[Middleware(OpenTelemetryMiddleware)],
+    )
+    app = Starlette(
+        routes=[Mount("/api", app=mounted_app), Route("/error", raise_error)],
+        middleware=[Middleware(OpenTelemetryMiddleware)],
+    )
+    client = test_client_factory(app, raise_server_exceptions=False)
+
+    exchanges = [
+        (client.get, "/api/users/marcelo", 200),
+        (client.get, "/api/missing", 404),
+        (client.get, "/api/users/marcelo/update", 405),
+        (client.get, "/missing", 404),
+        (client.get, "/error", 500),
+    ]
+    for request, path, expected_status in exchanges:
+        exporter.clear()
+        assert request(path).status_code == expected_status
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].kind == SpanKind.SERVER
 
 
 def test_http_span_without_starlette_app(

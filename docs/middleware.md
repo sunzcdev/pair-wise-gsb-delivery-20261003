@@ -53,6 +53,17 @@ Creates an OpenTelemetry server span for every incoming HTTP request. The span f
 OpenTelemetry HTTP semantic conventions, extracts distributed trace context from the request
 headers, and uses the matched route template for its name and `http.route` attribute.
 
+Only a fully matched route sets the span name and `http.route` attribute, using the full
+template including any `Mount` prefixes. A request that matches a path but not the HTTP method
+(a 405 response) keeps the `PARTIAL` match marker, and a request that matches no route is
+classified separately without a route template, so an unmatched request inside a mount is not
+attributed to the mount itself. The routing outcome is also recorded on the span as
+`starlette.route_match`, one of `FULL`, `PARTIAL`, or `NONE`.
+
+When an exception is raised after the response has started, the middleware keeps the status
+code already sent and marks the span as failed with the exception type, while re-raising the
+exception for the regular error handling chain.
+
 !!! warning "Experimental API"
     `OpenTelemetryMiddleware` is experimental. Its API and emitted telemetry may change in minor
     releases without a deprecation period.
