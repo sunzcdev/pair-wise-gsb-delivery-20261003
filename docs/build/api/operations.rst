@@ -164,6 +164,29 @@ The built-in operation objects are listed below.
 .. automodule:: alembic.operations.ops
     :members:
 
+.. _data_impact_api:
+
+Inspecting Data Impact
+==============================
+
+The operation tree may be examined for its effect on stored data using
+:func:`.inspect_data_impact`, documented in detail at :ref:`data_impact`.
+The objects it returns are listed below.
+
+.. autofunction:: alembic.operations.inspect_data_impact
+
+.. autoclass:: alembic.operations.DataImpactReport
+    :members:
+
+.. autoclass:: alembic.operations.DataImpactDirection
+    :members:
+
+.. autoclass:: alembic.operations.DataImpact
+    :members:
+
+.. autoclass:: alembic.operations.DataImpactType
+    :members:
+
 .. _operations_extending_builtin:
 
 Extending Existing Operations

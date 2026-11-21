@@ -1025,3 +1025,164 @@ by contrast, when no new operations are detected::
    and :paramref:`.EnvironmentContext.configure.compare_server_default`
    are in play as usual, as well as that limitations in autogenerate
    detection are the same when running ``alembic check``.
+
+.. _data_impact:
+
+Reviewing Data Impact of a Migration
+------------------------------------
+
+A migration script is normally reviewed by reading its ``upgrade()``
+function.  This is easy to do, but it can hide a change in the other
+direction:  a ``downgrade()`` that drops a column will silently discard
+its values when it runs, and there is nothing in the upgrade path that
+makes this visible.
+
+:func:`.inspect_data_impact` provides a read-only way to examine an
+existing :class:`.MigrationScript`, or any part of its operation tree,
+and report, separately for the ``upgrade`` and ``downgrade`` directions,
+which tables and columns are affected and what kind of change is applied
+to each.  It is purely descriptive:  it does not modify the operation
+objects, nor does it render or execute SQL, so the same operations can
+afterwards still be rendered with :func:`.render_python_code` or invoked
+with an :class:`.Operations` instance exactly as before.
+
+Given a script produced by autogenerate::
+
+    from alembic.autogenerate import produce_migrations, inspect_data_impact
+
+    script = produce_migrations(migration_context, target_metadata)
+    report = inspect_data_impact(script)
+    print(report)
+
+the report shows each direction with a summary line stating whether it
+loses original values, followed by one line per affected table and
+column::
+
+    upgrade: preserves original values
+      [add_column] table 'account' column 'name' (preserves original values)
+    downgrade: loses original values
+      [drop_column] table 'account' column 'name' (loses original values)
+
+The report also exposes the data structures directly, which is useful
+when writing a check or a test::
+
+    report.loses_data
+    # {'upgrade': False, 'downgrade': True}
+
+    for direction in report.losing_directions():
+        for impact in direction.impacts:
+            print(direction.name, impact.type, impact.table_label,
+                  impact.column, impact.loses_data)
+
+    report.downgrade.by_table()
+
+The individual facts are :class:`.DataImpact` objects; the two
+directions are :class:`.DataImpactDirection` objects.  Each
+:class:`.DataImpact` carries a :class:`.DataImpactType`, a table name, an
+optional column name and schema, and a ``loses_data`` flag which is
+``True``, ``False``, or ``None`` when the effect could not be determined.
+The direction-level ``loses_data`` collapses these:  it is ``True`` if
+any impact loses values, ``None`` if any impact is unknown, and
+``False`` only if every impact is known to preserve values.
+
+Tables, columns and categories
+==============================
+
+Impacts are reported at the granularity of the operation that produced
+them, with the table and column names taken from the operation itself.
+For example, :class:`.AddColumnOp`, :class:`.DropColumnOp` and
+:class:`.AlterColumnOp` report column-level impacts, while
+:class:`.CreateTableOp`, :class:`.DropTableOp` and the constraint and
+index operations report table-level impacts.  Several
+:class:`.AlterColumnOp` modifications map to distinct categories, e.g.
+:attr:`.DataImpactType.ALTER_COLUMN_TYPE`,
+:attr:`.DataImpactType.ALTER_COLUMN_NULLABILITY` and
+:attr:`.DataImpactType.RENAME_COLUMN`.
+
+A type change is only declared lossy when it can be shown to narrow the
+column, such as ``VARCHAR(255)`` to ``VARCHAR(10)``; a widening or a
+same-affinity change with no size information yields ``None`` so that a
+reviewer is prompted to look at the two types rather than being told the
+change is safe.
+
+Batch operations
+================
+
+Operations inside ``batch_alter_table()`` are represented by a
+:class:`.ModifyTableOps` container, and in rendered scripts nested inside
+a ``with op.batch_alter_table(...)`` block.  The inspection expands these
+containers so that each directive is reported on its own, using the
+container's table name and schema when the individual operation does not
+state one.  The batch container is never reported as a single opaque
+change.
+
+Renames
+=======
+
+A rename is an identity change that retains stored values.  It is
+reported with :attr:`.DataImpact.new_name` set and ``loses_data`` equal
+to ``False``, so that it is visible as a rename rather than mistaken for
+a drop plus an add::
+
+    [rename_column] table 'account' column 'old_name' \
+(identity change -> 'new_name') (preserves original values)
+
+Custom operations
+=================
+
+Operations of a type Alembic does not know are reported with
+:attr:`.DataImpactType.UNKNOWN` and ``loses_data`` of ``None``; the
+report does not assume such an operation is safe.  A custom operation can
+instead declare what it knows by overriding
+:meth:`.MigrateOperation.data_impact`, returning a sequence of
+:class:`.DataImpact` objects::
+
+    from alembic.operations import (
+        DataImpact,
+        DataImpactType,
+        MigrateOperation,
+        Operations,
+    )
+
+    class CreateSequenceOp(MigrateOperation):
+        def __init__(self, sequence_name, schema=None):
+            self.sequence_name = sequence_name
+            self.schema = schema
+
+        def data_impact(self):
+            # a sequence holds no row data of its own
+            return []
+
+    class TruncateTableOp(MigrateOperation):
+        def __init__(self, table_name):
+            self.table_name = table_name
+
+        def data_impact(self):
+            return [
+                DataImpact.for_table(
+                    DataImpactType.UNKNOWN,
+                    self.table_name,
+                    loses_data=True,
+                    detail="truncate",
+                )
+            ]
+
+Returning an empty sequence declares that there is nothing to report.
+Returning ``None``, or not implementing the method at all, leaves the
+operation as unknown.  The declaration is independent of any particular
+database backend; it describes what the operation does to stored data,
+not what DDL the dialect is able to emit.
+
+.. seealso::
+
+    :func:`.inspect_data_impact`
+
+    :class:`.DataImpactReport`
+
+    :class:`.DataImpactDirection`
+
+    :class:`.DataImpact`
+
+    :class:`.DataImpactType`
+
+    :meth:`.MigrateOperation.data_impact`

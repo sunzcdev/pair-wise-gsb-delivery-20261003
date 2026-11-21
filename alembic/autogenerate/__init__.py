@@ -1,5 +1,6 @@
 from .api import _render_migration_diffs as _render_migration_diffs
 from .api import compare_metadata as compare_metadata
+from .api import inspect_data_impact as inspect_data_impact
 from .api import produce_migrations as produce_migrations
 from .api import render_python_code as render_python_code
 from .api import RevisionContext as RevisionContext

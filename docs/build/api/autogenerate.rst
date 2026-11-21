@@ -43,6 +43,8 @@ which produces a structure consisting of operation directives detailed in
 
 .. autofunction:: alembic.autogenerate.produce_migrations
 
+.. autofunction:: alembic.autogenerate.inspect_data_impact
+
 .. _customizing_revision:
 
 Customizing Revision Generation

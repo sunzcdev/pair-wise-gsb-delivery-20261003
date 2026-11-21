@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from abc import abstractmethod
+from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import MutableMapping
 from collections.abc import Sequence
+from dataclasses import dataclass
+import enum
+import functools
 import os
 import pathlib
 import re
@@ -13,6 +17,7 @@ from typing import cast
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
+from sqlalchemy import types as sqltypes
 from sqlalchemy.types import NULLTYPE
 
 from . import schemaobj
@@ -51,6 +56,333 @@ _T = TypeVar("_T", bound=Any)
 _AC = TypeVar("_AC", bound="AddConstraintOp")
 
 
+class DataImpactType(enum.Enum):
+    """Describe the kind of data effect an operation has.
+
+    These values are reported by :func:`.inspect_data_impact`, both for
+    built-in operations and for custom operations that declare their own
+    impact using :meth:`.MigrateOperation.data_impact`.
+
+    .. versionadded:: 1.20.2
+
+    .. seealso::
+
+        :ref:`data_impact`
+
+    """
+
+    UNKNOWN = "unknown"
+    """The operation's data impact is not declared and could not be
+    determined.  A conservative reviewer should assume that original
+    values may be lost."""
+
+    CREATE_TABLE = "create_table"
+    DROP_TABLE = "drop_table"
+    RENAME_TABLE = "rename_table"
+
+    ADD_COLUMN = "add_column"
+    DROP_COLUMN = "drop_column"
+    RENAME_COLUMN = "rename_column"
+    ALTER_COLUMN_TYPE = "alter_column_type"
+    ALTER_COLUMN_NULLABILITY = "alter_column_nullability"
+    ALTER_COLUMN_DEFAULT = "alter_column_server_default"
+    ALTER_COLUMN_COMMENT = "alter_column_comment"
+
+    CREATE_INDEX = "create_index"
+    DROP_INDEX = "drop_index"
+    ADD_CONSTRAINT = "add_constraint"
+    DROP_CONSTRAINT = "drop_constraint"
+
+    INSERT_ROWS = "insert_rows"
+    TABLE_COMMENT = "table_comment"
+
+
+_DEFAULT_LOSES_DATA: dict[DataImpactType, bool | None] = {
+    impact_type: False for impact_type in DataImpactType
+}
+_DEFAULT_LOSES_DATA[DataImpactType.DROP_TABLE] = True
+_DEFAULT_LOSES_DATA[DataImpactType.DROP_COLUMN] = True
+_DEFAULT_LOSES_DATA[DataImpactType.ALTER_COLUMN_TYPE] = None
+_DEFAULT_LOSES_DATA[DataImpactType.UNKNOWN] = None
+
+
+class _Unset:
+    """Sentinel marking the ``loses_data`` argument as not provided."""
+
+    def __repr__(self) -> str:
+        return "<unset>"
+
+
+_UNSET = _Unset()
+
+
+def _resolve_loses_data(
+    type_: DataImpactType, loses_data: bool | None | _Unset
+) -> bool | None:
+    if isinstance(loses_data, _Unset):
+        return _DEFAULT_LOSES_DATA[type_]
+    else:
+        return loses_data
+
+
+@dataclass(frozen=True)
+class DataImpact:
+    """A single, read-only statement of what an operation does to stored
+    data.
+
+    Instances are produced by :func:`.inspect_data_impact`, or by custom
+    operations that return them from
+    :meth:`.MigrateOperation.data_impact`.  The
+    :attr:`.DataImpact.loses_data` attribute states whether original
+    values may be discarded by the change; ``None`` means this could not
+    be determined and should be treated conservatively.
+
+    The :meth:`.DataImpact.for_table` and
+    :meth:`.DataImpact.for_column` constructors derive a suitable
+    ``loses_data`` value from the given :attr:`.DataImpact.type` when one
+    is not supplied.
+
+    .. versionadded:: 1.20.2
+
+    .. seealso::
+
+        :ref:`data_impact`
+
+    """
+
+    type: DataImpactType
+    table: str | None
+    schema: str | None = None
+    column: str | None = None
+    new_name: str | None = None
+    """For rename impacts, the new name of the table or column; indicates
+    an identity change where values themselves are retained."""
+
+    loses_data: bool | None = None
+    """``True`` if original values may be discarded, ``False`` if they are
+    retained or converted reversibly, ``None`` if unknown."""
+
+    detail: str | None = None
+    """Optional free-form text, such as the old and new datatypes."""
+
+    @classmethod
+    def for_table(
+        cls,
+        type_: DataImpactType,
+        table: str | None,
+        *,
+        schema: str | None = None,
+        new_name: str | None = None,
+        loses_data: bool | None | _Unset = _UNSET,
+        detail: str | None = None,
+    ) -> DataImpact:
+        """Convenience constructor for a table-level impact."""
+        return cls(
+            type_,
+            table,
+            schema=schema,
+            new_name=new_name,
+            loses_data=_resolve_loses_data(type_, loses_data),
+            detail=detail,
+        )
+
+    @classmethod
+    def for_column(
+        cls,
+        type_: DataImpactType,
+        table: str | None,
+        column: str | None,
+        *,
+        schema: str | None = None,
+        new_name: str | None = None,
+        loses_data: bool | None | _Unset = _UNSET,
+        detail: str | None = None,
+    ) -> DataImpact:
+        """Convenience constructor for a column-level impact."""
+        return cls(
+            type_,
+            table,
+            schema=schema,
+            column=column,
+            new_name=new_name,
+            loses_data=_resolve_loses_data(type_, loses_data),
+            detail=detail,
+        )
+
+    @property
+    def table_label(self) -> str | None:
+        """The table name qualified with its schema, if any."""
+        if self.table is None:
+            return None
+        elif self.schema is None:
+            return self.table
+        else:
+            return f"{self.schema}.{self.table}"
+
+    @property
+    def identity_change(self) -> bool:
+        """True if this impact renames a table or column, retaining the
+        values under a new identity."""
+        return self.new_name is not None
+
+    def render(self) -> str:
+        """Render this impact as a single human-readable line."""
+        location = (
+            f"table {self.table_label!r}"
+            if self.table_label is not None
+            else "unknown table"
+        )
+        if self.column is not None:
+            location += f" column {self.column!r}"
+
+        if self.identity_change:
+            location += f" (identity change -> {self.new_name!r})"
+
+        detail = f" [{self.detail}]" if self.detail else ""
+
+        if self.loses_data is True:
+            state = "loses original values"
+        elif self.loses_data is False:
+            state = "preserves original values"
+        else:
+            state = "data impact unknown"
+
+        return f"[{self.type.value}] {location}{detail} ({state})"
+
+    def __str__(self) -> str:
+        return self.render()
+
+
+@dataclass(frozen=True)
+class DataImpactDirection:
+    """The data impacts collected for one direction of a migration.
+
+    .. versionadded:: 1.20.2
+
+    .. seealso::
+
+        :ref:`data_impact`
+
+    """
+
+    name: str
+    impacts: tuple[DataImpact, ...] = ()
+    provided: bool = True
+    """False when the inspected object did not include operations for
+    this direction, in which case nothing is known about it."""
+
+    @property
+    def loses_data(self) -> bool | None:
+        """``True`` if any impact in this direction loses original values.
+
+        Returns ``True``, ``False``, or ``None``.  ``False`` means every
+        reported impact is known to preserve values; ``None`` means the
+        direction was not provided or at least one impact is unknown.
+        """
+        if not self.provided:
+            return None
+        outcomes = [impact.loses_data for impact in self.impacts]
+        if any(outcome is True for outcome in outcomes):
+            return True
+        elif any(outcome is None for outcome in outcomes):
+            return None
+        else:
+            return False
+
+    @property
+    def may_lose_data(self) -> bool:
+        """True unless every impact in this direction is known to preserve
+        original values."""
+        return self.loses_data is not False
+
+    def by_table(self) -> dict[str, tuple[DataImpact, ...]]:
+        """Group impacts by qualified table name, in first-seen order."""
+        grouped: dict[str, list[DataImpact]] = {}
+        for impact in self.impacts:
+            label = impact.table_label or "<unknown>"
+            grouped.setdefault(label, []).append(impact)
+        return {label: tuple(items) for label, items in grouped.items()}
+
+    def for_table(
+        self, table: str, schema: str | None = None
+    ) -> list[DataImpact]:
+        """Return impacts recorded for a specific table."""
+        return [
+            impact
+            for impact in self.impacts
+            if impact.table == table and impact.schema == schema
+        ]
+
+    def render(self) -> str:
+        """Render this direction as a human-readable block of text."""
+        if not self.provided:
+            header = f"{self.name}: not available"
+        elif not self.impacts:
+            header = f"{self.name}: no data impact"
+        else:
+            if self.loses_data is True:
+                header = f"{self.name}: loses original values"
+            elif self.loses_data is False:
+                header = f"{self.name}: preserves original values"
+            else:
+                header = f"{self.name}: data impact unknown"
+
+        lines = [header]
+        lines.extend(f"  {impact.render()}" for impact in self.impacts)
+        return "\n".join(lines)
+
+    def __str__(self) -> str:
+        return self.render()
+
+
+@dataclass(frozen=True)
+class DataImpactReport:
+    """The result of :func:`.inspect_data_impact`.
+
+    Holds the impacts collected separately for the ``upgrade`` and
+    ``downgrade`` directions, so that a reviewer can see at a glance
+    which direction discards original values.
+
+    .. versionadded:: 1.20.2
+
+    .. seealso::
+
+        :ref:`data_impact`
+
+    """
+
+    upgrade: DataImpactDirection
+    downgrade: DataImpactDirection
+
+    @property
+    def directions(self) -> tuple[DataImpactDirection, ...]:
+        return (self.upgrade, self.downgrade)
+
+    @property
+    def loses_data(self) -> dict[str, bool | None]:
+        """Map of direction name to its :attr:`.DataImpactDirection.loses_data`
+        value."""
+        return {
+            direction.name: direction.loses_data
+            for direction in self.directions
+        }
+
+    def losing_directions(self) -> list[DataImpactDirection]:
+        """Return the directions that are known to lose original values."""
+        return [
+            direction
+            for direction in self.directions
+            if direction.loses_data is True
+        ]
+
+    def render(self) -> str:
+        """Render both directions as a human-readable block of text."""
+        return "\n".join(direction.render() for direction in self.directions)
+
+    def __str__(self) -> str:
+        return self.render()
+
+
 class MigrateOperation:
     """base class for migration command and organization objects.
 
@@ -81,6 +413,33 @@ class MigrateOperation:
 
     def to_diff_tuple(self) -> tuple[Any, ...]:
         raise NotImplementedError
+
+    def data_impact(self) -> Iterable[DataImpact] | None:
+        """Declare the data impact of this operation.
+
+        The return value is a sequence of :class:`.DataImpact` objects
+        describing which tables and columns the operation touches, what
+        kind of change it makes, and whether stored values are discarded.
+        A caller such as :func:`.inspect_data_impact` uses this to produce
+        a read-only, per-direction report of a migration.
+
+        The default implementation returns ``None``, which indicates that
+        the impact is not known; the report then lists the operation with
+        the :attr:`.DataImpactType.UNKNOWN` category rather than assuming
+        that it preserves data.  Returning an empty sequence instead
+        declares that the operation has no data impact to report.
+
+        Built-in operations have their impact determined by Alembic
+        itself and do not need to override this method.
+
+        .. versionadded:: 1.20.2
+
+        .. seealso::
+
+            :ref:`data_impact`
+
+        """
+        return None
 
 
 class AddConstraintOp(MigrateOperation):
@@ -2892,3 +3251,536 @@ class MigrationScript(MigrateOperation):
 
         """
         return self._downgrade_ops
+
+    def inspect_data_impact(self) -> DataImpactReport:
+        """Return a read-only data impact report for this migration.
+
+        This is a convenience shorthand for
+        ``inspect_data_impact(self)``.
+
+        .. versionadded:: 1.20.2
+
+        .. seealso::
+
+            :func:`.inspect_data_impact`
+
+        """
+        return inspect_data_impact(self)
+
+
+def _type_instance(type_: Any) -> Any:
+    if type_ is None or isinstance(type_, sqltypes.TypeEngine):
+        return type_
+    try:
+        return sqltypes.to_instance(type_)
+    except Exception:
+        return None
+
+
+def _type_detail(
+    existing_type: Any, new_type: Any
+) -> tuple[str | None, bool | None]:
+    """Return a ``(detail, loses_data)`` pair for a type modification.
+
+    ``loses_data`` is ``False`` when the change is regarded as
+    reversible with respect to stored values, ``True`` when the new type
+    is narrower than the old one, and ``None`` when there is not enough
+    information to say.
+
+    """
+    existing = _type_instance(existing_type)
+    new = _type_instance(new_type)
+
+    if existing is None or new is None:
+        detail = None
+        if existing_type is not None or new_type is not None:
+            detail = f"{existing_type!r} -> {new_type!r}"
+        return detail, None
+
+    detail = f"{existing} -> {new}"
+
+    existing_affinity = existing._type_affinity
+    new_affinity = new._type_affinity
+    if existing_affinity is not new_affinity:
+        # a change of affinity may or may not round-trip; a reviewer
+        # should look at the two types rather than be told it is safe
+        return detail, None
+
+    existing_length = getattr(existing, "length", None)
+    new_length = getattr(new, "length", None)
+    if existing_length is not None and new_length is not None:
+        return detail, new_length < existing_length
+    elif existing_length is None and new_length is not None:
+        # an unbounded type is being made bounded; values may be truncated
+        return detail, True
+    elif existing_length is not None and new_length is None:
+        return detail, False
+
+    existing_precision = getattr(existing, "precision", None)
+    new_precision = getattr(new, "precision", None)
+    if existing_precision is not None and new_precision is not None:
+        if new_precision < existing_precision:
+            return detail, True
+        elif new_precision > existing_precision:
+            return detail, False
+        else:
+            existing_scale = getattr(existing, "scale", None)
+            new_scale = getattr(new, "scale", None)
+            if existing_scale is not None and new_scale is not None:
+                return detail, new_scale < existing_scale
+            else:
+                return detail, False
+
+    if type(existing) is type(new):
+        return detail, False
+
+    # same affinity but a different type class and no size information
+    # to compare, e.g. Integer vs. BigInteger
+    return detail, None
+
+
+def _alter_column_impacts(op: AlterColumnOp) -> list[DataImpact]:
+    impacts = []
+
+    if op.modify_name is not None and op.modify_name != op.column_name:
+        impacts.append(
+            DataImpact.for_column(
+                DataImpactType.RENAME_COLUMN,
+                op.table_name,
+                op.column_name,
+                schema=op.schema,
+                new_name=op.modify_name,
+            )
+        )
+
+    if op.modify_type is not None:
+        detail, loses_data = _type_detail(op.existing_type, op.modify_type)
+        impacts.append(
+            DataImpact.for_column(
+                DataImpactType.ALTER_COLUMN_TYPE,
+                op.table_name,
+                op.column_name,
+                schema=op.schema,
+                loses_data=loses_data,
+                detail=detail,
+            )
+        )
+
+    if op.modify_nullable is not None:
+        impacts.append(
+            DataImpact.for_column(
+                DataImpactType.ALTER_COLUMN_NULLABILITY,
+                op.table_name,
+                op.column_name,
+                schema=op.schema,
+                detail=(
+                    "nullability -> %s"
+                    % ("NULL" if op.modify_nullable else "NOT NULL")
+                ),
+            )
+        )
+
+    if op.modify_server_default is not False:
+        impacts.append(
+            DataImpact.for_column(
+                DataImpactType.ALTER_COLUMN_DEFAULT,
+                op.table_name,
+                op.column_name,
+                schema=op.schema,
+            )
+        )
+
+    if op.modify_comment is not False:
+        impacts.append(
+            DataImpact.for_column(
+                DataImpactType.ALTER_COLUMN_COMMENT,
+                op.table_name,
+                op.column_name,
+                schema=op.schema,
+            )
+        )
+
+    return impacts
+
+
+def _create_table_impacts(op: CreateTableOp) -> list[DataImpact]:
+    return [
+        DataImpact.for_table(
+            DataImpactType.CREATE_TABLE, op.table_name, schema=op.schema
+        )
+    ]
+
+
+def _drop_table_impacts(op: DropTableOp) -> list[DataImpact]:
+    column_names = [
+        col.name
+        for col in (op._reverse.columns if op._reverse is not None else ())
+        if getattr(col, "name", None) is not None
+    ]
+    detail = (
+        "columns: %s" % ", ".join(column_names) if column_names else None
+    )
+    return [
+        DataImpact.for_table(
+            DataImpactType.DROP_TABLE,
+            op.table_name,
+            schema=op.schema,
+            detail=detail,
+        )
+    ]
+
+
+def _rename_table_impacts(op: RenameTableOp) -> list[DataImpact]:
+    return [
+        DataImpact.for_table(
+            DataImpactType.RENAME_TABLE,
+            op.table_name,
+            schema=op.schema,
+            new_name=op.new_table_name,
+        )
+    ]
+
+
+def _add_column_impacts(op: AddColumnOp) -> list[DataImpact]:
+    return [
+        DataImpact.for_column(
+            DataImpactType.ADD_COLUMN,
+            op.table_name,
+            op.column.name,
+            schema=op.schema,
+        )
+    ]
+
+
+def _drop_column_impacts(op: DropColumnOp) -> list[DataImpact]:
+    return [
+        DataImpact.for_column(
+            DataImpactType.DROP_COLUMN,
+            op.table_name,
+            op.column_name,
+            schema=op.schema,
+        )
+    ]
+
+
+def _add_constraint_impacts(
+    op: AddConstraintOp | DropConstraintOp,
+    type_: DataImpactType,
+) -> list[DataImpact]:
+    table_name = getattr(op, "table_name", None)
+    if table_name is None:
+        table_name = getattr(op, "source_table", None)
+    schema = getattr(op, "schema", None)
+    if schema is None:
+        schema = getattr(op, "source_schema", None)
+
+    constraint_type = getattr(op, "constraint_type", None)
+
+    if getattr(op, "local_cols", None):
+        columns = [
+            str(col)
+            for col in op.local_cols  # type: ignore[attr-defined]
+        ]
+    else:
+        columns = [
+            str(col)
+            for col in getattr(op, "columns", ())
+            if col is not None
+        ]
+
+    detail_parts = []
+    if constraint_type:
+        detail_parts.append(str(constraint_type))
+    if columns:
+        detail_parts.append("columns: %s" % ", ".join(dict.fromkeys(columns)))
+
+    return [
+        DataImpact.for_table(
+            type_,
+            table_name,
+            schema=schema,
+            detail="; ".join(detail_parts) or None,
+        )
+    ]
+
+
+def _create_index_impacts(op: CreateIndexOp) -> list[DataImpact]:
+    return [
+        DataImpact.for_table(
+            DataImpactType.CREATE_INDEX,
+            op.table_name,
+            schema=op.schema,
+            detail="index: %s" % op.index_name if op.index_name else None,
+        )
+    ]
+
+
+def _drop_index_impacts(op: DropIndexOp) -> list[DataImpact]:
+    return [
+        DataImpact.for_table(
+            DataImpactType.DROP_INDEX,
+            op.table_name,
+            schema=op.schema,
+            detail="index: %s" % op.index_name if op.index_name else None,
+        )
+    ]
+
+
+def _table_comment_impacts(
+    op: CreateTableCommentOp | DropTableCommentOp,
+) -> list[DataImpact]:
+    return [
+        DataImpact.for_table(
+            DataImpactType.TABLE_COMMENT, op.table_name, schema=op.schema
+        )
+    ]
+
+
+def _bulk_insert_impacts(op: BulkInsertOp) -> list[DataImpact]:
+    return [
+        DataImpact.for_table(
+            DataImpactType.INSERT_ROWS,
+            getattr(op.table, "name", None),
+            schema=getattr(op.table, "schema", None),
+            detail="%d row(s)" % len(op.rows),
+        )
+    ]
+
+
+def _execute_sql_impacts(op: ExecuteSQLOp) -> list[DataImpact]:
+    sqltext = op.sqltext
+    if not isinstance(sqltext, str):
+        sqltext = str(sqltext)
+    detail = " ".join(sqltext.split())
+    if len(detail) > 60:
+        detail = detail[:57] + "..."
+    return [
+        DataImpact(
+            DataImpactType.UNKNOWN,
+            None,
+            detail=detail or None,
+        )
+    ]
+
+
+_impact_handlers: dict[type[Any], Callable[..., list[DataImpact]]] = {
+    CreateTableOp: _create_table_impacts,
+    DropTableOp: _drop_table_impacts,
+    RenameTableOp: _rename_table_impacts,
+    AddColumnOp: _add_column_impacts,
+    DropColumnOp: _drop_column_impacts,
+    AlterColumnOp: _alter_column_impacts,
+    CreateIndexOp: _create_index_impacts,
+    DropIndexOp: _drop_index_impacts,
+    CreateTableCommentOp: _table_comment_impacts,
+    DropTableCommentOp: _table_comment_impacts,
+    BulkInsertOp: _bulk_insert_impacts,
+    ExecuteSQLOp: _execute_sql_impacts,
+}
+
+
+def _builtin_impact_handler(
+    op: MigrateOperation,
+) -> Callable[..., list[DataImpact]] | None:
+    for cls in type(op).__mro__:
+        handler = _impact_handlers.get(cls)
+        if handler is not None:
+            return handler
+    if isinstance(op, AddConstraintOp):
+        return functools.partial(
+            _add_constraint_impacts, type_=DataImpactType.ADD_CONSTRAINT
+        )
+    elif isinstance(op, DropConstraintOp):
+        return functools.partial(
+            _add_constraint_impacts, type_=DataImpactType.DROP_CONSTRAINT
+        )
+    else:
+        return None
+
+
+def _declares_data_impact(op: MigrateOperation) -> bool:
+    return type(op).data_impact is not MigrateOperation.data_impact
+
+
+def _apply_defaults(
+    impacts: list[DataImpact],
+    default_table: str | None,
+    default_schema: str | None,
+) -> list[DataImpact]:
+    """Fill in table/schema on impacts where the operation did not
+    provide them, using the enclosing batch container's values."""
+    if default_table is None and default_schema is None:
+        return impacts
+
+    patched: list[DataImpact] = []
+    for impact in impacts:
+        table = impact.table if impact.table is not None else default_table
+        schema = (
+            impact.schema if impact.schema is not None else default_schema
+        )
+        if table is impact.table and schema is impact.schema:
+            patched.append(impact)
+        else:
+            patched.append(
+                DataImpact(
+                    impact.type,
+                    table,
+                    schema=schema,
+                    column=impact.column,
+                    new_name=impact.new_name,
+                    loses_data=impact.loses_data,
+                    detail=impact.detail,
+                )
+            )
+    return patched
+
+
+def _operation_impacts(
+    op: MigrateOperation,
+    default_table: str | None = None,
+    default_schema: str | None = None,
+) -> list[DataImpact]:
+    handler = _builtin_impact_handler(op)
+    if handler is not None:
+        return _apply_defaults(handler(op), default_table, default_schema)
+
+    table = getattr(op, "table_name", None) or default_table
+    schema = getattr(op, "schema", None) or default_schema
+    column = getattr(op, "column_name", None)
+    if column is None:
+        column_obj = getattr(op, "column", None)
+        column = getattr(column_obj, "name", None)
+
+    return [
+        DataImpact(
+            DataImpactType.UNKNOWN,
+            table,
+            schema=schema,
+            column=column,
+            detail=type(op).__name__,
+        )
+    ]
+
+
+def _collect_impacts(
+    op: MigrateOperation,
+    default_table: str | None = None,
+    default_schema: str | None = None,
+) -> list[DataImpact]:
+    if _declares_data_impact(op):
+        declared = op.data_impact()
+        if declared is not None:
+            return list(declared)
+
+    if isinstance(op, ModifyTableOps):
+        table = op.table_name if op.table_name is not None else default_table
+        schema = op.schema if op.schema is not None else default_schema
+        impacts: list[DataImpact] = []
+        for child in op.ops:
+            impacts.extend(_collect_impacts(child, table, schema))
+        return impacts
+    elif isinstance(op, OpContainer):
+        impacts = []
+        for child in op.ops:
+            impacts.extend(
+                _collect_impacts(child, default_table, default_schema)
+            )
+        return impacts
+    else:
+        return _operation_impacts(op, default_table, default_schema)
+
+
+def _direction_from_containers(
+    name: str,
+    containers: Sequence[OpContainer],
+) -> DataImpactDirection:
+    impacts: list[DataImpact] = []
+    for container in containers:
+        impacts.extend(_collect_impacts(container))
+    return DataImpactDirection(
+        name, tuple(impacts), provided=bool(containers)
+    )
+
+
+def inspect_data_impact(subject: Any) -> DataImpactReport:
+    """Produce a read-only report of the data impact of a migration.
+
+    Given a :class:`.MigrationScript`, an operation container such as
+    :class:`.UpgradeOps`, :class:`.DowngradeOps` or
+    :class:`.ModifyTableOps`, or a single :class:`.MigrateOperation`,
+    return a :class:`.DataImpactReport` that lists, separately for the
+    ``upgrade`` and ``downgrade`` directions, the tables, columns and
+    :class:`.DataImpactType` categories affected.
+
+    The inspection does not modify the operation tree, invoke any
+    operation, or render SQL.  The same objects may afterwards be passed
+    to :func:`.render_python_code`, run through an
+    :class:`.Operations` instance, or otherwise used exactly as before;
+    the report is purely descriptive.
+
+    Operations nested inside batch / table containers such as
+    :class:`.ModifyTableOps` are expanded so that each individual
+    directive is reported, rather than the container as a whole.  A
+    rename is reported with :attr:`.DataImpact.new_name` set, indicating
+    an identity change in which stored values are retained.
+
+    For operations whose impact Alembic does not know, including custom
+    operations that do not declare one, the category
+    :attr:`.DataImpactType.UNKNOWN` is used and
+    :attr:`.DataImpact.loses_data` is ``None``, which a reviewer should
+    treat conservatively as possible data loss.  Custom operations may
+    declare their own impact by overriding
+    :meth:`.MigrateOperation.data_impact`.
+
+    :param subject: a :class:`.MigrationScript`, an
+     :class:`.OpContainer`, or a single :class:`.MigrateOperation`.
+    :return: a :class:`.DataImpactReport`.
+
+    .. versionadded:: 1.20.2
+
+    .. seealso::
+
+        :ref:`data_impact`
+
+    """
+    if isinstance(subject, MigrationScript):
+        upgrade_direction = _direction_from_containers(
+            "upgrade", subject.upgrade_ops_list
+        )
+        downgrade_direction = _direction_from_containers(
+            "downgrade", subject.downgrade_ops_list
+        )
+        return DataImpactReport(upgrade_direction, downgrade_direction)
+    elif isinstance(subject, UpgradeOps):
+        upgrade_direction = _direction_from_containers("upgrade", [subject])
+        downgrade_direction = DataImpactDirection(
+            "downgrade", (), provided=False
+        )
+        return DataImpactReport(upgrade_direction, downgrade_direction)
+    elif isinstance(subject, DowngradeOps):
+        upgrade_direction = DataImpactDirection(
+            "upgrade", (), provided=False
+        )
+        downgrade_direction = _direction_from_containers(
+            "downgrade", [subject]
+        )
+        return DataImpactReport(upgrade_direction, downgrade_direction)
+    elif isinstance(subject, OpContainer):
+        upgrade_direction = _direction_from_containers("upgrade", [subject])
+        downgrade_direction = DataImpactDirection(
+            "downgrade", (), provided=False
+        )
+        return DataImpactReport(upgrade_direction, downgrade_direction)
+    elif isinstance(subject, MigrateOperation):
+        upgrade_direction = DataImpactDirection(
+            "upgrade", tuple(_collect_impacts(subject)), provided=True
+        )
+        downgrade_direction = DataImpactDirection(
+            "downgrade", (), provided=False
+        )
+        return DataImpactReport(upgrade_direction, downgrade_direction)
+    else:
+        raise TypeError(
+            "inspect_data_impact() expects a MigrationScript, an "
+            "OpContainer, or a MigrateOperation; got %r" % (subject,)
+        )

@@ -199,6 +199,46 @@ def produce_migrations(
     return migration_script
 
 
+def inspect_data_impact(subject: Any) -> ops.DataImpactReport:
+    """Produce a read-only report of the data impact of a migration.
+
+    Accepts a :class:`.MigrationScript`, an operation container such as
+    :class:`.UpgradeOps`, :class:`.DowngradeOps` or
+    :class:`.ModifyTableOps`, or a single :class:`.MigrateOperation`, and
+    returns a :class:`.DataImpactReport`.  The report lists, separately
+    for the ``upgrade`` and ``downgrade`` directions, the tables, columns
+    and :class:`.DataImpactType` categories affected, including whether a
+    direction may discard original values.
+
+    Nested ``batch`` / table containers are expanded so that each
+    directive within them is reported; renames are reported as identity
+    changes; custom operations may declare their own impact by overriding
+    :meth:`.MigrateOperation.data_impact`, and operations that do not are
+    reported as :attr:`.DataImpactType.UNKNOWN`.
+
+    This function is purely descriptive: it does not modify the
+    operation tree, and the same objects may subsequently be passed to
+    :func:`.render_python_code` or executed with an
+    :class:`.Operations` instance to produce exactly the SQL or script
+    the original operations describe.
+
+    This is a convenience re-export of
+    :func:`.alembic.operations.inspect_data_impact`.
+
+    :param subject: a :class:`.MigrationScript`, an
+     :class:`.OpContainer`, or a single :class:`.MigrateOperation`.
+    :return: a :class:`.DataImpactReport`.
+
+    .. versionadded:: 1.20.2
+
+    .. seealso::
+
+        :ref:`data_impact`
+
+    """
+    return ops.inspect_data_impact(subject)
+
+
 def render_python_code(
     up_or_down_op: UpgradeOps | DowngradeOps,
     sqlalchemy_module_prefix: str = "sa.",
