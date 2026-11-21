@@ -1,3 +1,4 @@
+import functools
 import unittest
 from collections.abc import Callable
 
@@ -961,6 +962,254 @@ class CacheMethodTest(unittest.TestCase, MethodDecoratorTestMixin):
         self.assertEqual(Keyword.get_self(cached, self=2), 2)
         self.assertIn(keys.methodkey(cached, self=1), cached.cache)
         self.assertEqual(len(cached.cache), 2)
+
+    def test_decorator_evict(self):
+        cache = self.cache(2)
+        cached = Cached(cache)
+
+        # nothing cached yet, so nothing is evicted
+        self.assertFalse(cached.get.cache_evict(0))
+        self.assertEqual(cached.get(0), 0)
+        self.assertEqual(len(cache), 1)
+        # invalidating uses the same key as a real call
+        self.assertTrue(cached.get.cache_evict(0))
+        self.assertEqual(len(cache), 0)
+        self.assertFalse(cached.get.cache_evict(0))
+        # the next call evaluates the wrapped method again
+        self.assertEqual(cached.get(0), 1)
+
+    def test_decorator_evict_lock(self):
+        cache = self.cache(2)
+        cached = Cached(cache)
+
+        self.assertEqual(cached.get_lock(0), 0)
+        self.assertEqual(cached.lock.count, 2)
+        self.assertTrue(cached.get_lock.cache_evict(0))
+        self.assertEqual(cached.lock.count, 3)
+        self.assertFalse(cached.get_lock.cache_evict(0))
+        self.assertEqual(cached.lock.count, 4)
+        self.assertEqual(len(cache), 0)
+
+    def test_decorator_evict_cond(self):
+        cache = self.cache(2)
+        cached = Cached(cache)
+
+        self.assertEqual(cached.get_cond(0), 0)
+        self.assertEqual(cached.cond.count, 3)
+        self.assertTrue(cached.get_cond.cache_evict(0))
+        self.assertEqual(cached.cond.count, 4)
+        self.assertFalse(cached.get_cond.cache_evict(0))
+        self.assertEqual(cached.cond.count, 5)
+
+    def test_decorator_evict_info(self):
+        cache = self.cache(2)
+        cached = Cached(cache)
+        wrapper = cached.get_info
+
+        maxsize = cache.maxsize if isinstance(cache, Cache) else None
+        self.assertEqual(wrapper(0), 0)
+        self.assertEqual(wrapper.cache_info(), (0, 1, maxsize, 1))
+        self.assertTrue(wrapper.cache_evict(0))
+        # statistics are retained when a single entry is evicted
+        self.assertEqual(wrapper.cache_info(), (0, 1, maxsize, 0))
+        self.assertFalse(wrapper.cache_evict(0))
+
+    def test_decorator_evict_lock_info(self):
+        cache = self.cache(2)
+        cached = Cached(cache)
+
+        self.assertEqual(cached.get_lock_info(0), 0)
+        self.assertEqual(cached.lock.count, 2)
+        self.assertTrue(cached.get_lock_info.cache_evict(0))
+        self.assertEqual(cached.lock.count, 3)
+        self.assertFalse(cached.get_lock_info.cache_evict(0))
+        self.assertEqual(cached.lock.count, 4)
+
+    def test_decorator_evict_cond_info(self):
+        cache = self.cache(2)
+        cached = Cached(cache)
+
+        self.assertEqual(cached.get_cond_info(0), 0)
+        self.assertEqual(cached.cond.count, 3)
+        self.assertTrue(cached.get_cond_info.cache_evict(0))
+        self.assertEqual(cached.cond.count, 4)
+        self.assertFalse(cached.get_cond_info.cache_evict(0))
+        self.assertEqual(cached.cond.count, 5)
+
+
+class BindModeTest(unittest.TestCase):
+    class Service:
+        def __init__(self, cache):
+            self.cache = cache
+            self.calls = []
+
+        def _record(self, name, *args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            return (name,) + args + tuple(sorted(kwargs.items()))
+
+        @cachedmethod(lambda self: self.cache, bind=True)
+        def query(self, a, b=2, *, c=3):
+            return self._record("query", a, b, c=c)
+
+        @cachedmethod(lambda self: self.cache, bind=True)
+        def search(self, a, b=2, *, c=3):
+            return self._record("search", a, b, c=c)
+
+        @cachedmethod(lambda self: self.cache, bind=True, info=True)
+        def query_info(self, a, b=2, *, c=3):
+            return self._record("query_info", a, b, c=c)
+
+        @cachedmethod(lambda self: self.cache)
+        def raw(self, a):
+            return self._record("raw", a)
+
+        @cachedmethod(
+            lambda self: self.cache,
+            key=functools.partial(keys.methodkey, "custom"),
+        )
+        def custom(self, a):
+            return self._record("custom", a)
+
+    def test_normalized_calls_share_one_entry(self):
+        service = self.Service(Cache(maxsize=10))
+
+        result = service.query(1)
+        # explicit defaults, default omitted and positional vs. keyword
+        self.assertEqual(service.query(1, 2, c=3), result)
+        self.assertEqual(service.query(a=1), result)
+        self.assertEqual(service.query(1, 2), result)
+        self.assertEqual(service.query(1, c=3), result)
+        self.assertEqual(len(service.calls), 1)
+        self.assertEqual(len(service.cache), 1)
+
+    def test_receiver_is_excluded(self):
+        cache = Cache(maxsize=10)
+        first = self.Service(cache)
+        second = self.Service(cache)
+
+        self.assertEqual(first.query(1), second.query(1))
+        self.assertEqual(len(first.calls), 1)
+        self.assertEqual(len(second.calls), 0)
+        self.assertEqual(len(cache), 1)
+
+    def test_evict_with_real_call_arguments(self):
+        service = self.Service(Cache(maxsize=10))
+        result = service.query(1)
+        self.assertEqual(len(service.calls), 1)
+
+        # every equivalent call style locates the same single entry
+        self.assertTrue(service.query.cache_evict(a=1))
+        self.assertFalse(service.query.cache_evict(1, 2, c=3))
+        self.assertEqual(len(service.cache), 0)
+
+        # the next real call evaluates the wrapped method again
+        self.assertEqual(service.query(1), result)
+        self.assertEqual(len(service.calls), 2)
+
+    def test_shared_cache_keeps_the_other_method(self):
+        cache = Cache(maxsize=10)
+        service = self.Service(cache)
+
+        query_result = service.query(1)
+        search_result = service.search(1)
+        self.assertEqual(len(cache), 2)
+
+        # evicting one method's entry must not touch the other method
+        self.assertTrue(service.query.cache_evict(1))
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(list(cache.values()), [search_result])
+        self.assertEqual(service.search(1), search_result)  # still a hit
+        self.assertEqual(len(service.calls), 2)
+
+        # the next real evaluation lands back in the evicted method
+        self.assertEqual(service.query(1), query_result)
+        self.assertEqual(service.calls[-1], ("query", (1, 2), {"c": 3}))
+        self.assertEqual(len(cache), 2)
+
+    def test_similar_signatures_are_namespaced(self):
+        service = self.Service(Cache(maxsize=10))
+
+        self.assertNotEqual(service.query.cache_key(1), service.search.cache_key(1))
+        self.assertEqual(service.query(1)[0], "query")
+        self.assertEqual(service.search(1)[0], "search")
+        self.assertEqual(len(service.cache), 2)
+
+    def test_instances_and_signatures_together(self):
+        cache = Cache(maxsize=10)
+        first = self.Service(cache)
+        second = self.Service(cache)
+
+        first.query(1)
+        second.query(1)  # shared across instances
+        first.search(1)
+        self.assertEqual(len(cache), 2)
+
+        first.query.cache_evict(1)
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(next(iter(cache.values()))[0], "search")
+        # re-evaluation happens on the method whose entry was evicted
+        self.assertEqual(second.query(1)[0], "query")
+        self.assertEqual(len(second.calls), 1)
+        self.assertEqual(second.search(1)[0], "search")
+        self.assertEqual(len(second.calls), 1)
+
+    def test_default_key_mode_is_unchanged(self):
+        service = self.Service(Cache(maxsize=10))
+
+        service.raw(1)
+        # raw methodkey does not normalize, matching the historical behavior
+        self.assertIn(keys.methodkey(service, 1), service.cache)
+        self.assertTrue(service.raw.cache_evict(1))
+        self.assertEqual(len(service.cache), 0)
+
+    def test_custom_key_keeps_its_own_rules(self):
+        service = self.Service(Cache(maxsize=10))
+        expected = functools.partial(keys.methodkey, "custom")
+
+        service.custom(1)
+        self.assertIn(expected(service, 1), service.cache)
+        self.assertTrue(service.custom.cache_evict(1))
+        self.assertEqual(len(service.cache), 0)
+
+    def test_bind_with_custom_key_is_invalid(self):
+        with self.assertRaisesRegex(TypeError, "mutually exclusive"):
+
+            class Invalid:
+                @cachedmethod(
+                    lambda self: self.cache,
+                    key=keys.typedmethodkey,
+                    bind=True,
+                )
+                def get(self, value):
+                    return value
+
+    def test_bind_without_receiver_is_invalid(self):
+        with self.assertRaisesRegex(TypeError, "receiver parameter"):
+
+            class Invalid:
+                @cachedmethod(lambda self: self.cache, bind=True)  # type: ignore
+                def ping():
+                    return "pong"
+
+    def test_variadic_arguments(self):
+        class Variadic:
+            def __init__(self):
+                self.cache = Cache(maxsize=10)
+                self.count = 0
+
+            @cachedmethod(lambda self: self.cache, bind=True)
+            def get(self, *args, **kwargs):
+                self.count += 1
+                return args, kwargs
+
+        service = Variadic()
+        result = service.get(1, 2, z=3, y=4)
+        # keyword order is normalized away
+        self.assertEqual(service.get(1, 2, y=4, z=3), result)
+        self.assertEqual(service.count, 1)
+        self.assertTrue(service.get.cache_evict(1, 2, z=3, y=4))
+        self.assertEqual(service.get(1, 2, y=4, z=3), result)
+        self.assertEqual(service.count, 2)
 
 
 class DictMethodTest(unittest.TestCase, MethodDecoratorTestMixin):

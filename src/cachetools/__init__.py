@@ -874,7 +874,9 @@ def cached(cache, key=keys.hashkey, lock=None, condition=None, info=False):
     return decorator
 
 
-def cachedmethod(cache, key=keys.methodkey, lock=None, condition=None, info=False):
+def cachedmethod(
+    cache, key=keys.methodkey, lock=None, condition=None, info=False, bind=False
+):
     """Decorator to wrap a method with a memoizing callable that saves
     results in a cache.
 
@@ -885,7 +887,12 @@ def cachedmethod(cache, key=keys.methodkey, lock=None, condition=None, info=Fals
         raise TypeError("cache must be callable")
 
     def decorator(method):
+        make_key = key
+        if bind:
+            if make_key is not keys.methodkey:
+                raise TypeError("bind and a custom key function are mutually exclusive")
+            make_key = keys.boundkey(method, getattr(method, "__qualname__", None))
         make_info = CacheInfo._make_info if info else None
-        return _wrapper(method, cache, key, lock, condition, make_info)
+        return _wrapper(method, cache, make_key, lock, condition, make_info)
 
     return decorator

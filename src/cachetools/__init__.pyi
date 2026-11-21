@@ -180,6 +180,7 @@ class _cached_wrapper(Generic[_P, _R]):
     ) -> _cached_wrapper[_P, _R]: ...
     def __call__(self, /, *args: _P.args, **kwargs: _P.kwargs) -> _R: ...
     def cache_clear(self) -> None: ...
+    def cache_evict(self, /, *args: _P.args, **kwargs: _P.kwargs) -> bool: ...
 
 @type_check_only
 class _cached_wrapper_info(_cached_wrapper[_P, _R]):
@@ -264,6 +265,7 @@ class _cachedmethod_wrapper(Generic[_P, _R]):
     ) -> _cachedmethod_wrapper[_P, _R]: ...
     def __call__(self, /, *args: _P.args, **kwargs: _P.kwargs) -> _R: ...
     def cache_clear(self) -> None: ...
+    def cache_evict(self, /, *args: _P.args, **kwargs: _P.kwargs) -> bool: ...
 
 @type_check_only
 class _cachedmethod_wrapper_info(_cachedmethod_wrapper[_P, _R]):
@@ -285,6 +287,7 @@ def cachedmethod(
     condition: Callable[[Any], _AbstractCondition] | None = None,
     *,
     info: Literal[True],
+    bind: bool = ...,
 ) -> Callable[
     [Callable[Concatenate[Any, _P], _R]], _cachedmethod_wrapper_info[_P, _R]
 ]: ...
@@ -295,6 +298,7 @@ def cachedmethod(
     lock: Callable[[Any], AbstractContextManager[Any]] | None = None,
     condition: Callable[[Any], _AbstractCondition] | None = None,
     info: Literal[False] = ...,
+    bind: bool = ...,
 ) -> Callable[[Callable[Concatenate[Any, _P], _R]], _cachedmethod_wrapper[_P, _R]]: ...
 @overload
 def cachedmethod(
@@ -303,6 +307,7 @@ def cachedmethod(
     lock: Callable[[Any], AbstractContextManager[Any]] | None,
     condition: Callable[[Any], _AbstractCondition] | None,
     info: Literal[True],
+    bind: bool = ...,
 ) -> Callable[
     [Callable[Concatenate[Any, _P], _R]], _cachedmethod_wrapper_info[_P, _R]
 ]: ...

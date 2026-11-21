@@ -255,6 +255,81 @@ class DecoratorTestMixin(SimplifiedTestCaseProtocol):
         self.assertEqual(len(cache), 0)
         self.assertEqual(lock.count, 4)
 
+    def test_decorator_evict(self):
+        cache = self.cache(2)
+        wrapper = cachetools.cached(cache)(self.func)
+
+        self.assertFalse(wrapper.cache_evict(0))  # nothing cached yet
+        self.assertEqual(wrapper(0), 0)
+        self.assertEqual(len(cache), 1)
+        self.assertTrue(wrapper.cache_evict(0))
+        self.assertEqual(len(cache), 0)
+        # a cached None value must not be mistaken for a missing entry
+        self.assertEqual(wrapper(None), 1)
+        self.assertTrue(wrapper.cache_evict(None))
+        self.assertFalse(wrapper.cache_evict(None))
+
+    def test_decorator_evict_lock(self):
+        cache = self.cache(2)
+        lock = CountedLock()
+        wrapper = cachetools.cached(cache, lock=lock)(self.func)
+
+        self.assertEqual(wrapper(0), 0)
+        self.assertEqual(lock.count, 2)
+        self.assertTrue(wrapper.cache_evict(0))
+        self.assertEqual(lock.count, 3)
+        self.assertFalse(wrapper.cache_evict(0))
+        self.assertEqual(lock.count, 4)
+        self.assertEqual(len(cache), 0)
+
+    def test_decorator_evict_cond(self):
+        cache = self.cache(2)
+        lock = cond = CountedCondition()
+        wrapper = cachetools.cached(cache, condition=cond)(self.func)
+
+        self.assertEqual(wrapper(0), 0)
+        self.assertEqual(lock.count, 3)
+        self.assertTrue(wrapper.cache_evict(0))
+        self.assertEqual(lock.count, 4)
+        self.assertFalse(wrapper.cache_evict(0))
+        self.assertEqual(lock.count, 5)
+
+    def test_decorator_evict_info(self):
+        cache = self.cache(2)
+        wrapper = cachetools.cached(cache, info=True)(self.func)
+
+        self.assertEqual(wrapper(0), 0)
+        maxsize = cache.maxsize if isinstance(cache, cachetools.Cache) else None
+        self.assertEqual(wrapper.cache_info(), (0, 1, maxsize, 1))
+        # eviction removes the entry but leaves the statistics untouched
+        self.assertTrue(wrapper.cache_evict(0))
+        self.assertEqual(wrapper.cache_info(), (0, 1, maxsize, 0))
+        self.assertFalse(wrapper.cache_evict(0))
+
+    def test_decorator_evict_lock_info(self):
+        cache = self.cache(2)
+        lock = CountedLock()
+        wrapper = cachetools.cached(cache, lock=lock, info=True)(self.func)
+
+        self.assertEqual(wrapper(0), 0)
+        self.assertEqual(lock.count, 2)
+        self.assertTrue(wrapper.cache_evict(0))
+        self.assertEqual(lock.count, 3)
+        self.assertFalse(wrapper.cache_evict(0))
+        self.assertEqual(lock.count, 4)
+
+    def test_decorator_evict_cond_info(self):
+        cache = self.cache(2)
+        lock = cond = CountedCondition()
+        wrapper = cachetools.cached(cache, condition=cond, info=True)(self.func)
+
+        self.assertEqual(wrapper(0), 0)
+        self.assertEqual(lock.count, 3)
+        self.assertTrue(wrapper.cache_evict(0))
+        self.assertEqual(lock.count, 4)
+        self.assertFalse(wrapper.cache_evict(0))
+        self.assertEqual(lock.count, 5)
+
 
 class CacheWrapperTest(unittest.TestCase, DecoratorTestMixin):
     def cache(self, minsize):
@@ -537,6 +612,9 @@ class CustomCacheTest(unittest.TestCase, DecoratorTestMixin):
 
         def setdefault(self, key, value=None):
             return self.__data.setdefault(key, value)
+
+        def pop(self, key, default=None):
+            return self.__data.pop(key, default)
 
         def clear(self):
             self.__data.clear()

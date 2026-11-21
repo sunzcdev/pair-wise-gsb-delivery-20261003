@@ -413,6 +413,32 @@ often called with the same arguments:
       # no need for get_pep.cache_lock here
       get_pep.cache_clear()
 
+   Likewise, :meth:`cache_evict` removes a single cached result.  It
+   takes the same arguments as a call to the wrapped function, derives
+   the corresponding cache key and handles locking automatically,
+   returning :const:`True` if an entry was removed and :const:`False`
+   if there was nothing to evict:
+
+   .. doctest::
+
+      >>> @cached(cache={})
+      ... def square(number):
+      ...     print("computing")
+      ...     return number * number
+
+      >>> square(4)
+      computing
+      16
+      >>> square(4)
+      16
+      >>> square.cache_evict(4)
+      True
+      >>> square.cache_evict(4)
+      False
+      >>> square(4)
+      computing
+      16
+
    If `info` is set to :const:`True`, the wrapped function is
    instrumented with a :meth:`cache_info()` function that returns a
    :class:`CacheInfo` instance, a named tuple with fields `hits`,
@@ -557,7 +583,7 @@ often called with the same arguments:
       supported, and now raises a :exc:`TypeError`.
 
 
-.. decorator:: cachedmethod(cache, key=cachetools.keys.methodkey, lock=None, condition=None, info=False)
+.. decorator:: cachedmethod(cache, key=cachetools.keys.methodkey, lock=None, condition=None, info=False, bind=False)
 
    Decorator to wrap an instance method with a memoizing callable that
    saves results in a cache.
@@ -707,6 +733,81 @@ often called with the same arguments:
    :func:`~cachetools.keys.methodkey` skipping its initial `self`
    argument.
 
+   As described for the :func:`cached` decorator below, the default
+   key function treats positional and keyword arguments, as well as
+   explicitly passed and defaulted values, as distinct calls.  Setting
+   the optional `bind` flag to :const:`True` changes this:  arguments
+   are then bound to the wrapped method's signature and normalized into
+   a single cache key, so calls that Python considers equivalent share
+   one result.  The receiver is excluded from the key, while the
+   method's qualified name is included, keeping the entries of distinct
+   methods apart even when they share one cache:
+
+   .. doctest::
+
+      >>> class Service:
+      ...     def __init__(self, cache):
+      ...         self.cache = cache
+      ...         self.count = 0
+      ...
+      ...     @cachedmethod(lambda self: self.cache, bind=True)
+      ...     def query(self, value, flag=True):
+      ...         self.count += 1
+      ...         return (value, flag)
+      ...
+      ...     @cachedmethod(lambda self: self.cache, bind=True)
+      ...     def search(self, value, flag=True):
+      ...         self.count += 1
+      ...         return ("search", value, flag)
+
+      >>> cache = LRUCache(maxsize=10)
+      >>> service = Service(cache)
+      >>> service.query(1)
+      (1, True)
+      >>> # explicit default, omitted default, and keyword forms
+      >>> service.query(1, True) == service.query(1) == service.query(value=1)
+      True
+      >>> service.count
+      1
+
+   Because the key is built exactly as for a real call, individual
+   results can be invalidated through the wrapper's
+   :meth:`cache_evict` method with the same arguments, returning
+   :const:`True` when an entry was removed and :const:`False`
+   otherwise.  The next call then evaluates the wrapped method again:
+
+   .. doctest::
+
+      >>> service.query.cache_evict(1)
+      True
+      >>> service.query.cache_evict(value=1)
+      False
+      >>> service.query(1)
+      (1, True)
+      >>> service.count
+      2
+
+   Eviction only ever affects the method it is called on, so an entry
+   stored by another method in the same cache is preserved:
+
+   .. doctest::
+
+      >>> service.search(1)
+      ('search', 1, True)
+      >>> len(cache)
+      2
+      >>> service.query.cache_evict(1)
+      True
+      >>> len(cache)
+      1
+      >>> next(iter(cache.values()))
+      ('search', 1, True)
+
+   Note that `bind` cannot be combined with a custom `key` function;
+   doing so raises a :exc:`TypeError`.  Methods providing their own
+   `key` keep using it unchanged, and :meth:`cache_evict` still removes
+   the entry selected by that key.
+
    .. versionchanged:: 7.0
 
       Added the `info` option for reporting per-instance cache
@@ -733,6 +834,12 @@ often called with the same arguments:
       Using :func:`cachedmethod` with an instance that does not
       provide a mutable :attr:`__dict__` attribute is no longer
       supported, and now raises a :exc:`TypeError`.
+
+   .. versionadded:: 8.1
+
+      Added the `bind` option for signature-based key normalization and
+      the :meth:`cache_evict` method for invalidating individual cached
+      results.
 
 .. autoclass:: CacheInfo
 

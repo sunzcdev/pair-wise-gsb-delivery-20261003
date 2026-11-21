@@ -11,6 +11,10 @@ valid combinations of parameters lock, condition and info.
 __all__ = ()
 
 
+# Sentinel distinguishing a missing cache entry from a cached None value.
+_MISSING = object()
+
+
 class _BasicMixin:
     def __init__(self, func):
         self.__func = func
@@ -32,6 +36,10 @@ class _BasicMixin:
 
     def cache_clear(self):
         self.cache.clear()
+
+    def cache_evict(self, /, *args, **kwargs):
+        key = self.cache_key(*args, **kwargs)
+        return self.cache.pop(key, _MISSING) is not _MISSING
 
 
 class _LockedMixin:
@@ -61,6 +69,11 @@ class _LockedMixin:
     def cache_clear(self):
         with self.cache_lock:
             self.cache.clear()
+
+    def cache_evict(self, /, *args, **kwargs):
+        key = self.cache_key(*args, **kwargs)
+        with self.cache_lock:
+            return self.cache.pop(key, _MISSING) is not _MISSING
 
 
 class _ConditionMixin:
@@ -98,6 +111,11 @@ class _ConditionMixin:
         with self.cache_lock:
             self.cache.clear()
 
+    def cache_evict(self, /, *args, **kwargs):
+        key = self.cache_key(*args, **kwargs)
+        with self.cache_lock:
+            return self.cache.pop(key, _MISSING) is not _MISSING
+
 
 class _InfoMixin:
     def __init__(self, func, info):
@@ -125,6 +143,10 @@ class _InfoMixin:
     def cache_clear(self):
         self.cache.clear()
         self.__hits = self.__misses = 0
+
+    def cache_evict(self, /, *args, **kwargs):
+        key = self.cache_key(*args, **kwargs)
+        return self.cache.pop(key, _MISSING) is not _MISSING
 
     def cache_info(self):
         return self.__info(self.cache, self.__hits, self.__misses)
@@ -162,6 +184,11 @@ class _LockedInfoMixin:
         with self.cache_lock:
             self.cache.clear()
             self.__hits = self.__misses = 0
+
+    def cache_evict(self, /, *args, **kwargs):
+        key = self.cache_key(*args, **kwargs)
+        with self.cache_lock:
+            return self.cache.pop(key, _MISSING) is not _MISSING
 
     def cache_info(self):
         with self.cache_lock:
@@ -208,6 +235,11 @@ class _ConditionInfoMixin:
         with self.cache_lock:
             self.cache.clear()
             self.__hits = self.__misses = 0
+
+    def cache_evict(self, /, *args, **kwargs):
+        key = self.cache_key(*args, **kwargs)
+        with self.cache_lock:
+            return self.cache.pop(key, _MISSING) is not _MISSING
 
     def cache_info(self):
         with self.cache_lock:

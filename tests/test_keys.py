@@ -97,3 +97,60 @@ class CacheKeysTest(unittest.TestCase):
             pickled = pickle.loads(pickle.dumps(k))
             self.assertEqual(k, pickled)
             self.assertEqual(h, hash(pickled))
+
+
+class BoundKeyTest(unittest.TestCase):
+    class Example:
+        def method(self, a, b=2, *, c=3):
+            return a, b, c
+
+        def variadic(self, *args, **kwargs):
+            return args, kwargs
+
+    def setUp(self):
+        self.key = cachetools.keys.boundkey(
+            self.Example.method, "BoundKeyTest.Example.method"
+        )
+        self.first = self.Example()
+        self.second = self.Example()
+
+    def test_equivalent_calls_share_a_key(self):
+        # explicit defaults, the default omitted and positional vs. keyword
+        self.assertEqual(self.key(self.first, 1), self.key(self.first, 1, 2, c=3))
+        self.assertEqual(self.key(self.first, 1), self.key(self.first, a=1))
+        self.assertEqual(self.key(self.first, 1, 2), self.key(self.first, 1, b=2))
+
+    def test_receiver_is_ignored(self):
+        self.assertEqual(self.key(self.first, 1), self.key(self.second, 1))
+        # the receiver never appears among the normalized items
+        items = self.key(self.first, 1)[2]
+        self.assertEqual([name for name, _ in items], ["a", "b", "c"])
+
+    def test_namespace_is_part_of_the_key(self):
+        other = cachetools.keys.boundkey(self.Example.method, "other.namespace")
+        self.assertNotEqual(self.key(self.first, 1), other(self.first, 1))
+
+    def test_distinct_arguments_stay_distinct(self):
+        self.assertNotEqual(self.key(self.first, 1), self.key(self.first, 2))
+        self.assertNotEqual(self.key(self.first, 1, c=3), self.key(self.first, 1, c=4))
+
+    def test_variadic_arguments(self):
+        key = cachetools.keys.boundkey(
+            self.Example.variadic, "BoundKeyTest.Example.variadic"
+        )
+        self.assertEqual(
+            key(self.first, 1, 2, z=3, y=4),
+            key(self.first, 1, 2, y=4, z=3),
+        )
+        self.assertNotEqual(key(self.first, 1), key(self.first, 1, 2))
+
+    def test_invalid_calls_raise_type_error(self):
+        with self.assertRaises(TypeError):
+            self.key(self.first)  # missing required argument
+        with self.assertRaises(TypeError):
+            self.key(self.first, 1, 2, 3, 4)  # too many positional arguments
+
+    def test_key_is_a_plain_tuple(self):
+        key = self.key(self.first, 1)
+        self.assertIsInstance(key, tuple)
+        hash(key)  # must be usable as a cache mapping key
