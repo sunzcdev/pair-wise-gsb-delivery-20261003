@@ -101,7 +101,20 @@ class Gem::Package
     end
   end
 
+  ##
+  # Raised when a file listed in a deterministic build's gemspec does not
+  # exist, since such a gem could never be reproduced from the same source
+  # tree.
+
+  class MissingFileError < Error; end
+
   attr_accessor :build_time # :nodoc:
+
+  ##
+  # Whether this package is built in deterministic mode. See
+  # Gem::Package.build.
+
+  attr_reader :deterministic
 
   ##
   # Checksums for the contents of the package
@@ -157,8 +170,19 @@ class Gem::Package
   # +required_rubygems_version+ is constrained to at least
   # MINIMUM_RUBYGEMS_VERSION. Content-addressable builds are incompatible
   # with +file_name+.
+  #
+  # When +deterministic+ is true, the archive is built from a canonicalized
+  # spec: files are archived in sorted order, every tar header and the gzip
+  # streams use one explicit timestamp (+epoch+, or +SOURCE_DATE_EPOCH+, or
+  # DEFAULT_SOURCE_DATE_EPOCH), and stored file modes are reduced to the
+  # permissions that an installed gem actually depends on (whether a file is
+  # executable; symlinks get one fixed mode). Two source trees with identical
+  # contents produce byte-identical gems in deterministic mode even when the
+  # files are enumerated in a different order or carry different mtimes.
+  # Ordinary builds are unaffected and keep deriving timestamps from
+  # Gem.source_date_epoch exactly as before.
 
-  def self.build(spec, skip_validation = false, strict_validation = false, file_name = nil, content_addressable: false)
+  def self.build(spec, skip_validation = false, strict_validation = false, file_name = nil, content_addressable: false, deterministic: false, epoch: nil)
     if content_addressable && file_name
       raise ArgumentError, "Cannot specify an output file name for a content-addressable gem as these gems must use the generated file name."
     end
@@ -171,7 +195,7 @@ class Gem::Package
 
       package = new io
       package.spec = spec.dup
-      gem_file = package.build_content_addressable_file skip_validation, strict_validation
+      gem_file = package.build_content_addressable_file skip_validation, strict_validation, deterministic: deterministic, epoch: epoch
 
       spec.required_rubygems_version = package.spec.required_rubygems_version
     else
@@ -179,7 +203,7 @@ class Gem::Package
 
       package = new gem_file
       package.spec = spec
-      package.build skip_validation, strict_validation
+      package.build skip_validation, strict_validation, deterministic: deterministic, epoch: epoch
     end
     gem_file
   end
@@ -246,6 +270,7 @@ class Gem::Package
     @build_time      = Gem.source_date_epoch
     @checksums       = {}
     @contents        = nil
+    @deterministic   = false
     @digests         = Hash.new {|h, algorithm| h[algorithm] = {} }
     @files           = nil
     @security_policy = security_policy
@@ -308,7 +333,7 @@ class Gem::Package
   def add_contents(tar) # :nodoc:
     digests = tar.add_file_signed "data.tar.gz", 0o444, @signer do |io|
       gzip_to io do |gz_io|
-        Gem::Package::TarWriter.new gz_io do |data_tar|
+        Gem::Package::TarWriter.new gz_io, tar_mtime do |data_tar|
           add_files data_tar
         end
       end
@@ -318,23 +343,35 @@ class Gem::Package
   end
 
   ##
-  # Adds files included the package's Gem::Specification to the +tar+ file
+  # Adds files included the package's Gem::Specification to the +tar+ file.
+  #
+  # In deterministic mode the entries are written in sorted order regardless
+  # of how the gemspec enumerated them. In both modes a file listed by the
+  # gemspec but missing from disk raises MissingFileError, so a broken
+  # manifest is reported as a package build error rather than a bare
+  # Errno::ENOENT.
 
   def add_files(tar) # :nodoc:
-    @spec.files.each do |file|
+    files = @deterministic ? @spec.files.sort : @spec.files
+
+    files.each do |file|
       if invalid_windows_filename?(file)
         alert_warning "filename '#{file}' contains characters that are invalid on Windows (e.g., colons). This gem may fail to install on Windows."
       end
 
-      stat = File.lstat file
+      begin
+        stat = File.lstat file
+      rescue Errno::ENOENT
+        raise MissingFileError, "File \"#{file}\" does not exist, so the gem cannot be built"
+      end
 
       if stat.symlink?
-        tar.add_symlink file, File.readlink(file), stat.mode
+        tar.add_symlink file, File.readlink(file), symlink_archive_mode(stat.mode)
       end
 
       next unless stat.file?
 
-      tar.add_file_simple file, stat.mode, stat.size do |dst_io|
+      tar.add_file_simple file, archive_mode(stat.mode), stat.size do |dst_io|
         File.open file, "rb" do |src_io|
           copy_stream(src_io, dst_io, stat.size)
         end
@@ -357,13 +394,36 @@ class Gem::Package
 
   ##
   # Builds this package based on the specification set by #spec=
+  #
+  # When +deterministic+ is true the archive is produced under the canonical
+  # rules described by Gem::Package.build. +epoch+ sets the explicit
+  # timestamp source for such a build.
 
-  def build(skip_validation = false, strict_validation = false)
+  def build(skip_validation = false, strict_validation = false, deterministic: false, epoch: nil)
     raise ArgumentError, "skip_validation = true and strict_validation = true are incompatible" if skip_validation && strict_validation
+    raise ArgumentError, "Cannot specify an epoch for an ordinary, non-deterministic build" if epoch && !deterministic
+
+    @deterministic = deterministic
+
+    if deterministic
+      @build_time = deterministic_epoch(epoch)
+
+      # Canonicalization rewrites the spec's file manifest and may pin its
+      # date, so operate on a copy. The caller's spec keeps the values it
+      # declared.
+      @spec = @spec.dup
+
+      # Checked before validation, which memoizes a date derived from
+      # SOURCE_DATE_EPOCH. Only a date the gemspec declared is authoritative
+      # metadata; a derived one should follow the archive timestamps.
+      @spec_date_declared = !@spec.instance_variable_get(:@date).nil?
+    end
 
     Gem.load_yaml
 
     @spec.validate true, strict_validation unless skip_validation
+
+    canonicalize_spec! if @deterministic
 
     setup_signer(
       signer_options: {
@@ -372,7 +432,7 @@ class Gem::Package
     )
 
     @gem.with_write_io do |gem_io|
-      Gem::Package::TarWriter.new gem_io do |gem|
+      Gem::Package::TarWriter.new gem_io, tar_mtime do |gem|
         add_metadata gem
         add_contents gem
         add_checksums gem
@@ -398,14 +458,15 @@ EOM
   #
   # The spec is validated for content addressing. Its
   # +required_ruby_version+ determines the Ruby ABI, while its
-  # +required_rubygems_version+ is constrained before building.
+  # +required_rubygems_version+ is constrained before building. The
+  # +deterministic+ and +epoch+ keywords are forwarded to #build.
 
-  def build_content_addressable_file(skip_validation = false, strict_validation = false)
+  def build_content_addressable_file(skip_validation = false, strict_validation = false, deterministic: false, epoch: nil)
     Gem::ContentAddress.eligible!(@spec)
     ruby_abi = Gem::ContentAddress.ruby_abi_for(@spec.required_ruby_version)
     @spec.required_rubygems_version = normalized_required_rubygems_version(ruby_abi)
 
-    build skip_validation, strict_validation
+    build skip_validation, strict_validation, deterministic: deterministic, epoch: epoch
 
     bytes = @gem.with_read_io(&:read)
     gem_file = "#{@spec.name}-#{@spec.version}-#{Gem::ContentAddress.address_for(bytes)}.gem"
@@ -751,6 +812,96 @@ EOM
   end
 
   private
+
+  ##
+  # Puts the file-manifest attributes of +spec+ in a canonical order.
+  #
+  # Deterministic builds use this so that two source trees that enumerate the
+  # same files in different orders still serialize the same metadata and
+  # archive. Attributes whose order carries meaning (require_paths,
+  # dependencies, ...) are left untouched, and attributes that were never set
+  # stay unset instead of appearing as empty arrays in the metadata.
+
+  def canonicalize_spec!
+    # The #files getter merges executables, extra rdoc files and extensions,
+    # then deduplicates and sorts, canonicalizing @files as a side effect.
+    @spec.files
+
+    sort_spec_attribute :test_files
+    sort_spec_attribute :extra_rdoc_files
+    sort_spec_attribute :executables
+
+    # Validation has memoized the spec's date from SOURCE_DATE_EPOCH by now.
+    # Point a derived date at the deterministic build time so metadata and
+    # archive timestamps share one source; keep an author-declared date.
+    @spec.date = @build_time unless @spec_date_declared
+  end
+
+  ##
+  # Sorts +name+ on +@spec+ when it was set, leaving it untouched when absent.
+
+  def sort_spec_attribute(name)
+    value = @spec.instance_variable_get(:"@#{name}")
+    return unless value.is_a?(Array)
+
+    @spec.instance_variable_set(:"@#{name}", value.uniq.sort)
+  end
+
+  ##
+  # The timestamp to use for tar headers. Deterministic builds pin every
+  # header to the explicit build time; ordinary builds keep using
+  # Gem.source_date_epoch via Gem::Package::TarWriter.
+
+  def tar_mtime
+    @deterministic ? @build_time : nil
+  end
+
+  ##
+  # Resolves the timestamp source for a deterministic build. With no explicit
+  # +epoch+, SOURCE_DATE_EPOCH (or DEFAULT_SOURCE_DATE_EPOCH) applies, just as
+  # in ordinary builds.
+
+  def deterministic_epoch(epoch)
+    return Gem.source_date_epoch if epoch.nil?
+
+    case epoch
+    when Time
+      epoch.utc.freeze
+    when Integer
+      raise ArgumentError, "deterministic build epoch must not be negative, got #{epoch}" if epoch.negative?
+
+      Time.at(epoch).utc.freeze
+    else
+      raise ArgumentError, "deterministic build epoch must be an Integer or Time, got #{epoch.inspect}"
+    end
+  end
+
+  ##
+  # The mode stored in the archive for a file with +mode+.
+  #
+  # Deterministic builds keep the file type bits (so regular files stay
+  # marked as such) and only the permission that carries meaning once the gem
+  # is installed -- whether a file is executable. Umask and platform
+  # differences in the group/other bits cannot make the package differ.
+
+  def archive_mode(mode)
+    return mode unless @deterministic
+
+    permissions = (mode & 0o111).zero? ? 0o644 : 0o755
+    (mode & 0o170000) | permissions
+  end
+
+  ##
+  # The mode stored in the archive for a symlink. A symlink's own permission
+  # bits are not meaningful, so deterministic builds use one fixed value
+  # (the symlink type bit plus 0o777), while ordinary builds keep the mode
+  # reported by File.lstat.
+
+  def symlink_archive_mode(mode)
+    return mode unless @deterministic
+
+    0o120000 | 0o777
+  end
 
   ##
   # The +required_rubygems_version+ for a content-addressable build: the

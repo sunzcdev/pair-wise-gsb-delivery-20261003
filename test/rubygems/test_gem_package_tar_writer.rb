@@ -280,6 +280,54 @@ class TestGemPackageTarWriter < Gem::Package::TarTestCase
     end
   end
 
+  def test_mtime_overrides_source_date_epoch
+    mtime = Time.at(1_700_000_000).utc
+    @tar_writer.mtime = mtime
+
+    @tar_writer.add_file_simple "x", 0o644, 10 do |io|
+      io.write "a" * 10
+    end
+
+    assert_headers_equal tar_file_header("x", "", 0o644, 10, mtime), @io.string[0, 512]
+  end
+
+  def test_mtime_applies_to_symlinks_and_directories
+    mtime = Time.at(1_700_000_000).utc
+    @tar_writer.mtime = mtime
+
+    @tar_writer.mkdir "dir", 0o755
+    @tar_writer.add_symlink "link", "target", 0o777
+
+    assert_headers_equal tar_dir_header("dir", "", 0o755, mtime), @io.string[0, 512]
+    assert_headers_equal tar_symlink_header("link", "", 0o777, mtime, "target"), @io.string[512, 512]
+  end
+
+  def test_new_accepts_mtime
+    mtime = Time.at(1_700_000_000).utc
+    io = TempIO.new
+
+    Gem::Package::TarWriter.new(io, mtime) do |tar|
+      tar.add_file_simple "x", 0o644, 1 do |entry_io|
+        entry_io.write "a"
+      end
+    end
+
+    assert_headers_equal tar_file_header("x", "", 0o644, 1, mtime), io.string[0, 512]
+  ensure
+    io.close!
+  end
+
+  def test_mtime_defaults_to_source_date_epoch
+    ENV["SOURCE_DATE_EPOCH"] = "123456789"
+
+    @tar_writer.add_file_simple "x", 0o644, 1 do |io|
+      io.write "a"
+    end
+
+    assert_equal Time.at(123_456_789).utc, @tar_writer.header_mtime
+    assert_headers_equal tar_file_header("x", "", 0o644, 1, Time.at(123_456_789).utc), @io.string[0, 512]
+  end
+
   def test_split_name
     assert_equal ["b" * 100, "a" * 155],
                  @tar_writer.split_name("#{"a" * 155}/#{"b" * 100}")

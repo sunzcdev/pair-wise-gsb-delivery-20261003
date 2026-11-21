@@ -72,6 +72,175 @@ class TestGemCommandsBuildCommand < Gem::TestCase
     assert_nil @cmd.options[:output]
     assert_nil @cmd.options[:ruby_abi]
     refute @cmd.options[:content_addressable]
+    refute @cmd.options[:deterministic]
+    assert_nil @cmd.options[:deterministic_epoch]
+  end
+
+  def test_handle_options_deterministic
+    @cmd.handle_options %w[--deterministic]
+
+    assert @cmd.options[:deterministic]
+    assert_nil @cmd.options[:deterministic_epoch]
+  end
+
+  def test_handle_options_deterministic_with_epoch
+    @cmd.handle_options %w[--deterministic=1700000000 some.gemspec]
+
+    assert @cmd.options[:deterministic]
+    assert_equal 1_700_000_000, @cmd.options[:deterministic_epoch]
+    assert_equal ["some.gemspec"], @cmd.options[:args]
+  end
+
+  def test_handle_options_deterministic_rejects_non_integer_epoch
+    assert_raise Gem::OptionParser::InvalidArgument do
+      @cmd.handle_options %w[--deterministic=soon]
+    end
+  end
+
+  def test_deterministic_build_is_reproducible_across_trees
+    one = util_deterministic_gemspec_dir "det-one", %w[README.md lib/a.rb lib/b.rb], 1_000_000_000
+    two = util_deterministic_gemspec_dir "det-two", %w[lib/b.rb README.md lib/a.rb], 1_500_000_000
+
+    first = util_build_deterministic_from one
+    second = util_build_deterministic_from two
+
+    assert_equal File.binread(first), File.binread(second)
+
+    spec = Gem::Package.new(first).spec
+    assert_equal "deterministic_gem", spec.name
+    assert_equal %w[README.md lib/a.rb lib/b.rb], spec.files
+  end
+
+  def test_deterministic_build_honors_explicit_epoch
+    dir = util_deterministic_gemspec_dir "det-epoch", %w[lib/a.rb], 1_000_000_000
+
+    gem_file = util_build_deterministic_from dir, "--deterministic=1700000000"
+
+    data = nil
+    File.open gem_file, "rb" do |io|
+      Gem::Package::TarReader.new io do |tar|
+        tar.each_entry do |entry|
+          data = Gem::Util.gunzip entry.read if entry.full_name == "data.tar.gz"
+        end
+      end
+    end
+
+    mtimes = []
+    Gem::Package::TarReader.new StringIO.new(data) do |tar|
+      tar.each_entry {|entry| mtimes << entry.header.mtime }
+    end
+
+    assert_equal [1_700_000_000], mtimes.uniq
+
+    # The gemspec declares a date, which is author metadata, so it survives
+    # the deterministic build unchanged while archive timestamps are pinned.
+    assert_equal Time.utc(1980, 1, 2), Gem::Package.new(gem_file).spec.date
+  end
+
+  def test_deterministic_build_keeps_a_declared_date
+    dir = util_deterministic_gemspec_dir "det-declared-date", %w[lib/a.rb], 1_000_000_000,
+                                         date: Time.utc(2020, 1, 2)
+
+    gem_file = util_build_deterministic_from dir, "--deterministic=1700000000"
+
+    assert_equal Time.utc(2020, 1, 2), Gem::Package.new(gem_file).spec.date
+  end
+
+  def test_deterministic_build_does_not_mutate_the_loaded_spec
+    dir = util_deterministic_gemspec_dir "det-no-mutation", %w[lib/b.rb lib/a.rb], 1_000_000_000
+    gemspec_file = File.join dir, "deterministic_gem.gemspec"
+
+    spec = Gem::Specification.load(gemspec_file)
+    date_before = spec.instance_variable_get(:@date)
+
+    @cmd = Gem::Commands::BuildCommand.new
+    @cmd.handle_options [gemspec_file, "--deterministic=1700000000"]
+    @ui = Gem::MockGemUi.new
+
+    use_ui @ui do
+      Dir.chdir dir do
+        @cmd.execute
+      end
+    end
+
+    assert_equal date_before, spec.instance_variable_get(:@date)
+    assert_equal %w[lib/a.rb lib/b.rb], Gem::Package.new(File.join(dir, "deterministic_gem-1.0.gem")).spec.files
+  end
+
+  def test_deterministic_build_reads_identical_from_both_trees
+    one = util_deterministic_gemspec_dir "det-read-one", %w[README.md lib/a.rb], 1_000_000_000
+    two = util_deterministic_gemspec_dir "det-read-two", %w[lib/a.rb README.md], 2_000_000_000
+
+    first = Gem::Package.new(util_build_deterministic_from(one, "--deterministic=1700000000"))
+    second = Gem::Package.new(util_build_deterministic_from(two, "--deterministic=1700000000"))
+
+    assert first.verify
+    assert second.verify
+
+    assert_equal first.spec, second.spec
+    assert_equal first.contents, second.contents
+  end
+
+  def test_deterministic_build_pins_a_derived_date_to_the_epoch
+    dir = File.join @tempdir, "det-derived-date"
+    FileUtils.mkdir_p File.join(dir, "lib")
+    File.write File.join(dir, "lib/a.rb"), "# lib/a.rb\n"
+
+    File.write File.join(dir, "det_derived.gemspec"), <<~GEMSPEC
+      Gem::Specification.new do |s|
+        s.name = "det_derived"
+        s.version = "1.0"
+        s.summary = "deterministic"
+        s.authors = ["deterministic"]
+        s.license = "MIT"
+        s.files = ["lib/a.rb"]
+      end
+    GEMSPEC
+
+    gem_file = Dir.chdir(dir) do
+      @cmd = Gem::Commands::BuildCommand.new
+      @cmd.handle_options [File.join(dir, "det_derived.gemspec"), "--deterministic=1700000000"]
+      @ui = Gem::MockGemUi.new
+      use_ui(@ui) { @cmd.execute }
+      File.join dir, "det_derived-1.0.gem"
+    end
+
+    # No date was declared, so the derived default follows the explicit epoch
+    # rather than separating metadata from the archive timestamps.
+    assert_equal Time.utc(2023, 11, 14), Gem::Package.new(gem_file).spec.date
+  end
+
+  def test_ordinary_build_still_uses_source_date_epoch
+    epoch = ENV["SOURCE_DATE_EPOCH"]
+    ENV["SOURCE_DATE_EPOCH"] = "123456789"
+
+    dir = util_deterministic_gemspec_dir "ordinary-epoch", %w[lib/a.rb], 1_000_000_000
+
+    gem_file = Dir.chdir(dir) do
+      @cmd.handle_options [File.join(dir, "deterministic_gem.gemspec")]
+      use_ui @ui do
+        @cmd.execute
+      end
+      File.join dir, "deterministic_gem-1.0.gem"
+    end
+
+    data = nil
+    File.open gem_file, "rb" do |io|
+      Gem::Package::TarReader.new io do |tar|
+        tar.each_entry do |entry|
+          data = Gem::Util.gunzip entry.read if entry.full_name == "data.tar.gz"
+        end
+      end
+    end
+
+    mtimes = []
+    Gem::Package::TarReader.new StringIO.new(data) do |tar|
+      tar.each_entry {|entry| mtimes << entry.header.mtime }
+    end
+
+    assert_equal [123_456_789], mtimes.uniq
+  ensure
+    ENV["SOURCE_DATE_EPOCH"] = epoch
   end
 
   def test_execute
@@ -822,6 +991,46 @@ class TestGemCommandsBuildCommand < Gem::TestCase
     ensure
       Gem.platforms = platforms
     end
+  end
+
+  def util_deterministic_gemspec_dir(name, files, mtime, test_files: [], date: nil)
+    dir = File.join @tempdir, name
+    FileUtils.mkdir_p dir
+
+    files.each do |file|
+      path = File.join dir, file
+      FileUtils.mkdir_p File.dirname(path)
+      File.binwrite path, "# #{file}\n"
+      File.utime Time.at(mtime), Time.at(mtime), path
+    end
+
+    spec = Gem::Specification.new "deterministic_gem", "1.0"
+    spec.summary = "deterministic"
+    spec.authors = "deterministic"
+    spec.license = "MIT"
+    spec.files = files
+    spec.test_files = test_files unless test_files.empty?
+    spec.date = date if date
+
+    File.write File.join(dir, "deterministic_gem.gemspec"), spec.to_ruby
+
+    dir
+  end
+
+  def util_build_deterministic_from(dir, *options)
+    options = ["--deterministic"] if options.empty?
+
+    @cmd = Gem::Commands::BuildCommand.new
+    @cmd.handle_options [File.join(dir, "deterministic_gem.gemspec"), *options]
+    @ui = Gem::MockGemUi.new
+
+    use_ui @ui do
+      Dir.chdir dir do
+        @cmd.execute
+      end
+    end
+
+    File.join dir, "deterministic_gem-1.0.gem"
   end
 
   def test_execute_force

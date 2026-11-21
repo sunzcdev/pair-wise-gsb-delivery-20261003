@@ -31,6 +31,14 @@ class Gem::Commands::BuildCommand < Gem::Command
     add_option "--content-addressable", "build a content-addressable gem" do |_value, options|
       options[:content_addressable] = true
     end
+
+    add_option "--deterministic[=EPOCH]",
+               Integer,
+               "build a reproducible gem from a canonical file list, archive",
+               "timestamp and file modes (EPOCH defaults to SOURCE_DATE_EPOCH)" do |value, options|
+      options[:deterministic] = true
+      options[:deterministic_epoch] = value
+    end
   end
 
   def arguments # :nodoc:
@@ -66,6 +74,18 @@ Use the --content-addressable option to build a content-addressable gem using
 the platform and required_ruby_version declared in the gemspec:
 
   $ gem build my_gem-1.0.gemspec --content-addressable
+
+Use the --deterministic option to build a reproducible gem. The file list,
+archive timestamps and stored file modes are canonicalized so that two source
+trees with the same contents produce byte-identical gems regardless of file
+enumeration order or mtimes:
+
+  $ gem build my_gem-1.0.gemspec --deterministic
+
+Pass an explicit epoch to pin the timestamps instead of using
+SOURCE_DATE_EPOCH:
+
+  $ gem build my_gem-1.0.gemspec --deterministic=1700000000
 
 The options can be combined to set the Ruby ABI explicitly:
 
@@ -126,7 +146,9 @@ The options can be combined to set the Ruby ABI explicitly:
         options[:force],
         options[:strict],
         options[:output],
-        content_addressable: options[:content_addressable]
+        content_addressable: options[:content_addressable],
+        deterministic: options[:deterministic],
+        epoch: options[:deterministic_epoch]
       )
     else
       alert_error "Error loading gemspec. Aborting."

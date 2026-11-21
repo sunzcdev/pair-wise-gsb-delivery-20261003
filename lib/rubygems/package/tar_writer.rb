@@ -70,9 +70,17 @@ class Gem::Package::TarWriter
   end
 
   ##
+  # The mtime written to headers that do not specify their own. When nil,
+  # Gem.source_date_epoch is used. Gem::Package sets this to the package build
+  # time for deterministic builds so that every entry in an archive shares a
+  # single, explicit timestamp source.
+
+  attr_accessor :mtime
+
+  ##
   # Creates a new TarWriter, yielding it if a block is given
 
-  def self.new(io)
+  def self.new(io, mtime = nil)
     writer = super
 
     return writer unless block_given?
@@ -87,16 +95,26 @@ class Gem::Package::TarWriter
   end
 
   ##
-  # Creates a new TarWriter that will write to +io+
+  # Creates a new TarWriter that will write to +io+. The optional +mtime+ is
+  # the default timestamp for every entry, see #mtime.
 
-  def initialize(io)
+  def initialize(io, mtime = nil)
     @io = io
     @closed = false
+    @mtime = mtime
+  end
+
+  ##
+  # The timestamp written to headers that do not specify one. Defaults to
+  # Gem.source_date_epoch so ordinary builds keep their existing semantics.
+
+  def header_mtime
+    @mtime || Gem.source_date_epoch
   end
 
   ##
   # Adds file +name+ with permissions +mode+ and mtime +mtime+ (sets
-  # Gem.source_date_epoch if not specified), and yields an IO for
+  # #header_mtime if not specified), and yields an IO for
   # writing the file to
 
   def add_file(name, mode, mtime = nil) # :yields: io
@@ -119,7 +137,7 @@ class Gem::Package::TarWriter
 
     header = Gem::Package::TarHeader.new name: name, mode: mode,
                                          size: size, prefix: prefix,
-                                         mtime: mtime || Gem.source_date_epoch
+                                         mtime: mtime || header_mtime
 
     @io.write header
     @io.pos = final_pos
@@ -212,7 +230,7 @@ class Gem::Package::TarWriter
 
     header = Gem::Package::TarHeader.new(name: name, mode: mode,
                                          size: size, prefix: prefix,
-                                         mtime: Gem.source_date_epoch).to_s
+                                         mtime: header_mtime).to_s
 
     @io.write header
     os = BoundedStream.new @io, size
@@ -240,7 +258,7 @@ class Gem::Package::TarWriter
                                          size: 0, typeflag: "2",
                                          linkname: target,
                                          prefix: prefix,
-                                         mtime: Gem.source_date_epoch).to_s
+                                         mtime: header_mtime).to_s
 
     @io.write header
 
@@ -293,7 +311,7 @@ class Gem::Package::TarWriter
     header = Gem::Package::TarHeader.new name: name, mode: mode,
                                          typeflag: "5", size: 0,
                                          prefix: prefix,
-                                         mtime: Gem.source_date_epoch
+                                         mtime: header_mtime
 
     @io.write header
 

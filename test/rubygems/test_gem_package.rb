@@ -1951,4 +1951,351 @@ class TestGemPackage < Gem::Package::TarTestCase
     assert_match(/This gem may fail to install on Windows/, ui.error)
     assert_path_exist spec.file_name
   end
+
+  def test_build_deterministic_same_contents_different_order_and_mtime
+    epoch = 1_700_000_000
+    one = util_deterministic_tree "one", %w[README.md lib/a.rb lib/b.rb lib/sub/c.rb], 1_000_000_000
+    two = util_deterministic_tree "two", %w[lib/sub/c.rb lib/b.rb README.md lib/a.rb], 1_500_000_000
+
+    first = util_build_deterministic_gem one, epoch: epoch
+    second = util_build_deterministic_gem two, epoch: epoch
+
+    assert_equal File.binread(first), File.binread(second)
+
+    package = Gem::Package.new first
+    assert package.verify
+
+    spec = package.spec
+    assert_equal "deterministic", spec.name
+    assert_equal %w[README.md lib/a.rb lib/b.rb lib/sub/c.rb], spec.files
+    assert_equal spec.files, package.contents
+  end
+
+  def test_build_deterministic_uses_explicit_epoch_for_all_timestamps
+    epoch = 1_700_000_000
+    tree = util_deterministic_tree "epoch", %w[lib/a.rb], 1_000_000_000
+
+    gem_file = util_build_deterministic_gem tree, epoch: epoch
+
+    data_entry, metadata_entry, checksums_entry = util_gem_timestamps gem_file
+
+    assert_equal epoch, data_entry[:mtime]
+    assert_equal epoch, metadata_entry[:mtime]
+    assert_equal epoch, checksums_entry[:mtime]
+
+    entries = util_data_tar_headers gem_file
+    assert_equal [epoch], entries.map {|e| e[:mtime] }.uniq
+  end
+
+  def test_build_deterministic_epoch_defaults_to_source_date_epoch
+    epoch = ENV["SOURCE_DATE_EPOCH"]
+    ENV["SOURCE_DATE_EPOCH"] = "123456789"
+
+    tree = util_deterministic_tree "source-epoch", %w[lib/a.rb], 1_000_000_000
+    gem_file = util_build_deterministic_gem tree
+
+    entries = util_data_tar_headers gem_file
+
+    assert_equal [123_456_789], entries.map {|e| e[:mtime] }.uniq
+  ensure
+    ENV["SOURCE_DATE_EPOCH"] = epoch
+  end
+
+  def test_build_deterministic_ignores_source_tree_mtimes
+    epoch = 1_600_000_000
+    one = util_deterministic_tree "mtime-one", %w[lib/a.rb], 1_000_000_000
+    two = util_deterministic_tree "mtime-two", %w[lib/a.rb], 2_000_000_000
+
+    first = util_build_deterministic_gem one, epoch: epoch
+    second = util_build_deterministic_gem two, epoch: epoch
+
+    assert_equal File.binread(first), File.binread(second)
+  end
+
+  def test_build_deterministic_normalizes_file_modes
+    tree = util_deterministic_tree "modes", %w[lib/a.rb bin/tool], 1_000_000_000
+
+    File.chmod 0o600, File.join(tree, "lib/a.rb")
+    File.chmod 0o755, File.join(tree, "bin/tool")
+
+    gem_file = util_build_deterministic_gem tree, epoch: 1_700_000_000
+    headers = util_data_tar_headers(gem_file).to_h {|entry| [entry[:name], entry[:mode] & 0o777] }
+
+    assert_equal 0o644, headers["lib/a.rb"]
+
+    if (File.stat(File.join(tree, "bin/tool")).mode & 0o111).zero?
+      # This platform cannot mark a plain file executable (Windows), so the
+      # executable bit cannot be preserved and the file is not marked
+      # executable in the archive either.
+      assert_equal 0o644, headers["bin/tool"]
+    else
+      assert_equal 0o755, headers["bin/tool"]
+    end
+  end
+
+  def test_build_deterministic_preserves_ordinary_modes_when_disabled
+    tree = util_deterministic_tree "ordinary-modes", %w[lib/a.rb], 1_000_000_000
+    File.chmod 0o600, File.join(tree, "lib/a.rb")
+
+    spec = util_deterministic_spec ["lib/a.rb"]
+    gem_file = File.join tree, "ordinary.gem"
+
+    Dir.chdir tree do
+      use_ui Gem::MockGemUi.new do
+        Gem::Package.build spec, false, false, gem_file
+      end
+    end
+
+    headers = util_data_tar_headers gem_file
+
+    assert_equal File.stat(File.join(tree, "lib/a.rb")).mode, headers.first[:mode]
+  end
+
+  def test_build_deterministic_raises_for_missing_file
+    tree = util_deterministic_tree "missing", %w[lib/a.rb], 1_000_000_000
+    spec = util_deterministic_spec ["lib/a.rb", "lib/gone.rb"]
+
+    gem_file = File.join tree, "missing.gem"
+
+    e = assert_raise Gem::Package::MissingFileError do
+      Dir.chdir tree do
+        use_ui Gem::MockGemUi.new do
+          Gem::Package.build spec, true, false, gem_file, deterministic: true
+        end
+      end
+    end
+
+    assert_equal "File \"lib/gone.rb\" does not exist, so the gem cannot be built", e.message
+    assert_kind_of Gem::Package::Error, e
+  end
+
+  def test_build_raises_missing_file_error
+    tree = util_deterministic_tree "missing-ordinary", %w[lib/a.rb], 1_000_000_000
+    spec = util_deterministic_spec ["lib/a.rb", "lib/gone.rb"]
+
+    gem_file = File.join tree, "missing-ordinary.gem"
+
+    e = assert_raise Gem::Package::MissingFileError do
+      Dir.chdir tree do
+        use_ui Gem::MockGemUi.new do
+          Gem::Package.build spec, true, false, gem_file
+        end
+      end
+    end
+
+    assert_equal "File \"lib/gone.rb\" does not exist, so the gem cannot be built", e.message
+  end
+
+  def test_build_deterministic_rejects_invalid_epoch
+    tree = util_deterministic_tree "bad-epoch", %w[lib/a.rb], 1_000_000_000
+    spec = util_deterministic_spec ["lib/a.rb"]
+
+    e = assert_raise ArgumentError do
+      Dir.chdir tree do
+        use_ui Gem::MockGemUi.new do
+          Gem::Package.build spec, false, false, File.join(tree, "bad-epoch.gem"), deterministic: true, epoch: -1
+        end
+      end
+    end
+
+    assert_match(/must not be negative/, e.message)
+  end
+
+  def test_build_deterministic_keeps_a_gemspec_specified_date
+    tree = util_deterministic_tree "explicit-date", %w[lib/a.rb], 1_000_000_000
+    spec = util_deterministic_spec ["lib/a.rb"]
+    spec.date = Time.utc 2020, 1, 2
+
+    gem_file = File.join tree, "explicit-date.gem"
+
+    Dir.chdir tree do
+      use_ui Gem::MockGemUi.new do
+        Gem::Package.build spec, false, false, gem_file, deterministic: true, epoch: 1_700_000_000
+      end
+    end
+
+    assert_equal Time.utc(2020, 1, 2), Gem::Package.new(gem_file).spec.date
+  end
+
+  def test_build_deterministic_pins_a_derived_date_to_the_epoch
+    tree = util_deterministic_tree "derived-date", %w[lib/a.rb], 1_000_000_000
+    spec = util_deterministic_spec ["lib/a.rb"]
+
+    gem_file = File.join tree, "derived-date.gem"
+
+    Dir.chdir tree do
+      use_ui Gem::MockGemUi.new do
+        Gem::Package.build spec, false, false, gem_file, deterministic: true, epoch: 1_700_000_000
+      end
+    end
+
+    assert_equal Time.utc(2023, 11, 14), Gem::Package.new(gem_file).spec.date
+  end
+
+  def test_build_deterministic_does_not_mutate_the_caller_spec
+    tree = util_deterministic_tree "no-mutation", %w[lib/b.rb lib/a.rb], 1_000_000_000
+    spec = util_deterministic_spec %w[lib/b.rb lib/a.rb]
+    declared_date = spec.instance_variable_get(:@date)
+
+    gem_file = File.join tree, "no-mutation.gem"
+
+    Dir.chdir tree do
+      use_ui Gem::MockGemUi.new do
+        Gem::Package.build spec, true, false, gem_file, deterministic: true, epoch: 1_700_000_000
+      end
+    end
+
+    assert_equal %w[lib/b.rb lib/a.rb], spec.instance_variable_get(:@files)
+    assert_equal declared_date, spec.instance_variable_get(:@date)
+    assert_equal %w[lib/a.rb lib/b.rb], Gem::Package.new(gem_file).spec.files
+  end
+
+  def test_build_deterministic_canonicalizes_manifest_attribute_order
+    epoch = 1_700_000_000
+    first_tree = util_deterministic_tree "manifest-one", %w[lib/a.rb lib/b.rb test/a_test.rb test/b_test.rb], 1_000_000_000
+    second_tree = util_deterministic_tree "manifest-two", %w[test/b_test.rb test/a_test.rb lib/b.rb lib/a.rb], 1_500_000_000
+
+    first = util_build_deterministic_gem first_tree, epoch: epoch do |spec|
+      spec.files = %w[lib/b.rb lib/a.rb]
+      spec.test_files = %w[test/b_test.rb test/a_test.rb]
+    end
+    second = util_build_deterministic_gem second_tree, epoch: epoch do |spec|
+      spec.files = %w[lib/a.rb lib/b.rb]
+      spec.test_files = %w[test/a_test.rb test/b_test.rb]
+    end
+
+    assert_equal File.binread(first), File.binread(second)
+
+    spec = Gem::Package.new(first).spec
+    # #files merges the other manifest attributes and sorts them, so both
+    # trees end up with the same ordered manifest regardless of input order.
+    assert_equal %w[lib/a.rb lib/b.rb test/a_test.rb test/b_test.rb], spec.files
+    assert_equal %w[test/a_test.rb test/b_test.rb], spec.test_files
+  end
+
+  def test_build_deterministic_and_content_addressable_agree_across_trees
+    epoch = 1_700_000_000
+    one = util_deterministic_tree "ca-one", %w[README.md lib/a.rb lib/b.rb], 1_000_000_000
+    two = util_deterministic_tree "ca-two", %w[lib/b.rb README.md lib/a.rb], 1_500_000_000
+
+    first = util_build_deterministic_gem one, epoch: epoch, content_addressable: true
+    second = util_build_deterministic_gem two, epoch: epoch, content_addressable: true
+
+    assert_equal File.basename(first), File.basename(second)
+    assert_match(/\Adeterministic-1\.0-[0-9a-f]{8}\.gem\z/, File.basename(first))
+    assert_equal File.binread(first), File.binread(second)
+
+    package = Gem::Package.new first
+    assert package.verify
+    assert_equal %w[README.md lib/a.rb lib/b.rb], package.contents
+  end
+
+  def test_build_deterministic_requires_deterministic_for_explicit_epoch
+    tree = util_deterministic_tree "epoch-no-det", %w[lib/a.rb], 1_000_000_000
+    spec = util_deterministic_spec ["lib/a.rb"]
+
+    e = assert_raise ArgumentError do
+      Dir.chdir tree do
+        use_ui Gem::MockGemUi.new do
+          Gem::Package.build spec, false, false, File.join(tree, "x.gem"), epoch: 1
+        end
+      end
+    end
+
+    assert_match(/Cannot specify an epoch for an ordinary/, e.message)
+  end
+
+  private
+
+  def util_deterministic_tree(name, files, mtime)
+    dir = File.join @tempdir, name
+    FileUtils.mkdir_p dir
+
+    files.each do |file|
+      path = File.join dir, file
+      FileUtils.mkdir_p File.dirname(path)
+      File.binwrite path, "# #{file}\n"
+      File.utime Time.at(mtime), Time.at(mtime), path
+    end
+
+    dir
+  end
+
+  def util_deterministic_spec(files)
+    spec = Gem::Specification.new "deterministic", "1.0"
+    spec.summary = "deterministic"
+    spec.authors = "deterministic"
+    spec.license = "MIT"
+    spec.files = files
+    spec
+  end
+
+  def util_build_deterministic_gem(tree, epoch: nil, content_addressable: false)
+    spec = util_deterministic_spec util_tree_files(tree)
+    yield spec if block_given?
+    spec.platform = "arm64-darwin" if content_addressable
+    spec.required_ruby_version = "~> 3.4.0" if content_addressable
+
+    # Content-addressable builds pick their own file name; ordinary ones use
+    # the explicit path.
+    gem_file = File.join(tree, "built.gem") unless content_addressable
+
+    Dir.chdir tree do
+      use_ui Gem::MockGemUi.new do
+        gem_file = Gem::Package.build spec, true, false, gem_file,
+                                      content_addressable: content_addressable,
+                                      deterministic: true, epoch: epoch
+      end
+    end
+
+    content_addressable ? File.join(tree, gem_file) : gem_file
+  end
+
+  def util_tree_files(tree, prefix = nil)
+    Dir.children(File.join(tree, prefix.to_s)).sort.flat_map do |entry|
+      relative = [prefix, entry].compact.join("/")
+
+      if File.directory? File.join(tree, relative)
+        util_tree_files tree, relative
+      else
+        [relative]
+      end
+    end
+  end
+
+  def util_gem_timestamps(gem_file)
+    entries = {}
+
+    File.open gem_file, "rb" do |io|
+      Gem::Package::TarReader.new io do |tar|
+        tar.each_entry do |entry|
+          entries[entry.full_name] = { mtime: entry.header.mtime }
+        end
+      end
+    end
+
+    [entries["data.tar.gz"], entries["metadata.gz"], entries["checksums.yaml.gz"]]
+  end
+
+  def util_data_tar_headers(gem_file)
+    data = nil
+
+    File.open gem_file, "rb" do |io|
+      Gem::Package::TarReader.new io do |tar|
+        tar.each_entry do |entry|
+          data = Gem::Util.gunzip entry.read if entry.full_name == "data.tar.gz"
+        end
+      end
+    end
+
+    headers = []
+
+    Gem::Package::TarReader.new StringIO.new(data) do |tar|
+      tar.each_entry do |entry|
+        headers << { name: entry.full_name, mode: entry.header.mode, mtime: entry.header.mtime }
+      end
+    end
+
+    headers
+  end
 end
