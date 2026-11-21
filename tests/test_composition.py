@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from threading import Condition, Event
 
@@ -507,3 +508,269 @@ def test_groups_of_pipelines_can_have_completion_callbacks(stub_broker, stub_wor
 
     # And the callback should run after all the messages
     assert sorted(do_nothing_times)[-1] <= finalize_times[0]
+
+
+def test_pipeline_run_returns_independent_handle(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def add(x, y):
+        return x + y
+
+    # And a reusable pipeline template
+    template = pipeline([add.message(1, 2), add.message(3)])
+
+    # When I run it twice
+    first = template.run()
+    second = template.run()
+
+    # Then I should get back a handle per run
+    assert isinstance(first, dramatiq.pipeline_run)
+    assert isinstance(second, dramatiq.pipeline_run)
+    assert first is not second
+
+    # And the handles should not share message ids, options or links
+    assert [m.message_id for m in first.messages] != [m.message_id for m in second.messages]
+    assert first.messages[0].options["pipe_target"]["message_id"] == first.messages[1].message_id
+    assert second.messages[0].options["pipe_target"]["message_id"] == second.messages[1].message_id
+
+    # And the template itself should be untouched by the runs
+    assert "pipe_target" not in first.messages[-1].options
+    assert template.messages[0].message_id not in {m.message_id for m in first.messages}
+
+    # And each handle should resolve its own results
+    assert first.get_result(block=True) == 6
+    assert second.get_result(block=True) == 6
+    assert [m.message_id for m in first.messages] != [m.message_id for m in second.messages]
+
+
+def test_interleaved_runs_of_the_same_template_do_not_cross_talk(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def add(x, y):
+        return x + y
+
+    # And a template whose first message takes its inputs per run
+    template = pipeline([add.message(0, 0), add.message(3)])
+
+    # When two runs with different inputs are interleaved
+    first = template.run(args=(1, 2))
+    second = template.run(args=(10, 20))
+    stub_broker.join(add.queue_name)
+    stub_worker.join()
+
+    # Then the inputs should only have replaced the first message of each run
+    assert first.messages[0].args == (1, 2)
+    assert second.messages[0].args == (10, 20)
+    assert first.messages[1].args == (3,)
+    assert second.messages[1].args == (3,)
+
+    # And the two runs should produce their own end results
+    assert first.get_result(block=True) == 6
+    assert second.get_result(block=True) == 33
+    assert list(first.get_results()) == [3, 6]
+    assert list(second.get_results()) == [30, 33]
+
+
+def test_interleaved_processing_of_two_runs_does_not_cross_talk(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    # And an actor whose first step stalls run 1 until run 2 has reached it
+    first_step_ran = Event()
+
+    @dramatiq.actor(store_results=True)
+    def begin(x):
+        if x == 1:
+            first_step_ran.wait(timeout=5)
+        else:
+            first_step_ran.set()
+        return x
+
+    @dramatiq.actor(store_results=True)
+    def finish(x):
+        return x * 10
+
+    # And a nested template
+    template = pipeline([begin.message(0), finish.message()])
+
+    # When two runs are started and their processing is forced to
+    # interleave (run 2's first step completes while run 1 is still
+    # waiting on its first step)
+    first = template.run(args=(1,))
+    second = template.run(args=(2,))
+    stub_broker.join(begin.queue_name)
+    stub_broker.join(finish.queue_name)
+    stub_worker.join()
+
+    # Then each run should reach its own end result
+    assert first.get_result(block=True) == 10
+    assert second.get_result(block=True) == 20
+    assert list(first.get_results()) == [1, 10]
+    assert list(second.get_results()) == [2, 20]
+
+
+def test_reusing_a_child_pipeline_across_templates_does_not_share_state(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def add(x, y):
+        return x + y
+
+    # And a child pipeline that is reused by two different templates
+    child = pipeline([add.message(3), add.message(4)])
+    first_template = pipeline([add.message(1, 0), child])
+    second_template = pipeline([add.message(2, 0), child])
+
+    # When both templates are run
+    first = first_template.run()
+    second = second_template.run()
+    stub_broker.join(add.queue_name)
+    stub_worker.join()
+
+    # Then the nested child should still have been flattened
+    assert len(first.messages) == 3
+    assert len(second.messages) == 3
+
+    # And each template should keep its own first argument
+    assert first.messages[0].args == (1, 0)
+    assert second.messages[0].args == (2, 0)
+
+    # And the shared child definition must not have been mutated
+    assert child.messages[0].args == (3,)
+    assert child.messages[0].options["pipe_target"]["message_id"] == child.messages[1].message_id
+
+    # And the runs must reach their own end results
+    assert first.get_result(block=True) == 8
+    assert second.get_result(block=True) == 9
+
+
+def test_querying_the_template_after_run_matches_the_last_run(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def add(x, y):
+        return x + y
+
+    # And a template that is run twice with different inputs
+    template = pipeline([add.message(0, 0), add.message(3)])
+    template.run(args=(1, 2))
+    template.run(args=(10, 20))
+
+    # When I use the historical "run then query the same object" usage
+    # Then it should refer to the most recent run
+    assert template.get_result(block=True) == 33
+    assert list(template.get_results()) == [30, 33]
+    assert template.completed
+    assert template.completed_count == 2
+
+
+def test_pipeline_exposes_the_handle_of_its_last_run(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def add(x, y):
+        return x + y
+
+    # And a template that hasn't run yet
+    template = pipeline([add.message(1, 2), add.message(3)])
+    assert template.last_run is None
+
+    # When I run it
+    run = template.run()
+
+    # Then the template should expose that handle
+    assert template.last_run is run
+
+    # And a handle of an already-enqueued run cannot be composed again,
+    # since that would reuse its message ids
+    with pytest.raises(TypeError):
+        pipeline([run, add.message(100)])
+
+
+def test_composing_a_template_still_flattens_it(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def add(x, y):
+        return x + y
+
+    # When I compose a template into another pipeline
+    child = pipeline([add.message(1, 2), add.message(3)])
+    composed = pipeline([child, add.message(100)])
+
+    # Then the child should be flattened
+    assert len(composed) == 3
+    assert composed.messages[0].args == (1, 2)
+    assert composed.messages[2].args == (100,)
+
+
+def test_concurrent_runs_of_the_same_template_are_isolated(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def add(x, y):
+        return x + y
+
+    # And a template that a service holds for a long time
+    template = pipeline([add.message(0, 0), add.message(1)])
+
+    # When two threads run it at the same time with different inputs
+    runs = {}
+
+    def run_and_wait(thread_id, args):
+        runs[thread_id] = template.run(args=args)
+
+    threads = [
+        threading.Thread(target=run_and_wait, args=("a", (1, 2))),
+        threading.Thread(target=run_and_wait, args=("b", (10, 20))),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    stub_broker.join(add.queue_name)
+    stub_worker.join()
+
+    # Then both runs must have distinct message ids
+    assert {m.message_id for m in runs["a"].messages}.isdisjoint({m.message_id for m in runs["b"].messages})
+
+    # And each run should reach its own end result
+    assert {runs["a"].get_result(block=True), runs["b"].get_result(block=True)} == {4, 31}
+
+
+def test_group_run_queries_follow_the_run_handles(stub_broker, stub_worker, result_backend):
+    # Given a result backend
+    # And a broker with the results middleware
+    stub_broker.add_middleware(Results(backend=result_backend))
+
+    @dramatiq.actor(store_results=True)
+    def add(x, y):
+        return x + y
+
+    # When I run a group containing the same pipeline template twice
+    template = pipeline([add.message(1, 2), add.message(4)])
+    g = group([template, template])
+    g.run()
+
+    # Then the group should read the results of the runs it enqueued
+    assert list(g.get_results(block=True)) == [7, 7]
+    assert g.completed
+    assert g.completed_count == 2

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Iterable
 from uuid import uuid4
 
 from .broker import get_broker
+from .common import current_millis
 from .rate_limits import Barrier
 from .results import ResultMissing
 
@@ -28,9 +29,77 @@ if TYPE_CHECKING:
     from .message import Message
 
 
+def _copy_message(message: Message, **attributes) -> Message:
+    """Copy a message so that it no longer points at the rest of the
+    composition it was taken from.
+
+    ``Message.copy`` creates a fresh ``options`` dict, so dropping the
+    ``pipe_target`` option here is safe and leaves the source message
+    untouched.
+    """
+    message = message.copy(**attributes)
+    message.options.pop("pipe_target", None)
+    return message
+
+
+def _link_messages(messages: list[Message]) -> None:
+    """Point every message at the one that follows it.
+
+    The target payload shares the next message's ``options`` dict, so
+    setting later links is reflected in earlier payloads.  Callers must
+    only ever pass messages that belong to a single composition/run.
+    """
+    for message, next_message in zip(messages, messages[1:]):
+        message.options["pipe_target"] = next_message.asdict()
+
+
+def _completed(messages: list[Message]) -> bool:
+    try:
+        messages[-1].get_result()
+
+        return True
+    except ResultMissing:
+        return False
+
+
+def _completed_count(messages: list[Message]) -> int:
+    count = 0
+    for count, message in enumerate(messages, start=1):
+        try:
+            message.get_result()
+        except ResultMissing:
+            return count - 1
+
+    return count
+
+
+def _get_result(broker, messages: list[Message], *, block=False, timeout=None):
+    last_message = messages[-1]
+    backend = broker.get_results_backend()
+    return last_message.get_result(backend=backend, block=block, timeout=timeout)
+
+
+def _get_results(broker, messages: list[Message], *, block=False, timeout=None):
+    deadline = None
+    if timeout:
+        deadline = time.monotonic() + timeout / 1000
+
+    for message in messages:
+        if deadline:
+            timeout = max(0, int((deadline - time.monotonic()) * 1000))
+
+        backend = broker.get_results_backend()
+        yield message.get_result(backend=backend, block=block, timeout=timeout)
+
+
 class pipeline:
     """Chain actors together, passing the result of one actor to the
     next one in line.
+
+    A ``pipeline`` is a reusable template: running it derives a fresh
+    set of messages (with new message ids and their own ``pipe_target``
+    links) so that the same definition can be run any number of times,
+    even concurrently, without the runs sharing state.
 
     Parameters:
       children(Iterable[Message|pipeline]): A sequence of messages or
@@ -44,17 +113,22 @@ class pipeline:
 
     def __init__(self, children: Iterable[Message | pipeline], *, broker=None):
         self.broker = broker or get_broker()
+        self._last_run: pipeline_run | None = None
         messages: list[Message]
         self.messages = messages = []
 
         for child in children:
             if isinstance(child, pipeline):
-                messages.extend(message.copy() for message in child.messages)
+                messages.extend(_copy_message(message) for message in child.messages)
+            elif isinstance(child, pipeline_run):
+                raise TypeError(
+                    "pipeline_run is a handle for a run that was already enqueued and cannot be composed. "
+                    "Compose the pipeline template instead."
+                )
             else:
-                messages.append(child.copy())
+                messages.append(_copy_message(child))
 
-        for message, next_message in zip(messages, messages[1:]):
-            message.options["pipe_target"] = next_message.asdict()
+        _link_messages(messages)
 
     def __len__(self):
         """Returns the length of the pipeline."""
@@ -62,10 +136,33 @@ class pipeline:
 
     def __or__(self, other):
         """Returns a new pipeline with "other" added to the end."""
-        return type(self)(self.messages + [other])
+        return type(self)(self.messages + [other], broker=self.broker)
 
     def __str__(self):  # pragma: no cover
         return "pipeline([%s])" % ", ".join(str(m) for m in self.messages)
+
+    def _current_messages(self) -> list[Message]:
+        """The messages queries should read.
+
+        Before the template is run these are the template messages, so
+        the historical "run, then query the same object" usage keeps
+        working.  After a run they are the messages of the most recent
+        run, whose ids are the ones that were actually enqueued.
+        """
+        if self._last_run is not None:
+            return self._last_run.messages
+        return self.messages
+
+    @property
+    def last_run(self) -> pipeline_run | None:
+        """The handle of the most recent :meth:`run`, or ``None`` if the
+        template hasn't been run yet.
+
+        Keep the handle instead of the template when you need to query
+        a specific run, since running the template again moves this
+        property to the new run.
+        """
+        return self._last_run
 
     @property
     def completed(self):
@@ -77,12 +174,7 @@ class pipeline:
           RuntimeError: If your broker doesn't have a result backend
             set up.
         """
-        try:
-            self.messages[-1].get_result()
-
-            return True
-        except ResultMissing:
-            return False
+        return _completed(self._current_messages())
 
     @property
     def completed_count(self):
@@ -98,32 +190,175 @@ class pipeline:
         Returns:
           int: The total number of results.
         """
-        for count, message in enumerate(self.messages, start=1):
-            try:
-                message.get_result()
-            except ResultMissing:
-                return count - 1
+        return _completed_count(self._current_messages())
 
-        return count
+    def _derive_run(self, *, last_message_options=None, first_message_attributes=None) -> pipeline_run:
+        """Build a fresh set of messages for a single run.
 
-    def run(self, *, delay=None):
+        Every message gets a new id and timestamp, ``pipe_target``
+        links are rebuilt against the new messages and no option dict
+        is shared with the template, so a run cannot leak into the
+        template or into another run.
+        """
+        # Imported here to avoid a circular dependency at module load
+        # time (message imports pipeline at the top of its module).
+        from .message import generate_unique_id
+
+        messages = [
+            _copy_message(
+                message,
+                message_id=generate_unique_id(),
+                message_timestamp=current_millis(),
+            )
+            for message in self.messages
+        ]
+
+        if messages and first_message_attributes:
+            messages[0] = messages[0].copy(**first_message_attributes)
+
+        if messages and last_message_options:
+            messages[-1] = messages[-1].copy(options=last_message_options)
+
+        _link_messages(messages)
+        return pipeline_run(self.broker, messages)
+
+    def _run(self, *, delay=None, args=None, kwargs=None, last_message_options=None) -> pipeline_run:
+        """Derive, enqueue and record a single run of this template."""
+        first_message_attributes = {}
+        if args is not None:
+            first_message_attributes["args"] = tuple(args)
+        if kwargs is not None:
+            first_message_attributes["kwargs"] = dict(kwargs)
+
+        run = self._derive_run(
+            last_message_options=last_message_options,
+            first_message_attributes=first_message_attributes,
+        )
+        delay = max(delay or 0, run.messages[0].options.get("delay") or 0) or None
+        self.broker.enqueue(run.messages[0], delay=delay)
+        self._last_run = run
+        return run
+
+    def run(self, *, delay=None, args=None, kwargs=None):
         """Run this pipeline.
+
+        Every call derives an independent run: the template messages,
+        their options and their ``pipe_target`` links are left
+        untouched and the returned handle owns the messages that were
+        actually enqueued.  Running the same template twice therefore
+        cannot make the two runs share ids, options or downstream
+        messages.
 
         Parameters:
           delay(int): The minimum amount of time, in milliseconds, the
             pipeline should be delayed by. If both pipeline's delay and
             first message's delay are provided, the bigger value will be
             used.
+          args(tuple): When given, replaces the positional arguments of
+            the first message for this run only.  This is how a service
+            that keeps a single template around feeds it different
+            inputs.
+          kwargs(dict): When given, replaces the keyword arguments of
+            the first message for this run only.
 
         Returns:
-          pipeline: Itself.
+          pipeline_run: A handle for this run.
         """
-        delay = max(delay or 0, self.messages[0].options.get("delay") or 0) or None
-        self.broker.enqueue(self.messages[0], delay=delay)
-        return self
+        return self._run(delay=delay, args=args, kwargs=kwargs)
 
     def get_result(self, *, block=False, timeout=None):
         """Get the result of this pipeline.
+
+        Pipeline results are represented by the result of the last
+        message in the chain.  When the pipeline has been run, this
+        reads the most recent run.
+
+        Parameters:
+          block(bool): Whether or not to block until a result is set.
+          timeout(int): The maximum amount of time, in ms, to wait for
+            a result when block is True.  Defaults to 10 seconds.
+
+        Raises:
+          ResultMissing: When block is False and the result isn't set.
+          ResultTimeout: When waiting for a result times out.
+
+        Returns:
+          object: The result.
+        """
+        return _get_result(self.broker, self._current_messages(), block=block, timeout=timeout)
+
+    def get_results(self, *, block=False, timeout=None):
+        """Get the results of each job in the pipeline.
+
+        When the pipeline has been run, this reads the most recent run.
+
+        Parameters:
+          block(bool): Whether or not to block until a result is set.
+          timeout(int): The maximum amount of time, in ms, to wait for
+            a result when block is True.  Defaults to 10 seconds.
+
+        Raises:
+          ResultMissing: When block is False and the result isn't set.
+          ResultTimeout: When waiting for a result times out.
+
+        Returns:
+          A result generator.
+        """
+        yield from _get_results(self.broker, self._current_messages(), block=block, timeout=timeout)
+
+
+class pipeline_run:
+    """The handle returned by :meth:`pipeline.run`.
+
+    It owns the messages of exactly one run, so two handles produced
+    from the same template never share message ids, options or
+    ``pipe_target`` links.
+
+    Parameters:
+      broker(Broker): The broker the run was enqueued on.
+      messages(list[Message]): The messages of this run, in order.
+    """
+
+    def __init__(self, broker, messages: list[Message]):
+        self.broker = broker
+        self.messages = messages
+        self.run_id = str(uuid4())
+
+    def __len__(self):
+        """Returns the length of the run."""
+        return len(self.messages)
+
+    def __str__(self):  # pragma: no cover
+        return "pipeline_run(%r, [%s])" % (self.run_id, ", ".join(str(m) for m in self.messages))
+
+    @property
+    def completed(self):
+        """Returns True when all the jobs in this run have been
+        completed.  This will always return False if the last actor in
+        the pipeline doesn't store results.
+
+        Raises:
+          RuntimeError: If your broker doesn't have a result backend
+            set up.
+        """
+        return _completed(self.messages)
+
+    @property
+    def completed_count(self):
+        """Returns the total number of jobs in this run that have been
+        completed.
+
+        Raises:
+          RuntimeError: If your broker doesn't have a result backend
+            set up.
+
+        Returns:
+          int: The total number of results.
+        """
+        return _completed_count(self.messages)
+
+    def get_result(self, *, block=False, timeout=None):
+        """Get the result of this run.
 
         Pipeline results are represented by the result of the last
         message in the chain.
@@ -140,16 +375,10 @@ class pipeline:
         Returns:
           object: The result.
         """
-        last_message = self.messages[-1]
-
-        if isinstance(last_message, (group, pipeline)):
-            return last_message.get_result(block=block, timeout=timeout)
-
-        backend = self.broker.get_results_backend()
-        return last_message.get_result(backend=backend, block=block, timeout=timeout)
+        return _get_result(self.broker, self.messages, block=block, timeout=timeout)
 
     def get_results(self, *, block=False, timeout=None):
-        """Get the results of each job in the pipeline.
+        """Get the results of each job in this run.
 
         Parameters:
           block(bool): Whether or not to block until a result is set.
@@ -163,19 +392,7 @@ class pipeline:
         Returns:
           A result generator.
         """
-        deadline = None
-        if timeout:
-            deadline = time.monotonic() + timeout / 1000
-
-        for message in self.messages:
-            if deadline:
-                timeout = max(0, int((deadline - time.monotonic()) * 1000))
-
-            if isinstance(message, (group, pipeline)):
-                yield message.get_result(block=block, timeout=timeout)
-
-            backend = self.broker.get_results_backend()
-            yield message.get_result(backend=backend, block=block, timeout=timeout)
+        yield from _get_results(self.broker, self.messages, block=block, timeout=timeout)
 
 
 class group:
@@ -192,6 +409,20 @@ class group:
         self.children = list(children)
         self.broker = broker or get_broker()
         self.completion_callbacks = []
+        self._last_run_children = None
+
+    def _current_children(self):
+        """The children queries should read.
+
+        Before the group is run these are the declared children, so
+        querying a group that was never run keeps behaving as before.
+        After a run they are the handles/messages that run actually
+        enqueued, so a re-run does not make the previous run's results
+        ambiguous.
+        """
+        if self._last_run_children is not None:
+            return self._last_run_children
+        return self.children
 
     def __len__(self):
         """Returns the size of the group."""
@@ -247,7 +478,7 @@ class group:
           int: The total number of results.
         """
         count = 0
-        for child in self.children:
+        for child in self._current_children():
             try:
                 if isinstance(child, group):
                     child.get_results()
@@ -269,6 +500,7 @@ class group:
         Returns:
           group: This same group.
         """
+        completion_options = None
         if self.completion_callbacks:
             from .middleware.group_callbacks import GroupCallbacks
 
@@ -291,40 +523,38 @@ class group:
             completion_barrier = Barrier(rate_limiter_backend, completion_uuid, ttl=barrier_ttl)
             completion_barrier.create(len(self.children))
 
-            children = []
-            for child in self.children:
-                if isinstance(child, group):
+            completion_options = {
+                "group_completion_uuid": completion_uuid,
+                "group_completion_callbacks": self.completion_callbacks,
+            }
+
+        run_children = []
+        for child in self.children:
+            if isinstance(child, group):
+                if completion_options is not None:
                     raise NotImplementedError
 
-                elif isinstance(child, pipeline):
-                    pipeline_children = child.messages[:]
-                    pipeline_children[-1] = pipeline_children[-1].copy(
-                        options={
-                            "group_completion_uuid": completion_uuid,
-                            "group_completion_callbacks": self.completion_callbacks,
-                        }
-                    )
+                run_children.append(child.run(delay=delay))
 
-                    children.append(pipeline(pipeline_children, broker=child.broker))
+            elif isinstance(child, pipeline_run):
+                raise NotImplementedError(
+                    "A pipeline_run has already been enqueued; pass the pipeline template to the group instead."
+                )
 
-                else:
-                    children.append(
-                        child.copy(
-                            options={
-                                "group_completion_uuid": completion_uuid,
-                                "group_completion_callbacks": self.completion_callbacks,
-                            }
-                        )
-                    )
-        else:
-            children = self.children
+            elif isinstance(child, pipeline):
+                # Rely on the template to derive the run; when there are
+                # completion callbacks, only the derived last message
+                # carries the completion options.
+                run_children.append(child._run(delay=delay, last_message_options=completion_options))
 
-        for child in children:
-            if isinstance(child, (group, pipeline)):
-                child.run(delay=delay)
             else:
-                self.broker.enqueue(child, delay=delay)
+                if completion_options is not None:
+                    child = child.copy(options=completion_options)
 
+                self.broker.enqueue(child, delay=delay)
+                run_children.append(child)
+
+        self._last_run_children = run_children
         return self
 
     def get_results(self, *, block=False, timeout=None):
@@ -347,13 +577,13 @@ class group:
         if timeout:
             deadline = time.monotonic() + timeout / 1000
 
-        for child in self.children:
+        for child in self._current_children():
             if deadline:
                 timeout = max(0, int((deadline - time.monotonic()) * 1000))
 
             if isinstance(child, group):
                 yield list(child.get_results(block=block, timeout=timeout))
-            elif isinstance(child, pipeline):
+            elif isinstance(child, (pipeline, pipeline_run)):
                 yield child.get_result(block=block, timeout=timeout)
             else:
                 backend = self.broker.get_results_backend()

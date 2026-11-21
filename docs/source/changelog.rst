@@ -8,6 +8,19 @@ All notable changes to this project will be documented in this file.
 `Unreleased`_
 -------------
 
+Added
+^^^^^
+
+* ``pipeline.run`` now derives an independent set of messages (new
+  message ids and ``pipe_target`` links) for every call and returns a
+  ``pipeline_run`` handle for that run instead of the template itself.
+  This lets a single pipeline template be run repeatedly — even
+  concurrently, or as a shared child of several templates — without the
+  runs sharing message ids, options or downstream links.  ``run`` also
+  accepts per-run ``args``/``kwargs`` for the first message.  Calling
+  ``get_result``/``get_results`` on the template keeps working and reads
+  the most recent run.
+
 Fixed
 ^^^^^
 

@@ -144,6 +144,28 @@ call |pipeline_get_results|::
   for res in pipe.get_results(block=True):
       ...
 
+A pipeline is a reusable template: every call to ``run()`` derives a
+fresh set of messages, with new message ids and their own downstream
+links, and returns a ``pipeline_run`` handle for that one run.  Keep the
+handle -- not just the template -- when you need to query a specific
+run, since re-running the template does not change handles you already
+hold::
+
+  template = pipeline([get_uri_contents.message(), count_words.message()])
+
+  first = template.run(args=("http://example.com",))
+  second = template.run(args=("http://example.org",))
+
+  # Each handle only sees the messages and results of its own run.
+  first.get_result(block=True)
+  second.get_result(block=True)
+
+The ``args``/``kwargs`` passed to ``run()`` only replace the first
+message's arguments for that run, leaving the template untouched.  If
+you run a template and never keep the handle, calling ``get_result`` or
+``get_results`` on the template itself keeps working and refers to the
+most recent run.
+
 Asyncio Actors
 --------------
 

@@ -37,6 +37,8 @@ Message Composition
    :members:
 .. autoclass:: pipeline
    :members:
+.. autoclass:: pipeline_run
+   :members:
 
 Message Encoders
 ^^^^^^^^^^^^^^^^

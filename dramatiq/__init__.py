@@ -21,7 +21,7 @@ import warnings
 
 from .actor import Actor, actor
 from .broker import Broker, Consumer, MessageProxy, get_broker, set_broker
-from .composition import group, pipeline
+from .composition import group, pipeline, pipeline_run
 from .encoder import Encoder, JSONEncoder, PickleEncoder
 from .errors import (
     ActorNotFound,
@@ -56,6 +56,7 @@ __all__ = [
     # Composition
     "group",
     "pipeline",
+    "pipeline_run",
     # Encoding
     "Encoder",
     "JSONEncoder",
