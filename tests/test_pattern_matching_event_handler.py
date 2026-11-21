@@ -313,3 +313,242 @@ def test_events_lost_ignores_patterns() -> None:
 
     assert events_collected == [EventsLostEvent("/path/project", is_directory=True)]
     assert any_events == []
+
+
+def _collect_delivered(handler: PatternMatchingEventHandler) -> list[FileSystemEvent]:
+    delivered: list[FileSystemEvent] = []
+    handler.on_any_event = delivered.append
+    return delivered
+
+
+def _summarize(events: list[FileSystemEvent]) -> list[tuple[str, str, str]]:
+    return [(event.event_type, event.src_path, event.dest_path) for event in events]
+
+
+@pytest.mark.parametrize("scope_aware", [None, False])
+def test_move_keeps_legacy_behaviour_without_scope_aware(scope_aware: bool | None) -> None:
+    """
+    Without the new option, a move is matched as a whole: it is still delivered as
+    a move when only one endpoint is included, and one ignored endpoint can drop
+    it whatever the other endpoint is.
+    """
+    kwargs = {} if scope_aware is None else {"scope_aware": scope_aware}
+    handler = PatternMatchingEventHandler(patterns=["/project/src/**"], **kwargs)
+    assert handler.scope_aware is False
+    delivered = _collect_delivered(handler)
+
+    # Cross-boundary moves stay moves, with both endpoints, as before.
+    leaving = FileMovedEvent("/project/src/a.py", "/project/vendor/a.py")
+    entering = FileMovedEvent("/project/vendor/a.py", "/project/src/a.py")
+    handler.dispatch(leaving)
+    handler.dispatch(entering)
+    assert delivered == [leaving, entering]
+
+    # An ignored endpoint (ANY policy, the default) drops the whole move.
+    ignoring = PatternMatchingEventHandler(
+        patterns=["/project/src/**"],
+        ignore_patterns=["/project/vendor/**"],
+        **kwargs,
+    )
+    ignored_delivered = _collect_delivered(ignoring)
+    ignoring.dispatch(leaving)
+    ignoring.dispatch(entering)
+    assert ignored_delivered == []
+
+    # Moves inside the scope are still moves.
+    inside = FileMovedEvent("/project/src/a.py", "/project/src/b.py")
+    handler.dispatch(inside)
+    assert delivered == [leaving, entering, inside]
+
+
+def test_scope_aware_rename_inside_scope_is_a_move() -> None:
+    handler = PatternMatchingEventHandler(patterns=["/project/src/**"], scope_aware=True)
+    delivered = _collect_delivered(handler)
+
+    event = FileMovedEvent("/project/src/a.py", "/project/src/pkg/b.py")
+    handler.dispatch(event)
+
+    assert delivered == [event]
+    assert _summarize(delivered) == [(EVENT_TYPE_MOVED, "/project/src/a.py", "/project/src/pkg/b.py")]
+
+
+def test_scope_aware_move_into_scope_is_a_creation() -> None:
+    handler = PatternMatchingEventHandler(patterns=["/project/src/**"], scope_aware=True)
+    delivered = _collect_delivered(handler)
+
+    handler.dispatch(FileMovedEvent("/project/vendor/a.py", "/project/src/a.py"))
+
+    assert _summarize(delivered) == [(EVENT_TYPE_CREATED, "/project/src/a.py", "")]
+    assert isinstance(delivered[0], FileCreatedEvent)
+
+
+def test_scope_aware_move_out_of_scope_is_a_deletion() -> None:
+    handler = PatternMatchingEventHandler(patterns=["/project/src/**"], scope_aware=True)
+    delivered = _collect_delivered(handler)
+
+    handler.dispatch(FileMovedEvent("/project/src/a.py", "/project/vendor/a.py"))
+
+    assert _summarize(delivered) == [(EVENT_TYPE_DELETED, "/project/src/a.py", "")]
+    assert isinstance(delivered[0], FileDeletedEvent)
+
+
+def test_scope_aware_move_within_ignored_directory_is_dropped() -> None:
+    # Both endpoints are ignored: the scope sees no change at all.
+    handler = PatternMatchingEventHandler(
+        patterns=["/project/src/**"],
+        ignore_patterns=["/project/src/vendor/**"],
+        scope_aware=True,
+    )
+    delivered = _collect_delivered(handler)
+
+    handler.dispatch(FileMovedEvent("/project/src/vendor/a.py", "/project/src/vendor/b.py"))
+
+    assert delivered == []
+
+
+def test_scope_aware_move_between_ignored_and_included_is_a_creation() -> None:
+    handler = PatternMatchingEventHandler(
+        patterns=["/project/src/**"],
+        ignore_patterns=["/project/src/vendor/**"],
+        scope_aware=True,
+    )
+    delivered = _collect_delivered(handler)
+
+    handler.dispatch(FileMovedEvent("/project/src/vendor/a.py", "/project/src/a.py"))
+
+    assert _summarize(delivered) == [(EVENT_TYPE_CREATED, "/project/src/a.py", "")]
+    assert isinstance(delivered[0], FileCreatedEvent)
+
+
+def test_scope_aware_move_between_included_and_ignored_is_a_deletion() -> None:
+    handler = PatternMatchingEventHandler(
+        patterns=["/project/src/**"],
+        ignore_patterns=["/project/src/vendor/**"],
+        scope_aware=True,
+    )
+    delivered = _collect_delivered(handler)
+
+    handler.dispatch(FileMovedEvent("/project/src/a.py", "/project/src/vendor/a.py"))
+
+    assert _summarize(delivered) == [(EVENT_TYPE_DELETED, "/project/src/a.py", "")]
+    assert isinstance(delivered[0], FileDeletedEvent)
+
+
+def test_scope_aware_move_out_of_scope_of_both_patterns_is_dropped() -> None:
+    handler = PatternMatchingEventHandler(patterns=["/project/src/**"], scope_aware=True)
+    delivered = _collect_delivered(handler)
+
+    handler.dispatch(FileMovedEvent("/project/vendor/a.py", "/project/vendor/b.py"))
+
+    assert delivered == []
+
+
+def test_scope_aware_directory_move() -> None:
+    handler = PatternMatchingEventHandler(patterns=["/project/src/**"], scope_aware=True)
+    delivered = _collect_delivered(handler)
+
+    handler.dispatch(DirMovedEvent("/project/src/pkg", "/project/src/lib"))
+    handler.dispatch(DirMovedEvent("/project/src/pkg", "/project/vendor/pkg"))
+    handler.dispatch(DirMovedEvent("/project/vendor/pkg", "/project/src/pkg"))
+
+    assert _summarize(delivered) == [
+        (EVENT_TYPE_MOVED, "/project/src/pkg", "/project/src/lib"),
+        (EVENT_TYPE_DELETED, "/project/src/pkg", ""),
+        (EVENT_TYPE_CREATED, "/project/src/pkg", ""),
+    ]
+    assert isinstance(delivered[1], DirDeletedEvent)
+    assert isinstance(delivered[2], DirCreatedEvent)
+
+
+def test_scope_aware_honours_ignore_directories() -> None:
+    handler = PatternMatchingEventHandler(patterns=["/project/src/**"], ignore_directories=True, scope_aware=True)
+    delivered = _collect_delivered(handler)
+
+    handler.dispatch(DirMovedEvent("/project/src/pkg", "/project/vendor/pkg"))
+
+    assert delivered == []
+
+
+def test_scope_aware_relative_patterns_use_the_watch_path() -> None:
+    # Patterns are evaluated against the watch root as usual, on each endpoint.
+    handler = PatternMatchingEventHandler(patterns=["src/**"], scope_aware=True)
+    delivered = _collect_delivered(handler)
+
+    moved_in = FileMovedEvent("/project/vendor/a.py", "/project/src/a.py")
+    moved_in.watch_path = "/project"
+    handler.dispatch(moved_in)
+    moved_out = FileMovedEvent("/project/src/a.py", "/project/vendor/a.py")
+    moved_out.watch_path = "/project"
+    handler.dispatch(moved_out)
+
+    assert _summarize(delivered) == [
+        (EVENT_TYPE_CREATED, "/project/src/a.py", ""),
+        (EVENT_TYPE_DELETED, "/project/src/a.py", ""),
+    ]
+
+
+def test_scope_aware_derived_events_keep_their_origin_metadata() -> None:
+    handler = PatternMatchingEventHandler(patterns=["/project/src/**"], scope_aware=True)
+    delivered = _collect_delivered(handler)
+
+    synthetic = FileMovedEvent("/project/src/a.py", "/project/vendor/a.py", is_synthetic=True)
+    synthetic.watch_path = "/project/src"
+    handler.dispatch(synthetic)
+
+    assert _summarize(delivered) == [(EVENT_TYPE_DELETED, "/project/src/a.py", "")]
+    assert delivered[0].is_synthetic is True
+    assert delivered[0].watch_path == "/project/src"
+
+
+def test_scope_aware_accepts_bytes_paths() -> None:
+    handler = PatternMatchingEventHandler(patterns=["/project/src/**"], scope_aware=True)
+    delivered = _collect_delivered(handler)
+
+    handler.dispatch(FileMovedEvent(b"/project/vendor/a.py", b"/project/src/a.py"))
+
+    assert _summarize(delivered) == [(EVENT_TYPE_CREATED, b"/project/src/a.py", "")]
+
+
+def test_scope_aware_move_without_destination_keeps_legacy_handling() -> None:
+    # A partial record (no destination) is not a cross-boundary move: it is
+    # matched as a whole, as before.
+    handler = PatternMatchingEventHandler(patterns=["/project/src/**"], scope_aware=True)
+    delivered = _collect_delivered(handler)
+
+    event = FileMovedEvent("/project/src/a.py", "")
+    handler.dispatch(event)
+
+    assert delivered == [event]
+
+
+def test_scope_aware_leaves_other_events_untouched() -> None:
+    handler = PatternMatchingEventHandler(patterns=["/project/src/**"], scope_aware=True)
+    delivered = _collect_delivered(handler)
+
+    events = [
+        FileCreatedEvent("/project/src/a.py"),
+        FileModifiedEvent("/project/src/a.py"),
+        FileDeletedEvent("/project/src/a.py"),
+        FileCreatedEvent("/project/vendor/a.py"),
+    ]
+    for event in events:
+        handler.dispatch(event)
+
+    assert delivered == events[:3]
+
+
+def test_scope_aware_ignores_ignore_policy_for_moves() -> None:
+    # Each endpoint is matched on its own, so the whole-event policy cannot hide
+    # the included endpoint.
+    for policy in (IgnorePolicy.ANY, IgnorePolicy.ALL):
+        handler = PatternMatchingEventHandler(
+            patterns=["/project/src/**"],
+            ignore_patterns=["/project/vendor/**"],
+            ignore_policy=policy,
+            scope_aware=True,
+        )
+        delivered = _collect_delivered(handler)
+
+        handler.dispatch(FileMovedEvent("/project/src/a.py", "/project/vendor/a.py"))
+
+        assert _summarize(delivered) == [(EVENT_TYPE_DELETED, "/project/src/a.py", "")]

@@ -419,9 +419,22 @@ class PathMatchingEventHandler(FileSystemEventHandler):
         otherwise.
     :param ignore_policy:
         Policy for multi-path events (e.g. moves/renames). Defaults to
-        :attr:`~watchdog.events.IgnorePolicy.ANY`.
+        :attr:`~watchdog.events.IgnorePolicy.ANY`. It does not apply to moves
+        when ``scope_aware`` is ``True``.
     :type ignore_policy:
         :class:`~watchdog.events.IgnorePolicy` | str
+    :param scope_aware:
+        ``True`` to match each end of a move against the include and ignore
+        rules on its own, and to deliver the change of the endpoints that fall
+        within scope:
+
+        * a move whose two endpoints are in scope stays a move,
+        * a move leaving the scope is delivered as a deletion of its source,
+        * a move entering the scope is delivered as a creation of its destination,
+        * a move with no endpoint in scope is dropped.
+
+        ``False`` (default) keeps the historical handling of moves, where the
+        event is matched as a whole and ``ignore_policy`` decides.
     """
 
     def __init__(
@@ -430,11 +443,13 @@ class PathMatchingEventHandler(FileSystemEventHandler):
         ignore_directories: bool = False,
         case_sensitive: bool = False,
         ignore_policy: IgnorePolicy | Literal["any", "all"] = IgnorePolicy.ANY,
+        scope_aware: bool = False,
     ) -> None:
         super().__init__()
         self._ignore_directories = ignore_directories
         self._case_sensitive = case_sensitive
         self._ignore_policy = IgnorePolicy(ignore_policy)
+        self._scope_aware = scope_aware
 
     @property
     def ignore_directories(self) -> bool:
@@ -453,6 +468,13 @@ class PathMatchingEventHandler(FileSystemEventHandler):
         """Return the ignore policy."""
         return self._ignore_policy
 
+    @property
+    def scope_aware(self) -> bool:
+        """``True`` if each endpoint of a move is matched on its own; ``False``
+        otherwise.
+        """
+        return self._scope_aware
+
     def is_ignored(self, path: str, *, base_path: str | None = None) -> bool:
         """Return True if path matches ignore criteria."""
         raise NotImplementedError
@@ -463,6 +485,43 @@ class PathMatchingEventHandler(FileSystemEventHandler):
 
     def _validate_rules(self) -> None:
         """Hook to validate matching and ignore rules."""
+
+    def _is_in_scope(self, path: str, *, base_path: str | None = None) -> bool:
+        """Return True if path is included and not ignored on its own."""
+        return self.is_included(path, base_path=base_path) and not self.is_ignored(path, base_path=base_path)
+
+    def _dispatch_scoped_move(
+        self,
+        event: FileSystemMovedEvent,
+        *,
+        base_path: str | None = None,
+    ) -> None:
+        """Deliver a move as the changes of its endpoints that are in scope."""
+        src_path = os.fsdecode(event.src_path)
+        dest_path = os.fsdecode(event.dest_path)
+        src_in_scope = bool(src_path) and self._is_in_scope(src_path, base_path=base_path)
+        dest_in_scope = bool(dest_path) and self._is_in_scope(dest_path, base_path=base_path)
+
+        if src_in_scope and dest_in_scope:
+            super().dispatch(event)
+            return
+
+        # Only one endpoint is in scope: report the change the scope actually
+        # sees, i.e. a deletion for the source and a creation for the destination.
+        if src_in_scope:
+            event_class = DirDeletedEvent if event.is_directory else FileDeletedEvent
+            path = event.src_path
+        elif dest_in_scope:
+            event_class = DirCreatedEvent if event.is_directory else FileCreatedEvent
+            path = event.dest_path
+        else:
+            return
+
+        scoped_event = event_class(path, is_synthetic=event.is_synthetic)
+        watch_path = getattr(event, "watch_path", None)
+        if watch_path is not None:
+            scoped_event.watch_path = watch_path
+        super().dispatch(scoped_event)
 
     def dispatch(self, event: FileSystemEvent) -> None:
         """Dispatches events to the appropriate methods.
@@ -482,6 +541,10 @@ class PathMatchingEventHandler(FileSystemEventHandler):
             return
 
         base_path = getattr(event, "watch_path", None)
+
+        if self.scope_aware and isinstance(event, FileSystemMovedEvent) and event.src_path and event.dest_path:
+            self._dispatch_scoped_move(event, base_path=base_path)
+            return
 
         paths = []
         if event.dest_path:
@@ -520,9 +583,21 @@ class PatternMatchingEventHandler(PathMatchingEventHandler):
         otherwise.
     :param ignore_policy:
         Policy for multi-path events (e.g. moves/renames). Defaults to
-        :attr:`~watchdog.events.IgnorePolicy.ANY`.
+        :attr:`~watchdog.events.IgnorePolicy.ANY`. Ignored for moves when
+        ``scope_aware`` is ``True``.
     :type ignore_policy:
         :class:`~watchdog.events.IgnorePolicy` | str
+    :param scope_aware:
+        ``True`` to match each endpoint of a move on its own and deliver the
+        change seen within scope: a move staying in scope is delivered as a
+        move, one leaving it as a deletion of the source, one entering it as a
+        creation of the destination, and one with both endpoints out of scope
+        is dropped. ``False`` (default) keeps the usual whole-event matching.
+
+        This suits consumers keeping an index of a subtree, e.g. an incremental
+        build watching ``src/**``: sources moved in from elsewhere are added and
+        sources moved away are evicted, while renames inside the subtree are
+        still reported as moves.
     """
 
     def __init__(
@@ -533,11 +608,13 @@ class PatternMatchingEventHandler(PathMatchingEventHandler):
         ignore_directories: bool = False,
         case_sensitive: bool = False,
         ignore_policy: IgnorePolicy | Literal["any", "all"] = IgnorePolicy.ANY,
+        scope_aware: bool = False,
     ) -> None:
         super().__init__(
             ignore_directories=ignore_directories,
             case_sensitive=case_sensitive,
             ignore_policy=ignore_policy,
+            scope_aware=scope_aware,
         )
 
         self._patterns = patterns
@@ -603,9 +680,15 @@ class RegexMatchingEventHandler(PathMatchingEventHandler):
         otherwise.
     :param ignore_policy:
         Policy for multi-path events (e.g. moves/renames). Defaults to
-        :attr:`~watchdog.events.IgnorePolicy.ANY`.
+        :attr:`~watchdog.events.IgnorePolicy.ANY`. Ignored for moves when
+        ``scope_aware`` is ``True``.
     :type ignore_policy:
         :class:`~watchdog.events.IgnorePolicy` | str
+    :param scope_aware:
+        ``True`` to match each endpoint of a move on its own and deliver the
+        change seen within scope, as
+        :class:`~watchdog.events.PatternMatchingEventHandler` does. ``False``
+        (default) keeps the usual whole-event matching.
     """
 
     def __init__(
@@ -616,11 +699,13 @@ class RegexMatchingEventHandler(PathMatchingEventHandler):
         ignore_directories: bool = False,
         case_sensitive: bool = False,
         ignore_policy: IgnorePolicy | Literal["any", "all"] = IgnorePolicy.ANY,
+        scope_aware: bool = False,
     ) -> None:
         super().__init__(
             ignore_directories=ignore_directories,
             case_sensitive=case_sensitive,
             ignore_policy=ignore_policy,
+            scope_aware=scope_aware,
         )
 
         if regexes is None:

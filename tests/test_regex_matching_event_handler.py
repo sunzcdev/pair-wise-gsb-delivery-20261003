@@ -344,3 +344,43 @@ def test_conflicting_regexes(
             ignore_regexes=ignore_regexes,
             case_sensitive=case_sensitive,
         )
+
+
+def test_scope_aware_moves() -> None:
+    """
+    With ``scope_aware``, each endpoint of a move is matched on its own: the
+    scope sees a deletion when the source leaves it, and a creation when the
+    destination enters it.
+    """
+    collected = []
+
+    handler = RegexMatchingEventHandler(
+        regexes=[r"/project/src/.*"],
+        ignore_regexes=[r"/project/src/vendor/.*"],
+        scope_aware=True,
+    )
+    handler.on_any_event = collected.append
+    assert handler.scope_aware is True
+
+    # Inside the scope: still a move.
+    handler.dispatch(FileMovedEvent("/project/src/a.py", "/project/src/b.py"))
+    # Leaving the scope: a deletion of the source.
+    handler.dispatch(FileMovedEvent("/project/src/a.py", "/project/vendor/a.py"))
+    # Leaving the included part of the scope for the ignored one: a deletion.
+    handler.dispatch(FileMovedEvent("/project/src/a.py", "/project/src/vendor/a.py"))
+    # Entering the scope: a creation of the destination.
+    handler.dispatch(FileMovedEvent("/project/vendor/a.py", "/project/src/a.py"))
+    # Dividing the ignored part from the included one: a creation.
+    handler.dispatch(FileMovedEvent("/project/src/vendor/a.py", "/project/src/a.py"))
+    # Both endpoints out of scope: dropped.
+    handler.dispatch(FileMovedEvent("/project/vendor/a.py", "/project/vendor/b.py"))
+    # Both endpoints ignored: dropped.
+    handler.dispatch(FileMovedEvent("/project/src/vendor/a.py", "/project/src/vendor/b.py"))
+
+    assert [(e.event_type, e.src_path, e.dest_path) for e in collected] == [
+        ("moved", "/project/src/a.py", "/project/src/b.py"),
+        ("deleted", "/project/src/a.py", ""),
+        ("deleted", "/project/src/a.py", ""),
+        ("created", "/project/src/a.py", ""),
+        ("created", "/project/src/a.py", ""),
+    ]

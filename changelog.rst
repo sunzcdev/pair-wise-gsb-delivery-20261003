@@ -33,6 +33,7 @@ Changelog
 - [inotify] Stop watching directories moved out of a watched tree and emit synthetic deletion/moved events for their subdirectories. (`#354 <https://github.com/gorakhargosh/watchdog/issues/354>`__, thanks to @prateek-dagar)
 - [inotify] Events read before a kernel queue overflow are delivered instead of discarded, ahead of the ``EventsLostEvent``. (`#1440 <https://github.com/gorakhargosh/watchdog/issues/1440>`__, thanks to @KurathSec and @fstrasz)
 - [windows] Report lost events: when the ``ReadDirectoryChangesW`` buffer of a watch overflows, the watch gets an ``EventsLostEvent``, dispatched to ``FileSystemEventHandler.on_events_lost()``, as on inotify. (`#1440 <https://github.com/gorakhargosh/watchdog/issues/1440>`__, thanks to @fstrasz)
+- [core] Add the ``scope_aware`` option to ``PatternMatchingEventHandler``, ``RegexMatchingEventHandler`` and their base ``PathMatchingEventHandler``. When enabled, each endpoint of a move is matched against the include and ignore rules on its own: a move with both endpoints in scope stays a move, a move leaving the scope is delivered as a deletion of its source, and a move entering it as a creation of its destination, so consumers indexing a subtree see the path to evict or to add. ``ignore_policy`` no longer applies to moves in that mode. The default (``False``) keeps the previous whole-event matching.
 
 7.1.0
 ~~~~~
