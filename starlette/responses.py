@@ -27,6 +27,25 @@ from starlette.requests import ClientDisconnect
 from starlette.types import Message, Receive, Scope, Send
 
 
+@asynccontextmanager
+async def _closing_async_iterator(iterator: AsyncIterator[Any]) -> AsyncIterator[AsyncIterator[Any]]:
+    """Close an async iterator when leaving the context, regardless of why.
+
+    Unlike :func:`contextlib.aclosing`, iterators without an ``aclose``
+    coroutine (custom ``__aiter__``/``__anext__`` implementations) are used
+    as-is instead of raising ``AttributeError``. The close is shielded so that
+    a generator's ``finally`` block always gets the chance to run, even when
+    the surrounding scope has already been cancelled.
+    """
+    try:
+        yield iterator
+    finally:
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            with anyio.CancelScope(shield=True):
+                await aclose()
+
+
 class Response:
     media_type: str | None = None
     charset = "utf-8"
@@ -234,6 +253,7 @@ class StreamingResponse(Response):
         headers: Mapping[str, str] | None = None,
         media_type: str | None = None,
         background: BackgroundTask | None = None,
+        cleanup: BackgroundTask | None = None,
     ) -> None:
         if isinstance(content, AsyncIterable):
             self.body_iterator = content
@@ -242,6 +262,10 @@ class StreamingResponse(Response):
         self.status_code = status_code
         self.media_type = self.media_type if media_type is None else media_type
         self.background = background
+        # ``cleanup`` tasks run on every exit path (including disconnects and
+        # errors), while ``background`` tasks only run once the full body has
+        # been sent successfully.
+        self.cleanup = cleanup
         self.init_headers(headers)
 
     async def listen_for_disconnect(self, receive: Receive) -> None:
@@ -252,42 +276,76 @@ class StreamingResponse(Response):
 
     async def stream_response(self, send: Send) -> None:
         await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
-        async for chunk in self.body_iterator:
-            if isinstance(chunk, memoryview):
-                chunk = chunk.cast("B") if chunk.c_contiguous else chunk.tobytes()
-            elif not isinstance(chunk, bytes):
-                chunk = chunk.encode(self.charset)
-            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        # The iterator must be closed promptly on every exit path: when the
+        # body is exhausted, when the client disconnects (either reported via
+        # ``receive`` or surfaced as a failing ``send``), when the response is
+        # cancelled, or when the generator itself raises.
+        async with _closing_async_iterator(self.body_iterator) as body_iterator:
+            async for chunk in body_iterator:
+                if isinstance(chunk, memoryview):
+                    chunk = chunk.cast("B") if chunk.c_contiguous else chunk.tobytes()
+                elif not isinstance(chunk, bytes):
+                    chunk = chunk.encode(self.charset)
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
 
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "websocket":
             send = self._wrap_websocket_denial_send(send)
-            await self.stream_response(send)
+            try:
+                await self.stream_response(send)
+            finally:
+                # Cleanup runs on every exit path; the success-only
+                # background task is invoked explicitly below.
+                if self.cleanup is not None:
+                    with anyio.CancelScope(shield=True):
+                        await self.cleanup()
             if self.background is not None:
                 await self.background()
             return
 
         spec_version = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
 
-        if spec_version >= (2, 4):
-            try:
-                await self.stream_response(send)
-            except OSError:
-                raise ClientDisconnect()
-        else:
+        # Some ASGI servers report client disconnects through ``receive``,
+        # others only surface them as an error from ``send``. Running the
+        # disconnect listener and the response stream in a collapsing task
+        # group covers both paths, and the closing context manager inside
+        # ``stream_response`` makes sure the body iterator is returned on
+        # whichever path terminates the response.
+        body_sent = False
+
+        async def stream_response() -> None:
+            nonlocal body_sent
+            await self.stream_response(send)
+            # Reached only when the full body (including the terminating
+            # empty chunk) was sent without interruption.
+            body_sent = True
+
+        try:
             async with create_collapsing_task_group() as task_group:
 
                 async def wrap(func: Callable[[], Awaitable[None]]) -> None:
                     await func()
                     task_group.cancel_scope.cancel()
 
-                task_group.start_soon(wrap, partial(self.stream_response, send))
+                task_group.start_soon(wrap, stream_response)
                 await wrap(partial(self.listen_for_disconnect, receive))
 
-        if self.background is not None:
-            await self.background()
+            if body_sent and self.background is not None:
+                await self.background()
+        except OSError:
+            if spec_version >= (2, 4):
+                raise ClientDisconnect()
+            raise
+        finally:
+            if self.cleanup is not None:
+                # Shielded so cleanup still completes when an outer
+                # cancellation (for example a server shutting down the
+                # request) interrupted the stream. The pending cancellation
+                # is re-raised once cleanup finishes.
+                with anyio.CancelScope(shield=True):
+                    await self.cleanup()
 
 
 class MalformedRangeHeader(Exception):

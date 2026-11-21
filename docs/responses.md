@@ -177,6 +177,37 @@ async def app(scope, receive, send):
 
 Have in mind that <a href="https://docs.python.org/3/glossary.html#term-file-like-object" target="_blank">file-like</a> objects (like those created by `open()`) are normal iterators. So, you can return them directly in a `StreamingResponse`.
 
+The body iterator is always closed as soon as the response ends. It does not matter whether the body was fully streamed, the client disconnected (reported either through `receive` or as a failing `send`), the response was cancelled, or the generator itself raised: the generator's `finally` blocks are still awaited.
+
+#### Background and cleanup tasks
+
+`StreamingResponse` accepts two kinds of tasks, which differ in *when* they run. A `background` task only runs once the complete response body has been sent successfully. A `cleanup` task runs on every exit path instead, including disconnects, cancellations, and errors raised by the body generator. Both are skipped while an external cancellation is pending except that `cleanup` is shielded so it can finish, after which the cancellation continues to propagate.
+
+Use `cleanup` for releasing resources (such as returning a database cursor) that must not be leaked when the connection drops, and keep `background` for work that only makes sense once the client received the full response.
+
+```python
+from starlette.background import BackgroundTask
+from starlette.responses import StreamingResponse
+
+
+async def rows(cursor):
+    try:
+        for row in cursor.iter_rows():
+            yield row
+    finally:
+        # Also reached when the client disconnects mid-stream.
+        await cursor.aclose()
+
+
+async def app(scope, receive, send):
+    cursor = await acquire_cursor()
+    response = StreamingResponse(
+        rows(cursor),
+        cleanup=BackgroundTask(release_cursor, cursor),
+    )
+    await response(scope, receive, send)
+```
+
 ### FileResponse
 
 Asynchronously streams a file as the response.

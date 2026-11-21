@@ -815,6 +815,7 @@ async def test_streaming_response_non_contiguous_memoryview() -> None:
 @pytest.mark.anyio
 async def test_streaming_response_stops_if_receiving_http_disconnect() -> None:
     streamed = 0
+    finally_ran = False
 
     disconnected = anyio.Event()
 
@@ -831,25 +832,36 @@ async def test_streaming_response_stops_if_receiving_http_disconnect() -> None:
                 disconnected.set()
 
     async def stream_indefinitely() -> AsyncIterator[bytes]:
-        while True:
-            # Need a sleep for the event loop to switch to another task
-            await anyio.sleep(0)
-            yield b"chunk "
+        nonlocal finally_ran
+        try:
+            while True:
+                # Need a sleep for the event loop to switch to another task
+                await anyio.sleep(0)
+                yield b"chunk "
+        finally:
+            finally_ran = True
 
     response = StreamingResponse(content=stream_indefinitely())
 
     with anyio.move_on_after(1) as cancel_scope:
         await response({"type": "http"}, receive_disconnect, send)
     assert not cancel_scope.cancel_called, "Content streaming should stop itself."
+    assert finally_ran, "The generator's finally block must run when receive reports a disconnect."
 
 
 @pytest.mark.anyio
-async def test_streaming_response_on_client_disconnects() -> None:
+@pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
+async def test_streaming_response_closes_iterator_on_send_error(spec_version: str) -> None:
     chunks = bytearray()
     streamed = False
+    finally_ran = False
+    error = OSError("Disconnected")
 
     async def receive_disconnect() -> Message:
-        raise NotImplementedError
+        # The disconnect is only surfaced through the failing ``send`` below,
+        # so the listener stays parked until the task group is torn down.
+        await anyio.sleep_forever()
+        raise NotImplementedError  # pragma: no cover
 
     async def send(message: Message) -> None:
         nonlocal streamed
@@ -858,27 +870,205 @@ async def test_streaming_response_on_client_disconnects() -> None:
                 chunks.extend(message.get("body", b""))
                 streamed = True
             else:
-                raise OSError
+                raise error
 
     async def stream_indefinitely() -> AsyncGenerator[bytes, None]:
-        while True:
-            await anyio.sleep(0)
-            yield b"chunk"
+        nonlocal finally_ran
+        try:
+            while True:
+                await anyio.sleep(0)
+                yield b"chunk"
+        finally:
+            finally_ran = True
 
-    stream = stream_indefinitely()
-    response = StreamingResponse(content=stream)
+    response = StreamingResponse(content=stream_indefinitely())
+    scope: Scope = {"type": "http", "asgi": {"spec_version": spec_version}}
 
     with anyio.move_on_after(1) as cancel_scope:
-        with pytest.raises(ClientDisconnect):
-            await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive_disconnect, send)
+        if tuple(map(int, spec_version.split("."))) >= (2, 4):
+            with pytest.raises(ClientDisconnect) as exc_info:
+                await response(scope, receive_disconnect, send)
+            assert isinstance(exc_info.value.__context__, OSError)
+        else:
+            with pytest.raises(OSError) as exc_info:
+                await response(scope, receive_disconnect, send)
+            assert exc_info.value is error
     assert not cancel_scope.cancel_called, "Content streaming should stop itself."
     assert chunks == b"chunk"
-    await stream.aclose()
+    assert finally_ran, "The generator's finally block must run when send raises on disconnect."
+
+
+@pytest.mark.anyio
+async def test_streaming_response_closes_iterator_on_cancellation() -> None:
+    finally_ran = False
+    cleanup_ran = False
+
+    async def receive() -> Message:
+        await anyio.sleep_forever()
+        raise NotImplementedError  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            cancel_scope.cancel()
+            await anyio.sleep_forever()
+
+    async def stream_indefinitely() -> AsyncGenerator[bytes, None]:
+        nonlocal finally_ran
+        try:
+            while True:
+                await anyio.sleep(0)
+                yield b"chunk"
+        finally:
+            finally_ran = True
+
+    async def cleanup() -> None:
+        nonlocal cleanup_ran
+        cleanup_ran = True
+
+    async def background() -> None:
+        pytest.fail("Background tasks should not run after external cancellation")  # pragma: no cover
+
+    response = StreamingResponse(
+        content=stream_indefinitely(),
+        background=BackgroundTask(background),
+        cleanup=BackgroundTask(cleanup),
+    )
+
+    with anyio.fail_after(5), anyio.CancelScope() as cancel_scope:
+        await response({"type": "http"}, receive, send)
+
+    assert cancel_scope.cancelled_caught, "The external cancellation must propagate unchanged."
+    assert finally_ran, "The generator's finally block must run on external cancellation."
+    assert cleanup_ran, "Cleanup tasks run on every exit path, including external cancellation."
+
+
+@pytest.mark.anyio
+async def test_streaming_response_preserves_generator_error() -> None:
+    finally_ran = False
+    cleanup_ran = False
+    error = RuntimeError("boom")
+
+    async def receive() -> Message:
+        await anyio.sleep_forever()
+        raise NotImplementedError  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        pass
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        nonlocal finally_ran
+        try:
+            yield b"chunk"
+            raise error
+        finally:
+            finally_ran = True
+
+    async def cleanup() -> None:
+        nonlocal cleanup_ran
+        cleanup_ran = True
+
+    async def background() -> None:
+        pytest.fail("Background tasks should not run when the generator raises")  # pragma: no cover
+
+    response = StreamingResponse(
+        content=stream(),
+        background=BackgroundTask(background),
+        cleanup=BackgroundTask(cleanup),
+    )
+
+    with anyio.fail_after(5), pytest.raises(RuntimeError) as exc_info:
+        await response({"type": "http"}, receive, send)
+
+    assert exc_info.value is error, "The generator's own exception must propagate unchanged."
+    assert finally_ran, "The generator's finally block must run when it raises."
+    assert cleanup_ran, "Cleanup tasks run on every exit path, including generator errors."
+
+
+@pytest.mark.anyio
+async def test_streaming_response_background_and_cleanup_timing() -> None:
+    events: list[str] = []
+
+    async def receive() -> Message:
+        await anyio.sleep_forever()
+        raise NotImplementedError  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            events.append("send")
+
+    async def stream() -> AsyncIterator[bytes]:
+        try:
+            yield b"one"
+            yield b"two"
+        finally:
+            events.append("finally")
+
+    async def background() -> None:
+        events.append("background")
+
+    async def cleanup() -> None:
+        events.append("cleanup")
+
+    response = StreamingResponse(
+        content=stream(),
+        background=BackgroundTask(background),
+        cleanup=BackgroundTask(cleanup),
+    )
+
+    await response({"type": "http"}, receive, send)
+
+    # The generator's finally block runs as soon as the body is exhausted,
+    # the terminating empty chunk is still sent afterwards, and cleanup
+    # always follows the success-only background task.
+    assert events == ["send", "send", "finally", "send", "background", "cleanup"]
+
+@pytest.mark.anyio
+async def test_streaming_response_cleanup_runs_on_disconnect() -> None:
+    events: list[str] = []
+    disconnected = anyio.Event()
+
+    async def receive_disconnect() -> Message:
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            events.append("send")
+            disconnected.set()
+
+    async def stream_indefinitely() -> AsyncGenerator[bytes, None]:
+        try:
+            while True:
+                await anyio.sleep(0)
+                yield b"chunk"
+        finally:
+            events.append("finally")
+
+    async def background() -> None:
+        pytest.fail("Background tasks should not run when the client disconnects")  # pragma: no cover
+
+    async def cleanup() -> None:
+        events.append("cleanup")
+
+    response = StreamingResponse(
+        content=stream_indefinitely(),
+        background=BackgroundTask(background),
+        cleanup=BackgroundTask(cleanup),
+    )
+
+    with anyio.move_on_after(1):
+        await response({"type": "http"}, receive_disconnect, send)
+
+    assert "send" in events, "At least one body chunk should have been streamed."
+    assert "finally" in events, "The generator must be closed when the client disconnects."
+    assert events[-1] == "cleanup", "Cleanup is the last thing that runs."
+    assert "background" not in events, "Background tasks only run after a fully sent body."
 
 
 @pytest.mark.anyio
 async def test_streaming_response_runs_background_on_websocket_scope() -> None:
     background_called = False
+    cleanup_called = False
     sent: list[Message] = []
 
     async def receive() -> Message:
@@ -891,19 +1081,72 @@ async def test_streaming_response_runs_background_on_websocket_scope() -> None:
         nonlocal background_called
         background_called = True
 
+    async def run_cleanup() -> None:
+        nonlocal cleanup_called
+        cleanup_called = True
+
     async def stream() -> AsyncIterator[bytes]:
         yield b"chunk"
 
-    response = StreamingResponse(stream(), background=BackgroundTask(run_background))
+    response = StreamingResponse(
+        stream(),
+        background=BackgroundTask(run_background),
+        cleanup=BackgroundTask(run_cleanup),
+    )
 
     await response({"type": "websocket"}, receive, send)
 
     assert background_called
+    assert cleanup_called
     assert [message["type"] for message in sent] == [
         "websocket.http.response.start",
         "websocket.http.response.body",
         "websocket.http.response.body",
     ]
+
+
+@pytest.mark.anyio
+async def test_streaming_response_cleanup_runs_on_websocket_error() -> None:
+    cleanup_called = False
+    background_called = False
+    finally_ran = False
+    error = RuntimeError("boom")
+
+    async def receive() -> Message:
+        return {}  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        return None
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        nonlocal finally_ran
+        try:
+            yield b"chunk"
+            raise error
+        finally:
+            finally_ran = True
+
+    async def run_cleanup() -> None:
+        nonlocal cleanup_called
+        cleanup_called = True
+
+    async def run_background() -> None:
+        nonlocal background_called
+        background_called = True  # pragma: no cover
+
+    response = StreamingResponse(
+        stream(),
+        background=BackgroundTask(run_background),
+        cleanup=BackgroundTask(run_cleanup),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await response({"type": "websocket"}, receive, send)
+
+    assert exc_info.value is error
+    assert finally_ran
+    assert cleanup_called
+    assert not background_called
 
 
 README = """\
