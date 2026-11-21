@@ -9,6 +9,37 @@ module Dry
       include Dry::Equalizer(:values)
 
       # @api private
+      NO_OVERRIDE = Object.new.freeze
+      private_constant :NO_OVERRIDE
+
+      # @api private
+      OVERRIDE_STACKS_KEY = :dry_configurable_override_stacks
+      private_constant :OVERRIDE_STACKS_KEY
+
+      # Returns the override stacks for the current thread, keyed by config object_id.
+      #
+      # @api private
+      def self.__override_stacks__
+        Thread.current.thread_variable_get(OVERRIDE_STACKS_KEY) ||
+          Thread.current.thread_variable_set(OVERRIDE_STACKS_KEY, {})
+      end
+
+      # Returns the innermost active override for the given config and setting name,
+      # or NO_OVERRIDE when no override applies.
+      #
+      # @api private
+      def self.__override_value__(config, name)
+        stack = __override_stacks__[config.object_id]
+        return NO_OVERRIDE unless stack
+
+        stack.reverse_each do |layer|
+          return layer[name] if layer.key?(name)
+        end
+
+        NO_OVERRIDE
+      end
+
+      # @api private
       attr_reader :_settings
 
       # @api private
@@ -49,6 +80,9 @@ module Dry
           raise ArgumentError, "+#{name}+ is not a setting name"
         end
 
+        overridden = self.class.__override_value__(self, name)
+        return overridden unless overridden.equal?(NO_OVERRIDE)
+
         _values.fetch(name) {
           # Mutable settings may be configured after read
           _configured.add(name) if setting.cloneable?
@@ -76,6 +110,40 @@ module Dry
         _configured.add(name)
 
         _values[name] = setting.constructor.(value)
+      end
+
+      # Temporarily override config values for the duration of the given block.
+      #
+      # Inside the block, reads of the given keys return the overridden values instead
+      # of the configured ones; the underlying values are never written. Overrides can
+      # be nested: an inner block sees its own values, and when it exits (normally or
+      # via an exception) the enclosing layer's values apply again. Overrides are
+      # tracked per thread, so concurrent tasks each see their own layer.
+      #
+      # @param values [Hash, #to_hash] A hash of setting names to overridden values
+      #
+      # @return the block's return value
+      #
+      # @raise [FrozenConfigError] if the config is finalized
+      #
+      # @api public
+      def with_overrides(values)
+        raise FrozenConfigError, "Cannot override frozen config" if frozen?
+
+        layer = values.to_hash.each_with_object({}) { |(key, value), hsh|
+          hsh[key.to_sym] = value
+        }
+
+        stacks = self.class.__override_stacks__
+        stack = (stacks[object_id] ||= [])
+        stack.push(layer)
+
+        begin
+          yield
+        ensure
+          stack.pop
+          stacks.delete(object_id) if stack.empty?
+        end
       end
 
       # Update config with new values

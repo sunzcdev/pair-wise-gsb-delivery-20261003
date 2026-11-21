@@ -14,6 +14,15 @@ module Dry
         self
       end
 
+      # Temporarily override config values for the duration of the given block.
+      #
+      # @see Config#with_overrides
+      #
+      # @api public
+      def with_overrides(values, &block)
+        config.with_overrides(values, &block)
+      end
+
       # Finalize and freeze configuration
       #
       # @return [Dry::Configurable::Config]
