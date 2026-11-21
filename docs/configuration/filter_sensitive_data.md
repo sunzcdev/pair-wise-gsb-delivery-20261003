@@ -188,3 +188,44 @@ X-Http-Password:
 _When_ I run `ruby dynamic_filtering.rb`
 
 _Then_ the output should contain "john.doe/monkey".
+
+## Restricting a placeholder to part of the interaction
+
+By default the sensitive text is replaced wherever it appears in the whole
+HTTP interaction (the URI, every header and both bodies). When the same value
+legitimately occurs in more than one field, you can pass a `scope:` so the
+substitution is registered for a specific range only. On playback the same
+scope restores only that range, leaving identical strings in unrelated fields
+untouched.
+
+Symbol scopes target the request URI (`:uri`, `:scheme`, `:host`, `:port`,
+`:path`, `:query`), headers (`:headers`, both request and response), or bodies
+(`:body`, `:request_body`, `:response_body`). A hash targets a named header or
+one side of the interaction, and an array combines scopes:
+
+```ruby
+VCR.configure do |c|
+  # only the query string of the request URI
+  c.filter_sensitive_data('<TOKEN>', scope: :query) { token }
+
+  # a specific header, on requests and responses
+  c.filter_sensitive_data('<KEY>', scope: { headers: 'X-Api-Key' }) { api_key }
+
+  # a header of the request only
+  c.filter_sensitive_data('<KEY>', scope: { request: { headers: 'X-Api-Key' } }) { api_key }
+
+  # several ranges at once
+  c.filter_sensitive_data('<TOKEN>', scope: [:query, { request: { headers: 'X-Api-Key' } }]) { token }
+end
+```
+
+For example, with the public value `secret123` repeated in a query parameter,
+a header and the body, `scope: :query` writes `api_key=<TOKEN>` to the cassette
+while `secret123` stays verbatim in the header and body. Playback turns the
+query back into `api_key=secret123` and never touches the other two fields.
+
+The existing body conventions keep working with scoped filters: bodies are
+still stored as raw strings (or base64 with `preserve_exact_body_bytes`), and
+when a substitution changes the response body length,
+`update_content_length_header: true` recomputes `Content-Length` after the
+placeholder is restored on playback.

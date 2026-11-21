@@ -541,18 +541,225 @@ module VCR
         !!@ignored
       end
 
+      # The locations within an HTTP interaction in which a scoped
+      # placeholder substitution may be performed.
+      URI_SCOPES = [:uri, :scheme, :host, :port, :path, :query].freeze
+      BODY_SCOPES = [:body, :request_body, :response_body].freeze
+      HEADER_SCOPE = :headers
+
       # Replaces a string in any part of the HTTP interaction (headers, request body,
       # response body, etc) with the given replacement text.
       #
+      # When a `scope` is given, the replacement is restricted to the registered
+      # locations only, so an identical string appearing anywhere else in the
+      # interaction is left untouched. The same scope must be used when recording
+      # and playing back so that only the registered range is restored.
+      #
+      # @example Replace a value only in the request URI query string
+      #   interaction.filter!('secret', '<SECRET>', scope: :query)
+      #
+      # @example Replace a value only in a specific request header
+      #   interaction.filter!('secret', '<SECRET>', scope: { request: { headers: 'X-Api-Key' } })
+      #
       # @param [#to_s] text the text to replace
       # @param [#to_s] replacement_text the text to put in its place
-      def filter!(text, replacement_text)
+      # @param [Symbol, Hash, Array] scope the location(s) in which to replace.
+      #  Valid symbols are `:uri`, `:scheme`, `:host`, `:port`, `:path`, `:query`,
+      #  `:headers`, `:body`, `:request_body` and `:response_body`. A hash restricts
+      #  the substitution to `:request` and/or `:response`, e.g.
+      #  `{ headers: 'X-Secret' }`, `{ request: :query }` or
+      #  `{ response: { headers: ['X-A', 'X-B'] } }`. Arrays combine several scopes.
+      #  When omitted, every part of the interaction is filtered (the default behavior).
+      # @return [VCR::HTTPInteraction::HookAware] self
+      def filter!(text, replacement_text, scope: nil)
         text, replacement_text = text.to_s, replacement_text.to_s
         return self if [text, replacement_text].any? { |t| t.empty? }
-        filter_object!(self, text, replacement_text)
+        return filter_object!(self, text, replacement_text) if scope.nil?
+
+        scopes = scope.is_a?(Array) ? scope : [scope]
+        unknown = scopes.reject { |s| valid_scope?(s) }
+        raise ArgumentError, "Unknown placeholder filter scope: #{unknown.inspect}" if unknown.any?
+
+        scopes.each { |s| filter_scope!(s, text, replacement_text) }
+        self
       end
 
     private
+
+      def valid_scope?(scope)
+        case scope
+        when Symbol
+          URI_SCOPES.include?(scope) || BODY_SCOPES.include?(scope) || scope == HEADER_SCOPE
+        when Hash
+          scope.keys.all? do |side|
+            case side
+            when :headers then true
+            when :request, :response
+              values = wrap_scope(scope[side])
+              values.all? do |s|
+                s.is_a?(Symbol) ? valid_scope?(s) : s.is_a?(Hash) && s.keys == [:headers]
+              end
+            else false
+            end
+          end
+        else false
+        end
+      end
+
+      # Unlike `Array()`, this never flattens a hash into key/value pairs.
+      def wrap_scope(scope)
+        scope.is_a?(Array) ? scope : [scope]
+      end
+
+      def filter_scope!(scope, text, replacement_text)
+        case scope
+        when Symbol then filter_symbol_scope!(scope, text, replacement_text)
+        when Hash then filter_hash_scope!(scope, text, replacement_text)
+        end
+      end
+
+      def filter_symbol_scope!(scope, text, replacement_text)
+        if URI_SCOPES.include?(scope)
+          filter_uri_scope!(:request, scope, text, replacement_text)
+        elsif scope == HEADER_SCOPE
+          filter_headers!(request, text, replacement_text)
+          filter_headers!(response, text, replacement_text)
+        elsif scope == :body
+          filter_body!(request, text, replacement_text)
+          filter_body!(response, text, replacement_text)
+        elsif scope == :request_body
+          filter_body!(request, text, replacement_text)
+        elsif scope == :response_body
+          filter_body!(response, text, replacement_text)
+        end
+      end
+
+      def filter_hash_scope!(scope, text, replacement_text)
+        filter_header_names!(scope[:headers], text, replacement_text) if scope.key?(:headers)
+
+        [:request, :response].each do |side|
+          next unless scope.key?(side)
+          wrap_scope(scope[side]).each do |side_scope|
+            case side_scope
+            when Symbol then filter_side_symbol_scope!(side, side_scope, text, replacement_text)
+            when Hash then filter_header_names!(side_scope[:headers], text, replacement_text, side)
+            end
+          end
+        end
+      end
+
+      def filter_side_symbol_scope!(side, scope, text, replacement_text)
+        message = public_send(side)
+        if URI_SCOPES.include?(scope)
+          filter_uri_scope!(side, scope, text, replacement_text)
+        elsif scope == HEADER_SCOPE
+          filter_headers!(message, text, replacement_text)
+        elsif scope == :body || scope == :"#{side}_body"
+          filter_body!(message, text, replacement_text)
+        end
+      end
+
+      def filter_header_names!(names, text, replacement_text, side = nil)
+        messages = side ? [public_send(side)] : [request, response]
+        Array(names).each do |name|
+          messages.each { |message| filter_named_header!(message, name, text, replacement_text) }
+        end
+      end
+
+      def filter_named_header!(message, name, text, replacement_text)
+        actual_key = message.headers.keys.find { |key| key.downcase == name.to_s.downcase }
+        return unless actual_key
+
+        values = message.headers[actual_key]
+        message.headers[actual_key] = values.map { |v| v.is_a?(String) ? v.gsub(text, replacement_text) : v }
+      end
+
+      def filter_headers!(message, text, replacement_text)
+        message.headers.each_key do |name|
+          filter_named_header!(message, name, text, replacement_text)
+        end
+      end
+
+      def filter_body!(message, text, replacement_text)
+        return unless message.body.is_a?(String) && message.body.include?(text)
+        message.body = message.body.gsub(text, replacement_text)
+      end
+
+      # Matches the scheme and authority sections of an absolute URI, e.g.
+      # the `https://user:pass@example.com:8080` part of
+      # `https://user:pass@example.com:8080/path?query`.
+      URI_AUTHORITY_PATTERN = /\A([^:]*:\/\/)([^\/?#]*)/
+
+      def filter_uri_scope!(side, scope, text, replacement_text)
+        message = public_send(side)
+        return unless message.respond_to?(:parsed_uri) && message.uri.is_a?(String)
+        return unless message.uri.include?(text)
+
+        message.uri =
+          case scope
+          when :uri then message.uri.gsub(text, replacement_text)
+          when :scheme then replace_uri_scheme(message.uri, text, replacement_text)
+          when :host then replace_uri_host(message, text, replacement_text)
+          when :port then replace_uri_port(message, text, replacement_text)
+          when :path then replace_uri_path(message.uri, text, replacement_text)
+          when :query then replace_uri_query(message.uri, text, replacement_text)
+          end
+      end
+
+      # The replacements are plain string substitutions (matching the un-scoped
+      # `filter!` behavior): URI component setters would percent-encode or reject
+      # placeholder strings such as `<HOST>`.
+      def replace_uri_scheme(uri, text, replacement_text)
+        prefix = uri.slice(/\A[^:]+(?=:\/\/)/).to_s
+        return uri unless prefix.include?(text)
+        uri.sub(/\A[^:]+/) { |scheme| scheme.gsub(text, replacement_text) }
+      end
+
+      def replace_uri_host(message, text, replacement_text)
+        host = message.parsed_uri.host
+        return message.uri if host.nil? || !host.include?(text)
+        message.uri.sub(/(\/\/[^\/?#]*@)?#{Regexp.escape(host)}/) do
+          "#{$1}#{host.gsub(text, replacement_text)}"
+        end
+      end
+
+      def replace_uri_port(message, text, replacement_text)
+        port = message.parsed_uri.port
+        return message.uri if port.nil?
+
+        port_text = port.to_s
+        return message.uri unless port_text.include?(text)
+
+        new_port = port_text.gsub(text, replacement_text)
+        message.uri.sub(URI_AUTHORITY_PATTERN) do |authority|
+          if authority.end_with?(":#{port_text}")
+            authority[0...-port_text.length] + new_port
+          else
+            authority
+          end
+        end
+      end
+
+      def replace_uri_path(uri, text, replacement_text)
+        match = URI_AUTHORITY_PATTERN.match(uri)
+        after_authority = match ? match.end(0) : 0
+        section_start = uri.index('?', after_authority) || uri.index('#', after_authority) || uri.length
+        path = uri[after_authority...section_start].to_s
+        return uri unless path.include?(text)
+        uri[0...after_authority] + path.gsub(text, replacement_text) + uri[section_start..-1].to_s
+      end
+
+      def replace_uri_query(uri, text, replacement_text)
+        match = URI_AUTHORITY_PATTERN.match(uri)
+        after_authority = match ? match.end(0) : 0
+        query_start = uri.index('?', after_authority)
+        return uri if query_start.nil?
+
+        fragment_start = uri.index('#', query_start) || uri.length
+        query = uri[(query_start + 1)...fragment_start]
+        return uri unless query.include?(text)
+        uri[0..query_start] + query.gsub(text, replacement_text) + uri[fragment_start..-1].to_s
+      end
 
       # Strings are replaced rather than mutated with gsub!, and only when they
       # contain the text: cassette strings may be frozen (or chilled literals on

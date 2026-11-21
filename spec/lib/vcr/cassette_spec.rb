@@ -241,6 +241,29 @@ RSpec.describe VCR::Cassette do
       VCR::Cassette.new("abc", persist_with: :foo).http_interactions
     end
 
+    it 'restores placeholders before updating Content-Length so the header matches the final body' do
+      long_placeholder = '<A-MUCH-LONGER-PLACEHOLDER>'
+      original_body = 'the secret value'
+
+      VCR.configure do |c|
+        c.define_cassette_placeholder(long_placeholder, scope: :response_body) { 'secret' }
+      end
+
+      interaction = http_interaction do |i|
+        i.response = VCR::Response.new(
+          VCR::ResponseStatus.new(200),
+          { 'Content-Length' => [long_placeholder.bytesize.to_s] },
+          "the #{long_placeholder} value"
+        )
+      end
+      stub_old_interactions([interaction])
+
+      VCR::Cassette.new('example', record: :none, update_content_length_header: true).http_interactions
+
+      expect(interaction.response.body).to eq(original_body)
+      expect(interaction.response.headers['Content-Length']).to eq([original_body.bytesize.to_s])
+    end
+
     VCR::Cassette::VALID_RECORD_MODES.each do |record_mode|
       stub_requests = (record_mode != :all)
 

@@ -3,6 +3,8 @@ Changelog
 
 ## Unreleased
 
+- [new] `filter_sensitive_data` / `define_cassette_placeholder` accepts a `scope:` option (`:uri`, `:scheme`, `:host`, `:port`, `:path`, `:query`, `:headers`, `:body`, `:request_body`, `:response_body`, or a hash naming a header/side) so placeholders only replace and restore the registered part of the interaction; an identical value elsewhere is left untouched
+- [fix] `update_content_length_header` now runs after `before_playback` placeholder restoration, so Content-Length matches the body when a scoped or unscoped placeholder changes its length
 - [fix] `uri_without_params` ignores percent-encoded query params given by their decoded name, e.g. `uri_without_params('date[gte]')` now ignores `date%5Bgte%5D` (#633)
 - [fix] Leave the Content-Length header of HEAD and 304 responses untouched when `update_content_length_header` is enabled (#779)
 

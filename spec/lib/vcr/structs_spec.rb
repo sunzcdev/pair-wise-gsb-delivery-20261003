@@ -468,6 +468,261 @@ module VCR
         expect(response.body).to be(body)
       end
     end
+
+    describe '#filter! with a scope' do
+      let(:response_status) { VCR::ResponseStatus.new(200, "OK") }
+      let(:request) do
+        VCR::Request.new(
+          :get,
+          'https://foo.example.com:8080/foo/path?api_key=foo&untouched=foo',
+          'request body with foo in it',
+          {
+            'X-Api-Key' => ['token=foo'],
+            'X-Other'   => ['foo']
+          }
+        )
+      end
+      let(:response) do
+        VCR::Response.new(
+          response_status,
+          { 'X-Set-Token' => ['foo'], 'X-Other' => ['foo'] },
+          'response body with foo in it'
+        )
+      end
+      let(:interaction) { VCR::HTTPInteraction.new(request, response) }
+      subject { HTTPInteraction::HookAware.new(interaction) }
+
+      it 'does nothing with a blank argument even when a scope is given' do
+        expect {
+          subject.filter!(nil, 'AAA', scope: :query)
+          subject.filter!('foo', '', scope: :query)
+        }.not_to change { request.uri }
+      end
+
+      describe 'URI component scopes' do
+        it 'replaces within the whole request uri only for :uri' do
+          subject.filter!('foo', '<FOO>', scope: :uri)
+
+          expect(request.uri).to eq('https://<FOO>.example.com:8080/<FOO>/path?api_key=<FOO>&untouched=<FOO>')
+          expect(request.body).to eq('request body with foo in it')
+          expect(request.headers['X-Api-Key']).to eq(['token=foo'])
+          expect(response.body).to eq('response body with foo in it')
+        end
+
+        it 'replaces only the host for :host' do
+          subject.filter!('foo', '<FOO>', scope: :host)
+
+          expect(request.uri).to eq('https://<FOO>.example.com:8080/foo/path?api_key=foo&untouched=foo')
+        end
+
+        it 'replaces only the port for :port and leaves the same digits in the query alone' do
+          request.uri = 'http://example.com:8080/path?also=8080'
+          subject.filter!('8080', '<PORT>', scope: :port)
+
+          expect(request.uri).to eq('http://example.com:<PORT>/path?also=8080')
+        end
+
+        it 'replaces only the path for :path' do
+          subject.filter!('foo', '<FOO>', scope: :path)
+
+          expect(request.uri).to eq('https://foo.example.com:8080/<FOO>/path?api_key=foo&untouched=foo')
+        end
+
+        it 'replaces only the query string for :query' do
+          subject.filter!('foo', '<FOO>', scope: :query)
+
+          expect(request.uri).to eq('https://foo.example.com:8080/foo/path?api_key=<FOO>&untouched=<FOO>')
+          expect(request.body).to eq('request body with foo in it')
+          expect(request.headers['X-Api-Key']).to eq(['token=foo'])
+        end
+
+        it 'replaces only the scheme for :scheme' do
+          subject.filter!('https', '<SCHEME>', scope: :scheme)
+
+          expect(request.uri).to eq('<SCHEME>://foo.example.com:8080/foo/path?api_key=foo&untouched=foo')
+        end
+
+        it 'round-trips a query substitution using the same scope' do
+          original = request.uri
+          subject.filter!('foo', '<FOO>', scope: :query)
+          subject.filter!('<FOO>', 'foo', scope: :query)
+
+          expect(request.uri).to eq(original)
+        end
+
+        it 'does not restore an identical placeholder appearing outside the registered scope' do
+          subject.filter!('foo', '<FOO>', scope: :query)
+          request.body = 'body containing <FOO> already'
+
+          subject.filter!('<FOO>', 'foo', scope: :query)
+
+          expect(request.body).to eq('body containing <FOO> already')
+        end
+
+        it 'preserves a userinfo section when replacing the host' do
+          request.uri = 'https://user:foo@foo.example.com/path'
+          subject.filter!('foo', '<FOO>', scope: :host)
+
+          expect(request.uri).to eq('https://user:foo@<FOO>.example.com/path')
+        end
+
+        it 'leaves the fragment untouched when replacing the query' do
+          request.uri = 'http://example.com/path?x=foo#frag/foo'
+          subject.filter!('foo', '<FOO>', scope: :query)
+
+          expect(request.uri).to eq('http://example.com/path?x=<FOO>#frag/foo')
+        end
+
+        it 'leaves the fragment and query untouched when replacing the path' do
+          request.uri = 'http://example.com/foo?foo=1#foo'
+          subject.filter!('foo', '<FOO>', scope: :path)
+
+          expect(request.uri).to eq('http://example.com/<FOO>?foo=1#foo')
+        end
+
+        it 'handles a query whose value contains a question mark' do
+          request.uri = 'http://example.com/path?callback=foo?bar'
+          subject.filter!('foo', '<FOO>', scope: :query)
+
+          expect(request.uri).to eq('http://example.com/path?callback=<FOO>?bar')
+        end
+      end
+
+      describe 'header scopes' do
+        it 'replaces in every header of request and response for :headers' do
+          subject.filter!('foo', '<FOO>', scope: :headers)
+
+          expect(request.headers).to eq('X-Api-Key' => ['token=<FOO>'], 'X-Other' => ['<FOO>'])
+          expect(response.headers).to eq('X-Set-Token' => ['<FOO>'], 'X-Other' => ['<FOO>'])
+          expect(request.uri).to include('api_key=foo')
+          expect(response.body).to eq('response body with foo in it')
+        end
+
+        it 'replaces only a named header on both sides with { headers: name }' do
+          subject.filter!('foo', '<FOO>', scope: { headers: 'X-Other' })
+
+          expect(request.headers['X-Other']).to eq(['<FOO>'])
+          expect(response.headers['X-Other']).to eq(['<FOO>'])
+          expect(request.headers['X-Api-Key']).to eq(['token=foo'])
+          expect(response.headers['X-Set-Token']).to eq(['foo'])
+        end
+
+        it 'matches header names case-insensitively' do
+          subject.filter!('foo', '<FOO>', scope: { headers: 'x-api-key' })
+
+          expect(request.headers['X-Api-Key']).to eq(['token=<FOO>'])
+        end
+
+        it 'restricts a named header to the request with { request: { headers: } }' do
+          subject.filter!('foo', '<FOO>', scope: { request: { headers: 'X-Other' } })
+
+          expect(request.headers['X-Other']).to eq(['<FOO>'])
+          expect(response.headers['X-Other']).to eq(['foo'])
+        end
+
+        it 'restricts a named header to the response with { response: { headers: } }' do
+          subject.filter!('foo', '<FOO>', scope: { response: { headers: 'X-Set-Token' } })
+
+          expect(response.headers['X-Set-Token']).to eq(['<FOO>'])
+          expect(request.headers['X-Other']).to eq(['foo'])
+        end
+
+        it 'accepts several header names' do
+          subject.filter!('foo', '<FOO>', scope: { request: { headers: ['X-Api-Key', 'X-Other'] } })
+
+          expect(request.headers['X-Api-Key']).to eq(['token=<FOO>'])
+          expect(request.headers['X-Other']).to eq(['<FOO>'])
+        end
+
+        it 'leaves a named header untouched when it is absent' do
+          subject.filter!('foo', '<FOO>', scope: { headers: 'X-Missing' })
+
+          expect(request.headers).to include('X-Api-Key' => ['token=foo'])
+        end
+      end
+
+      describe 'body scopes' do
+        it 'replaces in request and response bodies for :body' do
+          subject.filter!('foo', '<FOO>', scope: :body)
+
+          expect(request.body).to eq('request body with <FOO> in it')
+          expect(response.body).to eq('response body with <FOO> in it')
+          expect(request.uri).to include('api_key=foo')
+          expect(request.headers['X-Api-Key']).to eq(['token=foo'])
+        end
+
+        it 'replaces only the request body for :request_body' do
+          subject.filter!('foo', '<FOO>', scope: :request_body)
+
+          expect(request.body).to eq('request body with <FOO> in it')
+          expect(response.body).to eq('response body with foo in it')
+        end
+
+        it 'replaces only the response body for :response_body' do
+          subject.filter!('foo', '<FOO>', scope: :response_body)
+
+          expect(response.body).to eq('response body with <FOO> in it')
+          expect(request.body).to eq('request body with foo in it')
+        end
+      end
+
+      describe 'combined scopes' do
+        it 'combines a symbol and a hash in an array' do
+          subject.filter!('foo', '<FOO>', scope: [:query, { request: { headers: 'X-Api-Key' } }])
+
+          expect(request.uri).to eq('https://foo.example.com:8080/foo/path?api_key=<FOO>&untouched=<FOO>')
+          expect(request.headers['X-Api-Key']).to eq(['token=<FOO>'])
+          expect(request.headers['X-Other']).to eq(['foo'])
+          expect(request.body).to eq('request body with foo in it')
+          expect(response.body).to eq('response body with foo in it')
+        end
+
+        it 'combines side scopes in a hash' do
+          subject.filter!('foo', '<FOO>', scope: { request: [:query, :request_body], response: :response_body })
+
+          expect(request.uri).to include('api_key=<FOO>')
+          expect(request.body).to eq('request body with <FOO> in it')
+          expect(response.body).to eq('response body with <FOO> in it')
+          expect(request.headers['X-Api-Key']).to eq(['token=foo'])
+        end
+      end
+
+      describe 'invalid scopes' do
+        it 'raises for an unknown symbol scope' do
+          expect { subject.filter!('foo', '<FOO>', scope: :nope) }
+            .to raise_error(ArgumentError, /Unknown placeholder filter scope/)
+        end
+
+        it 'raises for an unknown hash key' do
+          expect { subject.filter!('foo', '<FOO>', scope: { bogus: :query }) }
+            .to raise_error(ArgumentError, /Unknown placeholder filter scope/)
+        end
+
+        it 'raises for an unknown nested symbol' do
+          expect { subject.filter!('foo', '<FOO>', scope: { request: :nope }) }
+            .to raise_error(ArgumentError, /Unknown placeholder filter scope/)
+        end
+      end
+
+      describe 'frozen strings' do
+        it 'replaces within a frozen URI and body without mutating them' do
+          request.uri = 'http://foo.com/path?x=foo'.freeze
+          response.body = 'The body foo'.freeze
+
+          subject.filter!('foo', '<FOO>', scope: :query)
+          subject.filter!('foo', '<FOO>', scope: :response_body)
+
+          expect(request.uri).to eq('http://foo.com/path?x=<FOO>')
+          expect(response.body).to eq('The body <FOO>')
+        end
+
+        it 'replaces within a frozen header value' do
+          request.headers = { 'K' => ['foo'.freeze] }
+          subject.filter!('foo', '<FOO>', scope: :headers)
+          expect(request.headers['K']).to eq(['<FOO>'])
+        end
+      end
+    end
   end
 
   ::RSpec.describe Request::Typed do

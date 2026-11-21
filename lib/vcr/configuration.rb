@@ -213,25 +213,48 @@ module VCR
     #     # Put a "<USER_ID>" placeholder variable in our cassettes tagged with
     #     # :user_cassette since it can be different for different test runs.
     #     c.define_cassette_placeholder('<USER_ID>', :user_cassette) { User.last.id }
+    #
+    #     # Only replace the token in the request URI query string, leaving an
+    #     # identical token elsewhere (another query param, a header, a body)
+    #     # untouched.
+    #     c.define_cassette_placeholder('<TOKEN>', scope: :query) { token }
+    #
+    #     # Only replace a specific header, on requests and responses.
+    #     c.define_cassette_placeholder('<KEY>', scope: { headers: 'X-Api-Key' }) { api_key }
+    #
+    #     # Restrict the substitution to a header of the request only.
+    #     c.define_cassette_placeholder('<KEY>', scope: { request: { headers: 'X-Api-Key' } }) { api_key }
     #   end
     #
     # @param placeholder [String] The placeholder string.
     # @param tag [Symbol] Set this to apply this only to cassettes
     #  with a matching tag; otherwise it will apply to every cassette.
+    # @param scope [Symbol, Hash, Array] Restricts the substitution to particular
+    #  parts of the HTTP interaction. Valid symbols are `:uri`, `:scheme`, `:host`,
+    #  `:port`, `:path`, `:query`, `:headers`, `:body`, `:request_body` and
+    #  `:response_body`. Use a hash to target a specific header
+    #  (`{ headers: 'X-Secret' }`) or a side of the interaction
+    #  (`{ request: :query }`, `{ response: { headers: 'X-Secret' } }`), or an
+    #  array to combine scopes. Without a scope, the string is replaced in every
+    #  part of the interaction, as before. The same scope is used on record and
+    #  playback, so only the registered range is ever restored; a placeholder
+    #  value that happens to appear in another field is left alone.
     # @yield block that determines what string to replace
     # @yieldparam interaction [(optional) VCR::HTTPInteraction::HookAware] the HTTP interaction
     # @yieldreturn the string to replace
-    def define_cassette_placeholder(placeholder, tag = nil, &block)
+    def define_cassette_placeholder(placeholder, tag = nil, scope: nil, &block)
+      scope_description = " in scope #{scope.inspect}" if scope
+
       before_record(tag) do |interaction|
         orig_text = call_block(block, interaction)
-        log "before_record: replacing #{orig_text.inspect} with #{placeholder.inspect}"
-        interaction.filter!(orig_text, placeholder)
+        log "before_record: replacing #{orig_text.inspect} with #{placeholder.inspect}#{scope_description}"
+        interaction.filter!(orig_text, placeholder, scope: scope)
       end
 
       before_playback(tag) do |interaction|
         orig_text = call_block(block, interaction)
-        log "before_playback: replacing #{orig_text.inspect} with #{placeholder.inspect}"
-        interaction.filter!(placeholder, orig_text)
+        log "before_playback: replacing #{orig_text.inspect} with #{placeholder.inspect}#{scope_description}"
+        interaction.filter!(placeholder, orig_text, scope: scope)
       end
     end
     alias filter_sensitive_data define_cassette_placeholder
@@ -567,13 +590,17 @@ module VCR
     end
 
     define_hook :recompress_response
+    define_hook :update_content_length_header
 
     def register_built_in_hooks
       recompress_response(tag_filter_from(:recompress_response)) do |interaction|
         interaction.response.recompress if interaction.response.vcr_decompressed?
       end
 
-      before_playback(:update_content_length_header) do |interaction|
+      # Invoked separately by VCR::Cassette after the `before_playback` hooks, so
+      # that Content-Length is computed from the body once placeholders have been
+      # restored (their length may differ from what was serialized to the cassette).
+      update_content_length_header(tag_filter_from(:update_content_length_header)) do |interaction|
         # HEAD and 304 responses have no body, yet their Content-Length is the size
         # of the resource they describe (RFC 9110 §8.6).
         unless interaction.request.method == :head || interaction.response.status.code == 304

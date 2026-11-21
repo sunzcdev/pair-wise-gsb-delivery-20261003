@@ -221,6 +221,9 @@ module VCR
       @previously_recorded_interactions ||= if !raw_cassette_bytes.to_s.empty?
         deserialized_hash['http_interactions'].map { |h| HTTPInteraction.from_hash(h) }.tap do |interactions|
           invoke_hook(:before_playback, interactions)
+          # Run after before_playback so placeholder restoration (which can change
+          # body length) happens first and Content-Length describes the final body.
+          invoke_hook(:update_content_length_header, interactions)
           invoke_hook(:recompress_response, interactions)
 
           interactions.reject! do |i|

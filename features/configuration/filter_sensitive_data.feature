@@ -169,3 +169,79 @@ Feature: Filter sensitive data
 
     When I run `ruby dynamic_filtering.rb`
     Then the output should contain "john.doe/monkey"
+
+  Scenario: Restrict a placeholder to a URI query component
+    Given a file named "scoped_uri_filtering.rb" with:
+      """ruby
+      if ARGV.include?('--with-server')
+        $server = start_sinatra_app do
+          get('/') { "Hello World" }
+        end
+      end
+
+      require 'vcr'
+
+      # The same public test value appears in three places of the request:
+      # a query parameter, a header and the body.
+      TOKEN = 'secret123'
+
+      VCR.configure do |c|
+        c.hook_into :webmock
+        c.cassette_library_dir = 'cassettes'
+        c.filter_sensitive_data('<TOKEN>', scope: :query) { TOKEN }
+      end
+
+      VCR.use_cassette('scoped_uri') do
+        uri = URI("http://localhost:#{$server ? $server.port : 0}/?api_key=#{TOKEN}&other=#{TOKEN}")
+        request = Net::HTTP::Get.new(uri.request_uri)
+        request['X-Api-Key'] = TOKEN
+        request.body = "body repeats #{TOKEN}"
+        Net::HTTP.start(uri.host, uri.port) { |http| http.request(request) }
+      end
+      """
+    When I run `ruby scoped_uri_filtering.rb --with-server`
+    Then the file "cassettes/scoped_uri.yml" should contain "api_key=<TOKEN>"
+     And the file "cassettes/scoped_uri.yml" should contain "other=<TOKEN>"
+     And the file "cassettes/scoped_uri.yml" should contain "X-Api-Key:"
+     And the file "cassettes/scoped_uri.yml" should contain "secret123"
+     And the file "cassettes/scoped_uri.yml" should contain "body repeats secret123"
+
+    When I run `ruby scoped_uri_filtering.rb`
+    Then it should pass with "Hello World"
+
+  Scenario: Restrict a placeholder to a specific request header
+    Given a file named "scoped_header_filtering.rb" with:
+      """ruby
+      if ARGV.include?('--with-server')
+        $server = start_sinatra_app do
+          get('/') { "Hello World" }
+        end
+      end
+
+      require 'vcr'
+
+      TOKEN = 'secret123'
+
+      VCR.configure do |c|
+        c.hook_into :webmock
+        c.cassette_library_dir = 'cassettes'
+        c.filter_sensitive_data('<TOKEN>',
+          scope: { request: { headers: 'X-Api-Key' } }) { TOKEN }
+      end
+
+      VCR.use_cassette('scoped_header') do
+        uri = URI("http://localhost:#{$server ? $server.port : 0}/?api_key=#{TOKEN}")
+        request = Net::HTTP::Get.new(uri.request_uri)
+        request['X-Api-Key'] = TOKEN
+        request['X-Other'] = TOKEN
+        Net::HTTP.start(uri.host, uri.port) { |http| http.request(request) }
+      end
+      """
+    When I run `ruby scoped_header_filtering.rb --with-server`
+    Then the file "cassettes/scoped_header.yml" should contain "X-Api-Key:"
+     And the file "cassettes/scoped_header.yml" should contain "- <TOKEN>"
+     And the file "cassettes/scoped_header.yml" should contain "api_key=secret123"
+     And the file "cassettes/scoped_header.yml" should contain "X-Other:"
+
+    When I run `ruby scoped_header_filtering.rb`
+    Then it should pass with "Hello World"

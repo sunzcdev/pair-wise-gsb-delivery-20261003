@@ -180,13 +180,13 @@ RSpec.describe VCR::Configuration do
 
       it 'adds a before_record hook that replaces the string returned by the block with the given string' do
         subject.send(method, 'foo', &lambda { 'bar' })
-        expect(interaction).to receive(:filter!).with('bar', 'foo')
+        expect(interaction).to receive(:filter!).with('bar', 'foo', scope: nil)
         subject.invoke_hook(:before_record, interaction, double.as_null_object)
       end
 
       it 'adds a before_playback hook that replaces the given string with the string returned by the block' do
         subject.send(method, 'foo', &lambda { 'bar' })
-        expect(interaction).to receive(:filter!).with('foo', 'bar')
+        expect(interaction).to receive(:filter!).with('foo', 'bar', scope: nil)
         subject.invoke_hook(:before_playback, interaction, double.as_null_object)
       end
 
@@ -198,6 +198,20 @@ RSpec.describe VCR::Configuration do
       it 'tags the before_playback hook when given a tag' do
         expect(subject).to receive(:before_playback).with(:my_tag)
         subject.send(method, 'foo', :my_tag) { 'bar' }
+      end
+
+      it 'passes the given scope to the scoped filter on both hooks' do
+        subject.send(method, 'foo', scope: :query) { 'bar' }
+        expect(interaction).to receive(:filter!).with('bar', 'foo', scope: :query)
+        subject.invoke_hook(:before_record, interaction, double.as_null_object)
+        expect(interaction).to receive(:filter!).with('foo', 'bar', scope: :query)
+        subject.invoke_hook(:before_playback, interaction, double.as_null_object)
+      end
+
+      it 'supports a tag and a scope together' do
+        expect(subject).to receive(:before_record).with(:my_tag)
+        expect(subject).to receive(:before_playback).with(:my_tag)
+        subject.send(method, 'foo', :my_tag, scope: { headers: 'X-Secret' }) { 'bar' }
       end
 
       it 'yields the interaction to the block for the before_record hook' do
