@@ -88,6 +88,24 @@ module VCR
           end
         end
 
+        it 'identifies the request by its body when a branch of a composition includes the body' do
+          VCR.use_cassette('example', match_requests_on: [
+            VCR.request_matchers.any_of([:method, :uri], [:method, :uri, :body])
+          ]) do
+            expect(message_for(body: 'param=val1')).to include(
+              "Body: param=val1"
+            )
+          end
+        end
+
+        it 'does not identify the request by its body when no branch of the composition includes it' do
+          VCR.use_cassette('example', match_requests_on: [
+            VCR.request_matchers.any_of([:method, :uri], [:host])
+          ]) do
+            expect(message_for(body: 'param=val1')).to_not match(/body/i)
+          end
+        end
+
         it 'mentions the details about the single cassette when there is one cassette' do
           VCR.use_cassette('example') do
             expect(message).to match(/VCR is currently using the following cassette:.+example.yml/m)

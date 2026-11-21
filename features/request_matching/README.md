@@ -23,6 +23,21 @@ You can also register a custom request matcher. This particularly comes
 in handy for dealing with APIs that use non-deterministic URIs (i.e. by
 including a timestamp as a query parameter or whatever).
 
+`VCR.request_matchers.any_of` and `VCR.request_matchers.all_of` compose
+matchers so that one of several combinations is enough to match a request,
+e.g. when the body only has to be compared for one HTTP method:
+
+    match_requests_on: [
+      VCR.request_matchers.any_of(
+        VCR.request_matchers.all_of(post_request, :uri, :body),
+        VCR.request_matchers.all_of(other_request, :uri)
+      )
+    ]
+
+The entries of the `:match_requests_on` array still all have to match, as
+they always have; a composition is just one entry that can answer for
+several combinations.
+
 When a cassette contains multiple HTTP interactions that match a request
 based on the configured `:match_requests_on` setting, the responses are
 sequenced: the first matching request will get the first response,

@@ -48,6 +48,7 @@
   - Request matching
     - [Body](/request_matching/body.md)
     - [Body as json](/request_matching/body_as_json.md)
+    - [Composable matchers](/request_matching/composable_matchers.md)
     - [Custom matcher](/request_matching/custom_matcher.md)
     - [Headers](/request_matching/headers.md)
     - [Host](/request_matching/host.md)

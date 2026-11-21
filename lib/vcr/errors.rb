@@ -118,10 +118,14 @@ module VCR
       def current_matchers
         if current_cassettes.size > 0
           current_cassettes.inject([]) do |memo, cassette|
-            memo | cassette.match_requests_on
+            # Compositions resolve to the matchers they are built from, so
+            # that deleting duplicate entries can't drop a branch.
+            memo | VCR::RequestMatcherRegistry.declarations_of(cassette.match_requests_on)
           end
         else
-          VCR.configuration.default_cassette_options[:match_requests_on]
+          VCR::RequestMatcherRegistry.declarations_of(
+            VCR.configuration.default_cassette_options[:match_requests_on]
+          )
         end
       end
 

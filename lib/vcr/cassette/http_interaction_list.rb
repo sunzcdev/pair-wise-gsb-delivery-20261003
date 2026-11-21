@@ -95,12 +95,15 @@ module VCR
 
       def interaction_matches_request?(request, interaction)
         log "Checking if #{request_summary(request)} matches #{request_summary(interaction.request)} using #{@request_matchers.inspect}", 1
-        @request_matchers.all? do |matcher_name|
-          matcher = VCR.request_matchers[matcher_name]
-          matcher.matches?(request, interaction.request).tap do |matched|
-            matched = matched ? 'matched' : 'did not match'
-            log "#{matcher_name} (#{matched}): current request #{request_summary(request)} vs #{request_summary(interaction.request)}", 2
-          end
+
+        # A `:match_requests_on` list is evaluated the way it always has been:
+        # every entry has to match. Entries may be compositions, though, and a
+        # single evaluation is used for the whole comparison so that a matcher
+        # appearing in several branches is called once and each branch stops
+        # as soon as its result is known.
+        VCR.request_matchers.matches_all?(@request_matchers, request, interaction.request) do |matcher, matched|
+          description = matched ? 'matched' : 'did not match'
+          log "#{matcher} (#{description}): current request #{request_summary(request)} vs #{request_summary(interaction.request)}", 2
         end
       end
 

@@ -1,7 +1,9 @@
+require 'yaml'
 require 'vcr/util/logger'
 require 'vcr/cassette/http_interaction_list'
 require 'vcr/request_matcher_registry'
 require 'vcr/structs'
+require 'support/limited_uri'
 require 'support/configuration_stubbing'
 
 module VCR
@@ -287,6 +289,155 @@ module VCR
           original_dup = original_list_array.dup
           list.response_for(request_with(method: :post))
           expect(original_list_array).to eq original_dup
+        end
+
+        context 'when the request matchers are composable declarations' do
+          before { allow(config).to receive(:uri_parser) { LimitedURI } }
+
+          let(:post_only)  { lambda { |r1, r2| r1.method == :post && r2.method == :post } }
+          let(:other_only) { lambda { |r1, r2| r1.method != :post && r2.method != :post } }
+
+          # A legacy API only needs the body compared for POST requests; for
+          # every other method the URL is enough.
+          let(:legacy_matchers) do
+            [
+              VCR.request_matchers.any_of(
+                VCR.request_matchers.all_of(post_only, :path, :body),
+                VCR.request_matchers.all_of(other_only, :path)
+              )
+            ]
+          end
+
+          # Both records are on the same path and only differ by body.
+          let(:original_list_array) { [
+            interaction('alpha record', method: :post, uri: 'http://example.com/legacy/search', body: 'q=alpha'),
+            interaction('beta record', method: :post, uri: 'http://example.com/legacy/search', body: 'q=beta')
+          ] }
+
+          let(:list) { HTTPInteractionList.new(original_list_array, legacy_matchers, allow_playback_repeats) }
+
+          it 'requires the body for the method of the matching branch' do
+            expect(list.response_for(request_with(
+              method: :post, uri: 'http://example.com/legacy/search', body: 'q=beta'
+            ))).to respond_with('beta record')
+
+            expect(list.response_for(request_with(
+              method: :post, uri: 'http://example.com/legacy/search', body: 'q=alpha'
+            ))).to respond_with('alpha record')
+          end
+
+          it 'does not match a body through the URL-only branch' do
+            expect(list.response_for(request_with(
+              method: :post, uri: 'http://example.com/legacy/search', body: 'q=gamma'
+            ))).to respond_with(nil)
+          end
+
+          it 'returns nothing for a method that no branch matches' do
+            expect(list.response_for(request_with(
+              method: :get, uri: 'http://example.com/legacy/search'
+            ))).to respond_with(nil)
+          end
+
+          it 'consumes the first record that matches when several do' do
+            matchers = [VCR.request_matchers.any_of(:path)]
+            list = HTTPInteractionList.new(original_list_array, matchers)
+
+            expect(list.response_for(request_with(method: :post, uri: 'http://example.com/legacy/search')))
+              .to respond_with('alpha record')
+            expect(list.response_for(request_with(method: :post, uri: 'http://example.com/legacy/search')))
+              .to respond_with('beta record')
+          end
+
+          it 'still uses the legacy array meaning when mixed with a composition' do
+            matchers = legacy_matchers + [:method]
+            list = HTTPInteractionList.new(original_list_array, matchers)
+
+            expect(list.response_for(request_with(
+              method: :get, uri: 'http://example.com/legacy/search'
+            ))).to respond_with(nil)
+          end
+
+          it 'does not evaluate a matcher twice to try both branches' do
+            calls = Hash.new(0)
+            VCR.request_matchers.register(:body_counter) { |r1, r2| calls[:body] += 1; r1.body == r2.body }
+            VCR.request_matchers.register(:method_counter) { |r1, r2| calls[:method] += 1; r1.method == r2.method }
+
+            matchers = [
+              VCR.request_matchers.any_of(
+                VCR.request_matchers.all_of(:path, :body_counter, :method_counter),
+                VCR.request_matchers.all_of(:path, :method_counter)
+              )
+            ]
+
+            list = HTTPInteractionList.new(original_list_array, matchers)
+            list.response_for(request_with(method: :post, uri: 'http://example.com/legacy/search', body: 'q=beta'))
+
+            expect(calls[:body]).to eq(1)
+          end
+        end
+
+        context 'with the offline cassette holding two records on the same path' do
+          before { allow(config).to receive(:uri_parser) { LimitedURI } }
+
+          let(:fixture_interactions) do
+            path = File.expand_path('../../../fixtures/composable_match_requests_on.yml', File.dirname(__FILE__))
+            hashes = YAML.load_file(path)['http_interactions']
+            hashes.map { |h| VCR::HTTPInteraction.from_hash(h) }
+          end
+
+          let(:post_only)  { lambda { |r1, r2| r1.method == :post && r2.method == :post } }
+          let(:other_only) { lambda { |r1, r2| r1.method != :post && r2.method != :post } }
+
+          let(:legacy_matchers) do
+            [
+              VCR.request_matchers.any_of(
+                VCR.request_matchers.all_of(post_only, :uri, :body),
+                VCR.request_matchers.all_of(other_only, :uri)
+              )
+            ]
+          end
+
+          it 'consumes the record chosen by the branch that applies to the request' do
+            list = HTTPInteractionList.new(fixture_interactions, legacy_matchers)
+
+            response = list.response_for(request_with(
+              method: :post, uri: 'http://example.com/legacy/search', body: 'q=beta'
+            ))
+
+            expect(response.body).to eq('beta body record')
+            expect(list.interactions.map { |i| i.response.body }).to eq(['alpha body record', 'get url record'])
+          end
+
+          it 'falls back to the URL-only branch for the other methods' do
+            list = HTTPInteractionList.new(fixture_interactions, legacy_matchers)
+
+            response = list.response_for(request_with(
+              method: :get, uri: 'http://example.com/legacy/search'
+            ))
+
+            expect(response.body).to eq('get url record')
+          end
+
+          it 'does not consume a same-path record whose body does not match' do
+            list = HTTPInteractionList.new(fixture_interactions, legacy_matchers)
+
+            response = list.response_for(request_with(
+              method: :post, uri: 'http://example.com/legacy/search', body: 'q=gamma'
+            ))
+
+            expect(response).to be_nil
+            expect(list.remaining_unused_interaction_count).to eq(3)
+          end
+
+          it 'still works for a cassette whose records were written for the legacy array matchers' do
+            list = HTTPInteractionList.new(fixture_interactions, [:method, :uri])
+
+            response = list.response_for(request_with(
+              method: :post, uri: 'http://example.com/legacy/search', body: 'q=gamma'
+            ))
+
+            expect(response.body).to eq('alpha body record')
+          end
         end
       end
     end

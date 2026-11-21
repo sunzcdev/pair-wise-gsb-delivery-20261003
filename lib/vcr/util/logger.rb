@@ -1,3 +1,5 @@
+require 'vcr/request_matcher_registry'
+
 module VCR
   # @private
   # Provides log message formatting helper methods.
@@ -13,9 +15,15 @@ module VCR
     end
 
     def request_summary(request, request_matchers)
+      # `request_matchers` may contain request matcher compositions (see
+      # `VCR::RequestMatcherRegistry::Composition`), so the names to look at
+      # are the leaves of the declarations rather than the declarations
+      # themselves.
+      matchers = VCR::RequestMatcherRegistry.declarations_of(request_matchers)
+
       attributes = [request.method, request.uri]
-      attributes << request.body.to_s[0, 80].inspect if request_matchers.include?(:body)
-      attributes << request.headers.inspect          if request_matchers.include?(:headers)
+      attributes << request.body.to_s[0, 80].inspect if matchers.include?(:body)
+      attributes << request.headers.inspect          if matchers.include?(:headers)
       "[#{attributes.join(" ")}]"
     end
 

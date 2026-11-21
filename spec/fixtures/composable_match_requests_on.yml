@@ -1,0 +1,60 @@
+---
+http_interactions:
+- request:
+    method: post
+    uri: http://example.com/legacy/search
+    body:
+      encoding: UTF-8
+      string: q=alpha
+    headers: {}
+  response:
+    status:
+      code: 200
+      message: OK
+    headers:
+      Content-Length:
+      - "17"
+    body:
+      encoding: UTF-8
+      string: alpha body record
+    http_version: "1.1"
+  recorded_at: Tue, 01 Nov 2011 04:58:44 GMT
+- request:
+    method: post
+    uri: http://example.com/legacy/search
+    body:
+      encoding: UTF-8
+      string: q=beta
+    headers: {}
+  response:
+    status:
+      code: 200
+      message: OK
+    headers:
+      Content-Length:
+      - "16"
+    body:
+      encoding: UTF-8
+      string: beta body record
+    http_version: "1.1"
+  recorded_at: Tue, 01 Nov 2011 04:58:45 GMT
+- request:
+    method: get
+    uri: http://example.com/legacy/search
+    body:
+      encoding: UTF-8
+      string: ""
+    headers: {}
+  response:
+    status:
+      code: 200
+      message: OK
+    headers:
+      Content-Length:
+      - "14"
+    body:
+      encoding: UTF-8
+      string: get url record
+    http_version: "1.1"
+  recorded_at: Tue, 01 Nov 2011 04:58:46 GMT
+recorded_with: VCR 6.4.1

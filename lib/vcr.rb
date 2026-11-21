@@ -74,7 +74,10 @@ module VCR
   #  to use to determine what recorded HTTP interaction to replay. Defaults to
   #  [:method, :uri]. The built-in matchers are :method, :uri, :host, :path, :headers
   #  and :body. You can also pass the name of a registered custom request matcher or
-  #  any object that responds to #call.
+  #  any object that responds to #call. An entry may also be a composition built with
+  #  `VCR.request_matchers.any_of` or `VCR.request_matchers.all_of`, which lets one
+  #  cassette accept several combinations of matchers; the entries of the array keep
+  #  their usual meaning and all have to match.
   # @option options :re_record_interval [Integer] When given, the
   #  cassette will be re-recorded at the given interval, in seconds.
   # @option options :tag [Symbol] Used to apply tagged `before_record`

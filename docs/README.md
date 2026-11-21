@@ -63,7 +63,7 @@ Do *not* use 'test/fixtures' as the directory if you're using Rails and Minitest
     * [Excon](https://github.com/geemus/excon)
     * [Faraday](https://github.com/lostisland/faraday)
     * And of course any library built on Net::HTTP, such as [Mechanize](https://github.com/sparklemotion/mechanize), [HTTParty](https://github.com/jnunemaker/httparty) or [Rest Client](https://github.com/rest-client/rest-client).
-  * Request matching is configurable based on HTTP method, URI, host, path, body and headers, or you can easily implement a custom request matcher to handle any need.
+  * Request matching is configurable based on HTTP method, URI, host, path, body and headers, or you can easily implement a custom request matcher to handle any need. Matchers can also be composed (`VCR.request_matchers.any_of` / `all_of`) when a cassette has to accept several matching rules, such as matching the body for one HTTP method only.
   * The same request can receive different responses in different tests--just use different cassettes.
   * The recorded requests and responses are stored on disk in a serialization format of your choice (currently YAML and JSON are built in, and you can easily implement your own custom serializer) and can easily be inspected and edited.
   * Dynamic responses are supported using ERB.

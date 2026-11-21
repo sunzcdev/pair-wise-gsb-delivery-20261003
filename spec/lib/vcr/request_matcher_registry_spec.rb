@@ -216,6 +216,218 @@ module VCR
       end
     end
 
+    describe "#any_of" do
+      let(:post_only)  { lambda { |r1, r2| r1.method == :post && r2.method == :post } }
+      let(:other_only) { lambda { |r1, r2| r1.method != :post && r2.method != :post } }
+
+      # A legacy API only needs the body compared for POST requests; for every
+      # other method the URL is enough.
+      let(:legacy_matcher) do
+        subject.any_of(
+          subject.all_of(post_only, :uri, :body),
+          subject.all_of(other_only, :uri)
+        )
+      end
+
+      it 'matches when one of the branches matches' do
+        matches = legacy_matcher.call(
+          request_with(method: :post, uri: 'http://example.com/search', body: 'q=alpha'),
+          request_with(method: :post, uri: 'http://example.com/search', body: 'q=alpha')
+        )
+        expect(matches).to be true
+      end
+
+      it 'does not match when no branch matches' do
+        matches = legacy_matcher.call(
+          request_with(method: :post, uri: 'http://example.com/search', body: 'q=alpha'),
+          request_with(method: :post, uri: 'http://example.com/search', body: 'q=beta')
+        )
+        expect(matches).to be false
+      end
+
+      it 'does not require the body for the methods that only need the URL' do
+        matches = legacy_matcher.call(
+          request_with(method: :get, uri: 'http://example.com/search', body: 'anything'),
+          request_with(method: :get, uri: 'http://example.com/search', body: 'something else')
+        )
+        expect(matches).to be true
+      end
+
+      it 'does not match across the two branches' do
+        matches = legacy_matcher.call(
+          request_with(method: :get, uri: 'http://example.com/search'),
+          request_with(method: :post, uri: 'http://example.com/search', body: '')
+        )
+        expect(matches).to be false
+      end
+
+      it 'accepts matcher names and callables directly' do
+        matcher = subject.any_of(:body, post_only)
+
+        expect(matcher.call(
+          request_with(method: :get, body: 'same'),
+          request_with(method: :get, body: 'same')
+        )).to be true
+
+        expect(matcher.call(
+          request_with(method: :get, body: 'one'),
+          request_with(method: :get, body: 'two')
+        )).to be false
+      end
+
+      it 'accepts an array as an all-of branch' do
+        matcher = subject.any_of([:method, :uri])
+
+        expect(matcher.call(
+          request_with(method: :get, uri: 'http://example.com/a'),
+          request_with(method: :get, uri: 'http://example.com/a')
+        )).to be true
+
+        expect(matcher.call(
+          request_with(method: :get, uri: 'http://example.com/a'),
+          request_with(method: :get, uri: 'http://example.com/b')
+        )).to be false
+      end
+
+      it 'can be nested inside another combination' do
+        matcher = subject.all_of(:method, subject.any_of(:host, :body))
+
+        expect(matcher.call(
+          request_with(method: :get, uri: 'http://example.com/a', body: 'payload'),
+          request_with(method: :get, uri: 'http://other.com/b', body: 'payload')
+        )).to be true
+
+        expect(matcher.call(
+          request_with(method: :get, uri: 'http://example.com/a', body: 'payload'),
+          request_with(method: :get, uri: 'http://other.com/b', body: 'different')
+        )).to be false
+      end
+
+      it 'treats an empty combination as not matching' do
+        expect(subject.any_of.call(request_with(method: :get), request_with(method: :get))).to be false
+      end
+
+      it 'can be used through a matcher registered by name' do
+        subject.register(:legacy, &legacy_matcher.to_proc)
+
+        expect(subject[:legacy].matches?(
+          request_with(method: :post, uri: 'http://example.com/search', body: 'q=alpha'),
+          request_with(method: :post, uri: 'http://example.com/search', body: 'q=alpha')
+        )).to be true
+
+        expect(subject[:legacy].matches?(
+          request_with(method: :post, uri: 'http://example.com/search', body: 'q=alpha'),
+          request_with(method: :post, uri: 'http://example.com/search', body: 'q=beta')
+        )).to be false
+      end
+
+      it 'can be registered by name through a plain lambda as well' do
+        subject.register(:always, &legacy_matcher.to_proc)
+
+        expect(subject[:always].callable).to respond_to(:call)
+        expect(subject[:always].matches?(
+          request_with(method: :get, uri: 'http://example.com/search'),
+          request_with(method: :get, uri: 'http://example.com/search')
+        )).to be true
+      end
+
+      it 'has a readable inspect' do
+        expect(legacy_matcher.inspect).to start_with("any_of(all_of(")
+        expect(legacy_matcher.inspect).to include(', :uri, :body)')
+        expect(subject.all_of(:method, :uri).inspect).to eq('all_of(:method, :uri)')
+        expect(subject.any_of([:method, :uri]).inspect).to eq('any_of([:method, :uri])')
+      end
+    end
+
+    describe "#all_of" do
+      it 'matches only when every matcher matches' do
+        matcher = subject.all_of(:method, :uri)
+
+        expect(matcher.call(
+          request_with(method: :get, uri: 'http://example.com/a'),
+          request_with(method: :get, uri: 'http://example.com/a')
+        )).to be true
+
+        expect(matcher.call(
+          request_with(method: :get, uri: 'http://example.com/a'),
+          request_with(method: :post, uri: 'http://example.com/a')
+        )).to be false
+      end
+
+      it 'treats an empty combination as matching' do
+        expect(subject.all_of.call(request_with(method: :get), request_with(method: :get))).to be true
+      end
+    end
+
+    describe "combination evaluation order" do
+      it 'short-circuits the branches of an any_of, in declaration order' do
+        calls = []
+        first  = lambda { |r1, r2| calls << :first;  true }
+        second = lambda { |r1, r2| calls << :second; true }
+
+        subject.any_of(first, second).call(request_with(method: :get), request_with(method: :get))
+        expect(calls).to eq([:first])
+      end
+
+      it 'short-circuits the matchers of an all_of, in declaration order' do
+        calls = []
+        first  = lambda { |r1, r2| calls << :first;  false }
+        second = lambda { |r1, r2| calls << :second; true }
+
+        subject.all_of(first, second).call(request_with(method: :get), request_with(method: :get))
+        expect(calls).to eq([:first])
+      end
+
+      it 'evaluates a matcher shared by several branches only once' do
+        calls = 0
+        shared = lambda { |r1, r2| calls += 1; r1.body == r2.body }
+
+        matcher = subject.any_of(subject.all_of(:uri, shared), subject.all_of(shared, :method))
+        matcher.call(
+          request_with(method: :get, uri: 'http://example.com/a', body: 'x'),
+          request_with(method: :get, uri: 'http://example.com/a', body: 'x')
+        )
+
+        expect(calls).to eq(1)
+      end
+
+      it 'does not evaluate a matcher twice when it is also a named matcher' do
+        calls = 0
+        subject.register(:body_counter) { |r1, r2| calls += 1; r1.body == r2.body }
+
+        matcher = subject.any_of(subject.all_of(:uri, :body_counter), subject.all_of(:body_counter, :method))
+        matcher.call(
+          request_with(method: :get, uri: 'http://example.com/a', body: 'x'),
+          request_with(method: :get, uri: 'http://example.com/a', body: 'x')
+        )
+
+        expect(calls).to eq(1)
+      end
+
+      it 'keeps the legacy array meaning: every entry has to match, in order' do
+        calls = []
+        subject.register(:first)  { |r1, r2| calls << :first;  false }
+        subject.register(:second) { |r1, r2| calls << :second; true }
+
+        matched = subject.matches_all?([:first, :second], request_with(method: :get), request_with(method: :get))
+
+        expect(matched).to be false
+        expect(calls).to eq([:first])
+      end
+    end
+
+    describe "#declarations_of" do
+      it 'flattens combinations and arrays into their matchers' do
+        composition = subject.any_of(subject.all_of(:uri, :body), [:method, :headers])
+
+        expect(subject.class.declarations_of([composition, :query])).to eq([:uri, :body, :method, :headers, :query])
+      end
+
+      it 'leaves the legacy array shape untouched' do
+        expect(subject.class.declarations_of([:method, :uri])).to eq([:method, :uri])
+      end
+    end
+
     describe "built-ins" do
       describe ":method" do
         it 'matches when it is the same' do
