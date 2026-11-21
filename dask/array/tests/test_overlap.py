@@ -985,3 +985,208 @@ def test_overlap_not_blowing_up_graph():
     result = arr.rolling(dim={"year": 11}, center=True).construct("window_dim")
     dc = collections_to_expr([result.data]).__dask_graph__()
     assert len(dc) <= 1651  # previously 3000
+
+
+# ---------------------------------------------------------------------------
+# One-sided overlap over arrays with unequal, non-uniform chunk widths
+# ---------------------------------------------------------------------------
+
+def _forward_difference(a):
+    """Asymmetric 1-D operator consuming a one-sided (right) halo."""
+    out = np.empty_like(a)
+    out[:-1] = a[1:] - a[:-1]
+    out[-1] = 0
+    return out
+
+
+def test_map_overlap_uneven_chunks_one_sided_halo_matches_trim():
+    # Two arrays covering the same 11 elements with different, non-uniform
+    # chunk widths:  (3, 5, 3)  vs  (6, 5).
+    nx = np.arange(11, dtype=np.float64)
+    ny = np.arange(11, dtype=np.float64) * 10.0
+    x = da.from_array(nx, chunks=(3, 5, 3))
+    y = da.from_array(ny, chunks=(6, 5))
+
+    # depth = (left=0, right=2): purely one-sided halo on the right.
+    depth = {0: (0, 2)}
+    captured = []
+
+    def func(a, b):
+        captured.append((a.shape[0], a.copy(), b.copy()))
+        return _forward_difference(a) + (b * 0)
+
+    z = da.map_overlap(
+        func,
+        x,
+        y,
+        depth=depth,
+        boundary="none",
+        trim=True,
+        align_arrays=True,
+        dtype=nx.dtype,
+    )
+    z.compute(scheduler="sync")
+
+    # align/rechunk unifies both inputs onto a common chunking; the original
+    # block boundaries (0:3, 3:8, 8:11) and (0:6, 6:11) get re-indexed into
+    # four blocks of widths (3, 3, 2, 3).
+    assert z.chunks == ((3, 3, 2, 3),)
+    assert z.numblocks == (4,)
+
+    # map_blocks also probes the function with a 0-d / empty meta array; drop
+    # those probes, then sort by the first data element so block order is
+    # deterministic regardless of task scheduling order.
+    blocks = sorted(
+        ((n, a, b) for (n, a, b) in captured if n > 0), key=lambda item: item[1][0]
+    )
+    assert len(blocks) == 4
+
+    # Every real block must carry matching halo on both input arrays, and the
+    # halo must be the actual neighboring values (no padding with boundary).
+    # Block order follows the unified chunking (3, 3, 2, 3):
+    assert [n for (n, a, b) in blocks] == [5, 5, 4, 3]
+    expected_inputs = [
+        np.arange(0, 5, dtype=np.float64),  # own [0:3] + right halo [3:5]
+        np.arange(3, 8, dtype=np.float64),  # own [3:6] + right halo [6:8]
+        np.arange(6, 10, dtype=np.float64),  # own [6:8] + right halo [8:10]
+        np.arange(8, 11, dtype=np.float64),  # last block: right halo missing
+    ]
+    for (_n, a, b), expected in zip(blocks, expected_inputs):
+        assert_eq(a, expected)
+        assert_eq(b, expected * 10.0)
+
+    # With boundary='none' the last block gets nothing on its missing right
+    # side, so the function simply receives its own three data elements.
+    assert blocks[-1][1].tolist() == [8.0, 9.0, 10.0]
+
+    # End-to-end values must equal applying the asymmetric operator directly
+    # to the un-chunked array, i.e. the trim convention matches what the
+    # function actually received.
+    expected = _forward_difference(nx)
+    assert_eq(z, expected)
+
+    # The overlap layer's own chunk metadata must describe exactly the shapes
+    # the function received above (own width + right halo, last block
+    # unextended) -- the same convention used when trimming the output.
+    overlapped = da.overlap.overlap(
+        da.from_array(nx, chunks=(3, 3, 2, 3)),
+        depth=depth,
+        boundary="none",
+        allow_rechunk=False,
+    )
+    assert overlapped.chunks == ((5, 5, 4, 3),)
+
+
+def test_map_overlap_uneven_chunks_two_sided_asymmetric_depth():
+    # Asymmetric (left=1, right=2) depth with boundary='none': first block is
+    # missing its left halo, last block is missing its right halo.
+    nx = np.arange(11, dtype=np.float64)
+    ny = np.arange(11, dtype=np.float64) * 10.0
+    x = da.from_array(nx, chunks=(3, 5, 3))
+    y = da.from_array(ny, chunks=(6, 5))
+
+    depth = {0: (1, 2)}
+    captured = []
+
+    def func(a, b):
+        captured.append((a.shape[0], a.copy(), b.copy()))
+        return a * 2.0 + (b * 0)
+
+    z = da.map_overlap(
+        func,
+        x,
+        y,
+        depth=depth,
+        boundary="none",
+        trim=True,
+        align_arrays=True,
+        dtype=nx.dtype,
+    )
+    result = z.compute(scheduler="sync")
+
+    assert z.chunks == ((3, 3, 2, 3),)
+    blocks = sorted(
+        ((n, a, b) for (n, a, b) in captured if n > 0), key=lambda item: item[1][0]
+    )
+    assert [n for (n, a, b) in blocks] == [5, 6, 5, 4]
+
+    # first block: left halo missing (boundary='none'), right halo present
+    assert_eq(blocks[0][1], np.arange(0, 5, dtype=np.float64))
+    assert_eq(blocks[0][2], np.arange(0, 5, dtype=np.float64) * 10.0)
+    # internal blocks: both halos present
+    assert_eq(blocks[1][1], np.arange(2, 8, dtype=np.float64))
+    assert_eq(blocks[2][1], np.arange(5, 10, dtype=np.float64))
+    # last block: right halo missing, left halo present
+    assert_eq(blocks[3][1], np.arange(7, 11, dtype=np.float64))
+
+    # trimming the asymmetric halos restores the original values in order
+    assert_eq(result, nx * 2.0)
+
+    # metadata convention for the extended blocks: own width + left + right,
+    # minus the side that touches the array boundary.
+    overlapped = da.overlap.overlap(
+        da.from_array(nx, chunks=(3, 3, 2, 3)),
+        depth=depth,
+        boundary="none",
+        allow_rechunk=False,
+    )
+    assert overlapped.chunks == ((5, 6, 5, 4),)
+
+
+def test_map_overlap_allow_rechunk_false_names_undersized_axis():
+    # axis 0 is fine (chunks >= depth), axis 1 carries a chunk smaller than
+    # the requested depth: the early error must name axis 1 explicitly.
+    arr = da.ones((10, 10), chunks=((5, 5), (2, 8)))
+    with pytest.raises(ValueError, match=r"axis 1") as exc_info:
+        da.map_overlap(
+            lambda v: v,
+            arr,
+            depth={0: 1, 1: 3},
+            boundary="reflect",
+            allow_rechunk=False,
+        )
+    message = str(exc_info.value)
+    assert "axis 0" not in message
+    assert "depth 3 exceeds smallest chunk 2" in message
+
+    # a single-axis failure names that axis and shows the offending chunks
+    one_d = da.arange(6, chunks=2)
+    with pytest.raises(ValueError, match=r"axis 0.*depth 3.*chunk 2"):
+        da.map_overlap(
+            lambda v: v,
+            one_d,
+            depth=3,
+            boundary="reflect",
+            allow_rechunk=False,
+        )
+
+    # when rechunking is allowed the same array succeeds
+    result = da.map_overlap(
+        lambda v: v,
+        arr,
+        depth={0: 1, 1: 3},
+        boundary="reflect",
+        allow_rechunk=True,
+    )
+    assert all(c >= 3 for c in result.chunks[1])
+    assert_eq(result, arr)
+
+
+def test_map_overlap_uneven_chunks_rechunked_depth_keeps_blocks_aligned():
+    # Depth exceeds some chunks, so an automatic rechunk must happen before
+    # the overlap. After rechunking the block indices shift, and the halos
+    # handed to the function must still agree with the output trim metadata.
+    nx = np.arange(12, dtype=np.float64)
+    x = da.from_array(nx, chunks=(2, 1, 4, 2, 3))
+
+    z = x.map_overlap(
+        _forward_difference,
+        depth={0: (0, 2)},
+        boundary="none",
+        trim=True,
+        allow_rechunk=True,
+        dtype=nx.dtype,
+    )
+    assert all(c >= 2 for c in z.chunks[0])
+    assert_eq(z, _forward_difference(nx))
+

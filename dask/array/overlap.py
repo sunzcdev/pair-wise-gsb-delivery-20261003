@@ -442,11 +442,21 @@ def overlap(x, depth, boundary, *, allow_rechunk=True):
         )  # this is a no-op if x.chunks == new_chunks
 
     else:
-        original_chunks_too_small = any(min(c) < d for d, c in zip(depths, x.chunks))
-        if original_chunks_too_small:
+        undersized_axes = [
+            i
+            for i, (d, c) in enumerate(zip(depths, x.chunks))
+            if min(c) < d
+        ]
+        if undersized_axes:
+            axis_details = ", ".join(
+                f"axis {i}: depth {depths[i]} exceeds smallest chunk "
+                f"{min(x.chunks[i])} (chunks={x.chunks[i]})"
+                for i in undersized_axes
+            )
             raise ValueError(
                 "Overlap depth is larger than smallest chunksize.\n"
                 "Please set allow_rechunk=True to rechunk automatically.\n"
+                f"Undersized axis/axes: {axis_details}.\n"
                 f"Overlap depths required: {depths}\n"
                 f"Input chunks: {x.chunks}\n"
             )
