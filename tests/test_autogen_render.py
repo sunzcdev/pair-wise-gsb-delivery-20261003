@@ -2822,6 +2822,125 @@ class AutogenRenderTest(TestBase):
         )
 
 
+class PerTokenImportRenderingTest(TestBase):
+    """test the per-token import / render-context distribution used by the
+    multidb template"""
+
+    def _table_op(self, name="t"):
+        m = MetaData()
+        t = Table(name, m, Column("id", Integer, primary_key=True))
+        return ops.CreateTableOp.from_table(t)
+
+    def _make_context(self):
+        ctx_opts = {
+            "sqlalchemy_module_prefix": "sa.",
+            "alembic_module_prefix": "op.",
+            "target_metadata": MetaData(),
+        }
+        context = MigrationContext.configure(
+            dialect=DefaultDialect(), opts=ctx_opts
+        )
+        return api.AutogenContext(context)
+
+    def tearDown(self):
+        autogenerate.render.clear_render_contexts()
+
+    def _single_script(self):
+        autogen_context = self._make_context()
+        original = autogenerate.render.renderers.dispatch(ops.CreateTableOp)
+
+        def _render(ac, op):
+            ac.imports.add("from myhelpers import foo")
+            return "foo()"
+
+        autogenerate.render.renderers.dispatch_for(
+            ops.CreateTableOp, replace=True
+        )(_render)
+        try:
+            upgrade = ops.UpgradeOps([self._table_op()])
+            script = ops.MigrationScript(
+                "rev",
+                upgrade,
+                upgrade.reverse(),
+                imports={"from shared import bar"},
+            )
+            template_args = {}
+            autogenerate.render._render_python_into_templatevars(
+                autogen_context, script, template_args
+            )
+            return template_args
+        finally:
+            autogenerate.render.renderers.dispatch_for(
+                ops.CreateTableOp, replace=True
+            )(original)
+
+    def test_single_token_imports_module_level(self):
+        template_args = self._single_script()
+        # single-db templates keep all imports at module level
+        assert "from myhelpers import foo" in template_args["imports"]
+        assert "from shared import bar" in template_args["imports"]
+
+    def test_multidb_token_imports_isolated(self):
+        ctx1 = self._make_context()
+        ctx2 = self._make_context()
+
+        def _render1(ac, op):
+            ac.imports.add("from helpers import one")
+            return "one()"
+
+        def _render2(ac, op):
+            ac.imports.add("from helpers import two")
+            return "two()"
+
+        ctx1.renderers.dispatch_for(ops.CreateTableOp)(_render1)
+        ctx2.renderers.dispatch_for(ops.CreateTableOp)(_render2)
+
+        autogenerate.render.set_render_context("engine1_upgrades", ctx1)
+        autogenerate.render.set_render_context("engine2_upgrades", ctx2)
+
+        up1 = ops.UpgradeOps(
+            [self._table_op("t1")], upgrade_token="engine1_upgrades"
+        )
+        up2 = ops.UpgradeOps(
+            [self._table_op("t2")], upgrade_token="engine2_upgrades"
+        )
+        script = ops.MigrationScript(
+            "rev",
+            [up1, up2],
+            [
+                ops.DowngradeOps(
+                    [], downgrade_token="engine1_downgrades"
+                ),
+                ops.DowngradeOps(
+                    [], downgrade_token="engine2_downgrades"
+                ),
+            ],
+        )
+        template_args = {}
+        autogenerate.render._render_python_into_templatevars(
+            ctx1, script, template_args
+        )
+
+        token_imports = template_args["token_imports"]
+        eq_(
+            token_imports["engine1_upgrades"],
+            {"from helpers import one"},
+        )
+        eq_(
+            token_imports["engine2_upgrades"],
+            {"from helpers import two"},
+        )
+
+        # the per-bind imports are not leaked to the module-level block
+        assert "from helpers import one" not in template_args["imports"]
+        assert "from helpers import two" not in template_args["imports"]
+
+        # each bind rendered through its own renderer
+        assert "one()" in template_args["engine1_upgrades"]
+        assert "two()" in template_args["engine2_upgrades"]
+        assert "one()" not in template_args["engine2_upgrades"]
+
+
 class RenderNamingConventionTest(TestBase):
     def setUp(self):
         convention = {

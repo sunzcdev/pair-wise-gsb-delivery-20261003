@@ -32,6 +32,7 @@ def downgrade(engine_name: str) -> None:
 
 <%
     db_names = config.get_main_option("databases")
+    token_imports = context.get("token_imports", {})
 %>
 
 ## generate an "upgrade_<xyz>() / downgrade_<xyz>()" function
@@ -41,11 +42,17 @@ def downgrade(engine_name: str) -> None:
 
 def upgrade_${db_name}() -> None:
     """Upgrade ${db_name} schema."""
+% for import_line in sorted(token_imports.get("%s_upgrades" % db_name, ())):
+    ${import_line}
+% endfor
     ${context.get("%s_upgrades" % db_name, "pass")}
 
 
 def downgrade_${db_name}() -> None:
     """Downgrade ${db_name} schema."""
+% for import_line in sorted(token_imports.get("%s_downgrades" % db_name, ())):
+    ${import_line}
+% endfor
     ${context.get("%s_downgrades" % db_name, "pass")}
 
 % endfor

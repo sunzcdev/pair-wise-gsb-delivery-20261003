@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import contextlib
 from io import StringIO
 import re
 from typing import Any
 from typing import cast
+from typing import Iterator
 from typing import TYPE_CHECKING
 
 from mako.pygen import PythonPrinter
@@ -72,23 +74,156 @@ def _indent(text: str) -> str:
     return text
 
 
+# registry of per-bind AutogenContext objects used when rendering a
+# multidb revision, keyed by the upgrade token of the bind (e.g.
+# "engine1_upgrades").  Each bind's context carries its own renderer
+# dispatcher, so custom renderers registered for one bind do not silently
+# take over rendering of the same operation class in another bind.
+_render_contexts: dict[str, AutogenContext] = {}
+
+
+def set_render_context(
+    upgrade_token: str, autogen_context: AutogenContext
+) -> None:
+    """Associate a per-bind :class:`.AutogenContext` with the given upgrade
+    token.
+
+    In a multidb environment each bind runs autogenerate with its own
+    :class:`.AutogenContext`.  Registering that context here ensures that,
+    when the resulting migration script is finally rendered, operations
+    produced for this bind are rendered using the bind's own renderer
+    dispatcher (``autogen_context.renderers``) and contribute their imports
+    only to this bind's own tokens.  Renderers registered globally on
+    :data:`.renderers` remain in effect as the default for any bind that
+    does not register a context-local renderer.
+
+    This is invoked automatically for each bind by the autogenerate
+    process; it normally does not need to be called directly.
+
+    .. versionadded:: 1.20.3
+
+    """
+
+    _render_contexts[upgrade_token] = autogen_context
+
+
+def get_render_context(upgrade_token: str) -> AutogenContext | None:
+    """Return the per-bind :class:`.AutogenContext` registered for the given
+    upgrade token, if any.
+
+    .. versionadded:: 1.20.3
+
+    """
+
+    return _render_contexts.get(upgrade_token)
+
+
+def clear_render_contexts() -> None:
+    """Remove all per-bind render contexts.
+
+    This is invoked automatically when a revision generation operation
+    completes; it normally does not need to be called directly.
+
+    .. versionadded:: 1.20.3
+
+    """
+
+    _render_contexts.clear()
+
+
 def _render_python_into_templatevars(
     autogen_context: AutogenContext,
     migration_script: MigrationScript,
     template_args: dict[str, str | Config],
 ) -> None:
-    imports = autogen_context.imports
+    # imports attached directly to the MigrationScript (e.g. through a
+    # process_revision_directives hook or a third party caller) are
+    # module-level and are shared by every token.
+    migration_imports = set(migration_script.imports)
+
+    # Imports already present on the incoming context before rendering
+    # begins (e.g. added by a comparator or a render_item hook during the
+    # compare phase) are preserved as module-level imports, matching the
+    # behavior prior to per-token import collection.
+    pre_existing_imports = set(autogen_context.imports)
+
+    # Per-token imports, keyed by the token name.  In a multidb script each
+    # bind contributes its imports only to the tokens it rendered, rather
+    # than leaking them into every other bind's functions.  Upgrade and
+    # downgrade tokens track their imports independently, so an import used
+    # by only one direction is not forced into the other direction's
+    # function.
+    token_imports: dict[str, set[str]] = {}
+    all_rendered_imports: set[str] = set()
+
+    multidb = len(migration_script.upgrade_ops_list) > 1
 
     for upgrade_ops, downgrade_ops in zip(
         migration_script.upgrade_ops_list, migration_script.downgrade_ops_list
     ):
-        template_args[upgrade_ops.upgrade_token] = _indent(
-            _render_cmd_body(upgrade_ops, autogen_context)
+        # resolve the render context that belongs to this bind; a custom
+        # operation produced for one bind in a multidb run is rendered
+        # through that bind's own renderer dispatcher.  When no per-bind
+        # context was registered, the given autogen_context is used, i.e.
+        # the existing default rendering.
+        render_context = _render_contexts.get(
+            upgrade_ops.upgrade_token, autogen_context
         )
-        template_args[downgrade_ops.downgrade_token] = _indent(
-            _render_cmd_body(downgrade_ops, autogen_context)
+
+        # in a multidb run, each bind's context may already carry imports
+        # collected during its own compare phase; keep those module-level
+        # rather than silently discarding them when per-token collection
+        # begins
+        pre_existing_imports.update(render_context.imports)
+
+        upgrade_imports: set[str] = set()
+        with _local_imports(render_context, upgrade_imports):
+            template_args[upgrade_ops.upgrade_token] = _indent(
+                _render_cmd_body(upgrade_ops, render_context)
+            )
+
+        downgrade_imports: set[str] = set()
+        with _local_imports(render_context, downgrade_imports):
+            template_args[downgrade_ops.downgrade_token] = _indent(
+                _render_cmd_body(downgrade_ops, render_context)
+            )
+
+        token_imports[upgrade_ops.upgrade_token] = upgrade_imports
+        token_imports[downgrade_ops.downgrade_token] = downgrade_imports
+        all_rendered_imports.update(upgrade_imports)
+        all_rendered_imports.update(downgrade_imports)
+
+    if multidb:
+        # In a multidb script each bind carries its own imports inline, so
+        # the module-level import block only holds imports that were
+        # attached to the MigrationScript itself or were already present on
+        # the incoming context.
+        top_level_imports = migration_imports | pre_existing_imports
+    else:
+        # Single-token templates (the generic, async, pyproject templates)
+        # keep the legacy behavior of emitting every collected import at
+        # module level.
+        top_level_imports = (
+            migration_imports | pre_existing_imports | all_rendered_imports
         )
-    template_args["imports"] = "\n".join(sorted(imports))
+
+    template_args["imports"] = "\n".join(sorted(top_level_imports))
+    template_args["token_imports"] = token_imports
+
+
+@contextlib.contextmanager
+def _local_imports(
+    autogen_context: AutogenContext, import_set: set[str]
+) -> Iterator[None]:
+    """Temporarily redirect an AutogenContext's import collection into a
+    per-token import set."""
+
+    original = autogen_context.imports
+    autogen_context.imports = import_set
+    try:
+        yield
+    finally:
+        autogen_context.imports = original
 
 
 default_renderers = renderers = util.Dispatcher()
@@ -124,7 +259,7 @@ def _render_cmd_body(
 def render_op(
     autogen_context: AutogenContext, op: ops.MigrateOperation
 ) -> list[str]:
-    renderer = renderers.dispatch(op)
+    renderer = autogen_context.renderers.dispatch(op)
     lines = util.to_list(renderer(autogen_context, op))
     return lines
 

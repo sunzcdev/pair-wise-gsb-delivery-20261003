@@ -162,6 +162,72 @@ class DispatcherTest(TestBase):
         fn2 = dispatcher2.dispatch("target2")
         eq_(fn2(), "handler2")
 
+    def test_fallback(self):
+        """Test that an unhandled target falls back to the fallback
+        dispatcher."""
+        global_dispatcher = Dispatcher()
+
+        @global_dispatcher.dispatch_for("target1")
+        def handler1():
+            return "global1"
+
+        local_dispatcher = Dispatcher(fallback=global_dispatcher)
+
+        # local dispatcher delegates to the fallback for unhandled targets
+        eq_(local_dispatcher.dispatch("target1")(), "global1")
+
+        # a local registration shadows the fallback only for this
+        # dispatcher
+        @local_dispatcher.dispatch_for("target1")
+        def local_handler1():
+            return "local1"
+
+        eq_(local_dispatcher.dispatch("target1")(), "local1")
+        eq_(global_dispatcher.dispatch("target1")(), "global1")
+
+    def test_fallback_registration_after_creation(self):
+        """Test that the fallback is consulted live, so registrations made
+        on the fallback after the local dispatcher was created are still
+        honored."""
+        global_dispatcher = Dispatcher()
+        local_dispatcher = Dispatcher(fallback=global_dispatcher)
+
+        @global_dispatcher.dispatch_for("target1")
+        def handler1():
+            return "global1"
+
+        eq_(local_dispatcher.dispatch("target1")(), "global1")
+
+    def test_fallback_no_match_raises(self):
+        """Test that a ValueError propagates when neither the local
+        dispatcher nor its fallback handles the target."""
+        global_dispatcher = Dispatcher()
+        local_dispatcher = Dispatcher(fallback=global_dispatcher)
+
+        with testing.expect_raises_message(ValueError, "no dispatch function"):
+            local_dispatcher.dispatch("nonexistent")
+
+    def test_fallback_qualifier(self):
+        """Test that qualifier dispatch is passed through to the
+        fallback."""
+        global_dispatcher = Dispatcher()
+
+        @global_dispatcher.dispatch_for("target1", qualifier="postgresql")
+        def handler_pg():
+            return "postgresql"
+
+        @global_dispatcher.dispatch_for("target1")
+        def handler_default():
+            return "default"
+
+        local_dispatcher = Dispatcher(fallback=global_dispatcher)
+
+        eq_(
+            local_dispatcher.dispatch("target1", qualifier="postgresql")(),
+            "postgresql",
+        )
+        eq_(local_dispatcher.dispatch("target1")(), "default")
+
 
 class PriorityDispatcherTest(TestBase):
     """Tests for the PriorityDispatcher class."""

@@ -43,6 +43,9 @@ from alembic.testing.env import script_file_fixture
 from alembic.testing.env import staging_env
 from alembic.testing.env import three_rev_fixture
 from alembic.testing.env import write_script
+from alembic.autogenerate import render as render_module
+from alembic.operations import MigrateOperation
+from alembic.operations import Operations
 from alembic.testing.fixtures import TestBase
 from alembic.util import CommandError
 
@@ -52,6 +55,53 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo
 
 env, abc, def_ = None, None, None
+
+
+class MakeWidgetOp(MigrateOperation):
+    """custom operation used by the multidb per-bind rendering tests"""
+
+    def __init__(self, bind, label):
+        self.bind = bind
+        self.label = label
+
+    @classmethod
+    def make_widget(cls, operations, bind, label):
+        return operations.invoke(cls(bind, label))
+
+    def reverse(self):
+        return DropWidgetOp(self.bind, self.label)
+
+
+class DropWidgetOp(MigrateOperation):
+    """custom operation used by the multidb per-bind rendering tests"""
+
+    def __init__(self, bind, label):
+        self.bind = bind
+        self.label = label
+
+    @classmethod
+    def drop_widget(cls, operations, bind, label):
+        return operations.invoke(cls(bind, label))
+
+    def reverse(self):
+        return MakeWidgetOp(self.bind, self.label)
+
+
+Operations.register_operation("make_widget")(MakeWidgetOp)
+Operations.register_operation("drop_widget")(DropWidgetOp)
+
+
+def _default_widget_renderer(autogen_context, op):
+    return "op.widget(%r, %r)" % (op.bind, op.label)
+
+
+# provide a global placeholder renderer so fallback default rendering works
+render_module.renderers.dispatch_for(MakeWidgetOp)(
+    _default_widget_renderer
+)
+render_module.renderers.dispatch_for(DropWidgetOp)(
+    _default_widget_renderer
+)
 
 
 class GeneralOrderedTests(TestBase):
@@ -914,6 +964,380 @@ sa.Table('e3t1', m3, sa.Column('z', sa.Integer))
             eq_(op_mock.mock_calls[-1], mock.call.drop_table("e2t1"))
             rev.module.downgrade_engine3()
             eq_(op_mock.mock_calls[-1], mock.call.drop_table("e3t1"))
+
+
+class MultiContextCustomOpTest(TestBase):
+    """per-bind custom operations keep their own render context and
+    imports through directive processing"""
+
+    def setUp(self):
+        self.engine1 = _sqlite_file_db(tempname="eng1.db")
+        self.engine2 = _sqlite_file_db(tempname="eng2.db")
+
+        self.env = staging_env(template="multidb")
+        self.cfg = _multidb_testing_config(
+            {"engine1": self.engine1, "engine2": self.engine2}
+        )
+
+    def tearDown(self):
+        clear_staging_env()
+        render_module.clear_render_contexts()
+
+    def _write_env(self):
+        def process_revision_directives(context, rev, directives):
+            script = directives[0]
+            for upgrade_ops, downgrade_ops in zip(
+                script.upgrade_ops_list, script.downgrade_ops_list
+            ):
+                token = upgrade_ops.upgrade_token
+                bind_name = token.removesuffix("_upgrades")
+                ctx = render_module.get_render_context(token)
+                assert ctx is not None
+
+                if (MakeWidgetOp, "default") not in ctx.renderers._registry:
+
+                    @ctx.renderers.dispatch_for(MakeWidgetOp)
+                    def _render_make(ac, op):
+                        ac.imports.add(
+                            "from myhelpers import make_%s" % op.bind
+                        )
+                        return "make_%s(%r, %r)" % (
+                            op.bind,
+                            op.bind,
+                            op.label,
+                        )
+
+                    @ctx.renderers.dispatch_for(DropWidgetOp)
+                    def _render_drop(ac, op):
+                        ac.imports.add(
+                            "from myhelpers import drop_%s" % op.bind
+                        )
+                        return "drop_%s(%r, %r)" % (
+                            op.bind,
+                            op.bind,
+                            op.label,
+                        )
+
+                if not any(
+                    isinstance(existing, MakeWidgetOp)
+                    for existing in upgrade_ops.ops
+                ):
+                    make_op = MakeWidgetOp(bind_name, "widget-%s" % bind_name)
+                    upgrade_ops.ops.append(make_op)
+                    downgrade_ops.ops.insert(0, make_op.reverse())
+
+        self._write_env_py(process_revision_directives)
+
+    def _write_env_py(self, process_revision_directives):
+        path = os.path.join(_get_staging_directory(), "scripts", "env.py")
+        with open(path) as env_:
+            existing_env = env_.read()
+        existing_env = existing_env.replace(
+            "target_metadata = {}",
+            "import sqlalchemy as sa\n"
+            "from %s import process_revision_directives\n"
+            "m1 = sa.MetaData()\n"
+            "m2 = sa.MetaData()\n"
+            "sa.Table('widget_log', m1,\n"
+            "         sa.Column('id', sa.Integer, primary_key=True),\n"
+            "         sa.Column('bind_name', sa.String(20)),\n"
+            "         sa.Column('label', sa.String(40)))\n"
+            "sa.Table('widget_log', m2,\n"
+            "         sa.Column('id', sa.Integer, primary_key=True),\n"
+            "         sa.Column('bind_name', sa.String(20)),\n"
+            "         sa.Column('label', sa.String(40)))\n"
+            "target_metadata = {'engine1': m1, 'engine2': m2}\n"
+            % __name__,
+        )
+        existing_env = existing_env.replace(
+            '            context.configure(\n'
+            '                connection=rec["connection"],',
+            '            context.configure(\n'
+            '                connection=rec["connection"],\n'
+            "                process_revision_directives="
+            "process_revision_directives,",
+        )
+        with open(path, "w") as env_:
+            env_.write(existing_env)
+
+        # expose the hook at module level for the generated env.py import
+        globals()["process_revision_directives"] = (
+            process_revision_directives
+        )
+
+    def _write_metadata(self, meta):
+        path = os.path.join(_get_staging_directory(), "scripts", "env.py")
+        with open(path) as env_:
+            existing_env = env_.read()
+        existing_env = existing_env.replace("target_metadata = {}", meta)
+        with open(path, "w") as env_:
+            env_.write(existing_env)
+
+    def test_per_bind_renderers_and_imports(self):
+        self._write_env()
+        rev = command.revision(
+            self.cfg, message="custom ops", autogenerate=True
+        )
+
+        with open(rev.path) as f:
+            contents = f.read()
+
+        # both binds render their own custom op distinctly; the later bind
+        # did not silently override the earlier bind's renderer
+        assert "make_engine1('engine1', 'widget-engine1')" in contents
+        assert "make_engine2('engine2', 'widget-engine2')" in contents
+        assert "drop_engine1('engine1', 'widget-engine1')" in contents
+        assert "drop_engine2('engine2', 'widget-engine2')" in contents
+
+        up1 = contents.index("def upgrade_engine1")
+        up2 = contents.index("def upgrade_engine2")
+        section1 = contents[up1:up2]
+        section2 = contents[up2:]
+
+        # imports are carried by the correct bind functions only
+        assert "from myhelpers import make_engine1" in section1
+        assert "from myhelpers import make_engine2" not in section1
+        assert "from myhelpers import make_engine2" in section2
+        assert "from myhelpers import make_engine1" not in section2
+
+        # the per-bind imports are not leaked to the module-level block
+        header = contents[: contents.index("def upgrade(")]
+        assert "from myhelpers" not in header
+
+        # rendered upgrade functions are still valid default rendering for
+        # the autogenerated table ops
+        assert "op.create_table('widget_log'" in section1
+        assert "op.create_table('widget_log'" in section2
+
+    def test_render_contexts_are_cleared(self):
+        self._write_env()
+        command.revision(self.cfg, message="custom ops", autogenerate=True)
+
+        # the per-bind registry is cleared once rendering completes
+        eq_(render_module._render_contexts, {})
+
+    def test_no_custom_renderer_uses_default_rendering(self):
+        # plain multidb autogen without any custom renderer must keep the
+        # existing default rendering and produce runnable functions
+        self._write_metadata("""
+import sqlalchemy as sa
+
+m1 = sa.MetaData()
+m2 = sa.MetaData()
+target_metadata = {"engine1": m1, "engine2": m2}
+
+sa.Table('e1t1', m1, sa.Column('x', sa.Integer))
+sa.Table('e2t1', m2, sa.Column('y', sa.Integer))
+""")
+        rev = command.revision(
+            self.cfg, message="default render", autogenerate=True
+        )
+        with open(rev.path) as f:
+            contents = f.read()
+
+        assert "op.create_table('e1t1'" in contents
+        assert "op.create_table('e2t1'" in contents
+        # no inline helper imports when no custom renderer is involved
+        assert "from myhelpers" not in contents
+        # the standard module-level import block is intact
+        assert "import sqlalchemy as sa" in contents
+
+    def test_rendered_migration_runs_on_both_binds(self):
+        import sys
+
+        self._install_helper_module()
+        try:
+            self._write_env()
+            command.revision(
+                self.cfg, message="runnable custom ops", autogenerate=True
+            )
+
+            # execute the rendered migration against both local sqlite binds
+            command.upgrade(self.cfg, "head")
+
+            eq_(
+                sys.modules["myhelpers"].executed["make"],
+                [
+                    ("engine1", "engine1", "widget-engine1"),
+                    ("engine2", "engine2", "widget-engine2"),
+                ],
+            )
+
+            with self.engine1.begin() as conn:
+                rows = conn.execute(
+                    sa.text(
+                        "SELECT bind_name, label FROM widget_log"
+                        " ORDER BY bind_name"
+                    )
+                ).fetchall()
+                eq_(rows, [("engine1", "widget-engine1")])
+
+            with self.engine2.begin() as conn:
+                rows = conn.execute(
+                    sa.text(
+                        "SELECT bind_name, label FROM widget_log"
+                        " ORDER BY bind_name"
+                    )
+                ).fetchall()
+                eq_(rows, [("engine2", "widget-engine2")])
+
+            # downgrade exercises the rendered per-bind drop operations
+            command.downgrade(self.cfg, "base")
+            eq_(
+                sys.modules["myhelpers"].executed["drop"],
+                [
+                    ("engine1", "engine1", "widget-engine1"),
+                    ("engine2", "engine2", "widget-engine2"),
+                ],
+            )
+        finally:
+            self._uninstall_helper_module()
+
+    def _install_helper_module(self):
+        import types
+
+        helper = types.ModuleType("myhelpers")
+        helper.executed = {"make": [], "drop": []}
+
+        def _record(direction, bind, label):
+            helper.executed[direction].append((bind, bind, label))
+
+        def _insert(bind, label):
+            from alembic import op as _op
+
+            _op.get_bind().exec_driver_sql(
+                "INSERT INTO widget_log (bind_name, label) VALUES (?, ?)",
+                (bind, label),
+            )
+
+        def _delete(bind, label):
+            from alembic import op as _op
+
+            _op.get_bind().exec_driver_sql(
+                "DELETE FROM widget_log WHERE bind_name=? AND label=?",
+                (bind, label),
+            )
+
+        def make_engine1(bind, label):
+            _record("make", bind, label)
+            _insert(bind, label)
+
+        def make_engine2(bind, label):
+            _record("make", bind, label)
+            _insert(bind, label)
+
+        def drop_engine1(bind, label):
+            _record("drop", bind, label)
+            _delete(bind, label)
+
+        def drop_engine2(bind, label):
+            _record("drop", bind, label)
+            _delete(bind, label)
+
+        helper.make_engine1 = make_engine1
+        helper.make_engine2 = make_engine2
+        helper.drop_engine1 = drop_engine1
+        helper.drop_engine2 = drop_engine2
+
+        import sys
+
+        self._previous_helper = sys.modules.get("myhelpers")
+        sys.modules["myhelpers"] = helper
+
+    def _uninstall_helper_module(self):
+        import sys
+
+        if self._previous_helper is None:
+            sys.modules.pop("myhelpers", None)
+        else:
+            sys.modules["myhelpers"] = self._previous_helper
+
+
+class MultiContextGlobalRendererTest(TestBase):
+    """global renderers, including ones registered after an AutogenContext
+    was created, remain the default for every bind"""
+
+    def setUp(self):
+        self.engine1 = _sqlite_file_db(tempname="eng1.db")
+        self.engine2 = _sqlite_file_db(tempname="eng2.db")
+
+        self.env = staging_env(template="multidb")
+        self.cfg = _multidb_testing_config(
+            {"engine1": self.engine1, "engine2": self.engine2}
+        )
+
+    def tearDown(self):
+        clear_staging_env()
+        render_module.renderers.dispatch_for(MakeWidgetOp, replace=True)(
+            _default_widget_renderer
+        )
+        render_module.renderers.dispatch_for(DropWidgetOp, replace=True)(
+            _default_widget_renderer
+        )
+
+    def test_global_renderer_registered_after_context_creation(self):
+        # register the global renderer here in the test, i.e. after any
+        # AutogenContext objects may already have been created; the
+        # fallback must pick it up live
+        def _render(autogen_context, op):
+            autogen_context.imports.add("from myhelpers import global_make")
+            return "global_make(%r, %r)" % (op.bind, op.label)
+
+        render_module.renderers.dispatch_for(
+            MakeWidgetOp, replace=True
+        )(_render)
+
+        def process_revision_directives(context, rev, directives):
+            script = directives[0]
+            for upgrade_ops, downgrade_ops in zip(
+                script.upgrade_ops_list, script.downgrade_ops_list
+            ):
+                token = upgrade_ops.upgrade_token
+                bind_name = token.removesuffix("_upgrades")
+                if not any(
+                    isinstance(existing, MakeWidgetOp)
+                    for existing in upgrade_ops.ops
+                ):
+                    make_op = MakeWidgetOp(bind_name, "widget-%s" % bind_name)
+                    upgrade_ops.ops.append(make_op)
+                    downgrade_ops.ops.insert(0, make_op.reverse())
+
+        path = os.path.join(_get_staging_directory(), "scripts", "env.py")
+        with open(path) as env_:
+            existing_env = env_.read()
+        existing_env = existing_env.replace(
+            "target_metadata = {}",
+            "import sqlalchemy as sa\n"
+            "from %s import process_revision_directives\n"
+            "m1 = sa.MetaData()\n"
+            "m2 = sa.MetaData()\n"
+            "target_metadata = {'engine1': m1, 'engine2': m2}\n" % __name__,
+        )
+        existing_env = existing_env.replace(
+            '            context.configure(\n'
+            '                connection=rec["connection"],',
+            '            context.configure(\n'
+            '                connection=rec["connection"],\n'
+            "                process_revision_directives="
+            "process_revision_directives,",
+        )
+        with open(path, "w") as env_:
+            env_.write(existing_env)
+
+        globals()["process_revision_directives"] = (
+            process_revision_directives
+        )
+
+        rev = command.revision(
+            self.cfg, message="global renderer", autogenerate=True
+        )
+        with open(rev.path) as f:
+            contents = f.read()
+
+        assert "global_make('engine1', 'widget-engine1')" in contents
+        assert "global_make('engine2', 'widget-engine2')" in contents
+        # the global renderer's import is carried by both binds
+        assert contents.count("from myhelpers import global_make") == 2
 
 
 class RewriterTest(TestBase):

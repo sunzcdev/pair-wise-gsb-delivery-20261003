@@ -42,6 +42,26 @@ target_metadata = {}
 # my_important_option = config.get_main_option("my_important_option")
 # ... etc.
 
+# Custom autogenerate renderers may be registered per bind, on that bind's
+# own AutogenContext, e.g. within a process_revision_directives hook
+# configured for the revision run::
+#
+#     from alembic.autogenerate import render
+#
+#     def process_revision_directives(context, rev, directives):
+#         # one AutogenContext per bind, keyed by its upgrade token
+#         autogen_context = render.get_render_context("engine1_upgrades")
+#         autogen_context.renderers.dispatch_for(MyCustomOp)(_render_my_op)
+#
+# Each bind gets its own renderer dispatcher, which falls back to the global
+# ``alembic.autogenerate.render.renderers`` collection, so a renderer added
+# for one bind cannot silently take over rendering of the same operation
+# class in another bind.  Operations without a bind-local renderer keep
+# using the globally registered default rendering.  Imports added to
+# ``autogen_context.imports`` while rendering a bind are emitted inline
+# within that bind's own ``upgrade_<bind>()`` / ``downgrade_<bind>()``
+# functions.
+
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode.

@@ -566,6 +566,16 @@ The :class:`.AutogenContext` passed to these hooks is documented below.
 .. autoclass:: alembic.autogenerate.api.AutogenContext
     :members:
 
+The following functions manage the per-bind :class:`.AutogenContext` registry
+used to render a ``multidb`` revision; see
+:ref:`autogen_custom_ops_per_bind`.
+
+.. autofunction:: alembic.autogenerate.render.set_render_context
+
+.. autofunction:: alembic.autogenerate.render.get_render_context
+
+.. autofunction:: alembic.autogenerate.render.clear_render_contexts
+
 Creating a Render Function
 --------------------------
 
@@ -628,4 +638,57 @@ in our migration file::
 
 These are our custom directives that will invoke when ``alembic upgrade``
 or ``alembic downgrade`` is run.
+
+.. _autogen_custom_ops_per_bind:
+
+Rendering Custom Operations per Database Bind
+---------------------------------------------
+
+When using the ``multidb`` environment template, a single revision contains
+rendered content for several database binds, each with its own
+``upgrade_<bind>()`` / ``downgrade_<bind>()`` functions.   A custom operation
+may need to render differently for each bind, for example to reference a
+bind-specific helper or to add imports that belong only to that bind.
+
+The global ``renderers`` collection shown above is shared by all binds.
+Registering a renderer for an operation class there would therefore affect
+every bind, and registering twice (once per bind) for the same operation
+class would overwrite the earlier registration.   To render a custom
+operation per bind, register the renderer on that bind's own
+:class:`.AutogenContext`, available as ``autogen_context.renderers``::
+
+    from alembic.autogenerate import render
+
+    def process_revision_directives(context, rev, directives):
+        script = directives[0]
+        for upgrade_ops in script.upgrade_ops_list:
+            bind_name = upgrade_ops.upgrade_token.removesuffix("_upgrades")
+            autogen_context = render.get_render_context(
+                upgrade_ops.upgrade_token
+            )
+
+            @autogen_context.renderers.dispatch_for(CreateSequenceOp)
+            def render_create_sequence(ac, op, _bind=bind_name):
+                ac.imports.add("from myproject import %s_helpers" % _bind)
+                return "%s_create_sequence(%r)" % (_bind, op.sequence_name)
+
+Each :class:`.AutogenContext` has its own ``.renderers`` dispatcher, which
+falls back to the global :data:`~alembic.autogenerate.render.renderers`
+collection for any operation it does not handle itself.   A renderer
+registered for one bind therefore cannot silently take over rendering of the
+same operation class in another bind, while operations without a
+bind-local renderer continue to use the default rendering.
+
+Imports added to ``autogen_context.imports`` while rendering a bind are
+emitted inline within that bind's own ``upgrade_<bind>()`` and
+``downgrade_<bind>()`` functions, rather than being shared at module level
+across every bind's tokens.
+
+.. versionadded:: 1.20.3
+
+.. seealso::
+
+    :attr:`.AutogenContext.renderers`
+
+    :func:`.alembic.autogenerate.render.get_render_context`
 

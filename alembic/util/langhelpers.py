@@ -297,8 +297,14 @@ class DispatchPriority(enum.IntEnum):
 
 
 class Dispatcher:
-    def __init__(self) -> None:
+    def __init__(self, fallback: Dispatcher | None = None) -> None:
         self._registry: dict[tuple[Any, ...], Any] = {}
+
+        # an optional dispatcher consulted for any target that this
+        # dispatcher does not itself handle.  unlike branch(), the
+        # fallback is consulted live, so registrations made on the
+        # fallback after this dispatcher was created are still honored.
+        self._fallback = fallback
 
     def dispatch_for(
         self,
@@ -333,11 +339,14 @@ class Dispatcher:
             qualifiers = ["default"]
 
         for spcls in targets:
-            for qualifier in qualifiers:
-                if (spcls, qualifier) in self._registry:
-                    return self._registry[(spcls, qualifier)]
-        else:
-            raise ValueError("no dispatch function for object: %s" % obj)
+            for qual in qualifiers:
+                if (spcls, qual) in self._registry:
+                    return self._registry[(spcls, qual)]
+
+        if self._fallback is not None:
+            return self._fallback.dispatch(obj, qualifier=qualifier)
+
+        raise ValueError("no dispatch function for object: %s" % obj)
 
     def branch(self) -> Dispatcher:
         """Return a copy of this dispatcher that is independently

@@ -1,0 +1,16 @@
+.. change::
+    :tags: feature, autogenerate, multidb
+
+    Enhanced the ``multidb`` environment template so that custom operations
+    rendered for one database bind keep their own rendering context and
+    imports through directive processing.   Each bind's
+    :class:`.AutogenContext` now exposes its own ``renderers`` dispatcher,
+    which falls back to the global
+    :data:`~alembic.autogenerate.render.renderers` collection.
+    A custom renderer registered for one bind therefore no longer silently
+    takes over rendering of the same operation class in another bind, while
+    operations without a bind-local renderer continue to use the existing
+    default rendering.   Imports collected while rendering a bind are now
+    emitted inline within that bind's own ``upgrade_<bind>()`` and
+    ``downgrade_<bind>()`` functions instead of being shared across every
+    bind's tokens.   See :ref:`autogen_custom_ops_per_bind`.

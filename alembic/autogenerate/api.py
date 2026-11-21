@@ -329,6 +329,24 @@ class AutogenContext:
 
     comparators: PriorityDispatcher
 
+    renderers: util.Dispatcher
+    """A per-context dispatcher for rendering migration operations.
+
+    This dispatcher falls back to the global
+    :data:`~alembic.autogenerate.render.renderers` collection for any
+    operation it does not handle itself.  Renderers registered on this
+    dispatcher therefore apply only to operations rendered through this
+    :class:`.AutogenContext`, which allows a custom operation registered
+    for one database bind in a multidb environment to render distinctly
+    from the same operation class in another bind, without one bind's
+    renderer silently taking over the other's.  Operations without a
+    context-local renderer keep using the globally registered default
+    rendering.
+
+    .. versionadded:: 1.20.3
+
+    """
+
     def __init__(
         self,
         migration_context: MigrationContext,
@@ -399,6 +417,17 @@ class AutogenContext:
         self.imports = set()
         self.opts: dict[str, Any] = opts
         self._has_batch: bool = False
+
+        # a per-context renderer dispatcher, falling back to the global
+        # renderer collection.  Custom renderers registered on this
+        # dispatcher only affect operations rendered through this
+        # AutogenContext, so a custom operation registered for one bind in
+        # a multidb environment can't silently take over rendering of the
+        # same operation in another bind.  The fallback keeps the global
+        # renderers in effect as the default.
+        self.renderers: util.Dispatcher = util.Dispatcher(
+            fallback=render.renderers
+        )
 
     @util.memoized_property
     def inspector(self) -> Inspector:
@@ -540,6 +569,9 @@ class RevisionContext:
         self.script_directory = script_directory
         self.command_args = command_args
         self.process_revision_directives = process_revision_directives
+        # discard any per-bind render contexts left over from a previous
+        # run (e.g. a run that did not render a script, such as "check")
+        render.clear_render_contexts()
         self.template_args = {
             "config": config  # Let templates use config for
             # e.g. multiple databases
@@ -623,6 +655,12 @@ class RevisionContext:
         )
         self._last_autogen_context: AutogenContext = autogen_context
 
+        # remember this bind's own AutogenContext so that when the
+        # migration script is finally rendered, the directives produced
+        # for this bind are rendered through this bind's own renderer
+        # dispatcher and keep their imports local to this bind's tokens
+        render.set_render_context(upgrade_token, autogen_context)
+
         if autogenerate:
             compare._populate_migration_script(
                 autogen_context, migration_script
@@ -656,5 +694,10 @@ class RevisionContext:
         return op
 
     def generate_scripts(self) -> Iterator[Script | None]:
-        for generated_revision in self.generated_revisions:
-            yield self._to_script(generated_revision)
+        try:
+            for generated_revision in self.generated_revisions:
+                yield self._to_script(generated_revision)
+        finally:
+            # the per-bind render contexts, if any, belong only to the
+            # revision generation run that produced these scripts
+            render.clear_render_contexts()
