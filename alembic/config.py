@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from argparse import ArgumentParser
 from argparse import Namespace
+from collections.abc import Callable
 from collections.abc import Mapping
 from collections.abc import Sequence
 from configparser import ConfigParser
+from dataclasses import dataclass
 import inspect
 import logging
 import os
@@ -26,6 +28,120 @@ from .util import compat
 from .util.pyfiles import _preserving_path_as_str
 
 log = logging.getLogger(__name__)
+
+# legacy splitting for path-list options that predate ``path_separator``
+_legacy_space_comma_pattern = re.compile(r", *|(?: +)")
+_legacy_space_comma_colon_pattern = re.compile(r", *|(?: +)|\:")
+# a native Windows drive letter colon, e.g. the ':' in 'C:\' or 'C:/',
+# where the drive letter begins a path segment (string start, or preceded
+# by a list separator such as a space, comma or semicolon) rather than
+# being embedded within another token
+_windows_drive_colon = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]):([\\/])")
+# placeholder that cannot legitimately appear in a filesystem path
+_DRIVE_COLON_PLACEHOLDER = "\x00"
+
+
+def _legacy_split_space_comma(raw_value: str) -> list[str]:
+    """Legacy split of a path list on spaces and commas."""
+    return [
+        part for part in _legacy_space_comma_pattern.split(raw_value) if part
+    ]
+
+
+def _legacy_split_space_comma_colon(raw_value: str) -> list[str]:
+    """Legacy split of a path list on spaces, commas and colons.
+
+    On Windows, the colon that introduces a native drive letter (e.g. the
+    ``:`` in ``C:\\foo`` or ``C:/foo``) is not a list separator, and is
+    temporarily masked while splitting.  On other platforms colons are
+    always treated as separators, preserving the historical behavior.
+
+    """
+    if os.name == "nt":
+
+        def _protect(match: re.Match[str]) -> str:
+            return (
+                match.group(1) + _DRIVE_COLON_PLACEHOLDER + match.group(2)
+            )
+
+        protected = _windows_drive_colon.sub(_protect, raw_value)
+        return [
+            part.replace(_DRIVE_COLON_PLACEHOLDER, ":")
+            for part in _legacy_space_comma_colon_pattern.split(protected)
+            if part
+        ]
+    else:
+        return [
+            part
+            for part in _legacy_space_comma_colon_pattern.split(raw_value)
+            if part
+        ]
+
+
+class _ReadOnlyOptionSourceMeta(type):
+    def __setattr__(cls, name: str, value: Any) -> None:
+        raise AttributeError("can't set attribute")
+
+    def __delattr__(cls, name: str) -> None:
+        raise AttributeError("can't delete attribute")
+
+
+class OptionSource(metaclass=_ReadOnlyOptionSourceMeta):
+    """Identifies where a configuration option value originated.
+
+    The constants here are returned by
+    :meth:`.Config.get_alembic_option_source`, and are also present on
+    each :class:`.VersionLocation` entry, so that callers can determine
+    which config file (or programmatic override) produced a given value.
+
+    The class is read-only; the constants cannot be reassigned or deleted
+    at runtime.
+
+    .. versionadded:: 1.20.3
+
+    """
+
+    INI = "ini"
+    """The value was read from the configparser-parsed .ini file."""
+
+    TOML = "toml"
+    """The value was read from the toml-parsed pyproject.toml file."""
+
+    EXPLICIT = "explicit"
+    """The value was supplied programmatically or otherwise outside of a
+    configuration file, such as from the command line or via
+    :meth:`.Config.set_main_option`."""
+
+
+@dataclass(frozen=True)
+class VersionLocation:
+    """A single resolved ``version_locations`` entry.
+
+    The object is immutable and carries both the resolved filesystem path
+    and the :class:`.OptionSource` describing where the entry was defined.
+    Relative paths are resolved relative to the configuration file that
+    defines them, so the resolved value does not depend on the current
+    working directory.
+
+    .. versionadded:: 1.20.3
+
+    """
+
+    path: str
+    """The resolved version location, as an absolute POSIX-style path."""
+
+    source: str
+    """The :class:`.OptionSource` constant where this entry was defined."""
+
+    config_file_name: str | None = None
+    """Filesystem path of the config file that defined this entry.
+
+    Is ``None`` for entries supplied explicitly outside of a config file.
+
+    """
+
+    def __str__(self) -> str:
+        return self.path
 
 
 class Config:
@@ -139,6 +255,10 @@ class Config:
         self.cmd_opts = cmd_opts
         self.config_args = dict(config_args)
         self.toml_args = dict(config_args)
+        # main-section option names that were set programmatically, e.g.
+        # via set_main_option(), or otherwise overridden outside of the
+        # config files.  Maps option name to its OptionSource constant.
+        self._explicit_options: dict[str, str] = {}
         if attributes:
             self.attributes.update(attributes)
 
@@ -175,6 +295,64 @@ class Config:
         if self.toml_file_name is None:
             return None
         return Path(self.toml_file_name)
+
+    @property
+    def _ini_config_dir(self) -> Path | None:
+        """Absolute directory containing the .ini file, or ``None``.
+
+        Relative paths defined within the .ini file are resolved against
+        this directory.
+
+        """
+        if self._config_file_path is None:
+            return None
+        return self._config_file_path.resolve().parent
+
+    @property
+    def _toml_config_dir(self) -> Path | None:
+        """Absolute directory containing the pyproject.toml file, or
+        ``None``.
+
+        Relative paths defined within the pyproject.toml file are resolved
+        against this directory.
+
+        """
+        if self._toml_file_path is None:
+            return None
+        return self._toml_file_path.resolve().parent
+
+    def _resolve_path(
+        self, path: str | os.PathLike[str], config_dir: Path | None
+    ) -> str:
+        """Resolve a possibly relative filesystem path.
+
+        Relative paths are resolved against ``config_dir``, which is the
+        directory of the configuration file that defined the value.  When
+        no configuration file is involved (``config_dir`` is ``None``),
+        relative paths are resolved against the current working directory.
+        The returned path is always absolute, fully normalized (so e.g.
+        ``..`` segments are removed) and uses POSIX separators, so the
+        result does not depend on the current working directory.
+
+        A non-absolute value that contains a colon is interpreted as a
+        package resource rather than a relative filename, matching the
+        historical handling of ``version_locations`` entries; such values
+        are resolved via :func:`.coerce_resource_to_filename` and are not
+        rebased against the configuration file directory.
+
+        """
+        path_str = _preserving_path_as_str(path)
+        if not os.path.isabs(path_str) and ":" in path_str:
+            return (
+                util.coerce_resource_to_filename(path_str)
+                .resolve()
+                .as_posix()
+            )
+        path_obj = Path(path_str)
+        if not path_obj.is_absolute():
+            base_dir = config_dir if config_dir is not None else Path.cwd()
+            path_obj = base_dir / path_obj
+        return path_obj.resolve().as_posix()
 
     config_ini_section: str = None  # type: ignore[assignment]
     """Name of the config file section to read basic configuration
@@ -336,7 +514,9 @@ class Config:
 
         return dict(self.file_config.items(name))
 
-    def set_main_option(self, name: str, value: str) -> None:
+    def set_main_option(
+        self, name: str, value: str, source: str = OptionSource.EXPLICIT
+    ) -> None:
         """Set an option programmatically within the 'main' section.
 
         This overrides whatever was in the .ini file.
@@ -350,13 +530,26 @@ class Config:
          The given value may refer to another value already in the file
          using the interpolation format.
 
+        :param source: the :class:`.OptionSource` constant describing where
+         the override originated.  Defaults to
+         :attr:`.OptionSource.EXPLICIT`.
+
         """
-        self.set_section_option(self.config_ini_section, name, value)
+        self.set_section_option(
+            self.config_ini_section, name, value, source=source
+        )
 
     def remove_main_option(self, name: str) -> None:
         self.file_config.remove_option(self.config_ini_section, name)
+        self._explicit_options.pop(name, None)
 
-    def set_section_option(self, section: str, name: str, value: str) -> None:
+    def set_section_option(
+        self,
+        section: str,
+        name: str,
+        value: str,
+        source: str = OptionSource.EXPLICIT,
+    ) -> None:
         """Set an option programmatically within the given section.
 
         The section is created if it doesn't exist already.
@@ -380,11 +573,17 @@ class Config:
          The given value may refer to another value already in the file
          using the interpolation format.
 
+        :param source: the :class:`.OptionSource` constant describing where
+         the override originated.  Defaults to
+         :attr:`.OptionSource.EXPLICIT`.
+
         """
 
         if not self.file_config.has_section(section):
             self.file_config.add_section(section)
         self.file_config.set(section, name, value)
+        if section == self.config_ini_section:
+            self._explicit_options[name] = source
 
     def get_section_option(
         self, section: str, name: str, default: str | None = None
@@ -478,6 +677,42 @@ class Config:
                 )
             return value
 
+    def get_alembic_option_source(self, name: str) -> str | None:
+        """Return the source of an Alembic configuration option.
+
+        This is a read-only query that reports where the value returned by
+        :meth:`.Config.get_alembic_option` for the given ``name`` would come
+        from, without returning the value itself.  The returned value is
+        one of the constants on :class:`.OptionSource`:
+
+        * :attr:`.OptionSource.EXPLICIT` - the option was set
+          programmatically (e.g. via :meth:`.Config.set_main_option`) or
+          otherwise supplied outside of the configuration files, such as
+          from the command line.
+
+        * :attr:`.OptionSource.INI` - the option is present in the
+          configparser-parsed .ini file.
+
+        * :attr:`.OptionSource.TOML` - the option is present in the
+          toml-parsed pyproject.toml file.
+
+        Explicit overrides take precedence, followed by the .ini file and
+        finally the pyproject.toml file, mirroring the lookup order of
+        :meth:`.Config.get_alembic_option`.  ``None`` is returned when the
+        option is not defined anywhere.
+
+        .. versionadded:: 1.20.3
+
+        """
+        if name in self._explicit_options:
+            return self._explicit_options[name]
+        elif self.file_config.has_option(self.config_ini_section, name):
+            return OptionSource.INI
+        elif name in self.toml_alembic_config:
+            return OptionSource.TOML
+        else:
+            return None
+
     def _get_toml_config_value(
         self, name: str, default: Any | None = None
     ) -> None | str | list[str] | dict[str, str] | list[dict[str, str]] | int:
@@ -555,35 +790,172 @@ class Config:
                 )
             return sep
 
-    def get_version_locations_list(self) -> list[str] | None:
+    def _split_ini_path_option(
+        self,
+        raw_value: str,
+        *separator_names: str,
+        legacy_split: Callable[[str], list[str]],
+        legacy_warning: str,
+    ) -> list[str]:
+        split_char = self._get_file_separator_char(*separator_names)
+
+        if split_char is None:
+            # legacy behaviour for backwards compatibility
+            util.warn_deprecated(legacy_warning)
+            return legacy_split(raw_value)
+        else:
+            return [
+                x.strip() for x in raw_value.split(split_char) if x.strip()
+            ]
+
+    def get_version_locations(self) -> list[VersionLocation]:
+        """Return the fully resolved ``version_locations`` entries.
+
+        Each entry is returned as a :class:`.VersionLocation` carrying the
+        resolved absolute path together with the :class:`.OptionSource`
+        describing where it was defined.
+
+        Relative entries are resolved against the directory of the
+        configuration file that defines them - the directory of the
+        ``alembic.ini`` file for .ini entries, and the directory of the
+        ``pyproject.toml`` file for TOML entries.  Entries supplied
+        explicitly outside of a configuration file are resolved against the
+        current working directory.  The resulting absolute paths therefore
+        do not change when the process working directory changes.
+
+        Entries may be contributed by both configuration files at once; the
+        .ini entries are listed first, followed by the TOML entries, with
+        duplicates by resolved path removed.  An explicit override (e.g. set
+        via :meth:`.Config.set_main_option`) takes precedence over both
+        files and becomes the sole source.  An empty list is returned when
+        ``version_locations`` is not configured.
+
+        .. versionadded:: 1.20.3
+
+        .. seealso::
+
+            :meth:`.Config.get_version_locations_list` - returns the raw,
+            unresolved entries as plain strings
+
+        """
+        locations: list[VersionLocation] = []
+        seen: set[str] = set()
+
+        def _add(
+            raw_path: str,
+            source: str,
+            config_dir: Path | None,
+            *,
+            config_file_name: str | None,
+            dedupe: bool,
+        ) -> None:
+            resolved = self._resolve_path(raw_path, config_dir)
+            # deduplication is only applied across the two config files, so
+            # an explicitly repeated entry within a single file still
+            # produces the existing "loaded twice" runtime warning.
+            if dedupe and resolved in seen:
+                return
+            seen.add(resolved)
+            locations.append(
+                VersionLocation(
+                    path=resolved,
+                    source=source,
+                    config_file_name=config_file_name,
+                )
+            )
 
         version_locations_str = self.file_config.get(
             self.config_ini_section, "version_locations", fallback=None
         )
 
         if version_locations_str:
-            split_char = self._get_file_separator_char(
-                "path_separator", "version_path_separator"
+            # an explicit override (e.g. set_main_option) replaces the .ini
+            # provenance and is resolved against the current working
+            # directory, mirroring the precedence of get_alembic_option()
+            explicit_source = self._explicit_options.get("version_locations")
+            ini_source = (
+                explicit_source
+                if explicit_source is not None
+                else OptionSource.INI
             )
-
-            if split_char is None:
-
-                # legacy behaviour for backwards compatibility
-                util.warn_deprecated(
+            ini_config_dir = (
+                None if explicit_source is not None else self._ini_config_dir
+            )
+            ini_config_file_name = (
+                None if explicit_source is not None else self.config_file_name
+            )
+            ini_entries = self._split_ini_path_option(
+                version_locations_str,
+                "path_separator",
+                "version_path_separator",
+                legacy_split=_legacy_split_space_comma,
+                legacy_warning=(
                     "No path_separator found in configuration; "
                     "falling back to legacy splitting on spaces/commas "
                     "for version_locations.  Consider adding "
                     "path_separator=os to Alembic config."
+                ),
+            )
+            for entry in ini_entries:
+                _add(
+                    entry,
+                    ini_source,
+                    ini_config_dir,
+                    config_file_name=ini_config_file_name,
+                    dedupe=False,
                 )
 
-                _split_on_space_comma = re.compile(r", *|(?: +)")
-                return _split_on_space_comma.split(version_locations_str)
-            else:
-                return [
-                    x.strip()
-                    for x in version_locations_str.split(split_char)
-                    if x
-                ]
+            if explicit_source is not None:
+                # an explicit override wins over the pyproject.toml file
+                # entirely, in the same way that get_alembic_option() stops
+                # at the configparser namespace
+                return locations
+
+        toml_entries = cast(
+            "list[str] | None",
+            self._get_toml_config_value("version_locations", None),
+        )
+        if toml_entries:
+            for entry in toml_entries:
+                _add(
+                    entry,
+                    OptionSource.TOML,
+                    self._toml_config_dir,
+                    config_file_name=self.toml_file_name,
+                    dedupe=True,
+                )
+
+        return locations
+
+    def get_version_locations_list(self) -> list[str] | None:
+        """Return the raw ``version_locations`` entries as strings.
+
+        The returned entries are not resolved against any configuration
+        file directory; use :meth:`.Config.get_version_locations` to obtain
+        fully resolved paths together with their source.
+
+        Entries defined in the .ini file take precedence; when no .ini
+        entries are present, the TOML entries are returned directly.
+
+        """
+
+        version_locations_str = self.file_config.get(
+            self.config_ini_section, "version_locations", fallback=None
+        )
+
+        if version_locations_str:
+            return self._split_ini_path_option(
+                version_locations_str,
+                "path_separator",
+                "version_path_separator",
+                legacy_split=_legacy_split_space_comma,
+                legacy_warning=(
+                    "No path_separator found in configuration; "
+                    "falling back to legacy splitting on spaces/commas "
+                    "for version_locations.  Consider adding "
+                    "path_separator=os to Alembic config."
+                ),
+            )
         else:
             return cast(
                 "list[str]",
@@ -596,26 +968,17 @@ class Config:
         )
 
         if prepend_sys_path_str:
-            split_char = self._get_file_separator_char("path_separator")
-
-            if split_char is None:
-
-                # legacy behaviour for backwards compatibility
-                util.warn_deprecated(
+            return self._split_ini_path_option(
+                prepend_sys_path_str,
+                "path_separator",
+                legacy_split=_legacy_split_space_comma_colon,
+                legacy_warning=(
                     "No path_separator found in configuration; "
                     "falling back to legacy splitting on spaces, commas, "
                     "and colons for prepend_sys_path.  Consider adding "
                     "path_separator=os to Alembic config."
-                )
-
-                _split_on_space_comma_colon = re.compile(r", *|(?: +)|\:")
-                return _split_on_space_comma_colon.split(prepend_sys_path_str)
-            else:
-                return [
-                    x.strip()
-                    for x in prepend_sys_path_str.split(split_char)
-                    if x
-                ]
+                ),
+            )
         else:
             return cast(
                 "list[str]",

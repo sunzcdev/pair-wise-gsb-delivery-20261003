@@ -14,6 +14,7 @@ from typing import Any
 from typing import cast
 from typing import Optional
 from typing import TYPE_CHECKING
+from typing import TypeGuard
 
 from . import revision
 from . import write_hooks
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
     from ..config import Config
     from ..config import MessagingOptions
     from ..config import PostWriteHookConfig
+    from ..config import VersionLocation
     from ..runtime.migration import RevisionStep
     from ..runtime.migration import StampStep
 
@@ -44,6 +46,19 @@ _only_source_rev_file = re.compile(r"(?!\.\#|__init__)(.*\.py)$")
 _legacy_rev = re.compile(r"([a-f0-9]+)\.py$")
 _slug_re = re.compile(r"\w+")
 _default_file_template = "%(rev)s_%(slug)s"
+
+
+def _is_version_location(
+    location: str | os.PathLike[str] | VersionLocation,
+) -> TypeGuard[VersionLocation]:
+    """Return True for a resolved :class:`.VersionLocation` entry.
+
+    Duck typing is used rather than ``isinstance()`` so that
+    :mod:`alembic.config` need not be imported at module import time,
+    which would be circular.
+
+    """
+    return hasattr(location, "path") and hasattr(location, "source")
 
 
 class ScriptDirectory:
@@ -71,7 +86,9 @@ class ScriptDirectory:
         dir: str | os.PathLike[str],  # noqa: A002
         file_template: str = _default_file_template,
         truncate_slug_length: int | None = 40,
-        version_locations: None | (Sequence[str | os.PathLike[str]]) = None,
+        version_locations: None | (
+            Sequence[str | os.PathLike[str] | VersionLocation]
+        ) = None,
         sourceless: bool = False,
         output_encoding: str = "utf-8",
         timezone: str | None = None,
@@ -83,8 +100,25 @@ class ScriptDirectory:
     ) -> None:
         self.dir = _preserving_path_as_str(dir)
         self.version_locations = [
-            _preserving_path_as_str(p) for p in version_locations or ()
+            (
+                location.path
+                if _is_version_location(location)
+                else _preserving_path_as_str(location)
+            )
+            for location in version_locations or ()
         ]
+        self.version_location_entries: tuple[VersionLocation, ...] = tuple(
+            location
+            for location in version_locations or ()
+            if _is_version_location(location)
+        )
+        """The resolved :class:`.VersionLocation` entries supplied to the
+        constructor, if any, retaining the source information produced by
+        :meth:`.Config.get_version_locations`.
+
+        .. versionadded:: 1.20.3
+
+        """
         self.file_template = file_template
         self.truncate_slug_length = truncate_slug_length or 40
         self.sourceless = sourceless
@@ -123,7 +157,14 @@ class ScriptDirectory:
 
     @util.memoized_property
     def _version_locations(self) -> Sequence[Path]:
-        if self.version_locations:
+        if self.version_location_entries:
+            # the Config already resolved each entry relative to the
+            # configuration file that defined it, so no further,
+            # working-directory-dependent resolution is performed here.
+            return [
+                Path(entry.path) for entry in self.version_location_entries
+            ]
+        elif self.version_locations:
             return [
                 util.coerce_resource_to_filename(location).absolute()
                 for location in self.version_locations
@@ -187,7 +228,7 @@ class ScriptDirectory:
             output_encoding=config.get_alembic_option(
                 "output_encoding", "utf-8"
             ),
-            version_locations=config.get_version_locations_list(),
+            version_locations=config.get_version_locations(),
             timezone=config.get_alembic_option("timezone"),
             hooks=config.get_hooks_list(),
             recursive_version_locations=rvl,

@@ -1,0 +1,27 @@
+.. change::
+    :tags: usecase, configuration
+    :tickets: 1891
+
+    Enhanced configuration path handling so that relative
+    ``version_locations`` entries are resolved relative to the directory of
+    the configuration file that defines them, rather than the current
+    working directory.  When both an ``alembic.ini`` and a
+    ``pyproject.toml`` are supplied at once, each file may now contribute
+    ``version_locations`` entries, with ``.ini`` entries listed first
+    followed by the ``pyproject.toml`` entries; entries that resolve to the
+    same path across the two files are de-duplicated.
+
+    A new read-only :meth:`.Config.get_alembic_option_source` method and the
+    new :class:`.OptionSource` constants allow the source of any Alembic
+    option (``ini``, ``toml`` or an explicit override, such as one supplied
+    from the command line) to be determined.
+    :meth:`.Config.get_version_locations` now returns a list of
+    :class:`.VersionLocation` objects, each carrying its fully resolved
+    absolute path together with its source, and :class:`.ScriptDirectory`
+    consumes these already-resolved entries directly so that resolution no
+    longer depends on the working directory.
+
+    Legacy path-list splitting (used when ``path_separator`` is not
+    configured) is now also aware of native Windows drive letters, so a
+    colon that introduces a drive (e.g. the ``:`` in ``C:\\foo``) is no
+    longer mistaken for a list separator.

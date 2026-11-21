@@ -1,7 +1,10 @@
+import contextlib
 import io
 import logging
 import os
 import pathlib
+from pathlib import Path
+import shutil
 import sys
 import tempfile
 
@@ -9,6 +12,8 @@ from alembic import command
 from alembic import config
 from alembic import testing
 from alembic import util
+from alembic.config import OptionSource
+from alembic.config import VersionLocation
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from alembic.script import ScriptDirectory
@@ -267,11 +272,13 @@ script_location = %(base_path)s/db/migrations
                     "falling back to legacy splitting on spaces/commas "
                     "for version_locations"
                 ):
-                    s = ScriptDirectory.from_config(cfg)
+                    raw_locations = cfg.get_version_locations_list()
             else:
-                s = ScriptDirectory.from_config(cfg)
+                raw_locations = cfg.get_version_locations_list()
 
-            eq_(s.version_locations, expected_result)
+            # the raw list API preserves the separator splitting behavior,
+            # without resolving paths against the config file directory
+            eq_(raw_locations, expected_result)
 
     @testing.combinations(
         (
@@ -392,9 +399,9 @@ script_location = %(base_path)s/db/migrations
             "The version_path_separator configuration parameter is "
             "deprecated; please use path_separator"
         ):
-            script = ScriptDirectory.from_config(cfg)
+            raw_locations = cfg.get_version_locations_list()
         eq_(
-            script.version_locations,
+            raw_locations,
             ["/path/one", "/path/two", "/path:/three"],
         )
 
@@ -758,3 +765,484 @@ class CommandLineTest(TestBase):
         cli.main(["frobnicate", "abc42"])
 
         assert fake_stdout == ["Revision abc42 frobnicated."]
+
+
+@contextlib.contextmanager
+def _chdir(path):
+    previous = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+class VersionLocationResolutionTest(TestBase):
+    """Resolution of version_locations relative to the defining config file,
+    independent of the current working directory, with provenance tracking.
+    """
+
+    def setUp(self):
+        # two independent project directories, each with its own config
+        self.tmpdir = pathlib.Path(
+            tempfile.mkdtemp(prefix="alembic_vloc_")
+        ).absolute()
+        self.ini_dir = self.tmpdir / "ini_project"
+        self.toml_dir = self.tmpdir / "toml_project"
+        self.ini_dir.mkdir()
+        self.toml_dir.mkdir()
+
+        self.ini_file = self.ini_dir / "alembic.ini"
+        self.toml_file = self.toml_dir / "pyproject.toml"
+
+        # a script_location directory that actually exists, so that
+        # ScriptDirectory can be constructed
+        self.script_dir = self.tmpdir / "scripts"
+        (self.script_dir / "versions").mkdir(parents=True)
+        (self.script_dir / "env.py").write_text("")
+        (self.script_dir / "script.py.mako").write_text("")
+
+        self.ini_file.write_text(
+            "[alembic]\n"
+            f"script_location = {self.script_dir.as_posix()}\n"
+            "path_separator = space\n"
+            "version_locations = ini_versions extra_versions\n"
+        )
+        self.toml_file.write_text(
+            "[tool.alembic]\n"
+            'version_locations = ["toml_versions"]\n'
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, True)
+
+    def _cfg(self):
+        return config.Config(file_=self.ini_file, toml_file=self.toml_file)
+
+    def test_each_file_contributes_an_entry_with_source(self):
+        cfg = self._cfg()
+        locations = cfg.get_version_locations()
+
+        eq_(
+            [loc.path for loc in locations],
+            [
+                (self.ini_dir / "ini_versions").resolve().as_posix(),
+                (self.ini_dir / "extra_versions").resolve().as_posix(),
+                (self.toml_dir / "toml_versions").resolve().as_posix(),
+            ],
+        )
+        eq_(
+            [loc.source for loc in locations],
+            [
+                OptionSource.INI,
+                OptionSource.INI,
+                OptionSource.TOML,
+            ],
+        )
+        eq_(
+            [loc.config_file_name for loc in locations],
+            [
+                str(self.ini_file),
+                str(self.ini_file),
+                str(self.toml_file),
+            ],
+        )
+        assert all(isinstance(loc, VersionLocation) for loc in locations)
+
+    def test_resolution_is_independent_of_working_directory(self):
+        # build the expected resolution from one working directory
+        expected = [loc.path for loc in self._cfg().get_version_locations()]
+
+        # the same config, constructed and queried from a different working
+        # directory, must resolve to identical absolute paths
+        with _chdir(self.toml_dir):
+            cfg = config.Config(
+                file_=os.path.relpath(self.ini_file, self.toml_dir),
+                toml_file="pyproject.toml",
+            )
+            observed = [loc.path for loc in cfg.get_version_locations()]
+
+        eq_(observed, expected)
+
+    def test_script_directory_uses_the_resolved_entries(self):
+        cfg = self._cfg()
+        with _chdir(self.toml_dir):
+            script = ScriptDirectory.from_config(cfg)
+
+        eq_(
+            [Path(p).as_posix() for p in script._version_locations],
+            [loc.path for loc in cfg.get_version_locations()],
+        )
+        # provenance is retained on the ScriptDirectory
+        eq_(
+            [entry.source for entry in script.version_location_entries],
+            [OptionSource.INI, OptionSource.INI, OptionSource.TOML],
+        )
+
+    def test_absolute_entries_are_not_rebased(self):
+        absolute_ini = (self.tmpdir / "abs_ini").absolute()
+        absolute_toml = (self.tmpdir / "abs_toml").absolute()
+        self.ini_file.write_text(
+            "[alembic]\n"
+            f"script_location = {self.script_dir.as_posix()}\n"
+            "path_separator = space\n"
+            f"version_locations = {absolute_ini.as_posix()}\n"
+        )
+        self.toml_file.write_text(
+            "[tool.alembic]\n"
+            f'version_locations = ["{absolute_toml.as_posix()}"]\n'
+        )
+
+        locations = self._cfg().get_version_locations()
+        eq_(
+            [loc.path for loc in locations],
+            [absolute_ini.as_posix(), absolute_toml.as_posix()],
+        )
+
+    def test_duplicate_across_files_is_deduped(self):
+        shared = (self.ini_dir / "shared").resolve().as_posix()
+        self.ini_file.write_text(
+            "[alembic]\n"
+            f"script_location = {self.script_dir.as_posix()}\n"
+            "path_separator = space\n"
+            f"version_locations = {shared}\n"
+        )
+        # the TOML file lives in a different directory but points at the
+        # same resolved location
+        rel = os.path.relpath(shared, self.toml_dir)
+        self.toml_file.write_text(
+            "[tool.alembic]\n"
+            f'version_locations = ["{rel.replace(os.sep, "/")}"]\n'
+        )
+
+        locations = self._cfg().get_version_locations()
+        eq_([loc.path for loc in locations], [Path(shared).as_posix()])
+        eq_([loc.source for loc in locations], [OptionSource.INI])
+
+    def test_duplicate_within_one_file_is_preserved(self):
+        target = (self.ini_dir / "dup").resolve().as_posix()
+        self.ini_file.write_text(
+            "[alembic]\n"
+            f"script_location = {self.script_dir.as_posix()}\n"
+            "path_separator = space\n"
+            f"version_locations = {target} {target}\n"
+        )
+        # no TOML contribution; the duplicate must survive within one file
+        self.toml_file.write_text("")
+        locations = self._cfg().get_version_locations()
+        eq_([loc.path for loc in locations], [target, target])
+
+    def test_no_locations_returns_empty_list(self):
+        self.ini_file.write_text(
+            "[alembic]\n"
+            f"script_location = {self.script_dir.as_posix()}\n"
+        )
+        self.toml_file.write_text("")
+        eq_(self._cfg().get_version_locations(), [])
+
+    def test_explicit_override_is_tracked_and_resolved_from_cwd(self):
+        # only an explicit override is in play here; the TOML file no
+        # longer contributes a location
+        self.toml_file.write_text("")
+        cfg = self._cfg()
+        cfg.set_main_option("version_locations", "override_versions")
+
+        eq_(
+            cfg.get_alembic_option_source("version_locations"),
+            OptionSource.EXPLICIT,
+        )
+        locations = cfg.get_version_locations()
+        eq_(
+            [loc.path for loc in locations],
+            [(Path.cwd() / "override_versions").resolve().as_posix()],
+        )
+        eq_([loc.source for loc in locations], [OptionSource.EXPLICIT])
+        eq_([loc.config_file_name for loc in locations], [None])
+
+    def test_explicit_override_masks_toml_contribution(self):
+        # an explicit override replaces the .ini value *and* suppresses the
+        # pyproject.toml contribution, matching get_alembic_option() which
+        # stops searching once the configparser namespace has a value
+        cfg = self._cfg()
+        cfg.set_main_option("version_locations", "override_versions")
+
+        locations = cfg.get_version_locations()
+        eq_(
+            [loc.path for loc in locations],
+            [(Path.cwd() / "override_versions").resolve().as_posix()],
+        )
+        eq_([loc.source for loc in locations], [OptionSource.EXPLICIT])
+
+    def test_explicit_override_source_is_customizable(self):
+        cfg = self._cfg()
+        cfg.set_main_option(
+            "version_locations",
+            "override_versions",
+            source=OptionSource.INI,
+        )
+        eq_(
+            cfg.get_alembic_option_source("version_locations"),
+            OptionSource.INI,
+        )
+
+
+class OptionSourceQueryTest(TestBase):
+    def setUp(self):
+        self.tmpdir = pathlib.Path(
+            tempfile.mkdtemp(prefix="alembic_src_")
+        ).absolute()
+        self.ini_file = self.tmpdir / "alembic.ini"
+        self.toml_file = self.tmpdir / "pyproject.toml"
+        self.ini_file.write_text(
+            "[alembic]\nscript_location = ./scripts\n"
+            "ini_only = from_ini\nshared = ini_value\n"
+        )
+        self.toml_file.write_text(
+            "[tool.alembic]\n"
+            'toml_only = "from_toml"\n'
+            'shared = "toml_value"\n'
+        )
+        self.cfg = config.Config(
+            file_=self.ini_file, toml_file=self.toml_file
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, True)
+
+    def test_sources(self):
+        eq_(
+            self.cfg.get_alembic_option_source("ini_only"),
+            OptionSource.INI,
+        )
+        eq_(
+            self.cfg.get_alembic_option_source("toml_only"),
+            OptionSource.TOML,
+        )
+        # ini wins over toml for a shared key
+        eq_(
+            self.cfg.get_alembic_option_source("shared"),
+            OptionSource.INI,
+        )
+        eq_(self.cfg.get_alembic_option_source("missing"), None)
+
+    def test_explicit_override_takes_precedence(self):
+        self.cfg.set_main_option("shared", "override")
+        eq_(
+            self.cfg.get_alembic_option_source("shared"),
+            OptionSource.EXPLICIT,
+        )
+        eq_(self.cfg.get_main_option("shared"), "override")
+
+    def test_explicit_override_can_be_removed(self):
+        # an explicit override is dropped along with the option itself, so
+        # no source remains once it is removed
+        self.cfg.set_main_option("ini_only", "override")
+        eq_(
+            self.cfg.get_alembic_option_source("ini_only"),
+            OptionSource.EXPLICIT,
+        )
+        self.cfg.remove_main_option("ini_only")
+        eq_(self.cfg.get_alembic_option_source("ini_only"), None)
+        eq_(self.cfg.get_alembic_option_source("missing"), None)
+
+    def test_option_sources_are_read_only_constants(self):
+        eq_(OptionSource.INI, "ini")
+        eq_(OptionSource.TOML, "toml")
+        eq_(OptionSource.EXPLICIT, "explicit")
+        with expect_raises_message(AttributeError, "can.t set attribute"):
+            OptionSource.INI = "changed"  # type: ignore[misc]
+
+
+class LegacySeparatorTest(TestBase):
+    """Legacy path splitting must survive Windows drive letters."""
+
+    def _cfg_with(self, option, value):
+        cfg = config.Config()
+        cfg.set_main_option("script_location", tempfile.gettempdir())
+        cfg.set_main_option(option, value)
+        return cfg
+
+    def test_legacy_version_locations_keeps_windows_drive(self):
+        # commas separate entries; spaces are deliberately avoided so that
+        # the Windows drive letter (the colon before a backslash) is the
+        # only colon under test
+        cfg = self._cfg_with(
+            "version_locations",
+            r"C:\ProjectA,D:\ProjectB",
+        )
+        with testing.expect_deprecated(
+            "No path_separator found in configuration"
+        ):
+            entries = cfg.get_version_locations_list()
+        eq_(entries, [r"C:\ProjectA", r"D:\ProjectB"])
+
+    def test_legacy_prepend_sys_path_keeps_windows_drive(self):
+        # legacy prepend_sys_path splits on colons, but the colon that
+        # introduces a Windows drive letter (followed by a separator) must
+        # not be treated as a list separator
+        cfg = self._cfg_with(
+            "prepend_sys_path",
+            r"C:\ProjectA:D:\ProjectB",
+        )
+        with testing.expect_deprecated(
+            "No path_separator found in configuration"
+        ):
+            entries = cfg.get_prepend_sys_paths_list()
+        eq_(entries, [r"C:\ProjectA", r"D:\ProjectB"])
+
+    def test_legacy_prepend_sys_path_splits_non_drive_colons(self):
+        # a colon that does not introduce a native drive letter is always a
+        # list separator on every platform
+        cfg = self._cfg_with("prepend_sys_path", "alpha:beta")
+        with testing.expect_deprecated(
+            "No path_separator found in configuration"
+        ):
+            entries = cfg.get_prepend_sys_paths_list()
+        eq_(entries, ["alpha", "beta"])
+
+    def test_legacy_prepend_sys_path_windows_drive_posix_style(self):
+        # on Windows, a forward-slash drive prefix is protected too
+        if os.name != "nt":
+            testing.config.skip_test("Windows-only behavior")
+        cfg = self._cfg_with("prepend_sys_path", "C:/ProjectA:D:/ProjectB")
+        with testing.expect_deprecated(
+            "No path_separator found in configuration"
+        ):
+            entries = cfg.get_prepend_sys_paths_list()
+        eq_(entries, ["C:/ProjectA", "D:/ProjectB"])
+
+    def test_legacy_prepend_sys_path_posix_path_with_colon(self):
+        # a POSIX-style path where the colon is embedded after a path
+        # segment (not at a drive-letter boundary) splits on every platform
+        cfg = self._cfg_with("prepend_sys_path", "/ProjectA:/ProjectB")
+        with testing.expect_deprecated(
+            "No path_separator found in configuration"
+        ):
+            entries = cfg.get_prepend_sys_paths_list()
+        eq_(entries, ["/ProjectA", "/ProjectB"])
+
+    def test_legacy_prepend_sys_path_multiple_colons(self):
+        cfg = self._cfg_with("prepend_sys_path", "a:b:c")
+        with testing.expect_deprecated(
+            "No path_separator found in configuration"
+        ):
+            entries = cfg.get_prepend_sys_paths_list()
+        eq_(entries, ["a", "b", "c"])
+
+    def test_legacy_prepend_sys_path_drive_letter_at_segment_start(self):
+        # a drive letter is only protected when it begins a path segment;
+        # a letter-colon embedded in another token is not a drive prefix
+        if os.name != "nt":
+            testing.config.skip_test("Windows-only drive handling")
+        cfg = self._cfg_with("prepend_sys_path", r"fooC:\bar,C:\real")
+        with testing.expect_deprecated(
+            "No path_separator found in configuration"
+        ):
+            entries = cfg.get_prepend_sys_paths_list()
+        eq_(entries, ["fooC", r"\bar", r"C:\real"])
+
+    def test_windows_semicolon_separator_with_drive_letters(self):
+        cfg = self._cfg_with(
+            "version_locations",
+            r"C:\Project A;D:\Project B",
+        )
+        cfg.set_main_option("path_separator", ";")
+        eq_(
+            cfg.get_version_locations_list(),
+            [r"C:\Project A", r"D:\Project B"],
+        )
+
+    def test_legacy_split_resolves_relative_to_ini_dir(self):
+        tmpdir = pathlib.Path(
+            tempfile.mkdtemp(prefix="alembic_legacy_")
+        ).absolute()
+        ini_file = tmpdir / "alembic.ini"
+        script_dir = tmpdir / "scripts"
+        script_dir.mkdir()
+        (script_dir / "versions").mkdir()
+        (script_dir / "env.py").write_text("")
+        (script_dir / "script.py.mako").write_text("")
+        ini_file.write_text(
+            "[alembic]\n"
+            f"script_location = {script_dir.as_posix()}\n"
+            "version_locations = rel_one rel_two\n"
+        )
+        try:
+            cfg = config.Config(file_=ini_file)
+            with testing.expect_deprecated(
+                "No path_separator found in configuration"
+            ):
+                locations = cfg.get_version_locations()
+            eq_(
+                [loc.path for loc in locations],
+                [
+                    (tmpdir / "rel_one").resolve().as_posix(),
+                    (tmpdir / "rel_two").resolve().as_posix(),
+                ],
+            )
+            eq_({loc.source for loc in locations}, {OptionSource.INI})
+        finally:
+            shutil.rmtree(tmpdir, True)
+
+
+class VersionLocationTomlResolutionTest(TestBase):
+    """TOML entries resolve relative to the pyproject.toml directory."""
+
+    def test_toml_relative_entry_resolves_to_toml_dir(self):
+        tmpdir = pathlib.Path(
+            tempfile.mkdtemp(prefix="alembic_toml_")
+        ).absolute()
+        try:
+            toml_file = tmpdir / "pyproject.toml"
+            toml_file.write_text(
+                "[tool.alembic]\n"
+                'version_locations = ["versions/one", "versions/two"]\n'
+            )
+            cfg = config.Config(toml_file=toml_file)
+            locations = cfg.get_version_locations()
+            eq_(
+                [loc.path for loc in locations],
+                [
+                    (tmpdir / "versions" / "one").as_posix(),
+                    (tmpdir / "versions" / "two").as_posix(),
+                ],
+            )
+            eq_(
+                [loc.source for loc in locations],
+                [OptionSource.TOML, OptionSource.TOML],
+            )
+            eq_(
+                [loc.config_file_name for loc in locations],
+                [str(toml_file), str(toml_file)],
+            )
+        finally:
+            shutil.rmtree(tmpdir, True)
+
+
+class PackageResourceLocationTest(TestBase):
+    """Package-resource ``version_locations`` entries are not rebased."""
+
+    def test_package_resource_entry_is_coerced(self):
+        tmpdir = pathlib.Path(
+            tempfile.mkdtemp(prefix="alembic_pkgres_")
+        ).absolute()
+        try:
+            ini_file = tmpdir / "alembic.ini"
+            ini_file.write_text(
+                "[alembic]\n"
+                f"script_location = {tmpdir.as_posix()}\n"
+                "path_separator = space\n"
+                "version_locations = alembic.templates:generic\n"
+            )
+            locations = config.Config(file_=ini_file).get_version_locations()
+            eq_(len(locations), 1)
+            resolved = Path(locations[0].path)
+            # resolved to the actual package directory, not rebased onto
+            # the .ini file's own directory
+            eq_(resolved.name, "generic")
+            eq_(resolved.parent.name, "templates")
+            assert resolved.is_absolute()
+            assert resolved.exists()
+            eq_(locations[0].source, OptionSource.INI)
+        finally:
+            shutil.rmtree(tmpdir, True)
