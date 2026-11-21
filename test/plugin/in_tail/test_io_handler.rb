@@ -286,6 +286,71 @@ class IntailIOHandlerTest < Test::Unit::TestCase
     assert_equal text.bytesize, position
   end
 
+  test 'attaches byte ranges based on the raw file position to received lines' do
+    text = "first line\nsecond line\n"
+    @file.binmode
+    @file.write(text)
+    @file.close
+
+    watcher = create_watcher
+    stub(watcher).pe do
+      pe = 'position_file'
+      stub(pe).read_pos { 0 }
+      stub(pe).update_pos { |_val| }
+      pe
+    end
+
+    received = []
+    handler = Fluent::Plugin::TailInput::TailWatcher::IOHandler.new(
+      watcher, path: @file.path, read_lines_limit: 100, read_bytes_limit_per_second: -1,
+      log: $log, open_on_every_update: false, range_key: 'range', metrics: @metrics
+    ) do |lines, _watcher|
+      received.concat(lines)
+      true
+    end
+
+    handler.on_notify
+
+    byte_range = Fluent::Plugin::TailInput::ByteRange
+    assert_equal [[0, 11], [11, 23]], received.map { |line| byte_range.of(line) }
+    assert_equal ['first line', 'second line'], received.map(&:chomp)
+  ensure
+    handler&.close
+  end
+
+  test 'byte ranges stay correct when reads split a multibyte character' do
+    text = "てすと\nabc\n".dup.force_encoding(Encoding::ASCII_8BIT)
+    @file.binmode
+    @file.write(text)
+    @file.close
+
+    watcher = create_watcher
+    stub(watcher).pe do
+      pe = 'position_file'
+      stub(pe).read_pos { 0 }
+      stub(pe).update_pos { |_val| }
+      pe
+    end
+
+    received = []
+    handler = Fluent::Plugin::TailInput::TailWatcher::IOHandler.new(
+      watcher, path: @file.path, read_lines_limit: 100, read_bytes_limit_per_second: -1,
+      log: $log, open_on_every_update: false, range_key: 'range', metrics: @metrics
+    ) do |lines, _watcher|
+      received.concat(lines)
+      true
+    end
+    # Read one byte at a time so each read splits the multibyte characters.
+    stub(handler).bytes_to_read { 1 }
+
+    handler.on_notify
+
+    byte_range = Fluent::Plugin::TailInput::ByteRange
+    assert_equal [[0, 10], [10, 14]], received.map { |line| byte_range.of(line) }
+  ensure
+    handler&.close
+  end
+
   sub_test_case 'when open_on_every_update is true and read_pos returns always 0' do
     test 'open new IO and change pos to 0 and read it' do
       text = "this line is test\ntest line is test\n"

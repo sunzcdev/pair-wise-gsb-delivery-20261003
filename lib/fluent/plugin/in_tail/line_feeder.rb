@@ -26,7 +26,7 @@ module Fluent::Plugin
     # line-processing methods as handlers. This keeps subclass overrides in the
     # call path, and super reaches this built-in implementation.
     class LineFeeder
-      def initialize(parser:, router_provider:, log:, tag:, tag_prefix:, tag_suffix:, path_key:, emit_unmatched_lines:, multiline_mode:, parse_handler: nil, convert_handler: nil, flush_handler: nil)
+      def initialize(parser:, router_provider:, log:, tag:, tag_prefix:, tag_suffix:, path_key:, emit_unmatched_lines:, multiline_mode:, range_key: nil, parse_handler: nil, convert_handler: nil, flush_handler: nil)
         @parser = parser
         @router_provider = router_provider
         @log = log
@@ -36,6 +36,7 @@ module Fluent::Plugin
         @path_key = path_key
         @emit_unmatched_lines = emit_unmatched_lines
         @multiline_mode = multiline_mode
+        @range_key = range_key
         @parse_handler = parse_handler || if multiline_mode
                                            method(:parse_multilines)
                                          else
@@ -86,11 +87,13 @@ module Fluent::Plugin
         @parser.parse(buf) { |time, record|
           if time && record
             record[@path_key] ||= tw.path unless @path_key.nil?
+            add_byte_range(record, buf)
             @router_provider.call.emit(tag_for(tw), time, record)
           else
             if @emit_unmatched_lines
               record = { 'unmatched_line' => buf }
               record[@path_key] ||= tw.path unless @path_key.nil?
+              add_byte_range(record, buf)
               @router_provider.call.emit(tag_for(tw), Fluent::EventTime.now, record)
             end
             @log.warn "got incomplete line at shutdown from #{tw.path}: #{buf.inspect}"
@@ -151,11 +154,13 @@ module Fluent::Plugin
           @parser.parse(line) { |time, record|
             if time && record
               record[@path_key] ||= tail_watcher.path unless @path_key.nil?
+              add_byte_range(record, line)
               es.add(time, record)
             else
               if @emit_unmatched_lines
                 record = {'unmatched_line' => line}
                 record[@path_key] ||= tail_watcher.path unless @path_key.nil?
+                add_byte_range(record, line)
                 es.add(Fluent::EventTime.now, record)
               end
               @log.warn { "pattern not matched: #{line.inspect}" }
@@ -197,6 +202,7 @@ module Fluent::Plugin
                 @log.warn "got incomplete line before first line from #{tail_watcher.path}: #{line.inspect}"
               else
                 lb << line
+                TailInput::ByteRange.merge!(lb, line)
               end
             end
           }
@@ -204,6 +210,7 @@ module Fluent::Plugin
           lb ||= ''
           lines.each do |line|
             lb << line
+            TailInput::ByteRange.merge!(lb, line)
             @parser.parse(lb) { |time, record|
               if time && record
                 @convert_handler.call(lb, es, tail_watcher)
@@ -217,6 +224,13 @@ module Fluent::Plugin
       end
 
       private
+
+      def add_byte_range(record, line)
+        return if @range_key.nil?
+
+        range = TailInput::ByteRange.of(line)
+        record[@range_key] = TailInput::ByteRange.to_record_value(range) if range
+      end
 
       def tag_for(tw)
         if @tag_prefix || @tag_suffix

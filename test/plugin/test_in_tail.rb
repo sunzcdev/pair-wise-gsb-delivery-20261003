@@ -572,6 +572,139 @@ class TailInputTest < Test::Unit::TestCase
       assert num_events <= d.emit_count
     end
 
+    sub_test_case "range_key" do
+      # Reads the raw fragment covered by the byte range of a record back from
+      # the original file, in binary mode so multibyte characters are intact.
+      def read_fragment(path, range)
+        Fluent::FileWrapper.open(path, "rb") do |file|
+          file.seek(range["start"])
+          file.read(range["size"])
+        end
+      end
+
+      def configure_tiny_reads(driver)
+        # Feed the FIFO one byte at a time so read buffers split multibyte
+        # characters and CRLF line endings.
+        driver.instance.instance_variable_get(:@tails).each_value do |tw|
+          handler = tw.instance_variable_get(:@io_handler)
+          stub(handler).bytes_to_read { 1 } if handler
+        end
+      end
+
+      test "adds the field only when configured" do
+        Fluent::FileWrapper.open("#{@tmp_dir}/tail.txt", "wb") { |f| f.puts "test1" }
+        d = create_driver(CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG)
+        d.run(expect_emits: 1)
+
+        assert_false d.events[0][2].key?("range")
+      end
+
+      test "reads the original fragments back from the byte ranges with tiny read blocks" do
+        path = "#{@tmp_dir}/tail.txt"
+        # ASCII lines, a UTF-8 multibyte line and a CRLF-terminated line.
+        content = "test1\nてすと\r\nlast line\n".dup.force_encoding(Encoding::ASCII_8BIT)
+        Fluent::FileWrapper.open(path, "wb") { |f| f.write(content) }
+
+        config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG +
+                 config_element("", "", { "range_key" => "range", "read_lines_limit" => 1 })
+        d = create_driver(config)
+        d.run(expect_emits: 3, timeout: 20) { configure_tiny_reads(d) }
+
+        events = d.events
+        assert_equal 3, events.size
+
+        ranges = events.map { |event| event[2]["range"] }
+        assert_equal(
+          [{ "start" => 0, "end" => 6, "size" => 6 },
+           { "start" => 6, "end" => 17, "size" => 11 },
+           { "start" => 17, "end" => 27, "size" => 10 }],
+          ranges
+        )
+
+        # Every range must point at the exact raw bytes of the line in the file.
+        fragments = ranges.map { |range| read_fragment(path, range) }
+        assert_equal ["test1\n", "てすと\r\n".dup.force_encoding(Encoding::ASCII_8BIT), "last line\n"],
+                     fragments
+        # The ranges partition the whole file without gaps or overlaps.
+        assert_equal content.bytesize, ranges.last["end"]
+        ranges.each_cons(2) { |previous, current| assert_equal previous["end"], current["start"] }
+      end
+
+      test "adds the range to unmatched lines without renaming existing fields" do
+        path = "#{@tmp_dir}/tail.txt"
+        content = "test line 1\nbad line\n"
+        Fluent::FileWrapper.open(path, "wb") { |f| f.write(content) }
+
+        config = CONFIG_READ_FROM_HEAD +
+                 config_element("", "", {
+                   "format" => "/^(?<message>test.*)/",
+                   "emit_unmatched_lines" => true,
+                   "range_key" => "range",
+                   "path_key" => "path",
+                 })
+        d = create_driver(config)
+        d.run(expect_emits: 2, timeout: 20) { configure_tiny_reads(d) }
+
+        events = d.events
+        assert_equal(
+          [{ "message" => "test line 1",
+             "path" => path,
+             "range" => { "start" => 0, "end" => 12, "size" => 12 } },
+           { "unmatched_line" => "bad line",
+             "path" => path,
+             "range" => { "start" => 12, "end" => 21, "size" => 9 } }],
+          events.map { |event| event[2] }
+        )
+        assert_equal "bad line\n", read_fragment(path, events[1][2]["range"])
+      end
+
+      test "keeps byte ranges correct through from_encoding conversion" do
+        path = "#{@tmp_dir}/tail.txt"
+        # UTF-8 file converted to UTF-8: the recorded range is still measured on
+        # the raw file bytes, not on the converted string.
+        content = "てすと\nabc\n".dup.force_encoding(Encoding::ASCII_8BIT)
+        Fluent::FileWrapper.open(path, "wb") { |f| f.write(content) }
+
+        config = CONFIG_READ_FROM_HEAD + SINGLE_LINE_CONFIG +
+                 config_element("", "", {
+                   "range_key" => "range",
+                   "encoding" => "utf-8",
+                   "from_encoding" => "utf-8",
+                 })
+        d = create_driver(config)
+        d.run(expect_emits: 2, timeout: 20) { configure_tiny_reads(d) }
+
+        ranges = d.events.map { |event| event[2]["range"] }
+        assert_equal [{ "start" => 0, "end" => 10, "size" => 10 },
+                      { "start" => 10, "end" => 14, "size" => 4 }], ranges
+        assert_equal content[0, 10], read_fragment(path, ranges[0])
+      end
+
+      test "attaches byte ranges when parsing runs in worker threads" do
+        path = "#{@tmp_dir}/tail.txt"
+        content = "test1\ntest2\n"
+        Fluent::FileWrapper.open(path, "wb") { |f| f.write(content) }
+
+        config = CONFIG_READ_FROM_HEAD + PARSE_SINGLE_LINE_CONFIG +
+                 config_element("", "", {
+                   "range_key" => "range",
+                   "num_threads" => 2,
+                   "read_lines_limit" => 1,
+                 })
+        d = create_driver(config)
+        d.run(expect_emits: 2, timeout: 20) { configure_tiny_reads(d) }
+
+        events = d.events.sort_by { |event| event[2]["range"]["start"] }
+        assert_equal(
+          [{ "start" => 0, "end" => 6, "size" => 6 },
+           { "start" => 6, "end" => 12, "size" => 6 }],
+          events.map { |event| event[2]["range"] }
+        )
+        assert_equal ["test1\n", "test2\n"],
+                     events.map { |event| read_fragment(path, event[2]["range"]) }
+      end
+    end
+
     sub_test_case "log throttling per file" do
       teardown do
         cleanup_file("#{@tmp_dir}/tail.txt")
@@ -2209,6 +2342,42 @@ class TailInputTest < Test::Unit::TestCase
       assert_equal({"message1" => "test0", "message2" => "test1", "message3" => "test2"}, events[0][2])
       assert_equal({ 'unmatched_line' => "f test3" }, events[1][2])
       assert_equal({"message1" => "test4", "message2" => "test5", "message3" => "test6"}, events[2][2])
+    end
+
+    data(flat: MULTILINE_CONFIG,
+         parse: PARSE_MULTILINE_CONFIG)
+    def test_multiline_range_key_merges_the_ranges_of_all_lines(data)
+      path = "#{@tmp_dir}/tail.txt"
+      content = "s test1\nf test2\ns test3\n"
+      Fluent::FileWrapper.open(path, "wb") { |f| f.write(content) }
+
+      config = data + config_element("", "", {
+                                       "range_key" => "range",
+                                       "read_from_head" => "true",
+                                       "read_lines_limit" => 1,
+                                     })
+      d = create_driver(config)
+      d.run(expect_emits: 2, timeout: 20) do
+        d.instance.instance_variable_get(:@tails).each_value do |tw|
+          handler = tw.instance_variable_get(:@io_handler)
+          stub(handler).bytes_to_read { 1 } if handler
+        end
+      end
+
+      events = d.events
+      assert_equal 2, events.size
+      ranges = events.map { |event| event[2]["range"] }
+      # The first record spans two physical lines ("s test1\n" and "f test2\n"),
+      # including their line feeds, and starts at the first byte of the file.
+      assert_equal({ "start" => 0, "end" => 16, "size" => 16 }, ranges[0])
+      assert_equal({ "start" => 16, "end" => 24, "size" => 8 }, ranges[1])
+
+      Fluent::FileWrapper.open(path, "rb") do |file|
+        ranges.each do |range|
+          file.seek(range["start"])
+          assert_equal content.byteslice(range["start"], range["size"]), file.read(range["size"])
+        end
+      end
     end
 
     data(flat: MULTILINE_CONFIG,

@@ -131,6 +131,107 @@ class IntailFIFO < Test::Unit::TestCase
     end
   end
 
+  sub_test_case 'byte range' do
+    def byte_range(line)
+      Fluent::Plugin::TailInput::ByteRange.of(line)
+    end
+
+    test 'attaches absolute byte ranges of the emitted lines' do
+      fifo = Fluent::Plugin::TailInput::TailWatcher::FIFO.new(Encoding::ASCII_8BIT, $log, nil, nil, track_byte_range: true)
+      fifo << "test\n"
+      fifo.sync_base(5)
+      lines = []
+      fifo.read_lines(lines)
+
+      assert_equal 1, lines.size
+      assert_equal [0, 5], byte_range(lines[0])
+      assert_equal 'test', lines[0].chomp
+    end
+
+    test 'keeps ranges of lines split across chunks and reads' do
+      fifo = Fluent::Plugin::TailInput::TailWatcher::FIFO.new(Encoding::ASCII_8BIT, $log, nil, nil, track_byte_range: true)
+      fifo << 'foo'
+      fifo.sync_base(3)
+      lines = []
+      fifo.read_lines(lines)
+      assert_equal [], lines
+
+      fifo << "bar\nbaz\n"
+      fifo.read_lines(lines)
+      assert_equal [[0, 7], [7, 11]], lines.map { |line| byte_range(line) }
+      assert_equal ['foobar', 'baz'], lines.map(&:chomp)
+    end
+
+    test 'counts raw bytes before encoding conversion' do
+      # UTF-8 multibyte characters are read as ASCII-8BIT chunks, then converted
+      # to UTF-8. Each 'て' is 3 bytes in the file.
+      fifo = Fluent::Plugin::TailInput::TailWatcher::FIFO.new(Encoding::ASCII_8BIT, $log, nil, Encoding::UTF_8, track_byte_range: true)
+      text = "てすと\n".dup.force_encoding(Encoding::ASCII_8BIT)
+      # Feed it one byte at a time, splitting the multibyte characters.
+      text.each_byte do |byte|
+        fifo << byte.chr.force_encoding(Encoding::ASCII_8BIT)
+      end
+      fifo.sync_base(text.bytesize)
+      lines = []
+      fifo.read_lines(lines)
+
+      assert_equal 1, lines.size
+      assert_equal Encoding::UTF_8, lines[0].encoding
+      assert_equal [0, text.bytesize], byte_range(lines[0])
+      assert_equal 10, text.bytesize
+    end
+
+    test 'includes the full CRLF in the range' do
+      fifo = Fluent::Plugin::TailInput::TailWatcher::FIFO.new(Encoding::ASCII_8BIT, $log, nil, nil, track_byte_range: true)
+      fifo << "a\r\nb\r\n"
+      fifo.sync_base(6)
+      lines = []
+      fifo.read_lines(lines)
+
+      assert_equal [[0, 3], [3, 6]], lines.map { |line| byte_range(line) }
+    end
+
+    test 'does not split a CRLF whose CR and LF arrive in different reads' do
+      fifo = Fluent::Plugin::TailInput::TailWatcher::FIFO.new(Encoding::ASCII_8BIT, $log, nil, nil, track_byte_range: true)
+      fifo << "abc\r"
+      fifo.sync_base(4)
+      lines = []
+      fifo.read_lines(lines)
+      assert_equal [], lines
+
+      fifo << "\ndef\n"
+      fifo.read_lines(lines)
+      assert_equal [[0, 5], [5, 9]], lines.map { |line| byte_range(line) }
+      assert_equal ['abc', 'def'], lines.map(&:chomp)
+    end
+
+    test 'counts bytes of skipped long lines so later ranges stay correct' do
+      max_line_size = 6
+      fifo = Fluent::Plugin::TailInput::TailWatcher::FIFO.new(Encoding::ASCII_8BIT, $log, max_line_size, nil, track_byte_range: true)
+      fifo << "short\ntoolong"
+      fifo.sync_base(13)
+      lines = []
+      # "toolong" already exceeds the limit and is discarded while still
+      # waiting for its line ending.
+      fifo.read_lines(lines)
+      assert_equal ['short'], lines.map(&:chomp)
+
+      fifo << "line\nnext\n"
+      fifo.read_lines(lines)
+      assert_equal ['short', 'next'], lines.map(&:chomp)
+      assert_equal [[0, 6], [18, 23]], lines.map { |line| byte_range(line) }
+    end
+
+    test 'attaches nothing when byte range tracking is disabled' do
+      fifo = Fluent::Plugin::TailInput::TailWatcher::FIFO.new(Encoding::ASCII_8BIT, $log)
+      fifo << "test\n"
+      lines = []
+      fifo.read_lines(lines)
+
+      assert_nil byte_range(lines[0])
+    end
+  end
+
   sub_test_case '#<<' do
     test 'does not make any change about encoding to an argument' do
       fifo = Fluent::Plugin::TailInput::TailWatcher::FIFO.new(Encoding::ASCII_8BIT, $log)

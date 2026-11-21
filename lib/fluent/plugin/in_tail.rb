@@ -121,6 +121,8 @@ module Fluent::Plugin
     config_param :from_encoding, :string, default: nil
     desc 'Add the log path being tailed to records. Specify the field name to be used.'
     config_param :path_key, :string, default: nil
+    desc 'Add the byte range in the source file of the raw bytes of each record. Specify the field name to be used. The range is computed before encoding conversion and is a half-open [start, end) range including the line ending.'
+    config_param :range_key, :string, default: nil
     desc 'Open and close the file on every update instead of leaving it open until it gets rotated.'
     config_param :open_on_every_update, :bool, default: false
     desc 'Limit the watching files that the modification time is within the specified time range (when use \'*\' in path).'
@@ -380,6 +382,7 @@ module Fluent::Plugin
         path_key: @path_key,
         emit_unmatched_lines: @emit_unmatched_lines,
         multiline_mode: @multiline_mode,
+        range_key: @range_key,
         parse_handler: method(@multiline_mode ? :parse_multilines : :parse_singleline),
         convert_handler: method(:convert_line_to_event),
         flush_handler: method(:flush_buffer),
@@ -663,6 +666,7 @@ module Fluent::Plugin
         open_on_every_update: @open_on_every_update,
         metrics: @metrics,
         max_line_size: @max_line_size,
+        range_key: @range_key,
       }
       unless @encoding.nil?
         if @from_encoding.nil?
@@ -772,7 +776,8 @@ module Fluent::Plugin
         tag_suffix: @tag_suffix,
         path_key: @path_key,
         emit_unmatched_lines: @emit_unmatched_lines,
-        multiline_mode: false
+        multiline_mode: false,
+        range_key: @range_key
       )
     end
 

@@ -98,7 +98,7 @@ class IntailLineFeederTest < Test::Unit::TestCase
 
   def create_feeder(tag:, tag_prefix: nil, tag_suffix: nil, path_key: nil,
                     emit_unmatched_lines: false, multiline_mode: false, parser: nil,
-                    parse_handler: nil, convert_handler: nil, flush_handler: nil)
+                    range_key: nil, parse_handler: nil, convert_handler: nil, flush_handler: nil)
     Fluent::Plugin::TailInput::LineFeeder.new(
       parser: parser || create_parser,
       router_provider: -> { @router },
@@ -109,10 +109,15 @@ class IntailLineFeederTest < Test::Unit::TestCase
       path_key: path_key,
       emit_unmatched_lines: emit_unmatched_lines,
       multiline_mode: multiline_mode,
+      range_key: range_key,
       parse_handler: parse_handler,
       convert_handler: convert_handler,
       flush_handler: flush_handler,
     )
+  end
+
+  def attach_range(line, start_byte, end_byte)
+    Fluent::Plugin::TailInput::ByteRange.attach(line, start_byte, end_byte)
   end
 
   # Builds a FileFeed and its watcher.
@@ -549,6 +554,127 @@ class IntailLineFeederTest < Test::Unit::TestCase
       multiline_feeder = create_feeder(tag: 'tail', multiline_mode: true, parser: FirstlineParser.new)
 
       assert_equal(multiline_feeder.method(:parse_multilines), multiline_feeder.instance_variable_get(:@parse_handler))
+    end
+  end
+
+  sub_test_case 'range_key' do
+    test 'adds the byte range of a line to a normal record' do
+      line_feeder = create_feeder(tag: 'tail', range_key: 'range')
+      file_feed, tw = create_file_feed(line_feeder)
+
+      file_feed.feed_lines([attach_range('foo', 7, 11)], tw)
+
+      assert_equal(
+        [{ 'message' => 'foo', 'range' => { 'start' => 7, 'end' => 11, 'size' => 4 } }],
+        emitted_records
+      )
+    end
+
+    test 'adds the byte range to unmatched lines' do
+      line_feeder = create_feeder(tag: 'tail', range_key: 'range',
+                                  emit_unmatched_lines: true, parser: NeverMatchingParser.new)
+      file_feed, tw = create_file_feed(line_feeder)
+
+      file_feed.feed_lines([attach_range('bad', 20, 24)], tw)
+
+      assert_equal(
+        [{ 'unmatched_line' => 'bad', 'range' => { 'start' => 20, 'end' => 24, 'size' => 4 } }],
+        emitted_records
+      )
+    end
+
+    test 'does not add the field when range_key is not set' do
+      line_feeder = create_feeder(tag: 'tail')
+      file_feed, tw = create_file_feed(line_feeder)
+
+      file_feed.feed_lines([attach_range('foo', 7, 11)], tw)
+
+      assert_equal([{ 'message' => 'foo' }], emitted_records)
+    end
+
+    test 'merges the ranges of the physical lines of a multiline record' do
+      line_feeder = create_feeder(tag: 'tail', multiline_mode: true,
+                                  parser: FirstlineParser.new, range_key: 'range')
+      file_feed, tw = create_file_feed(line_feeder)
+
+      file_feed.feed_lines(
+        [attach_range("s test1\n", 0, 8), attach_range("f test2\n", 8, 16), attach_range("s test3\n", 16, 24)],
+        tw
+      )
+
+      assert_equal(
+        [{ 'message' => "s test1\nf test2",
+           'range' => { 'start' => 0, 'end' => 16, 'size' => 16 } }],
+        emitted_records
+      )
+      assert_equal([16, 24], Fluent::Plugin::TailInput::ByteRange.of(file_feed.line_buffer))
+    end
+
+    test 'keeps the merged range when a multiline buffer spans feeds' do
+      line_feeder = create_feeder(tag: 'tail', multiline_mode: true,
+                                  parser: FirstlineParser.new, range_key: 'range')
+      file_feed, tw = create_file_feed(line_feeder)
+
+      file_feed.feed_lines([attach_range("s test1\n", 0, 8)], tw)
+      file_feed.feed_lines([attach_range("f test2\n", 8, 16)], tw)
+      file_feed.feed_lines([attach_range("s test3\n", 16, 24)], tw)
+
+      assert_equal(
+        [{ 'message' => "s test1\nf test2",
+           'range' => { 'start' => 0, 'end' => 16, 'size' => 16 } }],
+        emitted_records
+      )
+    end
+
+    test 'adds the range when a buffered line is flushed' do
+      line_feeder = create_feeder(tag: 'tail', range_key: 'range')
+      file_feed, tw = create_file_feed(line_feeder)
+
+      file_feed.flush_buffer(attach_range("foo\n", 3, 7), tw)
+
+      assert_equal(
+        [{ 'message' => 'foo', 'range' => { 'start' => 3, 'end' => 7, 'size' => 4 } }],
+        emitted_records
+      )
+    end
+
+    test 'adopts the range after a multiline buffer without a firstline is reset' do
+      line_feeder = create_feeder(tag: 'tail', multiline_mode: true,
+                                  parser: IncompleteUntilEndParser.new, range_key: 'range')
+      file_feed, tw = create_file_feed(line_feeder)
+
+      # The first two lines complete one record, which resets the internal
+      # buffer to an empty string. The next record must still get the range of
+      # its lines rather than lose it.
+      file_feed.feed_lines([attach_range("a\n", 0, 2), attach_range("end\n", 2, 6)], tw)
+      file_feed.feed_lines([attach_range("b\n", 6, 8), attach_range("end\n", 8, 12)], tw)
+
+      assert_equal(
+        [{ 'message' => "a\nend", 'range' => { 'start' => 0, 'end' => 6, 'size' => 6 } },
+         { 'message' => "b\nend", 'range' => { 'start' => 6, 'end' => 12, 'size' => 6 } }],
+        emitted_records
+      )
+    end
+
+    test 'adds the range of an unmatched line when a multiline parser does not match' do
+      # NeverMatchingParser only defines #parse; stub the firstline hooks so the
+      # line is treated as a non-firstline orphan with no buffered first line.
+      parser = NeverMatchingParser.new
+      stub(parser).has_firstline? { true }
+      stub(parser).firstline? { false }
+      line_feeder = create_feeder(tag: 'tail', range_key: 'range', multiline_mode: true,
+                                  emit_unmatched_lines: true, parser: parser)
+      file_feed, tw = create_file_feed(line_feeder)
+
+      # A line which is not a firstline and which has no buffered first line is
+      # emitted as an unmatched line.
+      file_feed.feed_lines([attach_range("f orphan\n", 30, 39)], tw)
+
+      assert_equal(
+        [{ 'unmatched_line' => 'f orphan',
+           'range' => { 'start' => 30, 'end' => 39, 'size' => 9 } }],
+        emitted_records
+      )
     end
   end
 end

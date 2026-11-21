@@ -20,9 +20,67 @@ require 'fluent/file_wrapper'
 
 module Fluent::Plugin
   class TailInput < Fluent::Plugin::Input
+    # ByteRange carries the half-open [start, end) byte offsets, in the file,
+    # of the raw bytes that a line (or a record merged from several lines) was
+    # read from. Offsets are computed before encoding conversion, so splitting a
+    # multibyte character or a CRLF across read buffers does not affect them.
+    # The ranges are attached to the line strings as instance variables, which
+    # keeps the existing line-processing interfaces (including the worker mode)
+    # unchanged, and are only attached when `range_key` is configured.
+    module ByteRange
+      INSTANCE_VARIABLE = :@fluent_in_tail_byte_range
+
+      module_function
+
+      # Attaches an absolute [start, end) byte range to a copy of the line and
+      # returns it. A copy is used because lines sliced out of the frozen FIFO
+      # buffer may be frozen, and the ranges of a multiline buffer have to be
+      # mutable while further lines are appended to it.
+      def attach(line, start_byte, end_byte)
+        marked = line.dup
+        marked.instance_variable_set(INSTANCE_VARIABLE, [start_byte, end_byte])
+        marked
+      end
+
+      def of(line)
+        line.instance_variable_get(INSTANCE_VARIABLE)
+      end
+
+      # Extends the range already attached to a buffer up to the end of the
+      # range of another line when the latter is appended to the buffer. When
+      # the buffer does not carry a range yet (e.g. it was just reset to an
+      # empty string), the range of the appended line is adopted.
+      def merge!(buffer, line)
+        line_range = of(line)
+        return buffer unless line_range
+
+        buffer_range = of(buffer)
+        if buffer_range
+          buffer_range[1] = line_range[1]
+        else
+          # Use a fresh array instead of the one attached to the line: the line
+          # may be shared with a worker batch, and mutating its range would
+          # corrupt the range of the other copy.
+          buffer.instance_variable_set(INSTANCE_VARIABLE, [line_range[0], line_range[1]])
+        end
+        buffer
+      end
+
+      # Builds the value stored in the record field named by `range_key` from
+      # the absolute [start, end) byte range attached to the line.
+      def to_record_value(range)
+        start_byte, end_byte = range
+        {
+          'start' => start_byte,
+          'end' => end_byte,
+          'size' => end_byte - start_byte,
+        }
+      end
+    end
+
     class TailWatcher
       class FIFO
-        def initialize(encoding, log, max_line_size=nil, encoding_to_convert=nil)
+        def initialize(encoding, log, max_line_size=nil, encoding_to_convert=nil, track_byte_range: false)
           @buffer = ''.force_encoding(encoding)
           @eol = "\n".encode(encoding).freeze
           @encoding_to_convert = encoding_to_convert
@@ -30,12 +88,30 @@ module Fluent::Plugin
           @skip_current_line = false
           @skipping_current_line_bytesize = 0
           @log = log
+          @track_byte_range = track_byte_range
+          # Total bytes appended to and consumed (sliced out) from the FIFO.
+          # The difference equals the raw bytesize of the data left in @buffer.
+          @total_appended_bytesize = 0
+          @total_consumed_bytesize = 0
+          # File offset corresponding to the first byte the FIFO has received.
+          # It is lazily fixed on the first read of the opened IO.
+          @base_byte = nil
         end
 
         attr_reader :buffer, :max_line_size
 
         def <<(chunk)
           @buffer << chunk
+          @total_appended_bytesize += chunk.bytesize if @track_byte_range
+        end
+
+        # Fixes the file offset of the first received byte from the current IO
+        # position. Called after every read, but only the first call for a FIFO
+        # instance sets the base; later reads continue from the same origin.
+        def sync_base(io_pos)
+          return unless @track_byte_range && @base_byte.nil?
+
+          @base_byte = io_pos - @total_appended_bytesize
         end
 
         def convert(s)
@@ -59,6 +135,14 @@ module Fluent::Plugin
             slice_position = idx + 1
             rbuf = @buffer.slice(0, slice_position)
             @buffer = @buffer.slice(slice_position, @buffer.size - slice_position)
+            # The raw bytes of the line occupied these absolute offsets in the
+            # file, before any encoding conversion. A CRLF line is covered up to
+            # and including the line feed.
+            if @track_byte_range
+              line_start = @base_byte + @total_consumed_bytesize
+              line_end = line_start + rbuf.bytesize
+              @total_consumed_bytesize += rbuf.bytesize
+            end
             idx = @buffer.index(@eol)
 
             is_long_line = @max_line_size && (
@@ -78,7 +162,12 @@ module Fluent::Plugin
               next
             end
 
-            lines << convert(rbuf)
+            converted = convert(rbuf)
+            lines << if @track_byte_range
+                       ByteRange.attach(converted, line_start, line_end)
+                     else
+                       converted
+                     end
           end
 
           is_long_current_line = @max_line_size && (
@@ -93,6 +182,11 @@ module Fluent::Plugin
             ) { convert(@buffer).chomp }
             @skip_current_line = true
             @skipping_current_line_bytesize += @buffer.bytesize
+            if @track_byte_range
+              # Keep the offsets of future lines stable by counting the bytes
+              # which are discarded from the buffer as consumed.
+              @total_consumed_bytesize += @buffer.bytesize
+            end
             @buffer.clear
           end
 
@@ -112,7 +206,7 @@ module Fluent::Plugin
 
         attr_accessor :shutdown_timeout
 
-        def initialize(watcher, path:, read_lines_limit:, read_bytes_limit_per_second:, max_line_size: nil, log:, open_on_every_update:, encoding: Encoding::ASCII_8BIT, encoding_to_convert: nil, metrics:, &receive_lines)
+        def initialize(watcher, path:, read_lines_limit:, read_bytes_limit_per_second:, max_line_size: nil, log:, open_on_every_update:, encoding: Encoding::ASCII_8BIT, encoding_to_convert: nil, range_key: nil, metrics:, &receive_lines)
           @watcher = watcher
           @path = path
           @read_lines_limit = read_lines_limit
@@ -120,7 +214,7 @@ module Fluent::Plugin
           @receive_lines = receive_lines
           @open_on_every_update = open_on_every_update
           @encoding = encoding
-          @fifo = FIFO.new(encoding, log, max_line_size, encoding_to_convert)
+          @fifo = FIFO.new(encoding, log, max_line_size, encoding_to_convert, track_byte_range: !range_key.nil?)
           @lines = []
           @io = nil
           @notify_mutex = Mutex.new
@@ -207,6 +301,10 @@ module Fluent::Plugin
 
         private
 
+        def bytes_to_read
+          BYTES_TO_READ
+        end
+
         def limit_bytes_per_second_reached?
           return false if @read_bytes_limit_per_second < 0 # not enabled by conf
           return false if @number_bytes_read < @read_bytes_limit_per_second
@@ -259,10 +357,11 @@ module Fluent::Plugin
                     @start_reading_time ||= Fluent::Clock.now
                     group_watcher&.update_reading_time(@path)
 
-                    data = io.readpartial(BYTES_TO_READ, iobuf)
+                    data = io.readpartial(bytes_to_read, iobuf)
                     @eof = false
                     @number_bytes_read += data.bytesize
                     @fifo << data
+                    @fifo.sync_base(io.pos)
 
                     n_lines_before_read = @lines.size
                     has_skipped_line = @fifo.read_lines(@lines) || has_skipped_line
