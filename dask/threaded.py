@@ -30,6 +30,9 @@ main_thread = current_thread()
 default_pool: Executor | None = None
 pools: defaultdict[threading.Thread, dict[int, Executor]] = defaultdict(dict)
 pools_lock = Lock()
+# Number of computations currently running on each dask-created pool.
+# Pools supplied by the caller are never tracked here.
+_active_pools: dict[Executor, int] = {}
 
 
 def pack_exception(e, dumps):
@@ -95,9 +98,11 @@ def get(
     pool = pool or config.get("pool", None)
     num_workers = num_workers or config.get("num_workers", None)
     thread = current_thread()
+    dask_pool = False
 
     with pools_lock:
         if pool is None:
+            dask_pool = True
             if num_workers is None and thread is main_thread:
                 if default_pool is None:
                     default_pool = ContextAwareThreadPoolExecutor(CPU_COUNT)
@@ -109,19 +114,29 @@ def get(
                 pool = ContextAwareThreadPoolExecutor(num_workers)
                 atexit.register(pool.shutdown)
                 pools[thread][num_workers] = pool
+            _active_pools[pool] = _active_pools.get(pool, 0) + 1
         elif isinstance(pool, multiprocessing.pool.Pool):
             pool = MultiprocessingPoolExecutor(pool)
 
-    results = get_async(
-        pool.submit,
-        pool._max_workers,
-        dsk,
-        keys,
-        cache=cache,
-        get_id=_thread_get_id,
-        pack_exception=pack_exception,
-        **kwargs,
-    )
+    try:
+        results = get_async(
+            pool.submit,
+            pool._max_workers,
+            dsk,
+            keys,
+            cache=cache,
+            get_id=_thread_get_id,
+            pack_exception=pack_exception,
+            **kwargs,
+        )
+    finally:
+        if dask_pool:
+            with pools_lock:
+                n = _active_pools[pool] - 1
+                if n:
+                    _active_pools[pool] = n
+                else:
+                    del _active_pools[pool]
 
     # Cleanup pools associated to dead threads
     with pools_lock:
@@ -129,7 +144,38 @@ def get(
         if thread is not main_thread:
             for t in list(pools):
                 if t not in active_threads:
-                    for p in pools.pop(t).values():
-                        p.shutdown()
+                    for num_workers, p in list(pools[t].items()):
+                        if p not in _active_pools:
+                            p.shutdown()
+                            del pools[t][num_workers]
+                    if not pools[t]:
+                        del pools[t]
 
     return results
+
+
+def shutdown_pools():
+    """Shut down idle thread pools created by dask.
+
+    This shuts down the default pool and any pools created on behalf of
+    short-lived threads, but only those that are not currently running a
+    computation. Pools that are still in use keep running and are left
+    untouched, as are any pools supplied by the caller through the ``pool``
+    keyword argument or the ``pool`` config option; those keep their own
+    lifecycle.
+
+    New pools will be transparently recreated on subsequent calls to
+    :func:`get` as needed.
+    """
+    global default_pool
+    with pools_lock:
+        if default_pool is not None and default_pool not in _active_pools:
+            default_pool.shutdown()
+            default_pool = None
+        for thread in list(pools):
+            for num_workers, pool in list(pools[thread].items()):
+                if pool not in _active_pools:
+                    pool.shutdown()
+                    del pools[thread][num_workers]
+            if not pools[thread]:
+                del pools[thread]

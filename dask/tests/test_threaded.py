@@ -103,6 +103,83 @@ def test_threaded_within_thread():
         assert time() < start + 5
 
 
+def test_shutdown_pools():
+    """Explicitly clean up idle dask-created pools while leaving busy pools
+    and caller-provided pools alone.
+
+    Two short-lived threads run overlapping computations on dask-created
+    pools. Cleanup is triggered while one computation is still running: the
+    running computation and the external pool must remain usable, while the
+    idle pool is shut down.
+    """
+    from dask.threaded import pools, shutdown_pools
+
+    # Clear out any idle pools left over from previous tests
+    shutdown_pools()
+
+    started = [threading.Event(), threading.Event()]
+    finish = [threading.Event(), threading.Event()]
+
+    def slow(i):
+        started[i].set()
+        finish[i].wait()
+        return i
+
+    results = [None, None]
+
+    def f(i):
+        results[i] = get({"x": (slow, i)}, "x", num_workers=2)
+
+    threads = [threading.Thread(target=f, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for e in started:
+        assert e.wait(timeout=10)
+
+    try:
+        with ThreadPoolExecutor(1) as external_pool:
+            # External pool works before the cleanup
+            assert get({"x": (inc, 1)}, "x", pool=external_pool) == 2
+
+            # Both computations are in flight; nothing is idle, so the
+            # cleanup must not shut anything down.
+            shutdown_pools()
+            assert len(pools) == 2
+
+            # Let the first computation finish; its pool becomes idle while
+            # the second computation is still running.
+            finish[0].set()
+            threads[0].join(timeout=10)
+            assert results[0] == 0
+
+            shutdown_pools()
+            # The idle pool of the finished thread is gone; the pool of the
+            # still-running computation survives.
+            assert len(pools) == 1
+            assert threads[1] in pools
+
+            # The external pool is untouched by the cleanup
+            assert get({"x": (inc, 1)}, "x", pool=external_pool) == 2
+
+            # The still-running computation completes normally
+            finish[1].set()
+            threads[1].join(timeout=10)
+            assert results[1] == 1
+
+            # Everything is idle now; a final cleanup empties the registry
+            shutdown_pools()
+            assert len(pools) == 0
+
+            # Pools are transparently recreated on demand
+            assert get({"x": (inc, 1)}, "x", num_workers=2) == 2
+    finally:
+        for e in finish:
+            e.set()
+        for t in threads:
+            t.join(timeout=10)
+        shutdown_pools()
+
+
 def test_dont_spawn_too_many_threads():
     before = threading.active_count()
 
