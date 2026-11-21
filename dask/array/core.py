@@ -2751,7 +2751,9 @@ class Array(DaskMethodsMixin):
             func, self, depth=depth, boundary=boundary, trim=trim, **kwargs
         )
 
-    def cumsum(self, axis, dtype=None, out=None, *, method="sequential"):
+    def cumsum(
+        self, axis, dtype=None, out=None, *, method="sequential", markers=None
+    ):
         """Return the cumulative sum of the elements along the given axis.
 
         Refer to :func:`dask.array.cumsum` for full documentation.
@@ -2762,7 +2764,9 @@ class Array(DaskMethodsMixin):
         """
         from dask.array.reductions import cumsum
 
-        return cumsum(self, axis, dtype, out=out, method=method)
+        return cumsum(
+            self, axis, dtype, out=out, method=method, markers=markers
+        )
 
     def cumprod(self, axis, dtype=None, out=None, *, method="sequential"):
         """Return the cumulative product of the elements along the given axis.

@@ -711,6 +711,193 @@ def test_array_cumreduction_out(func):
     assert_eq(x, func(np.ones((10, 10)), axis=0))
 
 
+def _segmented_cumsum_reference(a, markers, axis):
+    """Plain serial reference for a cumsum that restarts at markers."""
+    a_m = np.moveaxis(np.asarray(a), axis, 0)
+    m_m = np.moveaxis(np.asarray(markers, dtype=bool), axis, 0)
+    out = np.empty_like(a_m, dtype=np.result_type(a_m.dtype, np.int64))
+    lanes = np.ndindex(a_m.shape[1:]) if a_m.ndim > 1 else [()]
+    for lane in lanes:
+        sel = (slice(None),) + lane
+        run = 0
+        for k in range(a_m.shape[0]):
+            if m_m[sel][k]:
+                run = 0
+            run += a_m[sel][k]
+            out[sel][k] = run
+    return np.moveaxis(out, 0, axis)
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        (4, 4, 4),  # markers land on a block seam and inside blocks
+        (3, 3, 3, 3),
+        (5, 2, 5),
+        (12,),  # single block
+        (1, 1, 10),
+        (6, 0, 6),  # empty block in the middle
+        (0, 4, 4, 4),  # leading empty block
+    ],
+)
+def test_cumsum_markers_1d(method, chunks):
+    a = np.array([4, 2, -3, -1, 5, -2, -5, -5, -7, 3, 2, 5], dtype=float)
+    markers = np.zeros(12, dtype=bool)
+    markers[[0, 3, 8]] = True
+
+    d = da.from_array(a, chunks=chunks)
+    m = da.from_array(markers, chunks=chunks)
+    expected = _segmented_cumsum_reference(a, markers, 0)
+
+    result = da.cumsum(d, axis=0, markers=m, method=method)
+    assert_eq(result, expected)
+
+    # Same input convention for both scan methods: both must agree exactly.
+    other = "blelloch" if method == "sequential" else "sequential"
+    assert_eq(
+        da.cumsum(d, axis=0, markers=m, method=method),
+        da.cumsum(d, axis=0, markers=m, method=other),
+    )
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+@pytest.mark.parametrize("axis", [0, 1, -1, -2])
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        ((2, 2, 2), (3, 4)),
+        ((3, 3), (2, 2, 3)),
+        ((6,), (7,)),
+        ((1, 0, 5), (4, 0, 3)),  # empty blocks along either dimension
+    ],
+)
+def test_cumsum_markers_nd(method, axis, chunks):
+    rng = np.random.default_rng(123)
+    a = rng.integers(-4, 5, size=(6, 7)).astype(float)
+    markers = np.zeros((6, 7), dtype=bool)
+    # A full reset row (index 2 is a seam for chunks=(2, 2, 2)) plus isolated
+    # resets that fall in the middle of blocks.
+    markers[2, :] = True
+    markers[0, 4] = True
+    markers[5, 0] = True
+    markers[3, 6] = True
+
+    d = da.from_array(a, chunks=chunks)
+    m = da.from_array(markers, chunks=chunks)
+    expected = _segmented_cumsum_reference(a, markers, axis)
+
+    assert_eq(da.cumsum(d, axis=axis, markers=m, method=method), expected)
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+def test_cumsum_markers_axis_none(method):
+    rng = np.random.default_rng(7)
+    a = rng.integers(-3, 4, size=(3, 4)).astype(float)
+    markers = np.zeros(12, dtype=bool)
+    markers[[0, 5]] = True
+
+    d = da.from_array(a, chunks=(2, 2))
+    m = da.from_array(markers.reshape(3, 4), chunks=(2, 2))
+    # axis=None flattens the input, matching numpy's cumsum behaviour.
+    expected = _segmented_cumsum_reference(a.ravel(), markers, 0)
+
+    assert_eq(da.cumsum(d, markers=m, method=method), expected)
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+def test_cumsum_markers_empty(method):
+    # Empty axis with empty blocks.
+    a = np.empty((5, 0, 3))
+    markers = np.zeros((5, 0, 3), dtype=bool)
+    d = da.from_array(a, chunks=((2, 3), (0,), (1, 2)))
+    m = da.from_array(markers, chunks=((2, 3), (0,), (1, 2)))
+    result = da.cumsum(d, axis=1, markers=m, method=method)
+    assert result.shape == a.shape
+    assert_eq(result, a)
+
+
+@pytest.mark.parametrize("method", ["sequential", "blelloch"])
+def test_cumsum_markers_extreme_cases(method):
+    a = np.arange(12.0) - 6
+
+    # No markers at all: identical to the ordinary cumsum.
+    no_markers = da.zeros(12, chunks=4, dtype=bool)
+    x = da.from_array(a, chunks=4)
+    assert_eq(
+        da.cumsum(x, axis=0, markers=no_markers, method=method), np.cumsum(a)
+    )
+
+    # A marker on every element: the output equals the input.
+    all_markers = da.ones(12, chunks=4, dtype=bool)
+    assert_eq(
+        da.cumsum(x, axis=0, markers=all_markers, method=method), a
+    )
+
+    # Marker on the very first element only, sitting on the first block.
+    first = np.zeros(12, dtype=bool)
+    first[0] = True
+    assert_eq(
+        da.cumsum(
+            x, axis=0, markers=da.from_array(first, chunks=4), method=method
+        ),
+        np.cumsum(a),
+    )
+
+
+def test_cumsum_markers_none_keeps_original_graph():
+    x = da.arange(12, chunks=4)
+    # Without markers the pre-existing cumreduction graph must be used, for
+    # both scan methods.
+    for method in ["sequential", "blelloch"]:
+        assert_eq(da.cumsum(x, method=method), np.arange(12).cumsum())
+    assert da.cumsum(x).name.startswith("cumsum-")
+
+
+def test_cumsum_markers_dtype_and_method():
+    a = np.arange(12, dtype=np.int32)
+    markers = np.zeros(12, dtype=bool)
+    markers[6] = True
+    result = da.cumsum(
+        da.from_array(a, chunks=4),
+        axis=0,
+        markers=da.from_array(markers, chunks=4),
+        dtype=np.float64,
+    )
+    assert result.dtype == np.float64
+    assert_eq(
+        result,
+        _segmented_cumsum_reference(a, markers, 0).astype(np.float64),
+    )
+
+    with pytest.raises(ValueError, match="Invalid method"):
+        da.cumsum(
+            da.from_array(a, chunks=4),
+            markers=da.from_array(markers, chunks=4),
+            method="not-a-method",
+        )
+
+
+def test_cumsum_markers_validation_and_rechunk():
+    a = np.arange(12.0)
+    markers = np.zeros(11, dtype=bool)
+    with pytest.raises(ValueError, match="same shape"):
+        da.cumsum(da.from_array(a, chunks=4), markers=da.from_array(markers))
+
+    # Mismatched chunking is rechunked automatically to match the data.
+    markers = np.zeros(12, dtype=bool)
+    markers[6] = True
+    result = da.cumsum(
+        da.from_array(a, chunks=4), markers=da.from_array(markers, chunks=6)
+    )
+    assert_eq(result, _segmented_cumsum_reference(a, markers, 0))
+
+    # The Array method exposes the same keyword.
+    result = da.from_array(a, chunks=4).cumsum(
+        0, markers=da.from_array(markers, chunks=4)
+    )
+    assert_eq(result, _segmented_cumsum_reference(a, markers, 0))
+
+
 @pytest.mark.parametrize(
     "npfunc,daskfunc", [(np.sort, da.topk), (np.argsort, da.argtopk)]
 )

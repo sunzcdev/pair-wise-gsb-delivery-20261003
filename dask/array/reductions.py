@@ -1292,9 +1292,267 @@ def _cumprod_merge(a, b):
     return a * b
 
 
+# ---------------------------------------------------------------------------
+# Segmented (reset-on-marker) cumsum
+#
+# Both the sequential and the Blelloch implementations use the exact same
+# per-block input convention.  Every block produces:
+#
+#   out       : local segmented cumsum, i.e. cumsum that restarts at every
+#               marker position (the marked element itself starts a new
+#               segment and contributes its own value)
+#   trailing  : sum of the elements in the open segment after the last reset,
+#               with keepdims semantics along ``axis``.  For a block without
+#               any marker this is simply the sum of the whole block.
+#   has_marker : bool (keepdims along ``axis``) telling whether the block
+#               contains at least one marker
+#
+# The state exchanged between blocks therefore only describes the segment
+# opened by the *last* reset.  Combining two neighbouring summaries
+# ``(t1, m1)`` and ``(t2, m2)`` is an associative monoid with identity
+# ``(zeros, False)``:
+#
+#   trailing   = t2                       if block 2 contains a reset
+#              = t1 + t2                  otherwise
+#   has_marker = m1 or m2
+#
+# Once the prefix summary of every preceding block is known it is only added
+# to the elements preceding the first marker inside the current block: a
+# marker discards any carried state.
+# ---------------------------------------------------------------------------
+
+
+def _segmented_cumsum_block(x, markers, axis, dtype):
+    """Local segmented cumsum of a single block.
+
+    Returns ``(out, trailing, has_marker)`` where ``trailing`` and
+    ``has_marker`` keep a singleton dimension along ``axis``.  See the module
+    level note above for the exact semantics.
+    """
+    markers = markers.astype(bool, copy=False)
+    if x.shape[axis] == 0:
+        # An empty block behaves like the monoid identity.
+        trailing = np.sum(x, axis=axis, dtype=dtype, keepdims=True)
+        has_marker = np.any(markers, axis=axis, keepdims=True)
+        return x, trailing, has_marker
+
+    move = np.arange(x.shape[axis]).reshape(
+        (1,) * axis + (-1,) + (1,) * (x.ndim - axis - 1)
+    )
+    # Index of the last marker at or before each position, -1 when there is
+    # none.  Using indices (rather than a running sum of flags) keeps the
+    # algorithm valid for inputs with negative values.
+    last_marker = np.where(markers, move, -1)
+    last_marker = np.maximum.accumulate(last_marker, axis=axis)
+
+    cumsum_full = np.cumsum(x, axis=axis, dtype=dtype)
+    # Cumulative value immediately before each position, i.e. cumsum shifted
+    # by one.  The value at a marker position is therefore excluded from the
+    # running segment sum.
+    pre_cumsum = cumsum_full - x
+    # Negative indices below wrap around, but those entries are discarded by
+    # the ``np.where`` on ``last_marker >= 0`` afterwards.
+    marker_baseline = np.take_along_axis(pre_cumsum, last_marker, axis=axis)
+    baseline = np.where(
+        last_marker >= 0, marker_baseline, np.array(0, dtype=dtype)
+    )
+    out = cumsum_full - baseline
+
+    slc = (slice(None),) * axis + (slice(-1, None),) + (
+        slice(None),
+    ) * (x.ndim - axis - 1)
+    trailing = out[slc]
+    has_marker = np.any(markers, axis=axis, keepdims=True)
+    return out, trailing, has_marker
+
+
+def _segmented_cumsum_summary_tuple(block):
+    """Extract the cross-block summary from a block result."""
+    return block[1], block[2]
+
+
+def _segmented_cumsum_summary(a, b):
+    """Combine two adjacent block summaries (the monoid product)."""
+    trailing_a, marker_a = a
+    trailing_b, marker_b = b
+    trailing = np.where(marker_b, trailing_b, trailing_a + trailing_b)
+    has_marker = np.logical_or(marker_a, marker_b)
+    return trailing, has_marker
+
+
+def _segmented_cumsum_apply(prefix, x, markers, axis):
+    """Add the prefix summary carried from preceding blocks.
+
+    The carry only reaches elements before the first marker of this block;
+    from the first marker onwards the block already started a fresh segment.
+    """
+    if x.shape[axis] == 0:
+        return x
+    markers = markers.astype(bool, copy=False)
+    move = np.arange(x.shape[axis]).reshape(
+        (1,) * axis + (-1,) + (1,) * (x.ndim - axis - 1)
+    )
+    first_marker = np.where(markers, move, x.shape[axis])
+    first_marker = np.minimum.accumulate(first_marker, axis=axis)
+    # The carry reaches a position only when no marker occurs at or before it.
+    # In particular a marker sitting on the block boundary (position 0)
+    # discards the carried state as well.
+    before_first = first_marker > move
+    trailing, _ = prefix
+    return np.where(before_first, x + trailing, x)
+
+
+def _segmented_cumsum_graph(x, markers, axis, dtype, method):
+    """Build the task graph for a segmented cumsum.
+
+    ``x`` and ``markers`` already share the same chunking and the (possibly
+    flattened) axis is a positive integer.
+    """
+    name = f"segmented-cumsum-{tokenize(x, markers, axis, dtype, method)}"
+    base_key = (name,)
+    n = x.numblocks[axis]
+
+    full_indices = [
+        list(
+            product(
+                *[range(nb) if j != axis else [i] for j, nb in enumerate(x.numblocks)]
+            )
+        )
+        for i in range(n)
+    ]
+
+    dsk = {}
+    summary_keys = []
+    local_keys = []
+    for i, indices in enumerate(full_indices):
+        block_keys = []
+        local_block_keys = []
+        for index in indices:
+            block_key = base_key + ("block",) + index
+            dsk[block_key] = (
+                _segmented_cumsum_block,
+                (x.name,) + index,
+                (markers.name,) + index,
+                axis,
+                dtype,
+            )
+            # First element of the block tuple is the local segmented cumsum.
+            local_key = base_key + ("local",) + index
+            dsk[local_key] = (operator.getitem, block_key, 0)
+            local_block_keys.append(local_key)
+            summary_key = base_key + ("summary",) + index
+            dsk[summary_key] = (
+                _segmented_cumsum_summary_tuple,
+                block_key,
+            )
+            block_keys.append(summary_key)
+        summary_keys.append(block_keys)
+        local_keys.append(local_block_keys)
+
+    if method == "sequential":
+        # prefix_keys[i] holds the summary of all blocks strictly before i.
+        prefix_keys = []
+        for i in range(1, n):
+            current = []
+            for j, index in enumerate(full_indices[i]):
+                key = base_key + ("prefix",) + index
+                if i == 1:
+                    dsk[key] = summary_keys[0][j]
+                else:
+                    dsk[key] = (
+                        _segmented_cumsum_summary,
+                        prefix_keys[-1][j],
+                        summary_keys[i - 1][j],
+                    )
+                current.append(key)
+            prefix_keys.append(current)
+    elif method == "blelloch":
+        # Exclusive prefix scan over the block summaries using the Brent-Kung
+        # upsweep/downsweep pattern; the merge itself is the summary monoid.
+        prefix_keys = [[None] * len(indices) for indices in full_indices]
+        working = [list(keys) for keys in summary_keys]
+        level = 0
+        if n >= 2:
+            # Upsweep
+            stride = 1
+            stride2 = 2
+            while stride2 <= n:
+                for i in range(stride2 - 1, n, stride2):
+                    new_vals = []
+                    for j, index in enumerate(full_indices[i]):
+                        key = base_key + ("tree",) + index + (level, i)
+                        dsk[key] = (
+                            _segmented_cumsum_summary,
+                            working[i - stride][j],
+                            working[i][j],
+                        )
+                        new_vals.append(key)
+                    working[i] = new_vals
+                stride = stride2
+                stride2 *= 2
+                level += 1
+
+            # Downsweep.  Mirror the stride bookkeeping of
+            # ``prefixscan_blelloch`` where the number of batches is n - 1.
+            half = (n - 1) // 2
+            stride2 = (
+                builtins.max(2, 2 ** math.ceil(math.log2(half)))
+                if half > 0
+                else 2
+            )
+            stride = stride2 // 2
+            while stride > 0:
+                for i in range(stride2 + stride - 1, n, stride2):
+                    new_vals = []
+                    for j, index in enumerate(full_indices[i]):
+                        key = base_key + ("tree",) + index + (level, i)
+                        dsk[key] = (
+                            _segmented_cumsum_summary,
+                            working[i - stride][j],
+                            working[i][j],
+                        )
+                        new_vals.append(key)
+                    working[i] = new_vals
+                stride2 = stride
+                stride //= 2
+                level += 1
+
+            # working[i] now holds the inclusive prefix through block i, so the
+            # exclusive prefix for block i is the inclusive prefix through i-1.
+            for i in range(1, n):
+                for j in range(len(full_indices[i])):
+                    prefix_keys[i][j] = working[i - 1][j]
+    else:  # pragma: no cover - validated by the public entry point
+        raise ValueError(
+            f'Invalid method for cumsum.  Expected "sequential" or '
+            f'"blelloch".  Got: {method!r}'
+        )
+
+    # The first block needs no carried state; every following block gets the
+    # summary of all preceding blocks applied to its local segmented cumsum.
+    for j, index in enumerate(full_indices[0]):
+        dsk[base_key + index] = local_keys[0][j]
+    for i in range(1, n):
+        for j, index in enumerate(full_indices[i]):
+            dsk[base_key + index] = (
+                _segmented_cumsum_apply,
+                prefix_keys[i - 1 if method == "sequential" else i][j],
+                local_keys[i][j],
+                (markers.name,) + index,
+                axis,
+            )
+
+    graph = HighLevelGraph.from_collections(
+        name, dsk, dependencies=[x, markers]
+    )
+    return Array(graph, name, x.chunks, dtype=dtype, meta=x._meta)
+
+
 @derived_from(np)
-def cumsum(x, axis=None, dtype=None, out=None, method="sequential"):
-    """Dask added an additional keyword-only argument ``method``.
+def cumsum(
+    x, axis=None, dtype=None, out=None, method="sequential", *, markers=None
+):
+    """Dask added an additional keyword-only arguments ``method`` and ``markers``.
 
     method : {'sequential', 'blelloch'}, optional
         Choose which method to use to perform the cumsum.  Default is 'sequential'.
@@ -1304,18 +1562,60 @@ def cumsum(x, axis=None, dtype=None, out=None, method="sequential"):
           first taking the sum of each block and combines the sums via a binary tree.
           This method may be faster or more memory efficient depending on workload,
           scheduler, and hardware.  More benchmarking is necessary.
+
+    markers : dask array or array-like of bool, optional
+        Boolean array with the same shape as ``x``.  Wherever ``markers`` is
+        ``True`` the cumulative sum restarts at that element along ``axis``:
+        the marked element begins a brand new segment and only contributes its
+        own value.  Markers may fall in the middle of a block or exactly on a
+        block boundary; the state exchanged between blocks always belongs to
+        the segment opened by the last reset.  When ``markers`` is ``None``
+        (the default) the ordinary cumulative sum graph is built.
     """
-    return cumreduction(
-        np.cumsum,
-        _cumsum_merge,
-        0,
-        x,
-        axis,
-        dtype,
-        out=out,
-        method=method,
-        preop=np.sum,
-    )
+    if markers is None:
+        return cumreduction(
+            np.cumsum,
+            _cumsum_merge,
+            0,
+            x,
+            axis,
+            dtype,
+            out=out,
+            method=method,
+            preop=np.sum,
+        )
+
+    if method not in ("sequential", "blelloch"):
+        raise ValueError(
+            f'Invalid method for cumsum.  Expected "sequential" or '
+            f'"blelloch".  Got: {method!r}'
+        )
+
+    markers = da.asarray(markers)
+    if markers.shape != x.shape:
+        raise ValueError(
+            "markers must have the same shape as the input array.  "
+            f"Got markers shape {markers.shape} and array shape {x.shape}."
+        )
+
+    if axis is None:
+        if x.ndim > 1:
+            x = x.flatten().rechunk(chunks=x.npartitions)
+        markers = markers.flatten().rechunk(chunks=x.chunks)
+        axis = 0
+    else:
+        assert isinstance(axis, Integral)
+        axis = validate_axis(axis, x.ndim)
+        if markers.chunks != x.chunks:
+            markers = markers.rechunk(x.chunks)
+
+    if dtype is None:
+        dtype = getattr(
+            np.cumsum(np.ones((0,), dtype=x.dtype)), "dtype", object
+        )
+
+    result = _segmented_cumsum_graph(x, markers, axis, dtype, method)
+    return handle_out(out, result)
 
 
 @derived_from(np)
