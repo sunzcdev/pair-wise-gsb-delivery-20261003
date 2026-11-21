@@ -98,6 +98,19 @@ class Middleware:
     def before_delay_message(self, broker: Broker, message: MessageProxy) -> None:
         """Called before a message has been delayed in worker memory."""
 
+    def after_enqueue_work_queue(self, broker: Broker, message: MessageProxy) -> None:
+        """Called after a message has been pushed onto the worker's
+        local work queue.  This is the point at which the message has
+        been claimed by this worker and starts waiting for a worker
+        thread to pick it up.
+        """
+
+    def after_requeue_work_queue(self, broker: Broker, message: MessageProxy) -> None:
+        """Called after a message that was sitting on the worker's
+        local work queue has been handed back to the broker during
+        worker shutdown, without having been executed.
+        """
+
     def before_process_message(self, broker: Broker, message: MessageProxy) -> None:
         """Called before a message is processed.
 

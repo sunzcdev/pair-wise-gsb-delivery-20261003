@@ -49,6 +49,7 @@ class Prometheus(Middleware):
         self.logger = get_logger(__name__, type(self))
         self.delayed_messages: set[str] = set()
         self.message_start_times: dict[str, int] = {}
+        self.work_queue_start_times: dict[str, int] = {}
 
     @property
     def forks(self):
@@ -101,6 +102,46 @@ class Prometheus(Middleware):
             ["queue_name", "actor_name"],
             registry=registry,
         )
+        self.inprogress_work_queue_messages = prom.Gauge(
+            "dramatiq_work_queue_messages_inprogress",
+            "The number of messages claimed by this worker and waiting on its local work queue.",
+            ["queue_name", "actor_name"],
+            registry=registry,
+            multiprocess_mode="livesum",
+        )
+        self.total_requeued_work_queue_messages = prom.Counter(
+            "dramatiq_work_queue_requeues_total",
+            "The total number of messages handed back to the broker from the local work queue during worker shutdown.",
+            ["queue_name", "actor_name"],
+            registry=registry,
+        )
+        self.work_queue_wait_durations = prom.Histogram(
+            "dramatiq_work_queue_wait_milliseconds",
+            "The time messages spent waiting on the worker's local work queue before execution.",
+            ["queue_name", "actor_name"],
+            buckets=(
+                5,
+                10,
+                25,
+                50,
+                75,
+                100,
+                250,
+                500,
+                750,
+                1000,
+                2500,
+                5000,
+                7500,
+                10000,
+                30000,
+                60000,
+                600000,
+                900000,
+                float("inf"),
+            ),
+            registry=registry,
+        )
         self.message_durations = prom.Histogram(
             "dramatiq_message_duration_milliseconds",
             "The time spent processing messages.",
@@ -149,11 +190,27 @@ class Prometheus(Middleware):
         self.delayed_messages.add(message.message_id)
         self.inprogress_delayed_messages.labels(*labels).inc()
 
+    def after_enqueue_work_queue(self, broker, message):
+        labels = (message.queue_name, message.actor_name)
+        self.work_queue_start_times[message.message_id] = current_millis()
+        self.inprogress_work_queue_messages.labels(*labels).inc()
+
+    def after_requeue_work_queue(self, broker, message):
+        labels = (message.queue_name, message.actor_name)
+        self.work_queue_start_times.pop(message.message_id, None)
+        self.inprogress_work_queue_messages.labels(*labels).dec()
+        self.total_requeued_work_queue_messages.labels(*labels).inc()
+
     def before_process_message(self, broker, message):
         labels = (message.queue_name, message.actor_name)
         if message.message_id in self.delayed_messages:
             self.delayed_messages.remove(message.message_id)
             self.inprogress_delayed_messages.labels(*labels).dec()
+
+        work_queue_start_time = self.work_queue_start_times.pop(message.message_id, None)
+        if work_queue_start_time is not None:
+            self.inprogress_work_queue_messages.labels(*labels).dec()
+            self.work_queue_wait_durations.labels(*labels).observe(current_millis() - work_queue_start_time)
 
         self.inprogress_messages.labels(*labels).inc()
         self.message_start_times[message.message_id] = current_millis()

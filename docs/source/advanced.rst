@@ -394,6 +394,21 @@ The following metrics are exported:
 ``dramatiq_delayed_messages_inprogress``
   A *gauge* for the number of delayed messages currently in memory.
 
+``dramatiq_work_queue_messages_inprogress``
+  A *gauge* for the number of messages that have been claimed by this
+  worker and are waiting on its local work queue.  These messages no
+  longer show up as broker backlog, but they haven't started executing
+  yet.
+
+``dramatiq_work_queue_requeues_total``
+  A *counter* for the total number of messages handed back to the
+  broker from the local work queue during worker shutdown.
+
+``dramatiq_work_queue_wait_milliseconds``
+  A *histogram* for the time messages spent waiting on the worker's
+  local work queue, measured from the moment they were pushed onto it
+  to the moment execution started.
+
 ``dramatiq_message_duration_milliseconds``
   A *histogram* for the time spent processing messages.
 

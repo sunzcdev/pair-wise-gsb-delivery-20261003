@@ -171,6 +171,7 @@ class Worker:
         messages_by_queue = defaultdict(list)
         for item in iter_queue(self.work_queue):
             messages_by_queue[item.message.queue_name].append(item.message)
+            self.broker.emit_after("requeue_work_queue", item.message)
 
         for queue_name, messages in messages_by_queue.items():
             try:
@@ -387,6 +388,7 @@ class ConsumerThread(Thread):
                 actor = self.broker.get_actor(message.actor_name)
                 self.logger.debug("Pushing message %r onto work queue.", message.message_id)
                 self.work_queue.put(_WorkQueueItem(actor.priority, message))
+                self.broker.emit_after("enqueue_work_queue", message)
         except ActorNotFound as e:
             self.logger.error(
                 "Received message for undefined actor %r. Moving it to the DLQ.",
