@@ -17,7 +17,7 @@ from .._models import (
     enforce_url,
 )
 from .._ssl import default_ssl_context
-from .._synchronization import AsyncLock
+from .._synchronization import AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
 from .connection import AsyncHTTPConnection
 from .connection_pool import AsyncConnectionPool
@@ -298,46 +298,63 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
 
                 stream = connect_response.extensions["network_stream"]
 
-                # Upgrade the stream to SSL
-                ssl_context = (
-                    default_ssl_context()
-                    if self._ssl_context is None
-                    else self._ssl_context
-                )
-                alpn_protocols = ["http/1.1", "h2"] if self._http2 else ["http/1.1"]
-                ssl_context.set_alpn_protocols(alpn_protocols)
-
-                kwargs = {
-                    "ssl_context": ssl_context,
-                    "server_hostname": self._remote_origin.host.decode("ascii"),
-                    "timeout": timeout,
-                }
-                async with Trace("start_tls", logger, request, kwargs) as trace:
-                    stream = await stream.start_tls(**kwargs)
-                    trace.return_value = stream
-
-                # Determine if we should be using HTTP/1.1 or HTTP/2
-                ssl_object = stream.get_extra_info("ssl_object")
-                http2_negotiated = (
-                    ssl_object is not None
-                    and ssl_object.selected_alpn_protocol() == "h2"
-                )
-
-                # Create the HTTP/1.1 or HTTP/2 connection
-                if http2_negotiated or (self._http2 and not self._http1):
-                    from .http2 import AsyncHTTP2Connection
-
-                    self._connection = AsyncHTTP2Connection(
-                        origin=self._remote_origin,
-                        stream=stream,
-                        keepalive_expiry=self._keepalive_expiry,
+                # Once the proxy has accepted the CONNECT the underlying stream has
+                # been handed over from the HTTP/1.1 proxy connection to the tunnel.
+                # From this point on nobody else owns it, so if the TLS upgrade or
+                # the new protocol connection fails to initialise (including a task
+                # cancellation), we must close the stream ourselves to avoid
+                # leaking the open socket. On success ownership is transferred to
+                # the new HTTP/1.1 or HTTP/2 connection, which is solely
+                # responsible for closing the stream from then on.
+                try:
+                    # Upgrade the stream to SSL
+                    ssl_context = (
+                        default_ssl_context()
+                        if self._ssl_context is None
+                        else self._ssl_context
                     )
-                else:
-                    self._connection = AsyncHTTP11Connection(
-                        origin=self._remote_origin,
-                        stream=stream,
-                        keepalive_expiry=self._keepalive_expiry,
+                    alpn_protocols = (
+                        ["http/1.1", "h2"] if self._http2 else ["http/1.1"]
                     )
+                    ssl_context.set_alpn_protocols(alpn_protocols)
+
+                    kwargs = {
+                        "ssl_context": ssl_context,
+                        "server_hostname": self._remote_origin.host.decode("ascii"),
+                        "timeout": timeout,
+                    }
+                    async with Trace("start_tls", logger, request, kwargs) as trace:
+                        stream = await stream.start_tls(**kwargs)
+                        trace.return_value = stream
+
+                    # Determine if we should be using HTTP/1.1 or HTTP/2
+                    ssl_object = stream.get_extra_info("ssl_object")
+                    http2_negotiated = (
+                        ssl_object is not None
+                        and ssl_object.selected_alpn_protocol() == "h2"
+                    )
+
+                    # Create the HTTP/1.1 or HTTP/2 connection
+                    if http2_negotiated or (self._http2 and not self._http1):
+                        from .http2 import AsyncHTTP2Connection
+
+                        self._connection = AsyncHTTP2Connection(
+                            origin=self._remote_origin,
+                            stream=stream,
+                            keepalive_expiry=self._keepalive_expiry,
+                        )
+                    else:
+                        self._connection = AsyncHTTP11Connection(
+                            origin=self._remote_origin,
+                            stream=stream,
+                            keepalive_expiry=self._keepalive_expiry,
+                        )
+                except BaseException:
+                    # The tunnel never finished initialising, so make sure the
+                    # upgraded stream is closed before the exception propagates.
+                    with AsyncShieldCancellation():
+                        await stream.aclose()
+                    raise
 
                 self._connected = True
         return await self._connection.handle_async_request(request)

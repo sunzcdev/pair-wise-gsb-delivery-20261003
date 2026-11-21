@@ -276,3 +276,108 @@ def test_proxy_headers():
     assert proxy.headers == [
         (b"Proxy-Authorization", b"Basic dXNlcm5hbWU6cGFzc3dvcmQ=")
     ]
+
+
+class TLSInitError(Exception):
+    pass
+
+
+class CloseTrackingMockStream(AsyncMockStream):
+    """
+    A mock stream that keeps track of how many times it has been closed.
+    """
+
+    def __init__(self, buffer: list[bytes], http2: bool = False) -> None:
+        super().__init__(buffer, http2=http2)
+        self.close_count = 0
+
+    async def aclose(self) -> None:
+        self.close_count += 1
+        await super().aclose()
+
+
+class FailingStartTLSStream(CloseTrackingMockStream):
+    """
+    Fails the TLS upgrade the first time it is attempted, while still recording
+    that the underlying stream gets closed as part of the cleanup.
+    """
+
+    async def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: typing.Optional[str] = None,
+        timeout: typing.Optional[float] = None,
+    ) -> AsyncNetworkStream:
+        raise TLSInitError("TLS upgrade failed")
+
+
+class StartTLSThenOKBackend(AsyncMockBackend):
+    """
+    The first connection fails its TLS upgrade, every subsequent connection
+    upgrades successfully and behaves like a normal mock stream.
+    """
+
+    def __init__(self, buffer: list[bytes], http2: bool = False) -> None:
+        super().__init__(buffer, http2=http2)
+        self.streams: list[CloseTrackingMockStream] = []
+        self._connect_attempts = 0
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: typing.Optional[float] = None,
+        local_address: typing.Optional[str] = None,
+        socket_options: typing.Optional[typing.Iterable[SOCKET_OPTION]] = None,
+    ) -> AsyncNetworkStream:
+        self._connect_attempts += 1
+        if self._connect_attempts == 1:
+            stream: CloseTrackingMockStream = FailingStartTLSStream(
+                list(self._buffer), http2=self._http2
+            )
+        else:
+            stream = CloseTrackingMockStream(list(self._buffer), http2=self._http2)
+        self.streams.append(stream)
+        return stream
+
+
+@pytest.mark.anyio
+async def test_proxy_tunneling_closes_stream_when_tls_fails():
+    """
+    If the tunneled stream fails to initialise the next protocol layer, the
+    underlying stream must be closed rather than leaked, and the same pool must
+    still be able to establish a fresh tunnel afterwards.
+    """
+    network_backend = StartTLSThenOKBackend(
+        [
+            # The initial response to the proxy CONNECT
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            # The actual response from the remote server
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    async with AsyncConnectionPool(
+        proxy=Proxy("http://localhost:8080/"),
+        network_backend=network_backend,
+    ) as proxy:
+        # The first tunnel is accepted by the proxy, but the TLS upgrade fails.
+        with pytest.raises(TLSInitError):
+            await proxy.request("GET", "https://example.com/")
+
+        # The stream of the failed tunnel must have been closed exactly once.
+        assert len(network_backend.streams) == 1
+        assert network_backend.streams[0].close_count == 1
+
+        # The tunnel never finished initialising (`_connected` is still False),
+        # so a second request through the same pool establishes a fresh tunnel.
+        response = await proxy.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert len(network_backend.streams) == 2
+        assert network_backend.streams[0].close_count == 1
+        assert network_backend.streams[1].close_count == 0
