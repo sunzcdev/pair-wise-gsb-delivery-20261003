@@ -35,6 +35,7 @@ from typing import (
 
 from .asyncio import async_to_sync
 from .broker import Broker, get_broker
+from .contracts import MessageContract
 from .logging import get_logger
 from .message import Message
 
@@ -73,6 +74,12 @@ class Actor(Generic[P, R]):
     ) -> None:
         if actor_name in broker.actors:
             raise ValueError(f"An actor named {actor_name!r} is already registered.")
+
+        # Normalize any declared message contract up front so that
+        # invalid contracts fail at declaration time.
+        contract = options.get("contract")
+        if contract is not None and not isinstance(contract, MessageContract):
+            options["contract"] = MessageContract(contract)
 
         self.logger = get_logger(fn.__module__ or "_", actor_name)
         self.fn: Callable[P, R] = async_to_sync(fn) if iscoroutinefunction(fn) else fn  # type: ignore[assignment]
@@ -284,6 +291,9 @@ def actor(
       broker(Broker): The broker to use with this actor.
       **options: Arbitrary options that vary with the set of
         middleware that you use.  See ``get_broker().actor_options``.
+        The built-in ``contract`` option may be used to declare a
+        :class:`MessageContract<dramatiq.MessageContract>` describing
+        the message arguments this actor is compatible with.
 
     Returns:
       Actor: The decorated function.

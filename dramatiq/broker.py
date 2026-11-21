@@ -99,7 +99,10 @@ class Broker:
         self.queues: Any = {}  # Subclasses make this a set!
         self.delay_queues: set[str] = set()
 
-        self.actor_options: set[str] = set()
+        # The "contract" option is built in: it is enforced by the
+        # broker itself (see validate_message_contract) rather than by
+        # any particular middleware.
+        self.actor_options: set[str] = {"contract"}
         self.middleware: list[Middleware] = []
 
         if middleware is None:
@@ -284,6 +287,32 @@ class Broker:
           on this Broker.
         """
         return self.delay_queues.copy()
+
+    def validate_message_contract(self, message: Message) -> Message:
+        """Check a message against the message contract declared by
+        its actor, if any.  Brokers call this when a message enters
+        them, so both regular sends and retries (which re-enqueue the
+        message) are validated at admission time.
+
+        Actors that don't declare a ``contract`` option accept any
+        arguments, exactly as before.  Messages for actors that aren't
+        declared on this broker are not checked either.
+
+        Raises:
+          MessageContractError: If the message's arguments don't
+            satisfy any of the actor's declared contract versions.
+
+        Parameters:
+          message(Message): The message to validate.
+
+        Returns:
+          Message: The message that was passed in.
+        """
+        actor = self.actors.get(message.actor_name)
+        contract = actor.options.get("contract") if actor is not None else None
+        if contract is not None:
+            contract.validate(message.actor_name, args=message.args, kwargs=message.kwargs)
+        return message
 
     def get_results_backend(self) -> ResultBackend:
         """Get the backend of the Results middleware.

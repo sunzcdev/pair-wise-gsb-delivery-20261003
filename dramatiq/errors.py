@@ -52,6 +52,24 @@ class QueueNotFound(BrokerError):
     """Raised when a message is sent to an queue that hasn't been declared."""
 
 
+class MessageContractError(BrokerError):
+    """Raised when a message's arguments don't satisfy any of the
+    contract versions declared by the actor the message is sent to.
+
+    Attributes:
+      actor_name(str): The name of the actor the message was meant for.
+      missing(list): The required parameters of the actor's current
+        contract version that the message doesn't provide, as
+        ``(position, name)`` pairs.  ``position`` is ``None`` for
+        keyword-only parameters.
+    """
+
+    def __init__(self, message, actor_name=None, missing=None):  # noqa: B042
+        super().__init__(message)
+        self.actor_name = actor_name
+        self.missing = missing or []
+
+
 class QueueJoinTimeout(DramatiqError):
     """Raised by brokers that support joining on queues when the join
     operation times out.

@@ -105,7 +105,11 @@ class StubBroker(Broker):
         Raises:
           QueueNotFound: If the queue the message is being enqueued on
             doesn't exist.
+          MessageContractError: If the message's arguments don't
+            satisfy the contract declared by its actor.
         """
+        self.validate_message_contract(message)
+
         queue_name = message.queue_name
         if delay is not None:
             queue_name = dq_name(queue_name)

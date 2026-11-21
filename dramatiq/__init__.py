@@ -22,6 +22,7 @@ import warnings
 from .actor import Actor, actor
 from .broker import Broker, Consumer, MessageProxy, get_broker, set_broker
 from .composition import group, pipeline
+from .contracts import MessageContract
 from .encoder import Encoder, JSONEncoder, PickleEncoder
 from .errors import (
     ActorNotFound,
@@ -31,6 +32,7 @@ from .errors import (
     ConnectionFailed,
     DecodeError,
     DramatiqError,
+    MessageContractError,
     QueueJoinTimeout,
     QueueNotFound,
     RateLimitExceeded,
@@ -56,6 +58,8 @@ __all__ = [
     # Composition
     "group",
     "pipeline",
+    # Contracts
+    "MessageContract",
     # Encoding
     "Encoder",
     "JSONEncoder",
@@ -65,6 +69,7 @@ __all__ = [
     "BrokerError",
     "DecodeError",
     "ActorNotFound",
+    "MessageContractError",
     "QueueNotFound",
     "QueueJoinTimeout",
     "BrokerConnectionError",

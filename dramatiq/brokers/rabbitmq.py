@@ -362,7 +362,11 @@ class RabbitmqBroker(Broker):
         Raises:
           ConnectionClosed: If the underlying channel or connection
             has been closed.
+          MessageContractError: If the message's arguments don't
+            satisfy the contract declared by its actor.
         """
+        self.validate_message_contract(message)
+
         canonical_queue_name = message.queue_name
         queue_name = canonical_queue_name
 

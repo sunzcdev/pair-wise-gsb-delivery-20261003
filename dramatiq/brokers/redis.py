@@ -157,7 +157,11 @@ class RedisBroker(Broker):
 
         Raises:
           ValueError: If ``delay`` is longer than 7 days.
+          MessageContractError: If the message's arguments don't
+            satisfy the contract declared by its actor.
         """
+        self.validate_message_contract(message)
+
         queue_name = message.queue_name
 
         # Each enqueued message must have a unique id in Redis so
