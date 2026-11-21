@@ -66,7 +66,17 @@ class Cache(MutableMapping[_KT, _VT]):
     def getsizeof(value: _VT) -> float: ...
 
 class FIFOCache(Cache[_KT, _VT]): ...
-class LFUCache(Cache[_KT, _VT]): ...
+
+class LFUCache(Cache[_KT, _VT]):
+    def __init__(
+        self,
+        maxsize: float,
+        getsizeof: Callable[[_VT], float] | None = None,
+        *,
+        decay_interval: int | None = None,
+        decay_factor: float = 0.5,
+    ) -> None: ...
+
 class LRUCache(Cache[_KT, _VT]): ...
 
 class RRCache(Cache[_KT, _VT]):

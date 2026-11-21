@@ -98,7 +98,7 @@ inserted into the cache.
    like a re-insertion, i.e. deleting the item followed by an insert,
    and therefore will reset the item's position in the cache.
 
-.. autoclass:: LFUCache(maxsize, getsizeof=None)
+.. autoclass:: LFUCache(maxsize, getsizeof=None, *, decay_interval=None, decay_factor=0.5)
    :members: popitem
 
    This class counts how often an item is retrieved, and discards the
@@ -108,6 +108,14 @@ inserted into the cache.
    Inserting or updating a cache item via :meth:`LFUCache.__setitem__`
    also counts as a use of the item; an update will increment the
    item's use count.
+
+   If `decay_interval` is given, all use counts are multiplied by
+   `decay_factor`, rounded down to a minimum of 1, after every
+   `decay_interval` uses of the cache.  This lets items that have
+   become popular only recently catch up with items that accumulated
+   high use counts in the past.  Use counts are decayed in a single
+   pass when the interval is reached, so cache hits in between remain
+   O(1), and ties are still broken by least recent use.
 
    .. versionchanged:: 7.3
 

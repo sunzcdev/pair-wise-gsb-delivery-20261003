@@ -247,8 +247,18 @@ class LFUCache(Cache):
             prev.next = next
             next.prev = prev
 
-    def __init__(self, maxsize, getsizeof=None):
+    def __init__(
+        self, maxsize, getsizeof=None, *, decay_interval=None, decay_factor=0.5
+    ):
         Cache.__init__(self, maxsize, getsizeof)
+        if decay_interval is not None:
+            if decay_interval < 1:
+                raise ValueError("decay_interval must be positive")
+            if not 0 < decay_factor < 1:
+                raise ValueError("decay_factor must be between 0 and 1")
+        self.__decay_interval = decay_interval
+        self.__decay_factor = decay_factor
+        self.__uses = 0
         self.__root = root = LFUCache._Link(0)  # sentinel
         root.prev = root.next = root
         self.__links = {}
@@ -264,6 +274,13 @@ class LFUCache(Cache):
         if key in self.__links:
             self.__touch(key)
             return
+        interval = self.__decay_interval
+        if interval is not None:
+            uses = self.__uses + 1
+            if uses >= interval:
+                self.__decay()
+                uses = 0
+            self.__uses = uses
         root = self.__root
         link = root.next
         if link.count != 1:
@@ -319,9 +336,17 @@ class LFUCache(Cache):
         root = self.__root
         root.prev = root.next = root
         self.__links.clear()
+        self.__uses = 0
 
     def __touch(self, key):
         """Increment use count."""
+        interval = self.__decay_interval
+        if interval is not None:
+            uses = self.__uses + 1
+            if uses >= interval:
+                self.__decay()
+                uses = 0
+            self.__uses = uses
         link = self.__links[key]
         curr = link.next
         if curr.count != link.count + 1:
@@ -337,6 +362,30 @@ class LFUCache(Cache):
         if not link.keys:
             link.unlink()
         self.__links[key] = curr
+
+    def __decay(self):
+        """Scale down all use counts, merging links with equal counts."""
+        factor = self.__decay_factor
+        root = self.__root
+        curr = root.next
+        root.prev = root.next = root
+        links = self.__links
+        while curr is not root:
+            next = curr.next
+            count = int(curr.count * factor)
+            count = max(count, 1)
+            prev = root.prev
+            if prev is root or prev.count != count:
+                # decayed counts are non-decreasing, so a new link is
+                # always inserted at the tail of the list
+                prev = LFUCache._Link(count)
+                prev.insert(root)
+            # keys keep their relative order, so ties are still
+            # broken by least recent use after merging links
+            for key in curr.keys:
+                prev.keys[key] = None
+                links[key] = prev
+            curr = next
 
 
 class LRUCache(Cache):

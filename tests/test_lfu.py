@@ -80,6 +80,93 @@ class LFUCacheTest(unittest.TestCase, CacheTestMixin):
             self.assertIn(key - 1, cache)
             self.assertIn(key, cache)
 
+    def test_lfu_decay(self):
+        # fixed access sequence: build up old hot keys, then switch
+        # to a new working set
+        def run(cache):
+            for key in (1, 2, 3):
+                cache[key] = key
+            for _ in range(15):
+                for key in (1, 2, 3):
+                    cache[key]
+            for _ in range(16):
+                for key in (4, 5, 6):
+                    cache[key] = key
+            return list(cache)
+
+        # without decay, the old hot keys keep their high use counts,
+        # so the new working set cannot move in
+        self.assertEqual([2, 3, 6], run(LFUCache(maxsize=3)))
+        # with decay, the old use counts fade away and the new working
+        # set gradually replaces the old hot keys
+        decaying = LFUCache[int, int](maxsize=3, decay_interval=8)
+        self.assertEqual([5, 6, 4], run(decaying))
+        # with decay_interval larger than the number of accesses,
+        # decay never kicks in and behavior matches the default
+        self.assertEqual([2, 3, 6], run(LFUCache(maxsize=3, decay_interval=1000)))
+
+    def test_lfu_decay_tie(self):
+        cache = LFUCache[int, int](maxsize=4, decay_interval=3)
+
+        cache[1] = 1
+        cache[2] = 2
+        cache[3] = 3  # third use triggers decay, links merge in order
+        cache[1]
+        cache[2]
+        cache[4] = 4  # third use triggers decay, counts 2 decay to 1
+
+        # merged links keep their relative order, so ties are still
+        # broken by least recent use
+        self.assertEqual([3, 1, 2, 4], [cache.popitem()[0] for _ in range(4)])
+
+    def test_lfu_decay_params(self):
+        with self.assertRaises(ValueError):
+            LFUCache(maxsize=1, decay_interval=0)
+        with self.assertRaises(ValueError):
+            LFUCache(maxsize=1, decay_interval=1, decay_factor=0)
+        with self.assertRaises(ValueError):
+            LFUCache(maxsize=1, decay_interval=1, decay_factor=1)
+
+        # decay_factor is ignored without decay_interval
+        cache = LFUCache[int, int](maxsize=1, decay_factor=2)
+        cache[1] = 1
+        self.assertEqual([1], list(cache))
+
+    def test_lfu_decay_clear(self):
+        cache = LFUCache[int, int](maxsize=2, decay_interval=2)
+
+        cache[1] = 1
+        cache.clear()
+
+        # the use counter is reset, so the first use after clear()
+        # does not trigger decay
+        cache[1] = 1
+        cache[1]
+        cache[2] = 2
+        cache[3] = 3
+
+        self.assertEqual([1, 3], list(cache))
+
+    def test_lfu_decay_copy_pickle(self):
+        import copy
+        import pickle
+
+        source = LFUCache[int, int](maxsize=2, decay_interval=2)
+        source[1] = 1
+        source[2] = 2
+        source[2]
+
+        for cache in (
+            copy.copy(source),
+            copy.deepcopy(source),
+            pickle.loads(pickle.dumps(source)),
+        ):
+            cache[3] = 3
+            cache[4] = 4
+            self.assertEqual([3, 4], list(cache))
+
+        self.assertEqual([1, 2], list(source))
+
     def test_lfu_getsizeof(self):
         cache = LFUCache[int, int](maxsize=3, getsizeof=lambda x: x)
 
