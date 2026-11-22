@@ -3,11 +3,25 @@ module HTTPX::Resolver
     class File < Base
       DEFAULT_PATH: String
 
+      CORRUPTED_FILE_ERRORS: Array[singleton(StandardError)]
+
       @store: PStore
+
+      @lookups: Hash[String, Array[dns_result]]?
+
+      @hostnames: Array[String]?
+
+      @dirty: Set[String]
+
+      @mutex: Thread::Mutex
 
       private
 
       def initialize: (?path path) -> void
+
+      def load_cache: () -> void
+
+      def save: () -> void
     end
   end
 end

@@ -86,11 +86,12 @@ module HTTPX
         ips unless ips.empty?
       end
 
-      def _set(hostname, family, entries, lookups, hostnames)
+      def _set(hostname, family, entries, lookups, hostnames, evicted: nil)
         # lru cleanup
         while lookups.size >= MAX_CACHE_SIZE
           hs = hostnames.shift
           lookups.delete(hs)
+          evicted << hs if evicted
         end
         hostnames << hostname
 
@@ -106,7 +107,7 @@ module HTTPX
           name = entry["name"]
           next unless name != hostname
 
-          _set(name, family, [entry], lookups, hostnames)
+          _set(name, family, [entry], lookups, hostnames, evicted: evicted)
         end
       end
 

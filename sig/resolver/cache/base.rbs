@@ -20,7 +20,7 @@ module HTTPX
 
       def _get: (String hostname, Hash[String, Array[dns_result]] lookups, Array[String] hostnames, Numeric ttl) -> Array[Entry]?
 
-      def _set: (String hostname, ip_family family, Array[dns_result] entries, Hash[String, Array[dns_result]] lookups, Array[String] hostnames) -> void
+      def _set: (String hostname, ip_family family, Array[dns_result] entries, Hash[String, Array[dns_result]] lookups, Array[String] hostnames, ?evicted: Array[String] evicted) -> void
 
       def _evict: (String hostname, String ip, Hash[String, Array[dns_result]] lookups, Array[String] hostnames) -> void
     end
