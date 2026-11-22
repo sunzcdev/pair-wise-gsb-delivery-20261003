@@ -6,9 +6,13 @@ import random
 import subprocess
 import sys
 
-import pylibmc
 import pytest
 import redis
+
+try:
+    import pylibmc
+except ImportError:  # pragma: no cover - optional dependency
+    pylibmc = None
 
 import dramatiq
 from dramatiq import Worker
@@ -44,6 +48,8 @@ def check_redis(client):
 
 
 def check_memcached(client):
+    if pylibmc is None:
+        pytest.skip("pylibmc is not installed.")
     try:
         client.get_stats()
     except pylibmc.SomeErrors as e:

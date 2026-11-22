@@ -20,8 +20,9 @@ from dramatiq.asyncio import (
 from dramatiq.broker import MessageProxy
 from dramatiq.brokers.stub import StubBroker
 from dramatiq.logging import get_logger
-from dramatiq.middleware import CurrentMessage
+from dramatiq.middleware import CurrentMessage, Retries, TimeLimit
 from dramatiq.middleware.asyncio import AsyncIO
+from dramatiq.middleware.time_limit import TimeLimitExceeded
 
 from ..common import worker
 
@@ -153,6 +154,185 @@ def test_event_loop_thread_run_coroutine_interrupted(started_thread: EventLoopTh
     # ensure interrupter thread has finished.
     interrupter_thread.join(timeout=1)
     assert not interrupter_thread.is_alive()
+
+
+def test_event_loop_thread_terminate_coroutine_cancels_and_waits(started_thread: EventLoopThread):
+    """terminate_coroutine() must cancel a still-running coroutine so it
+    receives a CancelledError, run its cleanup, and only return once the
+    cleanup has finished.
+    """
+    side_effect_target = {"cancelled": False, "cleanup": False}
+    coro_started = Event()
+
+    async def stuck_coro():
+        try:
+            coro_started.set()
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            side_effect_target["cancelled"] = True
+            raise
+        finally:
+            # Give the event loop something to do during cleanup; this
+            # would keep running in the background if termination didn't
+            # wait for it.
+            await asyncio.sleep(0.01)
+            side_effect_target["cleanup"] = True
+
+    done = Event()
+
+    async def wrapped():
+        try:
+            return await stuck_coro()
+        finally:
+            done.set()
+
+    future = asyncio.run_coroutine_threadsafe(wrapped(), started_thread.loop)
+    assert coro_started.wait(timeout=1.0)
+
+    # The future is still pending while the coroutine is stuck.
+    assert not future.done()
+
+    started_thread.terminate_coroutine(future, done)
+
+    # By the time terminate_coroutine() returns, the coroutine must have
+    # observed the cancellation and finished its cleanup.
+    assert side_effect_target["cancelled"]
+    assert side_effect_target["cleanup"]
+    assert future.done()
+    assert future.cancelled()
+
+
+def test_event_loop_thread_terminate_coroutine_on_finished_future(started_thread: EventLoopThread):
+    """terminate_coroutine() must be a no-op (aside from confirming the
+    cleanup) when the coroutine already completed on its own.
+    """
+    cleanup_ran = Event()
+
+    async def fast_coro():
+        try:
+            return "done"
+        finally:
+            cleanup_ran.set()
+
+    done = Event()
+
+    async def wrapped():
+        try:
+            return await fast_coro()
+        finally:
+            done.set()
+
+    future = asyncio.run_coroutine_threadsafe(wrapped(), started_thread.loop)
+    assert future.result(timeout=1.0) == "done"
+
+    # Must not raise even though the future is already done.
+    started_thread.terminate_coroutine(future, done)
+    assert cleanup_ran.wait(timeout=1.0)
+    assert future.result(timeout=0) == "done"
+
+
+@pytest.mark.skipif(
+    threading.current_platform not in threading.supported_platforms,
+    reason="Threading not supported on this platform.",
+)
+@pytest.mark.skipif(threading.is_gevent_active(), reason="Thread exceptions not supported with gevent.")
+def test_time_limit_cancels_stuck_async_actor_before_settling(stub_broker: StubBroker):
+    """End-to-end: when an async actor exceeds its time limit, the
+    coroutine actually running on the event loop must be cancelled and
+    finish its cleanup before the worker thread delivers the
+    TimeLimitExceeded failure and the message is retried/dead-lettered.
+    """
+    stub_broker.add_middleware(AsyncIO())
+    stub_broker.add_middleware(TimeLimit(interval=20))
+    stub_broker.add_middleware(Retries())
+
+    side_effect_target = {"cancellations": 0, "cleanups": 0, "runs": 0}
+    coro_started = Event()
+
+    @actor(
+        time_limit=100,
+        max_retries=1,
+        min_backoff=1,
+        max_backoff=1,
+        queue_name="stuck_async",
+    )
+    async def stuck_actor():
+        side_effect_target["runs"] += 1
+        try:
+            coro_started.set()
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            side_effect_target["cancellations"] += 1
+            raise
+        finally:
+            # Await something so the cleanup itself is scheduled on the
+            # event loop; this proves termination waits for cleanup.
+            await asyncio.sleep(0.01)
+            side_effect_target["cleanups"] += 1
+
+    with worker(stub_broker, worker_timeout=50, worker_threads=1):
+        stuck_actor.send()
+        assert coro_started.wait(timeout=1.0)
+
+        # Both the initial attempt and the retry must get time-limited.
+        stub_broker.join("stuck_async", fail_fast=False, timeout=30000)
+
+    # The coroutine was cancelled on every attempt and always ran its
+    # cleanup before the worker moved on.
+    assert side_effect_target["runs"] == 2
+    assert side_effect_target["cancellations"] == 2
+    assert side_effect_target["cleanups"] == 2
+
+    # The message settled as a TimeLimitExceeded failure on each
+    # attempt (the stub broker records one dead letter per nack).
+    dead_letters = stub_broker.dead_letters_by_queue["stuck_async"]
+    assert len(dead_letters) == 2
+    assert all(isinstance(letter._exception, TimeLimitExceeded) for letter in dead_letters)
+
+
+@pytest.mark.skipif(
+    threading.current_platform not in threading.supported_platforms,
+    reason="Threading not supported on this platform.",
+)
+@pytest.mark.skipif(threading.is_gevent_active(), reason="Thread exceptions not supported with gevent.")
+def test_fast_async_actor_completes_and_next_message_processes(stub_broker: StubBroker):
+    """End-to-end: an async actor that finishes immediately must not be
+    affected by the time-limit/termination path, and the worker must go
+    on to process the following message.
+    """
+    stub_broker.add_middleware(AsyncIO())
+    stub_broker.add_middleware(TimeLimit(interval=20))
+    stub_broker.add_middleware(Retries())
+
+    side_effect_target = {"fast_runs": 0, "next_runs": 0, "cleanups": 0}
+
+    @actor(time_limit=1000, max_retries=0, queue_name="fast_async")
+    async def fast_actor():
+        try:
+            side_effect_target["fast_runs"] += 1
+            return "ok"
+        finally:
+            side_effect_target["cleanups"] += 1
+
+    @actor(max_retries=0, queue_name="next_async")
+    async def next_actor():
+        side_effect_target["next_runs"] += 1
+
+    with worker(stub_broker, worker_timeout=50, worker_threads=1):
+        fast_actor.send()
+        stub_broker.join("fast_async", fail_fast=False, timeout=10000)
+
+        # The worker thread is free, so the next message is processed.
+        next_actor.send()
+        stub_broker.join("next_async", fail_fast=False, timeout=10000)
+
+    assert side_effect_target["fast_runs"] == 1
+    assert side_effect_target["cleanups"] == 1
+    assert side_effect_target["next_runs"] == 1
+
+    # Nothing failed, so no dead letters.
+    assert stub_broker.dead_letters_by_queue["fast_async"] == []
+    assert stub_broker.dead_letters_by_queue["next_async"] == []
 
 
 @mock.patch("dramatiq.middleware.asyncio.EventLoopThread")

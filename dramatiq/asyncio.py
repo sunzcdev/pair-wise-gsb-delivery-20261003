@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import functools
 import logging
 import threading
@@ -164,16 +165,15 @@ class EventLoopThread(threading.Thread):
                 # "During handling of the above exception, another exception occurred" messages.
                 # zero timeout used because future is now done.
 
-        except Interrupt as e:
-            # Asynchronously raised from another thread: cancel the
-            # future.
-            self.loop.call_soon_threadsafe(future.cancel)
-            # Wait for the 'done' event instead of the future; the
-            # future will raise CancelledError immediately while we
-            # should wait for the coro to actually finish its cleanup
-            # actions.
-            if not done.wait(timeout=1.0):
-                raise RuntimeError("Timed out while waiting for coroutine.") from e
+        except Interrupt:
+            # Asynchronously raised from another thread (e.g. by the
+            # TimeLimit or Shutdown middleware) while this thread was
+            # blocked waiting for the coroutine's result.  The worker
+            # thread must not deliver the failure until the coroutine
+            # actually running on the event loop has been cancelled and
+            # finished its cleanup, so delegate to the coroutine-aware
+            # termination routine before re-raising.
+            self.terminate_coroutine(future, done)
             raise
 
         finally:
@@ -183,3 +183,48 @@ class EventLoopThread(threading.Thread):
             del future
             # Without this, the potential reference cycle is
             # Exception -> Traceback -> Frames -> run_coroutine() locals -> future -> Exception
+
+    def terminate_coroutine(self, future: concurrent.futures.Future, done: threading.Event) -> None:
+        """Cancel a coroutine running on the event loop and wait for it
+        to finish cleaning up.
+
+        This is the coroutine-specific counterpart to raising an
+        :class:`Interrupt` in a worker thread.  While the calling
+        (worker) thread has already been interrupted asynchronously,
+        the actual coroutine keeps running on this thread's event loop
+        until it is cancelled.  Simply returning from the worker thread
+        at that point would deliver the failure (and trigger the usual
+        failure/retry settlement) while the old coroutine was still
+        running in the background.
+
+        The future is cancelled from within the event loop so the
+        coroutine receives a ``CancelledError``, and this method blocks
+        on ``done`` (set by the coroutine's ``finally`` block) rather
+        than on the future itself: a cancelled future resolves
+        immediately, whereas the coroutine may still need to run its
+        cleanup actions before it is really finished.
+
+        Parameters:
+          future: The future wrapping the running coroutine.
+          done: An event set once the coroutine has completed,
+            including any cleanup.
+
+        Raises:
+          RuntimeError: If the coroutine does not finish cleaning up
+            within the allotted time.
+        """
+        if future.done():
+            # Nothing to cancel: the coroutine already completed on its
+            # own, so just make sure its cleanup has settled.
+            done.wait(timeout=1.0)
+            return
+
+        # Schedule the cancellation on the event loop thread so the
+        # coroutine actually receives the CancelledError.
+        self.loop.call_soon_threadsafe(future.cancel)
+
+        # Wait for the 'done' event instead of the future; the future
+        # will raise CancelledError immediately while we should wait for
+        # the coro to actually finish its cleanup actions.
+        if not done.wait(timeout=1.0):
+            raise RuntimeError("Timed out while waiting for coroutine.")

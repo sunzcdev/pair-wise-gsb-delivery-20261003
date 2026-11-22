@@ -11,6 +11,14 @@ All notable changes to this project will be documented in this file.
 Fixed
 ^^^^^
 
+* When an async actor exceeds its time limit (or is interrupted on
+  shutdown) under the AsyncIO middleware, the coroutine actually
+  running on the event loop is now cancelled through a dedicated
+  coroutine termination routine, and the worker thread waits for the
+  coroutine's cleanup to finish before the message goes through the
+  usual failure/retry settlement.  Previously, the worker thread could
+  deliver the failure while the old coroutine was still running in the
+  background.  Synchronous actors are unaffected.
 * Treat ``redis.TimeoutError`` like ``redis.ConnectionError`` in the Redis
   broker, so a socket timeout while fetching, acking or nacking is reported
   as a closed connection instead of an unexpected error.
