@@ -229,4 +229,9 @@ module Faraday
   # Raised by Faraday::Middleware and subclasses when invalid default_options are used
   class InitializationError < Error
   end
+
+  # Raised when a marshalled {Response} snapshot cannot be restored, e.g.
+  # because it uses an unknown snapshot version or is not a snapshot at all.
+  class SnapshotError < Error
+  end
 end
