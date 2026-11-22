@@ -1,5 +1,14 @@
 # v1.20
 
+## Unreleased
+
+### Enhancement
+
+* out_copy: add per-`store` `copy_mode` parameter
+  * A `<store>` can now choose `no_copy`, `shallow`, `deep` or `marshal` on its own. The plugin-wide `copy_mode` stays as the default for stores that do not set it, and `deep_copy` still works as before.
+  * Records are copied lazily while each store consumes the stream, so a deep copy no longer builds an extra copy of the whole stream up front.
+  * Event order and `Fluent::EventTime` values are passed through unchanged.
+
 ## Release v1.20.1 - 2026/10/26
 
 ### Bug Fix
