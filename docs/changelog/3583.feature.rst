@@ -1,0 +1,5 @@
+Add a ``-Nested`` switch to the generated PowerShell ``activate.ps1`` so a virtual environment can be stacked on top of
+an already active one instead of replacing it. Each layer owns its own ``PATH`` prefix, ``VIRTUAL_ENV`` /
+``VIRTUAL_ENV_PROMPT`` values, prompt and ``pydoc`` function; every ``deactivate`` removes one layer and restores the
+layer below, and the last one returns the session to its original state. Activating the environment already on top is a
+no-op, and ``deactivate`` remains safe to call with no active environment (:pr:`3583`).

@@ -427,3 +427,202 @@ def test_powershell_home_from_registry(tmp_path: Path, powershell: str) -> None:
         check=True,
     )
     assert result.stdout.strip() == os.path.expanduser("~")
+
+
+def _run_powershell(powershell: str, driver: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+        check=False,
+    )
+
+
+def _nested_sessions(tmp_path: Path) -> tuple:
+    first = cli_run(["--no-seed", "--activators", "powershell", str(tmp_path / "env A")])
+    second = cli_run(["--no-seed", "--activators", "powershell", str(tmp_path / "env B nested")])
+    return first, second
+
+
+@pytest.mark.parametrize("powershell", _POWERSHELLS)
+def test_powershell_nested_activation_unwinds_in_reverse(tmp_path: Path, powershell: str) -> None:
+    first, second = _nested_sessions(tmp_path)
+    activate_a = PowerShellActivator.quote(str(first.creator.bin_dir / "activate.ps1"))
+    activate_b = PowerShellActivator.quote(str(second.creator.bin_dir / "activate.ps1"))
+    python_a = str(first.creator.exe.parent / os.path.basename(sys.executable))
+    python_b = str(second.creator.exe.parent / os.path.basename(sys.executable))
+    driver = tmp_path / "nested.ps1"
+    driver.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f". {activate_a}",
+            f". {activate_b} -Nested",
+            "(Get-Command python).Source",
+            "deactivate",
+            "(Get-Command python).Source",
+            "deactivate",
+            "if (Test-Path function:deactivate) { 'deactivate-left' } else { 'deactivate-gone' }",
+            "if ($null -eq $env:VIRTUAL_ENV) { 'venv-unset' } else { $env:VIRTUAL_ENV }",
+            "",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = _run_powershell(powershell, driver)
+
+    assert (result.returncode, result.stderr) == (0, "")
+    # The template joins the venv folder to the bin name with a forward slash, so normalize separators for comparison.
+    assert [os.path.normcase(line) for line in result.stdout.splitlines()] == [
+        os.path.normcase(python_b),
+        os.path.normcase(python_a),
+        "deactivate-gone",
+        "venv-unset",
+    ]
+
+
+@pytest.mark.parametrize("powershell", _POWERSHELLS)
+def test_powershell_nested_activation_stacks_path_and_names(tmp_path: Path, powershell: str) -> None:
+    first, second = _nested_sessions(tmp_path)
+    activate_a = PowerShellActivator.quote(str(first.creator.bin_dir / "activate.ps1"))
+    activate_b = PowerShellActivator.quote(str(second.creator.bin_dir / "activate.ps1"))
+    driver = tmp_path / "stack.ps1"
+    driver.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f". {activate_a}",
+            f". {activate_b} -Nested",
+            "Write-Output $env:VIRTUAL_ENV",
+            "Write-Output $env:VIRTUAL_ENV_PROMPT",
+            "Write-Output $_VIRTUAL_ENV_STACK.Count",
+            "Write-Output ($env:PATH.Split([IO.Path]::PathSeparator)[0..1] -join [IO.Path]::PathSeparator)",
+            "deactivate",
+            "Write-Output $env:VIRTUAL_ENV",
+            "Write-Output $_VIRTUAL_ENV_STACK.Count",
+            "",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = _run_powershell(powershell, driver)
+
+    assert (result.returncode, result.stderr) == (0, "")
+    expected_path = os.pathsep.join([str(second.creator.bin_dir), str(first.creator.bin_dir)])
+    lines = result.stdout.splitlines()
+    assert lines[:3] == [str(second.creator.dest), "env B nested", "1"]
+    assert os.path.normcase(lines[3]) == os.path.normcase(expected_path)
+    assert lines[4:] == [str(first.creator.dest), "0"]
+
+
+@pytest.mark.parametrize("powershell", _POWERSHELLS)
+def test_powershell_nested_repeat_of_active_layer_is_noop(tmp_path: Path, powershell: str) -> None:
+    first, second = _nested_sessions(tmp_path)
+    activate_a = PowerShellActivator.quote(str(first.creator.bin_dir / "activate.ps1"))
+    activate_b = PowerShellActivator.quote(str(second.creator.bin_dir / "activate.ps1"))
+    driver = tmp_path / "repeat.ps1"
+    driver.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f". {activate_a}",
+            f". {activate_a} -Nested",
+            "Write-Output $_VIRTUAL_ENV_STACK.Count",
+            f". {activate_b} -Nested",
+            f". {activate_b} -Nested",
+            "Write-Output $_VIRTUAL_ENV_STACK.Count",
+            "deactivate",
+            "Write-Output $_VIRTUAL_ENV_STACK.Count",
+            "",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = _run_powershell(powershell, driver)
+
+    assert (result.returncode, result.stderr) == (0, "")
+    assert result.stdout.splitlines() == ["0", "1", "0"]
+
+
+@pytest.mark.parametrize("powershell", _POWERSHELLS)
+def test_powershell_default_activation_replaces_instead_of_nesting(tmp_path: Path, powershell: str) -> None:
+    first, second = _nested_sessions(tmp_path)
+    activate_a = PowerShellActivator.quote(str(first.creator.bin_dir / "activate.ps1"))
+    activate_b = PowerShellActivator.quote(str(second.creator.bin_dir / "activate.ps1"))
+    driver = tmp_path / "replace.ps1"
+    driver.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f". {activate_a}",
+            f". {activate_b} -Nested",
+            f". {activate_a}",
+            "Write-Output $_VIRTUAL_ENV_STACK.Count",
+            "Write-Output $env:VIRTUAL_ENV",
+            "deactivate",
+            "if ($null -eq $env:VIRTUAL_ENV) { 'venv-unset' } else { 'venv-left' }",
+            "if (Test-Path function:deactivate) { 'deactivate-left' } else { 'deactivate-gone' }",
+            "",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = _run_powershell(powershell, driver)
+
+    assert (result.returncode, result.stderr) == (0, "")
+    assert result.stdout.splitlines() == ["0", str(first.creator.dest), "venv-unset", "deactivate-gone"]
+
+
+@pytest.mark.parametrize("powershell", _POWERSHELLS)
+def test_powershell_deactivate_without_activation_is_safe(tmp_path: Path, powershell: str) -> None:
+    session = cli_run(["--no-seed", "--activators", "powershell", str(tmp_path / "env")])
+    activate = PowerShellActivator.quote(str(session.creator.bin_dir / "activate.ps1"))
+    driver = tmp_path / "idle.ps1"
+    driver.write_text(
+        "\n".join([
+            "deactivate",
+            "if (Test-Path function:deactivate) { 'deactivate-left' } else { 'deactivate-gone' }",
+            f". {activate}",
+            "deactivate",
+            "if (Test-Path function:deactivate) { 'deactivate-left' } else { 'deactivate-gone' }",
+            "",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = _run_powershell(powershell, driver)
+
+    assert (result.returncode, result.stderr) == (0, "")
+    assert result.stdout.splitlines() == ["deactivate-gone", "deactivate-gone"]
+
+
+@pytest.mark.parametrize("powershell", _POWERSHELLS)
+def test_powershell_nested_prompt_restores_each_layer_and_cleans_handles(
+    tmp_path: Path, powershell: str
+) -> None:
+    first, second = _nested_sessions(tmp_path)
+    activate_a = PowerShellActivator.quote(str(first.creator.bin_dir / "activate.ps1"))
+    activate_b = PowerShellActivator.quote(str(second.creator.bin_dir / "activate.ps1"))
+    driver = tmp_path / "prompt-layers.ps1"
+    driver.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f". {activate_a}",
+            f". {activate_b} -Nested",
+            "(& prompt 6>&1) -join ''",
+            "deactivate",
+            "(& prompt 6>&1) -join ''",
+            "deactivate",
+            "(& prompt 6>&1) -join ''",
+            "@(Get-Variable -Name '_VIRTUAL_ENV_PROMPT_PREV_*' -ErrorAction SilentlyContinue).Count",
+            "",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = _run_powershell(powershell, driver)
+
+    assert (result.returncode, result.stderr) == (0, "")
+    lines = result.stdout.splitlines()
+    assert "(env B nested) (env A) " in lines[0]
+    assert lines[1].startswith("(env A) ")
+    assert not lines[2].startswith("(env")
+    assert lines[3] == "0"
