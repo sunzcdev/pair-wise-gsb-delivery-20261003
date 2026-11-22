@@ -221,8 +221,10 @@ module ActiveRecord
         true
       end
 
+      # Expression indexes are supported by SQLite 3.9.0 and newer.
+      # See https://www.sqlite.org/expridx.html
       def supports_expression_index?
-        true
+        database_version >= "3.9.0"
       end
 
       def requires_reloading?
@@ -264,8 +266,11 @@ module ActiveRecord
         !@memory_database
       end
 
+      # Generated (virtual and stored) columns are supported by SQLite 3.31.0
+      # and newer.
+      # See https://www.sqlite.org/gencol.html
       def supports_virtual_columns?
-        true
+        database_version >= "3.31.0"
       end
 
       def connected?
@@ -830,9 +835,13 @@ module ActiveRecord
           end
         end
 
-        COLLATE_REGEX = /.*"(\w+)".*collate\s+"(\w+)".*/i
-        PRIMARY_KEY_AUTOINCREMENT_REGEX = /.*"(\w+)".+PRIMARY KEY AUTOINCREMENT/i
-        GENERATED_ALWAYS_AS_REGEX = /.*"(\w+)".+GENERATED ALWAYS AS \((.+)\) (?:STORED|VIRTUAL)/i
+        COLLATE_REGEX = /\A\s*["`]?(?<column_name>\w+)["`]?\b.*\bCOLLATE\s+(?:"(?<double_quoted>\w+)"|`(?<back_quoted>\w+)`|(?<unquoted>\w+))/i
+        PRIMARY_KEY_AUTOINCREMENT_REGEX = /\A\s*["`]?(?<column_name>\w+)["`]?\b.*\bPRIMARY\s+KEY\s+AUTOINCREMENT/i
+        # Matches the `AS` keyword of a generated column definition, optionally
+        # preceded by `GENERATED ALWAYS`. The match has to be followed (ignoring
+        # whitespace) by the opening parenthesis of the generation expression.
+        GENERATED_COLUMN_AS_REGEX = /(?:GENERATED\s+ALWAYS\s+)?AS\b/i
+        QUOTE_DELIMITERS = { "'" => "'", '"' => '"', "`" => "`" }.freeze
 
         def table_structure_with_collation(table_name, basic_structure)
           column_strings = table_structure_sql(table_name, basic_structure.map { |column| column["name"] })
@@ -847,11 +856,19 @@ module ActiveRecord
 
           if column_strings.any?
             column_strings.each do |column_string|
-              # This regex will match the column name and collation type and will save
-              # the value in $1 and $2 respectively.
-              collation_hash[$1] = $2 if COLLATE_REGEX =~ column_string
-              auto_increments[$1] = true if PRIMARY_KEY_AUTOINCREMENT_REGEX =~ column_string
-              generated_columns[$1] = $2 if GENERATED_ALWAYS_AS_REGEX =~ column_string
+              # These regular expressions match the column name together with the
+              # collation, auto increment or generated column clause and save the
+              # relevant parts in named captures.
+              if (match = COLLATE_REGEX.match(column_string))
+                collation_hash[match[:column_name]] = match[:double_quoted] || match[:back_quoted] || match[:unquoted]
+              end
+
+              if (match = PRIMARY_KEY_AUTOINCREMENT_REGEX.match(column_string))
+                auto_increments[match[:column_name]] = true
+              end
+
+              name, expression = extract_generated_column(column_string)
+              generated_columns[name] = expression if name
             end
 
             basic_structure.map do |column|
@@ -873,6 +890,93 @@ module ActiveRecord
             end
           else
             basic_structure.to_a
+          end
+        end
+
+        # Extracts the name and generation expression of a generated column from
+        # its definition in the CREATE TABLE statement. Returns nil for ordinary
+        # columns and table constraints.
+        #
+        # SQLite accepts both the full `GENERATED ALWAYS AS (...) [STORED|VIRTUAL]`
+        # syntax and the shorthand `AS (...) [STORED|VIRTUAL]`, with or without
+        # quoted identifiers, so the statement cannot be parsed reliably with a
+        # single regular expression.
+        def extract_generated_column(column_string)
+          sql = column_string.strip
+          as_match = scan_generated_column_as(sql)
+          return nil unless as_match
+
+          open_parenthesis = sql.index("(", as_match.end(0))
+          return nil unless open_parenthesis && sql[(as_match.end(0))...open_parenthesis].blank?
+
+          close_parenthesis = scan_balanced_parenthesis(sql, open_parenthesis)
+          return nil unless close_parenthesis
+
+          expression = sql[(open_parenthesis + 1)...close_parenthesis].strip
+          [generated_column_name(sql), expression]
+        end
+
+        # Locates the AS keyword that introduces a generation expression, skipping
+        # keywords appearing inside string or identifier literals.
+        def scan_generated_column_as(sql)
+          index = 0
+          quote = nil
+
+          while index < sql.length
+            character = sql[index]
+
+            if quote
+              quote = nil if character == quote
+              index += 1
+            elsif (quote = QUOTE_DELIMITERS[character])
+              index += 1
+            elsif (match = GENERATED_COLUMN_AS_REGEX.match(sql, index)) && match.begin(0) == index
+              last_index = match.end(0)
+              last_index += 1 while last_index < sql.length && sql[last_index] =~ /\s/
+              return match if sql[last_index] == "("
+              index = match.end(0)
+            else
+              index += 1
+            end
+          end
+
+          nil
+        end
+
+        # Given the index of an opening parenthesis, returns the index of the
+        # parenthesis that closes it, accounting for nested parentheses and
+        # string or identifier literals.
+        def scan_balanced_parenthesis(sql, open_parenthesis)
+          depth = 0
+          index = open_parenthesis
+          quote = nil
+
+          while index < sql.length
+            character = sql[index]
+
+            if quote
+              quote = nil if character == quote
+            elsif (quote = QUOTE_DELIMITERS[character])
+              # Opening quote: the matching delimiter ends the literal below.
+            elsif character == "("
+              depth += 1
+            elsif character == ")"
+              depth -= 1
+              return index if depth == 0
+            end
+
+            index += 1
+          end
+
+          nil
+        end
+
+        def generated_column_name(sql)
+          case sql
+          when /\A"/ then sql[/\A"([^"]+)"/, 1]
+          when /\A`/ then sql[/\A`([^`]+)`/, 1]
+          when /\A\[/ then sql[/\A\[([^\]]+)\]/, 1]
+          else sql[/\A(\w+)/, 1]
           end
         end
 
@@ -909,12 +1013,18 @@ module ActiveRecord
 
           # Splitting with left parentheses and discarding the first part will return all
           # columns separated with comma(,).
+          # Column names may be quoted with double quotes or backticks, or left
+          # unquoted, so each separator has to accept all these forms.
+          quoted_column_names = column_names.map do |name|
+            /(?:["`]#{Regexp.escape(name)}["`]|#{Regexp.escape(name)})/.source
+          end.join("|")
+
           sql.partition(UNQUOTED_OPEN_PARENS_REGEX)
              .last
              .sub(FINAL_CLOSE_PARENS_REGEX, "")
              # column definitions can have a comma in them, so split on commas followed
-             # by a space and a column name in quotes or followed by the keyword CONSTRAINT
-             .split(/,(?=\s(?:CONSTRAINT|"(?:#{Regexp.union(column_names).source})"))/i)
+             # by a space and a column name (quoted or not) or the keyword CONSTRAINT
+             .split(/,(?=\s*(?:CONSTRAINT\b|(?:#{quoted_column_names})\s))/i)
              .map(&:strip)
         end
 

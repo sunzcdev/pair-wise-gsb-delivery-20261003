@@ -21,6 +21,10 @@ module ActiveRecord
             end
 
             if as = options[:as]
+              unless @conn.supports_virtual_columns?
+                raise DatabaseVersionError, "Generated columns require SQLite 3.31.0 or newer, but the current connection is using SQLite #{@conn.database_version}."
+              end
+
               sql << " GENERATED ALWAYS AS (#{as})"
 
               if options[:stored]

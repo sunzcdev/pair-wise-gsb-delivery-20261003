@@ -1,3 +1,21 @@
+*   Fix SQLite3 schema reflection and dumping of generated columns created with
+    syntax other than the one Active Record emits.
+
+    The reflection only recognized columns declared with quoted identifiers and
+    the full `GENERATED ALWAYS AS (...) [STORED|VIRTUAL]` clause, so columns
+    created with the shorthand `AS (...)` syntax (including unquoted identifiers
+    or no explicit storage kind) lost their expression on a `schema.rb` round
+    trip and were recreated as ordinary columns. The CREATE TABLE statement is
+    now parsed with the column's position in mind, preserving the expression
+    text, the virtual/stored choice and indexes built on the column.
+
+    `supports_virtual_columns?` and `supports_expression_index?` now report the
+    capabilities of the connected SQLite version, and attempting to use either
+    feature on a version that lacks it raises `ActiveRecord::DatabaseVersionError`
+    with an explanatory message.
+
+    *Active Record*
+
 *   Log source location when scoped order is ignored in batching.
 
     *fatkodima*

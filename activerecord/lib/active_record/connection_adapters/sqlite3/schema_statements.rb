@@ -10,6 +10,14 @@ module ActiveRecord
           table_name.is_a?(Array) ? result : result[table_name.to_s]
         end
 
+        def add_index(table_name, column_name, **options) # :nodoc:
+          if column_name.is_a?(String) && expression_column_name?(column_name) && !supports_expression_index?
+            raise DatabaseVersionError, "Expression indexes require SQLite 3.9.0 or newer, but the current connection is using SQLite #{database_version}."
+          end
+
+          super
+        end
+
         def add_foreign_key(from_table, to_table, if_not_exists: false, **options)
           options = foreign_key_options(from_table, to_table, options)
           return if if_not_exists && foreign_key_exists?(from_table, to_table, **options.slice(:column, :primary_key))
