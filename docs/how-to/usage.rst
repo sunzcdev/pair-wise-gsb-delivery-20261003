@@ -102,6 +102,31 @@ This also works with mise and asdf:
 
 No additional configuration is required. See :doc:`../explanation` for details on how shim resolution works.
 
+Choose what the interpreter probe inherits
+===========================================
+
+To discover an interpreter, virtualenv starts a probe subprocess that asks the executable for its information. A
+launcher or CI wrapper can leave variables such as ``PYTHONHOME`` or ``PYTHONPATH`` behind that make an otherwise healthy
+interpreter report another prefix, or fail to start at all. Pick a probe environment policy with ``--probe-env``:
+
+- ``inherit`` (the default) hands the probe the whole parent environment, as earlier releases did.
+- ``scrub`` hands the probe the parent environment without the variables that steer a Python at start-up
+  (``PYTHONHOME``, ``PYTHONPATH``, ``PYTHONSTARTUP``, ``PYTHONEXECUTABLE``, ``PYTHONUSERBASE``, ``PYTHONPLATLIBDIR``).
+- ``clean`` hands the probe only the variables a process needs to start, such as ``PATH`` and the Windows system ones.
+
+.. code-block:: console
+
+    $ virtualenv --probe-env scrub venv
+
+The policy only affects the probe. The executable named by ``--python`` and the options the creator receives are kept
+exactly as given, so the environment is still built from the caller's snapshot.
+
+If a probe fails under ``inherit``, virtualenv retries the same executable under every narrower policy before giving up.
+The raised error records whether a narrower policy made the interpreter answer, which tells a disturbed probe apart from
+a broken interpreter: ``external_env`` is ``True`` when the parent environment was at fault, and ``False`` when the
+interpreter itself cannot report its information. ``steering`` lists the variables the parent set and ``recovered``
+holds the information the narrower policy recovered.
+
 ********************************
  Activate a virtual environment
 ********************************

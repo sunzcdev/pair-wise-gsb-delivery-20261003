@@ -6,6 +6,8 @@ import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+from .probe_env import INHERIT, build_probe_env
+
 if TYPE_CHECKING:
     from argparse import ArgumentParser
     from collections.abc import Mapping
@@ -20,12 +22,24 @@ class Discover(ABC):
 
     :param options: the parsed options, providing the environment to search
 
+    :ivar probe_env: the policy for the environment handed to the interpreter probe
+
     """
 
     def __init__(self, options: VirtualEnvOptions) -> None:
         self._has_run = False
         self._interpreter: PythonInfo | None = None
         self._env: Mapping[str, str] = options.env if options.env is not None else os.environ
+        # older callers build options without the flag, so the historical inherit behavior stays the default
+        self.probe_env: str = getattr(options, "probe_env", INHERIT)
+
+    @property
+    def probe_environment(self) -> Mapping[str, str]:
+        """The environment to hand to the interpreter probe, built from :attr:`probe_env`.
+
+        The caller's environment is not mutated, so the creator still receives it as given.
+        """
+        return build_probe_env(self.probe_env, self._env)
 
     @property
     def interpreter(self) -> PythonInfo | None:

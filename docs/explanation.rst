@@ -292,6 +292,43 @@ version from:
 
 This convention is shared across pyenv, mise, and asdf, so the same resolution logic works for all three.
 
+The probe environment
+=====================
+
+To read an interpreter's information, virtualenv starts it as a subprocess with a small script and reads the JSON it
+prints. That subprocess inherits the environment of the virtualenv process. A launcher, CI wrapper or shell profile can
+leave variables such as ``PYTHONHOME`` or ``PYTHONPATH`` behind, and an interpreter honors them at start-up even when the
+executable was named explicitly. ``PYTHONHOME`` points the interpreter at another standard library, so the probe can
+report a different prefix, fail to import ``encodings``, or refuse to start. The interpreter is healthy; the inherited
+environment disturbed it.
+
+The ``--probe-env`` policy decides what the probe inherits:
+
+``inherit``
+    The whole parent environment, the behavior of earlier releases. This is the default so a probe sees what the caller
+    saw.
+
+``scrub``
+    The parent environment without the variables that steer an interpreter at start-up: ``PYTHONHOME``, ``PYTHONPATH``,
+    ``PYTHONSTARTUP``, ``PYTHONEXECUTABLE``, ``PYTHONUSERBASE`` and ``PYTHONPLATLIBDIR``. Every other variable, including
+    locale and the Windows ones a process needs, is kept.
+
+``clean``
+    Only the variables a process needs to start: ``PATH``, the Windows system variables (``SystemRoot``, ``COMSPEC``,
+    ``PATHEXT`` and the like) and the usual profile and locale variables elsewhere. This gives the probe a predictable
+    environment when the parent may be polluted in ways ``scrub`` does not know about.
+
+The policy touches the probe only. The executable named by ``--python``, the search environment used to find candidates
+and the options the creator receives all stay as the caller gave them, so the environment is still created from the
+caller's snapshot.
+
+A probe failure is classified rather than reported as a bare query error. Under any policy, virtualenv retries the same
+executable under every narrower policy. If one of them answers, the parent environment disturbed the probe
+(``external_env`` is ``True``, with the offending variables in ``steering`` and the recovered information in
+``recovered``). If none answers, the interpreter itself cannot report its information (``external_env`` is ``False``).
+The distinction matters in a pipeline: the first case is fixed by changing the launcher or the policy, the second by
+reinstalling or replacing the interpreter.
+
 .. warning::
 
     Virtual environments typically reference the system Python's standard library. If you upgrade the system Python, the

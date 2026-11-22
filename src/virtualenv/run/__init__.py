@@ -175,6 +175,7 @@ def _validate_option_values(args: list[str] | None) -> None:
         "-p",
         "--python",
         "--try-first-with",
+        "--probe-env",
         "--creator",
         "--seeder",
         "--activators",

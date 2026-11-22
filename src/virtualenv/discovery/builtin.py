@@ -7,6 +7,7 @@ __lazy_modules__ = [
     "virtualenv.config.cli.parser",
 ]
 
+import os
 import sys
 from typing import TYPE_CHECKING
 
@@ -15,6 +16,7 @@ import python_discovery
 from virtualenv.config.cli.parser import ExtendAction
 
 from .discover import Discover
+from .probe_env import CLEAN, INHERIT, POLICIES, PROBE_ERRORS, SCRUB, probe_interpreter
 
 if TYPE_CHECKING:
     from argparse import ArgumentParser
@@ -81,22 +83,52 @@ class Builtin(Discover):
             default=[],
             help="try first these interpreters before starting the discovery",
         )
+        parser.add_argument(
+            "--probe-env",
+            dest="probe_env",
+            metavar="policy",
+            type=str,
+            choices=POLICIES,
+            default=INHERIT,
+            help="which parent environment variables the interpreter probe inherits: "
+            f"{INHERIT} passes them all, {SCRUB} drops the ones that steer a Python at start-up, "
+            f"{CLEAN} passes only the ones a process needs to start",
+        )
 
     def run(self) -> PythonInfo | None:
         """Return the first interpreter that one of the specs matches.
 
+        A spec that names an existing interpreter but cannot be probed is re-probed under every narrower policy, so a
+        failure the caller's environment caused is told apart from an interpreter that cannot report itself.
+
         :returns: the interpreter, ``None`` when no spec matches
 
+        :raises ProbeEnvironmentError: when an explicitly named interpreter cannot be probed
+
         """
+        probe_env = self.probe_environment
         for python_spec in self.python_spec:
-            if result := get_interpreter(
-                python_spec,
-                self.try_first_with,
-                app_data=self.app_data,
-                env=self._env,
-            ):
+            try:
+                result = get_interpreter(
+                    python_spec,
+                    self.try_first_with,
+                    app_data=self.app_data,
+                    env=self._env,
+                    probe_env=probe_env,
+                )
+            except PROBE_ERRORS:
+                if _names_existing_interpreter(python_spec):
+                    # raises with the classification, which tells a disturbed probe from a broken interpreter
+                    probe_interpreter(python_spec, policy=self.probe_env, env=self._env)
+                raise
+            if result:
                 return result
         return None
+
+
+def _names_existing_interpreter(spec: str) -> bool:
+    # only an absolute path makes the probe's target known without searching first
+    return os.path.isabs(spec) and os.path.exists(spec)
 
 
 def get_interpreter(
@@ -105,19 +137,23 @@ def get_interpreter(
     cache: PyInfoCache | None = None,
     env: Mapping[str, str] | None = None,
     app_data: PyInfoCache | None = None,
+    probe_env: Mapping[str, str] | None = None,
 ) -> PythonInfo | None:
     """Find the interpreter that matches a spec, looking at the cache first.
 
-    :param key: the interpreter spec, a path or a name
+    :param key: the interpreter spec, a path or a name, kept exactly as given
     :param try_first_with: the interpreter paths to check before the rest
     :param cache: the cache of interpreter information, ``None`` for the application data cache
     :param env: the environment variables, ``None`` for the process environment
     :param app_data: the application data cache, used when no cache is given
+    :param probe_env: the environment handed to the interpreter probe, ``None`` to use ``env``
 
     :returns: the interpreter, ``None`` when none matches
 
     """
-    return python_discovery.get_interpreter(key, try_first_with, cache or app_data, env)
+    return python_discovery.get_interpreter(
+        key, try_first_with, cache or app_data, env if probe_env is None else probe_env
+    )
 
 
 __all__ = [
