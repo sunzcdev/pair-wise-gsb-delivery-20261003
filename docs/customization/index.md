@@ -58,6 +58,32 @@ conn.get do |req|
 end
 ```
 
+### Round-trip encoding
+
+The default encoders collapse a few distinct Ruby values onto the same query
+representation. For example, a `nil` field, an empty string and an empty array
+can become indistinguishable once serialized, and a key containing the `[` or
+`]` characters can be mistaken for nested structure.
+
+When a downstream service needs to tell those values apart, use the optional
+`Faraday::RoundtripParamsEncoder`. It keeps the following values distinct,
+preserves the order of repeated (including duplicate-key) values, and escapes
+brackets inside user keys so they survive a full encode/decode round-trip:
+
+```ruby
+conn = Faraday.new(request: { params_encoder: Faraday::RoundtripParamsEncoder })
+
+Faraday::RoundtripParamsEncoder.encode('a' => nil)   # => 'a'
+Faraday::RoundtripParamsEncoder.encode('a' => '')    # => 'a='
+Faraday::RoundtripParamsEncoder.encode('a' => [])    # => 'a[]'
+Faraday::RoundtripParamsEncoder.encode('a' => ['x']) # => 'a[0]=x'
+Faraday::RoundtripParamsEncoder.encode('a[b]' => 1)  # => 'a%5Bb%5D=1'
+```
+
+Pair it with the matching `.decode` (the encoder Faraday also uses to parse
+incoming query strings) to reconstruct the original structure. The default
+`NestedParamsEncoder` and `FlatParamsEncoder` formats are unchanged.
+
 ### Custom serializers
 
 You can build your custom encoder, if you like.
