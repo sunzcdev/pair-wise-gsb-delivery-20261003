@@ -30,6 +30,7 @@ from pip._internal.metadata import (
     get_wheel_distribution,
 )
 from pip._internal.metadata.base import FilesystemWheel
+from pip._internal.metadata.provenance import MetadataChangeReport, MetadataSnapshot
 from pip._internal.models.direct_url import DirectUrl
 from pip._internal.models.link import Link
 from pip._internal.operations.build.metadata import generate_metadata
@@ -164,6 +165,18 @@ class InstallRequirement:
         # The cached metadata distribution that this requirement represents.
         # See get_dist / set_dist.
         self._distribution: BaseDistribution | None = None
+
+        # A fingerprint of the metadata that drove dependency resolution.
+        # For source distributions this is captured from the metadata the
+        # build backend produced with prepare_metadata_for_build_wheel, so
+        # later steps can explain (and reject) changes that the built wheel
+        # introduces. See pip._internal.metadata.provenance.
+        self.resolution_metadata: MetadataSnapshot | None = None
+
+        # Set after a wheel is built, comparing the resolution metadata above
+        # with the wheel's own METADATA. None until a wheel has been built
+        # (or when no resolution snapshot is available, e.g. for wheels).
+        self.metadata_change_report: MetadataChangeReport | None = None
 
         # The static build requirements (from pyproject.toml)
         self.pyproject_requires: list[str] | None = None

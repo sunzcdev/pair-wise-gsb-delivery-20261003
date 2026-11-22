@@ -118,6 +118,8 @@ __all__ = [
     "InvalidWheel",
     "InvalidWheelFilename",
     "UnsupportedWheel",
+    # metadata
+    "BuiltMetadataChanged",
 ]
 
 logger = logging.getLogger(__name__)
@@ -259,6 +261,52 @@ class MetadataInvalid(InstallationError):
 
     def __str__(self) -> str:
         return f"Requested {self.ireq} has invalid metadata: {self.error}"
+
+
+class BuiltMetadataChanged(DiagnosticPipError, InstallationError):
+    """The built wheel's metadata no longer matches the metadata pip resolved.
+
+    The ``prepare_metadata_for_build_wheel`` hook produced metadata that pip
+    used to resolve dependencies, but the wheel built afterwards declares
+    different values for fields that affect resolution. Installing the wheel
+    would silently install something other than what was resolved, so pip
+    refuses and reports the difference.
+    """
+
+    reference = "built-metadata-changed"
+
+    def __init__(
+        self,
+        *,
+        package_details: str,
+        resolution_source: str,
+        resolution_digest: str,
+        built_source: str,
+        built_digest: str,
+        differences: str,
+    ) -> None:
+        super().__init__(
+            message=(
+                "The metadata used for dependency resolution does not match "
+                "the metadata in the built wheel."
+            ),
+            context=(
+                f"{package_details}\n"
+                f"Resolved with {resolution_source} ({resolution_digest})\n"
+                f"Built with {built_source} ({built_digest})\n"
+                f"{differences}"
+            ),
+            hint_stmt=(
+                "This usually means the build backend reported different "
+                "metadata when preparing metadata than it wrote into the "
+                "built wheel. pip stopped before installing anything."
+            ),
+            note_stmt="This is an issue with the package mentioned above, not pip.",
+        )
+        self.package_details = package_details
+        self.resolution_digest = resolution_digest
+        self.built_digest = built_digest
+        self.differences = differences
 
 
 class MetadataGenerationFailed(DiagnosticPipError, InstallationError):

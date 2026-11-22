@@ -81,6 +81,29 @@ package with the following properties:
 - `requested_extras`: extras requested by the user. This field is only present when the
   `requested` field is true.
 
+- `metadata_provenance`: present for source distributions that were built by pip. It
+  records the metadata pip resolved dependencies with and how it compares to the
+  metadata in the wheel that was actually built. The object has the following
+  properties:
+
+  - `resolution`: an object with `source`, `filename` and `digest` describing the
+    metadata produced by the build backend's `prepare_metadata_for_build_wheel` hook.
+    `source` is `"prepare-metadata"`.
+  - `built`: like `resolution`, but for the metadata read from the built wheel.
+    `source` is `"built-wheel"`. This is `null` when the wheel was not built (for
+    example with `--dry-run`).
+  - `differences`: an array of objects, one per field whose normalized value differs
+    between the two views. Each object has `field`, `resolution` and `built` values,
+    and an `affects_resolution` boolean. Purely descriptive fields (such as `summary`)
+    are reported but do not affect installation; changes to fields that drive
+    resolution (such as `requires_dist`) cause pip to abort before installing.
+  - `blocking`: `true` if any of the `differences` affect resolution.
+
+  ```{note}
+  When a resolver-affecting difference is found, pip stops before installing anything
+  and reports the change. Descriptive differences never block the installation.
+  ```
+
 ## Example
 
 The following command:

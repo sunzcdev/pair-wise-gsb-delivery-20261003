@@ -32,6 +32,10 @@ from pip._internal.exceptions import (
 from pip._internal.index.package_finder import PackageFinder
 from pip._internal.metadata import BaseDistribution, get_metadata_distribution
 from pip._internal.metadata.direct_references import check_pypi_direct_references
+from pip._internal.metadata.provenance import (
+    PREPARED_METADATA_SOURCE,
+    MetadataSnapshot,
+)
 from pip._internal.models.direct_url import ArchiveInfo, DirectUrl
 from pip._internal.models.link import Link, join_within_directory
 from pip._internal.models.wheel import Wheel
@@ -84,6 +88,27 @@ def _get_prepared_distribution(
                 build_env_installer, build_isolation, check_build_deps, allow_editables
             )
     return abstract_dist.get_metadata_distribution()
+
+
+def _record_resolution_metadata(
+    req: InstallRequirement, distribution: BaseDistribution
+) -> None:
+    """Remember the metadata that dependency resolution is based on.
+
+    For source distributions this is the metadata produced by
+    ``prepare_metadata_for_build_wheel``; it is later compared against the
+    wheel actually built, so pip can report (and reject) resolver-affecting
+    changes before installing. Wheels need no such comparison because their
+    metadata is the wheel's metadata.
+    """
+    if req.is_wheel or req.resolution_metadata is not None:
+        return
+    filename = req.link.filename if req.link else "<unknown>"
+    req.resolution_metadata = MetadataSnapshot.from_distribution(
+        distribution,
+        source=PREPARED_METADATA_SOURCE,
+        filename=filename,
+    )
 
 
 def _check_linked_requirement_metadata(
@@ -776,6 +801,7 @@ class RequirementPreparer:
             self.allow_editables,
         )
         _check_linked_requirement_metadata(req, dist)
+        _record_resolution_metadata(req, dist)
 
         # If a PEP 658 .metadata file was used, check that fields relevant for
         # dependency resolution match with the wheel's METADATA file.

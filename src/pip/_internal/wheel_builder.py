@@ -14,6 +14,10 @@ from pip._vendor.packaging.version import InvalidVersion, Version
 from pip._internal.cache import WheelCache
 from pip._internal.exceptions import InvalidWheelFilename, UnsupportedWheel
 from pip._internal.metadata import FilesystemWheel, get_wheel_distribution
+from pip._internal.metadata.provenance import (
+    build_metadata_change_report,
+    snapshot_built_wheel,
+)
 from pip._internal.models.link import Link
 from pip._internal.models.wheel import Wheel
 from pip._internal.operations.build.wheel import build_wheel_pep517
@@ -118,6 +122,37 @@ def _verify_one(req: InstallRequirement, wheel_path: str) -> None:
         )
 
 
+def _record_metadata_change_report(req: InstallRequirement, wheel_path: str) -> None:
+    """Compare the built wheel's metadata with the metadata pip resolved with.
+
+    The result is stored on the requirement so the installation report can
+    explain what changed, and so the install path can refuse to install a
+    wheel whose resolver-affecting metadata differs from what was resolved.
+    """
+    resolution = req.resolution_metadata
+    if resolution is None:
+        return
+    assert req.name
+    try:
+        built_dist = get_wheel_distribution(
+            FilesystemWheel(wheel_path), canonicalize_name(req.name)
+        )
+        built = snapshot_built_wheel(built_dist, os.path.basename(wheel_path))
+    except Exception as e:
+        # Reading metadata from the wheel must never turn a successful build
+        # into a failure; wheel validation happens separately in _verify_one.
+        logger.debug("Could not read metadata from %s: %s", wheel_path, e)
+        return
+    report = build_metadata_change_report(resolution, built)
+    req.metadata_change_report = report
+    if report.differences:
+        logger.debug(
+            "Metadata for %s changed between resolution and the built wheel: %s",
+            req.name,
+            ", ".join(difference.field for difference in report.differences),
+        )
+
+
 def _build_one(
     req: InstallRequirement,
     output_dir: str,
@@ -149,6 +184,8 @@ def _build_one(
         except (InvalidWheelFilename, UnsupportedWheel) as e:
             logger.warning("Built %s for %s is invalid: %s", artifact, req.name, e)
             return None
+    if wheel_path:
+        _record_metadata_change_report(req, wheel_path)
     return wheel_path
 
 

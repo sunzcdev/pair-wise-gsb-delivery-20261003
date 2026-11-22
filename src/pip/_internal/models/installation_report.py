@@ -12,9 +12,33 @@ class InstallationReport:
         self._install_requirements = install_requirements
 
     @classmethod
+    def _metadata_provenance_to_dict(
+        cls, ireq: InstallRequirement
+    ) -> dict[str, Any] | None:
+        """Describe the metadata pip resolved with, and any later changes.
+
+        For source distributions the metadata produced by
+        ``prepare_metadata_for_build_wheel`` is what drove resolution. After
+        the wheel is built, pip records how the wheel's metadata compares.
+        The two views are labelled by ``source`` so they can be told apart.
+        """
+        resolution = ireq.resolution_metadata
+        if resolution is None:
+            return None
+        report = ireq.metadata_change_report
+        if report is not None:
+            return report.to_dict()
+        return {
+            "resolution": resolution.to_source_dict(),
+            "built": None,
+            "differences": [],
+            "blocking": False,
+        }
+
+    @classmethod
     def _install_req_to_dict(cls, ireq: InstallRequirement) -> dict[str, Any]:
         assert ireq.download_info, f"No download_info for {ireq}"
-        res = {
+        res: dict[str, Any] = {
             # PEP 610 json for the download URL. download_info.archive_info.hashes may
             # be absent when the requirement was installed from the wheel cache
             # and the cache entry was populated by an older pip version that did not
@@ -35,6 +59,9 @@ class InstallationReport:
             # https://www.python.org/dev/peps/pep-0566/#json-compatible-metadata
             "metadata": ireq.get_dist().metadata_dict,
         }
+        provenance = cls._metadata_provenance_to_dict(ireq)
+        if provenance is not None:
+            res["metadata_provenance"] = provenance
         if ireq.user_supplied and ireq.extras:
             # For top level requirements, the list of requested extras, if any.
             res["requested_extras"] = sorted(ireq.extras)

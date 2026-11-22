@@ -1,0 +1,9 @@
+Detect when a build backend reports different metadata from
+``prepare_metadata_for_build_wheel`` than it writes into the built wheel. pip now
+records the metadata used for dependency resolution, compares it against the wheel's
+``METADATA`` after the build, and stops before installing if fields that affect
+resolution (``Name``, ``Version``, ``Requires-Dist``, ``Requires-Python`` and
+``Provides-Extra``) changed. Purely descriptive differences are allowed and reported.
+The ``--report`` output gains a ``metadata_provenance`` field that labels the
+resolution metadata (``prepare-metadata``) and the built wheel metadata
+(``built-wheel``) separately.

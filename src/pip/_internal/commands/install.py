@@ -48,6 +48,7 @@ from pip._internal.exceptions import (
 )
 from pip._internal.locations import get_scheme
 from pip._internal.metadata import BaseEnvironment, get_environment
+from pip._internal.metadata.provenance import raise_for_blocking_changes
 from pip._internal.models.installation_report import InstallationReport
 from pip._internal.operations.build.build_tracker import get_build_tracker
 from pip._internal.operations.check import ConflictDetails, check_install_conflicts
@@ -55,6 +56,7 @@ from pip._internal.req import InstallationResult, install_given_reqs
 from pip._internal.req.req_install import (
     InstallRequirement,
 )
+from pip._internal.req.req_set import RequirementSet
 from pip._internal.utils.compat import WINDOWS
 from pip._internal.utils.filesystem import test_writable_dir
 from pip._internal.utils.logging import getLogger
@@ -545,6 +547,16 @@ class InstallCommand(RequirementCommand):
         with super().pip_version_check(options, args):
             yield
 
+    def _write_report(
+        self, options: Values, requirement_set: RequirementSet
+    ) -> None:
+        report = InstallationReport(requirement_set.requirements_to_install)
+        if options.json_report_file == "-":
+            rich.print_json(data=report.to_dict())
+        else:
+            with open(options.json_report_file, "w", encoding="utf-8") as f:
+                json.dump(report.to_dict(), f, indent=2, ensure_ascii=False)
+
     @with_cleanup
     def run(self, options: Values, args: list[str]) -> int:
         if options.use_user_site and options.target_dir is not None:
@@ -656,13 +668,10 @@ class InstallCommand(RequirementCommand):
                 reqs, check_supported_wheels=not options.target_dir
             )
 
-            if options.json_report_file:
-                report = InstallationReport(requirement_set.requirements_to_install)
-                if options.json_report_file == "-":
-                    rich.print_json(data=report.to_dict())
-                else:
-                    with open(options.json_report_file, "w", encoding="utf-8") as f:
-                        json.dump(report.to_dict(), f, indent=2, ensure_ascii=False)
+            if options.json_report_file and options.dry_run:
+                # With --dry-run nothing is built, so the report can only show
+                # the metadata that resolution was based on. Write it now.
+                self._write_report(options, requirement_set)
 
             if options.dry_run:
                 would_install_items = sorted(
@@ -704,8 +713,24 @@ class InstallCommand(RequirementCommand):
                 allow_editables=True,
             )
 
+            # Write the report now so it reflects the built wheels (if any)
+            # and can be inspected regardless of what happens next.
+            if options.json_report_file:
+                self._write_report(options, requirement_set)
+
             if build_failures:
                 raise InstallWheelBuildError(build_failures)
+
+            # A built wheel may declare different metadata than the metadata
+            # used to resolve it. Reject resolver-affecting changes before
+            # anything is installed; purely descriptive changes are allowed.
+            for req in requirement_set.requirements_to_install:
+                report = req.metadata_change_report
+                if report is not None:
+                    raise_for_blocking_changes(
+                        f"Package: {req.name} {req.metadata['version']}",
+                        report,
+                    )
 
             to_install = resolver.get_installation_order(requirement_set)
 
