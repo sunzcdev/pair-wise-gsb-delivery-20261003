@@ -204,8 +204,9 @@ class FromAppData(BaseEmbed):
 
 
 def _build_wheel_image(parent: PathLockBase, name: str, installer: PipInstall) -> None:
+    # the check runs under the lock, so a process that waited for a rebuild revalidates and reuses the new image
     with parent.non_reentrant_lock_for_key(name):
-        if not installer.has_image():
+        if not installer.has_image() or not installer.check_image():
             installer.build_image()
 
 

@@ -41,6 +41,12 @@ _SCRIPTS_DIR: Final[str] = "Scripts" if os.name == "nt" else "bin"
 _PIP_EXE: Final[str] = "pip.exe" if os.name == "nt" else "pip"
 
 
+def _past_max_path(path: Path) -> Path:
+    # an image file can sit past MAX_PATH, which virtualenv reads through 8.3 short paths; the \\?\ form lifts the
+    # limit for the direct file operations of a test
+    return Path(f"\\\\?\\{path}") if os.name == "nt" else path
+
+
 @pytest.mark.parametrize(
     ("config_text", "extra_env", "extra_args"),
     [
@@ -808,6 +814,76 @@ def test_seed_image_build_direct_call(tmp_path: Path) -> None:
         (next(image.glob("*.dist-info")) / "INSTALLER").is_file(),
         session.creator.script("pip").exists(),
     ) == (["CopyPipInstall"], True, True)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        pytest.param("installer", id="installer-file"),
+        pytest.param("marker", id="marker-file"),
+        pytest.param("entry", id="registered-entry-point"),
+        pytest.param("entry-points", id="entry-points-file"),
+    ],
+)
+def test_seed_image_integrity_check(tmp_path: Path, missing: str) -> None:
+    session: Final = cli_run([str(tmp_path / "env"), "--no-seed"], setup_logging=False)
+    wheel: Final = BUNDLE_FOLDER / BUNDLE_SUPPORT[session.interpreter.version_release_str]["pip"]
+    image: Final = tmp_path / "image" / "CopyPipInstall" / wheel.stem
+    installer: Final = CopyPipInstall(wheel, session.creator, image)
+    installer.build_image()
+    assert installer.check_image()
+
+    dist_info: Final = next(image.glob("*.dist-info"))
+    if missing == "installer":
+        _past_max_path(dist_info / "INSTALLER").unlink()
+    elif missing == "marker":
+        _past_max_path(image / f"{dist_info.stem}.virtualenv").unlink()
+    elif missing == "entry":
+        entry_points: Final = _past_max_path(dist_info / "entry_points.txt")
+        registered: Final = entry_points.read_text(encoding="utf-8").splitlines(keepends=True)
+        dropped: Final = next(line for line in registered if line.startswith("pip3"))
+        entry_points.write_text("".join(line for line in registered if line != dropped), encoding="utf-8")
+    else:
+        _past_max_path(dist_info / "entry_points.txt").unlink()
+    assert not installer.check_image()
+
+
+def test_seed_image_missing_registered_entry_point_is_rebuilt(tmp_path: Path) -> None:
+    cache: Final = tmp_path / "cache"
+    args: Final = ["--app-data", str(cache), "--no-periodic-update", "--no-setuptools", "--pip", "embed"]
+    cli_run([str(tmp_path / "first"), *args], setup_logging=False)
+    entry_points: Final = _past_max_path(
+        next(cache.glob("wheel/*/image/1/CopyPipInstall/pip-*/*.dist-info/entry_points.txt"))
+    )
+    registered: Final = entry_points.read_text(encoding="utf-8").splitlines(keepends=True)
+    dropped: Final = next(line for line in registered if line.startswith("pip3"))
+    entry_points.write_text("".join(line for line in registered if line != dropped), encoding="utf-8")
+
+    # the first create rebuilds the shared image from the wheel, the second reuses the rebuilt image
+    for name in ("second", "third"):
+        session: Final = cli_run([str(tmp_path / name), *args], setup_logging=False)
+        pip: Final = session.creator.script("pip")
+        assert pip.exists()
+        process: Final = run(
+            [str(pip), "--version", "--disable-pip-version-check"], capture_output=True, text=True, check=False
+        )
+        assert process.returncode == 0
+    assert entry_points.read_text(encoding="utf-8") == "".join(registered)
+
+
+@pytest.mark.usefixtures("temp_app_data")
+def test_app_data_parallel_rebuild_of_incomplete_image(tmp_path: Path, temp_app_data: Path) -> None:
+    cli_run(["--seeder", "app-data", str(tmp_path / "seed"), "--no-setuptools", "--no-periodic-update"])
+    entry_points: Final = _past_max_path(
+        next(temp_app_data.glob("wheel/*/image/1/CopyPipInstall/pip-*/*.dist-info/entry_points.txt"))
+    )
+    entry_points.unlink()
+
+    exceptions: Final = _run_parallel_threads(tmp_path)
+    assert not exceptions, "\n".join(exceptions)
+    assert entry_points.is_file()
+    for env in ("env1", "env2"):
+        assert (tmp_path / env / _SCRIPTS_DIR / _PIP_EXE).exists()
 
 
 def test_seed_image_without_metadata_fails(no_seed_session: Session, tmp_path: Path) -> None:

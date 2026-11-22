@@ -23,11 +23,10 @@ import shlex
 import zipfile
 from abc import ABC, abstractmethod
 from configparser import ConfigParser
-from contextlib import suppress
 from itertools import chain
 from pathlib import Path
 from tempfile import mkdtemp
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, TextIO
 
 from distlib.scripts import ScriptMaker, enquote_executable
 
@@ -196,18 +195,25 @@ class PipInstall(ABC):
 
     @staticmethod
     def _read_console_scripts(dist_info: Path) -> dict[str, str]:
+        entry_points: Final = dist_info / "entry_points.txt"
+        if not entry_points.exists():
+            return {}
+        with entry_points.open(encoding="utf-8") as file_handler:
+            registered: Final = PipInstall._parse_console_scripts(file_handler)
         scripts: Final[dict[str, str]] = {}
-        entry_points = dist_info / "entry_points.txt"
-        if entry_points.exists():
-            parser = EntryPointConfig(interpolation=None, strict=False)
-            with entry_points.open(encoding="utf-8") as file_handler:
-                parser.read_file(file_handler)
-            if "console_scripts" in parser.sections():
-                for name, value in parser.items("console_scripts"):
-                    # fold only a trailing version (pip3, pip-3.13), so python3-config and 2to3 keep their names
-                    match = _MATCH_PATTERN.fullmatch(name)
-                    scripts[match.group("name") if match else name] = value
+        for name, value in registered.items():
+            # fold only a trailing version (pip3, pip-3.13), so python3-config and 2to3 keep their names
+            match: Final = _MATCH_PATTERN.fullmatch(name)
+            scripts[match.group("name") if match else name] = value
         return scripts
+
+    @staticmethod
+    def _parse_console_scripts(stream: TextIO) -> dict[str, str]:
+        parser: Final = EntryPointConfig(interpolation=None, strict=False)
+        parser.read_file(stream)
+        if "console_scripts" not in parser.sections():
+            return {}
+        return dict(parser.items("console_scripts"))
 
     def _create_console_entry_point(
         self, name: str, value: str, to_folder: Path, version_info: tuple[int, ...]
@@ -223,7 +229,8 @@ class PipInstall(ABC):
         Each archive entry is validated before extraction so a tampered wheel cannot escape the image directory via an
         absolute path or ``..`` traversal. Later runs reuse any image directory they find, so it only appears once the
         image is complete: a build that fails part way, for example on a full disk or a path that is too long, removes
-        its staging directory, and the next build removes one that a killed process left behind.
+        its staging directory, and the next build removes one that a killed process left behind. An image that failed
+        the integrity check is removed before the new one is moved into place.
 
         :raises RuntimeError: if the wheel contains an entry that would land outside the image directory.
 
@@ -241,8 +248,10 @@ class PipInstall(ABC):
                 self._populate_image(zip_ref, folder)
                 # keep the short path Windows may have switched to, the install reads through it
                 built: Final = folder.parent / self._image_dir.parent.name / self._image_dir.name
-                with suppress(FileNotFoundError):
-                    built.rmdir()  # an empty image directory counts as missing, but blocks the rename on Windows
+                if built.exists():
+                    # an empty image directory counts as missing, and an image that failed the integrity check is
+                    # rebuilt; either blocks the rename on Windows
+                    safe_delete(built)
                 os.replace(folder, built)
             except BaseException:
                 safe_delete(folder)
@@ -324,6 +333,44 @@ class PipInstall(ABC):
             with zipfile.ZipFile(str(self._wheel)) as zip_ref:
                 self._image_dir = self._short_path_if_needed(zip_ref, self._image_dir)
         return True
+
+    def check_image(self) -> bool:
+        """Whether the cached image still holds the content its build generated from the wheel.
+
+        Only the generated files and the console script registration are verified, against the metadata and the wheel
+        the image was built from, so a healthy image is reused without walking its tree.
+
+        :returns: ``True`` when the image is complete and can be reused as is
+
+        """
+        try:
+            dist_info: Final = self._find_dist_info(self._image_dir)
+        except RuntimeError:
+            LOGGER.debug("image at %s has no distribution metadata", self._image_dir)
+            return False
+        if not (dist_info / "INSTALLER").is_file() or not (self._image_dir / f"{dist_info.stem}.virtualenv").is_file():
+            LOGGER.debug("image at %s misses a generated file", self._image_dir)
+            return False
+        missing: Final = self._wheel_console_scripts(dist_info.name) - self._image_console_scripts(dist_info)
+        if missing:
+            LOGGER.debug("image at %s misses the registered console scripts %s", self._image_dir, sorted(missing))
+            return False
+        return True
+
+    def _image_console_scripts(self, dist_info: Path) -> set[str]:
+        entry_points: Final = dist_info / "entry_points.txt"
+        if not entry_points.is_file():
+            return set()
+        with entry_points.open(encoding="utf-8") as file_handler:
+            return set(self._parse_console_scripts(file_handler))
+
+    def _wheel_console_scripts(self, dist_info_name: str) -> set[str]:
+        with zipfile.ZipFile(str(self._wheel)) as zip_ref:
+            try:
+                with zip_ref.open(f"{dist_info_name}/entry_points.txt") as stream:
+                    return set(self._parse_console_scripts(io.TextIOWrapper(stream, encoding="utf-8")))
+            except KeyError:  # the wheel registers no console scripts
+                return set()
 
 
 class EntryPointConfig(ConfigParser):
