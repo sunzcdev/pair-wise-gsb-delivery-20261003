@@ -36,7 +36,10 @@ module OpenTelemetry
           @mutex = Mutex.new
           @registry = {}
           @registry_mutex = Mutex.new
+          # @span_processors mirrors the processors of
+          # @span_processor_registrations, at the same indices.
           @span_processors = []
+          @span_processor_registrations = []
           @span_limits = span_limits
           @sampler = sampler
           @id_generator = id_generator
@@ -75,7 +78,8 @@ module OpenTelemetry
         #
         # This operation may block until all the Spans are processed. Must be
         # called before turning off the main application to ensure all data are
-        # processed and exported.
+        # processed and exported. Spans that are still in flight are delivered
+        # to their processors before those processors are shut down.
         #
         # After this is called all the newly created {Span}s will be no-op.
         #
@@ -83,22 +87,28 @@ module OpenTelemetry
         # @return [Integer] Export::SUCCESS if no error occurred, Export::FAILURE if
         #   a non-specific failure occurred, Export::TIMEOUT if a timeout occurred.
         def shutdown(timeout: nil)
-          @mutex.synchronize do
+          registrations = @mutex.synchronize do
             if @stopped
               OpenTelemetry.logger.warn('calling Tracer#shutdown multiple times.')
               return Export::FAILURE
             end
 
-            start_time = OpenTelemetry::Common::Utilities.timeout_timestamp
-            results = @span_processors.map do |processor|
-              remaining_timeout = OpenTelemetry::Common::Utilities.maybe_timeout(timeout, start_time)
-              break [Export::TIMEOUT] if remaining_timeout&.zero?
-
-              processor.shutdown(timeout: remaining_timeout)
-            end
             @stopped = true
-            results.max || Export::SUCCESS
+            @span_processor_registrations
           end
+
+          start_time = OpenTelemetry::Common::Utilities.timeout_timestamp
+          registrations.each do |registration|
+            registration.retire(timeout: OpenTelemetry::Common::Utilities.maybe_timeout(timeout, start_time))
+          end
+
+          results = registrations.map do |registration|
+            remaining_timeout = OpenTelemetry::Common::Utilities.maybe_timeout(timeout, start_time)
+            break [Export::TIMEOUT] if remaining_timeout&.zero?
+
+            registration.wait(timeout: remaining_timeout)
+          end
+          results.compact.max || Export::SUCCESS
         end
 
         # Immediately export all spans that have not yet been exported for all the
@@ -117,11 +127,11 @@ module OpenTelemetry
             return Export::SUCCESS if @stopped
 
             start_time = OpenTelemetry::Common::Utilities.timeout_timestamp
-            results = @span_processors.map do |processor|
+            results = @span_processor_registrations.map do |registration|
               remaining_timeout = OpenTelemetry::Common::Utilities.maybe_timeout(timeout, start_time)
               return Export::TIMEOUT if remaining_timeout&.zero?
 
-              processor.force_flush(timeout: remaining_timeout)
+              registration.force_flush(timeout: remaining_timeout)
             end
             results.max || Export::SUCCESS
           end
@@ -129,15 +139,59 @@ module OpenTelemetry
 
         # Adds a new SpanProcessor to this {Tracer}.
         #
+        # A processor is registered at most once. Adding it again returns the
+        # existing registration rather than delivering every span to it twice,
+        # which keeps each span's callbacks delivered exactly once per processor.
+        #
         # @param span_processor the new SpanProcessor to be added.
+        # @return [SpanProcessorRegistration, nil] a handle for the registration,
+        #   or nil if this {TracerProvider} has been shut down.
         def add_span_processor(span_processor)
           @mutex.synchronize do
             if @stopped
               OpenTelemetry.logger.warn('calling Tracer#add_span_processor after shutdown.')
               return
             end
+
+            existing = @span_processor_registrations.find { |registration| same_processor?(registration.processor, span_processor) }
+            return existing if existing
+
+            registration = SpanProcessorRegistration.new(span_processor)
             @span_processors = @span_processors.dup.push(span_processor)
+            @span_processor_registrations = @span_processor_registrations.dup.push(registration)
+            registration
           end
+        end
+
+        # Removes a SpanProcessor previously added with {#add_span_processor}.
+        #
+        # Spans that started while the processor was registered still deliver
+        # their on_start/on_finish callbacks to it, so the pair is preserved for
+        # each span. Spans started after this method returns are not delivered
+        # to the processor.
+        #
+        # The processor is shut down once those in-flight spans have finished.
+        # Use the returned {SpanProcessorRegistration#wait} to await that
+        # shutdown, rather than shutting the processor down yourself.
+        #
+        # @param span_processor the SpanProcessor to remove.
+        # @return [SpanProcessorRegistration, nil] the registration that was
+        #   removed, or nil if the processor was not registered.
+        def remove_span_processor(span_processor)
+          registration = @mutex.synchronize do
+            index = @span_processors.index { |processor| same_processor?(processor, span_processor) }
+            next unless index
+
+            removed = @span_processor_registrations.at(index)
+            @span_processors = @span_processors.dup.tap { |processors| processors.delete_at(index) }
+            @span_processor_registrations = @span_processor_registrations.dup.tap { |registrations| registrations.delete_at(index) }
+            removed
+          end
+
+          return unless registration
+
+          registration.retire
+          registration
         end
 
         # @api private
@@ -170,7 +224,7 @@ module OpenTelemetry
               kind,
               parent_span_id,
               @span_limits,
-              @span_processors,
+              @span_processor_registrations,
               attributes,
               links,
               start_timestamp,
@@ -183,6 +237,14 @@ module OpenTelemetry
         end
 
         private
+
+        # Compares by object identity without relying on #equal?, which duck
+        # types such as Minitest::Mock may not implement.
+        def same_processor?(first, second)
+          first.equal?(second)
+        rescue NoMethodError
+          first.__id__ == second.__id__
+        end
 
         def sampler_from_environment(default_sampler)
           case ENV.fetch('OTEL_TRACES_SAMPLER', nil)

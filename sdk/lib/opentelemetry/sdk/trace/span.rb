@@ -364,7 +364,7 @@ module OpenTelemetry
                                @realtime_start_timestamp
                              end
           @end_timestamp = nil
-          @span_processors.each { |processor| processor.on_start(self, parent_context) }
+          notify_start(parent_context)
         end
 
         # TODO: Java implementation overrides finalize to log if a span isn't finished.
@@ -374,6 +374,17 @@ module OpenTelemetry
         attr_reader :monotonic_start_timestamp, :realtime_start_timestamp
 
         private
+
+        def notify_start(parent_context)
+          @span_processors.each { |processor| processor.on_start(self, parent_context) }
+        rescue StandardError
+          # A span that failed to construct will never finish, so any processor
+          # that reserved it must release it to let a removed processor shut down.
+          @span_processors.each do |processor|
+            processor.abandon(self) if processor.respond_to?(:abandon)
+          end
+          raise
+        end
 
         def validated_attributes(attrs)
           return attrs if Internal.valid_attributes?(name, 'span', attrs)

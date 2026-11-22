@@ -146,6 +146,204 @@ describe OpenTelemetry::SDK::Trace::TracerProvider do
     end
   end
 
+  describe '#remove_span_processor' do
+    # Records the callbacks it receives so tests can assert on delivery order.
+    class RecordingSpanProcessor
+      def initialize(events)
+        @events = events
+      end
+
+      def on_start(span, _parent_context)
+        @events << [:on_start, span.name]
+      end
+
+      def on_finishing(span)
+        @events << [:on_finishing, span.name]
+      end
+
+      def on_finish(span)
+        @events << [:on_finish, span.name]
+      end
+
+      def force_flush(timeout: nil)
+        OpenTelemetry::SDK::Trace::Export::SUCCESS
+      end
+
+      def shutdown(timeout: nil)
+        @events << [:shutdown]
+        OpenTelemetry::SDK::Trace::Export::SUCCESS
+      end
+    end
+
+    let(:events) { [] }
+    let(:recording_processor) { RecordingSpanProcessor.new(events) }
+    let(:tracer) { tracer_provider.tracer('remove-processor-test', '1.0') }
+
+    it 'returns nil for a processor that was never added' do
+      _(tracer_provider.remove_span_processor(Object.new)).must_be_nil
+    end
+
+    it 'delivers paired callbacks for overlapping spans before shutting down' do
+      tracer_provider.add_span_processor(recording_processor)
+      first = tracer.start_span('first')
+      second = tracer.start_span('second')
+
+      registration = tracer_provider.remove_span_processor(recording_processor)
+
+      # The processor is not shut down while spans it already saw are still
+      # running.
+      _(registration.done?).must_equal(false)
+
+      second.finish
+      first.finish
+
+      _(registration.wait).must_equal(OpenTelemetry::SDK::Trace::Export::SUCCESS)
+      _(events).must_equal(
+        [
+          [:on_start, 'first'],
+          [:on_start, 'second'],
+          [:on_finishing, 'second'],
+          [:on_finish, 'second'],
+          [:on_finishing, 'first'],
+          [:on_finish, 'first'],
+          [:shutdown]
+        ]
+      )
+    end
+
+    it 'delivers on_finish only after on_start for a span that straddles removal' do
+      tracer_provider.add_span_processor(recording_processor)
+      span = tracer.start_span('straddling')
+
+      registration = tracer_provider.remove_span_processor(recording_processor)
+      span.finish
+
+      _(registration.wait).must_equal(OpenTelemetry::SDK::Trace::Export::SUCCESS)
+      _(events).must_equal(
+        [
+          [:on_start, 'straddling'],
+          [:on_finishing, 'straddling'],
+          [:on_finish, 'straddling'],
+          [:shutdown]
+        ]
+      )
+    end
+
+    it 'does not deliver spans started after removal' do
+      tracer_provider.add_span_processor(recording_processor)
+      tracer.in_span('before') {}
+      tracer_provider.remove_span_processor(recording_processor).wait
+      tracer.in_span('after') {}
+
+      _(events).must_equal(
+        [
+          [:on_start, 'before'],
+          [:on_finishing, 'before'],
+          [:on_finish, 'before'],
+          [:shutdown]
+        ]
+      )
+    end
+
+    it 'does not shut down before the in-flight spans finish' do
+      tracer_provider.add_span_processor(recording_processor)
+      span = tracer.start_span('in-flight')
+
+      registration = tracer_provider.remove_span_processor(recording_processor)
+
+      _(events).wont_include([:shutdown])
+      _(registration.wait(timeout: 0.01)).must_equal(OpenTelemetry::SDK::Trace::Export::TIMEOUT)
+
+      span.finish
+
+      _(registration.wait(timeout: 1)).must_equal(OpenTelemetry::SDK::Trace::Export::SUCCESS)
+      _(events.last).must_equal([:shutdown])
+      _(events.map(&:first).count(:on_finish)).must_equal(1)
+      _(events.index([:shutdown])).must_be :>, events.index([:on_finish, 'in-flight'])
+    end
+
+    it 'shuts down exactly once per registration' do
+      tracer_provider.add_span_processor(recording_processor)
+      tracer.in_span('span') {}
+
+      tracer_provider.remove_span_processor(recording_processor).wait
+      tracer_provider.remove_span_processor(recording_processor)
+
+      _(events.count([:shutdown])).must_equal(1)
+    end
+
+    it 'registers a processor at most once' do
+      first = tracer_provider.add_span_processor(recording_processor)
+      second = tracer_provider.add_span_processor(recording_processor)
+
+      tracer.in_span('span') {}
+
+      _(second).must_equal(first)
+      _(events).must_equal(
+        [
+          [:on_start, 'span'],
+          [:on_finishing, 'span'],
+          [:on_finish, 'span']
+        ]
+      )
+    end
+
+    it 'still delivers the pair when the processor raises during on_finish' do
+      events = []
+      raising = Object.new
+      raising.define_singleton_method(:on_start) { |span, _| events << [:on_start, span.name] }
+      raising.define_singleton_method(:on_finish) { |span| events << [:on_finish, span.name]; raise 'boom' }
+      raising.define_singleton_method(:shutdown) { |timeout: nil| events << [:shutdown]; OpenTelemetry::SDK::Trace::Export::SUCCESS }
+      raising.define_singleton_method(:force_flush) { |timeout: nil| OpenTelemetry::SDK::Trace::Export::SUCCESS }
+
+      tracer_provider.add_span_processor(raising)
+      span = tracer.start_span('raising')
+      registration = tracer_provider.remove_span_processor(raising)
+
+      _ { span.finish }.must_raise(RuntimeError)
+
+      _(registration.wait(timeout: 1)).must_equal(OpenTelemetry::SDK::Trace::Export::SUCCESS)
+      _(events).must_equal([[:on_start, 'raising'], [:on_finish, 'raising'], [:shutdown]])
+    end
+
+    it 'does not wait forever on a span whose start failed' do
+      events = []
+      failing = Object.new
+      failing.define_singleton_method(:on_start) { |_span, _ctx| raise 'boom' }
+      failing.define_singleton_method(:on_finish) { |_span| events << [:on_finish] }
+      failing.define_singleton_method(:shutdown) { |timeout: nil| events << [:shutdown]; OpenTelemetry::SDK::Trace::Export::SUCCESS }
+      failing.define_singleton_method(:force_flush) { |timeout: nil| OpenTelemetry::SDK::Trace::Export::SUCCESS }
+
+      tracer_provider.add_span_processor(failing)
+      _ { tracer.start_span('failing') }.must_raise(RuntimeError)
+      registration = tracer_provider.remove_span_processor(failing)
+
+      _(registration.wait(timeout: 1)).must_equal(OpenTelemetry::SDK::Trace::Export::SUCCESS)
+      _(events).must_equal([[:shutdown]])
+    end
+
+    it 'blocks provider shutdown until in-flight spans have been delivered' do
+      registration = tracer_provider.add_span_processor(recording_processor)
+      span = tracer.start_span('in-flight')
+
+      shutdown_thread = Thread.new { tracer_provider.shutdown }
+      # Let the shutdown thread block waiting for the span without assuming a
+      # fixed delay.
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+      Thread.pass while shutdown_thread.alive? &&
+                        shutdown_thread.status != 'sleep' &&
+                        Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+
+      _(registration.done?).must_equal(false)
+      _(events).wont_include([:shutdown])
+
+      span.finish
+      shutdown_thread.join
+
+      _(events.index([:shutdown])).must_be :>, events.index([:on_finish, 'in-flight'])
+    end
+  end
+
   describe '#tracer' do
     # Legacy positional calling conventions
     it 'returns the same tracer for the same arguments' do

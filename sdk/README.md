@@ -81,6 +81,38 @@ end
 
 For additional examples, see the [examples on github][examples-github].
 
+## Removing a span processor
+
+Take a span processor offline without racing the spans that are already running:
+
+```ruby
+processor = OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor.new(exporter)
+provider = OpenTelemetry.tracer_provider
+provider.add_span_processor(processor)
+
+# ... later, e.g. during maintenance:
+
+registration = provider.remove_span_processor(processor)
+# Spans started from now on no longer reach `processor`.
+# Spans that started earlier still deliver their on_start/on_finish pair to it.
+registration.wait(timeout: 30) # blocks until `processor.shutdown` has returned
+```
+
+`remove_span_processor` returns a registration on which two things are guaranteed:
+
+- Callbacks stay paired per span. Every span whose `on_start` reached the
+  processor is also delivered to its `on_finish`, even if the span finishes
+  after the removal. Spans started after `remove_span_processor` returns are
+  never delivered to the processor.
+- The processor is not shut down early. Its `shutdown` is only called once the
+  spans it already saw have finished, so it never receives a span callback after
+  being shut down. `registration.wait` is the point at which that shutdown has
+  completed.
+
+Calling `TracerProvider#shutdown` applies the same ordering to every registered
+processor: in-flight spans are delivered first, then each processor is shut
+down.
+
 ## How can I get involved?
 
 The `opentelemetry-sdk` gem source is [on github][repo-github], along with related gems including `opentelemetry-api`.
