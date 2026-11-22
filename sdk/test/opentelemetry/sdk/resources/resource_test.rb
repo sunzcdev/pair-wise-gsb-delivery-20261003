@@ -142,6 +142,29 @@ describe OpenTelemetry::SDK::Resources::Resource do
     end
   end
 
+  describe '.merge_all' do
+    it 'merges resources in the order provided' do
+      first = Resource.create('shared' => 'first', 'first.only' => 'yes')
+      second = Resource.create('shared' => 'second', 'second.only' => 'yes')
+
+      merged = Resource.merge_all([first, second])
+
+      _(merged.attribute_enumerator.to_h).must_equal(
+        { 'shared' => 'second', 'first.only' => 'yes', 'second.only' => 'yes' }
+      )
+    end
+
+    it 'returns an empty resource for no input' do
+      _(Resource.merge_all([]).attribute_enumerator.to_h).must_be_empty
+      _(Resource.merge_all(nil).attribute_enumerator.to_h).must_be_empty
+    end
+
+    it 'ignores entries that are not resources' do
+      resource = Resource.create('k' => 'v')
+      _(Resource.merge_all([nil, resource, Object.new]).attribute_enumerator.to_h).must_equal({ 'k' => 'v' })
+    end
+  end
+
   describe '#merge' do
     it 'merges two resources into a third' do
       res1 = Resource.create('k1' => 'v1', 'k2' => 'v2')

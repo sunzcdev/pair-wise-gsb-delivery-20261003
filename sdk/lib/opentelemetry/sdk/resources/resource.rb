@@ -37,6 +37,24 @@ module OpenTelemetry
             @default ||= create(SemanticConventions::Resource::SERVICE_NAME => 'unknown_service').merge(process).merge(telemetry_sdk).merge(service_name_from_env)
           end
 
+          # Returns a new Resource formed by merging the given resources in the
+          # order provided.
+          #
+          # Merging is sequential, so a later entry takes precedence over an
+          # earlier one when they share an attribute key. This is independent of
+          # the order in which the resources were produced: precedence follows
+          # the position of each resource in +resources+, not its arrival time.
+          # Entries that are not {Resource} instances are ignored.
+          #
+          # @param [Array<Resource>] resources The resources to merge, in
+          #   ascending order of precedence.
+          # @return [Resource] An empty resource when +resources+ is empty.
+          def merge_all(resources)
+            Array(resources).reduce(create) do |merged, resource|
+              resource.is_a?(Resource) ? merged.merge(resource) : merged
+            end
+          end
+
           # Returns a Resource describing this telemetry SDK.
           #
           # @return [Resource]

@@ -133,6 +133,215 @@ describe OpenTelemetry::SDK::Configurator do
     end
   end
 
+  describe '#add_resource_detector' do
+    it 'rejects detectors that do not respond to #detect' do
+      _(-> { configurator.add_resource_detector(Object.new) }).must_raise(ArgumentError)
+    end
+
+    it 'returns the detector for chaining' do
+      detector = ResourceDetectorDoubles::Fast.new('k' => 'v')
+      _(configurator.add_resource_detector(detector)).must_be_same_as(detector)
+    end
+  end
+
+  describe '#resource_detector_concurrency=' do
+    it 'rejects non-positive and non-integer limits' do
+      _(-> { configurator.resource_detector_concurrency = 0 }).must_raise(ArgumentError)
+      _(-> { configurator.resource_detector_concurrency = -1 }).must_raise(ArgumentError)
+      _(-> { configurator.resource_detector_concurrency = 1.5 }).must_raise(ArgumentError)
+    end
+  end
+
+  describe '#resource_detection_timeout=' do
+    it 'rejects non-positive and non-numeric deadlines' do
+      _(-> { configurator.resource_detection_timeout = 0 }).must_raise(ArgumentError)
+      _(-> { configurator.resource_detection_timeout = -0.1 }).must_raise(ArgumentError)
+      _(-> { configurator.resource_detection_timeout = '5' }).must_raise(ArgumentError)
+    end
+
+    it 'accepts an explicit nil deadline' do
+      configurator.resource_detection_timeout = nil
+      _(configurator.instance_variable_get(:@resource_detection_timeout)).must_be_nil
+    end
+  end
+
+  describe 'resource detection' do
+    let(:gate) { Queue.new }
+
+    after { gate.close unless gate.closed? }
+
+    let(:detected_attributes) { OpenTelemetry.tracer_provider.resource.attribute_enumerator.to_h }
+
+    it 'merges detected attributes in declaration order regardless of completion order' do
+      configurator.add_resource_detector(ResourceDetectorDoubles::Fast.new('shared' => 'first', 'first.only' => 'yes'))
+      configurator.add_resource_detector(ResourceDetectorDoubles::Fast.new('shared' => 'second', 'second.only' => 'yes'))
+
+      configurator.configure
+
+      _(detected_attributes['shared']).must_equal('second')
+      _(detected_attributes['first.only']).must_equal('yes')
+      _(detected_attributes['second.only']).must_equal('yes')
+    end
+
+    it 'keeps settled results when a detector is still stuck at the deadline' do
+      configurator.add_resource_detector(ResourceDetectorDoubles::Fast.new('fast.key' => 'fast-value'))
+      configurator.add_resource_detector(ResourceDetectorDoubles::Stuck.new({ 'stuck.key' => 'stuck-value' }, gate))
+      configurator.add_resource_detector(ResourceDetectorDoubles::Failing.new(RuntimeError.new('detector exploded')))
+      configurator.resource_detection_timeout = 0.2
+
+      started = OpenTelemetry::Common::Utilities.timeout_timestamp
+      configurator.configure
+      elapsed = OpenTelemetry::Common::Utilities.timeout_timestamp - started
+
+      _(elapsed).must_be :<, 5
+      _(detected_attributes['fast.key']).must_equal('fast-value')
+      _(detected_attributes).wont_include('stuck.key')
+      _(configurator.resource_detection_results.map(&:status)).must_equal(%i[success timeout error])
+    end
+
+    it 'creates a usable tracer from the settled results of fast, stuck and failing detectors' do
+      configurator.add_resource_detector(ResourceDetectorDoubles::Fast.new('shared.name' => 'from-fast', 'fast.only' => 'yes'))
+      configurator.add_resource_detector(ResourceDetectorDoubles::Stuck.new({ 'shared.name' => 'from-stuck', 'stuck.only' => 'yes' }, gate))
+      configurator.add_resource_detector(ResourceDetectorDoubles::Failing.new(RuntimeError.new('detector exploded')))
+      configurator.resource_detection_timeout = 0.2
+
+      configurator.configure
+
+      tracer = OpenTelemetry.tracer_provider.tracer('resource-detection', '1.0')
+      span = tracer.start_span('probe')
+      attributes = span.resource.attribute_enumerator.to_h
+
+      _(span.context).wont_be_nil
+      _(attributes['shared.name']).must_equal('from-fast')
+      _(attributes['fast.only']).must_equal('yes')
+      _(attributes).wont_include('stuck.only')
+      _(configurator.resource_detection_results.map(&:status)).must_equal(%i[success timeout error])
+      span.finish
+    end
+
+    it 'applies declaration order rather than completion order for colliding keys' do
+      # The later-declared detector returns almost immediately; the
+      # earlier-declared one returns afterwards. Completion order is therefore
+      # reversed, but the later declaration must still win the collision.
+      configurator.add_resource_detector(ResourceDetectorDoubles::Slow.new({ 'shared.name' => 'early-declared' }, 0.05))
+      configurator.add_resource_detector(ResourceDetectorDoubles::Fast.new('shared.name' => 'late-declared'))
+
+      configurator.configure
+
+      _(detected_attributes['shared.name']).must_equal('late-declared')
+      _(configurator.resource_detection_results.map(&:status)).must_equal(%i[success success])
+    end
+
+    it 'discards attributes from a detector that returns after the deadline' do
+      configurator.add_resource_detector(ResourceDetectorDoubles::Fast.new('fast.key' => 'fast-value'))
+      configurator.add_resource_detector(ResourceDetectorDoubles::Stuck.new({ 'stuck.key' => 'stuck-value' }, gate))
+      configurator.resource_detection_timeout = 0.2
+
+      configurator.configure
+      resource = OpenTelemetry.tracer_provider.resource
+      before = resource.attribute_enumerator.to_h
+
+      gate << true # release the stuck detector after configuration completed
+      sleep 0.1     # let it come back and attempt to write into the run
+
+      _(resource.attribute_enumerator.to_h).must_equal(before)
+      _(resource.attribute_enumerator.to_h).wont_include('stuck.key')
+      _(OpenTelemetry.tracer_provider.resource).must_be_same_as(resource)
+    end
+
+    it 'records detector failures without aborting configuration' do
+      configurator.add_resource_detector(ResourceDetectorDoubles::Failing.new(ArgumentError.new('boom')))
+      configurator.add_resource_detector(ResourceDetectorDoubles::Fast.new('fast.key' => 'fast-value'))
+
+      configurator.configure
+
+      results = configurator.resource_detection_results
+      _(results.map(&:status)).must_equal(%i[error success])
+      _(results.first.error).must_be_kind_of(ArgumentError)
+      _(detected_attributes['fast.key']).must_equal('fast-value')
+    end
+
+    it 'lets an explicitly configured resource override detected attributes' do
+      configurator.add_resource_detector(ResourceDetectorDoubles::Fast.new('shared' => 'detected'))
+      configurator.resource = OpenTelemetry::SDK::Resources::Resource.create('shared' => 'configured')
+
+      configurator.configure
+
+      _(detected_attributes['shared']).must_equal('configured')
+    end
+
+    it 'accepts hashes and nil as detector results' do
+      configurator.add_resource_detector(ResourceDetectorDoubles::HashResult.new('hash.key' => 'hash-value'))
+      configurator.add_resource_detector(ResourceDetectorDoubles::NilResult.new)
+
+      configurator.configure
+
+      _(detected_attributes['hash.key']).must_equal('hash-value')
+      _(configurator.resource_detection_results.map(&:status)).must_equal(%i[success success])
+    end
+
+    it 'reports an unsupported detector result as an error' do
+      configurator.add_resource_detector(ResourceDetectorDoubles::Invalid.new)
+      configurator.add_resource_detector(ResourceDetectorDoubles::Fast.new('fast.key' => 'fast-value'))
+
+      configurator.configure
+
+      results = configurator.resource_detection_results
+      _(results.map(&:status)).must_equal(%i[error success])
+      _(results.first.error).must_be_kind_of(TypeError)
+      _(detected_attributes['fast.key']).must_equal('fast-value')
+    end
+
+    it 'waits for every detector when no deadline is set' do
+      configurator.resource_detection_timeout = nil
+      configurator.add_resource_detector(ResourceDetectorDoubles::Slow.new({ 'slow.key' => 'slow-value' }, 0.05))
+      configurator.add_resource_detector(ResourceDetectorDoubles::Fast.new('fast.key' => 'fast-value'))
+
+      configurator.configure
+
+      _(detected_attributes['slow.key']).must_equal('slow-value')
+      _(detected_attributes['fast.key']).must_equal('fast-value')
+      _(configurator.resource_detection_results.map(&:status)).must_equal(%i[success success])
+    end
+
+    it 'does not leave the resource with an in-flight detector result' do
+      configurator.add_resource_detector(ResourceDetectorDoubles::Stuck.new({ 'stuck.key' => 'stuck-value' }, gate))
+      configurator.resource_detection_timeout = 0.1
+
+      configurator.configure
+
+      _(configurator.resource_detection_results.map(&:status)).must_equal(%i[timeout])
+      _(detected_attributes).wont_include('stuck.key')
+    end
+
+    it 'does not wait forever when a detector aborts its worker entirely' do
+      configurator.add_resource_detector(ResourceDetectorDoubles::Aborting.new)
+      configurator.add_resource_detector(ResourceDetectorDoubles::Fast.new('fast.key' => 'fast-value'))
+      configurator.resource_detector_concurrency = 1
+      configurator.resource_detection_timeout = nil
+
+      runner = Thread.new { configurator.configure }
+      _(runner.join(5)).wont_be_nil
+
+      # The worker died before running the second detector, so that detector
+      # never produced a result; it must be reported, not awaited forever.
+      _(configurator.resource_detection_results.map(&:status)).must_equal(%i[timeout timeout])
+    end
+
+    it 'runs at most the configured number of detectors concurrently' do
+      tracker = ResourceDetectorDoubles::ConcurrencyTracker.new
+      detector = ResourceDetectorDoubles::Tracked.new(tracker)
+
+      4.times { configurator.add_resource_detector(detector) }
+      configurator.resource_detector_concurrency = 2
+
+      configurator.configure
+
+      _(tracker.peak).must_be :<=, 2
+      _(configurator.resource_detection_results.map(&:status)).must_equal(%i[success success success success])
+    end
+  end
+
   describe '#use' do
     it 'can be called multiple times' do
       configurator.use('TestInstrumentation', enabled: true)
@@ -388,6 +597,127 @@ describe OpenTelemetry::SDK::Configurator do
       propagator.instance_variable_get(:@propagators)
     else
       [propagator]
+    end
+  end
+end
+
+# Stand-in resource detectors used by the resource detection tests. They live
+# outside the +describe+ block so every example shares one definition.
+module ResourceDetectorDoubles
+  # Returns a fixed resource as soon as it runs.
+  class Fast
+    def initialize(attributes)
+      @attributes = attributes
+    end
+
+    def detect
+      OpenTelemetry::SDK::Resources::Resource.create(@attributes)
+    end
+  end
+
+  # Waits briefly, then returns a fixed resource, so it finishes after a
+  # concurrently-running {Fast} detector declared later.
+  class Slow
+    def initialize(attributes, delay)
+      @attributes = attributes
+      @delay = delay
+    end
+
+    def detect
+      sleep @delay
+      OpenTelemetry::SDK::Resources::Resource.create(@attributes)
+    end
+  end
+
+  # Blocks until the injected queue is pushed, then returns its resource.
+  class Stuck
+    def initialize(attributes, gate)
+      @attributes = attributes
+      @gate = gate
+    end
+
+    def detect
+      @gate.pop
+      OpenTelemetry::SDK::Resources::Resource.create(@attributes)
+    end
+  end
+
+  # Raises the injected exception as soon as it runs.
+  class Failing
+    def initialize(error)
+      @error = error
+    end
+
+    def detect
+      raise @error
+    end
+  end
+
+  # Returns a plain Hash of attributes.
+  class HashResult
+    def initialize(attributes)
+      @attributes = attributes
+    end
+
+    def detect
+      @attributes
+    end
+  end
+
+  # Returns nil, which means no attributes.
+  class NilResult
+    def detect; end
+  end
+
+  # Returns something that is neither a Resource nor a Hash.
+  class Invalid
+    def detect
+      :not_a_resource
+    end
+  end
+
+  # Terminates its own worker thread, so the worker exits without recording a
+  # result for this detector or any still queued behind it.
+  class Aborting
+    def detect
+      Thread.current.kill
+    end
+  end
+
+  # Tracks the highest number of overlapping detector calls.
+  class ConcurrencyTracker
+    attr_reader :peak
+
+    def initialize
+      @mutex = Mutex.new
+      @live = 0
+      @peak = 0
+    end
+
+    def enter
+      @mutex.synchronize do
+        @live += 1
+        @peak = @live if @live > @peak
+      end
+    end
+
+    def leave
+      @mutex.synchronize { @live -= 1 }
+    end
+  end
+
+  # Reports overlap to a {ConcurrencyTracker} and returns an empty resource.
+  class Tracked
+    def initialize(tracker)
+      @tracker = tracker
+    end
+
+    def detect
+      @tracker.enter
+      sleep 0.05
+      OpenTelemetry::SDK::Resources::Resource.create
+    ensure
+      @tracker.leave
     end
   end
 end
