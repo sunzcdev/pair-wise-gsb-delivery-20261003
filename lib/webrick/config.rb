@@ -91,6 +91,14 @@ module WEBrick
     # :HandlerTable::
     #   Maps file suffixes to file handlers.  DefaultFileHandler is used by
     #   default but any servlet can be used.
+    # :MimeTypes::
+    #   Maps file suffixes to Content-Type values for this mount.  Suffixes
+    #   are matched from the most specific one, so "tar.gz" takes precedence
+    #   over "gz" for "foo.tar.gz".  The mapping is copied and frozen when the
+    #   servlet is mounted, so mounts do not affect each other.  A suffix that
+    #   is not found here falls back to the server-wide :MimeTypes, and then to
+    #   "application/octet-stream".  +nil+ (the default) means only the
+    #   server-wide :MimeTypes is used.
     # :NondisclosureName::
     #   Do not show files matching this array of globs.  .ht* and *~ are
     #   excluded by default.
@@ -101,6 +109,7 @@ module WEBrick
     FileHandler = {
       :NondisclosureName => [".ht*", "*~"],
       :FancyIndexing     => false,
+      :MimeTypes         => nil,
       :HandlerTable      => {},
       :HandlerCallback   => nil,
       :DirectoryCallback => nil,

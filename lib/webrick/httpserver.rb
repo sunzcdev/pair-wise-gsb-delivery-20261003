@@ -155,10 +155,19 @@ module WEBrick
 
     ##
     # Mounts +servlet+ on +dir+ passing +options+ to the servlet at creation
-    # time
+    # time.
+    #
+    # If +servlet+ responds to +freeze_mount_options+ it is called with
+    # +options+ and returns the options that are stored for this mount.  A
+    # servlet may use this to take a snapshot of options that must not change
+    # after mounting, even though a new servlet instance is created for each
+    # request.
 
     def mount(dir, servlet, *options)
       @logger.debug(sprintf("%s is mounted on %s.", servlet.inspect, dir))
+      if servlet.respond_to?(:freeze_mount_options)
+        options = servlet.freeze_mount_options(*options)
+      end
       @mount_tab[dir] = [ servlet, options ]
     end
 

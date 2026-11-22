@@ -3,7 +3,13 @@ module WEBrick
     class DefaultFileHandler < AbstractServlet
       @local_path: String
 
-      def initialize: (HTTPServer server, String local_path) -> void
+      @mime_types: HTTPUtils::mime_types?
+
+      attr_reader mime_types: HTTPUtils::mime_types?
+
+      def mime_types=: (HTTPUtils::mime_types? mime_types) -> HTTPUtils::mime_types?
+
+      def initialize: (HTTPServer server, String local_path, ?HTTPUtils::mime_types? mime_types) -> void
 
       def do_GET: (HTTPRequest req, HTTPResponse res) -> void
 
@@ -15,6 +21,10 @@ module WEBrick
       def make_partial_content: (HTTPRequest req, HTTPResponse res, String filename, Integer filesize) -> void
 
       def prepare_range: (Range[Integer] range, Integer filesize) -> [Numeric, Numeric]
+
+      def mime_type_of: (String filename) -> String
+
+      def self.freeze_mount_options: (*untyped options) -> Array[untyped]
     end
 
     class FileHandler < AbstractServlet
@@ -26,11 +36,17 @@ module WEBrick
 
       @options: Hash[Symbol, untyped]
 
+      @mime_types: HTTPUtils::mime_types?
+
       HandlerTable: Hash[String, singleton(AbstractServlet)]
+
+      attr_reader mime_types: HTTPUtils::mime_types?
 
       def self.add_handler: (String suffix, singleton(AbstractServlet) handler) -> singleton(AbstractServlet)
 
       def self.remove_handler: (String suffix) -> singleton(AbstractServlet)
+
+      def self.freeze_mount_options: (*untyped options) -> Array[untyped]
 
       def initialize: (HTTPServer server, String root, ?Hash[Symbol, untyped] options, ?Hash[Symbol, untyped] default) -> void
 

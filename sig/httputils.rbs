@@ -16,6 +16,12 @@ module WEBrick
 
     def self?.mime_type: (String filename, mime_types mime_tab) -> String
 
+    def self?.mime_type_by_suffix: (String filename, mime_types mime_tab) -> String?
+
+    def self?.freeze_mime_types: (mime_types? mime_tab) -> mime_types?
+
+    def self?.normalized_mime_suffix?: (untyped suffix) -> bool
+
     class SplitHeader < Array[String]
       def join: (?String separator) -> String
     end

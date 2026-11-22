@@ -98,4 +98,67 @@ class TestWEBrickHTTPUtils < Test::Unit::TestCase
     assert_equal("/foo/bar/", escape_path("/foo/bar/"))
     assert_equal("/%25foo/bar/", escape_path("/%foo/bar/"))
   end
+
+  def test_mime_type_by_suffix
+    tab = {
+      "gz" => "application/gzip",
+      "tar.gz" => "application/x-tar",
+      "tgz" => "application/gzip",
+      "txt" => "text/plain",
+    }
+
+    assert_equal("application/x-tar", mime_type_by_suffix("foo.tar.gz", tab))
+    assert_equal("application/gzip", mime_type_by_suffix("foo.gz", tab))
+    assert_equal("text/plain", mime_type_by_suffix("foo.TXT", tab))
+    assert_equal("text/plain", mime_type_by_suffix("/dir/foo.txt", tab))
+    assert_nil(mime_type_by_suffix("foo.unknown", tab))
+    assert_nil(mime_type_by_suffix("foo", tab))
+    # same as ::mime_type, a leading dot still counts as a suffix
+    assert_equal("text/plain", mime_type_by_suffix(".txt", tab))
+    assert_nil(mime_type_by_suffix("foo.", tab))
+  end
+
+  def test_mime_type_by_suffix_most_specific_wins
+    tab = { "gz" => "application/gzip", "tar.gz" => "application/x-tar" }
+
+    assert_equal("application/x-tar", mime_type_by_suffix("a.b.tar.gz", tab))
+    assert_equal("application/gzip", mime_type_by_suffix("a.b.gz", tab))
+    # no entry for any suffix of the file
+    assert_nil(mime_type_by_suffix("a.b.tar.bz2", tab))
+  end
+
+  def test_mime_type_by_suffix_language_component
+    tab = { "html" => "text/html", "en" => "text/x-english" }
+
+    # a compound suffix ends the name, so it wins over the language
+    assert_equal("text/x-english",
+                 mime_type_by_suffix("index.html.en", tab))
+    assert_equal("text/x-english",
+                 mime_type_by_suffix("index.en", tab))
+    # the component before the last one is tried, like ::mime_type does
+    assert_equal("text/html",
+                 mime_type_by_suffix("index.html.de", tab))
+  end
+
+  def test_freeze_mime_types
+    source = { ".TAR.GZ" => "application/x-tar", "GZ" => "application/gzip" }
+    frozen = freeze_mime_types(source)
+
+    assert_equal("application/x-tar", frozen["tar.gz"])
+    assert_equal("application/gzip", frozen["gz"])
+    assert_predicate(frozen, :frozen?)
+    assert_nil(freeze_mime_types(nil))
+
+    # the snapshot is independent of the source mapping
+    source["tar.gz"] = "application/octet-stream"
+    assert_equal("application/x-tar", frozen["tar.gz"])
+
+    # a frozen table is normalized as well when its keys are not already
+    assert_equal("application/x-tar",
+                 freeze_mime_types({ ".TAR.GZ" => "application/x-tar" }.freeze)["tar.gz"])
+
+    # an already normalized snapshot is returned as is, so a mount's snapshot
+    # can be passed to each request without being copied again
+    assert_same(frozen, freeze_mime_types(frozen))
+  end
 end

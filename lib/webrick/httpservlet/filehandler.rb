@@ -33,10 +33,45 @@ module WEBrick
 
       ##
       # Creates a DefaultFileHandler instance for the file at +local_path+.
+      #
+      # +mime_types+ is an optional mapping of file suffixes to MIME types
+      # belonging to the mount that owns the file.  A frozen private copy is
+      # kept so that later changes to the mapping cannot affect the response.
+      # When a suffix has no entry in +mime_types+ the server-wide
+      # +:MimeTypes+ is used instead.
 
-      def initialize(server, local_path)
+      def initialize(server, local_path, mime_types = nil)
         super(server, local_path)
         @local_path = local_path
+        self.mime_types = mime_types
+      end
+
+      ##
+      # Snapshots the MIME type mapping of a directly mounted
+      # DefaultFileHandler, so the mount keeps the mapping it was configured
+      # with.  See FileHandler.freeze_mount_options.
+
+      def self.freeze_mount_options(*options)
+        options = options.dup
+        if options[1].is_a?(Hash)
+          options[1] = HTTPUtils.freeze_mime_types(options[1])
+        end
+        options
+      end
+
+      # The frozen MIME type table of the mount owning this file, or +nil+
+      # when the server-wide table should be used.
+
+      attr_reader :mime_types
+
+      # Sets the MIME type table of this handler.  The table is frozen, so the
+      # response for a file cannot change while it is being produced.
+      #
+      # Mounted FileHandlers pass their frozen mount snapshot here for every
+      # request, see FileHandler#exec_handler.
+
+      def mime_types=(mime_types)
+        @mime_types = HTTPUtils.freeze_mime_types(mime_types)
       end
 
       # :stopdoc:
@@ -53,7 +88,7 @@ module WEBrick
           make_partial_content(req, res, @local_path, st.size)
           raise HTTPStatus::PartialContent
         else
-          mtype = HTTPUtils::mime_type(@local_path, @config[:MimeTypes])
+          mtype = mime_type_of(@local_path)
           res['content-type'] = mtype
           res['content-length'] = st.size.to_s
           res['last-modified'] = mtime.httpdate
@@ -116,7 +151,7 @@ module WEBrick
       end
 
       def make_partial_content(req, res, filename, filesize)
-        mtype = HTTPUtils::mime_type(filename, @config[:MimeTypes])
+        mtype = mime_type_of(filename)
         unless ranges = HTTPUtils::parse_range_header(req['range'])
           raise HTTPStatus::BadRequest,
             "Unrecognized range-spec: \"#{req['range']}\""
@@ -160,6 +195,18 @@ module WEBrick
         return first, last
       end
 
+      # Resolves the MIME type of +filename+ using the mapping frozen for
+      # this file's mount, falling back to the server-wide +:MimeTypes+ when
+      # the mount mapping has no matching suffix.
+
+      def mime_type_of(filename)
+        if @mime_types
+          type = HTTPUtils.mime_type_by_suffix(filename, @mime_types)
+          return type if type
+        end
+        HTTPUtils::mime_type(filename, @config[:MimeTypes])
+      end
+
       # :startdoc:
     end
 
@@ -199,6 +246,15 @@ module WEBrick
       #
       # If +options+ is true or false then +:FancyIndexing+ is enabled or
       # disabled respectively.
+      #
+      # The +:MimeTypes+ option may be used to give this mount its own mapping
+      # of file suffixes to Content-Type values.  A frozen snapshot is taken
+      # when the servlet is mounted (see ::freeze_mount_options), so each mount
+      # has its own copy: changing the mapping of one mount, or the
+      # server-wide +:MimeTypes+, does not change the responses of another
+      # mount.  Suffixes are matched from the most specific one, so "tar.gz"
+      # wins over "gz" for "foo.tar.gz".  Suffixes without an entry in the
+      # mount mapping fall back to the server-wide +:MimeTypes+.
 
       def initialize(server, root, options={}, default=Config::FileHandler)
         @config = server.config
@@ -208,7 +264,35 @@ module WEBrick
           options = { :FancyIndexing => options }
         end
         @options = default.dup.update(options)
+        @mime_types = HTTPUtils.freeze_mime_types(@options[:MimeTypes])
       end
+
+      ##
+      # Snapshots the +:MimeTypes+ mapping of a mount's options so that this
+      # mount keeps the mapping it was configured with, independent of the
+      # caller's mapping and of other mounts.
+      #
+      # An options hash carrying +:MimeTypes+ is copied for this mount, so the
+      # caller's hash is never modified and a frozen options hash is accepted.
+      # Options in a hash without +:MimeTypes+ keep their usual live
+      # semantics, for example +:NondisclosureName+ may still be changed
+      # through +server[:DocumentRootOptions]+ after mounting.
+
+      def self.freeze_mount_options(*options)
+        options = options.dup
+        (1...options.size).each do |i|
+          opts = options[i]
+          next unless opts.is_a?(Hash) && opts.key?(:MimeTypes)
+          opts = options[i] = opts.dup
+          opts[:MimeTypes] = HTTPUtils.freeze_mime_types(opts[:MimeTypes])
+        end
+        options
+      end
+
+      # The frozen MIME type table of this mount, or +nil+ when the
+      # server-wide +:MimeTypes+ should be used.
+
+      attr_reader :mime_types
 
       # :stopdoc:
 
@@ -312,6 +396,12 @@ module WEBrick
           handler = get_handler(req, res)
           call_callback(:HandlerCallback, req, res)
           h = handler.get_instance(@config, res.filename)
+          # Hand the file's servlet the mapping frozen for this mount, so that
+          # GET, HEAD and Range responses for the file all agree on it.  Other
+          # handlers (CGI, ERB, custom) keep using the server-wide table.
+          if @mime_types && h.respond_to?(:mime_types=)
+            h.mime_types = @mime_types
+          end
           h.service(req, res)
           return true
         end

@@ -149,6 +149,74 @@ module WEBrick
     module_function :mime_type
 
     ##
+    # Returns the mime type of +filename+ from the list in +mime_tab+,
+    # trying the most specific suffix first, or +nil+ when +mime_tab+ has no
+    # entry for any of the suffixes of +filename+.
+    #
+    #   mime_type_by_suffix("foo.tar.gz", {"gz" => "application/gzip",
+    #                                      "tar.gz" => "application/x-tar"})
+    #   # => "application/x-tar"
+    #
+    # Suffixes that end the name are looked up from the longest to the
+    # shortest, so a compound suffix takes precedence over a single one.
+    # When the name carries an extra suffix such as the language added for
+    # +:AcceptableLanguages+ ("index.html.en"), the component before the last
+    # one is tried as well, just like ::mime_type does.
+    #
+    # Unlike ::mime_type this method never falls back to
+    # "application/octet-stream"; it returns +nil+ instead so callers can
+    # apply a fallback of their own.
+
+    def mime_type_by_suffix(filename, mime_tab)
+      parts = File.basename(filename).split(".")
+      (1...parts.size).each do |i|
+        type = mime_tab[parts[i..-1].join(".").downcase]
+        return type if type
+      end
+      if parts.size > 2
+        type = mime_tab[parts[-2].downcase]
+        return type if type
+      end
+      nil
+    end
+    module_function :mime_type_by_suffix
+
+    ##
+    # Returns a frozen copy of +mime_tab+ whose keys are normalized to
+    # lowercase suffixes without a leading dot, as expected by
+    # ::mime_type_by_suffix.  Returns +nil+ when +mime_tab+ is +nil+.
+    #
+    # Freezing the copy lets a caller keep a private snapshot of a mapping
+    # that may otherwise be shared or mutated, such as the +:MimeTypes+
+    # option of a mounted servlet.  A frozen table whose keys are already
+    # normalized is returned unchanged, so a snapshot can be passed to each
+    # request of a mount without being copied again.
+
+    def freeze_mime_types(mime_tab)
+      return nil if mime_tab.nil?
+      if mime_tab.frozen? && mime_tab.each_key.all?{|suffix|
+           normalized_mime_suffix?(suffix)
+         }
+        return mime_tab
+      end
+      tab = {}
+      mime_tab.each{|suffix, type|
+        tab[suffix.to_s.sub(/\A\.+/, "").downcase] = type
+      }
+      tab.freeze
+    end
+    module_function :freeze_mime_types
+
+    ##
+    # Returns whether +suffix+ is a normalized mapping key as produced by
+    # ::freeze_mime_types.
+
+    def normalized_mime_suffix?(suffix) # :nodoc:
+      suffix.is_a?(String) && suffix == suffix.sub(/\A\.+/, "").downcase
+    end
+    module_function :normalized_mime_suffix?
+
+    ##
     # Parses an HTTP header +raw+ into a hash of header fields with an Array
     # of values.
 
