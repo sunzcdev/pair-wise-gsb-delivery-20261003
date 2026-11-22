@@ -41,6 +41,7 @@ module OpenTelemetry
           # @return a new instance of the {InMemorySpanExporter}.
           def initialize(recording: true)
             @finished_spans = []
+            @resources = []
             @stopped = false
             @recording = recording
             @mutex = Mutex.new
@@ -56,12 +57,47 @@ module OpenTelemetry
             end
           end
 
+          # Returns a frozen array of the {OpenTelemetry::SDK::Resources::Resource}
+          # objects carried by the exported {SpanData}s, in export order.
+          #
+          # This exposes the resource that was actually handed to the exporter,
+          # which is the best way to confirm what a provider ended up using
+          # after resources from several sources were merged.
+          #
+          # @return [Array<OpenTelemetry::SDK::Resources::Resource>] a frozen array
+          #   of exported resources.
+          def resources
+            @mutex.synchronize do
+              @resources.clone.freeze
+            end
+          end
+
+          # Returns a frozen array of
+          # {OpenTelemetry::SDK::Resources::Resource::MergeReport}s, one per
+          # distinct exported resource.
+          #
+          # Each report names the source of every attribute and of the schema
+          # URL, and lists the collisions the merge resolved. Together with
+          # {#resources} it answers "what did the exporter actually receive, and
+          # which layer did each value come from?"
+          #
+          # @return [Array<OpenTelemetry::SDK::Resources::Resource::MergeReport>]
+          #   frozen merge reports.
+          def resource_reports
+            @mutex.synchronize do
+              @resources.map(&:merge_report)
+                        .uniq { |report| [report.attributes, report.schema_url] }
+                        .freeze
+            end
+          end
+
           # Clears the internal collection of finished {Span}s.
           #
           # Does not reset the state of this exporter if already shutdown.
           def reset
             @mutex.synchronize do
               @finished_spans.clear
+              @resources.clear
             end
           end
 
@@ -76,7 +112,11 @@ module OpenTelemetry
             @mutex.synchronize do
               return FAILURE if @stopped
 
-              @finished_spans.concat(span_datas.to_a) if @recording
+              if @recording
+                exported = span_datas.to_a
+                @finished_spans.concat(exported)
+                @resources.concat(exported.filter_map(&:resource))
+              end
             end
             SUCCESS
           end
@@ -100,6 +140,7 @@ module OpenTelemetry
           def shutdown(timeout: nil)
             @mutex.synchronize do
               @finished_spans.clear
+              @resources.clear
               @stopped = true
             end
             SUCCESS

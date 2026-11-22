@@ -81,6 +81,52 @@ end
 
 For additional examples, see the [examples on github][examples-github].
 
+## Diagnosing merged resources
+
+A resource can be assembled from several layers: the SDK defaults, values from
+`OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`, and values supplied by the
+application through `c.resource =`. Later layers win on collision, and the
+merged resource records where each value came from.
+
+```ruby
+resource = OpenTelemetry::SDK::Resources::Resource
+
+application = resource.create(
+  { 'service.name' => 'checkout', 'deployment.environment' => '' },
+  schema_url: 'https://opentelemetry.io/schemas/1.21.0',
+  source: :application
+)
+
+# The default resource already carries the SDK/process values and any
+# OTEL_SERVICE_NAME / OTEL_RESOURCE_ATTRIBUTES values; application wins.
+merged = resource.default.merge(application)
+report = merged.merge_report
+
+report.sources['service.name']         # => :application
+report.sources['process.pid']          # => :process
+report.schema_url                      # => "https://opentelemetry.io/schemas/1.21.0"
+report.schema_conflict                 # => nil, or the two competing URLs
+report.conflicts.map(&:key)            # => keys that were overridden
+```
+
+An explicitly supplied empty string is a normal attribute value, so it can win
+a collision and is reported like any other value. `merge` still returns a
+`Resource`; pass `source:` only when you want to label the incoming layer.
+
+The in-memory span exporter can show what actually reached the export pipeline:
+
+```ruby
+exporter = OpenTelemetry::SDK::Trace::Export::InMemorySpanExporter.new
+# ... configure a TracerProvider with the exporter ...
+exporter.resources         # => the resources carried by the exported spans
+exporter.resource_reports  # => their merge reports
+```
+
+`resource_reports` collapses identical resources, so it usually has one entry
+per distinct resource in the batch.
+
+For additional examples, see the [examples on github][examples-github].
+
 ## How can I get involved?
 
 The `opentelemetry-sdk` gem source is [on github][repo-github], along with related gems including `opentelemetry-api`.

@@ -35,6 +35,11 @@ module OpenTelemetry
       private_constant :USE_MODE_UNSPECIFIED, :USE_MODE_ONE, :USE_MODE_ALL
 
       attr_writer :propagators, :id_generator
+      # The resource that will be attached to telemetry from this SDK, after the
+      # default, environment, and application layers have been merged.
+      #
+      # @return [Resources::Resource]
+      attr_reader :resource
 
       def initialize
         @instrumentation_names = []
@@ -89,9 +94,14 @@ module OpenTelemetry
       # to include additional resource information.
       # If a resource key collision occurs the passed in resource takes priority.
       #
+      # The merged resource records +:application+ as the source of these
+      # attributes, so {Resources::Resource#merge_report} can distinguish them
+      # from the SDK defaults (+:default+, +:process+, +:telemetry_sdk+) and
+      # environment-provided values (+:environment+).
+      #
       # @param [Resource] new_resource The resource to be merged
       def resource=(new_resource)
-        @resource = @resource.merge(new_resource)
+        @resource = @resource.merge(new_resource, source: :application)
       end
 
       # Accepts a string that is merged in as the service.name resource attribute.

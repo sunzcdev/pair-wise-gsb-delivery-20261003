@@ -12,4 +12,6 @@ module OpenTelemetry
   end
 end
 
+require 'opentelemetry/sdk/resources/merge_report'
+require 'opentelemetry/sdk/resources/provenance'
 require 'opentelemetry/sdk/resources/resource'

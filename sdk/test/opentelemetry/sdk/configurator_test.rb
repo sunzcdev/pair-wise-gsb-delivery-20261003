@@ -95,6 +95,27 @@ describe OpenTelemetry::SDK::Configurator do
       _(configurator_resource_attributes).must_equal(expected_resource_attributes)
     end
 
+    it 'records :application as the source of the supplied attributes' do
+      configurator.resource = OpenTelemetry::SDK::Resources::Resource.create({ 'test_key' => 'test_value' }, source: :application)
+
+      report = configurator_resource.merge_report
+      _(report.sources['test_key']).must_equal(:application)
+      _(report.sources['process.pid']).must_equal(:process)
+      _(report.sources['telemetry.sdk.name']).must_equal(:telemetry_sdk)
+    end
+
+    it 'labels supplied attributes as :application even when the resource carries no source' do
+      configurator.resource = OpenTelemetry::SDK::Resources::Resource.create('test_key' => 'test_value')
+
+      _(configurator_resource.merge_report.sources['test_key']).must_equal(:application)
+    end
+
+    it 'exposes the merged resource through the reader' do
+      configurator.resource = OpenTelemetry::SDK::Resources::Resource.create('test_key' => 'test_value')
+
+      _(configurator.resource).must_be_same_as(configurator_resource)
+    end
+
     describe 'when there is a resource key collision' do
       let(:expected_resource_attributes) { default_resource_attributes.merge('important_value' => '25') }
 
@@ -106,6 +127,21 @@ describe OpenTelemetry::SDK::Configurator do
         OpenTelemetry::TestHelpers.with_env('OTEL_RESOURCE_ATTRIBUTES' => 'important_value=100') do
           configurator.resource = OpenTelemetry::SDK::Resources::Resource.create('important_value' => '25')
           _(configurator_resource_attributes).must_equal(expected_resource_attributes)
+        end
+      end
+
+      it 'reports the collision with both layers' do
+        OpenTelemetry::TestHelpers.with_env('OTEL_RESOURCE_ATTRIBUTES' => 'important_value=100') do
+          OpenTelemetry::SDK::Resources::Resource.instance_variable_set(:@default, nil)
+
+          configurator.resource = OpenTelemetry::SDK::Resources::Resource.create('important_value' => '25')
+
+          conflict = configurator_resource.merge_report.conflicts.find { |c| c.key == 'important_value' }
+          _(conflict).wont_be_nil
+          _(conflict.kept_value).must_equal('25')
+          _(conflict.kept_source).must_equal(:application)
+          _(conflict.replaced_value).must_equal('100')
+          _(conflict.replaced_source).must_equal(:environment)
         end
       end
     end
