@@ -7,12 +7,69 @@ module ActiveRecord
     attr_reader :model, :connection, :inserts, :keys
     attr_reader :on_duplicate, :update_only, :returning, :unique_by, :update_sql
 
+    # Mixed into exceptions raised while executing a multi-batch
+    # upsert (see Relation#upsert_all's <tt>:allow_partial_rows</tt>
+    # option), so the results of the batches that completed before the
+    # failure remain accessible.
+    module PartialBatchResults
+      attr_accessor :batch_results
+    end
+
     class << self
-      def execute(relation, ...)
-        relation.model.with_connection do |c|
-          new(relation, c, ...).execute
+      def execute(relation, inserts, allow_partial_rows: false, **options)
+        relation.model.with_connection do |connection|
+          if allow_partial_rows
+            execute_in_key_groups(relation, connection, inserts, **options)
+          else
+            new(relation, connection, inserts, **options).execute
+          end
         end.tap { relation.reset }
       end
+
+      private
+        # Splits rows into groups that share the same set of keys, so each
+        # group can be inserted with its own column list. Columns missing
+        # from a row are left out of that group's INSERT, which lets the
+        # database fill in column defaults on insert and keeps the existing
+        # values on conflict update. Keys explicitly set to +nil+ are still
+        # written as SQL NULL.
+        def execute_in_key_groups(relation, connection, inserts, **options)
+          stringified = inserts.map(&:stringify_keys)
+
+          groups = {}
+          stringified.each_with_index do |attributes, index|
+            (groups[attributes.keys.sort] ||= []) << index
+          end
+
+          if groups.size <= 1
+            return new(relation, connection, stringified, **options).execute
+          end
+
+          batches = []
+          begin
+            groups.each_value do |indices|
+              result = new(relation, connection, stringified.values_at(*indices), **options).execute
+              batches << [indices, result]
+            end
+          rescue StandardError => error
+            error.extend(PartialBatchResults)
+            error.batch_results = batches.map(&:last)
+            raise
+          end
+
+          combine_batch_results(batches, stringified.size)
+        end
+
+        # Reorders the rows returned by each batch so the combined result
+        # lines up with the positions of the rows originally passed in.
+        def combine_batch_results(batches, size)
+          columns = batches.map { |_, result| result.columns }.find(&:any?) || []
+          rows = Array.new(size)
+          batches.each do |indices, result|
+            indices.zip(result.rows) { |index, row| rows[index] = row }
+          end
+          ActiveRecord::Result.new(columns, rows.compact)
+        end
     end
 
     def initialize(relation, connection, inserts, on_duplicate:, update_only: nil, returning: nil, unique_by: nil, record_timestamps: nil)

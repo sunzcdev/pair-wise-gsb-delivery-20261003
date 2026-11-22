@@ -965,6 +965,28 @@ module ActiveRecord
     #     record_timestamps: true  # Always set timestamps automatically
     #     record_timestamps: false # Never set timestamps automatically
     #
+    # [:allow_partial_rows]
+    #   When true, the rows in +attributes+ may have different keys. Rows are
+    #   grouped by their set of keys and each group is upserted with its own
+    #   column list, so a column that is missing from a row is filled with
+    #   the database's default value on insert and is left untouched when a
+    #   conflict updates an existing row. Keys explicitly set to +nil+ are
+    #   still written as SQL NULL.
+    #
+    #     Book.upsert_all([
+    #       { id: 1, name: "Renamed" },  # keeps the stored cover on conflict
+    #       { name: "Fresh", cover: nil }, # inserts a NULL cover
+    #       { name: "Defaulted" }        # inserts the default cover
+    #     ], allow_partial_rows: true)
+    #
+    #   The returned ActiveRecord::Result lines up with the positions of the
+    #   rows passed in. If one of the groups fails, the exception is
+    #   re-raised with the results of the groups that already completed
+    #   attached as <tt>error.batch_results</tt>.
+    #
+    #   The <tt>:unique_by</tt>, <tt>:update_only</tt>, and <tt>:returning</tt>
+    #   options apply to every group.
+    #
     # ==== Examples
     #
     #   # Inserts multiple records, performing an upsert when records have duplicate ISBNs.
@@ -976,8 +998,8 @@ module ActiveRecord
     #   ], unique_by: :isbn)
     #
     #   Book.find_by(isbn: "1").title # => "Eloquent Ruby"
-    def upsert_all(attributes, on_duplicate: :update, update_only: nil, returning: nil, unique_by: nil, record_timestamps: nil)
-      InsertAll.execute(self, attributes, on_duplicate: on_duplicate, update_only: update_only, returning: returning, unique_by: unique_by, record_timestamps: record_timestamps)
+    def upsert_all(attributes, on_duplicate: :update, update_only: nil, returning: nil, unique_by: nil, record_timestamps: nil, allow_partial_rows: false)
+      InsertAll.execute(self, attributes, on_duplicate: on_duplicate, update_only: update_only, returning: returning, unique_by: unique_by, record_timestamps: record_timestamps, allow_partial_rows: allow_partial_rows)
     end
 
     # Updates the counters of the records in the current relation.

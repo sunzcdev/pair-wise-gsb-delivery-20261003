@@ -470,6 +470,73 @@ class InsertAllTest < ActiveRecord::TestCase
     assert_equal new_name, Book.find(1).name
   end
 
+  def test_upsert_all_with_partial_rows_accepts_rows_with_different_keys
+    skip unless supports_insert_on_duplicate_update? && supports_insert_returning?
+
+    book1 = Book.create!(name: "First", cover: "soft")
+    book2 = Book.create!(name: "Second", cover: "hard")
+
+    result = Book.upsert_all([
+      { id: book1.id, name: "First (updated)" },                 # missing cover: kept on conflict
+      { name: "Third", cover: nil },                             # explicit nil: SQL NULL
+      { name: "Fourth" },                                        # missing cover: database default
+      { id: book2.id, name: "Second (updated)", cover: "soft" }, # full row: updated
+    ], allow_partial_rows: true, returning: %w[ id name cover ])
+
+    assert_equal %w[ id name cover ], result.columns
+
+    # The returned rows line up with the positions of the rows passed in.
+    assert_equal [book1.id, "First (updated)", "soft"], result.rows[0]
+    assert_equal ["Third", nil], result.rows[1].last(2)
+    assert_equal ["Fourth", "hard"], result.rows[2].last(2)
+    assert_equal [book2.id, "Second (updated)", "soft"], result.rows[3]
+
+    assert_equal "First (updated)", book1.reload.name
+    assert_equal "soft", book1.cover # missing column kept its stored value
+    assert_nil Book.find(result.rows[1][0]).cover # explicit nil inserted as NULL
+    assert_equal "hard", Book.find(result.rows[2][0]).cover # missing column got the default
+    assert_equal "soft", book2.reload.cover
+  end
+
+  def test_upsert_all_with_partial_rows_respects_update_only
+    skip unless supports_insert_on_duplicate_update?
+
+    book = Book.create!(name: "Old name", cover: "soft")
+
+    Book.upsert_all([
+      { id: book.id, name: "New name", cover: "hard" },
+      { name: "Inserted" },
+    ], allow_partial_rows: true, update_only: [:name])
+
+    book.reload
+    assert_equal "New name", book.name
+    assert_equal "soft", book.cover
+    assert_equal "hard", Book.find_by(name: "Inserted").cover
+  end
+
+  def test_upsert_all_with_partial_rows_exposes_completed_batch_results_when_a_later_group_fails
+    skip unless supports_insert_on_duplicate_update? && supports_insert_conflict_target?
+
+    existing = Book.create!(name: "Existing", isbn: "existing-isbn")
+
+    error = assert_raises(ActiveRecord::RecordNotUnique) do
+      Book.upsert_all([
+        { name: "Committed batch", isbn: "committed-isbn" },
+        # Conflicts with the primary key, which is not the unique_by target.
+        { id: existing.id, name: "Conflicting", isbn: "other-isbn" },
+      ], allow_partial_rows: true, unique_by: :isbn)
+    end
+
+    assert_equal 1, error.batch_results.size
+    assert_equal "Committed batch", Book.find_by(isbn: "committed-isbn").name
+
+    if supports_insert_returning?
+      committed = error.batch_results.first
+      assert_equal %w[ id ], committed.columns
+      assert_equal [[Book.find_by(isbn: "committed-isbn").id]], committed.rows
+    end
+  end
+
   def test_upsert_all_updates_existing_record_by_primary_key
     skip unless supports_insert_conflict_target?
 
