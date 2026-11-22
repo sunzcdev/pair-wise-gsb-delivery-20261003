@@ -97,6 +97,23 @@ module Puma
         @env[REMOTE_ADDR] = addr
       end
 
+      # The peer of the accepted connection as the OS reports it, independent
+      # of the `remote_address` option, a request header and the PROXY
+      # protocol. It has the same value for every request on a keep-alive
+      # connection.
+      @env[PUMA_PEER_ADDR] = peer_addr
+
+      # The PROXY protocol line is read only from the first request of a
+      # connection, so these describe the whole connection. The version key is
+      # set for a valid `PROXY UNKNOWN` line too, which says the protocol took
+      # part but reported no endpoint.
+      if (proxy_version = proxy_protocol_version)
+        @env[PUMA_PROXY_PROTOCOL] = proxy_version.to_s
+      end
+      if (proxy_addr = proxy_protocol_addr)
+        @env[PUMA_PROXY_PROTOCOL_ADDR] = proxy_addr
+      end
+
       # The legacy HTTP_VERSION header can be sent as a client header.
       # Rack v4 may remove using HTTP_VERSION.  If so, remove this line.
       @env[HTTP_VERSION] = @env[SERVER_PROTOCOL] if @env_set_http_version

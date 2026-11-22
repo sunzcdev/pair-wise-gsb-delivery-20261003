@@ -1946,6 +1946,98 @@ class TestPumaServer < PumaTest
     assert_equal "1.2.3.4", response.body
   end
 
+  # The connection-address view the tests below compare, one key per line.
+  # "(absent)" stands in for a key Puma did not set.
+  def conn_view(env)
+    %w[REMOTE_ADDR puma.peer_addr puma.proxy_protocol puma.proxy_protocol_addr].map { |k|
+      "#{k}=#{env.key?(k) ? env[k] : '(absent)'}"
+    }.join("\n")
+  end
+
+  def conn_view_hash(body)
+    body.split("\n").to_h { |line| line.split("=", 2) }
+  end
+
+  # Opens a local connection, writes +data+ and returns the app's view of the
+  # env together with the address the client connected from, which is the peer
+  # the server's socket must report.
+  def conn_view_for(data)
+    socket = new_socket
+    peer = socket.local_address.ip_address
+    socket << data
+    [conn_view_hash(socket.read_body), peer]
+  end
+
+  def test_connection_address_view_for_three_local_connections
+    server_run(remote_address: :proxy_protocol, remote_address_proxy_protocol: :v1) do |env|
+      [200, {}, [conn_view(env)]]
+    end
+
+    # 1. Plain connection: no PROXY line, so the protocol took no part.
+    view, peer = conn_view_for "GET / HTTP/1.0\r\n\r\n"
+    assert_equal peer, view["puma.peer_addr"], 'plain: puma.peer_addr is the socket peer'
+    assert_equal peer, view["REMOTE_ADDR"],   'plain: REMOTE_ADDR is the socket peer'
+    assert_equal '(absent)', view["puma.proxy_protocol"],      'plain: no PROXY line was read'
+    assert_equal '(absent)', view["puma.proxy_protocol_addr"], 'plain: no PROXY line was read'
+
+    # 2. Complete PROXY line: reported and socket addresses stay apart.
+    view, peer = conn_view_for "PROXY TCP4 1.2.3.4 5.6.7.8 10000 80\r\nGET / HTTP/1.0\r\n\r\n"
+    assert_equal peer,      view["puma.peer_addr"],          'proxy: socket peer, not the report'
+    assert_equal 'v1',      view["puma.proxy_protocol"],     'proxy: protocol took part'
+    assert_equal '1.2.3.4', view["puma.proxy_protocol_addr"], 'proxy: reported source address'
+    assert_equal '1.2.3.4', view["REMOTE_ADDR"],             'proxy: REMOTE_ADDR keeps the report'
+
+    # 3. PROXY UNKNOWN: the protocol took part but reported no endpoint.
+    view, peer = conn_view_for "PROXY UNKNOWN\r\nGET / HTTP/1.0\r\n\r\n"
+    assert_equal peer,       view["puma.peer_addr"],           'unknown: socket peer is kept'
+    assert_equal peer,       view["REMOTE_ADDR"],              'unknown: REMOTE_ADDR falls back to it'
+    assert_equal 'v1',       view["puma.proxy_protocol"],      'unknown: protocol still took part'
+    assert_equal '(absent)', view["puma.proxy_protocol_addr"], 'unknown: nothing was reported'
+  end
+
+  def test_connection_address_view_is_the_same_for_every_keep_alive_request
+    views = []
+    server_run(remote_address: :proxy_protocol, remote_address_proxy_protocol: :v1) do |env|
+      views << conn_view_hash(conn_view(env))
+      [200, {}, [env["PATH_INFO"]]]
+    end
+
+    [
+      ["PROXY TCP4 1.2.3.4 5.6.7.8 10000 80\r\n", "1.2.3.4"],
+      ["PROXY UNKNOWN\r\n", "(absent)"],
+    ].each do |proxy_line, reported|
+      views.clear
+      socket = new_socket
+      peer = socket.local_address.ip_address
+      socket << proxy_line
+      socket << "GET /one HTTP/1.1\r\nHost: test.com\r\n\r\n"
+
+      assert_equal "/one", socket.read_body, proxy_line
+
+      socket << "GET /two HTTP/1.1\r\nHost: test.com\r\nConnection: close\r\n\r\n"
+
+      assert_equal "/two", socket.read_body, proxy_line
+      assert_equal 2, views.length, "#{proxy_line.inspect}: both requests reached the app"
+      assert_equal views.first, views.last,
+        "#{proxy_line.inspect}: all requests on the connection see the same view"
+      assert_equal peer, views.first["puma.peer_addr"], proxy_line.inspect
+      assert_equal reported, views.first["puma.proxy_protocol_addr"], proxy_line.inspect
+      assert_equal "v1", views.first["puma.proxy_protocol"], proxy_line.inspect
+    end
+  end
+
+  def test_connection_address_view_keeps_remote_addr_for_a_header_option
+    server_run(remote_address: :header, remote_address_header: 'HTTP_X_REAL_IP') do |env|
+      [200, {}, [conn_view(env)]]
+    end
+
+    view, peer = conn_view_for "GET / HTTP/1.0\r\nX-Real-IP: 9.9.9.9\r\n\r\n"
+    assert_equal peer,      view["puma.peer_addr"], 'peer_addr stays the socket peer'
+    assert_equal '9.9.9.9', view["REMOTE_ADDR"],    'REMOTE_ADDR still follows the option'
+    assert_equal '(absent)', view["puma.proxy_protocol"], 'no PROXY line was read'
+    assert_equal '(absent)', view["puma.proxy_protocol_addr"], 'no PROXY line was read'
+  end
+
   # To comply with the Rack spec, we have to split header field values
   # containing newlines into multiple headers.
   def assert_does_not_allow_http_injection(app, opts = {})

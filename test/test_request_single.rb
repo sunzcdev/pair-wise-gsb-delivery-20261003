@@ -846,6 +846,125 @@ class TestRequestPeerip < TestRequestBase
   end
 end
 
+# Tests the env keys that tell the address a PROXY protocol line reported apart
+# from the connection peer and from the chosen REMOTE_ADDR.
+class TestRequestProxyProtocolEnv < TestRequestBase
+
+  CONN_KEYS = %w[REMOTE_ADDR puma.peer_addr puma.proxy_protocol puma.proxy_protocol_addr]
+
+  # @return [Hash] only the keys Puma set
+  def conn_view(client)
+    CONN_KEYS.each_with_object({}) { |k, h| h[k] = client.env[k] if client.env.key?(k) }
+  end
+
+  def test_plain_request_reports_only_the_socket_peer
+    create_client("GET / HTTP/1.1\r\nHost: test.com\r\n\r\n") { |client|
+      client.expect_proxy_proto = :v1
+    }
+
+    assert_equal({
+      "REMOTE_ADDR" => "127.0.0.1",
+      "puma.peer_addr" => "127.0.0.1"
+    }, conn_view(@client))
+    refute @client.env.key?("puma.proxy_protocol")
+    refute @client.env.key?("puma.proxy_protocol_addr")
+  end
+
+  def test_proxy_line_keeps_the_report_apart_from_the_socket_peer
+    create_client("PROXY TCP4 1.2.3.4 5.6.7.8 10000 80\r\nGET / HTTP/1.1\r\nHost: test.com\r\n\r\n") { |client|
+      client.expect_proxy_proto = :v1
+    }
+
+    assert_equal "127.0.0.1", @client.peer_addr
+    assert_equal({
+      "REMOTE_ADDR" => "1.2.3.4",
+      "puma.peer_addr" => "127.0.0.1",
+      "puma.proxy_protocol" => "v1",
+      "puma.proxy_protocol_addr" => "1.2.3.4"
+    }, conn_view(@client))
+  end
+
+  def test_ipv6_proxy_line_keeps_the_report_apart_from_the_socket_peer
+    peer_addr = -> () { ["AF_INET6", 80, "::1", "::1"] }
+    create_client("PROXY TCP6 fd00::1 fd00::2 10000 80\r\nGET / HTTP/1.1\r\nHost: test.com\r\n\r\n",
+        peer_addr: peer_addr) { |client|
+      client.expect_proxy_proto = :v1
+    }
+
+    assert_equal "::1", @client.peer_addr
+    assert_equal "fd00::1", @client.env["puma.proxy_protocol_addr"]
+    assert_equal "fd00::1", @client.env["REMOTE_ADDR"]
+  end
+
+  def test_bare_unknown_means_the_protocol_took_part_without_an_endpoint
+    create_client("PROXY UNKNOWN\r\nGET / HTTP/1.1\r\nHost: test.com\r\n\r\n") { |client|
+      client.expect_proxy_proto = :v1
+    }
+
+    assert_equal({
+      "REMOTE_ADDR" => "127.0.0.1",
+      "puma.peer_addr" => "127.0.0.1",
+      "puma.proxy_protocol" => "v1"
+    }, conn_view(@client))
+    refute @client.env.key?("puma.proxy_protocol_addr")
+    assert_equal "127.0.0.1", @client.peerip
+  end
+
+  def test_unknown_with_fields_ignores_the_fields
+    create_client("PROXY UNKNOWN 1.2.3.4 5.6.7.8 10000 80\r\nGET / HTTP/1.1\r\nHost: test.com\r\n\r\n") { |client|
+      client.expect_proxy_proto = :v1
+    }
+
+    assert_equal "127.0.0.1", @client.env["REMOTE_ADDR"]
+    assert_equal "v1", @client.env["puma.proxy_protocol"]
+    refute @client.env.key?("puma.proxy_protocol_addr")
+  end
+
+  def test_view_is_unchanged_for_a_keep_alive_request_after_reset
+    first = "PROXY TCP4 1.2.3.4 5.6.7.8 10000 80\r\nGET / HTTP/1.1\r\nHost: test.com\r\n\r\n"
+    second = "GET /next HTTP/1.1\r\nHost: test.com\r\n\r\n"
+
+    create_client("#{first}#{second}") { |client|
+      client.expect_proxy_proto = :v1
+    }
+    first_view = conn_view(@client)
+
+    @client.reset
+    assert @client.process_back_to_back_requests
+
+    assert_equal "/next", @client.env["REQUEST_PATH"]
+    assert_equal first_view, conn_view(@client)
+  end
+
+  def test_peer_addr_ignores_a_remote_addr_header
+    create_client("GET / HTTP/1.1\r\nHost: test.com\r\nX-Real-IP: 9.9.9.9\r\n\r\n") { |client|
+      client.remote_addr_header = "HTTP_X_REAL_IP"
+    }
+
+    assert_equal "9.9.9.9", @client.env["REMOTE_ADDR"]
+    assert_equal "127.0.0.1", @client.env["puma.peer_addr"]
+    refute @client.env.key?("puma.proxy_protocol")
+    refute @client.env.key?("puma.proxy_protocol_addr")
+  end
+
+  def test_peer_addr_uses_localhost_when_the_socket_peer_is_empty
+    # unix sockets have no peer address; REMOTE_ADDR has always used localhost
+    empty_peer = -> () { ["AF_UNIX", ""] }
+    create_client("GET / HTTP/1.1\r\nHost: test.com\r\n\r\n", peer_addr: empty_peer)
+
+    assert_equal "127.0.0.1", @client.env["puma.peer_addr"]
+    assert_equal "127.0.0.1", @client.env["REMOTE_ADDR"]
+  end
+
+  def test_peer_addr_uses_the_unspecified_address_when_the_peer_is_gone
+    gone = -> () { raise Errno::ENOTCONN }
+    create_client("GET / HTTP/1.1\r\nHost: test.com\r\n\r\n", peer_addr: gone)
+
+    assert_equal "0.0.0.0", @client.env["puma.peer_addr"]
+    assert_equal "0.0.0.0", @client.env["REMOTE_ADDR"]
+  end
+end
+
 # Tests that the interim and error responses written while a request is being
 # read never block. When a request arrives in more than one read, it is parsed
 # by the reactor, which serves many connections with one thread, so a client

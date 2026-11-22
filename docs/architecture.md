@@ -59,6 +59,32 @@ _workers_, and we sometimes call the threads created by Puma's
   * Once done, the thread becomes available to process another connection in the
     "todo" set.
 
+### Connection addresses in the env
+
+Three views of where a request came from reach the app, so an address a proxy
+reported can be told apart from the socket that actually connected:
+
+* `REMOTE_ADDR` - what the `remote_address` option chose: the socket peer by
+  default, or a header value, a fixed value, or the source address a PROXY
+  protocol line reported.
+* `env['puma.peer_addr']` - always the peer of the accepted socket, as the OS
+  reports it. It ignores the `remote_address` option and the PROXY protocol and
+  keeps the same value on every request of a keep-alive connection. When the OS
+  cannot report one it falls back exactly as `REMOTE_ADDR` always has (localhost
+  for the empty address of a unix socket, the unspecified address when the peer
+  is already gone).
+* `env['puma.proxy_protocol']` and `env['puma.proxy_protocol_addr']` - the
+  version of the PROXY protocol line read from the connection, and the source
+  address it reported. `puma.proxy_protocol` is present (currently `"v1"`)
+  whenever a valid line was read, including `PROXY UNKNOWN`. `PROXY UNKNOWN`
+  means the protocol took part but reported no endpoint, so
+  `puma.proxy_protocol_addr` is absent. Both keys are absent when the
+  connection sent no PROXY protocol line.
+
+The PROXY protocol line is read only from the first request on a connection, so
+these values describe the connection and do not change across keep-alive
+requests.
+
 ### `queue_requests`
 
 ![https://bit.ly/2zxCJ1Z](images/puma-connection-flow-no-reactor.png)

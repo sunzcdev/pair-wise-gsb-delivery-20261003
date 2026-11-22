@@ -238,6 +238,19 @@ module Puma
     PUMA_PEERCERT = "puma.peercert"
     PUMA_UNDERSCORE_HEADERS = "puma.underscore_headers"
 
+    # The peer of the accepted connection as the OS reports it. Unlike
+    # REMOTE_ADDR it is never taken from the PROXY protocol, a request header
+    # or the `remote_address` option, and it is the same value for every
+    # request served on a keep-alive connection.
+    PUMA_PEER_ADDR = "puma.peer_addr"
+    # Version of the PROXY protocol line that was read from the connection.
+    # Present (currently "v1") also for a valid `PROXY UNKNOWN` line, which
+    # says the protocol took part but reported no endpoint.
+    PUMA_PROXY_PROTOCOL = "puma.proxy_protocol"
+    # Source address reported by a `PROXY TCP4` or `PROXY TCP6` line. Absent
+    # for `PROXY UNKNOWN` and when the connection sent no PROXY line.
+    PUMA_PROXY_PROTOCOL_ADDR = "puma.proxy_protocol_addr"
+
     HTTP = "http"
     HTTPS = "https"
 
@@ -295,7 +308,9 @@ module Puma
     # Banned keys of response header
     BANNED_HEADER_KEY = /\A(rack\.|status\z)/.freeze
 
-    PROXY_PROTOCOL_V1_REGEX = /\APROXY (?:TCP4|TCP6|UNKNOWN) ([^\r]+)\r\n/.freeze
+    # PROXY protocol v1. `PROXY UNKNOWN` may be followed by arbitrary fields
+    # that the spec says to ignore, so only TCP4/TCP6 capture addresses.
+    PROXY_PROTOCOL_V1_REGEX = /\APROXY (?:(TCP4|TCP6) ([^\r]+)|UNKNOWN(?: [^\r]*)?)\r\n/.freeze
     PROXY_PROTOCOL_V1_MAX_LENGTH = 107
 
     # All constants are prefixed with `PIPE_` to avoid name collisions.

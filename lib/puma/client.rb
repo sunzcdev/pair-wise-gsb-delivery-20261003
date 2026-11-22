@@ -88,7 +88,8 @@ module Puma
 
     attr_reader :env, :to_io, :body, :io, :timeout_at, :ready, :hijacked,
                 :tempfile, :io_buffer, :http_content_length_limit_exceeded,
-                :requests_served, :error_status_code, :bytes_read
+                :requests_served, :error_status_code, :bytes_read,
+                :proxy_protocol_version, :proxy_protocol_addr
 
     attr_writer :peerip, :http_content_length_limit, :supported_http_methods,
                 :allow_underscore_headers, :continue_callback
@@ -128,9 +129,14 @@ module Puma
 
       @peerip = nil
       @peer_family = nil
+      @peer_addr = nil
       @listener = nil
       @remote_addr_header = nil
       @expect_proxy_proto = false
+      # Describe the PROXY handshake of the connection. They are read only from
+      # the first request, so `reset` deliberately leaves them alone.
+      @proxy_protocol_version = nil
+      @proxy_protocol_addr = nil
 
       @body_remain = 0
       @bytes_read = 0
@@ -255,8 +261,16 @@ module Puma
           end
 
           if md = PROXY_PROTOCOL_V1_REGEX.match(@buffer)
-            if md[1]
-              @peerip = md[1].split(" ")[0]
+            # A well formed line, including `PROXY UNKNOWN`, means the protocol
+            # took part in this connection.
+            @proxy_protocol_version = :v1
+            if md[1] # TCP4 or TCP6; `UNKNOWN` reports no endpoint
+              addr = md[2].split(" ")[0]
+              if addr && !addr.empty?
+                @proxy_protocol_addr = addr
+                # Keep the historical REMOTE_ADDR value for proxied requests.
+                @peerip = addr
+              end
             end
             @buffer = md.post_match
           end
@@ -461,6 +475,32 @@ module Puma
       end
 
       @peerip ||= socket_peerip
+    end
+
+    # The peer of the accepted connection, as reported by the OS socket. Unlike
+    # `peerip` it is never taken from the PROXY protocol, a request header or
+    # the `remote_address` option, and it does not change between requests
+    # served on the same keep-alive connection.
+    #
+    # When the OS cannot report an address it falls back exactly as
+    # `REMOTE_ADDR` always has: localhost for an empty address (unix sockets)
+    # and the unspecified address when the peer is already gone.
+    #
+    # @return [String]
+    def peer_addr
+      @peer_addr ||= begin
+        addr = socket_peerip
+        # Set unix socket addrs to localhost
+        if addr.empty?
+          peer_family == Socket::AF_INET6 ? LOCALHOST_IPV6 : LOCALHOST_IPV4
+        else
+          addr
+        end
+      rescue SystemCallError, IOError
+        # A diagnostic view must not break a request when the socket is already
+        # gone or closed.
+        peer_family == Socket::AF_INET6 ? UNSPECIFIED_IPV6 : UNSPECIFIED_IPV4
+      end
     end
 
     def peer_family

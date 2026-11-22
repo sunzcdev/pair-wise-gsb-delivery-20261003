@@ -1481,8 +1481,32 @@ module Puma
     #
     # The default is +:socket+.
     #
+    # Whatever this option chooses, Puma also sets env keys that describe the
+    # connection itself, so an app can tell the address a proxy reported apart
+    # from the address of the socket that actually connected:
+    #
+    # * `env["puma.peer_addr"]` - the peer address the OS reports for the
+    #   accepted socket. It is never taken from a request header or the PROXY
+    #   protocol, so it is the same value `:socket` would put in `REMOTE_ADDR`.
+    # * `env["puma.proxy_protocol"]` - `"v1"` when a PROXY protocol line was
+    #   read from the connection, including a valid `PROXY UNKNOWN` line.
+    #   Absent when the connection sent no PROXY line.
+    # * `env["puma.proxy_protocol_addr"]` - the source address a
+    #   `PROXY TCP4`/`PROXY TCP6` line reported. Absent for `PROXY UNKNOWN`,
+    #   which says the protocol took part but reported no endpoint, and absent
+    #   when there was no line.
+    #
+    # The PROXY protocol line is read only from the first request of a
+    # connection, so these three keys stay the same for every request served on
+    # a keep-alive connection.
+    #
     # @example
     #   set_remote_address :localhost
+    #
+    # @example Telling the proxy report from the real peer
+    #   reported  = env["puma.proxy_protocol_addr"] # nil for UNKNOWN or no line
+    #   connected = env["puma.peer_addr"]           # the socket that connected
+    #   # env["REMOTE_ADDR"] is whatever set_remote_address chose
     #
     def set_remote_address(val=:socket)
       case val
