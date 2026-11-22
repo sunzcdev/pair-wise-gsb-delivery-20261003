@@ -20,4 +20,17 @@ class ErrorsTest < ActiveRecord::TestCase
       end
     end
   end
+
+  def test_stale_object_error_defaults_attempted_attributes_to_an_empty_hash
+    error = ActiveRecord::StaleObjectError.new
+    assert_equal({}, error.attempted_attributes)
+
+    record = Object.new
+    with_attributes = ActiveRecord::StaleObjectError.new(
+      record, "update", attempted_attributes: { "name" => "value" }
+    )
+    assert_same record, with_attributes.record
+    assert_equal "update", with_attributes.attempted_action
+    assert_equal({ "name" => "value" }, with_attributes.attempted_attributes)
+  end
 end

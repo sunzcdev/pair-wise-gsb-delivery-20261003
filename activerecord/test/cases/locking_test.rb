@@ -737,6 +737,186 @@ class OptimisticLockingTest < ActiveRecord::TestCase
     assert_equal t1.attributes, t2.attributes
   end
 
+  def test_stale_object_error_exposes_attempted_attributes
+    p1 = Person.find(1)
+    p2 = Person.find(1)
+
+    p1.first_name = "stu"
+    p1.save!
+
+    p2.first_name = "sue"
+    p2.comments = "unsaved note"
+
+    error = assert_raises(ActiveRecord::StaleObjectError) { p2.save! }
+    assert_same p2, error.record
+    assert_equal "update", error.attempted_action
+    assert_equal "sue", error.attempted_attributes["first_name"]
+    assert_equal "unsaved note", error.attempted_attributes["comments"]
+    # updated_at is stamped as part of every update and is therefore also
+    # part of what the failed UPDATE intended to persist.
+    assert error.attempted_attributes.key?("updated_at")
+    # The locking column is managed internally and is never part of the
+    # caller-facing attempted attributes.
+    assert_not error.attempted_attributes.key?("lock_version")
+  end
+
+  def test_attempted_attributes_only_contains_loaded_columns
+    # A partial select does not lay out the unselected columns, so the stale
+    # update must not synthesize them as nil.
+    p1 = Person.find(1)
+    p2 = Person.select(:id, :lock_version, :first_name).find(1)
+
+    p1.update!(comments: "winner comment")
+
+    p2.first_name = "sue"
+    error = assert_raises(ActiveRecord::StaleObjectError) { p2.save! }
+
+    # Only the loaded, edited user column is present; an unselected user
+    # column must never be synthesized as nil.
+    assert_equal "sue", error.attempted_attributes["first_name"]
+    assert_not error.attempted_attributes.key?("comments")
+    assert_not error.attempted_attributes.key?("lock_version")
+  end
+
+  def test_recover_from_stale_update_reloads_lock_version_and_reapplies_all_edits
+    p1 = Person.find(1)
+    p2 = Person.find(1)
+
+    p1.first_name = "stu"
+    p1.save!
+
+    p2.first_name = "sue"
+    p2.comments = "unsaved note"
+    error = assert_raises(ActiveRecord::StaleObjectError) { p2.save! }
+    assert_equal 0, p2.lock_version
+
+    recovered = p2.recover_from_stale_update(error)
+    assert_same p2, recovered
+
+    # The lock version now matches the database, and the unsaved edits survived.
+    assert_equal 1, p2.lock_version
+    assert_equal "stu", Person.find(1).first_name
+    assert_equal "sue", p2.first_name
+    assert_equal "unsaved note", p2.comments
+
+    p2.save!
+    person = Person.find(1)
+    assert_equal "sue", person.first_name
+    assert_equal "unsaved note", person.comments
+    assert_equal 2, person.lock_version
+  end
+
+  def test_recover_from_stale_update_lets_caller_keep_part_of_the_edits
+    p1 = Person.find(1)
+    p2 = Person.find(1)
+
+    p1.first_name = "stu"
+    p1.save!
+
+    p2.first_name = "losing edit"
+    p2.comments = "keep me"
+    error = assert_raises(ActiveRecord::StaleObjectError) { p2.save! }
+
+    p2.recover_from_stale_update(error) do |attempted_attributes|
+      assert_equal "losing edit", attempted_attributes["first_name"]
+      assert_equal "keep me", attempted_attributes["comments"]
+      assert attempted_attributes.key?("updated_at")
+      attempted_attributes.slice("comments")
+    end
+
+    # Reloaded state wins for the discarded field; only comments is re-applied.
+    assert_equal "stu", p2.first_name
+    assert_equal "keep me", p2.comments
+    assert_equal 1, p2.lock_version
+
+    p2.save!
+    person = Person.find(1)
+    assert_equal "stu", person.first_name
+    assert_equal "keep me", person.comments
+    assert_equal 2, person.lock_version
+  end
+
+  def test_recover_from_stale_update_accepts_attempted_attributes_directly
+    p1 = Person.find(1)
+    p2 = Person.find(1)
+
+    p1.update!(comments: "fresh")
+    p2.comments = "mine"
+    error = assert_raises(ActiveRecord::StaleObjectError) { p2.save! }
+
+    p2.recover_from_stale_update(error.attempted_attributes)
+    assert_equal "mine", p2.comments
+    assert_equal 1, p2.lock_version
+  end
+
+  def test_recover_from_stale_update_raises_when_the_record_was_deleted
+    p1 = Person.find(1)
+    p2 = Person.find(1)
+
+    p1.first_name = "stu"
+    p1.save!
+    p1.destroy
+
+    p2.first_name = "sue"
+    error = assert_raises(ActiveRecord::StaleObjectError) { p2.save! }
+
+    assert_raises(ActiveRecord::RecordNotFound) do
+      p2.recover_from_stale_update(error)
+    end
+  end
+
+  def test_recover_from_stale_update_does_not_nil_out_unloaded_columns
+    p1 = Person.find(1)
+    p2 = Person.select(:id, :lock_version, :first_name).find(1)
+
+    p1.update!(comments: "persisted comment")
+
+    # Before recovery the record never laid out the comments column.
+    assert_not p2.attribute_names.include?("comments")
+
+    p2.first_name = "sue"
+    error = assert_raises(ActiveRecord::StaleObjectError) { p2.save! }
+
+    p2.recover_from_stale_update(error)
+    assert_equal "sue", p2.first_name
+    assert_equal 1, p2.lock_version
+    # Reloading populates the missing column with the real database value
+    # rather than with a fabricated nil.
+    assert_equal "persisted comment", p2.comments
+
+    p2.save!
+    assert_equal "persisted comment", Person.find(1).comments
+  end
+
+  def test_stale_check_uses_the_lock_column_even_when_only_an_unrelated_column_changed
+    # Both copies start at the same version; the winner then touches a column
+    # the loser never edits. The loser must still be rejected by the same
+    # lock_version predicate the UPDATE uses, and recovery must keep the
+    # winner's untouched-by-us column instead of overwriting it.
+    winner = Person.find(1)
+    loser = Person.find(1)
+
+    winner.update!(comments: "winner only")
+
+    loser.first_name = "loser edit"
+    error = assert_raises(ActiveRecord::StaleObjectError) { loser.save! }
+
+    # Only the column the loser actually intended to write is captured.
+    assert_equal "loser edit", error.attempted_attributes["first_name"]
+    assert_not error.attempted_attributes.key?("comments")
+
+    loser.recover_from_stale_update(error)
+    assert_equal 1, loser.lock_version
+    assert_equal "loser edit", loser.first_name
+    assert_equal "winner only", loser.comments
+
+    loser.save!
+    reloaded = Person.find(1)
+    assert_equal 2, reloaded.lock_version
+    assert_equal "loser edit", reloaded.first_name
+    assert_equal "winner only", reloaded.comments
+  end
+
   private
     def locking_column_nil_error_message
       <<-MSG.squish
@@ -1221,3 +1401,111 @@ class OptimisticLockingRollbackTest < ActiveRecord::TestCase
     assert_equal "after-tx", Person.find(@person.id).first_name
   end
 end
+
+# Replays a real cross-process conflict: two SQLite connections (two model
+# classes with their own connection pools) point at the same database file,
+# so neither object sees the other's uncommitted session state. Only run on
+# SQLite, since the setup builds SQLite file connections directly.
+class OptimisticLockingStaleRecoveryWithSeparateConnectionsTest < ActiveRecord::TestCase
+  if current_adapter?(:SQLite3Adapter)
+    self.use_transactional_tests = false
+
+    class FirstProcessRecord < ActiveRecord::Base
+      self.table_name = "stale_recovery_records"
+    end
+
+    class SecondProcessRecord < ActiveRecord::Base
+      self.table_name = "stale_recovery_records"
+    end
+
+    setup do
+      # A unique file-backed database shared by both connection pools. Built
+      # from a plain path (rather than a Tempfile) so teardown can reliably
+      # remove it even on platforms where deleting an open file is restricted.
+      @database = File.join(Dir.tmpdir, "stale_recovery_#{Process.pid}_#{SecureRandom.hex(8)}.sqlite3")
+
+      FirstProcessRecord.establish_connection(adapter: "sqlite3", database: @database)
+      SecondProcessRecord.establish_connection(adapter: "sqlite3", database: @database)
+
+      FirstProcessRecord.lease_connection.create_table :stale_recovery_records, force: true do |t|
+        t.string :first_name, null: false, default: ""
+        t.string :comments
+        t.integer :lock_version, null: false, default: 0
+        t.timestamps null: false
+      end
+
+      @record = FirstProcessRecord.create!(first_name: "original", comments: "seed")
+    end
+
+    teardown do
+      # Remove the pools entirely, not just their connections: otherwise the
+      # test framework's fixture/schema-cache machinery lazily reopens them
+      # after this test, recreating the database file on disk.
+      handler = ActiveRecord::Base.connection_handler
+      [FirstProcessRecord, SecondProcessRecord].each do |model|
+        handler.remove_connection_pool(model.name)
+      end
+    ensure
+      # On Windows the SQLite file can stay locked for a moment after the
+      # pools are removed, so give the OS a few chances to release it instead
+      # of leaking the file.
+      retries = 0
+      begin
+        File.delete(@database) if File.exist?(@database)
+      rescue Errno::EACCES
+        retries += 1
+        if retries < 10
+          sleep 0.1
+          retry
+        end
+      end
+    end
+
+    def test_stale_update_from_a_second_connection_is_replayed_with_a_single_attribute
+      # Each "process" loads its own copy of the row.
+      process_one = FirstProcessRecord.find(@record.id)
+      process_two = SecondProcessRecord.find(@record.id)
+
+      assert_equal 0, process_one.lock_version
+      assert_equal 0, process_two.lock_version
+
+      # The first process commits first.
+      process_one.first_name = "committed by process one"
+      process_one.save!
+      assert_equal 1, process_one.lock_version
+
+      # The second process still holds its whole group of unsaved edits.
+      process_two.first_name = "stale name"
+      process_two.comments = "stale comment"
+
+      error = assert_raises(ActiveRecord::StaleObjectError) { process_two.save! }
+      assert_equal "stale name", error.attempted_attributes["first_name"]
+      assert_equal "stale comment", error.attempted_attributes["comments"]
+      assert_not error.attempted_attributes.key?("lock_version")
+      # The failed UPDATE must not have changed the row the first process wrote.
+      assert_equal "committed by process one", FirstProcessRecord.find(@record.id).first_name
+      assert_equal "seed", FirstProcessRecord.find(@record.id).comments
+      assert_equal 0, process_two.lock_version
+
+      # Recover: reload through the second connection, then re-apply just one
+      # of the attempted fields and persist it.
+      process_two.recover_from_stale_update(error) do |attempted_attributes|
+        attempted_attributes.slice("comments")
+      end
+
+      assert_equal 1, process_two.lock_version
+      assert_equal "committed by process one", process_two.first_name
+      assert_equal "stale comment", process_two.comments
+
+      assert_difference -> { FirstProcessRecord.find(@record.id).lock_version }, +1 do
+        process_two.save!
+      end
+
+      reloaded = FirstProcessRecord.find(@record.id)
+      assert_equal 2, reloaded.lock_version
+      assert_equal "committed by process one", reloaded.first_name
+      assert_equal "stale comment", reloaded.comments
+    end
+  end
+end
+

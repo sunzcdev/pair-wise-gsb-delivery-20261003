@@ -1,3 +1,37 @@
+*   Add `ActiveRecord::StaleObjectError#attempted_attributes` and
+    `ActiveRecord::Base#recover_from_stale_update` to make optimistic locking
+    conflicts recoverable.
+
+    When a stale update raises, the exception now carries the attributes the
+    failed UPDATE was actually going to write (the locking column itself is
+    excluded). `recover_from_stale_update` reloads the record against the
+    current database state and re-applies those edits; when given a block, the
+    caller decides which of the attempted attributes to keep. Columns that
+    were never loaded on the record are never written back as `nil`.
+
+    ```ruby
+    p1 = Person.find(1)
+    p2 = Person.find(1)
+
+    p1.first_name = "Michael"
+    p1.save!
+
+    p2.first_name = "should fail"
+    p2.comments = "keep me"
+    begin
+      p2.save! # raises ActiveRecord::StaleObjectError
+    rescue ActiveRecord::StaleObjectError => error
+      error.attempted_attributes # => {"first_name" => "should fail", "comments" => "keep me", ...}
+
+      p2.recover_from_stale_update(error) do |attempted_attributes|
+        attempted_attributes.slice("comments")
+      end
+      p2.save!
+    end
+    ```
+
+    *Active Record*
+
 *   Log source location when scoped order is ignored in batching.
 
     *fatkodima*

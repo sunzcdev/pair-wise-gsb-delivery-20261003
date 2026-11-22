@@ -400,14 +400,16 @@ module ActiveRecord
   # Read more about optimistic locking in ActiveRecord::Locking module
   # documentation.
   class StaleObjectError < ActiveRecordError
-    attr_reader :record, :attempted_action
+    attr_reader :record, :attempted_action, :attempted_attributes
 
-    def initialize(record = nil, attempted_action = nil)
+    def initialize(record = nil, attempted_action = nil, attempted_attributes: nil)
       if record && attempted_action
         @record = record
         @attempted_action = attempted_action
+        @attempted_attributes = attempted_attributes || {}
         super("Attempted to #{attempted_action} a stale object: #{record.class.name}.")
       else
+        @attempted_attributes = {}
         super("Stale object error.")
       end
     end

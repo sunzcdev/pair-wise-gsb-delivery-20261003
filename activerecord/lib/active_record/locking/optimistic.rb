@@ -45,6 +45,29 @@ module ActiveRecord
     # You're then responsible for dealing with the conflict by rescuing the exception and either rolling back, merging,
     # or otherwise apply the business logic needed to resolve the conflict.
     #
+    # When a save raises ActiveRecord::StaleObjectError, the exception carries
+    # StaleObjectError#attempted_attributes: a hash of the attributes the failed
+    # update was actually going to persist (the locking column is excluded).
+    # #recover_from_stale_update uses that information to reload the record and
+    # re-apply the unsaved edits, optionally letting a block decide which of
+    # them should be kept:
+    #
+    # ```
+    # p1 = Person.find(1)
+    # p2 = Person.find(1)
+    #
+    # p1.first_name = "Michael"
+    # p1.save!
+    #
+    # p2.first_name = "should fail"
+    # begin
+    #   p2.save! # Raises an ActiveRecord::StaleObjectError
+    # rescue ActiveRecord::StaleObjectError => error
+    #   p2.recover_from_stale_update(error) # Reloads and restores the edit
+    #   p2.save!                            # Succeeds against the fresh lock_version
+    # end
+    # ```
+    #
     # This locking mechanism will function inside a single Ruby process. To make it work across all
     # web requests, the recommended approach is to add `lock_version` as a hidden field to your form.
     #
@@ -92,6 +115,76 @@ module ActiveRecord
 
       def locking_enabled? # :nodoc:
         self.class.locking_enabled?
+      end
+
+      # Reloads the stale record and re-applies the attributes that a failed,
+      # stale update intended to write, so the update can be retried against the
+      # current database state.
+      #
+      # Pass the ActiveRecord::StaleObjectError raised by the conflicting save
+      # (or directly its StaleObjectError#attempted_attributes). The record is
+      # reloaded first, which refreshes the locking column and every loaded
+      # attribute; attributes that were never loaded on the record are left
+      # untouched and are never written back as +nil+.
+      #
+      # When a block is given, it receives the hash of the attributes the
+      # failed update intended to write, and only the attributes it returns are
+      # re-applied. This lets the caller keep part of the unsaved edits and
+      # discard the rest:
+      #
+      # ```
+      # p1 = Person.find(1)
+      # p2 = Person.find(1)
+      #
+      # p1.first_name = "Michael"
+      # p1.save!
+      #
+      # p2.first_name = "should fail"
+      # p2.comments = "unsaved note"
+      # begin
+      #   p2.save!
+      # rescue ActiveRecord::StaleObjectError => error
+      #   p2.recover_from_stale_update(error) do |attempted_attributes|
+      #     attempted_attributes.slice("comments")
+      #   end
+      #   p2.save! # => succeeds against the fresh lock_version
+      # end
+      # ```
+      #
+      # The record is returned, but it is not saved automatically: the caller
+      # decides when (and whether) to persist the merged result. If the record
+      # was deleted from the database in the meantime, ActiveRecord::RecordNotFound
+      # is raised by #reload, just like a manual recovery would.
+      def recover_from_stale_update(error_or_attributes)
+        unless locking_enabled?
+          raise ActiveRecordError, "#{self.class.name} does not have optimistic locking enabled."
+        end
+
+        attempted_attributes =
+          if error_or_attributes.is_a?(ActiveRecord::StaleObjectError)
+            error_or_attributes.attempted_attributes
+          else
+            error_or_attributes
+          end
+
+        reload
+
+        attributes_to_apply = if block_given?
+          yield(attempted_attributes)
+        else
+          attempted_attributes
+        end
+
+        attributes_to_apply.each do |name, value|
+          name = resolve_alias(name.to_s)
+          # Only re-apply attributes that exist on the (reloaded) record.
+          # Columns that were never loaded must not be synthesized as nil.
+          next unless @attributes.key?(name)
+
+          _write_attribute(name, value)
+        end
+
+        self
       end
 
       def increment!(*, **) # :nodoc:
@@ -147,6 +240,14 @@ module ActiveRecord
               MSG
             end
 
+            # Capture the values this update was actually going to persist,
+            # excluding the locking column itself (which is managed by the
+            # locking mechanism, not by the caller). They are exposed on the
+            # StaleObjectError so the caller can recover from the conflict.
+            attempted_attributes = attribute_names.without(locking_column).index_with do |name|
+              _read_attribute(name)
+            end
+
             self[locking_column] += 1
 
             affected_rows = self.class._update_record(
@@ -155,7 +256,11 @@ module ActiveRecord
             )
 
             if affected_rows != 1
-              raise ActiveRecord::StaleObjectError.new(self, attempted_action)
+              raise ActiveRecord::StaleObjectError.new(
+                self,
+                attempted_action,
+                attempted_attributes: attempted_attributes
+              )
             end
 
             affected_rows
