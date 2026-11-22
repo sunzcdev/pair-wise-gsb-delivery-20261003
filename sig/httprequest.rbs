@@ -34,6 +34,8 @@ module WEBrick
 
     @forwarded_for: String?
 
+    @header_deadline: Float?
+
     BODY_CONTAINABLE_METHODS: Array[String]
 
     attr_reader request_line: String?
@@ -148,6 +150,15 @@ module WEBrick
     def read_chunked: (IO socket, body_chunk_block block) -> void
 
     def _read_data: (IO io, Symbol method, *untyped arg) -> String?
+
+    DEFAULT_MONOTONIC_CLOCK: ^() -> Float
+
+    def header_clock: () -> (^() -> Float)
+    def start_header_deadline: () -> void
+
+    def clear_header_deadline: () -> void
+
+    def read_timeout: () -> (Integer | Float | nil)
 
     def read_line: (IO io, ?Integer size) -> String?
 

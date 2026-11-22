@@ -106,6 +106,15 @@ module WEBrick
     attr_reader :sent_size
 
     ##
+    # Has the server started writing this response (the status line and
+    # headers) to the socket?  Once this is +true+ an error response can no
+    # longer be sent on the same connection.
+
+    def started?
+      @started
+    end
+
+    ##
     # Set the response body proc as an streaming/upgrade response.
 
     attr_accessor :upgrade
@@ -132,6 +141,7 @@ module WEBrick
       @filename = nil
       @sent_size = 0
       @bodytempfile = nil
+      @started = false
     end
 
     ##
@@ -363,6 +373,7 @@ module WEBrick
           data << "Set-Cookie: " << check_header(cookie.to_s) << CRLF
         }
         data << CRLF
+        @started = true
         socket.write(data)
       end
     rescue InvalidHeader => e

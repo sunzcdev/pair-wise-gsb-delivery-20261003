@@ -199,16 +199,24 @@ module WEBrick
         raise HTTPStatus::EOFError
       end
 
-      read_request_line(socket)
-      if @http_version.major > 0
-        read_header(socket)
-        @header['cookie'].each{|cookie|
-          @cookies += Cookie::parse(cookie)
-        }
-        @accept = HTTPUtils.parse_qvalues(self['accept'])
-        @accept_charset = HTTPUtils.parse_qvalues(self['accept-charset'])
-        @accept_encoding = HTTPUtils.parse_qvalues(self['accept-encoding'])
-        @accept_language = HTTPUtils.parse_qvalues(self['accept-language'])
+      begin
+        start_header_deadline
+        read_request_line(socket)
+        if @http_version.major > 0
+          read_header(socket)
+          @header['cookie'].each{|cookie|
+            @cookies += Cookie::parse(cookie)
+          }
+          @accept = HTTPUtils.parse_qvalues(self['accept'])
+          @accept_charset = HTTPUtils.parse_qvalues(self['accept-charset'])
+          @accept_encoding = HTTPUtils.parse_qvalues(self['accept-encoding'])
+          @accept_language = HTTPUtils.parse_qvalues(self['accept-language'])
+        end
+      ensure
+        # The deadline only bounds reading this request's header block; the
+        # body (and, on keep-alive connections, the next request) is governed
+        # solely by :RequestTimeout.
+        clear_header_deadline
       end
 
       setup_forwarded_info
@@ -639,7 +647,14 @@ module WEBrick
 
     def _read_data(io, method, *arg)
       begin
-        WEBrick::Utils.timeout(@config[:RequestTimeout]){
+        timeout = read_timeout
+        # A non-positive remaining header deadline must abort without
+        # touching the socket so the overall bound is always honored, even
+        # if the underlying read would return immediately.
+        if timeout && timeout <= 0
+          raise HTTPStatus::RequestTimeout
+        end
+        WEBrick::Utils.timeout(timeout){
           return io.__send__(method, *arg)
         }
       rescue Errno::ECONNRESET
@@ -648,6 +663,54 @@ module WEBrick
         raise HTTPStatus::RequestTimeout
       end
     end
+
+    # Monotonic clock used to measure the header deadline.  May be replaced
+    # through the (private) :Clock configuration, mainly for testing.
+    def header_clock
+      @config[:Clock] || DEFAULT_MONOTONIC_CLOCK
+    end
+
+    # Starts the overall deadline for reading the request line and the whole
+    # header block.  A new request object (and therefore a new call to
+    # #parse) gets a fresh deadline, so the bound does not accumulate across
+    # requests of a keep-alive connection.
+    def start_header_deadline
+      timeout = @config[:RequestHeaderTimeout]
+      if timeout && timeout > 0
+        @header_deadline = header_clock.call + timeout
+      else
+        @header_deadline = nil
+      end
+    end
+
+    def clear_header_deadline
+      @header_deadline = nil
+    end
+
+    # Timeout to apply to a single read operation.  While reading the header
+    # block, each read is limited by the remaining overall header deadline so
+    # that a client spreading the header over many slow reads cannot exceed
+    # the configured bound.  Outside of the header block (request body,
+    # chunked trailers) only the per-read :RequestTimeout applies.
+    def read_timeout
+      if @header_deadline
+        remaining = @header_deadline - header_clock.call
+        return remaining if remaining <= 0
+        request_timeout = @config[:RequestTimeout]
+        if request_timeout && request_timeout > 0
+          [request_timeout, remaining].min
+        else
+          remaining
+        end
+      else
+        @config[:RequestTimeout]
+      end
+    end
+
+    DEFAULT_MONOTONIC_CLOCK = -> {
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    }
+    private_constant :DEFAULT_MONOTONIC_CLOCK
 
     def read_line(io, size=4096)
       _read_data(io, :gets, LF, size)

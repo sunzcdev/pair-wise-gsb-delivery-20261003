@@ -9,6 +9,166 @@ class TestWEBrickHTTPRequest < Test::Unit::TestCase
     super
   end
 
+  # Deterministic monotonic clock whose value only changes when a scripted
+  # socket performs a (simulated) blocking read.
+  class FixedClock
+    def initialize(start = 0)
+      @now = start
+    end
+
+    attr_reader :now
+
+    def advance(seconds)
+      @now += seconds
+    end
+
+    def call
+      @now
+    end
+  end
+
+  # Socket stub that serves a fixed script of return values.  Every blocking
+  # read advances the associated FixedClock, letting tests assert behavior
+  # against an entirely fixed timeline without sleeping.
+  class ScriptedSocket
+    def initialize(clock, script, read_step = 1)
+      @clock = clock
+      @script = script.dup
+      @read_step = read_step
+    end
+
+    def gets(*)
+      take(:gets)
+    end
+
+    def read(*)
+      take(:read)
+    end
+
+    def eof?
+      @script.empty?
+    end
+
+    def peeraddr
+      []
+    end
+
+    def addr
+      []
+    end
+
+    private
+
+    def take(*)
+      @clock.advance(@read_step)
+      @script.shift
+    end
+  end
+
+  def header_timeout_config(clock, **options)
+    WEBrick::Config::HTTP.dup.update(
+      :Logger => WEBrick::Log.new(StringIO.new, WEBrick::BasicLog::FATAL),
+      :Clock => clock,
+      :RequestHeaderTimeout => 3,
+      **options
+    )
+  end
+
+  # A header spread over several slow reads must be bounded by the overall
+  # header deadline even though every individual read completes well within
+  # the per-read :RequestTimeout.
+  def test_request_header_timeout_bounds_spread_out_header
+    clock = FixedClock.new(100)
+    socket = ScriptedSocket.new(clock, [
+      "POST /path HTTP/1.1\r\n",
+      "Host: example.com\r\n",
+      "Transfer-Encoding: chunked\r\n",
+      "\r\n", # end of headers, but never reached within the deadline
+    ])
+    req = WEBrick::HTTPRequest.new(
+      header_timeout_config(clock, :RequestTimeout => 100))
+
+    # Virtual timeline: 101 (request line), 102, 103 and, before the 4th
+    # read at 104, the deadline (103) has expired.
+    assert_raise(WEBrick::HTTPStatus::RequestTimeout) do
+      req.parse(socket)
+    end
+    assert_equal(103, clock.now)
+    assert_nil(req.send(:instance_variable_get, :@header_deadline))
+  end
+
+  # Without the dedicated header deadline the historical per-read behavior
+  # is preserved: each read resets the :RequestTimeout window, so the same
+  # spread-out header parses successfully.
+  def test_no_header_timeout_keeps_per_read_semantics
+    clock = FixedClock.new(100)
+    socket = ScriptedSocket.new(clock, [
+      "POST /path HTTP/1.1\r\n",
+      "Host: example.com\r\n",
+      "Transfer-Encoding: chunked\r\n",
+      "\r\n",
+      "5\r\n", "hello", "\r\n", "0\r\n", "\r\n",
+    ])
+    config = header_timeout_config(clock).tap { |c| c[:RequestHeaderTimeout] = nil }
+    req = WEBrick::HTTPRequest.new(config)
+    assert_nothing_raised { req.parse(socket) }
+    assert_equal("hello", req.body)
+  end
+
+  # The header deadline restarts for each request of a keep-alive
+  # connection because every request gets a fresh HTTPRequest object.
+  def test_header_deadline_restarts_per_keepalive_request
+    clock = FixedClock.new(100)
+    first = ScriptedSocket.new(clock, [
+      "GET /one HTTP/1.1\r\n",
+      "Host: example.com\r\n",
+      "\r\n",
+    ])
+    req1 = WEBrick::HTTPRequest.new(header_timeout_config(clock))
+    req1.parse(first)
+    assert_equal("/one", req1.path)
+    assert_equal(103, clock.now)
+
+    # A new request object must not inherit the previous request's deadline.
+    second = ScriptedSocket.new(clock, [
+      "GET /two HTTP/1.1\r\n",
+      "Host: example.com\r\n",
+      "\r\n",
+    ])
+    req2 = WEBrick::HTTPRequest.new(header_timeout_config(clock))
+    assert_nothing_raised { req2.parse(second) }
+    assert_equal("/two", req2.path)
+    assert_nil(req2.send(:instance_variable_get, :@header_deadline))
+  end
+
+  # Once the header block has been read, the deadline no longer applies: a
+  # slow chunked body is governed solely by the per-read :RequestTimeout.
+  def test_header_deadline_does_not_apply_to_chunked_body
+    clock = FixedClock.new(0)
+    # A tight header deadline that the four header reads fit inside.  The
+    # body reads then run well past the corresponding instant, which would
+    # have raised RequestTimeout if the deadline still applied.
+    socket = ScriptedSocket.new(clock, [
+      "POST /path HTTP/1.1\r\n",
+      "Host: example.com\r\n",
+      "Transfer-Encoding: chunked\r\n",
+      "\r\n",
+      "5\r\n", "hello", "\r\n",
+      "5\r\n", "world", "\r\n",
+      "0\r\n", "\r\n",
+    ])
+    req = WEBrick::HTTPRequest.new(
+      header_timeout_config(clock, :RequestHeaderTimeout => 4))
+    assert_nothing_raised { req.parse(socket) }
+    assert_equal(4, clock.now, "the header block spans four reads")
+
+    # The body phase passes the instant at which the header deadline would
+    # have fired (clock == 4) without any effect.
+    assert_equal("helloworld", req.body)
+    assert(clock.now > 4, "expected body reads to pass the header deadline, got #{clock.now}")
+    assert_nil(req.send(:instance_variable_get, :@header_deadline))
+  end
+
   def test_simple_request
     msg = <<~HTTP.gsub("\n", "\r\n")
       GET /

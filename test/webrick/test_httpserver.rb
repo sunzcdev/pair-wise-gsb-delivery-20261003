@@ -473,6 +473,90 @@ class TestWEBrickHTTPServer < Test::Unit::TestCase
     th&.join
   end
 
+  def test_request_header_timeout_returns_408_and_closes_connection
+    config = {
+      # Both are short so the test finishes quickly; the point is that the
+      # 408 below is produced by the overall header deadline rather than a
+      # single slow read.
+      :RequestHeaderTimeout => 1,
+      :RequestTimeout => 1,
+    }
+    # A clean RequestTimeout is reported as a 408 without logging an error.
+    log_tester = lambda {|log, access_log|
+      assert_empty log
+    }
+    TestWEBrick.start_httpserver(config, log_tester){|server, addr, port, log|
+      server.mount_proc('/', ->(req, res) { res.body = 'ok' })
+      TCPSocket.open(addr, port) do |c|
+        # Never send the blank line that terminates the header block.
+        c.write("POST / HTTP/1.1\r\nHost: example.com\r\n")
+        response = c.read
+        assert_match %r{\AHTTP/1\.1 408 }, response
+        # The connection must not be kept alive after a header timeout.
+        assert_match %r{Connection: close\r\n}i, response
+        assert c.eof?
+      end
+    }
+  end
+
+  def test_request_header_timeout_is_independent_of_body_read_timeout
+    # The header deadline must not constrain the request body.  A short
+    # header deadline is paired with a per-read body timeout, and a normal
+    # chunked upload that pauses between chunks longer than the header
+    # budget still succeeds.
+    config = {
+      :RequestHeaderTimeout => 1,
+      :RequestTimeout => 2,
+    }
+    TestWEBrick.start_httpserver(config){|server, addr, port, log|
+      server.mount_proc('/', ->(req, res) {
+        res.body = req.body
+      })
+      TCPSocket.open(addr, port) do |c|
+        c.write("POST / HTTP/1.1\r\nHost: example.com\r\n" \
+                "Transfer-Encoding: chunked\r\n\r\n")
+        c.write("5\r\nhello\r\n")
+        sleep 1.2 # longer than the header deadline, but inside body phase
+        c.write("5\r\nworld\r\n0\r\n\r\n")
+        head, body = c.read.split("\r\n\r\n")
+        assert_match %r{\AHTTP/1\.1 200 OK}, head
+        assert_equal 'helloworld', body
+      end
+    }
+  end
+
+  def test_request_header_timeout_restarts_on_keepalive_connection
+    config = {
+      :RequestHeaderTimeout => 1,
+      :RequestTimeout => 2,
+    }
+    TestWEBrick.start_httpserver(config){|server, addr, port, log|
+      server.mount_proc('/', ->(req, res) { res.body = req.request_method })
+      TCPSocket.open(addr, port) do |c|
+        io = Net::BufferedIO.new(c)
+        read_response = -> {
+          res = Net::HTTPResponse.read_new(io)
+          body = io.read(res['Content-Length'].to_i)
+          [res, body]
+        }
+        # Two requests on the same connection.  The second one is sent after
+        # the first request's header deadline has elapsed; it must get its
+        # own fresh deadline and still be answered.
+        c.write("GET /one HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        first, first_body = read_response.call
+        assert_equal '200', first.code
+        assert_equal 'Keep-Alive', first['Connection']
+        assert_equal 'GET', first_body
+
+        sleep 1.2
+        c.write("GET /two HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        second, second_body = read_response.call
+        assert_equal '200', second.code
+        assert_equal 'GET', second_body
+      end
+    }
+  end
+
   def test_gigantic_request_header
     log_tester = lambda {|log, access_log|
       assert_equal 1, log.size

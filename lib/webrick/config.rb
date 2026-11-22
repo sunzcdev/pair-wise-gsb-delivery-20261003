@@ -48,6 +48,12 @@ module WEBrick
     HTTP = General.dup.update(
       :Port           => 80,
       :RequestTimeout => 30,
+      # Upper bound (in seconds) for reading a whole request line plus its
+      # header block, independently of the per-read :RequestTimeout.  When
+      # +nil+ (the default) no overall deadline is enforced and only the
+      # per-read :RequestTimeout applies, preserving the historical behavior.
+      # The deadline restarts for every request on a keep-alive connection.
+      :RequestHeaderTimeout => nil,
       :HTTPVersion    => HTTPVersion.new("1.1"),
       :AccessLog      => nil,
       :MimeTypes      => HTTPUtils::DefaultMimeTypes,

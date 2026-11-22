@@ -8,6 +8,8 @@ module WEBrick
 
     @bodytempfile: File | Tempfile | nil
 
+    @started: bool
+
     class InvalidHeader < StandardError
     end
 
@@ -40,6 +42,8 @@ module WEBrick
     attr_reader config: Hash[Symbol, untyped]
 
     attr_reader sent_size: Integer
+
+    def started?: () -> bool
 
     attr_accessor upgrade: String?
 

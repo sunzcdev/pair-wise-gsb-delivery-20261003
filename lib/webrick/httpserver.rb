@@ -38,7 +38,14 @@ module WEBrick
     # :Port:: Port to listen on
     # :RequestCallback:: Called with a request and response before each
     #                    request is serviced.
-    # :RequestTimeout:: Maximum time to wait between requests
+    # :RequestTimeout:: Maximum time to wait between individual reads while
+    #                   consuming a request (its line, headers and body).
+    # :RequestHeaderTimeout:: Maximum total time to wait for a complete
+    #                         request line plus header block, regardless of
+    #                         how many reads it spans.  +nil+ disables the
+    #                         overall bound so that only :RequestTimeout
+    #                         applies.  The deadline is reset for each
+    #                         request on a keep-alive connection.
     # :ServerAlias:: Array of alternate names for this server for virtual
     #                hosting
     # :ServerName:: Name for this server for virtual hosting
@@ -114,7 +121,15 @@ module WEBrick
             if req.keep_alive? && res.keep_alive?
               req.fixup()
             end
-            res.send_response(sock)
+            if res.started?
+              # The response (or an interim message such as 100 Continue)
+              # has already been written, so an error response cannot be
+              # emitted without corrupting the stream.  Drop the
+              # keep-alive connection instead.
+              res.keep_alive = false
+            else
+              res.send_response(sock)
+            end
             server.access_log(@config, req, res)
           end
         end

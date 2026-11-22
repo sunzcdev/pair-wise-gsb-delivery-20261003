@@ -316,5 +316,20 @@ module WEBrick
         assert_match(/\S\r\n/, @res.status_line)
       end
     end
+
+    def test_started_reflects_whether_output_began
+      io = StringIO.new
+      refute @res.started?
+      @res.body = "hello"
+      @res.send_response(io)
+      assert @res.started?
+      assert_match %r{\AHTTP/1\.1 200 OK}, io.string
+    end
+
+    def test_not_started_when_response_was_never_sent
+      refute @res.started?
+      @res.status = 408
+      refute @res.started?
+    end
   end
 end
