@@ -11,7 +11,7 @@ import logging
 import os
 from configparser import ConfigParser, Error
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Final
+from typing import TYPE_CHECKING, ClassVar, Final, NamedTuple
 
 from platformdirs import user_config_dir
 
@@ -24,6 +24,26 @@ if TYPE_CHECKING:
     from .convert import TypeData
 
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
+
+
+class IniValue(NamedTuple):
+    """What the config file contributes to an option, including when it contributes nothing.
+
+    :param name: the key that matched, which differs from the requested key for a legacy hyphenated one
+    :param status: ``set``, ``invalid`` or ``unset``
+    :param value: the converted value, ``None`` unless the status is ``set``
+    :param raw: the raw value, ``None`` when the key is not set
+    :param problem: why the value is invalid, ``None`` unless the status is ``invalid``
+    :param legacy: ``True`` when the key used the historical hyphenated spelling
+
+    """
+
+    name: str
+    status: str
+    value: Any  # simplint: ignore[imprecise-annotation]  # the type depends on the converter
+    raw: str | None
+    problem: str | None
+    legacy: bool
 
 
 class IniConfig:
@@ -102,20 +122,67 @@ class IniConfig:
         :returns: the converted value and the source it came from, ``None`` when the key is not set
 
         """
+        result = self.read(key, as_type)
+        if result.status == "set":
+            return result.value, "file"
+        return None
+
+    def read(self, key: str, as_type: TypeData) -> IniValue:
+        """Read a key and report whether and why it contributed a value.
+
+        A key the file does not hold is reported as ``unset`` and one whose value cannot be converted as ``invalid``,
+        so a configuration audit can tell a missing key apart from a broken one.
+
+        :param key: the option name
+        :param as_type: the converter to apply to the value
+
+        :returns: what the config file contributes
+
+        """
         cache_key = key, as_type
         if cache_key in self._cache:
             return self._cache[cache_key]
-        try:
-            raw_value = self.config_parser.get(self.section, key.lower())
-            source = "file"
-            result = convert(raw_value, as_type, source), source
-        # a value that fails conversion reads as unset instead of failing the run
-        except Exception:  # ruff:ignore[blind-except]
-            result = None
+        result = self._read(key, as_type)
         self._cache[cache_key] = result
         return result
+
+    def _read(self, key: str, as_type: TypeData) -> IniValue:
+        if not self:
+            return IniValue(key, "unset", None, None, None, False)
+        matched, legacy = self._resolve_key(key)
+        if matched is None:
+            return IniValue(key, "unset", None, None, None, False)
+        # an option without a value, as configparser sees `key =` followed by another key, reads as an empty string,
+        # which stays a value: an empty list option means no items, and a boolean one then fails to convert
+        raw_value = self.config_parser.get(self.section, matched)
+        source = f"config file {self.config_file} key {matched}"
+        try:
+            value = convert(raw_value, as_type, source)
+        # a value that fails conversion reads as unset instead of failing the run, but the audit still names it
+        except Exception as exception:  # ruff:ignore[blind-except]
+            return IniValue(matched, "invalid", None, raw_value, str(exception) or type(exception).__name__, legacy)
+        return IniValue(matched, "set", value, raw_value, None, legacy)
+
+    def _resolve_key(self, key: str) -> tuple[str | None, bool]:
+        """Return the key the file holds for the option, accepting the historical hyphenated spelling.
+
+        :param key: the option name as the parser knows it, with underscores
+
+        :returns: the stored key and whether it is the historical hyphenated one, or ``None`` when the file has neither
+
+        """
+        # configparser lower-cases option names on read, so compare in lower case too
+        stored = self.config_parser.options(self.section) if self.has_virtualenv_section else []
+        normal = key.lower()
+        if normal in stored:
+            return normal, False
+        legacy = normal.replace("_", "-")
+        if legacy in stored:
+            return legacy, True
+        return None, False
 
 
 __all__ = [
     "IniConfig",
+    "IniValue",
 ]

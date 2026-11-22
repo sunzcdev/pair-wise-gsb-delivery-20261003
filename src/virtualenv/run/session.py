@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
     from virtualenv.activation.activator import Activator
     from virtualenv.app_data.base import AppData
+    from virtualenv.config.audit import ConfigAudit
     from virtualenv.create.creator import Creator
     from virtualenv.seed.seeder import Seeder
 
@@ -42,6 +43,8 @@ class Session:
     :param creator: the creator that builds the environment
     :param seeder: the seeder that installs the seed packages
     :param activators: the activators that generate the activation scripts
+    :param config_audit: how the configuration layers resolved the options, ``None`` when the caller built the session
+        itself
 
     """
 
@@ -54,6 +57,7 @@ class Session:
         creator: Creator,
         seeder: Seeder,
         activators: list[Activator],
+        config_audit: ConfigAudit | None = None,
     ) -> None:
         self._verbosity = verbosity
         self._app_data = app_data
@@ -61,6 +65,7 @@ class Session:
         self._creator = creator
         self._seeder = seeder
         self._activators = activators
+        self._config_audit = config_audit
 
     def __enter__(self) -> Self:
         return self
@@ -125,6 +130,15 @@ class Session:
     def creator(self) -> Creator:
         """The creator used to build the virtual environment (must be compatible with the interpreter)."""
         return self._creator
+
+    @property
+    def config_audit(self) -> ConfigAudit | None:
+        """How the configuration layers resolved the options, ``None`` when the caller built the session itself.
+
+        The values come from the same parse the creation read, so asking this after a run tells what the run used.
+
+        """
+        return self._config_audit
 
 
 class _Debug:

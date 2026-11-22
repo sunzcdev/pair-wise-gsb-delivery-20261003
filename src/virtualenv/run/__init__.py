@@ -5,6 +5,7 @@ __lazy_modules__ = [
     "functools",
     "logging",
     "virtualenv.app_data",
+    "virtualenv.config.audit",
     "virtualenv.config.cli.parser",
     "virtualenv.report",
     "virtualenv.seed.wheels.periodic_update",
@@ -18,11 +19,13 @@ __lazy_modules__ = [
 
 import logging
 import os
+import sys
 from argparse import ArgumentParser
 from functools import partial
 from typing import TYPE_CHECKING, Final
 
 from virtualenv.app_data import make_app_data as make_app_data
+from virtualenv.config.audit import ConfigAudit as ConfigAudit
 from virtualenv.config.cli.parser import VirtualEnvConfigParser as VirtualEnvConfigParser
 from virtualenv.config.cli.parser import VirtualEnvOptions as VirtualEnvOptions
 from virtualenv.report import LEVELS as LEVELS
@@ -91,6 +94,13 @@ def session_via_cli(
     parser, elements = build_parser(args, options, setup_logging, env)
     # parse_args returns a plain Namespace, not the VirtualEnvOptions it is typed as
     options = parser.parse_args(args)  # ty: ignore[invalid-assignment]
+    # the audit is taken from the same parse the creation reads, so it cannot disagree with the created environment
+    audit = parser.audit()
+    # a report-only run prints the audit of this parse and stops before any environment is created
+    if getattr(options, "config_audit", False):
+        report = audit.render(audit.interesting())
+        sys.stdout.write(f"{report}\n")  # ruff:ignore[print]  # the report is the command's output
+        raise SystemExit(0)
     # the parser carries the discovered interpreter to the session, which ty cannot see
     options.py_version = parser._interpreter.version_info  # ruff:ignore[private-member-access]  # ty: ignore[invalid-assignment, missing-union-attribute]
     creator, seeder, activators = tuple(
@@ -111,7 +121,31 @@ def session_via_cli(
         seeder,  # ty: ignore[invalid-argument-type]
         # the builders are untyped, so their create results are object to ty
         activators,  # ty: ignore[invalid-argument-type]
+        config_audit=audit,
     )
+
+
+def audit_via_cli(
+    args: list[str],
+    options: VirtualEnvOptions | None = None,
+    env: MutableMapping[str, str] | None = None,
+) -> ConfigAudit:
+    """Report how the configuration layers resolve the options of a run, without creating an environment.
+
+    This runs the same parse the creation runs, so the reported values are the values the creation would read.
+
+    :param args: the command line arguments
+    :param options: the options to populate, a fresh set when not given
+    :param env: the environment variables to use, ``None`` for the process environment
+
+    :returns: the resolved options, with the layer that provided each value
+
+    """
+    env = os.environ if env is None else env
+    # logging is left alone, so the report can be printed without the run's log lines around it
+    parser, _ = build_parser(args, options, setup_logging=False, env=env)
+    parser.parse_args(args)
+    return parser.audit()
 
 
 def build_parser(
@@ -142,6 +176,14 @@ def build_parser(
         action="store_true",
         default=False,
         help="on failure also display the stacktrace internals of virtualenv",
+    )
+    parser.add_argument(
+        "--config-audit",
+        dest="config_audit",
+        action="store_true",
+        default=False,
+        help="report how the config file, the environment variables and the command line resolve each option, then "
+        "exit without creating the environment",
     )
     _do_report_setup(parser, args, setup_logging)
     options = load_app_data(args, parser, options)
@@ -295,6 +337,8 @@ def build_parser_only(args: list[str] | None = None) -> VirtualEnvConfigParser:
 
 
 __all__ = [
+    "ConfigAudit",
+    "audit_via_cli",
     "cli_run",
     "session_via_cli",
 ]

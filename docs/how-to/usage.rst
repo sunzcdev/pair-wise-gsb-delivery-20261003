@@ -325,6 +325,46 @@ Options are resolved in this order (highest to lowest priority):
         style C fill:#d97706,stroke:#b45309,color:#fff
         style D fill:#6366f1,stroke:#4f46e5,color:#fff
 
+Check how an option was resolved
+================================
+
+``--help`` shows only the default an option ends up with, so a flag you passed can look as if it were ignored. Pass
+``--config-audit`` to report how the config file, the environment variables and the command line resolved the options the
+run sets, then exit without creating the environment:
+
+.. code-block:: console
+
+    $ virtualenv env --no-periodic-update --config-audit
+
+The first block repeats what the creation would use:
+
+.. code-block:: text
+
+    resolved:
+      destination: '/home/me/env'
+      creator: 'builtin' from cli
+      seeder: 'app-data' from cli
+      periodic update: disabled (no_periodic_update from cli)
+
+A negative flag is reported as the behavior it turns off, so ``--no-periodic-update`` reads as ``periodic update:
+disabled`` instead of leaving you to invert a boolean. The blocks below it explain each option in turn: the value and the
+layer it came from, what each layer offered, and why a layer was skipped. A boolean flag, for instance, says that a
+configured false leaves it unset instead of turning on the opposite flag; a list says that the command line replaces the
+configured items.
+
+Three kinds of layer value are kept apart:
+
+- A variable or key that is not set at all.
+- One set to the empty string. An empty ``VIRTUALENV_<OPTION>`` counts as unset, while an empty list option in the
+  config file means no items.
+- One that cannot be parsed. The report names the variable or key, the raw value and the parse error, because a value
+  that fails to parse reads as unset rather than failing the run.
+
+A config file key may use the historical hyphenated spelling, such as ``no-periodic-update`` instead of
+``no_periodic_update``; the report labels it so an old key is not mistaken for a current one. The report covers the
+options of the creator, seeder and activators that the run would select, so it matches the environment that would be
+created.
+
 ********************************
  Make environments discoverable
 ********************************
@@ -508,5 +548,17 @@ Use ``session_via_cli`` to describe the environment without creating it:
 
     session = session_via_cli(["venv"])
     # inspect session.creator, session.seeder, session.activators
+
+Audit a configuration from Python with ``audit_via_cli``, which runs the same parse the creation runs and returns the
+resolved options with the layer that provided each value:
+
+.. code-block:: python
+
+    from virtualenv import audit_via_cli
+
+    audit = audit_via_cli(["venv", "--no-periodic-update"])
+    audit.value("no_periodic_update")  # True
+    audit.source("no_periodic_update")  # 'cli'
+    print(audit.render())  # the same report --config-audit prints
 
 See :doc:`../reference/api` for complete API documentation.

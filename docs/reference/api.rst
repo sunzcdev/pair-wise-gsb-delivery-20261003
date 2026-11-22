@@ -38,3 +38,26 @@ Options namespace passed to plugin constructors, populated from the CLI, environ
 
 .. autoclass:: VirtualEnvOptions
     :members:
+
+***************
+ Configuration
+***************
+
+``audit_via_cli`` runs the same parse the creation runs, so the values it reports are the values the creation would
+read. Use it to explain how the config file, the environment variables and the command line resolved an option.
+
+.. currentmodule:: virtualenv.run
+
+.. autofunction:: audit_via_cli
+
+.. currentmodule:: virtualenv.config.audit
+
+.. autoclass:: ConfigAudit
+    :members:
+
+.. autoclass:: OptionAudit
+    :members:
+
+.. autoclass:: LayerReading
+    :members:
+

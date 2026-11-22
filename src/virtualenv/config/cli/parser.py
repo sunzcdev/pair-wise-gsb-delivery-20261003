@@ -3,6 +3,7 @@ from __future__ import annotations
 __lazy_modules__ = [
     "collections",
     "shutil",
+    "virtualenv.config.audit",
     "virtualenv.config.convert",
     "virtualenv.config.env_var",
     "virtualenv.config.ini",
@@ -17,10 +18,12 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
 
+    from virtualenv.config.audit import ConfigAudit
     from virtualenv.config.convert import TypeData
 
+from virtualenv.config.audit import ActionFacts, Configured, LayerReading, action_kind, build_audit
 from virtualenv.config.convert import get_type
-from virtualenv.config.env_var import get_env_var
+from virtualenv.config.env_var import read_env_var
 from virtualenv.config.ini import IniConfig
 
 
@@ -75,11 +78,22 @@ class VirtualEnvConfigParser(ArgumentParser):
         self.options = VirtualEnvOptions() if options is None else options
         self._interpreter = None
         self._app_data = None
+        self._audit: dict[int, ActionFacts] = {}
+        self._audit_order: list[int] = []
+        self._cli_dests: set[str] = set()
 
     def enable_help(self) -> None:
         """Add the ``-h`` and ``--help`` options, after fixing the defaults."""
         self._fix_defaults()
         self.add_argument("-h", "--help", action="help", default=SUPPRESS, help="show this help message and exit")
+
+    def audit(self) -> ConfigAudit:
+        """Report how the configuration layers resolved every option.
+
+        :returns: the audit, built from the same options the creation reads
+
+        """
+        return build_audit(self, self.options)
 
     def _fix_defaults(self) -> None:
         for action in self._actions:
@@ -95,32 +109,98 @@ class VirtualEnvConfigParser(ArgumentParser):
         if hasattr(action, "default") and hasattr(action, "dest") and action.default != SUPPRESS:
             as_type = get_type(action)
             names = OrderedDict((i.lstrip("-").replace("-", "_"), None) for i in action.option_strings)
-            outcome = self._configured_outcome(names, as_type)
-            if tri_state := action.default is None and isinstance(action.const, bool):
-                outcome = _as_passed_flag(action.const, outcome)
+            configured, readings, notes = self._configured_outcome(names, as_type)
+            tri_state = action.default is None and isinstance(action.const, bool)
+            if tri_state:
+                configured, notes = _as_passed_flag(action.const, configured, notes)
+            applied = None if configured is None else configured.applied
             # A sibling flag's environment value takes precedence over this flag's configuration file value.
-            if outcome is not None and not (
-                tri_state and outcome[1] == "file" and self.options.get_source(action.dest) == "env var"
+            if configured is not None and not (
+                tri_state and applied == "file" and self.options.get_source(action.dest) == "env var"
             ):
-                action.default, default_source = outcome
-                vars(action)["default_source"] = default_source  # simplint: ignore[vars-call]  # argparse metadata  # fmt: skip
+                action.default = configured.value
+                # argparse stores the source text on the action for the help formatter to show
+                vars(action)["default_source"] = configured.display  # simplint: ignore[vars-call]  # argparse metadata  # fmt: skip
+                self.options.set_src(action.dest, configured.value, configured.display)
+                self._record(action, readings, notes, applied, configured.winner)
             elif tri_state and hasattr(self.options, action.dest):
-                return  # a sibling flag sharing this destination already set it
+                # a sibling flag sharing this destination already took a value, so this one adds none; the note comes
+                # from whoever did take the value, so nothing is recorded here
+                self._record(action, readings, notes, None, None)
             else:
-                outcome = action.default, "default"
-            self.options.set_src(action.dest, *outcome)
+                self.options.set_src(action.dest, action.default, getattr(action, "default_source", "default"))
+                self._record(action, readings, notes, None, None)
+
+    def _record(
+        self,
+        action: Action,
+        readings: list[LayerReading],
+        notes: list[str],
+        applied_source: str | None,
+        winner: str | None,
+    ) -> None:
+        action_id = id(action)
+        if action_id not in self._audit:
+            self._audit_order.append(action_id)
+        self._audit[action_id] = (action, tuple(readings), tuple(notes), applied_source, winner)
+
+    def audit_facts(self) -> list[ActionFacts]:
+        """Return what the parser observed while resolving each option, in declaration order.
+
+        :returns: the observed facts of every option the parser resolved
+
+        """
+        return [
+            ActionFacts(
+                action.dest,
+                tuple(action.option_strings),
+                action_kind(action),
+                readings,
+                notes,
+                applied_source,
+                winner,
+            )
+            for action, readings, notes, applied_source, winner in (
+                self._audit[action_id] for action_id in self._audit_order
+            )
+        ]
 
     def _configured_outcome(
         self, names: Iterable[str], as_type: TypeData
-    ) -> tuple[Any, str] | None:  # simplint: ignore[imprecise-annotation]  # type known at run time
+    ) -> tuple[Configured | None, list[LayerReading], list[str]]:
+        readings: list[LayerReading] = []
+        notes: list[str] = []
         for name in names:
-            if (outcome := get_env_var(name, as_type, self.env)) is not None:
-                return outcome
-        if self.file_config:
-            for name in names:
-                if (outcome := self.file_config.get(name, as_type)) is not None:
-                    return outcome
-        return None
+            env = read_env_var(name, as_type, self.env)
+            readings.append(LayerReading("env var", env.name, env.status, env.raw, env.value, env.problem))
+        # the config file is only consulted when no env var supplied a value, so report it as skipped when it was not
+        consulted = bool(self.file_config)
+        for name in names:
+            if not consulted:
+                readings.append(LayerReading("ini", name, "skipped", None, None, None))
+                continue
+            ini = self.file_config.read(name, as_type)
+            readings.append(
+                LayerReading("ini", ini.name, ini.status, ini.raw, ini.value, ini.problem, legacy=ini.legacy)
+            )
+            if ini.legacy:
+                notes.append(f"the config file key {ini.name} uses the historical hyphenated spelling")
+        for reading in readings:
+            if reading.status == "invalid":
+                where = "env var" if reading.layer == "env var" else "config file"
+                notes.append(f"{reading.name} at the {where} level cannot be parsed, so it reads as unset")
+        for layer in ("env var", "ini"):
+            set_values = [i for i in readings if i.layer == layer and i.status == "set"]
+            if len(set_values) > 1:
+                where = "env var" if layer == "env var" else "config file"
+                others = ", ".join(i.name for i in set_values[1:])
+                notes.append(f"{set_values[0].name} wins over {others} at the {where} level")
+        for reading in readings:
+            if reading.status == "set":
+                applied = "env var" if reading.layer == "env var" else "file"
+                display = f"env var {reading.name}" if applied == "env var" else "file"
+                return Configured(reading.value, applied, display, reading.name), readings, notes
+        return None, readings, notes
 
     # narrows the base parse_known_args to VirtualEnvOptions, which ty flags as an override
     def parse_known_args(  # ty: ignore[incompatible-method-override]
@@ -150,6 +230,33 @@ class VirtualEnvConfigParser(ArgumentParser):
         finally:
             # the parser records the source of each option on the options object
             self.options._src = None  # ruff:ignore[private-member-access]
+
+    # narrows the base hook to the namespace this parser uses, ty flags it as an override
+    def _get_values(  # ty: ignore[incompatible-method-override]
+        self, action: Action, arg_strings: list[str]
+    ) -> Any:  # ruff:ignore[any-type]  # argparse converts values to the type of the action
+        """Record that an option appeared on the command line, then convert its values.
+
+        argparse re-assigns a string default while filling the namespace, which on its own makes a configured default
+        look as if it came from the command line. This hook runs only for the options argparse actually acts on, so
+        recording the destination here keeps that apart and lets the audit name the real source.
+
+        :param action: the action being applied
+        :param arg_strings: the raw values given for it
+
+        :returns: the converted values
+
+        """
+        self._cli_dests.add(action.dest)
+        return super()._get_values(action, arg_strings)
+
+    def cli_dests(self) -> frozenset[str]:
+        """Return the destinations the command line set, as opposed to the configured defaults.
+
+        :returns: the destinations seen on the command line
+
+        """
+        return frozenset(self._cli_dests)
 
 
 class HelpFormatter(ArgumentDefaultsHelpFormatter):
@@ -233,13 +340,22 @@ class VirtualEnvOptions(Namespace):
         return self._sources.get(key)
 
 
-def _as_passed_flag(const: bool, outcome: tuple[bool, str] | None) -> tuple[bool, str] | None:
+def _as_passed_flag(
+    const: bool, configured: Configured | None, notes: list[str]
+) -> tuple[Configured | None, list[str]]:
     # an env var or ini value for a --x/--no-x pair means "as if the flag was passed": true stores the flag's value,
     # while false on the negative flag leaves the choice unset rather than flipping it on
-    if outcome is None or const:
-        return outcome
-    value, source = outcome
-    return (False, source) if value else None
+    if configured is None or const:
+        return configured, notes
+    if configured.value:
+        return configured._replace(value=False), notes
+    layer = "env var" if configured.applied == "env var" else "config file"
+    notes = [
+        *notes,
+        f"{configured.winner} at the {layer} level is false, which leaves this flag unset instead of turning on "
+        "the opposite flag",
+    ]
+    return None, notes
 
 
 __all__ = [
