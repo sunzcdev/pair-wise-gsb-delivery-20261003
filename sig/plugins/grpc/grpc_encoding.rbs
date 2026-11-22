@@ -22,12 +22,23 @@ module HTTPX
       class Inflater
         @response: Response
         @grpc_encodings: Array[String]
+        @buffer: String
+        @payload_size: Integer?
+        @compressed: bool
+
+        HEADER_SIZE: Integer
 
         def initialize: (Response | StreamResponse response) -> void
 
-        def call: (String message) ?{ (String) -> void } -> String
+        # incrementally consumes a transport chunk and yields fully decoded messages
+        def call: (String chunk) ?{ (String) -> void } -> void
+
+        # raises if a half-delivered message remains once the transport ended
+        def finish!: () -> void
 
         private
+
+        def decode_payload: (String encoded_data) ?{ (String) -> void } -> void
 
         def grpc_encodings: () -> Array[String]
       end

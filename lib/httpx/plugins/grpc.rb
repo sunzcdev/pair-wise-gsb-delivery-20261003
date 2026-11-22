@@ -12,6 +12,28 @@ module HTTPX
     end
   end
 
+  # Base class for errors caused by a malformed/incomplete GRPC message stream
+  # (i.e. the transport ended before the length-prefixed framing of a message
+  # could be fully consumed), as opposed to a business failure reported through
+  # the trailing "grpc-status" metadata.
+  class GRPCMessageError < Error; end
+
+  # Raised when the stream ends in the middle of a 5-byte message header
+  # (1-byte compressed flag + 4-byte message length).
+  class GRPCMessageHeaderError < GRPCMessageError
+    def initialize(bytesize)
+      super("GRPC response ended prematurely: expected 5 header bytes, got #{bytesize}")
+    end
+  end
+
+  # Raised when the stream ends in the middle of a message payload, i.e. after
+  # a complete header advertised more bytes than the transport actually delivered.
+  class GRPCMessagePayloadError < GRPCMessageError
+    def initialize(expected, actual)
+      super("GRPC response ended prematurely: expected #{expected} message bytes, got #{actual}")
+    end
+  end
+
   module Plugins
     #
     # This plugin adds DSL to build GRPC interfaces.

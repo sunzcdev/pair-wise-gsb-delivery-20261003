@@ -15,7 +15,13 @@ module HTTPX
 
           decoder = Transcoder::GRPCEncoding.decode(response)
 
-          decoder.call(response.to_s)
+          data = "".b
+          response.each do |frame|
+            decoder.call(frame) { |message| data << message }
+          end
+          decoder.finish!
+
+          data
         end
 
         # lazy decodes a grpc stream response
@@ -27,6 +33,9 @@ module HTTPX
           response.each do |frame|
             decoder.call(frame, &block)
           end
+
+          # the transport stopped before the in-flight GRPC message was fully framed
+          decoder.finish!
 
           verify_status(response)
         end

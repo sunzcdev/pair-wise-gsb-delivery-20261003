@@ -5,6 +5,20 @@ module HTTPX
     attr_reader metadata: headers
   end
 
+  # base error for malformed/incomplete GRPC message framing
+  class GRPCMessageError < Error
+  end
+
+  # raised when the transport ends in the middle of a message header
+  class GRPCMessageHeaderError < GRPCMessageError
+    def initialize: (Integer bytesize) -> void
+  end
+
+  # raised when the transport ends in the middle of a message payload
+  class GRPCMessagePayloadError < GRPCMessageError
+    def initialize: (Integer expected, Integer actual) -> void
+  end
+
   module Plugins
     module GRPC
       DEADLINE: Integer
