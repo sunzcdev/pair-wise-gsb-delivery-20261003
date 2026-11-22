@@ -232,22 +232,23 @@ module Fluent
 
             catch :break_loop do
               @filters.each do |filter|
-                if filter.has_filter_with_time
-                  begin
-                    filtered_time, filtered_record = filter.filter_with_time(tag, filtered_time, filtered_record)
-                    throw :break_loop unless filtered_record && filtered_time
-                    filter.measure_metrics(OneEventStream.new(time, record))
-                  rescue => e
-                    filter.router.emit_error_event(tag, filtered_time, filtered_record, e)
-                  end
+                # Reuse the base Filter fault-tolerance protocol so that the
+                # optimized chain and the plain #filter_stream chain route
+                # failures identically. #filter_one snapshots the record
+                # before invoking the plugin and delivers it to the error
+                # route at most once (see Filter#route_error_once).
+                result = filter.filter_one(tag, filtered_time, filtered_record)
+
+                if result.passed?
+                  filtered_time = result.time
+                  filtered_record = result.record
+                  filter.measure_metrics(OneEventStream.new(time, record))
                 else
-                  begin
-                    filtered_record = filter.filter(tag, filtered_time, filtered_record)
-                    throw :break_loop unless filtered_record
-                    filter.measure_metrics(OneEventStream.new(time, record))
-                  rescue => e
-                    filter.router.emit_error_event(tag, filtered_time, filtered_record, e)
-                  end
+                  # :dropped (plugin returned nil) or :routed_to_error
+                  # (failure already delivered to @ERROR once). Either way
+                  # the record must not reach the business output, and a
+                  # retry must not re-deliver the error event.
+                  throw :break_loop
                 end
               end
 

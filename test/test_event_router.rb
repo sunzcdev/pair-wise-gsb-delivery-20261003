@@ -137,6 +137,379 @@ class EventRouterTest < ::Test::Unit::TestCase
     end
   end
 
+  sub_test_case 'filter chain fault tolerance protocol' do
+    # Filter that always succeeds: records how many times each record was
+    # seen and tags the record with a stage marker.
+    def passing_filter(marker)
+      Class.new(FluentTestFilter) do
+        define_method(:initialize) do |*args|
+          super(*args)
+          @marker = marker
+          @seen = Hash.new(0)
+        end
+
+        attr_reader :seen
+
+        define_method(:filter) do |tag, time, record|
+          key = record['id']
+          @seen[key] += 1
+          record['stages'] = (record['stages'] || []) + [@marker]
+          record
+        end
+      end.new(marker)
+    end
+
+    # Filter that intentionally drops a specific record (returns nil),
+    # everything else passes through untouched.
+    def dropping_filter(dropped_id)
+      Class.new(FluentTestFilter) do
+        define_method(:initialize) do |id|
+          super()
+          @dropped_id = id
+          @dropped = []
+        end
+
+        attr_reader :dropped
+
+        define_method(:filter) do |tag, time, record|
+          if record['id'] == @dropped_id
+            @dropped << record
+            nil
+          else
+            record['stages'] = (record['stages'] || []) + ['b']
+            record
+          end
+        end
+      end.new(dropped_id)
+    end
+
+    # Filter that mutates the record and THEN raises for a specific id.
+    # The error route must receive the snapshot taken *before* this filter
+    # ran, never the partially mutated record.
+    def failing_filter(failing_id, error_message)
+      Class.new(FluentTestFilter) do
+        define_method(:initialize) do |id, message|
+          super()
+          @failing_id = id
+          @message = message
+          @attempts = Hash.new(0)
+        end
+
+        attr_reader :attempts
+
+        define_method(:filter) do |tag, time, record|
+          @attempts[record['id']] += 1
+          if record['id'] == @failing_id
+            record['partial_mutation'] = true
+            raise RuntimeError, @message
+          end
+          record['stages'] = (record['stages'] || []) + ['c']
+          record
+        end
+      end.new(failing_id, error_message)
+    end
+
+    # Filter overriding #filter_stream, which forces the pipeline to disable
+    # optimization and use the plain reduce path. It delegates the per-record
+    # decision to an inner failing filter and applies the same filter_one
+    # fault-tolerance protocol as the base class.
+    def failing_stream_filter(failing_id, error_message)
+      inner = failing_filter(failing_id, error_message)
+      Class.new(FluentTestFilter) do
+        define_method(:initialize) do |delegate|
+          super()
+          @delegate = delegate
+        end
+
+        attr_reader :delegate
+
+        define_method(:filter_stream) do |tag, es|
+          new_es = MultiEventStream.new
+          es.each do |time, record|
+            result = filter_one(tag, time, record)
+            new_es.add(result.time, result.record) if result.passed?
+          end
+          new_es
+        end
+
+        define_method(:filter) do |tag, time, record|
+          @delegate.send(:filter, tag, time, record)
+        end
+
+        define_method(:attempts) do
+          @delegate.attempts
+        end
+      end.new(inner)
+    end
+
+    # A filter_stream filter that drops a given record, again forcing the
+    # non-optimized reduce path for the whole chain.
+    def dropping_stream_filter(dropped_id)
+      inner = dropping_filter(dropped_id)
+      Class.new(FluentTestFilter) do
+        define_method(:initialize) do |delegate|
+          super()
+          @delegate = delegate
+        end
+
+        attr_reader :delegate
+
+        define_method(:filter_stream) do |tag, es|
+          new_es = MultiEventStream.new
+          es.each do |time, record|
+            result = filter_one(tag, time, record)
+            new_es.add(result.time, result.record) if result.passed?
+          end
+          new_es
+        end
+
+        define_method(:filter) do |tag, time, record|
+          @delegate.send(:filter, tag, time, record)
+        end
+      end.new(inner)
+    end
+
+    # Error handler that records every record sent to the error route.
+    def capturing_error_handler
+      Class.new do
+        attr_reader :error_events
+
+        def initialize
+          @error_events = []
+        end
+
+        def handle_emit_error(tag, time, record, error)
+          @error_events << { tag: tag, time: time, record: record, error: error }
+        end
+
+        def handle_emits_error(tag, es, error)
+          es.each { |time, record| handle_emit_error(tag, time, record, error) }
+        end
+
+        def emit_error_event(tag, time, record, error)
+          handle_emit_error(tag, time, record, error)
+        end
+      end.new
+    end
+
+    def batch_events
+      es = MultiEventStream.new
+      [1, 2, 3].each do |id|
+        es.add(Engine.now + id, 'id' => id, 'stages' => [])
+      end
+      es
+    end
+
+    # Build the same logical three-stage chain for both paths:
+    #   stage 1: passing (marks 'a')
+    #   stage 2: drops record 2 (marks 'b' otherwise)
+    #   stage 3: fails record 3 after a partial mutation (marks 'c' otherwise)
+    def build_pipeline(stream_chain:)
+      pipeline = EventRouter::Pipeline.new
+      pipeline.add_filter(passing_filter('a'))
+      if stream_chain
+        pipeline.add_filter(dropping_stream_filter(2))
+        pipeline.add_filter(failing_stream_filter(3, 'boom on stream chain'))
+      else
+        pipeline.add_filter(dropping_filter(2))
+        pipeline.add_filter(failing_filter(3, 'boom on optimized chain'))
+      end
+      pipeline.set_output(FluentTestOutput.new)
+      pipeline
+    end
+
+    def attach_handler(pipeline, handler)
+      pipeline.instance_variable_get(:@optimizer).instance_variable_get(:@filters).each do |f|
+        f.router = handler
+        if f.respond_to?(:delegate) && f.delegate
+          f.delegate.router = handler
+        end
+      end
+    end
+
+    def expected_business_records
+      [
+        { 'id' => 1, 'stages' => ['a', 'b', 'c'] },
+      ]
+    end
+
+    test 'optimized path: marks passed / dropped / error-routed records correctly' do
+      pipeline = build_pipeline(stream_chain: false)
+      handler = capturing_error_handler
+      attach_handler(pipeline, handler)
+
+      pipeline.emit_events('test.tag', batch_events)
+      output = pipeline.instance_variable_get(:@output)
+
+      # only the fully-passed record reaches the business output
+      assert_equal expected_business_records, output.events['test.tag']
+
+      # exactly one error event, carrying the pre-failure snapshot
+      assert_equal 1, handler.error_events.size
+      err = handler.error_events.first
+      assert_equal 3, err[:record]['id']
+      assert_not_include err[:record].keys, 'partial_mutation'
+      assert_equal ['a', 'b'], err[:record]['stages']
+      assert_equal RuntimeError, err[:error].class
+    end
+
+    test 'non-optimized (filter_stream) path: identical business output and error route' do
+      pipeline = build_pipeline(stream_chain: true)
+      handler = capturing_error_handler
+      attach_handler(pipeline, handler)
+
+      pipeline.emit_events('test.tag', batch_events)
+      output = pipeline.instance_variable_get(:@output)
+
+      assert_equal expected_business_records, output.events['test.tag']
+
+      assert_equal 1, handler.error_events.size
+      err = handler.error_events.first
+      assert_equal 3, err[:record]['id']
+      assert_not_include err[:record].keys, 'partial_mutation'
+      assert_equal ['a', 'b'], err[:record]['stages']
+      assert_equal RuntimeError, err[:error].class
+    end
+
+    test 'both paths deliver the same record dispositions for the same batch' do
+      optimized = build_pipeline(stream_chain: false)
+      streamed = build_pipeline(stream_chain: true)
+      h_opt = capturing_error_handler
+      h_str = capturing_error_handler
+      attach_handler(optimized, h_opt)
+      attach_handler(streamed, h_str)
+
+      optimized.emit_events('test.tag', batch_events)
+      streamed.emit_events('test.tag', batch_events)
+
+      out_opt = optimized.instance_variable_get(:@output).events['test.tag']
+      out_str = streamed.instance_variable_get(:@output).events['test.tag']
+      assert_equal out_opt, out_str
+
+      err_opt = h_opt.error_events.map { |e| e[:record] }
+      err_str = h_str.error_events.map { |e| e[:record] }
+      assert_equal err_opt, err_str
+    end
+
+    test 'retry does not re-send records already delivered to the error route' do
+      pipeline = build_pipeline(stream_chain: false)
+      handler = capturing_error_handler
+      attach_handler(pipeline, handler)
+
+      es = batch_events
+      pipeline.emit_events('test.tag', es)
+      first_output = pipeline.instance_variable_get(:@output).events['test.tag'].size
+      first_errors = handler.error_events.size
+
+      # simulate an upstream retry reprocessing the exact same batch
+      pipeline.emit_events('test.tag', es)
+      second_output = pipeline.instance_variable_get(:@output).events['test.tag'].size
+      second_errors = handler.error_events.size
+
+      # the failing record must not be delivered to @ERROR again
+      assert_equal first_errors, second_errors
+      # the still-valid record is naturally reprocessed, but no extra
+      # error-routed duplicates appear
+      assert_equal first_output * 2, second_output
+    end
+
+    test 'retry is also idempotent on the non-optimized filter_stream path' do
+      pipeline = build_pipeline(stream_chain: true)
+      handler = capturing_error_handler
+      attach_handler(pipeline, handler)
+
+      es = batch_events
+      pipeline.emit_events('test.tag', es)
+      first_errors = handler.error_events.size
+
+      pipeline.emit_events('test.tag', es)
+      second_errors = handler.error_events.size
+
+      assert_equal first_errors, second_errors
+    end
+
+    test 'FilterResult exposes the three dispositions explicitly' do
+      passing = passing_filter('x')
+      passing.router = capturing_error_handler
+      r_pass = passing.filter_one('t', Engine.now, 'id' => 1)
+      assert r_pass.passed?
+      assert !r_pass.dropped?
+      assert !r_pass.routed_to_error?
+
+      dropping = dropping_filter(9)
+      dropping.router = capturing_error_handler
+      r_drop = dropping.filter_one('t', Engine.now, 'id' => 9)
+      assert r_drop.dropped?
+      assert !r_drop.passed?
+
+      failing = failing_filter(9, 'boom')
+      failing.router = capturing_error_handler
+      r_err = failing.filter_one('t', Engine.now, 'id' => 9)
+      assert r_err.routed_to_error?
+      assert !r_err.passed?
+      assert_instance_of RuntimeError, r_err.error
+    end
+
+    # A filter built on #filter_with_time instead of #filter must follow the
+    # exact same three-state protocol (this is the other optimizer branch).
+    test 'protocol also applies to filter_with_time based plugins' do
+      fwt = Class.new(FluentTestFilter) do
+        undef_method :filter
+
+        def filter_with_time(tag, time, record)
+          if record['id'] == 2
+            record['partial_mutation'] = true
+            raise RuntimeError, 'fwt boom'
+          elsif record['id'] == 3
+            # explicit drop via nil time/record
+            return [nil, nil]
+          end
+          [time, record]
+        end
+      end.new
+      handler = capturing_error_handler
+      fwt.router = handler
+
+      es = MultiEventStream.new
+      es.add(10, 'id' => 1)
+      es.add(20, 'id' => 2)
+      es.add(30, 'id' => 3)
+
+      out = fwt.filter_stream('wt', es)
+      results = out.to_a
+
+      # only id 1 is forwarded
+      assert_equal 1, results.size
+      assert_equal 10, results.first[0]
+      assert_equal 1, results.first[1]['id']
+
+      # id 2 reached the error route with its pristine pre-filter snapshot
+      assert_equal 1, handler.error_events.size
+      err = handler.error_events.first
+      assert_equal 2, err[:record]['id']
+      assert !err[:record].key?('partial_mutation')
+
+      # retrying the whole stream does not duplicate the error event
+      fwt.filter_stream('wt', es)
+      assert_equal 1, handler.error_events.size
+    end
+
+    test 'filter_with_time result time is honored through the protocol' do
+      fwt = Class.new(FluentTestFilter) do
+        undef_method :filter
+
+        def filter_with_time(tag, time, record)
+          [time + 100, record]
+        end
+      end.new
+      fwt.router = capturing_error_handler
+
+      result = fwt.filter_one('wt', 10, 'id' => 1)
+      assert result.passed?
+      assert_equal 110, result.time
+    end
+  end
+
   sub_test_case EventRouter do
     teardown do
       @event_router = nil
