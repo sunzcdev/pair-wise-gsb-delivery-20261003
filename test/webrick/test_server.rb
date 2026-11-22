@@ -161,6 +161,84 @@ class TestWEBrickServer < Test::Unit::TestCase
     }
   end
 
+  def test_per_listener_max_clients
+    address = "127.0.0.1"
+    log = []
+    config = {
+      :DoNotListen => true,
+      :Logger => WEBrick::Log.new(log, WEBrick::BasicLog::WARN),
+    }
+    server = Echo.new(config)
+    server.listen(address, 0, max_clients: 1)
+    server.listen(address, 0)
+    limited_port = server.listeners[0].addr[1]
+    open_port = server.listeners[1].addr[1]
+    server_thread = Thread.new { server.start }
+    begin
+      sleep 0.1 until server.status == :Running || !server_thread.status
+      # saturate the limited listener with a long-lived connection
+      sock1 = TCPSocket.open(address, limited_port)
+      sock1.puts("foo")
+      assert_equal("foo\n", sock1.gets, log.inspect)
+      # a second connection stays in the backlog while the limit is reached
+      sock2 = TCPSocket.open(address, limited_port)
+      sock2.puts("bar")
+      assert_nil(IO.select([sock2], nil, nil, 1),
+                 "limited listener accepted over its limit")
+      # the unlimited listener still accepts new connections
+      TCPSocket.open(address, open_port) {|sock|
+        sock.puts("baz")
+        assert_equal("baz\n", sock.gets, log.inspect)
+      }
+      # releasing the long-lived connection lets the queued one in
+      sock1.close
+      assert_equal("bar\n", sock2.gets, log.inspect)
+      sock2.close
+    ensure
+      server.shutdown
+      server_thread.join
+    end
+    assert_equal([], log)
+  end
+
+  def test_start_thread_failure_releases_slots
+    address = "127.0.0.1"
+    log = []
+    config = {
+      :DoNotListen => true,
+      :MaxClients => 1,
+      :Logger => WEBrick::Log.new(log, WEBrick::BasicLog::FATAL),
+    }
+    server = Class.new(Echo) {
+      attr_accessor :fail_start
+      def start_thread(sock, listener_tokens = nil, &block)
+        if fail_start
+          self.fail_start = false
+          raise ThreadError, "can't create Thread"
+        end
+        super
+      end
+    }.new(config)
+    server.fail_start = true
+    server.listen(address, 0, max_clients: 1)
+    port = server.listeners[0].addr[1]
+    server_thread = Thread.new { server.start }
+    begin
+      sleep 0.1 until server.status == :Running || !server_thread.status
+      # the first connection fails to spawn a thread; both the global and
+      # the per-listener slot must be returned.
+      TCPSocket.open(address, port) {|sock| sock.puts("foo") }
+      # so the next connection can be accepted and served.
+      TCPSocket.open(address, port) {|sock|
+        sock.puts("bar")
+        assert_equal("bar\n", sock.gets)
+      }
+    ensure
+      server.shutdown
+      server_thread.join
+    end
+  end
+
   def test_port_numbers
     config = {
       :BindAddress => '0.0.0.0',

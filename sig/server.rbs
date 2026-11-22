@@ -14,6 +14,10 @@ module WEBrick
   class GenericServer
     @shutdown_pipe: [IO, IO]?
 
+    @notify_pipe: [IO, IO]?
+
+    @listener_tokens: Hash[TCPServer | OpenSSL::SSL::SSLServer, Thread::SizedQueue]
+
     attr_reader status: :Stop | :Running | :Shutdown
 
     attr_reader config: Hash[Symbol, untyped]
@@ -28,7 +32,7 @@ module WEBrick
 
     def []: (Symbol key) -> untyped
 
-    def listen: (String address, Integer port) -> void
+    def listen: (String address, Integer port, ?max_clients: Integer?) -> void
 
     def start: () ?{ (TCPSocket) -> void } -> void
 
@@ -42,13 +46,23 @@ module WEBrick
 
     def accept_client: (TCPServer svr) -> TCPSocket?
 
-    def start_thread: (TCPSocket sock) ?{ (TCPSocket) -> void } -> Thread
+    def start_thread: (TCPSocket sock, ?Thread::SizedQueue? listener_tokens) ?{ (TCPSocket) -> void } -> Thread
 
     def call_callback: (Symbol callback_name, *untyped args) -> untyped
 
     def setup_shutdown_pipe: () -> [IO, IO]
 
     def cleanup_shutdown_pipe: ([IO, IO]? shutdown_pipe) -> void
+
+    def setup_notify_pipe: () -> [IO, IO]
+
+    def cleanup_notify_pipe: ([IO, IO]? notify_pipe) -> void
+
+    def wakeup_notify_pipe: () -> void
+
+    def listener_limit_reached?: (TCPServer | OpenSSL::SSL::SSLServer svr) -> bool
+
+    def register_listeners: (Array[TCPServer | OpenSSL::SSL::SSLServer] listeners, Integer? max_clients) -> void
 
     def alarm_shutdown_pipe: [T] () { (IO) -> T } -> T?
 

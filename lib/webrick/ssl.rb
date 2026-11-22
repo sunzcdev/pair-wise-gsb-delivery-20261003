@@ -165,7 +165,7 @@ module WEBrick
     ##
     # Updates +listen+ to enable SSL when the SSL configuration is active.
 
-    def listen(address, port) # :nodoc:
+    def listen(address, port, max_clients: nil) # :nodoc:
       listeners = Utils::create_listeners(address, port)
       if @config[:SSLEnable]
         listeners.collect!{|svr|
@@ -174,7 +174,7 @@ module WEBrick
           ssvr
         }
       end
-      @listeners += listeners
+      register_listeners(listeners, max_clients)
       setup_shutdown_pipe
     end
 
