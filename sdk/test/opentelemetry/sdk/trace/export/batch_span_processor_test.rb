@@ -8,6 +8,7 @@ require 'test_helper'
 
 describe OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor do
   BatchSpanProcessor = OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor
+  ExportResult = OpenTelemetry::SDK::Trace::Export::ExportResult
   SUCCESS = OpenTelemetry::SDK::Trace::Export::SUCCESS
   FAILURE = OpenTelemetry::SDK::Trace::Export::FAILURE
   TIMEOUT = OpenTelemetry::SDK::Trace::Export::TIMEOUT
@@ -49,6 +50,28 @@ describe OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor do
     def shutdown(timeout: nil); end
 
     def force_flush(timeout: nil); end
+  end
+
+  # Reports a per-span receipt for each batch. +results+ is consumed one call
+  # at a time; a nil entry means a plain SUCCESS.
+  class PartialExporter
+    attr_reader :batches
+
+    def initialize(results)
+      @results = results
+      @batches = []
+    end
+
+    def export(batch, timeout: nil)
+      @batches << batch
+      @results.shift || SUCCESS
+    end
+
+    def shutdown(timeout: nil); end
+
+    def force_flush(timeout: nil)
+      SUCCESS
+    end
   end
 
   class TestMetricsReporter
@@ -343,6 +366,205 @@ describe OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor do
 
       _(te.failed_batches.size).must_equal(1)
       _(te.failed_batches[0].size).must_equal(3)
+    end
+  end
+
+  describe 'partial acceptance' do
+    let(:metrics_reporter) { TestMetricsReporter.new }
+
+    # Builds three spans with stable ids so assertions can identify them after
+    # they cross the exporter boundary.
+    def three_spans
+      [TestSpan.new('accepted'), TestSpan.new('rejected'), TestSpan.new('retryable')]
+    end
+
+    def dropped_counts(reporter)
+      (reporter.reported_metrics['otel.bsp.dropped_spans'] || []).each_with_object(Hash.new(0)) do |(count, labels), acc|
+        acc[labels['reason']] += count
+      end
+    end
+
+    it 'resends only the retryable segment and reconciles the final drop counts' do
+      exporter = PartialExporter.new([
+                                       ExportResult.new(accepted: [0], rejected: [1], retryable: [2]),
+                                       ExportResult.new(accepted: [0])
+                                     ])
+      bsp = BatchSpanProcessor.new(exporter,
+                                   metrics_reporter: metrics_reporter,
+                                   max_queue_size: 6,
+                                   max_export_batch_size: 3,
+                                   start_thread_on_boot: false)
+      spans = three_spans
+      spans.each { |span| bsp.on_finish(span) }
+      result = bsp.force_flush
+
+      _(result).must_equal(SUCCESS)
+
+      # First call receives the whole batch, second call only the retryable span.
+      _(exporter.batches.size).must_equal(2)
+      _(exporter.batches[0]).must_equal(spans)
+      _(exporter.batches[1]).must_equal([spans[2]])
+
+      # Permanent rejection is counted as dropped, the retried span was accepted.
+      _(dropped_counts(metrics_reporter)).must_equal({ 'export-rejected' => 1 })
+      _(metrics_reporter.reported_metrics['otel.bsp.exported_spans'].sum { |count, _| count }).must_equal(2)
+
+      # Nothing is left behind in the queue or re-exported.
+      _(bsp.instance_variable_get(:@spans)).must_be_empty
+    end
+
+    it 'keeps the legacy SUCCESS return value working' do
+      exporter = PartialExporter.new([])
+      bsp = BatchSpanProcessor.new(exporter,
+                                   metrics_reporter: metrics_reporter,
+                                   max_queue_size: 6,
+                                   max_export_batch_size: 3,
+                                   start_thread_on_boot: false)
+      spans = three_spans
+      spans.each { |span| bsp.on_finish(span) }
+
+      _(bsp.force_flush).must_equal(SUCCESS)
+      _(exporter.batches).must_equal([spans])
+      _(dropped_counts(metrics_reporter)).must_be_empty
+    end
+
+    it 'keeps the legacy FAILURE return value working' do
+      exporter = PartialExporter.new([FAILURE])
+      bsp = BatchSpanProcessor.new(exporter,
+                                   metrics_reporter: metrics_reporter,
+                                   max_queue_size: 6,
+                                   max_export_batch_size: 3,
+                                   start_thread_on_boot: false)
+      spans = three_spans
+      spans.each { |span| bsp.on_finish(span) }
+
+      _(bsp.force_flush).must_equal(FAILURE)
+      _(exporter.batches.size).must_equal(1)
+      _(dropped_counts(metrics_reporter)).must_equal({ 'export-failure' => 3 })
+    end
+
+    it 'treats an all-accepted receipt as success and does not resend' do
+      exporter = PartialExporter.new([ExportResult.new(accepted: [0, 1, 2])])
+      bsp = BatchSpanProcessor.new(exporter,
+                                   metrics_reporter: metrics_reporter,
+                                   max_queue_size: 6,
+                                   max_export_batch_size: 3,
+                                   start_thread_on_boot: false)
+      three_spans.each { |span| bsp.on_finish(span) }
+
+      _(bsp.force_flush).must_equal(SUCCESS)
+      _(exporter.batches.size).must_equal(1)
+      _(dropped_counts(metrics_reporter)).must_be_empty
+      _(metrics_reporter.reported_metrics['otel.bsp.export.success'].size).must_equal(1)
+    end
+
+    it 'drops spans that are still retryable once the attempt limit is reached' do
+      always_retry = ExportResult.new(retryable: [0, 1, 2])
+      exporter = PartialExporter.new([always_retry] * BatchSpanProcessor::MAX_EXPORT_ATTEMPTS)
+      bsp = BatchSpanProcessor.new(exporter,
+                                   metrics_reporter: metrics_reporter,
+                                   max_queue_size: 6,
+                                   max_export_batch_size: 3,
+                                   start_thread_on_boot: false)
+      three_spans.each { |span| bsp.on_finish(span) }
+
+      _(bsp.force_flush).must_equal(FAILURE)
+      _(exporter.batches.size).must_equal(BatchSpanProcessor::MAX_EXPORT_ATTEMPTS)
+      _(dropped_counts(metrics_reporter)).must_equal({ 'export-retry-exhausted' => 3 })
+    end
+
+    it 'does not resend a span that was both rejected and retryable' do
+      exporter = PartialExporter.new([ExportResult.new(rejected: [1], retryable: [1])])
+      bsp = BatchSpanProcessor.new(exporter,
+                                   metrics_reporter: metrics_reporter,
+                                   max_queue_size: 6,
+                                   max_export_batch_size: 3,
+                                   start_thread_on_boot: false)
+      spans = three_spans
+      spans.each { |span| bsp.on_finish(span) }
+
+      _(bsp.force_flush).must_equal(SUCCESS)
+      _(exporter.batches.size).must_equal(1)
+      _(dropped_counts(metrics_reporter)).must_equal({ 'export-rejected' => 1 })
+      _(metrics_reporter.reported_metrics['otel.bsp.exported_spans'].sum { |count, _| count }).must_equal(2)
+    end
+
+    it 'ignores receipts that point outside the batch' do
+      exporter = PartialExporter.new([ExportResult.new(accepted: [0, 1, 2], rejected: [99], retryable: [-1])])
+      bsp = BatchSpanProcessor.new(exporter,
+                                   metrics_reporter: metrics_reporter,
+                                   max_queue_size: 6,
+                                   max_export_batch_size: 3,
+                                   start_thread_on_boot: false)
+      three_spans.each { |span| bsp.on_finish(span) }
+
+      _(bsp.force_flush).must_equal(SUCCESS)
+      _(exporter.batches.size).must_equal(1)
+      _(dropped_counts(metrics_reporter)).must_be_empty
+    end
+
+    it 'counts permanent rejections separately from an exhausted retry' do
+      exporter = PartialExporter.new([
+                                       ExportResult.new(rejected: [0], retryable: [1, 2]),
+                                       ExportResult.new(rejected: [0], retryable: [1]),
+                                       ExportResult.new(retryable: [0])
+                                     ])
+      bsp = BatchSpanProcessor.new(exporter,
+                                   metrics_reporter: metrics_reporter,
+                                   max_queue_size: 6,
+                                   max_export_batch_size: 3,
+                                   start_thread_on_boot: false)
+      three_spans.each { |span| bsp.on_finish(span) }
+
+      _(bsp.force_flush).must_equal(FAILURE)
+      _(exporter.batches.size).must_equal(BatchSpanProcessor::MAX_EXPORT_ATTEMPTS)
+      _(dropped_counts(metrics_reporter)).must_equal({ 'export-rejected' => 2, 'export-retry-exhausted' => 1 })
+    end
+
+    it 'reports dropped spans with consistent label keys' do
+      exporter = PartialExporter.new([ExportResult.new(rejected: [0], retryable: [1, 2]),
+                                      ExportResult.new(retryable: [0, 1]),
+                                      ExportResult.new(retryable: [0, 1])])
+      bsp = BatchSpanProcessor.new(exporter,
+                                   metrics_reporter: metrics_reporter,
+                                   max_queue_size: 6,
+                                   max_export_batch_size: 3,
+                                   start_thread_on_boot: false)
+      three_spans.each { |span| bsp.on_finish(span) }
+      bsp.force_flush
+
+      dropped = metrics_reporter.reported_metrics['otel.bsp.dropped_spans']
+      reasons = dropped.map { |_count, labels| labels['reason'] }
+      label_key_sets = dropped.map { |_count, labels| labels.keys.sort }.uniq
+
+      _(reasons).must_include 'export-rejected'
+      _(reasons).must_include 'export-retry-exhausted'
+      _(label_key_sets.size).must_equal(1)
+      _(label_key_sets.first).must_equal(
+        ['reason', OpenTelemetry::SemanticConventions::Trace::CODE_FUNCTION].sort
+      )
+    end
+
+    it 'applies the receipt to batches exported by the work thread' do
+      exporter = PartialExporter.new([
+                                       ExportResult.new(accepted: [0], rejected: [1], retryable: [2]),
+                                       ExportResult.new(accepted: [0])
+                                     ])
+      bsp = BatchSpanProcessor.new(exporter,
+                                   metrics_reporter: metrics_reporter,
+                                   schedule_delay: 1,
+                                   max_queue_size: 6,
+                                   max_export_batch_size: 3)
+      spans = three_spans
+      spans.each { |span| bsp.on_finish(span) }
+
+      # Let the work thread loop through both export attempts.
+      sleep(1)
+      bsp.shutdown
+
+      _(exporter.batches.size).must_equal(2)
+      _(exporter.batches[1]).must_equal([spans[2]])
+      _(dropped_counts(metrics_reporter)).must_equal({ 'export-rejected' => 1 })
     end
   end
 

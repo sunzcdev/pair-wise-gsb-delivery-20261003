@@ -25,7 +25,19 @@ module OpenTelemetry
         # If the queue gets half full a preemptive notification is sent to the
         # worker thread that exports the spans to wake up and start a new
         # export cycle.
+        #
+        # Exporters may return {SUCCESS} or {FAILURE} to describe the whole
+        # batch, or an {ExportResult} to describe the outcome of each span. In
+        # the latter case only the spans the exporter marked as retryable are
+        # sent again (up to {MAX_EXPORT_ATTEMPTS} attempts), spans marked as
+        # rejected are discarded without a retry, and the two kinds of loss are
+        # reported separately.
         class BatchSpanProcessor # rubocop:disable Metrics/ClassLength
+          # The maximum number of times a batch, or the retryable subset of a
+          # partially accepted batch, is sent to the exporter before the spans
+          # that were not accepted are dropped as an export failure.
+          MAX_EXPORT_ATTEMPTS = 3
+
           # Returns a new instance of the {BatchSpanProcessor}.
           #
           # @param [SpanExporter] exporter the (duck type) SpanExporter to where the
@@ -184,16 +196,35 @@ module OpenTelemetry
           end
 
           def export_batch(span_array, timeout: @exporter_timeout_seconds)
+            return SUCCESS if span_array.empty?
+
+            remaining = span_array
+            attempts = 0
+            start_time = OpenTelemetry::Common::Utilities.timeout_timestamp
+            loop do
+              remaining_timeout = OpenTelemetry::Common::Utilities.maybe_timeout(timeout, start_time)
+              return drop_remaining(remaining, reason: 'export-failure') if remaining_timeout&.zero?
+
+              attempts += 1
+              result = export_attempt(remaining, timeout: remaining_timeout)
+              return report_result(result, remaining) unless result.is_a?(ExportResult)
+
+              remaining = report_export_result(result, remaining)
+              return SUCCESS if remaining.empty?
+              return drop_remaining(remaining, reason: 'export-retry-exhausted') if attempts >= MAX_EXPORT_ATTEMPTS
+            end
+          end
+
+          def export_attempt(span_array, timeout:)
             batch = span_array.map(&:to_span_data)
-            result_code = @export_mutex.synchronize { @exporter.export(batch, timeout: timeout) }
-            report_result(result_code, span_array)
-            result_code
+            @export_mutex.synchronize { @exporter.export(batch, timeout: timeout) }
           rescue StandardError => e
-            report_result(FAILURE, span_array)
             @metrics_reporter.add_to_counter('otel.bsp.error', labels: { 'reason' => e.class.to_s })
             FAILURE
           end
 
+          # Reports the outcome of a whole-batch (legacy) export result and
+          # returns the result code so callers can propagate it.
           def report_result(result_code, span_array)
             if result_code == SUCCESS
               @metrics_reporter.add_to_counter('otel.bsp.export.success')
@@ -203,6 +234,42 @@ module OpenTelemetry
               @metrics_reporter.add_to_counter('otel.bsp.export.failure')
               report_dropped_spans(span_array, reason: 'export-failure')
             end
+            result_code
+          end
+
+          # Reports the outcome of a per-span {ExportResult} and returns the
+          # subset of +span_array+ that the exporter asked to retry.
+          #
+          # Permanently rejected spans are counted as dropped with the
+          # 'export-rejected' reason and are never retried. A receipt with no
+          # rejected and no retryable spans counts as a successful export;
+          # otherwise the drop counter, not the success counter, records the
+          # loss.
+          def report_export_result(result, span_array)
+            size = span_array.size
+            rejected_spans = result.rejected.select { |index| index < size }.map { |index| span_array[index] }
+            retryable_spans = result.retryable.select { |index| index < size }.map { |index| span_array[index] }
+            accepted_count = size - rejected_spans.size - retryable_spans.size
+
+            @metrics_reporter.add_to_counter('otel.bsp.exported_spans', increment: accepted_count) if accepted_count.positive?
+
+            if rejected_spans.any?
+              OpenTelemetry.handle_error(exception: ExportError.new(rejected_spans))
+              report_dropped_spans(rejected_spans, reason: 'export-rejected')
+            end
+            @metrics_reporter.add_to_counter('otel.bsp.export.success') if rejected_spans.empty? && retryable_spans.empty?
+
+            retryable_spans
+          end
+
+          # Drops +spans+ after they could not be exported, reporting them with
+          # the given reason. Used when a retryable segment is exhausted or an
+          # export attempt raises.
+          def drop_remaining(spans, reason:)
+            OpenTelemetry.handle_error(exception: ExportError.new(spans))
+            @metrics_reporter.add_to_counter('otel.bsp.export.failure')
+            report_dropped_spans(spans, reason: reason)
+            FAILURE
           end
 
           def report_dropped_spans(dropped_spans, reason:, function: nil)

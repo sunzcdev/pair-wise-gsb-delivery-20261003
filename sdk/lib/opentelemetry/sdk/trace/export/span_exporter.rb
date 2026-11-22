@@ -22,10 +22,18 @@ module OpenTelemetry
 
           # Called to export sampled {SpanData}s.
           #
+          # Implementations may report the outcome of the whole batch by
+          # returning {SUCCESS} or {FAILURE}, or, when the backend can report
+          # which spans it accepted, return an {ExportResult} describing the
+          # per-span disposition. Returning an {ExportResult} lets
+          # {BatchSpanProcessor} retry only the spans the backend asked it to
+          # retry rather than re-sending the whole batch.
+          #
           # @param [Enumerable<SpanData>] span_data the list of sampled {SpanData} to be
           #   exported.
           # @param [optional Numeric] timeout An optional timeout in seconds.
-          # @return [Integer] the result of the export.
+          # @return [Integer, ExportResult] the result of the export. {SUCCESS},
+          #   {FAILURE}, or an {ExportResult} with per-span dispositions.
           def export(span_data, timeout: nil)
             return SUCCESS unless @stopped
 

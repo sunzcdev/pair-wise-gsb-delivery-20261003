@@ -32,6 +32,11 @@ module OpenTelemetry
         # The operation finished with an error.
         FAILURE = 1
 
+        # SpanExporter#export may alternatively return an {ExportResult}, which
+        # reports the disposition of each span in the exported batch. Exporters
+        # that cannot report per-span outcomes should keep returning SUCCESS or
+        # FAILURE; processors continue to accept those legacy return values.
+
         # Additional result code for the SpanProcessor#force_flush and SpanProcessor#shutdown methods.
 
         # The operation timed out.
@@ -41,6 +46,7 @@ module OpenTelemetry
   end
 end
 
+require 'opentelemetry/sdk/trace/export/export_result'
 require 'opentelemetry/sdk/trace/export/batch_span_processor'
 require 'opentelemetry/sdk/trace/export/console_span_exporter'
 require 'opentelemetry/sdk/trace/export/in_memory_span_exporter'
