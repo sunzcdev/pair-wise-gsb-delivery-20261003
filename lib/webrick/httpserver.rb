@@ -31,6 +31,9 @@ module WEBrick
     # An HTTP server uses the following attributes:
     #
     # :AccessLog:: An array of access logs.  See WEBrick::AccessLog
+    # :AccessLogResponseHeaders:: Response header fields the access log may
+    #                              report, and those it must mask.  See
+    #                              WEBrick::AccessLog::ResponseHeaderView
     # :BindAddress:: Local address for the server to bind to
     # :DocumentRoot:: Root path to serve files from
     # :DocumentRootOptions:: Options for the default HTTPServlet::FileHandler
@@ -221,10 +224,28 @@ module WEBrick
     ##
     # Logs +req+ and +res+ in the access logs.  +config+ is used for the
     # server name.
+    #
+    # Each entry of :AccessLog is either <tt>[logger, format]</tt> or
+    # <tt>[logger, format, response_header_view]</tt>.  The optional third
+    # element overrides the :AccessLogResponseHeaders option for that log, so
+    # one log may record a field while another masks it.  See
+    # WEBrick::AccessLog::ResponseHeaderView.
 
     def access_log(config, req, res)
       param = AccessLog::setup_params(config, req, res)
-      @config[:AccessLog].each{|logger, fmt|
+      default_view = param["W"]
+      @config[:AccessLog].each{|entry|
+        logger, fmt, view = entry
+        # Each log may carry its own view, so a plain log and a masking log
+        # can coexist for the same response.  A log without an override keeps
+        # the view built by setup_params (from the server config) even when an
+        # earlier log supplied its own.
+        param["W"] =
+          if entry.length > 2
+            AccessLog.build_response_header_view(view, res)
+          else
+            default_view
+          end
         logger << AccessLog::format(fmt+"\n", param)
       }
     end

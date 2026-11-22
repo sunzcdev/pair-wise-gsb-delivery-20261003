@@ -8,6 +8,18 @@ module WEBrick
 
     @bodytempfile: File | Tempfile | nil
 
+    @sent_header: Array[[String, String]]
+
+    @header_write_state: :unsent | :partial | :complete
+
+    @header_bytes_written: Integer
+
+    @sent_header_size: Integer
+
+    @sent_status: Integer?
+
+    @response_header_view: AccessLog::ResponseHeaderView?
+
     class InvalidHeader < StandardError
     end
 
@@ -41,11 +53,25 @@ module WEBrick
 
     attr_reader sent_size: Integer
 
+    attr_reader sent_header: Array[[String, String]]
+
+    attr_reader header_write_state: :unsent | :partial | :complete
+
+    attr_reader header_bytes_written: Integer
+
+    attr_reader sent_header_size: Integer
+
+    attr_reader sent_status: Integer?
+
+    attr_reader response_header_view: AccessLog::ResponseHeaderView?
+
     attr_accessor upgrade: String?
 
     def initialize: (Hash[Symbol, untyped] config) -> void
 
     def status_line: () -> String
+
+    def response_header_view=: (AccessLog::ResponseHeaderView | Hash[Symbol | String, untyped] | Array[String] | nil spec) -> AccessLog::ResponseHeaderView?
 
     def status=: (Integer status) -> Integer
 

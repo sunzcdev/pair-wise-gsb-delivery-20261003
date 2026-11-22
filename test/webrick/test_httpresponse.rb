@@ -15,6 +15,14 @@ module WEBrick
       def warn msg
         @messages << msg
       end
+
+      def error msg
+        @messages << msg
+      end
+
+      def debug msg
+        @messages << msg
+      end
     end
 
     attr_reader :config, :logger, :res
@@ -315,6 +323,97 @@ module WEBrick
         @res.status = status
         assert_match(/\S\r\n/, @res.status_line)
       end
+    end
+
+    def test_sent_header_records_every_occurrence
+      @res['x-cache'] = 'hit'
+      @res.cookies << WEBrick::Cookie.new('a', '1')
+      @res.cookies << WEBrick::Cookie.new('b', '2')
+      @res.body = 'hello'
+
+      io = StringIO.new
+      @res.send_header(io)
+
+      # The Hash can only keep one value per field name, but the snapshot
+      # keeps both Set-Cookie lines in wire order.
+      assert_nil @res['set-cookie']
+      assert_equal 2, @res.cookies.size
+
+      assert_equal(
+        [
+          ['X-Cache', 'hit'],
+          ['Set-Cookie', 'a=1'],
+          ['Set-Cookie', 'b=2'],
+        ],
+        @res.sent_header
+      )
+      assert_equal :complete, @res.header_write_state
+      assert_equal 200, @res.sent_status
+      assert_equal io.string.bytesize, @res.header_bytes_written
+    end
+
+    def test_sent_header_is_empty_before_sending
+      @res['x-cache'] = 'hit'
+      assert_equal [], @res.sent_header
+      assert_equal :unsent, @res.header_write_state
+      assert_equal 0, @res.header_bytes_written
+      assert_nil @res.sent_status
+    end
+
+    def test_sent_header_keeps_wire_spelling
+      @res['content-type'] = 'text/plain'
+      @res.body = 'x'
+      @res.setup_header
+      @res.send_header(StringIO.new)
+
+      names = @res.sent_header.map(&:first)
+      assert_include names, 'Content-Type'
+      assert_include names, 'Content-Length'
+    end
+
+    def test_failed_header_write_is_reported_as_partial
+      @res['x-cache'] = 'hit'
+      @res.body = 'hello'
+
+      socket = Object.new
+      def socket.write(data)
+        raise Errno::EPIPE
+      end
+
+      @res.send_response(socket)
+
+      # The header never reached the transport in full, so the log can tell
+      # that no complete response header was sent.
+      assert_equal :partial, @res.header_write_state
+      assert_equal 0, @res.header_bytes_written
+      assert_nil @res.sent_status
+      assert_include @res.sent_header.map(&:first), 'X-Cache'
+      refute @res.keep_alive?
+    end
+
+    def test_sent_status_matches_written_status_line
+      @res.status = 503
+      @res.body = 'busy'
+      @res.send_header(StringIO.new)
+      assert_equal 503, @res.sent_status
+      assert_equal 503, @res.status
+    end
+
+    def test_response_header_view_accepts_options
+      @res['x-cache'] = 'hit'
+      @res.response_header_view = {
+        :fields => %w[x-cache],
+        :masked => %w[x-cache],
+        :mask => '***',
+      }
+      @res.body = 'x'
+      @res.send_header(StringIO.new)
+
+      view = @res.response_header_view
+      assert_equal %w[x-cache], view.fields
+      assert_equal '***', view.value(@res, 'X-Cache')
+      # Masking is a log-only concern: the wire value is unchanged.
+      assert_equal 'hit', @res['x-cache']
     end
   end
 end

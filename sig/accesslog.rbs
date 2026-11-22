@@ -3,6 +3,43 @@ module WEBrick
     class AccessLogError < StandardError
     end
 
+    class ResponseHeaderView
+      type spec = ResponseHeaderView | Array[String] | Hash[Symbol | String, untyped] | String | nil
+
+      DEFAULT_SEPARATOR: String
+
+      DEFAULT_PAIR_SEPARATOR: String
+
+      DEFAULT_MASK: String
+
+      attr_reader fields: Array[String]
+
+      attr_reader masked: Array[String]
+
+      attr_reader mask: String
+
+      attr_reader separator: String
+
+      attr_reader pair_separator: String
+
+      def self.build: (spec spec) -> ResponseHeaderView?
+                  | (untyped spec) -> ResponseHeaderView?
+
+      def initialize: (?fields: Array[String] | String, ?masked: Array[String] | String, ?mask: _ToS, ?separator: _ToS, ?pair_separator: _ToS) -> void
+
+      def field?: (_ToS name) -> bool
+
+      def masked?: (_ToS name) -> bool
+
+      def values: (HTTPResponse response, _ToS name) -> Array[String]
+
+      def value: (HTTPResponse response, _ToS name) -> String?
+
+      def selected_value: (HTTPResponse response, _ToS name) -> String?
+
+      def to_log_string: (HTTPResponse response) -> String
+    end
+
     CLF_TIME_FORMAT: String
 
     COMMON_LOG_FORMAT: String
@@ -15,9 +52,25 @@ module WEBrick
 
     COMBINED_LOG_FORMAT: String
 
+    DEFAULT_HEADER_VIEW: ResponseHeaderView
+
     def self?.setup_params: (Hash[Symbol, untyped] config, HTTPRequest req, HTTPResponse res) -> Hash[String, untyped]
 
+    def self?.response_header_view: (Hash[Symbol, untyped] config, HTTPResponse res) -> ResponseHeaderView?
+
+    def self?.build_response_header_view: (untyped spec, HTTPResponse res) -> ResponseHeaderView?
+
+    def self?.response_status: (HTTPResponse res) -> Integer
+
     def self?.format: (String format_string, Hash[String, untyped] params) -> String
+
+    def self?.format_response_header: (Hash[String, untyped] params, String name) -> String?
+
+    def self?.format_response_headers: (Hash[String, untyped] params) -> String
+
+    def self?.response_header_view_of: (Hash[String, untyped] params) -> ResponseHeaderView
+
+    def self?.format_header_write: (Hash[String, untyped] params, String? param) -> String
 
     def self?.escape: (String data) -> String
   end

@@ -15,6 +15,7 @@ require_relative 'httpversion'
 require_relative 'htmlutils'
 require_relative 'httputils'
 require_relative 'httpstatus'
+require_relative 'accesslog'
 
 module WEBrick
   ##
@@ -106,6 +107,59 @@ module WEBrick
     attr_reader :sent_size
 
     ##
+    # The response header as it was handed to the transport.
+    #
+    # Each entry is a <tt>[name, value]</tt> pair, in the order the pair was
+    # written.  Unlike #header (a Hash that keeps a single value per field
+    # name) this keeps every occurrence, so a field written twice, such as two
+    # <tt>Set-Cookie</tt> lines, appears twice.  The name keeps the spelling
+    # used on the wire and the value is the value that passed #check_header.
+    #
+    # The Array is empty until #send_header is called.
+
+    attr_reader :sent_header
+
+    ##
+    # How much of the response header reached the transport.
+    #
+    # :unsent::   #send_header has not handed the header to the transport
+    # :partial::  the header was handed to the transport but the write did not
+    #             finish; the transport may have received any prefix of it
+    # :complete:: the whole header, including the terminating blank line, was
+    #             written
+
+    attr_reader :header_write_state
+
+    ##
+    # Number of response header bytes confirmed written to the transport.
+    # Zero while the header has not been written and equal to #sent_header_size
+    # once #header_write_state is :complete.
+
+    attr_reader :header_bytes_written
+
+    ##
+    # Total size of the header block handed to the transport, status line and
+    # terminating blank line included.  Zero until #send_header is called.
+
+    attr_reader :sent_header_size
+
+    ##
+    # The status code carried by a status line that the transport confirmed
+    # wrote, or nil.  A partial write can confirm the status line while the
+    # rest of the header is lost, so this may be set while
+    # #header_write_state is :partial.  Compare #status, which is the status
+    # this response would send.
+
+    attr_reader :sent_status
+
+    ##
+    # The WEBrick::AccessLog::ResponseHeaderView used when this response is
+    # logged, or nil.  Assign an options Hash, an Array of field names or a
+    # ResponseHeaderView; see WEBrick::AccessLog::ResponseHeaderView.
+
+    attr_reader :response_header_view
+
+    ##
     # Set the response body proc as an streaming/upgrade response.
 
     attr_accessor :upgrade
@@ -132,6 +186,12 @@ module WEBrick
       @filename = nil
       @sent_size = 0
       @bodytempfile = nil
+      @sent_header = []
+      @header_write_state = :unsent
+      @header_bytes_written = 0
+      @sent_header_size = 0
+      @sent_status = nil
+      @response_header_view = nil
     end
 
     ##
@@ -139,6 +199,19 @@ module WEBrick
 
     def status_line
       "HTTP/#@http_version #@status #@reason_phrase".rstrip << CRLF
+    end
+
+    ##
+    # Sets the view used to select and mask response header fields in the
+    # access log.  See WEBrick::AccessLog::ResponseHeaderView.
+
+    def response_header_view=(spec)
+      @response_header_view =
+        if spec.is_a?(AccessLog::ResponseHeaderView)
+          spec
+        else
+          AccessLog::ResponseHeaderView.build(spec)
+        end
     end
 
     ##
@@ -351,25 +424,60 @@ module WEBrick
 
     ##
     # Sends the headers on +socket+
+    #
+    # The header is built as a single block and handed to the transport in one
+    # write.  #sent_header records the pairs as they appear in that block, so
+    # repeated fields stay distinct, and #header_write_state reports whether
+    # the transport confirmed the whole block.  When the write raises, the
+    # state stays :partial: the transport may have received a prefix of the
+    # header and the caller can tell that no complete header was sent.
 
     def send_header(socket) # :nodoc:
       if @http_version.major > 0
-        data = status_line().dup
-        @header.each{|key, value|
-          tmp = key.gsub(/\bwww|^te$|\b\w/){ $&.upcase }
-          data << "#{tmp}: #{check_header(value)}" << CRLF
-        }
-        @cookies.each{|cookie|
-          data << "Set-Cookie: " << check_header(cookie.to_s) << CRLF
-        }
-        data << CRLF
-        socket.write(data)
+        begin
+          data = status_line().dup
+          status_line_size = data.bytesize
+          pairs = []
+          @header.each{|key, value|
+            tmp = key.gsub(/\bwww|^te$|\b\w/){ $&.upcase }
+            checked = check_header(value)
+            data << "#{tmp}: #{checked}" << CRLF
+            pairs << [tmp, checked]
+          }
+          @cookies.each{|cookie|
+            checked = check_header(cookie.to_s)
+            data << "Set-Cookie: " << checked << CRLF
+            pairs << ["Set-Cookie", checked]
+          }
+          data << CRLF
+        rescue InvalidHeader => e
+          @header.clear
+          @cookies.clear
+          set_error e
+          retry
+        end
+
+        # The header is complete and about to be handed to the transport.
+        # Anything that goes wrong from here on leaves the state at :partial.
+        @sent_header = pairs
+        @sent_header_size = data.bytesize
+        @sent_status = nil
+        @header_bytes_written = 0
+        @header_write_state = :partial
+        written = socket.write(data)
+        written =
+          if written.is_a?(Integer)
+            [written, data.bytesize].min
+          else
+            data.bytesize
+          end
+        @header_bytes_written = written
+        # A status line that the transport confirmed wrote is reported even
+        # when the rest of the header was lost, so the log can say a response
+        # was started but not completed.
+        @sent_status = @status if written >= status_line_size
+        @header_write_state = :complete if written >= data.bytesize
       end
-    rescue InvalidHeader => e
-      @header.clear
-      @cookies.clear
-      set_error e
-      retry
     end
 
     ##

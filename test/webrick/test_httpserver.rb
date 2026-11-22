@@ -1,6 +1,7 @@
 # frozen_string_literal: false
 require "test/unit"
 require "net/http"
+require "stringio"
 require "webrick"
 require_relative "utils"
 
@@ -446,6 +447,164 @@ class TestWEBrickHTTPServer < Test::Unit::TestCase
       end
     }
     assert_equal(0, requested, "Server responded to #{requested} requests after shutdown")
+  end
+
+  def test_access_log_selected_response_headers
+    logged = []
+    config = {
+      :ServerName => "localhost",
+      :AccessLogResponseHeaders => {
+        :fields => %w[x-cache set-cookie],
+        :masked => %w[set-cookie],
+        :mask => "***",
+      },
+      :AccessLog => [[logged, "cache=%{x-cache}o cookies=%{set-cookie}o all=%W"]],
+    }
+    log_tester = lambda {|log, access_log| assert_empty log }
+    TestWEBrick.start_httpserver(config, log_tester){|server, addr, port, log|
+      server.mount_proc("/") {|req, res|
+        # Two entries under the same field name.  The Hash keys differ only in
+        # case, so both are written, which is how a duplicate header reaches
+        # the transport.
+        res.header["X-Cache"] = "hit"
+        res.header["x-cache"] = "miss"
+        res.cookies << WEBrick::Cookie.new("sid", "abc")
+        res.cookies << WEBrick::Cookie.new("uid", "u1")
+        res.body = "ok"
+      }
+      Thread.pass while server.status == :Stop
+
+      # Raw socket so the literal bytes on the wire are checked.
+      s = TCPSocket.new(addr, port)
+      s.write("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+      wire = s.read
+      s.close
+
+      # The response toward the client is unchanged: both X-Cache lines are
+      # present, both cookies are present, and nothing is masked.
+      assert_include(wire, "X-Cache: hit\r\n")
+      assert_include(wire, "X-Cache: miss\r\n")
+      assert_include(wire, "Set-Cookie: sid=abc\r\n")
+      assert_include(wire, "Set-Cookie: uid=u1\r\n")
+      refute_includes(wire, "***")
+    }
+
+    assert_equal(1, logged.size)
+    # Two X-Cache lines were written; the log keeps both, in wire order.
+    assert_match(/cache=hit, miss/, logged[0])
+    # Set-Cookie appears twice but is masked, and the mask is repeated once
+    # per occurrence so the count is still visible.
+    assert_match(/cookies=\*\*\*, \*\*/, logged[0])
+    refute_match(/sid=abc/, logged[0])
+    # %W emits the same selected fields as name=value pairs.
+    assert_match(/all=x-cache=hit, miss set-cookie=\*\*\*, \*\*/, logged[0])
+  end
+
+  def test_access_log_view_can_be_set_per_log_entry
+    plain = []
+    after = []
+    masked = []
+    config = {
+      :ServerName => "localhost",
+      :AccessLog => [
+        [plain, "cache=%{x-cache}o"],
+        [masked, "cache=%{x-cache}o", { :fields => %w[x-cache],
+                                        :masked => %w[x-cache],
+                                        :mask => "***" }],
+        # A log without an override after one with an override: it must not
+        # inherit that override.
+        [after, "cache=%{x-cache}o"],
+      ],
+    }
+    log_tester = lambda {|log, access_log| assert_empty log }
+    TestWEBrick.start_httpserver(config, log_tester){|server, addr, port, log|
+      server.mount_proc("/") {|req, res|
+        res["x-cache"] = "hit"
+        res.body = "ok"
+      }
+      Thread.pass while server.status == :Stop
+      http = Net::HTTP.new(addr, port)
+      http.request(Net::HTTP::Get.new("/")) {|res| assert_equal("ok", res.body) }
+    }
+
+    # One log keeps the value, one masks it; the plain log after it is
+    # unaffected.  The wire is checked by the duplicate-header test above.
+    assert_equal ["cache=hit\n"], plain
+    assert_equal ["cache=***\n"], masked
+    assert_equal ["cache=hit\n"], after
+  end
+
+  def test_access_log_reports_header_write_failure
+    config = WEBrick::Config::HTTP.dup.update(
+      :Logger => NoLog,
+      :ServerName => "localhost",
+      :DoNotListen => true,
+      :AccessLog => [[access_log_ary = [], "status=%s write=%x bytes=%{bytes}x sent=%{status}x"]]
+    )
+    server = WEBrick::HTTPServer.new(config)
+    res = WEBrick::HTTPResponse.new(server.config)
+    res.status = 503
+    res["X-Cache"] = "hit"
+    res.body = "busy"
+
+    socket = Object.new
+    def socket.write(data)
+      raise Errno::EPIPE
+    end
+    res.send_response(socket)
+
+    # The status is 503 and the header was prepared, but the transport did not
+    # accept it, so the log can tell no complete response header was sent.
+    assert_equal :partial, res.header_write_state
+    assert_equal 0, res.header_bytes_written
+    assert_nil res.sent_status
+    assert_include res.sent_header.map(&:first), "X-Cache"
+
+    server.access_log(config, request_stub, res)
+
+    assert_equal 1, access_log_ary.size
+    # The response wanted 503, but nothing was delivered, so %s does not claim
+    # it; the partial state and zero byte count make that explicit.
+    assert_match(/status=-/, access_log_ary[0])
+    assert_match(/write=partial/, access_log_ary[0])
+    assert_match(/bytes=0/, access_log_ary[0])
+    assert_match(/sent=-/, access_log_ary[0])
+  ensure
+    server&.shutdown
+  end
+
+  def test_access_log_reports_complete_header_write
+    access_log_ary = []
+    config = WEBrick::Config::HTTP.dup.update(
+      :Logger => NoLog,
+      :ServerName => "localhost",
+      :DoNotListen => true,
+      :AccessLog => [[access_log_ary, "status=%s write=%x sent=%{status}x"]]
+    )
+    server = WEBrick::HTTPServer.new(config)
+    res = WEBrick::HTTPResponse.new(server.config)
+    res.status = 503
+    res.body = "busy"
+    res.send_header(StringIO.new)
+
+    server.access_log(config, request_stub, res)
+
+    assert_equal 1, access_log_ary.size
+    assert_match(/status=503/, access_log_ary[0])
+    assert_match(/write=complete/, access_log_ary[0])
+    assert_match(/sent=503/, access_log_ary[0])
+  ensure
+    server&.shutdown
+  end
+
+  def request_stub
+    Struct.new(
+      :peeraddr, :request_method, :attributes, :port, :query_string,
+      :request_line, :request_time, :user, :unparsed_uri
+    ).new(
+      ["AF_INET", 12345, "127.0.0.1", "127.0.0.1"],
+      "GET", {}, 80, nil, "GET / HTTP/1.1\r\n", Time.now, nil, "/"
+    )
   end
 
   def test_cntrl_in_path

@@ -50,6 +50,33 @@ trap 'INT' do server.shutdown end
 server.start
 ```
 
+## Logging selected response headers
+
+The access log can record a small set of response header fields without
+changing what is sent to the client.  The values are read from the header as it
+was actually handed to the transport, so a field written more than once (two
+`Set-Cookie` lines, for example) is reported once per occurrence.
+
+```ruby
+server = WEBrick::HTTPServer.new(
+  :Port => 8000,
+  :AccessLogResponseHeaders => {
+    :fields => %w[cache-control x-cache set-cookie],
+    :masked => %w[set-cookie],
+  },
+  :AccessLog => [[$stderr, "%h %s %{x-cache}o %W"]]
+)
+```
+
+`%{header}o` reports one field with its repeated values joined, and `%W` reports
+every selected field as `name=value` pairs.  Fields named in `:masked` are
+replaced by the mask in the log only; the response toward the client keeps the
+original values.  Use `%x`, `%{bytes}x`, `%{size}x` and `%{status}x` to record
+how much of the response header reached the transport, which tells a request
+whose header was written completely apart from one whose header write failed.
+
+See WEBrick::AccessLog::ResponseHeaderView for the full option list.
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake test` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.

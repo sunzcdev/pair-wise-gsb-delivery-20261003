@@ -45,11 +45,22 @@ module WEBrick
     )
 
     # for HTTPServer, HTTPRequest, HTTPResponse ...
+    #
+    # :AccessLogResponseHeaders::
+    #   Selects the response header fields the access log may report, and the
+    #   ones it must mask.  Accepts a Hash of options for
+    #   WEBrick::AccessLog::ResponseHeaderView (:fields, :masked, :mask,
+    #   :separator, :pair_separator), an Array of field names, or nil (no
+    #   selection and no masking).  The values come from the header as it was
+    #   handed to the transport, so repeated fields are reported once per
+    #   occurrence, and masking never changes what is written to the client.
+    #   See WEBrick::AccessLog::ResponseHeaderView.
     HTTP = General.dup.update(
       :Port           => 80,
       :RequestTimeout => 30,
       :HTTPVersion    => HTTPVersion.new("1.1"),
       :AccessLog      => nil,
+      :AccessLogResponseHeaders => nil,
       :MimeTypes      => HTTPUtils::DefaultMimeTypes,
       :DirectoryIndex => ["index.html","index.htm","index.cgi","index.rhtml"],
       :DocumentRoot   => nil,
