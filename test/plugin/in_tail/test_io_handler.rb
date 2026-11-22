@@ -2,6 +2,7 @@ require_relative '../../helper'
 
 require 'fluent/plugin/in_tail'
 require 'fluent/plugin/metrics_local'
+require 'fluent/clock'
 require 'tempfile'
 
 class IntailIOHandlerTest < Test::Unit::TestCase
@@ -511,6 +512,127 @@ class IntailIOHandlerTest < Test::Unit::TestCase
       assert_equal [[short_line]], returned_lines
 
       io_handler.close
+    end
+  end
+
+  sub_test_case 'group watcher bounded allocation' do
+    def build_handler(path, group_watcher, received)
+      target_info = Fluent::Plugin::TailInput::TargetInfo.new(path, Fluent::FileWrapper.stat(path).ino)
+      watcher = Fluent::Plugin::TailInput::TailWatcher.new(target_info, nil, nil, nil, nil, nil, nil, nil, nil)
+      watcher.group_watcher = group_watcher
+      position = 0
+      stub(watcher).pe do
+        pe = 'position_file'
+        stub(pe).read_pos { position }
+        stub(pe).update_pos { |value| position = value }
+        pe
+      end
+
+      Fluent::Plugin::TailInput::TailWatcher::IOHandler.new(
+        watcher, path: path, read_lines_limit: 1000, read_bytes_limit_per_second: -1,
+        log: $log, open_on_every_update: true, metrics: @metrics
+      ) do |lines, _tail_watcher|
+        received.concat(lines)
+        true
+      end
+    end
+
+    def with_frozen_clock
+      base = Fluent::Clock.now_raw
+      Fluent::Clock.freeze(base)
+      yield ->(seconds) { Fluent::Clock.freeze(base + seconds) }
+    ensure
+      Fluent::Clock.return
+    end
+
+    test 'a small file next to a hot file is read in every round within its bounded share' do
+      hot_path = "#{Dir.tmpdir}/intail_gw_hot_#{Process.pid}.log"
+      small_path = "#{Dir.tmpdir}/intail_gw_small_#{Process.pid}.log"
+      File.write(hot_path, '')
+      File.write(small_path, '')
+
+      with_frozen_clock do |advance|
+        # Group limit of 10 lines per 10-second round, shared by both files.
+        group_watcher = Fluent::Plugin::TailInput::GroupWatcher.new(10, 10)
+        hot_received = []
+        small_received = []
+        hot_handler = build_handler(hot_path, group_watcher, hot_received)
+        small_handler = build_handler(small_path, group_watcher, small_received)
+        group_watcher.add(hot_path, Object.new)
+        group_watcher.add(small_path, Object.new)
+
+        # Round 1: both files are appended simultaneously; the hot file gets far more data.
+        File.open(hot_path, 'ab') { |file| 20.times { file.puts 'hot' } }
+        File.open(small_path, 'ab') { |file| 5.times { file.puts 'small' } }
+
+        # The shares are reserved up front before either reader is scheduled.
+        group_watcher.limit_lines_reached?(hot_path)
+        assert_equal 5, group_watcher.current_paths[hot_path].quota
+        assert_equal 5, group_watcher.current_paths[small_path].quota
+
+        # The hot reader drains everything available in its read chunk, then is
+        # throttled for the rest of the round.
+        hot_handler.on_notify
+        hot_handler.on_notify
+        assert_equal 20, hot_received.size
+
+        # The small file still keeps its reserved share and is read in this round.
+        assert_false group_watcher.limit_lines_reached?(small_path)
+        small_handler.on_notify
+        assert_equal 5, small_received.size
+        assert_equal 5, small_received.count { |line| line.start_with?('small') }
+
+        # Round 2: a new rate period starts and both files are appended again.
+        advance.call(11)
+        File.open(hot_path, 'ab') { |file| 20.times { file.puts 'hot' } }
+        File.open(small_path, 'ab') { |file| 5.times { file.puts 'small' } }
+
+        # The round budget is fresh: the first limit check rolls the period and
+        # neither reader borrows from the other round.
+        assert_false group_watcher.limit_lines_reached?(small_path)
+        assert_equal 0, group_watcher.number_lines_read
+        hot_handler.on_notify
+        small_handler.on_notify
+        assert_equal 10, small_received.size
+        assert_equal 10, small_received.count { |line| line.start_with?('small') }
+
+        hot_handler.close
+        small_handler.close
+      end
+    ensure
+      File.delete(hot_path) if File.exist?(hot_path)
+      File.delete(small_path) if File.exist?(small_path)
+    end
+
+    test 'an EOF reader surrenders its share so an active reader can reuse it' do
+      active_path = "#{Dir.tmpdir}/intail_gw_active_#{Process.pid}.log"
+      idle_path = "#{Dir.tmpdir}/intail_gw_idle_#{Process.pid}.log"
+      File.write(active_path, (["active\n"] * 10).join)
+      File.write(idle_path, '')
+
+      group_watcher = Fluent::Plugin::TailInput::GroupWatcher.new(10, 10)
+      active_received = []
+      idle_received = []
+      active_handler = build_handler(active_path, group_watcher, active_received)
+      idle_handler = build_handler(idle_path, group_watcher, idle_received)
+      group_watcher.add(active_path, Object.new)
+      group_watcher.add(idle_path, Object.new)
+
+      # The idle reader hits EOF first and gives back its five-line share.
+      idle_handler.on_notify
+      assert_true idle_handler.eof?
+      assert_false group_watcher.active?(idle_path)
+      assert_equal 10, group_watcher.current_paths[active_path].quota
+
+      active_handler.on_notify
+      assert_equal 10, active_received.size
+      assert_equal 10, group_watcher.number_lines_read
+
+      active_handler.close
+      idle_handler.close
+    ensure
+      File.delete(active_path) if File.exist?(active_path)
+      File.delete(idle_path) if File.exist?(idle_path)
     end
   end
 end

@@ -1,5 +1,11 @@
 # v1.20
 
+## Unreleased
+
+### Enhancement
+
+* in_tail: bound each group watcher reader with an up-front per-round share of the group line limit, reuse the share of readers at EOF, and rotate the indivisible remainder across readers so a hot file can no longer starve the other files of the group.
+
 ## Release v1.20.1 - 2026/10/26
 
 ### Bug Fix

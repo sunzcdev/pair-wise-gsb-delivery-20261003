@@ -492,6 +492,167 @@ class TailInputTest < Test::Unit::TestCase
       gw.add("#{@tmp_dir}/new.log", Object.new)
       assert_false(gw.limit_lines_reached?("#{@tmp_dir}/new.log"))
     end
+
+    def with_frozen_clock
+      base = Fluent::Clock.now_raw
+      Fluent::Clock.freeze(base)
+      yield ->(seconds) { Fluent::Clock.freeze(base + seconds) }
+    ensure
+      Fluent::Clock.return
+    end
+
+    test "every reader receives a bounded up-front share so one reader cannot consume another's" do
+      with_frozen_clock do |advance|
+        gw = Fluent::Plugin::TailInput::GroupWatcher.new(10, 10)
+        hot = "#{@tmp_dir}/hot.log"
+        small = "#{@tmp_dir}/small.log"
+        gw.add(hot, Object.new)
+        gw.add(small, Object.new)
+
+        assert_false(gw.limit_lines_reached?(hot))
+        assert_equal(5, gw.current_paths[hot].quota)
+        assert_equal(5, gw.current_paths[small].quota)
+
+        gw.update_lines_read(hot, 5)
+        assert_true(gw.limit_lines_reached?(hot))
+
+        # The small file keeps its whole share even though the hot file is drained.
+        gw.update_lines_read(small, 3)
+        assert_false(gw.limit_lines_reached?(small))
+        gw.update_lines_read(small, 2)
+        assert_true(gw.limit_lines_reached?(small))
+        assert_equal(10, gw.number_lines_read)
+        advance.call(1)
+      end
+    end
+
+    test "an idle reader's unused share is reused by active readers in the same round" do
+      with_frozen_clock do |advance|
+        gw = Fluent::Plugin::TailInput::GroupWatcher.new(10, 10)
+        active = "#{@tmp_dir}/active.log"
+        idle = "#{@tmp_dir}/idle.log"
+        gw.add(active, Object.new)
+        gw.add(idle, Object.new)
+
+        gw.limit_lines_reached?(active)
+        gw.mark_idle(idle)
+        assert_false(gw.active?(idle))
+        assert_equal(10, gw.current_paths[active].quota)
+
+        gw.update_lines_read(active, 10)
+        assert_true(gw.limit_lines_reached?(active))
+        assert_equal(10, gw.number_lines_read)
+        advance.call(1)
+      end
+    end
+
+    test "a reactivated reader cannot reclaim lines that were redistributed in the same round" do
+      with_frozen_clock do |advance|
+        gw = Fluent::Plugin::TailInput::GroupWatcher.new(10, 10)
+        first = "#{@tmp_dir}/first.log"
+        second = "#{@tmp_dir}/second.log"
+        gw.add(first, Object.new)
+        gw.add(second, Object.new)
+
+        gw.limit_lines_reached?(first)
+        gw.mark_idle(second)
+        assert_equal(10, gw.current_paths[first].quota)
+
+        gw.mark_active(second)
+        assert_equal(0, gw.current_paths[second].quota)
+        assert_true(gw.limit_lines_reached?(second))
+        advance.call(1)
+      end
+    end
+
+    test "the indivisible remainder rotates across readers between rounds" do
+      with_frozen_clock do |advance|
+        gw = Fluent::Plugin::TailInput::GroupWatcher.new(10, 5)
+        paths = (0..2).map { |i| "#{@tmp_dir}/f#{i}.log" }
+        paths.each { |path| gw.add(path, Object.new) }
+
+        gw.limit_lines_reached?(paths[0])
+        assert_equal([2, 2, 1], paths.map { |path| gw.current_paths[path].quota })
+
+        advance.call(11)
+        gw.limit_lines_reached?(paths[1])
+        assert_equal([1, 2, 2], paths.map { |path| gw.current_paths[path].quota })
+
+        advance.call(22)
+        gw.limit_lines_reached?(paths[2])
+        assert_equal([2, 1, 2], paths.map { |path| gw.current_paths[path].quota })
+      end
+    end
+
+    test "more readers than the limit leaves every reader at least one line" do
+      with_frozen_clock do |advance|
+        gw = Fluent::Plugin::TailInput::GroupWatcher.new(10, 2)
+        paths = (0..2).map { |i| "#{@tmp_dir}/r#{i}.log" }
+        paths.each { |path| gw.add(path, Object.new) }
+
+        gw.limit_lines_reached?(paths[0])
+        assert_equal([1, 1, 1], paths.map { |path| gw.current_paths[path].quota })
+        advance.call(1)
+      end
+    end
+
+    test "a reader joining a fully granted round waits for the next round" do
+      with_frozen_clock do |advance|
+        gw = Fluent::Plugin::TailInput::GroupWatcher.new(10, 10)
+        first = "#{@tmp_dir}/first.log"
+        second = "#{@tmp_dir}/second.log"
+        joining = "#{@tmp_dir}/joining.log"
+        gw.add(first, Object.new)
+        gw.add(second, Object.new)
+        gw.limit_lines_reached?(first)
+
+        gw.add(joining, Object.new)
+        assert_equal(0, gw.current_paths[joining].quota)
+        assert_true(gw.limit_lines_reached?(joining))
+
+        advance.call(11)
+        assert_false(gw.limit_lines_reached?(joining))
+        assert_equal([3, 3, 4], gw.current_paths.values.map(&:quota).sort)
+      end
+    end
+
+    test "removing a reader redistributes its unused share without borrowing the next round" do
+      with_frozen_clock do |advance|
+        gw = Fluent::Plugin::TailInput::GroupWatcher.new(10, 10)
+        remaining = "#{@tmp_dir}/remaining.log"
+        removed = "#{@tmp_dir}/removed.log"
+        watcher = Object.new
+        gw.add(remaining, Object.new)
+        gw.add(removed, watcher)
+
+        gw.limit_lines_reached?(remaining)
+        gw.delete(removed, watcher)
+        assert_equal(10, gw.current_paths[remaining].quota)
+        assert_equal(10, gw.current_paths.values.sum(&:quota))
+        advance.call(1)
+      end
+    end
+
+    test "an idle reader is active again with a fresh share when the next round starts" do
+      with_frozen_clock do |advance|
+        gw = Fluent::Plugin::TailInput::GroupWatcher.new(10, 10)
+        busy = "#{@tmp_dir}/busy.log"
+        quiet = "#{@tmp_dir}/quiet.log"
+        gw.add(busy, Object.new)
+        gw.add(quiet, Object.new)
+
+        gw.limit_lines_reached?(busy)
+        gw.mark_idle(quiet)
+        assert_false(gw.active?(quiet))
+        assert_equal(10, gw.current_paths[busy].quota)
+
+        advance.call(11)
+        gw.limit_lines_reached?(busy)
+        assert_true(gw.active?(quiet))
+        assert_equal(5, gw.current_paths[quiet].quota)
+        assert_equal(0, gw.current_paths[quiet].number_lines_read)
+      end
+    end
   end
 
   sub_test_case "singleline" do

@@ -242,6 +242,10 @@ module Fluent::Plugin
           # A notification may arrive while a rejected batch is waiting for capacity.
           @pending_read_more = true unless @lines.empty?
 
+          # Rejoin the active readers before the limit check so a file that
+          # received data while idle can claim its share of the current round.
+          group_watcher&.mark_active(@path)
+
           if limit_bytes_per_second_reached? || group_watcher&.limit_lines_reached?(@path)
             @metrics.throttled.inc
             return
@@ -312,6 +316,10 @@ module Fluent::Plugin
               end
             end while read_more
           end
+
+          # No pending data: surrender this reader's share so the other active
+          # readers in the group can reuse it within the current round.
+          group_watcher&.mark_idle(@path) if @eof
         end
 
         def open
