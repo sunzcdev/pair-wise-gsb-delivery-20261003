@@ -66,8 +66,82 @@ module WEBrick
     #     # res.header['content-length'] = 10
     #     res.body = proc { |out| out.write(Time.now.to_s) }
     #   end
+    #
+    # When the body is an IO, #body_range may be used to send only one part
+    # of it.  See #body_range for details.
 
-    attr_accessor :body
+    attr_reader :body
+
+    ##
+    # Sets the response body.  A declared #body_range only applies to an
+    # IO-like body; assigning anything else clears it.
+
+    def body=(body)
+      @body_send_window = nil
+      @body_range = nil unless body.nil? || body.respond_to?(:readpartial)
+      @body = body
+    end
+
+    ##
+    # The part of an IO-like body that will be sent, or +nil+ to use the
+    # default behaviour.
+    #
+    # A servlet may hand the response an IO it has already read from, or that
+    # should only be sent partially.  Assigning #body_range makes the
+    # Content-Length, the offset at which the transfer starts, and the bytes
+    # actually written all come from the same view of the body:
+    #
+    # * +:current+ - send from the IO's current position to the end of the
+    #   body;
+    # * an Integer - send from that byte offset to the end of the body;
+    # * a Range - send that inclusive byte range.
+    #
+    # The total size is taken from a regular file's stat, or from the body's
+    # +size+ method when one is available.  A body whose length cannot be
+    # determined is sent until EOF and the connection is closed.  A body that
+    # ends before the declared length is wrapped up by closing the connection
+    # instead of leaving the client waiting for bytes that will never arrive.
+    #
+    # HEAD responses use the same Content-Length as a GET response and do not
+    # read the body, so only the cursor of a ranged body is observed, never
+    # advanced.  The response still closes the body it was given.
+    #
+    # Example:
+    #
+    #   io = File.open(path, "rb")
+    #   io.seek(1024, IO::SEEK_SET)
+    #   res['content-type'] = "application/octet-stream"
+    #   res.body = io
+    #   res.body_range = :current
+
+    attr_reader :body_range
+
+    ##
+    # Declares which part of an IO-like body to send.  +range+ may be
+    # +:current+, a non-negative Integer, a Range of non-negative Integers,
+    # or +nil+ to restore the default behaviour.
+
+    def body_range=(range)
+      case range
+      when nil, :current
+        # accepted as-is
+      when Integer
+        raise ArgumentError, "negative body offset: #{range}" if range < 0
+      when Range
+        first = range.begin
+        last = range.end
+        last -= 1 if last.is_a?(Integer) && range.exclude_end?
+        unless first.is_a?(Integer) && last.is_a?(Integer) &&
+               first >= 0 && last >= first
+          raise ArgumentError, "invalid body range: #{range.inspect}"
+        end
+      else
+        raise ArgumentError, "invalid body range: #{range.inspect}"
+      end
+      @body_range = range
+      @body_send_window = nil
+      range
+    end
 
     ##
     # Request method for this response
@@ -132,6 +206,8 @@ module WEBrick
       @filename = nil
       @sent_size = 0
       @bodytempfile = nil
+      @body_range = nil
+      @body_send_window = nil
     end
 
     ##
@@ -290,6 +366,17 @@ module WEBrick
         @header.delete('content-length')
       elsif %r{^multipart/byteranges} =~ @header['content-type']
         @header.delete('content-length')
+      elsif @body_range && @body.respond_to?(:readpartial)
+        # The declared body range is the single source of truth for both the
+        # Content-Length and the bytes that will actually be written.  A body
+        # of unknown length can only be delimited by closing the connection.
+        _, length = body_send_window
+        if length
+          @header['content-length'] = length.to_s
+        else
+          @header.delete('content-length')
+          @header['connection'] = 'close'
+        end
       elsif @header['content-length'].nil?
         if @body.respond_to?(:bytesize)
           @header['content-length'] = @body.bytesize.to_s
@@ -337,6 +424,10 @@ module WEBrick
       end
       bodytempfile.rewind
       @body = @bodytempfile = bodytempfile
+      # The whole body has been buffered, so any earlier byte range no longer
+      # applies and the length is the buffered size.
+      @body_range = nil
+      @body_send_window = nil
       @header['content-length'] = bodytempfile.stat.size.to_s
     end
 
@@ -442,6 +533,8 @@ module WEBrick
 
     def error_body(backtrace, ex, host, port)
       @body = +""
+      @body_range = nil
+      @body_send_window = nil
       @body << <<-_end_of_html_
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0//EN">
 <HTML>
@@ -473,7 +566,10 @@ module WEBrick
     def send_body_io(socket)
       begin
         if @request_method == "HEAD"
-          # do nothing
+          # Never read the body.  A ranged body's cursor is observed when the
+          # header is built, but not advanced here.
+        elsif @body_range
+          send_body_io_range(socket)
         elsif chunked?
           buf = +''
           begin
@@ -505,9 +601,207 @@ module WEBrick
           end
         end
       ensure
-        @body.close
+        @body.close if @body.respond_to?(:close)
       end
       remove_body_tempfile
+    end
+
+    # Sends the part of the IO body described by #body_range.  The offset and
+    # length come from #body_send_window, which is the same source the header
+    # used, so the announced Content-Length and the written bytes agree.
+    def send_body_io_range(socket)
+      offset, length = body_send_window
+      align_body(offset)
+
+      if chunked?
+        remaining = length
+        truncated = false
+        buf = +''
+        begin
+          while remaining.nil? || remaining > 0
+            want = @buffer_size
+            want = remaining if remaining && remaining < want
+            @body.readpartial(want, buf)
+            size = buf.bytesize
+            remaining -= size if remaining
+            socket.write(+"#{size.to_s(16)}#{CRLF}#{buf}#{CRLF}")
+            @sent_size += size
+          end
+        rescue EOFError
+          # When the whole length was known, ending early means the body is
+          # short; report it by dropping the connection instead of closing the
+          # chunked message as if it were complete.
+          truncated = !remaining.nil? && remaining > 0
+        end
+        if truncated
+          @keep_alive = false
+          @header['connection'] = 'close'
+        else
+          socket.write("0#{CRLF}#{CRLF}")
+        end
+      else
+        sent = IO.copy_stream(@body, socket, length)
+        @sent_size = sent
+        if length && sent < length
+          # The body ended before the announced window.  The header is already
+          # on the wire, so the only correct finish is to close the connection
+          # instead of letting the client wait for bytes that will not come.
+          @keep_alive = false
+          @header['connection'] = 'close'
+        end
+      end
+    end
+
+    # The [offset, length] pair that both the header and the body writer use.
+    # +length+ is +nil+ when the body's total size is unknown.  The result is
+    # memoized so a later read of the body cannot shift what was announced.
+    #
+    # A non-seekable body cannot move backwards.  If the declared start is
+    # behind its current position the window is rebased to the current
+    # position, so the header and the bytes sent still agree.
+    def body_send_window # :nodoc:
+      return @body_send_window if @body_send_window
+
+      size = body_size
+      start, finish = requested_body_window(size)
+      start = effective_body_start(start)
+      length =
+        if start.nil?
+          # The body's position is not reported, so the size of what remains
+          # is unknowable: the response must be delimited by connection close.
+          nil
+        elsif finish
+          finish - start + 1
+        elsif size
+          size - start
+        end
+      length = 0 if length && length < 0
+
+      if length.nil? && (declared = @header['content-length'])
+        # The body's size cannot be probed, but the caller declared one.  Use
+        # it so the header and the bytes written still describe one window.
+        begin
+          length = Integer(declared)
+          length = 0 if length < 0
+        rescue ArgumentError
+          length = nil
+        end
+      end
+
+      @body_send_window = [start, length]
+    end
+
+    # Translates #body_range into an inclusive [start, finish] window, or
+    # +nil+ finish for "until the end of the body".  +start+ is +nil+ for
+    # +:current+ when the body cannot report its position.
+    def requested_body_window(size) # :nodoc:
+      case range = @body_range
+      when :current
+        [body_position, size && size - 1]
+      when Integer
+        [range, size && size - 1]
+      when Range
+        finish = range.end
+        finish -= 1 if range.exclude_end?
+        finish = size - 1 if size && finish >= size
+        [range.begin, finish]
+      else
+        [0, size && size - 1]
+      end
+    end
+
+    # The position the body can actually start from.  A seekable body can be
+    # moved anywhere; a non-seekable one can only move forward, so a start
+    # behind its current position is replaced by the current position.
+    def effective_body_start(start) # :nodoc:
+      position = body_position
+      return start if position.nil? || start.nil?
+      return start if position <= start
+      return start if body_seekable?
+      position
+    end
+
+    def body_seekable? # :nodoc:
+      return false unless @body.respond_to?(:seek)
+      if @body.respond_to?(:stat)
+        stat = @body.stat
+        return false unless stat.file?
+      end
+      true
+    rescue IOError, SystemCallError
+      false
+    end
+
+    # Total number of bytes in the body, or +nil+ when it cannot be known.
+    def body_size # :nodoc:
+      if @body.respond_to?(:stat)
+        begin
+          stat = @body.stat
+          return stat.size if stat.file?
+        rescue IOError, SystemCallError
+          # fall through to the size probe
+        end
+      end
+      @body.size if @body.respond_to?(:size)
+    rescue IOError, SystemCallError
+      nil
+    end
+
+    # Current byte position of the body, or +nil+ when it is not reported.
+    def body_position # :nodoc:
+      @body.pos if @body.respond_to?(:pos)
+    rescue IOError, SystemCallError
+      nil
+    end
+
+    # Moves the body so its next byte is at +offset+.  A seekable body is
+    # repositioned with #seek.  A non-seekable body can only move forward, so
+    # it is advanced by reading and discarding.  A start behind a non-seekable
+    # body was already rebased to its current position by #effective_body_start,
+    # so no backwards move is attempted here.
+    def align_body(offset) # :nodoc:
+      return if offset.nil?
+
+      position = body_position
+      return if position == offset
+      return if position.nil? # trust the caller that the body is positioned
+
+      if @body.respond_to?(:seek) && body_seekable?
+        begin
+          @body.seek(offset, IO::SEEK_SET)
+          return
+        rescue IOError, NotImplementedError, SystemCallError
+          # The body claimed to be seekable but is not; skip forward instead.
+        end
+      end
+
+      # A non-seekable body cannot go backwards.  A start behind the current
+      # position was already rebased to it, so there is nothing to skip.
+      return if offset <= position
+
+      skip_body_bytes(offset - position)
+    end
+
+    # Reads and discards up to +count+ bytes.  Returns the number of bytes
+    # actually skipped, which is smaller than +count+ on early EOF.
+    def skip_body_bytes(count) # :nodoc:
+      remaining = count
+      while remaining > 0
+        want = remaining < @buffer_size ? remaining : @buffer_size
+        chunk =
+          if @body.respond_to?(:read)
+            @body.read(want)
+          else
+            begin
+              @body.readpartial(want)
+            rescue EOFError
+              nil
+            end
+          end
+        break if chunk.nil? || chunk.empty?
+        remaining -= chunk.bytesize
+      end
+      count - remaining
     end
 
     def send_body_string(socket)

@@ -540,6 +540,39 @@ class TestWEBrickHTTPServer < Test::Unit::TestCase
     }
   end
 
+  def test_body_range_from_current_position
+    payload = "0123456789ABCDEF"
+    seen = {}
+
+    TestWEBrick.start_httpserver do |server, addr, port, log|
+      server.mount_proc("/") do |req, res|
+        io = StringIO.new(payload)
+        io.pos = 4 # servlet has already consumed a prefix
+        res["content-type"] = "text/plain"
+        res.body = io
+        res.body_range = :current
+        seen[req.request_method] = io
+      end
+
+      http = Net::HTTP.new(addr, port)
+
+      http.request(Net::HTTP::Get.new("/")) do |res|
+        assert_equal("200", res.code, log.call)
+        assert_equal("12", res["content-length"], log.call)
+        assert_equal(payload.byteslice(4..-1), res.body, log.call)
+      end
+      assert_equal(payload.bytesize, seen["GET"].pos, log.call)
+
+      http.request(Net::HTTP::Head.new("/")) do |res|
+        assert_equal("200", res.code, log.call)
+        assert_equal("12", res["content-length"], log.call)
+        assert_nil(res.body, log.call)
+      end
+      assert_equal(4, seen["HEAD"].pos,
+                   "HEAD must not advance the body\n#{log.call}")
+    end
+  end
+
   def test_accept_put_requests
     TestWEBrick.start_httpserver do |server, addr, port, log|
       server.mount_proc("/", lambda {|req, res|

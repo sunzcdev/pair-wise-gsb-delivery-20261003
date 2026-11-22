@@ -2,6 +2,7 @@
 require "webrick"
 require "stringio"
 require "net/http"
+require "tmpdir"
 
 module WEBrick
   class TestHTTPResponse < Test::Unit::TestCase
@@ -298,6 +299,316 @@ module WEBrick
         thread.join
       end
       assert_empty logger.messages
+    end
+
+    # A read-only stream that can only be consumed forwards.  It has no
+    # #seek, so it stands in for pipes and other non-seekable sources.
+    class FakeReadOnlyStream
+      attr_reader :pos
+
+      def initialize(data, size: data.bytesize)
+        @data = data.b
+        @pos = 0
+        @size = size
+      end
+
+      def size
+        @size
+      end
+
+      def eof?
+        @pos >= @data.bytesize
+      end
+
+      def read(length = nil, outbuf = nil)
+        return nil if eof?
+        chunk = @data.byteslice(@pos, length || remaining)
+        @pos += chunk.bytesize
+        outbuf ? outbuf.replace(chunk) : chunk
+      end
+
+      def readpartial(length, outbuf = nil)
+        raise EOFError if eof?
+        read([length, remaining].min, outbuf)
+      end
+
+      private
+
+      def remaining
+        @data.bytesize - @pos
+      end
+    end
+
+    # A non-seekable stream whose total length cannot be discovered either.
+    class FakeUnknownLengthStream < FakeReadOnlyStream
+      undef_method :size
+    end
+
+    DATA = "0123456789ABCDEF"
+
+    def ranged_response(method, body, range)
+      res = HTTPResponse.new config
+      res.request_method = method
+      res.keep_alive = true
+      res["content-type"] = "text/plain"
+      res.body = body
+      res.body_range = range
+      res
+    end
+
+    def send_body_to_string(res)
+      out = StringIO.new
+      out.binmode
+      res.setup_header
+      res.send_body(out)
+      out.string
+    end
+
+    def test_body_range_current_position_get
+      io = StringIO.new(DATA)
+      io.pos = 4
+      res = ranged_response("GET", io, :current)
+
+      body = send_body_to_string(res)
+
+      assert_equal "12", res["content-length"]
+      assert_equal 12, res.content_length
+      assert_equal DATA.byteslice(4..-1), body
+      assert_equal 12, res.sent_size
+      assert_equal DATA.bytesize, io.pos
+    end
+
+    def test_body_range_current_position_head
+      io = StringIO.new(DATA)
+      io.pos = 4
+      res = ranged_response("HEAD", io, :current)
+
+      body = send_body_to_string(res)
+
+      assert_equal "12", res["content-length"]
+      assert_equal "", body
+      assert_equal 0, res.sent_size
+      assert_equal 4, io.pos, "HEAD must not advance the body"
+    end
+
+    def test_body_range_current_position_fake_stream_get
+      stream = FakeReadOnlyStream.new(DATA)
+      stream.read(4)
+      res = ranged_response("GET", stream, :current)
+
+      body = send_body_to_string(res)
+
+      assert_equal "12", res["content-length"]
+      assert_equal DATA.byteslice(4..-1), body
+      assert_equal 12, res.sent_size
+      assert_equal DATA.bytesize, stream.pos
+    end
+
+    def test_body_range_current_position_fake_stream_head
+      stream = FakeReadOnlyStream.new(DATA)
+      stream.read(4)
+      res = ranged_response("HEAD", stream, :current)
+
+      body = send_body_to_string(res)
+
+      assert_equal "12", res["content-length"]
+      assert_equal "", body
+      assert_equal 0, res.sent_size
+      assert_equal 4, stream.pos, "HEAD must not advance the body"
+    end
+
+    def test_body_range_integer_offset_get
+      io = StringIO.new(DATA)
+      res = ranged_response("GET", io, 6)
+
+      body = send_body_to_string(res)
+
+      assert_equal "10", res["content-length"]
+      assert_equal DATA.byteslice(6..-1), body
+      assert_equal 10, res.sent_size
+    end
+
+    def test_body_range_byte_range_get_and_head
+      io = StringIO.new(DATA)
+      res = ranged_response("GET", io, 5..9)
+
+      body = send_body_to_string(res)
+
+      assert_equal "5", res["content-length"]
+      assert_equal DATA.byteslice(5..9), body
+      assert_equal 5, res.sent_size
+
+      io = StringIO.new(DATA)
+      res = ranged_response("HEAD", io, 5..9)
+
+      body = send_body_to_string(res)
+
+      assert_equal "5", res["content-length"]
+      assert_equal "", body
+      assert_equal 0, res.sent_size
+      assert_equal 0, io.pos
+    end
+
+    def test_body_range_offset_ahead_of_fake_stream_skips_forward
+      stream = FakeReadOnlyStream.new(DATA)
+      stream.read(4)
+      res = ranged_response("GET", stream, 8)
+
+      body = send_body_to_string(res)
+
+      assert_equal "8", res["content-length"]
+      assert_equal DATA.byteslice(8..-1), body
+      assert_equal 8, res.sent_size
+      assert_equal DATA.bytesize, stream.pos
+    end
+
+    def test_body_range_offset_behind_fake_stream_starts_at_cursor
+      stream = FakeReadOnlyStream.new(DATA)
+      stream.read(4)
+      res = ranged_response("GET", stream, 2)
+
+      body = send_body_to_string(res)
+
+      assert_equal "12", res["content-length"]
+      assert_equal DATA.byteslice(4..-1), body,
+                   "a non-seekable stream cannot rewind"
+      assert_equal 12, res.sent_size
+    end
+
+    def test_body_range_early_eof_closes_connection
+      stream = FakeReadOnlyStream.new(DATA.byteslice(0, 8), size: DATA.bytesize)
+      res = ranged_response("GET", stream, :current)
+
+      body = send_body_to_string(res)
+
+      assert_equal DATA.bytesize.to_s, res["content-length"]
+      assert_equal DATA.byteslice(0, 8), body
+      assert_equal 8, res.sent_size
+      assert_equal "close", res["connection"]
+      refute res.keep_alive?
+    end
+
+    def test_body_range_unknown_length_is_close_delimited
+      stream = FakeUnknownLengthStream.new(DATA)
+      res = ranged_response("GET", stream, :current)
+
+      body = send_body_to_string(res)
+
+      assert_nil res["content-length"]
+      assert_equal "close", res["connection"]
+      assert_equal DATA, body
+      assert_equal DATA.bytesize, res.sent_size
+    end
+
+    def test_body_range_rejects_invalid_values
+      @res.body = StringIO.new(DATA)
+      assert_raise(ArgumentError) { @res.body_range = -1 }
+      assert_raise(ArgumentError) { @res.body_range = 9..1 }
+      assert_raise(ArgumentError) { @res.body_range = 1...1 }
+      assert_raise(ArgumentError) { @res.body_range = "current" }
+    end
+
+    def test_body_range_cleared_when_body_is_not_io
+      @res.body = StringIO.new(DATA)
+      @res.body_range = :current
+      @res.body = "hello"
+      assert_nil @res.body_range
+    end
+
+    def test_body_range_current_position_seekable_file
+      Dir.mktmpdir do |dir|
+        path = File.join(dir, "data.bin")
+        File.binwrite(path, DATA)
+        io = File.open(path, "rb")
+        io.read(4)
+        begin
+          res = ranged_response("GET", io, :current)
+
+          body = send_body_to_string(res)
+
+          assert_equal "12", res["content-length"]
+          assert_equal DATA.byteslice(4..-1), body
+          assert_equal 12, res.sent_size
+        ensure
+          io.close unless io.closed?
+        end
+      end
+    end
+
+    def test_body_range_integer_can_seek_backwards_on_file
+      Dir.mktmpdir do |dir|
+        path = File.join(dir, "data.bin")
+        File.binwrite(path, DATA)
+        io = File.open(path, "rb")
+        io.read(4)
+        begin
+          res = ranged_response("GET", io, 0)
+
+          body = send_body_to_string(res)
+
+          assert_equal DATA.bytesize.to_s, res["content-length"]
+          assert_equal DATA, body
+        ensure
+          io.close unless io.closed?
+        end
+      end
+    end
+
+    def test_body_range_clamped_to_known_size
+      io = StringIO.new(DATA)
+      res = ranged_response("GET", io, 10..100)
+
+      body = send_body_to_string(res)
+
+      assert_equal "6", res["content-length"]
+      assert_equal DATA.byteslice(10..-1), body
+    end
+
+    def test_body_range_content_length_matches_written_bytes
+      io = StringIO.new(DATA)
+      io.pos = 4
+      res = ranged_response("GET", io, :current)
+
+      body = send_body_to_string(res)
+
+      assert_equal res.content_length, body.bytesize
+      assert_equal res.content_length, res.sent_size
+    end
+
+    def test_body_range_overrides_stale_content_length
+      io = StringIO.new(DATA)
+      io.pos = 4
+      res = ranged_response("GET", io, :current)
+      res["content-length"] = "999"
+
+      body = send_body_to_string(res)
+
+      assert_equal "12", res["content-length"]
+      assert_equal 12, body.bytesize
+    end
+
+    def test_body_range_chunked
+      io = StringIO.new(DATA)
+      io.pos = 4
+      res = ranged_response("GET", io, :current)
+      res.chunked = true
+
+      body = send_body_to_string(res)
+
+      assert_nil res["content-length"]
+      assert_equal "c\r\n#{DATA.byteslice(4..-1)}\r\n0\r\n\r\n".b, body
+      assert_equal 12, res.sent_size
+    end
+
+    def test_body_range_chunked_truncated_closes_connection
+      stream = FakeReadOnlyStream.new(DATA.byteslice(0, 8), size: DATA.bytesize)
+      res = ranged_response("GET", stream, :current)
+      res.chunked = true
+
+      send_body_to_string(res)
+
+      assert_equal "close", res["connection"]
+      refute res.keep_alive?
     end
 
     def test_set_error

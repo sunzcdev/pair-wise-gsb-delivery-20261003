@@ -95,6 +95,50 @@ class WEBrick::TestFileHandler < Test::Unit::TestCase
     assert_equal exp, body
   end
 
+  def test_make_partial_content_head_shares_length
+    filename = __FILE__
+    filesize = File.size(filename)
+    first = 100
+    last = 199
+
+    [["GET", filesize > last], ["HEAD", filesize > last]].each do |method, ok|
+      next unless ok
+      msg = <<~HTTP.gsub("\n", "\r\n")
+        #{method} / HTTP/1.1
+        Host: example.com
+        Range: bytes=#{first}-#{last}
+
+      HTTP
+      req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+      req.parse(StringIO.new(msg))
+      res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+      res.request_method = method
+      res.keep_alive = true
+      handler = default_file_handler(filename)
+      begin
+        handler.make_partial_content(req, res, filename, filesize)
+      rescue WEBrick::HTTPStatus::PartialContent
+      end
+
+      body = StringIO.new
+      body.binmode
+      res.setup_header
+      res.send_body(body)
+
+      assert_equal((last - first + 1).to_s, res["content-length"], method)
+      assert_equal("bytes #{first}-#{last}/#{filesize}",
+                   res["content-range"], method)
+      if method == "HEAD"
+        assert_equal("", body.string, method)
+        assert_equal(0, res.sent_size, method)
+      else
+        assert_equal(File.binread(filename, last - first + 1, first),
+                     body.string, method)
+        assert_equal(last - first + 1, res.sent_size, method)
+      end
+    end
+  end
+
   def test_filehandler
     config = { :DocumentRoot => File.dirname(__FILE__), }
     this_file = File.basename(__FILE__)

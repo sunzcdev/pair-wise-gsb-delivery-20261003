@@ -144,8 +144,11 @@ module WEBrick
             raise HTTPStatus::RequestRangeNotSatisfiable if first < 0
             res['content-type'] = mtype
             res['content-range'] = "bytes #{first}-#{last}/#{filesize}"
-            res['content-length'] = (last - first + 1).to_s
+            # Declaring the byte window lets the response derive the
+            # Content-Length and the bytes written from the same view of the
+            # file, instead of repeating the arithmetic here.
             res.body = io.dup
+            res.body_range = first..last
           else
             raise HTTPStatus::BadRequest
           end
