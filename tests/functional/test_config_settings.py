@@ -306,3 +306,49 @@ def test_install_config_reqs(script: PipTestEnvironment) -> None:
     config = script.site_packages_path / f"{name}-config.json"
     with open(config, "rb") as f:
         assert json.load(f) == {"--build-option": ["--cffi", "--avx2"], "FOO": "BAR"}
+
+
+def test_wheel_cache_keyed_on_config_settings(script: PipTestEnvironment) -> None:
+    """The same sdist built with different config settings gets distinct cache
+    entries, and a repeated build retrieves the previously cached wheel.
+
+    Run A, B, A: the third invocation must hit the cache populated by the
+    first one rather than rebuilding or returning wheel B.
+    """
+    name, version, project_dir = make_project(script.scratch_path)
+    dists_dir = script.scratch_path / "dists"
+    dists_dir.mkdir()
+    with tarfile.open(dists_dir / f"{name}-{version}.tar.gz", "w:gz") as dist_tar:
+        dist_tar.add(project_dir, arcname=name)
+
+    wheel_file_name = f"{name}-{version}-py3-none-any.whl"
+
+    def build(settings: list[tuple[str, str]], out_dir: Path) -> tuple[object, dict]:
+        args = ["wheel", "--no-index", "-f", dists_dir, "-w", out_dir, name]
+        for key, value in settings:
+            args.extend(["--config-settings", f"{key}={value}"])
+        result = script.pip(*args)
+        with ZipFile(out_dir / wheel_file_name) as z:
+            marker = json.loads(z.read(f"{name}-config.json"))
+        return result, marker
+
+    # A: first build, populates the cache.
+    dir_a = script.scratch_path / "wheels_a"
+    result_a, marker_a = build([("MARK", "A")], dir_a)
+    assert "Successfully built foo" in result_a.stdout, result_a.stdout
+    assert marker_a == {"MARK": "A"}
+
+    # B: different settings, must build a different wheel (no cache hit).
+    dir_b = script.scratch_path / "wheels_b"
+    result_b, marker_b = build([("MARK", "B")], dir_b)
+    assert "Successfully built foo" in result_b.stdout, result_b.stdout
+    assert marker_b == {"MARK": "B"}
+
+    # A again: same settings as the first build, so the cached wheel from
+    # the first run must be retrieved without rebuilding.
+    dir_a_again = script.scratch_path / "wheels_a_again"
+    result_a_again, marker_a_again = build([("MARK", "A")], dir_a_again)
+    assert "Successfully built foo" not in result_a_again.stdout, result_a_again.stdout
+    assert marker_a_again == {"MARK": "A"}
+    # The wheel must be A's, not B's that was cached in between.
+    assert marker_a_again != marker_b

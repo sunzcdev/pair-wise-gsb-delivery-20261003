@@ -1,0 +1,4 @@
+Include ``--config-settings`` build options in the wheel cache identity, so wheels
+built from the same source with different settings do not overwrite or collide
+with each other. Repeated option values and option ordering are preserved in the
+cache key.

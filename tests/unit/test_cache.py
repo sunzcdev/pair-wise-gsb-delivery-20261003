@@ -28,6 +28,73 @@ def test_subdirectory_fragment(tmp_path: Path) -> None:
     assert wc.get_path_for_link(link1) != wc.get_path_for_link(link2)
 
 
+def test_config_settings_are_part_of_cache_key(tmp_path: Path) -> None:
+    """
+    Test build backend config settings are part of the cache key, so wheels
+    built from the same source with different settings do not collide.
+    """
+    wc = WheelCache(os.fspath(tmp_path))
+    link = Link("https://g.c/package.tar.gz")
+    no_settings_path = wc.get_path_for_link(link)
+    settings_a_path = wc.get_path_for_link(link, {"FOO": "bar"})
+    settings_b_path = wc.get_path_for_link(link, {"FOO": "baz"})
+
+    # Empty/omitted settings keep the historical path.
+    assert wc.get_path_for_link(link, None) == no_settings_path
+    assert wc.get_path_for_link(link, {}) == no_settings_path
+    assert settings_a_path != no_settings_path
+    assert settings_b_path != no_settings_path
+    assert settings_a_path != settings_b_path
+    # Identical settings resolve to the same path.
+    assert wc.get_path_for_link(link, {"FOO": "bar"}) == settings_a_path
+
+
+def test_config_settings_preserve_duplicates_and_order(tmp_path: Path) -> None:
+    """
+    Test repeated values and ordering are significant in the cache key.
+    """
+    wc = WheelCache(os.fspath(tmp_path))
+    link = Link("https://g.c/package.tar.gz")
+
+    # Repeated values must not be collapsed.
+    single = wc.get_path_for_link(link, {"opt": "a"})
+    repeated = wc.get_path_for_link(link, {"opt": ["a", "a"]})
+    assert single != repeated
+
+    # List value order must not be lost.
+    order_ab = wc.get_path_for_link(link, {"opt": ["a", "b"]})
+    order_ba = wc.get_path_for_link(link, {"opt": ["b", "a"]})
+    assert order_ab != order_ba
+
+    # Key insertion order must not be lost.
+    keys_ab = wc.get_path_for_link(link, {"a": "1", "b": "2"})
+    keys_ba = wc.get_path_for_link(link, {"b": "2", "a": "1"})
+    assert keys_ab != keys_ba
+
+
+def test_config_settings_cache_lookup(tmp_path: Path) -> None:
+    """
+    Test a wheel cached under given config settings is only returned for a
+    lookup with the same settings.
+    """
+    wc = WheelCache(os.fspath(tmp_path))
+    link = Link("https://g.c/package.tar.gz")
+    supported_tags = [Tag("py3", "none", "any")]
+
+    cache_path = wc.get_path_for_link(link, {"FOO": "bar"})
+    ensure_dir(cache_path)
+    with open(os.path.join(cache_path, "package-1.0-py3-none-any.whl"), "w"):
+        pass
+
+    # Same settings: cache hit.
+    cached_link = wc.get(link, "package", supported_tags, {"FOO": "bar"})
+    assert cached_link is not link
+    assert os.path.exists(cached_link.file_path)
+    # Different or missing settings: cache miss, the original link is kept.
+    assert wc.get(link, "package", supported_tags, {"FOO": "baz"}) is link
+    assert wc.get(link, "package", supported_tags) is link
+
+
 def test_wheel_name_filter(tmpdir: Path) -> None:
     """
     Test the wheel cache filters on wheel name when several wheels
