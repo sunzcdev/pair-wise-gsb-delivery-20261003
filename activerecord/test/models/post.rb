@@ -195,6 +195,8 @@ class Post < ActiveRecord::Base
   has_many :readers
   has_many :secure_readers
   has_many :readers_with_person, -> { includes(:person) }, class_name: "Reader"
+  has_many :ordered_readers, -> { order(skimmer: :desc, id: :asc) }, class_name: "Reader"
+  has_many :ordered_people, -> { distinct }, through: :ordered_readers, source: :person
   has_many :people, through: :readers
   has_many :single_people, through: :readers
   has_many :people_with_callbacks, source: :person, through: :readers,

@@ -1522,6 +1522,42 @@ class HasManyThroughAssociationsTest < ActiveRecord::TestCase
     assert_equal ["parrot", "bulbul"], owner.toys.map { |r| r.pet.name }
   end
 
+  def test_preloading_has_many_through_with_order_on_through_association_and_distinct
+    person_a = Person.create!(first_name: "Alice")
+    person_b = Person.create!(first_name: "Bob")
+    person_c = Person.create!(first_name: "Carol")
+
+    post1 = Post.create!(title: "post1", body: "body")
+    post1.ordered_readers.create!(person: person_a, skimmer: true)
+    post1.ordered_readers.create!(person: person_b, skimmer: false)
+    post1.ordered_readers.create!(person: person_c, skimmer: false)
+    post1.ordered_readers.create!(person: person_a, skimmer: false)
+
+    # The same endpoints as post1, reached through differently ordered readers.
+    post2 = Post.create!(title: "post2", body: "body")
+    post2.ordered_readers.create!(person: person_b, skimmer: true)
+    post2.ordered_readers.create!(person: person_a, skimmer: false)
+    post2.ordered_readers.create!(person: person_a, skimmer: false)
+
+    # Lazily loaded, the through association's order applies and duplicates
+    # collapse on their first occurrence.
+    assert_equal [person_a, person_b, person_c], Post.find(post1.id).ordered_people.to_a
+    assert_equal [person_b, person_a], Post.find(post2.id).ordered_people.to_a
+
+    preloaded_posts = nil
+
+    # Batched into one query per association, not one query per owner.
+    assert_queries_count(3) do
+      preloaded_posts = Post.preload(:ordered_people).where(id: [post1.id, post2.id]).order(:id).to_a
+      preloaded_posts.each { |post| post.ordered_people.load }
+    end
+
+    assert_no_queries do
+      assert_equal [person_a, person_b, person_c], preloaded_posts[0].ordered_people.to_a
+      assert_equal [person_b, person_a], preloaded_posts[1].ordered_people.to_a
+    end
+  end
+
   def test_has_many_through_associations_sum_on_columns
     post1 = Post.create(title: "active", body: "sample")
     post2 = Post.create(title: "inactive", body: "sample")
