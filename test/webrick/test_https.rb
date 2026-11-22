@@ -108,4 +108,47 @@ class TestWEBrickHTTPS < Test::Unit::TestCase
       end
     }
   end
+
+  def test_sni_ambiguous_virtual_host
+    log_ary = []
+    config = {
+      :ServerName => "localhost",
+      :SSLEnable => true,
+      :SSLCertName => "/CN=localhost",
+      :Logger => WEBrick::Log.new(log_ary, WEBrick::BasicLog::WARN),
+    }
+    TestWEBrick.start_httpserver(config){|server, addr, port, log|
+      server.mount_proc("/"){|req, res| res.body = "master" }
+
+      stderr_buffer = StringIO.new
+      old_stderr, $stderr = $stderr, stderr_buffer
+      begin
+        2.times do |i|
+          vhost = WEBrick::HTTPServer.new(
+            :ServerName => "vhost#{i}",
+            :ServerAlias => ["ambiguous.example"],
+            :Port => port,
+            :DoNotListen => true,
+            :Logger => NoLog,
+            :AccessLog => [],
+            :SSLEnable => true,
+            :SSLCertName => "/CN=vhost#{i}")
+          vhost.mount_proc("/"){|req, res| res.body = "vhost#{i}" }
+          server.virtual_host(vhost)
+        end
+      ensure
+        $stderr = old_stderr
+      end
+
+      # SNI for an ambiguous name cannot select a certificate.  The problem
+      # is logged and the connection falls back to the default certificate
+      # instead of failing the handshake.
+      sni_socket = Struct.new(:addr).new([addr, port, addr, addr])
+      assert_nil(server.ssl_servername_callback(sni_socket, "ambiguous.example"))
+      assert(log_ary.any?{|line| line.include?("AmbiguousVirtualHostError") },
+             log_ary.inspect)
+      assert(log_ary.any?{|line| line.include?("ambiguous.example") },
+             log_ary.inspect)
+    }
+  end
 end

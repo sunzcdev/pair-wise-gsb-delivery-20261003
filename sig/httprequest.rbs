@@ -140,6 +140,10 @@ module WEBrick
 
     def parse_host_request_line: (String host) -> [String, String]
 
+    def extract_host_port: () -> [String?, Integer?]
+
+    def bracket_ipv6: (untyped host) -> untyped
+
     def read_body: (IO socket, body_chunk_block block) -> String
                  | (nil socket, top block) -> nil
 

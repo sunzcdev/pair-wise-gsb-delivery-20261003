@@ -128,7 +128,15 @@ module WEBrick
 
     def ssl_servername_callback(sslsocket, hostname = nil)
       req = SNIRequest.new(sslsocket, hostname)
-      server = lookup_server(req)
+      begin
+        server = lookup_server(req)
+      rescue AmbiguousVirtualHostError => ex
+        # The SNI name does not identify a single virtual host.  There is no
+        # response to report the problem on yet, so log it and let the
+        # connection use the listening server's context.
+        @logger.error(ex)
+        server = nil
+      end
       server ? server.ssl_context : nil
     end
 

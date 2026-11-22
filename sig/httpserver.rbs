@@ -2,6 +2,20 @@ module WEBrick
   class HTTPServerError < ServerError
   end
 
+  class AmbiguousVirtualHostError < HTTPServerError
+    type candidate_type = [HTTPServer, String?]
+
+    attr_reader request_host: String?
+
+    attr_reader request_port: Integer?
+
+    attr_reader candidates: Array[candidate_type]
+
+    def initialize: (String? request_host, Integer? request_port, Array[candidate_type] candidates) -> void
+
+    def describe: (untyped server) -> String
+  end
+
   class HTTPServer < ::WEBrick::GenericServer
     @http_version: HTTPVersion
 
@@ -9,6 +23,11 @@ module WEBrick
 
     @virtual_hosts: Array[untyped]
 
+    @virtual_host_declarations: Hash[Integer, String?]
+
+    @declared_config_keys: Array[Symbol]
+
+    attr_reader declared_config_keys: Array[Symbol]
     def initialize: (?Hash[Symbol, untyped] config, ?Hash[Symbol, untyped] default) -> void
 
     def run: (TCPSocket sock) -> void
@@ -28,9 +47,41 @@ module WEBrick
 
     def search_servlet: (String path) -> [singleton(HTTPServlet::AbstractServlet), Array[untyped], String, String]?
 
-    def virtual_host: (instance server) -> void
+    def virtual_host: (instance server) -> instance
 
-    def lookup_server: (HTTPRequest req) -> instance?
+    def virtual_host_declaration_location: () -> String?
+
+    def lookup_server: (untyped req) -> instance?
+
+    def virtual_host_specificity: (untyped server) -> Array[Integer]
+
+    def virtual_host_address_specificity: (untyped server) -> Integer
+
+    def virtual_host_declares?: (untyped server, Symbol key) -> bool
+
+    def virtual_host_declares_name?: (untyped server) -> bool
+
+    def virtual_host_match?: (untyped server, untyped req) -> bool
+
+    def virtual_host_name_constraint_match?: (untyped server, String? actual) -> bool
+
+    def virtual_host_aliases: (untyped server) -> Array[untyped]
+
+    def virtual_host_address_match?: (untyped configured, untyped req) -> bool
+
+    def virtual_host_unspecified_address?: (String address) -> bool
+
+    def virtual_host_port_match?: (untyped configured, untyped req) -> bool
+
+    def virtual_host_request_port: (untyped req) -> Integer?
+
+    def virtual_host_local_port: (untyped req) -> Integer?
+
+    def virtual_host_host_name_given?: (untyped req) -> bool
+
+    def virtual_host_name_match?: (untyped configured, String? actual) -> bool
+
+    def virtual_host_ip_address: (untyped address) -> untyped
 
     def access_log: (Hash[Symbol, untyped] config, HTTPRequest req, HTTPResponse res) -> void
 

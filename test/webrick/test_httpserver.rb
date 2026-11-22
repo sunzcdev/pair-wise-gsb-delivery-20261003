@@ -226,6 +226,417 @@ class TestWEBrickHTTPServer < Test::Unit::TestCase
     assert_eql?(host10, host1.lookup_server(Req.new(local, portz, namez)))
   end
 
+  # A request as seen by lookup_server: a local socket address, the port the
+  # request arrived on, and the host named by the request.  +request_port+
+  # defaults to the local port but can differ, as it does for a client that
+  # sends no port in its Host header.
+  class LookupReq
+    attr_reader :port, :host
+    def initialize(addr, port, host, request_port = port)
+      @addr, @local_port, @host, @port = addr, port, host, request_port
+    end
+    def addr
+      ["AF_INET", @local_port, @addr, @addr]
+    end
+  end
+
+  def vhost(addr, port, host, ali = nil)
+    WEBrick::HTTPServer.new(
+      :Logger      => NoLog,
+      :DoNotListen => true,
+      :BindAddress => addr,
+      :Port        => port,
+      :ServerName  => host,
+      :ServerAlias => ali,
+    )
+  end
+
+  def test_lookup_server_alias_on_two_ports
+    master = vhost(nil, 8000, "master", nil)
+    on_8080 = vhost(nil, 8080, nil, ["shared.example"])
+    on_8081 = vhost(nil, 8081, nil, ["shared.example"])
+    master.virtual_host(on_8080)
+    master.virtual_host(on_8081)
+
+    # The port the client connected to selects one of the two aliases, and a
+    # connection on a port neither virtual host declares selects neither.
+    assert_eql?(on_8080,
+                master.lookup_server(LookupReq.new("127.0.0.1", 8080, "shared.example")))
+    assert_eql?(on_8081,
+                master.lookup_server(LookupReq.new("127.0.0.1", 8081, "shared.example")))
+    assert_eql?(nil,
+                master.lookup_server(LookupReq.new("127.0.0.1", 8082, "shared.example")))
+  end
+
+  def test_lookup_server_port_selection_is_by_listening_port
+    master = vhost(nil, 8000, "master", nil)
+    on_8080 = vhost(nil, 8080, nil, ["shared.example"])
+    on_8081 = vhost(nil, 8081, nil, ["shared.example"])
+    master.virtual_host(on_8080)
+    master.virtual_host(on_8081)
+
+    # The two virtual hosts cannot be told apart by the host name alone.  The
+    # port the connection was accepted on decides, even though the port in
+    # the request itself is unrelated (a client that sends a bare Host header
+    # leaves it at the default 80).
+    req_on_8080 = LookupReq.new("127.0.0.1", 8080, "shared.example", 80)
+    req_on_8081 = LookupReq.new("127.0.0.1", 8081, "shared.example", 80)
+    assert_equal(80, req_on_8080.port)
+    assert_equal(80, req_on_8081.port)
+
+    assert_eql?(on_8080, master.lookup_server(req_on_8080))
+    assert_eql?(on_8081, master.lookup_server(req_on_8081))
+  end
+
+  def test_lookup_server_same_alias_port_and_name
+    master = vhost(nil, 8000, "master", nil)
+    first  = vhost(nil, 8080, nil, ["shared.example"])
+    second = vhost(nil, 8080, nil, ["shared.example"])
+    master.virtual_host(first)
+    master.virtual_host(second)
+
+    ex = assert_raise(WEBrick::AmbiguousVirtualHostError) do
+      master.lookup_server(LookupReq.new("127.0.0.1", 8080, "shared.example"))
+    end
+    assert_equal("shared.example", ex.request_host)
+    assert_equal(8080, ex.request_port)
+    assert_equal([first.object_id, second.object_id],
+                 ex.candidates.map{|server, _| server.object_id })
+    assert_match(/shared.example/, ex.message)
+    assert_match(/:Port/, ex.message)
+    ex.candidates.each do |server, location|
+      assert_not_nil(location)
+    end
+  end
+
+  def test_lookup_server_ambiguity_points_at_declarations
+    master = vhost(nil, 8000, "master", nil)
+    first = vhost(nil, 8080, nil, ["shared.example"])
+    first_line = __LINE__ + 1
+    master.virtual_host(first)
+    second = vhost(nil, 8080, nil, ["shared.example"])
+    second_line = __LINE__ + 1
+    master.virtual_host(second)
+
+    ex = assert_raise(WEBrick::AmbiguousVirtualHostError) do
+      master.lookup_server(LookupReq.new("127.0.0.1", 8080, "shared.example"))
+    end
+    locations = ex.candidates.map{|_, location| location }
+    assert_include(locations,
+                   "#{__FILE__}:#{first_line}:in 'TestWEBrickHTTPServer#test_lookup_server_ambiguity_points_at_declarations'")
+    assert_include(locations,
+                   "#{__FILE__}:#{second_line}:in 'TestWEBrickHTTPServer#test_lookup_server_ambiguity_points_at_declarations'")
+    assert_include(ex.backtrace, locations[0])
+    assert_include(ex.backtrace, locations[1])
+  end
+
+  def test_lookup_server_exact_address_and_port_disambiguate
+    master = vhost(nil, 8000, "master", nil)
+    any_address = vhost(nil, 8080, nil, ["shared.example"])
+    one_address = vhost("192.168.100.1", 8080, nil, ["shared.example"])
+    master.virtual_host(any_address)
+    master.virtual_host(one_address)
+
+    # The narrower :BindAddress wins where it applies ...
+    assert_eql?(one_address,
+                master.lookup_server(LookupReq.new("192.168.100.1", 8080, "shared.example")))
+    # ... and the alias-only host serves everywhere else.
+    assert_eql?(any_address,
+                master.lookup_server(LookupReq.new("192.168.100.2", 8080, "shared.example")))
+  end
+
+  def test_lookup_server_wildcard_address_loses_to_concrete_address
+    master = vhost(nil, 8000, "master", nil)
+    wildcard = vhost("0.0.0.0", 8080, nil, ["shared.example"])
+    concrete = vhost("192.168.100.1", 8080, nil, ["shared.example"])
+    master.virtual_host(wildcard)
+    master.virtual_host(concrete)
+
+    # A wildcard :BindAddress matches, but a concrete one is more specific.
+    assert_eql?(concrete,
+                master.lookup_server(LookupReq.new("192.168.100.1", 8080, "shared.example")))
+    assert_eql?(wildcard,
+                master.lookup_server(LookupReq.new("192.168.100.2", 8080, "shared.example")))
+  end
+
+  def test_lookup_server_tied_concrete_addresses_are_ambiguous
+    master = vhost(nil, 8000, "master", nil)
+    first  = vhost("192.168.100.1", 8080, nil, ["shared.example"])
+    second = vhost("192.168.100.1", 8080, nil, ["shared.example"])
+    master.virtual_host(first)
+    master.virtual_host(second)
+
+    # Neither address, port nor name distinguishes these two hosts, so the
+    # request cannot be routed.
+    ex = assert_raise(WEBrick::AmbiguousVirtualHostError) do
+      master.lookup_server(LookupReq.new("192.168.100.1", 8080, "shared.example"))
+    end
+    assert_equal([first.object_id, second.object_id],
+                 ex.candidates.map{|server, _| server.object_id })
+    assert_include(ex.message, "BindAddress=\"192.168.100.1\"")
+  end
+
+  def test_lookup_server_ipv6_address_spellings
+    master = vhost(nil, 8000, "master", nil)
+    by_value = vhost("0:0:0:0:0:0:0:1", 8080, nil, ["v6.example"])
+    master.virtual_host(by_value)
+
+    # The local address reported by Socket#addr has no brackets; the
+    # configured address is compared as an address, not as a string.
+    assert_eql?(by_value,
+                master.lookup_server(LookupReq.new("::1", 8080, "v6.example")))
+    assert_eql?(by_value,
+                master.lookup_server(LookupReq.new("[::1]", 8080, "v6.example")))
+  end
+
+  def test_lookup_server_port_and_alias_beats_name_only
+    master = vhost(nil, 8000, "master", nil)
+    # Neither virtual host binds an address, so the port and the host name
+    # have to tell them apart.
+    name_only = WEBrick::HTTPServer.new(
+      :Logger => NoLog, :DoNotListen => true, :ServerName => "shared.example")
+    port_and_alias = vhost(nil, 8080, nil, ["shared.example"])
+    master.virtual_host(name_only)
+    master.virtual_host(port_and_alias)
+
+    # On port 8080 both match; the one that also declares the port wins.
+    assert_eql?(port_and_alias,
+                master.lookup_server(LookupReq.new("127.0.0.1", 8080, "shared.example")))
+    # Elsewhere only the name-only virtual host applies.
+    assert_eql?(name_only,
+                master.lookup_server(LookupReq.new("127.0.0.1", 8081, "shared.example")))
+  end
+
+  def test_lookup_server_no_host_keeps_first_declared
+    master = vhost(nil, 8000, "master", nil)
+    # Two virtual hosts that constrain the same port and no name: an HTTP/1.0
+    # request cannot tell them apart either.
+    first  = vhost(nil, 8080, nil, nil)
+    second = vhost(nil, 8080, nil, nil)
+    master.virtual_host(first)
+    master.virtual_host(second)
+
+    # An HTTP/1.0 request without a Host header names no host: webrick keeps
+    # its historical behaviour and serves it from the first declared host.
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP.merge(:Port => 8080))
+    req.parse(StringIO.new("GET / HTTP/1.0\r\n\r\n"))
+    assert_nil(req["host"])
+    assert_eql?(first, master.lookup_server(req))
+  end
+
+  def test_lookup_server_no_host_uses_default_host
+    master = vhost(nil, 8000, "master", nil)
+    named = vhost(nil, 8080, "named.example", nil)
+    master.virtual_host(named)
+
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP.merge(:Port => 8080))
+    req.parse(StringIO.new("GET / HTTP/1.0\r\n\r\n"))
+    assert_nil(master.lookup_server(req))
+  end
+
+  def test_lookup_server_inherited_port_does_not_constrain
+    master = vhost(nil, 8000, "master", nil)
+    # :Port comes from Config::HTTP (:Port => 80) rather than from the
+    # caller, so this virtual host does not constrain the port it serves.
+    inherited_port = WEBrick::HTTPServer.new(
+      :Logger => NoLog, :DoNotListen => true, :ServerName => "inherited.example")
+    master.virtual_host(inherited_port)
+
+    assert_eql?(inherited_port,
+                master.lookup_server(LookupReq.new("127.0.0.1", 8080, "inherited.example")))
+    assert_eql?(inherited_port,
+                master.lookup_server(LookupReq.new("127.0.0.1", 80, "inherited.example")))
+  end
+
+  def test_virtual_host_shared_alias_on_two_listeners
+    log_ary = []
+    master = WEBrick::HTTPServer.new(
+      :BindAddress => "127.0.0.1", :Port => 0,
+      :Logger => WEBrick::Log.new(log_ary, WEBrick::BasicLog::WARN),
+      :AccessLog => [])
+    master.mount_proc("/"){|req, res| res.body = "master" }
+    master.listen("127.0.0.1", 0)
+    port_a, port_b = master.listeners.map{|listener| listener.addr[1] }
+    refute_equal(port_a, port_b)
+
+    vhost_on_a = vhost("127.0.0.1", port_a, nil, ["shared.example"])
+    vhost_on_a.config[:AccessLog] = []
+    vhost_on_a.mount_proc("/"){|req, res| res.body = "vhost-a" }
+    vhost_on_b = vhost("127.0.0.1", port_b, nil, ["shared.example"])
+    vhost_on_b.config[:AccessLog] = []
+    vhost_on_b.mount_proc("/"){|req, res| res.body = "vhost-b" }
+    master.virtual_host(vhost_on_a)
+    master.virtual_host(vhost_on_b)
+
+    server_thread = Thread.new { master.start }
+    begin
+      Thread.pass while master.status != :Running
+
+      [[port_a, "vhost-a"], [port_b, "vhost-b"]].each do |port, expected|
+        http = Net::HTTP.new("127.0.0.1", port)
+        req = Net::HTTP::Get.new("/")
+        req["Host"] = "shared.example"
+        http.request(req){|res| assert_equal(expected, res.body) }
+
+        req = Net::HTTP::Get.new("/")
+        req["Host"] = "shared.example:#{port}"
+        http.request(req){|res| assert_equal(expected, res.body) }
+
+        req = Net::HTTP::Get.new("/")
+        req["Host"] = "unknown.example"
+        http.request(req){|res| assert_equal("master", res.body) }
+      end
+
+      # HTTP/1.0 with no Host header has no name to match, so the default
+      # host serves it on either listener.
+      [port_a, port_b].each do |port|
+        TCPSocket.open("127.0.0.1", port) do |sock|
+          sock.write("GET / HTTP/1.0\r\n\r\n")
+          response = sock.read
+          assert_match(/\AHTTP\/1\.\d 200 /, response)
+          assert_match(/master/, response)
+        end
+      end
+    ensure
+      master.shutdown
+      server_thread.join
+    end
+    assert_equal([], log_ary)
+  end
+
+  def test_virtual_host_ipv6_listener
+    begin
+      master = WEBrick::HTTPServer.new(
+        :BindAddress => "::1", :Port => 0,
+        :Logger => NoLog, :AccessLog => [])
+    rescue Errno::EADDRNOTAVAIL, Errno::EAFNOSUPPORT, SocketError
+      omit("IPv6 loopback is not available")
+    end
+
+    master.mount_proc("/"){|req, res| res.body = "master" }
+    port = master.listeners[0].addr[1]
+
+    # A virtual host selected by a bracketed IPv6 address and the port.
+    by_address = vhost("[::1]", port, nil, nil)
+    by_address.config[:AccessLog] = []
+    by_address.mount_proc("/"){|req, res| res.body = "vhost-v6" }
+    master.virtual_host(by_address)
+
+    server_thread = Thread.new { master.start }
+    begin
+      Thread.pass while master.status == :Stop
+      Thread.pass while master.status != :Running
+
+      # The Host header keeps its bracketed IPv6 spelling; the address
+      # selector is compared as an address, not as a string.
+      http = Net::HTTP.new("::1", port)
+      req = Net::HTTP::Get.new("/")
+      req["Host"] = "[::1]:#{port}"
+      http.request(req){|res| assert_equal("vhost-v6", res.body) }
+
+      # An HTTP/1.0 request without a Host header names no host, so webrick
+      # keeps using the local socket address; the address-and-port virtual
+      # host still selects it.
+      TCPSocket.open("::1", port) do |sock|
+        sock.write("GET / HTTP/1.0\r\n\r\n")
+        response = sock.read
+        assert_match(/\AHTTP\/1\.\d 200 /, response)
+        assert_match(/vhost-v6/, response)
+      end
+    ensure
+      master.shutdown
+      server_thread.join
+    end
+  end
+
+  def test_virtual_host_ipv6_alias_not_used_without_host_header
+    begin
+      master = WEBrick::HTTPServer.new(
+        :BindAddress => "::1", :Port => 0,
+        :Logger => NoLog, :AccessLog => [])
+    rescue Errno::EADDRNOTAVAIL, Errno::EAFNOSUPPORT, SocketError
+      omit("IPv6 loopback is not available")
+    end
+
+    master.mount_proc("/"){|req, res| res.body = "master" }
+    port = master.listeners[0].addr[1]
+
+    by_alias = vhost("[::1]", port, nil, ["v6.example"])
+    by_alias.config[:AccessLog] = []
+    by_alias.mount_proc("/"){|req, res| res.body = "vhost-v6" }
+    master.virtual_host(by_alias)
+
+    server_thread = Thread.new { master.start }
+    begin
+      Thread.pass while master.status != :Running
+
+      http = Net::HTTP.new("::1", port)
+      req = Net::HTTP::Get.new("/")
+      req["Host"] = "v6.example"
+      http.request(req){|res| assert_equal("vhost-v6", res.body) }
+
+      # No Host header, no alias to match: the default host answers, exactly
+      # as it did before virtual host selection existed.
+      TCPSocket.open("::1", port) do |sock|
+        sock.write("GET / HTTP/1.0\r\n\r\n")
+        response = sock.read
+        assert_match(/\AHTTP\/1\.\d 200 /, response)
+        assert_match(/master/, response)
+      end
+    ensure
+      master.shutdown
+      server_thread.join
+    end
+  end
+
+  def test_virtual_host_ambiguous_over_http
+    log_ary = []
+    master = WEBrick::HTTPServer.new(
+      :BindAddress => "127.0.0.1", :Port => 0,
+      :Logger => WEBrick::Log.new(log_ary, WEBrick::BasicLog::WARN),
+      :AccessLog => [])
+    master.mount_proc("/"){|req, res| res.body = "master" }
+    port = master.listeners[0].addr[1]
+
+    first  = vhost("127.0.0.1", port, nil, ["dup.example"])
+    first.config[:AccessLog] = []
+    first.mount_proc("/"){|req, res| res.body = "first" }
+    first_line = __LINE__ + 1
+    master.virtual_host(first)
+    second = vhost("127.0.0.1", port, nil, ["dup.example"])
+    second.config[:AccessLog] = []
+    second.mount_proc("/"){|req, res| res.body = "second" }
+    second_line = __LINE__ + 1
+    master.virtual_host(second)
+
+    server_thread = Thread.new { master.start }
+    begin
+      Thread.pass while master.status != :Running
+
+      http = Net::HTTP.new("127.0.0.1", port)
+      req = Net::HTTP::Get.new("/")
+      req["Host"] = "dup.example"
+      http.request(req) do |res|
+        assert_equal("500", res.code)
+        assert_include(res.body, "ambiguous virtual host")
+        assert_include(res.body, "dup.example")
+        # Both declarations are named, so the operator can find and fix them.
+        assert_include(res.body, "#{__FILE__}:#{first_line}")
+        assert_include(res.body, "#{__FILE__}:#{second_line}")
+      end
+
+      # A host name that only one of them serves is not ambiguous.
+      req = Net::HTTP::Get.new("/")
+      req["Host"] = "unknown.example"
+      http.request(req){|res| assert_equal("master", res.body) }
+    ensure
+      master.shutdown
+      server_thread.join
+    end
+    assert(log_ary.any?{|line| line.include?("AmbiguousVirtualHostError") },
+           log_ary.inspect)
+  end
+
   def test_callbacks
     accepted = started = stopped = 0
     requested0 = requested1 = 0

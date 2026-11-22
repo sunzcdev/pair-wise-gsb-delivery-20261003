@@ -52,6 +52,52 @@ class TestWEBrickHTTPRequest < Test::Unit::TestCase
     assert(req.query.empty?)
   end
 
+  # A socket that only reports a local address, as a real accepted socket
+  # does.
+  class AddressedSocket < StringIO
+    def initialize(msg, addr)
+      super(msg)
+      @addr = addr
+    end
+    attr_reader :addr
+  end
+
+  def test_parse_10_ipv6_without_host
+    # Socket#addr gives a bare IPv6 address; the request built from it must
+    # carry the bracketed form a URI requires.
+    msg = "GET / HTTP/1.0\r\n\r\n"
+    socket = AddressedSocket.new(msg, ["AF_INET6", 8080, "::1", "::1"])
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(socket)
+    assert_equal("[::1]", req.host)
+    assert_equal(8080, req.port)
+    assert_equal(URI.parse("http://[::1]:8080/"), req.request_uri)
+    assert_nil(req["host"])
+  end
+
+  def test_parse_10_ipv4_without_host_keeps_host
+    msg = "GET / HTTP/1.0\r\n\r\n"
+    socket = AddressedSocket.new(msg, ["AF_INET", 8080, "192.168.1.1", "192.168.1.1"])
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(socket)
+    assert_equal("192.168.1.1", req.host)
+    assert_equal(8080, req.port)
+    assert_equal(URI.parse("http://192.168.1.1:8080/"), req.request_uri)
+  end
+
+  def test_parse_host_header_ipv6_keeps_brackets
+    msg = <<~HTTP.gsub("\n", "\r\n")
+      GET /path HTTP/1.1
+      Host: [::1]:8080
+
+    HTTP
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(StringIO.new(msg))
+    assert_equal("[::1]", req.host)
+    assert_equal(8080, req.port)
+    assert_equal(URI.parse("http://[::1]:8080/path"), req.request_uri)
+  end
+
   def test_parse_11
     msg = <<~HTTP.gsub("\n", "\r\n")
       GET /path HTTP/1.1

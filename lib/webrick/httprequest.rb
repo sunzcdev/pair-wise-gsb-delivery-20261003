@@ -10,6 +10,7 @@
 # $IPR: httprequest.rb,v 1.64 2003/07/13 17:18:22 gotoyuzo Exp $
 
 require 'fiber'
+require 'ipaddr'
 require 'uri'
 require_relative 'httpversion'
 require_relative 'httpstatus'
@@ -545,12 +546,32 @@ module WEBrick
         host, port = parse_host_request_line(self["host"])
         port = port.to_i if port
       elsif @addr.size > 0
-        host, port = @addr[2], @addr[1]
+        host, port = bracket_ipv6(@addr[2]), @addr[1]
       else
-        host, port = @config[:ServerName], @config[:Port]
+        host, port = bracket_ipv6(@config[:ServerName]), @config[:Port]
       end
 
       [host, port]
+    end
+
+    # Socket#addr reports an IPv6 address without brackets, but a URI (and a
+    # Host header) may only carry an IPv6 literal between brackets.  Requests
+    # that supply no Host header - HTTP/1.0 for example - are given the local
+    # socket address as their host, so the address must be bracketed before
+    # it is put in a URI.  IPv4 addresses and host names pass through, and an
+    # address that is not a valid IPv6 literal is left alone so the caller
+    # sees the original value.
+    def bracket_ipv6(host)
+      return host unless host.is_a?(String)
+      return host if host.start_with?("[")
+      return host unless host.include?(":")
+
+      begin
+        IPAddr.new(host)
+      rescue ArgumentError
+        return host
+      end
+      "[#{host}]"
     end
 
     def parse_uri(str, scheme="http")
