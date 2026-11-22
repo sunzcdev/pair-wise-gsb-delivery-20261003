@@ -384,6 +384,42 @@ module Puma
       end
     end
 
+    # Reconciles the number of running threads with the current +@min+ and
+    # +@max+ bounds. Must be called after either bound is changed.
+    #
+    # When the pool is above the new +@max+, trim requests are issued for the
+    # surplus threads. Only idle threads honor trim requests, so threads that
+    # are busy processing requests keep running until their current work item
+    # finishes; when they loop back and find themselves idle they exit, and the
+    # pool settles at the new target size. The pool is never trimmed below
+    # +@min+ because the trim count is capped as requests are issued.
+    #
+    # When the pool is below the new +@max+ and work is queued, threads are
+    # spawned immediately (up to +@max+) so that the waiting queue is advanced
+    # without waiting for new work to arrive.
+    #
+    def adjust_thread_count
+      with_mutex do
+        wanted = @spawned - @trim_requested
+
+        if wanted > @max
+          (wanted - @max).times do
+            break unless @spawned - @trim_requested > @min
+            @trim_requested += 1
+          end
+          # Wake every idle thread so the trim requests are picked up promptly,
+          # even when several threads are parked waiting for work.
+          @not_empty.broadcast
+        else
+          # Cover every queued item plus the threads already busy, capped by the
+          # new maximum. An idle pool with no backlog is grown lazily when work
+          # arrives instead of spawning threads that have nothing to do.
+          target = [@max, (@spawned - @waiting) + @todo.size].min
+          spawn_thread while @spawned < target && can_spawn_processor?
+        end
+      end
+    end
+
     # If there are dead threads in the pool make them go away while decreasing
     # spawned counter so that new healthy threads could be created again.
     def reap

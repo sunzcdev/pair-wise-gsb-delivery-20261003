@@ -3142,19 +3142,109 @@ class TestPumaServer < PumaTest
     req_ary = send_http_array 5
     req_ary.map { |req| req.read_response }
 
+    # After the change, the new configuration, the currently running thread
+    # count and the number of completed requests are all readable together.
     assert_equal 3, @pool.max
     assert_equal 3, @pool.min
     assert_equal 3, @server.max_threads
     assert_equal 3, @server.min_threads
     assert_equal 3, @pool&.spawned
+    assert_equal 3, @server.running
+    assert_equal 5, @server.requests_count
+    assert_empty @log_writer.stdout.string
   end
 
-  def test_update_thread_pool_min_max_warns_if_min_greater_than_max
+  def test_update_thread_pool_min_max_scale_up_advances_waiting_queue
+    started = Queue.new
+    completed = Queue.new
+    release = Queue.new
+    @app = ->(_env) do
+      started << true
+      release.pop
+      completed << true
+      [200, {}, ['ok']]
+    end
+
+    server_run(min_threads: 1, max_threads: 1, force_shutdown_after: 2)
+
+    # One request occupies the single thread, four more wait for a worker.
+    req_ary = send_http_array 5
+    started.pop
+    Timeout.timeout(2) { sleep 0.01 until release.num_waiting == 1 }
+    assert_equal 1, @pool.spawned
+
+    @server.update_thread_pool_min_max(min: 5, max: 5)
+
+    # Growing the pool spawns the threads needed to process the waiting
+    # requests promptly, without waiting for new work to arrive.
+    4.times { started.pop }
+    Timeout.timeout(2) { sleep 0.01 until release.num_waiting == 5 }
+    assert_equal 5, @pool.spawned
+
+    5.times { release << true }
+    Timeout.timeout(2) { sleep 0.01 until completed.length == 5 }
+    req_ary.map { |req| req.read_response }
+
+    assert_equal 5, @pool.spawned
+    assert_equal 5, @server.running
+    assert_equal 0, @pool.backlog
+    assert_equal 5, @server.requests_count
+  end
+
+  def test_update_thread_pool_min_max_scale_down_finishes_in_flight_requests
+    started = Queue.new
+    completed = Queue.new
+    release = Queue.new
+    @app = ->(_env) do
+      started << true
+      release.pop
+      completed << true
+      [200, {}, ['ok']]
+    end
+
+    server_run(min_threads: 4, max_threads: 4, force_shutdown_after: 2)
+
+    # Occupy three threads; the fourth stays idle.
+    busy = send_http_array 3
+    3.times { started.pop }
+    Timeout.timeout(2) { sleep 0.01 until release.num_waiting == 3 }
+
+    @server.update_thread_pool_min_max(min: 1, max: 1)
+
+    # The idle thread is reclaimed immediately, busy threads are not killed.
+    Timeout.timeout(2) { sleep 0.01 until @pool.spawned == 3 }
+    assert_equal 1, @pool.min
+    assert_equal 1, @pool.max
+    assert_equal 1, @server.min_threads
+    assert_equal 1, @server.max_threads
+    assert_equal 0, completed.length
+
+    # Let the in-flight requests finish; their threads exit once idle because
+    # the new maximum is 1.
+    3.times { release << true }
+    busy.each { |req| req.read_response }
+
+    Timeout.timeout(2) { sleep 0.01 until completed.length == 3 }
+    Timeout.timeout(2) { sleep 0.01 until @pool.spawned == 1 }
+    assert_equal 1, @pool.spawned
+    assert_equal 3, @server.requests_count
+
+    # A later scale-up still works after the pool settled at the lower bound.
+    @server.update_thread_pool_min_max(min: 2, max: 2)
+    assert_equal 2, @pool.min
+    assert_equal 2, @pool.max
+  end
+
+  def test_update_thread_pool_min_max_raises_if_min_greater_than_max
     server_run(min_threads: 1, max_threads: 1, auto_trim_time: 1)
 
-    @server.update_thread_pool_min_max(min: 5, max: 1)
+    error = assert_raises(ArgumentError) do
+      @server.update_thread_pool_min_max(min: 5, max: 1)
+    end
+    assert_match(/min.*cannot be greater than.*max/, error.message)
 
-    assert_equal "`min' value cannot be greater than `max' value.\n", @log_writer.stdout.string
+    # Invalid bounds leave the existing configuration and pool untouched.
+    assert_empty @log_writer.stdout.string
     assert_equal 1, @pool.max
     assert_equal 1, @pool.min
     assert_equal 1, @server.max_threads
@@ -3162,17 +3252,47 @@ class TestPumaServer < PumaTest
     assert_equal 1, @pool&.spawned
   end
 
-  def test_update_thread_pool_min_max_warns_if_min_less_than_zero
+  def test_update_thread_pool_min_max_raises_if_min_less_than_zero
     server_run(min_threads: 1, max_threads: 1, auto_trim_time: 1)
 
-    @server.update_thread_pool_min_max(min: -1, max: 5)
+    error = assert_raises(ArgumentError) do
+      @server.update_thread_pool_min_max(min: -1, max: 5)
+    end
+    assert_match(/min.*cannot be less than 0/, error.message)
 
-    assert_equal "`min' value cannot be less than 0\n", @log_writer.stdout.string
+    assert_empty @log_writer.stdout.string
     assert_equal 1, @pool.max
     assert_equal 1, @pool.min
     assert_equal 1, @server.max_threads
     assert_equal 1, @server.min_threads
     assert_equal 1, @pool&.spawned
+  end
+
+  def test_update_thread_pool_min_max_raises_if_max_less_than_zero
+    server_run(min_threads: 1, max_threads: 1, auto_trim_time: 1)
+
+    error = assert_raises(ArgumentError) do
+      @server.update_thread_pool_min_max(min: 0, max: -1)
+    end
+    assert_match(/max.*cannot be less than 0/, error.message)
+
+    assert_equal 1, @pool.max
+    assert_equal 1, @pool.min
+    assert_equal 1, @pool&.spawned
+  end
+
+  def test_update_thread_pool_min_max_raises_on_non_integer_bounds
+    server_run(min_threads: 1, max_threads: 1)
+
+    assert_raises(ArgumentError) do
+      @server.update_thread_pool_min_max(min: '1', max: 1)
+    end
+    assert_raises(ArgumentError) do
+      @server.update_thread_pool_min_max(min: 1, max: nil)
+    end
+
+    assert_equal 1, @pool.min
+    assert_equal 1, @pool.max
   end
 
   def test_update_thread_pool_min_max_allows_min_zero
@@ -3185,5 +3305,21 @@ class TestPumaServer < PumaTest
     assert_equal 0, @pool.min
     assert_equal 5, @server.max_threads
     assert_equal 0, @server.min_threads
+  end
+
+  def test_update_thread_pool_min_max_defaults_keep_unchanged_bound
+    server_run(min_threads: 2, max_threads: 4)
+
+    @server.update_thread_pool_min_max(max: 3)
+    assert_equal 2, @server.min_threads
+    assert_equal 3, @server.max_threads
+    assert_equal 2, @pool.min
+    assert_equal 3, @pool.max
+
+    @server.update_thread_pool_min_max(min: 1)
+    assert_equal 1, @server.min_threads
+    assert_equal 3, @server.max_threads
+    assert_equal 1, @pool.min
+    assert_equal 3, @pool.max
   end
 end

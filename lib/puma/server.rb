@@ -822,18 +822,25 @@ module Puma
     #
     # This method allows dynamic adjustment of the thread pool size while the server
     # is running. It validates the provided values and updates both the thread pool
-    # and the server's thread configuration.
+    # and the server's thread configuration, then reconciles the running threads:
+    #
+    # * When shrinking, idle threads are reclaimed up to the new bounds; threads
+    #   currently processing requests keep running until their request completes.
+    # * When growing, threads are spawned immediately so that queued requests are
+    #   processed without waiting for new work to arrive.
     #
     # @param min [Integer] The minimum number of threads to maintain in the pool.
-    #   Defaults to the current minimum if not specified. Must be greater than 0
-    #   and less than or equal to max.
+    #   Defaults to the current minimum if not specified. Must be greater than or
+    #   equal to 0 and less than or equal to max.
     # @param max [Integer] The maximum number of threads allowed in the pool.
     #   Defaults to the current maximum if not specified. Must be greater than or
     #   equal to min.
     #
     # @return [void]
     #
-    # @note If validation fails, a warning message is logged and no changes are made.
+    # @raise [ArgumentError] If +min+ or +max+ is not an Integer, is negative,
+    #   or +min+ is greater than +max+. When raised, no configuration is
+    #   changed and the running pool is left untouched.
     #
     # @example Update both min and max threads
     #   server.update_thread_pool_min_max(min: 2, max: 8)
@@ -845,19 +852,31 @@ module Puma
     #   server.update_thread_pool_min_max(max: 16)
     #
     def update_thread_pool_min_max(min: @min_threads, max: @max_threads)
-      if min > max
-        @log_writer.log "`min' value cannot be greater than `max' value."
-        return
+      unless min.is_a?(Integer)
+        raise ArgumentError, "invalid value for thread pool minimum: #{min.inspect}"
+      end
+      unless max.is_a?(Integer)
+        raise ArgumentError, "invalid value for thread pool maximum: #{max.inspect}"
       end
 
       if min < 0
-        @log_writer.log "`min' value cannot be less than 0"
-        return
+        raise ArgumentError, "`min' value cannot be less than 0, got #{min}"
       end
 
-      @thread_pool&.with_mutex do
+      if max < 0
+        raise ArgumentError, "`max' value cannot be less than 0, got #{max}"
+      end
+
+      if min > max
+        raise ArgumentError,
+          "`min' value (#{min}) cannot be greater than `max' value (#{max})"
+      end
+
+      if @thread_pool
         @thread_pool.min, @thread_pool.max = min, max
         @min_threads, @max_threads = min, max
+        # Reconcile spawned threads with the new bounds under the pool mutex.
+        @thread_pool.adjust_thread_count
       end
     end
 

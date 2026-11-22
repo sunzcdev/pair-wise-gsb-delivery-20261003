@@ -504,4 +504,147 @@ class TestThreadPool < PumaTest
     mutex.unlock if mutex.owned?
     pool.shutdown(1)
   end
+
+  def test_adjust_thread_count_shrinks_idle_threads_to_new_max
+    mutex = Mutex.new
+    mutex.lock
+    started = Queue.new
+    pool = new_pool(2, 4) do
+      started << true
+      mutex.synchronize { }
+    end
+
+    # Two threads exist at the min; two more spawn for the extra work items.
+    4.times { pool << 1 }
+    4.times { started.pop }
+    assert_equal 4, pool.spawned
+
+    mutex.unlock
+    Timeout.timeout(1) { sleep 0.01 until pool.waiting == 4 }
+
+    pool.min = 1
+    pool.max = 2
+    pool.adjust_thread_count
+
+    Timeout.timeout(1) { sleep 0.01 until pool.spawned == 2 }
+    assert_equal 2, pool.spawned
+    assert_equal 0, pool.trim_requested
+  ensure
+    mutex.unlock if mutex.owned?
+  end
+
+  def test_adjust_thread_count_respects_new_min_when_shrinking
+    mutex = Mutex.new
+    mutex.lock
+    started = Queue.new
+    pool = new_pool(3, 5) do
+      started << true
+      mutex.synchronize { }
+    end
+
+    5.times { pool << 1 }
+    5.times { started.pop }
+    assert_equal 5, pool.spawned
+
+    mutex.unlock
+    Timeout.timeout(1) { sleep 0.01 until pool.waiting == 5 }
+
+    pool.min = 3
+    pool.max = 3
+    pool.adjust_thread_count
+
+    Timeout.timeout(1) { sleep 0.01 until pool.spawned == 3 }
+    assert_equal 3, pool.spawned
+  ensure
+    mutex.unlock if mutex.owned?
+  end
+
+  def test_adjust_thread_count_keeps_busy_threads_until_work_completes
+    mutex = Mutex.new
+    mutex.lock
+    started = Queue.new
+    pool = new_pool(2, 4) do
+      started << true
+      mutex.synchronize { }
+    end
+
+    4.times { pool << 1 }
+    4.times { started.pop }
+    assert_equal 4, pool.spawned
+
+    pool.min = 1
+    pool.max = 1
+    pool.adjust_thread_count
+
+    # No idle threads exist, so trim requests wait until work completes.
+    sleep 0.1
+    assert_equal 4, pool.spawned
+
+    mutex.unlock
+    Timeout.timeout(1) { sleep 0.01 until pool.spawned == 1 }
+    assert_equal 1, pool.spawned
+  ensure
+    mutex.unlock if mutex.owned?
+  end
+
+  def test_adjust_thread_count_grows_to_drain_queued_work
+    mutex = Mutex.new
+    mutex.lock
+    started = Queue.new
+    pool = new_pool(1, 1) do
+      started << true
+      mutex.synchronize { }
+    end
+
+    4.times { pool << Object.new }
+    started.pop
+    assert_equal 1, pool.spawned
+    assert_equal 3, pool.backlog
+
+    pool.min = 1
+    pool.max = 4
+    pool.adjust_thread_count
+
+    # The three queued items each get their newly spawned thread immediately.
+    3.times { started.pop }
+    assert_equal 4, pool.spawned
+    assert_equal 0, pool.backlog
+  ensure
+    mutex.unlock if mutex.owned?
+  end
+
+  def test_adjust_thread_count_does_not_spawn_when_idle
+    pool = new_pool(1, 1)
+    assert_equal 1, pool.spawned
+
+    pool.min = 3
+    pool.max = 5
+    pool.adjust_thread_count
+
+    sleep 0.05
+    assert_equal 1, pool.spawned
+  end
+
+  def test_adjust_thread_count_caps_growth_at_new_max
+    mutex = Mutex.new
+    mutex.lock
+    started = Queue.new
+    pool = new_pool(1, 1) do
+      started << true
+      mutex.synchronize { }
+    end
+
+    10.times { pool << Object.new }
+    started.pop
+    assert_equal 1, pool.spawned
+
+    pool.max = 3
+    pool.adjust_thread_count
+
+    2.times { started.pop }
+    assert_equal 3, pool.spawned
+    assert_equal 7, pool.backlog
+  ensure
+    mutex.unlock if mutex.owned?
+  end
 end
