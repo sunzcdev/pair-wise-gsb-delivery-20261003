@@ -156,14 +156,28 @@ module Puma
       # Close the connection after a reasonable number of inline requests
       force_keep_alive = @enable_keep_alives && client.requests_served < @max_keep_alive
 
-      resp_info = str_headers(env, status, headers, res_body, io_buffer, force_keep_alive)
+      # A body that responds to both `each` and `call` can be rendered two
+      # ways.  When this server supports streaming bodies, it is consumed via
+      # `body.call(stream)`; otherwise it is enumerated via `each`.  The
+      # decision is made here, before any response headers are sent, so
+      # headers and body termination stay consistent (Content-Length,
+      # chunked, or connection close).  Bodies that only respond to `call`
+      # keep the historical hijack behavior (they are handed the raw
+      # socket), and 101 responses always use the hijack logic.
+      streaming_capable = streaming_body_supported? && status != 101 &&
+        res_body.respond_to?(:call) && res_body.respond_to?(:each)
+
+      resp_info = str_headers(env, status, headers, res_body, io_buffer, force_keep_alive, streaming_capable)
 
       close_body = false
       response_hijack = nil
+      streaming = streaming_capable && !resp_info[:response_hijack]
       content_length = resp_info[:content_length]
       keep_alive     = resp_info[:keep_alive]
 
-      if res_body.respond_to?(:each) && !resp_info[:response_hijack]
+      if streaming
+        body = res_body
+      elsif res_body.respond_to?(:each) && !resp_info[:response_hijack]
         # below converts app_body into body, dependent on app_body's characteristics, and
         # content_length will be set if it can be determined
         if !content_length && !resp_info[:transfer_encoding] && status != 204 && status != 304
@@ -244,6 +258,18 @@ module Puma
         uncork_socket socket.flush
         response_hijack.call socket
         return :async
+      end
+
+      if streaming
+        stream = StreamIO.new(io_buffer, chunked) { |str| fast_write_str socket, str }
+        begin
+          body.call stream
+        ensure
+          stream.close
+        end
+        socket.flush
+        uncork_socket socket
+        return !shutting_down? && keep_alive ? :keep_alive : :close
       end
 
       fast_write_response socket, body, io_buffer, chunked, content_length.to_i
@@ -387,6 +413,88 @@ module Puma
 
     private :fast_write_str, :fast_write_response
 
+    # Whether this server supports streaming response bodies, i.e. bodies
+    # that respond to `call` and are invoked with a writable stream instead
+    # of being enumerated via `each`.
+    # @return [Boolean]
+    #
+    def streaming_body_supported?
+      @streaming_body
+    end
+    private :streaming_body_supported?
+
+    # The stream object passed to streaming bodies via `body.call(stream)`.
+    # Wraps the client socket: the response headers (already assembled in
+    # `io_buffer`) are written before the first body bytes.  When `chunked`
+    # is true, every `write` is framed as one HTTP chunk and `close`
+    # terminates the body with the last-chunk marker; otherwise bytes are
+    # written as-is and the body is terminated by closing the connection.
+    # The socket itself is owned by the server and is never closed here.
+    class StreamIO # :nodoc:
+      def initialize(io_buffer, chunked, &writer)
+        @io_buffer = io_buffer
+        @chunked = chunked
+        @writer = writer
+        @headers_sent = false
+        @closed = false
+      end
+
+      # Writes `str` to the socket, framing it as a single chunk when the
+      # response is chunked.  Returns the number of bytes written.
+      def write(str)
+        raise IOError, 'closed stream' if @closed
+        str = str.to_s
+        send_headers
+        byte_size = str.bytesize
+        unless byte_size.zero? # a zero-length chunk would end a chunked body
+          if @chunked
+            @writer.call "#{byte_size.to_s(16)}\r\n#{str}\r\n"
+          else
+            @writer.call str
+          end
+        end
+        byte_size
+      end
+
+      def <<(str)
+        write str
+        self
+      end
+
+      # Compatibility with the raw socket that was previously handed to
+      # callable bodies.
+      def syswrite(str)
+        write str
+      end
+
+      def flush
+        send_headers
+        true
+      end
+
+      # Idempotent.  Sends the headers if the body was empty, and terminates
+      # a chunked body.  Does not close the socket.
+      def close
+        return if @closed
+        @closed = true
+        send_headers
+        @writer.call Const::CLOSE_CHUNKED if @chunked
+        nil
+      end
+
+      def closed?
+        @closed
+      end
+
+      private
+
+      def send_headers
+        return if @headers_sent
+        @headers_sent = true
+        @writer.call @io_buffer.read_and_reset
+      end
+    end
+
     # @param header_key [#to_s]
     # @return [Boolean]
     #
@@ -447,10 +555,13 @@ module Puma
     # @param io_buffer [Puma::IOBuffer] modified inn place
     # @param force_keep_alive [Boolean] 'anded' with keep_alive, based on system
     #   status and `@max_keep_alive`
+    # @param streaming_body [Boolean] body will be consumed via `call`, used to
+    #   force connection close when the body length is unknown and chunking is
+    #   not available
     # @return [Hash] resp_info
     # @version 5.0.3
     #
-    def str_headers(env, status, headers, res_body, io_buffer, force_keep_alive)
+    def str_headers(env, status, headers, res_body, io_buffer, force_keep_alive, streaming_body = false)
 
       line_ending = LINE_END
       colon = COLON
@@ -535,6 +646,13 @@ module Puma
         else
           io_buffer.append key, colon, line_ending
         end
+      end
+
+      # A streaming body (consumed via `call`) with an unknown length and no
+      # chunking available can only be terminated by closing the connection.
+      if streaming_body && !resp_info[:no_body] && !resp_info[:response_hijack] &&
+          !resp_info[:content_length] && !resp_info[:allow_chunked]
+        resp_info[:keep_alive] = false
       end
 
       # HTTP/1.1 & 1.0 assume different defaults:

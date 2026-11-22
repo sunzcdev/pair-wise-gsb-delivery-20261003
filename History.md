@@ -1,3 +1,8 @@
+## master
+
+* Features
+  * Support streaming response bodies: a body responding to both `each` and `call` is rendered via `body.call(stream)` when the server supports it (the `streaming_body` option, default `true`). The interface is chosen before response headers are sent, so Content-Length, chunked framing, and body termination stay consistent. Bodies that only respond to `call` keep the historical hijack behavior.
+
 ## 8.1.2 / 2026-11-17
 
 * Security

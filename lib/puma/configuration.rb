@@ -171,6 +171,7 @@ module Puma
       remote_address: :socket,
       silence_fork_callback_warning: false,
       silence_single_worker_warning: false,
+      streaming_body: true,
       tag: File.basename(Dir.getwd),
       tcp_host: '::'.freeze,
       tcp_port: 9292,

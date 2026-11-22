@@ -1606,6 +1606,22 @@ module Puma
       @options[:enable_keep_alives] = enabled
     end
 
+    # When +true+, a response body that responds to +call+ is treated as a
+    # streaming body: it is invoked with a writable stream instead of being
+    # enumerated via +each+.  When a body implements both interfaces, this
+    # setting determines which one is used.  The decision is made before
+    # response headers are sent, so headers and body termination stay
+    # consistent (Content-Length, chunked, or connection close).
+    #
+    # The default is +true+.
+    #
+    # @example
+    #   streaming_body false
+    #
+    def streaming_body(enabled=true)
+      @options[:streaming_body] = enabled
+    end
+
     # When +false+, request headers with underscores in their names are discarded.
     # When such headers are present, their names are exposed in
     # +env["puma.underscore_headers"]+ for auditing. This value is

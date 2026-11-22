@@ -111,6 +111,7 @@ module Puma
       @http_content_length_limit = @options[:http_content_length_limit]
       @continue_callback         = @options[:continue_callback]
       @allow_underscore_headers  = @options.fetch(:allow_underscore_headers, true)
+      @streaming_body            = @options.fetch(:streaming_body, true)
       @cluster_accept_loop_delay = ClusterAcceptLoopDelay.new(
         workers: @options[:workers],
         max_delay: @options[:wait_for_less_busy_worker] || 0 # Real default is in Configuration::DEFAULTS, this is for unit testing
