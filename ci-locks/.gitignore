@@ -1,0 +1,4 @@
+# Transient outputs from manual end-to-end checks; the wheelhouse and lock
+# files are the committed, reproducible artifacts.
+downloaded/
+host-report.json

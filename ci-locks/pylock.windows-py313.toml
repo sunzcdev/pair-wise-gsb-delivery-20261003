@@ -1,0 +1,59 @@
+lock-version = "1.0"
+environments = [
+    "sys_platform == \"win32\" and python_version == \"3.13\"",
+]
+requires-python = "<3.14,>=3.13"
+created-by = "pip"
+
+[[packages]]
+name = "directref"
+
+[packages.archive]
+path = "wheelhouse/directref-3.1.0-py3-none-any.whl"
+
+[packages.archive.hashes]
+sha256 = "fba4c003ce8f6a696e559ed3c38b89b5b086916bc67df20dc504b0ed98292c8f"
+
+[[packages]]
+name = "nativepkg"
+version = "2.0"
+
+[[packages.wheels]]
+name = "nativepkg-2.0-cp313-cp313-win_amd64.whl"
+path = "wheelhouse/nativepkg-2.0-cp313-cp313-win_amd64.whl"
+
+[packages.wheels.hashes]
+sha256 = "930b937a570348dbf8fb71edd3f7a0cb720904c095722622cc8ab9339aefc955"
+
+[[packages]]
+name = "osutil"
+version = "1.0"
+
+[[packages.wheels]]
+name = "osutil-1.0-py3-none-win_amd64.whl"
+path = "wheelhouse/osutil-1.0-py3-none-win_amd64.whl"
+
+[packages.wheels.hashes]
+sha256 = "9463b4d4c42054a52ecdf1461e625b5786132f05c354b01cd5bb8ee996e58553"
+
+[[packages]]
+name = "pylib"
+version = "1.0"
+
+[[packages.wheels]]
+name = "pylib-1.0-cp313-none-any.whl"
+path = "wheelhouse/pylib-1.0-cp313-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "34ade772f02453f63efc5bcee48371feac1af0c6222cca7ab1533ea43d8c6cec"
+
+[[packages]]
+name = "sharedlib"
+version = "1.4.0"
+
+[[packages.wheels]]
+name = "sharedlib-1.4.0-py3-none-any.whl"
+path = "wheelhouse/sharedlib-1.4.0-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "56a4f210b88d6cc1fd978beb342096544e787c84b26e6ec51738662146815149"
