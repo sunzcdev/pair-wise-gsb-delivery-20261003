@@ -196,4 +196,155 @@ describe "class_matchers plugin" do
     app.freeze
     app.opts[:class_matchers].frozen?.must_equal true
   end
+
+  it "restores remaining path and captures on conversion failure, identically in normal and optimized matching modes" do
+    ident = Class.new
+    pair = Class.new
+    seg = Class.new
+
+    build = lambda do
+      Class.new(Roda) do
+        plugin :class_matchers
+
+        # String-based matcher (_consume_segment): convert first segment to
+        # internal identifier, reject values not matching the ID format.
+        class_matcher(ident, String){|s| s if s =~ /\AID-\d+\z/}
+        # Regexp-based matcher (consume): reject during block processing.
+        class_matcher(pair, /(\w+)=(\w+)/){|k, v| [k, v] unless k == 'bad'}
+        # segment: true matcher (_consume_single_segment): reject one value.
+        class_matcher(seg, /S-\d+/, segment: true){|s| s unless s == 'S-000'}
+
+        route do |r|
+          r.on 'api' do
+            r.on ident do |id|
+              "ident:#{id}"
+            end
+            r.on pair do |k, v|
+              "pair:#{k}:#{v}"
+            end
+            r.on seg do |s|
+              "seg:#{s}"
+            end
+            r.on String do |s|
+              "fallback:#{s}"
+            end
+            "none"
+          end
+
+          r.on 'multi' do
+            r.on ident, 'tail' do |id|
+              "multi-ident:#{id}"
+            end
+            r.on String do |s|
+              "multi-fallback:#{s}"
+            end
+            "multi-none"
+          end
+
+          # Directly probe state restoration on conversion failure.
+          r.on 'probe' do
+            before_rp = r.remaining_path
+            before_cap = r.captures.dup
+            matched = r.send(:"_match_class_#{ident}")
+            "probe:matched=#{matched ? 'y' : 'n'}:rp=#{r.remaining_path == before_rp}:cap=#{r.captures == before_cap}"
+          end
+
+          # Same probe, but with a capture already present before the call.
+          r.on 'nested', String do |s0|
+            before_rp = r.remaining_path
+            before_cap = r.captures.dup
+            matched = r.send(:"_match_class_#{ident}")
+            "nested:#{s0}:matched=#{matched ? 'y' : 'n'}:rp=#{r.remaining_path == before_rp}:cap=#{r.captures == before_cap}"
+          end
+        end
+      end
+    end
+
+    normal_app = build.call
+    optimized_app = build.call.freeze
+
+    # Sanity check: the two apps really use different matching implementations.
+    normal_app::RodaRequest.instance_method(:on).owner.must_equal Roda::RodaPlugins::Base::RequestMethods
+    optimized_app::RodaRequest.instance_method(:on).owner.must_equal Roda::RodaPlugins::OptimizedMatching::RequestMethods
+
+    expectations = {
+      # Conversion succeeds, first branch is hit.
+      '/api/ID-1' => 'ident:ID-1',
+      # String segment matches but conversion fails -> fallback branch hit.
+      '/api/ID-x' => 'fallback:ID-x',
+      '/api/k=v' => 'pair:k:v',
+      # Regexp matches but conversion block rejects -> fallback branch hit.
+      '/api/bad=v' => 'fallback:bad=v',
+      '/api/S-123' => 'seg:S-123',
+      # segment: true regexp matches but conversion rejects -> fallback branch hit.
+      '/api/S-000' => 'fallback:S-000',
+      '/api/other' => 'fallback:other',
+      # Conversion succeeds but a later matcher fails -> path restored, next branch hit.
+      '/multi/ID-2/tail' => 'multi-ident:ID-2',
+      '/multi/ID-2/other' => 'multi-fallback:ID-2',
+      '/multi/nope/tail' => 'multi-fallback:nope',
+      # Probes: on conversion failure remaining_path and captures are untouched.
+      '/probe/bad' => 'probe:matched=n:rp=true:cap=true',
+      '/probe/ID-9' => 'probe:matched=y:rp=false:cap=false',
+      '/nested/x/bad' => 'nested:x:matched=n:rp=true:cap=true',
+      '/nested/x/ID-9' => 'nested:x:matched=y:rp=false:cap=false',
+    }
+
+    [normal_app, optimized_app].each do |a|
+      @app = a
+      expectations.each do |path, expected|
+        body(path).must_equal expected
+      end
+    end
+  end
+
+  it "lets a subclass override a class matcher with its own capture convention without affecting the frozen parent" do
+    token = Class.new
+
+    parent = Class.new(Roda) do
+      plugin :class_matchers
+      class_matcher(token, String){|s| "P-#{s}" unless s == 'skip'}
+      route do |r|
+        r.on token do |*a|
+          "parent-hit:#{a.join('|')}"
+        end
+        r.on String do |s|
+          "parent-fallback:#{s}"
+        end
+        "parent-none"
+      end
+    end
+
+    child = Class.new(parent) do
+      class_matcher(token, /(\w+)-(\w+)/){|x, y| [x.upcase, y.upcase]}
+      route do |r|
+        r.on token do |*a|
+          "child-hit:#{a.join('|')}"
+        end
+        r.on String do |s|
+          "child-fallback:#{s}"
+        end
+        "child-none"
+      end
+    end
+
+    parent.freeze
+    child.freeze
+
+    # Each class has its own class_matchers hash and its own entry for token.
+    parent.class_matchers.frozen?.must_equal true
+    child.class_matchers.frozen?.must_equal true
+    parent.class_matchers.wont_be_same_as child.class_matchers
+    parent.class_matchers[token].wont_be_same_as child.class_matchers[token]
+
+    # Parent keeps its own capture convention (single converted value).
+    @app = parent
+    body('/a-b').must_equal 'parent-hit:P-a-b'
+    body('/skip').must_equal 'parent-fallback:skip'
+
+    # Subclass follows its own capture convention (two captures from regexp).
+    @app = child
+    body('/a-b').must_equal 'child-hit:A|B'
+    body('/plain').must_equal 'child-fallback:plain'
+  end
 end
