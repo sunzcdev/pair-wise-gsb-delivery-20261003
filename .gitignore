@@ -23,6 +23,16 @@
 # Ignore all tempfiles
 /tmp
 
+# Lock files created by safe (concurrent) cassette writes
+*.yml.lock
+*.yaml.lock
+*.json.lock
+
+# Interactions rejected by safe cassette writes
+*.rejected-*.yml
+*.rejected-*.yaml
+*.rejected-*.json
+
 # Ignore documentation cache and generated files
 /.yardoc/
 /_yardoc/

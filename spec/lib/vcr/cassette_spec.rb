@@ -528,6 +528,132 @@ RSpec.describe VCR::Cassette do
       cassette.eject
     end
 
+    describe 'safe_write option' do
+      it 'is accepted as a cassette option and exposed on the cassette' do
+        cassette = VCR::Cassette.new('safe', safe_write: true)
+        expect(cassette.safe_write).to be(true)
+      end
+
+      it 'defaults to false so single-process recording uses the plain overwrite' do
+        cassette = VCR::Cassette.new('plain')
+        expect(cassette.safe_write).to be_nil
+      end
+
+      it 'records and ejects exactly like a normal single-process run when enabled' do
+        cassette = VCR::Cassette.new(:safe_eject_test, safe_write: true)
+        cassette.record_http_interaction http_interaction
+
+        expect { cassette.eject }.to change { ::File.exist?(cassette.file) }.from(false).to(true)
+        saved = YAML.load_file(cassette.file)
+        expect(saved['http_interactions'].size).to eq(1)
+        expect(Dir.glob(File.join(File.dirname(cassette.file), '*.tmp'))).to be_empty
+      end
+
+      it 'does not write anything when no interactions were recorded' do
+        cassette = VCR::Cassette.new(:safe_empty, safe_write: true)
+        expect { cassette.eject }.not_to change { ::File.exist?(cassette.file) }.from(false)
+      end
+
+      it 'routes the save through the persister safe_write entry point' do
+        VCR.configuration.cassette_library_dir = nil
+        persister = double('safe persister', :[] => nil)
+        VCR.cassette_persisters[:safe] = persister
+        cassette = VCR.insert_cassette('foo', persist_with: :safe, safe_write: true)
+        cassette.record_http_interaction http_interaction
+
+        expect(persister).to receive(:safe_write).with(
+          'foo.yml',
+          hash_including(
+            request_matchers: [:method, :uri],
+            incoming_interactions: cassette.new_recorded_interactions
+          )
+        )
+
+        cassette.eject
+      end
+
+      it 'raises NotImplementedError when the persister has no safe_write entry point' do
+        VCR.configuration.cassette_library_dir = nil
+        VCR.cassette_persisters[:unsafe] = double('plain persister', :[] => nil, :[]= => nil)
+        cassette = VCR.insert_cassette('foo', persist_with: :unsafe, safe_write: true)
+        cassette.record_http_interaction http_interaction
+
+        expect { cassette.eject }.to raise_error(NotImplementedError, /does not support safe saves/)
+      end
+
+      it 'surfaces a CassetteWriteConflictError from the safe writer instead of overwriting' do
+        cassette = VCR::Cassette.new(:safe_conflict, safe_write: true)
+        cassette.record_http_interaction http_interaction
+
+        allow(VCR::Cassette::Persisters::FileSystem).to receive(:safe_write)
+          .and_raise(VCR::Errors::CassetteWriteConflictError.new(
+                       cassette_file: cassette.file,
+                       rejected_interactions_file: cassette.file + '.rejected',
+                       conflicts: []
+                     ))
+
+        expect { cassette.eject }.to raise_error(VCR::Errors::CassetteWriteConflictError)
+      end
+
+      def safe_interaction(uri, body)
+        request = VCR::Request.new(:get, uri, '', {})
+        response = VCR::Response.new(
+          VCR::ResponseStatus.new(200, 'OK'),
+          { 'Content-Length' => [body.bytesize.to_s] }, body, '1.1'
+        )
+        VCR::HTTPInteraction.new(request, response)
+      end
+
+      it 'merges two split recordings started from the same cassette version' do
+        name = :safe_split_merge
+
+        first = VCR::Cassette.new(name, record: :new_episodes, safe_write: true)
+        first.record_http_interaction(safe_interaction('http://example.com/a', 'AAA'))
+        first.eject
+
+        # The second writer started from the same (empty) base as the first.
+        second = VCR::Cassette.new(name, record: :new_episodes, safe_write: true)
+        second.record_http_interaction(safe_interaction('http://example.com/b', 'BBB'))
+        second.eject
+
+        uris = YAML.load_file(second.file)['http_interactions'].map { |h| h['request']['uri'] }
+        expect(uris.sort).to eq(['http://example.com/a', 'http://example.com/b'])
+      end
+
+      it 'keeps the first finished cassette and rejects the clashing response with diagnostics' do
+        name = :safe_split_conflict
+        base = [safe_interaction('http://example.com/base', 'BASE')]
+        cassette_file = VCR::Cassette::Persisters::FileSystem.absolute_path_to_file("#{name}.yml")
+        File.binwrite(
+          cassette_file,
+          VCR.cassette_serializers[:yaml].serialize(
+            'http_interactions' => base.map(&:to_hash),
+            'recorded_with' => "VCR #{VCR.version}"
+          )
+        )
+        base_bytes = File.binread(cassette_file)
+
+        # Both split writers started from the same base revision.
+        first = VCR::Cassette.new(name, record: :new_episodes, safe_write: true)
+        first.record_http_interaction(safe_interaction('http://example.com/s', 'FIRST'))
+        allow(first).to receive(:base_cassette_bytes).and_return(base_bytes)
+        first.eject
+        first_bytes = File.binread(cassette_file)
+
+        second = VCR::Cassette.new(name, record: :new_episodes, safe_write: true)
+        second.record_http_interaction(safe_interaction('http://example.com/s', 'SECOND'))
+        allow(second).to receive(:base_cassette_bytes).and_return(base_bytes)
+
+        expect { second.eject }.to raise_error(VCR::Errors::CassetteWriteConflictError) do |error|
+          expect(error.cassette_file).to eq(first.file)
+          expect(File).to exist(error.rejected_interactions_file)
+          rejected = YAML.load_file(error.rejected_interactions_file)
+          expect(rejected['http_interactions'].first['response']['body']['string']).to eq('SECOND')
+        end
+        expect(File.binread(first.file)).to eq(first_bytes)
+      end
+    end
+
     it 'stores the cassette content using the configured persister' do
       VCR.configuration.cassette_library_dir = nil
       VCR.cassette_persisters[:foo] = custom_persister

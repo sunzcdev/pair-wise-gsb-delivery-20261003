@@ -31,6 +31,60 @@ module VCR
     # Error raised when a VCR 1.x cassette is used with VCR 2.
     class InvalidCassetteFormatError < Error; end
 
+    # Error raised by an explicit safe save when another writer has landed
+    # a different response for the same request since the cassette was read.
+    #
+    # The cassette that finished first is left untouched on disk and the
+    # interactions that lost the race are written next to it for inspection.
+    #
+    # @see VCR::Cassette::Persisters::FileSystem.safe_write
+    class CassetteWriteConflictError < Error
+      # @return [String] the cassette file that kept the first writer's content
+      attr_reader :cassette_file
+
+      # @return [String] the file containing the interactions that were rejected
+      attr_reader :rejected_interactions_file
+
+      # @return [Array<Hash>] structured details about every conflicting request
+      attr_reader :conflicts
+
+      # Constructs the error.
+      #
+      # @param [String] cassette_file the cassette that won the write race
+      # @param [String] rejected_interactions_file where the losing interactions were written
+      # @param [Array<Hash>] conflicts details of the clashing interactions
+      def initialize(cassette_file:, rejected_interactions_file:, conflicts:)
+        @cassette_file = cassette_file
+        @rejected_interactions_file = rejected_interactions_file
+        @conflicts = conflicts
+        super(construct_message)
+      end
+
+    private
+
+      def construct_message
+        lines = [
+          "VCR refused to overwrite '#{cassette_file}' because another process " \
+          "recorded a different response for the same request(s).",
+          "The cassette that finished first was kept as-is. The rejected " \
+          "interaction(s) were written to '#{rejected_interactions_file}'.",
+          "",
+          "#{conflicts.size} conflicting request(s):"
+        ]
+
+        conflicts.each do |conflict|
+          lines << "  - #{conflict[:request_summary]}"
+          lines << "      kept response:     #{conflict[:kept_response_summary]}"
+          lines << "      rejected response: #{conflict[:rejected_response_summary]}"
+        end
+
+        lines << ""
+        lines << "Inspect the rejected interactions, then either delete the " \
+                 "rejected file or manually merge the responses you want to keep."
+        lines.join("\n")
+      end
+    end
+
     # Error raised when an `around_http_request` hook is used improperly.
     # @see VCR::Configuration#around_http_request
     class AroundHTTPRequestHookError < Error; end

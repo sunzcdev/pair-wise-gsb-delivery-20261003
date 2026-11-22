@@ -15,6 +15,7 @@
     - [Naming](/cassettes/naming.md)
     - [No cassette](/cassettes/no_cassette.md)
     - [Recompress](/cassettes/recompress.md)
+    - [Safe write](/cassettes/safe_write.md)
     - [Update content length header](/cassettes/update_content_length_header.md)
   - Configuration
     - [Allow http connections when no cassette](/configuration/allow_http_connections_when_no_cassette.md)

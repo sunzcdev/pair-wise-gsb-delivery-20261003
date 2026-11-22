@@ -108,6 +108,15 @@ module VCR
   # @option options :persist_with [Symbol] Which cassette persister to
   #  use. Defaults to :file_system. You can also register and use a
   #  custom persister.
+  # @option options :safe_write [Boolean] When true, the cassette is saved
+  #  through the explicit, concurrency-aware safe-save entry point instead of
+  #  a plain overwrite. VCR re-reads the cassette under a file lock and merges
+  #  interactions another writer committed in the meantime; if two writers
+  #  recorded different responses for the same request it raises a
+  #  {VCR::Errors::CassetteWriteConflictError}, keeps the first-finished
+  #  cassette and writes the rejected interactions to a `*.rejected-*` file.
+  #  Only supported by the built-in :file_system persister. Defaults to false,
+  #  so ordinary single-process recording is unchanged.
   # @option options :persister_options [Hash] Pass options to the
   #  persister specified in `persist_with`. Currently available options for the file_system persister:
   #    - `:downcase_cassette_names`: when `true`, names of cassettes will be

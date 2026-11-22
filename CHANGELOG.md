@@ -3,6 +3,7 @@ Changelog
 
 ## Unreleased
 
+- [new] Add an explicit `safe_write: true` cassette option and `VCR::Cassette::Persisters::FileSystem.safe_write` entry point for split recording tasks. Saves re-read the cassette under a file lock, three-way merge interactions landed by another writer, and raise a `VCR::Errors::CassetteWriteConflictError` (keeping the first-finished cassette plus a `*.rejected-*` diagnostics file) when two writers recorded different responses for the same request.
 - [fix] `uri_without_params` ignores percent-encoded query params given by their decoded name, e.g. `uri_without_params('date[gte]')` now ignores `date%5Bgte%5D` (#633)
 - [fix] Leave the Content-Length header of HEAD and 304 responses untouched when `update_content_length_header` is enabled (#779)
 

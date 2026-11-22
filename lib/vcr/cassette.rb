@@ -49,6 +49,10 @@ module VCR
     # @return [Boolean] Should unused requests be dropped from the cassette?
     attr_reader :drop_unused_requests
 
+    # @return [Boolean] Should the cassette be saved through the explicit,
+    #  concurrency-aware safe-save entry point instead of a plain overwrite?
+    attr_reader :safe_write
+
     # @return [Array<Symbol>] If set, {VCR::Configuration#before_record} and
     #  {VCR::Configuration#before_playback} hooks with a corresponding tag will apply.
     attr_reader :tags
@@ -187,7 +191,7 @@ module VCR
         :update_content_length_header, :allow_playback_repeats, :allow_unused_http_interactions,
         :exclusive, :serialize_with, :preserve_exact_body_bytes, :decode_compressed_response,
         :recompress_response, :persist_with, :persister_options, :clean_outdated_http_interactions,
-        :drop_unused_requests
+        :drop_unused_requests, :safe_write
       ]
 
       if invalid_options.size > 0
@@ -197,7 +201,8 @@ module VCR
 
     def extract_options
       [:record_on_error, :erb, :match_requests_on, :re_record_interval, :clean_outdated_http_interactions,
-       :allow_playback_repeats, :allow_unused_http_interactions, :exclusive, :drop_unused_requests].each do |name|
+       :allow_playback_repeats, :allow_unused_http_interactions, :exclusive, :drop_unused_requests,
+       :safe_write].each do |name|
         instance_variable_set("@#{name}", @options[name])
       end
 
@@ -283,6 +288,13 @@ module VCR
       @raw_cassette_bytes ||= VCR::Cassette::ERBRenderer.new(@persister[storage_key], erb, name).render
     end
 
+    # The raw bytes the persister returned when this cassette was loaded,
+    # before any rendering or deserialization. Safe saves treat this as the
+    # base revision they started from.
+    def base_cassette_bytes
+      @base_cassette_bytes ||= @persister[storage_key]
+    end
+
     def merged_interactions
       old_interactions = previously_recorded_interactions
 
@@ -318,7 +330,30 @@ module VCR
       hash = serializable_hash
       return if hash["http_interactions"].none?
 
-      @persister[storage_key] = @serializer.serialize(hash)
+      if safe_write?
+        write_with_safe_save(hash)
+      else
+        @persister[storage_key] = @serializer.serialize(hash)
+      end
+    end
+
+    def safe_write?
+      @safe_write
+    end
+
+    def write_with_safe_save(hash)
+      unless @persister.respond_to?(:safe_write)
+        raise NotImplementedError,
+              "The configured cassette persister does not support safe saves. " \
+              "Only the built-in :file_system persister implements `safe_write`."
+      end
+
+      @persister.safe_write(storage_key,
+                            serializer: @serializer,
+                            incoming_interactions: new_recorded_interactions,
+                            base_bytes: base_cassette_bytes,
+                            request_matchers: match_requests_on,
+                            full_cassette_hash: hash)
     end
 
     def invoke_hook(type, interactions)

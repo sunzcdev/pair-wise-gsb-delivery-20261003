@@ -3,6 +3,7 @@ module VCR
     # Keeps track of the cassette persisters in a hash-like object.
     class Persisters
       autoload :FileSystem, 'vcr/cassette/persisters/file_system'
+      autoload :SafeWriter, 'vcr/cassette/persisters/safe_writer'
 
       # @private
       def initialize

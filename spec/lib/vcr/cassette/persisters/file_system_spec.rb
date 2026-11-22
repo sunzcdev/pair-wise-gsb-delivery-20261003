@@ -44,6 +44,66 @@ module VCR
           end
         end
 
+        describe ".safe_write" do
+          let(:file_name) { 'safe_cassette.yml' }
+          let(:location) { FileSystem.absolute_path_to_file(file_name) }
+          let(:serializer) { VCR.cassette_serializers[:yaml] }
+
+          def interaction(uri, body)
+            request = VCR::Request.new(:get, uri, '', {})
+            response = VCR::Response.new(
+              VCR::ResponseStatus.new(200, 'OK'),
+              { 'Content-Length' => [body.bytesize.to_s] }, body, '1.1'
+            )
+            VCR::HTTPInteraction.new(request, response)
+          end
+
+          def attributes(incoming, base_bytes: nil)
+            base_interactions = base_bytes.to_s.empty? ? [] :
+              serializer.deserialize(base_bytes)['http_interactions'].map { |h| VCR::HTTPInteraction.from_hash(h) }
+            {
+              serializer: serializer,
+              incoming_interactions: incoming,
+              base_bytes: base_bytes,
+              request_matchers: [:method, :uri],
+              full_cassette_hash: {
+                'http_interactions' => (base_interactions + incoming).map(&:to_hash),
+                'recorded_with' => "VCR #{VCR.version}"
+              }
+            }
+          end
+
+          it 'writes the cassette through the SafeWriter when the file does not exist' do
+            FileSystem.safe_write(file_name, attributes([interaction('http://example.com/a', 'AAA')]))
+
+            saved = ::YAML.unsafe_load_file(location)
+            expect(saved['http_interactions'].map { |h| h['request']['uri'] }).to eq(['http://example.com/a'])
+          end
+
+          it 'merges interactions another writer committed in the meantime' do
+            first = [interaction('http://example.com/a', 'AAA')]
+            FileSystem.safe_write(file_name, attributes(first))
+            landed = File.binread(location)
+
+            second = [interaction('http://example.com/b', 'BBB')]
+            FileSystem.safe_write(file_name, attributes(second, base_bytes: nil))
+
+            uris = ::YAML.unsafe_load_file(location)['http_interactions'].map { |h| h['request']['uri'] }
+            expect(uris.sort).to eq(['http://example.com/a', 'http://example.com/b'])
+            expect(landed).not_to eq(File.binread(location))
+          end
+
+          it 'raises a CassetteWriteConflictError and keeps the first response on a clash' do
+            FileSystem.safe_write(file_name, attributes([interaction('http://example.com/s', 'FIRST')]))
+            before = File.binread(location)
+
+            expect {
+              FileSystem.safe_write(file_name, attributes([interaction('http://example.com/s', 'SECOND')]))
+            }.to raise_error(VCR::Errors::CassetteWriteConflictError)
+            expect(File.binread(location)).to eq(before)
+          end
+        end
+
         describe "#absolute_path_to_file" do
           it "returns the absolute path to the given relative file based on the storage location" do
             expected = File.join(FileSystem.storage_location, "bar/bazz.json")
