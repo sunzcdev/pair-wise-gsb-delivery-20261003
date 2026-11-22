@@ -60,6 +60,50 @@ def url_to_path(url: str) -> str:
     return path
 
 
+_VCS_RELATIVE_URL_RE = re.compile(r"^(?P<vcs>[A-Za-z][A-Za-z0-9]*)\+(?P<path>\..*)$")
+
+
+def resolve_relative_path_url(url: str, *, vcs_only: bool = False) -> str:
+    """Resolve a direct reference that uses a relative path.
+
+    Requirements such as ``pkg @ ./dir`` or ``pkg @ git+./repo@rev`` point to
+    a location relative to the current working directory (this is the form
+    emitted by ``pip freeze --workspace``).  Rewrite them to an absolute
+    ``file:`` URL, keeping any VCS prefix, ``@revision`` suffix and
+    ``#fragment`` intact, so that the rest of pip only ever deals with
+    absolute locations.  Anything that is not a relative path reference is
+    returned unchanged.
+
+    :param vcs_only: only resolve VCS-prefixed references (e.g.
+        ``git+./repo``); plain relative paths are left untouched.
+    """
+    url_part, sep, fragment = url.partition("#")
+    prefix = ""
+    path_part = url_part
+    if url_part.startswith("."):
+        if vcs_only:
+            return url
+    else:
+        match = _VCS_RELATIVE_URL_RE.match(url_part)
+        if match is None:
+            return url
+        from pip._internal.vcs import vcs
+
+        vcs_name = match.group("vcs").lower()
+        if vcs_name not in {backend.name for backend in vcs.backends}:
+            return url
+        prefix = match.group("vcs") + "+"
+        path_part = match.group("path")
+    rev = ""
+    if prefix and "@" in path_part:
+        path_part, _, rev_part = path_part.rpartition("@")
+        rev = "@" + rev_part
+    resolved = prefix + path_to_url(path_part) + rev
+    if sep:
+        resolved += sep + fragment
+    return resolved
+
+
 def _convert_extras(extras: str | None) -> set[str]:
     if not extras:
         return set()

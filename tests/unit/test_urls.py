@@ -1,10 +1,15 @@
 import os
 import sys
 import urllib.parse
+from pathlib import Path
 
 import pytest
 
-from pip._internal.utils.urls import path_to_url, url_to_path
+from pip._internal.utils.urls import (
+    path_to_url,
+    resolve_relative_path_url,
+    url_to_path,
+)
 
 
 @pytest.mark.skipif("sys.platform == 'win32'")
@@ -75,3 +80,85 @@ def test_url_to_path_path_to_url_symmetry_win() -> None:
 
     unc_path = r"\\unc\share\path"
     assert url_to_path(path_to_url(unc_path)) == unc_path
+
+
+class TestResolveRelativePathUrl:
+    def test_non_relative_urls_unchanged(self) -> None:
+        for url in (
+            "https://example.com/pkg-1.0.tar.gz",
+            "file:///abs/path/pkg",
+            "git+https://example.com/repo@abc123#egg=pkg",
+            "git+file:///abs/path/repo@abc123",
+            "pkg==1.0",
+        ):
+            assert resolve_relative_path_url(url) == url
+
+    def test_unknown_vcs_prefix_unchanged(self) -> None:
+        assert resolve_relative_path_url("foo+./repo@abc") == "foo+./repo@abc"
+
+    def test_relative_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert resolve_relative_path_url("./pkg") == path_to_url(
+            os.fspath(tmp_path / "pkg")
+        )
+
+    def test_relative_parent_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        subdir = tmp_path / "sub"
+        subdir.mkdir()
+        monkeypatch.chdir(subdir)
+        assert resolve_relative_path_url("../pkg") == path_to_url(
+            os.fspath(tmp_path / "pkg")
+        )
+
+    def test_relative_archive_with_hash_fragment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert resolve_relative_path_url("./dist/pkg-1.0.tar.gz#sha256=abc") == (
+            path_to_url(os.fspath(tmp_path / "dist" / "pkg-1.0.tar.gz"))
+            + "#sha256=abc"
+        )
+
+    def test_vcs_relative_with_rev_and_subdirectory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        resolved = resolve_relative_path_url(
+            "git+./repo@abc123#subdirectory=sub%dir"
+        )
+        assert resolved == (
+            "git+"
+            + path_to_url(os.fspath(tmp_path / "repo"))
+            + "@abc123#subdirectory=sub%dir"
+        )
+
+    def test_vcs_relative_without_rev(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert resolve_relative_path_url("git+../repo") == (
+            "git+" + path_to_url(os.fspath(tmp_path.parent / "repo"))
+        )
+
+    def test_vcs_only_skips_plain_paths(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert resolve_relative_path_url("./pkg", vcs_only=True) == "./pkg"
+        assert resolve_relative_path_url("git+./repo@abc", vcs_only=True) == (
+            "git+" + path_to_url(os.fspath(tmp_path / "repo")) + "@abc"
+        )
+
+    def test_percent_characters_round_trip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        resolved = resolve_relative_path_url("./edit%pkg")
+        assert "%25" in resolved
+        assert url_to_path(resolved) == os.path.join(
+            os.fspath(tmp_path), "edit%pkg"
+        )

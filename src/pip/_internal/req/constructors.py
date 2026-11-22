@@ -37,7 +37,11 @@ from pip._internal.utils.pylock import (
     package_vcs_requirement_url,
     package_wheel_requirement_url,
 )
-from pip._internal.utils.urls import path_to_url, strip_extras
+from pip._internal.utils.urls import (
+    path_to_url,
+    resolve_relative_path_url,
+    strip_extras,
+)
 from pip._internal.vcs import is_url, vcs
 
 __all__ = [
@@ -132,6 +136,10 @@ def parse_editable(editable_req: str) -> tuple[str | None, str, set[str]]:
         package_name, url, extras = _parse_direct_url_editable(editable_req)
     except ValueError:
         package_name, url, extras = _parse_pip_syntax_editable(editable_req)
+
+    # Resolve relative path references (e.g. ``git+./repo@rev``, as emitted
+    # by ``pip freeze --workspace``) against the current working directory.
+    url = resolve_relative_path_url(url)
 
     link = Link(url)
 
@@ -331,6 +339,10 @@ def parse_req_from_line(name: str, line_source: str | None) -> RequirementParts:
     else:
         markers = None
     name = name.strip()
+    # Support VCS URLs with a relative path (e.g. ``git+./repo@rev``), as
+    # emitted by ``pip freeze --workspace``.  Plain relative paths are
+    # handled by the regular path logic below.
+    name = resolve_relative_path_url(name, vcs_only=True)
     req_as_string = None
     path = os.path.normpath(os.path.abspath(name))
     link = None

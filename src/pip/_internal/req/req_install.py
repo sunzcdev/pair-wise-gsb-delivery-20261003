@@ -52,6 +52,7 @@ from pip._internal.utils.packaging import get_requirement, requirement_without_m
 from pip._internal.utils.subprocess import runner_with_spinner_message
 from pip._internal.utils.temp_dir import TempDirectory, TempDirectoryKind
 from pip._internal.utils.unpacking import unpack_file
+from pip._internal.utils.urls import resolve_relative_path_url
 from pip._internal.utils.virtualenv import running_under_virtualenv
 from pip._internal.vcs import vcs
 
@@ -101,8 +102,11 @@ class InstallRequirement:
         # original_link is the direct URL that was provided by the user for the
         # requirement, either directly or via a constraints file.
         if link is None and req and req.url:
-            # PEP 508 URL requirement
-            link = Link(req.url)
+            # PEP 508 URL requirement.  Relative paths (e.g. ``pkg @ ./dir``
+            # or ``pkg @ git+./repo@rev``, as emitted by
+            # ``pip freeze --workspace``) are resolved against the current
+            # working directory.
+            link = Link(resolve_relative_path_url(req.url))
         self.link = self.original_link = link
 
         # The link selected before wheel-cache substitution. Unlike ``link``, this

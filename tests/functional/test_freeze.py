@@ -942,3 +942,89 @@ def test_freeze_rejects_extra_argument(script: PipTestEnvironment) -> None:
     result = script.pip("freeze", "unexpected_arg", expect_error=True)
     assert "ERROR: Too many arguments" in result.stderr
     assert result.returncode != 0
+
+
+@pytest.mark.git
+def test_freeze_workspace_relative_references(script: PipTestEnvironment) -> None:
+    """
+    ``pip freeze --workspace`` rewrites PEP 610 references located under the
+    workspace as relative paths and leaves references outside of it
+    unchanged.
+    """
+    workspace = script.scratch_path / "workspace"
+    workspace.mkdir()
+
+    # Editable install, not version controlled, with a % in the path.
+    editable_pkg = create_test_package(workspace, name="editable_pkg")
+    os.rename(editable_pkg / ".git", editable_pkg / ".bak")
+    percent_pkg = workspace / "edit%pkg"
+    os.rename(editable_pkg, percent_pkg)
+    script.pip("install", "--no-build-isolation", "-e", percent_pkg)
+
+    # Non-editable install from a local directory inside the workspace.
+    dir_pkg = create_test_package(workspace, name="dir_pkg")
+    script.pip("install", "--no-build-isolation", os.fspath(dir_pkg))
+
+    # Install from a local VCS URL inside the workspace.
+    vcs_pkg = create_test_package(workspace, name="vcs_pkg")
+    script.pip(
+        "install", "--no-build-isolation", f"git+{vcs_pkg.as_uri()}#egg=vcs_pkg"
+    )
+
+    # Install from a local directory outside the workspace.
+    outside_pkg = create_test_package(script.scratch_path, name="outside_pkg")
+    script.pip("install", "--no-build-isolation", os.fspath(outside_pkg))
+
+    result = script.pip("freeze", "--workspace", workspace)
+    expected = textwrap.dedent("""\
+    ...dir...pkg @ ./dir_pkg
+    ...# Editable install with no version control (editable...pkg==0.1)
+    -e ./edit%pkg
+    outside...pkg @ file://...
+    vcs...pkg @ git+./vcs_pkg@...
+    """)
+    _check_output(result.stdout, expected)
+
+
+@pytest.mark.git
+def test_freeze_workspace_replay_moved_workspace(
+    script: PipTestEnvironment,
+) -> None:
+    """
+    A freeze generated with --workspace stays valid when the whole workspace
+    is moved: replaying it from the new location installs the packages from
+    there.
+    """
+    workspace = script.scratch_path / "workspace"
+    workspace.mkdir()
+
+    pkg_path = create_test_package(workspace, name="version_pkg")
+    os.rename(pkg_path / ".git", pkg_path / ".bak")
+    script.pip("install", "--no-build-isolation", "-e", pkg_path)
+
+    vcs_pkg = create_test_package(workspace, name="vcs_pkg")
+    script.pip(
+        "install", "--no-build-isolation", f"git+{vcs_pkg.as_uri()}#egg=vcs_pkg"
+    )
+
+    result = script.pip("freeze", "--workspace", workspace)
+    assert "-e ./version_pkg" in result.stdout
+    assert "vcs_pkg @ git+./vcs_pkg@" in result.stdout
+
+    requirements = script.scratch_path / "requirements.txt"
+    requirements.write_text(result.stdout)
+
+    # Move the workspace elsewhere and replay the freeze output from there.
+    moved = script.scratch_path / "moved"
+    os.rename(workspace, moved)
+    script.pip("uninstall", "-y", "version_pkg", "vcs_pkg")
+    script.pip("install", "--no-build-isolation", "-r", requirements, cwd=moved)
+
+    # The replayed installs must come from the moved workspace.
+    result = script.pip("freeze")
+    expected = textwrap.dedent(f"""\
+    ...vcs...pkg @ git+{moved.joinpath("vcs_pkg").as_uri()}@...
+    # Editable install with no version control (version...pkg==0.1)
+    -e {os.path.normcase(os.fspath(moved / "version_pkg"))}
+    """)
+    _check_output(result.stdout, expected)

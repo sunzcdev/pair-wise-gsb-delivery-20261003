@@ -81,6 +81,20 @@ class FreezeCommand(Command):
             action="store_true",
             help="Exclude editable package from output.",
         )
+        self.cmd_opts.add_option(
+            "--workspace",
+            dest="workspace",
+            metavar="dir",
+            default=None,
+            help=(
+                "Root directory of the workspace. Local PEP 610 references "
+                "(editable installs, local directories, archives and VCS "
+                "URLs) located under this directory are written as paths "
+                "relative to it, so the output stays valid when the "
+                "workspace is moved to a different location. References "
+                "outside the workspace are left unchanged."
+            ),
+        )
         self.cmd_opts.add_option(cmdoptions.list_exclude())
 
         self.parser.insert_option_group(0, self.cmd_opts)
@@ -105,6 +119,7 @@ class FreezeCommand(Command):
             isolated=options.isolated_mode,
             skip=skip,
             exclude_editable=options.exclude_editable,
+            workspace=options.workspace,
         ):
             sys.stdout.write(line + "\n")
         return SUCCESS
