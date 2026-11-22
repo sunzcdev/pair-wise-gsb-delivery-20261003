@@ -12,6 +12,27 @@ module OpenTelemetry
       # class to provide an implementation of SpanProcessor, provided the interface is
       # satisfied.
       class SpanProcessor
+        # Returns the sampling decisions this processor is interested in, or
+        # nil to receive all recording spans.
+        #
+        # This method is optional on the Span Processor interface. When it
+        # returns an Enumerable of {Samplers::Decision} constants (e.g.
+        # `[Samplers::Decision::RECORD_ONLY]`), the {TracerProvider} will only
+        # deliver a span to this processor if the sampler's decision for that
+        # span is included. The filtering happens once, when the span starts,
+        # so both {SpanProcessor#on_start} and {SpanProcessor#on_finish} are
+        # called on the same set of processors for a given span.
+        #
+        # Note that filtering does not affect the span's trace flags: a
+        # record-only span delivered to a local debugging processor still
+        # propagates the unsampled flag to outbound contexts.
+        #
+        # @return [nil, Enumerable<Symbol>] the decisions to receive, or nil
+        #   for all recording spans.
+        def sampling_decision_filter
+          nil
+        end
+
         # Called when a {Span} is started, if the {Span#recording?}
         # returns true.
         #

@@ -1,5 +1,9 @@
 # Release History: opentelemetry-sdk
 
+### Unreleased
+
+* ADDED: Add optional `sampling_decision_filter` to span processors so a processor can subscribe to specific sampler decisions (e.g. record-only spans for local debugging); filtering happens once at span start so start and finish go to the same processors, and sampler-provided trace flags are preserved
+
 ### v1.13.1 / 2026-09-15
 
 * DOCS: Document custom error handlers (#2264)

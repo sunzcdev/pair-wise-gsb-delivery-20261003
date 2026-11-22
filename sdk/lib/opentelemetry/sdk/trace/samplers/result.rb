@@ -17,6 +17,12 @@ module OpenTelemetry
           DECISIONS = [Decision::RECORD_ONLY, Decision::DROP, Decision::RECORD_AND_SAMPLE].freeze
           private_constant(:EMPTY_HASH, :DECISIONS)
 
+          # Returns the sampling decision made by the sampler.
+          #
+          # @return [Symbol] one of {Decision::DROP}, {Decision::RECORD_ONLY},
+          #   or {Decision::RECORD_AND_SAMPLE}.
+          attr_reader :decision
+
           # Returns a frozen hash of attributes to be attached to the span.
           #
           # @return [Hash{String => String, Numeric, Boolean, Array<String, Numeric, Boolean>}]

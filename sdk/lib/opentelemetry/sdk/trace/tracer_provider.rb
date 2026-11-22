@@ -159,6 +159,15 @@ module OpenTelemetry
           result = @sampler.should_sample?(trace_id: trace_id, parent_context: parent_context, links: links, name: name, kind: kind, attributes: attributes)
           span_id = @id_generator.generate_span_id
           if result.recording? && !@stopped
+            # Select the processors interested in this sampling decision once,
+            # so the span's start and finish are delivered to the same set of
+            # processors. The sampler's trace flags are left untouched: a
+            # record-only span keeps the unsampled flag even when a local
+            # processor records it.
+            span_processors = @span_processors.select do |processor|
+              filter = processor.sampling_decision_filter if processor.respond_to?(:sampling_decision_filter)
+              filter.nil? || filter.include?(result.decision)
+            end
             trace_flags = result.sampled? ? OpenTelemetry::Trace::TraceFlags::SAMPLED : OpenTelemetry::Trace::TraceFlags::DEFAULT
             context = OpenTelemetry::Trace::SpanContext.new(trace_id: trace_id, span_id: span_id, trace_flags: trace_flags, tracestate: result.tracestate)
             attributes = attributes&.merge(result.attributes) || result.attributes.dup
@@ -170,7 +179,7 @@ module OpenTelemetry
               kind,
               parent_span_id,
               @span_limits,
-              @span_processors,
+              span_processors,
               attributes,
               links,
               start_timestamp,
