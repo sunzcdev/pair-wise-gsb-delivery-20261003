@@ -30,6 +30,11 @@ These guidelines ensure all AI agents (Copilot, Claude, Cursor, etc.) contribute
 - Follow the project's test organization and naming conventions.
 - Run the unit tests with `bundle exec rake`: it excludes `spec/integration/`, which needs service containers.
 
+### Test adapter (`Faraday::Adapter::Test`)
+- `Stubs.new(debug: true)` extends the `Stubs::NotFound` message with a `Faraday::Adapter::Test::Diagnostics` report that lists each candidate stub, separates already consumed stubs from pending ones, and shows the first failing matching step (`host`, `path`, `params`, `body`, `headers`). Passing an `#puts`-able object (e.g. `StringIO`, `$stdout`) writes the report there and keeps the original one-line error. The same report is exposed on `stubs.last_diagnostics`.
+- Matching steps short-circuit on the first failure. A proc body matcher runs at most once per candidate and must never be re-evaluated just to render diagnostics; build per-step results during the regular matching pass (`Stub#match_breakdown`), not a second pass.
+- Debug mode only explains matching; the strict/non-strict judgement itself must stay unchanged, and with `debug: false` (the default) behavior and error messages are identical to before.
+
 ### Integration Tests
 Specs under `spec/integration/` exercise the Options classes (`RequestOptions`, `SSLOptions`, `ProxyOptions`, `ConnectionOptions`, `Env`) with real HTTP requests, to catch behavior changes when the options are refactored (see `docs/options-detach-plan.md`). Details for humans are in `.github/CONTRIBUTING.md`.
 - One file per class in `spec/integration/options/<name>_integration_spec.rb`. Files in `spec/integration/` are automatically tagged `type: :integration`, which includes `Faraday::IntegrationHelpers` and disables WebMock. Never add `type: :integration` explicitly to the spec files.

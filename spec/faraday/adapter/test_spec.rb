@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'stringio'
+
 RSpec.describe Faraday::Adapter::Test do
   let(:stubs) do
     described_class::Stubs.new do |stub|
@@ -407,6 +409,153 @@ RSpec.describe Faraday::Adapter::Test do
         end
 
         it { expect(with_proc.status).to eq 200 }
+      end
+    end
+  end
+
+  describe 'debug diagnostics' do
+    let(:stubs) do
+      described_class::Stubs.new(debug: debug) do |stub|
+        stub.get('/widgets?a=1', 'X-Token' => 'secret') { [200, {}, 'a'] }
+      end
+    end
+
+    let(:connection) do
+      Faraday.new do |builder|
+        builder.adapter :test, stubs
+      end
+    end
+
+    describe 'with debug: true' do
+      let(:debug) { true }
+
+      it 'appends a report naming the step where the candidate was eliminated' do
+        expect do
+          connection.get('/widgets?a=2') { |req| req.headers['X-Token'] = 'wrong' }
+        end.to raise_error(described_class::Stubs::NotFound) do |error|
+          expect(error.message).to include('Faraday::Adapter::Test diagnostics for GET')
+          expect(error.message).to include('Pending stubs (not consumed yet) (1):')
+          expect(error.message).to include('path: matched')
+          expect(error.message).to include('params: expected query params')
+          # The short-circuiting matcher stops at params, so headers are never evaluated.
+          expect(error.message).not_to include('headers:')
+        end
+      end
+
+      it 'reports a header mismatch with the expected and actual values' do
+        expect do
+          connection.get('/widgets?a=1') { |req| req.headers['X-Token'] = 'wrong' }
+        end.to raise_error(described_class::Stubs::NotFound) do |error|
+          expect(error.message).to include('params: matched')
+          expect(error.message).to include('headers: expected headers')
+        end
+      end
+
+      it 'exposes structured diagnostics with pending and consumed candidates separated' do
+        # Consume the only /widgets stub, then add a second pending candidate so a
+        # request matching neither produces a report listing both groups.
+        expect(connection.get('/widgets?a=1') { |req| req.headers['X-Token'] = 'secret' }.status).to eq(200)
+        stubs.get('/gadgets') { [200, {}, 'g'] }
+
+        expect { connection.get('/unknown') }.to raise_error(described_class::Stubs::NotFound)
+
+        diagnostics = stubs.last_diagnostics
+        expect(diagnostics).to be_a(described_class::Diagnostics)
+        expect(diagnostics.consumed_reports.size).to eq(1)
+        expect(diagnostics.pending_reports.size).to eq(1)
+
+        consumed_report = diagnostics.consumed_reports.first
+        expect(consumed_report.consumed).to be(true)
+        expect(consumed_report.stub.path).to eq('/widgets')
+        expect(consumed_report.eliminated_at[:name]).to eq('path')
+
+        pending_report = diagnostics.pending_reports.first
+        expect(pending_report.consumed).to be(false)
+        expect(pending_report.stub.path).to eq('/gadgets')
+      end
+
+      it 'does not consume any stub while collecting a failing-request report' do
+        expect { connection.get('/widgets?a=2') }.to raise_error(described_class::Stubs::NotFound)
+        expect(stubs.last_diagnostics.pending_reports.first.consumed).to be(false)
+
+        # The follow-up correct request still finds the untouched stub and consumes it.
+        response = connection.get('/widgets?a=1') { |req| req.headers['X-Token'] = 'secret' }
+        expect(response.status).to eq(200)
+        expect(stubs.last_diagnostics).to be_nil
+        stubs.verify_stubbed_calls
+      end
+
+      it 'evaluates a proc body matcher only once while diagnosing' do
+        calls = 0
+        stubs.post('/items', ->(body) { calls += 1; body == 'wanted' }) { [200, {}, 'created'] }
+
+        expect { connection.post('/items', 'unwanted') }.to raise_error(described_class::Stubs::NotFound)
+        expect(calls).to eq(1)
+        expect(stubs.last_diagnostics.pending_reports.last.eliminated_at[:name]).to eq('body')
+
+        # The same proc still drives a successful match afterwards, proving it was not consumed.
+        expect(connection.post('/items', 'wanted').status).to eq(200)
+        expect(calls).to eq(2)
+      end
+
+      it 'reports when no stub exists for the request method at all' do
+        expect { connection.put('/widgets') }.to raise_error(described_class::Stubs::NotFound) do |error|
+          expect(error.message).to include('Pending stubs (not consumed yet) (0):')
+          expect(error.message).to include('Already consumed stubs (0):')
+        end
+        expect(stubs.last_diagnostics.pending_reports).to be_empty
+        expect(stubs.last_diagnostics.consumed_reports).to be_empty
+      end
+
+      context 'with strict_mode enabled' do
+        let(:stubs) do
+          described_class::Stubs.new(strict_mode: true, debug: true) do |stub|
+            stub.get('/strict?a=1', 'Authorization' => 'Bearer token') { [200, {}, 'a'] }
+          end
+        end
+
+        it 'keeps the strict judgement and reports the strict params mismatch' do
+          expect do
+            connection.get('/strict', { a: '2' }, { authorization: 'Bearer token' })
+          end.to raise_error(described_class::Stubs::NotFound) do |error|
+            expect(error.message).to include('params: expected query params')
+            expect(error.message).to include('strict: true')
+          end
+        end
+
+        it 'still matches the exact strict request' do
+          response = connection.get('/strict', { a: '1' }, { authorization: 'Bearer token' })
+          expect(response.status).to eq(200)
+          expect(stubs.last_diagnostics).to be_nil
+        end
+      end
+    end
+
+    describe 'with an IO-like debug target' do
+      let(:output) { StringIO.new }
+      let(:debug) { output }
+
+      it 'writes the report to the target and keeps the original error message' do
+        expect { connection.get('/nope') }.to raise_error(described_class::Stubs::NotFound) do |error|
+          expect(error.message).to eq("no stubbed request for get http:/nope  ")
+          expect(error.message.lines.size).to eq(1)
+        end
+
+        report = output.string
+        expect(report).to include('Faraday::Adapter::Test diagnostics for GET')
+        expect(report).to include('path: expected path "/widgets", got "/nope"')
+        expect(stubs.last_diagnostics).to be_a(described_class::Diagnostics)
+      end
+    end
+
+    describe 'with debug disabled' do
+      let(:debug) { false }
+
+      it 'raises the original one-line error and collects no diagnostics' do
+        expect { connection.get('/nope') }.to raise_error(described_class::Stubs::NotFound) do |error|
+          expect(error.message.lines.size).to eq(1)
+        end
+        expect(stubs.last_diagnostics).to be_nil
       end
     end
   end

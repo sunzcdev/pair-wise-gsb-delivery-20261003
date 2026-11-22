@@ -92,6 +92,52 @@ will be handled in a strict way.
 stubs.strict_mode = true
 ```
 
+## Debugging unmatched requests
+
+When several stubs match the same HTTP method, a `Stubs::NotFound` error only
+tells you that no stub matched, not whether the request was rejected because of
+its query params, headers or body. Pass `debug: true` when creating the `Stubs`
+to append a diagnostics report to that error. The report lists every candidate
+stub, separates the ones that have already been consumed from the ones still
+pending, and shows the matching step at which each candidate was eliminated
+(`host`, `path`, `params`, `body` or `headers`), including the expected and
+actual values.
+
+```ruby
+stubs = Faraday::Adapter::Test::Stubs.new(debug: true) do |stub|
+  stub.get('/ikura?nori=true', 'X-Soy-Sauce' => '5ml') { |env| [200, {}, 'ikura'] }
+end
+```
+
+A failing request now raises with a message such as:
+
+```text
+no stubbed request for get http:/ikura?nori=false
+Faraday::Adapter::Test diagnostics for GET http:/ikura?nori=false:
+Pending stubs (not consumed yet) (1):
+  - /ikura ?nori=true headers={"X-Soy-Sauce"=>"5ml"}
+      host: matched
+      path: matched
+      params: expected query params {"nori"=>"true"}, got {"nori"=>"false"} (strict: false)
+Already consumed stubs (0):
+  (none)
+```
+
+Matching steps short-circuit on the first failure, so a step that was never
+reached (for example `headers` above) is not shown, and a proc body matcher is
+evaluated at most once per candidate — it is never run again just to build the
+report. The same report is also available programmatically through
+`stubs.last_diagnostics` while handling the error. Strict mode (`strict_mode`)
+judgements are unchanged; diagnostics only explain them.
+
+Instead of `true`, you can pass any object that responds to `#puts` (for
+example `$stdout` or a `StringIO`). The report is then written to that object,
+and the original one-line `Stubs::NotFound` message is preserved.
+
+```ruby
+stubs = Faraday::Adapter::Test::Stubs.new(debug: $stdout)
+```
+
 Finally, you can treat your stubs as mocks by verifying that all of the stubbed
 calls were made. NOTE: this feature is still fairly experimental. It will not
 verify the order or count of any stub.

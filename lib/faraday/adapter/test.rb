@@ -39,7 +39,17 @@ module Faraday
     #
     #       # You can set strict_mode to exactly match the stubbed requests.
     #       stub.strict_mode = true
+    #
+    #       # Pass debug: true to append a diagnostics report to the
+    #       # Stubs::NotFound error, showing at which step (host, path, params,
+    #       # body or headers) each pending or consumed candidate was eliminated.
+    #       # An object responding to #puts (e.g. $stdout) writes the report
+    #       # there instead and keeps the original error message.
     #     end
+    #   end
+    #
+    #   stubs = Faraday::Adapter::Test::Stubs.new(debug: true) do |stub|
+    #     stub.get('/resource.json') { [200, {}, 'hi world'] }
     #   end
     #
     #   resp = test.get '/resource.json'
@@ -67,14 +77,33 @@ module Faraday
         class NotFound < StandardError
         end
 
-        def initialize(strict_mode: false)
+        # @param strict_mode [Boolean] when true, stubs match requests only when
+        #   their path, parameters and headers are exactly the same.
+        # @param debug [Boolean, #puts] when false (the default), a failed match
+        #   raises the usual {Stubs::NotFound} error without any extra output.
+        #   When true, the {Stubs::NotFound} message is extended with a
+        #   diagnostics report explaining at which step each pending or already
+        #   consumed candidate stub was eliminated. When given an object that
+        #   responds to `#puts` (e.g. `$stdout`, `StringIO`), the report is
+        #   written to it instead and the original error message is preserved.
+        def initialize(strict_mode: false, debug: false)
           # { get: [Stub, Stub] }
           @stack = {}
           @consumed = {}
           @strict_mode = strict_mode
+          @debug = debug
+          @last_diagnostics = nil
           @stubs_mutex = Monitor.new
           yield(self) if block_given?
         end
+
+        # @return [Stubs::Diagnostics, nil] the diagnostics collected while
+        #   resolving the last request, or nil when the last request matched a
+        #   stub directly or debug mode is disabled.
+        attr_reader :last_diagnostics
+
+        # @return [Boolean, #puts] the configured debug output target.
+        attr_reader :debug
 
         def empty?
           @stack.empty?
@@ -83,20 +112,27 @@ module Faraday
         # @param env [Faraday::Env]
         def match(env)
           request_method = env[:method]
-          return false unless @stack.key?(request_method)
+          unless @stack.key?(request_method)
+            record_diagnostics(Diagnostics.empty(env)) if @debug
+            return false
+          end
 
           stack = @stack[request_method]
           consumed = (@consumed[request_method] ||= [])
 
           @stubs_mutex.synchronize do
-            stub, meta = matches?(stack, env)
-            if stub
-              removed = stack.delete(stub)
-              consumed << removed unless removed.nil?
-              return stub, meta
+            if @debug
+              match_with_diagnostics(env, request_method, stack, consumed)
+            else
+              stub, meta = matches?(stack, env)
+              if stub
+                removed = stack.delete(stub)
+                consumed << removed unless removed.nil?
+                return stub, meta
+              end
+              matches?(consumed, env)
             end
           end
-          matches?(consumed, env)
         end
 
         def get(path, headers = {}, &block)
@@ -189,25 +225,143 @@ module Faraday
           end
           nil
         end
+
+        # Scans a stack while collecting, for every candidate stub, the detailed
+        # result of every matching step. The matching logic itself is unchanged,
+        # so a proc body matcher is evaluated at most once per candidate.
+        #
+        # @param stack [Array<Stub>]
+        # @param env [Faraday::Env]
+        # @param consumed [Boolean] whether the stack holds already consumed stubs.
+        # @return [Array(Stub, Hash, Array)] the matched stub (or nil), its meta
+        #   hash (or nil) and the collected {Diagnostics::CandidateReport}s.
+        def scan(stack, env, consumed:)
+          reports = stack.map do |stub|
+            result, meta, breakdown = stub.match_breakdown(env)
+            Diagnostics::CandidateReport.new(stub, consumed, breakdown, result, meta)
+          end
+          matched = reports.find(&:matched)
+          [matched&.stub, matched&.meta, reports]
+        end
+
+        # Debug counterpart of {#match}. Both pending and already consumed
+        # candidates are scanned so the report can distinguish them.
+        def match_with_diagnostics(env, request_method, stack, consumed)
+          stub, meta, pending_reports = scan(stack, env, consumed: false)
+          if stub
+            removed = stack.delete(stub)
+            consumed << removed unless removed.nil?
+            @last_diagnostics = nil
+            return stub, meta
+          end
+
+          consumed_stub, consumed_meta, consumed_reports = scan(consumed, env, consumed: true)
+          record_diagnostics(
+            Diagnostics.new(env, request_method, pending_reports, consumed_reports)
+          )
+          return consumed_stub, consumed_meta if consumed_stub
+
+          nil
+        end
+
+        def record_diagnostics(diagnostics)
+          @last_diagnostics = diagnostics
+          return if @debug == true
+
+          @debug.puts(diagnostics.to_s)
+        end
+      end
+
+      # Human-readable report describing why a request could not be matched.
+      # Each {CandidateReport} pairs a stub with the per-step result of the
+      # matching process, split between pending and already consumed stubs.
+      class Diagnostics
+        # @attr stub [Stub] the inspected stub.
+        # @attr consumed [Boolean] whether the stub has already been consumed.
+        # @attr breakdown [Array<Hash>] the per-step matching results.
+        # @attr matched [Boolean] whether the stub matched the request as a whole.
+        # @attr meta [Hash] the meta hash that would have been yielded to the stub.
+        CandidateReport = Struct.new(:stub, :consumed, :breakdown, :matched, :meta) do
+          # @return [Hash, nil] the first failing matching step, if any.
+          def eliminated_at
+            breakdown.find { |step| !step[:matched] }
+          end
+        end
+
+        # @param env [Faraday::Env] the request that could not be matched.
+        # @param request_method [Symbol] the request HTTP method.
+        # @param pending_reports [Array<CandidateReport>] reports for stubs that
+        #   have not been consumed yet.
+        # @param consumed_reports [Array<CandidateReport>] reports for stubs that
+        #   have already been consumed by previous requests.
+        def initialize(env, request_method, pending_reports, consumed_reports)
+          @env = env
+          @request_method = request_method
+          @pending_reports = pending_reports
+          @consumed_reports = consumed_reports
+        end
+
+        # Builds a report for a request whose HTTP method has no stub at all.
+        #
+        # @param env [Faraday::Env] the unmatched request.
+        # @return [Diagnostics]
+        def self.empty(env)
+          new(env, env[:method], [], [])
+        end
+
+        # @return [Array<CandidateReport>] reports for pending (not consumed) stubs.
+        attr_reader :pending_reports
+
+        # @return [Array<CandidateReport>] reports for already consumed stubs.
+        attr_reader :consumed_reports
+
+        # @return [String] the multi-line diagnostics report.
+        def to_s
+          lines = ["Faraday::Adapter::Test diagnostics for #{@request_method.to_s.upcase} #{@env[:url]}:"]
+          render_reports(lines, 'Pending stubs (not consumed yet)', @pending_reports)
+          render_reports(lines, 'Already consumed stubs', @consumed_reports)
+          lines.join("\n")
+        end
+
+        private
+
+        def render_reports(lines, title, reports)
+          lines << "#{title} (#{reports.size}):"
+          if reports.empty?
+            lines << '  (none)'
+            return
+          end
+
+          reports.each do |report|
+            lines << "  - #{report.stub.description}"
+            report.breakdown.each do |step|
+              lines << "      #{step[:name]}: #{step[:matched] ? 'matched' : step[:detail]}"
+            end
+          end
+        end
       end
 
       # Stub request
       Stub = Struct.new(:host, :path, :query, :headers, :body, :strict_mode, :block) do
         # @param env [Faraday::Env]
         def matches?(env)
-          request_host = env[:url].host
-          request_path = Faraday::Utils.normalize_path(env[:url].path)
-          request_headers = env.request_headers
-          request_body = env[:body]
+          matched, meta, = match_breakdown(env)
+          [matched, meta]
+        end
 
-          # meta is a hash used as carrier
-          # that will be yielded to consumer block
+        # Same matching process as {#matches?}, but keeps the result of every
+        # step so a diagnostics report can show where the candidate was
+        # eliminated. The steps are evaluated in order and short-circuit on the
+        # first failure, which guarantees a proc body matcher runs at most once
+        # and is never re-evaluated just to build the report.
+        #
+        # @param env [Faraday::Env]
+        # @return [Array(Boolean, Hash, Array<Hash>)] whether the stub matches,
+        #   the meta hash yielded to the consumer block, and the per-step results.
+        def match_breakdown(env)
           meta = {}
-          [(host.nil? || host == request_host) &&
-            path_match?(request_path, meta) &&
-            params_match?(env) &&
-            body_match?(request_body) &&
-            headers_match?(request_headers), meta]
+          steps = build_breakdown(env, meta)
+          [steps.all? { |step| step[:matched] }, meta, steps]
         end
 
         def path_match?(request_path, meta)
@@ -261,6 +415,92 @@ module Faraday
         def to_s
           "#{path} #{body}"
         end
+
+        # @return [String] a stable description of the stub expectation, used in
+        #   diagnostics reports.
+        def description
+          location = path.is_a?(Regexp) ? path.inspect : path
+          parts = ["#{location}"]
+          parts << "?#{query}" if query && !query.to_s.empty?
+          parts << "body=#{body.inspect}" unless body.to_s.empty?
+          parts << "headers=#{headers.to_hash.inspect}" unless headers.empty?
+          parts.join(' ')
+        end
+
+        private
+
+        def build_breakdown(env, meta)
+          request_host = env[:url].host
+          request_path = Faraday::Utils.normalize_path(env[:url].path)
+          request_headers = env.request_headers
+          request_body = env[:body]
+
+          step_builders = [
+            -> { host_step(request_host) },
+            -> { path_step(request_path, meta) },
+            -> { params_step(env) },
+            -> { body_step(request_body) },
+            -> { headers_step(request_headers) }
+          ]
+
+          steps = []
+          step_builders.each do |builder|
+            step = builder.call
+            steps << step
+            # Stop at the first failing step, exactly like the short-circuit
+            # `&&` chain used by the original matcher, so later matchers are
+            # never evaluated just for the report.
+            break unless step[:matched]
+          end
+          steps
+        end
+
+        def host_step(request_host)
+          matched = host.nil? || host == request_host
+          detail = "expected host #{host.inspect}, got #{request_host.inspect}" unless matched
+          { name: 'host', matched: matched, detail: detail }
+        end
+
+        def path_step(request_path, meta)
+          matched = path_match?(request_path, meta)
+          expected = path.is_a?(Regexp) ? path.inspect : path
+          detail = "expected path #{expected.inspect}, got #{request_path.inspect}" unless matched
+          { name: 'path', matched: matched, detail: detail }
+        end
+
+        def params_step(env)
+          matched = params_match?(env)
+          expected = env.params_encoder.decode(query) || {}
+          unless matched
+            detail = "expected query params #{expected.inspect}, " \
+                     "got #{env[:params].inspect} (strict: #{strict_mode})"
+          end
+          { name: 'params', matched: matched, detail: detail }
+        end
+
+        def body_step(request_body)
+          # The proc is invoked here, as part of the regular matching process,
+          # and never a second time when rendering the diagnostics report.
+          matched = body_match?(request_body)
+          detail =
+            if body.is_a?(Proc)
+              "proc body matcher #{body.inspect} returned false for #{request_body.inspect}"
+            else
+              "expected body #{body.inspect}, got #{request_body.inspect}"
+            end
+          { name: 'body', matched: matched, detail: matched ? nil : detail }
+        end
+
+        def headers_step(request_headers)
+          matched = headers_match?(request_headers)
+          if strict_mode
+            expected = headers.dup.tap { |hs| hs[:user_agent] ||= Connection::USER_AGENT }.to_hash
+            detail = "expected headers #{expected.inspect}, got #{request_headers.inspect} (strict)"
+          else
+            detail = "expected headers #{headers.to_hash.inspect}, got #{request_headers.inspect}"
+          end
+          { name: 'headers', matched: matched, detail: matched ? nil : detail }
+        end
       end
 
       def initialize(app, stubs = nil, &block)
@@ -282,8 +522,11 @@ module Faraday
         stub, meta = stubs.match(env)
 
         unless stub
-          raise Stubs::NotFound, "no stubbed request for #{env[:method]} " \
-                                 "#{env[:url]} #{env[:body]} #{env[:headers]}"
+          message = "no stubbed request for #{env[:method]} " \
+                    "#{env[:url]} #{env[:body]} #{env[:headers]}"
+          diagnostics = stubs.last_diagnostics
+          message = "#{message}\n#{diagnostics}" if stubs.debug == true && diagnostics
+          raise Stubs::NotFound, message
         end
 
         block_arity = stub.block.arity
