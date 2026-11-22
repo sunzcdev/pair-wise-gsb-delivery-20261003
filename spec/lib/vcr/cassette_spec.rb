@@ -441,6 +441,108 @@ RSpec.describe VCR::Cassette do
             expect(cassette.send(:previously_recorded_interactions).size).to eq(2)
           end
 
+          describe 'playback response copying' do
+            let(:fixture_dir) { "#{VCR::SPEC_ROOT}/fixtures/cassette_spec" }
+            let(:matching_request) { VCR::Request.new(:get, 'http://example.com/api/users/42') }
+
+            def json_body(response)
+              ::JSON.parse(response.body)
+            end
+
+            it 'hands out an independent working copy on every playback and keeps the fixture intact on repeat' do
+              VCR.configure do |c|
+                c.cassette_library_dir = fixture_dir
+                c.before_playback do |interaction|
+                  next unless interaction.request.uri == 'http://example.com/api/users/42'
+                  interaction.response.headers['X-Request-Id'] = ['rewritten-by-hook']
+                  interaction.response.body = interaction.response.body.gsub('"name":"alice"', '"name":"hook-alice"')
+                end
+              end
+
+              cassette = VCR::Cassette.new(
+                'nested_playback_copy',
+                record: record_mode,
+                match_requests_on: [:method, :uri],
+                allow_playback_repeats: true
+              )
+
+              first = cassette.http_interactions.response_for(matching_request)
+
+              # The first playback clearly shows the before_playback changes, including in nested JSON.
+              expect(first.headers['X-Request-Id']).to eq(['rewritten-by-hook'])
+              expect(json_body(first)['user']['name']).to eq('hook-alice')
+              expect(json_body(first)['user']['profile']['skills']).to eq(['ruby', 'rails'])
+
+              # The caller can further mutate its own working copy without touching the cassette.
+              first.headers['X-Request-Id'] << 'caller-tweak'
+              first.body = first.body.gsub('"sms":false', '"sms":true')
+              expect(first.headers['X-Request-Id']).to eq(['rewritten-by-hook', 'caller-tweak'])
+              expect(json_body(first)['user']['settings']['notifications']['sms']).to be(true)
+
+              # A second playback sees the fixture as persisted: hook output is rebuilt, caller tweaks are gone.
+              second = cassette.http_interactions.response_for(matching_request)
+              expect(second).not_to be(first)
+              expect(second.headers['X-Request-Id']).to eq(['rewritten-by-hook'])
+              expect(json_body(second)['user']['name']).to eq('hook-alice')
+              expect(json_body(second)['user']['settings']['notifications']['sms']).to be(false)
+              expect(json_body(second)['meta']['version']).to eq('1.0.0')
+
+              # The on-disk fixture itself was never modified.
+              raw = File.read(File.join(fixture_dir, 'nested_playback_copy.yml'))
+              expect(raw).to include('fixture-request-id')
+              expect(raw).not_to include('rewritten-by-hook')
+              expect(raw).to include('"name":"alice"')
+              expect(raw).not_to include('hook-alice')
+            end
+
+            it 'returns an independent copy when a before_playback hook mutates nested JSON in place' do
+              VCR.configure do |c|
+                c.cassette_library_dir = fixture_dir
+                c.before_playback do |interaction|
+                  next unless interaction.request.uri == 'http://example.com/api/users/42'
+                  data = ::JSON.parse(interaction.response.body)
+                  data['user']['profile']['skills'] << 'go'
+                  interaction.response.body = ::JSON.generate(data)
+                end
+              end
+
+              cassette = VCR::Cassette.new(
+                'nested_playback_copy',
+                record: record_mode,
+                match_requests_on: [:method, :uri],
+                allow_playback_repeats: true
+              )
+
+              first  = cassette.http_interactions.response_for(matching_request)
+              second = cassette.http_interactions.response_for(matching_request)
+
+              expect(json_body(first)['user']['profile']['skills']).to eq(['ruby', 'rails', 'go'])
+              expect(json_body(second)['user']['profile']['skills']).to eq(['ruby', 'rails', 'go'])
+              expect(second).not_to be(first)
+            end
+
+            it 'does not change consumption counts when playback repeats are disabled' do
+              VCR.configuration.cassette_library_dir = fixture_dir
+              cassette = VCR::Cassette.new(
+                'nested_playback_copy',
+                record: record_mode,
+                match_requests_on: [:method, :uri],
+                allow_playback_repeats: false
+              )
+
+              expect(cassette.http_interactions.remaining_unused_interaction_count).to eq(1)
+
+              first = cassette.http_interactions.response_for(matching_request)
+              expect(first).to be_a(VCR::Response)
+              expect(cassette.http_interactions.remaining_unused_interaction_count).to eq(0)
+
+              # With repeats disabled the single interaction is not replayed, and copying adds no extra consumption.
+              second = cassette.http_interactions.response_for(matching_request)
+              expect(second).to be_nil
+              expect(cassette.http_interactions.remaining_unused_interaction_count).to eq(0)
+            end
+          end
+
           it 'instantiates the http_interactions with the loaded interactions and the request matchers' do
             VCR.configuration.cassette_library_dir = "#{VCR::SPEC_ROOT}/fixtures/cassette_spec"
             cassette = VCR::Cassette.new('example', record: record_mode, match_requests_on: [:body, :headers])

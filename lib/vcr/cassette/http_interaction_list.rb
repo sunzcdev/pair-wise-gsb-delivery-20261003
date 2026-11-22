@@ -36,9 +36,9 @@ module VCR
             interaction = @interactions.delete_at(index)
             @used_interactions.unshift interaction
             log "Found matching interaction for #{request_summary(request)} at index #{index}: #{response_summary(interaction.response)}", 1
-            interaction.response
+            deep_duplicate_response(interaction.response)
           elsif interaction = matching_used_interaction_for(request)
-            interaction.response
+            deep_duplicate_response(interaction.response)
           else
             @parent_list.response_for(request)
           end
@@ -74,6 +74,44 @@ module VCR
       end
 
     private
+
+      # Returns a deep copy of the given response so that mutations made by a
+      # `before_playback` hook (or by the code consuming the played-back response,
+      # such as changing a header or a JSON string) never leak back into the
+      # interaction stored on the cassette. Without this, a repeated playback
+      # (when `allow_playback_repeats` is enabled) would hand out the same,
+      # already-mutated response object instead of the original fixture data.
+      #
+      # The copy is built directly from the struct members rather than via
+      # `Marshal` (the normalized-header hash carries a default proc, which
+      # cannot be marshalled) or `to_hash`/`from_hash` (which consults global
+      # VCR configuration for body byte preservation).
+      def deep_duplicate_response(response)
+        return nil if response.nil?
+
+        VCR::Response.new(
+          deep_duplicate(response.status),
+          deep_duplicate(response.headers),
+          response.body.nil? ? nil : response.body.dup,
+          response.http_version,
+          deep_duplicate(response.adapter_metadata)
+        )
+      end
+
+      def deep_duplicate(object)
+        case object
+        when ::Hash
+          object.each_with_object({}) { |(key, value), copy| copy[key] = deep_duplicate(value) }
+        when ::Array
+          object.map { |value| deep_duplicate(value) }
+        when VCR::ResponseStatus
+          VCR::ResponseStatus.new(object.code, object.message)
+        when ::String
+          object.dup
+        else
+          object
+        end
+      end
 
       # @return [Boolean] Whether or not there are unused interactions left in the list.
       def has_unused_interactions?

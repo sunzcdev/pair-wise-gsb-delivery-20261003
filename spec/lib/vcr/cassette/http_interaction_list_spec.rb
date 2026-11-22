@@ -288,6 +288,105 @@ module VCR
           list.response_for(request_with(method: :post))
           expect(original_list_array).to eq original_dup
         end
+
+        it 'returns a fresh response object on each playback rather than the stored response' do
+          interaction = self.interaction('response', method: :get)
+          list = HTTPInteractionList.new([interaction], [:method], true)
+
+          first  = list.response_for(request_with(method: :get))
+          second = list.response_for(request_with(method: :get))
+
+          expect(first).not_to be(interaction.response)
+          expect(second).not_to be(interaction.response)
+          expect(first).not_to be(second)
+        end
+
+        it 'returns a deep copy so mutations to a played-back response do not leak into the fixture' do
+          interaction = self.interaction(
+            '{"user":{"name":"alice","roles":["admin"]}}',
+            method: :get
+          )
+          interaction.response.headers = {
+            'X-User'       => ['alice'],
+            'Content-Type' => ['application/json']
+          }
+          list = HTTPInteractionList.new([interaction], [:method], true)
+
+          first = list.response_for(request_with(method: :get))
+          first.headers['X-User'] << 'mutated'
+          first.headers['X-User'][0].gsub!('alice', 'BOB')
+          first.body.gsub!('alice', 'BOB')
+
+          expect(first.body).to eq('{"user":{"name":"BOB","roles":["admin"]}}')
+          expect(first.headers['X-User']).to eq(['BOB', 'mutated'])
+
+          # The interaction stored in the cassette must still hold the original fixture data.
+          expect(interaction.response.body).to eq('{"user":{"name":"alice","roles":["admin"]}}')
+          expect(interaction.response.headers['X-User']).to eq(['alice'])
+
+          # A second (repeated) playback starts from the pristine fixture again.
+          second = list.response_for(request_with(method: :get))
+          expect(second).not_to be(first)
+          expect(second.body).to eq('{"user":{"name":"alice","roles":["admin"]}}')
+          expect(second.headers['X-User']).to eq(['alice'])
+        end
+
+        context 'when allow_playback_repeats is set to true' do
+          let(:allow_playback_repeats) { true }
+
+          it 'continues to return the response from the last matching interaction when there are no more' do
+            list.response_for(request_with(method: :post))
+
+            results = 10.times.map do
+              response = list.response_for(request_with(method: :post))
+              response ? response.body : nil
+            end
+
+            expect(results).to eq(["post response 2"] * 10)
+          end
+
+          it 'hands out independent copies on every repeated playback' do
+            list.response_for(request_with(method: :post))
+
+            copies = 3.times.map { list.response_for(request_with(method: :post)) }
+            copies.first.body.gsub!('post response 2', 'tampered')
+
+            expect(copies.map(&:body)).to eq(
+              ['tampered', 'post response 2', 'post response 2']
+            )
+            expect(copies.each_cons(2).all? { |a, b| !a.equal?(b) }).to be(true)
+          end
+        end
+
+        context 'when allow_playback_repeats is set to false' do
+          let(:allow_playback_repeats) { false }
+
+          it 'returns nil when there are no more unused interactions' do
+            list.response_for(request_with(method: :post))
+            list.response_for(request_with(method: :post))
+
+            results = 10.times.map do
+              list.response_for(request_with(method: :post))
+            end
+
+            expect(results).to eq([nil] * 10)
+          end
+
+          it 'still only consumes each interaction once even though responses are copied' do
+            expect(list.remaining_unused_interaction_count).to eq(3)
+
+            list.response_for(request_with(method: :post))
+            expect(list.remaining_unused_interaction_count).to eq(2)
+
+            list.response_for(request_with(method: :post))
+            expect(list.remaining_unused_interaction_count).to eq(1)
+
+            # No repeat playback without an unused matching interaction: consumption is unchanged.
+            list.response_for(request_with(method: :post))
+            expect(list.remaining_unused_interaction_count).to eq(1)
+            expect(list.response_for(request_with(method: :post))).to be_nil
+          end
+        end
       end
     end
   end
