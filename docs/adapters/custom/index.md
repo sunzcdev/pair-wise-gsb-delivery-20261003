@@ -118,6 +118,42 @@ end
 `#save_response` also accepts a `finished` keyword argument, which defaults to `true`, but that you can set to false
 if you don't want it to call `#finish` on the `Response` object.
 
+## Completing a response later
+
+Adapters that perform requests asynchronously (or that return before the server
+responds) can hand the response back unfinished, then finish it once the
+response arrives. Call `#save_response` with `finished: false`, and call
+`Faraday::Response#finish` with the env when the body is ready:
+
+```ruby
+class FlorpHttp < Faraday::Adapter
+  def call(env)
+    super
+    # The callback below runs on FlorpHttp's own thread, after #call returned.
+    FlorpHttp.perform_async_request(env) do |status, body, headers|
+      save_response(env, status, body, headers, nil, finished: false)
+      env.response.finish(env)
+    end
+    env.response
+  end
+end
+```
+
+Middleware and callers may register `#on_complete` callbacks on the unfinished
+response. Faraday guarantees the following:
+
+* callbacks run in registration order when the adapter finishes the response;
+* a callback that registers another callback from within `#finish` is queued
+  behind the callbacks that were already registered;
+* notifying completion more than once (for example, when an adapter reports a
+  timeout after it already reported a response) does not run any callback again;
+* if a callback raises, the remaining callbacks still run, the response stays
+  finished with its env readable, and the first error is re-raised once the
+  queue is drained.
+
+A response created with an env (`Faraday::Response.new(env)`) is already
+finished and still raises when `#finish` is called on it.
+
 ### `#request_timeout`
 
 Most HTTP libraries support different types of timeouts, like `:open_timeout`, `:read_timeout` and `:write_timeout`.

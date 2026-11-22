@@ -46,6 +46,13 @@ It's important to do all processing of the response only in the `#on_complete`
 block. This enables middleware to work in parallel mode where requests are
 asynchronous.
 
+When an adapter completes a response asynchronously, the `#on_complete` blocks
+run in the order they were registered, and completing the same response again
+does not run them a second time. Registering a block from inside another
+`#on_complete` block queues it behind the blocks that were already registered.
+For the full set of guarantees, see [Completing a response
+later](/adapters/custom/index.md#completing-a-response-later).
+
 The `request_env` and `response_env` are both [Env Objects](getting-started/env-object.md) but note the amount of
 information available in each one will differ based on the request/response lifecycle.
 

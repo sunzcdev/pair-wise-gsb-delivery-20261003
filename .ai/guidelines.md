@@ -22,6 +22,7 @@ These guidelines ensure all AI agents (Copilot, Claude, Cursor, etc.) contribute
 - If providing parallel support, include the `Parallelism` module and set `supports_parallel = true`.
 - Implement required methods (`build_connection`, `close`, etc.) as seen in existing adapters.
 - Keep each adapter in its own file under `lib/faraday/adapter/`.
+- Adapters that complete responses later call `save_response(..., finished: false)` and then `Faraday::Response#finish(env)`. `#finish` is idempotent, runs `on_complete` callbacks in registration order (callbacks registered from a callback go behind the existing queue), and re-raises the first callback error after the remaining callbacks ran. See `docs/adapters/custom/index.md`.
 
 ## Testing
 - All code must be tested with RSpec. Use shared examples for adapters/middleware where applicable (see `spec/support`).

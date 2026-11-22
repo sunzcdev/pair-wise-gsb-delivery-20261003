@@ -73,3 +73,13 @@ but this method should be considered deprecated.
 
 For reference, please see an example using `run` from [em-synchrony](https://github.com/lostisland/faraday-em_synchrony/blob/main/lib/faraday/adapter/em_synchrony.rb)
 and its [ParallelManager implementation](https://github.com/lostisland/faraday-em_synchrony/blob/main/lib/faraday/adapter/em_synchrony/parallel_manager.rb).
+
+## Completing responses asynchronously
+
+An adapter that completes requests on its own schedule returns an unfinished
+response and calls `Faraday::Response#finish` once the response arrives. The
+response then runs every `#on_complete` callback exactly once, in registration
+order. Completing the same response again is a no-op, so an adapter may report
+the outcome from more than one place without running the middleware stack
+twice. See [Writing custom adapters](/adapters/custom/index.md#completing-a-response-later)
+for the details and the error behaviour.
