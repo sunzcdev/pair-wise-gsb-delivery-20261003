@@ -40,6 +40,10 @@ describe OpenTelemetry::Trace::Span do
     it 'returns self' do
       _(span.add_link(OpenTelemetry::Trace::Link.new(span_context))).must_equal(span)
     end
+
+    it 'accepts a preferred flag' do
+      _(span.add_link(OpenTelemetry::Trace::Link.new(span_context), preferred: true)).must_equal(span)
+    end
   end
 
   describe '#add_event' do
@@ -58,6 +62,10 @@ describe OpenTelemetry::Trace::Span do
     it 'accepts a timestamp' do
       _(span.add_event('event-name', timestamp: Time.now)).must_equal(span)
     end
+
+    it 'accepts a preferred flag' do
+      _(span.add_event('event-name', preferred: true)).must_equal(span)
+    end
   end
 
   describe '#record_exception' do
@@ -66,6 +74,9 @@ describe OpenTelemetry::Trace::Span do
     end
     it 'accepts attributes' do
       _(span.record_exception(StandardError.new('oops'), attributes: { 'foo' => 'bar' })).must_be_nil
+    end
+    it 'accepts a preferred flag' do
+      _(span.record_exception(StandardError.new('oops'), preferred: false)).must_be_nil
     end
   end
 

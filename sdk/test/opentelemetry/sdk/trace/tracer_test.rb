@@ -177,6 +177,15 @@ describe OpenTelemetry::SDK::Trace::Tracer do
       _(span.links.size).must_equal(1)
       _(span.links.first).must_equal(link1)
     end
+
+    it 'retains preferred links supplied at span creation' do
+      tracer_provider.span_limits = SpanLimits.new(link_count_limit: 1, retention_policy: :keep_preferred)
+      ordinary = OpenTelemetry::Trace::Link.new(OpenTelemetry::Trace::SpanContext.new, 'n' => 'ordinary')
+      diagnostic = OpenTelemetry::Trace::Link.new(OpenTelemetry::Trace::SpanContext.new, 'n' => 'diagnostic', preferred: true)
+      span = tracer.start_root_span('root', links: [ordinary, diagnostic])
+      _(span.links.size).must_equal(1)
+      _(span.links.first.attributes['n']).must_equal('diagnostic')
+    end
   end
 
   describe '#start_span' do

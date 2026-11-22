@@ -115,5 +115,32 @@ describe OpenTelemetry::SDK::Trace::SpanLimits do
         _(span_limits.attribute_length_limit).must_equal 32
       end
     end
+
+    describe 'retention policy' do
+      it 'defaults to no retention policy' do
+        _(span_limits.retention_policy).must_be_nil
+      end
+
+      it 'accepts the supported retention policies' do
+        %i[keep_newest keep_oldest keep_preferred].each do |policy|
+          limits = OpenTelemetry::SDK::Trace::SpanLimits.new(retention_policy: policy)
+          _(limits.retention_policy).must_equal policy
+        end
+      end
+
+      it 'rejects unknown retention policies' do
+        _(proc { OpenTelemetry::SDK::Trace::SpanLimits.new(retention_policy: :keep_all) }).must_raise(ArgumentError)
+      end
+
+      it 'rejects a retention policy given as a string' do
+        _(proc { OpenTelemetry::SDK::Trace::SpanLimits.new(retention_policy: 'keep_newest') }).must_raise(ArgumentError)
+      end
+
+      it 'does not change the existing count limits' do
+        limits = OpenTelemetry::SDK::Trace::SpanLimits.new(event_count_limit: 3, link_count_limit: 4, retention_policy: :keep_preferred)
+        _(limits.event_count_limit).must_equal 3
+        _(limits.link_count_limit).must_equal 4
+      end
+    end
   end
 end

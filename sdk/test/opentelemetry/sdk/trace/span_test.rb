@@ -188,6 +188,17 @@ describe OpenTelemetry::SDK::Trace::Span do
       _(links.first.attributes).must_equal(attrs)
     end
 
+    it 'marks a link as preferred when requested' do
+      span.add_link(OpenTelemetry::Trace::Link.new(context), preferred: true)
+      _(span.links.first.preferred?).must_equal(true)
+    end
+
+    it 'keeps an already preferred link as is' do
+      link = OpenTelemetry::Trace::Link.new(context, preferred: true)
+      span.add_link(link, preferred: true)
+      _(span.links.first).must_equal(link)
+    end
+
     it 'updates the links count' do
       span.add_link(OpenTelemetry::Trace::Link.new(context))
       span.add_link(OpenTelemetry::Trace::Link.new(context))
@@ -331,6 +342,216 @@ describe OpenTelemetry::SDK::Trace::Span do
       span.add_event('3')
       _(span.events.size).must_equal(1)
     end
+
+    it 'marks events as not preferred by default' do
+      span.add_event('1')
+      _(span.events.first.preferred?).must_equal(false)
+    end
+  end
+
+  describe 'retention policy' do
+    def span_with(policy, events: 1, links: 1)
+      limits = SpanLimits.new(event_count_limit: events, link_count_limit: links, retention_policy: policy)
+      Span.new(context, Context.empty, OpenTelemetry::Trace::Span::INVALID, 'name', SpanKind::INTERNAL, nil, limits,
+               [], nil, nil, Time.now, nil, nil)
+    end
+
+    describe ':keep_newest' do
+      it 'keeps the newest events' do
+        span = span_with(:keep_newest)
+        %w[1 2 3].each { |name| span.add_event(name) }
+        _(span.events.map(&:name)).must_equal %w[3]
+      end
+
+      it 'keeps the newest links, even when created at start' do
+        limits = SpanLimits.new(link_count_limit: 1, retention_policy: :keep_newest)
+        links = %w[1 2 3].map { |n| OpenTelemetry::Trace::Link.new(context, 'n' => n) }
+        span = Span.new(context, Context.empty, OpenTelemetry::Trace::Span::INVALID, 'name', SpanKind::INTERNAL, nil, limits,
+                        [], nil, links, Time.now, nil, nil)
+        _(span.links.map { |l| l.attributes['n'] }).must_equal %w[3]
+      end
+    end
+
+    describe ':keep_oldest' do
+      it 'keeps the oldest events' do
+        span = span_with(:keep_oldest)
+        %w[1 2 3].each { |name| span.add_event(name) }
+        _(span.events.map(&:name)).must_equal %w[1]
+      end
+
+      it 'keeps the oldest links' do
+        limits = SpanLimits.new(link_count_limit: 1, retention_policy: :keep_oldest)
+        links = %w[1 2 3].map { |n| OpenTelemetry::Trace::Link.new(context, 'n' => n) }
+        span = Span.new(context, Context.empty, OpenTelemetry::Trace::Span::INVALID, 'name', SpanKind::INTERNAL, nil, limits,
+                        [], nil, links, Time.now, nil, nil)
+        _(span.links.map { |l| l.attributes['n'] }).must_equal %w[1]
+      end
+    end
+
+    describe ':keep_preferred' do
+      it 'retains a preferred event recorded after the limit is reached' do
+        span = span_with(:keep_preferred)
+        span.add_event('ordinary-1')
+        span.add_event('diagnostic', preferred: true)
+        _(span.events.map(&:name)).must_equal %w[diagnostic]
+      end
+
+      it 'retains a preferred event even when it is the oldest' do
+        span = span_with(:keep_preferred, events: 2)
+        span.add_event('diagnostic', preferred: true)
+        span.add_event('ordinary-1')
+        span.add_event('ordinary-2')
+        _(span.events.map(&:name)).must_equal %w[diagnostic ordinary-2]
+      end
+
+      it 'fills spare capacity with the newest unmarked events' do
+        span = span_with(:keep_preferred, events: 3)
+        %w[1 2 3 4 5].each { |name| span.add_event(name) }
+        span.add_event('diagnostic', preferred: true)
+        _(span.events.map(&:name)).must_equal %w[4 5 diagnostic]
+      end
+
+      it 'keeps retained events in their original order' do
+        span = span_with(:keep_preferred, events: 3)
+        span.add_event('preferred-1', preferred: true)
+        span.add_event('ordinary-1')
+        span.add_event('preferred-2', preferred: true)
+        span.add_event('ordinary-2')
+        _(span.events.map(&:name)).must_equal %w[preferred-1 preferred-2 ordinary-2]
+      end
+
+      it 'keeps the newest preferred events when preferred entries alone exceed the limit' do
+        span = span_with(:keep_preferred, events: 2)
+        %w[p1 p2 p3 p4].each { |name| span.add_event(name, preferred: true) }
+        _(span.events.map(&:name)).must_equal %w[p3 p4]
+      end
+
+      it 'still respects the event count limit' do
+        span = span_with(:keep_preferred, events: 2)
+        5.times { |i| span.add_event("ordinary-#{i}") }
+        5.times { |i| span.add_event("preferred-#{i}", preferred: true) }
+        _(span.events.size).must_equal 2
+        _(span.to_span_data.total_recorded_events).must_equal 10
+      end
+
+      it 'retains a preferred link added after the limit is reached' do
+        span = span_with(:keep_preferred)
+        span.add_link(OpenTelemetry::Trace::Link.new(context, 'n' => '1'))
+        span.add_link(OpenTelemetry::Trace::Link.new(context, 'n' => 'diagnostic'), preferred: true)
+        _(span.links.map { |l| l.attributes['n'] }).must_equal %w[diagnostic]
+      end
+
+      it 'retains links marked preferred at span creation, filling with the oldest unmarked links' do
+        limits = SpanLimits.new(link_count_limit: 2, retention_policy: :keep_preferred)
+        links = [
+          OpenTelemetry::Trace::Link.new(context, 'n' => 'diagnostic', preferred: true),
+          OpenTelemetry::Trace::Link.new(context, 'n' => 'ordinary-1'),
+          OpenTelemetry::Trace::Link.new(context, 'n' => 'ordinary-2'),
+          OpenTelemetry::Trace::Link.new(context, 'n' => 'ordinary-3')
+        ]
+        span = Span.new(context, Context.empty, OpenTelemetry::Trace::Span::INVALID, 'name', SpanKind::INTERNAL, nil, limits,
+                        [], nil, links, Time.now, nil, nil)
+        _(span.links.map { |l| l.attributes['n'] }).must_equal %w[diagnostic ordinary-1]
+      end
+
+      it 'falls back to the historical per-type fill when nothing is preferred' do
+        events_span = span_with(:keep_preferred, events: 2)
+        %w[1 2 3].each { |name| events_span.add_event(name) }
+        _(events_span.events.map(&:name)).must_equal %w[2 3]
+
+        limits = SpanLimits.new(link_count_limit: 2, retention_policy: :keep_preferred)
+        links = %w[1 2 3].map { |n| OpenTelemetry::Trace::Link.new(context, 'n' => n) }
+        links_span = Span.new(context, Context.empty, OpenTelemetry::Trace::Span::INVALID, 'name', SpanKind::INTERNAL, nil, limits,
+                              [], nil, links, Time.now, nil, nil)
+        _(links_span.links.map { |l| l.attributes['n'] }).must_equal %w[1 2]
+      end
+    end
+
+    describe 'default policy' do
+      it 'keeps the newest events and drops the oldest' do
+        span = span_with(nil)
+        %w[1 2 3].each { |name| span.add_event(name) }
+        _(span.events.map(&:name)).must_equal %w[3]
+      end
+
+      it 'keeps the oldest links and drops the newest' do
+        limits = SpanLimits.new(link_count_limit: 1)
+        links = %w[1 2 3].map { |n| OpenTelemetry::Trace::Link.new(context, 'n' => n) }
+        span = Span.new(context, Context.empty, OpenTelemetry::Trace::Span::INVALID, 'name', SpanKind::INTERNAL, nil, limits,
+                        [], nil, links, Time.now, nil, nil)
+        _(span.links.map { |l| l.attributes['n'] }).must_equal %w[1]
+      end
+
+      it 'ignores preferred markers' do
+        span = span_with(nil)
+        span.add_event('diagnostic', preferred: true)
+        span.add_event('ordinary')
+        _(span.events.map(&:name)).must_equal %w[ordinary]
+      end
+    end
+
+    describe 'through the exporter' do
+      let(:exporter) { OpenTelemetry::SDK::Trace::Export::InMemorySpanExporter.new }
+      let(:provider) do
+        OpenTelemetry::SDK::Trace::TracerProvider.new(span_limits: limits).tap do |p|
+          p.add_span_processor(OpenTelemetry::SDK::Trace::Export::SimpleSpanProcessor.new(exporter))
+        end
+      end
+      let(:tracer) { provider.tracer('retention-test', '1.0') }
+
+      let(:limits) do
+        SpanLimits.new(
+          attribute_count_limit: 64,
+          event_count_limit: 2,
+          link_count_limit: 1,
+          event_attribute_count_limit: 64,
+          link_attribute_count_limit: 64,
+          retention_policy: :keep_preferred
+        )
+      end
+
+      def export_span
+        tracer.in_span('task') do |span|
+          span.add_event('noise-1')
+          span.add_event('noise-2')
+          span.add_event('noise-3')
+          span.add_event('failure-diagnosis', preferred: true)
+          span.add_link(OpenTelemetry::Trace::Link.new(context))
+          span.add_link(OpenTelemetry::Trace::Link.new(context), preferred: true)
+        end
+        exporter.finished_spans.last
+      end
+
+      it 'exports only the retained events and links' do
+        span_data = export_span
+        # Capacity is 2: the preferred event plus the newest unmarked event.
+        _(span_data.events.map(&:name)).must_equal %w[noise-3 failure-diagnosis]
+        # Capacity is 1: the preferred link wins over the ordinary one.
+        _(span_data.links.size).must_equal 1
+      end
+
+      it 'reports the dropped counts against the recorded totals' do
+        span_data = export_span
+        _(span_data.total_recorded_events).must_equal 4
+        _(span_data.total_recorded_links).must_equal 2
+        _(span_data.total_recorded_events - span_data.events.size).must_equal 2
+        _(span_data.total_recorded_links - span_data.links.size).must_equal 1
+      end
+
+      it 'surfaces the retained events through the console exporter' do
+        span_data = export_span
+        captured = StringIO.new
+        original = $stdout
+        $stdout = captured
+        begin
+          OpenTelemetry::SDK::Trace::Export::ConsoleSpanExporter.new.export([span_data])
+        ensure
+          $stdout = original
+        end
+        _(captured.string).must_include('failure-diagnosis')
+        _(captured.string).wont_include('noise-1')
+      end
+    end
   end
 
   describe '#record_exception' do
@@ -404,6 +625,25 @@ describe OpenTelemetry::SDK::Trace::Span do
         _(ev.attributes['exception.message']).must_equal(error.message)
         _(ev.attributes['exception.stacktrace']).must_equal(error.full_message(highlight: false, order: :top))
       end
+    end
+
+    it 'marks the exception event as preferred by default' do
+      span.record_exception(error)
+      _(span.events.first.preferred?).must_equal(true)
+    end
+
+    it 'can opt out of the preferred marker' do
+      span.record_exception(error, preferred: false)
+      _(span.events.first.preferred?).must_equal(false)
+    end
+
+    it 'keeps the exception event when preferred is retained over noise' do
+      limits = SpanLimits.new(event_count_limit: 1, retention_policy: :keep_preferred)
+      preferred_span = Span.new(context, Context.empty, OpenTelemetry::Trace::Span::INVALID, 'name', SpanKind::INTERNAL, nil, limits,
+                                [], nil, nil, Time.now, nil, nil)
+      preferred_span.add_event('noise')
+      preferred_span.record_exception(error)
+      _(preferred_span.events.map(&:name)).must_equal %w[exception]
     end
   end
 

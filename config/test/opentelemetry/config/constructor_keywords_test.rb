@@ -13,6 +13,7 @@ describe 'declarative config constructor keywords' do
 
   ENV_FREE_KEYWORDS = {
     OpenTelemetry::SDK::Trace::TracerProvider => %i[id_generator],
+    OpenTelemetry::SDK::Trace::SpanLimits => %i[retention_policy],
     OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor => %i[metrics_reporter],
     OpenTelemetry::Exporter::OTLP::Exporter => %i[metrics_reporter]
   }.freeze

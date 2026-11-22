@@ -81,6 +81,71 @@ end
 
 For additional examples, see the [examples on github][examples-github].
 
+## Retaining important events and links
+
+A span silently drops the oldest events (and the newest links) once it reaches
+its `event_count_limit` (or `link_count_limit`). Long-running tasks can fill
+that capacity with low-value entries before the diagnostic information — an
+exception event, the link to the originating job — is recorded.
+
+`SpanLimits` accepts an opt-in `retention_policy` so callers can mark entries as
+preferred and still respect the same count limits:
+
+```ruby
+require 'opentelemetry/sdk'
+
+SpanLimits = OpenTelemetry::SDK::Trace::SpanLimits
+
+# Keep preferred entries regardless of age, filling any spare capacity with
+# the historical per-type defaults (newest events, oldest links).
+span_limits = SpanLimits.new(
+  event_count_limit: 4,
+  link_count_limit: 2,
+  retention_policy: :keep_preferred
+)
+
+# `OpenTelemetry::SDK.configure` does not expose span limits, so build the
+# provider directly when a custom policy is required.
+OpenTelemetry.tracer_provider = OpenTelemetry::SDK::Trace::TracerProvider.new(
+  span_limits: span_limits
+).tap do |provider|
+  provider.add_span_processor(
+    OpenTelemetry::SDK::Trace::Export::SimpleSpanProcessor.new(
+      OpenTelemetry::SDK::Trace::Export::ConsoleSpanExporter.new
+    )
+  )
+end
+
+tracer = OpenTelemetry.tracer_provider.tracer('my_app_or_gem', '0.1.0')
+
+tracer.in_span('long-running-task') do |span|
+  span.add_event('progress', attributes: { 'step' => 1 })
+  span.add_event('progress', attributes: { 'step' => 2 })
+  # Mark the entries that matter. Preferred entries survive trimming.
+  span.add_event('validation-failed', attributes: { 'reason' => 'timeout' }, preferred: true)
+  # record_exception marks its event as preferred by default.
+  span.record_exception(StandardError.new('boom'))
+  # Links can be marked when created...
+  span.add_link(OpenTelemetry::Trace::Link.new(OpenTelemetry::Trace.current_span.context, preferred: true))
+  # ...or when added.
+  span.add_link(OpenTelemetry::Trace::Link.new(OpenTelemetry::Trace.current_span.context), preferred: true)
+end
+```
+
+Every policy still honours the configured count limits, and the retained entries
+keep their original order. When the preferred entries alone exceed a limit, the
+newest preferred entries are kept. The dropped totals are still reported on the
+exported `SpanData` through `total_recorded_events` and `total_recorded_links`.
+
+The accepted policies are:
+
+| Policy            | Behaviour when the limit is reached                                              |
+| ----------------- | -------------------------------------------------------------------------------- |
+| `nil` (default)   | Historical behaviour: keep the newest events, keep the oldest links; markers ignored. |
+| `:keep_newest`    | Keep the newest entries for both events and links.                               |
+| `:keep_oldest`    | Keep the oldest entries for both events and links.                               |
+| `:keep_preferred` | Keep preferred entries first, then fill spare capacity with the per-type default; newest preferred wins when over capacity. |
+
 ## How can I get involved?
 
 The `opentelemetry-sdk` gem source is [on github][repo-github], along with related gems including `opentelemetry-api`.

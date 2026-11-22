@@ -13,7 +13,16 @@ module OpenTelemetry
       #  name: String
       #  attributes: frozen Hash{String => String, Numeric, Boolean, Array<String, Numeric, Boolean>}
       #  timestamp: Integer nanoseconds since Epoch
-      Event = Struct.new(:name, :attributes, :timestamp)
+      #  preferred: Boolean (whether the event is marked for retention, see
+      #    {OpenTelemetry::SDK::Trace::SpanLimits#retention_policy})
+      Event = Struct.new(:name, :attributes, :timestamp, :preferred) do
+        # Returns true if the event was marked as preferred for retention.
+        #
+        # @return [Boolean]
+        def preferred?
+          preferred ? true : false
+        end
+      end
     end
   end
 end

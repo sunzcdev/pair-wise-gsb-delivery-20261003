@@ -94,9 +94,13 @@ module OpenTelemetry
       # meanings.
       #
       # @param [OpenTelemetry::Trace::Link] link The link object to add on the {Span}.
+      # @param [optional Boolean] preferred Whether to mark the link as
+      #   preferred for retention. Implementations that support a retention
+      #   policy may use this hint to keep such links when a limit is reached.
+      #   Defaults to false.
       #
       # @return [self] returns itself
-      def add_link(link)
+      def add_link(link, preferred: false)
         self
       end
 
@@ -117,9 +121,13 @@ module OpenTelemetry
       #   strings and the values may be (array of) string, boolean or numeric
       #   type.
       # @param [optional Time] timestamp Optional timestamp for the event.
+      # @param [optional Boolean] preferred Whether to mark the event as
+      #   preferred for retention. Implementations that support a retention
+      #   policy may use this hint to keep such events when a limit is reached.
+      #   Defaults to false.
       #
       # @return [self] returns itself
-      def add_event(name, attributes: nil, timestamp: nil)
+      def add_event(name, attributes: nil, timestamp: nil, preferred: false)
         self
       end
 
@@ -131,9 +139,13 @@ module OpenTelemetry
       #   attributes One or more key:value pairs, where the keys must be
       #   strings and the values may be (array of) string, boolean or numeric
       #   type.
+      # @param [optional Boolean] preferred Whether to mark the exception event
+      #   as preferred for retention. Implementations that support a retention
+      #   policy may use this hint to keep such events when a limit is reached.
+      #   Defaults to true.
       #
       # @return [void]
-      def record_exception(exception, attributes: nil); end
+      def record_exception(exception, attributes: nil, preferred: true); end
 
       # Sets the Status to the Span
       #

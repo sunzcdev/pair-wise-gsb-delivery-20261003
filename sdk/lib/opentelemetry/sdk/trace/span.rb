@@ -134,13 +134,19 @@ module OpenTelemetry
         # meanings.
         #
         # @param [OpenTelemetry::Trace::Link] link The link object to add on the {Span}.
+        # @param [optional Boolean] preferred Whether to mark the link as
+        #   preferred for retention. Has no effect unless the {Span}'s
+        #   {SpanLimits#retention_policy} is +:keep_preferred+. Prefer marking
+        #   the {OpenTelemetry::Trace::Link} itself with <tt>preferred: true</tt>
+        #   when the link is supplied at span creation.
         #
         # @return [self] returns itself
-        def add_link(link)
+        def add_link(link, preferred: false)
           @mutex.synchronize do
             if @ended
               OpenTelemetry.logger.warn('Calling add_link on an ended Span.')
             else
+              link = OpenTelemetry::Trace::Link.new(link.span_context, link.attributes, preferred: true) if preferred && !preferred?(link)
               @links ||= []
               @links = trim_links(@links << link, @span_limits.link_count_limit, @span_limits.link_attribute_count_limit)
               @total_recorded_links += 1
@@ -165,10 +171,13 @@ module OpenTelemetry
         #   One or more key:value pairs, where the keys must be strings and the
         #   values may be (array of) string, boolean or numeric type.
         # @param [optional Time] timestamp Optional timestamp for the event.
+        # @param [optional Boolean] preferred Whether to mark the event as
+        #   preferred for retention. Has no effect unless the {Span}'s
+        #   {SpanLimits#retention_policy} is +:keep_preferred+.
         #
         # @return [self] returns itself
-        def add_event(name, attributes: nil, timestamp: nil)
-          event = Event.new(name, truncate_attribute_values(attributes, @span_limits.event_attribute_length_limit), relative_timestamp(timestamp))
+        def add_event(name, attributes: nil, timestamp: nil, preferred: false)
+          event = Event.new(name, truncate_attribute_values(attributes, @span_limits.event_attribute_length_limit), relative_timestamp(timestamp), preferred)
 
           @mutex.synchronize do
             if @ended
@@ -190,16 +199,20 @@ module OpenTelemetry
         #   attributes One or more key:value pairs, where the keys must be
         #   strings and the values may be (array of) string, boolean or numeric
         #   type.
+        # @param [optional Boolean] preferred Whether to mark the exception
+        #   event as preferred for retention. Defaults to true, since exception
+        #   events usually carry the diagnostic value of a span. Pass false to
+        #   opt out.
         #
         # @return [void]
-        def record_exception(exception, attributes: nil)
+        def record_exception(exception, attributes: nil, preferred: true)
           event_attributes = {
             'exception.type' => exception.class.to_s,
             'exception.message' => exception.message,
             'exception.stacktrace' => exception.full_message(highlight: false, order: :top).encode('UTF-8', invalid: :replace, undef: :replace, replace: '�')
           }
           event_attributes.merge!(attributes) unless attributes.nil?
-          add_event('exception', attributes: event_attributes)
+          add_event('exception', attributes: event_attributes, preferred: preferred)
         end
 
         # Sets the Status to the Span
@@ -413,17 +426,16 @@ module OpenTelemetry
             return links
           end
 
-          # Slow path: trim attributes for each Link.
+          # Slow path: trim attributes for each Link, then apply the retention policy.
           valid_links = links.select { |link| link.span_context.valid? }
-          excess_link_count = valid_links.size - link_count_limit
-          valid_links.pop(excess_link_count) if excess_link_count.positive?
           valid_links.map! do |link|
             attrs = link.attributes.to_h.dup # link.attributes is frozen, so we need an unfrozen copy to adjust.
             attrs.keep_if { |key, value| Internal.valid_key?(key) && Internal.valid_value?(value) }
             excess = attrs.size - link_attribute_count_limit
             excess.times { attrs.shift } if excess.positive?
-            OpenTelemetry::Trace::Link.new(link.span_context, attrs)
+            OpenTelemetry::Trace::Link.new(link.span_context, attrs, preferred: preferred?(link))
           end
+          retain_entries(valid_links, link_count_limit, :keep_oldest)
         end
 
         def append_event(events, event) # rubocop:disable Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
@@ -438,19 +450,63 @@ module OpenTelemetry
             return events << event
           end
 
-          # Slow path.
-          excess = events.size + 1 - event_count_limit
-          events.shift(excess) if excess.positive?
-
+          # Slow path: trim the event's attributes, then apply the retention policy.
           excess = event.attributes.size - event_attribute_count_limit
           if excess.positive? || !valid_attributes
             attrs = event.attributes.to_h.dup # event.attributes is frozen, so we need an unfrozen copy to adjust.
             attrs.keep_if { |key, value| Internal.valid_key?(key) && Internal.valid_value?(value) }
             excess = attrs.size - event_attribute_count_limit
             excess.times { attrs.shift } if excess.positive?
-            event = Event.new(event.name, attrs.freeze, event.timestamp)
+            event = Event.new(event.name, attrs.freeze, event.timestamp, event.preferred)
           end
           events << event
+          retain_entries(events, event_count_limit, :keep_newest)
+        end
+
+        # Applies the configured retention policy to +entries+, keeping at most
+        # +limit+ of them in their original order. When no policy is configured,
+        # +default_policy+ preserves the historical behaviour of the caller.
+        def retain_entries(entries, limit, default_policy)
+          return entries if entries.size <= limit
+
+          policy = @span_limits.retention_policy || default_policy
+          if policy == :keep_preferred
+            retain_preferred_entries(entries, limit, default_policy)
+          elsif policy == :keep_oldest
+            entries.slice!(limit, entries.size)
+          else
+            entries.shift(entries.size - limit)
+          end
+          entries
+        end
+
+        # Retains preferred entries first, filling any remaining capacity with
+        # unmarked entries chosen by +default_policy+. When the preferred
+        # entries alone exceed +limit+, the newest preferred entries win. The
+        # kept entries preserve their original relative order.
+        def retain_preferred_entries(entries, limit, default_policy)
+          preferred = []
+          ordinary = []
+          entries.each_index do |index|
+            if preferred?(entries[index])
+              preferred << index
+            else
+              ordinary << index
+            end
+          end
+
+          keep = if preferred.size >= limit
+                   preferred.last(limit)
+                 elsif default_policy == :keep_oldest
+                   preferred + ordinary.first(limit - preferred.size)
+                 else
+                   preferred + ordinary.last(limit - preferred.size)
+                 end
+          entries.replace(keep.sort.map { |index| entries[index] })
+        end
+
+        def preferred?(entry)
+          entry.respond_to?(:preferred?) ? entry.preferred? : false
         end
 
         def relative_timestamp(timestamp)
