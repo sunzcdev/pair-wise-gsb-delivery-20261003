@@ -81,6 +81,13 @@ module Fluent::Plugin
           @line_buffer = nil
         end
 
+        # Bytes of complete lines kept here until they become part of an
+        # emitted event. Mirrors LineFeeder::FileFeed#pending_bytesize so the
+        # read position stays before uncommitted multiline records.
+        def pending_bytesize
+          @line_buffer ? @line_buffer.bytesize : 0
+        end
+
         def on_notify(tw)
           unless @start && @flush_method
             return

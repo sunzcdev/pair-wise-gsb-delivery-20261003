@@ -200,6 +200,34 @@ class IntailLineFeederTest < Test::Unit::TestCase
       assert_equal("s test3\n", file_feed.line_buffer)
     end
 
+    test 'reports the bytesize of the multiline lines waiting for a continuation' do
+      line_feeder = create_feeder(tag: 'tail', multiline_mode: true, parser: FirstlineParser.new)
+      file_feed, tw = create_file_feed(line_feeder)
+
+      assert_equal 0, file_feed.pending_bytesize
+
+      file_feed.feed_lines(["s test1\n", "f test2\n"], tw)
+
+      assert_equal "s test1\nf test2\n".bytesize, file_feed.pending_bytesize
+
+      # Completing the buffered record emits it and frees the pending bytes.
+      file_feed.feed_lines(["s test3\n"], tw)
+
+      assert_equal "s test3\n".bytesize, file_feed.pending_bytesize
+    end
+
+    test 'pending_bytesize drops to zero after a flush' do
+      line_feeder = create_feeder(tag: 'tail', multiline_mode: true, parser: FirstlineParser.new)
+      file_feed, tw = create_file_feed(line_feeder, flush_interval: 0)
+      file_feed.feed_lines(["s test1\n", "f test2\n"], tw)
+
+      assert_operator file_feed.pending_bytesize, :>, 0
+
+      file_feed.on_notify(tw)
+
+      assert_equal 0, file_feed.pending_bytesize
+    end
+
     test 'keeps the buffered line between the feeds of the file' do
       line_feeder = create_feeder(tag: 'tail', multiline_mode: true, parser: FirstlineParser.new)
       file_feed, tw = create_file_feed(line_feeder)
@@ -419,6 +447,17 @@ class IntailLineFeederTest < Test::Unit::TestCase
 
       assert_equal([[FILE_PATH, "s test1\nf test2\n"]], flushed)
       assert_nil flusher.line_buffer
+    end
+
+    test 'exposes the bytesize of the buffered line like FileFeed' do
+      line_feeder = create_feeder(tag: 'tail', multiline_mode: true, parser: FirstlineParser.new)
+      flusher, tw = create_legacy_flusher_watcher(flush_interval: 4) { |_tw, _buf| nil }
+
+      assert_equal 0, flusher.pending_bytesize
+
+      line_feeder.feed_lines(["s test1\n", "f test2\n"], tw)
+
+      assert_equal "s test1\nf test2\n".bytesize, flusher.pending_bytesize
     end
 
     test 'does not start the timer of a multiline parser without a firstline' do

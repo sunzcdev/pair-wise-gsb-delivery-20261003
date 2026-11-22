@@ -30,6 +30,105 @@ class IntailIOHandlerTest < Test::Unit::TestCase
     Fluent::Plugin::TailInput::TailWatcher.new(create_target_info, nil, nil, nil, nil, nil, nil, nil, nil)
   end
 
+  test 'a multiline record buffered for its continuation keeps the position before it' do
+    text = "s first\nf continuation\n"
+    @file.write(text)
+    @file.close
+    watcher = create_watcher
+    update_pos = nil
+    stub(watcher).pe do
+      pe = 'position_file'
+      stub(pe).read_pos { 0 }
+      stub(pe).update_pos { |val| update_pos = val }
+      pe
+    end
+    # The first line is held by the multiline LineFeeder, waiting for its
+    # continuation, while the second line is the batch being delivered now.
+    file_feed = Object.new
+    file_feed.define_singleton_method(:pending_bytesize) { 8 }
+    stub(watcher).file_feed { file_feed }
+    returned_lines = []
+    handler = Fluent::Plugin::TailInput::TailWatcher::IOHandler.new(
+      watcher, path: @file.path, read_lines_limit: 100, read_bytes_limit_per_second: -1,
+      log: $log, open_on_every_update: false, metrics: @metrics
+    ) do |lines, _tail_watcher|
+      returned_lines.concat(lines)
+      true
+    end
+
+    handler.on_notify
+
+    # The IO reached EOF, but the position must stop before the buffered record.
+    assert_equal text.lines, returned_lines
+    assert_equal 15, update_pos
+  ensure
+    handler&.close
+  end
+
+  test 'an asynchronous receive commits a position backed off over buffered multiline bytes' do
+    text = "s first\nf continuation\n"
+    @file.write(text)
+    @file.close
+    watcher = create_watcher
+    position = 0
+    stub(watcher).pe do
+      pe = 'position_file'
+      stub(pe).read_pos { position }
+      stub(pe).update_pos { |value| position = value }
+      pe
+    end
+    file_feed = Object.new
+    file_feed.define_singleton_method(:pending_bytesize) { 8 }
+    stub(watcher).file_feed { file_feed }
+    handler = Fluent::Plugin::TailInput::TailWatcher::IOHandler.new(
+      watcher, path: @file.path, read_lines_limit: 100, read_bytes_limit_per_second: -1,
+      log: $log, open_on_every_update: false, metrics: @metrics
+    ) do
+      Fluent::Plugin::TailInput::TailWatcher::IOHandler::ASYNC_PENDING
+    end
+
+    handler.on_notify
+    assert_true handler.pending?
+    assert_equal 0, position
+    # No further notification is needed at EOF, but the committed position still
+    # backs off over the buffered multiline record.
+    assert_false handler.complete_async(true)
+    assert_equal 15, position
+  ensure
+    handler&.close
+  end
+
+  test 'a notification after a multiline flush confirms the freed position' do
+    text = "s first\nf continuation\n"
+    @file.write(text)
+    @file.close
+    watcher = create_watcher
+    position = 8
+    stub(watcher).pe do
+      pe = 'position_file'
+      stub(pe).read_pos { position }
+      stub(pe).update_pos { |value| position = value }
+      pe
+    end
+    pending = 8
+    file_feed = Object.new
+    file_feed.define_singleton_method(:pending_bytesize) { pending }
+    stub(watcher).file_feed { file_feed }
+    handler = Fluent::Plugin::TailInput::TailWatcher::IOHandler.new(
+      watcher, path: @file.path, read_lines_limit: 100, read_bytes_limit_per_second: -1,
+      log: $log, open_on_every_update: false, metrics: @metrics
+    ) { true }
+
+    # The flush timer (or shutdown) delivered the buffered record before this
+    # notification, so the previously held bytes can now be confirmed.
+    pending = 0
+    handler.on_notify
+
+    assert_equal text.bytesize, position
+  ensure
+    handler&.close
+  end
+
   test '#on_notify load file content and passed it to receive_lines method' do
     text = "this line is test\ntest line is test\n"
     @file.write(text)

@@ -179,6 +179,16 @@ module Fluent::Plugin
           @async_pending
         end
 
+        # The position that can be committed safely: everything read up to the
+        # current IO offset, except data which has not been delivered as a
+        # complete event yet. The FIFO holds a partial line without a newline,
+        # and the watcher's line buffer holds multiline lines waiting for their
+        # continuation (or for their timed/shutdown flush). Committing past
+        # either of them would lose data on restart or retry.
+        def committed_position(io)
+          io.pos - @fifo.reading_bytesize - @watcher.pending_bytesize
+        end
+
         # Completes a receive callback that returned ASYNC_PENDING. The caller
         # must invoke TailWatcher#on_notify when this returns true.
         def complete_async(success)
@@ -292,16 +302,22 @@ module Fluent::Plugin
               end
 
               if @lines.empty?
-                @watcher.pe.update_pos(io.pos - @fifo.reading_bytesize) if has_skipped_line
+                if io
+                  # A skipped long line or a multiline flush (timer/shutdown)
+                  # changes how much of the read data is already delivered:
+                  # confirm the new offset, but leave idle notifications quiet.
+                  position = committed_position(io)
+                  @watcher.pe.update_pos(position) if has_skipped_line || position != @watcher.pe.read_pos
+                end
               else
                 received = @receive_lines.call(@lines, @watcher)
                 if received == ASYNC_PENDING
-                  @pending_position = io.pos - @fifo.reading_bytesize
+                  @pending_position = committed_position(io)
                   @pending_read_more ||= read_more
                   @async_pending = true
                   read_more = false
                 elsif received
-                  @watcher.pe.update_pos(io.pos - @fifo.reading_bytesize)
+                  @watcher.pe.update_pos(committed_position(io))
                   @lines.clear
                   @pending_read_more = false
                 else

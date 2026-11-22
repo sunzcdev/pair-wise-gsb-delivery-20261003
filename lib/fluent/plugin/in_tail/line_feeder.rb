@@ -110,6 +110,13 @@ module Fluent::Plugin
           @start = nil
         end
 
+        # Bytes of complete lines kept here until they become part of an
+        # emitted event. The committed read position must stop before them so
+        # that a restart does not lose the beginning of a multiline record.
+        def pending_bytesize
+          @line_buffer ? @line_buffer.bytesize : 0
+        end
+
         # @return true if no error or unrecoverable error happens in emit action. false if got BufferOverflowError
         def feed_lines(lines, tail_watcher)
           @line_feeder.feed_lines(lines, tail_watcher)

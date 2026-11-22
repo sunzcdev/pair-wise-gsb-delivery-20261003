@@ -51,6 +51,14 @@ module Fluent::Plugin
       attr_reader :watchers
       attr_accessor :group_watcher
 
+      # Bytes already read from the file but not delivered as complete events
+      # yet: a multiline record waiting for its continuation (plus any partial
+      # line held by the IOHandler's FIFO). The position file must not advance
+      # past them, otherwise a restart loses the beginning of the record.
+      def pending_bytesize
+        (file_feed ? file_feed.pending_bytesize : 0)
+      end
+
       def tag
         @parsed_tag ||= @path.tr('/', '.').squeeze('.').gsub(/^\./, '')
       end

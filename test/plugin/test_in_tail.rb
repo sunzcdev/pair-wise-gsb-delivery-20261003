@@ -2417,6 +2417,129 @@ class TailInputTest < Test::Unit::TestCase
       assert_equal({"var1" => "foo 1", "var2" => "bar 1", "var3" => "baz 1"}, events[0][2])
       assert_equal({"var1" => "foo 2", "var2" => "bar 2", "var3" => "baz 2"}, events[1][2])
     end
+
+    data(flat: MULTILINE_CONFIG,
+         parse: PARSE_MULTILINE_CONFIG)
+    def test_multiline_position_stays_before_a_record_waiting_for_continuation(data)
+      path = "#{@tmp_dir}/tail.txt"
+      pos_file = "#{@tmp_dir}/tail.pos"
+      Fluent::FileWrapper.open(path, "wb") { |f| f.puts "s complete"; f.puts "s partial" }
+
+      config = data + config_element("", "", {
+        "path" => path,
+        "tag" => "t1",
+        "pos_file" => pos_file,
+        "read_from_head" => true,
+        "refresh_interval" => "1h",
+        "enable_stat_watcher" => false,
+      })
+
+      first = create_driver(config, false)
+      target = create_target_info(path)
+      first.end_if { first.instance.instance_variable_get(:@pf)[target].read_pos == "s complete\n".bytesize }
+      first.run(timeout: 5, shutdown: false) do
+      end
+
+      entry = first.instance.instance_variable_get(:@pf)[target]
+      # The complete record is confirmed; the partial record, which only lives in
+      # the LineFeeder while waiting for its continuation, is not confirmed.
+      assert_equal "s complete\n".bytesize, entry.read_pos
+
+      # Simulate a hard stop: the in-memory line buffer is lost without running
+      # the shutdown flush, exactly like a process restart. Detach the watchers
+      # first so the event loop can stop cleanly, and make the shutdown flush a
+      # no-op so the partial record is only recoverable from the position file.
+      first.instance.instance_variable_get(:@tails).each_value do |tw|
+        stub(tw.file_feed).close {}
+        tw.watchers.each { |watcher| first.instance.event_loop_detach(watcher) }
+      end
+      first.instance_shutdown
+
+      # The continuation completes the record that straddled the stop position.
+      # A following firstline makes the second driver emit it on its first read,
+      # instead of keeping it until its own shutdown flush.
+      Fluent::FileWrapper.open(path, "ab") { |f| f.puts "f continuation"; f.puts "s next" }
+
+      second = create_driver(config, false)
+      second.end_if { second.record_count.positive? }
+      second.run(timeout: 5) do
+      end
+
+      records = second.events.map { |event| event[2] }
+      assert_equal(
+        { "message1" => "partial", "message2" => "continuation" },
+        records.first
+      )
+    end
+
+    data(flat: MULTILINE_CONFIG,
+         parse: PARSE_MULTILINE_CONFIG)
+    def test_multiline_flush_advances_the_position_to_the_delivered_record(data)
+      path = "#{@tmp_dir}/tail.txt"
+      Fluent::FileWrapper.open(path, "wb") { |f| f.puts "s flushed"; f.puts "f part" }
+
+      config = data + config_element("", "", {
+        "path" => path,
+        "tag" => "t1",
+        "pos_file" => "#{@tmp_dir}/tail.pos",
+        "read_from_head" => true,
+        "refresh_interval" => "1h",
+        "enable_stat_watcher" => false,
+        "multiline_flush_interval" => "1s",
+      })
+
+      d = create_driver(config, false)
+      target = create_target_info(path)
+      d.end_if { d.instance.instance_variable_get(:@pf)[target].read_pos == File.size(path) }
+      d.run(expect_records: 1, timeout: 5, shutdown: false) do
+      end
+      entry = d.instance.instance_variable_get(:@pf)[target]
+      assert_equal File.size(path), entry.read_pos
+    ensure
+      d&.instance_shutdown
+    end
+
+    data(flat: MULTILINE_CONFIG,
+         parse: PARSE_MULTILINE_CONFIG)
+    def test_multiline_keeps_the_position_when_the_router_rejects_a_batch(data)
+      path = "#{@tmp_dir}/tail.txt"
+      Fluent::FileWrapper.open(path, "wb") { |f|
+        f.puts "s ready"
+        f.puts "s first"
+        f.puts "f second"
+      }
+
+      config = data + config_element("", "", {
+        "path" => path,
+        "tag" => "t1",
+        "pos_file" => "#{@tmp_dir}/tail.pos",
+        "read_from_head" => true,
+        "refresh_interval" => "1h",
+        "enable_stat_watcher" => false,
+      })
+
+      d = create_driver(config, false)
+      target = create_target_info(path)
+      d.end_if { d.instance.instance_variable_get(:@pf)[target].read_pos.positive? }
+      d.run(timeout: 5, shutdown: false) do
+      end
+
+      tw = d.instance.instance_variable_get(:@tails)[path]
+      position_before = d.instance.instance_variable_get(:@pf)[target].read_pos
+
+      # A BufferOverflowError rejects the whole batch: no position is confirmed
+      # for it, so the same bytes are retried afterwards.
+      router = d.instance.router
+      stub(router).emit_stream do
+        raise Fluent::Plugin::Buffer::BufferOverflowError, "buffer is full"
+      end
+      result = d.instance.receive_lines(["s rejected\n", "f record\n"], tw)
+
+      assert_false result
+      assert_equal position_before, d.instance.instance_variable_get(:@pf)[target].read_pos
+    ensure
+      d&.instance_shutdown
+    end
   end
 
   sub_test_case "path" do
