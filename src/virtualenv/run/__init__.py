@@ -241,13 +241,26 @@ def load_app_data(
         action="store_true",
         help="use app data folder in read-only mode (write operations will fail with error)",
     )
+    parser.add_argument(
+        "--read-only-app-data-fallback",
+        action="store_true",
+        help=(
+            "in read-only app data mode, build seed wheel images missing from the read-only folder in a private "
+            "temporary folder removed once the environment is created"
+        ),
+    )
     options, _ = parser.parse_known_args(args, namespace=options)
 
     # here we need a write-able application data (e.g. the zipapp might need this for discovery cache)
     app_data: Final = parser.add_argument(
         "--app-data",
         help="a data folder used as cache by the virtualenv",
-        type=partial(make_app_data, read_only=options.read_only_app_data, env=options.env),
+        type=partial(
+            make_app_data,
+            read_only=options.read_only_app_data,
+            fallback_to_temp=options.read_only_app_data_fallback,
+            env=options.env,
+        ),
         default=None,
     )
     parser.add_argument(
@@ -264,7 +277,12 @@ def load_app_data(
     if options.app_data is None:
         # build the default only when no folder was given, since building it creates the folder or, when read-only,
         # requires it to exist; it is also stored on the action so that --help still shows it
-        options.app_data = app_data.default = make_app_data(None, read_only=options.read_only_app_data, env=options.env)
+        options.app_data = app_data.default = make_app_data(
+            None,
+            read_only=options.read_only_app_data,
+            fallback_to_temp=options.read_only_app_data_fallback,
+            env=options.env,
+        )
     if options.reset_app_data:
         options.app_data.reset()
     return options

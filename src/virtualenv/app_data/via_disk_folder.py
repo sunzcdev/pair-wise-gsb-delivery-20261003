@@ -54,6 +54,8 @@ if TYPE_CHECKING:
     from collections.abc import Generator
     from pathlib import Path
 
+    from virtualenv.util.lock import PathLockBase
+
 LOGGER: Final[logging.Logger] = logging.getLogger(__name__)  # simplint: ignore[module-variable-prefix]  # existing name
 
 
@@ -96,18 +98,18 @@ class AppDataDiskFolder(AppData):
         """Do nothing."""
 
     @contextmanager
-    def locked(self, path: Path) -> Generator[None]:
+    def locked(self, path: Path) -> Generator[PathLockBase]:
         """Hold the lock for the path while the caller uses it.
 
         :param path: the path to lock
 
-        :yields: nothing
+        :yields: the lock of the folder holding the path, for taking per-key locks
 
         """
         # the lock's / operator takes a str key, and path here is a Path
         path_lock = self.lock / path  # ty: ignore[unsupported-operator]
         with path_lock:
-            yield path_lock.path
+            yield path_lock
 
     @contextmanager
     def extract(self, path: Path, to_folder: Path | None) -> Generator[Path]:

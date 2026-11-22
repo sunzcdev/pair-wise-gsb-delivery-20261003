@@ -13,7 +13,7 @@ import pytest
 from python_discovery import PythonInfo
 
 from virtualenv import __version__
-from virtualenv.app_data import AppDataDiskFolder, ReadOnlyAppData
+from virtualenv.app_data import AppDataDiskFolder, ReadOnlyAppData, ReadOnlyFallbackAppData
 from virtualenv.config.cli.parser import VirtualEnvOptions
 from virtualenv.run import cli_run, session_via_cli
 
@@ -86,6 +86,33 @@ def test_read_only_app_data_rejects_missing_given_folder(
     args: Final = ["--read-only-app-data", *give_app_data(cache), str(tmp_path / "env")]
     with pytest.raises(RuntimeError, match=rf"^read-only app data directory {re.escape(str(cache))} does not exist$"):
         session_via_cli(args)
+
+
+def test_read_only_app_data_fallback_flag_selects_fallback_store(
+    tmp_path: Path, give_app_data: Callable[[Path], list[str]]
+) -> None:
+    cache: Final = tmp_path / "cache"
+    # a read-only cache is populated first (discovery py info included), then only read
+    session_via_cli([*give_app_data(cache), str(tmp_path / "warm")])
+    options: Final = VirtualEnvOptions()
+    session_via_cli(
+        ["--read-only-app-data", "--read-only-app-data-fallback", *give_app_data(cache), str(tmp_path / "env")],
+        options,
+    )
+    assert (type(options.app_data), str(options.app_data)) == (ReadOnlyFallbackAppData, str(cache))
+    options.app_data.close()
+
+
+def test_read_only_app_data_fallback_env_var_selects_fallback_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, give_app_data: Callable[[Path], list[str]]
+) -> None:
+    cache: Final = tmp_path / "cache"
+    session_via_cli([*give_app_data(cache), str(tmp_path / "warm")])
+    monkeypatch.setenv("VIRTUALENV_READ_ONLY_APP_DATA_FALLBACK", "true")
+    options: Final = VirtualEnvOptions()
+    session_via_cli(["--read-only-app-data", *give_app_data(cache), str(tmp_path / "env")], options)
+    assert type(options.app_data) is ReadOnlyFallbackAppData
+    options.app_data.close()
 
 
 def test_help_shows_default_app_data(

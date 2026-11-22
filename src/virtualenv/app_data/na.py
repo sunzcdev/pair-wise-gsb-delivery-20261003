@@ -3,12 +3,16 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
+from virtualenv.util.lock import NoOpFileLock
+
 from .base import AppData, ContentStore
 
 if TYPE_CHECKING:
     from collections.abc import Generator
     from pathlib import Path
     from typing import Any, NoReturn
+
+    from virtualenv.util.lock import PathLockBase
 
 
 class AppDataDisabled(AppData):
@@ -80,15 +84,15 @@ class AppDataDisabled(AppData):
 
     @contextmanager
     # the no-op store takes no lock, so the path is unused
-    def locked(self, path: Path) -> Generator[None]:  # ruff:ignore[unused-method-argument]
-        """Do nothing.
+    def locked(self, path: Path) -> Generator[PathLockBase]:  # ruff:ignore[unused-method-argument]
+        """Yield a no-op lock, since no app data folder is available.
 
         :param path: the path to lock, ignored since no lock is taken
 
-        :yields: nothing
+        :yields: a lock that takes no lock
 
         """
-        yield
+        yield NoOpFileLock(path)
 
     # the no-op store never has an image, so the arguments are unused
     def wheel_image(self, for_py_version: str, name: str) -> NoReturn:  # ruff:ignore[unused-method-argument]

@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from pathlib import Path
     from typing import Any
 
+    from virtualenv.util.lock import PathLockBase
+
 
 class AppData(ABC):
     """Abstract storage interface for the virtualenv application."""
@@ -113,12 +115,12 @@ class AppData(ABC):
 
     @abstractmethod
     @contextmanager
-    def locked(self, path: Path) -> Generator[None]:
+    def locked(self, path: Path) -> Generator[PathLockBase]:
         """Acquire an exclusive lock on the given path.
 
         :param path: the path to lock
 
-        :returns: a context manager holding the lock
+        :returns: a context manager yielding the folder lock the caller can take per-key locks from
 
         """
         raise NotImplementedError

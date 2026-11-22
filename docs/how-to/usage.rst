@@ -295,6 +295,20 @@ An empty or whitespace-only ``--app-data`` value is an error, as is a whitespace
 shell variables before using ``--app-data "$CACHE"``, especially with ``--reset-app-data``, which deletes the selected
 cache. An empty ``VIRTUALENV_APP_DATA`` or a blank ``VIRTUALENV_OVERRIDE_APP_DATA`` is treated as unset.
 
+Read-only app data with a temporary fallback
+============================================
+
+A build machine may mount the app-data cache read-only, with wheel images for only some of the seed packages. Pass
+``--read-only-app-data`` together with ``--read-only-app-data-fallback`` (or set
+``VIRTUALENV_READ_ONLY_APP_DATA_FALLBACK=true``) to keep using that folder without writing to it: wheel images already
+present in the read-only folder are reused as usual, while any missing image is built from the bundled wheels inside a
+private temporary folder.
+
+The temporary folder is removed as soon as the environment has been created. Seed packages are copied into the
+environment rather than symlinked, so the finished environment never points at a path that is later cleaned up, and the
+read-only folder is left unchanged. Without ``--read-only-app-data-fallback``, read-only mode keeps failing on a missing
+image.
+
 Allow unverified HTTPS for periodic updates
 ===========================================
 

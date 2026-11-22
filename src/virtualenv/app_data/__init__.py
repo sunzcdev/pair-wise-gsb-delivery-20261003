@@ -5,6 +5,7 @@ __lazy_modules__ = [
     f"{__spec__.parent}.cache_migration",  # ty: ignore[missing-union-attribute]  # imported modules have a spec
     f"{__spec__.parent}.na",  # ty: ignore[missing-union-attribute]  # imported modules have a spec
     f"{__spec__.parent}.read_only",  # ty: ignore[missing-union-attribute]  # imported modules have a spec
+    f"{__spec__.parent}.read_only_fallback",  # ty: ignore[missing-union-attribute]  # imported modules have a spec
     f"{__spec__.parent}.via_disk_folder",  # ty: ignore[missing-union-attribute]  # imported modules have a spec
     f"{__spec__.parent}.via_tempdir",  # ty: ignore[missing-union-attribute]  # imported modules have a spec
 ]
@@ -18,6 +19,7 @@ from typing import TYPE_CHECKING, Final
 from .cache_migration import cache_dir_with_migration
 from .na import AppDataDisabled
 from .read_only import ReadOnlyAppData
+from .read_only_fallback import ReadOnlyFallbackAppData
 from .via_disk_folder import AppDataDiskFolder
 from .via_tempdir import TempAppData
 
@@ -29,11 +31,15 @@ if TYPE_CHECKING:
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 
-def make_app_data(folder: str | None, *, read_only: bool, env: Mapping[str, str]) -> AppData:
+def make_app_data(
+    folder: str | None, *, read_only: bool, fallback_to_temp: bool = False, env: Mapping[str, str]
+) -> AppData:
     """Create the app data store for the given folder, falling back to a temporary one when the folder is unusable.
 
     :param folder: the folder to use, ``None`` for the default cache directory
     :param read_only: ``True`` to open the folder without writing to it
+    :param fallback_to_temp: in read-only mode, build wheel images missing from the folder in a private temporary
+        folder that is removed when the store closes; ignored outside read-only mode
     :param env: the environment variables, used to find the default folder and the override
 
     :returns: the app data store
@@ -55,6 +61,8 @@ def make_app_data(folder: str | None, *, read_only: bool, env: Mapping[str, str]
     folder = os.path.abspath(folder)
 
     if read_only:
+        if fallback_to_temp:
+            return ReadOnlyFallbackAppData(folder)
         return ReadOnlyAppData(folder)
 
     try:
@@ -91,6 +99,7 @@ __all__ = [
     "AppDataDisabled",
     "AppDataDiskFolder",
     "ReadOnlyAppData",
+    "ReadOnlyFallbackAppData",
     "TempAppData",
     "make_app_data",
 ]

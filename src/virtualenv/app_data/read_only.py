@@ -3,6 +3,7 @@ from __future__ import annotations
 __lazy_modules__ = ["virtualenv.util.lock"]
 
 import os.path
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from virtualenv.util.lock import NoOpFileLock
@@ -10,8 +11,11 @@ from virtualenv.util.lock import NoOpFileLock
 from .via_disk_folder import AppDataDiskFolder, PyInfoStoreDisk
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
     from pathlib import Path
     from typing import NoReturn
+
+    from virtualenv.util.lock import PathLockBase
 
 
 class ReadOnlyAppData(AppDataDiskFolder):
@@ -61,6 +65,17 @@ class ReadOnlyAppData(AppDataDiskFolder):
 
         """
         return _PyInfoStoreDiskReadOnly(self.py_info_at, path)
+
+    @contextmanager
+    def locked(self, path: Path) -> Generator[PathLockBase]:
+        """Yield the no-op lock, since nothing in the read-only folder is written to.
+
+        :param path: the path to lock, only used to name the no-op lock
+
+        :yields: a lock that takes no lock
+
+        """
+        yield NoOpFileLock(path)
 
     def embed_update_log(self, distribution: str, for_py_version: str) -> NoReturn:
         """Refuse to provide an embed update log, since it is not kept for read-only folders.

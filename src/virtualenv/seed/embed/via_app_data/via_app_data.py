@@ -113,7 +113,8 @@ class FromAppData(BaseEmbed):
                     key = Path(installer_class.__name__) / wheel.path.stem
                     wheel_img = self.app_data.wheel_image(creator.interpreter.version_release_str, key)
                     installer = installer_class(wheel.path, creator, wheel_img)
-                    _build_wheel_image(self.app_data.lock / wheel_img.parent, wheel_img.name, installer)
+                    with self.app_data.locked(wheel_img.parent) as locked_parent:
+                        _build_wheel_image(locked_parent, wheel_img.name, installer)
                     # version_info is a VersionInfo, which install types as a plain tuple
                     installer.install(creator.interpreter.version_info)  # ty: ignore[invalid-argument-type]
                 # the failure is stored and raised once every install has finished
