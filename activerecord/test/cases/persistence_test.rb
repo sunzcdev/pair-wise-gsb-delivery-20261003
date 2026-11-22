@@ -1706,6 +1706,71 @@ class PersistenceTest < ActiveRecord::TestCase
     assert_same custom_state, post.instance_variable_get(:@custom_state)
   end
 
+  def test_fetch_attributes_fills_in_unselected_columns_without_touching_unsaved_changes
+    post = Post.select(:id, :title).find(posts(:welcome).id)
+
+    assert_not post.has_attribute?(:body)
+    assert_raises(ActiveModel::MissingAttributeError) { post.body }
+
+    post.title = "Unsaved title"
+
+    sql = capture_sql { post.fetch_attributes(:body, :deleted_at) }.sole
+    assert_no_match(/SELECT\s+\*/i, sql)
+    assert_includes sql, "body"
+    assert_includes sql, "deleted_at"
+    assert_no_match(/title/i, sql)
+
+    assert_equal "Unsaved title", post.title
+    assert_equal ["title"], post.changed
+    assert_equal posts(:welcome).body, post.body
+
+    # A fetched NULL is distinguishable from an attribute never selected.
+    assert post.has_attribute?(:deleted_at)
+    assert_nil post.deleted_at
+    assert_not post.has_attribute?(:author_id)
+    assert_raises(ActiveModel::MissingAttributeError) { post.author_id }
+  end
+
+  def test_fetch_attributes_does_not_clobber_dirty_attributes
+    post = Post.select(:id, :title).find(posts(:welcome).id)
+    post.title = "Unsaved title"
+
+    post.fetch_attributes(:title)
+
+    assert_equal "Unsaved title", post.title
+    assert_equal ["title"], post.changed
+  end
+
+  def test_fetch_attributes_only_writes_back_changed_columns
+    post = Post.select(:id, :title).find(posts(:welcome).id)
+    post.title = "Unsaved title"
+    post.fetch_attributes(:body)
+
+    sql = capture_sql { post.save! }.grep(/UPDATE/i).sole
+    quoted_title = Post.connection.quote_column_name("title")
+    quoted_body = Post.connection.quote_column_name("body")
+    assert_match(/#{Regexp.escape(quoted_title)}\s*=/, sql)
+    assert_no_match(/#{Regexp.escape(quoted_body)}\s*=/, sql)
+    assert_equal ["title"], post.saved_changes.keys
+  end
+
+  def test_fetch_attributes_raises_for_unknown_attribute
+    post = Post.select(:id, :title).find(posts(:welcome).id)
+
+    assert_raises(ArgumentError) { post.fetch_attributes(:wibble) }
+  end
+
+  def test_fetch_attributes_raises_on_new_record
+    assert_raises(ActiveRecord::ActiveRecordError) { Post.new.fetch_attributes(:title) }
+  end
+
+  def test_fetch_attributes_raises_when_record_no_longer_exists
+    post = Post.select(:id, :title).find(posts(:welcome).id)
+    Post.where(id: post.id).delete_all
+
+    assert_raises(ActiveRecord::RecordNotFound) { post.fetch_attributes(:body) }
+  end
+
   def test_find_via_reload
     post = Post.new
 

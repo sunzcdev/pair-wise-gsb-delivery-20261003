@@ -818,6 +818,66 @@ module ActiveRecord
       self
     end
 
+    # Fetches the given attributes from the database and fills them in on
+    # this object, leaving every other attribute untouched.
+    #
+    # This is an explicit, partial counterpart to #reload, aimed at records
+    # loaded with a narrowed +select+ that later need a few more columns:
+    #
+    # ```
+    # post = Post.select(:id, :title).first
+    # post.title = "draft"        # unsaved change
+    # post.body                   # raises ActiveModel::MissingAttributeError
+    #
+    # post.fetch_attributes(:body, :excerpt)
+    # post.body                   # => "..." (read back from the database)
+    # post.title                  # => "draft" (unsaved change is preserved)
+    # ```
+    #
+    # The row is looked up by this object's primary key on the class's
+    # current connection, and the generated query selects exactly the
+    # requested columns -- no more, no less.
+    #
+    # Attributes with unsaved changes are never overwritten: their in-memory
+    # value wins over the database. Every other requested attribute is
+    # written straight from the database, so it becomes present without
+    # being marked as changed. In particular, an attribute that was fetched
+    # and happens to be +NULL+ is distinguishable from one that was never
+    # selected: the former answers +true+ to #has_attribute? and reads as
+    # +nil+, while the latter still raises
+    # ActiveModel::MissingAttributeError when read.
+    #
+    # If the record no longer exists in the database,
+    # ActiveRecord::RecordNotFound is raised. Returns +self+ for
+    # convenience.
+    def fetch_attributes(*names)
+      raise ActiveRecordError, "can't fetch attributes on a new record" if new_record?
+
+      names = names.flatten.map(&:to_s).uniq.map do |name|
+        self.class.attribute_aliases[name] || name
+      end
+      return self if names.empty?
+
+      unknown = names.reject { |name| self.class._has_attribute?(name) }
+      unless unknown.empty?
+        raise ArgumentError, "unknown attribute#{'s' if unknown.many?} for #{self.class.name}: #{unknown.join(', ')}"
+      end
+
+      self.class.connection_pool.clear_query_cache
+
+      fresh_object = self.class.unscoped do
+        self.class.select(*names).find_by!(self.class.primary_key => id)
+      end
+      fresh_attributes = fresh_object.instance_variable_get(:@attributes)
+
+      names.each do |name|
+        next if @attributes.key?(name) && will_save_change_to_attribute?(name)
+        @attributes[name] = fresh_attributes[name]
+      end
+
+      self
+    end
+
     # Saves the record with the updated_at/on attributes set to the current time
     # or the time specified.
     # Please note that no validation is performed and only the `after_touch`,

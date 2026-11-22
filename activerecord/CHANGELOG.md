@@ -1,3 +1,23 @@
+*   Add `ActiveRecord::Persistence#fetch_attributes`, an explicit partial
+    counterpart to `reload` for records loaded with a narrowed `select`.
+
+    It looks the row up by primary key on the current connection, selects
+    exactly the requested columns, and fills them in without touching any
+    other attribute. Unsaved changes are never overwritten, and a fetched
+    `NULL` is distinguishable from an attribute that was never selected
+    (the former answers `true` to `has_attribute?`, the latter still raises
+    `ActiveModel::MissingAttributeError` when read).
+
+    ```ruby
+    post = Post.select(:id, :title).first
+    post.title = "draft" # unsaved change
+    post.fetch_attributes(:body, :excerpt)
+    post.body  # read back from the database
+    post.title # => "draft"
+    ```
+
+    *GSB Harness*
+
 *   Log source location when scoped order is ignored in batching.
 
     *fatkodima*
