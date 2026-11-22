@@ -18,27 +18,43 @@ module HTTPX
       def initialize_dup(orig)
         super
         @mtx = orig.instance_variable_get(:@mtx).dup
-        @cookies = orig.instance_variable_get(:@cookies).dup
+        @current_partition = orig.instance_variable_get(:@current_partition).dup
+        @cookies = orig.instance_variable_get(:@cookies).map(&:dup)
       end
 
       # initializes the cookie store, either empty, or with whatever is passed as +cookies+, which
       # can be an array of HTTPX::Plugins::Cookies::Cookie objects or hashes-or-tuples of cookie attributes.
-      def initialize(cookies = nil)
+      #
+      # +partition_key+ optionally isolates the cookies managed by this jar in a named partition,
+      # so that multiple logical stores (i.e. one per upstream) can coexist in the same jar, even
+      # when they share domains and cookie names.
+      def initialize(cookies = nil, partition_key: nil)
         @mtx = Thread::Mutex.new
+        # the current partition is kept in a mutable cell, so that it can be switched even when
+        # the jar itself is frozen (i.e. when it is part of frozen session options), just like
+        # the cookie store and the mutex already are.
+        @current_partition = [partition_key]
         @cookies = []
 
         cookies.each do |elem|
-          cookie = case elem
-                   when Cookie
-                     elem
-                   when Array
-                     Cookie.new(*elem)
-                   else
-                     Cookie.new(elem)
-          end
-
-          @cookies << cookie
+          @cookies << [partition_key, to_cookie(elem)]
         end if cookies
+      end
+
+      # the key of the partition cookies are stored under and looked up from.
+      #
+      # when nil (the default), the jar behaves as a single, unpartitioned store.
+      #
+      # it can be changed at any time (i.e. to associate the jar with a different
+      # upstream before performing requests), and all operations (updates, lookups,
+      # expiry eviction, deletions) only apply to the partition it points to.
+      def partition_key
+        @current_partition[0]
+      end
+
+      # associates the jar with the partition identified by +partition_key+.
+      def partition_key=(partition_key)
+        @current_partition[0] = partition_key
       end
 
       # parses the `Set-Cookie` header value as +set_cookie+ and does the corresponding updates.
@@ -80,13 +96,7 @@ module HTTPX
                    Cookie.new(name, value_or_options)
         end
 
-        synchronize do
-          # If the user agent receives a new cookie with the same cookie-name, domain-value, and path-value
-          # as a cookie that it has already stored, the existing cookie is evicted and replaced with the new cookie.
-          @cookies.delete_if { |ck| ck.name == cookie.name && ck.domain == cookie.domain && ck.path == cookie.path }
-
-          @cookies << cookie
-        end
+        store(partition_key, cookie)
       end
 
       # @deprecated
@@ -105,11 +115,16 @@ module HTTPX
         synchronize do
           case name_or_options
           when Cookie
-            @cookies.delete(name_or_options)
+            @cookies.delete_if { |(partition, ck)| partition == partition_key && ck == name_or_options }
           else
-            @cookies.delete_if { |ck| ck.match?(name_or_options) }
+            @cookies.delete_if { |(partition, ck)| partition == partition_key && ck.match?(name_or_options) }
           end
         end
+      end
+
+      # deletes all cookies stored under the current partition key.
+      def clear
+        synchronize { @cookies.delete_if { |(partition, _)| partition == partition_key } }
       end
 
       # returns the list of valid cookies which matdh the domain and path from the URI object passed to +uri+.
@@ -117,19 +132,27 @@ module HTTPX
         each(uri).sort
       end
 
-      # enumerates over all stored cookies. if +uri+ is passed, it'll filter out expired cookies and
-      # only yield cookies which match its domain and path.
+      # enumerates over the cookies stored under the current partition key. if +uri+ is passed,
+      # it'll filter out expired cookies and only yield cookies which match its domain and path.
       def each(uri = nil, &blk)
         return enum_for(__method__, uri) unless blk
 
-        return synchronize { @cookies.each(&blk) } unless uri
+        unless uri
+          return synchronize do
+            @cookies.each do |(partition, cookie)|
+              yield cookie if partition == partition_key
+            end
+          end
+        end
 
         now = Time.now
         tpath = uri.path
 
         synchronize do
-          @cookies.delete_if do |cookie|
-            if cookie.expired?(now)
+          @cookies.delete_if do |(partition, cookie)|
+            if partition != partition_key
+              false
+            elsif cookie.expired?(now)
               true
             else
               yield cookie if cookie.valid_for_uri?(uri) && Cookie.path_match?(cookie.path, tpath)
@@ -142,23 +165,58 @@ module HTTPX
       def merge(other)
         jar_dup = dup
 
-        other.each do |elem|
-          cookie = case elem
-                   when Cookie
-                     elem
-                   when Array
-                     Cookie.new(*elem)
-                   else
-                     Cookie.new(elem)
+        if other.is_a?(Jar)
+          # preserve the partitions the cookies were stored under, and follow
+          # the partition the other jar is currently associated with
+          other.each_stored do |partition, elem|
+            jar_dup.send(:store, partition, elem)
           end
 
-          jar_dup.set(cookie)
+          jar_dup.partition_key = other.partition_key
+        else
+          other.each do |elem|
+            jar_dup.set(to_cookie(elem))
+          end
         end
 
         jar_dup
       end
 
+      protected
+
+      # enumerates over all stored (partition key, cookie) pairs, across all partitions.
+      def each_stored(&blk)
+        synchronize { @cookies.each(&blk) }
+      end
+
       private
+
+      def to_cookie(elem)
+        case elem
+        when Cookie
+          elem
+        when Array
+          Cookie.new(*elem)
+        else
+          Cookie.new(elem)
+        end
+      end
+
+      # stores +cookie+ under +partition_key+.
+      #
+      # If the user agent receives a new cookie with the same cookie-name, domain-value, and path-value
+      # as a cookie that it has already stored under the same partition, the existing cookie is evicted
+      # and replaced with the new cookie.
+      def store(partition_key, cookie)
+        synchronize do
+          @cookies.delete_if do |(partition, ck)|
+            partition == partition_key &&
+              ck.name == cookie.name && ck.domain == cookie.domain && ck.path == cookie.path
+          end
+
+          @cookies << [partition_key, cookie]
+        end
+      end
 
       def synchronize(&block)
         return yield if @mtx.owned?

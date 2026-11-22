@@ -214,7 +214,119 @@ class CookieJarTest < Minitest::Test
     assert jar.each.to_a == [cookie]
   end
 
+  def test_plugin_cookies_jar_partition
+    HTTPX.plugin(:cookies) # force loading the modules
+
+    uri = jar_cookies_uri
+
+    # two upstreams sharing host and cookie names, isolated via partition keys
+    jar = HTTPX::Plugins::Cookies::Jar.new(partition_key: :upstream_a)
+    jar.set("session", "token-a")
+    jar.partition_key = :upstream_b
+    jar.set("session", "token-b")
+
+    jar.partition_key = :upstream_a
+    assert jar.get("session").value == "token-a"
+    assert jar[uri].map(&:value) == %w[token-a]
+    jar.partition_key = :upstream_b
+    assert jar.get("session").value == "token-b"
+    assert jar[uri].map(&:value) == %w[token-b]
+
+    # same-name override is scoped to the current partition
+    jar.partition_key = :upstream_a
+    jar.set("session", "token-a2")
+    assert jar.get_all("session").map(&:value) == %w[token-a2]
+    jar.partition_key = :upstream_b
+    assert jar.get_all("session").map(&:value) == %w[token-b]
+
+    # set-cookie parsing follows the current partition as well
+    jar.parse("session=token-b2; Path=/")
+    assert jar.get("session").value == "token-b2"
+    jar.partition_key = :upstream_a
+    assert jar.get("session").value == "token-a2"
+
+    # expiry eviction only affects the current partition
+    jar.parse("session=expired; Path=/; Max-Age=0")
+    assert jar[uri].empty?, "expired cookie should have been evicted from partition :upstream_a"
+    jar.partition_key = :upstream_b
+    assert jar[uri].map(&:value) == %w[token-b2], "partition :upstream_b should be unaffected"
+
+    # delete is scoped to the current partition
+    jar.partition_key = :upstream_a
+    jar.set("session", "token-a3")
+    jar.delete("session")
+    assert jar.get("session").nil?
+    jar.partition_key = :upstream_b
+    assert jar.get("session").value == "token-b2"
+
+    # clear only wipes the current partition
+    jar.partition_key = :upstream_a
+    jar.set("session", "token-a4")
+    jar.clear
+    assert jar.each.to_a.empty?
+    jar.partition_key = :upstream_b
+    assert jar.get("session").value == "token-b2"
+
+    # without the option, the jar behaves as a single unpartitioned store
+    jar = HTTPX::Plugins::Cookies::Jar.new
+    assert jar.partition_key.nil?
+    jar.set("session", "token")
+    assert jar[uri].map(&:value) == %w[token]
+    jar.clear
+    assert jar.each.to_a.empty?
+  end
+
+  def test_plugin_cookies_jar_partition_requests
+    HTTPX.plugin(:cookies) # force loading the modules
+
+    uri = "http://example.com/cookies"
+
+    # a single long-lived session serving two upstreams which share host and cookie names;
+    # each upstream gets its own partition in the jar
+    jar = HTTPX::Plugins::Cookies::Jar.new(partition_key: :upstream_a)
+    jar.set("session", "token-a")
+    jar.partition_key = :upstream_b
+    jar.set("session", "token-b")
+
+    session = HTTPX.plugin(:cookies).with(cookies: jar)
+
+    # the session carries both partitions over, and stays associated with the last one
+    jar = session.cookies
+    assert jar.partition_key == :upstream_b
+
+    # serial requests: each upstream only sends its own cookies
+    jar.partition_key = :upstream_a
+    assert sent_cookie_header(session, uri) == "session=token-a"
+    jar.partition_key = :upstream_b
+    assert sent_cookie_header(session, uri) == "session=token-b"
+
+    # interleaved requests: selection follows the current upstream association
+    jar.partition_key = :upstream_a
+    assert sent_cookie_header(session, uri) == "session=token-a"
+    jar.partition_key = :upstream_b
+    assert sent_cookie_header(session, uri) == "session=token-b"
+    jar.partition_key = :upstream_a
+    assert sent_cookie_header(session, uri) == "session=token-a"
+
+    # updates (i.e. from a `Set-Cookie` response) only touch the current partition
+    jar.parse("session=token-a2; Path=/")
+    assert sent_cookie_header(session, uri) == "session=token-a2"
+    jar.partition_key = :upstream_b
+    assert sent_cookie_header(session, uri) == "session=token-b"
+
+    # clearing one partition does not leak into the other
+    jar.clear
+    assert sent_cookie_header(session, uri).nil?, "no cookie should be sent after clearing partition :upstream_b"
+    jar.partition_key = :upstream_a
+    assert sent_cookie_header(session, uri) == "session=token-a2"
+  end
+
   private
+
+  def sent_cookie_header(session, uri)
+    request = session.build_request("GET", uri)
+    request.headers["cookie"]
+  end
 
   def jar_cookies_uri(path = "/cookies", scheme: "http")
     URI("#{scheme}://example.com#{path}")

@@ -5,8 +5,13 @@ module HTTPX
 
       include Enumerable[Cookie]
 
-      @cookies: Array[Cookie]
+      @cookies: Array[[untyped, Cookie]]
       @mtx: Thread::Mutex
+      @current_partition: Array[untyped]
+
+      def partition_key: () -> untyped
+
+      def partition_key=: (untyped partition_key) -> untyped
 
       def parse: (String set_cookie) -> void
 
@@ -20,16 +25,26 @@ module HTTPX
 
       def delete: (String | Cookie | cookie_attributes name_or_options) -> void
 
+      def clear: () -> void
+
       def []: (http_uri) -> Array[Cookie]
 
       def each: (?http_uri?) { (Cookie) -> void } -> void
               | (?http_uri?) -> Enumerable[Cookie]
 
-      def merge: (_Each[cookie] cookies) -> self
+      def merge: (_Each[cookie] | Jar cookies) -> self
+
+      protected
+
+      def each_stored: () { (untyped, Cookie) -> void } -> void
 
       private
 
-      def initialize: (?_Each[cookie] cookies) -> untyped
+      def initialize: (?_Each[cookie] cookies, ?partition_key: untyped) -> untyped
+
+      def to_cookie: (untyped elem) -> Cookie
+
+      def store: (untyped partition_key, Cookie cookie) -> void
 
       def synchronize: [T] { () -> T } -> T
     end
