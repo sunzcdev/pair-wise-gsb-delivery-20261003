@@ -173,13 +173,19 @@ module Fluent
 
       # Internal states
       FlushThreadState = Struct.new(:thread, :next_clock, :mutex, :cond_var)
-      DequeuedChunkInfo = Struct.new(:chunk_id, :time, :timeout) do
+      # attempt_id identifies a single sending (a single #try_write call).
+      # The same chunk can be sent multiple times after rollbacks (e.g. delayed
+      # commit timeout), so a chunk_id alone cannot tell which sending an ack
+      # belongs to. Plugins that keep the attempt_id passed to #try_write can
+      # hand it back to #commit_write/#rollback_write so that stale acks of
+      # older sendings never touch the chunk which is currently in flight.
+      DequeuedChunkInfo = Struct.new(:chunk_id, :time, :timeout, :attempt_id) do
         def expired?
           time + timeout < Time.now
         end
       end
 
-      attr_reader :as_secondary, :delayed_commit, :delayed_commit_timeout, :timekey_zone
+      attr_reader :as_secondary, :delayed_commit, :delayed_commit_timeout, :timekey_zone, :delayed_commit_attempt
 
       # for tests
       attr_reader :buffer, :retry, :secondary, :chunk_keys, :chunk_key_accessors, :chunk_key_time, :chunk_key_tag
@@ -195,6 +201,9 @@ module Fluent
         @delayed_commit = false
         @as_secondary = false
         @primary_instance = nil
+
+        # monotonically increasing id of each sending attempt (each #try_write call)
+        @delayed_commit_attempt = 0
 
         # TODO: well organized counters
         @num_errors_metrics = nil
@@ -252,8 +261,8 @@ module Fluent
         self.context_router = primary.context_router
 
         singleton_class.module_eval do
-          define_method(:commit_write){ |chunk_id| @primary_instance.commit_write(chunk_id, delayed: delayed_commit, secondary: true) }
-          define_method(:rollback_write){ |chunk_id, update_retry: true| @primary_instance.rollback_write(chunk_id, update_retry) }
+          define_method(:commit_write){ |chunk_id, attempt_id: nil| @primary_instance.commit_write(chunk_id, attempt_id: attempt_id, delayed: delayed_commit, secondary: true) }
+          define_method(:rollback_write){ |chunk_id, attempt_id: nil, update_retry: true| @primary_instance.rollback_write(chunk_id, attempt_id: attempt_id, update_retry: update_retry) }
         end
       end
 
@@ -520,6 +529,7 @@ module Fluent
 
           @dequeued_chunks = []
           @dequeued_chunks_mutex = Mutex.new
+          @delayed_commit_attempt = 0
 
           @output_flush_thread_current_position = 0
           @buffer_config.flush_thread_count.times do |i|
@@ -1151,13 +1161,41 @@ module Fluent
         true
       end
 
-      def commit_write(chunk_id, delayed: @delayed_commit, secondary: false)
-        log.on_trace { log.trace "committing write operation to a chunk", chunk: dump_unique_id_hex(chunk_id), delayed: delayed }
+      # Returns a fresh, monotonically increasing id for one sending attempt.
+      # Always called under @dequeued_chunks_mutex so ids stay gap-free and
+      # unique for the lifetime of this output (or its primary, when acting
+      # as a secondary).
+      def next_delayed_commit_attempt_id
+        @delayed_commit_attempt += 1
+      end
+
+      def commit_write(chunk_id, attempt_id: nil, delayed: @delayed_commit, secondary: false)
+        log.on_trace { log.trace "committing write operation to a chunk", chunk: dump_unique_id_hex(chunk_id), attempt_id: attempt_id, delayed: delayed }
 
         if delayed
+          ack_accepted = false
           @dequeued_chunks_mutex.synchronize do
-            @dequeued_chunks.delete_if{ |info| info.chunk_id == chunk_id }
+            if attempt_id.nil?
+              # Backward compatibility: legacy plugins only know the chunk_id.
+              # Remove every tracker for this chunk, including ones of newer
+              # sendings, just as before attempt_id was introduced.
+              @dequeued_chunks.delete_if{ |info| info.chunk_id == chunk_id }
+              ack_accepted = true
+            else
+              # Only the ack of the sending which is currently tracked may
+              # finish the chunk. A stale ack (e.g. arriving after a delayed
+              # commit timeout already re-queued and re-sent the chunk) is
+              # ignored instead of deleting the tracker of the newer sending.
+              info = @dequeued_chunks.find{ |d| d.chunk_id == chunk_id && d.attempt_id == attempt_id }
+              if info
+                @dequeued_chunks.delete(info)
+                ack_accepted = true
+              else
+                log.warn "ignored stale commit ack for a buffer chunk", chunk_id: dump_unique_id_hex(chunk_id), attempt_id: attempt_id
+              end
+            end
           end
+          return unless ack_accepted
         end
         @buffer.purge_chunk(chunk_id)
 
@@ -1175,12 +1213,26 @@ module Fluent
 
       # update_retry parameter is for preventing busy loop by async write
       # We will remove this parameter by re-design retry_state management between threads.
-      def rollback_write(chunk_id, update_retry: true)
+      def rollback_write(chunk_id, attempt_id: nil, update_retry: true)
         # This API is to rollback chunks explicitly from plugins.
         # 3rd party plugins can depend it on automatic rollback of #try_rollback_write
+        ack_accepted = false
         @dequeued_chunks_mutex.synchronize do
-          @dequeued_chunks.delete_if{ |info| info.chunk_id == chunk_id }
+          if attempt_id.nil?
+            # Backward compatibility: legacy plugins only know the chunk_id.
+            @dequeued_chunks.delete_if{ |info| info.chunk_id == chunk_id }
+            ack_accepted = true
+          else
+            info = @dequeued_chunks.find{ |d| d.chunk_id == chunk_id && d.attempt_id == attempt_id }
+            if info
+              @dequeued_chunks.delete(info)
+              ack_accepted = true
+            else
+              log.warn "ignored stale rollback ack for a buffer chunk", chunk_id: dump_unique_id_hex(chunk_id), attempt_id: attempt_id
+            end
+          end
         end
+        return false unless ack_accepted
         # returns true if chunk was rollbacked as expected
         #         false if chunk was already flushed and couldn't be rollbacked unexpectedly
         # in many cases, false can be just ignored
@@ -1261,12 +1313,23 @@ module Fluent
             log.trace "executing delayed write and commit", chunk: dump_unique_id_hex(chunk.unique_id)
             @write_count_metrics.inc
             @write_secondary_count_metrics.inc if using_secondary
+            attempt_id = nil
             @dequeued_chunks_mutex.synchronize do
               # delayed_commit_timeout for secondary is configured in <buffer> of primary (<secondary> don't get <buffer>)
-              @dequeued_chunks << DequeuedChunkInfo.new(chunk.unique_id, Time.now, self.delayed_commit_timeout)
+              # A fresh attempt_id is minted per sending, including re-sendings
+              # after rollback, so acks can be matched to this exact #try_write.
+              primary = @as_secondary ? @primary_instance : self
+              attempt_id = primary.next_delayed_commit_attempt_id
+              @dequeued_chunks << DequeuedChunkInfo.new(chunk.unique_id, Time.now, self.delayed_commit_timeout, attempt_id)
             end
 
-            output.try_write(chunk)
+            # Existing plugins still define #try_write with only a chunk
+            # argument, so the attempt_id is passed only when accepted.
+            if output.method(:try_write).arity.abs > 1 || output.method(:try_write).arity < 0
+              output.try_write(chunk, attempt_id)
+            else
+              output.try_write(chunk)
+            end
             check_slow_flush(chunk_write_start)
           else # output plugin without delayed purge
             chunk_id = chunk.unique_id

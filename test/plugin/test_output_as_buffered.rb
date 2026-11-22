@@ -57,6 +57,42 @@ module FluentPluginOutputAsBufferedTest
       super
     end
   end
+  # A delayed commit output that keeps the attempt_id handed over per sending,
+  # so tests can replay acks (including late ones) against the exact sending.
+  class DummyAttemptAwareDelayedOutput < DummyBareOutput
+    # records [chunk, attempt_id] for every #try_write invocation
+    attr_reader :sendings
+    # pending acks waiting to be replayed: attempt_id => chunk_id
+    attr_reader :pending_acks
+
+    def initialize
+      super
+      @format = nil
+      @sendings = []
+      @pending_acks = {}
+      @send_hook = nil
+    end
+
+    # The base Output defines both #write and #try_write, so delayed commit is
+    # only selected when the plugin explicitly prefers it.
+    def prefer_delayed_commit
+      true
+    end
+
+    def register_send_hook(&block)
+      @send_hook = block
+    end
+
+    def format(tag, time, record)
+      @format ? @format.call(tag, time, record) : [tag, time, record].to_json
+    end
+
+    def try_write(chunk, attempt_id)
+      @sendings << [chunk, attempt_id]
+      @pending_acks[attempt_id] = chunk.unique_id
+      @send_hook.call(chunk, attempt_id) if @send_hook
+    end
+  end
   class DummyStandardBufferedOutput < DummyBareOutput
     def initialize
       super
@@ -183,6 +219,7 @@ class BufferedOutputTest < Test::Unit::TestCase
     when :sync     then FluentPluginOutputAsBufferedTest::DummySyncOutput.new
     when :buffered then FluentPluginOutputAsBufferedTest::DummyAsyncOutput.new
     when :delayed  then FluentPluginOutputAsBufferedTest::DummyDelayedOutput.new
+    when :delayed_attempt then FluentPluginOutputAsBufferedTest::DummyAttemptAwareDelayedOutput.new
     when :standard then FluentPluginOutputAsBufferedTest::DummyStandardBufferedOutput.new
     when :custom   then FluentPluginOutputAsBufferedTest::DummyCustomFormatBufferedOutput.new
     when :full     then FluentPluginOutputAsBufferedTest::DummyFullFeatureOutput.new
@@ -2018,6 +2055,187 @@ class BufferedOutputTest < Test::Unit::TestCase
 
       @i.after_shutdown
 
+      assert{ @i.rollback_count == 2 }
+    end
+
+    # Builds a fully manual delayed-commit output: no flush thread runs, so the
+    # test itself drives #try_flush / #try_rollback_write while moving a fake
+    # clock (Timecop) through the timeout/retry timeline.
+    def create_manual_attempt_output(timeout: 30)
+      hash = {
+        'flush_mode' => 'immediate',
+        'flush_thread_count' => 0,
+        'flush_thread_burst_interval' => 0.1,
+        'delayed_commit_timeout' => timeout,
+        'chunk_limit_size' => 1024,
+      }
+      i = create_output(:delayed_attempt)
+      i.configure(config_element('ROOT', '', {}, [config_element('buffer', 'tag', hash)]))
+      i.start
+      i.after_start
+      i.log = Fluent::Test::TestLogger.new
+      i
+    end
+
+    def emit_one_chunk(i, tag: 'test.tag.1')
+      t = event_time('2016-04-13 14:03:21 +0900')
+      record = {"data" => "x" * 256, "name" => "xxx"}
+      i.emit_events(tag, Fluent::ArrayEventStream.new([[t, record]]))
+    end
+
+    test 'a stale ack of an older sending cannot finish the chunk re-sent after timeout' do
+      base = Time.parse('2016-04-13 14:04:01 +0900')
+      Timecop.freeze(base)
+      @i = create_manual_attempt_output(timeout: 30)
+
+      emit_one_chunk(@i)
+      # flush_mode is immediate, but enqueue is done by the enqueue thread;
+      # force it deterministically here.
+      @i.buffer.enqueue_all
+      assert{ @i.buffer.queue.size == 1 }
+
+      chunk_id = @i.buffer.queue.first.unique_id
+
+      # --- 1st sending (attempt 1): try_write times out, no ack yet --------
+      @i.try_flush
+      assert{ @i.write_count == 1 }
+      assert{ @i.sendings.size == 1 }
+      attempt1 = @i.sendings[0][1]
+      assert_equal 1, attempt1
+      assert{ @i.buffer.dequeued.size == 1 && @i.buffer.queue.size == 0 }
+      assert{ @i.instance_eval{ @dequeued_chunks.size } == 1 }
+      assert_equal attempt1, @i.instance_eval{ @dequeued_chunks.first.attempt_id }
+
+      # advance the fake clock past delayed_commit_timeout: the chunk is taken
+      # back to the queue while the ack of attempt 1 is still in flight.
+      Timecop.freeze(base + 31)
+      @i.try_rollback_write
+      assert{ @i.rollback_count == 1 }
+      assert{ @i.buffer.queue.size == 1 && @i.buffer.queue.first.unique_id == chunk_id }
+      assert{ @i.buffer.dequeued.size == 0 }
+      assert{ @i.instance_eval{ @dequeued_chunks.size } == 0 }
+      assert{ @i.pending_acks.key?(attempt1) } # the late ack has not arrived yet
+
+      # --- 2nd sending (attempt 2) starts while attempt 1 ack is pending ---
+      @i.try_flush
+      assert{ @i.write_count == 2 }
+      assert{ @i.sendings.size == 2 }
+      attempt2 = @i.sendings[1][1]
+      assert_equal 2, attempt2
+      assert{ @i.buffer.dequeued.size == 1 && @i.buffer.queue.size == 0 }
+      assert{ @i.instance_eval{ @dequeued_chunks.size } == 1 }
+      assert_equal attempt2, @i.instance_eval{ @dequeued_chunks.first.attempt_id }
+
+      # --- the ack of the 1st sending finally comes back ------------------
+      # It must be ignored: the chunk is owned by attempt 2 now.
+      @i.commit_write(chunk_id, attempt_id: attempt1)
+      assert{ @i.buffer.dequeued.size == 1 }          # still in flight
+      assert{ !@i.sendings[1][0].empty? }             # chunk not purged
+      assert{ @i.instance_eval{ @dequeued_chunks.size } == 1 }
+      assert_equal attempt2, @i.instance_eval{ @dequeued_chunks.first.attempt_id }
+      assert_match(/ignored stale commit ack/, @i.log.out.logs.join)
+
+      # --- the ack of the 2nd sending is the one that actually finishes ---
+      @i.commit_write(chunk_id, attempt_id: attempt2)
+      assert{ @i.buffer.dequeued.size == 0 }
+      assert{ @i.buffer.queue.size == 0 }
+      assert{ @i.sendings[1][0].empty? }
+      assert{ @i.instance_eval{ @dequeued_chunks.size } == 0 }
+      # write happened twice, but only one chunk was ever purged and one
+      # timeout rollback was recorded: attempt 2 is the real closer.
+      assert{ @i.write_count == 2 }
+      assert{ @i.rollback_count == 1 }
+    end
+
+    test 'a stale rollback of an older sending cannot take back the re-sent chunk' do
+      base = Time.parse('2016-04-13 14:04:01 +0900')
+      Timecop.freeze(base)
+      @i = create_manual_attempt_output(timeout: 30)
+
+      emit_one_chunk(@i)
+      @i.buffer.enqueue_all
+      chunk_id = @i.buffer.queue.first.unique_id
+
+      @i.try_flush
+      attempt1 = @i.sendings[0][1]
+
+      Timecop.freeze(base + 31)
+      @i.try_rollback_write
+      assert{ @i.rollback_count == 1 }
+      assert{ @i.buffer.queue.size == 1 }
+
+      @i.try_flush
+      attempt2 = @i.sendings[1][1]
+      assert{ @i.buffer.dequeued.size == 1 }
+
+      # late rollback ack for attempt 1 must not move the attempt-2 chunk
+      assert_equal false, @i.rollback_write(chunk_id, attempt_id: attempt1)
+      assert{ @i.buffer.queue.size == 0 }
+      assert{ @i.buffer.dequeued.size == 1 }
+      assert{ @i.instance_eval{ @dequeued_chunks.size } == 1 }
+      assert_equal attempt2, @i.instance_eval{ @dequeued_chunks.first.attempt_id }
+      assert_match(/ignored stale rollback ack/, @i.log.out.logs.join)
+
+      @i.commit_write(chunk_id, attempt_id: attempt2)
+      assert{ @i.buffer.dequeued.size == 0 }
+      assert{ @i.rollback_count == 1 }
+    end
+
+    test 'legacy plugins calling commit_write/rollback_write with only a chunk_id keep working' do
+      base = Time.parse('2016-04-13 14:04:01 +0900')
+      Timecop.freeze(base)
+      # the old dummy only accepts a single chunk argument in #try_write
+      hash = {
+        'flush_mode' => 'immediate',
+        'flush_thread_count' => 0,
+        'flush_thread_burst_interval' => 0.1,
+        'delayed_commit_timeout' => 30,
+        'chunk_limit_size' => 1024,
+      }
+      @i = create_output(:delayed)
+      @i.configure(config_element('ROOT', '', {}, [config_element('buffer', 'tag', hash)]))
+      @i.start
+      @i.after_start
+      @i.log = Fluent::Test::TestLogger.new
+
+      seen_chunks = []
+      @i.register(:try_write) { |chunk| seen_chunks << chunk }
+
+      emit_one_chunk(@i)
+      @i.buffer.enqueue_all
+      chunk_id = @i.buffer.queue.first.unique_id
+
+      # arity-1 #try_write must still be called with a single argument
+      @i.try_flush
+      assert{ @i.write_count == 1 }
+      assert_equal 1, seen_chunks.size
+      assert{ @i.buffer.dequeued.size == 1 }
+      # an attempt_id is still tracked internally even for legacy plugins
+      assert{ @i.instance_eval{ @dequeued_chunks.first.attempt_id } == 1 }
+
+      # legacy ack without attempt_id still commits the chunk
+      assert_nothing_raised do
+        @i.commit_write(chunk_id)
+      end
+      assert{ @i.buffer.dequeued.size == 0 }
+      assert{ seen_chunks.first.empty? }
+
+      # legacy rollback path on a re-sent chunk
+      emit_one_chunk(@i)
+      @i.buffer.enqueue_all
+      rollback_chunk_id = @i.buffer.queue.first.unique_id
+      @i.try_flush
+      Timecop.freeze(base + 31)
+      @i.try_rollback_write
+      assert{ @i.rollback_count == 1 }
+      assert{ @i.buffer.queue.size == 1 && @i.buffer.queue.first.unique_id == rollback_chunk_id }
+
+      @i.try_flush
+      assert{ @i.write_count == 3 }
+      assert{ @i.rollback_write(seen_chunks.last.unique_id) }
+      # legacy rollback takes the chunk back to the queue and bumps the stats
+      assert{ @i.buffer.queue.size == 1 && @i.buffer.queue.first.unique_id == rollback_chunk_id }
+      assert{ @i.buffer.dequeued.size == 0 }
       assert{ @i.rollback_count == 2 }
     end
   end
