@@ -1,3 +1,26 @@
+*   Add a `by:` option to `ActiveRecord::Calculations#count` to make the
+    counted unit explicit when a query joins other tables.
+
+    `count(by: :rows)` counts the rows of the (possibly joined) result, which
+    is the historical default and remains unchanged. `count(by: :entities)`
+    counts each record once, keyed by its primary key, so a record that spans
+    several joined rows is only counted once. Both modes compose with `group`
+    and `select`, and `async_count` accepts the same option.
+
+    Models with a composite primary key are supported: entities are counted
+    through a `DISTINCT` subquery over the full primary key instead of
+    concatenating the key columns, so different key combinations can never
+    collide.
+
+    ```ruby
+    Person.joins(:posts).count # => joined rows (unchanged)
+    Person.joins(:posts).count(by: :rows) # => joined rows, explicitly
+    Person.joins(:posts).count(by: :entities) # => distinct people
+    Person.joins(:posts).group(:city).count(by: :entities) # => per city
+    ```
+
+    *GSB Harness*
+
 *   Log source location when scoped order is ignored in batching.
 
     *fatkodima*

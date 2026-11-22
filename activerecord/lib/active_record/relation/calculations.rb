@@ -87,6 +87,33 @@ module ActiveRecord
     # Note: not all valid {Relation#select}[rdoc-ref:QueryMethods#select] expressions are valid +count+ expressions. The specifics differ
     # between databases. In invalid cases, an error from the database is thrown.
     #
+    # ==== Counting joined rows or entities
+    #
+    # When the relation joins other tables, a single record may appear in
+    # several rows of the result. The +by+ option makes explicit which of the
+    # two is counted:
+    #
+    #   Person.joins(:posts).count(by: :rows)
+    #   # => the number of rows in the joined result (same as plain #count)
+    #
+    #   Person.joins(:posts).count(by: :entities)
+    #   # => the number of distinct people, keyed by their primary key
+    #
+    # Both modes compose with {Relation#group}[rdoc-ref:QueryMethods#group] and
+    # {Relation#select}[rdoc-ref:QueryMethods#select], so the origin of each
+    # figure can be verified:
+    #
+    #   Person.joins(:posts).group(:city).count(by: :entities)
+    #   # => { 'Rome' => 5, 'Paris' => 3 } (distinct people per city)
+    #
+    # Models with a composite primary key are supported: entities are counted
+    # through a +DISTINCT+ subquery over the full primary key instead of
+    # concatenating the key columns, so different key combinations can never
+    # collide.
+    #
+    # When no +by+ option is given, +count+ keeps its historical behavior of
+    # counting rows, equivalent to <tt>by: :rows</tt>.
+    #
     # When given a block, calls the block with each record in the relation and
     # returns the number of records for which the block returns a truthy value.
     #
@@ -96,22 +123,36 @@ module ActiveRecord
     # If the relation hasn't been loaded yet, calling +count+ with a block will
     # load all records in the relation. If there are a lot of records in the
     # relation, loading all records could result in performance issues.
-    def count(column_name = nil)
+    def count(column_name = nil, by: nil)
       if block_given?
         unless column_name.nil?
           raise ArgumentError, "Column name argument is not supported when a block is passed."
         end
+        unless by.nil?
+          raise ArgumentError, "The :by argument is not supported when a block is passed."
+        end
 
         super()
       else
-        calculate(:count, column_name)
+        case by
+        when nil, :rows
+          calculate(:count, column_name)
+        when :entities
+          unless column_name.nil?
+            raise ArgumentError, "Column name argument is not supported when counting by entities."
+          end
+
+          entity_count
+        else
+          raise ArgumentError, "Unsupported :by value #{by.inspect}; expected :rows or :entities."
+        end
       end
     end
 
     # Same as #count, but performs the query asynchronously and returns an
     # ActiveRecord::Promise.
-    def async_count(column_name = nil)
-      async.count(column_name)
+    def async_count(column_name = nil, by: nil)
+      async.count(column_name, by: by)
     end
 
     # Calculates the average value on a given column. Returns +nil+ if there's
@@ -606,6 +647,123 @@ module ActiveRecord
               key = key_records[key] if associated
 
               result[key] = type_cast_calculated_value(row[column_alias], operation, type)
+            end
+          end
+        end
+      end
+
+      # Counts each record of the relation once, no matter how many rows the
+      # (possibly joined) result holds for it. Used by #count with
+      # <tt>by: :entities</tt>.
+      def entity_count # :nodoc:
+        if @none
+          result = group_values.any? ? Hash.new : 0
+          return @async ? Promise::Complete.new(result) : result
+        end
+
+        primary_keys = Array(model.primary_key)
+        if primary_keys.empty?
+          raise UnknownPrimaryKey.new(model, "Cannot count entities of a model without a primary key.")
+        end
+
+        if primary_keys.one?
+          distinct.calculate(:count, primary_keys.first)
+        else
+          composite_primary_key_entity_count(primary_keys.map(&:to_s))
+        end
+      end
+
+      # Entity count for models with a composite primary key. Counting is done
+      # through a DISTINCT subquery over the full primary key, so key parts are
+      # never concatenated and different key combinations cannot collide.
+      def composite_primary_key_entity_count(primary_keys) # :nodoc:
+        relation = eager_loading? ? apply_join_dependency : self
+        relation = relation.except(:order, :default_order)
+        pk_fields = primary_keys.map { |key| relation.aggregate_column(key) }
+
+        if group_values.empty?
+          relation.select_values = pk_fields
+          relation.distinct!
+          query_builder = build_count_subquery(relation, :all, true)
+
+          query_result = skip_query_cache_if_necessary do
+            model.with_connection do |c|
+              if @async
+                model._async_select_all(c, query_builder, "#{model.name} Count")
+              else
+                c.select_all(query_builder, "#{model.name} Count")
+              end
+            end
+          end
+
+          query_result.then do |result|
+            type_cast_calculated_value(result.cast_values.first, "count", nil)
+          end
+        else
+          grouped_composite_primary_key_entity_count(relation, pk_fields)
+        end
+      end
+
+      def grouped_composite_primary_key_entity_count(relation, pk_fields) # :nodoc:
+        if relation.where_clause.contradiction?
+          return @async ? Promise::Complete.new({}) : {}
+        end
+
+        group_fields = relation.arel_columns(group_values)
+        relation.group_values = []
+        relation.distinct!
+
+        model.with_connection do |connection|
+          column_alias_tracker = ColumnAliasTracker.new(connection)
+
+          group_aliases = group_fields.map { |field|
+            field = connection.visitor.compile(field) if Arel.arel_node?(field)
+            column_alias_tracker.alias_for(field.to_s.downcase)
+          }
+          group_columns = group_aliases.zip(group_fields)
+
+          relation.select_values = group_columns.map { |aliaz, field|
+            aliaz = model.adapter_class.quote_column_name(aliaz)
+            if field.respond_to?(:as)
+              field.as(aliaz)
+            else
+              "#{field} AS #{aliaz}"
+            end
+          } + pk_fields
+
+          subquery = relation.arel.as(SUBQUERY_FOR_COUNT_ALIAS)
+          outer_group_columns = group_aliases.map { |aliaz| subquery[aliaz] }
+          count_alias = column_alias_tracker.alias_for("count entities")
+
+          query_builder = Arel::SelectManager.new(subquery)
+            .project(*outer_group_columns, Arel.star.count.as(model.adapter_class.quote_column_name(count_alias)))
+            .group(*outer_group_columns)
+
+          result = skip_query_cache_if_necessary do
+            if @async
+              model._async_select_all(connection, query_builder, "#{model.name} Count")
+            else
+              connection.select_all(query_builder, "#{model.name} Count")
+            end
+          end
+
+          result.then do |calculated_data|
+            key_types = group_columns.each_with_object({}) do |(aliaz, col_name), types|
+              result_type = proc { calculated_data.column_types.fetch(aliaz, Type.default_value) }
+              types[aliaz] = col_name.try(:type_caster, &result_type) || type_for(col_name, &result_type)
+            end
+
+            hash_rows = calculated_data.cast_values(key_types).map! do |row|
+              calculated_data.columns.each_with_object({}).with_index do |(col_name, hash), i|
+                hash[col_name] = row[i]
+              end
+            end
+
+            hash_rows.each_with_object({}) do |row, hash|
+              key = group_aliases.map { |aliaz| row[aliaz] }
+              key = key.first if key.size == 1
+
+              hash[key] = type_cast_calculated_value(row[count_alias], "count", nil)
             end
           end
         end

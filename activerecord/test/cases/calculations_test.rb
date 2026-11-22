@@ -855,6 +855,110 @@ class CalculationsTest < ActiveRecord::TestCase
     assert_equal 6, Account.order(:credit_limit).reverse_order.count
   end
 
+  def test_count_by_rows_matches_default_count
+    relation = Author.joins(:posts)
+    assert_equal relation.count, relation.count(by: :rows)
+    assert_async_equal relation.count, relation.async_count(by: :rows)
+  end
+
+  def test_count_by_entities_and_by_rows_with_joins
+    alice  = Author.create!(name: "dup")
+    alice2 = Author.create!(name: "dup")
+    bob    = Author.create!(name: "solo")
+
+    2.times { |i| Post.create!(title: "a#{i}", body: "!", author: alice) }
+    Post.create!(title: "a2", body: "!", author: alice2)
+    3.times { |i| Post.create!(title: "b#{i}", body: "!", author: bob) }
+
+    relation = Author.where(id: [alice, alice2, bob]).joins(:posts)
+    assert_equal 6, relation.count
+    assert_equal 6, relation.count(by: :rows)
+    assert_equal 3, relation.count(by: :entities)
+    assert_async_equal 3, relation.async_count(by: :entities)
+  end
+
+  def test_count_by_entities_with_joins_and_group
+    alice  = Author.create!(name: "dup")
+    alice2 = Author.create!(name: "dup")
+    bob    = Author.create!(name: "solo")
+
+    2.times { |i| Post.create!(title: "a#{i}", body: "!", author: alice) }
+    Post.create!(title: "a2", body: "!", author: alice2)
+    3.times { |i| Post.create!(title: "b#{i}", body: "!", author: bob) }
+
+    grouped = Author.where(id: [alice, alice2, bob]).joins(:posts).group(:name)
+    assert_equal({ "dup" => 3, "solo" => 3 }, grouped.count)
+    assert_equal({ "dup" => 3, "solo" => 3 }, grouped.count(by: :rows))
+    assert_equal({ "dup" => 2, "solo" => 1 }, grouped.count(by: :entities))
+    assert_async_equal({ "dup" => 2, "solo" => 1 }, grouped.async_count(by: :entities))
+  end
+
+  def test_count_by_entities_with_select
+    alice = Author.create!(name: "alice")
+    2.times { |i| Post.create!(title: "a#{i}", body: "!", author: alice) }
+
+    relation = Author.where(id: alice).select(:name).joins(:posts)
+    assert_equal 2, relation.count
+    assert_equal 1, relation.count(by: :entities)
+  end
+
+  def test_count_by_entities_with_none
+    assert_equal 0, Author.none.count(by: :entities)
+    assert_equal({}, Author.none.group(:name).count(by: :entities))
+  end
+
+  def test_count_by_entities_with_composite_primary_key
+    Cpk::Order.create!(id: [1, 101],  status: "paid")
+    Cpk::Order.create!(id: [1, 111],  status: "paid")
+    Cpk::Order.create!(id: [11, 102], status: "cancelled")
+
+    Cpk::Book.create!(id: [1, 1001], shop_id: 1, order_id: 101, title: "b1")
+    Cpk::Book.create!(id: [1, 1002], shop_id: 1, order_id: 101, title: "b2")
+    Cpk::Book.create!(id: [1, 1003], shop_id: 1, order_id: 111, title: "b3")
+
+    joined = Cpk::Order.where(shop_id: [1, 11]).joins(:books)
+    assert_equal 3, joined.count
+    assert_equal 3, joined.count(by: :rows)
+    assert_equal 2, joined.count(by: :entities)
+    assert_async_equal 2, joined.async_count(by: :entities)
+  end
+
+  def test_count_by_entities_with_composite_primary_key_does_not_collide_key_parts
+    # [1, 111] and [11, 11] would be the same if key parts were concatenated.
+    Cpk::Order.create!(id: [1, 111], status: "paid")
+    Cpk::Order.create!(id: [11, 11], status: "paid")
+
+    relation = Cpk::Order.where(shop_id: [1, 11])
+    assert_equal 2, relation.count(by: :entities)
+  end
+
+  def test_count_by_entities_with_composite_primary_key_and_group
+    Cpk::Order.create!(id: [1, 101],  status: "paid")
+    Cpk::Order.create!(id: [1, 111],  status: "paid")
+    Cpk::Order.create!(id: [11, 102], status: "cancelled")
+
+    Cpk::Book.create!(id: [1, 1001], shop_id: 1, order_id: 101, title: "b1")
+    Cpk::Book.create!(id: [1, 1002], shop_id: 1, order_id: 101, title: "b2")
+    Cpk::Book.create!(id: [1, 1003], shop_id: 1, order_id: 111, title: "b3")
+
+    grouped = Cpk::Order.where(shop_id: [1, 11]).left_joins(:books).group(:status)
+    assert_equal({ "paid" => 3, "cancelled" => 1 }, grouped.count)
+    assert_equal({ "paid" => 2, "cancelled" => 1 }, grouped.count(by: :entities))
+    assert_async_equal({ "paid" => 2, "cancelled" => 1 }, grouped.async_count(by: :entities))
+  end
+
+  def test_count_by_entities_with_column_name_raises
+    assert_raise(ArgumentError) { Account.count(:firm_id, by: :entities) }
+  end
+
+  def test_count_with_invalid_by_raises
+    assert_raise(ArgumentError) { Account.count(by: :bogus) }
+  end
+
+  def test_count_by_with_block_raises
+    assert_raise(ArgumentError) { Account.count(by: :entities) { true } }
+  end
+
   def test_count_with_where_and_order
     assert_equal 1, Account.where(firm_name: "37signals").count
     assert_equal 1, Account.where(firm_name: "37signals").order(:firm_name).count
