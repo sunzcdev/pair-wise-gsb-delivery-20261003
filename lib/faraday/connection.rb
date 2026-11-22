@@ -17,6 +17,12 @@ module Faraday
     METHODS = Set.new %i[get post put delete head patch options trace]
     USER_AGENT = "Faraday v#{VERSION}".freeze
 
+    # Scopes accepted by {#in_parallel}, see there for the semantics.
+    # `:auto` is the default, `:inherit` joins an enclosing group and `:new`
+    # opens an independent one.
+    # @api private
+    PARALLEL_SCOPES = %i[auto inherit new].freeze
+
     # @return [Hash] URI query unencoded key/value pairs.
     attr_reader :params
 
@@ -37,7 +43,15 @@ module Faraday
     attr_reader :parallel_manager
 
     # Sets the default parallel manager for this connection.
-    attr_writer :default_parallel_manager
+    #
+    # The manager is reused by every group, but a group that aborts stops it
+    # from being handed out again (see {#reset_default_parallel_manager}), so
+    # the requests it collected are never submitted later.
+    #
+    # @param manager [Object, nil] the parallel manager to use.
+    def default_parallel_manager=(manager)
+      @default_parallel_manager = manager
+    end
 
     # @return [Hash] proxy options.
     attr_reader :proxy
@@ -284,19 +298,22 @@ module Faraday
 
     # Check if the adapter is parallel-capable.
     #
+    # The manager is memoized so consecutive groups reuse it, and it is dropped
+    # when a group aborts (see {#reset_default_parallel_manager}), so an aborted
+    # batch can never be submitted later.
+    #
     # @yield if the adapter isn't parallel-capable, or if no adapter is set yet.
     #
     # @return [Object, nil] a parallel manager or nil if yielded
     # @api private
     def default_parallel_manager
-      @default_parallel_manager ||= begin
-        adapter = @builder.adapter.klass if @builder.adapter
+      return @default_parallel_manager if @default_parallel_manager
 
-        if support_parallel?(adapter)
-          adapter.setup_parallel_manager
-        elsif block_given?
-          yield
-        end
+      adapter = @builder.adapter&.klass
+      if support_parallel?(adapter)
+        @default_parallel_manager = adapter.setup_parallel_manager
+      elsif block_given?
+        yield
       end
     end
 
@@ -312,30 +329,146 @@ module Faraday
 
     # Sets up the parallel manager to make a set of requests.
     #
+    # Nested calls must state which group they belong to:
+    #
+    # * with no arguments (or `scope: :inherit`) inside an active group, the
+    #   requests join the enclosing group and stay deferred until the block
+    #   that owns that group ends;
+    # * passing a `manager`, or `scope: :new`, opens an independent group whose
+    #   requests are submitted when this call's block ends, even when nested.
+    #
+    # Blocks are submitted only at the boundary that owns their group, so an
+    # inherited nested block never flushes the outer group on its own. When a
+    # block raises, its group is not submitted and the previous calling
+    # environment is restored, so later requests do not stay attached to the
+    # aborted group.
+    #
     # @param manager [Object] The parallel manager that this Connection's
     #                Adapter uses.
+    # @param scope [Symbol] `:auto` (default), `:inherit` or `:new`.
     #
     # @yield a block to execute multiple requests.
     # @return [void]
-    def in_parallel(manager = nil, &block)
-      previous_manager = @parallel_manager
-      @parallel_manager = manager || previous_manager || default_parallel_manager do
-        warn('Warning: `in_parallel` called but no parallel-capable adapter ' \
-             'on Faraday stack', caller[2, 10].join("\n"))
-        nil
-      end
-      return yield unless @parallel_manager && !@parallel_manager.equal?(previous_manager)
+    def in_parallel(manager = nil, scope: :auto, &block)
+      raise ArgumentError, '`in_parallel` requires a block' unless block
 
-      if @parallel_manager.respond_to?(:execute)
-        # Execute is the new method that is responsible for executing the block.
-        @parallel_manager.execute(&block)
-      else
-        # TODO: Old behaviour, deprecate and remove in 3.0
-        yield
-        @parallel_manager.run
+      validate_parallel_scope!(manager, scope)
+
+      previous_manager = @parallel_manager
+      active_manager = manager || resolve_parallel_manager(scope, previous_manager)
+      return yield unless active_manager
+
+      run_parallel_group(active_manager, previous_manager, &block)
+    end
+
+    # Runs a block inside the given group and submits it only at the boundary
+    # that owns it.
+    #
+    # A manager equal to the enclosing one means the requests stay deferred for
+    # that enclosing group; anything else is a fresh group owned by this call
+    # and is submitted once the block completes.
+    #
+    # @param manager [Object] the group's parallel manager.
+    # @param previous_manager [Object, nil] the manager of the enclosing group.
+    # @return [void]
+    # @api private
+    def run_parallel_group(manager, previous_manager, &block)
+      owns_group = !manager.equal?(previous_manager)
+      @parallel_manager = manager
+      completed = false
+      begin
+        if owns_group && manager.respond_to?(:execute)
+          # Execute drives the block itself and submits the collected requests
+          # when the group completes.
+          manager.execute(&block)
+        else
+          block.call
+          # Submit only at the boundary owning this group: an inherited nested
+          # block leaves its requests deferred for the outer group.
+          manager.run if owns_group
+        end
+        completed = true
+      ensure
+        # The group was aborted: drop the requests it collected so they can
+        # never be submitted, and so the next group starts clean.
+        reset_default_parallel_manager(manager) if owns_group && !completed
+        @parallel_manager = previous_manager
       end
-    ensure
-      @parallel_manager = previous_manager
+    end
+
+    # @param manager [Object, nil]
+    # @param scope [Symbol]
+    # @return [void]
+    # @raise [ArgumentError] for unknown scopes or contradictory arguments.
+    # @api private
+    def validate_parallel_scope!(manager, scope)
+      unless PARALLEL_SCOPES.include?(scope)
+        raise ArgumentError, "unknown parallel scope: #{scope.inspect}"
+      end
+      return unless manager && scope == :inherit
+
+      raise ArgumentError, 'cannot inherit a parallel group while passing a manager'
+    end
+
+    # Resolves the manager a (possibly nested) {#in_parallel} call belongs to.
+    #
+    # Inside an active group, `:auto` and `:inherit` reuse that group, while
+    # `:new` asks the adapter for an independent manager. Outside of any group
+    # every scope falls back to the connection's default manager.
+    #
+    # @param scope [Symbol] `:auto`, `:inherit` or `:new`.
+    # @param previous_manager [Object, nil] the manager of the enclosing group.
+    # @return [Object, nil]
+    # @api private
+    def resolve_parallel_manager(scope, previous_manager)
+      return previous_manager if previous_manager && scope != :new
+      return setup_fresh_parallel_manager if previous_manager
+
+      default_parallel_manager { warn_no_parallel_adapter }
+    end
+
+    # Builds a manager independent from the memoized default, used by the
+    # `scope: :new` calls nested in an active group.
+    #
+    # @return [Object, nil]
+    # @api private
+    def setup_fresh_parallel_manager
+      adapter = @builder.adapter&.klass
+      return adapter.setup_parallel_manager if support_parallel?(adapter)
+
+      warn_no_parallel_adapter
+    end
+
+    # Drops the connection's default manager when the group that used it was
+    # aborted. Its collected requests were never submitted and the manager API
+    # offers no way to discard them, so handing the same object to the next
+    # group would silently carry them over. The next group therefore obtains a
+    # fresh manager instead.
+    #
+    # A manager supplied through the `parallel_manager` connection option or
+    # {#default_parallel_manager=} is dropped the same way: the caller keeps its
+    # reference and may assign it again once it is known to be clean.
+    #
+    # @param manager [Object, nil] the manager of the aborted group.
+    # @return [void]
+    # @api private
+    def reset_default_parallel_manager(manager)
+      return unless @default_parallel_manager.equal?(manager)
+
+      @default_parallel_manager = nil
+    end
+
+    # @return [nil]
+    # @api private
+    def warn_no_parallel_adapter
+      # Report the caller's frames, not this file's own dispatch helpers.
+      here = File.expand_path(__FILE__)
+      frames = caller_locations.reject do |location|
+        File.expand_path(location.absolute_path || location.path) == here
+      end
+      warn('Warning: `in_parallel` called but no parallel-capable adapter ' \
+           'on Faraday stack', frames.first(10).join("\n"))
+      nil
     end
 
     # Sets the Hash proxy options.

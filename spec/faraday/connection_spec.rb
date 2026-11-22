@@ -10,6 +10,81 @@ class CustomEncoder
   end
 end
 
+# Collects the paths of a parallel group and records each submission, in the
+# order it happened, so specs can tell which group a request ended up in.
+class RecordingParallelManager
+  attr_reader :name, :pending
+
+  def initialize(name, log)
+    @name = name
+    @log = log
+    @pending = []
+  end
+
+  def collect(path)
+    @pending << path
+  end
+
+  def run
+    batch = @pending
+    @pending = []
+    @log << { manager: name, members: batch, at: @log.size }
+    batch
+  end
+end
+
+# Manager implementing the newer `execute` interface, which drives the block
+# itself instead of having the connection call `run` afterwards.
+class ExecutingParallelManager < RecordingParallelManager
+  def execute
+    yield
+    run
+  end
+end
+
+# Minimal parallel adapter: it routes requests to the manager carried by the
+# Env, or answers them directly outside a parallel group.
+class ParallelRecordingAdapter < Faraday::Adapter
+  self.supports_parallel = true
+
+  class << self
+    attr_accessor :log
+
+    def manager_class
+      RecordingParallelManager
+    end
+
+    def reset!
+      self.log = []
+      @created = 0
+    end
+
+    def setup_parallel_manager
+      @created = (@created || 0) + 1
+      manager_class.new("group-#{@created}", log)
+    end
+  end
+
+  def call(env)
+    super
+    path = env.url.path
+    if (manager = env.parallel_manager)
+      manager.collect(path)
+    else
+      self.class.log << { manager: nil, members: [path], at: self.class.log.size }
+      save_response(env, 200, "plain #{path}")
+    end
+    @app.call(env)
+  end
+end
+
+# The same recording, with a manager implementing the newer `execute` API.
+class ExecutingParallelRecordingAdapter < ParallelRecordingAdapter
+  def self.manager_class
+    ExecutingParallelManager
+  end
+end
+
 shared_examples 'initializer with url' do
   context 'with simple url' do
     let(:address) { 'http://httpbingo.org' }
@@ -799,6 +874,242 @@ RSpec.describe Faraday::Connection do
     it 'checks the given adapter class' do
       expect(conn.support_parallel?(parallel_adapter)).to be(true)
       expect(conn.support_parallel?(Faraday::Adapter::Test)).to be(false)
+    end
+  end
+
+  describe '#in_parallel' do
+    let(:adapter_class) { ParallelRecordingAdapter }
+
+    let(:conn) do
+      Faraday::Connection.new('http://example.com') { |builder| builder.adapter adapter_class }
+    end
+
+    let(:log) { adapter_class.log }
+
+    before { adapter_class.reset! }
+
+    def submitted
+      log.map { |entry| entry[:members] }
+    end
+
+    it 'submits the whole group once at the outermost boundary' do
+      conn.get('/before')
+      conn.in_parallel do
+        conn.get('/a')
+        conn.get('/b')
+      end
+      conn.get('/after')
+
+      expect(submitted).to eq([['/before'], %w[/a /b], ['/after']])
+    end
+
+    context 'with a nested call that keeps the enclosing group' do
+      it 'defers nested requests until the outermost block ends' do
+        conn.in_parallel do
+          conn.get('/a')
+          conn.in_parallel { conn.get('/nested') }
+          conn.get('/b')
+        end
+
+        expect(submitted).to eq([%w[/a /nested /b]])
+      end
+
+      it 'accepts scope: :inherit as an explicit form of the same thing' do
+        conn.in_parallel do
+          conn.get('/a')
+          conn.in_parallel(scope: :inherit) { conn.get('/nested') }
+          conn.get('/b')
+        end
+
+        expect(submitted).to eq([%w[/a /nested /b]])
+      end
+    end
+
+    context 'with a nested call opening its own group' do
+      it 'submits the inner group when its own block ends' do
+        conn.in_parallel do
+          conn.get('/a')
+          conn.in_parallel(scope: :new) { conn.get('/nested') }
+          conn.get('/b')
+        end
+
+        expect(submitted).to eq([['/nested'], %w[/a /b]])
+      end
+
+      it 'uses an explicit manager without disturbing the enclosing group' do
+        outer = RecordingParallelManager.new('outer', log)
+        inner = RecordingParallelManager.new('inner', log)
+
+        conn.in_parallel(outer) do
+          conn.get('/a')
+          conn.in_parallel(inner) { conn.get('/nested') }
+          conn.get('/b')
+        end
+
+        expect(submitted).to eq([['/nested'], %w[/a /b]])
+        expect(log.map { |entry| entry[:manager] }).to eq(%w[inner outer])
+        expect(outer.pending).to be_empty
+        expect(inner.pending).to be_empty
+      end
+    end
+
+    context 'when a nested group raises' do
+      it 'leaves the enclosing group intact when the error is rescued inside it' do
+        conn.in_parallel do
+          conn.get('/a')
+          begin
+            conn.in_parallel(scope: :new) do
+              conn.get('/failed')
+              raise 'nested boom'
+            end
+          rescue RuntimeError
+            conn.get('/recovered')
+          end
+          conn.get('/b')
+        end
+
+        expect(submitted).to eq([%w[/a /recovered /b]])
+        expect(log.flat_map { |entry| entry[:members] }).not_to include('/failed')
+      end
+
+      it 'does not submit the aborted groups and restores the connection state' do
+        expect do
+          conn.in_parallel do
+            conn.get('/a')
+            conn.in_parallel(scope: :new) do
+              conn.get('/nested')
+              raise 'boom'
+            end
+          end
+        end.to raise_error(RuntimeError, 'boom')
+
+        expect(submitted).to be_empty
+        expect(conn.in_parallel?).to be(false)
+      end
+
+      it 'keeps a plain request after the failure out of any old group' do
+        begin
+          conn.in_parallel do
+            conn.get('/a')
+            conn.in_parallel(scope: :new) do
+              conn.get('/nested')
+              raise 'boom'
+            end
+          end
+        rescue RuntimeError
+          nil
+        end
+
+        response = conn.get('/plain')
+
+        expect(response.body).to eq('plain /plain')
+        expect(log.last).to include(manager: nil, members: ['/plain'])
+      end
+
+      it 'starts the next group with a fresh manager' do
+        begin
+          conn.in_parallel do
+            conn.get('/aborted')
+            raise 'boom'
+          end
+        rescue RuntimeError
+          nil
+        end
+
+        conn.in_parallel { conn.get('/fresh') }
+
+        expect(submitted).to eq([['/fresh']])
+        expect(log.map { |entry| entry[:manager] }).to eq(['group-2'])
+      end
+
+      it 'does not hand the aborted default manager to the next group' do
+        aborted = Class.new(ExecutingParallelManager) do
+          def execute
+            yield
+            raise 'submit failed'
+          end
+        end.new('explicit', log)
+        conn.default_parallel_manager = aborted
+
+        expect { conn.in_parallel { conn.get('/aborted') } }
+          .to raise_error(RuntimeError, 'submit failed')
+
+        conn.in_parallel { conn.get('/fresh') }
+
+        expect(aborted.pending).to eq(['/aborted'])
+        expect(log.map { |entry| entry[:manager] }).to eq(['group-1'])
+        expect(submitted).to eq([['/fresh']])
+      end
+    end
+
+    context 'when the manager implements execute' do
+      let(:adapter_class) { ExecutingParallelRecordingAdapter }
+
+      it 'keeps nested requests deferred until the owning boundary' do
+        conn.in_parallel do
+          conn.get('/a')
+          conn.in_parallel { conn.get('/nested') }
+          conn.get('/b')
+        end
+
+        expect(submitted).to eq([%w[/a /nested /b]])
+      end
+
+      it 'submits a nested independent group on its own' do
+        conn.in_parallel do
+          conn.get('/a')
+          conn.in_parallel(scope: :new) { conn.get('/nested') }
+          conn.get('/b')
+        end
+
+        expect(submitted).to eq([['/nested'], %w[/a /b]])
+      end
+
+      it 'recovers the caller environment after a nested failure' do
+        begin
+          conn.in_parallel do
+            conn.get('/a')
+            conn.in_parallel(scope: :new) do
+              conn.get('/nested')
+              raise 'boom'
+            end
+          end
+        rescue RuntimeError
+          nil
+        end
+
+        expect(conn.in_parallel?).to be(false)
+        expect(conn.get('/plain').body).to eq('plain /plain')
+        expect(submitted).to eq([['/plain']])
+      end
+    end
+
+    it 'rejects unknown scopes' do
+      expect { conn.in_parallel(scope: :bogus) { nil } }
+        .to raise_error(ArgumentError, /unknown parallel scope/)
+    end
+
+    it 'rejects inheriting a group while passing a manager' do
+      manager = RecordingParallelManager.new('manual', log)
+
+      expect { conn.in_parallel(manager, scope: :inherit) { nil } }
+        .to raise_error(ArgumentError, /cannot inherit a parallel group/)
+    end
+
+    it 'requires a block' do
+      expect { conn.in_parallel }.to raise_error(ArgumentError, /requires a block/)
+    end
+
+    it 'warns and yields when the adapter is not parallel-capable' do
+      plain = Faraday.new('http://example.com') { |builder| builder.adapter :test, [] }
+      yielded = false
+
+      expect do
+        plain.in_parallel { yielded = true }
+      end.to output(/no parallel-capable adapter/).to_stderr
+
+      expect(yielded).to be(true)
+      expect(plain.in_parallel?).to be(false)
     end
   end
 

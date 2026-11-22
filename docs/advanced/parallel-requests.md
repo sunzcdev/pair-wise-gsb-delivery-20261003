@@ -22,6 +22,46 @@ end
 puts "Time taken: #{Time.now - now}"
 ```
 
+## Nested parallel blocks
+
+Helper methods called from inside an `in_parallel` block sometimes open a
+parallel block of their own. Such nested calls must say which group their
+requests belong to:
+
+* with no arguments (or `scope: :inherit`), the nested block joins the
+  enclosing group. Its requests stay deferred, and the group is submitted once,
+  when the outermost block that opened it ends.
+* passing a `manager`, or `scope: :new`, opens an independent group. That group
+  is submitted when the nested block ends, while the enclosing group keeps
+  collecting its own requests.
+
+```ruby
+conn.in_parallel do
+  conn.get('/one')                        # joins the outer group
+
+  conn.in_parallel do                     # joins the outer group as well
+    conn.get('/two')
+  end
+
+  conn.in_parallel(scope: :new) do        # submitted on its own right here
+    conn.get('/three')
+  end
+
+  conn.get('/four')                       # still part of the outer group
+end
+# Submitted: ['/three'], then ['/one', '/two', '/four'].
+```
+
+Requests are only submitted at the boundary that owns their group, so an
+inherited nested block never flushes the surrounding group early.
+
+If a nested block raises, the group it opened is aborted and not submitted, and
+the connection state of the enclosing block is restored. Once the error is
+handled, the connection is no longer in parallel mode, so a later plain request
+is sent on its own instead of being attached to the aborted group. The next
+`in_parallel` block also starts with a fresh manager, so requests collected by
+the aborted group can never be submitted later.
+
 ## A note on Async
 
 You might have heard about [Async] and its native integration with Ruby 3.0.

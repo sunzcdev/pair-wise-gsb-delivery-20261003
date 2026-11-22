@@ -60,6 +60,14 @@ class FlorpParallelManager
 end
 ```
 
+`execute` is called once per submitted group: a nested block that inherits its
+enclosing group does not call it again, and the requests collected there are
+submitted together with that enclosing group. When a nested helper needs its own
+group, pass an explicit manager or `in_parallel(scope: :new)`; Faraday asks the
+adapter for a separate manager and submits that group when the nested block
+ends. A group whose block raises is aborted, so the requests it collected are
+never submitted.
+
 ### A note on the old, deprecated interface
 
 Prior to the introduction of the `execute` method, the `ParallelManager` was expected to implement a `run` method
