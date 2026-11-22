@@ -37,6 +37,13 @@ module Puma
     # @version 5.0.0
     PRINTABLE_COMMANDS = %w[gc-stats stats thread-backtraces].freeze
 
+    # Commands that only read information and never change the state of the
+    # server.  These are sent without a running-identity check, since sending
+    # them to a newer generation occupying the same control address is
+    # harmless.  Every other request command is stateful and is only sent
+    # after the peer's running identity has been verified.
+    READ_ONLY_REQUEST_COMMANDS = %w[gc-stats stats status thread-backtraces].freeze
+
     def initialize(argv, stdout=STDOUT, stderr=STDERR, env: ENV)
       @state = nil
       @quiet = false
@@ -47,6 +54,14 @@ module Puma
       @control_ca_file = nil
       @config_file = nil
       @command = nil
+      # Set from the state file's `running_identity` key.  nil means the
+      # state file was written by an older Puma that does not record an
+      # identity, in which case identity verification is skipped for
+      # backwards compatibility.
+      @running_identity = nil
+      # Set when the state file records an identity, so verification is
+      # required before a stateful request is sent.
+      @verify_running_identity = false
       @environment = env['APP_ENV'] || env['RACK_ENV'] || env['RAILS_ENV']
 
       @argv = argv.dup
@@ -167,52 +182,36 @@ module Puma
         @control_url = sf.control_url
         @control_auth_token = sf.control_auth_token
         @pid = sf.pid
+        prepare_running_identity sf
       elsif @pidfile
         # get pid from pid_file
         @pid = File.read(@pidfile, mode: 'rb:UTF-8').to_i
       end
     end
 
+    # Reads the state file's running identity.  A state file written by an
+    # older Puma has no `running_identity` key; such a file remains usable,
+    # but identity verification cannot be performed, so stateful requests
+    # behave exactly as they did before the feature existed.
+    def prepare_running_identity(state_file)
+      identity = state_file.running_identity
+      return unless identity && !identity.to_s.strip.empty?
+
+      @running_identity = identity
+      @verify_running_identity = true
+    end
+
     def send_request
+      verify_running_identity if identity_verification_required?
+
       uri = URI.parse @control_url
 
-      host = uri.host
-
-      # create server object by scheme
-      server =
-        case uri.scheme
-        when 'ssl'
-          require 'openssl'
-          host = host[1..-2] if host&.start_with? '['
-          ctx = OpenSSL::SSL::SSLContext.new
-          ctx.ca_file = @control_ca_file if @control_ca_file
-          ctx.set_params
-          ssl = OpenSSL::SSL::SSLSocket.new(
-            TCPSocket.new(host, uri.port),
-            ctx)
-          ssl.tap { |socket| socket.sync_close = true }
-            .tap { |socket| socket.hostname = host }
-            .tap(&:connect)
-            .tap { |socket| socket.post_connection_check host }
-        when 'tcp'
-          host = host[1..-2] if host&.start_with? '['
-          TCPSocket.new host, uri.port
-        when 'unix'
-          # check for abstract UNIXSocket
-          UNIXSocket.new(@control_url.start_with?('unix://@') ?
-            "\0#{host}#{uri.path}" : "#{host}#{uri.path}")
-        else
-          raise "Invalid scheme: #{uri.scheme}"
-        end
+      server = open_control_socket uri
 
       if @command == 'status'
         message 'Puma is started'
       else
-        url = "/#{@command}"
-
-        if @control_auth_token
-          url = url + "?token=#{@control_auth_token}"
-        end
+        url = request_url "/#{@command}"
 
         server.syswrite "GET #{url} HTTP/1.0\r\n\r\n"
 
@@ -240,13 +239,115 @@ module Puma
         message response.last if PRINTABLE_COMMANDS.include?(@command)
       end
     ensure
-      server ||= ssl
-      if server
-        if uri.scheme == 'ssl'
-          server.sysclose
-        else
-          server.close unless server.closed?
-        end
+      close_control_socket server, uri
+    end
+
+    # Identity verification is only possible when the state file recorded a
+    # `running_identity` (Puma 8.2+), and only matters for requests that can
+    # change server state.  Read-only commands and `status` are safe to send
+    # to whichever generation currently owns the address.
+    def identity_verification_required?
+      @verify_running_identity && !READ_ONLY_REQUEST_COMMANDS.include?(@command)
+    end
+
+    # Confirms the server listening on the control address is the same Puma
+    # generation that wrote the state file, by comparing its `/identity`
+    # response with the identity loaded from the state file.  Raises without
+    # sending the stateful command when they differ, so a command can never be
+    # delivered to a later generation that took over the same address.
+    def verify_running_identity
+      body = control_request('/identity')[:body]
+
+      begin
+        require 'json'
+        peer_identity = JSON.parse(body)['running_identity']
+      rescue JSON::ParserError
+        raise "Invalid identity response from control server: #{body.inspect}"
+      end
+
+      unless peer_identity.is_a?(String) && peer_identity == @running_identity
+        raise "Control server identity mismatch: state file expects " \
+              "#{@running_identity.inspect}, but the server at " \
+              "#{@control_url} returned #{peer_identity.inspect}. The control " \
+              "address is likely held by a different Puma generation; " \
+              "refusing to send '#{@command}'"
+      end
+
+      message "Control server identity verified"
+    end
+
+    # Opens its own connection to the control server, sends a GET request for
+    # `path`, and returns `{ code:, body: }`.  The identity pre-check uses a
+    # separate connection so the actual stateful command is only written after
+    # the peer has been confirmed.
+    def control_request(path)
+      uri = URI.parse @control_url
+      server = open_control_socket uri
+
+      server.syswrite "GET #{request_url(path)} HTTP/1.0\r\n\r\n"
+
+      data = server.read or raise 'Server closed connection before responding'
+      response = data.split("\r\n")
+      raise "Server sent empty response" if response.empty?
+
+      _http, code, _message = response.first.split(' ', 3)
+
+      if code == '403'
+        raise 'Unauthorized access to server (wrong auth token)'
+      elsif code == '404'
+        # An older Puma that does not serve `/identity` cannot be verified.
+        # Only reachable when a new state file points at an older server, so
+        # fail closed rather than guessing at the peer's generation.
+        raise "Control server does not support identity verification " \
+              "(no /identity endpoint); refusing to send a stateful command"
+      elsif code != '200'
+        raise "Bad response from server: #{code}"
+      end
+
+      { code: code, body: response.last.to_s }
+    ensure
+      close_control_socket server, uri
+    end
+
+    def request_url(path)
+      return path unless @control_auth_token
+
+      "#{path}?token=#{@control_auth_token}"
+    end
+
+    def open_control_socket(uri)
+      host = uri.host
+
+      case uri.scheme
+      when 'ssl'
+        require 'openssl'
+        host = host[1..-2] if host&.start_with? '['
+        ctx = OpenSSL::SSL::SSLContext.new
+        ctx.ca_file = @control_ca_file if @control_ca_file
+        ctx.set_params
+        ssl = OpenSSL::SSL::SSLSocket.new(TCPSocket.new(host, uri.port), ctx)
+        ssl.tap { |socket| socket.sync_close = true }
+          .tap { |socket| socket.hostname = host }
+          .tap(&:connect)
+          .tap { |socket| socket.post_connection_check host }
+      when 'tcp'
+        host = host[1..-2] if host&.start_with? '['
+        TCPSocket.new host, uri.port
+      when 'unix'
+        # check for abstract UNIXSocket
+        UNIXSocket.new(@control_url.start_with?('unix://@') ?
+          "\0#{host}#{uri.path}" : "#{host}#{uri.path}")
+      else
+        raise "Invalid scheme: #{uri.scheme}"
+      end
+    end
+
+    def close_control_socket(server, uri)
+      return unless server
+      if uri.scheme == 'ssl'
+        server.sysclose
+      else
+        server.close unless server.closed?
       end
     end
 

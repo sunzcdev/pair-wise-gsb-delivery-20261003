@@ -136,8 +136,21 @@ module Puma
       sf.control_url = @options[:control_url]
       sf.control_auth_token = @options[:control_auth_token]
       sf.running_from = File.expand_path('.')
+      sf.running_identity = running_identity
 
       sf.save path, permission
+    end
+
+    # A random token that uniquely identifies this boot of Puma.  It is written
+    # to the state file and served by the control app's `/identity` endpoint,
+    # allowing `pumactl` to confirm it is still talking to the same generation
+    # before issuing a stateful command.  Generated once per Launcher, so a
+    # restarted process produces a different identity.
+    def running_identity
+      @running_identity ||= begin
+        require 'securerandom' unless defined?(SecureRandom)
+        SecureRandom.hex(16)
+      end
     end
 
     # Delete the configured pidfile

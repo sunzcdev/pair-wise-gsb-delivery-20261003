@@ -13,7 +13,12 @@ module Puma
   #
   class StateFile
 
-    ALLOWED_FIELDS = %w!control_url control_auth_token pid running_from!
+    # `running_identity` is a random token generated each time a Puma process
+    # boots and writes its state file.  `pumactl` compares it with the value
+    # returned by the control server before sending a stateful command, so a
+    # command cannot be delivered to a later generation that has taken over
+    # the same control address.  See `Puma::ControlCLI#verify_running_identity`.
+    ALLOWED_FIELDS = %w!control_url control_auth_token pid running_from running_identity!
 
     def initialize
       @options = {}

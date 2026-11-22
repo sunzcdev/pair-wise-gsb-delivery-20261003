@@ -2,12 +2,79 @@
 
 require_relative "helper"
 require_relative "helpers/ssl"
+require_relative "helpers/tmp_path"
 
 require 'pathname'
 require 'puma/control_cli'
+require 'json'
+
+# A minimal stand-in for Puma's control/status app over TCP.  It records
+# every request path it receives and answers `/identity` with the running
+# identity it was constructed with, while stateful commands get the same
+# `{ "status": "ok" }` body the real app returns.  Two of these can be bound
+# to the same address in sequence to simulate a generation taking over a
+# control address after the previous one exited.
+class ControlStatusStub
+  attr_reader :requests, :identity
+
+  # Pass `port:` to bind a fixed address, which allows a second stub to take
+  # over the exact same port after the first is shut down.  SO_REUSEADDR is
+  # enabled so the address can be rebound immediately.
+  def initialize(identity, port: 0)
+    @identity = identity
+    @requests = []
+    # Build the listener manually so SO_REUSEADDR is set before binding,
+    # allowing the address to be rebound by a later generation.
+    @server = Socket.new(Socket::AF_INET, Socket::SOCK_STREAM, 0)
+    @server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true)
+    @server.bind(Addrinfo.tcp('127.0.0.1', port))
+    @server.listen(Socket::SOMAXCONN)
+    @thread = Thread.new { accept_loop }
+  end
+
+  def port
+    @server.local_address.ip_port
+  end
+
+  def control_url
+    "tcp://127.0.0.1:#{port}/"
+  end
+
+  def shutdown
+    @server.close unless @server.closed?
+    @thread.join
+  end
+
+  private
+
+  def accept_loop
+    loop do
+      socket, = @server.accept
+      request_line = socket.gets
+      break unless request_line
+      path = request_line.split[1]
+      @requests << path
+      socket.write response_for(path)
+      socket.close
+    end
+  rescue IOError, Errno::EBADF, Errno::ENOTSOCK
+  end
+
+  def response_for(path)
+    command = path[/\/([^?]+)/, 1]
+    body =
+      if command == 'identity'
+        JSON.generate('running_identity' => @identity)
+      else
+        '{ "status": "ok" }'
+      end
+    "HTTP/1.0 200 OK\r\ncontent-type: application/json\r\n#{body}\r\n"
+  end
+end
 
 class TestPumaControlCli < PumaTest
   include SSLHelper
+  include TmpPath
 
   def setup
     # use a pipe to get info across thread boundary
@@ -386,7 +453,146 @@ class TestPumaControlCli < PumaTest
     assert_kind_of Thread, t.join, "server didn't stop"
   end
 
+  # A stateful command sent while the original generation still owns the
+  # control address must first verify `/identity`, then deliver the command.
+  def test_running_identity_verified_before_stateful_command
+    identity = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
+    stub = ControlStatusStub.new(identity)
+    state_path = write_state_file(stub.control_url, identity)
+
+    out = run_pumactl ['-S', state_path, 'stop']
+
+    assert_includes out, 'Control server identity verified'
+    assert_includes out, 'Command stop sent success'
+    assert_equal ['/identity?token=ctrl', '/stop?token=ctrl'], stub.requests
+  ensure
+    stub&.shutdown
+  end
+
+  # Read-only commands must not be gated on the running identity, since
+  # querying a newer generation on the same address is harmless.
+  def test_read_only_command_skips_identity_check
+    identity = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
+    stub = ControlStatusStub.new(identity)
+    state_path = write_state_file(stub.control_url, identity)
+
+    out = run_pumactl ['-S', state_path, 'stats']
+
+    assert_includes out, 'Command stats sent success'
+    refute_includes out, 'identity verified'
+    assert_equal ['/stats?token=ctrl'], stub.requests
+  ensure
+    stub&.shutdown
+  end
+
+  def test_status_command_skips_identity_check
+    identity = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
+    stub = ControlStatusStub.new(identity)
+    state_path = write_state_file(stub.control_url, identity)
+
+    out = run_pumactl ['-S', state_path, 'status']
+
+    assert_includes out, 'Puma is started'
+    assert_empty stub.requests
+  ensure
+    stub&.shutdown
+  end
+
+  # The central scenario: generation one exits and generation two takes over
+  # the same control address.  pumactl must detect the identity mismatch and
+  # refuse to deliver the stateful command to the new generation.
+  def test_stateful_command_refused_after_generation_takeover
+    identity_one = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
+    identity_two = 'fedcba98765432100123456789abcdef'
+
+    stub_one = ControlStatusStub.new(identity_one)
+    port = stub_one.port
+    state_path = write_state_file(stub_one.control_url, identity_one)
+
+    # generation one receives and accepts a command before it exits
+    out = run_pumactl ['-S', state_path, 'stop']
+    assert_includes out, 'Command stop sent success'
+
+    stub_one.shutdown
+
+    # generation two binds the same address with a different identity
+    stub_two = ControlStatusStub.new(identity_two, port: port)
+    assert_equal port, stub_two.port, 'second stub must reuse the same address'
+
+    out = run_pumactl ['-S', state_path, 'halt'], expect_failure: true
+
+    assert_match(/identity mismatch/, out)
+    # it only ever answered the identity probe; halt must not be delivered
+    assert_equal ['/identity?token=ctrl'], stub_two.requests
+  ensure
+    stub_one&.shutdown
+    stub_two&.shutdown
+  end
+
+  # A state file written by an older Puma has no running_identity.  It must
+  # keep working exactly as before: no identity probe, command delivered.
+  def test_legacy_state_file_without_identity_still_works
+    stub = ControlStatusStub.new('fedcba98765432100123456789abcdef')
+    state_path = write_state_file(stub.control_url, nil)
+
+    out = run_pumactl ['-S', state_path, 'stop']
+
+    assert_includes out, 'Command stop sent success'
+    refute_match(/identity/i, out)
+    assert_equal ['/stop?token=ctrl'], stub.requests
+  ensure
+    stub&.shutdown
+  end
+
+  # A new state file pointing at a server that lacks the /identity endpoint
+  # fails closed instead of blindly sending the stateful command.
+  def test_missing_identity_endpoint_fails_closed
+    identity = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
+    stub = ControlStatusStub.new(identity)
+    stub.define_singleton_method(:response_for) do |_path|
+      "HTTP/1.0 404 Not Found\r\nconnection: close\r\n\r\n"
+    end
+    state_path = write_state_file(stub.control_url, identity)
+
+    out = run_pumactl ['-S', state_path, 'stop'], expect_failure: true
+
+    assert_match(/identity verification/, out)
+    assert_equal ['/identity?token=ctrl'], stub.requests
+  ensure
+    stub&.shutdown
+  end
+
   private
+
+  def write_state_file(control_url, identity)
+    path = tmp_path('.state')
+    contents = +"---\n"
+    contents << "pid: #{Process.pid}\n"
+    contents << "control_url: #{control_url}\n"
+    contents << "control_auth_token: ctrl\n"
+    contents << "running_identity: #{identity}\n" if identity
+    File.write path, contents
+    path
+  end
+
+  # Runs pumactl against a pipe (matching the existing helpers), returning
+  # the captured output.  A failing run exits with status 1, which is the
+  # expected outcome when `expect_failure:` is set.
+  def run_pumactl(options, expect_failure: false)
+    rd, wr = IO.pipe
+    if expect_failure
+      exit_status = assert_raises(SystemExit) do
+        Puma::ControlCLI.new(options, wr, wr).run
+      end.status
+      assert_equal 1, exit_status
+    else
+      Puma::ControlCLI.new(options, wr, wr).run
+    end
+    wr.close
+    rd.read
+  ensure
+    rd&.close
+  end
 
   def assert_command_cli_output(options, expected_out)
     @rd, @wr = IO.pipe

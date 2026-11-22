@@ -4,14 +4,16 @@ require_relative "helper"
 
 require "puma/app/status"
 require "rack"
+require "json"
 
 class TestAppStatus < PumaTest
   class FakeServer
     def initialize
       @status = :running
+      @running_identity = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
     end
 
-    attr_reader :status
+    attr_reader :status, :running_identity
 
     def stop
       @status = :stop
@@ -112,5 +114,33 @@ class TestAppStatus < PumaTest
     assert_equal :running, @server.status
     assert_equal 404, status
     assert_equal ['Command "stop" unavailable'], app.enum_for.to_a
+  end
+
+  def test_identity
+    status, _ , app = lint('/identity')
+
+    assert_equal 200, status
+    body = JSON.parse(app.enum_for.to_a.first)
+    assert_equal @server.running_identity, body.fetch('running_identity')
+  end
+
+  # /identity is a read-only probe needed by pumactl even when the control
+  # app was restricted to data-only commands.
+  def test_identity_available_when_data_only
+    @app = Puma::App::Status.new(@server, data_only: true)
+
+    status, _ , app = lint('/identity')
+
+    assert_equal 200, status
+    body = JSON.parse(app.enum_for.to_a.first)
+    assert_equal @server.running_identity, body.fetch('running_identity')
+  end
+
+  def test_identity_requires_valid_token
+    @app.instance_variable_set(:@auth_token, "abcdef")
+
+    status, _ , _ = lint('/identity')
+
+    assert_equal 403, status
   end
 end

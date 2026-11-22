@@ -16,6 +16,27 @@ $ pumactl --control-url 'tcp://127.0.0.1:9293' --control-token foo restart
 
 To see a list of `pumactl` options, use `pumactl --help`.
 
+## Running identity and state file safety
+
+Each time Puma boots it generates a random `running_identity` token and writes it
+to the [state file](../lib/puma/state_file.rb) together with the control URL and
+auth token. The control server also serves that token from a read-only
+`GET /identity` endpoint.
+
+When `pumactl` is given a state file (`-S`/`--state`), it loads that identity and,
+before sending a **stateful** command (`stop`, `halt`, `restart`,
+`phased-restart`, `refork`, `reload-worker-directory`, `gc`, ...), queries
+`/identity` and confirms the server still returns the same value. This matters
+because a control address (a TCP port or UNIX socket) can be taken over by a
+different Puma generation after the previous one exits: the check prevents a
+command intended for the old generation from being delivered to the new one.
+
+Read-only commands (`status`, `stats`, `gc-stats`, `thread-backtraces`) skip the
+check, since querying whichever generation currently owns the address is
+harmless. A state file written by an older Puma has no `running_identity` key;
+such a file keeps working unchanged, but identity verification cannot be
+performed for it.
+
 ## Accessing stats
 
 Stats can be accessed in two ways:

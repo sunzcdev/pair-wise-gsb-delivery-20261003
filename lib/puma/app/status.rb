@@ -29,7 +29,10 @@ module Puma
         # resp_type is processed by following case statement, return
         # is a number (status) or a string used as the body of a 200 response
         command = env['PATH_INFO'][/\/([^\/]+)$/, 1]
-        if @enabled_commands && !@enabled_commands.include?(command)
+        # `/identity` stays available in data-only mode: pumactl needs it to
+        # confirm the peer's running identity before any stateful command.
+        identity_command = command == 'identity'
+        if @enabled_commands && !@enabled_commands.include?(command) && !identity_command
           return rack_response(404, "Command #{command.inspect} unavailable", 'text/plain')
         end
 
@@ -61,6 +64,14 @@ module Puma
 
           when 'stats'
             Puma::JSONSerialization.generate @launcher.stats
+
+          when 'identity'
+            # Identifies the boot generation currently serving this control
+            # address.  `pumactl` compares this with the state file's
+            # `running_identity` before sending a stateful command.
+            Puma::JSONSerialization.generate(
+              'running_identity' => @launcher.running_identity
+            )
 
           when 'thread-backtraces'
             backtraces = []

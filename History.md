@@ -1,3 +1,8 @@
+## Next
+
+* Features
+  * Record a per-boot `running_identity` in the state file and serve it from a new read-only `/identity` control endpoint. `pumactl -S` now verifies the peer still returns that identity before sending a stateful command, so a command cannot be delivered to a later Puma generation that has taken over the same control address. Read-only commands (`status`, `stats`, `gc-stats`, `thread-backtraces`) are exempt; state files written by older Puma versions continue to work without verification.
+
 ## 8.1.2 / 2026-11-17
 
 * Security

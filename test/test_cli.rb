@@ -259,8 +259,9 @@ class TestCLI < PumaTest
     Puma::StateFile::ALLOWED_FIELDS.each do |key|
       val =
         case key
-        when 'pid'          then Process.pid
-        when 'running_from' then File.expand_path('.') # same as Launcher
+        when 'pid'              then Process.pid
+        when 'running_from'     then File.expand_path('.') # same as Launcher
+        when 'running_identity' then cli.launcher.running_identity
         else                     opts[key.to_sym]
         end
       assert_equal val, data[key]
