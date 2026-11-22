@@ -474,6 +474,33 @@ subprocess and fails when the base Python has been removed:
 ``pyvenv.cfg`` has no section header, hence the prefix. The key holds the feature release only; reach for ``version``
 when you need the patch level too.
 
+***************************************
+ Preview the files a creation will use
+***************************************
+
+Pass ``--show-plan`` to print the files the creator would copy or link, and why, then stop without creating anything.
+The plan is built from the same layout rules the creation applies, so it names the executables, aliases, DLLs and other
+files that would end up in the environment:
+
+.. code-block:: console
+
+    $ virtualenv --show-plan venv
+
+The output is JSON. Each action carries the source path, the destinations it would be written to, whether it is copied
+or linked, the reason for that choice, and a ``fallback`` describing what applies instead when the chosen method is not
+permitted on this host, such as symlinks being unavailable. An action a creator does not describe is reported with the
+``unknown`` method rather than being omitted.
+
+The same view is available from Python code through ``Session.action_plan`` without running the creation:
+
+.. code-block:: python
+
+    from virtualenv.run import session_via_cli
+
+    session = session_via_cli(["--no-seed", "venv"])
+    for action in session.action_plan().actions:
+        print(action.src, "->", action.dest, action.method, action.reason)
+
 **********************
  Use from Python code
 **********************

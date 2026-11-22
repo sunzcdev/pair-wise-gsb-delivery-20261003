@@ -64,6 +64,24 @@ class RefWhen(StrEnum):
     SYMLINK = "symlink"
 
 
+def applies(when: str, symlinks: bool) -> bool:
+    """Whether a reference that applies under ``when`` is applied in the selected mode.
+
+    :param when: the ``RefWhen`` value of the reference
+    :param symlinks: ``True`` when the creator links instead of copying
+
+    :returns: ``True`` when the creation applies the reference
+
+    """
+    if when == RefWhen.ANY:
+        return True
+    if when == RefWhen.SYMLINK:
+        return symlinks is True
+    if when == RefWhen.COPY:
+        return symlinks is False
+    return False
+
+
 class PathRef(ABC):
     """Base class that checks if a file reference can be symlink/copied.
 
@@ -151,11 +169,36 @@ class PathRef(ABC):
         :returns: the ``symlink`` or ``copy`` function that applies
 
         """
-        if self.must == RefMust.SYMLINK:
+        if self.method_kind(symlinks) == RefMust.SYMLINK:
             return symlink
+        return copy
+
+    def method_kind(self, symlinks: bool) -> RefMust:
+        """Return which way the reference is applied, without performing it.
+
+        :param symlinks: ``True`` to prefer symlinks over copies
+
+        :returns: ``RefMust.SYMLINK`` when linking, ``RefMust.COPY`` when copying
+
+        """
+        if self.must == RefMust.SYMLINK:
+            return RefMust.SYMLINK
         if self.must == RefMust.COPY:
-            return copy
-        return symlink if symlinks else copy
+            return RefMust.COPY
+        return RefMust.SYMLINK if symlinks else RefMust.COPY
+
+    def destinations(self, creator: object) -> list[Path]:
+        """Return where the reference is written, without writing anything.
+
+        A third-party reference that does not describe its destination returns an empty list, which the action view
+        reports as an unknown destination rather than failing.
+
+        :param creator: the creator the environment is created by
+
+        :returns: the destination paths, in the order creation writes them
+
+        """
+        return []
 
 
 class ExePathRef(PathRef, ABC):
@@ -225,6 +268,17 @@ class PathRefToDest(PathRef):
         for dst in dest_iterable:
             method(self.src, dst)
 
+    def destinations(self, creator: object) -> list[Path]:
+        """Return the destination path or paths, without writing anything.
+
+        :param creator: the creator the environment is created by
+
+        :returns: the destination paths
+
+        """
+        dest = self.dest(creator, self.src)
+        return dest if isinstance(dest, list) else [dest]
+
 
 class ExePathRefToDest(PathRefToDest, ExePathRef):
     """Link a exe path on the file system.
@@ -285,6 +339,17 @@ class ExePathRefToDest(PathRefToDest, ExePathRef):
                 copy(self.src, link_file)
             if not symlinks:
                 make_exe(link_file)
+
+    def destinations(self, creator: object) -> list[Path]:
+        """Return the executable's own path followed by its alias paths, without writing anything.
+
+        :param creator: the creator the environment is created by
+
+        :returns: the destination paths, the base name first
+
+        """
+        bin_dir = self.dest(creator, self.src).parent
+        return [bin_dir / self.base, *(bin_dir / alias for alias in self.aliases)]
 
 
 __all__ = [

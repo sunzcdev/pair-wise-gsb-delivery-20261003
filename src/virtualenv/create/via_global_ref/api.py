@@ -4,6 +4,7 @@ __lazy_modules__ = [
     "pathlib",
     "virtualenv.info",
     "virtualenv.util.path",
+    "virtualenv.create.plan",
 ]
 
 import logging
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from virtualenv.create.creator import Creator, CreatorMeta
+from virtualenv.create.plan import Action as PlanAction
+from virtualenv.create.plan import ActionKind, ActionMethod, ActionPlan
 from virtualenv.info import fs_supports_symlink
 from virtualenv.util.path import write_file
 
@@ -24,6 +27,21 @@ if TYPE_CHECKING:
     from virtualenv.config.cli.parser import VirtualEnvOptions
 
 LOGGER: Final[logging.Logger] = logging.getLogger(__name__)  # simplint: ignore[module-variable-prefix]  # existing name
+
+_SOURCE_LABELS: Final[dict[str, str]] = {
+    "cli": "command line",
+    "env var": "environment variable",
+    "file": "configuration file",
+    "default": "default",
+}
+
+
+def _copy_fallback_reason(meta: object) -> str:
+    # metadata is only present for a creator chosen through the CLI; without it the reason stays generic
+    symlink_error = getattr(meta, "symlink_error", None)
+    if symlink_error:
+        return f"copy is the fallback because symlinks are unavailable: {symlink_error}"
+    return "copy is the fallback when nothing selects symlinks"
 
 
 class ViaGlobalRefMeta(CreatorMeta):
@@ -61,31 +79,48 @@ class ViaGlobalRefApi(Creator, ABC):
     :param interpreter: the interpreter the environment is created from
 
     :var symlinks: ``True`` to link files instead of copying them
+    :var symlink_reason: why the creator links or copies
     :var enable_system_site_package: ``True`` to give the environment access to the system site-packages
 
     """
 
     def __init__(self, options: VirtualEnvOptions, interpreter: PythonInfo) -> None:
         super().__init__(options, interpreter)
-        self.symlinks = self._should_symlink(options)
+        self.symlinks, self.symlink_reason = self._symlink_decision(options)
         self.enable_system_site_package = options.system_site
+        # the capability metadata is only present when the creator was chosen through the CLI
+        self._meta = getattr(options, "meta", None)
 
     @staticmethod
-    def _should_symlink(options: VirtualEnvOptions) -> bool:
+    def _symlink_decision(options: VirtualEnvOptions) -> tuple[bool, str]:
+        """Pick linking or copying from the option sources, and say why.
+
+        :param options: the parsed options
+
+        :returns: ``True`` to link, and the reason that choice was made
+
+        """
         # Priority of where the option is set to follow the order: CLI, env var, file, hardcoded.
         # If both set at same level prefers copy over symlink.
         copies, symlinks = getattr(options, "copies", False), getattr(options, "symlinks", False)
         copy_src, sym_src = options.get_source("copies"), options.get_source("symlinks")
+        meta = getattr(options, "meta", None)
         for level in ["cli", "env var", "file", "default"]:
             s_opt = symlinks if sym_src == level else None
             c_opt = copies if copy_src == level else None
+            where = _SOURCE_LABELS[level]
             if s_opt is True and c_opt is True:
-                return False
+                return False, f"both copies and symlinks were requested from the {where}, copy wins"
             if s_opt is True:
-                return True
+                if (symlink_error := getattr(meta, "symlink_error", None)) is not None:
+                    return True, f"symlinks requested from the {where}, but unavailable: {symlink_error}"
+                return True, f"symlinks requested from the {where}"
             if c_opt is True:
-                return False
-        return False  # fallback to copy
+                # a copy that comes from the hardcoded default follows the host, so report the host's limit
+                if level == "default":
+                    return False, _copy_fallback_reason(meta)
+                return False, f"copies requested from the {where}"
+        return False, _copy_fallback_reason(meta)
 
     if TYPE_CHECKING:
 
@@ -158,6 +193,28 @@ class ViaGlobalRefApi(Creator, ABC):
     def create(self) -> None:
         """Create the environment by installing the patch that guards the import hook."""
         self.install_patch()
+
+    def action_plan(self) -> ActionPlan:
+        """Describe the file actions, which this creator leaves to the host's ``venv`` module.
+
+        The mode decision is known, but the individual files the stdlib ``venv`` writes are not, so they are reported
+        as a single unknown action rather than being guessed.
+
+        :returns: the read-only view of the creation
+
+        """
+        return ActionPlan(
+            creator=type(self).__name__,
+            symlinks=self.symlinks,
+            mode_reason=self.symlink_reason,
+            actions=[
+                PlanAction(
+                    kind=ActionKind.UNKNOWN,
+                    method=ActionMethod.UNKNOWN,
+                    reason="the host's venv module performs the file actions, their layout is not described here",
+                )
+            ],
+        )
 
     def install_patch(self) -> None:
         """Write the distutils guard files into the purelib folder, only on interpreters older than Python 3.10."""

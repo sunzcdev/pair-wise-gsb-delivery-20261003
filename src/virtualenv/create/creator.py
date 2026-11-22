@@ -10,6 +10,7 @@ __lazy_modules__ = [
     "virtualenv.util.subprocess",
     "virtualenv.util.text",
     "virtualenv.version",
+    f"{__spec__.parent}.plan",  # ty: ignore[missing-union-attribute]  # imported modules have a spec
     f"{__spec__.parent}.pyenv_cfg",  # ty: ignore[missing-union-attribute]  # imported modules have a spec
 ]
 
@@ -44,6 +45,8 @@ from virtualenv.util.subprocess import LogCmd, run_cmd
 from virtualenv.util.text import collapse_line_boundaries
 from virtualenv.version import __version__
 
+from .plan import Action as PlanAction
+from .plan import ActionKind, ActionMethod, ActionPlan
 from .pyenv_cfg import PyEnvCfg
 
 #: Directory of this module.
@@ -352,6 +355,26 @@ class Creator(ABC):
             self.setup_ignore_vcs()
         if self.venv_redirect is not False:
             self.point_venv_redirect()
+
+    def action_plan(self) -> ActionPlan:
+        """Return a read-only view of the files the creator would use, without writing anything.
+
+        Creators that know their layout override this with the files they reference. The base implementation reports a
+        single unknown action, for a third-party creator that does not describe where its files come from.
+
+        :returns: the read-only view of the creation
+
+        """
+        return ActionPlan(
+            creator=type(self).__name__,
+            actions=[
+                PlanAction(
+                    kind=ActionKind.UNKNOWN,
+                    method=ActionMethod.UNKNOWN,
+                    reason=f"{type(self).__name__} does not describe the files it uses",
+                )
+            ],
+        )
 
     @abstractmethod
     def create(self) -> None:

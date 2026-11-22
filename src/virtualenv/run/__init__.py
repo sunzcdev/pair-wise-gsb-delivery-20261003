@@ -3,6 +3,7 @@ from __future__ import annotations
 __lazy_modules__ = [
     "argparse",
     "functools",
+    "json",
     "logging",
     "virtualenv.app_data",
     "virtualenv.config.cli.parser",
@@ -16,6 +17,7 @@ __lazy_modules__ = [
     f"{__spec__.parent}.session",  # ty: ignore[missing-union-attribute]  # imported modules have a spec
 ]
 
+import json
 import logging
 import os
 from argparse import ArgumentParser
@@ -61,9 +63,14 @@ def cli_run(
 
     """
     env = os.environ if env is None else env
+    options = VirtualEnvOptions() if options is None else options
     of_session = session_via_cli(args, options, setup_logging, env)
     with of_session:
-        of_session.run()
+        if options.show_plan:
+            report = of_session.action_plan().to_dict()
+            print(json.dumps(report, indent=2))  # ruff:ignore[print]  # the report is the command's output
+        else:
+            of_session.run()
     return of_session
 
 
@@ -144,6 +151,13 @@ def build_parser(
         help="on failure also display the stacktrace internals of virtualenv",
     )
     _do_report_setup(parser, args, setup_logging)
+    parser.add_argument(
+        "--show-plan",
+        dest="show_plan",
+        action="store_true",
+        default=False,
+        help="print the files the creator would copy or link, and why, then exit without creating the environment",
+    )
     options = load_app_data(args, parser, options)
     handle_extra_commands(options)
 

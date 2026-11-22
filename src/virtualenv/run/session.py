@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from virtualenv.activation.activator import Activator
     from virtualenv.app_data.base import AppData
     from virtualenv.create.creator import Creator
+    from virtualenv.create.plan import ActionPlan
     from virtualenv.seed.seeder import Seeder
 
 if sys.version_info >= (3, 11):
@@ -84,6 +85,14 @@ class Session:
         self._seed()
         self._activate()
         self.creator.pyenv_cfg.write()
+
+    def action_plan(self) -> ActionPlan:
+        """Describe the files the creation would use, without creating anything.
+
+        :returns: the read-only view of the creator's actions
+
+        """
+        return self.creator.action_plan()
 
     def _create(self) -> None:
         LOGGER.info("create virtual environment via %s", self.creator)

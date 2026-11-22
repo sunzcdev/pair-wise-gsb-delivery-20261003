@@ -8,13 +8,17 @@ __lazy_modules__ = [
 from abc import ABC
 from typing import TYPE_CHECKING
 
+from virtualenv.create.plan import Action, ActionKind, ActionMethod, ActionPlan, Fallback
 from virtualenv.create.via_global_ref.api import ViaGlobalRefApi, ViaGlobalRefMeta
 from virtualenv.util.path import ensure_within
 
 from .builtin_way import VirtualenvBuiltin
 from .ref import (
+    ExePathRef,
     ExePathRefToDest,
+    RefMust,
     RefWhen,
+    applies,
 )
 
 if TYPE_CHECKING:
@@ -113,6 +117,92 @@ class ViaGlobalRefVirtualenvBuiltin(ViaGlobalRefApi, VirtualenvBuiltin, ABC):
         """
         return self.bin_dir / src.name
 
+    def action_plan(self) -> ActionPlan:
+        """Describe the files the creator would copy or link, without writing anything.
+
+        The actions come from the same ``sources`` the creation applies, so the view and the real environment cannot
+        disagree about which files are used or where they land.
+
+        :returns: the read-only view of the creation
+
+        """
+        return ActionPlan(
+            creator=type(self).__name__,
+            symlinks=self.symlinks,
+            mode_reason=self.symlink_reason,
+            actions=[self._action_for(ref) for ref in self._plan_sources() if applies(ref.when, self.symlinks)],
+        )
+
+    def _plan_sources(self) -> list[PathRef]:
+        # the plan reads the very list creation iterates, so the two cannot disagree about the files in play
+        return list(self._sources)
+
+    def _action_for(self, ref: PathRef) -> Action:
+        chosen = ActionMethod.SYMLINK if ref.method_kind(self.symlinks) == RefMust.SYMLINK else ActionMethod.COPY
+        destinations = ref.destinations(self)
+        return Action(
+            src=ref.src,
+            dest=destinations[0] if destinations else None,
+            kind=self._action_kind(ref),
+            method=chosen,
+            reason=self._method_reason(ref, chosen),
+            aliases=destinations[1:],
+            exists=ref.exists,
+            fallback=self._fallback_for(ref, chosen),
+        )
+
+    @staticmethod
+    def _action_kind(ref: PathRef) -> str:
+        if isinstance(ref, ExePathRef):
+            return ActionKind.EXECUTABLE
+        if ref.exists and ref.src.is_dir():
+            return ActionKind.DIRECTORY
+        return ActionKind.FILE
+
+    @staticmethod
+    def _method_reason(ref: PathRef, chosen: str) -> str:
+        if ref.must == RefMust.COPY:
+            return "the creator always copies this file, linking it is unreliable"
+        if ref.must == RefMust.SYMLINK:
+            return "the creator always links this file, the environment needs it at the host location"
+        if chosen == ActionMethod.SYMLINK:
+            return "symlinks are enabled for the environment"
+        return "copy is used when symlinks are not enabled"
+
+    def _fallback_for(self, ref: PathRef, chosen: str) -> Fallback | None:
+        available, reason = self._method_capability(ref, chosen)
+        if available:
+            return None
+        alternative = ActionMethod.COPY if chosen == ActionMethod.SYMLINK else ActionMethod.SYMLINK
+        alt_available, _ = self._method_capability(ref, alternative)
+        return Fallback(alternative if alt_available else None, reason, alt_available)
+
+    def _method_capability(self, ref: PathRef, method: str) -> tuple[bool, str]:
+        meta = self._meta
+        if method == ActionMethod.SYMLINK:
+            if meta is not None and meta.symlink_error:
+                return False, meta.symlink_error
+            if ref.can_symlink:
+                return True, ""
+            return False, self._symlink_blocker(ref)
+        if meta is not None and meta.copy_error:
+            return False, meta.copy_error
+        if ref.can_copy:
+            return True, ""
+        if not ref.exists:
+            return False, "the host file is missing"
+        if not ref.can_read:
+            return False, "the host file cannot be read"
+        return False, "the host file cannot be copied"
+
+    @staticmethod
+    def _symlink_blocker(ref: PathRef) -> str:
+        if not ref.FS_SUPPORTS_SYMLINK:
+            return "the filesystem does not support symlinks"
+        if not ref.can_read:
+            return "the host file cannot be read"
+        return "the host executable is not marked executable"
+
     @staticmethod
     def _record_present_source(meta: BuiltinViaGlobalRefMeta, src: ExePathRefToDest) -> None:
         if meta.can_copy and not src.can_copy:
@@ -149,11 +239,7 @@ class ViaGlobalRefVirtualenvBuiltin(ViaGlobalRefApi, VirtualenvBuiltin, ABC):
         try:
             self.enable_system_site_package = False
             for src in self._sources:
-                if (
-                    src.when == RefWhen.ANY
-                    or (src.when == RefWhen.SYMLINK and self.symlinks is True)
-                    or (src.when == RefWhen.COPY and self.symlinks is False)
-                ):
+                if applies(src.when, self.symlinks):
                     src.run(self, self.symlinks)
         finally:
             if true_system_site != self.enable_system_site_package:
