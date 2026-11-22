@@ -60,13 +60,18 @@ describe OpenTelemetry::Context do
       token2 = Context.attach(Context.current)
       token3 = Context.attach(Context.current)
 
-      Context.detach(token0)
+      # A mismatched detach reports an error and does not pop a stack layer,
+      # so the subsequent balanced detaches still unwind the whole stack.
+      _(Context.detach(token0)).must_equal(false)
       _(Context.current).must_equal(c1)
-      Context.detach(token1)
+
+      Context.detach(token3)
       _(Context.current).must_equal(c1)
       Context.detach(token2)
       _(Context.current).must_equal(c1)
-      Context.detach(token3)
+      Context.detach(token1)
+      _(Context.current).must_equal(c1)
+      Context.detach(token0)
       _(Context.current).must_equal(Context::ROOT)
     end
   end
@@ -93,14 +98,27 @@ describe OpenTelemetry::Context do
         c1_token = Context.attach(c1)
 
         c2 = Context.current.set_value(foo_key, 'c2')
-        Context.attach(c2)
+        c2_token = Context.attach(c2)
 
         c3 = Context.current.set_value(foo_key, 'c3')
-        Context.attach(c3)
+        c3_token = Context.attach(c3)
 
-        Context.detach(c1_token)
+        # Detaching c1's token while c2 and c3 are still active is a stack
+        # ordering mismatch. The error is reported but the stack is left
+        # untouched so the balanced detaches can still run.
+        _(Context.detach(c1_token)).must_equal(false)
+        _(Context.current).must_equal(c3)
 
         _(log_stream.string).must_match(/OpenTelemetry error: calls to detach should match corresponding calls to attach/)
+
+        # The balanced detaches still unwind the full stack because the
+        # failed call did not remove any layer.
+        Context.detach(c3_token)
+        _(Context.current).must_equal(c2)
+        Context.detach(c2_token)
+        _(Context.current).must_equal(c1)
+        Context.detach(c1_token)
+        _(Context.current).must_equal(Context::ROOT)
       end
     end
 
@@ -131,8 +149,24 @@ describe OpenTelemetry::Context do
 
     it 'detaching with a junk token leaves the current context as root' do
       OpenTelemetry::TestHelpers.with_test_logger do |log_stream|
-        Context.detach('junk')
+        _(Context.detach('junk')).must_equal(false)
         _(Context.current).must_equal(Context::ROOT)
+        _(log_stream.string).must_match(/OpenTelemetry error: calls to detach should match corresponding calls to attach/)
+      end
+    end
+
+    it 'detaching with a junk token does not drop an active stack layer' do
+      OpenTelemetry::TestHelpers.with_test_logger do |log_stream|
+        c1 = new_context
+        token = Context.attach(c1)
+
+        _(Context.detach('junk')).must_equal(false)
+        _(Context.current).must_equal(c1)
+
+        # The owning fiber can still finish its own cleanup.
+        _(Context.detach(token)).must_equal(true)
+        _(Context.current).must_equal(Context::ROOT)
+
         _(log_stream.string).must_match(/OpenTelemetry error: calls to detach should match corresponding calls to attach/)
       end
     end
@@ -331,6 +365,140 @@ describe OpenTelemetry::Context do
         _(log_stream.string).must_be_empty
       end
     end
+
+    it 'keeps two manually interleaved fibers balanced through correct attach and detach' do
+      OpenTelemetry::TestHelpers.with_test_logger do |log_stream|
+        main = Fiber.current
+        fiber_a = nil
+        fiber_b = nil
+        a_finished = false
+        b_finished = false
+
+        fiber_a = Fiber.new do
+          ctx_a1 = new_context
+          token_a1 = Context.attach(ctx_a1)
+          _(Context.current).must_equal(ctx_a1)
+
+          # Hand control to fiber B while A's context remains active.
+          fiber_b.transfer
+
+          ctx_a2 = Context.current.set_value(bar_key, 'a2')
+          token_a2 = Context.attach(ctx_a2)
+          _(Context.current).must_equal(ctx_a2)
+
+          fiber_b.transfer
+
+          Context.detach(token_a2)
+          _(Context.current).must_equal(ctx_a1)
+          Context.detach(token_a1)
+          _(Context.current).must_equal(Context::ROOT)
+
+          a_finished = true
+          main.transfer
+        end
+
+        fiber_b = Fiber.new do
+          ctx_b1 = Context.empty.set_value(foo_key, 'b1')
+          token_b1 = Context.attach(ctx_b1)
+          _(Context.current).must_equal(ctx_b1)
+
+          fiber_a.transfer
+
+          # B only ever sees its own stack, even though A has nested contexts.
+          _(Context.current).must_equal(ctx_b1)
+          Context.detach(token_b1)
+          _(Context.current).must_equal(Context::ROOT)
+
+          b_finished = true
+          fiber_a.transfer
+        end
+
+        fiber_a.transfer # A attaches ctx_a1, switches to B
+        # B attaches ctx_b1, switches back to A
+        # A attaches ctx_a2, switches to B
+        # B detaches, switches back to A
+        # A detaches both and transfers back to main
+
+        _(a_finished).must_equal(true)
+        _(b_finished).must_equal(true)
+        _(Context.current).must_equal(Context::ROOT)
+        _(log_stream.string).must_be_empty
+      end
+    end
+
+    it 'reports ownership and stack-order mismatches without dropping a layer when fibers cross' do
+      OpenTelemetry::TestHelpers.with_test_logger do |log_stream|
+        main = Fiber.current
+
+        tokens = {}
+        contexts = {}
+        fiber_a = nil
+        fiber_b = nil
+        a_finished = false
+        b_finished = false
+
+        fiber_a = Fiber.new do
+          contexts[:a1] = new_context
+          tokens[:a1] = Context.attach(contexts[:a1])
+          contexts[:a2] = Context.current.set_value(bar_key, 'a2')
+          tokens[:a2] = Context.attach(contexts[:a2])
+
+          fiber_b.transfer
+
+          # The failed detach on B must not have removed any of A's layers.
+          _(Context.current).must_equal(contexts[:a2])
+
+          Context.detach(tokens[:a2])
+          _(Context.current).must_equal(contexts[:a1])
+          Context.detach(tokens[:a1])
+          _(Context.current).must_equal(Context::ROOT)
+
+          a_finished = true
+          main.transfer
+        end
+
+        fiber_b = Fiber.new do
+          contexts[:b1] = Context.empty.set_value(baz_key, 'b1')
+          tokens[:b1] = Context.attach(contexts[:b1])
+          _(Context.current).must_equal(contexts[:b1])
+
+          # A task object resumes on the wrong fiber: B tries to detach a
+          # token that A's fiber owns. This is an ownership mismatch.
+          _(Context.detach(tokens[:a1])).must_equal(false)
+
+          # B's own stack is untouched by the erroneous call.
+          _(Context.current).must_equal(contexts[:b1])
+
+          # A stack-order mismatch on B's own fiber: the outer token cannot
+          # be detached while B's inner context is still active.
+          inner = Context.attach(Context.empty.set_value(bar_key, 'b2'))
+          _(Context.detach(tokens[:b1])).must_equal(false)
+          _(Context.current[bar_key]).must_equal('b2')
+
+          # Balanced detaches still work after the reported errors.
+          Context.detach(inner)
+          _(Context.current).must_equal(contexts[:b1])
+          Context.detach(tokens[:b1])
+          _(Context.current).must_equal(Context::ROOT)
+
+          b_finished = true
+          fiber_a.transfer
+        end
+
+        fiber_a.transfer # A attaches two contexts and transfers to B
+        # B hits the ownership and ordering mismatches, then cleans up and
+        # transfers back to A, which completes its own cleanup and returns.
+
+        _(a_finished).must_equal(true)
+        _(b_finished).must_equal(true)
+        _(Context.current).must_equal(Context::ROOT)
+
+        log = log_stream.string
+        _(log).must_match(/different fiber/)
+        _(log).must_match(/top of the current fiber context stack/)
+        _(log.scan(/calls to detach should match corresponding calls to attach/).size).must_equal(2)
+      end
+    end
   end
 
   describe 'threading' do
@@ -398,3 +566,4 @@ describe OpenTelemetry::Context do
     end
   end
 end
+

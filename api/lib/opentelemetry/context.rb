@@ -17,6 +17,27 @@ module OpenTelemetry # rubocop:disable Style/Documentation
 
     DetachError = Class.new(OpenTelemetry::Error) # rubocop:disable Style/EmptyClassDefinition
 
+    # Token returned by {Context.attach} and consumed by the matching
+    # {Context.detach}. It records the Fiber that performed the attach and the
+    # depth of the context stack at that point, so that a detach can detect
+    # both an ownership mismatch (the token belongs to another Fiber) and a
+    # stack ordering mismatch (an outer context is being detached while inner
+    # contexts are still active).
+    class Token
+      # @return [Fiber] The Fiber that performed the matching attach.
+      attr_reader :fiber
+
+      # @return [Integer] The size of the owning Fiber's context stack after
+      #   the matching attach.
+      attr_reader :stack_depth
+
+      # @api private
+      def initialize(fiber, stack_depth)
+        @fiber = fiber
+        @stack_depth = stack_depth
+      end
+    end
+
     class << self
       # Returns a key used to index a value in a Context
       #
@@ -36,30 +57,57 @@ module OpenTelemetry # rubocop:disable Style/Documentation
       # Associates a Context with the caller's current Fiber. Every call to
       # this operation should be paired with a corresponding call to detach.
       #
-      # Returns a token to be used with the matching call to detach
+      # Returns a token to be used with the matching call to detach. The token
+      # is bound to the calling Fiber: detaching it from a different Fiber (for
+      # example, when a task object resumes on another Fiber) reports a
+      # DetachError through the configured error handler without disturbing
+      # either Fiber's context stack.
       #
       # @param [Context] context The new context
-      # @return [Object] A token to be used when detaching
+      # @return [Token] A token to be used when detaching
       def attach(context)
         s = stack
         s.push(context)
-        s.size
+        Token.new(Fiber.current, s.size)
       end
 
       # Restores the previous Context associated with the current Fiber.
       # The supplied token is used to check if the call to detach is balanced
-      # with a corresponding attach call. A warning is logged if the
-      # calls are unbalanced.
+      # with a corresponding attach call. A {DetachError} is reported via the
+      # configured error handler when:
       #
-      # @param [Object] token The token provided by the matching call to attach
+      # 1. the token was issued by a different Fiber (an ownership mismatch),
+      #    or
+      # 2. the token does not correspond to the top of the current Fiber's
+      #    context stack (a stack ordering mismatch, such as detaching an
+      #    outer context before its inner contexts).
+      #
+      # On a mismatch the current Fiber's context stack is left untouched, so
+      # the Fiber that owns the token can still resume and perform its own
+      # balanced detach instead of losing a stack layer to the failed call.
+      #
+      # @param [Token] token The token provided by the matching call to attach
       # @return [Boolean] True if the calls matched, false otherwise
       def detach(token)
         s = stack
-        calls_matched = (token == s.size)
-        OpenTelemetry.handle_error(exception: DetachError.new('calls to detach should match corresponding calls to attach.')) unless calls_matched
+
+        unless token.is_a?(Token)
+          OpenTelemetry.handle_error(exception: DetachError.new("calls to detach should match corresponding calls to attach. Expected a Token returned by attach, got #{token.class}."))
+          return false
+        end
+
+        unless token.fiber.equal?(Fiber.current)
+          OpenTelemetry.handle_error(exception: DetachError.new('calls to detach should match corresponding calls to attach. The token was issued by a different fiber.'))
+          return false
+        end
+
+        unless token.stack_depth == s.size
+          OpenTelemetry.handle_error(exception: DetachError.new('calls to detach should match corresponding calls to attach. The token does not match the top of the current fiber context stack.'))
+          return false
+        end
 
         s.pop
-        calls_matched
+        true
       end
 
       # Executes a block with ctx as the current context. It restores

@@ -1,5 +1,9 @@
 # Release History: opentelemetry-api
 
+### Unreleased
+
+* FIXED: Bind Context attach tokens to the attaching Fiber so detach reports ownership and stack-order mismatches without dropping a context stack layer
+
 ### v1.11.1 / 2026-09-15
 
 * FIXED: Enforce W3C Baggage limits on the extract path (#2298)
