@@ -8,6 +8,17 @@ All notable changes to this project will be documented in this file.
 `Unreleased`_
 -------------
 
+Added
+^^^^^
+
+* Added wave-scoped joins to the ``StubBroker``.  ``broker.wave(queue_name)``
+  opens a submission wave whose ``join`` waits only for the messages
+  submitted as part of that wave -- including retries, pipeline
+  follow-ups and delayed re-enqueues they derive while processing --
+  so independent jobs another test keeps submitting to the same queue
+  no longer keep the wait from returning.  The existing whole-queue
+  ``StubBroker.join`` interface is unchanged.
+
 Fixed
 ^^^^^
 

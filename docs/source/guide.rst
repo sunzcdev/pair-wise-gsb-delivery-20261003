@@ -509,4 +509,41 @@ eagerly within your test.  Note that the exception will only be raised
 once the actor exceeds its available retries.
 
 
+Waiting on a single submission wave
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+|StubBroker_join| waits until *every* message on a queue has been
+processed.  When several tests share a broker and another test keeps
+enqueueing messages onto the same queue, that makes it impossible to
+tell whether your own batch of work has actually finished.
+
+A *wave* scopes the wait to a single batch of submissions.  Open one
+with |StubBroker_wave|, enqueue the messages that belong to your test
+inside the ``with`` block and then join the returned |Wave|::
+
+  def test_my_batch(stub_broker, stub_worker):
+      with stub_broker.wave(count_words.queue_name) as wave:
+          count_words.send("http://example.com")
+      wave.join()
+
+The wave includes not just the messages you enqueue directly, but also
+everything those messages derive while they are being processed:
+automatic retries, pipeline follow-ups, delayed re-enqueues and so on.
+Messages enqueued by unrelated work -- for example, another test
+running against the same broker -- are not part of the wave and never
+keep |Wave_join| from returning.
+
+The same behaviour is available through the familiar queue-level
+``join`` entry point by passing the wave along::
+
+  with stub_broker.wave(count_words.queue_name) as wave:
+      count_words.send("http://example.com")
+  stub_broker.join(count_words.queue_name, wave=wave)
+
+Waves support the same ``timeout`` and ``fail_fast`` arguments as
+|StubBroker_join|.  The wave-agnostic |StubBroker_join| keeps its
+original, whole-queue semantics and remains available for tests that
+own their broker outright.
+
+
 .. _pytest fixtures: https://docs.pytest.org/en/latest/fixture.html

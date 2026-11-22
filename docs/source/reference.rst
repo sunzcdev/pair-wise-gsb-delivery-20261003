@@ -70,6 +70,9 @@ Brokers
    :members:
    :inherited-members:
    :show-inheritance:
+.. autoclass:: dramatiq.brokers.stub.Wave
+   :members:
+   :show-inheritance:
 
 
 Middleware
