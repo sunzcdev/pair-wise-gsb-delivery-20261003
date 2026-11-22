@@ -1,5 +1,5 @@
 import random
-from collections.abc import Callable, Iterator, MutableMapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import AbstractContextManager
 from typing import (
     Any,
@@ -10,6 +10,7 @@ from typing import (
     NamedTuple,
     ParamSpec,
     Protocol,
+    TypeAlias,
     TypeVar,
     overload,
     type_check_only,
@@ -154,6 +155,10 @@ class _AbstractCondition(AbstractContextManager[Any], Protocol):
     def notify(self, n: int = 1) -> None: ...
     def notify_all(self) -> None: ...
 
+# Mapping of exception classes to the time-to-live of their negative
+# results, expressed in units returned by the timer.
+_NegativePolicy: TypeAlias = Mapping[type[BaseException], Any]
+
 @type_check_only
 class _cached_wrapper(Generic[_P, _R]):
     __wrapped__: Callable[_P, _R]
@@ -209,6 +214,8 @@ def cached(
     condition: _AbstractCondition | None = None,
     *,
     info: Literal[True],
+    negative: _NegativePolicy | None = ...,
+    timer: Callable[[], Any] = ...,
 ) -> Callable[[Callable[_P, _R]], _cached_wrapper_info[_P, _R]]: ...
 @overload
 def cached(
@@ -217,6 +224,9 @@ def cached(
     lock: AbstractContextManager[Any] | None = None,
     condition: _AbstractCondition | None = None,
     info: Literal[False] = ...,
+    *,
+    negative: _NegativePolicy | None = ...,
+    timer: Callable[[], Any] = ...,
 ) -> Callable[[Callable[_P, _R]], _cached_wrapper[_P, _R]]: ...
 @overload
 def cached(
@@ -225,6 +235,9 @@ def cached(
     lock: AbstractContextManager[Any] | None,
     condition: _AbstractCondition | None,
     info: Literal[True],
+    *,
+    negative: _NegativePolicy | None = ...,
+    timer: Callable[[], Any] = ...,
 ) -> Callable[[Callable[_P, _R]], _cached_wrapper_info[_P, _R]]: ...
 
 @type_check_only
@@ -285,6 +298,8 @@ def cachedmethod(
     condition: Callable[[Any], _AbstractCondition] | None = None,
     *,
     info: Literal[True],
+    negative: _NegativePolicy | None = ...,
+    timer: Callable[[], Any] = ...,
 ) -> Callable[
     [Callable[Concatenate[Any, _P], _R]], _cachedmethod_wrapper_info[_P, _R]
 ]: ...
@@ -295,6 +310,9 @@ def cachedmethod(
     lock: Callable[[Any], AbstractContextManager[Any]] | None = None,
     condition: Callable[[Any], _AbstractCondition] | None = None,
     info: Literal[False] = ...,
+    *,
+    negative: _NegativePolicy | None = ...,
+    timer: Callable[[], Any] = ...,
 ) -> Callable[[Callable[Concatenate[Any, _P], _R]], _cachedmethod_wrapper[_P, _R]]: ...
 @overload
 def cachedmethod(
@@ -303,6 +321,9 @@ def cachedmethod(
     lock: Callable[[Any], AbstractContextManager[Any]] | None,
     condition: Callable[[Any], _AbstractCondition] | None,
     info: Literal[True],
+    *,
+    negative: _NegativePolicy | None = ...,
+    timer: Callable[[], Any] = ...,
 ) -> Callable[
     [Callable[Concatenate[Any, _P], _R]], _cachedmethod_wrapper_info[_P, _R]
 ]: ...

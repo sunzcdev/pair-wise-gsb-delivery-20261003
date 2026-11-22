@@ -857,7 +857,30 @@ class CacheInfo(collections.namedtuple("CacheInfo", "hits misses maxsize currsiz
             return cls(hits, misses, None, len(cache))
 
 
-def cached(cache, key=keys.hashkey, lock=None, condition=None, info=False):
+def _make_negative(negative, timer):
+    """Validate a negative result policy and its timer."""
+    if negative is None:
+        return None, timer
+    if not isinstance(negative, collections.abc.Mapping) or not negative:
+        raise TypeError("negative must be a non-empty mapping of exception to TTL")
+    for exc_type in negative:
+        if not isinstance(exc_type, type) or not issubclass(exc_type, BaseException):
+            raise TypeError("negative keys must be exception classes")
+    if not callable(timer):
+        raise TypeError("timer must be callable")
+    return negative, timer
+
+
+def cached(
+    cache,
+    key=keys.hashkey,
+    lock=None,
+    condition=None,
+    info=False,
+    *,
+    negative=None,
+    timer=time.monotonic,
+):
     """Decorator to wrap a function with a memoizing callable that saves
     results in a cache.
 
@@ -867,14 +890,25 @@ def cached(cache, key=keys.hashkey, lock=None, condition=None, info=False):
     if cache is None:  # unsupported since v8.0.0
         raise TypeError("cache must not be None")
 
+    negative, timer = _make_negative(negative, timer)
+
     def decorator(func):
         make_info = CacheInfo._make_info if info else None
-        return _wrapper(func, cache, key, lock, condition, make_info)
+        return _wrapper(func, cache, key, lock, condition, make_info, negative, timer)
 
     return decorator
 
 
-def cachedmethod(cache, key=keys.methodkey, lock=None, condition=None, info=False):
+def cachedmethod(
+    cache,
+    key=keys.methodkey,
+    lock=None,
+    condition=None,
+    info=False,
+    *,
+    negative=None,
+    timer=time.monotonic,
+):
     """Decorator to wrap a method with a memoizing callable that saves
     results in a cache.
 
@@ -884,8 +918,10 @@ def cachedmethod(cache, key=keys.methodkey, lock=None, condition=None, info=Fals
     if not callable(cache):
         raise TypeError("cache must be callable")
 
+    negative, timer = _make_negative(negative, timer)
+
     def decorator(method):
         make_info = CacheInfo._make_info if info else None
-        return _wrapper(method, cache, key, lock, condition, make_info)
+        return _wrapper(method, cache, key, lock, condition, make_info, negative, timer)
 
     return decorator

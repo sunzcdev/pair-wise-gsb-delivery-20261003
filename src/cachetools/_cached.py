@@ -53,58 +53,64 @@ class _WrapperBase:
 
 
 class _BasicWrapper(_WrapperBase, _BasicMixin):
-    def __init__(self, func, cache, key):
+    def __init__(self, func, cache, key, negative=None, timer=None):
         _WrapperBase.__init__(self, func, cache, key)
-        _BasicMixin.__init__(self, func)
+        _BasicMixin.__init__(self, func, negative, timer)
 
 
 class _LockedWrapper(_WrapperBase, _LockedMixin):
-    def __init__(self, func, cache, key, lock):
+    def __init__(self, func, cache, key, lock, negative=None, timer=None):
         _WrapperBase.__init__(self, func, cache, key, lock)
-        _LockedMixin.__init__(self, func)
+        _LockedMixin.__init__(self, func, negative, timer)
 
 
 class _ConditionWrapper(_WrapperBase, _ConditionMixin):
-    def __init__(self, func, cache, key, lock, cond):
+    def __init__(self, func, cache, key, lock, cond, negative=None, timer=None):
         _WrapperBase.__init__(self, func, cache, key, lock, cond)
-        _ConditionMixin.__init__(self, func)
+        _ConditionMixin.__init__(self, func, negative, timer)
 
 
 class _InfoWrapper(_WrapperBase, _InfoMixin):
-    def __init__(self, func, cache, key, info):
+    def __init__(self, func, cache, key, info, negative=None, timer=None):
         _WrapperBase.__init__(self, func, cache, key)
-        _InfoMixin.__init__(self, func, info)
+        _InfoMixin.__init__(self, func, info, negative, timer)
 
 
 class _LockedInfoWrapper(_WrapperBase, _LockedInfoMixin):
-    def __init__(self, func, cache, key, lock, info):
+    def __init__(self, func, cache, key, lock, info, negative=None, timer=None):
         _WrapperBase.__init__(self, func, cache, key, lock)
-        _LockedInfoMixin.__init__(self, func, info)
+        _LockedInfoMixin.__init__(self, func, info, negative, timer)
 
 
 class _ConditionInfoWrapper(_WrapperBase, _ConditionInfoMixin):
-    def __init__(self, func, cache, key, lock, cond, info):
+    def __init__(self, func, cache, key, lock, cond, info, negative=None, timer=None):
         _WrapperBase.__init__(self, func, cache, key, lock, cond)
-        _ConditionInfoMixin.__init__(self, func, info)
+        _ConditionInfoMixin.__init__(self, func, info, negative, timer)
 
 
-def _wrapper(func, cache, key, lock=None, cond=None, info=None):
+def _wrapper(
+    func, cache, key, lock=None, cond=None, info=None, negative=None, timer=None
+):
     if info is not None:
         if cond is not None and lock is not None:
-            wrapper = _ConditionInfoWrapper(func, cache, key, lock, cond, info)
+            wrapper = _ConditionInfoWrapper(
+                func, cache, key, lock, cond, info, negative, timer
+            )
         elif cond is not None:
-            wrapper = _ConditionInfoWrapper(func, cache, key, cond, cond, info)
+            wrapper = _ConditionInfoWrapper(
+                func, cache, key, cond, cond, info, negative, timer
+            )
         elif lock is not None:
-            wrapper = _LockedInfoWrapper(func, cache, key, lock, info)
+            wrapper = _LockedInfoWrapper(func, cache, key, lock, info, negative, timer)
         else:
-            wrapper = _InfoWrapper(func, cache, key, info)
+            wrapper = _InfoWrapper(func, cache, key, info, negative, timer)
     else:
         if cond is not None and lock is not None:
-            wrapper = _ConditionWrapper(func, cache, key, lock, cond)
+            wrapper = _ConditionWrapper(func, cache, key, lock, cond, negative, timer)
         elif cond is not None:
-            wrapper = _ConditionWrapper(func, cache, key, cond, cond)
+            wrapper = _ConditionWrapper(func, cache, key, cond, cond, negative, timer)
         elif lock is not None:
-            wrapper = _LockedWrapper(func, cache, key, lock)
+            wrapper = _LockedWrapper(func, cache, key, lock, negative, timer)
         else:
-            wrapper = _BasicWrapper(func, cache, key)
+            wrapper = _BasicWrapper(func, cache, key, negative, timer)
     return wrapper

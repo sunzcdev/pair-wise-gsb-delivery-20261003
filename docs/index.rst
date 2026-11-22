@@ -317,7 +317,7 @@ often called with the same arguments:
    >>> fib(42)
    267914296
 
-.. decorator:: cached(cache, key=cachetools.keys.hashkey, lock=None, condition=None, info=False)
+.. decorator:: cached(cache, key=cachetools.keys.hashkey, lock=None, condition=None, info=False, *, negative=None, timer=time.monotonic)
 
    Decorator to wrap a function with a memoizing callable that saves
    results in a cache.
@@ -511,6 +511,76 @@ often called with the same arguments:
           print(e, "-", _get_pep_wrapped.cache_info())
 
 
+   Alternatively, the `negative` parameter declares a short-lived
+   *negative result* policy.  It takes a mapping of exception classes
+   to the time for which a raised exception is remembered, expressed
+   in the units returned by `timer`, which defaults to
+   :func:`time.monotonic`.  While a negative result is live, repeated
+   calls with the same arguments do not invoke the wrapped function
+   again.  Instead, a fresh exception of the same type is raised,
+   without the traceback of the original call.  Exceptions not present
+   in the mapping are never cached and keep propagating immediately.
+
+   .. doctest::
+
+      >>> class Clock:
+      ...     def __init__(self):
+      ...         self.time = 0
+      ...     def __call__(self):
+      ...         return self.time
+      ...     def tick(self, seconds=1):
+      ...         self.time += seconds
+
+      >>> clock = Clock()
+      >>> calls = 0
+
+      >>> class RouteNotFound(Exception):
+      ...     pass
+
+      >>> @cached(LRUCache(maxsize=10), negative={RouteNotFound: 5}, timer=clock)
+      ... def lookup(route):
+      ...     global calls
+      ...     calls += 1
+      ...     raise RouteNotFound(route)
+
+      >>> try:
+      ...     lookup("/missing")
+      ... except RouteNotFound as error:
+      ...     print(type(error).__name__, calls)
+      RouteNotFound 1
+
+   Repeated lookups within the retention window replay the negative
+   result, so the underlying function is not executed again:
+
+   .. doctest::
+
+      >>> clock.tick(4)
+      >>> try:
+      ...     lookup("/missing")
+      ... except RouteNotFound:
+      ...     print("still negative", calls)
+      still negative 1
+
+   Once the window has elapsed, the negative result expires and the
+   wrapped function is invoked again:
+
+   .. doctest::
+
+      >>> clock.tick(1)  # now exactly at the retention boundary
+      >>> try:
+      ...     lookup("/missing")
+      ... except RouteNotFound:
+      ...     print("expired, re-executed", calls)
+      expired, re-executed 2
+
+   Different exception classes may keep their results for different
+   lengths of time, and subclasses match a declared exception type.
+   Negative results are stored separately from ordinary return values,
+   which become visible again as soon as the wrapped function succeeds
+   after the negative result has expired.  Calling
+   :meth:`cache_clear()` also discards all negative results.
+
+
    Curiously, default function arguments are not quite handled as one
    might expect, and also the use of positional vs. keyword arguments
    may lead to surprising results.  In the example below, `foo()`,
@@ -557,7 +627,7 @@ often called with the same arguments:
       supported, and now raises a :exc:`TypeError`.
 
 
-.. decorator:: cachedmethod(cache, key=cachetools.keys.methodkey, lock=None, condition=None, info=False)
+.. decorator:: cachedmethod(cache, key=cachetools.keys.methodkey, lock=None, condition=None, info=False, *, negative=None, timer=time.monotonic)
 
    Decorator to wrap an instance method with a memoizing callable that
    saves results in a cache.
@@ -706,6 +776,11 @@ often called with the same arguments:
    to create distinct cache keys, to avoid issues with
    :func:`~cachetools.keys.methodkey` skipping its initial `self`
    argument.
+
+   As with :func:`cached`, the keyword-only `negative` and `timer`
+   parameters enable short-lived negative result caching for the
+   decorated method.  The same `timer` is shared across all instances,
+   since it is provided at decoration rather than at call time.
 
    .. versionchanged:: 7.0
 
