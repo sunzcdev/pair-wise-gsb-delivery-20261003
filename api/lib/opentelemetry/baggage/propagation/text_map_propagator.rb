@@ -4,22 +4,17 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-require 'uri'
+require 'opentelemetry/baggage/propagation/serializer'
 
 module OpenTelemetry
   module Baggage
     module Propagation
       # Propagates baggage using the W3C Baggage format
       class TextMapPropagator
-        # Maximums according to W3C Baggage spec
-        MAX_ENTRIES = 180
-        MAX_ENTRY_LENGTH = 4096
-        MAX_TOTAL_LENGTH = 8192
-
         BAGGAGE_KEY = 'baggage'
         FIELDS = [BAGGAGE_KEY].freeze
 
-        private_constant :BAGGAGE_KEY, :FIELDS, :MAX_ENTRIES, :MAX_ENTRY_LENGTH, :MAX_TOTAL_LENGTH
+        private_constant :BAGGAGE_KEY, :FIELDS
 
         # Inject in-process baggage into the supplied carrier.
         #
@@ -33,14 +28,21 @@ module OpenTelemetry
 
           return if baggage.nil? || baggage.empty?
 
-          encoded_baggage = encode(baggage)
-          setter.set(carrier, BAGGAGE_KEY, encoded_baggage) if encoded_baggage && !encoded_baggage.empty?
+          encoded_baggage = SERIALIZER.encode(baggage)
+          setter.set(carrier, BAGGAGE_KEY, encoded_baggage) unless encoded_baggage.empty?
           nil
         end
 
         # Extract remote baggage from the supplied carrier.
         # If extraction fails or there is no baggage to extract,
-        # then the original context will be returned
+        # then the original context will be returned.
+        #
+        # All +baggage+ header fields in the carrier are combined into a single
+        # list, because the W3C limits apply to their combination. Invalid
+        # list-members are skipped individually rather than discarding the whole
+        # header. When a key occurs more than once, the last occurrence wins, as
+        # baggage names map to exactly one value. Entries already in +context+
+        # are kept unless the header carries the same key.
         #
         # @param [Carrier] carrier The carrier to get the header from
         # @param [optional Context] context Context to be updated with the baggage
@@ -52,13 +54,13 @@ module OpenTelemetry
         # @return [Context] context updated with extracted baggage, or the original context
         #   if extraction fails
         def extract(carrier, context: Context.current, getter: Context::Propagation.text_map_getter)
-          header = getter.get(carrier, BAGGAGE_KEY)
-          return context if header.nil? || header.empty?
+          header = join_fields(carrier, getter)
+          return context if header.nil?
 
-          entries = split_entries(header)
+          entries = SERIALIZER.decode(header)
 
           OpenTelemetry::Baggage.build(context: context) do |builder|
-            decode_entries(entries, builder)
+            entries.each { |key, entry| builder.set_value(key, entry.value, metadata: entry.metadata) }
           end
         rescue StandardError => e
           OpenTelemetry.logger.debug "Error extracting W3C baggage: #{e.message}"
@@ -75,60 +77,27 @@ module OpenTelemetry
 
         private
 
-        def split_entries(header)
-          return header.split(',') if header.bytesize <= MAX_TOTAL_LENGTH
+        SERIALIZER = Serializer.new
+        private_constant :SERIALIZER
 
-          window = header.byteslice(0, MAX_TOTAL_LENGTH + 1)
-          last_separator = window.byterindex(',')
-          return [] unless last_separator
+        # Joins every value of the baggage field into a single list, so that the
+        # limits apply to the combination of all fields. Returns nil when the
+        # carrier holds no baggage.
+        def join_fields(carrier, getter)
+          values = field_values(carrier, getter).map(&:to_s).reject(&:empty?)
+          return if values.empty?
 
-          window.byteslice(0, last_separator).split(',')
+          values.map(&:b).join(',')
         end
 
-        def decode_entries(entries, builder)
-          decoded_length = 0
-          decoded_count = 0
-          entries.each do |raw_entry|
-            break unless decoded_count < MAX_ENTRIES
-
-            entry = raw_entry.gsub(/\s/, '')
-            next if entry.empty?
-            next unless entry.bytesize <= MAX_ENTRY_LENGTH &&
-                        entry.bytesize + decoded_length <= MAX_TOTAL_LENGTH
-
-            # Note metadata is currently unused in OpenTelemetry, but is part
-            # the W3C spec where it's referred to as properties. We preserve
-            # the properties (as-is) so that they can be propagated elsewhere.
-            kv, meta = entry.split(';', 2)
-            k, v = kv.split('=').map! { |part| URI.decode_uri_component(part) }
-            builder.set_value(k, v, metadata: meta)
-            decoded_length += entry.bytesize + 1
-            decoded_count += 1
-          end
-        end
-
-        def encode(baggage)
-          result = +''
-          encoded_count = 0
-          baggage.each_pair do |key, entry|
-            break unless encoded_count < MAX_ENTRIES
-
-            encoded_entry = encode_value(key, entry)
-            next unless encoded_entry.size <= MAX_ENTRY_LENGTH &&
-                        encoded_entry.size + result.size <= MAX_TOTAL_LENGTH
-
-            result << encoded_entry << ','
-            encoded_count += 1
-          end
-          result.chop!
-        end
-
-        def encode_value(key, entry)
-          result = "#{URI.encode_uri_component(key.to_s)}=#{URI.encode_uri_component(entry.value.to_s)}"
-          # We preserve metadata received on extract and assume it's already formatted
-          # for transport. It's sent as-is without further processing.
-          result << ";#{entry.metadata}" if entry.metadata
-          result
+        # Carriers may hold more than one value for the field, either because
+        # the getter exposes them all or because the carrier stores them as an
+        # array.
+        def field_values(carrier, getter)
+          values = []
+          values = Array(getter.get_all(carrier, BAGGAGE_KEY)).compact if getter.respond_to?(:get_all)
+          values = Array(getter.get(carrier, BAGGAGE_KEY)).compact if values.empty?
+          values
         end
       end
     end
