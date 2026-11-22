@@ -10,6 +10,7 @@ __all__ = (
     "TLRUCache",
     "TTLCache",
     "cached",
+    "cachedcoro",
     "cachedmethod",
 )
 
@@ -870,6 +871,26 @@ def cached(cache, key=keys.hashkey, lock=None, condition=None, info=False):
     def decorator(func):
         make_info = CacheInfo._make_info if info else None
         return _wrapper(func, cache, key, lock, condition, make_info)
+
+    return decorator
+
+
+def cachedcoro(cache, key=keys.hashkey, info=False):
+    """Decorator to wrap a coroutine function with a memoizing callable
+    that saves results in a cache.
+
+    Only completed results are stored, concurrent calls with the same
+    key share a single lookup, and exceptions are never cached.
+
+    """
+    from ._cachedcoro import _wrapper
+
+    if cache is None:
+        raise TypeError("cache must not be None")
+
+    def decorator(func):
+        make_info = CacheInfo._make_info if info else None
+        return _wrapper(func, cache, key, make_info)
 
     return decorator
 

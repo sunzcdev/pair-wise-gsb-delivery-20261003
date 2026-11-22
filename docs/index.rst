@@ -21,11 +21,12 @@ method calls.
 
 .. testsetup:: *
 
-   from cachetools import cached, cachedmethod, LRUCache, TLRUCache, TTLCache
+   from cachetools import cached, cachedcoro, cachedmethod, LRUCache, TLRUCache, TTLCache
 
    from unittest import mock
    urllib = mock.MagicMock()
 
+   import asyncio
    import threading
    import time
 
@@ -555,6 +556,83 @@ often called with the same arguments:
 
       Passing :const:`None` as the `cache` parameter is no longer
       supported, and now raises a :exc:`TypeError`.
+
+
+.. decorator:: cachedcoro(cache, key=cachetools.keys.hashkey, info=False)
+
+   Decorator to wrap a *coroutine function* with a memoizing callable
+   that saves results in a cache.  It provides an asynchronous entry
+   point for :func:`cached`, and therefore accepts neither a `lock` nor
+   a `condition` argument: a single asyncio event loop runs its tasks
+   cooperatively, so mutual exclusion and the notification of waiters
+   are handled internally.
+
+   The wrapped function must be a coroutine function, otherwise a
+   :exc:`TypeError` is raised when the decorator is applied.
+
+   Only *completed* results are stored in `cache`; the cache never
+   holds in-flight tasks.  Concurrent calls with identical arguments, or
+   cache keys, share a single lookup, so the wrapped function runs at
+   most once for a given key while a lookup is pending.  Every caller
+   awaits its own :func:`asyncio.shield`, so canceling one waiting
+   caller only cancels that caller: the shared lookup and all other
+   waiters still run to completion, and the result is cached.
+
+   .. testcode::
+
+      import asyncio
+
+      cache = LRUCache(maxsize=128)
+
+      @cachedcoro(cache, info=True)
+      async def get_config(name):
+          await asyncio.sleep(0)  # e.g. an asynchronous configuration lookup
+          return {"name": name}
+
+      async def main():
+          # three concurrent lookups for the same key run the wrapped
+          # coroutine only once, and all three return the same result
+          return await asyncio.gather(
+              get_config("db"), get_config("db"), get_config("db")
+          )
+
+      results = asyncio.run(main())
+      assert results[0] == results[1] == results[2]
+      print(get_config.cache_info())
+
+   .. testoutput::
+
+      CacheInfo(hits=0, misses=1, maxsize=128, currsize=1)
+
+   If the wrapped coroutine raises an exception, nothing is stored, and
+   the exception propagates to every caller awaiting the shared lookup.
+   The pending entry is removed as soon as the lookup finishes, so the
+   next call starts a fresh lookup rather than replaying the failure:
+
+   .. doctest::
+
+      >>> state = {"calls": 0}
+      >>> @cachedcoro({})
+      ... async def flaky(n):
+      ...     state["calls"] += 1
+      ...     raise ValueError("lookup failed")
+      ...
+      >>> for _ in range(2):
+      ...     try:
+      ...         asyncio.run(flaky(1))
+      ...     except ValueError:
+      ...         print("failed", state["calls"])
+      failed 1
+      failed 2
+
+   As with :func:`cached`, the `cache` and `key` parameters are
+   available as :attr:`cache` and :attr:`cache_key` attributes, and a
+   :meth:`cache_clear()` function is provided.  If `info` is set to
+   :const:`True`, a :meth:`cache_info()` function reports the cache
+   statistics; only the call that starts a lookup counts as a miss,
+   while waiters joining an in-flight lookup count as neither a hit nor
+   a miss.  The synchronous :func:`cached` and :func:`cachedmethod`
+   decorators are unaffected and continue to work as before.
 
 
 .. decorator:: cachedmethod(cache, key=cachetools.keys.methodkey, lock=None, condition=None, info=False)

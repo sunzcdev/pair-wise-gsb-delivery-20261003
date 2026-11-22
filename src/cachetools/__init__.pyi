@@ -1,5 +1,5 @@
 import random
-from collections.abc import Callable, Iterator, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, MutableMapping, Sequence
 from contextlib import AbstractContextManager
 from typing import (
     Any,
@@ -25,6 +25,7 @@ __all__: Final = (
     "TLRUCache",
     "TTLCache",
     "cached",
+    "cachedcoro",
     "cachedmethod",
 )
 __version__: str
@@ -226,6 +227,69 @@ def cached(
     condition: _AbstractCondition | None,
     info: Literal[True],
 ) -> Callable[[Callable[_P, _R]], _cached_wrapper_info[_P, _R]]: ...
+
+@type_check_only
+class _cachedcoro_wrapper(Generic[_P, _R]):
+    __wrapped__: Callable[_P, Awaitable[_R]]
+    __name__: str
+    __qualname__: str
+    __doc__: str | None
+    cache: MutableMapping[Any, Any]
+    cache_key: Callable[..., Any] = ...
+    @overload  # class access, e.g. Cls.method
+    def __get__(
+        self, obj: None, objtype: type | None = None
+    ) -> _cachedcoro_wrapper[_P, _R]: ...
+    @overload  # instance access binds the first parameter
+    def __get__(
+        self: _cachedcoro_wrapper[Concatenate[_S, _Q], _R],
+        obj: _S,
+        objtype: type | None = None,
+    ) -> _cachedcoro_wrapper[_Q, _R]: ...
+    @overload  # fallback, e.g. when wrapped by @staticmethod or @classmethod
+    def __get__(
+        self, obj: object, objtype: type | None = None
+    ) -> _cachedcoro_wrapper[_P, _R]: ...
+    def __call__(self, /, *args: _P.args, **kwargs: _P.kwargs) -> Awaitable[_R]: ...
+    def cache_clear(self) -> None: ...
+
+@type_check_only
+class _cachedcoro_wrapper_info(_cachedcoro_wrapper[_P, _R]):
+    @overload
+    def __get__(
+        self, obj: None, objtype: type | None = None
+    ) -> _cachedcoro_wrapper_info[_P, _R]: ...
+    @overload
+    def __get__(
+        self: _cachedcoro_wrapper_info[Concatenate[_S, _Q], _R],
+        obj: _S,
+        objtype: type | None = None,
+    ) -> _cachedcoro_wrapper_info[_Q, _R]: ...
+    @overload
+    def __get__(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, obj: object, objtype: type | None = None
+    ) -> _cachedcoro_wrapper_info[_P, _R]: ...
+    def cache_info(self) -> CacheInfo: ...
+
+@overload
+def cachedcoro(
+    cache: MutableMapping[_KT, Any],
+    key: Callable[..., _KT] = ...,
+    *,
+    info: Literal[True],
+) -> Callable[[Callable[_P, Awaitable[_R]]], _cachedcoro_wrapper_info[_P, _R]]: ...
+@overload
+def cachedcoro(
+    cache: MutableMapping[_KT, Any],
+    key: Callable[..., _KT] = ...,
+    info: Literal[False] = ...,
+) -> Callable[[Callable[_P, Awaitable[_R]]], _cachedcoro_wrapper[_P, _R]]: ...
+@overload
+def cachedcoro(
+    cache: MutableMapping[_KT, Any],
+    key: Callable[..., _KT],
+    info: Literal[True],
+) -> Callable[[Callable[_P, Awaitable[_R]]], _cachedcoro_wrapper_info[_P, _R]]: ...
 
 @type_check_only
 class _cachedmethod_unbound(Generic[_P, _R]):
