@@ -34,6 +34,23 @@ Puma will automatically scale the number of threads, from the minimum until it c
 
 Be aware that additionally Puma creates threads on its own for internal purposes (e.g. handling slow clients). So, even if you specify -t 1:1, expect around 7 threads created in your application.
 
+## Queue timeout
+
+When every thread is busy, a request that has already been fully received waits
+in the queue. `queue_timeout` sets a limit, in seconds, on that wait. A request
+that waits longer is answered with `503 Service Unavailable` and its connection
+is closed, without calling the Rack app:
+
+```ruby
+# config/puma.rb
+queue_timeout 5
+```
+
+The clock starts when the request is complete and ready for the Rack app, and it
+stops when a thread takes it, so time spent reading the request from the client
+is not included. The default is `nil`, which means no limit. See
+[architecture.md](architecture.md#queue_timeout).
+
 ## Master process lifecycle hooks
 
 Puma's configuration DSL provides master process lifecycle hooks `after_booted`, `before_restart`, and `after_stopped`

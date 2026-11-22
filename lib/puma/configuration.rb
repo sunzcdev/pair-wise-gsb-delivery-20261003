@@ -165,6 +165,10 @@ module Puma
       persistent_timeout: 65, # PUMA_PERSISTENT_TIMEOUT
       prune_bundler: false,
       queue_requests: true,
+      # Number of seconds a complete request may wait for a thread before it is
+      # answered with a 503 instead of being passed to the Rack app. +nil+
+      # disables the limit.
+      queue_timeout: nil,
       rackup: 'config.ru'.freeze,
       raise_exception_on_sigterm: true,
       reaping_time: 1,

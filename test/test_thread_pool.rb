@@ -12,15 +12,18 @@ class TestThreadPool < PumaTest
     @pool.shutdown(1) if defined?(@pool)
   end
 
-  def new_pool(min, max, max_io_threads: 0, pool_shutdown_grace_time: nil, &block)
+  def new_pool(min, max, max_io_threads: 0, pool_shutdown_grace_time: nil,
+      queue_timeout: nil, queue_timeout_handler: nil, &block)
     block = proc { } unless block
     options = {
       min_threads: min,
       max_threads: max,
       max_io_threads: max_io_threads,
       pool_shutdown_grace_time: pool_shutdown_grace_time,
+      queue_timeout: queue_timeout,
     }
-    @pool = Puma::ThreadPool.new("tst", options, &block)
+    @pool = Puma::ThreadPool.new("tst", options,
+      queue_timeout_handler: queue_timeout_handler, &block)
   end
 
   def mutex_pool(min, max, pool_shutdown_grace_time: nil, &block)
@@ -503,5 +506,232 @@ class TestThreadPool < PumaTest
   ensure
     mutex.unlock if mutex.owned?
     pool.shutdown(1)
+  end
+
+  def test_queue_timeout_expires_work_while_every_thread_is_busy
+    started = Queue.new
+    release = Queue.new
+    timed_out = Queue.new
+
+    pool = new_pool(1, 1, queue_timeout: 0.05, queue_timeout_handler: ->(work, waited) {
+      timed_out << [work, waited]
+    }) do |_processor, work|
+      started << work
+      release.pop if work == :blocker
+    end
+
+    pool << :blocker
+    assert_equal :blocker, started.pop
+
+    # Nobody is free to take this item, so only the timer can drop it.
+    pool << :queued
+    work, waited = Timeout.timeout(2) { timed_out.pop }
+
+    assert_equal :queued, work
+    assert_operator waited, :>=, 0.05
+    assert_equal 0, pool.backlog
+  ensure
+    release&.close
+    pool&.shutdown(1)
+  end
+
+  def test_queue_timeout_ignores_work_that_is_not_ready
+    started = Queue.new
+    release = Queue.new
+    timed_out = Queue.new
+
+    pool = new_pool(1, 1, queue_timeout: 0.05, queue_timeout_handler: ->(work, _) {
+      timed_out << work
+    }) do |_processor, work|
+      started << work
+      release.pop if work == :blocker
+    end
+
+    pool << :blocker
+    assert_equal :blocker, started.pop
+
+    # Work that cannot run yet has no deadline, so it must not be dropped.
+    pool.add_work :unread, ready: false
+    sleep 0.2
+
+    assert_equal 1, pool.backlog
+    assert timed_out.empty?, "work that was not ready was expired by the queue timeout"
+
+    release << true
+    assert_equal :unread, Timeout.timeout(2) { started.pop }
+  ensure
+    release&.close
+    pool&.shutdown(1)
+  end
+
+  def test_queue_timeout_boundary_has_exactly_one_outcome
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    item = Puma::ThreadPool::QueuedWork.new(:item, now, 0.05)
+
+    refute item.expired?(now + 0.049_9), "expired before the deadline"
+    assert item.expired?(now + 0.05), "not expired at the deadline"
+    assert item.expired?(now + 0.05_1), "not expired after the deadline"
+
+    pool = new_pool(0, 0, queue_timeout: 10, queue_timeout_handler: ->(_work, _waited) {})
+
+    # Stop the timer so this test controls when expiry is observed.
+    timer = pool.instance_variable_get(:@queue_timeout_thread)
+    timer.kill
+    timer.join
+    pool.instance_variable_set(:@queue_timeout_thread, nil)
+
+    # A request whose deadline has long passed.
+    expired_item = Puma::ThreadPool::QueuedWork.new(:expired, now - 1, 0.05)
+    pool.with_mutex { pool.instance_variable_get(:@todo) << expired_item }
+
+    # Taking work at or after the deadline yields the expiration, not the work.
+    work = expired = nil
+    pool.with_mutex do
+      expired = pool.send(:take_expired_locked)
+      work = pool.send(:take_work_locked) if expired.empty?
+    end
+    assert_nil work
+    assert_equal [expired_item], expired
+
+    # It has been removed, so a later take sees nothing to expire.
+    pool.with_mutex do
+      expired = pool.send(:take_expired_locked)
+      work = pool.send(:take_work_locked) if expired.empty?
+    end
+    assert_nil work
+    assert_empty expired
+  ensure
+    pool&.shutdown(1)
+  end
+
+  def test_queue_timeout_runs_or_expires_each_item_exactly_once
+    runs = Queue.new
+    expirations = Queue.new
+
+    pool = new_pool(1, 1, queue_timeout: 0.01, queue_timeout_handler: ->(work, _) {
+      expirations << work
+    }) do |_processor, work|
+      runs << work
+    end
+
+    items = (1..50).to_a
+    items.each { |item| pool << item }
+    Timeout.timeout(10) { sleep 0.001 until runs.size + expirations.size >= items.size }
+
+    handled = []
+    handled << runs.pop until runs.empty?
+    handled << expirations.pop until expirations.empty?
+
+    assert_equal items.sort, handled.sort
+    assert_equal items.size, handled.uniq.size
+    assert_equal 0, pool.backlog
+  ensure
+    pool&.shutdown(1)
+  end
+
+  def test_queue_timeout_timer_is_woken_by_new_work
+    started = Queue.new
+    release = Queue.new
+    timed_out = Queue.new
+
+    pool = new_pool(1, 1, queue_timeout: 5, queue_timeout_handler: ->(work, _) {
+      timed_out << work
+    }) do |_processor, work|
+      started << work
+      release.pop if work == :blocker
+    end
+
+    pool << :blocker
+    assert_equal :blocker, started.pop
+
+    pool << :later
+    sleep 0.05
+
+    assert_equal 1, pool.backlog
+    assert timed_out.empty?
+  ensure
+    release&.close
+    pool&.shutdown(1)
+  end
+
+  def test_queue_timeout_drains_instead_of_expiring_during_shutdown
+    started = Queue.new
+    release = Queue.new
+    timed_out = Queue.new
+    served = Queue.new
+
+    # Long enough that shutdown always wins the race against the timer.
+    pool = new_pool(1, 1, queue_timeout: 30, queue_timeout_handler: ->(work, _) {
+      timed_out << work
+    }) do |_processor, work|
+      started << work
+      release.pop if work == :blocker
+      served << work
+    end
+
+    pool << :blocker
+    assert_equal :blocker, started.pop
+    pool << :queued
+
+    # Shutdown drains the queue rather than expiring it.
+    release << true
+    pool.shutdown(1)
+
+    assert timed_out.empty?, "queue timeout handler ran during shutdown"
+    assert_equal [:blocker, :queued], [served.pop, served.pop].sort
+    assert_nil pool.instance_variable_get(:@queue_timeout_thread)
+  ensure
+    release&.close
+  end
+
+  def test_queue_timeout_expires_only_ready_items_when_interleaved
+    timed_out = Queue.new
+    ran = Queue.new
+
+    # No threads, so the queue is only drained by the explicit takes below.
+    pool = new_pool(0, 0, queue_timeout: 0.1, queue_timeout_handler: ->(work, _) {
+      timed_out << work
+    }) do |_processor, work|
+      ran << work
+    end
+
+    pool.add_work :unread, ready: false
+    pool.add_work :ready_1
+
+    # Stop the timer so this test controls when expiry is observed.
+    timer = pool.instance_variable_get(:@queue_timeout_thread)
+    timer.kill
+    timer.join
+    pool.instance_variable_set(:@queue_timeout_thread, nil)
+
+    # Wait past the deadline, then read from the queue in order: only ready
+    # work may be dropped.
+    sleep 0.15
+
+    work = expired = nil
+    pool.with_mutex do
+      expired = pool.send(:take_expired_locked)
+      work = pool.send(:take_work_locked) if expired.empty?
+    end
+
+    assert_equal [:ready_1], expired.map(&:work)
+    assert_nil work
+    assert_equal [:unread], pool.with_mutex { pool.instance_variable_get(:@todo).map(&:work) }
+    assert ran.empty?
+  ensure
+    pool&.shutdown(1)
+  end
+
+  def test_queue_timeout_requires_a_handler
+    assert_raises(ArgumentError) do
+      Puma::ThreadPool.new("tst", { min_threads: 0, max_threads: 1, queue_timeout: 1 })
+    end
+  end
+
+  def test_queue_timeout_rejects_non_positive_values
+    assert_raises(ArgumentError) do
+      Puma::ThreadPool.new("tst", { min_threads: 0, max_threads: 1, queue_timeout: 0 },
+        queue_timeout_handler: ->(_work, _waited) {})
+    end
   end
 end

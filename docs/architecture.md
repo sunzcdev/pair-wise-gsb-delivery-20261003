@@ -72,3 +72,33 @@ for the request to arrive.
 In this mode, when a connection is accepted, it is added to the "todo" queue
 immediately, and a worker will synchronously do any waiting necessary to read
 the HTTP request from the socket.
+
+### `queue_timeout`
+
+By default a request that has been fully received waits in the "todo" set for
+as long as it takes a worker thread to become free. The optional
+`queue_timeout` sets a limit, in seconds, on that wait:
+
+```ruby
+# config/puma.rb
+queue_timeout 5
+```
+
+The clock starts when the request is complete and could be given to the Rack
+app, and it stops when a worker thread takes it. Time spent reading the
+request from the client is therefore not counted: a client that sends a request
+slowly within `first_data_timeout` is not affected. When the limit passes, the
+request is removed from the "todo" set, answered with `503 Service Unavailable`
+and the connection is closed, and the Rack app is never called for it. This
+happens even when every worker thread is busy, so a stalled pool can shed
+requests instead of accumulating them.
+
+At the moment the limit is reached exactly one outcome applies: the request is
+either taken by a thread (and runs normally) or answered with the `503`. The
+check is made under the same lock that hands work to a thread, so a request is
+never both run and timed out.
+
+Because the timer only applies once a request is complete, enabling
+`queue_timeout` makes the Reactor read newly accepted requests before they
+reach the thread pool by default. It requires `queue_requests` to be enabled
+(the default) and has no effect when it is `false`.

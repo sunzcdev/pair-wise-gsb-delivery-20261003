@@ -548,6 +548,149 @@ class TestPumaServer < PumaTest
     assert_includes response, '<no backtrace available>'
   end
 
+  # A request that is completely received but cannot be given to the Rack app
+  # because every thread is busy. With `queue_timeout` set, it must be answered
+  # without calling the app, and the client must actually receive that answer.
+  def test_queue_timeout_answers_parsed_request_without_calling_the_app
+    app_calls = Queue.new
+    release = Queue.new
+
+    server_run(max_threads: 1, min_threads: 1, queue_timeout: 0.2) do
+      app_calls << Thread.current
+      release.pop
+      [200, {}, ["ok"]]
+    end
+
+    # Occupy the only processor thread.
+    blocker = send_http GET_11
+    Timeout.timeout(5) { app_calls.pop }
+
+    # A second, complete request. It can reach the Rack app only after the
+    # blocker finishes, so its queue deadline passes first.
+    waiting = send_http GET_11
+
+    response = Timeout.timeout(5) { waiting.read_response }
+    assert_equal "HTTP/1.1 503 #{STATUS_CODES[503]}", response.status
+    assert_equal 0, response.body.bytesize
+
+    # The app must not have been called for the timed-out request.
+    assert app_calls.empty?, "the Rack app was called for a request that timed out in the queue"
+
+    # Closing the connection is how the client learns the response is final.
+    Timeout.timeout(5) do
+      sleep 0.01 until waiting.wait_readable(0.1) && waiting.read_nonblock(1, exception: false).nil?
+    end
+
+    release << true
+    assert_equal "HTTP/1.1 200 OK", Timeout.timeout(5) { blocker.read_response }.status
+  ensure
+    release&.close
+    blocker&.close
+    waiting&.close
+  end
+
+  # The queue timeout must not count the time spent reading a request, so a
+  # slow client that still makes progress is not answered with a 503.
+  def test_queue_timeout_starts_after_the_request_is_received
+    app_calls = Queue.new
+    release = Queue.new
+
+    server_run(max_threads: 1, min_threads: 1, queue_timeout: 0.3) do
+      app_calls << Thread.current
+      release.pop
+      [200, {}, ["ok"]]
+    end
+
+    blocker = send_http GET_11
+    Timeout.timeout(5) { app_calls.pop }
+
+    # Send the request slowly but within `first_data_timeout`, so the server is
+    # still reading it while the queue timeout would otherwise have elapsed.
+    slow = new_socket
+    slow.write "GET / HTTP/1.1\r\nHost: test.com\r\n"
+    sleep 0.15
+    slow.write "X-Slow: 1\r\n"
+    sleep 0.15
+    slow.write "\r\n"
+
+    # The request is complete and enters the queue; its queue timeout starts
+    # only now, so it is not timed out while still being read.
+    sleep 0.1
+    assert app_calls.empty?
+
+    release << true
+    assert_equal "HTTP/1.1 200 OK", Timeout.timeout(5) { blocker.read_response }.status
+
+    release << true
+    assert_equal "HTTP/1.1 200 OK", Timeout.timeout(5) { slow.read_response }.status
+  ensure
+    release&.close
+    blocker&.close
+    slow&.close
+  end
+
+  # A finished request keeps working when the queue timeout is not configured.
+  def test_queue_timeout_disabled_by_default
+    server_run(max_threads: 1, min_threads: 1) do
+      [200, {}, ["ok"]]
+    end
+
+    assert_nil @pool.queue_timeout
+    assert_equal "HTTP/1.1 200 OK", send_http_read_response(GET_11).status
+  end
+
+  # A request that gets a thread before the deadline runs normally.
+  def test_queue_timeout_does_not_affect_requests_that_get_a_thread
+    seen = Queue.new
+
+    server_run(max_threads: 1, min_threads: 1, queue_timeout: 30) do |env|
+      seen << env["PATH_INFO"]
+      [200, {}, ["ok"]]
+    end
+
+    3.times do
+      assert_equal "HTTP/1.1 200 OK", send_http_read_response(GET_11).status
+    end
+    assert_equal 3, seen.size
+  end
+
+  # The 503 uses the request's protocol version.
+  def test_queue_timeout_answers_http_1_0_request
+    app_calls = Queue.new
+    release = Queue.new
+
+    server_run(max_threads: 1, min_threads: 1, queue_timeout: 0.2) do
+      app_calls << Thread.current
+      release.pop
+      [200, {}, ["ok"]]
+    end
+
+    blocker = send_http GET_11
+    Timeout.timeout(5) { app_calls.pop }
+
+    waiting = send_http GET_10
+    response = Timeout.timeout(5) { waiting.read_response }
+
+    assert_equal "HTTP/1.0 503 #{STATUS_CODES[503]}", response.status
+    assert_equal 0, response.body.bytesize
+    assert app_calls.empty?, "the Rack app was called for a request that timed out in the queue"
+  ensure
+    release&.close
+    blocker&.close
+    waiting&.close
+  end
+
+  # Without the reactor there is no point at which a request is known to be
+  # complete but not yet being served, so the queue timeout does not apply.
+  def test_queue_timeout_requires_queue_requests
+    server_run(max_threads: 1, min_threads: 1, queue_timeout: 1, queue_requests: false) do
+      [200, {}, ["ok"]]
+    end
+
+    assert_nil @pool.queue_timeout
+    assert_includes @log_writer.stdout.string, "queue_timeout requires queue_requests"
+  end
+
   def test_force_shutdown_error_default
     server_run(force_shutdown_after: 2) do
       @server.stop

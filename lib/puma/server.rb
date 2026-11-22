@@ -104,6 +104,7 @@ module Puma
       @min_threads               = @options[:min_threads]
       @max_threads               = @options[:max_threads]
       @queue_requests            = @options[:queue_requests]
+      @queue_timeout             = @options[:queue_timeout]
       @max_keep_alive            = @options[:max_keep_alive]
       @enable_keep_alives        = @options[:enable_keep_alives]
       @enable_keep_alives      &&= @queue_requests
@@ -264,7 +265,14 @@ module Puma
       @status = :run
       @shutdown_body_deadline = nil
 
-      @thread_pool = ThreadPool.new(thread_name, options, server: self) do |processor, client|
+      if @queue_timeout && !@queue_requests
+        @log_writer.log "queue_timeout requires queue_requests, which is disabled; the queue timeout will not apply"
+        @queue_timeout = nil
+      end
+
+      @thread_pool = ThreadPool.new(thread_name, options, server: self,
+          queue_timeout: @queue_timeout,
+          queue_timeout_handler: method(:handle_queue_timeout)) do |processor, client|
         process_client(processor, client)
       end
 
@@ -329,8 +337,14 @@ module Puma
     def reactor_wakeup(client)
       shutdown = !@queue_requests
       read = client.bytes_read
-      if client.try_to_finish { shutdown_body_limit } || (shutdown && !client.can_close?)
+      if client.try_to_finish { shutdown_body_limit }
+        # The request is complete, so it is ready for the Rack app: this is
+        # where its queue timeout starts.
         hand_to_thread_pool client
+      elsif shutdown && !client.can_close?
+        # The request still has to be read, so it cannot go to the Rack app
+        # yet and its queue timeout has not started.
+        hand_to_thread_pool client, ready: false
       elsif shutdown || client.timeout == 0
         client.timeout!
       else
@@ -342,19 +356,61 @@ module Puma
       true
     rescue StandardError => e
       # Writing the error response may block on a client that is not reading,
-      # so leave it to a thread pool thread.
+      # so leave it to a thread pool thread. The request has been read enough
+      # to produce the error response, so its queue timeout applies.
       client.reactor_error = e
       hand_to_thread_pool client
     end
 
-    def hand_to_thread_pool(client)
-      @thread_pool << client
+    def hand_to_thread_pool(client, ready: true)
+      if ready
+        @thread_pool << client
+      else
+        @thread_pool.add_work client, ready: false
+      end
       true
     rescue ThreadError
       true
     rescue StandardError
       close_client_safely client
       true
+    end
+
+    # Hands a newly accepted connection to the reactor to be read.
+    #
+    # Only used when a queue timeout is configured. The reactor can read a
+    # request while every processor thread is busy, so the request reaches the
+    # thread pool as soon as it can enter Rack, which is where its queue
+    # timeout starts. Without a queue timeout, connections go straight to the
+    # thread pool as before.
+    def hand_to_reactor(client)
+      client.set_timeout @first_data_timeout
+      unless @reactor.add client
+        # The reactor is shutting down, so nothing will ever read this client.
+        close_client_safely client
+      end
+      true
+    rescue ConnectionError, IOError, SystemCallError
+      close_client_safely client
+      true
+    end
+
+    # Called by the thread pool when a request that was ready for the Rack app
+    # waited longer than `queue_timeout` for a processor thread.
+    #
+    # The Rack app is never called for such a request, so nothing it would do
+    # (reading the body, streaming, hijacking) applies. The client is answered
+    # with a 503 and closed. The write is non-blocking and best effort, so a
+    # client that is not reading cannot hold up the queue timeout timer.
+    def handle_queue_timeout(client, waited)
+      @log_writer.debug { "Request waited #{waited.round(3)}s for a Puma thread, responding 503" }
+      client.write_queue_timeout
+    rescue ConnectionError, IOError, SystemCallError
+      # The client is gone; closing below is enough.
+    rescue StandardError => e
+      @log_writer.unknown_error e, client, "Queue timeout"
+    ensure
+      close_client_safely client
     end
 
     def handle_servers
@@ -443,7 +499,17 @@ module Puma
 
                 client = new_client(io, sock)
                 client.send(addr_send_name, addr_value) if addr_value
-                pool << client
+                if @queue_timeout && @reactor && !shutting_down?
+                  # With a queue timeout the reactor reads the request before it
+                  # reaches the thread pool, so the timeout measures only the
+                  # wait for a thread and a complete request can expire even
+                  # when every thread is busy.
+                  hand_to_reactor client
+                else
+                  # The request has not been read yet, so it cannot go to the
+                  # Rack app and its queue timeout has not started.
+                  hand_to_thread_pool client, ready: false
+                end
               end
             end
           rescue IOError, Errno::EBADF

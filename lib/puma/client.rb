@@ -414,6 +414,24 @@ module Puma
       raise ConnectionError
     end
 
+    # Writes a minimal `503 Service Unavailable` response for a request whose
+    # queue deadline passed before a processor thread took it, so the Rack app
+    # is never called for it.
+    #
+    # The response matches the request's protocol version, states that the
+    # connection will be closed, and has no body. It is written without
+    # blocking: the caller is the queue timeout timer, which must not wait for
+    # a client that is not reading.
+    def write_queue_timeout
+      return unless @env
+
+      http_version = @env[SERVER_PROTOCOL] == HTTP_11 ? HTTP_11 : 'HTTP/1.0'
+
+      write_interim "#{http_version} 503 Service Unavailable\r\n" \
+        "content-length: 0\r\n" \
+        "connection: close\r\n\r\n"
+    end
+
     def write_error(status_code)
       begin
         write_interim ERROR_RESPONSE[status_code]

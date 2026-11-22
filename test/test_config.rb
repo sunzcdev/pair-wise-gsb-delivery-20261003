@@ -16,6 +16,7 @@ class TestConfigFile < PumaTest
     conf.clamp
     assert_equal max_threads, conf.options.default_options[:max_threads]
     assert_equal 25, conf.options.default_options[:shutdown_body_timeout]
+    assert_nil conf.options.default_options[:queue_timeout]
   end
 
   def test_app_from_rackup
@@ -458,12 +459,31 @@ class TestConfigFile < PumaTest
     assert_equal 6, conf.options[:persistent_timeout]
     assert_equal 3, conf.options[:first_data_timeout]
     assert_equal 7.0, conf.options[:shutdown_body_timeout]
+    assert_equal 2.0, conf.options[:queue_timeout]
     assert_equal 2, conf.options[:workers]
     assert_equal 4, conf.options[:min_threads]
     assert_equal 8, conf.options[:max_threads]
     assert_equal 90, conf.options[:worker_timeout]
     assert_equal 120, conf.options[:worker_boot_timeout]
     assert_equal 150, conf.options[:worker_shutdown_timeout]
+  end
+
+  def test_queue_timeout_accepts_float_string
+    conf = Puma::Configuration.new { |c| c.queue_timeout "0.5" }
+    conf.clamp
+    assert_equal 0.5, conf.options[:queue_timeout]
+  end
+
+  def test_queue_timeout_can_be_disabled
+    conf = Puma::Configuration.new { |c| c.queue_timeout nil }
+    conf.clamp
+    assert_nil conf.options[:queue_timeout]
+  end
+
+  def test_queue_timeout_rejects_non_positive_values
+    assert_raises(ArgumentError) do
+      Puma::Configuration.new { |c| c.queue_timeout 0 }
+    end
   end
 
   def test_worker_check_interval_accepts_float

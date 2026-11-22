@@ -1415,6 +1415,41 @@ module Puma
       @options[:queue_requests] = answer
     end
 
+    # The number of seconds a request that is complete and able to enter the
+    # Rack app may wait for a Puma thread. When it expires the request is
+    # answered with `503 Service Unavailable` and the connection is closed,
+    # without calling the Rack app.
+    #
+    # The clock starts when the request is complete, so the time spent reading
+    # the request from the client is not counted, and it stops when a thread
+    # takes the request. At the moment the deadline is reached exactly one
+    # outcome applies: the request is either run by a thread or answered with
+    # the `503`, never both.
+    #
+    # This requires the Reactor, so it only applies when `queue_requests` is
+    # enabled (the default).
+    #
+    # The default is +nil+, which means no limit.
+    #
+    # @example
+    #   queue_timeout 5
+    #
+    # @see Puma::ThreadPool.new
+    # @see queue_requests
+    #
+    def queue_timeout(seconds)
+      @options[:queue_timeout] =
+        if seconds.nil?
+          nil
+        else
+          timeout = Float(seconds)
+          unless timeout.finite? && timeout > 0
+            raise ArgumentError, "queue_timeout must be a finite number of seconds greater than 0, got #{timeout}"
+          end
+          timeout
+        end
+    end
+
     # When a shutdown is requested, the backtraces of all the
     # threads will be written to $stdout. This can help figure
     # out why shutdown is hanging.
