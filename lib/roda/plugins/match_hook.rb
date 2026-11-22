@@ -14,9 +14,27 @@ class Roda
     #   match_hook do
     #     logger.debug("#{request.matched_path} matched. #{request.remaining_path} remaining.")
     #   end
+    #
+    # == Route Tracing
+    #
+    # Pass the +trace+ option to enable route tracing, which records each
+    # successful match in +request.route_trace+.  This is useful for seeing
+    # which part of the routing tree handled a request, and for distinguishing
+    # matches that were tried but abandoned from the match that actually
+    # returned the response:
+    #
+    #   plugin :match_hook, trace: true
+    #
+    #   match_hook do
+    #     entry = request.route_trace.last
+    #     logger.debug("#{entry.marker.inspect} matched")
+    #   end
+    #
+    # See the match_hook_args plugin documentation for details on the trace
+    # entries and their statuses.
     module MatchHook
-      def self.load_dependencies(app)
-        app.plugin :match_hook_args
+      def self.load_dependencies(app, opts=OPTS)
+        app.plugin :match_hook_args, **opts
       end
 
       module ClassMethods
