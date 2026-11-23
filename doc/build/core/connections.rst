@@ -2584,9 +2584,12 @@ Working with the DBAPI cursor directly
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 There are some cases where SQLAlchemy does not provide a genericized way
-at accessing some :term:`DBAPI` functions, such as calling stored procedures as well
-as dealing with multiple result sets.  In these cases, it's just as expedient
-to deal with the raw DBAPI connection directly.
+at accessing some :term:`DBAPI` functions, such as calling stored
+procedures.  Multiple result sets produced by a DBAPI cursor's
+:pep:`249` ``nextset()`` method are supported through
+:meth:`_engine.CursorResult.next_result_set`, as detailed below; for still
+lower level access it can also be just as expedient to deal with the raw
+DBAPI connection directly.
 
 The most common way to access the raw DBAPI connection is to get it
 from an already present :class:`_engine.Connection` object directly.  It is
@@ -2681,11 +2684,45 @@ You should consult your underlying DBAPI and database documentation in these
 situations to determine the correct syntax and patterns to use.
 
 
+.. _multiple_result_sets:
+
 Multiple Result Sets
 ~~~~~~~~~~~~~~~~~~~~
 
-Multiple result set support is available from a raw DBAPI cursor using the
-`nextset <https://legacy.python.org/dev/peps/pep-0249/#nextset>`_ method::
+Some DBAPIs allow a single cursor to expose more than one result set,
+moved between using the :pep:`249`
+`nextset <https://legacy.python.org/dev/peps/pep-0249/#nextset>`_ method.
+The :meth:`_engine.CursorResult.next_result_set` method provides an explicit
+entry point for advancing a :class:`_engine.CursorResult` through these
+result sets while retaining SQLAlchemy's row mapping and result processing::
+
+    with engine.connect() as conn:
+        result = conn.exec_driver_sql(
+            "select * from table1; select * from table2"
+        )
+
+        # first result set, read according to its own columns
+        rows_one = result.all()
+
+        # move to the second result set; the CursorResult is updated in
+        # place to describe the new set's columns and processors
+        has_more = result.next_result_set()
+        if has_more:
+            rows_two = result.all()
+
+The :class:`_engine.CursorResult` is reused in place.  After a successful
+switch, its keys and row metadata describe only the new result set, so each
+set is read using its own column definitions even when two sets share column
+names.  Any rows left unconsumed in the previous set are discarded.  The
+method returns ``False`` when no further result set is available, at which
+point the underlying DBAPI cursor is released; calling it again (or after a
+result has been exhausted or :meth:`_engine.CursorResult.close` was called)
+raises :class:`.ResourceClosedError`.
+
+.. versionadded:: 2.1 Added :meth:`_engine.CursorResult.next_result_set`.
+
+For full control, the underlying DBAPI cursor remains available directly via
+:attr:`_engine.Connection.connection`::
 
     connection = engine.raw_connection()
     try:

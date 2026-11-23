@@ -14,6 +14,7 @@ import collections
 import operator
 import typing
 from typing import Any
+from typing import Callable
 from typing import cast
 from typing import ClassVar
 from typing import Deque
@@ -1116,6 +1117,21 @@ class ResultFetchStrategy:
     ) -> Any:
         raise NotImplementedError()
 
+    def nextset(
+        self,
+        result: CursorResult[Unpack[TupleAny]],
+        dbapi_cursor: DBAPICursor,
+    ) -> Optional[_DBAPICursorDescription]:
+        """Advance the DBAPI cursor to the next result set using
+        :pep:`249` ``cursor.nextset()``.
+
+        Any rows still buffered for the current result set are discarded.
+        Returns the ``cursor.description`` of the new result set, or
+        ``None`` if there are no more result sets.
+
+        """
+        raise NotImplementedError()
+
     def handle_exception(
         self,
         result: CursorResult[Unpack[TupleAny]],
@@ -1170,6 +1186,16 @@ class NoCursorFetchStrategy(ResultFetchStrategy):
         self, result: CursorResult[Unpack[TupleAny]], dbapi_cursor: DBAPICursor
     ) -> Any:
         return self._non_result(result, [])
+
+    def nextset(
+        self,
+        result: CursorResult[Unpack[TupleAny]],
+        dbapi_cursor: DBAPICursor,
+    ) -> Optional[_DBAPICursorDescription]:
+        raise exc.ResourceClosedError(
+            "This result object is closed and can't move to another "
+            "result set."
+        )
 
     def _non_result(
         self,
@@ -1317,6 +1343,21 @@ class CursorFetchStrategy(ResultFetchStrategy):
             return rows
         except BaseException as e:
             self.handle_exception(result, dbapi_cursor, e)
+
+    def nextset(
+        self,
+        result: CursorResult[Any],
+        dbapi_cursor: DBAPICursor,
+    ) -> Optional[_DBAPICursorDescription]:
+        try:
+            has_next = dbapi_cursor.nextset()
+        except BaseException as e:
+            self.handle_exception(result, dbapi_cursor, e)
+        else:
+            if has_next is False:
+                # the driver explicitly reports no further result sets
+                return None
+            return dbapi_cursor.description
 
 
 _DEFAULT_FETCH = CursorFetchStrategy()
@@ -1477,6 +1518,17 @@ class BufferedRowCursorFetchStrategy(CursorFetchStrategy):
         except BaseException as e:
             self.handle_exception(result, dbapi_cursor, e)
 
+    def nextset(
+        self,
+        result: CursorResult[Any],
+        dbapi_cursor: DBAPICursor,
+    ) -> Optional[_DBAPICursorDescription]:
+        # discard any rows prefetched from the current result set before
+        # asking the driver to switch, so stale buffered rows can't be read
+        # as part of the next result set
+        self._rowbuffer.clear()
+        return super().nextset(result, dbapi_cursor)
+
 
 class FullyBufferedCursorFetchStrategy(CursorFetchStrategy):
     """A cursor strategy that buffers rows fully upon creation.
@@ -1553,6 +1605,14 @@ class FullyBufferedCursorFetchStrategy(CursorFetchStrategy):
         self._rowbuffer = collections.deque()
         result._soft_close()
         return ret
+
+    def nextset(
+        self,
+        result: CursorResult[Any],
+        dbapi_cursor: DBAPICursor,
+    ) -> Optional[_DBAPICursorDescription]:
+        self._rowbuffer.clear()
+        return super().nextset(result, dbapi_cursor)
 
 
 class _NoResultMetaData(ResultMetaData):
@@ -1663,13 +1723,7 @@ class CursorResult(Result[Unpack[_Ts]]):
             self._init_metadata(context, cursor_description)
 
             if echo:
-                log = self.context.connection._log_debug
-
-                def _log_row(row: Any) -> Any:
-                    log("Row %r", sql_util._repr_row(row))
-                    return row
-
-                self._row_logging_fn = _log_row
+                self._row_logging_fn = self._make_row_logging_fn()
 
             # call Result._row_getter to set up the row factory
             self._row_getter
@@ -1682,6 +1736,8 @@ class CursorResult(Result[Unpack[_Ts]]):
         self,
         context: DefaultExecutionContext,
         cursor_description: _DBAPICursorDescription,
+        *,
+        _rebuild: bool = False,
     ) -> CursorResultMetaData:
         driver_column_names = context.execution_options.get(
             "driver_column_names", False
@@ -1700,7 +1756,7 @@ class CursorResult(Result[Unpack[_Ts]]):
                     num_sentinel_cols=context._num_sentinel_cols,
                 )
                 assert not metadata._safe_for_cache
-            elif compiled._cached_metadata:
+            elif not _rebuild and compiled._cached_metadata:
                 metadata = compiled._cached_metadata
             else:
                 metadata = CursorResultMetaData(
@@ -1711,7 +1767,11 @@ class CursorResult(Result[Unpack[_Ts]]):
                     # so it's ok to apply it to a cacheable metadata.
                     num_sentinel_cols=context._num_sentinel_cols,
                 )
-                if metadata._safe_for_cache:
+                # a result set reached via cursor.nextset() has its own
+                # description that doesn't correspond to the compiled
+                # statement, so it must neither reuse nor populate the
+                # compiled statement's cached metadata
+                if metadata._safe_for_cache and not _rebuild:
                     compiled._cached_metadata = metadata
 
             # result rewrite/ adapt step.  this is to suit the case
@@ -1788,6 +1848,127 @@ class CursorResult(Result[Unpack[_Ts]]):
             self.cursor = None  # type: ignore[assignment]
             self.connection._safe_close_cursor(cursor)
             self._soft_closed = True
+
+    def _reopen_for_next_result_set(
+        self, cursor_description: _DBAPICursorDescription
+    ) -> None:
+        """Reset this result so that it represents a new row-returning
+        DBAPI result set delivered by ``cursor.nextset()``.
+
+        The same DBAPI cursor remains in use, so it must not have been
+        released by :meth:`_soft_close`; the row factory memoizations and
+        soft-close state are rebuilt against the new cursor description.
+
+        """
+        # a fully-buffered strategy only ever reads from its in-memory
+        # buffer, which was just discarded, and a "no cursor" strategy has
+        # no cursor to drive; switch back to direct cursor fetching.  A
+        # plain or row-buffering strategy refills from the cursor on demand
+        # and is kept as-is so that e.g. yield_per settings are preserved.
+        if isinstance(
+            self.cursor_strategy,
+            (NoCursorFetchStrategy, FullyBufferedCursorFetchStrategy),
+        ):
+            self.cursor_strategy = _DEFAULT_FETCH
+
+        self._init_metadata(
+            self.context, cursor_description, _rebuild=True
+        )
+        if self._echo:
+            self._row_logging_fn = self._make_row_logging_fn()
+
+        # discard row factories / getters memoized against the previous
+        # result set's metadata and processors
+        self._reset_memoizations()
+
+        self._soft_closed = False
+        self.closed = False
+
+    def _make_row_logging_fn(
+        self,
+    ) -> Optional[Callable[[Row[Unpack[TupleAny]]], Row[Unpack[TupleAny]]]]:
+        log = self.context.connection._log_debug
+
+        def _log_row(row: Any) -> Any:
+            log("Row %r", sql_util._repr_row(row))
+            return row
+
+        return _log_row
+
+    def next_result_set(self) -> bool:
+        """Advance to the next result set made available by the DBAPI
+        cursor's :pep:`249` ``nextset()`` method.
+
+        The :class:`_engine.CursorResult` is reused in place: after a
+        successful call, its :attr:`_engine.Result.keys` / row metadata and
+        result processors describe the *new* result set only.  Result
+        metadata and rows fetched from the previous result set are no longer
+        available; any unconsumed rows are discarded.
+
+        Each result set is read according to its own
+        ``cursor.description`` and column types, so two result sets may
+        share column names while applying different processing without one
+        result set's state leaking into the other.
+
+        :return: ``True`` if a new result set was made available, ``False``
+         if there are no further result sets.  When ``False`` is returned,
+         the underlying DBAPI cursor is released and this result behaves as
+         a soft-closed, non-row-returning result.
+        :raises: :class:`.ResourceClosedError` if this result was explicitly
+         closed via :meth:`_engine.CursorResult.close` or its cursor has
+         already been released.
+
+        .. versionadded:: 2.1
+
+        .. seealso::
+
+            :ref:`multiple_result_sets`
+
+        """
+        if self.closed:
+            raise exc.ResourceClosedError(
+                "This result object is closed."
+            )
+        elif self._soft_closed or self.cursor is None:
+            raise exc.ResourceClosedError(
+                "The DBAPI cursor for this result object has already been "
+                "released; can't move to another result set."
+            )
+
+        cursor = self.cursor
+        try:
+            cursor_description = self.cursor_strategy.nextset(self, cursor)
+        except BaseException:
+            # the connection's exception handling has already released the
+            # DBAPI cursor; reflect that here so the result is not asked to
+            # close it a second time
+            self._mark_cursor_released()
+            raise
+
+        if cursor_description is None:
+            # either there are no further result sets, or the next result
+            # set does not return rows (e.g. a DML statement); in both
+            # cases release the cursor through the same path used when
+            # rows are exhausted and mark this result as non-row-returning
+            self._metadata = self._no_result_metadata
+            self._reset_memoizations()
+            self._soft_close()
+            return False
+
+        self._reopen_for_next_result_set(cursor_description)
+        return True
+
+    def _mark_cursor_released(self) -> None:
+        """Record that the DBAPI cursor backing this result has been
+        released outside of :meth:`_soft_close` (e.g. by the connection's
+        DBAPI exception handling), preventing a second close.
+
+        """
+        if self._soft_closed:
+            return
+        self.cursor_strategy.soft_close(self, self.cursor)
+        self.cursor = None  # type: ignore[assignment]
+        self._soft_closed = True
 
     @property
     def inserted_primary_key_rows(self) -> List[Optional[Any]]:

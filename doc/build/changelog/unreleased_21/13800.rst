@@ -1,0 +1,15 @@
+.. change::
+    :tags: feature, engine
+    :tickets: 13800
+
+    Added :meth:`_engine.CursorResult.next_result_set`, which advances a
+    :class:`_engine.CursorResult` to the next result set exposed by a
+    DBAPI cursor's :pep:`249` ``nextset()`` method.  The result is reused in
+    place and rebuilt with the new result set's column metadata and result
+    processors, so each set is read according to its own column definitions
+    and references to the previous set's metadata can no longer read rows
+    from the new set.  The method returns ``False`` and releases the
+    underlying DBAPI cursor when no further result set is available, and
+    driver errors raised while switching are propagated through the usual
+    DBAPI exception handling while still ensuring the cursor is closed
+    exactly once.

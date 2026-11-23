@@ -11,6 +11,7 @@ from unittest.mock import patch
 from sqlalchemy import bindparam
 from sqlalchemy import CHAR
 from sqlalchemy import column
+from sqlalchemy import create_engine
 from sqlalchemy import DDL
 from sqlalchemy import event
 from sqlalchemy import exc
@@ -33,6 +34,7 @@ from sqlalchemy import tuple_
 from sqlalchemy import type_coerce
 from sqlalchemy import TypeDecorator
 from sqlalchemy import VARCHAR
+from sqlalchemy.dialects import registry
 from sqlalchemy.engine import cursor as _cursor
 from sqlalchemy.engine import default
 from sqlalchemy.engine import Row
@@ -4349,3 +4351,535 @@ class AllTuplesTest(fixtures.TablesTest):
             row_messages,
             ["Row (1, 'p1', 'U1')", "Row (2, 'p2', None)"],
         )
+
+
+class _NextSetDBAPIError(Exception):
+    pass
+
+
+class _NextSetCursor:
+    """A local DBAPI cursor stand-in that serves multiple result sets
+    through ``nextset()``.
+
+    Both row-returning sets expose the same column name, but the test
+    assigns each set a different result processor to prove per-set metadata
+    is used.  A ``None`` entry in ``descriptions`` models a non-row
+    returning set (e.g. a DML statement) as reported by a real DBAPI.  The
+    cursor records ``close()`` calls so tests can assert the underlying
+    cursor is released exactly once.
+
+    """
+
+    descriptions = (
+        (("col", None, None, None, None, None, None),),
+        (("col", None, None, None, None, None, None),),
+    )
+
+    def __init__(
+        self,
+        fail_nextset=False,
+        descriptions=None,
+        rows=None,
+    ):
+        if descriptions is None:
+            descriptions = self.descriptions
+        if rows is None:
+            rows = (
+                [("set1-a",), ("set1-b",)],
+                [("set2-a",), ("set2-b",)],
+            )
+        self._descriptions = descriptions
+        self._rows = rows
+        self._set_index = 0
+        self._row_index = 0
+        self.description = self._descriptions[0]
+        self.rowcount = -1
+        self.arraysize = 1
+        self.close_count = 0
+        self.nextset_count = 0
+        self._fail_nextset = fail_nextset
+
+    def execute(self, statement, parameters=None):
+        return None
+
+    def executemany(self, statement, parameters):
+        return None
+
+    def fetchone(self):
+        rows = self._rows[self._set_index]
+        if rows is None or self._row_index >= len(rows):
+            return None
+        row = rows[self._row_index]
+        self._row_index += 1
+        return row
+
+    def fetchmany(self, size=None):
+        if size is None:
+            size = self.arraysize
+        rows = self._rows[self._set_index]
+        if rows is None:
+            return []
+        chunk = rows[self._row_index : self._row_index + size]
+        self._row_index += len(chunk)
+        return chunk
+
+    def fetchall(self):
+        rows = self._rows[self._set_index]
+        if rows is None:
+            return []
+        chunk = rows[self._row_index :]
+        self._row_index = len(rows)
+        return chunk
+
+    def nextset(self):
+        self.nextset_count += 1
+        if self._fail_nextset:
+            raise _NextSetDBAPIError("driver failure during nextset")
+        if self._set_index + 1 >= len(self._descriptions):
+            return False
+        self._set_index += 1
+        self._row_index = 0
+        self.description = self._descriptions[self._set_index]
+        return True
+
+    def close(self):
+        self.close_count += 1
+
+    def setinputsizes(self, sizes):
+        pass
+
+    def setoutputsize(self, size, column=None):
+        pass
+
+
+class _NextSetConnection:
+    def __init__(self, fail_nextset=False, three_sets=False):
+        self._fail_nextset = fail_nextset
+        self._three_sets = three_sets
+
+    def cursor(self):
+        if self._three_sets:
+            # row set, then a non-row set (description None), then a row set
+            descriptions = (
+                (("col", None, None, None, None, None, None),),
+                None,
+                (("col", None, None, None, None, None, None),),
+            )
+            rows = (
+                [("set1-a",)],
+                None,
+                [("set3-a",), ("set3-b",)],
+            )
+            return _NextSetCursor(
+                descriptions=descriptions, rows=rows
+            )
+        return _NextSetCursor(fail_nextset=self._fail_nextset)
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _NextSetDBAPI:
+    Error = _NextSetDBAPIError
+    paramstyle = "qmark"
+    apilevel = "2.0"
+    threadsafety = 1
+
+    def __init__(self, fail_nextset=False, three_sets=False):
+        self._fail_nextset = fail_nextset
+        self._three_sets = three_sets
+
+    def connect(self, *args, **kwargs):
+        return _NextSetConnection(
+            fail_nextset=self._fail_nextset,
+            three_sets=self._three_sets,
+        )
+
+
+class _NextSetDialect(default.DefaultDialect):
+    name = "nextsetdialect"
+    driver = "nextsetdialect"
+    supports_statement_cache = False
+
+    @classmethod
+    def import_dbapi(cls):
+        return _NextSetDBAPI()
+
+    def _get_server_version_info(self, connection):
+        return (1,)
+
+    def get_default_isolation_level(self, dbapi_conn):
+        return None
+
+
+class _FailingNextSetDialect(_NextSetDialect):
+    name = "failingnextsetdialect"
+    driver = "failingnextsetdialect"
+    supports_statement_cache = False
+
+    @classmethod
+    def import_dbapi(cls):
+        return _NextSetDBAPI(fail_nextset=True)
+
+
+class _ThreeSetDialect(_NextSetDialect):
+    name = "threenextsetdialect"
+    driver = "threenextsetdialect"
+    supports_statement_cache = False
+
+    @classmethod
+    def import_dbapi(cls):
+        return _NextSetDBAPI(three_sets=True)
+
+
+registry.register(
+    "nextsetdialect",
+    __name__,
+    "_NextSetDialect",
+)
+registry.register(
+    "failingnextsetdialect",
+    __name__,
+    "_FailingNextSetDialect",
+)
+registry.register(
+    "threenextsetdialect",
+    __name__,
+    "_ThreeSetDialect",
+)
+
+
+class _UpperType(TypeDecorator):
+    impl = String
+    cache_ok = True
+
+    def process_result_value(self, value, dialect):
+        return value.upper()
+
+
+class _BangType(TypeDecorator):
+    impl = String
+    cache_ok = True
+
+    def process_result_value(self, value, dialect):
+        return value + "!"
+
+
+class NextResultSetTest(fixtures.TestBase):
+    """Test :meth:`.CursorResult.next_result_set` against a local DBAPI
+    cursor stand-in that returns multiple result sets."""
+
+    def _engine(self, failing=False, three_sets=False):
+        if failing:
+            url = "failingnextsetdialect://"
+        elif three_sets:
+            url = "threenextsetdialect://"
+        else:
+            url = "nextsetdialect://"
+        return create_engine(url)
+
+    def _result(self, conn, type_=_UpperType):
+        return conn.execute(text("SELECT col FROM t").columns(col=type_()))
+
+    def test_switch_before_first_set_exhausted(self):
+        """switch to the second result set while the first is still being
+        read; each set keeps its own keys and rows"""
+        engine = self._engine()
+        with engine.connect() as conn:
+            result = self._result(conn)
+            cursor = result.cursor
+
+            eq_(list(result.keys()), ["col"])
+            # read only the first row of set one, leaving set one unread
+            row = result.fetchone()
+            eq_(row.col, "SET1-A")
+            eq_(result.fetchmany(1), [("SET1-B",)])
+
+            ok = result.next_result_set()
+            is_true(ok)
+
+            # the second set is read from its own cursor position; the
+            # unconsumed remainder of set one does not leak into it
+            eq_(list(result.keys()), ["col"])
+            eq_(
+                [r.col for r in result.all()],
+                ["SET2-A", "SET2-B"],
+            )
+
+            # exhausting the final set releases the cursor exactly once
+            eq_(cursor.close_count, 1)
+            is_true(result._soft_closed)
+            is_(result.cursor, None)
+            eq_(cursor.nextset_count, 1)
+
+    def test_each_set_uses_its_own_processor(self):
+        """two sets with identical column names apply distinct result
+        processors, and a metadata reference kept from the first set is
+        not mutated by the switch"""
+        engine = self._engine()
+        with engine.connect() as conn:
+            result = self._result(conn, _UpperType)
+            cursor = result.cursor
+
+            old_metadata = result._metadata
+            eq_(result.fetchone().col, "SET1-A")
+
+            # give the second result set a different compiled column type
+            compiled = result.context.compiled
+            entry = list(compiled._result_columns)[0]
+            compiled._result_columns = (
+                type(entry)(entry[0], entry[1], entry[2], _BangType()),
+            )
+            result.context.result_column_struct = (
+                compiled._result_columns,
+                compiled._ordered_columns,
+                compiled._textual_ordered_columns,
+                compiled._ad_hoc_textual,
+                compiled._loose_column_name_matching,
+            )
+
+            is_true(result.next_result_set())
+
+            # a fresh metadata instance backs the new set
+            assert result._metadata is not old_metadata
+            # the stale reference still carries set one's processor list
+            assert (
+                old_metadata._processors is not result._metadata._processors
+            )
+
+            eq_(
+                [r.col for r in result.all()],
+                ["set2-a!", "set2-b!"],
+            )
+            eq_(cursor.close_count, 1)
+
+    def test_no_more_sets_while_cursor_open(self):
+        """when the driver reports no further set while the cursor is still
+        open, the method returns False and releases the cursor"""
+        engine = self._engine()
+        with engine.connect() as conn:
+            result = self._result(conn)
+            cursor = result.cursor
+
+            is_true(result.next_result_set())
+            is_false(result._soft_closed)
+
+            # the cursor stand-in reports False on the second nextset()
+            is_false(result.next_result_set())
+            is_true(result._soft_closed)
+            is_(result.cursor, None)
+            eq_(cursor.close_count, 1)
+            eq_(cursor.nextset_count, 2)
+
+            # a subsequent hard close does not close the cursor again
+            result.close()
+            eq_(cursor.close_count, 1)
+
+    def test_switch_after_exhaustion_raises(self):
+        """once a set was exhausted its cursor was released, so switching
+        is rejected rather than reusing a closed cursor"""
+        engine = self._engine()
+        with engine.connect() as conn:
+            result = self._result(conn)
+            cursor = result.cursor
+
+            result.all()
+            is_true(result._soft_closed)
+            is_(result.cursor, None)
+            eq_(cursor.close_count, 1)
+
+            assert_raises_message(
+                exc.ResourceClosedError,
+                "already been released",
+                result.next_result_set,
+            )
+            # the failed switch does not trigger another cursor close
+            eq_(cursor.close_count, 1)
+
+            # soft-closed DQL results keep returning empty fetch results
+            eq_(result.fetchall(), [])
+            is_(result.fetchone(), None)
+
+    def test_hard_closed_result_rejects_switch(self):
+        engine = self._engine()
+        with engine.connect() as conn:
+            result = self._result(conn)
+            cursor = result.cursor
+            result.fetchone()
+
+            result.close()
+            is_true(result.closed)
+            eq_(cursor.close_count, 1)
+
+            assert_raises_message(
+                exc.ResourceClosedError,
+                "object is closed",
+                result.next_result_set,
+            )
+            eq_(cursor.close_count, 1)
+
+    def test_driver_error_releases_cursor_once(self):
+        """a driver error from nextset() propagates through the connection's
+        DBAPI exception handling and the cursor is closed a single time"""
+        engine = self._engine(failing=True)
+        with engine.connect() as conn:
+            result = self._result(conn)
+            cursor = result.cursor
+            result.fetchone()
+
+            assert_raises_message(
+                sa_exc.DBAPIError,
+                "driver failure during nextset",
+                result.next_result_set,
+            )
+
+            # the result now reflects that its cursor was released
+            is_true(result._soft_closed)
+            is_(result.cursor, None)
+            eq_(cursor.close_count, 1)
+            eq_(cursor.nextset_count, 1)
+
+            # hard closing afterwards must not call cursor.close() again
+            result.close()
+            eq_(cursor.close_count, 1)
+
+    def test_second_set_scalar_and_hard_close(self):
+        """scalar reads on the switched result take the first row and hard
+        close the underlying cursor exactly once"""
+        engine = self._engine()
+        with engine.connect() as conn:
+            result = self._result(conn)
+            cursor = result.cursor
+            # leave set one partially read before switching
+            result.fetchone()
+            is_true(result.next_result_set())
+
+            eq_(result.scalar(), "SET2-A")
+            # scalar() hard-closes after taking one row
+            is_true(result.closed)
+            is_(result.cursor, None)
+            eq_(cursor.close_count, 1)
+
+    def test_mappings_reflect_current_set_only(self):
+        engine = self._engine()
+        with engine.connect() as conn:
+            result = self._result(conn)
+            old_metadata = result._metadata
+            result.fetchone()
+
+            is_true(result.next_result_set())
+            mappings = result.mappings().all()
+            eq_(
+                [dict(m) for m in mappings],
+                [{"col": "SET2-A"}, {"col": "SET2-B"}],
+            )
+            # stale metadata object is untouched and remains usable
+            eq_(list(old_metadata.keys), ["col"])
+
+    def test_buffered_strategy_discards_prefetched_rows(self):
+        """with a row-buffering strategy, rows prefetched from set one are
+        dropped when switching so they can't be read as set two rows"""
+        engine = self._engine()
+        with engine.connect() as conn:
+            result = self._result(conn).yield_per(10)
+            assert isinstance(
+                result.cursor_strategy,
+                _cursor.BufferedRowCursorFetchStrategy,
+            )
+            cursor = result.cursor
+
+            # the buffer fills from set one on the first fetch
+            result.fetchone()
+            assert len(result.cursor_strategy._rowbuffer) >= 1
+
+            is_true(result.next_result_set())
+            # buffering strategy is retained and its buffer was cleared
+            assert isinstance(
+                result.cursor_strategy,
+                _cursor.BufferedRowCursorFetchStrategy,
+            )
+            eq_(len(result.cursor_strategy._rowbuffer), 0)
+
+            eq_(
+                [r.col for r in result.all()],
+                ["SET2-A", "SET2-B"],
+            )
+            eq_(cursor.close_count, 1)
+
+    def test_switch_after_partial_iteration(self):
+        """breaking out of iteration over set one and then switching must
+        not deliver the abandoned set-one rows through set two"""
+        engine = self._engine()
+        with engine.connect() as conn:
+            result = self._result(conn)
+            cursor = result.cursor
+
+            seen = []
+            for row in result:
+                seen.append(row.col)
+                break
+            eq_(seen, ["SET1-A"])
+            is_false(result._soft_closed)
+
+            is_true(result.next_result_set())
+            eq_(
+                result.fetchmany(1),
+                [("SET2-A",)],
+            )
+            eq_(
+                [r.col for r in result.fetchall()],
+                ["SET2-B"],
+            )
+            eq_(cursor.close_count, 1)
+
+    def test_fetchmany_then_switch(self):
+        engine = self._engine()
+        with engine.connect() as conn:
+            result = self._result(conn)
+            cursor = result.cursor
+
+            eq_(result.fetchmany(1), [("SET1-A",)])
+            is_true(result.next_result_set())
+
+            # set two begins at its first row regardless of set one's
+            # partially-read position
+            eq_(list(result.keys()), ["col"])
+            eq_(
+                [r.col for r in result.fetchall()],
+                ["SET2-A", "SET2-B"],
+            )
+            eq_(cursor.close_count, 1)
+            eq_(cursor.nextset_count, 1)
+
+    def test_non_row_returning_intermediate_set(self):
+        """a result set with no description (e.g. DML) returns False and
+        soft-closes, even though another row set exists at the driver; the
+        cursor is released exactly once"""
+        engine = self._engine(three_sets=True)
+        with engine.connect() as conn:
+            result = self._result(conn)
+            cursor = result.cursor
+
+            eq_(result.fetchone().col, "SET1-A")
+
+            # next set is non-row returning: description is None
+            is_false(result.next_result_set())
+            is_true(result._soft_closed)
+            is_(result.cursor, None)
+            is_false(result.returns_rows)
+            eq_(cursor.close_count, 1)
+            eq_(cursor.nextset_count, 1)
+
+            # the released result can't be advanced to the third set
+            assert_raises_message(
+                exc.ResourceClosedError,
+                "already been released",
+                result.next_result_set,
+            )
+            eq_(cursor.close_count, 1)
