@@ -17,13 +17,13 @@ from unittest.mock import patch
 import pytest
 
 import zeroconf as r
-from zeroconf import DNSAddress, RecordUpdate, const
+from zeroconf import AddressFamilyState, DNSAddress, RecordUpdate, const
 from zeroconf._protocol.outgoing import DNSOutgoing
 from zeroconf._services import info
 from zeroconf._services.info import ServiceInfo, _has_more_scope_info
 from zeroconf._utils.ipaddress import ZeroconfIPv4Address
 from zeroconf._utils.net import IPVersion
-from zeroconf.asyncio import AsyncZeroconf
+from zeroconf.asyncio import AsyncServiceInfo, AsyncZeroconf
 
 from .. import (
     QUICK_REQUEST_TIMEOUT_MS,
@@ -2857,6 +2857,68 @@ def test_denial_is_reset_when_srv_changes_server(zc: r.Zeroconf) -> None:
     zc.cache.async_add_records([_nsec(denied_host, [const._TYPE_TXT])])
     info.async_update_records(zc, now, [RecordUpdate(_srv(registration_name, denied_host), None)])
     assert (info._ipv4_denied, info._ipv6_denied) == (True, True)
+
+
+def test_address_family_state_requires_a_single_version(zc: r.Zeroconf) -> None:
+    """address_family_state rejects IPVersion.All since one state cannot cover both families."""
+    type_ = "_http._tcp.local."
+    info = ServiceInfo(type_, f"famstateall.{type_}")
+    with pytest.raises(ValueError, match="IPVersion"):
+        info.address_family_state(IPVersion.All)
+
+
+def test_address_family_state_tracks_current_srv_target(zc: r.Zeroconf) -> None:
+    """Per-family state follows the current SRV target; a late answer for the old target is ignored."""
+    type_ = "_http._tcp.local."
+    registration_name = f"famstate.{type_}"
+    old_host = "famstate-old.local."
+    new_host = "famstate-new.local."
+    info = AsyncServiceInfo(type_, registration_name)
+    now = r.current_time_millis()
+
+    assert info.address_family_state(IPVersion.V4Only) is AddressFamilyState.Pending
+    assert info.address_family_state(IPVersion.V6Only) is AddressFamilyState.Pending
+
+    # the first target answers A and denies AAAA via NSEC
+    info.async_update_records(
+        zc,
+        now,
+        [
+            RecordUpdate(_srv(registration_name, old_host), None),
+            RecordUpdate(
+                r.DNSAddress(
+                    old_host,
+                    const._TYPE_A,
+                    const._CLASS_IN | const._CLASS_UNIQUE,
+                    120,
+                    socket.inet_aton("192.0.2.1"),
+                ),
+                None,
+            ),
+            RecordUpdate(_nsec(old_host, [const._TYPE_A]), None),
+        ],
+    )
+    assert info.address_family_state(IPVersion.V4Only) is AddressFamilyState.Resolved
+    assert info.address_family_state(IPVersion.V6Only) is AddressFamilyState.Denied
+
+    # the SRV target moves, then the old host's AAAA arrives late
+    info.async_update_records(zc, now, [RecordUpdate(_srv(registration_name, new_host), None)])
+    old_aaaa = r.DNSAddress(
+        old_host,
+        const._TYPE_AAAA,
+        const._CLASS_IN | const._CLASS_UNIQUE,
+        120,
+        socket.inet_pton(socket.AF_INET6, "2001:db8::1"),
+    )
+    zc.cache.async_add_records([old_aaaa])
+    info.async_update_records(zc, now, [RecordUpdate(old_aaaa, None)])
+
+    # the old host keeps its record in the cache, but the new target
+    # still waits for answers of its own for both families
+    assert zc.cache.get_by_details(old_host, const._TYPE_AAAA, const._CLASS_IN) is not None
+    assert info.address_family_state(IPVersion.V4Only) is AddressFamilyState.Pending
+    assert info.address_family_state(IPVersion.V6Only) is AddressFamilyState.Pending
+    assert info.addresses == []
 
 
 def test_newer_nsec_clears_previous_denial(zc: r.Zeroconf) -> None:

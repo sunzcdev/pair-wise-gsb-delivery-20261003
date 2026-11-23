@@ -44,6 +44,7 @@ from ._services import (  # noqa # import needed for backwards compat
 )
 from ._services.browser import ServiceBrowser
 from ._services.info import (  # noqa # import needed for backwards compat
+    AddressFamilyState,
     AddressResolver,
     AddressResolverIPv4,
     AddressResolverIPv6,
@@ -78,6 +79,7 @@ __license__ = "LGPL"
 
 
 __all__ = [
+    "AddressFamilyState",
     "AbstractMethodException",
     "BadTypeInNameException",
     "DNSQuestionType",

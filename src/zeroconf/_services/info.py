@@ -8,6 +8,7 @@ in the project's git history.
 from __future__ import annotations
 
 import asyncio
+import enum
 import random
 import warnings
 from collections.abc import Sequence
@@ -66,6 +67,7 @@ from ..const import (
 
 _IPVersion_All_value = IPVersion.All.value
 _IPVersion_V4Only_value = IPVersion.V4Only.value
+_IPVersion_V6Only_value = IPVersion.V6Only.value
 # https://datatracker.ietf.org/doc/html/rfc6762#section-5.2
 # The most common case for calling ServiceInfo is from a
 # ServiceBrowser. After the first request we add a few random
@@ -133,6 +135,15 @@ def instance_name_from_service_info(info: ServiceInfo, strict: bool = True) -> s
     if not info.type.endswith(service_name):
         raise BadTypeInNameException
     return info.name[: -len(service_name) - 1]
+
+
+@enum.unique
+class AddressFamilyState(enum.Enum):
+    """Resolution state of one address family for the current SRV target."""
+
+    Pending = 1
+    Resolved = 2
+    Denied = 3
 
 
 class ServiceInfo(RecordUpdateListener):
@@ -253,6 +264,26 @@ class ServiceInfo(RecordUpdateListener):
                 )
             ),
         )
+
+    def address_family_state(self, version: IPVersion) -> AddressFamilyState:
+        """State of one address family for the current SRV target.
+
+        Denied means an NSEC record asserted the address type does not
+        exist (RFC 6762 section 6.1); pending means neither an address
+        nor a denial has arrived yet. Only the current SRV target counts:
+        the state is re-derived when the target changes, so late answers
+        for a previous target never affect it.
+        """
+        version_value = version.value
+        if version_value == _IPVersion_V4Only_value:
+            if self._ipv4_addresses:
+                return AddressFamilyState.Resolved
+            return AddressFamilyState.Denied if self._ipv4_denied else AddressFamilyState.Pending
+        if version_value == _IPVersion_V6Only_value:
+            if self._ipv6_addresses:
+                return AddressFamilyState.Resolved
+            return AddressFamilyState.Denied if self._ipv6_denied else AddressFamilyState.Pending
+        raise ValueError("version must be IPVersion.V4Only or IPVersion.V6Only")
 
     @property
     def addresses(self) -> list[bytes]:

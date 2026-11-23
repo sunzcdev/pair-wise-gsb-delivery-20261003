@@ -44,6 +44,7 @@ cdef object QM_QUESTION
 
 cdef object _IPVersion_All_value
 cdef object _IPVersion_V4Only_value
+cdef object _IPVersion_V6Only_value
 
 cdef unsigned int _DUPLICATE_QUESTION_INTERVAL
 
