@@ -92,6 +92,16 @@ class HTTPResponseBodyEvent(TypedDict):
     more_body: bool
 
 
+class HTTPResponseZeroCopySendEvent(TypedDict):
+    # ASGI http.response.zerocopysend extension. ``file`` is an open file
+    # descriptor; ``offset``/``count`` select the byte range to transmit.
+    type: Literal["http.response.zerocopysend"]
+    file: int
+    offset: NotRequired[int]
+    count: NotRequired[int]
+    more_body: NotRequired[bool]
+
+
 class HTTPResponseTrailersEvent(TypedDict):
     type: Literal["http.response.trailers"]
     headers: Iterable[tuple[bytes, bytes]]
@@ -197,6 +207,7 @@ ASGIReceiveEvent = (
 ASGISendEvent = (
     HTTPResponseStartEvent
     | HTTPResponseBodyEvent
+    | HTTPResponseZeroCopySendEvent
     | HTTPResponseTrailersEvent
     | HTTPServerPushEvent
     | HTTPEarlyHintEvent

@@ -1,3 +1,12 @@
+Unreleased
+----------
+
+* Support the WSGI ``wsgi.file_wrapper`` environ entry. Files are streamed
+  chunk by chunk, and negotiated to the ASGI ``http.response.zerocopysend``
+  extension when the connection advertises it. The server takes ownership of
+  the handed-over handle and always closes it, including on interrupted
+  transfers; the file is never re-opened from its disk path.
+
 0.18.0 2025-11-08
 -----------------
 

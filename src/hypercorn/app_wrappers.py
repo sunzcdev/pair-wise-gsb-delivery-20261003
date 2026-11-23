@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import io
+import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from functools import partial
 from io import BytesIO
+from typing import IO
 
 from .typing import (
     ASGIFramework,
@@ -14,9 +17,52 @@ from .typing import (
     WSGIFramework,
 )
 
+# The ASGI extension negotiated for zero-copy file transmission. A backend
+# (or test harness) advertises the capability by placing this key in the
+# request scope's ``extensions`` mapping.
+ZERO_COPY_SEND_EXTENSION = "http.response.zerocopysend"
+
+# Default block size used when a file has to be streamed chunk by chunk.
+DEFAULT_FILE_BLOCK_SIZE = 8192
+
 
 class InvalidPathError(Exception):
     pass
+
+
+class FileWrapper:
+    """PEP 3333 ``wsgi.file_wrapper`` implementation.
+
+    A WSGI application hands a pre-opened file (and optionally a block size)
+    to ``environ["wsgi.file_wrapper"]`` and returns the resulting iterable
+    instead of reading the file itself. Only bytes from the current file
+    position onwards are delivered.
+
+    Ownership of the file is transferred to the server with the returned
+    wrapper: the server iterates the wrapper and, once the response is
+    complete or the connection is abandoned, calls :meth:`close` to release
+    the underlying handle. The file is therefore never re-opened from its
+    (possibly missing or altered) disk path.
+    """
+
+    def __init__(self, file: IO[bytes], block_size: int = DEFAULT_FILE_BLOCK_SIZE) -> None:
+        self.file = file
+        self.block_size = block_size
+
+    def __iter__(self) -> Iterator[bytes]:
+        return self
+
+    def __next__(self) -> bytes:
+        data = self.file.read(self.block_size)
+        if not data:
+            raise StopIteration
+        return data
+
+    def close(self) -> None:
+        # Idempotent: iterating to exhaustion and an interrupted transfer
+        # must both be able to release the handle safely.
+        if hasattr(self.file, "close"):
+            self.file.close()
 
 
 class ASGIWrapper:
@@ -80,10 +126,17 @@ class WSGIWrapper:
         except InvalidPathError:
             await send({"type": "http.response.start", "status": 404, "headers": []})
         else:
-            await sync_spawn(self.run_app, environ, partial(call_soon, send))
+            await sync_spawn(
+                self.run_app,
+                environ,
+                partial(call_soon, send),
+                ZERO_COPY_SEND_EXTENSION in scope.get("extensions", {}),
+            )
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
-    def run_app(self, environ: dict, send: Callable) -> None:
+    def run_app(
+        self, environ: dict, send: Callable, supports_zero_copy_send: bool = False
+    ) -> None:
         headers: list[tuple[bytes, bytes]]
         response_started = False
         status_code: int | None = None
@@ -106,19 +159,69 @@ class WSGIWrapper:
         response_body = self.app(environ, start_response)
 
         try:
+            if isinstance(response_body, FileWrapper) and supports_zero_copy_send:
+                file = response_body.file
+                if _can_zero_copy_send(file):
+                    if not response_started:
+                        raise RuntimeError("WSGI app did not call start_response")
+                    self._send_file(file, send, status_code, headers)
+                    return
+
             first_chunk = True
             for output in response_body:
                 if first_chunk:
                     if not response_started:
                         raise RuntimeError("WSGI app did not call start_response")
 
-                    send({"type": "http.response.start", "status": status_code, "headers": headers})
+                    send(
+                        {
+                            "type": "http.response.start",
+                            "status": status_code,
+                            "headers": headers,
+                        }
+                    )
                     first_chunk = False
 
                 send({"type": "http.response.body", "body": output, "more_body": True})
         finally:
             if hasattr(response_body, "close"):
                 response_body.close()
+
+    def _send_file(
+        self,
+        file: IO[bytes],
+        send: Callable,
+        status_code: int | None,
+        headers: list[tuple[bytes, bytes]],
+    ) -> None:
+        # Honour the current position of the pre-opened handle and only hand
+        # over the bytes from there to the end of the file. The handle itself
+        # is passed (as a file descriptor); no disk path is re-opened.
+        offset = file.tell()
+        count = os.fstat(file.fileno()).st_size - offset
+
+        send({"type": "http.response.start", "status": status_code, "headers": headers})
+        if count > 0:
+            send(
+                {
+                    "type": ZERO_COPY_SEND_EXTENSION,
+                    "file": file.fileno(),
+                    "offset": offset,
+                    "count": count,
+                    "more_body": True,
+                }
+            )
+
+
+def _can_zero_copy_send(file: IO[bytes]) -> bool:
+    """Zero-copy transmission requires a real, open OS file descriptor."""
+    if file.closed or not hasattr(file, "fileno") or not hasattr(file, "tell"):
+        return False
+    try:
+        file.fileno()
+    except (OSError, ValueError, io.UnsupportedOperation):
+        return False
+    return True
 
 
 def _build_environ(scope: HTTPScope, body: bytes) -> dict:
@@ -143,6 +246,7 @@ def _build_environ(scope: HTTPScope, body: bytes) -> dict:
         "wsgi.url_scheme": scope.get("scheme", "http"),
         "wsgi.input": BytesIO(body),
         "wsgi.errors": sys.stdout,
+        "wsgi.file_wrapper": FileWrapper,
         "wsgi.multithread": True,
         "wsgi.multiprocess": True,
         "wsgi.run_once": False,
