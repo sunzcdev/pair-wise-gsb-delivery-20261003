@@ -1,0 +1,1576 @@
+import pickle
+from unittest.mock import ANY, Mock, PropertyMock, patch
+from uuid import uuid4
+
+import pytest
+from billiard.einfo import ExceptionInfo
+from kombu.exceptions import EncodeError, OperationalError
+
+from celery import group, signals, states, uuid
+from celery.app.amqp import _callback_publish_retry
+from celery.app.task import Context
+from celery.app.trace import (TraceInfo, build_tracer, fast_trace_task, get_log_policy, get_task_name,
+                              log_policy_expected, log_policy_ignore, log_policy_internal, log_policy_reject,
+                              log_policy_unexpected, report_internal_error, reset_worker_optimizations,
+                              setup_worker_optimizations, trace_task, trace_task_ret, traceback_clear)
+from celery.backends.base import BaseDictBackend
+from celery.backends.cache import CacheBackend
+from celery.exceptions import BackendGetMetaError, Ignore, Reject, Retry
+from celery.result import AsyncResult
+from celery.states import PENDING
+from celery.worker.state import successful_requests
+from t.unit.utils.test_dispatcher import garbage_collect
+
+
+def trace(
+    app, task, args=(), kwargs={}, propagate=False,
+    eager=True, request=None, task_id='id-1', **opts
+):
+    t = build_tracer(task.name, task, eager=eager, propagate=propagate, app=app, **opts)
+    ret = t(task_id, args, kwargs, request)
+    return ret.retval, ret.info, ret.runtime
+
+
+class TraceCase:
+    def setup_method(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        self.add = add
+
+        @self.app.task(shared=False, ignore_result=True)
+        def add_cast(x, y):
+            return x + y
+
+        self.add_cast = add_cast
+
+        @self.app.task(shared=False)
+        def raises(exc):
+            raise exc
+
+        self.raises = raises
+
+    def trace(self, *args, **kwargs):
+        return trace(self.app, *args, **kwargs)
+
+
+class test_trace(TraceCase):
+    @pytest.mark.parametrize('group_as_link', [False, True])
+    def test_grouped_callbacks_publish_in_retry_context(self, group_as_link):
+        @self.app.task(shared=False)
+        def link(value, extra):
+            return value + extra
+
+        callbacks = [link.s(1), link.s(2)]
+        if group_as_link:
+            callbacks = [group(callbacks, app=self.app), link.s(3)]
+        contexts = []
+
+        def publish(*args, **kwargs):
+            contexts.append(_callback_publish_retry.get())
+
+        producer, acquire = self._producer_for_publish(publish)
+        with acquire:
+            result, info, _ = self.trace(
+                self.add, (2, 2), {}, request={'callbacks': callbacks}, eager=False,
+            )
+        assert result == 4
+        assert info is None
+        assert producer.publish.call_count == len(contexts)
+        assert contexts == [True] * (3 if group_as_link else 2)
+        assert _callback_publish_retry.get() is False
+
+    def _producer_for_publish(self, side_effect):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def reraise_as_library_errors():
+            yield
+
+        producer = Mock(name='producer')
+        producer.connection.recoverable_connection_errors = ()
+        producer.publish.side_effect = side_effect
+        producer.connection._reraise_as_library_errors = reraise_as_library_errors
+        acquire = Mock(name='producer_or_acquire')
+        acquire.return_value.__enter__ = Mock(return_value=producer)
+        acquire.return_value.__exit__ = Mock(return_value=False)
+        return producer, patch.object(self.app, 'producer_or_acquire', acquire)
+
+    @pytest.mark.parametrize('acks_late', [False, True])
+    @pytest.mark.parametrize('dispatch', ['callbacks', 'chain'])
+    @patch('celery.canvas.maybe_signature')
+    def test_refused_publish_retries_without_rerunning_body(
+        self, maybe_signature, dispatch, acks_late,
+    ):
+        self.app.conf.task_publish_retry_policy = {
+            'max_retries': 2, 'interval_start': 0, 'interval_step': 0, 'interval_max': 0,
+        }
+        self.add.acks_late = acks_late
+
+        @self.app.task(shared=False)
+        def link(x, y):
+            return x + y
+
+        sig = link.s(2)
+        maybe_signature.return_value = sig
+        request = {dispatch: [sig], 'root_id': 'root'}
+        producer, acquire = self._producer_for_publish(
+            [OperationalError('refused'), None],
+        )
+        with acquire, patch.object(self.add, 'run', wraps=self.add.run) as run:
+            result, info, _ = self.trace(
+                self.add, (2, 2), {}, request=request, eager=False,
+            )
+        assert result == 4
+        assert info is None
+        assert producer.publish.call_count == 2
+        run.assert_called_once_with(2, 2)
+        assert self.add.backend.get_state('id-1') == states.SUCCESS
+
+    @pytest.mark.parametrize('acks_late', [False, True])
+    @pytest.mark.parametrize('dispatch', ['callbacks', 'chain'])
+    def test_refused_publish_exhaustion_is_a_task_failure(self, dispatch, acks_late):
+        self.app.conf.task_publish_retry_policy = {
+            'max_retries': 2, 'interval_start': 0, 'interval_step': 0, 'interval_max': 0,
+        }
+        self.add.acks_late = acks_late
+        task_id = uuid()
+
+        @self.app.task(shared=False)
+        def link(x, y):
+            return x + y
+
+        sig = link.s(2).set(task_id=uuid())
+        producer, acquire = self._producer_for_publish(OperationalError('refused'))
+        with acquire, patch.object(self.add, 'run', wraps=self.add.run) as run, \
+                patch('celery.app.trace.signals.task_internal_error.send') as internal_error:
+            _, info, _ = self.trace(
+                self.add, (2, 2), {}, request={'id': task_id, dispatch: [sig]},
+                task_id=task_id, eager=False,
+            )
+        assert info.state == states.FAILURE
+        assert producer.publish.call_count == 3
+        run.assert_called_once_with(2, 2)
+        internal_error.assert_not_called()
+        assert self.add.backend.get_state(task_id) == states.FAILURE
+        if dispatch == 'chain':
+            assert self.add.backend.get_state(sig.id) == states.FAILURE
+
+    @pytest.mark.parametrize('dispatch', ['callbacks', 'chain'])
+    @pytest.mark.parametrize('error', [EncodeError, OperationalError])
+    def test_result_write_error_after_callbacks_preserves_error_handling(self, dispatch, error):
+        @self.app.task(shared=False, after_return=Mock())
+        def add(x, y):
+            return x + y
+
+        @self.app.task(shared=False)
+        def link(value):
+            return value
+
+        task_id, sig = uuid(), link.s()
+        with patch.object(sig, 'apply_async') as apply_async, \
+                patch.object(add.backend, 'mark_as_done', side_effect=error('store failed')), \
+                patch.object(add, 'run', wraps=add.run) as run, \
+                patch('celery.app.trace.signals.task_internal_error.send') as internal_error:
+            _, info, _ = self.trace(
+                add, (2, 2), {}, request={'id': task_id, dispatch: [sig]},
+                task_id=task_id, eager=False,
+            )
+        apply_async.assert_called_once()
+        run.assert_called_once_with(2, 2)
+        assert info.state == states.FAILURE
+        assert add.backend.get_state(task_id) == states.FAILURE
+        if error is OperationalError:
+            internal_error.assert_called_once()
+            add.after_return.assert_not_called()
+        else:
+            internal_error.assert_not_called()
+            add.after_return.assert_called_once_with(states.FAILURE, ANY, task_id, (2, 2), {}, None)
+
+    def test_trace_successful(self):
+        retval, info, _ = self.trace(self.add, (2, 2), {})
+        assert info is None
+        assert retval == 4
+
+    def test_trace_before_start(self):
+        @self.app.task(shared=False, before_start=Mock())
+        def add_with_before_start(x, y):
+            return x + y
+
+        self.trace(add_with_before_start, (2, 2), {})
+        add_with_before_start.before_start.assert_called()
+
+    def test_trace_on_success(self):
+        @self.app.task(shared=False, on_success=Mock())
+        def add_with_success(x, y):
+            return x + y
+
+        self.trace(add_with_success, (2, 2), {})
+        add_with_success.on_success.assert_called()
+
+    def test_trace_on_success_raises_after_success_was_stored(self):
+        @self.app.task(shared=False,
+                       on_success=Mock(side_effect=RuntimeError('hook failed')),
+                       after_return=Mock())
+        def add_with_failing_success(x, y):
+            return x + y
+
+        on_task_success = Mock()
+        on_task_failure = Mock()
+        on_task_internal_error = Mock()
+        signals.task_success.connect(on_task_success)
+        signals.task_failure.connect(on_task_failure)
+        signals.task_internal_error.connect(on_task_internal_error)
+        try:
+            with patch('celery.app.trace.TraceInfo.handle_failure') as handle_failure, \
+                    patch('celery.app.trace.logger') as mock_logger:
+                retval, info, _ = self.trace(
+                    add_with_failing_success, (2, 2), {}, eager=False,
+                )
+        finally:
+            signals.task_success.receivers[:] = []
+            signals.task_failure.receivers[:] = []
+            signals.task_internal_error.receivers[:] = []
+
+        assert info is None
+        assert retval == 4
+        # The cache backend keeps a stored SUCCESS even on main, so the state
+        # check alone doesn't pin the fix: handle_failure, the task_success
+        # receiver and after_return do.
+        assert add_with_failing_success.backend.get_state('id-1') == states.SUCCESS
+        handle_failure.assert_not_called()
+        on_task_success.assert_called()
+        on_task_failure.assert_not_called()
+        on_task_internal_error.assert_not_called()
+        add_with_failing_success.after_return.assert_called_with(
+            states.SUCCESS, 4, 'id-1', (2, 2), {}, None,
+        )
+        mock_logger.exception.assert_called_once()
+        assert 'on_success handler raised' in mock_logger.exception.call_args[0][0]
+
+    def test_trace_on_success_raises_eager_propagates(self):
+        @self.app.task(shared=False,
+                       on_success=Mock(side_effect=RuntimeError('hook failed')))
+        def add_with_failing_success(x, y):
+            return x + y
+
+        with pytest.raises(RuntimeError, match='hook failed'):
+            self.trace(add_with_failing_success, (2, 2), {}, eager=True)
+
+    def test_trace_on_success_raises_reject_is_not_swallowed(self):
+        @self.app.task(shared=False,
+                       on_success=Mock(side_effect=Reject('no', requeue=False)))
+        def add_with_rejecting_success(x, y):
+            return x + y
+
+        with pytest.raises(Reject):
+            self.trace(add_with_rejecting_success, (2, 2), {}, eager=False)
+
+    def test_trace_after_return_raises_reject_is_not_swallowed(self):
+        @self.app.task(shared=False,
+                       after_return=Mock(side_effect=Reject('no', requeue=False)))
+        def add_with_rejecting_after_return(x, y):
+            return x + y
+
+        with pytest.raises(Reject):
+            self.trace(add_with_rejecting_after_return, (2, 2), {}, eager=False)
+
+    def test_trace_on_success_raises_memory_error_propagates(self):
+        @self.app.task(shared=False,
+                       on_success=Mock(side_effect=MemoryError('oom')))
+        def add_with_oom_success(x, y):
+            return x + y
+
+        with pytest.raises(MemoryError):
+            self.trace(add_with_oom_success, (2, 2), {}, eager=False)
+
+    @pytest.mark.parametrize('fails', [False, True])
+    def test_trace_after_return_raises(self, fails):
+        @self.app.task(shared=False,
+                       after_return=Mock(side_effect=RuntimeError('hook failed')))
+        def task_with_failing_after_return(x, y):
+            if fails:
+                raise KeyError('task failed')
+            return x + y
+
+        with patch('celery.app.trace.TraceInfo.handle_failure',
+                   return_value=ExceptionInfo) as handle_failure, \
+                patch('celery.app.trace.logger') as mock_logger:
+            self.trace(task_with_failing_after_return, (2, 2), {}, eager=False)
+
+        # A failed task is recorded once, by its own exception; a successful
+        # one is not recorded as failed at all.
+        assert handle_failure.call_count == (1 if fails else 0)
+        mock_logger.exception.assert_called_once()
+        assert 'after_return handler raised' in mock_logger.exception.call_args[0][0]
+
+    def test_trace_after_return_raises_eager_propagates(self):
+        @self.app.task(shared=False,
+                       after_return=Mock(side_effect=RuntimeError('hook failed')))
+        def add_with_failing_after_return(x, y):
+            return x + y
+
+        with pytest.raises(RuntimeError, match='hook failed'):
+            self.trace(add_with_failing_after_return, (2, 2), {}, eager=True)
+
+    def test_get_log_policy(self):
+        einfo = Mock(name='einfo')
+        einfo.internal = False
+        assert get_log_policy(self.add, einfo, Reject()) is log_policy_reject
+        assert get_log_policy(self.add, einfo, Ignore()) is log_policy_ignore
+
+        self.add.throws = (TypeError,)
+        assert get_log_policy(self.add, einfo, KeyError()) is log_policy_unexpected
+        assert get_log_policy(self.add, einfo, TypeError()) is log_policy_expected
+
+        einfo2 = Mock(name='einfo2')
+        einfo2.internal = True
+        assert get_log_policy(self.add, einfo2, KeyError()) is log_policy_internal
+
+    def test_get_task_name(self):
+        assert get_task_name(Context({}), 'default') == 'default'
+        assert get_task_name(Context({'shadow': None}), 'default') == 'default'
+        assert get_task_name(Context({'shadow': ''}), 'default') == 'default'
+        assert get_task_name(Context({'shadow': 'test'}), 'default') == 'test'
+
+    def test_trace_after_return(self):
+        @self.app.task(shared=False, after_return=Mock())
+        def add_with_after_return(x, y):
+            return x + y
+
+        self.trace(add_with_after_return, (2, 2), {})
+        add_with_after_return.after_return.assert_called()
+
+    def test_with_prerun_receivers(self):
+        on_prerun = Mock()
+        signals.task_prerun.connect(on_prerun)
+        try:
+            self.trace(self.add, (2, 2), {})
+            on_prerun.assert_called()
+        finally:
+            signals.task_prerun.receivers[:] = []
+
+    def test_with_postrun_receivers(self):
+        on_postrun = Mock()
+        signals.task_postrun.connect(on_postrun)
+        try:
+            self.trace(self.add, (2, 2), {})
+            on_postrun.assert_called()
+        finally:
+            signals.task_postrun.receivers[:] = []
+
+    def test_with_success_receivers(self):
+        on_success = Mock()
+        signals.task_success.connect(on_success)
+        try:
+            _, _, expected_runtime = self.trace(self.add, (2, 2), {})
+            on_success.assert_called()
+            runtime = on_success.call_args[1]['runtime']
+            assert isinstance(runtime, float)
+            assert runtime == expected_runtime
+        finally:
+            signals.task_success.receivers[:] = []
+
+    @pytest.mark.parametrize('signal', [
+        signals.task_prerun,
+        signals.task_postrun,
+        signals.task_success,
+    ], ids=lambda signal: signal.name)
+    def test_trace_works_after_receivers_disconnect_and_connect(self, signal):
+        received_senders = []
+
+        def temporary_receiver(**kwargs):
+            pass
+
+        def receiver(sender, **kwargs):
+            received_senders.append(sender)
+
+        signal.connect(temporary_receiver)
+        try:
+            tracer = build_tracer(self.add.name, self.add, app=self.app)
+            signal.disconnect(temporary_receiver)
+            del temporary_receiver
+            garbage_collect()
+
+            signal.connect(receiver)
+            result = tracer('id-1', (2, 2), {})
+        finally:
+            signal.disconnect(receiver)
+
+        assert result.info is None
+        assert result.retval == 4
+        assert received_senders == [self.add]
+
+    def test_when_chord_part(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        add.backend = Mock()
+
+        request = {'chord': uuid()}
+        self.trace(add, (2, 2), {}, request=request)
+        add.backend.mark_as_done.assert_called()
+        args, kwargs = add.backend.mark_as_done.call_args
+        assert args[0] == 'id-1'
+        assert args[1] == 4
+        assert args[2].chord == request['chord']
+        assert not args[3]
+
+    def test_when_backend_cleanup_raises(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        add.backend = Mock(name='backend')
+        add.backend.process_cleanup.side_effect = KeyError()
+        self.trace(add, (2, 2), {}, eager=False)
+        add.backend.process_cleanup.assert_called_with()
+        add.backend.process_cleanup.side_effect = MemoryError()
+        with pytest.raises(MemoryError):
+            self.trace(add, (2, 2), {}, eager=False)
+
+    def test_eager_task_does_not_store_result_even_if_not_ignore_result(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        add.backend = Mock(name='backend')
+        add.ignore_result = False
+
+        self.trace(add, (2, 2), {}, eager=True)
+
+        add.backend.mark_as_done.assert_called_once_with(
+            'id-1',     # task_id
+            4,          # result
+            ANY,        # request
+            False       # store_result
+        )
+
+    def test_eager_task_does_not_call_store_result(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = BaseDictBackend(app=self.app)
+        backend.store_result = Mock()
+        add.backend = backend
+        add.ignore_result = False
+
+        self.trace(add, (2, 2), {}, eager=True)
+
+        add.backend.store_result.assert_not_called()
+
+    def test_eager_task_will_store_result_if_proper_setting_is_set(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        add.backend = Mock(name='backend')
+        add.store_eager_result = True
+        add.ignore_result = False
+
+        self.trace(add, (2, 2), {}, eager=True)
+
+        add.backend.mark_as_done.assert_called_once_with(
+            'id-1',     # task_id
+            4,          # result
+            ANY,        # request
+            True        # store_result
+        )
+
+    def test_eager_task_with_setting_will_call_store_result(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = BaseDictBackend(app=self.app)
+        backend.store_result = Mock()
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+
+        self.trace(add, (2, 2), {}, eager=True)
+
+        add.backend.store_result.assert_called_once_with(
+            'id-1',
+            4,
+            states.SUCCESS,
+            request=ANY
+        )
+
+    def test_when_backend_raises_exception(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        add.backend = Mock(name='backend')
+        add.backend.mark_as_done.side_effect = Exception()
+        add.backend.mark_as_failure.side_effect = Exception("failed mark_as_failure")
+
+        with pytest.raises(Exception):
+            self.trace(add, (2, 2), {}, eager=False)
+
+    def test_traceback_clear(self):
+        import inspect
+        import sys
+        sys.exc_clear = Mock()
+        frame_list = []
+
+        def raise_dummy():
+            frame_str_temp = str(inspect.currentframe().__repr__)
+            frame_list.append(frame_str_temp)
+            raise KeyError('foo')
+
+        try:
+            raise_dummy()
+        except KeyError as exc:
+            traceback_clear(exc)
+
+            tb_ = exc.__traceback__
+            while tb_ is not None:
+                if str(tb_.tb_frame.__repr__) == frame_list[0]:
+                    assert len(tb_.tb_frame.f_locals) == 0
+                tb_ = tb_.tb_next
+
+        try:
+            raise_dummy()
+        except KeyError as exc:
+            traceback_clear()
+
+            tb_ = exc.__traceback__
+            while tb_ is not None:
+                if str(tb_.tb_frame.__repr__) == frame_list[0]:
+                    assert len(tb_.tb_frame.f_locals) == 0
+                tb_ = tb_.tb_next
+
+        try:
+            raise_dummy()
+        except KeyError as exc:
+            traceback_clear(str(exc))
+
+            tb_ = exc.__traceback__
+            while tb_ is not None:
+                if str(tb_.tb_frame.__repr__) == frame_list[0]:
+                    assert len(tb_.tb_frame.f_locals) == 0
+                tb_ = tb_.tb_next
+
+    @patch('celery.app.trace.traceback_clear')
+    def test_when_Ignore(self, mock_traceback_clear):
+        @self.app.task(shared=False)
+        def ignored():
+            raise Ignore()
+
+        retval, info, _ = self.trace(ignored, (), {})
+        assert info.state == states.IGNORED
+        mock_traceback_clear.assert_called()
+
+    @patch('celery.app.trace.traceback_clear')
+    def test_when_Reject(self, mock_traceback_clear):
+        @self.app.task(shared=False)
+        def rejecting():
+            raise Reject()
+
+        retval, info, _ = self.trace(rejecting, (), {})
+        assert info.state == states.REJECTED
+        mock_traceback_clear.assert_called()
+
+    def test_backend_cleanup_raises(self):
+        self.add.backend.process_cleanup = Mock()
+        self.add.backend.process_cleanup.side_effect = RuntimeError()
+        self.trace(self.add, (2, 2), {})
+
+    @patch('celery.canvas.maybe_signature')
+    def test_callbacks__scalar(self, maybe_signature):
+        sig = Mock(name='sig')
+        request = {'callbacks': [sig], 'root_id': 'root'}
+        maybe_signature.return_value = sig
+        retval, _, _ = self.trace(self.add, (2, 2), {}, request=request)
+        sig.apply_async.assert_called_with(
+            (4,), parent_id='id-1', root_id='root', priority=None
+        )
+
+    @patch('celery.canvas.maybe_signature')
+    def test_chain_proto2(self, maybe_signature):
+        sig = Mock(name='sig')
+        sig2 = Mock(name='sig2')
+        request = {'chain': [sig2, sig], 'root_id': 'root'}
+        maybe_signature.return_value = sig
+        retval, _, _ = self.trace(self.add, (2, 2), {}, request=request)
+        sig.apply_async.assert_called_with(
+            (4,), parent_id='id-1', root_id='root', chain=[sig2], priority=None
+        )
+
+    @patch('celery.canvas.maybe_signature')
+    def test_chain_inherit_parent_priority(self, maybe_signature):
+        self.app.conf.task_inherit_parent_priority = True
+        sig = Mock(name='sig')
+        sig2 = Mock(name='sig2')
+        request = {
+            'chain': [sig2, sig],
+            'root_id': 'root',
+            'delivery_info': {'priority': 42},
+        }
+        maybe_signature.return_value = sig
+        retval, _, _ = self.trace(self.add, (2, 2), {}, request=request)
+        sig.apply_async.assert_called_with(
+            (4,), parent_id='id-1', root_id='root', chain=[sig2], priority=42
+        )
+
+    @patch('celery.canvas.maybe_signature')
+    def test_callbacks__EncodeError(self, maybe_signature):
+        sig = Mock(name='sig')
+        request = {'callbacks': [sig], 'root_id': 'root'}
+        maybe_signature.return_value = sig
+        sig.apply_async.side_effect = EncodeError()
+        retval, einfo, _ = self.trace(self.add, (2, 2), {}, request=request)
+        assert einfo.state == states.FAILURE
+
+    @patch('celery.canvas.maybe_signature')
+    @patch('celery.app.trace.group.apply_async')
+    def test_callbacks__sigs(self, group_, maybe_signature):
+        sig1 = Mock(name='sig')
+        sig2 = Mock(name='sig2')
+        sig3 = group([Mock(name='g1'), Mock(name='g2')], app=self.app)
+        sig3.apply_async = Mock(name='gapply')
+        request = {'callbacks': [sig1, sig3, sig2], 'root_id': 'root'}
+
+        def pass_value(s, *args, **kwargs):
+            return s
+
+        maybe_signature.side_effect = pass_value
+        retval, _, _ = self.trace(self.add, (2, 2), {}, request=request)
+        group_.assert_called_with((4,), parent_id='id-1', root_id='root', priority=None)
+        sig3.apply_async.assert_called_with(
+            (4,), parent_id='id-1', root_id='root', priority=None
+        )
+
+    @patch('celery.canvas.maybe_signature')
+    @patch('celery.app.trace.group.apply_async')
+    def test_callbacks__only_groups(self, group_, maybe_signature):
+        sig1 = group([Mock(name='g1'), Mock(name='g2')], app=self.app)
+        sig2 = group([Mock(name='g3'), Mock(name='g4')], app=self.app)
+        sig1.apply_async = Mock(name='gapply')
+        sig2.apply_async = Mock(name='gapply')
+        request = {'callbacks': [sig1, sig2], 'root_id': 'root'}
+
+        def pass_value(s, *args, **kwargs):
+            return s
+
+        maybe_signature.side_effect = pass_value
+        retval, _, _ = self.trace(self.add, (2, 2), {}, request=request)
+        sig1.apply_async.assert_called_with(
+            (4,), parent_id='id-1', root_id='root', priority=None
+        )
+        sig2.apply_async.assert_called_with(
+            (4,), parent_id='id-1', root_id='root', priority=None
+        )
+
+    def test_trace_SystemExit(self):
+        with pytest.raises(SystemExit):
+            self.trace(self.raises, (SystemExit(),), {})
+
+    @patch('celery.app.trace.traceback_clear')
+    def test_trace_Retry(self, mock_traceback_clear):
+        exc = Retry('foo', 'bar')
+        _, info, _ = self.trace(self.raises, (exc,), {})
+        assert info.state == states.RETRY
+        assert info.retval is exc
+        mock_traceback_clear.assert_called()
+
+    @patch('celery.app.trace.traceback_clear')
+    def test_trace_exception(self, mock_traceback_clear):
+        exc = KeyError('foo')
+        _, info, _ = self.trace(self.raises, (exc,), {})
+        assert info.state == states.FAILURE
+        assert info.retval is exc
+        mock_traceback_clear.assert_called()
+
+    def test_trace_task_ret__no_content_type(self):
+        trace_task_ret(
+            self.add.name, 'id1', {}, ((2, 2), {}, {}), None, None, app=self.app,
+        )
+
+    @patch('celery.app.trace._localized', [])
+    def test_fast_trace_task__empty_registry_raises_helpful_error(self):
+        with pytest.raises(RuntimeError, match='worker task registry is empty'):
+            fast_trace_task(
+                self.add.name,
+                'id1',
+                {},
+                ((2, 2), {}, {}),
+                None,
+                None,
+                app=self.app,
+            )
+
+    def test_fast_trace_task__no_content_type(self):
+        self.app.tasks[self.add.name].__trace__ = build_tracer(
+            self.add.name, self.add, app=self.app,
+        )
+        fast_trace_task(
+            self.add.name,
+            'id1',
+            {},
+            ((2, 2), {}, {}),
+            None,
+            None,
+            app=self.app,
+            _loc=[self.app.tasks, {}, 'hostname'],
+        )
+
+    def test_trace_exception_propagate(self):
+        with pytest.raises(KeyError):
+            self.trace(self.raises, (KeyError('foo'),), {}, propagate=True)
+
+    def test_report_internal_error_with_unpickleable_exception_type(self):
+        class LocalError(ValueError):
+            pass
+
+        try:
+            raise LocalError('internal error')
+        except LocalError as exc:
+            with pytest.warns(RuntimeWarning):
+                einfo = report_internal_error(self.add, exc)
+
+        restored = pickle.loads(pickle.dumps(einfo))
+
+        assert isinstance(restored, ExceptionInfo)
+        assert restored.internal is True
+        assert restored.type is Exception
+        assert isinstance(restored.exception, ValueError)
+        assert restored.exception.args == ('internal error',)
+        assert restored.traceback == einfo.traceback
+
+    def test_report_internal_error_with_pickleable_exception_type(self):
+        try:
+            raise ValueError('internal error')
+        except ValueError as exc:
+            with pytest.warns(RuntimeWarning):
+                einfo = report_internal_error(self.add, exc)
+
+        restored = pickle.loads(pickle.dumps(einfo))
+
+        assert restored.type is ValueError
+        assert isinstance(restored.exception, ValueError)
+        assert restored.exception.args == ('internal error',)
+
+    @patch('celery.app.trace.signals.task_internal_error.send')
+    @patch('celery.app.trace.build_tracer')
+    @patch('celery.app.trace.report_internal_error')
+    def test_outside_body_error(self, report_internal_error, build_tracer, send):
+        tracer = Mock()
+        tracer.side_effect = KeyError('foo')
+        build_tracer.return_value = tracer
+
+        @self.app.task(shared=False)
+        def xtask():
+            pass
+
+        trace_task(xtask, 'uuid', (), {})
+        assert report_internal_error.call_count
+        assert send.call_count
+        assert xtask.__trace__ is tracer
+
+    def test_backend_error_should_report_failure(self):
+        """check internal error is reported as failure.
+
+        In case of backend error, an exception may bubble up from trace and be
+        caught by trace_task.
+        """
+
+        @self.app.task(shared=False)
+        def xtask():
+            pass
+
+        xtask.backend = BaseDictBackend(app=self.app)
+        xtask.backend.mark_as_done = Mock()
+        xtask.backend.mark_as_done.side_effect = Exception()
+        xtask.backend.mark_as_failure = Mock()
+        xtask.backend.mark_as_failure.side_effect = Exception()
+
+        ret, info, _, _ = trace_task(xtask, 'uuid', (), {}, app=self.app)
+        assert info is not None
+        assert isinstance(ret, ExceptionInfo)
+
+    def test_deduplicate_successful_tasks__deduplication(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        assert trace(self.app, add, (1, 1), task_id=task_id, request=request)[:2] == (2, None)
+        assert trace(self.app, add, (1, 1), task_id=task_id, request=request)[:2] == (None, None)
+
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__no_deduplication(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        with patch('celery.app.trace.AsyncResult') as async_result_mock:
+            async_result_mock().state.return_value = PENDING
+            assert trace(self.app, add, (1, 1), task_id=task_id, request=request)[:2] == (2, None)
+            assert trace(self.app, add, (1, 1), task_id=task_id, request=request)[:2] == (2, None)
+
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__result_not_found(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        with patch('celery.app.trace.AsyncResult') as async_result_mock:
+            assert trace(self.app, add, (1, 1), task_id=task_id, request=request)[:2] == (2, None)
+            state_property = PropertyMock(side_effect=BackendGetMetaError)
+            type(async_result_mock()).state = state_property
+            assert trace(self.app, add, (1, 1), task_id=task_id, request=request)[:2] == (2, None)
+
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__cached_request(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        successful_requests.add(task_id)
+
+        assert trace(self.app, add, (1, 1), task_id=task_id,
+                     request=request)[:2] == (None, None)
+
+        successful_requests.clear()
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__backend_dedup_dispatches_chain(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        trace(self.app, add, (1, 1), task_id=task_id, request=request)
+
+        request_with_chain = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+            'chain': [self.add.s(10)],
+        }
+
+        with patch('celery.canvas.maybe_signature') as mock_signature:
+            mock_apply = Mock()
+            mock_signature.return_value.apply_async = mock_apply
+            trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
+            mock_apply.assert_called_once()
+            call_args = mock_apply.call_args
+            assert call_args[0] == ((2,),)
+            assert call_args[1]['parent_id'] == task_id
+            assert call_args[1]['root_id'] == task_id
+
+        successful_requests.discard(task_id)
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__backend_dedup_multi_element_chain(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        trace(self.app, add, (1, 1), task_id=task_id, request=request)
+
+        step2 = self.add.s(20)
+        step3 = self.add.s(30)
+        request_with_chain = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+            'chain': [step3, step2],
+        }
+
+        with patch('celery.canvas.maybe_signature') as mock_signature:
+            mock_apply = Mock()
+            mock_signature.return_value.apply_async = mock_apply
+            trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
+            mock_apply.assert_called_once()
+            call_args = mock_apply.call_args
+            assert call_args[1]['chain'] == [step3]
+
+        successful_requests.discard(task_id)
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__backend_dedup_adds_to_successful_requests(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        trace(self.app, add, (1, 1), task_id=task_id, request=request)
+
+        successful_requests.discard(task_id)
+
+        request_dedup = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+        }
+        with patch('celery.canvas.maybe_signature'):
+            trace(self.app, add, (1, 1), task_id=task_id, request=request_dedup)
+
+        assert task_id in successful_requests
+
+        successful_requests.discard(task_id)
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__backend_dedup_dispatch_failure_skips_successful_requests(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        trace(self.app, add, (1, 1), task_id=task_id, request=request)
+
+        successful_requests.discard(task_id)
+
+        request_with_chain = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+            'chain': [self.add.s(10)],
+        }
+        with patch('celery.canvas.maybe_signature') as mock_signature:
+            mock_signature.return_value.apply_async.side_effect = RuntimeError('broker down')
+            with patch('celery.app.trace.logger'):
+                with pytest.raises(Reject):
+                    trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
+
+        assert task_id not in successful_requests
+
+        successful_requests.discard(task_id)
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__inmemory_dedup_skips_chain(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+
+        task_id = str(uuid4())
+        request_with_chain = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+            'chain': [self.add.s(10)],
+        }
+
+        successful_requests.add(task_id)
+
+        with patch('celery.canvas.maybe_signature') as mock_signature:
+            mock_apply = Mock()
+            mock_signature.return_value.apply_async = mock_apply
+            trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
+            mock_apply.assert_not_called()
+
+        successful_requests.clear()
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_chain_dispatch_does_not_mutate_request_chain(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+
+        chain_list = [self.add.s(10), self.add.s(20)]
+        original_length = len(chain_list)
+        task_id = str(uuid4())
+        request = {
+            'id': task_id,
+            'delivery_info': {'redelivered': False},
+            'chain': chain_list,
+        }
+
+        with patch('celery.canvas.maybe_signature') as mock_signature:
+            mock_signature.return_value.apply_async = Mock()
+            trace(self.app, add, (1, 1), task_id=task_id, request=request)
+            call_args = mock_signature.return_value.apply_async.call_args
+            assert call_args[1]['chain'] == chain_list[:-1]
+        assert len(chain_list) == original_length
+
+    def test_deduplicate_successful_tasks__backend_dedup_dispatches_callbacks(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        trace(self.app, add, (1, 1), task_id=task_id, request=request)
+
+        request_with_callbacks = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+            'callbacks': [self.add.s(99)],
+        }
+
+        with patch('celery.canvas.maybe_signature') as mock_signature:
+            mock_apply = Mock()
+            mock_signature.return_value.apply_async = mock_apply
+            trace(self.app, add, (1, 1), task_id=task_id, request=request_with_callbacks)
+            mock_apply.assert_called_once()
+            call_args = mock_apply.call_args
+            assert call_args[0] == ((2,),)
+            assert call_args[1]['parent_id'] == task_id
+
+        successful_requests.discard(task_id)
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__backend_dedup_chain_and_callbacks(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        trace(self.app, add, (1, 1), task_id=task_id, request=request)
+
+        request_both = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+            'chain': [self.add.s(10)],
+            'callbacks': [self.add.s(99)],
+        }
+
+        with patch('celery.canvas.maybe_signature') as mock_signature:
+            mock_apply = Mock()
+            mock_signature.return_value.apply_async = mock_apply
+            trace(self.app, add, (1, 1), task_id=task_id, request=request_both)
+            assert mock_apply.call_count == 2
+
+        successful_requests.discard(task_id)
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__backend_dedup_skips_when_children_present(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        trace(self.app, add, (1, 1), task_id=task_id, request=request)
+
+        request_with_chain = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+            'chain': [self.add.s(10)],
+            'callbacks': [self.add.s(99)],
+        }
+
+        meta_with_children = {
+            'status': 'SUCCESS', 'result': 2,
+            'children': [('some-child-id', None)],
+        }
+        with patch('celery.canvas.maybe_signature') as mock_signature:
+            mock_apply = Mock()
+            mock_signature.return_value.apply_async = mock_apply
+            with patch('celery.result.AsyncResult._get_task_meta',
+                       return_value=meta_with_children):
+                trace(self.app, add, (1, 1), task_id=task_id,
+                      request=request_with_chain)
+            mock_apply.assert_not_called()
+
+        successful_requests.discard(task_id)
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__backend_dedup_dispatch_failure_logged(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        trace(self.app, add, (1, 1), task_id=task_id, request=request)
+
+        request_with_chain = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+            'chain': [self.add.s(10)],
+        }
+
+        with patch('celery.canvas.maybe_signature') as mock_signature:
+            mock_signature.return_value.apply_async.side_effect = RuntimeError('broker down')
+            with patch('celery.app.trace.logger') as mock_logger:
+                with pytest.raises(Reject):
+                    trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
+                mock_logger.error.assert_called_once()
+                assert 'deduplicated task' in mock_logger.error.call_args[0][0]
+
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__backend_dedup_memory_error_propagates(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        trace(self.app, add, (1, 1), task_id=task_id, request=request)
+
+        request_with_chain = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+            'chain': [self.add.s(10)],
+        }
+
+        with patch('celery.canvas.maybe_signature') as mock_signature:
+            mock_signature.return_value.apply_async.side_effect = MemoryError()
+            with pytest.raises(MemoryError):
+                trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
+
+        successful_requests.discard(task_id)
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__reject_propagates_through_trace_task(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        trace(self.app, add, (1, 1), task_id=task_id, request=request)
+
+        request_with_chain = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+            'chain': [self.add.s(10)],
+        }
+
+        add.__trace__ = None
+        with patch('celery.canvas.maybe_signature') as mock_signature:
+            mock_signature.return_value.apply_async.side_effect = RuntimeError('broker down')
+            with patch('celery.app.trace.logger'):
+                with pytest.raises(Reject):
+                    trace_task(add, task_id, (1, 1), {}, request=request_with_chain, app=self.app)
+
+        successful_requests.discard(task_id)
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__root_id_fallback(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        trace(self.app, add, (1, 1), task_id=task_id, request=request)
+
+        request_no_root_id = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+            'chain': [self.add.s(10)],
+        }
+
+        with patch('celery.canvas.maybe_signature') as mock_signature:
+            mock_apply = Mock()
+            mock_signature.return_value.apply_async = mock_apply
+            trace(self.app, add, (1, 1), task_id=task_id, request=request_no_root_id)
+            call_args = mock_apply.call_args
+            assert call_args[1]['root_id'] == task_id
+
+        successful_requests.discard(task_id)
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__empty_chain_skips_dispatch(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        trace(self.app, add, (1, 1), task_id=task_id, request=request)
+
+        request_empty_chain = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+            'chain': [],
+            'callbacks': [],
+        }
+
+        with patch('celery.canvas.maybe_signature') as mock_signature:
+            mock_apply = Mock()
+            mock_signature.return_value.apply_async = mock_apply
+            trace(self.app, add, (1, 1), task_id=task_id, request=request_empty_chain)
+            mock_apply.assert_not_called()
+
+        successful_requests.discard(task_id)
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_deduplicate_successful_tasks__backend_read_failure_rejects(self):
+        """When _get_task_meta() fails after state==SUCCESS, the exception
+        is caught and re-raised as Reject(requeue=True)."""
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        backend = CacheBackend(app=self.app, backend='memory')
+        add.backend = backend
+        add.store_eager_result = True
+        add.ignore_result = False
+        add.acks_late = True
+
+        self.app.conf.worker_deduplicate_successful_tasks = True
+        task_id = str(uuid4())
+        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
+
+        trace(self.app, add, (1, 1), task_id=task_id, request=request)
+
+        successful_requests.discard(task_id)
+
+        request_with_chain = {
+            'id': task_id,
+            'delivery_info': {'redelivered': True},
+            'chain': [self.add.s(10)],
+        }
+
+        # First call to _get_task_meta (from r.state) returns normally;
+        # second call (line 508 in trace.py) raises to simulate a
+        # transient backend failure during dispatch.
+        original = AsyncResult._get_task_meta
+        call_count = 0
+
+        def fail_on_second_call(self_):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                raise ConnectionError('redis gone')
+            return original(self_)
+
+        with patch.object(AsyncResult, '_get_task_meta', fail_on_second_call):
+            with patch('celery.app.trace.logger'):
+                with pytest.raises(Reject):
+                    trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
+
+        assert task_id not in successful_requests
+
+        successful_requests.discard(task_id)
+        self.app.conf.worker_deduplicate_successful_tasks = False
+
+    def test_ignore_result_priority__request_overrides_task_true(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        add.backend = Mock(name='backend')
+        add.ignore_result = True
+        request = {'ignore_result': False}
+
+        self.trace(add, (2, 2), {}, request=request, eager=False)
+
+        add.backend.mark_as_done.assert_called_with(ANY, 4, ANY, True)
+
+    def test_ignore_result_priority__request_overrides_task_false(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        add.backend = Mock(name='backend')
+        add.ignore_result = False
+        request = {'ignore_result': True}
+
+        self.trace(add, (2, 2), {}, request=request, eager=False)
+
+        add.backend.mark_as_done.assert_called_with(ANY, 4, ANY, False)
+
+    def test_ignore_result_priority__request_overrides_app_config(self):
+        prev_ignore = self.app.conf.task_ignore_result
+
+        try:
+            self.app.conf.task_ignore_result = True
+
+            @self.app.task(shared=False)
+            def add(x, y):
+                return x + y
+
+            add.backend = Mock(name='backend')
+
+            assert add.ignore_result is True
+
+            request = {'ignore_result': False}
+            self.trace(add, (2, 2), {}, request=request, eager=False)
+
+            add.backend.mark_as_done.assert_called_with(ANY, 4, ANY, True)
+        finally:
+            self.app.conf.task_ignore_result = prev_ignore
+
+
+class test_TraceInfo(TraceCase):
+    class TI(TraceInfo):
+        __slots__ = TraceInfo.__slots__ + ('__dict__',)
+
+    def test_handle_error_state(self):
+        x = self.TI(states.FAILURE)
+        x.handle_failure = Mock()
+        x.handle_error_state(self.add_cast, self.add_cast.request)
+        x.handle_failure.assert_called_with(
+            self.add_cast,
+            self.add_cast.request,
+            store_errors=self.add_cast.store_errors_even_if_ignored,
+            call_errbacks=True,
+        )
+
+    def test_handle_error_state_for_eager_task(self):
+        x = self.TI(states.FAILURE)
+        x.handle_failure = Mock()
+
+        x.handle_error_state(self.add, self.add.request, eager=True)
+        x.handle_failure.assert_called_once_with(
+            self.add,
+            self.add.request,
+            store_errors=False,
+            call_errbacks=True,
+        )
+
+    def test_handle_error_for_eager_saved_to_backend(self):
+        x = self.TI(states.FAILURE)
+        x.handle_failure = Mock()
+
+        self.add.store_eager_result = True
+
+        x.handle_error_state(self.add, self.add.request, eager=True)
+        x.handle_failure.assert_called_with(
+            self.add,
+            self.add.request,
+            store_errors=True,
+            call_errbacks=True,
+        )
+
+    def test_handle_error_state_missing_request_store_errors_false_while_task_ignore_result_true(self):
+        x = self.TI(states.FAILURE)
+        x.handle_failure = Mock()
+
+        self.add.ignore_result = True
+        self.add.store_errors_even_if_ignored = False
+
+        x.handle_error_state(self.add, None)
+        x.handle_failure.assert_called_once_with(
+            self.add,
+            None,
+            store_errors=False,
+            call_errbacks=True,
+        )
+
+    def test_handle_error_state_missing_request_store_errors_true_while_task_ignore_result_false(self):
+        x = self.TI(states.FAILURE)
+        x.handle_failure = Mock()
+
+        self.add.ignore_result = False
+
+        x.handle_error_state(self.add, None)
+        x.handle_failure.assert_called_once_with(
+            self.add,
+            None,
+            store_errors=True,
+            call_errbacks=True,
+        )
+
+    @patch('celery.app.trace.ExceptionInfo')
+    def test_handle_reject(self, ExceptionInfo):
+        x = self.TI(states.FAILURE)
+        x._log_error = Mock(name='log_error')
+        req = Mock(name='req')
+        x.handle_reject(self.add, req)
+        x._log_error.assert_called_with(self.add, req, ExceptionInfo())
+
+
+class test_stackprotection:
+    def test_stackprotection(self):
+        setup_worker_optimizations(self.app)
+        try:
+
+            @self.app.task(shared=False, bind=True)
+            def foo(self, i):
+                if i:
+                    return foo(0)
+                return self.request
+
+            assert foo(1).called_directly
+        finally:
+            reset_worker_optimizations(self.app)
+
+    def test_stackprotection_headers_passed_on_new_request_stack(self):
+        setup_worker_optimizations(self.app)
+        try:
+
+            @self.app.task(shared=False, bind=True)
+            def foo(self, i):
+                if i:
+                    return foo.apply(args=(i-1,), headers=456)
+                return self.request
+
+            task = foo.apply(args=(2,), headers=123, loglevel=5)
+            assert task.result.result.result.args == (0,)
+            assert task.result.result.result.headers == 456
+            assert task.result.result.result.loglevel == 0
+        finally:
+            reset_worker_optimizations(self.app)
+
+    def test_stackprotection_headers_persisted_calling_task_directly(self):
+        setup_worker_optimizations(self.app)
+        try:
+
+            @self.app.task(shared=False, bind=True)
+            def foo(self, i):
+                if i:
+                    return foo(i-1)
+                return self.request
+
+            task = foo.apply(args=(2,), headers=123, loglevel=5)
+            assert task.result.args == (0,)
+            assert task.result.headers == 123
+            assert task.result.loglevel == 5
+        finally:
+            reset_worker_optimizations(self.app)

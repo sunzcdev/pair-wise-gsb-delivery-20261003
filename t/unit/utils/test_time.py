@@ -1,0 +1,739 @@
+import sys
+from datetime import datetime, timedelta
+from datetime import timezone as _timezone
+from datetime import tzinfo
+from unittest.mock import Mock, patch
+
+import pytest
+from dateutil import tz as dateutil_tz
+
+if sys.version_info >= (3, 9):
+    from zoneinfo import ZoneInfo
+else:
+    from backports.zoneinfo import ZoneInfo
+
+from celery.utils import time as time_utils
+from celery.utils.iso8601 import parse_iso8601
+from celery.utils.time import (LocalTimezone, _is_imaginary, add_seconds_to_datetime, delta_resolution, ffwd,
+                               get_exponential_backoff_interval, humanize_seconds, localize, make_aware,
+                               maybe_iso8601, maybe_make_aware, maybe_timedelta, rate, remaining, timezone,
+                               utcoffset)
+
+
+class test_LocalTimezone:
+
+    def test_daylight(self, patching):
+        time = patching('celery.utils.time._time')
+        time.timezone = 3600
+        time.daylight = False
+        x = LocalTimezone()
+        assert x.STDOFFSET == timedelta(seconds=-3600)
+        assert x.DSTOFFSET == x.STDOFFSET
+        time.daylight = True
+        time.altzone = 3600
+        y = LocalTimezone()
+        assert y.STDOFFSET == timedelta(seconds=-3600)
+        assert y.DSTOFFSET == timedelta(seconds=-3600)
+
+        assert repr(y)
+
+        y._isdst = Mock()
+        y._isdst.return_value = True
+        assert y.utcoffset(datetime.now())
+        assert not y.dst(datetime.now())
+        y._isdst.return_value = False
+        assert y.utcoffset(datetime.now())
+        assert not y.dst(datetime.now())
+
+        assert y.tzname(datetime.now())
+
+    def test_fromutc_with_negative_offset(self, patching):
+        # Regression test for #10517: negative UTC offsets (western
+        # hemisphere) must not lose their sign when converting from UTC.
+        # `timedelta.seconds` is normalized to [0, 86399] with the sign in
+        # `timedelta.days`, so the old code turned a -04:00 offset into +20:00.
+        time = patching('celery.utils.time._time')
+        time.timezone = 5 * 3600        # UTC-5 standard time (US Eastern)
+        time.daylight = True
+        time.altzone = 4 * 3600         # UTC-4 daylight saving time
+        time.tzname = ('EST', 'EDT')
+        x = LocalTimezone()
+        x._isdst = Mock(return_value=True)   # force DST: -04:00
+        result = x.fromutc(datetime(2026, 6, 15, 12, 0))
+        assert result.utcoffset() == timedelta(hours=-4)
+        assert result == datetime(2026, 6, 15, 8, 0, tzinfo=result.tzinfo)
+
+
+class test_iso8601:
+
+    def test_parse_with_timezone(self):
+        d = datetime.now(_timezone.utc).replace(tzinfo=ZoneInfo("UTC"))
+        assert parse_iso8601(d.isoformat()) == d
+        # 2013-06-07T20:12:51.775877+00:00
+        iso = d.isoformat()
+        iso1 = iso.replace('+00:00', '-01:00')
+        d1 = parse_iso8601(iso1)
+        d1_offset_in_minutes = d1.utcoffset().total_seconds() / 60
+        assert d1_offset_in_minutes == -60
+        iso2 = iso.replace('+00:00', '+01:00')
+        d2 = parse_iso8601(iso2)
+        d2_offset_in_minutes = d2.utcoffset().total_seconds() / 60
+        assert d2_offset_in_minutes == +60
+        iso3 = iso.replace('+00:00', 'Z')
+        d3 = parse_iso8601(iso3)
+        assert d3.tzinfo == _timezone.utc
+
+
+@pytest.mark.parametrize('delta,expected', [
+    (timedelta(days=2), datetime(2010, 3, 30, 0, 0)),
+    (timedelta(hours=2), datetime(2010, 3, 30, 11, 0)),
+    (timedelta(minutes=2), datetime(2010, 3, 30, 11, 50)),
+    (timedelta(seconds=2), None),
+])
+def test_delta_resolution(delta, expected):
+    dt = datetime(2010, 3, 30, 11, 50, 58, 41065)
+    assert delta_resolution(dt, delta) == expected or dt
+
+
+@pytest.mark.parametrize('seconds,expected', [
+    (4 * 60 * 60 * 24, '4.00 days'),
+    (1 * 60 * 60 * 24, '1.00 day'),
+    (4 * 60 * 60, '4.00 hours'),
+    (1 * 60 * 60, '1.00 hour'),
+    (4 * 60, '4.00 minutes'),
+    (1 * 60, '1.00 minute'),
+    (4, '4.00 seconds'),
+    (1, '1.00 second'),
+    (4.3567631221, '4.36 seconds'),
+    (0, 'now'),
+])
+def test_humanize_seconds(seconds, expected):
+    assert humanize_seconds(seconds) == expected
+
+
+def test_humanize_seconds__prefix():
+    assert humanize_seconds(4, prefix='about ') == 'about 4.00 seconds'
+
+
+def test_maybe_iso8601_datetime():
+    now = datetime.now()
+    assert maybe_iso8601(now) is now
+
+
+@pytest.mark.parametrize('date_str,expected', [
+    ('2011-11-04T00:05:23', datetime(2011, 11, 4, 0, 5, 23)),
+    ('2011-11-04T00:05:23Z', datetime(2011, 11, 4, 0, 5, 23, tzinfo=_timezone.utc)),
+    ('2011-11-04 00:05:23.283+00:00',
+     datetime(2011, 11, 4, 0, 5, 23, 283000, tzinfo=_timezone.utc)),
+    ('2011-11-04T00:05:23+04:00',
+     datetime(2011, 11, 4, 0, 5, 23,  tzinfo=_timezone(timedelta(seconds=14400)))),
+])
+def test_iso8601_string_datetime(date_str, expected):
+    assert maybe_iso8601(date_str) == expected
+
+
+@pytest.mark.parametrize('arg,expected', [
+    (30, timedelta(seconds=30)),
+    (30.6, timedelta(seconds=30.6)),
+    (timedelta(days=2), timedelta(days=2)),
+])
+def test_maybe_timedelta(arg, expected):
+    assert maybe_timedelta(arg) == expected
+
+
+def test_remaining():
+    # Relative
+    remaining(datetime.now(_timezone.utc), timedelta(hours=1), relative=True)
+
+    """
+    The upcoming cases check whether the next run is calculated correctly
+    """
+    eastern_tz = ZoneInfo("US/Eastern")
+    tokyo_tz = ZoneInfo("Asia/Tokyo")
+
+    # Case 1: `start` in UTC and `now` in other timezone
+    start = datetime.now(ZoneInfo("UTC"))
+    now = datetime.now(eastern_tz)
+    delta = timedelta(hours=1)
+    assert str(start.tzinfo) == str(ZoneInfo("UTC"))
+    assert str(now.tzinfo) == str(eastern_tz)
+    rem_secs = remaining(start, delta, now).total_seconds()
+    # assert remaining time is approximately equal to delta
+    assert rem_secs == pytest.approx(delta.total_seconds(), abs=1)
+
+    # Case 2: `start` and `now` in different timezones (other than UTC)
+    start = datetime.now(eastern_tz)
+    now = datetime.now(tokyo_tz)
+    delta = timedelta(hours=1)
+    assert str(start.tzinfo) == str(eastern_tz)
+    assert str(now.tzinfo) == str(tokyo_tz)
+    rem_secs = remaining(start, delta, now).total_seconds()
+    assert rem_secs == pytest.approx(delta.total_seconds(), abs=1)
+
+    """
+    Case 3: DST check
+    Suppose start (which is last_run_time) is in EST while next_run is in EDT,
+    then check whether the `next_run` is actually the time specified in the
+    start (i.e. there is not an hour diff due to DST).
+    In 2019, DST starts on March 10
+    """
+    start = datetime(
+        month=3, day=9, year=2019, hour=10,
+        minute=0, tzinfo=eastern_tz)  # EST
+
+    now = datetime(
+        day=11, month=3, year=2019, hour=1,
+        minute=0, tzinfo=eastern_tz)  # EDT
+    delta = ffwd(hour=10, year=2019, microsecond=0, minute=0,
+                 second=0, day=11, weeks=0, month=3)
+    # `next_actual_time` is the next time to run (derived from delta)
+    next_actual_time = datetime(
+        day=11, month=3, year=2019, hour=10, minute=0, tzinfo=eastern_tz)  # EDT
+    assert start.tzname() == "EST"
+    assert now.tzname() == "EDT"
+    assert next_actual_time.tzname() == "EDT"
+    rem_time = remaining(start, delta, now)
+    next_run = now + rem_time
+    assert next_run == next_actual_time
+
+    """
+    Case 4: DST check between now and next_run
+    Suppose start (which is last_run_time) and now are in EST while next_run
+    is in EDT, then check that the remaining time returned is the exact real
+    time difference (not wall time).
+    For example, between
+    2019-03-10 01:30:00-05:00 and
+    2019-03-10 03:30:00-04:00
+    There is only 1 hour difference in real time, but 2 on wall time.
+    Python by default uses wall time in arithmetic between datetimes with
+    equal non-UTC timezones.
+    In 2019, DST starts on March 10
+    """
+    start = datetime(
+        day=10, month=3, year=2019, hour=1,
+        minute=30, tzinfo=eastern_tz)  # EST
+
+    now = datetime(
+        day=10, month=3, year=2019, hour=1,
+        minute=30, tzinfo=eastern_tz)  # EST
+    delta = ffwd(hour=3, year=2019, microsecond=0, minute=30,
+                 second=0, day=10, weeks=0, month=3)
+    # `next_actual_time` is the next time to run (derived from delta)
+    next_actual_time = datetime(
+        day=10, month=3, year=2019, hour=3, minute=30, tzinfo=eastern_tz)  # EDT
+    assert start.tzname() == "EST"
+    assert now.tzname() == "EST"
+    assert next_actual_time.tzname() == "EDT"
+    rem_time = remaining(start, delta, now)
+    assert rem_time.total_seconds() == 3600
+    next_run_utc = now.astimezone(ZoneInfo("UTC")) + rem_time
+    next_run_edt = next_run_utc.astimezone(eastern_tz)
+    assert next_run_utc == next_actual_time
+    assert next_run_edt == next_actual_time
+
+
+def test_remaining_across_fall_back():
+    paris_tz = ZoneInfo('Europe/Paris')
+    start = datetime(2020, 10, 25, 2, 59, 55, tzinfo=paris_tz, fold=0)
+    now = datetime(2020, 10, 25, 2, 0, 5, tzinfo=paris_tz, fold=1)
+    assert start.isoformat() == '2020-10-25T02:59:55+02:00'
+
+    # DST changes the UTC offset from +02:00 to +01:00.
+    assert now.isoformat() == '2020-10-25T02:00:05+01:00'
+    assert now.astimezone(_timezone.utc) - start.astimezone(_timezone.utc) == timedelta(seconds=10)
+
+    assert remaining(start, timedelta(seconds=10), now) == timedelta(0)
+
+
+class test_timezone:
+
+    def test_get_timezone_with_zoneinfo(self):
+        assert timezone.get_timezone('UTC')
+
+    def test_tz_or_local(self):
+        assert timezone.tz_or_local() == timezone.local
+        assert timezone.tz_or_local(timezone.utc)
+
+    def test_to_local(self):
+        assert timezone.to_local(make_aware(datetime.now(_timezone.utc), timezone.utc))
+        assert timezone.to_local(datetime.now(_timezone.utc))
+
+    def test_to_local_fallback(self):
+        assert timezone.to_local_fallback(
+            make_aware(datetime.now(_timezone.utc), timezone.utc))
+        assert timezone.to_local_fallback(datetime.now(_timezone.utc))
+
+
+class test_make_aware:
+
+    def test_standard_tz(self):
+        tz = tzinfo()
+        wtz = make_aware(datetime.now(_timezone.utc), tz)
+        assert wtz.tzinfo == tz
+
+    def test_tz_when_zoneinfo(self):
+        tz = ZoneInfo('US/Eastern')
+        wtz = make_aware(datetime.now(_timezone.utc), tz)
+        assert wtz.tzinfo == tz
+
+    def test_tz_when_zoneinfo_and_time_does_not_exist(self):
+        tz = ZoneInfo('US/Eastern')
+        wtz = make_aware(datetime(2024, 3, 10, 2, 30), tz)
+
+        assert wtz == datetime(2024, 3, 10, 3, 30, tzinfo=tz)
+        assert wtz.utcoffset().total_seconds() == -4 * 60 * 60
+
+    def test_imaginary_detection_ignores_unsupported_timezones(self):
+        assert not _is_imaginary(datetime.now(_timezone.utc), tzinfo())
+
+    @patch('dateutil.tz.datetime_exists')
+    def test_imaginary_detection_handles_dateutil_value_error(self, datetime_exists_mock):
+        datetime_exists_mock.side_effect = ValueError
+        tz = ZoneInfo('US/Eastern')
+        dt = datetime(2024, 3, 10, 2, 30, tzinfo=tz)
+
+        assert not _is_imaginary(dt, tz)
+        datetime_exists_mock.assert_called_once_with(dt, tz)
+
+    def test_maybe_make_aware(self):
+        aware = datetime.now(_timezone.utc).replace(tzinfo=timezone.utc)
+        assert maybe_make_aware(aware)
+        naive = datetime.now()
+        assert maybe_make_aware(naive)
+        assert maybe_make_aware(naive).tzinfo is ZoneInfo("UTC")
+
+        tz = ZoneInfo('US/Eastern')
+        eastern = datetime.now(_timezone.utc).replace(tzinfo=tz)
+        assert maybe_make_aware(eastern).tzinfo is tz
+        utcnow = datetime.now()
+        assert maybe_make_aware(utcnow, 'UTC').tzinfo is ZoneInfo("UTC")
+
+
+class test_localize:
+
+    def test_standard_tz(self):
+        class tzz(tzinfo):
+
+            def utcoffset(self, dt):
+                return None  # Mock no utcoffset specified
+
+        tz = tzz()
+        assert localize(make_aware(datetime.now(_timezone.utc), tz), tz)
+
+    @patch('dateutil.tz.datetime_ambiguous')
+    def test_when_zoneinfo(self, datetime_ambiguous_mock):
+        datetime_ambiguous_mock.return_value = False
+        tz = ZoneInfo("US/Eastern")
+        assert localize(make_aware(datetime.now(_timezone.utc), tz), tz)
+
+        datetime_ambiguous_mock.return_value = True
+        tz2 = ZoneInfo("US/Eastern")
+        assert localize(make_aware(datetime.now(_timezone.utc), tz2), tz2)
+
+    @patch('dateutil.tz.datetime_ambiguous')
+    def test_when_is_ambiguous(self, datetime_ambiguous_mock):
+        class tzz(tzinfo):
+
+            def utcoffset(self, dt):
+                return None  # Mock no utcoffset specified
+
+            def is_ambiguous(self, dt):
+                return True
+
+        datetime_ambiguous_mock.return_value = False
+        tz = tzz()
+        assert localize(make_aware(datetime.now(_timezone.utc), tz), tz)
+
+        datetime_ambiguous_mock.return_value = True
+        tz2 = tzz()
+        assert localize(make_aware(datetime.now(_timezone.utc), tz2), tz2)
+
+    def test_localize_changes_utc_dt(self):
+        now_utc_time = datetime.now(tz=ZoneInfo("UTC"))
+        local_tz = ZoneInfo('US/Eastern')
+        localized_time = localize(now_utc_time, local_tz)
+        assert localized_time.tzinfo == local_tz
+        # Compare instants: inter-zone == is always False inside an ambiguous
+        # hour (PEP 495), even when both datetimes are the same moment.
+        assert localized_time.timestamp() == now_utc_time.timestamp()
+
+    @pytest.mark.parametrize('utc_dt', [
+        datetime(2026, 11, 1, 5, 55, tzinfo=ZoneInfo("UTC")),  # 01:55 EDT (first pass)
+        datetime(2026, 11, 1, 6, 55, tzinfo=ZoneInfo("UTC")),  # 01:55 EST (second pass)
+    ])
+    def test_localize_ambiguous_hour(self, utc_dt):
+        local_tz = ZoneInfo('US/Eastern')
+        localized_time = localize(utc_dt, local_tz)
+        assert localized_time.tzinfo == local_tz
+        assert localized_time.timestamp() == utc_dt.timestamp()
+
+    def test_localize_aware_dt_idempotent(self):
+        t = (2017, 4, 23, 21, 36, 59, 0)
+        local_zone = ZoneInfo('America/New_York')
+        local_time = datetime(*t)
+        local_time_aware = datetime(*t, tzinfo=local_zone)
+        alternate_zone = ZoneInfo('America/Detroit')
+        localized_time = localize(local_time_aware, alternate_zone)
+        assert localized_time == local_time_aware
+        assert local_zone.utcoffset(
+            local_time) == alternate_zone.utcoffset(local_time)
+        localized_utc_offset = localized_time.tzinfo.utcoffset(local_time)
+        assert localized_utc_offset == alternate_zone.utcoffset(local_time)
+        assert localized_utc_offset == local_zone.utcoffset(local_time)
+
+
+@pytest.mark.parametrize('s,expected', [
+    (999, 999),
+    (7.5, 7.5),
+    ('2.5/s', 2.5),
+    ('1456/s', 1456),
+    ('100/m', 100 / 60.0),
+    ('10/h', 10 / 60.0 / 60.0),
+    (0, 0),
+    (None, 0),
+    ('0/m', 0),
+    ('0/h', 0),
+    ('0/s', 0),
+    ('0.0/s', 0),
+])
+def test_rate_limit_string(s, expected):
+    assert rate(s) == expected
+
+
+class test_ffwd:
+
+    def test_repr(self):
+        x = ffwd(year=2012)
+        assert repr(x)
+
+    def test_radd_with_unknown_gives_NotImplemented(self):
+        x = ffwd(year=2012)
+        assert x.__radd__(object()) == NotImplemented
+
+
+class test_utcoffset:
+
+    def test_utcoffset(self, patching):
+        _time = patching('celery.utils.time._time')
+        _time.daylight = True
+        assert utcoffset(time=_time) is not None
+        _time.daylight = False
+        assert utcoffset(time=_time) is not None
+
+    def test_utcoffset_whole_hour_unaffected(self, patching):
+        # US Eastern standard time: UTC-5, i.e. 5 hours *west* of UTC, so
+        # time.timezone (seconds west of UTC) is positive.
+        _time = patching('celery.utils.time._time')
+        _time.timezone = 5 * 3600
+        localtime = Mock(return_value=Mock(tm_isdst=0))
+        assert utcoffset(time=_time, localtime=localtime) == 5
+
+    def test_utcoffset_fractional_hour_offset(self, patching):
+        # Regression test: time.timezone/altzone (seconds west of UTC) must
+        # not be rounded at all, or a fractional-hour, east-of-UTC zone
+        # (e.g. India/Sri Lanka/Iran at UTC+5:30, so time.timezone ==
+        # -19800) picks up an error in one direction or the other:
+        # -19800 // 3600 == -6 (floor) and int(-19800 / 3600) == -5
+        # (truncate) are both 30 minutes off. The exact value is -5.5.
+        _time = patching('celery.utils.time._time')
+        _time.timezone = -19800  # UTC+5:30 standard time (India, Sri Lanka)
+        localtime = Mock(return_value=Mock(tm_isdst=0))
+        assert utcoffset(time=_time, localtime=localtime) == -5.5
+
+        _time.altzone = -19800  # same offset while a DST rule is in effect
+        localtime = Mock(return_value=Mock(tm_isdst=1))
+        assert utcoffset(time=_time, localtime=localtime) == -5.5
+
+    def test_utcoffset_quarter_hour_offset(self, patching):
+        # Quarter-hour zones are where floor and truncation actually
+        # diverge in severity: floor is 15 minutes off, truncation would be
+        # 45 minutes off. Only the exact value is correct for both.
+        _time = patching('celery.utils.time._time')
+        _time.timezone = -20700  # UTC+5:45 (Nepal)
+        localtime = Mock(return_value=Mock(tm_isdst=0))
+        assert utcoffset(time=_time, localtime=localtime) == -5.75
+
+
+class test_get_exponential_backoff_interval:
+
+    @patch('random.randrange', lambda n: n - 2)
+    def test_with_jitter(self):
+        assert get_exponential_backoff_interval(
+            factor=4,
+            retries=3,
+            maximum=100,
+            full_jitter=True
+        ) == 4 * (2 ** 3) - 1
+
+    def test_without_jitter(self):
+        assert get_exponential_backoff_interval(
+            factor=4,
+            retries=3,
+            maximum=100,
+            full_jitter=False
+        ) == 4 * (2 ** 3)
+
+    def test_bound_by_maximum(self):
+        maximum_boundary = 100
+        assert get_exponential_backoff_interval(
+            factor=40,
+            retries=3,
+            maximum=maximum_boundary
+        ) == maximum_boundary
+
+    @patch('random.randrange', lambda n: n - 1)
+    def test_negative_values(self):
+        assert get_exponential_backoff_interval(
+            factor=-40,
+            retries=3,
+            maximum=100
+        ) == 0
+
+    @patch('random.randrange')
+    def test_valid_random_range(self, rr):
+        rr.return_value = 0
+        maximum = 100
+        get_exponential_backoff_interval(
+            factor=40, retries=10, maximum=maximum, full_jitter=True)
+        rr.assert_called_once_with(maximum + 1)
+
+
+class test_add_seconds_to_datetime:
+
+    def test_across_spring_forward(self):
+        now = datetime(2026, 3, 8, 1, 30, tzinfo=ZoneInfo('America/New_York'))
+        assert now.isoformat() == '2026-03-08T01:30:00-05:00'
+
+        result = add_seconds_to_datetime(now, 90 * 60)
+
+        # DST changes the UTC offset from -05:00 to -04:00.
+        assert result.isoformat() == '2026-03-08T04:00:00-04:00'
+        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=90)
+
+    def test_naive_datetime(self):
+        now = datetime(2026, 3, 8, 1, 30)
+
+        result = add_seconds_to_datetime(now, 90 * 60)
+
+        assert result == datetime(2026, 3, 8, 3, 0)
+
+    def test_across_fall_back(self):
+        now = datetime(2026, 11, 1, 1, 30, tzinfo=ZoneInfo('America/New_York'), fold=0)
+        assert now.isoformat() == '2026-11-01T01:30:00-04:00'
+
+        result = add_seconds_to_datetime(now, 90 * 60)
+
+        # DST changes the UTC offset from -04:00 to -05:00.
+        assert result.isoformat() == '2026-11-01T02:00:00-05:00'
+        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=90)
+
+    def test_second_occurrence_of_repeated_hour(self):
+        now = datetime(2026, 11, 1, 1, 30, tzinfo=ZoneInfo('America/New_York'), fold=1)
+        assert now.isoformat() == '2026-11-01T01:30:00-05:00'
+
+        result = add_seconds_to_datetime(now, 15 * 60)
+
+        assert result.isoformat() == '2026-11-01T01:45:00-05:00'
+        assert result.fold == 1
+        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=15)
+
+    def test_local_timezone(self):
+        local_timezone = LocalTimezone()
+        now = datetime(2026, 6, 15, 1, 30, tzinfo=local_timezone)
+
+        result = add_seconds_to_datetime(now, 90 * 60)
+
+        # Adding 90 minutes must keep the correct local offset and elapsed duration.
+        assert result.utcoffset() == local_timezone.utcoffset(result)
+        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=90)
+
+    def test_dateutil_timezone_across_spring_forward(self):
+        now = datetime(2026, 3, 8, 1, 30, tzinfo=dateutil_tz.gettz('America/New_York'))
+        assert now.isoformat() == '2026-03-08T01:30:00-05:00'
+
+        result = add_seconds_to_datetime(now, 90 * 60)
+
+        # DST skips an hour, so 90 elapsed minutes from 01:30 end at 04:00.
+        assert result.isoformat() == '2026-03-08T04:00:00-04:00'
+        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=90)
+
+    def test_fixed_offset_timezone(self):
+        now = datetime(2026, 3, 8, 1, 30, tzinfo=_timezone(timedelta(hours=-5)))
+        assert now.isoformat() == '2026-03-08T01:30:00-05:00'
+
+        result = add_seconds_to_datetime(now, 90 * 60)
+
+        # A fixed UTC-05:00 offset stays the same even on a DST transition date.
+        assert result.isoformat() == '2026-03-08T03:00:00-05:00'
+        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=90)
+
+    def test_utc_timezone(self):
+        now = datetime(2026, 3, 8, 6, 30, tzinfo=_timezone.utc)
+        assert now.isoformat() == '2026-03-08T06:30:00+00:00'
+
+        result = add_seconds_to_datetime(now, 90 * 60)
+
+        # UTC input stays in UTC after adding 90 minutes.
+        assert result.isoformat() == '2026-03-08T08:00:00+00:00'
+        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=90)
+
+
+class test_subtract_datetimes_both_aware:
+
+    @pytest.mark.parametrize('end,start,expected', [
+        pytest.param(
+            datetime(2026, 3, 8, 4, 0, tzinfo=ZoneInfo('America/New_York')),
+            datetime(2026, 3, 8, 1, 30, tzinfo=ZoneInfo('America/New_York')),
+            timedelta(minutes=90),
+            id='spring-forward',
+        ),
+        pytest.param(
+            datetime(2026, 11, 1, 1, 30, tzinfo=ZoneInfo('America/New_York'), fold=1),
+            datetime(2026, 11, 1, 1, 30, tzinfo=ZoneInfo('America/New_York'), fold=0),
+            timedelta(hours=1),
+            id='fall-back',
+        ),
+        pytest.param(
+            datetime(2026, 11, 1, 1, 30, tzinfo=ZoneInfo('America/New_York'), fold=0),
+            datetime(2026, 11, 1, 1, 30, tzinfo=ZoneInfo('America/New_York'), fold=1),
+            timedelta(hours=-1),
+            id='negative-difference',
+        ),
+        pytest.param(
+            datetime(2026, 3, 8, 8, 0, tzinfo=_timezone.utc),
+            datetime(2026, 3, 8, 1, 30, tzinfo=ZoneInfo('America/New_York')),
+            timedelta(minutes=90),
+            id='different-timezones',
+        ),
+        pytest.param(
+            datetime(2026, 3, 8, 6, 30, tzinfo=_timezone.utc),
+            datetime(2026, 3, 8, 1, 30, tzinfo=ZoneInfo('America/New_York')),
+            timedelta(0),
+            id='same-instant',
+        ),
+        pytest.param(
+            datetime(2026, 3, 8, 8, 0, tzinfo=_timezone.utc),
+            datetime(2026, 3, 8, 6, 30, tzinfo=_timezone.utc),
+            timedelta(minutes=90),
+            id='utc-datetimes',
+        ),
+        pytest.param(
+            datetime(2026, 3, 8, 4, 0, tzinfo=_timezone(timedelta(hours=-4))),
+            datetime(2026, 3, 8, 1, 30, tzinfo=_timezone(timedelta(hours=-5))),
+            timedelta(minutes=90),
+            id='fixed-offset-timezones',
+        )
+    ])
+    def test_elapsed_time(self, end, start, expected):
+        assert time_utils.subtract_datetimes(end, start) == expected
+
+    @pytest.mark.parametrize('end,start,expected', [
+        pytest.param(
+            datetime(2026, 3, 8, 4, 0),
+            datetime(2026, 3, 8, 1, 30),
+            timedelta(minutes=90),
+            id='spring-forward',
+        ),
+        pytest.param(
+            datetime(2026, 11, 1, 1, 30, fold=1),
+            datetime(2026, 11, 1, 1, 30, fold=0),
+            timedelta(hours=1),
+            id='fall-back',
+        ),
+    ])
+    def test_dateutil_timezone_across_dst(self, end, start, expected):
+        tz = dateutil_tz.gettz('America/New_York')
+        end = end.replace(tzinfo=tz)
+        start = start.replace(tzinfo=tz)
+
+        assert time_utils.subtract_datetimes(end, start) == expected
+
+
+class test_subtract_datetimes_both_naive:
+
+    @pytest.mark.parametrize('end,start,expected', [
+        pytest.param(
+            datetime(2026, 3, 8, 4, 0),
+            datetime(2026, 3, 8, 1, 30),
+            timedelta(minutes=150),
+            id='positive-difference',
+        ),
+        pytest.param(
+            datetime(2026, 3, 8, 1, 30),
+            datetime(2026, 3, 8, 4, 0),
+            timedelta(minutes=-150),
+            id='negative-difference',
+        ),
+        pytest.param(
+            datetime(2026, 3, 8, 1, 30),
+            datetime(2026, 3, 8, 1, 30),
+            timedelta(0),
+            id='same-instant',
+        ),
+    ])
+    def test_elapsed_time(self, end, start, expected):
+        assert time_utils.subtract_datetimes(end, start) == expected
+
+
+class test_subtract_datetimes_mixed:
+
+    @pytest.mark.parametrize('end,start,expected', [
+        pytest.param(
+            datetime(2026, 3, 8, 8, 0),
+            datetime(2026, 3, 8, 1, 30, tzinfo=ZoneInfo('America/New_York')),
+            timedelta(minutes=90),
+            id='naive-end-positive-difference',
+        ),
+        pytest.param(
+            datetime(2026, 3, 8, 1, 30, tzinfo=ZoneInfo('America/New_York')),
+            datetime(2026, 3, 8, 8, 0),
+            timedelta(minutes=-90),
+            id='naive-start-negative-difference',
+        ),
+        pytest.param(
+            datetime(2026, 3, 8, 4, 0, tzinfo=ZoneInfo('America/New_York')),
+            datetime(2026, 3, 8, 6, 30),
+            timedelta(minutes=90),
+            id='naive-start-positive-difference',
+        ),
+        pytest.param(
+            datetime(2026, 3, 8, 6, 30),
+            datetime(2026, 3, 8, 4, 0, tzinfo=ZoneInfo('America/New_York')),
+            timedelta(minutes=-90),
+            id='naive-end-negative-difference',
+        ),
+        pytest.param(
+            datetime(2026, 3, 8, 6, 30),
+            datetime(2026, 3, 8, 1, 30, tzinfo=ZoneInfo('America/New_York')),
+            timedelta(0),
+            id='naive-end-same-instant',
+        ),
+        pytest.param(
+            datetime(2026, 3, 8, 1, 30, tzinfo=ZoneInfo('America/New_York')),
+            datetime(2026, 3, 8, 6, 30),
+            timedelta(0),
+            id='naive-start-same-instant',
+        ),
+    ])
+    def test_mixed_naive_and_aware_datetimes(self, end, start, expected):
+        assert time_utils.subtract_datetimes(end, start) == expected
+
+    def test_start_with_no_utc_offset_is_naive(self):
+        class NaiveTimezone(tzinfo):
+            def utcoffset(self, dt):
+                return None
+
+        end = datetime(2026, 3, 8, 4, 0, tzinfo=ZoneInfo('America/New_York'))
+        start = datetime(2026, 3, 8, 6, 30, tzinfo=NaiveTimezone())
+
+        assert time_utils.subtract_datetimes(end, start) == timedelta(minutes=90)
+
+    def test_end_with_no_utc_offset_is_naive(self):
+        class NaiveTimezone(tzinfo):
+            def utcoffset(self, dt):
+                return None
+
+        end = datetime(2026, 3, 8, 6, 30, tzinfo=NaiveTimezone())
+        start = datetime(2026, 3, 8, 4, 0, tzinfo=ZoneInfo('America/New_York'))
+
+        assert time_utils.subtract_datetimes(end, start) == timedelta(minutes=-90)

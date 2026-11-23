@@ -1,0 +1,1698 @@
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from pickle import dumps, loads
+from unittest.mock import Mock, patch
+
+import pytest
+from kombu.utils.encoding import ensure_bytes
+
+from celery import states, uuid
+from celery.app.task import Context
+from celery.exceptions import ImproperlyConfigured
+from celery.result import result_from_tuple
+
+pytest.importorskip('sqlalchemy')
+
+from celery.backends.database import DatabaseBackend, session, session_cleanup  # noqa
+from celery.backends.database.models import Task, TaskSet  # noqa
+from celery.backends.database.session import PREPARE_MODELS_MAX_RETRIES, ResultModelBase, SessionManager  # noqa
+from t import skip  # noqa
+
+DB_PATH = "test.db"
+
+
+class SomeClass:
+
+    def __init__(self, data):
+        self.data = data
+
+    def __eq__(self, cmp):
+        return self.data == cmp.data
+
+
+class test_session_cleanup:
+
+    def test_context(self):
+        session = Mock(name='session')
+        with session_cleanup(session):
+            pass
+        session.close.assert_called_with()
+
+    def test_context_raises(self):
+        session = Mock(name='session')
+        with pytest.raises(KeyError):
+            with session_cleanup(session):
+                raise KeyError()
+        session.rollback.assert_called_with()
+        session.close.assert_called_with()
+
+
+@skip.if_pypy
+class test_ModelsIdFieldTypeVariations:
+
+    def test_for_mssql_dialect(self):
+        """Test that ID columns use BigInteger for MSSQL and Integer for other dialects."""
+        from sqlalchemy import BigInteger, Integer
+        from sqlalchemy.dialects import mssql, mysql, oracle, postgresql, sqlite
+
+        models = [Task, TaskSet]
+        id_columns = [m.__table__.columns['id'] for m in models]
+
+        for dialect in [mssql, postgresql, mysql, sqlite, oracle]:
+            for id_column in id_columns:
+                compiled_type = id_column.type.dialect_impl(dialect.dialect())
+                if dialect == mssql:
+                    assert isinstance(compiled_type, BigInteger)
+                else:
+                    assert isinstance(compiled_type, Integer)
+
+
+@skip.if_pypy
+class test_DateDoneIndex:
+    """Test that date_done columns have index=True on Task and TaskSet models."""
+
+    def test_task_date_done_has_index(self):
+        col = Task.__table__.columns['date_done']
+        assert col.index is True, "Task.date_done should have index=True"
+
+    def test_taskset_date_done_has_index(self):
+        col = TaskSet.__table__.columns['date_done']
+        assert col.index is True, "TaskSet.date_done should have index=True"
+
+
+class test_DateDoneColumnDefaults:
+    """Test that date_done column defaults are callables, not fixed values.
+
+    The default and onupdate values must be callables (lambdas) so that
+    datetime.now() is evaluated per-row at INSERT/UPDATE time, not once
+    at module import time.
+    """
+
+    def test_task_date_done_default_is_callable(self):
+        """Task.date_done default should be a callable."""
+        col = Task.__table__.columns['date_done']
+        assert col.default is not None, \
+            "Task.date_done should have a default"
+        assert callable(col.default.arg), \
+            "Task.date_done default should be a callable, not a fixed datetime"
+
+    def test_task_date_done_onupdate_is_callable(self):
+        """Task.date_done onupdate should be a callable (lambda)."""
+        col = Task.__table__.columns['date_done']
+        assert col.onupdate is not None, \
+            "Task.date_done should have an onupdate"
+        assert callable(col.onupdate.arg), \
+            "Task.date_done onupdate should be a callable, not a fixed datetime"
+
+    def test_taskset_date_done_default_is_callable(self):
+        """TaskSet.date_done default should be a callable."""
+        col = TaskSet.__table__.columns['date_done']
+        assert col.default is not None, \
+            "TaskSet.date_done should have a default"
+        assert callable(col.default.arg), \
+            "TaskSet.date_done default should be a callable, not a fixed datetime"
+
+
+@skip.if_pypy
+class test_DatabaseBackend:
+
+    @pytest.fixture(autouse=True)
+    def remmove_db(self):
+        yield
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+
+    def setup_method(self):
+        self.uri = 'sqlite:///' + DB_PATH
+        self.app.conf.result_serializer = 'pickle'
+
+    def test_store_result_retries_on_database_error(self):
+        """Test that _store_result retries when database errors occur."""
+        from celery.backends.database import DatabaseError
+
+        self.app.conf.result_backend_always_retry = True
+        self.app.conf.result_backend_max_retries = 3
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tb._sleep = Mock()
+
+        original_store = tb._store_result
+        call_count = [0]
+
+        def failing_store(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] < 3:
+                raise DatabaseError("connection lost", "SELECT 1", [], Exception())
+            return original_store(*args, **kwargs)
+
+        tb._store_result = failing_store
+
+        tb.store_result('task_id_1', {'result': 42}, states.SUCCESS)
+        assert call_count[0] == 3
+        assert tb._sleep.call_count == 2
+
+    def test_get_task_meta_retries_on_database_error(self):
+        """Test that _get_task_meta_for retries when database errors occur."""
+        from celery.backends.database import DatabaseError
+
+        self.app.conf.result_backend_always_retry = True
+        self.app.conf.result_backend_max_retries = 2
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tb._sleep = Mock()
+
+        tb.store_result('task_id_2', {'result': 'test'}, states.SUCCESS)
+
+        original_get = tb._get_task_meta_for
+        call_count = [0]
+
+        def failing_get(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise DatabaseError("temporary failure", None, None)
+            return original_get(*args, **kwargs)
+
+        tb._get_task_meta_for = failing_get
+
+        meta = tb.get_task_meta('task_id_2')
+        assert meta['status'] == states.SUCCESS
+        assert call_count[0] == 2
+        assert tb._sleep.call_count == 1
+
+    def test_save_group_retries_on_database_error(self):
+        """Test that _save_group retries when database errors occur."""
+        from celery.backends.database import DatabaseError
+
+        self.app.conf.result_backend_always_retry = True
+        self.app.conf.result_backend_max_retries = 2
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tb._sleep = Mock()
+
+        original_save_group = tb._save_group
+        call_count = [0]
+
+        def failing_save_group(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise DatabaseError("connection error", None, None)
+            return original_save_group(*args, **kwargs)
+
+        tb._save_group = failing_save_group
+
+        tb.save_group('group_id_1', {'result': ['task1', 'task2']})
+        assert call_count[0] == 2
+        assert tb._sleep.call_count == 1
+
+    def test_forget_retries_on_database_error(self):
+        """Test that _forget retries when database errors occur."""
+        from celery.backends.database import DatabaseError
+
+        self.app.conf.result_backend_always_retry = True
+        self.app.conf.result_backend_max_retries = 2
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tb._sleep = Mock()
+
+        tb.store_result('task_id_3', {'result': 'to_forget'}, states.SUCCESS)
+
+        original_forget = tb._forget
+        call_count = [0]
+
+        def failing_forget(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise DatabaseError("temporary error", None, None)
+            return original_forget(*args, **kwargs)
+
+        tb._forget = failing_forget
+
+        tb.forget('task_id_3')
+        assert call_count[0] == 2
+        assert tb._sleep.call_count == 1
+
+    def test_cleanup_retries_on_database_error(self):
+        """Test that cleanup retries when database errors occur."""
+        from celery.backends.database import DatabaseError
+
+        self.app.conf.result_backend_always_retry = True
+        self.app.conf.result_backend_max_retries = 2
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tb._sleep = Mock()
+
+        original_cleanup = tb._cleanup
+        call_count = [0]
+
+        def failing_cleanup(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise DatabaseError("temporary failure", None, None)
+            return original_cleanup(*args, **kwargs)
+
+        tb._cleanup = failing_cleanup
+
+        tb.cleanup()
+        assert call_count[0] == 2
+        assert tb._sleep.call_count == 1
+
+    def test_task_result_exists_retries_on_database_error(self):
+        """Test that task_result_exists retries when database errors occur."""
+        from celery.backends.database import DatabaseError
+
+        self.app.conf.result_backend_always_retry = True
+        self.app.conf.result_backend_max_retries = 2
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tb._sleep = Mock()
+
+        tb.store_result('task_id_exists', {'result': 'value'}, states.SUCCESS)
+
+        original = tb._task_result_exists
+        call_count = [0]
+
+        def failing(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise DatabaseError("temporary failure", None, None)
+            return original(*args, **kwargs)
+
+        tb._task_result_exists = failing
+
+        assert tb.task_result_exists('task_id_exists') is True
+        assert call_count[0] == 2
+        assert tb._sleep.call_count == 1
+
+    def test_create_tables_retries_on_database_error(self):
+        """Test that _create_tables retries when ResultSession() fails."""
+        from celery.backends.database import DatabaseError
+
+        self.app.conf.result_backend_always_retry = True
+        self.app.conf.result_backend_max_retries = 2
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tb._sleep = Mock()
+
+        original = tb.ResultSession
+        call_count = [0]
+
+        def failing(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise DatabaseError("engine init failure", None, None)
+            return original(*args, **kwargs)
+
+        tb.ResultSession = failing
+
+        tb._create_tables()
+        assert call_count[0] == 2
+        assert tb._sleep.call_count == 1
+
+    def test_retries_respect_max_retries_config(self):
+        """Test that retries stop after max_retries is reached."""
+        from celery.backends.database import DatabaseError
+        from celery.exceptions import BackendStoreError
+
+        self.app.conf.result_backend_always_retry = True
+        self.app.conf.result_backend_max_retries = 2
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tb._sleep = Mock()
+
+        call_count = [0]
+
+        def always_failing_store(*args, **kwargs):
+            call_count[0] += 1
+            raise DatabaseError("persistent failure", None, None)
+
+        tb._store_result = always_failing_store
+
+        with pytest.raises(BackendStoreError):
+            tb.store_result('task_id_4', {'result': 42}, states.SUCCESS)
+
+        assert call_count[0] == 3
+        assert tb._sleep.call_count == 2
+
+    def test_retries_call_on_backend_retryable_error_hook(self):
+        """Test that on_backend_retryable_error is called during retries."""
+        from celery.backends.database import DatabaseError
+
+        self.app.conf.result_backend_always_retry = True
+        self.app.conf.result_backend_max_retries = 2
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tb._sleep = Mock()
+        tb.session_manager.invalidate = Mock()
+
+        original_store = tb._store_result
+        call_count = [0]
+
+        def failing_store(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise DatabaseError("connection lost", "SELECT 1", [], Exception())
+            return original_store(*args, **kwargs)
+
+        tb._store_result = failing_store
+
+        tb.store_result('task_id_5', {'result': 42}, states.SUCCESS)
+
+        tb.session_manager.invalidate.assert_called_once_with(tb.url)
+        assert tb._sleep.call_count == 1
+
+    def test_non_retryable_exceptions_propagate_immediately(self):
+        """Test that non-retryable exceptions are not retried and propagate directly."""
+        self.app.conf.result_backend_always_retry = True
+        self.app.conf.result_backend_max_retries = 5
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tb._sleep = Mock()
+
+        call_count = [0]
+
+        def failing_store(*args, **kwargs):
+            call_count[0] += 1
+            raise ValueError("not a database error")
+
+        tb._store_result = failing_store
+
+        with pytest.raises(ValueError, match="not a database error"):
+            tb.store_result('task_id_6', {'result': 42}, states.SUCCESS)
+
+        assert call_count[0] == 1
+        assert tb._sleep.call_count == 0
+
+    def test_without_fallback_exc_reaching_max_retries(self):
+        """
+        Test that _ensure_retryable raises the original exception
+        when max retries are reached and no fallback_exc is provided.
+        """
+        self.app.conf.result_backend_always_retry, prev = True, self.app.conf.result_backend_always_retry
+        self.app.conf.result_backend_max_retries, prev_max_retries = 0, self.app.conf.result_backend_max_retries
+
+        expected_exc = Exception("operation failed")
+        try:
+            tb = DatabaseBackend(self.uri, app=self.app)
+            tb.exception_safe_to_retry = lambda exc: True
+            tb._sleep = Mock()
+            tb._forget = Mock()
+            tb._forget.side_effect = expected_exc
+            try:
+                tb.forget('dummy_task_id')
+                assert False, "Should have raised the original exception"
+            except Exception as exc:
+                assert exc == expected_exc
+                assert tb._sleep.call_count == 0
+        finally:
+            self.app.conf.result_backend_always_retry = prev
+            self.app.conf.result_backend_max_retries = prev_max_retries
+
+    def test_retry_settings_defaults(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert tb.always_retry is True
+        assert tb.max_retries == 3
+
+    def test_retry_settings_set_to_none_use_the_defaults(self):
+        self.app.conf.result_backend_always_retry = None
+        self.app.conf.result_backend_max_retries = None
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert tb.always_retry is True
+        assert tb.max_retries == 3
+
+    @pytest.mark.parametrize('config', [
+        {'result_backend_always_retry': False, 'result_backend_max_retries': 0},
+        # The old setting names
+        {'CELERY_RESULT_BACKEND_ALWAYS_RETRY': False, 'CELERY_RESULT_BACKEND_MAX_RETRIES': 0},
+    ])
+    def test_retry_settings_from_config_object(self, config):
+        with self.Celery(set_as_current=False) as app:
+            app.config_from_object(config)
+            tb = DatabaseBackend(self.uri, app=app)
+            assert tb.always_retry is False
+            assert tb.max_retries == 0
+
+    def test_missing_dburi_raises_ImproperlyConfigured(self):
+        self.app.conf.database_url = None
+        with pytest.raises(ImproperlyConfigured):
+            DatabaseBackend(app=self.app)
+
+    def test_engine_options_include_pool_health_defaults(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert tb.engine_options["pool_pre_ping"] is True
+        assert tb.engine_options["pool_recycle"] == 3600
+
+    def test_engine_options_explicit_values_override_defaults(self):
+        self.app.conf.database_engine_options = {"pool_pre_ping": False}
+        tb = DatabaseBackend(
+            self.uri,
+            app=self.app,
+            engine_options={"pool_recycle": 15},
+        )
+        assert tb.engine_options["pool_pre_ping"] is False
+        assert tb.engine_options["pool_recycle"] == 15
+
+    def test_exception_safe_to_retry(self):
+        from celery.backends.database import DatabaseError, InvalidRequestError, StaleDataError
+
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert tb.exception_safe_to_retry(DatabaseError("", "", Exception("db error")))
+        assert tb.exception_safe_to_retry(InvalidRequestError())
+        assert tb.exception_safe_to_retry(StaleDataError())
+        assert not tb.exception_safe_to_retry(RuntimeError("not retryable"))
+
+    def test_exception_safe_to_retry_with_interface_error(self):
+        from celery.backends.database import InterfaceError
+
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert tb.exception_safe_to_retry(InterfaceError("", None, Exception("connection lost")))
+
+    def test_on_backend_retryable_error_invalidates_session(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tb.session_manager.invalidate = Mock()
+
+        tb.on_backend_retryable_error(RuntimeError("retryable"))
+        tb.session_manager.invalidate.assert_called_once_with(tb.url)
+
+    def test_on_backend_retryable_error_called_with_exception(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tb.session_manager.invalidate = Mock()
+        mock_exc = RuntimeError("connection lost")
+
+        tb.on_backend_retryable_error(mock_exc)
+
+        tb.session_manager.invalidate.assert_called_once_with(tb.url)
+
+    def test_table_schema_config(self):
+        self.app.conf.database_table_schemas = {
+            'task': 'foo',
+            'group': 'bar',
+        }
+        # disable table creation because schema foo and bar do not exist
+        # and aren't created if they don't exist.
+        self.app.conf.database_create_tables_at_setup = False
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert tb.task_cls.__table__.schema == 'foo'
+        assert tb.task_cls.__table__.c.id.default.schema == 'foo'
+        assert tb.taskset_cls.__table__.schema == 'bar'
+        assert tb.taskset_cls.__table__.c.id.default.schema == 'bar'
+
+    def test_table_name_config(self):
+        self.app.conf.database_table_names = {
+            'task': 'foo',
+            'group': 'bar',
+        }
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert tb.task_cls.__table__.name == 'foo'
+        assert tb.taskset_cls.__table__.name == 'bar'
+
+    def test_table_name_config_names_indexes_after_tables(self):
+        self.app.conf.database_table_names = {
+            'task': 'foo',
+            'group': 'bar',
+        }
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert {i.name for i in tb.task_cls.__table__.indexes} == {'ix_foo_date_done'}
+        assert {i.name for i in tb.taskset_cls.__table__.indexes} == {'ix_bar_date_done'}
+
+    def test_long_table_names_keep_index_names_within_the_limit(self):
+        from sqlalchemy.dialects import postgresql
+        from sqlalchemy.schema import CreateIndex
+        self.app.conf.database_table_names = {
+            'task': 'x' * 51 + '_taskmeta',
+            'group': 'y' * 50 + '_groupmeta',
+        }
+        self.app.conf.database_create_tables_at_setup = False
+        tb = DatabaseBackend(self.uri, app=self.app)
+        for table in (tb.task_cls.__table__, tb.taskset_cls.__table__):
+            for index in table.indexes:
+                ddl = str(CreateIndex(index).compile(dialect=postgresql.dialect()))
+                name = ddl.split()[2]
+                assert len(name) <= 63, name
+
+    def test_renaming_indexes_leaves_multi_column_indexes_alone(self):
+        import sqlalchemy as sa
+
+        from celery.backends.database.models import _rename_indexes_with_table
+        table = sa.Table(
+            'results', sa.MetaData(),
+            sa.Column('date_done', sa.DateTime, index=True),
+            sa.Column('status', sa.String(50)),
+        )
+        # named as a single-column index on ``status`` would be
+        sa.Index('ix_results_status', table.c.status, table.c.date_done)
+        table.name = 'myapp_results'
+        _rename_indexes_with_table(table, 'results')
+        assert {i.name for i in table.indexes} == {
+            'ix_myapp_results_date_done', 'ix_results_status',
+        }
+
+    def test_renaming_indexes_leaves_an_explicitly_named_index_alone(self):
+        import sqlalchemy as sa
+
+        from celery.backends.database.models import _rename_indexes_with_table
+        table = sa.Table(
+            'results', sa.MetaData(),
+            sa.Column('date_done', sa.DateTime, index=True),
+            sa.Column('status', sa.String(50)),
+        )
+        sa.Index('my_status_index', table.c.status)
+        table.name = 'myapp_results'
+        _rename_indexes_with_table(table, 'results')
+        assert {i.name for i in table.indexes} == {
+            'ix_myapp_results_date_done', 'my_status_index',
+        }
+
+    def test_table_names_can_be_configured_again(self):
+        self.app.conf.database_table_names = {'task': 'foo', 'group': 'bar'}
+        DatabaseBackend(self.uri, app=self.app)
+        self.app.conf.database_table_names = {'task': 'baz'}
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert {i.name for i in tb.task_cls.__table__.indexes} == {'ix_baz_date_done'}
+        assert {i.name for i in tb.taskset_cls.__table__.indexes} == {'ix_celery_tasksetmeta_date_done'}
+
+    def test_default_table_names_keep_default_index_names(self):
+        # Existing databases already have these indexes; their names must not change.
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert {i.name for i in tb.task_cls.__table__.indexes} == {'ix_celery_taskmeta_date_done'}
+        assert {i.name for i in tb.taskset_cls.__table__.indexes} == {'ix_celery_tasksetmeta_date_done'}
+
+    def test_two_apps_with_their_own_table_names_share_a_database(self, tmp_path):
+        # Index names are unique per database on SQLite (per schema on
+        # PostgreSQL). With one shared name, SQLite skips the second app's
+        # index, and PostgreSQL fails to create the second app's tables.
+        from sqlalchemy import inspect
+        uri = f'sqlite:///{tmp_path / "shared.db"}'
+        for app_name in ('billing', 'reports'):
+            self.app.conf.database_table_names = {
+                'task': f'{app_name}_taskmeta',
+                'group': f'{app_name}_groupmeta',
+            }
+            tb = DatabaseBackend(uri, app=self.app)
+            tb.store_result(f'{app_name}-task', 42, states.SUCCESS)
+            assert tb.get_task_meta(f'{app_name}-task', cache=False)['status'] == states.SUCCESS
+        inspector = inspect(tb.session_manager.get_engine(tb.url))
+        for table in ('billing_taskmeta', 'billing_groupmeta', 'reports_taskmeta', 'reports_groupmeta'):
+            indexed = [i['column_names'] for i in inspector.get_indexes(table)]
+            assert ['date_done'] in indexed, f'{table} has no date_done index'
+
+    def test_table_creation_at_setup_config(self):
+        from sqlalchemy import inspect
+        self.app.conf.database_create_tables_at_setup = True
+        tb = DatabaseBackend(self.uri, app=self.app)
+        engine = tb.session_manager.get_engine(tb.url)
+        inspect(engine).has_table("celery_taskmeta")
+        inspect(engine).has_table("celery_tasksetmeta")
+
+    def test_missing_task_id_is_PENDING(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert tb.get_state('xxx-does-not-exist') == states.PENDING
+
+    def test_missing_task_meta_is_dict_with_pending(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        meta = tb.get_task_meta('xxx-does-not-exist-at-all')
+        assert meta['status'] == states.PENDING
+        assert meta['task_id'] == 'xxx-does-not-exist-at-all'
+        assert meta['result'] is None
+        assert meta['traceback'] is None
+
+    def test_task_result_exists_for_missing_task(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert tb.task_result_exists('xxx-does-not-exist') is False
+
+    def test_task_result_exists_after_mark_as_done(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        assert tb.task_result_exists(tid) is False
+        tb.mark_as_done(tid, 42)
+        assert tb.task_result_exists(tid) is True
+
+    def test_task_result_exists_after_mark_as_failure(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.mark_as_failure(tid, RuntimeError('fail'), traceback='tb')
+        assert tb.task_result_exists(tid) is True
+
+    def test_mark_as_done(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+
+        tid = uuid()
+
+        assert tb.get_state(tid) == states.PENDING
+        assert tb.get_result(tid) is None
+
+        tb.mark_as_done(tid, 42)
+        assert tb.get_state(tid) == states.SUCCESS
+        assert tb.get_result(tid) == 42
+
+    def test_is_pickled(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+
+        tid2 = uuid()
+        result = {'foo': 'baz', 'bar': SomeClass(12345)}
+        tb.mark_as_done(tid2, result)
+        # is serialized properly.
+        rindb = tb.get_result(tid2)
+        assert rindb.get('foo') == 'baz'
+        assert rindb.get('bar').data == 12345
+
+    def test_result_respects_configured_serializer(self):
+        """Regression test for celery/celery#3025.
+
+        The result column must contain the bytes produced by the
+        configured ``result_serializer``, not an implicit pickle blob.
+        """
+        self.app.conf.result_serializer = 'json'
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.mark_as_done(tid, {'answer': 42})
+
+        session = tb.ResultSession()
+        raw = session.query(Task).filter(Task.task_id == tid).first().result
+        session.close()
+
+        assert raw[:1] != b'\x80', 'result was pickled despite json serializer'
+        assert json.loads(raw) == {'answer': 42}
+        assert tb.get_result(tid) == {'answer': 42}
+
+    def test_result_decode_falls_back_to_pickle_for_legacy_rows(self):
+        """Rows written before the celery/celery#3025 fix are always
+        pickle, regardless of the configured serializer. Reading them
+        back after upgrading must still work.
+        """
+        self.app.conf.result_serializer = 'json'
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+
+        session = tb.ResultSession()
+        task = Task(tid)
+        task.status = states.SUCCESS
+        task.result = dumps({'legacy': 'pickle-data'})
+        session.add(task)
+        session.commit()
+        session.close()
+
+        with patch('celery.backends.database.logger.warning') as warning:
+            meta = tb.get_task_meta(tid)
+
+        assert meta['result'] == {'legacy': 'pickle-data'}
+        warning.assert_called_once()
+
+    def test_result_decode_does_not_unpickle_non_pickle_garbage(self):
+        """The pickle fallback must not fire on arbitrary bytes that
+        merely fail to decode under the configured serializer -- only on
+        payloads that actually look like a pickle (see review discussion
+        on PR #10536).
+        """
+        self.app.conf.result_serializer = 'json'
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+
+        session = tb.ResultSession()
+        task = Task(tid)
+        task.status = states.SUCCESS
+        task.result = b'not-json-and-not-pickle-either'
+        session.add(task)
+        session.commit()
+        session.close()
+
+        with pytest.raises(Exception):
+            tb.get_task_meta(tid)
+
+    @pytest.mark.parametrize(
+        'result_serializer',
+        ['pickle', 'json'],
+        ids=['using pickle', 'using json']
+    )
+    def test_store_result_with_children(self, result_serializer):
+        self.app.conf.result_serializer = result_serializer
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        child1 = self.app.AsyncResult(uuid())
+        child2 = self.app.AsyncResult(uuid())
+
+        request = Context()
+        request.children.extend([child1, child2])
+        tb.store_result(tid, 42, states.SUCCESS, request=request)
+        meta = tb.get_task_meta(tid)
+
+        assert meta['result'] == 42
+        assert len(meta['children']) == 2
+        deserialized = [result_from_tuple(c, self.app) for c in meta['children']]
+        assert [c.id for c in deserialized] == [child1.id, child2.id]
+
+    def test_async_result_children(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        child_id = uuid()
+        child = self.app.AsyncResult(child_id)
+
+        request = Context()
+        request.children.append(child)
+        tb.store_result(tid, 42, states.SUCCESS, request=request)
+
+        result = self.app.AsyncResult(tid, backend=tb)
+        children = result.children
+        assert children is not None
+        assert len(children) == 1
+        assert children[0].id == child_id
+
+    def test_store_result_no_children(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.store_result(tid, 42, states.SUCCESS)
+        meta = tb.get_task_meta(tid)
+        assert meta['children'] is None
+        result = self.app.AsyncResult(tid)
+        assert result.children is None
+
+    def test_migrate_missing_columns(self):
+        import sqlalchemy as sa
+        engine = sa.create_engine('sqlite:///:memory:')
+        metadata = sa.MetaData()
+        sa.Table(
+            'celery_taskmeta', metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('task_id', sa.String(155), unique=True),
+            sa.Column('status', sa.String(50)),
+            sa.Column('result', sa.LargeBinary, nullable=True),
+            sa.Column('date_done', sa.DateTime, nullable=True),
+            sa.Column('traceback', sa.Text, nullable=True),
+        )
+        metadata.create_all(engine)
+
+        session_mgr = SessionManager()
+        session_mgr.prepare_models(engine)
+
+        from sqlalchemy import inspect
+        inspector = inspect(engine)
+        cols = {c['name'] for c in inspector.get_columns('celery_taskmeta')}
+        assert 'children' in cols
+
+    def test_store_result_task_without_children_attribute(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+
+        class TaskWithoutChildren:
+            pass
+
+        dummy = TaskWithoutChildren()
+        tb._update_result(dummy, 42, states.SUCCESS)
+        assert not hasattr(dummy, 'children')
+
+    def test_migrate_missing_columns_failure_logs_warning_and_degrades_gracefully(self):
+        import sqlalchemy as sa
+        engine = sa.create_engine('sqlite:///:memory:')
+        metadata = sa.MetaData()
+        sa.Table(
+            'celery_taskmeta', metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('task_id', sa.String(155), unique=True),
+            sa.Column('status', sa.String(50)),
+            sa.Column('result', sa.LargeBinary, nullable=True),
+            sa.Column('date_done', sa.DateTime, nullable=True),
+            sa.Column('traceback', sa.Text, nullable=True),
+        ).create(engine)
+
+        session_mgr = SessionManager()
+        failing_conn = Mock()
+        failing_conn.execute.side_effect = Exception("permission denied: ALTER TABLE")
+
+        class FailingBegin:
+            def __enter__(self):
+                return failing_conn
+
+            def __exit__(self, *args):
+                pass
+
+        with patch.object(engine, 'begin', return_value=FailingBegin()):
+            with patch('celery.backends.database.session.logger.warning') as mock_warn:
+                session_mgr.prepare_models(engine)
+                assert mock_warn.called
+                logged_msg = mock_warn.call_args[0][0]
+                assert "Failed to add missing column" in logged_msg
+
+        # Test backend tolerant read path on this database:
+        tb = DatabaseBackend('sqlite:///:memory:', app=self.app)
+        with engine.begin() as conn:
+            conn.execute(sa.text(
+                "INSERT INTO celery_taskmeta (task_id, status, result) VALUES ('test-tid', 'SUCCESS', :res)"
+            ), {'res': tb.encode(42)})
+
+        tb.session_manager.session_factory = lambda *a, **kw: sa.orm.sessionmaker(bind=engine)()
+        meta = tb.get_task_meta('test-tid')
+        assert meta['result'] == 42
+        assert meta['children'] is None
+
+    def test_query_task_fallback_on_operational_error(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        session = Mock()
+
+        # Simulate first query failing with 'no such column: celery_taskmeta.children'
+        from sqlalchemy.exc import DatabaseError
+        err = DatabaseError("SELECT", {}, Exception("no such column: celery_taskmeta.children"))
+        query_mock = Mock()
+        query_mock.filter.side_effect = [err, [Mock(task_id=tid, to_dict=lambda: {'task_id': tid})]]
+        query_mock.options.return_value = query_mock
+        session.query.return_value = query_mock
+
+        res = tb._query_task(session, tid)
+        assert res.task_id == tid
+        assert query_mock.options.called
+
+    def test_migrate_missing_columns_ignores_exceptions(self):
+        session_mgr = SessionManager()
+        mock_engine = Mock()
+        with patch('celery.backends.database.session.inspect', side_effect=Exception("inspect error")):
+            with patch('celery.backends.database.session.logger.warning') as mock_warn:
+                # Must not raise and must log warning
+                session_mgr._migrate_missing_columns(mock_engine)
+                assert mock_warn.called
+
+    def test_migrate_missing_columns_when_table_not_exists(self):
+        session_mgr = SessionManager()
+        mock_engine = Mock()
+        mock_inspector = Mock()
+        mock_inspector.has_table.return_value = False
+        with patch('celery.backends.database.session.inspect', return_value=mock_inspector):
+            session_mgr._migrate_missing_columns(mock_engine)
+        mock_inspector.get_columns.assert_not_called()
+
+    def test_mark_as_started(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.mark_as_started(tid)
+        assert tb.get_state(tid) == states.STARTED
+
+    def test_mark_as_revoked(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.mark_as_revoked(tid)
+        assert tb.get_state(tid) == states.REVOKED
+
+    def test_mark_as_retry(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        try:
+            raise KeyError('foo')
+        except KeyError as exception:
+            import traceback
+            trace = '\n'.join(traceback.format_stack())
+            tb.mark_as_retry(tid, exception, traceback=trace)
+            assert tb.get_state(tid) == states.RETRY
+            assert isinstance(tb.get_result(tid), KeyError)
+            assert tb.get_traceback(tid) == trace
+
+    def test_mark_as_failure(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+
+        tid3 = uuid()
+        try:
+            raise KeyError('foo')
+        except KeyError as exception:
+            import traceback
+            trace = '\n'.join(traceback.format_stack())
+            tb.mark_as_failure(tid3, exception, traceback=trace)
+            assert tb.get_state(tid3) == states.FAILURE
+            assert isinstance(tb.get_result(tid3), KeyError)
+            assert tb.get_traceback(tid3) == trace
+
+    @pytest.mark.parametrize('state, result', [
+        (states.STARTED, {'pid': 1}),
+        (states.FAILURE, KeyError('foo')),
+        (states.SUCCESS, 43),
+    ])
+    def test_store_result_after_success_is_ignored(self, state, result):
+        # e.g. the task runs again after its worker was lost before the ack
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.mark_as_done(tid, 42)
+        tb.store_result(tid, result, state)
+        meta = tb.get_task_meta(tid, cache=False)
+        assert meta['status'] == states.SUCCESS
+        assert meta['result'] == 42
+
+    def test_store_result_before_success_is_saved(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.mark_as_started(tid)
+        tb.mark_as_retry(tid, KeyError('foo'))
+        tb.mark_as_failure(tid, KeyError('foo'))
+        assert tb.get_task_meta(tid, cache=False)['status'] == states.FAILURE
+        tb.mark_as_done(tid, 42)
+        meta = tb.get_task_meta(tid, cache=False)
+        assert meta['status'] == states.SUCCESS
+        assert meta['result'] == 42
+
+    def start_while_other_run_succeeds(self, tb, tid, on_locked_read):
+        # A second run starts just as the first one saves its SUCCESS
+        query_task = tb._query_task
+
+        def query_task_then_other_run_succeeds(session, task_id, for_update=False):
+            task = query_task(session, task_id, for_update=for_update)
+            if for_update == on_locked_read:
+                tb._query_task = query_task
+                tb.mark_as_done(task_id, 42)
+            return task
+
+        tb._query_task = query_task_then_other_run_succeeds
+        tb.mark_as_started(tid, pid=2)
+
+    def test_store_result_racing_a_success_keeps_it(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.mark_as_started(tid, pid=1)
+        # The SUCCESS is saved before the second run locks the row
+        self.start_while_other_run_succeeds(tb, tid, on_locked_read=False)
+        meta = tb.get_task_meta(tid, cache=False)
+        assert (meta['status'], meta['result']) == (states.SUCCESS, 42)
+
+    def test_store_result_racing_a_success_without_row_locks(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.mark_as_started(tid, pid=1)
+        # SQLite has no row locks, so the SUCCESS can be saved even after the
+        # second run read the row. The row then has that run's state.
+        self.start_while_other_run_succeeds(tb, tid, on_locked_read=True)
+        meta = tb.get_task_meta(tid, cache=False)
+        assert (meta['status'], meta['result']) == (states.STARTED, {'pid': 2})
+        tb.mark_as_done(tid, 43)
+        assert tb.get_task_meta(tid, cache=False)['result'] == 43
+
+    def test_forget(self):
+        tb = DatabaseBackend(self.uri, backend='memory://', app=self.app)
+        tid = uuid()
+        tb.mark_as_done(tid, {'foo': 'bar'})
+        tb.mark_as_done(tid, {'foo': 'bar'})
+        x = self.app.AsyncResult(tid, backend=tb)
+        x.forget()
+        assert x.result is None
+
+    def test_process_cleanup(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tb.process_cleanup()
+
+    @pytest.mark.usefixtures('depends_on_current_app')
+    def test_reduce(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert loads(dumps(tb))
+
+    @pytest.mark.usefixtures('depends_on_current_app')
+    def test_save__restore__delete_group(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+
+        tid = uuid()
+        res = self.app.GroupResult(
+            tid, [self.app.AsyncResult(uuid()), self.app.AsyncResult(uuid())])
+        assert tb.save_group(tid, res) == res
+
+        res2 = tb.restore_group(tid)
+        assert res2 == res
+
+        tb.delete_group(tid)
+        assert tb.restore_group(tid) is None
+
+        assert tb.restore_group('xxx-nonexisting-id') is None
+
+    @pytest.mark.usefixtures('depends_on_current_app')
+    def test_save__restore_group_respects_configured_serializer(self):
+        """Regression test for celery/celery#3025 (group results).
+
+        Covers the real GroupResult.save()/.restore() path (see review
+        discussion on PR #10536), not just an arbitrary value.
+        """
+        self.app.conf.result_serializer = 'json'
+        tb = DatabaseBackend(self.uri, app=self.app)
+
+        tid = uuid()
+        res = self.app.GroupResult(
+            tid, [self.app.AsyncResult(uuid()), self.app.AsyncResult(uuid())])
+        tb.save_group(tid, res)
+
+        session = tb.ResultSession()
+        raw = session.query(TaskSet).filter(
+            TaskSet.taskset_id == tid).first().result
+        session.close()
+
+        assert raw[:1] != b'\x80', 'group result was pickled despite json serializer'
+        assert tb.restore_group(tid) == res
+
+    def test_cleanup(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        for i in range(10):
+            tb.mark_as_done(uuid(), 42)
+            tb.save_group(uuid(), {'foo': 'bar'})
+        s = tb.ResultSession()
+        for t in s.query(Task).all():
+            t.date_done = datetime.now() - tb.expires * 2
+        for t in s.query(TaskSet).all():
+            t.date_done = datetime.now() - tb.expires * 2
+        s.commit()
+        s.close()
+
+        tb.cleanup()
+
+    def test_cleanup_respects_timezone_for_expiration(self):
+        """Regression test for timezone bug where cleanup uses app.now() while date_done is UTC."""
+        original_timezone = self.app.conf.timezone
+        original_expires = self.app.conf.result_expires
+
+        try:
+            self.app.conf.timezone = 'Asia/Tokyo'
+            self.app.conf.result_expires = 86400
+
+            tb = DatabaseBackend(self.uri, app=self.app)
+
+            unexpired_task_id = uuid()
+            expired_task_id = uuid()
+            tb.mark_as_done(unexpired_task_id, 42)
+            tb.mark_as_done(expired_task_id, 100)
+
+            session = tb.ResultSession()
+            now = datetime.now(timezone.utc)
+
+            session.query(Task).filter(
+                Task.task_id == unexpired_task_id
+            ).first().date_done = now - timedelta(hours=20)
+
+            session.query(Task).filter(
+                Task.task_id == expired_task_id
+            ).first().date_done = now - timedelta(hours=30)
+
+            session.commit()
+            session.close()
+
+            tb.cleanup()
+
+            session = tb.ResultSession()
+            assert session.query(Task).filter(
+                Task.task_id == unexpired_task_id
+            ).first() is not None
+            assert session.query(Task).filter(
+                Task.task_id == expired_task_id
+            ).first() is None
+            session.close()
+        finally:
+            self.app.conf.timezone = original_timezone
+            self.app.conf.result_expires = original_expires
+
+    def test_Task__repr__(self):
+        assert 'foo' in repr(Task('foo'))
+
+    def test_TaskSet__repr__(self):
+        assert 'foo', repr(TaskSet('foo' in None))
+
+
+@skip.if_pypy
+class test_DatabaseBackend_result_extended():
+    def setup_method(self):
+        self.uri = 'sqlite:///' + DB_PATH
+        self.app.conf.result_serializer = 'pickle'
+        self.app.conf.result_extended = True
+
+    @pytest.mark.parametrize(
+        'result_serializer, args, kwargs',
+        [
+            ('pickle', (SomeClass(1), SomeClass(2)), {'foo': SomeClass(123)}),
+            ('json', ['a', 'b'], {'foo': 'bar'}),
+        ],
+        ids=['using pickle', 'using json']
+    )
+    def test_store_result(self, result_serializer, args, kwargs):
+        self.app.conf.result_serializer = result_serializer
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+
+        request = Context(args=args, kwargs=kwargs,
+                          task='mytask', retries=2,
+                          hostname='celery@worker_1',
+                          delivery_info={'routing_key': 'celery'})
+
+        tb.store_result(tid, {'fizz': 'buzz'}, states.SUCCESS, request=request)
+        meta = tb.get_task_meta(tid)
+
+        assert meta['result'] == {'fizz': 'buzz'}
+        assert meta['args'] == args
+        assert meta['kwargs'] == kwargs
+        assert meta['queue'] == 'celery'
+        assert meta['name'] == 'mytask'
+        assert meta['retries'] == 2
+        assert meta['worker'] == "celery@worker_1"
+
+    @pytest.mark.parametrize(
+        'result_serializer, args, kwargs',
+        [
+            ('pickle', (SomeClass(1), SomeClass(2)), {'foo': SomeClass(123)}),
+            ('json', ['a', 'b'], {'foo': 'bar'}),
+        ],
+        ids=['using pickle', 'using json']
+    )
+    def test_store_none_result(self, result_serializer, args, kwargs):
+        self.app.conf.result_serializer = result_serializer
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+
+        request = Context(args=args, kwargs=kwargs,
+                          task='mytask', retries=2,
+                          hostname='celery@worker_1',
+                          delivery_info={'routing_key': 'celery'})
+
+        tb.store_result(tid, None, states.SUCCESS, request=request)
+        meta = tb.get_task_meta(tid)
+
+        assert meta['result'] is None
+        assert meta['args'] == args
+        assert meta['kwargs'] == kwargs
+        assert meta['queue'] == 'celery'
+        assert meta['name'] == 'mytask'
+        assert meta['retries'] == 2
+        assert meta['worker'] == "celery@worker_1"
+
+    def test_store_result_after_success_keeps_extended_fields(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        request = Context(args=(1, 2), kwargs={'foo': 'bar'}, task='mytask',
+                          retries=0, hostname='celery@worker_1',
+                          delivery_info={'routing_key': 'celery'})
+        tb.store_result(tid, {'fizz': 'buzz'}, states.SUCCESS, request=request)
+        meta = tb.get_task_meta(tid, cache=False)
+        # The task runs again on another worker
+        request.update(hostname='celery@worker_2', retries=1)
+        tb.store_result(tid, {'pid': 2}, states.STARTED, request=request)
+        assert tb.get_task_meta(tid, cache=False) == meta
+
+    @pytest.mark.parametrize(
+        'result_serializer',
+        ['pickle', 'json'],
+        ids=['using pickle', 'using json']
+    )
+    def test_store_result_with_stamps(self, result_serializer):
+        self.app.conf.result_serializer = result_serializer
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+
+        request = Context(args=(1, 2), kwargs={'foo': 'bar'},
+                          task='mytask', retries=2,
+                          hostname='celery@worker_1',
+                          delivery_info={'routing_key': 'celery'},
+                          stamped_headers=['stamp1', 'stamp2'],
+                          stamps={'stamp1': ['val1'], 'stamp2': 'val2'})
+
+        tb.store_result(tid, {'fizz': 'buzz'}, states.SUCCESS, request=request)
+        meta = tb.get_task_meta(tid)
+
+        assert meta['result'] == {'fizz': 'buzz'}
+        assert meta['stamped_headers'] == ['stamp1', 'stamp2']
+        assert meta['stamp1'] == ['val1']
+        assert meta['stamp2'] == 'val2'
+        # Matches BaseBackend: stamps are flattened, and 'stamps' key is never leaked
+        assert 'stamps' not in meta
+
+    def test_store_result_without_stamps(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+
+        request = Context(args=(1, 2), kwargs={'foo': 'bar'},
+                          task='mytask', retries=2,
+                          hostname='celery@worker_1',
+                          delivery_info={'routing_key': 'celery'})
+
+        tb.store_result(tid, {'fizz': 'buzz'}, states.SUCCESS, request=request)
+        meta = tb.get_task_meta(tid)
+
+        assert meta['result'] == {'fizz': 'buzz'}
+        assert 'stamps' not in meta
+        assert 'stamped_headers' not in meta
+
+    def test_store_result_stamps_header_missing_from_meta(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        request = Context(args=(), kwargs={}, task='mytask',
+                          stamped_headers=['stamp1', 'stamp_missing'],
+                          stamps={'stamp1': 'val1'})
+        tb.store_result(tid, 'res', states.SUCCESS, request=request)
+        meta = tb.get_task_meta(tid)
+        assert meta['stamp1'] == 'val1'
+        assert 'stamp_missing' not in meta
+        assert meta['stamped_headers'] == ['stamp1', 'stamp_missing']
+        assert 'stamps' not in meta
+
+    def test_store_result_stamps_corrupt_non_dict_payload(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        request = Context(args=(), kwargs={}, task='mytask',
+                          stamped_headers=['stamp1'],
+                          stamps={'stamp1': 'val1'})
+        tb.store_result(tid, 'res', states.SUCCESS, request=request)
+        session = tb.ResultSession()
+        task = session.query(tb.task_cls).filter(tb.task_cls.task_id == tid).first()
+        task.stamps = ensure_bytes(tb.encode("not-a-dict"))
+        session.commit()
+        session.close()
+        tb._cache.clear()
+        meta = tb.get_task_meta(tid)
+        assert meta['result'] == 'res'
+        # Corrupt / non-dict payload fails closed and never leaks raw bytes into meta
+        assert 'stamps' not in meta
+
+    def test_store_result_stamps_only_stamps_without_headers(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        request = Context(args=(), kwargs={}, task='mytask')
+        tb.store_result(tid, 'res', states.SUCCESS, request=request)
+        session = tb.ResultSession()
+        task = session.query(tb.task_cls).filter(tb.task_cls.task_id == tid).first()
+        task.stamps = ensure_bytes(tb.encode({'stamps': {'only_stamps': 'value'}}))
+        session.commit()
+        session.close()
+        tb._cache.clear()
+        meta = tb.get_task_meta(tid)
+        assert meta['only_stamps'] == 'value'
+        assert 'stamped_headers' not in meta
+        assert 'stamps' not in meta
+
+    def test_store_result_stamps_only_headers_without_stamps(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        request = Context(args=(), kwargs={}, task='mytask')
+        tb.store_result(tid, 'res', states.SUCCESS, request=request)
+        session = tb.ResultSession()
+        task = session.query(tb.task_cls).filter(tb.task_cls.task_id == tid).first()
+        task.stamps = ensure_bytes(tb.encode({'stamped_headers': ['only_header']}))
+        session.commit()
+        session.close()
+        tb._cache.clear()
+        meta = tb.get_task_meta(tid)
+        assert meta['stamped_headers'] == ['only_header']
+        assert 'stamps' not in meta
+
+    def test_store_result_stamps_disabled_when_result_extended_false(self):
+        self.app.conf.result_extended = False
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert tb.task_cls is Task
+        assert not hasattr(Task, 'stamps')
+        tid = uuid()
+        request = Context(stamped_headers=['stamp1'], stamps={'stamp1': 'val1'})
+        tb.store_result(tid, 'res', states.SUCCESS, request=request)
+        meta = tb.get_task_meta(tid)
+        assert 'stamp1' not in meta
+        assert 'stamped_headers' not in meta
+        assert 'stamps' not in meta
+
+    def test_store_result_stamps_missing_column_graceful_fallback(self):
+        from sqlalchemy.exc import DatabaseError
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        tb.store_result(tid, 'res', states.SUCCESS)
+
+        session = tb.ResultSession()
+
+        # When DatabaseError occurs with 'stamps', _query_task defers the column
+        with patch.object(session, 'query') as mock_query:
+            first_mock = Mock()
+            first_mock.filter.side_effect = DatabaseError(
+                "SELECT celery_taskmeta.stamps", None, Exception("no such column: celery_taskmeta.stamps")
+            )
+            second_mock = Mock()
+            second_filter = Mock()
+            second_filter.return_value = [tb.task_cls(tid)]
+            second_mock.filter = second_filter
+            first_mock.options.side_effect = lambda opt: second_mock
+
+            mock_query.return_value = first_mock
+            task = tb._query_task(session, tid)
+            assert task is not None
+            assert task.task_id == tid
+
+    def test_stamped_signature_roundtrip_with_async_result(self):
+        from celery.canvas import signature
+        from celery.result import AsyncResult
+
+        tb = DatabaseBackend(self.uri, app=self.app)
+        sig = signature('mytask')
+        sig.stamp(stamp_key='stamp_value', custom_run_id=123)
+
+        tid = uuid()
+        request = Context(
+            task='mytask',
+            stamped_headers=sig.options['stamped_headers'],
+            stamps={h: sig.options[h] for h in sig.options['stamped_headers'] if h in sig.options}
+        )
+
+        tb.store_result(tid, {'status': 'completed'}, states.SUCCESS, request=request)
+        async_res = AsyncResult(tid, backend=tb)
+        assert async_res.result == {'status': 'completed'}
+        assert async_res.state == states.SUCCESS
+
+        meta = tb.get_task_meta(tid)
+        assert meta['stamp_key'] == 'stamp_value'
+        assert meta['custom_run_id'] == 123
+        assert set(meta['stamped_headers']) == {'stamp_key', 'custom_run_id'}
+        assert 'stamps' not in meta
+
+    def test_store_result_stamps_corrupt_unpicklable_decode_error(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        tid = uuid()
+        request = Context(args=(), kwargs={}, task='mytask')
+        tb.store_result(tid, 'res', states.SUCCESS, request=request)
+        session = tb.ResultSession()
+        task = session.query(tb.task_cls).filter(tb.task_cls.task_id == tid).first()
+        task.stamps = b'corrupt-unpicklable-blob'
+        session.commit()
+        session.close()
+        tb._cache.clear()
+        meta = tb.get_task_meta(tid)
+        assert meta['result'] == 'res'
+        assert 'stamps' not in meta
+
+    def test_task_extended_to_dict_tolerant_of_stamps_error(self):
+        from unittest.mock import PropertyMock
+
+        from celery.backends.database.models import TaskExtended
+        task = TaskExtended('test-task')
+        with patch.object(TaskExtended, 'stamps', new_callable=PropertyMock, side_effect=Exception("error")):
+            d = task.to_dict()
+            assert d['stamps'] is None
+
+    def test_query_task_unrelated_database_error_raises(self):
+        from sqlalchemy.exc import DatabaseError
+        tb = DatabaseBackend(self.uri, app=self.app)
+        session = Mock()
+        session.query.side_effect = DatabaseError("SELECT", {}, Exception("unrelated connection lost"))
+        with pytest.raises(DatabaseError):
+            tb._query_task(session, 'some-id')
+
+    @pytest.mark.parametrize(
+        'result_serializer, args, kwargs',
+        [
+            ('pickle', (SomeClass(1), SomeClass(2)),
+             {'foo': SomeClass(123)}),
+            ('json', ['a', 'b'], {'foo': 'bar'}),
+        ],
+        ids=['using pickle', 'using json']
+    )
+    def test_get_result_meta(self, result_serializer, args, kwargs):
+        self.app.conf.result_serializer = result_serializer
+        tb = DatabaseBackend(self.uri, app=self.app)
+
+        request = Context(args=args, kwargs=kwargs,
+                          task='mytask', retries=2,
+                          hostname='celery@worker_1',
+                          delivery_info={'routing_key': 'celery'})
+
+        meta = tb._get_result_meta(result={'fizz': 'buzz'},
+                                   state=states.SUCCESS, traceback=None,
+                                   request=request, format_date=False,
+                                   encode=True)
+
+        assert meta['result'] == {'fizz': 'buzz'}
+        assert tb.decode(meta['args']) == args
+        assert tb.decode(meta['kwargs']) == kwargs
+        assert meta['queue'] == 'celery'
+        assert meta['name'] == 'mytask'
+        assert meta['retries'] == 2
+        assert meta['worker'] == "celery@worker_1"
+
+    @pytest.mark.parametrize(
+        'result_serializer, args, kwargs',
+        [
+            ('pickle', (SomeClass(1), SomeClass(2)),
+             {'foo': SomeClass(123)}),
+            ('json', ['a', 'b'], {'foo': 'bar'}),
+        ],
+        ids=['using pickle', 'using json']
+    )
+    def test_get_result_meta_with_none(self, result_serializer, args, kwargs):
+        self.app.conf.result_serializer = result_serializer
+        tb = DatabaseBackend(self.uri, app=self.app)
+
+        request = Context(args=args, kwargs=kwargs,
+                          task='mytask', retries=2,
+                          hostname='celery@worker_1',
+                          delivery_info={'routing_key': 'celery'})
+
+        meta = tb._get_result_meta(result=None,
+                                   state=states.SUCCESS, traceback=None,
+                                   request=request, format_date=False,
+                                   encode=True)
+
+        assert meta['result'] is None
+        assert tb.decode(meta['args']) == args
+        assert tb.decode(meta['kwargs']) == kwargs
+        assert meta['queue'] == 'celery'
+        assert meta['name'] == 'mytask'
+        assert meta['retries'] == 2
+        assert meta['worker'] == "celery@worker_1"
+
+
+class test_SessionManager:
+
+    def test_after_fork(self):
+        s = SessionManager()
+        assert not s.forked
+        s._after_fork()
+        assert s.forked
+
+    @patch('celery.backends.database.session.create_engine')
+    def test_get_engine_forked(self, create_engine):
+        s = SessionManager()
+        s._after_fork()
+        engine = s.get_engine('dburi', foo=1)
+        create_engine.assert_called_with('dburi', foo=1)
+        assert engine is create_engine()
+        engine2 = s.get_engine('dburi', foo=1)
+        assert engine2 is engine
+
+    @patch('celery.backends.database.session.create_engine')
+    def test_get_engine_kwargs(self, create_engine):
+        s = SessionManager()
+        engine = s.get_engine('dbur', foo=1, pool_size=5)
+        assert engine is create_engine()
+        engine2 = s.get_engine('dburi', foo=1)
+        assert engine2 is engine
+
+    def test_invalidate_disposes_cached_engine(self):
+        s = SessionManager()
+        engine = Mock()
+        s._engines['dburi'] = engine
+        s._sessions['dburi'] = Mock()
+
+        s.invalidate('dburi')
+
+        assert 'dburi' not in s._engines
+        assert 'dburi' not in s._sessions
+        engine.dispose.assert_called_once_with()
+
+    def test_invalidate_nonexistent_dburi_is_noop(self):
+        s = SessionManager()
+        s.invalidate('nonexistent-dburi')
+        assert 'nonexistent-dburi' not in s._engines
+        assert 'nonexistent-dburi' not in s._sessions
+
+    def test_invalidate_only_engine_cached(self):
+        s = SessionManager()
+        engine = Mock()
+        s._engines['dburi'] = engine
+
+        s.invalidate('dburi')
+
+        assert 'dburi' not in s._engines
+        engine.dispose.assert_called_once_with()
+
+    @patch('celery.backends.database.session.sessionmaker')
+    def test_create_session_forked(self, sessionmaker):
+        s = SessionManager()
+        s.get_engine = Mock(name='get_engine')
+        s._after_fork()
+        engine, session = s.create_session('dburi', short_lived_sessions=True)
+        sessionmaker.assert_called_with(bind=s.get_engine())
+        assert session is sessionmaker()
+        sessionmaker.return_value = Mock(name='new')
+        engine, session2 = s.create_session('dburi', short_lived_sessions=True)
+        sessionmaker.assert_called_with(bind=s.get_engine())
+        assert session2 is not session
+        sessionmaker.return_value = Mock(name='new2')
+        engine, session3 = s.create_session(
+            'dburi', short_lived_sessions=False)
+        sessionmaker.assert_called_with(bind=s.get_engine())
+        assert session3 is session2
+
+    def test_coverage_madness(self):
+        prev, session.register_after_fork = (
+            session.register_after_fork, None,
+        )
+        try:
+            SessionManager()
+        finally:
+            session.register_after_fork = prev
+
+    @patch('celery.backends.database.session.create_engine')
+    def test_prepare_models_terminates(self, create_engine):
+        """SessionManager.prepare_models has retry logic because the creation
+        of database tables by multiple workers is racy. This test patches
+        the used method to always raise, so we can verify that it does
+        eventually terminate.
+        """
+        from sqlalchemy.dialects.sqlite import dialect
+        from sqlalchemy.exc import DatabaseError
+
+        if hasattr(dialect, 'dbapi'):
+            # Method name in SQLAlchemy < 2.0
+            sqlite = dialect.dbapi()
+        else:
+            # Newer method name in SQLAlchemy 2.0
+            sqlite = dialect.import_dbapi()
+        manager = SessionManager()
+        engine = manager.get_engine('dburi')
+
+        def raise_err(bind):
+            raise DatabaseError("", "", [], sqlite.DatabaseError)
+
+        patch_create_all = patch.object(
+            ResultModelBase.metadata, 'create_all', side_effect=raise_err)
+
+        with pytest.raises(DatabaseError), patch_create_all as mock_create_all:
+            manager.prepare_models(engine)
+
+        assert mock_create_all.call_count == PREPARE_MODELS_MAX_RETRIES + 1
+
+    @patch('celery.backends.database.session.create_engine')
+    def test_get_engine_filters_nullpool_unsupported_kwargs(self, mock_create_engine):
+        """
+        Test that QueuePool-specific kwargs (like pool_size and max_overflow)
+        are filtered out when creating an engine with NullPool.
+        """
+        from celery.backends.database.session import NullPool
+
+        s = SessionManager()
+        s.forked = False  # Ensure we're in the non-forked code path
+
+        s.get_engine('dburi', echo_pool=True, pool_size=10, max_overflow=5)
+
+        mock_create_engine.assert_called_once_with(
+            'dburi',
+            poolclass=NullPool,
+        )
+
+
+@skip.if_pypy
+class test_EngineCallback:
+
+    @pytest.fixture(autouse=True)
+    def remove_db(self):
+        yield
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+
+    def setup_method(self):
+        self.uri = 'sqlite:///' + DB_PATH
+
+    def test_no_callback_default_behavior(self):
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert tb.session_manager.engine_callback is None
+
+    def test_non_callable_callback_raises(self):
+        self.app.conf.database_engine_callback = 42
+        with pytest.raises(ImproperlyConfigured):
+            DatabaseBackend(self.uri, app=self.app)
+
+    def test_callback_from_config(self):
+        callback = Mock()
+        self.app.conf.database_engine_callback = callback
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert tb.session_manager.engine_callback is callback
+        callback.assert_called_once()
+        engine = callback.call_args[0][0]
+        assert hasattr(engine, 'execute') or hasattr(engine, 'connect')
+
+    def test_callback_from_constructor_kwarg(self):
+        callback = Mock()
+        tb = DatabaseBackend(self.uri, app=self.app, engine_callback=callback)
+        assert tb.session_manager.engine_callback is callback
+        callback.assert_called_once()
+
+    def test_constructor_kwarg_overrides_config(self):
+        config_callback = Mock()
+        kwarg_callback = Mock()
+        self.app.conf.database_engine_callback = config_callback
+        tb = DatabaseBackend(
+            self.uri, app=self.app, engine_callback=kwarg_callback)
+        assert tb.session_manager.engine_callback is kwarg_callback
+        kwarg_callback.assert_called_once()
+        config_callback.assert_not_called()
+
+    def test_callback_from_dotted_path(self):
+        self.app.conf.database_engine_callback = (
+            'unittest.mock:Mock'
+        )
+        tb = DatabaseBackend(self.uri, app=self.app)
+        assert tb.session_manager.engine_callback is not None
+        assert callable(tb.session_manager.engine_callback)
+
+    @patch('celery.backends.database.session.create_engine')
+    def test_callback_called_in_forked_mode(self, create_engine):
+        callback = Mock()
+        s = SessionManager(engine_callback=callback)
+        s._after_fork()
+        s.get_engine('dburi')
+        callback.assert_called_once_with(create_engine.return_value)
+
+    @patch('celery.backends.database.session.create_engine')
+    def test_callback_called_in_non_forked_mode(self, create_engine):
+        callback = Mock()
+        s = SessionManager(engine_callback=callback)
+        s.get_engine('dburi')
+        callback.assert_called_once_with(create_engine.return_value)
+
+    @patch('celery.backends.database.session.create_engine')
+    def test_callback_reapplied_after_invalidate(self, create_engine):
+        callback = Mock()
+        s = SessionManager(engine_callback=callback)
+        s._after_fork()
+
+        s.get_engine('dburi')
+        assert callback.call_count == 1
+
+        s.invalidate('dburi')
+
+        s.get_engine('dburi')
+        assert callback.call_count == 2
+
+    @patch('celery.backends.database.session.create_engine')
+    def test_cached_engine_skips_callback(self, create_engine):
+        callback = Mock()
+        s = SessionManager(engine_callback=callback)
+        s._after_fork()
+
+        s.get_engine('dburi')
+        s.get_engine('dburi')
+        callback.assert_called_once()
+
+    def test_callback_fires_before_create_tables(self):
+        call_order = []
+
+        def track_callback(engine):
+            call_order.append('callback')
+
+        original_create_all = ResultModelBase.metadata.create_all
+
+        def track_create_all(bind, **kwargs):
+            call_order.append('create_all')
+            return original_create_all(bind, **kwargs)
+
+        with patch.object(
+            ResultModelBase.metadata, 'create_all', side_effect=track_create_all
+        ):
+            DatabaseBackend(
+                self.uri, app=self.app, engine_callback=track_callback)
+
+        assert call_order == ['callback', 'create_all']
+
+    def test_do_connect_event_integration(self):
+        """Integration test: engine_callback registers a do_connect event
+        that modifies connection params on every new connection."""
+        connect_calls = []
+
+        def register_do_connect(engine):
+            from sqlalchemy import event
+
+            @event.listens_for(engine, 'do_connect')
+            def on_connect(dialect, conn_rec, cargs, cparams):
+                connect_calls.append(cparams.copy())
+
+        tb = DatabaseBackend(
+            self.uri, app=self.app, engine_callback=register_do_connect)
+
+        tid = 'test-task-id'
+        tb.mark_as_done(tid, 42)
+        assert len(connect_calls) >= 1

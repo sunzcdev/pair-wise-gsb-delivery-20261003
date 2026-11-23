@@ -1,0 +1,2163 @@
+import dbm
+import errno
+import pickle
+import socket
+import sys
+import time
+from contextlib import ExitStack
+from datetime import datetime, timedelta, timezone
+from pickle import dumps, loads
+from threading import Event
+from time import sleep
+from unittest.mock import MagicMock, Mock, call, patch
+
+import pytest
+
+from celery import __version__, beat, uuid
+from celery.beat import BeatLazyFunc, event_t
+from celery.schedules import crontab, schedule, solar
+from celery.utils.objects import Bunch
+
+if sys.version_info >= (3, 9):
+    from zoneinfo import ZoneInfo
+else:
+    from backports.zoneinfo import ZoneInfo
+
+
+class MockShelve(dict):
+    closed = False
+    synced = False
+
+    def close(self):
+        self.closed = True
+
+    def sync(self):
+        self.synced = True
+
+
+class MockService:
+    started = False
+    stopped = False
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def start(self, **kwargs):
+        self.started = True
+
+    def stop(self, **kwargs):
+        self.stopped = True
+
+
+class test_BeatLazyFunc:
+
+    def test_beat_lazy_func(self):
+        def add(a, b):
+            return a + b
+        result = BeatLazyFunc(add, 1, 2)
+        assert add(1, 2) == result()
+        assert add(1, 2) == result.delay()
+
+
+class test_ScheduleEntry:
+    Entry = beat.ScheduleEntry
+
+    def create_entry(self, **kwargs):
+        entry = {
+            'name': 'celery.unittest.add',
+            'schedule': timedelta(seconds=10),
+            'args': (2, 2),
+            'options': {'routing_key': 'cpu'},
+            'app': self.app,
+        }
+        return self.Entry(**dict(entry, **kwargs))
+
+    def test_next(self):
+        entry = self.create_entry(schedule=10)
+        assert entry.last_run_at
+        assert isinstance(entry.last_run_at, datetime)
+        assert entry.total_run_count == 0
+
+        next_run_at = entry.last_run_at + timedelta(seconds=10)
+        next_entry = entry.next(next_run_at)
+        assert next_entry.last_run_at >= next_run_at
+        assert next_entry.total_run_count == 1
+
+    def test_is_due(self):
+        entry = self.create_entry(schedule=timedelta(seconds=10))
+        assert entry.app is self.app
+        assert entry.schedule.app is self.app
+        due1, next_time_to_run1 = entry.is_due()
+        assert not due1
+        assert next_time_to_run1 > 9
+
+        next_run_at = entry.last_run_at - timedelta(seconds=10)
+        next_entry = entry.next(next_run_at)
+        due2, next_time_to_run2 = next_entry.is_due()
+        assert due2
+        assert next_time_to_run2 > 9
+
+    def test_repr(self):
+        entry = self.create_entry()
+        assert '<ScheduleEntry:' in repr(entry)
+
+    def test_reduce(self):
+        entry = self.create_entry(schedule=timedelta(seconds=10))
+        fun, args = entry.__reduce__()
+        res = fun(*args)
+        assert res.schedule == entry.schedule
+
+    def test_lt(self):
+        e1 = self.create_entry(schedule=timedelta(seconds=10))
+        e2 = self.create_entry(schedule=timedelta(seconds=2))
+        # order doesn't matter, see comment in __lt__
+        res1 = e1 < e2  # noqa
+        try:
+            res2 = e1 < object()  # noqa
+        except TypeError:
+            pass
+
+    def test_update(self):
+        entry = self.create_entry()
+        assert entry.schedule == timedelta(seconds=10)
+        assert entry.args == (2, 2)
+        assert entry.kwargs == {}
+        assert entry.options == {'routing_key': 'cpu'}
+
+        entry2 = self.create_entry(schedule=timedelta(minutes=20),
+                                   args=(16, 16),
+                                   kwargs={'callback': 'foo.bar.baz'},
+                                   options={'routing_key': 'urgent'})
+        entry.update(entry2)
+        assert entry.schedule == schedule(timedelta(minutes=20))
+        assert entry.args == (16, 16)
+        assert entry.kwargs == {'callback': 'foo.bar.baz'}
+        assert entry.options == {'routing_key': 'urgent'}
+
+
+class mScheduler(beat.Scheduler):
+
+    def __init__(self, *args, **kwargs):
+        self.sent = []
+        super().__init__(*args, **kwargs)
+
+    def send_task(self, name=None, args=None, kwargs=None, **options):
+        self.sent.append({'name': name,
+                          'args': args,
+                          'kwargs': kwargs,
+                          'options': options})
+        return self.app.AsyncResult(uuid())
+
+
+class mSchedulerSchedulingError(mScheduler):
+
+    def send_task(self, *args, **kwargs):
+        raise beat.SchedulingError('Could not apply task')
+
+
+class mSchedulerRuntimeError(mScheduler):
+
+    def is_due(self, *args, **kwargs):
+        raise RuntimeError('dict modified while itervalues')
+
+
+class mocked_schedule(schedule):
+
+    def now_func():
+        return datetime.now(timezone.utc)
+
+    def __init__(self, is_due, next_run_at, nowfun=now_func):
+        self._is_due = is_due
+        self._next_run_at = next_run_at
+        self.run_every = timedelta(seconds=1)
+        self.nowfun = nowfun
+        self.default_now = self.nowfun
+
+    def is_due(self, last_run_at):
+        return self._is_due, self._next_run_at
+
+
+class raising_schedule(mocked_schedule):
+
+    def __init__(self):
+        super().__init__(False, 1)
+
+    def is_due(self, last_run_at):
+        raise RuntimeError('cannot calculate next run')
+
+
+always_due = mocked_schedule(True, 1)
+always_pending = mocked_schedule(False, 1)
+always_pending_left_10_milliseconds = mocked_schedule(False, 0.01)
+
+
+class test_Scheduler:
+
+    def test_custom_schedule_dict(self):
+        custom = {'foo': 'bar'}
+        scheduler = mScheduler(app=self.app, schedule=custom, lazy=True)
+        assert scheduler.data is custom
+
+    def test_apply_async_uses_registered_task_instances(self):
+
+        @self.app.task(shared=False)
+        def foo():
+            pass
+        foo.apply_async = Mock(name='foo.apply_async')
+        assert foo.name in foo._get_app().tasks
+
+        scheduler = mScheduler(app=self.app)
+        scheduler.apply_async(scheduler.Entry(task=foo.name, app=self.app))
+        foo.apply_async.assert_called()
+
+    def test_apply_async_with_null_args(self):
+
+        @self.app.task(shared=False)
+        def foo():
+            pass
+        foo.apply_async = Mock(name='foo.apply_async')
+
+        scheduler = mScheduler(app=self.app)
+        scheduler.apply_async(
+            scheduler.Entry(
+                task=foo.name, app=self.app, args=None, kwargs=None))
+        foo.apply_async.assert_called()
+
+    def test_apply_async_with_null_args_set_to_none(self):
+
+        @self.app.task(shared=False)
+        def foo():
+            pass
+        foo.apply_async = Mock(name='foo.apply_async')
+
+        scheduler = mScheduler(app=self.app)
+        entry = scheduler.Entry(task=foo.name, app=self.app, args=None,
+                                kwargs=None)
+        entry.args = None
+        entry.kwargs = None
+
+        scheduler.apply_async(entry, advance=False)
+        foo.apply_async.assert_called()
+
+    def test_apply_async_without_null_args(self):
+
+        @self.app.task(shared=False)
+        def foo(moo: int):
+            return moo
+        foo.apply_async = Mock(name='foo.apply_async')
+
+        scheduler = mScheduler(app=self.app)
+        entry = scheduler.Entry(task=foo.name, app=self.app, args=None,
+                                kwargs=None)
+        entry.args = (101,)
+        entry.kwargs = None
+
+        scheduler.apply_async(entry, advance=False)
+        foo.apply_async.assert_called()
+        assert foo.apply_async.call_args[0][0] == [101]
+
+    def test_should_sync(self):
+
+        @self.app.task(shared=False)
+        def not_sync():
+            pass
+        not_sync.apply_async = Mock()
+
+        s = mScheduler(app=self.app)
+        s._do_sync = Mock()
+        s.should_sync = Mock()
+        s.should_sync.return_value = True
+        s.apply_async(s.Entry(task=not_sync.name, app=self.app))
+        s._do_sync.assert_called_with()
+
+        s._do_sync = Mock()
+        s.should_sync.return_value = False
+        s.apply_async(s.Entry(task=not_sync.name, app=self.app))
+        s._do_sync.assert_not_called()
+
+    def test_should_sync_increments_sync_every_counter(self):
+        self.app.conf.beat_sync_every = 2
+
+        @self.app.task(shared=False)
+        def not_sync():
+            pass
+        not_sync.apply_async = Mock()
+
+        s = mScheduler(app=self.app)
+        assert s.sync_every_tasks == 2
+        s._do_sync = Mock()
+
+        s.apply_async(s.Entry(task=not_sync.name, app=self.app))
+        assert s._tasks_since_sync == 1
+        s.apply_async(s.Entry(task=not_sync.name, app=self.app))
+        s._do_sync.assert_called_with()
+
+        self.app.conf.beat_sync_every = 0
+
+    def test_sync_task_counter_resets_on_do_sync(self):
+        self.app.conf.beat_sync_every = 1
+
+        @self.app.task(shared=False)
+        def not_sync():
+            pass
+        not_sync.apply_async = Mock()
+
+        s = mScheduler(app=self.app)
+        assert s.sync_every_tasks == 1
+
+        s.apply_async(s.Entry(task=not_sync.name, app=self.app))
+        assert s._tasks_since_sync == 0
+
+        self.app.conf.beat_sync_every = 0
+
+    @patch('celery.app.base.Celery.send_task')
+    def test_send_task(self, send_task):
+        b = beat.Scheduler(app=self.app)
+        b.send_task('tasks.add', countdown=10)
+        send_task.assert_called_with('tasks.add', countdown=10)
+
+    def test_info(self):
+        scheduler = mScheduler(app=self.app)
+        assert isinstance(scheduler.info, str)
+
+    def test_apply_entry_handles_empty_result(self):
+        s = mScheduler(app=self.app)
+        entry = s.Entry(name='a name', task='foo', app=self.app)
+
+        with patch.object(s, 'apply_async') as mock_apply_async:
+            with patch("celery.beat.debug") as mock_debug:
+                mock_apply_async.return_value = None
+                s.apply_entry(entry)
+        mock_debug.assert_called_once_with('%s sent.', entry.task)
+
+        with patch.object(s, 'apply_async') as mock_apply_async:
+            with patch("celery.beat.debug") as mock_debug:
+                mock_apply_async.return_value = object()
+                s.apply_entry(entry)
+        mock_debug.assert_called_once_with('%s sent.', entry.task)
+
+        task_id = 'taskId123456'
+        with patch.object(s, 'apply_async') as mock_apply_async:
+            with patch("celery.beat.debug") as mock_debug:
+                mock_apply_async.return_value = self.app.AsyncResult(task_id)
+                s.apply_entry(entry)
+        mock_debug.assert_called_once_with('%s sent. id->%s', entry.task, task_id)
+
+    def test_maybe_entry(self):
+        s = mScheduler(app=self.app)
+        entry = s.Entry(name='add every', task='tasks.add', app=self.app)
+        assert s._maybe_entry(entry.name, entry) is entry
+        assert s._maybe_entry('add every', {'task': 'tasks.add'})
+
+    def test_set_schedule(self):
+        s = mScheduler(app=self.app)
+        s.schedule = {'foo': 'bar'}
+        assert s.data == {'foo': 'bar'}
+
+    @patch('kombu.connection.Connection.ensure_connection')
+    def test_ensure_connection_error_handler(self, ensure):
+        s = mScheduler(app=self.app)
+        assert s._ensure_connected()
+        ensure.assert_called()
+        callback = ensure.call_args[0][0]
+
+        callback(KeyError(), 5)
+
+    def test_install_default_entries(self):
+        self.app.conf.result_expires = None
+        self.app.conf.beat_schedule = {}
+        s = mScheduler(app=self.app)
+        s.install_default_entries({})
+        assert 'celery.backend_cleanup' not in s.data
+        self.app.backend.supports_autoexpire = False
+
+        self.app.conf.result_expires = 30
+        s = mScheduler(app=self.app)
+        s.install_default_entries({})
+        assert 'celery.backend_cleanup' in s.data
+
+        self.app.backend.supports_autoexpire = True
+        self.app.conf.result_expires = 31
+        s = mScheduler(app=self.app)
+        s.install_default_entries({})
+        assert 'celery.backend_cleanup' not in s.data
+
+    def test_due_tick(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='test_due_tick',
+                      schedule=always_due,
+                      args=(1, 2),
+                      kwargs={'foo': 'bar'})
+        assert scheduler.tick() == 0
+
+    def test_due_tick_returns_delay_when_heap_top_changed(self):
+        scheduler = mScheduler(app=self.app)
+        first = scheduler.add(name='first', task='c.first', schedule=always_due)
+        second = scheduler.add(name='second', task='c.second', schedule=always_due)
+        # so populate_heap() doesn't run and override our setup
+        scheduler.old_schedulers = scheduler.schedule
+        scheduler._heap = [event_t(scheduler._when(first, 0) - 1, 5, first)]
+
+        def mutating_first_entry_is_due(_last_run_at):
+            scheduler._heap.insert(0, event_t(scheduler._when(second, 0) - 2, 5, second))
+            return True, 1
+
+        # simulates an entry inserted while first's is_due() is running
+        first.schedule.is_due = mutating_first_entry_is_due
+        assert scheduler.tick() < 0
+        assert not scheduler.sent
+
+    @patch('celery.beat.error')
+    def test_due_tick_SchedulingError(self, error):
+        scheduler = mSchedulerSchedulingError(app=self.app)
+        scheduler.add(name='test_due_tick_SchedulingError',
+                      schedule=always_due)
+        assert scheduler.tick() == 0
+        error.assert_called()
+
+    @patch('celery.beat.error')
+    def test_tick_survives_entry_failing_in_populate_heap(self, error):
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='broken', task='c.broken',
+                      schedule=raising_schedule())
+        scheduler.add(name='healthy', task='c.healthy', schedule=always_due)
+        assert scheduler.tick() == 0
+        assert [s['name'] for s in scheduler.sent] == ['c.healthy']
+        error.assert_called()
+        assert 'broken' in error.call_args[0]
+        broken_event = next(
+            e for e in scheduler._heap if e[2].name == 'broken')
+        assert broken_event[0] == pytest.approx(scheduler._when(
+            broken_event[2], scheduler.max_interval), abs=1)
+
+    @patch('celery.beat.error')
+    def test_tick_survives_entry_failing_when_due(self, error):
+        scheduler = mScheduler(app=self.app)
+        broken = scheduler.add(name='broken', task='c.broken',
+                               schedule=raising_schedule())
+        # so populate_heap() doesn't run and override our setup
+        scheduler.old_schedulers = scheduler.schedule
+        scheduler._heap = [event_t(scheduler._when(broken, 0) - 1, 5, broken)]
+        assert scheduler.tick() == scheduler.adjust(scheduler.max_interval)
+        assert not scheduler.sent
+        error.assert_called()
+        assert scheduler._heap[0][0] == pytest.approx(
+            scheduler._when(broken, scheduler.max_interval), abs=1)
+
+    def test_pending_tick(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='test_pending_tick',
+                      schedule=always_pending)
+        assert 0 < scheduler.tick() <= 1 - 0.010
+
+    def test_pending_left_10_milliseconds_tick(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='test_pending_left_10_milliseconds_tick',
+                      schedule=always_pending_left_10_milliseconds)
+        assert scheduler.tick() == 0.010 - 0.010
+
+    def test_honors_max_interval(self):
+        scheduler = mScheduler(app=self.app)
+        maxi = scheduler.max_interval
+        scheduler.add(name='test_honors_max_interval',
+                      schedule=mocked_schedule(False, maxi * 4))
+        assert scheduler.tick() == maxi
+
+    def test_ticks(self):
+        scheduler = mScheduler(app=self.app)
+        nums = [600, 300, 650, 120, 250, 36]
+        s = {'test_ticks%s' % i: {'schedule': mocked_schedule(False, j)}
+             for i, j in enumerate(nums)}
+        scheduler.update_from_dict(s)
+        assert 0 < scheduler.tick() <= min(nums) - 0.010
+
+    def test_ticks_microseconds(self):
+        scheduler = mScheduler(app=self.app)
+
+        now_ts = 1514797200.2
+        now = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+        schedule_half = schedule(timedelta(seconds=0.5), nowfun=lambda: now)
+        scheduler.add(name='half_second_schedule', schedule=schedule_half)
+
+        scheduler.tick()
+        # ensure those 0.2 seconds on now_ts don't get dropped
+        expected_time = now_ts + 0.5 - 0.010
+        assert scheduler._heap[0].time == expected_time
+
+    @pytest.mark.parametrize('now,last_run_at,after_sunrise', [
+        pytest.param(
+            datetime.fromisoformat('2026-03-08T01:30:00-05:00'),
+            datetime.fromisoformat('2026-03-07T03:00:00-05:00'),
+            datetime.fromisoformat('2026-03-08T03:08:00-04:00'),
+            id='spring-forward',
+        ),
+        pytest.param(
+            datetime.fromisoformat('2026-11-01T01:45:00-04:00'),
+            datetime.fromisoformat('2026-10-31T03:00:00-04:00'),
+            datetime.fromisoformat('2026-11-01T01:41:00-05:00'),
+            id='fall-back',
+        ),
+    ])
+    def test_tick_solar_across_dst(self, now, last_run_at, after_sunrise):
+        pytest.importorskip('ephem')
+        tz = self.app.timezone = ZoneInfo('America/New_York')
+        now_utc = now.astimezone(timezone.utc)
+        s = solar('sunrise', 0, -15, app=self.app, nowfun=lambda: now_utc.astimezone(tz))
+        scheduler = mScheduler(app=self.app, lazy=True)
+        entry = scheduler.add(
+            name='sunrise', task='t.fake.task', schedule=s,
+            last_run_at=last_run_at,
+        )
+
+        delays = []
+        for _ in range(5):
+            delays.append(scheduler.tick())
+            now_utc += timedelta(seconds=1)
+
+        assert scheduler.sent == []
+        assert all(delay > 0 for delay in delays)
+
+        now_utc = after_sunrise.astimezone(timezone.utc)
+        scheduler.tick()
+        assert [sent['name'] for sent in scheduler.sent] == ['t.fake.task']
+        reserved = scheduler.schedule[entry.name]
+        assert reserved.total_run_count == 1
+        assert reserved.last_run_at.astimezone(timezone.utc) == now_utc
+
+        now_utc += timedelta(seconds=1)
+        assert scheduler.tick() > 0
+        assert len(scheduler.sent) == 1
+
+    def test_tick_daily_relative_spring_forward(self, monkeypatch):
+        self.app.conf.timezone = 'America/New_York'
+        tz = ZoneInfo('America/New_York')
+        now = datetime(2026, 3, 8, tzinfo=tz)
+        monkeypatch.setattr(self.app, 'now', lambda: now)
+        scheduler = mScheduler(app=self.app, lazy=True)
+        entry = scheduler.add(
+            name='daily', task='t.fake.task',
+            schedule=timedelta(days=1), relative=True,
+            last_run_at=datetime(2026, 3, 7, tzinfo=tz),
+        )
+
+        assert scheduler.tick() == 0
+        assert scheduler.schedule[entry.name].total_run_count == 1
+
+        # The next midnight is 23 elapsed hours away, including heap drift.
+        next_delay = scheduler._heap[0].time - now.timestamp()
+        assert next_delay == pytest.approx(82800, abs=0.02, rel=0)
+
+        now = datetime(2026, 3, 8, 23, 59, 59, tzinfo=tz)
+        assert scheduler.tick() > 0
+        assert scheduler.schedule[entry.name].total_run_count == 1
+
+        now = datetime(2026, 3, 9, tzinfo=tz)
+        assert scheduler.tick() == 0
+        assert scheduler.schedule[entry.name].total_run_count == 2
+        assert scheduler.tick() > 0
+        assert scheduler.schedule[entry.name].total_run_count == 2
+
+    def test_ticks_schedule_change(self):
+        # initialise schedule and check heap is not initialized
+        scheduler = mScheduler(app=self.app)
+        assert scheduler._heap is None
+
+        # set initial schedule and check heap is updated
+        schedule_5 = schedule(5)
+        scheduler.add(name='test_schedule', schedule=schedule_5)
+        scheduler.tick()
+        assert scheduler._heap[0].entry.schedule == schedule_5
+
+        # update schedule and check heap is updated
+        schedule_10 = schedule(10)
+        scheduler.add(name='test_schedule', schedule=schedule(10))
+        scheduler.tick()
+        assert scheduler._heap[0].entry.schedule == schedule_10
+
+    def test_schedule_no_remain(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='test_schedule_no_remain',
+                      schedule=mocked_schedule(False, None))
+        assert scheduler.tick() == scheduler.max_interval - 0.01
+
+    def test_not_due_top_entry_is_rescheduled_behind_due_entry(self):
+        scheduler = mScheduler(app=self.app)
+        stuck = scheduler.add(name='stuck', task='c.stuck', schedule=always_pending)
+        ready = scheduler.add(name='ready', task='c.ready', schedule=always_due)
+        # so populate_heap() doesn't run and override our setup
+        scheduler.old_schedulers = scheduler.schedule
+        # stuck is at the top of the heap
+        scheduler._heap = [
+            event_t(scheduler._when(stuck, 0) - 2, 5, stuck),
+            event_t(scheduler._when(ready, 0) - 1, 5, ready),
+        ]
+        assert scheduler.tick() == 0
+        assert not scheduler.sent
+        assert scheduler._heap[0].entry is ready
+        assert scheduler.tick() == 0
+        assert scheduler.sent[0]['name'] == 'c.ready'
+
+    def test_reheap_skipped_when_is_due_mutates_heap(self):
+        scheduler = mScheduler(app=self.app)
+        stuck = scheduler.add(name='stuck', task='c.stuck', schedule=mocked_schedule(False, 1))
+        intruder = scheduler.add(name='other', task='c.other', schedule=always_due)
+        # so populate_heap() doesn't run and override our setup
+        scheduler.old_schedulers = scheduler.schedule
+        stuck_event = event_t(scheduler._when(stuck, 0) - 1, 5, stuck)
+        intruder_event = event_t(scheduler._when(intruder, 0) - 2, 5, intruder)
+        scheduler._heap = [stuck_event]
+
+        def mutating_stuck_entry_is_due(_last_run_at):
+            scheduler._heap.insert(0, intruder_event)
+            return False, 1
+
+        # simulates an entry inserted while stuck's is_due() is running
+        stuck.schedule.is_due = mutating_stuck_entry_is_due
+        assert scheduler.tick() < 0
+        assert not scheduler.sent
+        assert scheduler._heap[0] is intruder_event
+        assert scheduler._heap[1] is stuck_event
+
+    @pytest.mark.parametrize('is_due', [True, False])
+    def test_tick_uses_fresh_time_when_heap_top_changes(self, is_due):
+        clock = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+
+        def nowfun():
+            return clock[0]
+
+        scheduler = mScheduler(app=self.app)
+        first = scheduler.add(name='first', task='c.first', schedule=schedule(1, nowfun=nowfun))
+        second = scheduler.add(name='second', task='c.second', schedule=schedule(1, nowfun=nowfun))
+        # so populate_heap() doesn't run and override our setup
+        scheduler.old_schedulers = scheduler.schedule
+        scheduler._heap = [event_t(scheduler._when(first, 0) - 1, 5, first)]
+
+        def replace_heap_top(_last_run_at):
+            # Make a delay calculated from the stale time exceed max_interval.
+            clock[0] += timedelta(seconds=scheduler.max_interval + 1)
+            scheduler._heap[0] = event_t(scheduler._when(second, 1), 5, second)
+            return is_due, 1
+
+        first.schedule.is_due = replace_heap_top
+        assert scheduler.tick() == pytest.approx(scheduler.adjust(1))
+        assert scheduler._heap[0].entry is second
+
+    def test_tick_dispatches_missed_cron_within_deadline_non_uniform(self):
+        # Non-uniform crontab (:00, :45). Most recent feasible run
+        # (10:00) is 20 min before now=10:20, within the 30-min
+        # deadline, so the missed task should dispatch.
+        self.app.conf.beat_cron_starting_deadline = 1800
+        now = datetime(2022, 12, 5, 10, 20)
+        last_run = datetime(2022, 12, 5, 8, 45)
+        cron = crontab(minute='0,45', nowfun=lambda: now, app=self.app)
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='within_deadline', task='t.fake.task',
+                      schedule=cron, last_run_at=last_run)
+        scheduler.tick()
+        assert [s['name'] for s in scheduler.sent] == ['t.fake.task']
+
+    def test_tick_skips_missed_cron_outside_deadline_non_uniform(self):
+        # Non-uniform crontab (:00, :45). Most recent feasible run
+        # (10:00) is 35 min before now=10:35, past the 30-min
+        # deadline, so the missed task should not dispatch.
+        self.app.conf.beat_cron_starting_deadline = 1800
+        now = datetime(2022, 12, 5, 10, 35)
+        last_run = datetime(2022, 12, 5, 8, 45)
+        cron = crontab(minute='0,45', nowfun=lambda: now, app=self.app)
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='outside_deadline', task='t.fake.task',
+                      schedule=cron, last_run_at=last_run)
+        scheduler.tick()
+        assert scheduler.sent == []
+
+    def test_tick_dispatches_missed_cron_on_deadline_boundary_non_uniform(self):
+        # Non-uniform crontab (:00, :45). Most recent feasible run
+        # (10:00) is exactly 30 min before now=10:30, matching the
+        # 30-min deadline, so the missed task should still dispatch.
+        self.app.conf.beat_cron_starting_deadline = 1800
+        now = datetime(2022, 12, 5, 10, 30)
+        last_run = datetime(2022, 12, 5, 8, 45)
+        cron = crontab(minute='0,45', nowfun=lambda: now, app=self.app)
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='on_deadline_boundary', task='t.fake.task',
+                      schedule=cron, last_run_at=last_run)
+        scheduler.tick()
+        assert [s['name'] for s in scheduler.sent] == ['t.fake.task']
+
+    def test_interface(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.sync()
+        scheduler.setup_schedule()
+        scheduler.close()
+
+    def test_merge_inplace(self):
+        a = mScheduler(app=self.app)
+        b = mScheduler(app=self.app)
+        a.update_from_dict({'foo': {'schedule': mocked_schedule(True, 10)},
+                            'bar': {'schedule': mocked_schedule(True, 20)}})
+        b.update_from_dict({'bar': {'schedule': mocked_schedule(True, 40)},
+                            'baz': {'schedule': mocked_schedule(True, 10)}})
+        a.merge_inplace(b.schedule)
+
+        assert 'foo' not in a.schedule
+        assert 'baz' in a.schedule
+        assert a.schedule['bar'].schedule._next_run_at == 40
+
+    def test_when(self):
+        now_time_utc = datetime(2000, 10, 10, 10, 10,
+                                10, 10, tzinfo=ZoneInfo("UTC"))
+        now_time_casey = now_time_utc.astimezone(
+            ZoneInfo('Antarctica/Casey')
+        )
+        scheduler = mScheduler(app=self.app)
+        result_utc = scheduler._when(
+            mocked_schedule(True, 10, lambda: now_time_utc),
+            10
+        )
+        result_casey = scheduler._when(
+            mocked_schedule(True, 10, lambda: now_time_casey),
+            10
+        )
+        assert result_utc == result_casey
+
+    @patch('celery.beat.Scheduler._when', return_value=1)
+    def test_populate_heap(self, _when):
+        scheduler = mScheduler(app=self.app)
+        scheduler.update_from_dict(
+            {'foo': {'schedule': mocked_schedule(True, 10)}}
+        )
+        scheduler.populate_heap()
+        assert scheduler._heap == [event_t(1, 5, scheduler.schedule['foo'])]
+
+    def create_schedule_entry(self, schedule=None, args=(), kwargs={},
+                              options={}, task=None):
+        entry = {
+            'name': 'celery.unittest.add',
+            'schedule': schedule,
+            'app': self.app,
+            'args': args,
+            'kwargs': kwargs,
+            'options': options,
+            'task': task
+        }
+        return beat.ScheduleEntry(**dict(entry))
+
+    def test_schedule_equal_schedule_vs_schedule_success(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(schedule=schedule(5))}
+        b = {'a': self.create_schedule_entry(schedule=schedule(5))}
+        assert scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_schedule_vs_schedule_fail(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(schedule=schedule(5))}
+        b = {'a': self.create_schedule_entry(schedule=schedule(10))}
+        assert not scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_crontab_vs_crontab_success(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(schedule=crontab(minute=5))}
+        b = {'a': self.create_schedule_entry(schedule=crontab(minute=5))}
+        assert scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_crontab_vs_crontab_fail(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(schedule=crontab(minute=5))}
+        b = {'a': self.create_schedule_entry(schedule=crontab(minute=10))}
+        assert not scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_crontab_vs_schedule_fail(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(schedule=crontab(minute=5))}
+        b = {'a': self.create_schedule_entry(schedule=schedule(5))}
+        assert not scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_different_key_fail(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(schedule=schedule(5))}
+        b = {'b': self.create_schedule_entry(schedule=schedule(5))}
+        assert not scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_args_vs_args_success(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(args='a')}
+        b = {'a': self.create_schedule_entry(args='a')}
+        assert scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_args_vs_args_fail(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(args='a')}
+        b = {'a': self.create_schedule_entry(args='b')}
+        assert not scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_kwargs_vs_kwargs_success(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(kwargs={'a': 'a'})}
+        b = {'a': self.create_schedule_entry(kwargs={'a': 'a'})}
+        assert scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_kwargs_vs_kwargs_fail(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(kwargs={'a': 'a'})}
+        b = {'a': self.create_schedule_entry(kwargs={'b': 'b'})}
+        assert not scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_options_vs_options_success(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(options={'a': 'a'})}
+        b = {'a': self.create_schedule_entry(options={'a': 'a'})}
+        assert scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_options_vs_options_fail(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(options={'a': 'a'})}
+        b = {'a': self.create_schedule_entry(options={'b': 'b'})}
+        assert not scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_task_vs_task_success(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(task='a')}
+        b = {'a': self.create_schedule_entry(task='a')}
+        assert scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_task_vs_task_fail(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(task='a')}
+        b = {'a': self.create_schedule_entry(task='b')}
+        assert not scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_none_entry_vs_entry(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = None
+        b = {'a': self.create_schedule_entry(task='b')}
+        assert not scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_entry_vs_none_entry(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(task='a')}
+        b = None
+        assert not scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_none_entry_vs_none_entry(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = None
+        b = None
+        assert scheduler.schedules_equal(a, b)
+
+    def test_apply_async_adds_beat_header(self):
+        scheduler = mScheduler(app=self.app)
+        entry = scheduler.Entry(
+            name='test_task',
+            task='test_task',
+            schedule=schedule(10.0),
+            options={'queue': 'test_queue'},
+            app=self.app
+        )
+
+        result = scheduler.apply_async(entry)
+        assert result.id
+
+        sent_task = scheduler.sent[0]
+        assert 'headers' in sent_task['options']
+        assert sent_task['options']['headers']['celery_beat_task'] is True
+
+    def test_apply_async_preserves_existing_headers(self):
+        scheduler = mScheduler(app=self.app)
+        entry = scheduler.Entry(
+            name='test_task',
+            task='test_task',
+            schedule=schedule(10.0),
+            options={
+                'queue': 'test_queue',
+                'headers': {'existing_header': 'value'}
+            },
+            app=self.app
+        )
+
+        result = scheduler.apply_async(entry)
+        assert result.id
+
+        sent_task = scheduler.sent[0]
+        assert 'headers' in sent_task['options']
+        assert sent_task['options']['headers']['existing_header'] == 'value'
+        assert sent_task['options']['headers']['celery_beat_task'] is True
+
+
+def create_persistent_scheduler(shelv=None):
+    if shelv is None:
+        shelv = MockShelve()
+
+    class MockPersistentScheduler(beat.PersistentScheduler):
+        sh = shelv
+        persistence = Bunch(
+            open=lambda *a, **kw: shelv,
+        )
+        tick_raises_exit = False
+        shutdown_service = None
+
+        def tick(self):
+            if self.tick_raises_exit:
+                raise SystemExit()
+            if self.shutdown_service:
+                self.shutdown_service._is_shutdown.set()
+            return 0.0
+
+    return MockPersistentScheduler, shelv
+
+
+def create_persistent_scheduler_w_call_logging(shelv=None):
+    if shelv is None:
+        shelv = MockShelve()
+
+    class MockPersistentScheduler(beat.PersistentScheduler):
+        sh = shelv
+        persistence = Bunch(
+            open=lambda *a, **kw: shelv,
+        )
+
+        def __init__(self, *args, **kwargs):
+            self.sent = []
+            super().__init__(*args, **kwargs)
+
+        def send_task(self, task=None, args=None, kwargs=None, **options):
+            self.sent.append({'task': task,
+                              'args': args,
+                              'kwargs': kwargs,
+                              'options': options})
+            return self.app.AsyncResult(uuid())
+    return MockPersistentScheduler, shelv
+
+
+class test_SchedulerShutdown:
+
+    @pytest.fixture(params=[beat.Scheduler, beat.PersistentScheduler])
+    def scheduler(self, request):
+        if request.param is beat.PersistentScheduler:
+            return create_persistent_scheduler()[0](
+                app=self.app, schedule_filename='schedule',
+            )
+        return beat.Scheduler(app=self.app, lazy=True)
+
+    def test_close_releases_connection_and_channel(self, scheduler):
+        with scheduler.connection as connection:
+            channel = scheduler.producer.channel
+            assert connection.connected
+            assert not channel.closed
+
+            with patch.object(
+                connection, 'release', wraps=connection.release,
+            ) as release:
+                scheduler.close()
+
+                assert not connection.connected
+                assert channel.closed
+                assert 'connection' not in scheduler.__dict__
+                assert 'producer' not in scheduler.__dict__
+                if isinstance(scheduler, beat.PersistentScheduler):
+                    assert scheduler._store.synced
+                    assert scheduler._store.closed
+                scheduler.close()
+                release.assert_called_once_with()
+
+    def test_close_releases_plain_subclass_attributes(self):
+        class CustomScheduler(beat.Scheduler):
+            connection = None
+            producer = None
+
+        scheduler = CustomScheduler(app=self.app, lazy=True)
+        with self.app.connection_for_write() as connection:
+            scheduler.connection = connection
+            scheduler.producer = scheduler.Producer(connection)
+            channel = scheduler.producer.channel
+
+            scheduler.close()
+
+            assert not connection.connected
+            assert channel.closed
+            assert 'connection' not in scheduler.__dict__
+            assert 'producer' not in scheduler.__dict__
+
+    def test_base_publishing_resources_recreated_after_close(self):
+        scheduler = beat.Scheduler(app=self.app, lazy=True)
+        with scheduler.connection as old_connection:
+            old_producer = scheduler.producer
+            old_channel = old_producer.channel
+            scheduler.close()
+
+            with scheduler.connection as connection:
+                producer = scheduler.producer
+                channel = producer.channel
+                try:
+                    producer.publish({'probe': True})
+                    assert connection is not old_connection
+                    assert producer is not old_producer
+                    assert channel is not old_channel
+                    assert connection.connected
+                    assert not channel.closed
+                    assert not old_connection.connected
+                    assert old_channel.closed
+                finally:
+                    scheduler.close()
+
+    def test_persistent_close_twice_with_real_shelf(self, tmp_path):
+        scheduler = beat.PersistentScheduler(
+            app=self.app, schedule_filename=str(tmp_path / 'schedule'),
+        )
+        scheduler.close()
+        with patch.object(scheduler, '_open_schedule') as open_schedule, \
+                patch.object(self.app, 'connection_for_write') as connect:
+            scheduler.close()
+        open_schedule.assert_not_called()
+        connect.assert_not_called()
+
+    def test_close_does_not_create_broker_resources(self, scheduler):
+        with patch.object(self.app, 'connection_for_write') as connect, \
+                patch.object(scheduler, 'Producer') as producer:
+            scheduler.close()
+        connect.assert_not_called()
+        producer.assert_not_called()
+
+    @pytest.mark.parametrize('use_connection', [False, True])
+    def test_persistent_close_before_schedule_setup(self, use_connection):
+        scheduler = beat.PersistentScheduler(app=self.app, lazy=True)
+        with ExitStack() as resources:
+            if use_connection:
+                connection = resources.enter_context(scheduler.connection)
+                channel = scheduler.producer.channel
+            with patch.object(scheduler, '_open_schedule') as open_schedule, \
+                    patch.object(self.app, 'connection_for_write') as connect:
+                scheduler.close()
+            assert scheduler._store is None
+            open_schedule.assert_not_called()
+            connect.assert_not_called()
+            if use_connection:
+                assert not connection.connected
+                assert channel.closed
+
+    def test_close_releases_connection_after_producer_creation_fails(
+        self, scheduler,
+    ):
+        with scheduler.connection as connection:
+            with patch.object(
+                scheduler, 'Producer',
+                side_effect=RuntimeError('producer failed'),
+            ):
+                with pytest.raises(RuntimeError, match='producer failed'):
+                    scheduler.producer
+            assert connection.connected
+
+            scheduler.close()
+
+            assert not connection.connected
+
+    def test_close_releases_resources_when_sync_fails(self, scheduler):
+        with scheduler.connection as connection:
+            channel = scheduler.producer.channel
+            with patch.object(
+                scheduler, 'sync', side_effect=RuntimeError('sync failed'),
+            ):
+                with pytest.raises(RuntimeError, match='sync failed'):
+                    scheduler.close()
+
+            assert not connection.connected
+            assert channel.closed
+            if isinstance(scheduler, beat.PersistentScheduler):
+                assert scheduler._store.closed
+
+    @pytest.mark.parametrize(
+        'error_type', ['connection_errors', 'channel_errors'],
+    )
+    def test_close_ignores_broker_errors(self, scheduler, error_type):
+        with scheduler.connection as connection:
+            scheduler.producer.channel
+            error = getattr(connection, error_type)[0]('broker unavailable')
+            with patch.object(
+                connection, 'release', side_effect=error,
+            ) as release:
+                scheduler.close()
+            release.assert_called_once_with()
+            assert 'connection' not in scheduler.__dict__
+            assert 'producer' not in scheduler.__dict__
+            if isinstance(scheduler, beat.PersistentScheduler):
+                assert scheduler._store.closed
+
+    @pytest.mark.parametrize('sync_fails', [False, True])
+    def test_close_prioritizes_sync_over_unexpected_release_error(
+        self, scheduler, sync_fails,
+    ):
+        sync_error = RuntimeError('sync failed')
+        release_error = RuntimeError('unexpected release failure')
+        with scheduler.connection as connection:
+            scheduler.producer.channel
+            with patch.object(
+                connection, 'release', side_effect=release_error,
+            ) as release, patch.object(
+                scheduler, 'sync', wraps=scheduler.sync,
+                side_effect=sync_error if sync_fails else None,
+            ), patch('celery.beat.error') as log_error:
+                with pytest.raises(RuntimeError) as exc:
+                    scheduler.close()
+            assert exc.value is (sync_error if sync_fails else release_error)
+            release.assert_called_once_with()
+            if sync_fails:
+                log_error.assert_called_once()
+                assert log_error.call_args.kwargs['exc_info']
+            else:
+                log_error.assert_not_called()
+            assert 'connection' not in scheduler.__dict__
+            assert 'producer' not in scheduler.__dict__
+            if isinstance(scheduler, beat.PersistentScheduler):
+                assert scheduler._store.closed
+
+    @pytest.mark.parametrize('sync_fails', [False, True])
+    def test_persistent_close_releases_connection_when_store_close_fails(
+        self, sync_fails,
+    ):
+        scheduler = create_persistent_scheduler()[0](
+            app=self.app, schedule_filename='schedule',
+        )
+        with scheduler.connection as connection:
+            channel = scheduler.producer.channel
+            sync_error = RuntimeError('sync failed')
+            store_error = RuntimeError('store close failed')
+            with patch.object(
+                scheduler._store, 'close',
+                side_effect=store_error,
+            ), patch.object(
+                scheduler, 'sync', wraps=scheduler.sync,
+                side_effect=sync_error if sync_fails else None,
+            ), patch('celery.beat.error') as log_error:
+                with pytest.raises(RuntimeError) as exc:
+                    scheduler.close()
+            assert exc.value is (sync_error if sync_fails else store_error)
+            if sync_fails:
+                log_error.assert_called_once()
+                assert log_error.call_args.kwargs['exc_info']
+            else:
+                log_error.assert_not_called()
+            assert not connection.connected
+            assert channel.closed
+
+
+class test_PersistentScheduler:
+
+    @patch('os.remove')
+    def test_remove_db(self, remove):
+        s = create_persistent_scheduler()[0](app=self.app,
+                                             schedule_filename='schedule')
+        s._remove_db()
+        remove.assert_has_calls(
+            [call('schedule' + suffix) for suffix in s.known_suffixes]
+        )
+        err = OSError()
+        err.errno = errno.ENOENT
+        remove.side_effect = err
+        s._remove_db()
+        err.errno = errno.EPERM
+        with pytest.raises(OSError):
+            s._remove_db()
+
+    def test_create_schedule_corrupted(self):
+        """
+        Test that any decoding errors that might happen when opening beat-schedule.db are caught
+        """
+        s = create_persistent_scheduler()[0](app=self.app,
+                                             schedule_filename='schedule')
+        s._store = MagicMock()
+        s._destroy_open_corrupted_schedule = Mock()
+        s._destroy_open_corrupted_schedule.return_value = MagicMock()
+
+        # self._store['entries'] will throw a KeyError
+        s._store.__getitem__.side_effect = KeyError()
+        # then, when _create_schedule tries to reset _store['entries'], throw another error
+        expected_error = UnicodeDecodeError("ascii", b"ordinal not in range(128)", 0, 0, "")
+        s._store.__setitem__.side_effect = expected_error
+
+        s._create_schedule()
+        s._destroy_open_corrupted_schedule.assert_called_with(expected_error)
+
+    def test_create_schedule_corrupted_dbm_error(self):
+        """
+        Test that any dbm.error that might happen when opening beat-schedule.db are caught
+        """
+        s = create_persistent_scheduler()[0](app=self.app,
+                                             schedule_filename='schedule')
+        s._store = MagicMock()
+        s._destroy_open_corrupted_schedule = Mock()
+        s._destroy_open_corrupted_schedule.return_value = MagicMock()
+
+        # self._store['entries'] = {} will throw a KeyError
+        s._store.__getitem__.side_effect = KeyError()
+        # then, when _create_schedule tries to reset _store['entries'], throw another error, specifically dbm.error
+        expected_error = dbm.error[0]()
+        s._store.__setitem__.side_effect = expected_error
+
+        s._create_schedule()
+        s._destroy_open_corrupted_schedule.assert_called_with(expected_error)
+
+    def test_create_schedule_corrupted_pickle_error(self):
+        """
+        Test that any UnpicklingError that might happen when opening beat-schedule.db is caught
+        """
+        s = create_persistent_scheduler()[0](app=self.app,
+                                             schedule_filename='schedule')
+        s._store = MagicMock()
+        s._destroy_open_corrupted_schedule = Mock()
+        s._destroy_open_corrupted_schedule.return_value = MagicMock()
+
+        # self._store['entries'] = {} will throw a pickle.UnpicklingError
+        s._store.__getitem__.side_effect = pickle.UnpicklingError("test")
+        # then, when _create_schedule tries to reset _store['entries'],
+        # throw another error, specifically pickle.UnpicklingError
+        expected_error = pickle.UnpicklingError("test")
+        s._store.__setitem__.side_effect = expected_error
+
+        s._create_schedule()
+        s._destroy_open_corrupted_schedule.assert_called_with(expected_error)
+
+    def test_create_schedule_missing_entries(self):
+        """
+        Test that if _create_schedule can't find the key "entries" in _store it will recreate it
+        """
+        s = create_persistent_scheduler()[0](app=self.app, schedule_filename="schedule")
+        s._store = MagicMock()
+
+        # self._store['entries'] will throw a KeyError
+        s._store.__getitem__.side_effect = TypeError()
+
+        s._create_schedule()
+        s._store.__setitem__.assert_called_with("entries", {})
+
+    def test_create_schedule_invalid_stored_crontab(self):
+        """
+        Test that entries stored by an older version, containing a crontab
+        that is now rejected (e.g. the 30th of February), are recreated
+        """
+        stored = crontab(day_of_month=28, month_of_year=2)
+        stored._orig_day_of_month = '30'
+        pickled_entries = pickle.dumps({'invalid': stored})
+        s = create_persistent_scheduler()[0](app=self.app, schedule_filename="schedule")
+        s._store = MagicMock()
+
+        # self._store['entries'] will throw a ValueError when unpickled
+        s._store.__getitem__.side_effect = lambda key: pickle.loads(pickled_entries)
+
+        with patch('celery.beat.warning') as warning:
+            s._create_schedule()
+        s._store.__setitem__.assert_called_with("entries", {})
+        warning.assert_called_once()
+        assert isinstance(warning.call_args[0][1], ValueError)
+
+    def test_create_schedule_missing_entries_not_logged(self):
+        """
+        Test that creating the entries of a new schedule db doesn't log a warning
+        """
+        s = create_persistent_scheduler()[0](app=self.app, schedule_filename="schedule")
+        s._store = MagicMock()
+        s._store.__getitem__.side_effect = KeyError('entries')
+
+        with patch('celery.beat.warning') as warning:
+            s._create_schedule()
+        s._store.__setitem__.assert_called_with("entries", {})
+        warning.assert_not_called()
+
+    def test_setup_schedule(self):
+        s = create_persistent_scheduler()[0](app=self.app,
+                                             schedule_filename='schedule')
+        opens = s.persistence.open = Mock()
+        s._remove_db = Mock()
+
+        def effect(*args, **kwargs):
+            if opens.call_count > 1:
+                return s.sh
+            raise OSError()
+        opens.side_effect = effect
+        s.setup_schedule()
+        s._remove_db.assert_called_with()
+
+        s._store = {'__version__': 1}
+        s.setup_schedule()
+
+        s._store.clear = Mock()
+        op = s.persistence.open = Mock()
+        op.return_value = s._store
+        s._store['tz'] = 'FUNKY'
+        s.setup_schedule()
+        op.assert_called_with(s.schedule_filename, writeback=True)
+        s._store.clear.assert_called_with()
+        s._store['utc_enabled'] = False
+        s._store.clear = Mock()
+        s.setup_schedule()
+        s._store.clear.assert_called_with()
+
+    def test_get_schedule(self):
+        s = create_persistent_scheduler()[0](
+            schedule_filename='schedule', app=self.app,
+        )
+        s._store = {'entries': {}}
+        s.schedule = {'foo': 'bar'}
+        assert s.schedule == {'foo': 'bar'}
+        assert s._store['entries'] == s.schedule
+
+    def test_run_all_due_tasks_after_restart(self):
+        scheduler_class, shelve = create_persistent_scheduler_w_call_logging()
+
+        shelve['tz'] = 'UTC'
+        shelve['utc_enabled'] = True
+        shelve['__version__'] = __version__
+        cur_seconds = 20
+
+        def now_func():
+            return datetime(2018, 1, 1, 1, 11, cur_seconds)
+        app_schedule = {
+            'first_missed': {'schedule': crontab(
+                minute='*/10', nowfun=now_func), 'task': 'first_missed'},
+            'second_missed': {'schedule': crontab(
+                minute='*/1', nowfun=now_func), 'task': 'second_missed'},
+            'non_missed': {'schedule': crontab(
+                minute='*/13', nowfun=now_func), 'task': 'non_missed'}
+        }
+        shelve['entries'] = {
+            'first_missed': beat.ScheduleEntry(
+                'first_missed', 'first_missed',
+                last_run_at=now_func() - timedelta(minutes=2),
+                total_run_count=10,
+                app=self.app,
+                schedule=app_schedule['first_missed']['schedule']),
+            'second_missed': beat.ScheduleEntry(
+                'second_missed', 'second_missed',
+                last_run_at=now_func() - timedelta(minutes=2),
+                total_run_count=10,
+                app=self.app,
+                schedule=app_schedule['second_missed']['schedule']),
+            'non_missed': beat.ScheduleEntry(
+                'non_missed', 'non_missed',
+                last_run_at=now_func() - timedelta(minutes=2),
+                total_run_count=10,
+                app=self.app,
+                schedule=app_schedule['non_missed']['schedule']),
+        }
+
+        self.app.conf.beat_schedule = app_schedule
+
+        scheduler = scheduler_class(self.app)
+
+        max_iter_number = 5
+        for i in range(max_iter_number):
+            delay = scheduler.tick()
+            if delay > 0:
+                break
+        assert {'first_missed', 'second_missed'} == {
+            item['task'] for item in scheduler.sent}
+        # ensure next call on the beginning of next min
+        assert abs(60 - cur_seconds - delay) < 1
+
+
+class test_Service:
+
+    def get_service(self):
+        Scheduler, mock_shelve = create_persistent_scheduler()
+        return beat.Service(
+            app=self.app, scheduler_cls=Scheduler), mock_shelve
+
+    def test_pickleable(self):
+        s = beat.Service(app=self.app, scheduler_cls=Mock)
+        assert loads(dumps(s))
+
+    def test_start_records_the_effective_max_interval(self):
+        s, sh = self.get_service()
+        assert s.effective_max_interval is None
+        s.scheduler.shutdown_service = s
+        s.start()
+        assert s.effective_max_interval == s.scheduler.max_interval
+
+    def test_start_stamps_last_tick(self):
+        s, sh = self.get_service()
+        assert s._last_tick is None
+        s.scheduler.shutdown_service = s
+        s.start()
+        assert s._last_tick is not None
+
+    def test_reduce_preserves_hostname(self):
+        s = beat.Service(app=self.app, scheduler_cls=Mock,
+                         hostname='probe@example.com')
+        cls, args = s.__reduce__()
+        assert cls(*args).hostname == 'probe@example.com'
+
+    def test_reduce_preserves_remote_control(self):
+        # EmbeddedService forces remote_control off, and billiard pickles
+        # the service when the embedded beat runs under a spawning start
+        # method.  If __reduce__ drops the flag the child re-reads the
+        # config and silently starts a control node anyway.
+        self.app.conf.beat_enable_remote_control = True
+        s = beat.Service(app=self.app, scheduler_cls=Mock,
+                         remote_control=False)
+        cls, args = s.__reduce__()
+        assert cls(*args).remote_control is False
+
+    def test_start(self):
+        s, sh = self.get_service()
+        schedule = s.scheduler.schedule
+        assert isinstance(schedule, dict)
+        assert isinstance(s.scheduler, beat.Scheduler)
+        scheduled = list(schedule.keys())
+        for task_name in sh['entries'].keys():
+            assert task_name in scheduled
+
+        s.sync()
+        assert sh.closed
+        assert sh.synced
+        assert s._is_stopped.is_set()
+        s.sync()
+        s.stop(wait=False)
+        assert s._is_shutdown.is_set()
+        s.stop(wait=True)
+        assert s._is_shutdown.is_set()
+
+        p = s.scheduler._store
+        s.scheduler._store = None
+        try:
+            s.scheduler.sync()
+        finally:
+            s.scheduler._store = p
+
+    def test_start_embedded_process(self):
+        s, sh = self.get_service()
+        s._is_shutdown.set()
+        s.start(embedded_process=True)
+
+    def test_start_thread(self):
+        s, sh = self.get_service()
+        s._is_shutdown.set()
+        s.start(embedded_process=False)
+
+    def test_start_tick_raises_exit_error(self):
+        s, sh = self.get_service()
+        s.scheduler.tick_raises_exit = True
+        s.start()
+        assert s._is_shutdown.is_set()
+
+    def test_start_manages_one_tick_before_shutdown(self):
+        s, sh = self.get_service()
+        s.scheduler.shutdown_service = s
+        s.start()
+        assert s._is_shutdown.is_set()
+
+    def test_start_starts_and_stops_pidbox_when_enabled(self):
+        self.app.conf.beat_enable_remote_control = True
+        s, sh = self.get_service()
+        s.scheduler.shutdown_service = s
+        with patch('celery.beat.BeatPidbox') as BeatPidbox:
+            s.start()
+        BeatPidbox.assert_called_once_with(s)
+        BeatPidbox.return_value.start.assert_called_once_with()
+        BeatPidbox.return_value.stop.assert_called_once_with()
+
+    def test_start_does_not_start_pidbox_by_default(self):
+        s, sh = self.get_service()
+        s.scheduler.shutdown_service = s
+        with patch('celery.beat.BeatPidbox') as BeatPidbox:
+            s.start()
+        BeatPidbox.assert_not_called()
+
+    def test_remote_control_argument_overrides_setting(self):
+        self.app.conf.beat_enable_remote_control = True
+        s = beat.Service(app=self.app, scheduler_cls=Mock,
+                         remote_control=False)
+        assert s.remote_control is False
+        s2, _ = self.get_service()
+        assert s2.remote_control is True
+
+
+def _idle_then_timeout(*args, **kwargs):
+    """Stand in for ``drain_events``, blocking instead of spinning.
+
+    Raising :exc:`socket.timeout` immediately turns the consumer loop
+    into a busy-wait that burns a core for the duration of the test.
+    """
+    sleep(0.01)
+    raise socket.timeout()
+
+
+class test_beat_nodename:
+
+    def test_defaults_to_celerybeat_at_local_host(self):
+        from celery.utils.nodenames import gethostname
+        assert beat.beat_nodename() == f'celerybeat@{gethostname()}'
+        assert beat.beat_nodename('') == f'celerybeat@{gethostname()}'
+
+    def test_bare_value_is_the_host(self):
+        # matches `celery worker -n foo` giving celery@foo
+        assert beat.beat_nodename('example.com') == 'celerybeat@example.com'
+
+    def test_full_nodename_is_kept(self):
+        assert beat.beat_nodename('probe@example.com') == 'probe@example.com'
+
+    def test_expands_host_abbreviations(self):
+        from celery.utils.nodenames import gethostname
+        assert beat.beat_nodename('probe@%h') == f'probe@{gethostname()}'
+
+
+class test_BeatPidbox:
+
+    def get_pidbox(self):
+        service = beat.Service(app=self.app, scheduler_cls=Mock)
+        return beat.BeatPidbox(service), service
+
+    def test_enable_remote_control_setting_defaults_to_false(self):
+        assert self.app.conf.beat_enable_remote_control is False
+
+    def test_node_name(self):
+        from celery.utils.nodenames import gethostname
+        pb, _ = self.get_pidbox()
+        assert pb.node.hostname == f'celerybeat@{gethostname()}'
+
+    def test_node_name_follows_the_service_hostname(self):
+        service = beat.Service(app=self.app, scheduler_cls=Mock,
+                               hostname='probe@example.com')
+        assert beat.BeatPidbox(service).node.hostname == 'probe@example.com'
+
+    def test_ping_handler_replies_pong(self):
+        # Must match the worker's reply exactly: Inspect.ping and
+        # Control.ping both document {HOSTNAME: {'ok': 'pong'}} as
+        # their return contract.
+        pb, _ = self.get_pidbox()
+        assert pb.node.handlers['ping'](pb.state) == {'ok': 'pong'}
+
+    def test_max_tick_age_defaults_to_twice_the_loop_interval(self):
+        self.app.conf.beat_max_loop_interval = 120.0
+        pb, _ = self.get_pidbox()
+        assert pb.max_tick_age == 240.0
+
+    def test_max_tick_age_falls_back_to_the_module_default(self):
+        # beat_max_loop_interval defaults to 0, which the scheduler
+        # itself reads as "use DEFAULT_MAX_INTERVAL".
+        pb, service = self.get_pidbox()
+        assert service.max_interval == 0
+        assert pb.max_tick_age == beat.DEFAULT_MAX_INTERVAL * 2
+
+    def test_max_tick_age_uses_the_interval_the_scheduler_settled_on(self):
+        # A scheduler class may pick its own interval when neither the
+        # argument nor beat_max_loop_interval is set -- django-celery-beat
+        # uses five seconds -- so the service's value is not the real cap.
+        pb, service = self.get_pidbox()
+        service.effective_max_interval = 600.0
+        assert pb.max_tick_age == 1200.0
+
+    def test_max_tick_age_never_drops_below_the_floor(self):
+        pb, service = self.get_pidbox()
+        service.effective_max_interval = 5.0   # django-celery-beat
+        assert pb.max_tick_age == pb.min_tick_age
+
+    def test_max_tick_age_can_be_configured(self):
+        pb, _ = self.get_pidbox()
+        self.app.conf.beat_remote_control_max_tick_age = 42.0
+        assert pb.max_tick_age == 42.0
+
+    def test_not_stale_before_the_first_tick_is_recorded(self):
+        pb, service = self.get_pidbox()
+        service._last_tick = None
+        assert pb.tick_age() is None
+        assert pb.is_stale() is False
+
+    def test_stale_once_a_tick_is_overdue(self):
+        pb, service = self.get_pidbox()
+        self.app.conf.beat_remote_control_max_tick_age = 10.0
+        service._last_tick = time.monotonic()
+        assert pb.is_stale() is False
+        service._last_tick = time.monotonic() - 11.0
+        assert pb.is_stale() is True
+
+    def test_staleness_check_can_be_disabled(self):
+        pb, service = self.get_pidbox()
+        self.app.conf.beat_remote_control_max_tick_age = 0
+        service._last_tick = time.monotonic() - 10_000.0
+        assert pb.is_stale() is False
+
+    def _fanout(self, pb):
+        # start() asks the transport about fanout, and that call goes
+        # through connection_for_read() too.  These tests drive the
+        # consumer loop, not the guard, so keep it out of their
+        # connection sequence -- otherwise it silently eats the first
+        # one and the test stops exercising what it claims to.
+        return patch.object(pb, 'fanout_support',
+                            return_value=(True, 'memory'))
+
+    def _message(self):
+        # handle_message reads headers['clock'] before it does anything
+        # else; a bare Mock there raises inside the clock and the error
+        # is swallowed, which would make these tests pass vacuously.
+        message = Mock(name='message')
+        message.headers = {}
+        return message
+
+    def _stale_pidbox(self, max_tick_age=10.0):
+        pb, service = self.get_pidbox()
+        self.app.conf.beat_remote_control_max_tick_age = max_tick_age
+        service._last_tick = time.monotonic() - (max_tick_age + 1)
+        pb.node.reply = Mock(name='reply')
+        return pb
+
+    def test_does_not_reply_when_stale(self):
+        # Silence is the only thing a probe can see: `celery inspect`
+        # exits non-zero only when nothing replies at all.
+        pb = self._stale_pidbox()
+        with patch('celery.beat.warning') as warning:
+            pb.on_message({'method': 'ping', 'arguments': {},
+                           'destination': [pb.hostname],
+                           'reply_to': {'exchange': 'r', 'routing_key': 'r'}},
+                          self._message())
+        pb.node.reply.assert_not_called()
+        warning.assert_called_once()
+
+    def test_stale_check_ignores_messages_for_other_nodes(self):
+        # The gate runs inside dispatch, which handle_message only
+        # reaches for messages addressed here -- otherwise a stale beat
+        # would log about every worker's liveness probe.
+        pb = self._stale_pidbox()
+        for body in (
+            {'method': 'ping', 'arguments': {},
+             'destination': ['celery@somewhere-else']},
+            {'method': 'ping', 'arguments': {},
+             'pattern': 'celery@*', 'matcher': 'glob'},
+        ):
+            with patch('celery.beat.error') as error:
+                with patch('celery.beat.warning') as warning:
+                    pb.on_message(body, self._message())
+            pb.node.reply.assert_not_called()
+            warning.assert_not_called()
+            error.assert_not_called()   # not "passed because it threw"
+
+    def test_declines_a_destination_less_broadcast_when_stale(self):
+        # A plain `celery inspect ping` carries no destination, and
+        # kombu dispatches those to every node, so this is the shape the
+        # settings docs describe as logging a warning per probe.
+        pb = self._stale_pidbox()
+        with patch('celery.beat.warning') as warning:
+            pb.on_message({'method': 'ping', 'arguments': {},
+                           'reply_to': {'exchange': 'r',
+                                        'routing_key': 'r'}},
+                          self._message())
+        pb.node.reply.assert_not_called()
+        warning.assert_called_once()
+
+    def test_replies_to_a_broadcast_addressed_to_it(self):
+        pb, service = self.get_pidbox()
+        service._last_tick = time.monotonic()
+        pb.node.reply = Mock(name='reply')
+        pb.on_message({'method': 'ping', 'arguments': {},
+                       'pattern': 'celerybeat@*', 'matcher': 'glob',
+                       'reply_to': {'exchange': 'r', 'routing_key': 'r'}},
+                      self._message())
+        pb.node.reply.assert_called_once()
+        assert pb.node.reply.call_args[0][0] == {
+            pb.hostname: {'ok': 'pong'}}
+
+    def test_on_message_replies_while_ticking(self):
+        pb, service = self.get_pidbox()
+        self.app.conf.beat_remote_control_max_tick_age = 10.0
+        service._last_tick = time.monotonic()
+        pb.node.handle_message = Mock(name='handle_message')
+        body = {'method': 'ping', 'arguments': {}}
+        message = Mock(name='message')
+        pb.on_message(body, message)
+        pb.node.handle_message.assert_called_once_with(body, message)
+
+    def test_on_message_ignores_unknown_method(self):
+        # handle_message is the only path that sends a reply, so not
+        # calling it is exactly "produces no reply".
+        pb, _ = self.get_pidbox()
+        pb.node.handle_message = Mock(name='handle_message')
+        for method in ('active', 'stats', 'shutdown', 'revoke'):
+            pb.on_message({'method': method, 'arguments': {}}, Mock())
+        pb.node.handle_message.assert_not_called()
+
+    def test_on_message_dispatches_known_method(self):
+        pb, _ = self.get_pidbox()
+        pb.node.handle_message = Mock(name='handle_message')
+        body = {'method': 'ping', 'arguments': {}}
+        message = Mock(name='message')
+        pb.on_message(body, message)
+        pb.node.handle_message.assert_called_once_with(body, message)
+
+    def test_on_message_ignores_non_dict_body(self):
+        # A non-dict payload used to raise AttributeError out through
+        # drain_events, where it was mis-logged as a connection error
+        # and cost a channel teardown plus a reconnect.
+        pb, _ = self.get_pidbox()
+        pb.node.handle_message = Mock(name='handle_message')
+        with patch('celery.beat.error') as error:
+            pb.on_message('not a mapping', Mock())
+        pb.node.handle_message.assert_not_called()
+        error.assert_not_called()  # ignored, not logged as a command error
+
+    def test_on_message_survives_handler_error(self):
+        pb, _ = self.get_pidbox()
+        pb.node.handle_message = Mock(side_effect=KeyError('boom'))
+        pb.on_message({'method': 'ping', 'arguments': {}}, Mock())
+
+    def test_start_stop_thread_lifecycle(self):
+        pb, _ = self.get_pidbox()
+        pb.node.listen = Mock(name='listen')
+        with patch.object(self.app, 'connection_for_read') as cfr:
+            conn = cfr.return_value.__enter__.return_value
+            conn.drain_events.side_effect = _idle_then_timeout
+            with self._fanout(pb):
+                pb.start()
+            assert pb.thread.is_alive()
+            assert pb.thread.daemon
+            pb.stop()
+        # cleared only because the thread really did terminate
+        assert pb.thread is None
+
+    def test_start_refuses_a_transport_without_fanout(self):
+        # node.listen() would fail on every attempt, and the reconnect
+        # loop cannot tell that apart from a dropped connection, so it
+        # would log an error every retry_interval forever.
+        pb, _ = self.get_pidbox()
+        with patch.object(pb, 'fanout_support',
+                          return_value=(False, 'sqs')):
+            with patch('celery.beat.warning') as warning:
+                pb.start()
+        assert pb.thread is None
+        warning.assert_called_once()
+        assert warning.call_args[0][1] == 'sqs'
+
+    def test_fanout_support_asks_the_transport(self):
+        pb, _ = self.get_pidbox()
+        with patch.object(self.app, 'connection_for_read') as cfr:
+            cfr.return_value.supports_exchange_type.return_value = False
+            cfr.return_value.transport_cls = 'sqs'
+            assert pb.fanout_support() == (False, 'sqs')
+        cfr.return_value.supports_exchange_type.assert_called_once_with(
+            'fanout')
+
+    def test_fanout_support_opens_only_one_connection(self):
+        # The transport name used in the warning comes back with the
+        # answer, rather than from a second throwaway Connection.
+        pb, _ = self.get_pidbox()
+        with patch.object(self.app, 'connection_for_read') as cfr:
+            cfr.return_value.supports_exchange_type.return_value = False
+            pb.start()
+        assert cfr.call_count == 1
+        cfr.return_value.release.assert_called_once_with()
+
+    def test_fanout_support_on_a_real_transport(self):
+        pb, _ = self.get_pidbox()
+        supported, transport = pb.fanout_support()
+        assert supported is True          # memory:// has fanout
+        assert transport == 'memory'
+
+    def test_start_is_idempotent_while_running(self):
+        pb, _ = self.get_pidbox()
+        pb.node.listen = Mock(name='listen')
+        with patch.object(self.app, 'connection_for_read') as cfr:
+            conn = cfr.return_value.__enter__.return_value
+            conn.drain_events.side_effect = _idle_then_timeout
+            with self._fanout(pb):
+                pb.start()
+                running = pb.thread
+                pb.start()  # must not spawn a second consumer
+            assert pb.thread is running
+            pb.stop()
+        assert pb.thread is None
+
+    def test_stop_before_start_is_a_noop(self):
+        pb, _ = self.get_pidbox()
+        pb.stop()
+        assert pb.thread is None
+
+    def test_stop_twice_is_a_noop(self):
+        pb, _ = self.get_pidbox()
+        pb.node.listen = Mock(name='listen')
+        with patch.object(self.app, 'connection_for_read') as cfr:
+            conn = cfr.return_value.__enter__.return_value
+            conn.drain_events.side_effect = _idle_then_timeout
+            with self._fanout(pb):
+                pb.start()
+            pb.stop()
+            pb.stop()  # must not raise or block on the cleared thread
+        assert pb.thread is None
+
+    def test_stop_warns_and_keeps_thread_that_will_not_die(self):
+        pb, _ = self.get_pidbox()
+        pb.join_timeout = 0.01
+        pb.thread = Mock(name='thread')
+        pb.thread.is_alive.return_value = True
+        with patch('celery.beat.warning') as warning:
+            pb.stop()
+        pb.thread.join.assert_called_once_with(timeout=0.01)
+        warning.assert_called_once()
+        # kept, so the idempotent start() cannot add a second consumer
+        assert pb.thread is not None
+
+    def test_loop_exits_on_error_during_shutdown(self):
+        pb, _ = self.get_pidbox()
+
+        def raise_after_shutdown(*args, **kwargs):
+            pb._shutdown.set()
+            raise ConnectionResetError('gone during shutdown')
+
+        with patch.object(self.app, 'connection_for_read',
+                          side_effect=raise_after_shutdown) as cfr:
+            pb._loop()  # must break out instead of retrying
+        assert cfr.call_count == 1
+
+    def test_loop_exits_when_an_open_connection_drops_during_shutdown(self):
+        # The reconnect path must also notice a shutdown in progress,
+        # and go quietly -- this is not a surprise failure.
+        pb, _ = self.get_pidbox()
+        pb.node.listen = Mock(name='listen')
+
+        def drop(*args, **kwargs):
+            pb._shutdown.set()
+            raise ConnectionResetError('gone during shutdown')
+
+        connection = MagicMock()
+        connection.__enter__.return_value.drain_events.side_effect = drop
+        with patch.object(self.app, 'connection_for_read',
+                          return_value=connection) as cfr:
+            with patch('celery.beat.warning') as warning:
+                pb._loop()
+        assert cfr.call_count == 1
+        warning.assert_not_called()
+
+    def test_loop_reconnects_on_connection_error(self):
+        pb, _ = self.get_pidbox()
+        pb.retry_interval = 0.01
+        pb.node.listen = Mock(name='listen')
+
+        conn_bad = MagicMock()
+        conn_bad.__enter__.return_value.drain_events.side_effect = (
+            ConnectionResetError('broker gone'))
+        conn_ok = MagicMock()
+        conn_ok.__enter__.return_value.drain_events.side_effect = (
+            _idle_then_timeout)
+        conns = iter([conn_bad])
+        reconnected = Event()
+
+        def next_connection(*args, **kwargs):
+            try:
+                return next(conns)
+            except StopIteration:
+                reconnected.set()
+                return conn_ok
+
+        with patch.object(self.app, 'connection_for_read',
+                          side_effect=next_connection) as cfr:
+            with self._fanout(pb):
+                pb.start()
+            assert reconnected.wait(timeout=10), 'did not reconnect'
+            pb.stop()
+        assert cfr.call_count >= 2
+        assert pb.thread is None
+
+    def test_first_connect_uses_the_startup_retry_setting(self):
+        # The worker fails fast at startup when asked to; beat's control
+        # thread should not quietly retry instead.
+        pb, _ = self.get_pidbox()
+        self.app.conf.broker_connection_retry_on_startup = False
+        self.app.conf.broker_connection_retry = True
+        self.app.conf.broker_connection_max_retries = 7
+        with patch.object(self.app, 'connection_for_read') as cfr:
+            pb._connect()
+        cfr.return_value.ensure_connection.assert_called_once_with(
+            pb._error_handler, 0, callback=pb._abort_if_stopping)
+
+    def test_first_connect_falls_back_when_startup_setting_unset(self):
+        pb, _ = self.get_pidbox()
+        self.app.conf.broker_connection_retry_on_startup = None
+        self.app.conf.broker_connection_retry = True
+        self.app.conf.broker_connection_max_retries = 7
+        with patch.object(self.app, 'connection_for_read') as cfr:
+            pb._connect()
+        cfr.return_value.ensure_connection.assert_called_once_with(
+            pb._error_handler, 7, callback=pb._abort_if_stopping)
+
+    def test_only_the_first_connect_is_a_startup_connect(self):
+        pb, _ = self.get_pidbox()
+        self.app.conf.broker_connection_retry_on_startup = False
+        self.app.conf.broker_connection_retry = True
+        self.app.conf.broker_connection_max_retries = 7
+        with patch.object(self.app, 'connection_for_read') as cfr:
+            pb._connect()   # startup, so no retries
+            pb._connect()   # a reconnect, so the other setting applies
+        assert [c.args[1] for c
+                in cfr.return_value.ensure_connection.call_args_list] == [0, 7]
+
+    def test_start_makes_the_next_connect_a_startup_connect_again(self):
+        # A restarted consumer connects from scratch, so its first
+        # attempt is governed by the startup setting once more.  _loop
+        # is stubbed out so the thread doesn't consume the flag first.
+        pb, _ = self.get_pidbox()
+        pb.first_connection_attempt = False
+        with self._fanout(pb):
+            with patch.object(pb, '_loop'):
+                pb.start()
+                assert pb.first_connection_attempt is True
+                pb.stop()
+
+    def test_connect_honours_broker_connection_max_retries(self):
+        pb, _ = self.get_pidbox()
+        self.app.conf.broker_connection_max_retries = 7
+        with patch.object(self.app, 'connection_for_read') as cfr:
+            pb._connect()
+        cfr.return_value.ensure_connection.assert_called_once_with(
+            pb._error_handler, 7, callback=pb._abort_if_stopping)
+
+    def _give_up_message(self, **conf):
+        pb, _ = self.get_pidbox()
+        for key, value in conf.items():
+            setattr(self.app.conf, key, value)
+
+        def fail(*args, **kwargs):
+            # Safety net: fail the assertion below rather than spinning
+            # here forever if the give-up path ever regresses.
+            if cfr.call_count > 3:
+                pb._shutdown.set()
+            raise ConnectionResetError('down')
+
+        with patch.object(self.app, 'connection_for_read',
+                          side_effect=fail) as cfr:
+            with patch('celery.beat.error') as error:
+                pb._loop()
+        assert cfr.call_count == 1
+        return error.call_args[0][0]
+
+    def test_giving_up_says_the_same_thing_however_it_failed(self):
+        # The message names the settings instead of diagnosing which
+        # one applied, so it has to hold for every way a connect can
+        # fail: retrying off, budget spent, a zero budget, and an error
+        # retrying would never have fixed.
+        for conf in (
+            {'broker_connection_retry_on_startup': False},
+            {'broker_connection_retry_on_startup': None,
+             'broker_connection_retry': False},
+            {'broker_connection_retry_on_startup': None,
+             'broker_connection_retry': True},
+            {'broker_connection_retry': True,
+             'broker_connection_max_retries': 0},
+        ):
+            fmt = self._give_up_message(**conf)
+            assert 'could not connect to the broker' in fmt
+            for setting in ('broker_connection_retry',
+                            'broker_connection_retry_on_startup',
+                            'broker_connection_max_retries'):
+                assert setting in fmt
+
+    def test_stop_interrupts_a_connect_that_is_backing_off(self):
+        # kombu sleeps its whole backoff unless it is given a callback,
+        # so without one a stop() during an outage waited out the full
+        # join timeout and then warned that the thread would not die.
+        pb, _ = self.get_pidbox()
+        # Generous, so that a slow runner doesn't fail the test.  The fake
+        # backoff below outlasts it, so a stop() that can't interrupt the
+        # backoff still times out and fails.
+        pb.join_timeout = 5
+        backing_off_started = Event()
+        backoff_over = Event()
+
+        def backing_off(errback, max_retries, callback=None, **kwargs):
+            backing_off_started.set()
+            # Tolerate a missing callback instead of raising TypeError,
+            # so dropping it from _connect() shows up here as a thread
+            # that will not stop rather than an unrelated crash.
+            while not backoff_over.wait(timeout=0.01):
+                if callback is not None:
+                    callback()      # kombu calls this once a second
+            raise ConnectionResetError('never got there')
+
+        try:
+            with patch.object(self.app, 'connection_for_read') as cfr:
+                cfr.return_value.ensure_connection.side_effect = backing_off
+                with self._fanout(pb):
+                    pb.start()
+                    # Stop during the backoff, not before the thread
+                    # gets there.
+                    assert backing_off_started.wait(timeout=10), \
+                        'never connected'
+                    with patch('celery.beat.warning') as warning:
+                        pb.stop()
+        finally:
+            # End the backoff, so a thread that didn't stop doesn't
+            # outlive the test.
+            backoff_over.set()
+        assert pb.thread is None        # it really did stop
+        warning.assert_not_called()     # so nothing to warn about
+
+    def test_loop_stops_once_connect_retries_are_exhausted(self):
+        # ensure_connection() applies the retry policy itself, so once it
+        # raises there is nothing left to wait for.  Reconnecting here
+        # would hand it a fresh budget and make the setting meaningless.
+        pb, _ = self.get_pidbox()
+        pb.retry_interval = 0
+        self.app.conf.broker_connection_max_retries = 1
+
+        def exhausted(*args, **kwargs):
+            # Safety net: fail the assertion below rather than spinning
+            # here forever if the give-up path ever regresses.
+            if cfr.call_count > 3:
+                pb._shutdown.set()
+            connection = MagicMock()
+            connection.ensure_connection.side_effect = (
+                ConnectionResetError('broker down'))
+            return connection
+
+        with patch.object(self.app, 'connection_for_read',
+                          side_effect=exhausted) as cfr:
+            with patch('celery.beat.warning') as warning:
+                pb._loop()
+        assert cfr.call_count == 1
+        warning.assert_called_once()
+
+    def test_connect_honours_broker_connection_retry_disabled(self):
+        pb, _ = self.get_pidbox()
+        self.app.conf.broker_connection_retry = False
+        self.app.conf.broker_connection_max_retries = 7
+        with patch.object(self.app, 'connection_for_read') as cfr:
+            pb._connect()
+        cfr.return_value.ensure_connection.assert_called_once_with(
+            pb._error_handler, 0, callback=pb._abort_if_stopping)
+
+    def test_connect_releases_connection_it_could_not_establish(self):
+        pb, _ = self.get_pidbox()
+        with patch.object(self.app, 'connection_for_read') as cfr:
+            cfr.return_value.ensure_connection.side_effect = (
+                ConnectionResetError('gone'))
+            with pytest.raises(ConnectionResetError):
+                pb._connect()
+        cfr.return_value.release.assert_called_once_with()
+
+    def test_error_handler_logs_the_retry(self):
+        pb, _ = self.get_pidbox()
+        with patch('celery.beat.error') as error:
+            pb._error_handler(ConnectionResetError('gone'), 5)
+        error.assert_called_once()
+
+    def test_loop_does_not_retry_a_failed_connect_when_retry_disabled(self):
+        pb, _ = self.get_pidbox()
+        pb.retry_interval = 0
+        self.app.conf.broker_connection_retry = False
+
+        def fail(*args, **kwargs):
+            # Safety net: if the no-retry guard ever regresses, fail the
+            # assertion below rather than looping here forever.
+            if cfr.call_count > 3:
+                pb._shutdown.set()
+            raise ConnectionResetError('gone')
+
+        with patch.object(self.app, 'connection_for_read',
+                          side_effect=fail) as cfr:
+            with patch('celery.beat.warning') as warning:
+                pb._loop()
+        assert cfr.call_count == 1
+        # the consumer is gone for good, so say so out loud
+        warning.assert_called_once()
+
+    def test_loop_does_not_reconnect_a_dropped_link_when_retry_disabled(self):
+        # broker_connection_retry governs reconnecting to a broker that
+        # went away, not only the first attempt.  The connect path and
+        # the dropped-connection path are separate branches, so this
+        # needs its own test: mocking connection_for_read to raise only
+        # ever exercises the former.
+        pb, _ = self.get_pidbox()
+        pb.retry_interval = 0
+        pb.node.listen = Mock(name='listen')
+        self.app.conf.broker_connection_retry = False
+
+        def dropped(*args, **kwargs):
+            # Safety net: fail the assertion below rather than spinning
+            # here forever if the guard regresses again.
+            if cfr.call_count > 3:
+                pb._shutdown.set()
+            connection = MagicMock()
+            connection.__enter__.return_value.drain_events.side_effect = (
+                ConnectionResetError('broker gone'))
+            return connection
+
+        with patch.object(self.app, 'connection_for_read',
+                          side_effect=dropped) as cfr:
+            with patch('celery.beat.warning') as warning:
+                pb._loop()
+        assert cfr.call_count == 1
+        warning.assert_called_once()
+
+    def test_loop_is_quiet_when_stopped_deliberately(self):
+        pb, _ = self.get_pidbox()
+        pb._shutdown.set()
+        with patch('celery.beat.warning') as warning:
+            pb._loop()
+        warning.assert_not_called()
+
+
+class test_EmbeddedService:
+
+    def xxx_start_stop_process(self):
+        pytest.importorskip('_multiprocessing')
+        from billiard.process import Process
+
+        s = beat.EmbeddedService(self.app)
+        assert isinstance(s, Process)
+        assert isinstance(s.service, beat.Service)
+        s.service = MockService()
+
+        class _Popen:
+            terminated = False
+
+            def terminate(self):
+                self.terminated = True
+
+        with patch('celery.platforms.close_open_fds'):
+            s.run()
+        assert s.service.started
+
+        s._popen = _Popen()
+        s.stop()
+        assert s.service.stopped
+        assert s._popen.terminated
+
+    def test_start_stop_threaded(self):
+        s = beat.EmbeddedService(self.app, thread=True)
+        from threading import Thread
+        assert isinstance(s, Thread)
+        assert isinstance(s.service, beat.Service)
+        s.service = MockService()
+
+        s.run()
+        assert s.service.started
+
+        s.stop()
+        assert s.service.stopped
+
+    def test_embedded_disables_remote_control(self):
+        self.app.conf.beat_enable_remote_control = True
+        s = beat.EmbeddedService(self.app, thread=True)
+        assert s.service.remote_control is False
+        if beat._Process is not None:
+            p = beat.EmbeddedService(self.app)
+            assert p.service.remote_control is False
+
+    def test_embedded_remote_control_is_an_overridable_default(self):
+        s = beat.EmbeddedService(self.app, thread=True, remote_control=True)
+        assert s.service.remote_control is True
+
+
+class test_schedule:
+
+    def test_maybe_make_aware(self):
+        x = schedule(10, app=self.app)
+        x.utc_enabled = True
+        d = x.maybe_make_aware(datetime.now(timezone.utc))
+        assert d.tzinfo
+        x.utc_enabled = False
+        d2 = x.maybe_make_aware(datetime.now(timezone.utc))
+        assert d2.tzinfo
+
+    def test_to_local(self):
+        x = schedule(10, app=self.app)
+        x.utc_enabled = True
+        d = x.to_local(datetime.now())
+        assert d.tzinfo is None
+        x.utc_enabled = False
+        d = x.to_local(datetime.now(timezone.utc))
+        assert d.tzinfo
