@@ -1,3 +1,31 @@
+*   Interpret `where` Ranges on fixed-scale decimal columns at the column scale.
+
+    A Range whose bounds carry more decimal places than the column stores used
+    to be rounded per bound, which could both widen the range and make
+    `where.not` invert a condition that never matched those bounds. The bounds
+    are now narrowed to the smallest and largest storable values inside the
+    range, an excluded end is honored, and an empty range selects nothing.
+    `where.not` inverts the same condition, so both directions agree, and
+    `nil` bounds keep their SQL meaning.
+
+    A column that stores numbers but cannot report its scale raises
+    `ActiveRecord::RangePrecisionError` for a non-whole-number bound instead of
+    silently truncating it.
+
+    ```ruby
+    # t.decimal :price, precision: 10, scale: 2
+
+    Product.where(price: BigDecimal("1.004")..BigDecimal("1.006"))
+    # Before: WHERE price BETWEEN 1.0 AND 1.01 (both bounds rounded outwards)
+    # After:  WHERE price BETWEEN 1.01 AND 1.0 (nothing is storable in that range)
+
+    Product.where(price: BigDecimal("1.0")...BigDecimal("1.004"))
+    # Before: WHERE price >= 1.0 AND price < 1.0 (nothing selected)
+    # After:  WHERE price = 1.0 (1.0 is the only storable value in the range)
+    ```
+
+    *Rails*
+
 *   Log source location when scoped order is ignored in batching.
 
     *fatkodima*

@@ -100,4 +100,136 @@ class NumericDataTest < ActiveRecord::TestCase
       assert_predicate m1.big_bank_balance, :nan?
     end
   end
+
+  test "decimal range bounds are interpreted at the column scale" do
+    create_balance(1.00)
+    create_balance(1.01)
+    create_balance(1.02)
+    create_balance(1.03)
+    create_balance(nil)
+
+    assert_balance_range BigDecimal("1.005")..BigDecimal("1.02"), [1.01, 1.02]
+  end
+
+  test "an upper bound with more decimals than the column stores is narrowed into the range" do
+    create_balance(1.00)
+    create_balance(1.01)
+    create_balance(1.02)
+    create_balance(1.03)
+
+    assert_balance_range BigDecimal("1.00")..BigDecimal("1.019"), [1.00, 1.01]
+    assert_balance_range BigDecimal("1.00")..BigDecimal("1.021"), [1.00, 1.01, 1.02]
+  end
+
+  test "an excluded upper bound selects the last storable value below it" do
+    create_balance(1.00)
+    create_balance(1.01)
+    create_balance(1.02)
+    create_balance(1.03)
+
+    assert_balance_range BigDecimal("1.00")...BigDecimal("1.02"), [1.00, 1.01]
+    assert_balance_range BigDecimal("1.00")...BigDecimal("1.025"), [1.00, 1.01, 1.02]
+  end
+
+  test "a range with no storable value selects nothing and its negation selects everything" do
+    create_balance(1.00)
+    create_balance(1.01)
+    create_balance(1.02)
+
+    assert_balance_range BigDecimal("1.005")..BigDecimal("1.005"), []
+    assert_balance_range BigDecimal("1.001")...BigDecimal("1.009"), []
+    assert_balance_range BigDecimal("1.03")..BigDecimal("1.00"), []
+  end
+
+  test "a range on storable values selects the same rows in both directions" do
+    create_balance(1.00)
+    create_balance(1.01)
+    create_balance(1.02)
+    create_balance(1.03)
+    create_balance(nil)
+
+    assert_balance_range BigDecimal("1.00")..BigDecimal("1.02"), [1.00, 1.01, 1.02]
+    assert_balance_range BigDecimal("1.00")...BigDecimal("1.02"), [1.00, 1.01]
+  end
+
+  test "a range with an open bound keeps the SQL meaning of nil" do
+    create_balance(1.00)
+    create_balance(1.01)
+    create_balance(1.02)
+    create_balance(nil)
+
+    assert_balance_range nil..BigDecimal("1.015"), [1.00, 1.01]
+    assert_balance_range BigDecimal("1.005")..nil, [1.01, 1.02]
+  end
+
+  test "decimal range bounds carry across a whole number" do
+    create_balance(9.99)
+    create_balance(10.00)
+    create_balance(10.01)
+
+    assert_balance_range BigDecimal("9.995")..BigDecimal("10.005"), [10.00]
+    assert_balance_range BigDecimal("9.99")...BigDecimal("10.01"), [9.99, 10.00]
+  end
+
+  test "decimal range bounds are interpreted on unscaled decimal columns too" do
+    create_balance(1, column: :unscaled_bank_balance)
+    create_balance(2, column: :unscaled_bank_balance)
+    create_balance(3, column: :unscaled_bank_balance)
+
+    relation = NumericData.where(unscaled_bank_balance: BigDecimal("1.5")..BigDecimal("3.5"))
+    assert_equal [2, 3], relation.order(:unscaled_bank_balance).pluck(:unscaled_bank_balance)
+    assert_equal [1], NumericData.where.not(unscaled_bank_balance: BigDecimal("1.5")..BigDecimal("3.5")).pluck(:unscaled_bank_balance)
+  end
+
+  test "a decimal range on a column without a reported scale is reported instead of guessed" do
+    model = Class.new(ActiveRecord::Base) do
+      self.table_name = "numeric_data"
+      def self.name
+        "ScaleFreeNumericData"
+      end
+    end
+    model.attribute :bank_balance, Class.new(ActiveRecord::Type::Decimal) {
+      def self.name
+        "ScaleFreeDecimal"
+      end
+
+      def stored_decimal_scale
+        nil
+      end
+
+      def stored_decimal_scale_known?
+        false
+      end
+    }.new
+
+    error = assert_raises(ActiveRecord::RangePrecisionError) do
+      model.where(bank_balance: BigDecimal("1.001")..BigDecimal("1.009")).to_a
+    end
+    assert_match(/bank_balance/, error.message)
+    assert_match(/ScaleFreeDecimal/, error.message)
+
+    assert_raises(ActiveRecord::RangePrecisionError) do
+      model.where.not(bank_balance: BigDecimal("1.001")..BigDecimal("1.009")).to_a
+    end
+
+    assert_equal 0, model.where(bank_balance: 1..2).count
+  end
+
+  private
+    def create_balance(value, column: :bank_balance)
+      NumericData.create!(column => value)
+    end
+
+    def assert_balance_range(range, expected)
+      expected = expected.map { |value| BigDecimal(value.to_s) }
+
+      relation = NumericData.where(bank_balance: range)
+      actual = relation.where.not(bank_balance: nil).order(:bank_balance).pluck(:bank_balance)
+      assert_equal expected, actual, "forward: #{relation.to_sql}"
+
+      negated = NumericData.where.not(bank_balance: range)
+      negated_values = negated.where.not(bank_balance: nil).order(:bank_balance).pluck(:bank_balance)
+      stored = NumericData.where.not(bank_balance: nil).order(:bank_balance).pluck(:bank_balance)
+      assert_equal stored - expected, negated_values, "negated: #{negated.to_sql}"
+    end
 end

@@ -17,6 +17,12 @@ module ActiveModel
           Type::Value.new.as_json
         end
       end
+
+      def test_stored_decimal_scale_is_unknown_by_default
+        assert_nil Type::Value.new.stored_decimal_scale
+        assert_predicate Type::Value.new, :stored_decimal_scale_known?
+        assert_nil Type::String.new.stored_decimal_scale
+      end
     end
   end
 end

@@ -1235,6 +1235,25 @@ module ActiveRecord
     # # SELECT * FROM users WHERE (created_at BETWEEN '2012-06-09 07:00:00.000000' AND '2012-06-10 07:00:00.000000')
     # ```
     #
+    # A Range for a column that stores numbers at a fixed scale, such as
+    # `t.decimal :price, precision: 10, scale: 2`, is interpreted on that
+    # scale. The bounds are narrowed to the smallest and largest storable
+    # values inside the range, so the query matches exactly the stored values
+    # the range contains and never a value outside it. An excluded end and an
+    # open end are honored: `1.005...2` selects up to and including `1.99`
+    # when the column has scale 2, an empty range selects nothing, and `nil`
+    # keeps its meaning of "no bound on that side". `where.not` inverts the
+    # same condition, so the two directions agree.
+    #
+    # ```
+    # # price is decimal(10, 2)
+    # Product.where(price: 1.231..1.239) # SELECT * FROM products WHERE price BETWEEN 1.24 AND 1.23
+    # ```
+    #
+    # A column that stores numbers but cannot report their scale raises
+    # ActiveRecord::RangePrecisionError for a bound that is not a whole
+    # number, instead of silently truncating it.
+    #
     # In the case of a belongs_to relationship, an association key can be used
     # to specify the model if an ActiveRecord object is used as the value.
     #

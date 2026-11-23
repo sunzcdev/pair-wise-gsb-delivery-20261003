@@ -66,6 +66,12 @@ module ActiveRecord
         coder.respond_to?(:object_class) && value.is_a?(coder.object_class)
       end
 
+      # The stored value is the coder's output, not the subtype's number, so
+      # there is no decimal grid to map Range bounds onto.
+      def stored_decimal_scale
+        nil
+      end
+
       def serialized? # :nodoc:
         true
       end

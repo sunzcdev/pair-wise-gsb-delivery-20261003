@@ -115,6 +115,25 @@ module ActiveModel
         false
       end
 
+      # The decimal scale the column stores values at, or +nil+ when values
+      # are not stored on a fixed decimal grid.
+      #
+      # Types that store numbers on a fixed grid, such as decimal columns,
+      # override this to describe it. Range predicates use it to decide which
+      # values the lower and upper bounds of a Ruby range select.
+      def stored_decimal_scale
+        nil
+      end
+
+      # Whether the type can tell the decimal scale its values are stored at.
+      #
+      # Types that store numbers but cannot report their scale return +false+,
+      # so that a range predicate over them is reported as unsupported rather
+      # than interpreted by truncating or widening its bounds.
+      def stored_decimal_scale_known?
+        true
+      end
+
       def map(value, &) # :nodoc:
         value
       end

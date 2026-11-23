@@ -321,6 +321,22 @@ module ActiveRecord
   class RangeError < StatementInvalid
   end
 
+  # Raised when a +where+ condition with a Range cannot be translated into a
+  # set of storable values: the column stores numbers but does not report the
+  # decimal scale it stores them at, or its type would store a bound as a
+  # different value.
+  #
+  # Interpreting such a Range would either widen or narrow it, so Active Record
+  # refuses to guess. Declare the scale on the column or attribute, or use
+  # whole-number bounds:
+  #
+  # ```ruby
+  # # t.decimal :amount, precision: 10, scale: 2
+  # Model.where(amount: BigDecimal("1.235")..BigDecimal("2.5"))
+  # ```
+  class RangePrecisionError < ActiveRecordError
+  end
+
   # Raised when a string containing a null byte (+\0+) is used in a statement
   # against a database that cannot store it, such as a text column in PostgreSQL.
   #

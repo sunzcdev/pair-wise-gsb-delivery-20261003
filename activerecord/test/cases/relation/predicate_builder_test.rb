@@ -770,7 +770,152 @@ module ActiveRecord
       assert_not_predicate topic.new(title: "CASE INSENSITIVE EXPRESSION"), :valid?
     end
 
+    def test_decimal_range_bounds_are_narrowed_to_the_column_scale
+      model = decimal_model(scale: 2)
+
+      assert_sql "WHERE #{quoted(model, "price")} BETWEEN 1.24 AND 2.0", model.where(price: BigDecimal("1.231")..BigDecimal("2"))
+      assert_sql "WHERE #{quoted(model, "price")} BETWEEN 1.24 AND 1.99", model.where(price: BigDecimal("1.231")..BigDecimal("1.999"))
+    end
+
+    def test_decimal_range_with_no_storable_value_selects_nothing
+      model = decimal_model(scale: 2)
+
+      assert_sql "WHERE #{quoted(model, "price")} BETWEEN 1.24 AND 1.23", model.where(price: BigDecimal("1.231")..BigDecimal("1.239"))
+      assert_sql "WHERE #{quoted(model, "price")} BETWEEN 1.24 AND 1.23", model.where(price: BigDecimal("1.235")..BigDecimal("1.235"))
+    end
+
+    def test_decimal_range_excluded_end_selects_the_storable_value_below_it
+      model = decimal_model(scale: 2)
+
+      assert_sql "WHERE #{quoted(model, "price")} BETWEEN 1.0 AND 1.01", model.where(price: BigDecimal("1.0")...BigDecimal("1.02"))
+      assert_sql "WHERE #{quoted(model, "price")} BETWEEN 1.0 AND 1.01", model.where(price: BigDecimal("1.0")...BigDecimal("1.015"))
+    end
+
+    def test_decimal_range_bounds_on_the_grid_are_unchanged
+      model = decimal_model(scale: 2)
+
+      assert_sql "WHERE #{quoted(model, "price")} BETWEEN 1.23 AND 1.24", model.where(price: BigDecimal("1.23")..BigDecimal("1.24"))
+    end
+
+    def test_decimal_range_open_bounds_keep_their_sql_meaning
+      model = decimal_model(scale: 2)
+
+      assert_sql "WHERE #{quoted(model, "price")} <= 1.23", model.where(price: ..BigDecimal("1.239"))
+      assert_sql "WHERE #{quoted(model, "price")} >= 1.24", model.where(price: BigDecimal("1.231")..)
+      assert_sql "WHERE #{quoted(model, "price")} <= 1.23", model.where(price: -Float::INFINITY..BigDecimal("1.239"))
+    end
+
+    def test_negated_decimal_range_uses_the_same_bounds
+      model = decimal_model(scale: 2)
+
+      assert_sql "WHERE NOT (#{quoted(model, "price")} BETWEEN 1.24 AND 1.23)", model.where.not(price: BigDecimal("1.231")..BigDecimal("1.239"))
+      assert_sql "WHERE NOT (#{quoted(model, "price")} BETWEEN 1.24 AND 1.23)", model.where.not(price: BigDecimal("1.235")..BigDecimal("1.235"))
+    end
+
+    def test_decimal_range_accepts_string_and_float_bounds
+      model = decimal_model(scale: 2)
+
+      assert_sql "WHERE #{quoted(model, "price")} BETWEEN 1.24 AND 2.0", model.where(price: "1.231".."2")
+      assert_sql "WHERE #{quoted(model, "price")} BETWEEN 1.24 AND 2.0", model.where(price: 1.231..2.0)
+    end
+
+    def test_decimal_range_keeps_the_scale_through_type_decorators
+      model = decimal_model(scale: 2)
+      model.normalizes :price, with: ->(price) { price&.round(2) }
+
+      type = model.type_for_attribute("price")
+      assert_equal 2, type.stored_decimal_scale
+
+      assert_sql "WHERE #{quoted(model, "price")} = 1.24", model.where(price: BigDecimal("1.231")..BigDecimal("1.244"))
+    end
+
+    def test_decimal_range_reports_bounds_the_column_type_would_change
+      type = Class.new(ActiveRecord::Type::Decimal) do
+        def self.name
+          "TruncatingDecimal"
+        end
+
+        def cast(value)
+          super(value).truncate(1) if value
+        end
+      end.new(precision: 10, scale: 2)
+      model = Class.new(ActiveRecord::Base) do
+        self.table_name = "topics"
+      end
+      model.attribute :replies_count, type
+
+      error = assert_raises(ActiveRecord::RangePrecisionError) do
+        model.where(replies_count: BigDecimal("1.23")..BigDecimal("2.0")).to_sql
+      end
+      assert_match(/replies_count/, error.message)
+      assert_match(/TruncatingDecimal/, error.message)
+    end
+
+    def test_decimal_range_reports_an_unknown_scale_for_fractional_bounds
+      type = Class.new(ActiveRecord::Type::Decimal) do
+        def self.name
+          "ScaleFreeDecimal"
+        end
+
+        def stored_decimal_scale
+          nil
+        end
+
+        def stored_decimal_scale_known?
+          false
+        end
+      end.new
+      model = Class.new(ActiveRecord::Base) do
+        self.table_name = "topics"
+      end
+      model.attribute :replies_count, type
+
+      error = assert_raises(ActiveRecord::RangePrecisionError) do
+        model.where(replies_count: BigDecimal("1.1")..BigDecimal("2.2")).to_sql
+      end
+      assert_match(/replies_count/, error.message)
+      assert_match(/ScaleFreeDecimal/, error.message)
+      assert_match(/whole-number bounds/, error.message)
+
+      assert_raises(ActiveRecord::RangePrecisionError) do
+        model.where.not(replies_count: BigDecimal("1.1")..BigDecimal("2.2")).to_sql
+      end
+
+      assert_sql "WHERE #{quoted(model, "replies_count")} BETWEEN 1.0 AND 2.0", model.where(replies_count: 1..2)
+    end
+
+    def test_decimal_range_leaves_bounds_of_types_without_a_decimal_grid_alone
+      serialized_decimal = ActiveRecord::Type::Serialized.new(ActiveRecord::Type::Decimal.new(precision: 10, scale: 2), PrefixCoder)
+      serialized_string = ActiveRecord::Type::Serialized.new(ActiveRecord::Type::String.new, PrefixCoder)
+      model = Class.new(ActiveRecord::Base) do
+        self.table_name = "topics"
+      end
+      model.attribute :price, serialized_decimal
+      model.attribute :title, serialized_string
+
+      assert_nil serialized_decimal.stored_decimal_scale
+      assert_nothing_raised do
+        model.where(price: BigDecimal("1.231")..BigDecimal("2")).to_sql
+      end
+      assert_sql "WHERE #{quoted(model, "title")} BETWEEN 'coded:a' AND 'coded:b'", model.where(title: "a".."b")
+    end
+
     private
+      def decimal_model(scale:)
+        Class.new(ActiveRecord::Base) do
+          self.table_name = "topics"
+          attribute :price, :decimal, precision: 10, scale: scale
+        end
+      end
+
+      def quoted(model, column)
+        model.lease_connection.quote_table_name("topics.#{column}")
+      end
+
+      def assert_sql(expected_where, relation)
+        assert_equal "SELECT #{quoted_topics}.* FROM #{quoted_topics} #{expected_where}", relation.to_sql
+      end
+
       def quoted_topics
         quote_table_name("topics")
       end

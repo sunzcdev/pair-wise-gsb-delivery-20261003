@@ -113,6 +113,18 @@ module ActiveModel
         assert_equal BigDecimal("1.250"), type.cast(1.250473853637869)
         assert_equal BigDecimal("1.250"), type.cast("1.250473853637869")
       end
+
+      def test_stored_decimal_scale_is_the_declared_scale
+        assert_equal 2, Decimal.new(precision: 10, scale: 2).stored_decimal_scale
+        assert_equal 0, Decimal.new(precision: 10, scale: 0).stored_decimal_scale
+        assert_nil Decimal.new(precision: 10).stored_decimal_scale
+        assert_nil Decimal.new.stored_decimal_scale
+      end
+
+      def test_stored_decimal_scale_is_known_for_decimals
+        assert_predicate Decimal.new, :stored_decimal_scale_known?
+        assert_predicate Decimal.new(precision: 10, scale: 2), :stored_decimal_scale_known?
+      end
     end
   end
 end

@@ -58,6 +58,12 @@ module ActiveModel
         :decimal
       end
 
+      # Decimals are stored as multiples of 10^-scale when a scale is
+      # declared. Without one, values keep whatever precision they were given.
+      def stored_decimal_scale
+        scale if scale.is_a?(::Integer) && scale >= 0
+      end
+
       def type_cast_for_schema(value)
         value.to_s.inspect
       end

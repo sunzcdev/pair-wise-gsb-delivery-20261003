@@ -49,6 +49,16 @@ module ActiveRecord
         def comparison_expression(expression)
           subtype.comparison_expression(expression)
         end
+
+        # Decorators keep the stored representation of their subtype, so they
+        # report the same decimal grid.
+        def stored_decimal_scale
+          subtype.stored_decimal_scale if subtype.respond_to?(:stored_decimal_scale)
+        end
+
+        def stored_decimal_scale_known?
+          !subtype.respond_to?(:stored_decimal_scale_known?) || subtype.stored_decimal_scale_known?
+        end
       end
 
       module NormalizedValueTypeDecorator # :nodoc:
