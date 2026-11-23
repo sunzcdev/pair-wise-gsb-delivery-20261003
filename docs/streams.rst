@@ -107,6 +107,38 @@ The above script gives the following output::
 .. tip:: In some cases, you may need to inject data directly into the buffer. You can do
     that with the :meth:`~.streams.buffered.BufferedByteReceiveStream.feed_data` method.
 
+Speculative reads with checkpoints
+**********************************
+
+Sometimes a protocol frame may start with an optional prefix, so a parser needs to
+speculatively read a few bytes and, if the guess was wrong, restart parsing from the
+exact same position. A buffered byte stream supports this through *checkpoints*.
+
+Call :meth:`~.streams.buffered.BufferedByteReceiveStream.checkpoint` to take a mark at
+the current position. Bytes consumed while the checkpoint is open are held aside
+instead of being discarded. Calling
+:meth:`~.streams.buffered.Checkpoint.commit` keeps the speculative read, while
+:meth:`~.streams.buffered.Checkpoint.rollback` restores every consumed byte to the
+front of the buffer so that another parser can read them again. The wrapped stream is
+strictly forward-only: a rollback only replays bytes already pulled into the buffer and
+never re-reads anything from upstream.
+
+A checkpoint can optionally be bounded by a *budget*: the maximum number of bytes that
+may be consumed through it. Once the budget is exhausted, further reads raise
+:exc:`~anyio.CheckpointBudgetExceeded` without consuming additional bytes, giving you a
+deterministic state for over-long prefixes. An early end of stream still raises
+:exc:`~anyio.IncompleteRead`, and task cancellation never discards buffered bytes, so
+every failure mode leaves the checkpoint either recoverable or committable.
+
+Checkpoints work as async context managers that roll back automatically when the block
+is exited without an explicit decision:
+
+.. literalinclude:: snippets/streams/buffered_checkpoint.py
+
+The above script gives the following output::
+
+    b'PREFIX-record-b'
+
 Text streams
 ------------
 

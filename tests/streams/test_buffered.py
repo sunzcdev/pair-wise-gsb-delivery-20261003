@@ -3,13 +3,15 @@ from __future__ import annotations
 import pytest
 
 from anyio import (
+    CheckpointBudgetExceeded,
     ClosedResourceError,
     DelimiterNotFound,
     EndOfStream,
     IncompleteRead,
     create_memory_object_stream,
+    create_task_group,
 )
-from anyio.abc import ObjectStream, ObjectStreamConnectable
+from anyio.abc import ByteReceiveStream, ObjectStream, ObjectStreamConnectable
 from anyio.streams.buffered import (
     BufferedByteReceiveStream,
     BufferedByteStream,
@@ -248,3 +250,382 @@ async def test_feed_data() -> None:
     buffered_stream.feed_data(b"foo")
     assert await buffered_stream.receive_exactly(10) == b"xxxfooabcd"
     await buffered_stream.aclose()
+
+
+class TestCheckpoint:
+    async def test_rollback_restores_consumed_bytes(self) -> None:
+        send, receive = create_memory_object_stream[bytes](4)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"abcdefgh")
+
+            checkpoint = stream.checkpoint()
+            assert await stream.receive_exactly(4) == b"abcd"
+            assert checkpoint.consumed == 4
+            assert stream.buffer == b"efgh"
+            checkpoint.rollback()
+
+            # The same bytes can be parsed again, without touching upstream
+            assert await stream.receive_exactly(8) == b"abcdefgh"
+            assert stream.buffer == b""
+
+    async def test_commit_discards_consumed_bytes(self) -> None:
+        send, receive = create_memory_object_stream[bytes](4)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"abcdefgh")
+
+            checkpoint = stream.checkpoint()
+            assert await stream.receive_exactly(4) == b"abcd"
+            checkpoint.commit()
+            assert checkpoint.closed
+
+            assert await stream.receive_exactly(4) == b"efgh"
+
+    async def test_context_manager_rolls_back_by_default(self) -> None:
+        send, receive = create_memory_object_stream[bytes](4)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"abcdefgh")
+
+            async with stream.checkpoint() as checkpoint:
+                assert await stream.receive_exactly(3) == b"abc"
+
+            assert checkpoint.closed
+            assert await stream.receive_exactly(4) == b"abcd"
+
+    async def test_context_manager_commit_inside_block(self) -> None:
+        send, receive = create_memory_object_stream[bytes](4)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"abcdefgh")
+
+            async with stream.checkpoint() as checkpoint:
+                assert await stream.receive_exactly(3) == b"abc"
+                checkpoint.commit()
+
+            assert await stream.receive_exactly(5) == b"defgh"
+
+    async def test_double_close_rejected(self) -> None:
+        send, receive = create_memory_object_stream[bytes](1)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            checkpoint = stream.checkpoint()
+            checkpoint.rollback()
+            with pytest.raises(RuntimeError, match="already been closed"):
+                checkpoint.rollback()
+            with pytest.raises(RuntimeError, match="already been closed"):
+                checkpoint.commit()
+
+    async def test_nested_checkpoints_rejected(self) -> None:
+        send, receive = create_memory_object_stream[bytes](1)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            stream.checkpoint()
+            with pytest.raises(RuntimeError, match="already has an active checkpoint"):
+                stream.checkpoint()
+
+    async def test_new_checkpoint_allowed_after_release(self) -> None:
+        send, receive = create_memory_object_stream[bytes](1)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            stream.checkpoint().commit()
+            checkpoint = stream.checkpoint(4)
+            assert checkpoint.budget == 4
+
+    @pytest.mark.parametrize("budget", [0, -1])
+    async def test_invalid_budget(self, budget: int) -> None:
+        send, receive = create_memory_object_stream[bytes](1)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            with pytest.raises(ValueError, match="budget must be a positive integer"):
+                stream.checkpoint(budget)
+
+    async def test_budget_exceeded_receive_exactly(self) -> None:
+        send, receive = create_memory_object_stream[bytes](4)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"abcdefgh")
+
+            checkpoint = stream.checkpoint(budget=4)
+            assert checkpoint.remaining == 4
+            with pytest.raises(CheckpointBudgetExceeded) as exc:
+                await stream.receive_exactly(5)
+
+            assert exc.value.budget == 4
+            # Nothing was consumed by the failed read
+            assert checkpoint.consumed == 0
+            assert checkpoint.remaining == 4
+            assert not checkpoint.closed
+
+            # The checkpoint is still usable
+            assert await stream.receive_exactly(4) == b"abcd"
+            assert checkpoint.consumed == 4
+            assert checkpoint.remaining == 0
+            with pytest.raises(CheckpointBudgetExceeded):
+                await stream.receive(1)
+
+    async def test_budget_exceeded_partial_budget_used(self) -> None:
+        send, receive = create_memory_object_stream[bytes](4)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"abcdefgh")
+
+            checkpoint = stream.checkpoint(budget=4)
+            assert await stream.receive_exactly(2) == b"ab"
+            assert checkpoint.remaining == 2
+            with pytest.raises(CheckpointBudgetExceeded):
+                await stream.receive_exactly(3)
+
+            # The failed read must not consume or pull any bytes
+            assert checkpoint.consumed == 2
+            checkpoint.rollback()
+            assert await stream.receive_exactly(4) == b"abcd"
+
+    async def test_budget_enforced_across_reads(self) -> None:
+        send, receive = create_memory_object_stream[bytes](4)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"abcdefgh")
+
+            async with stream.checkpoint(3) as checkpoint:
+                assert await stream.receive(2) == b"ab"
+                assert await stream.receive(1) == b"c"
+                assert checkpoint.consumed == 3
+                with pytest.raises(CheckpointBudgetExceeded):
+                    await stream.receive(1)
+
+            # Auto rollback restores everything
+            assert await stream.receive_exactly(4) == b"abcd"
+
+    async def test_budget_covers_buffer_and_upstream(self) -> None:
+        send, receive = create_memory_object_stream[bytes](4)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            stream.feed_data(b"ab")
+            await send.send(b"cdefgh")
+
+            checkpoint = stream.checkpoint(budget=3)
+            # First two bytes come from the pre-existing buffer
+            assert await stream.receive_exactly(2) == b"ab"
+            assert checkpoint.consumed == 2
+            assert await stream.receive(1) == b"c"
+            with pytest.raises(CheckpointBudgetExceeded):
+                await stream.receive_exactly(1)
+
+            checkpoint.rollback()
+            assert await stream.receive_exactly(4) == b"abcd"
+
+    async def test_budget_exceeded_with_oversized_object_chunk(self) -> None:
+        send, receive = create_memory_object_stream[bytes](1)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"abcdef")
+
+            checkpoint = stream.checkpoint(budget=2)
+            with pytest.raises(CheckpointBudgetExceeded):
+                await stream.receive(4)
+
+            # No upstream data should have been pulled by the failed read
+            assert checkpoint.consumed == 0
+            checkpoint.rollback()
+            assert await stream.receive_exactly(6) == b"abcdef"
+
+    async def test_rollback_after_split_reads_no_upstream_reread(self) -> None:
+        """The prefix spans two upstream chunks; after cancellation a normal parser
+        gets the complete prefix from the buffer without re-reading upstream."""
+        from anyio.abc import ByteReceiveStream
+
+        send, receive = create_memory_object_stream[bytes](4)
+        upstream_reads = 0
+
+        class CountingByteReceiveStream(ByteReceiveStream):
+            def __init__(self, wrapped: object) -> None:
+                self._wrapped = wrapped
+
+            async def receive(self, max_bytes: int = 65536) -> bytes:
+                nonlocal upstream_reads
+                upstream_reads += 1
+                return await self._wrapped.receive()  # type: ignore[attr-defined]
+
+            async def aclose(self) -> None:
+                await self._wrapped.aclose()  # type: ignore[attr-defined]
+
+            @property
+            def extra_attributes(self) -> dict[object, object]:
+                return {}
+
+        async with send, receive:
+            await send.send(b"ab")
+            await send.send(b"cd")
+            await send.send(b"rest")
+            stream = BufferedByteReceiveStream(CountingByteReceiveStream(receive))
+
+            # Speculative reader: the prefix needs two chunks to complete
+            checkpoint = stream.checkpoint(budget=8)
+            assert await stream.receive_exactly(2) == b"ab"
+            assert await stream.receive_exactly(2) == b"cd"
+            reads_before_rollback = upstream_reads
+            assert reads_before_rollback == 2
+
+            # Speculation fails: cancel and switch to a normal parser
+            checkpoint.rollback()
+
+            # The normal parser gets the whole prefix from the checkpoint buffer
+            assert await stream.receive_exactly(4) == b"abcd"
+            assert upstream_reads == reads_before_rollback
+            assert await stream.receive_exactly(4) == b"rest"
+
+    async def test_cancellation_does_not_lose_buffered_bytes(self) -> None:
+        send, receive = create_memory_object_stream[bytes](2)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"abcd")
+
+            checkpoint = stream.checkpoint(budget=8)
+            assert await stream.receive_exactly(2) == b"ab"
+
+            # A cancellation delivered at a checkpoint must not close the checkpoint
+            # nor discard the bytes already pulled into it
+            async with create_task_group() as tg:
+                tg.cancel_scope.cancel()
+
+            assert not checkpoint.closed
+            checkpoint.rollback()
+            assert await stream.receive_exactly(4) == b"abcd"
+
+    async def test_cancellation_during_blocking_read_is_recoverable(self) -> None:
+        send, receive = create_memory_object_stream[bytes](1)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            checkpoint = stream.checkpoint(budget=8)
+
+            async def speculative_read() -> None:
+                # Blocks until the second chunk arrives or the task is cancelled
+                await stream.receive_exactly(4)
+
+            async with create_task_group() as tg:
+                tg.start_soon(speculative_read)
+                await send.send(b"ab")
+                await send.send(b"cd")
+                tg.cancel_scope.cancel()
+
+            # Cancellation does not close the checkpoint; rollback restores the
+            # bytes that made it into the buffer before the cancellation point
+            assert not checkpoint.closed
+            checkpoint.rollback()
+            assert await stream.receive_exactly(4) == b"abcd"
+
+    async def test_eof_during_checkpoint_is_incomplete_read(self) -> None:
+        send, receive = create_memory_object_stream[bytes](1)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"ab")
+            await send.aclose()
+
+            checkpoint = stream.checkpoint(budget=8)
+            with pytest.raises(IncompleteRead):
+                await stream.receive_exactly(4)
+
+            # The bytes already read remain recoverable after the early EOF
+            assert checkpoint.consumed == 2
+            checkpoint.rollback()
+            assert stream.buffer == b"ab"
+            assert await stream.receive(2) == b"ab"
+            with pytest.raises(EndOfStream):
+                await stream.receive(1)
+
+    async def test_budget_failure_takes_precedence_over_eof(self) -> None:
+        send, receive = create_memory_object_stream[bytes](1)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.aclose()
+
+            checkpoint = stream.checkpoint(budget=2)
+            with pytest.raises(CheckpointBudgetExceeded):
+                await stream.receive_exactly(4)
+
+            assert not checkpoint.closed
+            checkpoint.rollback()
+
+    async def test_receive_until_under_checkpoint_rollback(self) -> None:
+        send, receive = create_memory_object_stream[bytes](2)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"abc\nrest")
+
+            checkpoint = stream.checkpoint(budget=16)
+            assert await stream.receive_until(b"\n", 10) == b"abc"
+            assert checkpoint.consumed == 4
+            checkpoint.rollback()
+
+            assert await stream.receive_until(b"\n", 10) == b"abc"
+            assert await stream.receive_exactly(4) == b"rest"
+
+    async def test_receive_until_budget_exceeded(self) -> None:
+        send, receive = create_memory_object_stream[bytes](2)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"abcdef")
+
+            async with stream.checkpoint(budget=3):
+                with pytest.raises(CheckpointBudgetExceeded):
+                    await stream.receive_until(b"\n", 10)
+
+            # Auto rollback: nothing was lost
+            assert await stream.receive_exactly(6) == b"abcdef"
+
+    async def test_receive_until_delimiter_not_found_under_checkpoint(self) -> None:
+        send, receive = create_memory_object_stream[bytes](2)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"abcdef")
+
+            checkpoint = stream.checkpoint(budget=16)
+            with pytest.raises(DelimiterNotFound):
+                await stream.receive_until(b"\n", 4)
+
+            # DelimiterNotFound leaves the buffer intact
+            assert not checkpoint.closed
+            checkpoint.rollback()
+            assert await stream.receive_exactly(6) == b"abcdef"
+
+    async def test_checkpoint_on_closed_stream(self) -> None:
+        send, receive = create_memory_object_stream[bytes](1)
+        stream = BufferedByteReceiveStream(receive)
+        await stream.aclose()
+        with pytest.raises(ClosedResourceError):
+            stream.checkpoint()
+
+        send.close()
+        receive.close()
+
+    async def test_unlimited_budget(self) -> None:
+        send, receive = create_memory_object_stream[bytes](4)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            await send.send(b"abcdefgh")
+
+            checkpoint = stream.checkpoint()
+            assert checkpoint.remaining is None
+            assert await stream.receive_exactly(8) == b"abcdefgh"
+            assert checkpoint.consumed == 8
+            checkpoint.commit()
+
+    async def test_rollback_orders_held_before_unconsumed_buffer(self) -> None:
+        send, receive = create_memory_object_stream[bytes](4)
+        async with send, receive:
+            stream = BufferedByteReceiveStream(receive)
+            stream.feed_data(b"abcdef")
+
+            checkpoint = stream.checkpoint(budget=8)
+            assert await stream.receive_exactly(2) == b"ab"
+            # More data lands in the buffer while the checkpoint is open
+            stream.feed_data(b"gh")
+            assert await stream.receive_exactly(2) == b"cd"
+            checkpoint.rollback()
+
+            # The held bytes come back before the bytes that were never consumed
+            assert await stream.receive_exactly(6) == b"abcdef"
+            assert await stream.receive_exactly(2) == b"gh"
+

@@ -86,6 +86,22 @@ def iterate_exceptions(
         yield exception
 
 
+class CheckpointBudgetExceeded(Exception):
+    """
+    Raised when a :class:`~anyio.streams.buffered.Checkpoint` would consume more bytes
+    from the underlying stream than its budget allows.
+
+    The checkpoint stays open and usable after this exception is raised, so the bytes
+    read up to the limit can still be committed or rolled back.
+    """
+
+    def __init__(self, budget: int) -> None:
+        super().__init__(
+            f"The checkpoint read budget of {budget} bytes has been exceeded"
+        )
+        self.budget = budget
+
+
 class DelimiterNotFound(Exception):
     """
     Raised during
