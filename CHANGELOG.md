@@ -3,6 +3,7 @@ Changelog
 
 ## Unreleased
 
+- [new] Add a review-then-publish directory cassette migration (`VCR::Cassette::Migrator.migrate_directory(source, target)` and `rake vcr:migrate_directory DIR=<source> TARGET=<target>`). It detects VCR 1.x YAML cassettes and existing serializer formats, preserves exact body bytes through the target serializer, writes atomically so a failed conversion never leaves a half-written target, and never modifies the source directory
 - [fix] `uri_without_params` ignores percent-encoded query params given by their decoded name, e.g. `uri_without_params('date[gte]')` now ignores `date%5Bgte%5D` (#633)
 - [fix] Leave the Content-Length header of HEAD and 304 responses untouched when `update_content_length_header` is enabled (#779)
 
