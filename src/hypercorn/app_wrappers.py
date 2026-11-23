@@ -84,16 +84,31 @@ class WSGIWrapper:
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
     def run_app(self, environ: dict, send: Callable) -> None:
-        headers: list[tuple[bytes, bytes]]
+        headers: list[tuple[bytes, bytes]] = []
         response_started = False
+        headers_sent = False
         status_code: int | None = None
+
+        def send_headers() -> None:
+            nonlocal headers_sent
+            if not headers_sent:
+                if not response_started:
+                    raise RuntimeError("WSGI app did not call start_response")
+
+                send({"type": "http.response.start", "status": status_code, "headers": headers})
+                headers_sent = True
 
         def start_response(
             status: str,
             response_headers: list[tuple[str, str]],
-            exc_info: Exception | None = None,
-        ) -> None:
+            exc_info: tuple | None = None,
+        ) -> Callable:
             nonlocal headers, response_started, status_code
+
+            if exc_info is not None and headers_sent:
+                # The headers have already been sent, so the response
+                # cannot be replaced and the exception must be re-raised.
+                raise exc_info[1].with_traceback(exc_info[2])
 
             raw, _ = status.split(" ", 1)
             status_code = int(raw)
@@ -103,18 +118,17 @@ class WSGIWrapper:
             ]
             response_started = True
 
+            def write(body: bytes) -> None:
+                send_headers()
+                send({"type": "http.response.body", "body": body, "more_body": True})
+
+            return write
+
         response_body = self.app(environ, start_response)
 
         try:
-            first_chunk = True
             for output in response_body:
-                if first_chunk:
-                    if not response_started:
-                        raise RuntimeError("WSGI app did not call start_response")
-
-                    send({"type": "http.response.start", "status": status_code, "headers": headers})
-                    first_chunk = False
-
+                send_headers()
                 send({"type": "http.response.body", "body": output, "more_body": True})
         finally:
             if hasattr(response_body, "close"):
