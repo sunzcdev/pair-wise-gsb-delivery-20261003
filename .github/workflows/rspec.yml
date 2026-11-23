@@ -1,0 +1,97 @@
+name: Run RSpec
+on:
+  workflow_call:
+    inputs:
+      # This tells the build which library to run
+      library:
+        required: true
+        type: string
+
+      # This tells rspec-rails what branch to run in ci it is passed in to allow the @main
+      # version of this workflow to be shared amongst branches
+      rspec_version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  DIFF_LCS_VERSION: "> 1.4.3"
+  RSPEC_CI: true
+  RSPEC_VERSION: ${{ inputs.rspec_version }}
+
+jobs:
+  rspec:
+    name: Ruby ${{ matrix.ruby }}
+    runs-on: 'ubuntu-latest'
+    strategy:
+      matrix:
+        ruby:
+          - '4.0'
+          - '3.4'
+          - '3.3'
+          - '3.2'
+          - '3.1'
+          - '3.0'
+      fail-fast: false
+    continue-on-error: false
+    defaults:
+      run:
+        working-directory: ${{ inputs.library }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+      - run: ../script/update_rubygems_and_install_bundler
+      - run: ../script/bundle
+      - run: ../script/run_rspec
+      - run: ../script/run_rspec_one_by_one
+      - run: ../script/run_cucumber
+
+  compatibility:
+    name: Compatibility sanity checks (specs only) ${{ matrix.ruby }}
+    runs-on: 'ubuntu-latest'
+    strategy:
+      matrix:
+        ruby:
+          - jruby-10.1 # ruby 4.0 compatible
+          - jruby-10.0 # ruby 3.4 compatible
+          - jruby-9.4  # ruby 3.1 compatible
+      fail-fast: false
+    continue-on-error: false
+    defaults:
+      run:
+        working-directory: ${{ inputs.library }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+      - run: ../script/update_rubygems_and_install_bundler
+      - run: ../script/bundle
+      - run: ../script/run_rspec
+
+  windows:
+    name: Ruby ${{ matrix.ruby }} (Windows)
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        ruby:
+          - '3.4'
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - run: choco install ansicon
+      - run: bundle exec rspec --backtrace

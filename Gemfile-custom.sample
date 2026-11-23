@@ -1,0 +1,10 @@
+group :development do
+  gem 'interactive_rspec'
+  gem 'guard-rspec', '~> 1.2.1'
+  gem 'growl', '1.0.3'
+
+  platform :mri do
+    gem 'rb-fsevent', '~> 0.9.0'
+    gem 'ruby-prof', '~> 0.13.0'
+  end
+end

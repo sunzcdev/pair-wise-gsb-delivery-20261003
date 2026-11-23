@@ -1,0 +1,20 @@
+set -e
+
+ROOT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
+SCRIPT_DIR="${ROOT_DIR}/script"
+source $SCRIPT_DIR/functions.sh
+
+function run_specs {
+  local rspec_bin=$ROOT_DIR/bin/rspec
+
+  # rspec-core needs to run with a special script that loads simplecov first,
+  # so that it can instrument rspec-core's code before rspec-core has been loaded.
+  if [ -f $PWD/script/rspec_with_simplecov ] && is_mri; then
+    rspec_bin=script/rspec_with_simplecov
+  fi;
+
+  echo "Running RSpec for ${PWD}/spec"
+  $rspec_bin spec --backtrace --format progress --profile --format progress $@
+}
+
+decide_what_to_run run_specs $@
