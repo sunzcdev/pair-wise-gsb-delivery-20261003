@@ -1,0 +1,1 @@
+Added ``NamedTemporaryFile.publish()`` for atomically promoting the temporary file to a permanent location, waiting for in-flight writes to finish first and never leaving a half-written file behind at the target location

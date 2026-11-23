@@ -24,6 +24,27 @@ Named Temporary File
 
 .. literalinclude:: snippets/tempfile/named_temporary_file.py
 
+Publishing a Named Temporary File
+---------------------------------
+
+A named temporary file can be promoted to a permanent file with
+:meth:`NamedTemporaryFile.publish`. This is particularly useful on Windows, where a
+temporary file opened with delete-on-close semantics cannot simply be renamed while it
+is open.
+
+The ``publish()`` method waits for any writes already accepted by the file object to
+finish, then transfers the contents to the target path. The transfer is shielded from
+cancellation once it has started, and on Windows the contents are copied via a staging
+file in the target directory which is then atomically renamed, so the target path never
+contains a half-written file. If publishing fails or is cancelled while waiting for
+pending writes, the temporary file is still cleaned up when the context manager exits.
+Once publishing has succeeded, exiting the context manager no longer deletes the
+published file.
+
+**Example:**
+
+.. literalinclude:: snippets/tempfile/publish_named_temporary_file.py
+
 Spooled Temporary File
 ----------------------
 

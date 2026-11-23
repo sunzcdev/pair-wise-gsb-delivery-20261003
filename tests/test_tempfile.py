@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 import pathlib
 import shutil
+import sys
 import tempfile
+import threading
 from typing import Any, AnyStr
 from unittest.mock import patch
 
@@ -15,12 +17,15 @@ from anyio import (
     SpooledTemporaryFile,
     TemporaryDirectory,
     TemporaryFile,
+    create_task_group,
     from_thread,
     get_cancelled_exc_class,
     gettempdir,
     gettempdirb,
     mkdtemp,
     mkstemp,
+    to_thread,
+    wait_all_tasks_blocked,
 )
 from anyio.lowlevel import checkpoint
 
@@ -59,6 +64,136 @@ class TestNamedTemporaryFile:
 
         with pytest.raises(ValueError):
             await af.write(b"should fail")
+
+    async def test_publish(self, tmp_path: pathlib.Path) -> None:
+        """A published file survives context exit; the temp file is cleaned up."""
+        target = tmp_path / "final.txt"
+        ntf = NamedTemporaryFile[bytes]()
+        async with ntf as af:
+            filename = af.name
+            await af.write(b"published data")
+            await ntf.publish(target)
+
+        assert target.read_bytes() == b"published data"
+        assert not os.path.exists(filename)  # type: ignore[arg-type]
+
+    async def test_publish_waits_for_accepted_write(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """publish() waits for an in-flight write to finish before transferring."""
+        target = tmp_path / "final.txt"
+        write_started = threading.Event()
+        finish_write = threading.Event()
+        ntf = NamedTemporaryFile[bytes]()
+        async with ntf as af:
+            original_write = af.wrapped.write
+
+            def slow_write(data: bytes) -> int:
+                write_started.set()
+                assert finish_write.wait(10)
+                return original_write(data)
+
+            with patch.object(af.wrapped, "write", slow_write):
+                async with create_task_group() as tg:
+                    tg.start_soon(af.write, b"late data")
+                    await to_thread.run_sync(write_started.wait)
+                    tg.start_soon(ntf.publish, target)
+                    await wait_all_tasks_blocked()
+                    finish_write.set()
+
+        assert target.read_bytes() == b"late data"
+
+    async def test_publish_cancelled_while_write_in_flight(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """
+        Cancelling a publish() that is waiting for a stuck write must leave the
+        temporary file under the scope's cleanup responsibility and must not
+        leave anything behind at the target location.
+        """
+        target = tmp_path / "final.txt"
+        write_started = threading.Event()
+        finish_write = threading.Event()
+        ntf = NamedTemporaryFile[bytes]()
+        async with ntf as af:
+            filename = af.name
+            original_write = af.wrapped.write
+
+            def stuck_write(data: bytes) -> int:
+                write_started.set()
+                assert finish_write.wait(10)
+                return original_write(data)
+
+            with patch.object(af.wrapped, "write", stuck_write):
+                async with create_task_group() as tg:
+                    tg.start_soon(af.write, b"some data")
+                    await to_thread.run_sync(write_started.wait)
+                    with CancelScope() as scope:
+                        scope.cancel()
+                        with pytest.raises(get_cancelled_exc_class()):
+                            await ntf.publish(target)
+
+                    finish_write.set()
+
+        assert not os.path.exists(filename)  # type: ignore[arg-type]
+        assert not target.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_publish_failure_keeps_cleanup(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """A failed publish() must not lose the temp file cleanup responsibility."""
+        target = tmp_path / "nonexistent" / "final.txt"
+        ntf = NamedTemporaryFile[bytes]()
+        async with ntf as af:
+            filename = af.name
+            await af.write(b"data")
+            with pytest.raises(OSError):
+                await ntf.publish(target)
+
+        assert not os.path.exists(filename)  # type: ignore[arg-type]
+        assert not target.exists()
+
+    async def test_publish_twice(self, tmp_path: pathlib.Path) -> None:
+        ntf = NamedTemporaryFile[bytes]()
+        async with ntf as af:
+            await af.write(b"data")
+            await ntf.publish(tmp_path / "first.txt")
+            with pytest.raises(RuntimeError, match="already been published"):
+                await ntf.publish(tmp_path / "second.txt")
+
+        assert (tmp_path / "first.txt").read_bytes() == b"data"
+        assert not (tmp_path / "second.txt").exists()
+
+    async def test_publish_before_enter(self, tmp_path: pathlib.Path) -> None:
+        ntf = NamedTemporaryFile[bytes]()
+        with pytest.raises(RuntimeError, match="has not been created yet"):
+            await ntf.publish(tmp_path / "final.txt")
+
+    async def test_publish_text_mode(self, tmp_path: pathlib.Path) -> None:
+        target = tmp_path / "final.txt"
+        ntf = NamedTemporaryFile[str](mode="w+", encoding="utf-8", newline="\n")
+        async with ntf as af:
+            await af.write("published täxt\n")
+            await ntf.publish(target)
+
+        assert target.read_bytes() == "published täxt\n".encode()
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 12), reason="delete_on_close requires Python 3.12+"
+    )
+    async def test_publish_delete_on_close_false(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        target = tmp_path / "final.txt"
+        ntf = NamedTemporaryFile[bytes](delete_on_close=False)
+        async with ntf as af:
+            filename = af.name
+            await af.write(b"published data")
+            await ntf.publish(target)
+
+        assert target.read_bytes() == b"published data"
+        assert not os.path.exists(filename)  # type: ignore[arg-type]
 
 
 class TestSpooledTemporaryFile:

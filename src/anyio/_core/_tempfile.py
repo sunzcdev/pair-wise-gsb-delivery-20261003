@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 from collections.abc import Iterable
@@ -17,6 +18,7 @@ from typing import (
 from .. import to_thread
 from .._core._fileio import AsyncFile
 from ..lowlevel import checkpoint_if_cancelled
+from ._synchronization import CapacityLimiter
 from ._tasks import CancelScope
 
 if TYPE_CHECKING:
@@ -139,6 +141,8 @@ class NamedTemporaryFile(Generic[AnyStr]):
     :param delete: Whether to delete the file when it is closed.
     :param errors: The error handling scheme used for encoding/decoding errors.
     :param delete_on_close: (Python 3.12+) Whether to delete the file on close.
+
+    The temporary file can be promoted to a permanent file with :meth:`publish`.
     """
 
     _async_file: AsyncFile[AnyStr]
@@ -202,11 +206,16 @@ class NamedTemporaryFile(Generic[AnyStr]):
         if sys.version_info >= (3, 12):
             self._params["delete_on_close"] = delete_on_close
 
+        # Serializes operations on the file so that publish() can wait for
+        # already accepted writes to finish before transferring the file.
+        self._op_limiter = CapacityLimiter(1)
+        self._published: str | None = None
+
     async def __aenter__(self) -> AsyncFile[AnyStr]:
         fp = await to_thread.run_sync(
             lambda: tempfile.NamedTemporaryFile(**self._params)
         )
-        self._async_file = AsyncFile(fp)
+        self._async_file = AsyncFile(fp, limiter=self._op_limiter)
         return self._async_file
 
     async def __aexit__(
@@ -216,6 +225,116 @@ class NamedTemporaryFile(Generic[AnyStr]):
         traceback: TracebackType | None,
     ) -> None:
         await self._async_file.aclose()
+
+    async def publish(self, target: str | os.PathLike[str]) -> None:
+        """
+        Publish the contents of the temporary file to a permanent location.
+
+        This waits for any writes already accepted by the file object to finish,
+        then transfers the contents to ``target`` and marks the file as
+        published. Once the file has been published, exiting the context manager
+        no longer deletes the published file; the temporary file itself is still
+        cleaned up as usual. If publishing fails (or the attempt is cancelled
+        while waiting for pending writes), the temporary file remains the
+        responsibility of this context manager and no partially written file is
+        left behind at the target location.
+
+        The transfer is shielded from cancellation once it has started, so the
+        target path never contains a half-written file. On Windows, where a
+        delete-on-close handle cannot simply be renamed, the contents are first
+        copied to a staging file in the target directory which is then
+        atomically renamed over ``target``.
+
+        :param target: the path of the file to publish the contents to
+        :raises RuntimeError: if the file has already been published, or the
+            context manager has not been entered yet
+
+        .. versionadded:: 4.17.0
+
+        """
+        if not hasattr(self, "_async_file"):
+            raise RuntimeError(
+                "the temporary file has not been created yet "
+                "(use publish() inside the context manager)"
+            )
+
+        if self._published is not None:
+            raise RuntimeError(
+                f"the temporary file has already been published to "
+                f"{self._published!r}"
+            )
+
+        target_path = os.fspath(target)
+        await checkpoint_if_cancelled()
+        async with self._op_limiter:
+            with CancelScope(shield=True):
+                await to_thread.run_sync(self._publish, target_path)
+
+    def _publish(self, target: str) -> None:
+        fp = self._async_file.wrapped
+        fp.flush()
+        source: str = fp.name
+        closer = getattr(fp, "_closer", None)
+        delete_on_close = bool(
+            getattr(closer, "delete", False)
+            and getattr(closer, "delete_on_close", True)
+        )
+        if sys.platform == "win32" and delete_on_close:
+            # The file was opened with O_TEMPORARY, so its contents cannot
+            # outlive the handle and the delete-on-close flag cannot be
+            # cleared. Copy the contents via a staging file instead.
+            self._publish_via_staging_file(fp, target)
+        elif sys.platform == "win32":
+            # Windows cannot rename an open file, so close the handle first.
+            # Disarm the closer so that closing does not delete the file, and
+            # restore it (plus unlink the file ourselves) if the rename fails.
+            if closer is not None:
+                closer.delete = False
+
+            try:
+                fp.close()
+                os.replace(source, target)
+            except BaseException:
+                if closer is not None:
+                    closer.delete = True
+
+                try:
+                    os.unlink(source)
+                except OSError:
+                    pass
+
+                raise
+        else:
+            os.replace(source, target)
+            if closer is not None:
+                closer.delete = False
+
+        self._published = target
+
+    @staticmethod
+    def _publish_via_staging_file(fp: Any, target: str) -> None:
+        target_dir = os.path.dirname(os.path.abspath(target))
+        fd, staging = tempfile.mkstemp(
+            dir=target_dir, prefix=os.path.basename(target) + "."
+        )
+        try:
+            with os.fdopen(fd, "wb") as staging_fp:
+                # Read through the binary buffer of text mode files; a
+                # delete-on-close file cannot be reopened by name on Windows.
+                raw = getattr(fp, "buffer", fp)
+                raw.seek(0)
+                shutil.copyfileobj(raw, staging_fp)
+                staging_fp.flush()
+                os.fsync(staging_fp.fileno())
+
+            os.replace(staging, target)
+        except BaseException:
+            try:
+                os.unlink(staging)
+            except FileNotFoundError:
+                pass
+
+            raise
 
 
 class SpooledTemporaryFile(AsyncFile[AnyStr]):
