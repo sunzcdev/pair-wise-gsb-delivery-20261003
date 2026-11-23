@@ -78,7 +78,10 @@ accesslog                  ``--access-logfile``          The target logger for a
 alpn_protocols             N/A                           The HTTP protocols to advertise over            ``h2`` and ``http/1.1``
                                                          ALPN.
 alt_svc_headers            N/A                           List of header values to return as
-                                                         Alt-Svc headers.
+                                                         Alt-Svc headers. When empty the
+                                                         QUIC listeners are advertised
+                                                         instead, using their actual bound
+                                                         addresses.
 application_path           N/A                           The path location of the ASGI                   cwd
                                                          application.
 backlog                    ``--backlog``                 The maximum number of pending                   100

@@ -10,7 +10,7 @@ import sys
 import types
 import warnings
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from ssl import (
     create_default_context,
     OP_NO_COMPRESSION,
@@ -46,6 +46,93 @@ class Sockets:
     quic_sockets: list[socket.socket]
 
 
+@dataclass
+class AltSvcAlternative:
+    """An alternative service (a QUIC listener) and the entrypoint it serves.
+
+    The entries are created from the actual bound sockets, so system
+    assigned ports (``:0``) are advertised with the value the system
+    chose. An alternative is only advertised whilst both its own socket
+    and the entrypoint socket it is paired with are still listening.
+    """
+
+    address: tuple[str, int]
+    entrypoint: tuple[str, int] | None = None
+    socket: Any = field(default=None, repr=False, compare=False)
+    entrypoint_socket: Any = field(default=None, repr=False, compare=False)
+    closed: bool = field(default=False, compare=False)
+
+    @property
+    def valid(self) -> bool:
+        return (
+            not self.closed
+            and _socket_listening(self.socket)
+            and _socket_listening(self.entrypoint_socket)
+        )
+
+    def serves(self, server: tuple[str, int] | None) -> bool:
+        """Whether this alternative can be reached from ``server``.
+
+        ``server`` is the address the response is sent from. A paired
+        alternative is only advertised on its own entrypoint, whilst an
+        unpaired one (no entrypoint mapping) is advertised on any
+        entrypoint that shares its host.
+        """
+        if server is None:
+            return True
+        if self.entrypoint is not None:
+            return _addresses_compatible(self.entrypoint, server)
+        return _hosts_compatible(self.address[0], server[0])
+
+
+def _getsockname(sock: Any) -> Any:
+    getsockname = getattr(sock, "getsockname", None)
+    if getsockname is None:
+        return None
+    try:
+        return getsockname()
+    except OSError:
+        return None
+
+
+def _socket_address(name: Any) -> tuple[str, int] | None:
+    if isinstance(name, (tuple, list)) and len(name) >= 2:
+        host, port = name[0], name[1]
+        if isinstance(host, str) and isinstance(port, int):
+            return (host, port)
+    return None
+
+
+def _socket_listening(sock: Any) -> bool:
+    if sock is None:
+        return True
+    try:
+        fileno = sock.fileno()
+    except (AttributeError, OSError):
+        return True
+    if not isinstance(fileno, int):
+        # e.g. a test double, the close watcher is the only signal.
+        return True
+    return fileno != -1
+
+
+def _hosts_compatible(left: str, right: str) -> bool:
+    wildcards = {"", "0.0.0.0", "::"}
+    return left in wildcards or right in wildcards or left == right
+
+
+def _addresses_compatible(left: tuple[str, int], right: tuple[str, int]) -> bool:
+    return left[1] == right[1] and _hosts_compatible(left[0], right[0])
+
+
+def _socket_of(entrypoint: Any) -> Any:
+    if entrypoint is None:
+        return None
+    if hasattr(entrypoint, "getsockname"):
+        return entrypoint
+    return getattr(entrypoint, "socket", None)
+
+
 class SocketTypeError(Exception):
     def __init__(self, expected: SocketKind, actual: SocketKind) -> None:
         super().__init__(
@@ -59,6 +146,7 @@ class Config:
     _insecure_bind: list[str] = []
     _quic_bind: list[str] = []
     _quic_addresses: list[tuple] = []
+    _alt_svc_alternatives: list[AltSvcAlternative] = []
     _log: Logger | None = None
     _root_path: str = ""
 
@@ -202,24 +290,165 @@ class Config:
             secure_sockets = self._create_sockets(self.bind)
             insecure_sockets = self._create_sockets(self.insecure_bind)
             quic_sockets = self._create_sockets(self.quic_bind, socket.SOCK_DGRAM)
-            self._set_quic_addresses(quic_sockets)
+            self._set_quic_addresses(quic_sockets, [*secure_sockets, *insecure_sockets])
         else:
             secure_sockets = []
             insecure_sockets = self._create_sockets(self.bind)
             quic_sockets = []
         return Sockets(secure_sockets, insecure_sockets, quic_sockets)
 
-    def _set_quic_addresses(self, sockets: list[socket.socket]) -> None:
+    def _set_quic_addresses(
+        self,
+        sockets: list[socket.socket],
+        entrypoints: list[socket.socket] | None = None,
+    ) -> None:
+        """Declare the QUIC listeners as alternatives for the entrypoints.
+
+        Each QUIC socket is paired with the entrypoint (the secure bind)
+        it can serve. The pairing uses the actual bound addresses, so a
+        system assigned port is advertised with the value the system
+        chose rather than the requested ``:0``. The listeners are also
+        watched, such that a closed or failed listener is no longer
+        advertised.
+        """
         self._quic_addresses = []
-        for sock in sockets:
+        self._alt_svc_alternatives = []
+        candidates = list(entrypoints or [])
+        paired: set[int] = set()
+        for index, sock in enumerate(sockets):
             name = sock.getsockname()
-            if type(name) is not str and len(name) >= 2:
+            address = _socket_address(name)
+            if address is not None:
+                entrypoint, entrypoint_socket = self._pair_entrypoint(
+                    address, candidates, index, paired
+                )
+                alternative = AltSvcAlternative(
+                    address=address,
+                    entrypoint=entrypoint,
+                    socket=sock,
+                    entrypoint_socket=entrypoint_socket,
+                )
+                self._watch_alternative(alternative)
                 self._quic_addresses.append(name)
+                self._alt_svc_alternatives.append(alternative)
             else:
                 warnings.warn(
                     f'Cannot create a alt-svc header for the QUIC socket with address "{name}"',
                     Warning,
                 )
+
+    def _pair_entrypoint(
+        self,
+        address: tuple[str, int],
+        entrypoints: list[Any],
+        index: int,
+        paired: set[int],
+    ) -> tuple[tuple[str, int] | None, Any]:
+        for candidate_index, entrypoint in enumerate(entrypoints):
+            if candidate_index in paired:
+                continue
+            entrypoint_address = _socket_address(_getsockname(entrypoint))
+            if entrypoint_address is not None and _hosts_compatible(
+                entrypoint_address[0], address[0]
+            ):
+                paired.add(candidate_index)
+                return entrypoint_address, _socket_of(entrypoint)
+        if index < len(entrypoints) and index not in paired:
+            entrypoint = entrypoints[index]
+            entrypoint_address = _socket_address(_getsockname(entrypoint))
+            if entrypoint_address is not None:
+                paired.add(index)
+                return entrypoint_address, _socket_of(entrypoint)
+        return None, None
+
+    def _watch_alternative(self, alternative: AltSvcAlternative) -> None:
+        sockets = {
+            id(alternative.socket): alternative.socket,
+            id(alternative.entrypoint_socket): alternative.entrypoint_socket,
+        }
+        for sock in sockets.values():
+            if sock is None:
+                continue
+            close = getattr(sock, "close", None)
+            if close is None or not callable(close):
+                continue
+
+            def watcher(
+                *args: Any,
+                _alternative: AltSvcAlternative = alternative,
+                _close: Any = close,
+                **kwargs: Any,
+            ) -> Any:
+                _alternative.closed = True
+                return _close(*args, **kwargs)
+
+            try:
+                sock.close = watcher
+            except (AttributeError, TypeError):
+                # Builtin sockets cannot be patched, the closed state is
+                # instead read from the socket when responding.
+                pass
+
+    def mark_listener_failed(self, sock: Any) -> None:
+        """Stop advertising the alternative(s) served by ``sock``.
+
+        Used when a listener cannot be started (e.g. the datagram
+        endpoint errors), the address is then no longer advertised.
+        """
+        address = _socket_address(_getsockname(sock))
+        for alternative in self._alt_svc_alternatives:
+            if alternative.socket is sock or (
+                address is not None and alternative.address == address
+            ):
+                alternative.closed = True
+
+    def _valid_alternatives(self, server: tuple[str, int] | None) -> list[AltSvcAlternative]:
+        alternatives = self._alt_svc_alternatives
+        if not alternatives and self._quic_addresses:
+            # Addresses declared without their listeners cannot be
+            # watched or paired, so they are taken as they are.
+            alternatives = [
+                AltSvcAlternative(address=address)
+                for address in map(_socket_address, self._quic_addresses)
+                if address is not None
+            ]
+        return [
+            alternative
+            for alternative in alternatives
+            if alternative.valid and alternative.serves(server)
+        ]
+
+    def attach_sockets(self, sockets: Sockets) -> None:
+        """Pair the alternatives with this process' listeners.
+
+        When workers are used the config is pickled, which drops the
+        socket references, so the alternatives are re-paired with the
+        sockets handed to the worker.
+        """
+        if self.alt_svc_headers or not sockets.quic_sockets:
+            return
+        if self._alt_svc_alternatives and all(
+            alternative.socket is not None for alternative in self._alt_svc_alternatives
+        ):
+            return
+        self._set_quic_addresses(
+            sockets.quic_sockets, [*sockets.secure_sockets, *sockets.insecure_sockets]
+        )
+
+    def __getstate__(self) -> dict:
+        state = dict(self.__dict__)
+        alternatives = state.get("_alt_svc_alternatives", [])
+        if alternatives:
+            # Sockets are process specific (and passed to the workers
+            # separately), so only the declared addresses are pickled.
+            state["_alt_svc_alternatives"] = [
+                AltSvcAlternative(address=a.address, entrypoint=a.entrypoint)
+                for a in alternatives
+            ]
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
 
     def _create_sockets(
         self, binds: list[str], type_: int = socket.SOCK_STREAM
@@ -282,7 +511,9 @@ class Config:
             sockets.append(sock)
         return sockets
 
-    def response_headers(self, protocol: str) -> list[tuple[bytes, bytes]]:
+    def response_headers(
+        self, protocol: str, server: tuple[str, int] | None = None
+    ) -> list[tuple[bytes, bytes]]:
         headers = []
         if self.include_date_header:
             headers.append((b"date", format_date_time(time()).encode("ascii")))
@@ -291,13 +522,17 @@ class Config:
 
         for alt_svc_header in self.alt_svc_headers:
             headers.append((b"alt-svc", alt_svc_header.encode()))
-        if len(self.alt_svc_headers) == 0 and self._quic_addresses:
-            from aioquic.h3.connection import H3_ALPN
+        if len(self.alt_svc_headers) == 0:
+            alternatives = self._valid_alternatives(server)
+            if alternatives:
+                from aioquic.h3.connection import H3_ALPN
 
-            for version in H3_ALPN:
-                for addr in self._quic_addresses:
-                    port = addr[1]
-                    headers.append((b"alt-svc", b'%s=":%d"; ma=3600' % (version.encode(), port)))
+                for version in H3_ALPN:
+                    for alternative in alternatives:
+                        port = alternative.address[1]
+                        headers.append(
+                            (b"alt-svc", b'%s=":%d"; ma=3600' % (version.encode(), port))
+                        )
 
         return headers
 

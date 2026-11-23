@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import os
+import pickle
 import socket
 import ssl
 import sys
-from unittest.mock import Mock, NonCallableMock
+from types import SimpleNamespace
+from unittest.mock import Mock, NonCallableMock, patch
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
 
 import hypercorn.config
-from hypercorn.config import Config
+from hypercorn.config import Config, Sockets
 
 access_log_format = "bob"
 h11_max_incomplete_size = 4
@@ -152,3 +154,103 @@ def test_response_headers(monkeypatch: MonkeyPatch) -> None:
     ]
     config.include_server_header = False
     assert config.response_headers("test") == [(b"date", b"Sat, 02 Dec 2017 15:43:15 GMT")]
+
+
+class FakeSocket:
+    def __init__(self, address: tuple[str, int]) -> None:
+        self.address = address
+        self.closed = False
+
+    def getsockname(self) -> tuple[str, int]:
+        return self.address
+
+    def fileno(self) -> int:
+        return -1 if self.closed else 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _alt_svc_headers(config: Config, server: tuple[str, int] | None = None) -> list[bytes]:
+    with patch.dict(sys.modules, {"aioquic.h3.connection": SimpleNamespace(H3_ALPN=["h3"])}):
+        return [
+            value for name, value in config.response_headers("h2", server) if name == b"alt-svc"
+        ]
+
+
+def test_alt_svc_uses_actual_bound_ports() -> None:
+    config = Config()
+    entrypoints = [FakeSocket(("127.0.0.1", 43118)), FakeSocket(("127.0.0.2", 43119))]
+    quic = [FakeSocket(("127.0.0.1", 43118)), FakeSocket(("127.0.0.2", 43119))]
+    config._set_quic_addresses(quic, entrypoints)  # type: ignore[arg-type]
+
+    assert _alt_svc_headers(config, ("127.0.0.1", 43118)) == [b'h3=":43118"; ma=3600']
+    assert _alt_svc_headers(config, ("127.0.0.2", 43119)) == [b'h3=":43119"; ma=3600']
+
+
+def test_alt_svc_closed_listener_is_withdrawn() -> None:
+    config = Config()
+    entrypoints = [FakeSocket(("127.0.0.1", 43118)), FakeSocket(("127.0.0.2", 43119))]
+    quic = [FakeSocket(("127.0.0.1", 43118)), FakeSocket(("127.0.0.2", 43119))]
+    config._set_quic_addresses(quic, entrypoints)  # type: ignore[arg-type]
+    assert len(_alt_svc_headers(config)) == 2
+
+    quic[1].close()
+    assert _alt_svc_headers(config, ("127.0.0.1", 43118)) == [b'h3=":43118"; ma=3600']
+    assert _alt_svc_headers(config, ("127.0.0.2", 43119)) == []
+
+    entrypoints[0].close()
+    assert _alt_svc_headers(config, ("127.0.0.1", 43118)) == []
+
+
+def test_alt_svc_explicit_headers_are_unchanged() -> None:
+    config = Config()
+    config.alt_svc_headers = ['h3=":443"; ma=60']
+    quic = [FakeSocket(("127.0.0.1", 43118))]
+    config._set_quic_addresses(quic)  # type: ignore[arg-type]
+    quic[0].close()
+
+    assert _alt_svc_headers(config) == [b'h3=":443"; ma=60']
+
+
+def test_alt_svc_unknown_entrypoint_advertises_all() -> None:
+    config = Config()
+    entrypoints = [FakeSocket(("127.0.0.1", 43118)), FakeSocket(("127.0.0.2", 43119))]
+    quic = [FakeSocket(("127.0.0.1", 43118)), FakeSocket(("127.0.0.2", 43119))]
+    config._set_quic_addresses(quic, entrypoints)  # type: ignore[arg-type]
+
+    assert _alt_svc_headers(config) == [
+        b'h3=":43118"; ma=3600',
+        b'h3=":43119"; ma=3600',
+    ]
+
+
+def test_alt_svc_is_picklable_and_reattached() -> None:
+    config = Config()
+    config.application_path = "module:app"
+    entrypoints = [FakeSocket(("127.0.0.1", 43118))]
+    quic = [FakeSocket(("127.0.0.1", 43118))]
+    config._set_quic_addresses(quic, entrypoints)  # type: ignore[arg-type]
+
+    restored = pickle.loads(pickle.dumps(config))
+    assert restored._alt_svc_alternatives[0].address == ("127.0.0.1", 43118)
+    assert restored._alt_svc_alternatives[0].socket is None
+
+    restored.attach_sockets(Sockets([], [], quic))  # type: ignore[arg-type]
+    assert _alt_svc_headers(restored, ("127.0.0.1", 43118)) == [b'h3=":43118"; ma=3600']
+
+
+def test_alt_svc_failed_listener_is_withdrawn() -> None:
+    config = Config()
+    entrypoints = [FakeSocket(("127.0.0.1", 43118)), FakeSocket(("127.0.0.2", 43119))]
+    quic = [FakeSocket(("127.0.0.1", 43118)), FakeSocket(("127.0.0.2", 43119))]
+    config._set_quic_addresses(quic, entrypoints)  # type: ignore[arg-type]
+
+    config.mark_listener_failed(quic[1])
+    assert _alt_svc_headers(config, ("127.0.0.1", 43118)) == [b'h3=":43118"; ma=3600']
+    assert _alt_svc_headers(config, ("127.0.0.2", 43119)) == []
+
+
+def test_alt_svc_no_quic_sockets() -> None:
+    assert _alt_svc_headers(Config()) == []
+

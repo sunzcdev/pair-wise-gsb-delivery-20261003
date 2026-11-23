@@ -121,7 +121,9 @@ class H11Protocol:
     async def stream_send(self, event: StreamEvent) -> None:
         if isinstance(event, Response):
             if event.status_code >= 200:
-                headers = list(chain(event.headers, self.config.response_headers("h11")))
+                headers = list(
+                    chain(event.headers, self.config.response_headers("h11", self.server))
+                )
                 if self.keep_alive_requests >= self.config.keep_alive_max_requests:
                     headers.append((b"connection", b"close"))
                 await self._send_h11_event(
@@ -133,7 +135,12 @@ class H11Protocol:
             else:
                 await self._send_h11_event(
                     h11.InformationalResponse(
-                        headers=list(chain(event.headers, self.config.response_headers("h11"))),
+                        headers=list(
+                            chain(
+                                event.headers,
+                                self.config.response_headers("h11", self.server),
+                            )
+                        ),
                         status_code=event.status_code,
                     )
                 )
@@ -155,7 +162,8 @@ class H11Protocol:
             if self.connection.they_are_waiting_for_100_continue:
                 await self._send_h11_event(
                     h11.InformationalResponse(
-                        status_code=100, headers=self.config.response_headers("h11")
+                        status_code=100,
+                        headers=self.config.response_headers("h11", self.server),
                     )
                 )
 
@@ -261,7 +269,7 @@ class H11Protocol:
                 headers=list(
                     chain(
                         [(b"content-length", b"0"), (b"connection", b"close")],
-                        self.config.response_headers("h11"),
+                        self.config.response_headers("h11", self.server),
                     )
                 ),
             )
@@ -312,7 +320,7 @@ class H11Protocol:
             await self._send_h11_event(
                 h11.InformationalResponse(
                     status_code=101,
-                    headers=self.config.response_headers("h11")
+                    headers=self.config.response_headers("h11", self.server)
                     + [(b"connection", b"upgrade"), (b"upgrade", b"h2c")],
                 )
             )

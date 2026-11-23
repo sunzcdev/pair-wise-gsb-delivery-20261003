@@ -55,6 +55,8 @@ async def worker_serve(
                     sock.listen(config.backlog)
                 for sock in sockets.insecure_sockets:
                     sock.listen(config.backlog)
+            else:
+                config.attach_sockets(sockets)
 
             ssl_context = config.create_ssl_context()
             listeners: list[trio.SSLListener[trio.SocketStream] | trio.SocketListener] = []
@@ -78,11 +80,16 @@ async def worker_serve(
                 await config.log.info(f"Running on http://{bind} (CTRL + C to quit)")
 
             for sock in sockets.quic_sockets:
-                await server_nursery.start(
-                    UDPServer(
-                        app, config, context, ConnectionState(lifespan_state.copy()), sock
-                    ).run
-                )
+                try:
+                    await server_nursery.start(
+                        UDPServer(
+                            app, config, context, ConnectionState(lifespan_state.copy()), sock
+                        ).run
+                    )
+                except OSError:
+                    # The alternative cannot be reached, so stop advertising it.
+                    config.mark_listener_failed(sock)
+                    continue
                 bind = repr_socket_addr(sock.family, sock.getsockname())
                 await config.log.info(f"Running on https://{bind} (QUIC) (CTRL + C to quit)")
 

@@ -90,6 +90,8 @@ async def worker_serve(
 
     if sockets is None:
         sockets = config.create_sockets()
+    else:
+        config.attach_sockets(sockets)
 
     ssl_handshake_timeout = None
     if config.ssl_enabled:
@@ -139,12 +141,25 @@ async def worker_serve(
         if config.workers > 1 and platform.system() == "Windows":
             sock = _share_socket(sock)
 
-        _, protocol = await loop.create_datagram_endpoint(
-            lambda: UDPServer(app, loop, config, context, lifespan_state), sock=sock
-        )
+        try:
+            _, protocol = await loop.create_datagram_endpoint(
+                lambda: UDPServer(app, loop, config, context, lifespan_state), sock=sock
+            )
+        except OSError:
+            # The alternative cannot be reached, so stop advertising it.
+            config.mark_listener_failed(sock)
+            sock.close()
+            continue
+
         task = loop.create_task(protocol.run())
-        server_tasks.add(task)
-        task.add_done_callback(server_tasks.discard)
+
+        def _quic_done(finished: asyncio.Task, *, _sock: Any = sock) -> None:
+            server_tasks.discard(finished)
+            if not finished.cancelled() and finished.exception() is not None:
+                # The listener stopped serving, so stop advertising it.
+                config.mark_listener_failed(_sock)
+
+        task.add_done_callback(_quic_done)
         bind = repr_socket_addr(sock.family, sock.getsockname())
         await config.log.info(f"Running on https://{bind} (QUIC) (CTRL + C to quit)")
 

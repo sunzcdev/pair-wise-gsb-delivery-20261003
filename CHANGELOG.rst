@@ -1,3 +1,10 @@
+Unreleased
+----------
+
+* Advertise QUIC listeners via Alt-Svc per entrypoint using their
+  actual bound (system assigned) ports, and stop advertising a
+  listener once it fails or closes.
+
 0.18.0 2025-11-08
 -----------------
 

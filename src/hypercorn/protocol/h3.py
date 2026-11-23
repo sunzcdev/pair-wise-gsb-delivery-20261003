@@ -73,7 +73,7 @@ class H3Protocol:
                 event.stream_id,
                 [(b":status", b"%d" % event.status_code)]
                 + event.headers
-                + self.config.response_headers("h3"),
+                + self.config.response_headers("h3", self.server),
             )
             await self.send()
         elif isinstance(event, (Body, Data)):
@@ -139,7 +139,7 @@ class H3Protocol:
     ) -> None:
         request_headers = [(b":method", b"GET"), (b":path", path)]
         request_headers.extend(headers)
-        request_headers.extend(self.config.response_headers("h3"))
+        request_headers.extend(self.config.response_headers("h3", self.server))
         try:
             push_stream_id = self.connection.send_push_promise(
                 stream_id=stream_id, headers=request_headers
