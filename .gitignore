@@ -1,0 +1,11 @@
+*.egg-info
+/*.lock
+/.*_cache/
+/.coverage
+/.jj/
+/.tox/
+/.venv/
+/dist/
+/docs/_build/
+/site/
+__pycache__/

@@ -1,0 +1,40 @@
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    labels:
+      - dependencies
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      docs:
+        patterns:
+          - "mkdocs*"
+          - "zensical"
+      tests:
+        patterns:
+          - "pytest*"
+      linters:
+        patterns:
+          - "mypy"
+          - "basedpyright"
+          - "ruff"
+          - "ty"
+          - "tox*"
+          - "zizmor"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    labels:
+      - dependencies
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns:
+          - "*"

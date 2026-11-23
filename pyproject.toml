@@ -1,0 +1,235 @@
+[project]
+name = "pykka"
+version = "4.5.0"
+description = "Pykka is a Python implementation of the actor model"
+authors = [{ name = "Stein Magnus Jodal", email = "stein.magnus@jodal.no" }]
+requires-python = ">=3.11"
+readme = "README.md"
+license = "Apache-2.0"
+keywords = ["actor", "concurrency", "threading"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+"Source code" = "https://github.com/jodal/pykka"
+Documentation = "https://pykka.readthedocs.io/"
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+
+[dependency-groups]
+dev = [
+    "tox>=4.21.2",
+    "tox-uv>=1.23.2",
+    { include-group = "benchmark" },
+    { include-group = "docs" },
+    { include-group = "mypy" },
+    { include-group = "pyright" },
+    { include-group = "ruff" },
+    { include-group = "tests" },
+    { include-group = "ty" },
+    { include-group = "zizmor" },
+]
+benchmark = ["pyperf>=2.9.0"]
+docs = [
+    "mkdocstrings-python>=2.0.1",
+    "zensical>=0.0.69",
+]
+mypy = ["mypy>=2.4.0"]
+pyright = ["basedpyright>=1.39.6"]
+ruff = ["ruff>=0.16.3"]
+tests = ["pytest>=8.3.5", "pytest-cov>=5.0.0", "pytest-mock>=3.14.0"]
+ty = ["ty==0.0.91"]
+zizmor = ["zizmor==1.31.1"]
+
+
+[tool.coverage.paths]
+source = ["src/", "*/site-packages/"]
+
+[tool.coverage.run]
+branch = true
+source_pkgs = ["pykka"]
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING", '\.\.\.']
+
+
+[tool.mypy]
+disallow_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+warn_return_any = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["pyperf"]
+ignore_missing_imports = true
+
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+# Already covered by tests and careful import ordering:
+reportImportCycles = false
+# Already covered by flake8-self:
+reportPrivateUsage = false
+
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "A003",    # builtin-attribute-shadowing
+    "ANN401",  # any-type
+    "CPY",     # flake8-pyright
+    "D203",    # one-blank-line-before-class
+    "D213",    # multi-line-summary-second-line
+    "G004",    # logging-f-string
+    "PLR2004", # magic-value-comparison
+    "RET504",  # unnecessary-assign
+    "S101",    # assert
+    "TRY003",  # raise-vanilla-args
+    #
+    # These rules interfere with `ruff format`
+    "COM812", # missing-trailing-comma
+    "ISC001", # single-line-implicit-string-concatenation
+]
+
+[tool.ruff.lint.per-file-ignores]
+"benchmarks/*" = [
+    "D", # pydocstyle
+]
+"docs/*" = [
+    "D",      # pydocstyle
+    "INP001", # implicit-namespace-package
+]
+"examples/*" = [
+    "ANN",    # flake8-annotations
+    "BLE001", # blind-except
+    "D",      # pydocstyle
+    "INP001", # implicit-namespace-package
+    "T20",    # flake8-print
+]
+"tests/*" = [
+    "ANN",    # flake8-annotations
+    "ARG",    # flake8-unused-arguments
+    "D",      # pydocstyle
+    "EM101",  # raw-string-in-exception
+    "TRY002", # raise-vanilla-class
+]
+
+
+[tool.rumdl]
+flavor = "mkdocs"
+
+
+[tool.tox]
+env_list = [
+    "3.11",
+    "3.12",
+    "3.13",
+    "3.14",
+    "3.15",
+    "docs",
+    "mypy",
+    "pyright",
+    "ruff-format",
+    "ruff-check",
+    "ty",
+    "zizmor",
+]
+
+[tool.tox.env_run_base]
+package = "wheel"
+wheel_build_env = ".pkg"
+dependency_groups = ["tests"]
+commands = [
+    [
+        "pytest",
+        "--cov",
+        "--basetemp={envtmpdir}",
+        { replace = "posargs", extend = true },
+    ],
+]
+
+[tool.tox.env.docs]
+dependency_groups = ["docs"]
+commands = [["zensical", "build", "--clean", "--strict"]]
+
+[tool.tox.env.mypy]
+dependency_groups = ["benchmark", "tests", "mypy"]
+commands = [
+    [
+        "mypy",
+        { replace = "posargs", default = [
+            "benchmarks",
+            "examples",
+            "src",
+            "tests",
+        ], extend = true },
+    ],
+]
+
+[tool.tox.env.pyright]
+dependency_groups = ["benchmark", "tests", "pyright"]
+commands = [
+    [
+        "basedpyright",
+        { replace = "posargs", default = [
+            "benchmarks",
+            "examples",
+            "src",
+            "tests",
+        ], extend = true },
+    ],
+]
+
+[tool.tox.env.ruff-format]
+skip_install = true
+dependency_groups = ["ruff"]
+commands = [["ruff", "format", "--check", "{posargs:.}"]]
+
+[tool.tox.env.ruff-check]
+skip_install = true
+dependency_groups = ["ruff"]
+commands = [["ruff", "check", "{posargs:.}"]]
+
+[tool.tox.env.ty]
+dependency_groups = ["benchmark", "tests", "ty"]
+commands = [
+    [
+        "ty",
+        "check",
+        { replace = "posargs", default = [
+            "benchmarks",
+            "examples",
+            "src",
+            "tests",
+        ], extend = true },
+    ],
+]
+
+[tool.tox.env.zizmor]
+skip_install = true
+dependency_groups = ["zizmor"]
+commands = [["zizmor", "{posargs:.}"]]
+
+
+[[tool.ty.overrides]]
+include = ["examples/**"]
+
+[tool.ty.overrides.rules]
+undefined-reveal = "ignore"
+
+[[tool.ty.overrides]]
+include = ["tests/**"]
+
+[tool.ty.overrides.rules]
+unsupported-base = "ignore"
