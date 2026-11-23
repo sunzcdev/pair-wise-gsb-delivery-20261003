@@ -13,6 +13,8 @@ from .info import ServiceInfo
 _str = str
 _ServiceInfo = ServiceInfo
 _ServiceIndex = dict[str, dict[str, ServiceInfo]]
+_ServerReferenceIndex = dict[str, dict[tuple[str, int], int]]
+_DrainedInterfaces = dict[str, set[tuple[str, int]]]
 
 
 class ServiceRegistry:
@@ -22,7 +24,7 @@ class ServiceRegistry:
     the event loop as it is not thread safe.
     """
 
-    __slots__ = ("_services", "has_entries", "servers", "types")
+    __slots__ = ("_server_drained", "_server_references", "_services", "has_entries", "servers", "types")
 
     def __init__(
         self,
@@ -31,11 +33,39 @@ class ServiceRegistry:
         self._services: dict[str, ServiceInfo] = {}
         self.types: _ServiceIndex = {}
         self.servers: _ServiceIndex = {}
+        self._server_references: _ServerReferenceIndex = {}
+        self._server_drained: _DrainedInterfaces = {}
         self.has_entries: bool = False
 
     def async_add(self, info: ServiceInfo) -> None:
         """Add a new service to the registry."""
         self._add(info)
+
+    def async_decrement_server_reference(
+        self, info: ServiceInfo, interface_key: tuple[str, int]
+    ) -> None:
+        """Drop one per-interface reference to an info's server.
+
+        An interface without an explicit count implicitly references every
+        registered instance, so the first decrement seeds it from the current
+        number of infos on the server before subtracting one. Interfaces that
+        already reached zero stay drained instead of being reseeded.
+        """
+        assert info.server_key is not None
+        drained = self._server_drained.setdefault(info.server_key, set())
+        if interface_key in drained:
+            return
+        interface_buckets = self._server_references.setdefault(info.server_key, {})
+        if interface_key not in interface_buckets:
+            interface_buckets[interface_key] = len(self.servers.get(info.server_key, {}))
+        count = interface_buckets[interface_key]
+        if count <= 1:
+            del interface_buckets[interface_key]
+            drained.add(interface_key)
+            if not interface_buckets:
+                del self._server_references[info.server_key]
+        else:
+            interface_buckets[interface_key] = count - 1
 
     def async_get_info_name(self, name: str) -> ServiceInfo | None:
         """Return all ServiceInfo for the name."""
@@ -49,6 +79,11 @@ class ServiceRegistry:
         """Return all ServiceInfo matching type."""
         return self._async_get_by_index(self.types, type_)
 
+    def async_get_server_reference_interfaces(self, server: str) -> set[tuple[str, int]]:
+        """Return the interfaces that still hold a reference to the server."""
+        interface_buckets = self._server_references.get(server)
+        return set(interface_buckets) if interface_buckets else set()
+
     def async_get_service_infos(self) -> list[ServiceInfo]:
         """Return all ServiceInfo."""
         return list(self._services.values())
@@ -56,6 +91,27 @@ class ServiceRegistry:
     def async_get_types(self) -> list[str]:
         """Return all types."""
         return list(self.types)
+
+    def async_increment_server_reference(
+        self, info: ServiceInfo, interface_key: tuple[str, int]
+    ) -> None:
+        """Add one per-interface reference to an info's server."""
+        assert info.server_key is not None
+        drained = self._server_drained.get(info.server_key)
+        if drained is not None:
+            drained.discard(interface_key)
+            if not drained:
+                del self._server_drained[info.server_key]
+        interface_buckets = self._server_references.setdefault(info.server_key, {})
+        interface_buckets[interface_key] = interface_buckets.get(interface_key, 0) + 1
+
+    def async_is_server_reference_drained(
+        self, info: ServiceInfo, interface_key: tuple[str, int]
+    ) -> bool:
+        """Return whether the interface already withdrew the info's server address."""
+        assert info.server_key is not None
+        drained = self._server_drained.get(info.server_key)
+        return bool(drained and interface_key in drained)
 
     def async_remove(self, info: list[ServiceInfo] | ServiceInfo) -> None:
         """Remove a new service from the registry."""

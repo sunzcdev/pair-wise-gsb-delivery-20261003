@@ -171,3 +171,55 @@ class TestServiceRegistry(unittest.TestCase):
 
         assert registry.async_get_infos_type(type_)[0] is updated
         assert registry.async_get_infos_server(server)[0] is updated
+
+    def test_per_interface_server_references(self):
+        type_ = "_test-srvc-type._tcp.local."
+        server = "shared.local."
+        first_iface = ("127.0.0.1", 0)
+        second_iface = ("10.0.0.2", 0)
+        info = make_service_info(type_, f"one.{type_}", server=server)
+        info2 = make_service_info(type_, f"two.{type_}", server=server)
+
+        registry = r.ServiceRegistry()
+        registry.async_add(info)
+        registry.async_add(info2)
+        for interface_key in (first_iface, second_iface):
+            registry.async_increment_server_reference(info, interface_key)
+            registry.async_increment_server_reference(info2, interface_key)
+
+        # Removing one reference keeps both interfaces live.
+        registry.async_decrement_server_reference(info, first_iface)
+        assert registry.async_get_server_reference_interfaces(server) == {first_iface, second_iface}
+        assert not registry.async_is_server_reference_drained(info, first_iface)
+
+        # The first interface loses its remaining reference with info2.
+        registry.async_decrement_server_reference(info2, first_iface)
+        assert first_iface not in registry.async_get_server_reference_interfaces(server)
+        assert registry.async_is_server_reference_drained(info2, first_iface)
+        # Further decrements on a drained interface stay no-ops.
+        registry.async_decrement_server_reference(info, first_iface)
+        assert registry.async_is_server_reference_drained(info, first_iface)
+
+        # Re-adding a reference revives the drained interface.
+        registry.async_increment_server_reference(info2, first_iface)
+        assert not registry.async_is_server_reference_drained(info2, first_iface)
+        assert first_iface in registry.async_get_server_reference_interfaces(server)
+
+    def test_decrement_seeds_unseeded_interface_from_registry(self):
+        type_ = "_test-srvc-type._tcp.local."
+        server = "implicit.local."
+        interface_key = ("127.0.0.1", 0)
+        info = make_service_info(type_, f"one.{type_}", server=server)
+        info2 = make_service_info(type_, f"two.{type_}", server=server)
+
+        registry = r.ServiceRegistry()
+        registry.async_add(info)
+        registry.async_add(info2)
+
+        # An interface with no explicit bookkeeping implicitly references
+        # every registered instance, so one removal leaves one reference.
+        registry.async_decrement_server_reference(info, interface_key)
+        assert registry.async_get_server_reference_interfaces(server) == {interface_key}
+        registry.async_decrement_server_reference(info2, interface_key)
+        assert registry.async_get_server_reference_interfaces(server) == set()
+        assert registry.async_is_server_reference_drained(info2, interface_key)

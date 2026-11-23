@@ -339,6 +339,7 @@ class Zeroconf(QuietLogger):
         await self.async_wait_for_start()
         await self.async_check_service(info, allow_name_change, cooperating_responders, strict)
         self.registry.async_add(info)
+        self._async_add_server_references(info)
         return asyncio.ensure_future(self._async_broadcast_service(info, _REGISTER_TIME, None))
 
     def async_remove_listener(self, listener: RecordUpdateListener) -> None:
@@ -401,15 +402,13 @@ class Zeroconf(QuietLogger):
     async def async_unregister_service(self, info: ServiceInfo) -> Awaitable:
         """Withdraw a service from the event loop, broadcasting goodbyes."""
         info.set_server_if_missing()
-        self.registry.async_remove(info)
-        # If another server uses the same addresses, we do not want to send
-        # goodbye packets for the address records
-
         assert info.server_key is not None
-        entries = self.registry.async_get_infos_server(info.server_key)
-        broadcast_addresses = not bool(entries)
+        # Capture the interfaces that lose their last reference to the shared
+        # host with this removal before the registry entry is dropped.
+        address_goodbye_interfaces = self._async_server_reference_interfaces_reaching_zero(info)
+        self.registry.async_remove(info)
         return asyncio.ensure_future(
-            self._async_broadcast_service(info, _UNREGISTER_TIME, 0, broadcast_addresses)
+            self._async_broadcast_service(info, _UNREGISTER_TIME, 0, address_goodbye_interfaces)
         )
 
     async def async_update_interfaces(
@@ -461,6 +460,8 @@ class Zeroconf(QuietLogger):
         # the rest, so collect exceptions and log them individually, naming the
         # service so a partial failure is actionable.
         infos = self.registry.async_get_service_infos()
+        for info in infos:
+            self._async_add_server_references(info)
         results = await asyncio.gather(
             *[self._async_broadcast_service(info, _REGISTER_TIME, None) for info in infos],
             return_exceptions=True,
@@ -518,11 +519,16 @@ class Zeroconf(QuietLogger):
         self,
         info: ServiceInfo,
         ttl: int | None,
-        broadcast_addresses: bool = True,
+        address_goodbye_interfaces: set[tuple[str, int]] | None = None,
     ) -> DNSOutgoing:
-        """Generate a broadcast to announce a service."""
+        """Generate a broadcast to announce a service.
+
+        A None address_goodbye_interfaces includes address records on every
+        interface; an empty set omits them; otherwise they are carried only
+        when the packet leaves one of the named interfaces.
+        """
         out = DNSOutgoing(_FLAGS_QR_RESPONSE | _FLAGS_AA)
-        self._add_broadcast_answer(out, info, ttl, broadcast_addresses)
+        self._add_broadcast_answer(out, info, ttl, address_goodbye_interfaces)
         return out
 
     def generate_service_query(self, info: ServiceInfo) -> DNSOutgoing:  # pylint: disable=no-self-use
@@ -719,7 +725,7 @@ class Zeroconf(QuietLogger):
         out: DNSOutgoing,
         info: ServiceInfo,
         override_ttl: int | None,
-        broadcast_addresses: bool = True,
+        address_goodbye_interfaces: set[tuple[str, int]] | None = None,
     ) -> None:
         """Add answers to broadcast a service."""
         current_time_millis()
@@ -728,28 +734,73 @@ class Zeroconf(QuietLogger):
         out.add_answer_at_time(info.dns_pointer(override_ttl=other_ttl), 0)
         out.add_answer_at_time(info.dns_service(override_ttl=host_ttl), 0)
         out.add_answer_at_time(info.dns_text(override_ttl=other_ttl), 0)
-        if broadcast_addresses:
+        if address_goodbye_interfaces is None:
             for record in info.get_address_and_nsec_records(override_ttl=host_ttl):
                 out.add_answer_at_time(record, 0)
+
+    def _async_add_server_references(self, info: ServiceInfo) -> None:
+        """Count one reference to the info's server on every sending interface.
+
+        Interfaces that already hold a reference are skipped, so re-announcing
+        after a new sender appears only seeds the new one.
+        """
+        assert info.server_key is not None
+        counted = self.registry.async_get_server_reference_interfaces(info.server_key)
+        for transport in self.engine.senders:
+            interface_key = transport.interface_key
+            if interface_key not in counted:
+                self.registry.async_increment_server_reference(info, interface_key)
 
     async def _async_broadcast_service(
         self,
         info: ServiceInfo,
         interval: int,
         ttl: int | None,
-        broadcast_addresses: bool = True,
+        address_goodbye_interfaces: set[tuple[str, int]] | None = None,
     ) -> None:
         """Send a broadcasts to announce a service at intervals."""
         for i in range(_REGISTER_BROADCASTS):
             if i != 0:
                 await asyncio.sleep(millis_to_seconds(interval))
-            self.async_send(self.generate_service_broadcast(info, ttl, broadcast_addresses))
+            out = self.generate_service_broadcast(info, ttl, address_goodbye_interfaces)
+            if address_goodbye_interfaces is None:
+                self.async_send(out)
+                continue
+            assert info.server_key is not None
+            live_interfaces = self.registry.async_get_server_reference_interfaces(info.server_key)
+            for transport in self.engine.senders:
+                interface_key = transport.interface_key
+                if interface_key in address_goodbye_interfaces:
+                    address_out = self.generate_service_broadcast(info, ttl, None)
+                    self.async_send(address_out, transport=transport)
+                elif (
+                    interface_key in live_interfaces
+                    and not self.registry.async_is_server_reference_drained(info, interface_key)
+                ):
+                    self.async_send(out, transport=transport)
 
     async def _async_close(self) -> None:
         """Shut down for AsyncZeroconf; callers unregister services first."""
         self._close()
         await self.engine._async_close()  # pylint: disable=protected-access
         self._shutdown_threads()
+
+    def _async_server_reference_interfaces_reaching_zero(
+        self, info: ServiceInfo
+    ) -> set[tuple[str, int]]:
+        """Drop this service's per-interface refs; return interfaces left with none."""
+        assert info.server_key is not None
+        zero_interfaces: set[tuple[str, int]] = set()
+        for transport in self.engine.senders:
+            interface_key = transport.interface_key
+            if self.registry.async_is_server_reference_drained(info, interface_key):
+                continue
+            self.registry.async_decrement_server_reference(info, interface_key)
+            if interface_key not in self.registry.async_get_server_reference_interfaces(
+                info.server_key
+            ):
+                zero_interfaces.add(interface_key)
+        return zero_interfaces
 
     def _close(self) -> None:
         """Set global done and remove all service listeners."""

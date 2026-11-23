@@ -8,7 +8,7 @@ import os
 import socket
 import threading
 from typing import cast
-from unittest.mock import ANY, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 import pytest
 
@@ -33,6 +33,7 @@ from zeroconf._exceptions import (
 )
 from zeroconf._services import ServiceListener
 from zeroconf._services.info import ServiceInfo
+from zeroconf._transport import _WrappedTransport
 from zeroconf._utils.time import current_time_millis
 from zeroconf.asyncio import (
     AsyncServiceBrowser,
@@ -344,6 +345,153 @@ async def test_async_service_registration_same_server_same_ports(quick_timing: N
         ("remove", type_, registration_name),
         ("remove", type_, registration_name2),
     ]
+
+
+@pytest.mark.asyncio
+async def test_async_unregister_shared_server_keeps_address_until_last_instance(
+    quick_timing: None,
+) -> None:
+    """The shared host address is withdrawn once, with the last instance's goodbye."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    zc = aiozc.zeroconf
+    await zc.async_wait_for_start()
+    type_ = "_shared-server._tcp.local."
+    server = "shared-host.local."
+    desc = {"path": "/healthz/"}
+    info = make_service_info(type_, f"one.{type_}", properties=desc, server=server)
+    info2 = make_service_info(type_, f"two.{type_}", properties=desc, server=server)
+    zc.registry.async_add(info)
+    zc.registry.async_add(info2)
+
+    address_records = info.get_address_and_nsec_records()
+
+    def _ttl_zero_addresses() -> set[DNSRecord]:
+        seen: set[DNSRecord] = set()
+        for send_call in send_mock.mock_calls:
+            outgoing = send_call.args[0]
+            for record, _at_time in outgoing.answers:
+                if record.ttl == 0 and record in address_records:
+                    seen.add(record)
+        return seen
+
+    protocol = zc.engine.protocols[0]
+
+    async def _query(question: DNSQuestion) -> set[DNSRecord]:
+        query = DNSOutgoing(const._FLAGS_QR_QUERY, multicast=True)
+        query.add_question(question)
+        send_mock.reset_mock()
+        protocol.datagram_received(query.packets()[0], ("127.0.0.1", const._MDNS_PORT))
+        # PTR answers ride the multicast aggregation queue; flush it.
+        await asyncio.sleep(0.15)
+        answers: set[DNSRecord] = set()
+        for send_call in send_mock.mock_calls:
+            outgoing = send_call.args[0]
+            answers.update(record for record, _at_time in outgoing.answers)
+            answers.update(outgoing.additionals)
+        send_mock.reset_mock()
+        return answers
+
+    with patch.object(zc, "async_send") as send_mock:
+        task = await aiozc.async_unregister_service(info)
+        await task
+
+        # The first goodbye only withdraws the instance records; the host
+        # address still backs the surviving instance.
+        assert not _ttl_zero_addresses()
+        first_goodbye = send_mock.mock_calls[0].args[0]
+        first_records = {record for record, _at_time in first_goodbye.answers}
+        assert info.dns_pointer(override_ttl=0) in first_records
+        assert info.dns_service(override_ttl=0) in first_records
+        assert info.dns_text(override_ttl=0) in first_records
+
+        # A query still resolves the surviving instance and its address.
+        srv_answers = await _query(DNSQuestion(info2.name, const._TYPE_SRV, const._CLASS_IN))
+        assert info2.dns_service() in srv_answers
+        assert address_records.issubset(srv_answers)
+        a_answers = await _query(DNSQuestion(server, const._TYPE_A, const._CLASS_IN))
+        assert address_records.issubset(a_answers)
+        ptr_answers = await _query(DNSQuestion(type_, const._TYPE_PTR, const._CLASS_IN))
+        assert info2.dns_pointer() in ptr_answers
+        assert info.dns_pointer() not in ptr_answers
+
+        task = await aiozc.async_unregister_service(info2)
+        await task
+
+        # With the last reference gone the address is withdrawn exactly once.
+        assert _ttl_zero_addresses() == address_records
+
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+async def test_async_unregister_shared_server_counts_references_per_interface(
+    quick_timing: None,
+) -> None:
+    """Reference scope is per interface: one interface withdraws the address while another keeps it."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    zc = aiozc.zeroconf
+    await zc.async_wait_for_start()
+    type_ = "_shared-server-iface._tcp.local."
+    server = "shared-host-iface.local."
+    desc = {"path": "/healthz/"}
+    info = make_service_info(type_, f"one.{type_}", properties=desc, server=server)
+    info2 = make_service_info(type_, f"two.{type_}", properties=desc, server=server)
+    zc.registry.async_add(info)
+    zc.registry.async_add(info2)
+    address_records = info.get_address_and_nsec_records()
+
+    first_sender = zc.engine.senders[0]
+    other_sender = _WrappedTransport(
+        transport=Mock(),
+        is_ipv6=False,
+        sock=Mock(),
+        fileno=1,
+        sock_name=("10.0.0.2", const._MDNS_PORT),
+    )
+    zc.engine.senders.append(other_sender)
+    # Both interfaces host both instances...
+    for sender in (first_sender, other_sender):
+        zc.registry.async_increment_server_reference(info, sender.interface_key)
+        zc.registry.async_increment_server_reference(info2, sender.interface_key)
+    # ...but the second interface never saw info2, so it holds only one
+    # reference to the shared host and reaches zero with the first removal.
+    zc.registry.async_decrement_server_reference(info2, other_sender.interface_key)
+
+    def _ttl_zero_by_sender() -> dict[object, set[DNSRecord]]:
+        per_sender: dict[object, set[DNSRecord]] = {}
+        for send_call in send_mock.mock_calls:
+            outgoing = send_call.args[0]
+            transport = send_call.kwargs.get("transport")
+            bucket = per_sender.setdefault(transport, set())
+            for record, _at_time in outgoing.answers:
+                if record.ttl == 0:
+                    bucket.add(record)
+        return per_sender
+
+    try:
+        with patch.object(zc, "async_send") as send_mock:
+            task = await aiozc.async_unregister_service(info)
+            await task
+
+            per_sender = _ttl_zero_by_sender()
+            # The interface that lost its last reference withdraws the
+            # address; the interface that still hosts info2 keeps it.
+            assert address_records.issubset(per_sender[other_sender])
+            assert not per_sender[first_sender] & address_records
+            send_mock.reset_mock()
+
+            task = await aiozc.async_unregister_service(info2)
+            await task
+
+            per_sender = _ttl_zero_by_sender()
+            # The remaining interface withdraws the address once, and the
+            # already-withdrawn interface does not send a second goodbye.
+            assert address_records.issubset(per_sender[first_sender])
+            assert other_sender not in per_sender
+    finally:
+        zc.engine.senders.remove(other_sender)
+
+    await aiozc.async_close()
 
 
 @pytest.mark.asyncio

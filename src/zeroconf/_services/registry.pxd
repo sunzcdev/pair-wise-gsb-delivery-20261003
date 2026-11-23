@@ -7,6 +7,8 @@ from .info cimport ServiceInfo
 cdef class ServiceRegistry:
 
     cdef cython.dict _services
+    cdef cython.dict _server_references
+    cdef cython.dict _server_drained
     cdef public cython.dict types
     cdef public cython.dict servers
     cdef public bint has_entries
@@ -35,3 +37,11 @@ cdef class ServiceRegistry:
     cpdef cython.list async_get_infos_type(self, str type_)
 
     cpdef cython.list async_get_infos_server(self, str server)
+
+    cpdef async_decrement_server_reference(self, ServiceInfo info, tuple interface_key)
+
+    cpdef set async_get_server_reference_interfaces(self, str server)
+
+    cpdef bint async_is_server_reference_drained(self, ServiceInfo info, tuple interface_key)
+
+    cpdef async_increment_server_reference(self, ServiceInfo info, tuple interface_key)
