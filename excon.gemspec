@@ -1,0 +1,42 @@
+# frozen_string_literal: true
+
+$LOAD_PATH.unshift File.join(File.dirname(__FILE__), 'lib')
+require 'excon/version'
+
+Gem::Specification.new do |s|
+  s.name             = 'excon'
+  s.version          = Excon::VERSION
+  s.summary          = 'speed, persistence, http(s)'
+  s.description      = 'EXtended http(s) CONnections'
+  s.authors          = ['dpiddy (Dan Peterson)', 'geemus (Wesley Beary)', 'nextmat (Matt Sanders)']
+  s.email            = 'geemus@gmail.com'
+  s.homepage         = 'https://github.com/excon/excon'
+  s.license          = 'MIT'
+  s.rdoc_options     = ['--charset=UTF-8']
+  s.extra_rdoc_files = %w[README.md CONTRIBUTORS.md CONTRIBUTING.md]
+  s.files            = `git ls-files -- data/* lib/*`.split("\n") + [
+    'CONTRIBUTING.md',
+    'CONTRIBUTORS.md',
+    'LICENSE.md',
+    'README.md',
+    'excon.gemspec'
+  ]
+  s.required_ruby_version = '>= 3.3.0'
+
+  s.add_development_dependency('minitest', '>= 6')
+  # Puma 8.1.0 rejects the empty Host header excon sends over unix sockets
+  # (puma/puma#3957); remove the cap once puma/puma#4152 is released.
+  s.add_development_dependency('puma', '< 8.1')
+  s.add_development_dependency('rake')
+  s.add_development_dependency('webrick')
+
+  s.metadata = {
+    'bug_tracker_uri' => 'https://github.com/excon/excon/issues',
+    'changelog_uri' => 'https://github.com/excon/excon/blob/master/changelog.txt',
+    'documentation_uri' => 'https://github.com/excon/excon/blob/master/README.md',
+    'funding_uri' => 'https://github.com/sponsors/geemus',
+    'homepage_uri' => 'https://github.com/excon/excon',
+    'source_code_uri' => 'https://github.com/excon/excon',
+    'wiki_uri' => 'https://github.com/excon/excon/wiki'
+  }
+end
