@@ -8,7 +8,7 @@ in the project's git history.
 from __future__ import annotations
 
 from ._cache import DNSCache  # noqa # import needed for backwards compat
-from ._core import Zeroconf
+from ._core import ScopedRegistration, Zeroconf
 from ._dns import (  # noqa # import needed for backwards compat
     DNSAddress,
     DNSEntry,
@@ -92,6 +92,7 @@ __all__ = [
     "NotRunningException",
     "RecordUpdate",
     "RecordUpdateListener",
+    "ScopedRegistration",
     "ServiceBrowser",
     "ServiceInfo",
     "ServiceListener",

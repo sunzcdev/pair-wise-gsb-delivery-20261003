@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from types import TracebackType  # used in type hints
 from typing import Self
 
-from ._core import Zeroconf
+from ._core import ScopedRegistration, Zeroconf
 from ._dns import DNSQuestionType
 from ._exceptions import NotRunningException
 from ._services import ServiceListener
@@ -199,6 +199,24 @@ class AsyncZeroconf:
         """
         return await self.zeroconf.async_register_service(
             info, ttl, allow_name_change, cooperating_responders, strict
+        )
+
+    async def async_register_service_scoped(
+        self,
+        info: ServiceInfo,
+        interfaces: InterfacesType,
+        ttl: int | None = None,
+        allow_name_change: bool = False,
+        strict: bool = True,
+    ) -> ScopedRegistration:
+        """Announce a service on only the given interfaces under one unified name.
+
+        Completes once the announcements have been sent and returns a
+        ScopedRegistration reporting the final info and the interfaces the
+        registration took effect on.
+        """
+        return await self.zeroconf.async_register_service_scoped(
+            info, interfaces, ttl, allow_name_change, strict
         )
 
     async def async_remove_all_service_listeners(self) -> None:

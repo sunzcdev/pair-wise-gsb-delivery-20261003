@@ -18,7 +18,7 @@ from typing import Self
 
 from ._cache import DNSCache
 from ._dns import DNSQuestion, DNSQuestionType
-from ._engine import AsyncEngine
+from ._engine import AsyncEngine, _interface_key
 from ._exceptions import NonUniqueNameException, NotRunningException
 from ._handlers.multicast_outgoing_queue import MulticastOutgoingQueue
 from ._handlers.query_handler import QueryHandler
@@ -53,6 +53,7 @@ from ._utils.net import (
     autodetect_ip_version,
     can_send_to,
     create_sockets,
+    normalize_interface_choice,
 )
 from ._utils.time import current_time_millis, millis_to_seconds
 from .const import (
@@ -133,6 +134,27 @@ def async_send_with_transport(
         _, _, sock_flowinfo, sock_scopeid = transport.sock_name
         v6_flow_scope = (sock_flowinfo, sock_scopeid)
     transport.transport.sendto(packet, (real_addr, port or _MDNS_PORT, *v6_flow_scope))
+
+
+def _interface_scope_keys(interfaces: InterfacesType, ip_version: IPVersion) -> set[tuple[str, int]]:
+    """Return the (address, scope_id) sender keys an interface scope covers."""
+    return {_interface_key(interface) for interface in normalize_interface_choice(interfaces, ip_version)}
+
+
+class ScopedRegistration:
+    """The result of a scoped service registration.
+
+    ``info`` carries the final (possibly renamed) service; ``interfaces``
+    holds the ``(address, scope_id)`` keys of the interfaces the
+    registration probed clean and announced on.
+    """
+
+    __slots__ = ("info", "interfaces")
+
+    def __init__(self, info: ServiceInfo, interfaces: tuple[tuple[str, int], ...]) -> None:
+        """Initialize the scoped registration result."""
+        self.info = info
+        self.interfaces = interfaces
 
 
 class Zeroconf(QuietLogger):
@@ -340,6 +362,43 @@ class Zeroconf(QuietLogger):
         await self.async_check_service(info, allow_name_change, cooperating_responders, strict)
         self.registry.async_add(info)
         return asyncio.ensure_future(self._async_broadcast_service(info, _REGISTER_TIME, None))
+
+    async def async_register_service_scoped(
+        self,
+        info: ServiceInfo,
+        interfaces: InterfacesType,
+        ttl: int | None = None,
+        allow_name_change: bool = False,
+        strict: bool = True,
+    ) -> ScopedRegistration:
+        """Announce a service on only the given interfaces under one unified name.
+
+        Probes the in-scope interfaces in lockstep, holding each candidate
+        name until all of them reach a result; a conflict on any interface
+        (with allow_name_change) renames and replays probing on all of
+        them. Interfaces that leave mid-probe drop out of the round's
+        coverage. Only the final name is announced, and only on the
+        in-scope interfaces. Completes once the announcements have been
+        sent and returns a ScopedRegistration reporting the final info and
+        the interfaces the registration took effect on. Raises ValueError
+        when none of the requested interfaces is available.
+        """
+        if ttl is not None:
+            # ttl argument is used to maintain backward compatibility
+            # Setting TTLs via ServiceInfo is preferred
+            info.host_ttl = ttl
+            info.other_ttl = ttl
+
+        info.set_server_if_missing()
+        await self.async_wait_for_start()
+        scope = _interface_scope_keys(interfaces, self._ip_version)
+        if not self._scoped_senders(scope):
+            raise ValueError(f"None of the requested interfaces are available: {interfaces!r}")
+        await self._async_check_service_scoped(info, scope, allow_name_change, strict)
+        self.registry.async_add(info)
+        effective = tuple(sender.interface_key for sender in self._scoped_senders(scope))
+        await self._async_broadcast_service_scoped(info, _REGISTER_TIME, None, scope)
+        return ScopedRegistration(info, effective)
 
     def async_remove_listener(self, listener: RecordUpdateListener) -> None:
         """Detach a record listener; event loop only, not threadsafe."""
@@ -602,6 +661,26 @@ class Zeroconf(QuietLogger):
             _REGISTER_TIME * _REGISTER_BROADCASTS,
         )
 
+    def register_service_scoped(
+        self,
+        info: ServiceInfo,
+        interfaces: InterfacesType,
+        ttl: int | None = None,
+        allow_name_change: bool = False,
+        strict: bool = True,
+    ) -> ScopedRegistration:
+        """Announce a service on only the given interfaces under one unified name.
+
+        May raise EventLoopBlocked when the event loop cannot complete the
+        registration in time.
+        """
+        assert self.loop is not None
+        return run_coro_with_timeout(
+            self.async_register_service_scoped(info, interfaces, ttl, allow_name_change, strict),
+            self.loop,
+            _REGISTER_TIME * _REGISTER_BROADCASTS,
+        )
+
     def remove_all_service_listeners(self) -> None:
         """Stop the browsers behind every registered listener."""
         for listener in list(self.browsers):
@@ -745,6 +824,70 @@ class Zeroconf(QuietLogger):
                 await asyncio.sleep(millis_to_seconds(interval))
             self.async_send(self.generate_service_broadcast(info, ttl, broadcast_addresses))
 
+    async def _async_broadcast_service_scoped(
+        self,
+        info: ServiceInfo,
+        interval: int,
+        ttl: int | None,
+        scope: set[tuple[str, int]],
+    ) -> None:
+        """Send broadcasts to announce a service at intervals, only in scope."""
+        for i in range(_REGISTER_BROADCASTS):
+            if i != 0:
+                await asyncio.sleep(millis_to_seconds(interval))
+            out = self.generate_service_broadcast(info, ttl)
+            for sender in self._scoped_senders(scope):
+                self.async_send(out, transport=sender)
+
+    async def _async_check_service_scoped(
+        self,
+        info: ServiceInfo,
+        scope: set[tuple[str, int]],
+        allow_name_change: bool,
+        strict: bool,
+    ) -> None:
+        """Probe the in-scope interfaces for name uniqueness, renaming first when allowed."""
+        instance_name = instance_name_from_service_info(info, strict=strict)
+
+        # Wait a random amount of time up avoid collisions and avoid
+        # a thundering herd when multiple services are started on the network
+        await self.async_wait(random.randint(*_PROBE_RANDOM_DELAY_INTERVAL))  # noqa: S311
+
+        next_instance_number = 2
+        probes_sent = 0
+        next_probe_at = current_time_millis()
+        while probes_sent < _REGISTER_BROADCASTS:
+            # check for a name conflict; a cache update during the wait below
+            # wakes async_wait, so a conflicting response lands here promptly
+            if self.cache.current_entry_with_name_and_alias(info.type, info.name):
+                if not allow_name_change:
+                    raise NonUniqueNameException
+
+                # change the name and restart probing from zero on every
+                # in-scope interface so all of them converge on one name
+                info.name = f"{instance_name}-{next_instance_number}.{info.type}"
+                next_instance_number += 1
+                service_type_name(info.name, strict=strict)
+                probes_sent = 0
+                next_probe_at = current_time_millis()
+                continue
+
+            remaining = next_probe_at - current_time_millis()
+            if remaining > 0:
+                await self.async_wait(remaining)
+                continue
+
+            # The sender set is re-resolved before every probe so an
+            # interface leaving mid-round drops out of this round's coverage.
+            senders = self._scoped_senders(scope)
+            if not senders:
+                raise ValueError("No in-scope interfaces remain to probe")
+            out = self.generate_service_query(info)
+            for sender in senders:
+                self.async_send(out, transport=sender)
+            probes_sent += 1
+            next_probe_at += _CHECK_TIME
+
     async def _async_close(self) -> None:
         """Shut down for AsyncZeroconf; callers unregister services first."""
         self._close()
@@ -757,6 +900,10 @@ class Zeroconf(QuietLogger):
             return
         self.remove_all_service_listeners()
         self.done = True
+
+    def _scoped_senders(self, scope: set[tuple[str, int]]) -> list[_WrappedTransport]:
+        """Return the current senders bound to an interface in scope."""
+        return [sender for sender in self.engine.senders if sender.interface_key in scope]
 
     def _shutdown_threads(self) -> None:
         """Shutdown any threads."""
