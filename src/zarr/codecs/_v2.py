@@ -1,0 +1,140 @@
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import numpy as np
+from numcodecs.compat import ensure_bytes, ensure_ndarray_like
+
+from zarr.abc.codec import ArrayBytesCodec
+from zarr.core.config import config
+from zarr.errors import PickleCodecDisabledError
+from zarr.registry import get_ndbuffer_class
+
+if TYPE_CHECKING:
+    from zarr.abc.numcodec import Numcodec
+    from zarr.core.array_spec import ArraySpec
+    from zarr.core.buffer import Buffer, NDBuffer
+
+
+def _check_pickle_allowed(codecs: tuple[Numcodec | None, ...]) -> None:
+    """
+    Raise if any of ``codecs`` is the pickle codec and reading pickled data has not been enabled.
+
+    Unpickling can run arbitrary code, so data from an untrusted store must not be decoded
+    with the pickle codec unless the user has explicitly opted in.
+    """
+    if not any(getattr(codec, "codec_id", None) == "pickle" for codec in codecs):
+        return
+    # Compare with ``True`` rather than testing truthiness: donfig keeps an environment
+    # variable it cannot parse as a Python literal (e.g. ``false``) as a non-empty string.
+    if config.get("array.allow_unsafe_pickle_decode") is not True:
+        raise PickleCodecDisabledError(
+            "Refusing to decode data with the 'pickle' codec, because unpickling data "
+            "from an untrusted source can execute arbitrary code. If you trust this data, "
+            "enable the pickle codec with zarr.config.set({'array.allow_unsafe_pickle_decode': True}) "
+            "or set the environment variable ZARR_ARRAY__ALLOW_UNSAFE_PICKLE_DECODE=True. numcodecs has "
+            "its own opt-in, which must be enabled as well: set "
+            "numcodecs.pickles.ALLOW_UNSAFE_PICKLE_DECODE = True, or set the environment "
+            "variable NUMCODECS_ALLOW_UNSAFE_PICKLE_DECODE=1 before importing numcodecs."
+        )
+
+
+@dataclass(frozen=True)
+class V2Codec(ArrayBytesCodec):
+    filters: tuple[Numcodec, ...] | None
+    compressor: Numcodec | None
+
+    is_fixed_size = False
+
+    def _decode_sync(
+        self,
+        chunk_bytes: Buffer,
+        chunk_spec: ArraySpec,
+    ) -> NDBuffer:
+        _check_pickle_allowed((self.compressor, *(self.filters or ())))
+        cdata = chunk_bytes.as_array_like()
+        # decompress
+        if self.compressor:
+            chunk = self.compressor.decode(cdata)
+        else:
+            chunk = cdata
+
+        # apply filters
+        if self.filters:
+            for f in reversed(self.filters):
+                chunk = f.decode(chunk)
+
+        # view as numpy array with correct dtype
+        chunk = ensure_ndarray_like(chunk)
+        # special case object dtype, because incorrect handling can lead to
+        # segfaults and other bad things happening
+        if chunk_spec.dtype.dtype_cls is not np.dtypes.ObjectDType:
+            try:
+                chunk = chunk.view(chunk_spec.dtype.to_native_dtype())
+            except TypeError:
+                # this will happen if the dtype of the chunk
+                # does not match the dtype of the array spec i.g. if
+                # the dtype of the chunk_spec is a string dtype, but the chunk
+                # is an object array. In this case, we need to convert the object
+                # array to the correct dtype.
+
+                chunk = np.array(chunk).astype(chunk_spec.dtype.to_native_dtype())
+
+        elif chunk.dtype != object:
+            # If we end up here, someone must have hacked around with the filters.
+            # We cannot deal with object arrays unless there is an object
+            # codec in the filter chain, i.e., a filter that converts from object
+            # array to something else during encoding, and converts back to object
+            # array during decoding.
+            raise RuntimeError("cannot read object array without object codec")
+
+        # ensure correct chunk shape
+        chunk = chunk.reshape(-1, order="A")
+        chunk = chunk.reshape(chunk_spec.shape, order=chunk_spec.order)
+
+        return get_ndbuffer_class().from_ndarray_like(chunk)
+
+    def _encode_sync(
+        self,
+        chunk_array: NDBuffer,
+        chunk_spec: ArraySpec,
+    ) -> Buffer | None:
+        chunk = chunk_array.as_ndarray_like()
+
+        # ensure contiguous and correct order
+        chunk = chunk.astype(chunk_spec.dtype.to_native_dtype(), order=chunk_spec.order, copy=False)
+
+        # apply filters
+        if self.filters:
+            for f in self.filters:
+                chunk = f.encode(chunk)
+        # check object encoding
+        if ensure_ndarray_like(chunk).dtype == object:
+            raise RuntimeError("cannot write object array without object codec")
+
+        # compress
+        if self.compressor:
+            cdata = self.compressor.encode(chunk)
+        else:
+            cdata = chunk
+        cdata = ensure_bytes(cdata)
+        return chunk_spec.prototype.buffer.from_bytes(cdata)
+
+    async def _decode_single(
+        self,
+        chunk_bytes: Buffer,
+        chunk_spec: ArraySpec,
+    ) -> NDBuffer:
+        return await asyncio.to_thread(self._decode_sync, chunk_bytes, chunk_spec)
+
+    async def _encode_single(
+        self,
+        chunk_array: NDBuffer,
+        chunk_spec: ArraySpec,
+    ) -> Buffer | None:
+        return await asyncio.to_thread(self._encode_sync, chunk_array, chunk_spec)
+
+    def compute_encoded_size(self, _input_byte_length: int, _chunk_spec: ArraySpec) -> int:
+        raise NotImplementedError

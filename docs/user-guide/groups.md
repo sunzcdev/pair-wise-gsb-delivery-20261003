@@ -1,0 +1,199 @@
+# Working with groups
+
+Zarr supports hierarchical organization of arrays via groups. As with arrays,
+groups can be stored in memory, on disk, or via other storage systems that
+support a similar interface.
+
+To create a group, use the [`zarr.create_group`][] function:
+
+```python exec="true" session="groups" source="above" result="ansi"
+import zarr
+root = zarr.create_group(store="memory://groups-demo")
+print(root)
+```
+
+Zarr-Python provides three related functions for making groups:
+[`zarr.create_group`][] creates a new group; [`zarr.open_group`][] creates or
+re-opens a group depending on its `mode` argument (see below); and
+[`zarr.group`][], which is kept for compatibility with Zarr-Python 2, is
+equivalent to calling [`zarr.open_group`][] with `mode='a'` (or `mode='w'`
+when `overwrite=True`).
+
+Groups have a similar API to the Group class from [h5py](https://www.h5py.org/). For example, groups can contain other groups:
+
+```python exec="true" session="groups" source="above"
+foo = root.create_group('foo')
+bar = foo.create_group('bar')
+```
+
+Groups can also contain arrays, e.g.:
+
+```python exec="true" session="groups" source="above" result="ansi"
+z1 = bar.create_array(name='baz', shape=(10000, 10000), chunks=(1000, 1000), dtype='int32')
+print(z1)
+```
+
+Members of a group can be accessed with square-bracket item access, like a
+Python `dict`, e.g.:
+
+```python exec="true" session="groups" source="above" result="ansi"
+print(root['foo'])
+```
+
+The '/' character can be used to access multiple levels of the hierarchy in one
+call, e.g.:
+
+```python exec="true" session="groups" source="above" result="ansi"
+print(root['foo/bar'])
+```
+
+```python exec="true" session="groups" source="above" result="ansi"
+print(root['foo/bar/baz'])
+```
+
+Accessing a member with `[]` returns either an [`zarr.Array`][] or a [`zarr.Group`][], depending on
+what is stored at the given path. When you expect a node of a particular kind, use
+[`zarr.Group.get_array`][] or [`zarr.Group.get_group`][] instead. These methods accept the same
+paths as `[]`, but they have precise return types and raise an error if no node exists at the
+given path, or if the node is not of the expected kind:
+
+```python exec="true" session="groups" source="above" result="ansi"
+print(root.get_group('foo'))
+```
+
+```python exec="true" session="groups" source="above" result="ansi"
+print(root.get_array('foo/bar/baz'))
+```
+
+```python exec="true" session="groups" source="above" result="ansi"
+from zarr.errors import ContainsGroupError
+
+try:
+    root.get_array('foo')
+except ContainsGroupError as e:
+    print(e)
+```
+
+The [`zarr.Group.tree`][] method can be used to print a tree
+representation of the hierarchy, e.g.:
+
+```python exec="true" session="groups" source="above" result="ansi"
+print(root.tree())
+```
+
+The [`zarr.open_group`][] function provides a convenient way to create or
+re-open a group stored in a directory on the file-system, with sub-groups stored in
+sub-directories, e.g.:
+
+```python exec="true" session="groups" source="above" result="ansi"
+root = zarr.open_group('data/group.zarr', mode='w')
+print(root)
+```
+
+```python exec="true" session="groups" source="above" result="ansi"
+z = root.create_array(name='foo/bar/baz', shape=(10000, 10000), chunks=(1000, 1000), dtype='int32')
+print(z)
+```
+
+For more information on groups see the [`zarr.Group` API docs](../api/zarr/group.md).
+
+## Exploring group contents
+
+Groups also support a dict-like interface for enumerating their contents. The
+[`zarr.Group.keys`][] method iterates over member names, and the `in` operator
+tests for membership:
+
+```python exec="true" session="groups" source="above" result="ansi"
+print(list(root.keys()))
+print('foo' in root)
+```
+
+The [`zarr.Group.members`][] method returns `(name, member)` pairs for the
+arrays and groups contained in a group:
+
+```python exec="true" session="groups" source="above" result="ansi"
+for name, member in root.members():
+    print(name, member)
+```
+
+By default only immediate members are returned. Pass `max_depth=None` to
+recursively traverse the whole hierarchy below a group:
+
+```python exec="true" session="groups" source="above" result="ansi"
+for name, member in root.members(max_depth=None):
+    print(name, member)
+```
+
+Members can be deleted with the `del` operator, which removes the member's
+metadata and data from the store:
+
+```python exec="true" session="groups" source="above" result="ansi"
+del root['foo/bar/baz']
+for name, member in root.members(max_depth=None):
+    print(name, member)
+```
+
+## Batch group creation
+
+You can also create multiple groups concurrently with a single function call. [`zarr.create_hierarchy`][] takes
+a [`Store`](../api/zarr/storage.md) instance and a dict of `key : metadata` pairs, parses that dict, and
+writes metadata documents to storage:
+
+```python exec="true" session="groups" source="above" result="ansi"
+from zarr import create_hierarchy
+from zarr.core.group import GroupMetadata
+from zarr.storage import LocalStore
+
+from pprint import pprint
+import io
+
+node_spec = {'a/b/c': GroupMetadata()}
+nodes_created = dict(create_hierarchy(store=LocalStore(root='data'), nodes=node_spec, overwrite=True))
+# Report nodes (pprint is used for cleaner rendering in the docs)
+output = io.StringIO()
+pprint(nodes_created, stream=output, width=60)
+print(output.getvalue())
+```
+
+Note that we only specified a single group named `a/b/c`, but 4 groups were created. These additional groups
+were created to ensure that the desired node `a/b/c` is connected to the root group `''` by a sequence
+of intermediate groups. [`zarr.create_hierarchy`][] normalizes the `nodes` keyword argument to
+ensure that the resulting hierarchy is complete, i.e. all groups or arrays are connected to the root
+of the hierarchy via intermediate groups.
+
+Because [`zarr.create_hierarchy`][] concurrently creates metadata documents, it's more efficient
+than repeated calls to [`create_group`][zarr.create_group] or [`create_array`][zarr.create_array], provided you can statically define
+the metadata for the groups and arrays you want to create.
+
+## Array and group diagnostics
+
+Diagnostic information about arrays and groups is available via the `info`
+property. E.g.:
+
+```python exec="true" session="groups" source="above" result="ansi"
+root = zarr.group(store="memory://diagnostics-demo")
+foo = root.create_group('foo')
+bar = foo.create_array(name='bar', shape=1000000, chunks=100000, dtype='int64')
+bar[:] = 42
+baz = foo.create_array(name='baz', shape=(1000, 1000), chunks=(100, 100), dtype='float32')
+baz[:] = 4.2
+print(root.info)
+```
+
+```python exec="true" session="groups" source="above" result="ansi"
+print(foo.info)
+```
+
+```python exec="true" session="groups" source="above" result="ansi"
+print(bar.info_complete())
+```
+
+```python exec="true" session="groups" source="above" result="ansi"
+print(baz.info)
+```
+
+Groups also have the [`zarr.Group.tree`][] method, e.g.:
+
+```python exec="true" session="groups" source="above" result="ansi"
+print(root.tree())
+```

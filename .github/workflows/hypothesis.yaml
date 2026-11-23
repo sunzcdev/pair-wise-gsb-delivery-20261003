@@ -1,0 +1,124 @@
+name: Slow Hypothesis CI
+on:
+  push:
+    branches: [main, 3.1.x]
+  pull_request:
+    branches: [main, 3.1.x]
+    types: [opened, reopened, synchronize, labeled]
+  schedule:
+    - cron: "0 0 * * *" # Daily “At 00:00” UTC
+  workflow_dispatch: # allows you to trigger manually
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: 3
+  # Use the uv from astral-sh/setup-uv instead of hatch's bundled (pyapp) uv.
+  HATCH_ENV_TYPE_VIRTUAL_UV_PATH: uv
+
+jobs:
+
+  hypothesis:
+    name: Slow Hypothesis Tests
+    permissions:
+      contents: read
+      issues: write
+    environment:
+      name: codecov-upload
+      deployment: false
+    runs-on: "ubuntu-latest"
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    strategy:
+      matrix:
+        python-version: ['3.12']
+        dependency-set: ["optional"]
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Set HYPOTHESIS_PROFILE based on trigger
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+      run: |
+        if [[ "$EVENT_NAME" == "schedule" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
+          echo "HYPOTHESIS_PROFILE=nightly" >> $GITHUB_ENV
+        else
+          echo "HYPOTHESIS_PROFILE=ci" >> $GITHUB_ENV
+        fi
+    - name: Set up Python
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'pip'
+    - name: Install uv
+      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+    - name: Install Hatch
+      uses: pypa/hatch@f647ed70d49adb885f53a27d1c7f5bdaeacf2c60
+      with:
+        version: '1.16.5'
+    - name: Install just
+      uses: extractions/setup-crate@7577c1bdf2d95e6d65d532788f35ed79d4b1dda2 # v2.0.1
+      with:
+        repo: casey/just
+        version: 1.58.0
+    - name: Set Up Hatch Env
+      env:
+        HATCH_ENV: test.py${{ matrix.python-version }}-${{ matrix.dependency-set }}
+      run: |
+        just setup
+    # https://github.com/actions/cache/blob/main/tips-and-workarounds.md#update-a-cache
+    - name: Restore cached hypothesis directory
+      id: restore-hypothesis-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .hypothesis/
+        key: cache-hypothesis-${{ runner.os }}-${{ github.run_id }}
+        restore-keys: |
+          cache-hypothesis-
+
+    - name: Run slow Hypothesis tests
+      if: success()
+      id: status
+      env:
+        HATCH_ENV: test.py${{ matrix.python-version }}-${{ matrix.dependency-set }}
+        PYTEST_ADDOPTS: "--report-log=output-${{ matrix.python-version }}-log.jsonl"
+      run: |
+        echo "Using Hypothesis profile: $HYPOTHESIS_PROFILE"
+        just hypothesis
+
+    # explicitly save the cache so it gets updated, also do this even if it fails.
+    - name: Save cached hypothesis directory
+      id: save-hypothesis-cache
+      if: always() && steps.status.outcome != 'skipped'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .hypothesis/
+        key: cache-hypothesis-${{ runner.os }}-${{ github.run_id }}
+
+    - name: Upload coverage
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        flags: tests
+        verbose: true # optional (default = false)
+
+    - name: Generate and publish the report
+      if: |
+        failure()
+        && steps.status.outcome == 'failure'
+        && github.event_name == 'schedule'
+        && github.repository_owner == 'zarr-developers'
+      uses: scientific-python/issue-from-pytest-log-action@35b4e0a9e06f8e7e261778289cf4b968b722662d # v1.6.2
+      with:
+        log-path: output-${{ matrix.python-version }}-log.jsonl
+        issue-title: "Nightly Hypothesis tests failed"
+        issue-label: "automated issue"

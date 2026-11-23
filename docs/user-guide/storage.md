@@ -1,0 +1,277 @@
+# Storage guide
+
+Zarr-Python supports multiple storage backends, including: local file systems,
+Zip files, remote stores via [fsspec](https://filesystem-spec.readthedocs.io/en/latest/) (S3, HTTP, etc.), and in-memory stores. In
+Zarr-Python 3, stores must implement the abstract store API from
+[`zarr.abc.store.Store`][].
+
+!!! note
+    Unlike Zarr-Python 2 where the store interface was built around a generic `MutableMapping`
+    API, Zarr-Python 3 utilizes a custom store API that utilizes Python's AsyncIO library.
+
+## Implicit Store Creation
+
+In most cases, it is not required to create a `Store` object explicitly. Passing a string
+(or other [StoreLike value](#user-guide-store-like)) to Zarr's top level API will result in the store
+being created automatically:
+
+```python exec="true" session="storage" source="above" result="ansi"
+import zarr
+
+# Implicitly creates a writable LocalStore
+group = zarr.create_group(store='data/foo/bar', overwrite=True)
+print(group)
+```
+
+```python exec="true" session="storage" source="above" result="ansi"
+# Implicitly creates a read-only FsspecStore
+# Note: requires s3fs to be installed
+group = zarr.open_group(
+   store='s3://noaa-nwm-retro-v2-zarr-pds',
+   mode='r',
+   storage_options={'anon': True}
+)
+print(group)
+```
+
+```python exec="true" session="storage" source="above" result="ansi"
+# Implicitly creates a MemoryStore
+data = {}
+group = zarr.create_group(store=data)
+print(group)
+```
+
+### StoreLike {#user-guide-store-like}
+
+`StoreLike` values can be:
+
+- a `Path` or string indicating a location on the local file system.
+  This will create a [local store](#local-store):
+
+   ```python exec="true" session="storage" source="above" result="ansi"
+   group = zarr.open_group(store='data/foo/bar')
+   print(group)
+   ```
+
+   ```python exec="true" session="storage" source="above" result="ansi"
+   from pathlib import Path
+   group = zarr.open_group(store=Path('data/foo/bar'))
+   print(group)
+   ```
+
+- an FSSpec URI string, indicating a [remote store](#remote-store) location:
+
+   ```python exec="true" session="storage" source="above" result="ansi"
+   # Note: requires s3fs to be installed
+   group = zarr.open_group(
+      store='s3://noaa-nwm-retro-v2-zarr-pds',
+      mode='r',
+      storage_options={'anon': True}
+   )
+   print(group)
+   ```
+
+- an empty dictionary or None, which will create a new [memory store](#memory-store):
+
+   ```python exec="true" session="storage" source="above" result="ansi"
+   group = zarr.create_group(store={})
+   print(group)
+   ```
+
+   ```python exec="true" session="storage" source="above" result="ansi"
+   group = zarr.create_group(store=None)
+   print(group)
+   ```
+
+- a dictionary of string to [`Buffer`][zarr.abc.buffer.Buffer] mappings. This will
+  create a [memory store](#memory-store), using this dictionary as the
+  [`store_dict` argument][zarr.storage.MemoryStore].
+
+- an FSSpec [FSMap object](https://filesystem-spec.readthedocs.io/en/latest/api.html#fsspec.FSMap),
+  which will create an [FsspecStore](#remote-store).
+
+- a [universal-pathlib](https://github.com/fsspec/universal_pathlib) `UPath`, which will create an
+  [FsspecStore](#remote-store), or a [local store](#local-store) if the `UPath` is local. Put your
+  storage options on the `UPath` itself; passing a separate `storage_options` argument alongside
+  one raises `TypeError`.
+
+   ```python exec="false" reason="requires universal-pathlib, which is not in the docs environment"
+   from upath import UPath
+   group = zarr.open_group(UPath('s3://noaa-nwm-retro-v2-zarr-pds', anon=True), mode='r')
+   ```
+
+- a [`URLPipeline`][zarr.storage.URLPipeline], the parsed form of a
+  [URL pipeline](#user-guide-url-pipelines) such as `s3://bucket/data.zip|zip:`, which
+  is resolved through registered adapters.
+
+- a [`Store`][zarr.abc.store.Store] or [`StorePath`][zarr.storage.StorePath] -
+  see explicit store creation below.
+
+## URL Pipelines {#user-guide-url-pipelines}
+
+Zarr supports [URL pipelines](https://github.com/jbms/url-pipeline): `|`-chained URLs
+read left to right. The first sub-URL locates a resource with a conventional URL; each
+later sub-URL names an *adapter* that reinterprets everything to its left (e.g.
+`s3://bucket/data.zip|zip:|zarr3:`). Adapters are provided by packages; see
+[custom URL pipeline adapters](extending.md#custom-url-pipeline-adapters).
+
+Parse a pipeline with [`URLPipeline.from_url`][zarr.storage.URLPipeline.from_url] and
+pass it to any function that accepts a `StoreLike`. At present, this is the only way a string is
+read as a pipeline: a plain string store specification currently maintains its existing meaning, so a
+local path containing `|` still names a directory.
+
+```python exec="true" session="storage" source="above" result="ansi"
+from zarr.storage import URLPipeline
+
+pipeline = URLPipeline.from_url("memory://pipeline-demo|zarr2:")
+group = zarr.open_group(pipeline, mode="w")
+print(zarr.open_group(pipeline, mode="r").metadata.zarr_format)
+```
+
+A trailing `zarr2:` or `zarr3:` *format segment* selects the zarr format,
+and its body (`zarr3:path/to/node`) is the node path; `zarr:` gives a node path and
+detects the format. A conflicting `zarr_format` argument raises `ValueError`, including
+the default `zarr_format=3` of `zarr.create_array`, `Group.open`, `Group.from_store` and
+`Array.open`.
+
+The root sub-URL must carry a scheme, so a local path is spelled as an absolute `file:`
+URL (`file:/data/x.zarr`, with at most a `localhost` authority). Every `memory:` root
+addresses one managed in-memory store, and its body is a path within it (`memory:a` ≡
+`memory:/a` ≡ `memory://a`); data lives only while some store object refers to it.
+Neither root accepts `.` or `..` path components, and drive letters are only special on
+Windows. No percent-escape is decoded anywhere in a pipeline. Other roots, such as
+`s3://...`, are opened exactly as the same plain string would be.
+
+`storage_options` configure the root sub-URL, and every adapter in the pipeline can
+see them. When a pipeline may come from an untrusted source, keep credentials out of
+`storage_options` unless you trust every installed adapter, and don't accept `memory:`
+roots in a process that serves several users: the in-memory store is process-wide.
+
+For complex store configurations, explicit store creation, as described below, may be
+required.
+
+## Explicit Store Creation
+
+In some cases, it may be helpful to create a store instance directly. Zarr-Python offers
+built-in stores: [`zarr.storage.LocalStore`][], [`zarr.storage.FsspecStore`][],
+[`zarr.storage.ZipStore`][], [`zarr.storage.MemoryStore`][], and [`zarr.storage.ObjectStore`][].
+
+### Local Store
+
+The [`zarr.storage.LocalStore`][] stores data in a nested set of directories on a local
+filesystem:
+
+```python exec="true" session="storage" source="above" result="ansi"
+store = zarr.storage.LocalStore('data/foo/bar', read_only=True)
+group = zarr.open_group(store=store, mode='r')
+print(group)
+```
+
+### Zip Store
+
+The [`zarr.storage.ZipStore`][] stores the contents of a Zarr hierarchy in a single
+Zip file. The [Zip Store specification](https://github.com/zarr-developers/zarr-specs/pull/311) is currently in draft form:
+
+```python exec="true" session="storage" source="above" result="ansi"
+store = zarr.storage.ZipStore('data.zip', mode='w')
+array = zarr.create_array(store=store, shape=(2,), dtype='float64')
+print(array)
+```
+
+In place of a path, `ZipStore` also accepts an open binary file object (for
+example a file opened with `fsspec`, or an `obstore` reader), enabling zip
+archives on remote storage. The file must stay open for as long as the store
+is in use:
+
+```python exec="true" session="storage" source="above" result="ansi"
+store.close()
+f = open('data.zip', mode='rb')  # must stay open while the store is used
+array = zarr.open_array(store=zarr.storage.ZipStore(f), mode='r')
+print(array[:])
+f.close()
+```
+
+### Remote Store
+
+The [`zarr.storage.FsspecStore`][] stores the contents of a Zarr hierarchy following the same
+logical layout as the [`LocalStore`][zarr.storage.LocalStore], except the store is assumed to be on a remote storage system
+such as cloud object storage (e.g. AWS S3, Google Cloud Storage, Azure Blob Store). The
+[`zarr.storage.FsspecStore`][] is backed by [fsspec](https://filesystem-spec.readthedocs.io/en/latest/) and can support any backend
+that implements the [AbstractFileSystem](https://filesystem-spec.readthedocs.io/en/stable/api.html#fsspec.spec.AbstractFileSystem)
+API. `storage_options` can be used to configure the fsspec backend:
+
+```python exec="true" session="storage" source="above" result="ansi"
+# Note: requires s3fs to be installed
+store = zarr.storage.FsspecStore.from_url(
+   's3://noaa-nwm-retro-v2-zarr-pds',
+   read_only=True,
+   storage_options={'anon': True}
+)
+group = zarr.open_group(store=store, mode='r')
+print(group)
+```
+
+The type of filesystem (e.g. S3, https, etc..) is inferred from the scheme of the url (e.g. s3 for "**s3**://noaa-nwm-retro-v2-zarr-pds").
+In case a specific filesystem is needed, one can explicitly create it. For example to create an S3 filesystem
+(note that the filesystem must be created with `asynchronous=True`):
+
+```python exec="true" session="storage" source="above" result="ansi"
+# Note: requires s3fs to be installed
+import fsspec
+fs = fsspec.filesystem('s3', anon=True, asynchronous=True)
+store = zarr.storage.FsspecStore(fs, path='noaa-nwm-retro-v2-zarr-pds', read_only=True)
+print(store)
+```
+
+When using an S3-compatible service other than AWS, pass the service endpoint to the
+filesystem via `client_kwargs={'endpoint_url': 'https://...'}`.
+
+### Memory Store
+
+The [`zarr.storage.MemoryStore`][] stores Zarr data (metadata and chunks) in an
+in-memory dictionary:
+
+```python exec="true" session="storage" source="above" result="ansi"
+data = {}
+store = zarr.storage.MemoryStore(data)
+array = zarr.create_array(store=store, shape=(2,), dtype='float64')
+print(array)
+```
+
+### Object Store
+
+[`zarr.storage.ObjectStore`][] stores the contents of the Zarr hierarchy using any ObjectStore
+[storage implementation](https://developmentseed.org/obstore/latest/api/store/), including AWS S3 ([`obstore.store.S3Store`][]), Google Cloud Storage ([`obstore.store.GCSStore`][]), and Azure Blob Storage ([`obstore.store.AzureStore`][]). This store is backed by [obstore](https://developmentseed.org/obstore/latest/), which
+builds on the production quality Rust library [object_store](https://docs.rs/object_store/latest/object_store/).
+
+```python exec="true" session="storage" source="above" result="ansi"
+from zarr.storage import ObjectStore
+from obstore.store import MemoryStore
+
+store = ObjectStore(MemoryStore())
+array = zarr.create_array(store=store, shape=(2,), dtype='float64')
+print(array)
+```
+
+Here's an example of using ObjectStore for accessing remote data:
+
+```python exec="true" session="storage" source="above" result="ansi"
+from zarr.storage import ObjectStore
+from obstore.store import S3Store
+
+s3_store = S3Store('noaa-nwm-retro-v2-zarr-pds', skip_signature=True, region="us-west-2")
+store = zarr.storage.ObjectStore(store=s3_store, read_only=True)
+group = zarr.open_group(store=store, mode='r')
+print(group.info)
+```
+
+!!! warning
+    The [`zarr.storage.ObjectStore`][] class is experimental.
+
+## Developing custom stores
+
+Zarr-Python [`zarr.abc.store.Store`][] API is meant to be extended. The Store Abstract Base
+Class includes all of the methods needed to be a fully operational store in Zarr Python.
+Zarr also provides a test harness for custom stores: [`zarr.testing.store.StoreTests`][].
+See the [Custom stores](extending.md#custom-stores) section of the extending guide for
+more on implementing your own store.

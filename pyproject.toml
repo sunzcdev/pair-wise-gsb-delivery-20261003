@@ -1,0 +1,505 @@
+[build-system]
+requires = ["hatchling>=1.29.0", "hatch-vcs", "setuptools-scm>=9"]
+build-backend = "hatchling.build"
+
+# An allowlist, not a blocklist: anything new — a subpackage under `packages/`, a
+# config file in the repository root — stays out of the sdist unless it is named
+# here. Beyond `src` and `tests`, the entries are what keeps the shipped test
+# suite and docs build runnable from an unpacked sdist: `tests/test_docs.py`
+# walks `docs/` and `testpaths` collects `docs/user-guide`; the pages under
+# `docs/user-guide/examples/` pull their source out of `examples/` via pymdownx
+# snippet includes; `mkdocs.yml` and `mkdocs_hooks.py` let `mkdocs build` run
+# too. `pyproject.toml`, `README.md`, `LICENSE.txt` and `.gitignore` are added by
+# hatchling itself.
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  "/docs",
+  "/examples",
+  "/mkdocs.yml",
+  "/mkdocs_hooks.py",
+  "/Justfile",
+  "/ci",
+]
+
+[project]
+name = "zarr"
+description = "An implementation of chunked, compressed, N-dimensional arrays for Python"
+readme = { file = "README.md", content-type = "text/markdown" }
+authors = [
+    { name = "Alistair Miles", email = "alimanfoo@googlemail.com" },
+]
+maintainers = [
+    { name = "Davis Bennett", email = "davis.v.bennett@gmail.com" },
+    { name = "jakirkham" },
+    { name = "Josh Moore", email = "josh@openmicroscopy.org" },
+    { name = "Joe Hamman", email = "joe@earthmover.io" },
+    { name = "Juan Nunez-Iglesias", email = "juan.nunez-iglesias@monash.edu" },
+    { name = "Martin Durant", email = "mdurant@anaconda.com" },
+    { name = "Norman Rzepka" },
+    { name = "Ryan Abernathey" },
+    { name = "David Stansby" },
+    { name = "Tom Augspurger", email = "tom.w.augspurger@gmail.com" },
+    { name = "Deepak Cherian" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    'packaging>=24.0',
+    'numpy>=2',
+    # 0.16.6 and 0.17.1 refuse to unpickle untrusted data (GHSA-jqc8-qjfv-5m6r); 0.17.0 does not.
+    'numcodecs>=0.16.6,!=0.17.0',
+    'google-crc32c>=1.5',
+    'typing_extensions>=4.14',
+    'donfig>=0.8',
+    'msgspec>=0.19',
+]
+
+dynamic = [
+  "version",
+]
+classifiers = [
+    'Development Status :: 6 - Mature',
+    'Intended Audience :: Developers',
+    'Intended Audience :: Information Technology',
+    'Intended Audience :: Science/Research',
+    'Programming Language :: Python',
+    'Topic :: Software Development :: Libraries :: Python Modules',
+    'Operating System :: Unix',
+    'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+    'Programming Language :: Python :: 3.14',
+    'Programming Language :: Python :: 3.15',
+]
+license = "MIT"
+license-files = ["LICENSE.txt"]
+keywords = ["Python", "compressed", "ndimensional-arrays", "zarr"]
+
+[project.optional-dependencies]
+# User-facing extras (shipped in package metadata)
+remote = [
+    "fsspec>=2023.10.0",
+    "obstore>=0.5.1",
+]
+gpu = [
+    "cupy-cuda12x; sys_platform != 'darwin'",
+]
+cast-value-rs = ["cast-value-rs>=0.5.1"]
+cli = ["typer"]
+optional = ["universal-pathlib"]
+
+[project.scripts]
+zarr = "zarr._cli.cli:app"
+
+
+[project.urls]
+issues = "https://github.com/zarr-developers/zarr-python/issues"
+changelog = "https://zarr.readthedocs.io/en/stable/release-notes.html"
+Discussions = "https://github.com/zarr-developers/zarr-python/discussions"
+documentation = "https://zarr.readthedocs.io/"
+homepage = "https://github.com/zarr-developers/zarr-python"
+
+# Dev *tooling* is pinned to exact versions for reproducible CI: the hatch envs
+# (see `tool.hatch.envs.*`) and bare `uv run` resolve these groups fresh from
+# PyPI and do NOT consult uv.lock, so an unrelated tooling release can break CI
+# without any change on our side (e.g. the pytest 9.1.0 `duplicate
+# parametrization` regression). Runtime/integration deps (fsspec, obstore, s3fs,
+# botocore, numcodecs, universal-pathlib) are intentionally left floating so the
+# `optional` test matrix keeps exercising their latest releases; their floor and
+# bleeding edge are covered by the `min_deps` and `upstream` hatch envs. Bump the
+# pins deliberately, e.g. via dependabot or `uv lock --upgrade`.
+[dependency-groups]
+test = [
+    "coverage==7.17.2",
+    "pytest==9.2.0",
+    "pytest-asyncio==1.4.1.post1",
+    "pytest-cov==7.1.0",
+    "numpydoc==1.11.0",
+    "hypothesis==6.170.15",
+    "pytest-reportlog==1.0.0",
+    "pytest-xdist==3.8.0",
+    "pytest-benchmark==5.3.1",
+    "pytest-codspeed==5.0.4",
+    "uv==0.13.7",
+]
+remote-tests = [
+    {include-group = "test"},
+    "fsspec>=2023.10.0",
+    "obstore>=0.5.1",
+    "botocore",
+    "s3fs>=2023.10.0",
+    "moto[s3,server]==5.2.5",
+    "requests==2.34.2",
+]
+release = [
+    "towncrier==26.9.0",
+]
+docs = [
+    # Doc building
+    "mkdocs-material[imaging]==9.8.1",
+    "mkdocs==1.6.1",
+    "mkdocstrings==1.0.8",
+    "mkdocstrings-python==2.0.10",
+    "mike==2.2.0",
+    "mkdocs-redirects==1.2.3",
+    "markdown-exec[ansi]==1.13.0",
+    "griffe-inherited-docstrings==1.1.4",
+    "ruff==0.17.4",
+    # Changelog generation
+    {include-group = "release"},
+    # Optional dependencies to run examples
+    "numcodecs[msgpack]",
+    "s3fs>=2023.10.0",
+    "astroid==4.3.4",
+    "pytest==9.2.0",
+]
+dev = [
+    {include-group = "test"},
+    {include-group = "remote-tests"},
+    {include-group = "docs"},
+    "universal-pathlib",
+    "mypy==2.4.1",
+]
+
+[tool.coverage.report]
+exclude_also = [
+    'if TYPE_CHECKING:',
+]
+
+[tool.coverage.run]
+omit = [
+    "bench/compress_normal.py",
+]
+
+[tool.hatch]
+version.source = "vcs"
+# Only consider zarr-python's own `v*` tags when deriving the version. Without
+# this filter `git describe` matches the most recent tag of any shape,
+# including the `zarr_metadata-v*` and `zarr_http_server-v*` tags used to
+# release the subpackages under `packages/` — which would make a from-source
+# build report e.g. a `0.2.x` version instead of `3.x`.
+version.raw-options = { scm = { git = { describe_command = "git describe --dirty --tags --long --match v*" } } }
+
+[tool.hatch.build]
+hooks.vcs.version-file = "src/zarr/_version.py"
+
+[tool.hatch.envs.dev]
+dependency-groups = ["dev"]
+
+[tool.hatch.envs.test]
+dependency-groups = ["test"]
+
+[tool.hatch.envs.test.env-vars]
+
+[[tool.hatch.envs.test.matrix]]
+python = ["3.12", "3.13", "3.14", "3.15"]
+deps = ["minimal", "optional"]
+
+[tool.hatch.envs.test.overrides]
+matrix.deps.features = [
+  {value = "remote", if = ["optional"]},
+  {value = "optional", if = ["optional"]},
+  {value = "cli", if = ["optional"]},
+  {value = "cast-value-rs", if = ["optional"]},
+]
+matrix.deps.dependency-groups = [
+  {value = "remote-tests", if = ["optional"]},
+]
+
+[tool.hatch.envs.gputest]
+template = "test"
+extra-dependencies = [
+    "universal_pathlib",
+    # Needed so tests/test_docs.py is collectable under `pytest -m gpu`; otherwise its
+    # module-level importorskip("pytest_examples") skips the whole module and the gpu
+    # docs example is never executed on GPU hardware.
+    "pytest-examples",
+]
+features = ["gpu"]
+
+[[tool.hatch.envs.gputest.matrix]]
+python = ["3.12", "3.13"]
+
+[tool.hatch.envs.upstream]
+template = 'test'
+python = "3.14"
+extra-dependencies = [
+    'packaging @ git+https://github.com/pypa/packaging',
+    'numpy',  # from scientific-python-nightly-wheels
+    'numcodecs @ git+https://github.com/zarr-developers/numcodecs',
+    's3fs @ git+https://github.com/fsspec/s3fs',
+    'universal_pathlib @ git+https://github.com/fsspec/universal_pathlib',
+    'typing_extensions @ git+https://github.com/python/typing_extensions',
+    'donfig @ git+https://github.com/pytroll/donfig',
+    'obstore @ git+https://github.com/developmentseed/obstore@main#subdirectory=obstore',
+]
+
+[tool.hatch.envs.upstream.env-vars]
+PIP_INDEX_URL = "https://pypi.anaconda.org/scientific-python-nightly-wheels/simple/"
+PIP_EXTRA_INDEX_URL = "https://pypi.org/simple/"
+PIP_PRE = "1"
+
+[tool.hatch.envs.min_deps]
+description = """Test environment for minimum supported dependencies
+
+See Spec 0000 for details and drop schedule: https://scientific-python.org/specs/spec-0000/
+"""
+template = "test"
+python = "3.12"
+features = ["remote"]
+dependency-groups = ["remote-tests"]
+extra-dependencies = [
+    'packaging==24.*',
+    'numpy==2.0.*',
+    'numcodecs==0.16.*',
+    'fsspec==2023.10.0',
+    's3fs==2023.10.0',
+    'universal_pathlib==0.2.0',
+    'typing_extensions==4.14.*',
+    'donfig==0.8.*',
+    'obstore==0.5.*',
+    'msgspec==0.19.*',
+]
+
+[tool.hatch.envs.default]
+installer = "uv"
+
+[tool.hatch.envs.doctest]
+description = "Test environment for validating executable code blocks in documentation"
+features = ['remote']
+dependency-groups = ['remote-tests']
+extra-dependencies = [
+    "pytest-examples",
+]
+
+[tool.ruff]
+line-length = 100
+force-exclude = true
+extend-exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".ruff_cache",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "venv",
+    "docs",
+    "tests/test_regression/scripts/", # these are scripts that use a different version of python
+    "src/zarr/v2/",
+    "tests/v2/",
+]
+
+[tool.ruff.lint]
+extend-select = [
+    "ANN",  # flake8-annotations
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "EXE",  # flake8-executable
+    "FA",   # flake8-future-annotations
+    "FLY",  # flynt
+    "FURB", # refurb
+    "G",    # flake8-logging-format
+    "I",    # isort
+    "ISC",  # flake8-implicit-str-concat
+    "LOG",  # flake8-logging
+    "PERF", # Perflint
+    "PIE",  # flake8-pie
+    "PGH",  # pygrep-hooks
+    "PT",   # flake8-pytest-style
+    "PYI",  # flake8-pyi
+    "RET",  # flake8-return
+    "RSE",  # flake8-raise
+    "RUF",
+    "S101", # flake8-bandit: no assert in runtime code
+    "SIM",  # flake8-simplify
+    "SLOT", # flake8-slots
+    "TC",  # flake8-type-checking
+    "TRY",  # tryceratops
+    "UP",   # pyupgrade
+    "W",    # pycodestyle warnings
+]
+ignore = [
+    "ANN401",
+    "PT011",  # TODO: apply this rule
+    "RET505",
+    "RET506",
+    "RUF005",
+    "RUF043",
+    "SIM108",
+    "TRY003",
+    # https://docs.astral.sh/ruff/formatter/#conflicting-lint-rules
+    "W191",
+    "E111",
+    "E114",
+    "E117",
+    "D206",
+    "D300",
+    "Q000",
+    "Q001",
+    "Q002",
+    "Q003",
+    "COM812",
+    "COM819",
+    "TC006",
+]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"tests/**" = ["ANN001", "ANN201", "RUF029", "SIM117", "SIM300"]
+# S101 (no assert) is for runtime code only. Tests, examples, and test-support
+# packages (store conformance suite, hypothesis strategies) assert on purpose.
+# The globs cover the root package and every package under packages/.
+"**/tests/**" = ["S101"]
+"**/examples/**" = ["S101"]
+"**/testing/**" = ["S101"]
+
+[tool.mypy]
+files = ["src", "tests"]
+python_version = "3.12"
+ignore_missing_imports = true
+namespace_packages = false
+pretty = true
+show_error_code_links = true
+show_error_context = true
+strict = true
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool", "truthy-iterable"]
+
+[[tool.mypy.overrides]]
+module = [
+    "tests.package_with_entrypoint.*",
+    "zarr.testing.stateful",
+    "tests.test_codecs.test_transpose",
+    "tests.test_config",
+    "tests.test_store.test_zip",
+    "tests.test_store.test_local",
+    "tests.test_store.test_memory",
+    "tests.test_codecs.test_codecs",
+    "tests.test_metadata.*",
+    "tests.test_store.test_core",
+    "tests.test_store.test_logging",
+    "tests.test_store.test_object",
+    "tests.test_store.test_stateful",
+    "tests.test_store.test_wrapper",
+]
+strict = false
+
+# TODO: Move the next modules up to the strict = false section
+# and fix the errors
+[[tool.mypy.overrides]]
+module = [
+    "tests.test_store.test_fsspec",
+    "tests.test_group",
+    "tests.test_indexing",
+    "tests.test_properties",
+    "tests.test_sync",
+    "tests.test_regression.scripts.*"
+]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+minversion = "9"
+testpaths = ["src", "tests", "docs/user-guide"]
+log_cli_level = "INFO"
+log_level = "INFO"
+# Enables strict_config, strict_markers, strict_xfail, strict_parametrization_ids, and
+# any strictness options added in future pytest releases. Note that the equivalent
+# `--strict-config`/`--strict-markers` flags were silently ignored when passed via
+# addopts before pytest 9.1 (pytest#14442), so this option is the reliable spelling.
+strict = true
+# Turn deadlocks into loud failures: if a single test exceeds this many seconds, dump
+# every thread's traceback and kill the run (exit_on_timeout is new in pytest 9). Sized
+# far above the slowest legitimate test (~20s locally; slower under coverage/Windows/
+# nightly stateful-hypothesis runs) so only a genuine hang can trip it.
+faulthandler_timeout = 600
+faulthandler_exit_on_timeout = true
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+doctest_optionflags = [
+    "NORMALIZE_WHITESPACE",
+    "ELLIPSIS",
+    "IGNORE_EXCEPTION_DETAIL",
+]
+addopts = [
+    "--benchmark-columns", "min,mean,stddev,outliers,rounds,iterations",
+    "--benchmark-disable", # benchmark routines run as tests without benchmarking instrumentation
+    "--durations", "10",
+    "-ra",
+    "--doctest-modules",
+    "--ignore=tests/test_regression/scripts",
+    "--ignore=src/zarr/_cli",
+]
+filterwarnings = [
+    "error",
+    "ignore:Unclosed client session <aiohttp.client.ClientSession.*:ResourceWarning",
+    "ignore:Numcodecs codecs are not in the Zarr version 3 specification.*:UserWarning",
+    # s3fs finalizers can fail during session cleanup when aiobotocore sessions are garbage
+    # collected without being entered. This is a known issue in s3fs/aiobotocore, and pytest
+    # per-test filterwarnings markers can't catch it (https://github.com/pytest-dev/pytest/issues/14096).
+    "ignore:Exception ignored ((on calling weakref callback)|(in[\\s\\S]*Session was never entered)):pytest.PytestUnraisableExceptionWarning",
+    # pytest-asyncio implicitly creates an event loop in _get_event_loop_no_warn during
+    # fixture setup/teardown and never closes it (allocation site verified with
+    # PYTHONTRACEMALLOC: pytest_asyncio/plugin.py). When the garbage collector reclaims
+    # that loop (and its self-pipe socketpair: AF_UNIX family=1 on POSIX, emulated with
+    # AF_INET family=2 on Windows) mid-test, the unraisable hook fails whichever unrelated
+    # test happens to be running — the long-standing "random cross-file failure" in the
+    # pipeline suites. The message contains only the __del__ repr, so these patterns cannot
+    # scope to pytest-asyncio specifically: a loop/socketpair leak in zarr's own sync
+    # machinery would also be silenced. Accepted tradeoff — revisit if zarr.core.sync grows
+    # loop-lifecycle changes.
+    "ignore:Exception ignored in[\\s\\S]*<function BaseEventLoop.__del__:pytest.PytestUnraisableExceptionWarning",
+    "ignore:Exception ignored in[\\s\\S]*<socket.socket fd=\\d+, family=(1|2), type=1:pytest.PytestUnraisableExceptionWarning",
+]
+markers = [
+    "gpu: mark a test as requiring CuPy and GPU",
+    "s3: mark a test as requiring a (mock) S3 backend via moto",
+    "slow_hypothesis: slow hypothesis tests",
+    "examples: runs a script in examples/; skipped unless --run-examples is passed",
+]
+
+[tool.repo-review]
+ignore = [
+	"PC111",  # fix Python code in documentation - enable later
+    "PC140",  # we run mypy via `uv run mypy`, not via mirrors-mypy
+    "PC170",  # use PyGrep hooks - no *.rst files to check
+	"PC180",  # for JavaScript - not interested
+	"PC902",  # pre-commit.ci custom autofix message - not using autofix
+]
+
+[tool.numpydoc_validation]
+# See https://numpydoc.readthedocs.io/en/latest/validation.html#built-in-validation-checks for list of checks
+checks = [
+    # Requires third-party support; see https://github.com/numpy/numpydoc/issues/463
+    # "GL06",
+    # "GL07",
+    # Currently broken; see https://github.com/numpy/numpydoc/issues/573
+    # "GL09",
+    "GL10",
+    "SS04",
+    "PR02",
+    "PR03",
+    "PR05",
+    "PR06",
+]
+
+[tool.towncrier]
+directory = 'changes'
+filename = "docs/release-notes.md"
+underlines = ["", "", ""]
+title_format = "## {version} ({project_date})"
+issue_format = "[#{issue}](https://github.com/zarr-developers/zarr-python/pull/{issue})"
+start_string = "<!-- towncrier release notes start -->\n"
+
+[tool.codespell]
+ignore-words-list = "astroid"
+
+[project.entry-points.pytest11]
+zarr = "zarr.testing"

@@ -1,0 +1,62 @@
+# Installation
+
+## Required dependencies
+
+Required dependencies include:
+
+- [Python](https://docs.python.org/3/) (3.12 or later)
+- [packaging](https://packaging.pypa.io/en/stable/) (24.0 or later)
+- [numpy](https://numpy.org) (2.0 or later)
+- [numcodecs](https://numcodecs.readthedocs.io/en/stable/) (0.14 or later)
+- [google-crc32c](https://github.com/googleapis/python-crc32c) (1.5 or later)
+- [typing_extensions](https://typing-extensions.readthedocs.io/en/latest/) (4.14 or later)
+- [donfig](https://donfig.readthedocs.io/en/latest/) (0.8 or later)
+
+## pip
+
+Zarr is available on [PyPI](https://pypi.org/project/zarr/). Install it using `pip`:
+
+```console
+pip install zarr
+```
+
+There are a number of optional dependency groups you can install for extra functionality.
+These can be installed using `pip install "zarr[<extra>]"`, e.g. `pip install "zarr[gpu]"`
+
+- `remote`: support for reading/writing to remote data stores (fsspec, obstore)
+- `gpu`: support for GPUs (cupy)
+- `cli`: support for the `zarr` [command-line interface](cli.md) (typer)
+- `optional`: support for path-like access to local and remote stores (universal-pathlib)
+- `cast-value-rs`: support for the `cast_value` codec (cast-value-rs)
+
+## conda
+
+Zarr is also published to [conda-forge](https://conda-forge.org). Install it using `conda`:
+
+```console
+conda install -c conda-forge zarr
+```
+
+Conda does not support optional dependencies, so you will have to manually install any packages
+needed to enable extra functionality.
+
+## Nightly wheels
+
+Development wheels are built nightly and published to the [scientific-python-nightly-wheels](https://anaconda.org/scientific-python-nightly-wheels) index. To install the latest nightly build:
+
+```console
+pip install --pre --extra-index-url https://pypi.anaconda.org/scientific-python-nightly-wheels/simple zarr
+```
+
+Note that nightly wheels may be unstable and are intended for testing purposes.
+
+## Dependency support
+
+Zarr has endorsed [Scientific-Python SPEC 0](https://scientific-python.org/specs/spec-0000/) and now follows the version support window as outlined below:
+
+- Python: 36 months after initial release
+- Core package dependencies (e.g. NumPy): 24 months after initial release
+
+## Development
+
+To install the latest development version of Zarr, see the [contributing guide](../contributing.md).

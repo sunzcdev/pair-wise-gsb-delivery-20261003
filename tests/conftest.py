@@ -1,0 +1,652 @@
+from __future__ import annotations
+
+import itertools
+import math
+import os
+import pathlib
+import re
+import sys
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, cast
+
+import numpy as np
+import numpy.typing as npt
+import pytest
+from hypothesis import HealthCheck, Verbosity, settings
+from hypothesis import strategies as st
+
+import zarr.registry
+from zarr import AsyncGroup, config
+from zarr.abc.store import Store
+from zarr.codecs.sharding import IndexLocation, ShardingCodec
+from zarr.core.array import (
+    _parse_chunk_encoding_v2,
+    _parse_chunk_encoding_v3,
+    _parse_chunk_key_encoding,
+)
+from zarr.core.chunk_grids import (
+    SHARDED_INNER_CHUNK_MAX_BYTES,
+    guess_chunks,
+    normalize_chunks_nd,
+    resolve_outer_and_inner_chunks,
+)
+from zarr.core.common import (
+    JSON,
+    DimensionNamesLike,
+    MemoryOrder,
+    ShapeLike,
+    ZarrFormat,
+    parse_shapelike,
+)
+from zarr.core.config import config as zarr_config
+from zarr.core.dtype import (
+    data_type_registry,
+    get_data_type_from_native_dtype,
+)
+from zarr.core.dtype.common import HasItemSize
+from zarr.core.metadata.v2 import ArrayV2Metadata
+from zarr.core.metadata.v3 import ArrayV3Metadata, create_chunk_grid_metadata
+from zarr.core.sync import sync
+from zarr.storage import FsspecStore, LocalStore, MemoryStore, StorePath, ZipStore
+from zarr.testing.store import LatencyStore
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+    from contextlib import AbstractContextManager
+    from typing import Any, Literal
+
+    from zarr.abc.codec import Codec
+    from zarr.core.array import CompressorsLike, FiltersLike, SerializerLike, ShardsLike
+    from zarr.core.chunk_key_encodings import (
+        ChunkKeyEncoding,
+        ChunkKeyEncodingLike,
+        V2ChunkKeyEncoding,
+    )
+    from zarr.core.dtype.wrapper import ZDType
+
+
+@dataclass(frozen=True)
+class Expect[TIn, TOut]:
+    """A test case with explicit input, expected output, and a human-readable id."""
+
+    input: TIn
+    output: TOut
+    id: str
+
+
+@dataclass(frozen=True)
+class ExpectFail[TIn]:
+    """A test case that should raise an exception.
+
+    `msg` is a regex matched against the exception text (pytest's native
+    `match=` semantics). Leave it `None` to assert only the exception type. Set
+    `escape=True` when `msg` is a literal that contains regex metacharacters
+    such as `(`, `[`, or `.`; `escape` has no effect when `msg` is `None`.
+    """
+
+    input: TIn
+    exception: type[Exception]
+    id: str
+    msg: str | None = None
+    escape: bool = False
+
+    def raises(self) -> AbstractContextManager[pytest.ExceptionInfo[Exception]]:
+        if self.msg is None:
+            return pytest.raises(self.exception)
+        pattern = re.escape(self.msg) if self.escape else self.msg
+        return pytest.raises(self.exception, match=pattern)
+
+
+async def parse_store(
+    store: Literal["local", "memory", "fsspec", "zip", "memory_get_latency"], path: str
+) -> LocalStore | MemoryStore | FsspecStore | ZipStore | LatencyStore:
+    if store == "local":
+        return await LocalStore.open(path)
+    if store == "memory":
+        return await MemoryStore.open()
+    if store == "fsspec":
+        return await FsspecStore.open(url=path)
+    if store == "zip":
+        return await ZipStore.open(f"{path}/zarr.zip", mode="w")
+    if store == "memory_get_latency":
+        return LatencyStore(MemoryStore(), get_latency=0.0001, set_latency=0.0)
+    raise AssertionError
+
+
+@pytest.fixture(params=[str, pathlib.Path])
+def path_type(request: pytest.FixtureRequest) -> Any:
+    return request.param
+
+
+# todo: harmonize this with local_store fixture
+@pytest.fixture
+async def store_path(tmp_path: pathlib.Path) -> StorePath:
+    store = await LocalStore.open(str(tmp_path))
+    return StorePath(store)
+
+
+@pytest.fixture
+async def local_store(tmp_path: pathlib.Path) -> LocalStore:
+    return await LocalStore.open(str(tmp_path))
+
+
+@pytest.fixture
+async def remote_store(url: str) -> FsspecStore:
+    return await FsspecStore.open(url)
+
+
+@pytest.fixture
+async def memory_store() -> MemoryStore:
+    return await MemoryStore.open()
+
+
+@pytest.fixture
+async def zip_store(tmp_path: pathlib.Path) -> ZipStore:
+    return await ZipStore.open(str(tmp_path / "zarr.zip"), mode="w")
+
+
+@pytest.fixture
+async def store(request: pytest.FixtureRequest, tmp_path: pathlib.Path) -> Store:
+    param = request.param
+    return await parse_store(param, str(tmp_path))
+
+
+@pytest.fixture
+async def store2(request: pytest.FixtureRequest, tmp_path: pathlib.Path) -> Store:
+    """Fixture to create a second store for testing copy operations between stores"""
+    param = request.param
+    store2_path = tmp_path / "store2"
+    store2_path.mkdir()
+    return await parse_store(param, str(store2_path))
+
+
+@pytest.fixture(params=["local", "memory", "zip"])
+def sync_store(request: pytest.FixtureRequest, tmp_path: pathlib.Path) -> Store:
+    result = sync(parse_store(request.param, str(tmp_path)))
+    if not isinstance(result, Store):
+        raise TypeError(f"Wrong store class returned by test fixture! got {result} instead")
+    return result
+
+
+@dataclass
+class AsyncGroupRequest:
+    zarr_format: ZarrFormat
+    store: Literal["local", "fsspec", "memory", "zip"]
+    attributes: dict[str, Any] = field(default_factory=dict)
+
+
+@pytest.fixture
+async def async_group(request: pytest.FixtureRequest, tmp_path: pathlib.Path) -> AsyncGroup:
+    param: AsyncGroupRequest = request.param
+
+    store = await parse_store(param.store, str(tmp_path))
+    return await AsyncGroup.from_store(
+        store,
+        attributes=param.attributes,
+        zarr_format=param.zarr_format,
+        overwrite=False,
+    )
+
+
+@pytest.fixture(params=["numpy", "cupy"])
+def xp(request: pytest.FixtureRequest) -> Any:
+    """Fixture to parametrize over numpy-like libraries"""
+
+    if request.param == "cupy":
+        request.node.add_marker(pytest.mark.gpu)
+
+    return pytest.importorskip(request.param)
+
+
+@pytest.fixture(autouse=True)
+def reset_config() -> Generator[None, None, None]:
+    config.reset()
+    yield
+    config.reset()
+
+
+@dataclass
+class ArrayRequest:
+    shape: tuple[int, ...]
+    dtype: str
+    order: MemoryOrder
+
+
+@pytest.fixture
+def array_fixture(request: pytest.FixtureRequest) -> npt.NDArray[Any]:
+    array_request: ArrayRequest = request.param
+    return (
+        np.arange(np.prod(array_request.shape))
+        .reshape(array_request.shape, order=array_request.order)
+        .astype(array_request.dtype)
+    )
+
+
+@pytest.fixture(params=(2, 3), ids=["zarr2", "zarr3"])
+def zarr_format(request: pytest.FixtureRequest) -> ZarrFormat:
+    if request.param == 2:
+        return 2
+    elif request.param == 3:
+        return 3
+    msg = f"Invalid zarr format requested. Got {request.param}, expected on of (2,3)."
+    raise ValueError(msg)
+
+
+def _clear_registries() -> None:
+    registries = zarr.registry._collect_entrypoints()
+    for registry in registries:
+        registry.lazy_load_list.clear()
+    data_type_registry._lazy_load_list.clear()
+
+
+@pytest.fixture
+def set_path() -> Generator[None, None, None]:
+    tests_dir = str(pathlib.Path(__file__).parent.absolute())
+    sys.path.append(tests_dir)
+    _clear_registries()
+    zarr.registry._collect_entrypoints()
+
+    yield
+
+    sys.path.remove(tests_dir)
+    _clear_registries()
+    zarr.registry._collect_entrypoints()
+    config.reset()
+
+
+def pytest_addoption(parser: Any) -> None:
+    parser.addoption(
+        "--run-slow-hypothesis",
+        action="store_true",
+        default=False,
+        help="run slow hypothesis tests",
+    )
+    parser.addoption(
+        "--run-examples",
+        action="store_true",
+        default=False,
+        help="run the scripts in examples/",
+    )
+
+
+# Tests with one of these markers are skipped unless the matching option is passed.
+_OPT_IN_MARKERS = {
+    "slow_hypothesis": "--run-slow-hypothesis",
+    "examples": "--run-examples",
+}
+
+
+def pytest_collection_modifyitems(config: Any, items: Any) -> None:
+    for marker, option in _OPT_IN_MARKERS.items():
+        if config.getoption(option):
+            continue
+        skip = pytest.mark.skip(reason=f"need {option} option to run")
+        for item in items:
+            if marker in item.keywords:
+                item.add_marker(skip)
+
+
+settings.register_profile(
+    "default",
+    parent=settings.get_profile("default"),
+    max_examples=300,
+    suppress_health_check=[HealthCheck.filter_too_much, HealthCheck.too_slow],
+    deadline=None,
+    verbosity=Verbosity.verbose,
+)
+settings.register_profile(
+    "ci",
+    parent=settings.get_profile("ci"),
+    max_examples=300,
+    derandomize=True,  # more like regression testing
+    deadline=None,
+    suppress_health_check=[HealthCheck.filter_too_much, HealthCheck.too_slow],
+)
+settings.register_profile(
+    "nightly",
+    max_examples=500,
+    parent=settings.get_profile("ci"),
+    derandomize=False,
+    stateful_step_count=100,
+)
+
+settings.load_profile(os.getenv("HYPOTHESIS_PROFILE", "default"))
+
+
+@st.composite
+def json_attributes(draw: st.DrawFn, *, depth: int) -> dict[str, JSON]:
+    """Generate JSON attribute dictionaries with additional nested object/array layers."""
+    keys = st.text(max_size=8)
+    scalars = (
+        st.none()
+        | st.booleans()
+        | st.integers()
+        | st.floats(allow_nan=False, allow_infinity=False)
+        | st.text(max_size=8)
+    )
+    values = st.recursive(
+        scalars,
+        lambda children: (
+            st.lists(children, max_size=3) | st.dictionaries(keys, children, max_size=3)
+        ),
+        max_leaves=8,
+    )
+    attributes: dict[str, JSON] = draw(st.dictionaries(keys, values, max_size=3))
+    if depth:
+        value: JSON = attributes
+        for is_object in draw(st.lists(st.booleans(), min_size=depth, max_size=depth)):
+            value = {draw(keys): value} if is_object else [value]
+        attributes = {draw(keys): value}
+    return attributes
+
+
+# TODO: uncomment these overrides when we can get mypy to accept them
+"""
+@overload
+def create_array_metadata(
+    *,
+    shape: ShapeLike,
+    dtype: npt.DTypeLike,
+    chunks: tuple[int, ...] | Literal["auto"],
+    shards: None,
+    filters: FiltersLike,
+    compressors: CompressorsLike,
+    serializer: SerializerLike,
+    fill_value: Any | None,
+    order: MemoryOrder | None,
+    zarr_format: Literal[2],
+    attributes: dict[str, JSON] | None,
+    chunk_key_encoding: ChunkKeyEncoding | ChunkKeyEncodingLike | None,
+    dimension_names: None,
+) -> ArrayV2Metadata: ...
+
+
+@overload
+def create_array_metadata(
+    *,
+    shape: ShapeLike,
+    dtype: npt.DTypeLike,
+    chunks: tuple[int, ...] | Literal["auto"],
+    shards: ShardsLike | None,
+    filters: FiltersLike,
+    compressors: CompressorsLike,
+    serializer: SerializerLike,
+    fill_value: Any | None,
+    order: None,
+    zarr_format: Literal[3],
+    attributes: dict[str, JSON] | None,
+    chunk_key_encoding: ChunkKeyEncoding | ChunkKeyEncodingLike | None,
+    dimension_names: Iterable[str] | None,
+) -> ArrayV3Metadata: ...
+"""
+
+
+def create_array_metadata(
+    *,
+    shape: ShapeLike,
+    dtype: npt.DTypeLike,
+    chunks: tuple[int, ...] | Literal["auto"] = "auto",
+    shards: ShardsLike | None = None,
+    filters: FiltersLike = "auto",
+    compressors: CompressorsLike = "auto",
+    serializer: SerializerLike = "auto",
+    fill_value: Any = 0,
+    order: MemoryOrder | None = None,
+    zarr_format: ZarrFormat,
+    attributes: dict[str, JSON] | None = None,
+    chunk_key_encoding: ChunkKeyEncoding | ChunkKeyEncodingLike | None = None,
+    dimension_names: DimensionNamesLike = None,
+) -> ArrayV2Metadata | ArrayV3Metadata:
+    """
+    Create array metadata
+    """
+    dtype_parsed = get_data_type_from_native_dtype(dtype)
+    shape_parsed = parse_shapelike(shape)
+    chunk_key_encoding_parsed = _parse_chunk_key_encoding(
+        chunk_key_encoding, zarr_format=zarr_format
+    )
+    item_size = 1
+    if isinstance(dtype_parsed, HasItemSize):
+        item_size = dtype_parsed.item_size
+    if chunks == "auto":
+        chunks_normalized = guess_chunks(
+            shape_parsed,
+            item_size,
+            max_bytes=SHARDED_INNER_CHUNK_MAX_BYTES if shards is not None else None,
+        )
+    else:
+        chunks_normalized = normalize_chunks_nd(chunks, shape_parsed)
+    outer_chunks, inner = resolve_outer_and_inner_chunks(
+        array_shape=shape_parsed,
+        chunks=chunks_normalized,
+        shard_shape=shards,
+        item_size=item_size,
+    )
+
+    if order is None:
+        order_parsed = zarr_config.get("array.order")
+    else:
+        order_parsed = order
+
+    if zarr_format == 2:
+        filters_parsed, compressor_parsed = _parse_chunk_encoding_v2(
+            compressor=compressors, filters=filters, dtype=dtype_parsed
+        )
+        chunk_key_encoding_parsed = cast("V2ChunkKeyEncoding", chunk_key_encoding_parsed)
+        return ArrayV2Metadata(
+            shape=shape_parsed,
+            dtype=dtype_parsed,
+            chunks=outer_chunks.chunk_shape,
+            order=order_parsed,
+            dimension_separator=chunk_key_encoding_parsed.separator,
+            fill_value=fill_value,
+            compressor=compressor_parsed,
+            filters=filters_parsed,
+            attributes=attributes,
+        )
+    elif zarr_format == 3:
+        array_array, array_bytes, bytes_bytes = _parse_chunk_encoding_v3(
+            compressors=compressors,
+            filters=filters,
+            serializer=serializer,
+            dtype=dtype_parsed,
+        )
+
+        sub_codecs: tuple[Codec, ...] = (*array_array, array_bytes, *bytes_bytes)
+        codecs_out: tuple[Codec, ...]
+        if inner is not None:
+            inner_chunks_flat = inner.outer_chunks.chunk_shape
+            index_location: IndexLocation = "end"
+            if isinstance(shards, dict):
+                index_location = cast("IndexLocation", shards.get("index_location", "end"))
+            sharding_codec = ShardingCodec(
+                chunk_shape=inner_chunks_flat,
+                codecs=sub_codecs,
+                index_location=index_location,
+            )
+            validation_grid = create_chunk_grid_metadata(outer_chunks)
+            sharding_codec.validate(
+                shape=inner_chunks_flat,
+                dtype=dtype_parsed,
+                chunk_grid=validation_grid,
+            )
+            codecs_out = (sharding_codec,)
+        else:
+            codecs_out = sub_codecs
+
+        return ArrayV3Metadata(
+            shape=shape_parsed,
+            data_type=dtype_parsed,
+            chunk_grid=create_chunk_grid_metadata(outer_chunks),
+            chunk_key_encoding=chunk_key_encoding_parsed,
+            fill_value=fill_value,
+            codecs=codecs_out,
+            attributes=attributes,
+            dimension_names=dimension_names,
+        )
+
+    raise ValueError(f"Invalid Zarr format: {zarr_format}")
+
+
+# TODO: uncomment these overrides when we can get mypy to accept them
+"""
+@overload
+def meta_from_array(
+    array: np.ndarray[Any, Any],
+    chunks: tuple[int, ...] | Literal["auto"],
+    shards: None,
+    filters: FiltersLike,
+    compressors: CompressorsLike,
+    serializer: SerializerLike,
+    fill_value: Any | None,
+    order: MemoryOrder | None,
+    zarr_format: Literal[2],
+    attributes: dict[str, JSON] | None,
+    chunk_key_encoding: ChunkKeyEncoding | ChunkKeyEncodingLike | None,
+    dimension_names: Iterable[str] | None,
+) -> ArrayV2Metadata: ...
+
+
+@overload
+def meta_from_array(
+    array: np.ndarray[Any, Any],
+    chunks: tuple[int, ...] | Literal["auto"],
+    shards: ShardsLike | None,
+    filters: FiltersLike,
+    compressors: CompressorsLike,
+    serializer: SerializerLike,
+    fill_value: Any | None,
+    order: None,
+    zarr_format: Literal[3],
+    attributes: dict[str, JSON] | None,
+    chunk_key_encoding: ChunkKeyEncoding | ChunkKeyEncodingLike | None,
+    dimension_names: Iterable[str] | None,
+) -> ArrayV3Metadata: ...
+
+"""
+
+
+def meta_from_array(
+    array: np.ndarray[Any, Any],
+    *,
+    chunks: tuple[int, ...] | Literal["auto"] = "auto",
+    shards: ShardsLike | None = None,
+    filters: FiltersLike = "auto",
+    compressors: CompressorsLike = "auto",
+    serializer: SerializerLike = "auto",
+    fill_value: Any = 0,
+    order: MemoryOrder | None = None,
+    zarr_format: ZarrFormat = 3,
+    attributes: dict[str, JSON] | None = None,
+    chunk_key_encoding: ChunkKeyEncoding | ChunkKeyEncodingLike | None = None,
+    dimension_names: DimensionNamesLike = None,
+) -> ArrayV3Metadata | ArrayV2Metadata:
+    """
+    Create array metadata from an array
+    """
+    return create_array_metadata(
+        shape=array.shape,
+        dtype=array.dtype,
+        chunks=chunks,
+        shards=shards,
+        filters=filters,
+        compressors=compressors,
+        serializer=serializer,
+        fill_value=fill_value,
+        order=order,
+        zarr_format=zarr_format,
+        attributes=attributes,
+        chunk_key_encoding=chunk_key_encoding,
+        dimension_names=dimension_names,
+    )
+
+
+def skip_object_dtype(dtype: ZDType[Any, Any]) -> None:
+    if dtype.dtype_cls is type(np.dtype("O")):
+        msg = (
+            f"{dtype} uses the numpy object data type, which is not a valid target for data "
+            "type resolution"
+        )
+        pytest.skip(msg)
+
+
+def nan_equal(a: object, b: object) -> bool:
+    """
+    Convenience function for equality comparison between two values ``a`` and ``b``, that might both
+    be NaN. Returns True if both ``a`` and ``b`` are NaN, otherwise returns a == b
+    """
+    if math.isnan(a) and math.isnan(b):  # type: ignore[arg-type]
+        return True
+    return a == b
+
+
+def deep_nan_equal(a: object, b: object) -> bool:
+    if isinstance(a, Mapping) and isinstance(b, Mapping):
+        return all(deep_nan_equal(a[k], b[k]) for k in a)
+    if isinstance(a, Sequence) and isinstance(b, Sequence):
+        return all(deep_nan_equal(a[i], b[i]) for i in range(len(a)))
+    return nan_equal(a, b)
+
+
+def declared_chunk_data_sizes(declared: int | Sequence[int], extent: int) -> tuple[int, ...]:
+    """The data sizes of the chunks one declared chunk grid dimension places
+    over `extent`, worked out from the declaration alone: a bare int repeats
+    to cover the extent, explicit edges are clipped to it. An oracle that does
+    not go through zarr's chunk grid code."""
+    sizes: list[int] = []
+    offset = 0
+    for edge in itertools.repeat(declared) if isinstance(declared, int) else declared:
+        if offset >= extent:
+            break
+        sizes.append(min(edge, extent - offset))
+        offset += edge
+    return tuple(sizes)
+
+
+def gzip_streams_equal_except_mtime(a: bytes, b: bytes) -> bool:
+    """Compare two gzip streams, ignoring the MTIME field of the header.
+
+    Per RFC 1952 the gzip header is [magic(2)][CM(1)][FLG(1)][MTIME(4)][XFL(1)][OS(1)],
+    so bytes 4-8 are MTIME. The fixed offsets assume the standard 10-byte header
+    with no FNAME/FEXTRA/FCOMMENT flags set, which holds here because numcodecs'
+    ``GZip.encode`` wraps ``gzip.GzipFile`` without a filename.
+    """
+    if len(a) != len(b):
+        return False
+
+    return a[:4] == b[:4] and a[8:] == b[8:]
+
+
+# Shared mock-S3 (moto) backend. A single server is reused across the whole test session by
+# every test that needs S3 -- both the fsspec store tests and the documentation examples --
+# instead of each module standing up its own. Consumers create their own buckets and choose
+# how the endpoint reaches the client (explicit storage_options vs. the AWS_ENDPOINT_URL
+# env var) on top of this fixture.
+
+
+@pytest.fixture(scope="session")
+def moto_server() -> Generator[str, None, None]:
+    """Start a session-scoped moto S3 server and yield its endpoint URL.
+
+    The server binds an ephemeral port (port=0), so the endpoint is only known at
+    runtime; consumers must take it from this fixture rather than a constant. A fixed
+    port deadlocks under pytest-xdist: session-scoped fixtures run once per *worker*, so
+    concurrent workers race to bind the same port, and the losers block forever inside
+    ThreadedMotoServer.start(), whose server thread dies on "Address already in use"
+    before ever setting the ready event that start() waits on.
+
+    importorskip lives inside the fixture so moto is only required when a test actually
+    requests an S3 backend, not for the whole test session."""
+    moto_server_mod = pytest.importorskip("moto.moto_server.threaded_moto_server")
+
+    server = moto_server_mod.ThreadedMotoServer(ip_address="127.0.0.1", port=0)
+    server.start()
+    host, port = server.get_host_and_port()
+    # moto needs *some* credentials present; use throwaway values if the environment has none.
+    os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "foo")
+    os.environ.setdefault("AWS_ACCESS_KEY_ID", "foo")
+    try:
+        yield f"http://{host}:{port}/"
+    finally:
+        server.stop()

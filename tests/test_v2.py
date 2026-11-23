@@ -1,0 +1,438 @@
+import json
+import pickle
+from pathlib import Path
+from typing import Any, Literal
+
+import numcodecs.errors
+import numcodecs.pickles
+import numpy as np
+import pytest
+from numcodecs import Delta, Pickle, VLenUTF8, Zlib
+from numcodecs.blosc import Blosc
+from numcodecs.zstd import Zstd
+
+import zarr
+import zarr.core.buffer
+import zarr.storage
+from zarr import config
+from zarr.abc.store import Store
+from zarr.core.buffer.core import default_buffer_prototype
+from zarr.core.dtype import FixedLengthUTF32, VariableLengthUTF8
+from zarr.core.dtype.npy.bytes import NullTerminatedBytes
+from zarr.core.dtype.npy.structured import Struct
+from zarr.core.dtype.wrapper import ZDType
+from zarr.core.group import Group
+from zarr.core.sync import sync
+from zarr.errors import PickleCodecDisabledError, ZarrDeprecationWarning
+from zarr.storage import MemoryStore, StorePath
+
+
+@pytest.fixture
+async def store() -> StorePath:
+    return StorePath(await MemoryStore.open())
+
+
+def test_simple(store: StorePath) -> None:
+    data = np.arange(0, 256, dtype="uint16").reshape((16, 16))
+
+    a = zarr.create_array(
+        store / "simple_v2",
+        zarr_format=2,
+        shape=data.shape,
+        chunks=(16, 16),
+        dtype=data.dtype,
+        fill_value=0,
+    )
+
+    a[:, :] = data
+    assert np.array_equal(data, a[:, :])
+
+
+def test_codec_pipeline() -> None:
+    # https://github.com/zarr-developers/zarr-python/issues/2243
+    store = MemoryStore()
+    array = zarr.create(
+        store=store,
+        shape=(1,),
+        dtype="i4",
+        zarr_format=2,
+        filters=[Delta(dtype="i4").get_config()],
+        compressor=Blosc().get_config(),
+    )
+    array[:] = 1
+    result = array[:]
+    expected = np.ones(1)
+    np.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_dtype", "fill_value", "fill_value_json"),
+    [
+        ("|S1", "|S1", b"X", "WA=="),
+        ("|V1", "|V1", b"X", "WA=="),
+        ("|V10", "|V10", b"X", "WAAAAAAAAAAAAA=="),
+    ],
+)
+async def test_v2_encode_decode(
+    dtype: str, expected_dtype: str, fill_value: bytes, fill_value_json: str
+) -> None:
+    store = zarr.storage.MemoryStore()
+    g = zarr.group(store=store, zarr_format=2)
+    g.create_array(
+        name="foo", shape=(3,), chunks=(3,), dtype=dtype, fill_value=fill_value, compressor=None
+    )
+
+    result = await store.get("foo/.zarray", zarr.core.buffer.default_buffer_prototype())
+    assert result is not None
+
+    serialized = json.loads(result.to_bytes())
+    expected = {
+        "chunks": [3],
+        "compressor": None,
+        "dtype": expected_dtype,
+        "fill_value": fill_value_json,
+        "filters": None,
+        "order": "C",
+        "shape": [3],
+        "zarr_format": 2,
+        "dimension_separator": ".",
+    }
+    assert serialized == expected
+
+    data = zarr.open_array(store=store, path="foo")[:]
+    np.testing.assert_equal(data, np.full((3,), b"X", dtype=dtype))
+
+    data = zarr.open_array(store=store, path="foo")[:]
+    np.testing.assert_equal(data, np.full((3,), b"X", dtype=dtype))
+
+
+@pytest.mark.parametrize(
+    ("dtype", "value"),
+    [
+        (NullTerminatedBytes(length=1), b"Y"),
+        (FixedLengthUTF32(length=1), "Y"),
+        (VariableLengthUTF8(), "Y"),
+    ],
+)
+def test_v2_encode_decode_with_data(dtype: ZDType[Any, Any], value: str) -> None:
+    expected = np.full((3,), value, dtype=dtype.to_native_dtype())
+    a = zarr.create(
+        shape=(3,),
+        zarr_format=2,
+        dtype=dtype,
+    )
+    a[:] = expected
+    data = a[:]
+    np.testing.assert_equal(data, expected)
+
+
+@pytest.mark.parametrize("filters", [[], [Delta(dtype="<i4")], [Zlib(level=2)]])
+@pytest.mark.parametrize("order", ["C", "F"])
+def test_v2_filters_codecs(filters: Any, order: Literal["C", "F"]) -> None:
+    array_fixture = [42]
+    with config.set({"array.order": order}):
+        arr = zarr.create(shape=1, dtype="<i4", zarr_format=2, filters=filters)
+    arr[:] = array_fixture
+    result = arr[:]
+    np.testing.assert_array_equal(result, array_fixture)
+
+
+@pytest.mark.filterwarnings("ignore")
+@pytest.mark.parametrize("store", ["memory"], indirect=True)
+def test_create_array_defaults(store: Store) -> None:
+    """
+    Test that passing compressor=None results in no compressor. Also test that the default value of the compressor
+    parameter does produce a compressor.
+    """
+    g = zarr.open(store, mode="w", zarr_format=2)
+    assert isinstance(g, Group)
+    arr = g.create_array("one", dtype="i8", shape=(1,), chunks=(1,), compressor=None)
+    assert arr.compressors == ()
+    assert not (arr.filters)
+    arr = g.create_array("two", dtype="i8", shape=(1,), chunks=(1,))
+    assert arr.compressors != ()
+    assert not (arr.filters)
+    arr = g.create_array("three", dtype="i8", shape=(1,), chunks=(1,), compressor=Zstd())
+    assert arr.compressors != ()
+    assert not (arr.filters)
+    with pytest.raises(ValueError):
+        g.create_array(
+            "four", dtype="i8", shape=(1,), chunks=(1,), compressor=None, compressors=None
+        )
+
+
+@pytest.mark.parametrize("numpy_order", ["C", "F"])
+@pytest.mark.parametrize("zarr_order", ["C", "F"])
+def test_v2_non_contiguous(numpy_order: Literal["C", "F"], zarr_order: Literal["C", "F"]) -> None:
+    """
+    Make sure zarr v2 arrays save data using the memory order given to the zarr array,
+    not the memory order of the original numpy array.
+    """
+    store = MemoryStore()
+    arr = zarr.create_array(
+        store,
+        shape=(10, 8),
+        chunks=(3, 3),
+        fill_value=np.nan,
+        dtype="float64",
+        zarr_format=2,
+        filters=None,
+        compressors=None,
+        overwrite=True,
+        order=zarr_order,
+    )
+
+    # Non-contiguous write, using numpy memory order
+    a = np.arange(arr.shape[0] * arr.shape[1]).reshape(arr.shape, order=numpy_order)
+    arr[6:9, 3:6] = a[6:9, 3:6]  # The slice on the RHS is important
+    np.testing.assert_array_equal(arr[6:9, 3:6], a[6:9, 3:6])
+
+    buf = sync(store.get("2.1", default_buffer_prototype()))
+    assert buf is not None
+    np.testing.assert_array_equal(
+        a[6:9, 3:6],
+        np.frombuffer(buf.to_bytes(), dtype="float64").reshape((3, 3), order=zarr_order),
+    )
+    # After writing and reading from zarr array, order should be same as zarr order
+    sub_arr = arr[6:9, 3:6]
+    assert isinstance(sub_arr, np.ndarray)
+    if zarr_order == "F":
+        assert (sub_arr).flags.f_contiguous
+    else:
+        assert (sub_arr).flags.c_contiguous
+
+    # Contiguous write
+    store = MemoryStore()
+    arr = zarr.create_array(
+        store,
+        shape=(10, 8),
+        chunks=(3, 3),
+        fill_value=np.nan,
+        dtype="float64",
+        zarr_format=2,
+        compressors=None,
+        filters=None,
+        overwrite=True,
+        order=zarr_order,
+    )
+
+    a = np.arange(9).reshape((3, 3), order=numpy_order)
+    arr[6:9, 3:6] = a
+    np.testing.assert_array_equal(arr[6:9, 3:6], a)
+    # After writing and reading from zarr array, order should be same as zarr order
+    sub_arr = arr[6:9, 3:6]
+    assert isinstance(sub_arr, np.ndarray)
+    if zarr_order == "F":
+        assert (sub_arr).flags.f_contiguous
+    else:
+        assert (sub_arr).flags.c_contiguous
+
+
+def test_default_compressor_deprecation_warning() -> None:
+    with pytest.warns(ZarrDeprecationWarning, match="default_compressor is deprecated") as caught:
+        zarr.storage.default_compressor = "zarr.codecs.zstd.ZstdCodec()"  # type: ignore[attr-defined]
+    assert caught[0].filename == __file__
+
+
+def test_v2_metadata_chunk_grid_deprecation_warning() -> None:
+    metadata = zarr.create(shape=(2,), chunks=(1,), zarr_format=2).metadata
+    with pytest.warns(
+        DeprecationWarning, match="ArrayV2Metadata.chunk_grid is deprecated"
+    ) as caught:
+        metadata.chunk_grid  # noqa: B018
+    assert caught[0].filename == __file__
+
+
+@pytest.mark.parametrize("fill_value", [None, (b"", 0, 0.0)], ids=["no_fill", "fill"])
+def test_structured_dtype_roundtrip(fill_value: float | bytes, tmp_path: Path) -> None:
+    a = np.array(
+        [(b"aaa", 1, 4.2), (b"bbb", 2, 8.4), (b"ccc", 3, 12.6)],
+        dtype=[("foo", "S3"), ("bar", "i4"), ("baz", "f8")],
+    )
+    array_path = tmp_path / "data.zarr"
+    za = zarr.create(
+        shape=(3,),
+        store=array_path,
+        chunks=(2,),
+        fill_value=fill_value,
+        zarr_format=2,
+        dtype=a.dtype,
+    )
+    if fill_value is not None:
+        assert (np.array([fill_value] * a.shape[0], dtype=a.dtype) == za[:]).all()
+    za[...] = a
+    za = zarr.open_array(store=array_path)
+    assert (a == za[:]).all()
+
+
+@pytest.mark.parametrize(
+    (
+        "fill_value",
+        "dtype",
+        "expected_result",
+    ),
+    [
+        (
+            ("Alice", 30),
+            np.dtype([("name", "U10"), ("age", "i4")]),
+            np.array([("Alice", 30)], dtype=[("name", "U10"), ("age", "i4")])[0],
+        ),
+        (
+            ["Bob", 25],
+            np.dtype([("name", "U10"), ("age", "i4")]),
+            np.array([("Bob", 25)], dtype=[("name", "U10"), ("age", "i4")])[0],
+        ),
+        (
+            b"\x01\x00\x00\x00\x02\x00\x00\x00",
+            np.dtype([("x", "<i4"), ("y", "<i4")]),
+            np.array([(1, 2)], dtype=[("x", "<i4"), ("y", "<i4")])[0],
+        ),
+    ],
+    ids=[
+        "tuple_input",
+        "list_input",
+        "bytes_input",
+    ],
+)
+def test_parse_structured_fill_value_valid(
+    fill_value: Any, dtype: np.dtype[Any], expected_result: Any
+) -> None:
+    zdtype = Struct.from_native_dtype(dtype)
+    result = zdtype.cast_scalar(fill_value)
+    assert result.dtype == expected_result.dtype
+    assert result == expected_result
+    if isinstance(expected_result, np.void):
+        for name in expected_result.dtype.names or []:
+            assert result[name] == expected_result[name]
+
+
+@pytest.mark.parametrize("fill_value", [None, b"x"], ids=["no_fill", "fill"])
+def test_other_dtype_roundtrip(fill_value: bytes | None, tmp_path: Path) -> None:
+    a = np.array([b"a\0\0", b"bb", b"ccc"], dtype="V7")
+    array_path = tmp_path / "data.zarr"
+    za = zarr.create(
+        shape=(3,),
+        store=array_path,
+        chunks=(2,),
+        fill_value=fill_value,
+        zarr_format=2,
+        dtype=a.dtype,
+    )
+    if fill_value is not None:
+        assert (np.array([fill_value] * a.shape[0], dtype=a.dtype) == za[:]).all()
+    za[...] = a
+    za = zarr.open_array(store=array_path)
+    assert (a == za[:]).all()
+
+
+def _pickle_compressed_array() -> zarr.Array[Any]:
+    # Writing with the pickle codec is allowed without opting in, only decoding is gated.
+    arr = zarr.create_array(
+        store={},
+        shape=(3,),
+        dtype=VariableLengthUTF8(),  # type: ignore[arg-type]
+        zarr_format=2,
+        filters=[VLenUTF8()],
+        compressors=Pickle(),
+        fill_value="",
+    )
+    arr[:] = np.array(["a", "bb", "ccc"])
+    return arr
+
+
+@pytest.fixture
+def allow_numcodecs_unpickle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Opt in to numcodecs' own gate on ``Pickle.decode``.
+
+    numcodecs refuses to unpickle unless the process opts in (GHSA-jqc8-qjfv-5m6r). zarr's
+    opt-in is separate, so tests that read pickled data after opting in to zarr also need this.
+    """
+    monkeypatch.setattr(numcodecs.pickles, "ALLOW_UNSAFE_PICKLE_DECODE", True)
+
+
+def test_pickle_codec_read_disabled_by_default() -> None:
+    """Reading data encoded with the pickle codec fails unless the user opts in."""
+    arr = _pickle_compressed_array()
+    with pytest.raises(
+        PickleCodecDisabledError, match=r"array\.allow_unsafe_pickle_decode"
+    ) as excinfo:
+        arr[:]
+    # numcodecs has its own opt-in; the message must name it so users are not left guessing
+    assert "ALLOW_UNSAFE_PICKLE_DECODE" in str(excinfo.value)
+
+
+def test_pickle_codec_read_does_not_unpickle() -> None:
+    """A malicious chunk is not unpickled when the pickle codec is disabled."""
+
+    class Payload:
+        def __reduce__(self) -> tuple[Any, ...]:
+            return (exec, ("raise AssertionError('payload was unpickled')",))
+
+    meta = {
+        "zarr_format": 2,
+        "shape": [1],
+        "chunks": [1],
+        "dtype": "|O",
+        "compressor": {"id": "pickle"},
+        "fill_value": None,
+        "filters": [{"id": "vlen-utf8"}],
+        "order": "C",
+    }
+    buffer_cls = default_buffer_prototype().buffer
+    store = {
+        ".zarray": buffer_cls.from_bytes(json.dumps(meta).encode()),
+        "0": buffer_cls.from_bytes(pickle.dumps(Payload())),
+    }
+    arr = zarr.open_array(store=MemoryStore(store), mode="r", zarr_format=2)
+    with pytest.raises(PickleCodecDisabledError):
+        arr[:]
+
+
+def test_pickle_codec_zarr_opt_in_does_not_bypass_numcodecs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opting in to zarr does not disable numcodecs' own gate on ``Pickle.decode``."""
+    monkeypatch.setattr(numcodecs.pickles, "ALLOW_UNSAFE_PICKLE_DECODE", False)
+    arr = _pickle_compressed_array()
+    with (
+        config.set({"array.allow_unsafe_pickle_decode": True}),
+        pytest.raises(numcodecs.errors.UnsafeDecodeError),
+    ):
+        arr[:]
+
+
+@pytest.mark.usefixtures("allow_numcodecs_unpickle")
+def test_pickle_codec_read_enabled_via_config() -> None:
+    arr = _pickle_compressed_array()
+    with config.set({"array.allow_unsafe_pickle_decode": True}):
+        np.testing.assert_array_equal(arr[:], np.array(["a", "bb", "ccc"]))
+
+
+@pytest.mark.usefixtures("allow_numcodecs_unpickle")
+@pytest.mark.parametrize(("env_value", "allowed"), [("True", True), ("false", False)])
+def test_pickle_codec_read_enabled_via_env_var(
+    monkeypatch: pytest.MonkeyPatch, env_value: str, allowed: bool
+) -> None:
+    """
+    The opt-in can be set with an environment variable. Only a value that parses to ``True``
+    enables it: donfig keeps ``false`` as a (truthy) string, which must not enable it.
+    """
+    arr = _pickle_compressed_array()
+    monkeypatch.setenv("ZARR_ARRAY__ALLOW_UNSAFE_PICKLE_DECODE", env_value)
+    config.refresh()
+    if allowed:
+        np.testing.assert_array_equal(arr[:], np.array(["a", "bb", "ccc"]))
+    else:
+        with pytest.raises(PickleCodecDisabledError):
+            arr[:]
+
+
+def test_pickle_opt_in_does_not_affect_other_codecs() -> None:
+    """Arrays that do not use the pickle codec are read without opting in."""
+    assert config.get("array.allow_unsafe_pickle_decode") is False
+    arr = zarr.create_array(
+        store={}, shape=(3,), dtype="<i4", zarr_format=2, filters=[Delta(dtype="<i4")]
+    )
+    arr[:] = [1, 2, 3]
+    np.testing.assert_array_equal(arr[:], [1, 2, 3])

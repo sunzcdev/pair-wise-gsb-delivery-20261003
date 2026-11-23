@@ -1,0 +1,172 @@
+# Extending Zarr
+
+Zarr-Python 3 was designed to be extensible. This means that you can extend
+the library by writing custom classes and plugins. Currently, Zarr can be extended
+in the following ways:
+
+## Custom codecs
+
+!!! note
+    This section explains how custom codecs can be created for Zarr format 3 arrays. For Zarr
+    format 2, codecs should subclass the
+    [numcodecs.abc.Codec](https://numcodecs.readthedocs.io/en/stable/abc.html#numcodecs.abc.Codec)
+    base class and register through
+    [numcodecs.registry.register_codec](https://numcodecs.readthedocs.io/en/stable/registry.html#numcodecs.registry.register_codec).
+
+There are three types of codecs in Zarr:
+
+- array-to-array
+- array-to-bytes
+- bytes-to-bytes
+
+Array-to-array codecs are used to transform the array data before serializing
+to bytes. Examples include delta encoding or scaling codecs. Array-to-bytes codecs are used
+for serializing the array data to bytes. In Zarr, the main codec to use for numeric arrays
+is the [`zarr.codecs.BytesCodec`][]. Bytes-to-bytes codecs transform the serialized bytestreams
+of the array data. Examples include compression codecs, such as
+[`zarr.codecs.GzipCodec`][], [`zarr.codecs.BloscCodec`][] or
+[`zarr.codecs.ZstdCodec`][], and codecs that add a checksum to the bytestream, such as
+[`zarr.codecs.Crc32cCodec`][].
+
+Custom codecs for Zarr are implemented by subclassing the relevant base class, see
+[`zarr.abc.codec.ArrayArrayCodec`][], [`zarr.abc.codec.ArrayBytesCodec`][] and
+[`zarr.abc.codec.BytesBytesCodec`][]. Most custom codecs should implement the
+`_encode_single` and `_decode_single` methods. These methods operate on single chunks
+of the array data. Alternatively, custom codecs can implement the `encode` and `decode`
+methods, which operate on batches of chunks, in case the codec is intended to implement
+its own batch processing.
+
+Custom codecs should also implement the following methods:
+
+- `compute_encoded_size`, which returns the byte size of the encoded data given the byte
+  size of the original data. It should raise `NotImplementedError` for codecs with
+  variable-sized outputs, such as compression codecs.
+- `validate` (optional), which can be used to check that the codec metadata is compatible with the
+  array metadata. It should raise errors if not.
+- `resolve_metadata` (optional), which is important for codecs that change the shape,
+  dtype or fill value of a chunk.
+- `evolve_from_array_spec` (optional), which can be useful for automatically filling in
+  codec configuration metadata from the array metadata.
+
+To use custom codecs in Zarr, they need to be registered using the
+[entrypoint mechanism](https://packaging.python.org/en/latest/specifications/entry-points/).
+Commonly, entrypoints are declared in the `pyproject.toml` of your package under the
+`[project.entry-points."zarr.codecs"]` section. Zarr will automatically discover
+all codecs registered via the entrypoint mechanism in installed packages.
+
+```toml
+[project.entry-points."zarr.codecs"]
+"custompackage.fancy_codec" = "custompackage:FancyCodec"
+```
+
+New codecs need to have their own unique identifier. To avoid naming collisions, it is
+strongly recommended to prefix the codec identifier with a unique name. For example,
+the codecs from `numcodecs` are prefixed with `numcodecs.`, e.g. `numcodecs.delta`.
+
+If someone opens an array that uses your codec without your package installed, Zarr raises
+[`zarr.errors.UnknownCodecError`][] explaining how to register an implementation. Zarr also
+keeps a small table of codec names and the published packages that provide them, and names
+those packages in that error. Once your package is on PyPI, please open a pull request adding
+it to the codec-package tables in `src/zarr/registry.py`, so that users get a message telling them
+exactly what to install.
+
+!!! note
+    Note that the extension mechanism for the Zarr format 3 is still under development.
+    Requirements for custom codecs including the choice of codec identifiers might
+    change in the future.
+
+It is also possible to register codecs as replacements for existing codecs. This might be
+useful for providing specialized implementations, such as GPU-based codecs. In case of
+multiple codecs, the [`zarr.config`][] mechanism can be used to select the preferred
+implementation.
+
+## Custom stores
+
+Custom stores can be created by implementing the [`zarr.abc.store.Store`][] interface.
+See [developing custom stores](storage.md#developing-custom-stores) for more information.
+
+## Custom URL pipeline adapters
+
+In a [URL pipeline](storage.md#user-guide-url-pipelines) such as
+`s3://bucket/data.zip|zip:|zarr3:`, each sub-URL after the first names an *adapter*
+that reinterprets everything to its left. A package provides an adapter by subclassing
+[`zarr.abc.url_pipeline.URLPipelineAdapter`][] and implementing one classmethod, which
+returns an open store and the path addressed inside it as a
+[`StorePath`][zarr.storage.StorePath]:
+
+```python test="true" session="url-adapter"
+from zarr.abc.url_pipeline import URLPipelineAdapter
+from zarr.storage import PipelineContext, PipelineSegment, StorePath, WrapperStore
+
+
+class MyAdapter(URLPipelineAdapter):
+    @classmethod
+    async def open_pipeline_segment(
+        cls, segment: PipelineSegment, context: PipelineContext
+    ) -> StorePath:
+        # A wrapper adapter opens the resource to its left and wraps it, joining the
+        # preceding residual path with this segment's own path.
+        preceding = await context.resolve_preceding()
+        store = WrapperStore(preceding.store)
+        path = "/".join(part.strip("/") for part in (preceding.path, segment.body) if part)
+        return StorePath(store, path)
+```
+
+To resolve the preceding pipeline with another mode or options, use a derived context:
+`await dataclasses.replace(context, mode="r").resolve_preceding()`. Wrapper adapters
+compose: `memory://x|mypackage.myscheme:a|mypackage.myscheme:b` resolves to `a/b`.
+
+```python test="true" session="url-adapter"
+import zarr
+from zarr.registry import register_url_adapter
+from zarr.storage import URLPipeline
+
+register_url_adapter("mypackage.myscheme", MyAdapter)
+url = "memory://x|mypackage.myscheme:a|mypackage.myscheme:b"
+# keep a reference: in-memory data lives only while a store refers to it
+created = zarr.create_group(URLPipeline.from_url(url))
+group = zarr.open_group(URLPipeline.from_url(url), mode="r")
+assert group.path == "a/b"
+```
+
+Register the class under the `zarr.url_adapters` entry-point group with the scheme as
+the entry-point name, vendor-prefixed for nonstandard schemes. Adapters are imported
+only when a pipeline naming their scheme is resolved.
+
+```toml
+[project.entry-points."zarr.url_adapters"]
+"mypackage.myscheme" = "mypackage.zarr_adapter:MyAdapter"
+```
+
+An adapter can also be a *root* scheme (`mypackage.myscheme://org/repo`), with an empty
+`context.preceding`. Installing a root adapter for a scheme fsspec also handles takes
+that scheme over at the root of every pipeline. The schemes zarr handles itself
+(`file`, `memory`, `zarr`, `zarr2`, `zarr3`) cannot be registered, and entry points
+with those names are ignored.
+
+Every adapter sees all of the caller's `storage_options`, including the root's
+credentials: consume only keys namespaced for your adapter, strip them before resolving
+the rest of the pipeline, and never log the options. The returned store must honor
+`context.read_only`, and `open_pipeline_segment` must not block or call zarr's
+synchronous API. See [`PipelineContext`][zarr.storage.PipelineContext] for the full
+contract.
+
+## Custom array buffers
+
+Zarr-python provides control over where and how arrays are stored in memory through
+[`zarr.abc.buffer.Buffer`][]. Currently both CPU (the default) and GPU implementations are
+provided (see [Using GPUs with Zarr](gpu.md) for more information). You can implement your own buffer
+classes by implementing the interface defined in [`zarr.abc.buffer.BufferPrototype`][].
+Like codecs, custom buffer implementations can be registered via entrypoints, using the
+`zarr.buffer` and `zarr.ndbuffer` entrypoint groups.
+
+## Custom data types
+
+Zarr supports user-defined data types. See the
+[data types documentation](data_types.md) for an explanation of how Zarr Python
+models data types and how to write your own, and the
+[custom data type example](examples/custom_dtype.md) for a complete worked example.
+
+## Other extensions
+
+In the future, Zarr will support writing custom chunk grids.
