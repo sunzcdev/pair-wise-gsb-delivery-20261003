@@ -1,3 +1,11 @@
+Unreleased
+----------
+
+* Add StateStore and StatePublication to support atomic, versioned
+  releases of paired lifespan state values. Scopes acquire a
+  consistent publication, failed releases are discarded, and earlier
+  publications remain usable by long lived scopes.
+
 0.18.0 2025-11-08
 -----------------
 
