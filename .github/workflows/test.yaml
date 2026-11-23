@@ -1,0 +1,208 @@
+name: Test
+on:
+  # Pull requests are tested by the pull_request event, so only run on pushes to master
+  push:
+    branches: [master]
+  pull_request:
+jobs:
+  test:
+    services:
+      postgres:
+        image: postgis/postgis:10-2.5
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      mysql:
+        image: mysql:8.0
+        ports:
+          - 3306:3306
+        env:
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_ROOT_HOST: '%'
+          MYSQL_USER: github
+          MYSQL_PASSWORD: github
+          MYSQL_DATABASE: activerecord_import_test
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby:
+          - 3.4
+        env:
+          - AR_VERSION: '8.1'
+            RUBYOPT: --enable-frozen-string-literal
+          - AR_VERSION: '8.0'
+            RUBYOPT: --enable-frozen-string-literal
+          - AR_VERSION: '7.2'
+            RUBYOPT: --enable-frozen-string-literal
+          - AR_VERSION: '7.1'
+            RUBYOPT: --enable-frozen-string-literal
+          - AR_VERSION: '7.0'
+            RUBYOPT: --enable-frozen-string-literal
+          - AR_VERSION: '6.1'
+            RUBYOPT: --enable-frozen-string-literal
+        include:
+          # Rails main (8.2.0.alpha). Allowed to fail so that in-flight upstream changes do
+          # not turn the whole matrix red; see continue-on-error below.
+          - ruby: 3.4
+            experimental: true
+            env:
+              AR_VERSION: '8.2'
+          # The oldest supported Ruby, with the oldest and newest ActiveRecord it supports
+          - ruby: 3.1
+            env:
+              AR_VERSION: '6.1'
+          - ruby: 3.1
+            env:
+              AR_VERSION: '7.2'
+          # The oldest Ruby that ActiveRecord 8 supports
+          - ruby: 3.2
+            env:
+              AR_VERSION: '8.0'
+          - ruby: jruby-9.4.8.0
+            env:
+              AR_VERSION: '7.0'
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental || false }}
+    env:
+      AR_VERSION: ${{ matrix.env.AR_VERSION }}
+      DB_DATABASE: activerecord_import_test
+      # Skips JRuby's optimizing JIT, which mostly slows down short-lived processes like these test runs
+      JRUBY_OPTS: ${{ startsWith(matrix.ruby, 'jruby') && '--dev' || '' }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install SQLite3 Development Library
+        run: |
+          sudo apt-get update
+          sudo apt-get install libsqlite3-dev
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+          rubygems: latest
+      - name: Update Rails to the current main revision
+        # A restored bundler cache can pin the git source to a stale revision, which would
+        # quietly test an old Rails main instead of the current branch head.
+        if: ${{ matrix.experimental }}
+        run: bundle update activesupport activemodel activerecord
+      - name: Set up databases
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-mysql-client
+          mysql -h 127.0.0.1 -uroot -proot -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'root';"
+          mysql -h 127.0.0.1 -uroot -proot -e "ALTER USER 'root'@'%' IDENTIFIED WITH mysql_native_password BY 'root';"
+          mysql -h 127.0.0.1 -uroot -proot -e "ALTER USER 'github'@'%' IDENTIFIED WITH mysql_native_password BY 'github';"
+          mysql -h 127.0.0.1 -uroot -proot -e "FLUSH PRIVILEGES;"
+          psql -h localhost -U postgres -c 'create database ${{ env.DB_DATABASE }};'
+          psql -h localhost -U postgres -d ${{ env.DB_DATABASE }} -c 'create extension if not exists hstore;'
+          psql -h localhost -U postgres -c 'create extension if not exists postgis;'
+          psql -h localhost -U postgres -c 'create extension if not exists "uuid-ossp";'
+          cp test/github/database.yml test/database.yml
+        env:
+          PGPASSWORD: postgres
+      - name: Run tests with mysql2
+        run: |
+          bundle exec rake test:mysql2
+          bundle exec rake test:mysql2_makara
+          bundle exec rake test:mysql2spatial
+          bundle exec rake test:mysql2_proxy
+          bundle exec rake test:janus_mysql2
+      - name: Run tests with postgresql
+        run: |
+          bundle exec rake test:postgis
+          bundle exec rake test:postgresql
+          bundle exec rake test:postgresql_makara
+          bundle exec rake test:postgresql_proxy
+      - name: Run tests with sqlite
+        run: |
+          bundle exec rake test:spatialite
+          bundle exec rake test:sqlite3
+          bundle exec rake test:sqlite3_proxy
+      - name: Run trilogy tests
+        if: ${{ matrix.env.AR_VERSION >= '7.0' && !startsWith(matrix.ruby, 'jruby') }}
+        run: |
+          bundle exec rake test:trilogy
+          bundle exec rake test:trilogy_proxy
+          bundle exec rake test:janus_trilogy
+
+  test-mariadb:
+    services:
+      mariadb:
+        image: mariadb:${{ matrix.mariadb }}
+        ports:
+          - 3306:3306
+        env:
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: activerecord_import_test
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    strategy:
+      fail-fast: false
+      matrix:
+        # The current long-term support releases
+        mariadb:
+          - '10.11'
+          - '11.8'
+        ar_version:
+          - '8.1'
+          - '7.2'
+          - '6.1'
+    runs-on: ubuntu-latest
+    env:
+      AR_VERSION: ${{ matrix.ar_version }}
+      RUBYOPT: --enable-frozen-string-literal
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install SQLite3 Development Library
+        run: |
+          sudo apt-get update
+          sudo apt-get install libsqlite3-dev
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.4
+          bundler-cache: true
+          rubygems: latest
+      - name: Set up database
+        run: cp test/github/database.yml test/database.yml
+      - name: Run tests with mysql2
+        run: |
+          bundle exec rake test:mysql2
+          bundle exec rake test:mysql2_proxy
+      - name: Run trilogy tests
+        if: ${{ matrix.ar_version >= '7.0' }}
+        run: |
+          bundle exec rake test:trilogy
+          bundle exec rake test:trilogy_proxy
+
+  lint:
+    runs-on: ubuntu-latest
+    env:
+      AR_VERSION: '7.0'
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install SQLite3 Development Library
+        run: |
+          sudo apt-get update
+          sudo apt-get install libsqlite3-dev
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.1
+          bundler-cache: true
+      - name: Run Rubocop
+        run: bundle exec rubocop
