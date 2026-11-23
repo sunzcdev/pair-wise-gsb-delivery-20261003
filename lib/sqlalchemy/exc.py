@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import typing
 from typing import Any
+from typing import Dict
 from typing import List
 from typing import Optional
 from typing import overload
@@ -506,6 +507,147 @@ class DontWrapMixin:
     """
 
 
+class BindParameterContext:
+    """Value-free structural context describing where in the parameter
+    binding process a failure occurred.
+
+    This object is attached to :class:`.StatementError` as the
+    :attr:`.StatementError.bind_context` attribute when an error is
+    raised while SQLAlchemy is binding parameters to a statement, e.g.
+    while a datatype's bind processor is running, and may also be
+    populated for driver-level errors encountered during an
+    ``executemany()`` style execution.
+
+    The object records **structural information only**: parameter group
+    numbers, bind parameter ("statement slot") names, and expansion
+    positions for "expanding" parameters.  It never carries the original
+    parameter values or their processed forms, so it is safe to log or
+    record even when the engine is configured with
+    :paramref:`_sa.create_engine.hide_parameters` set to ``True``.
+
+    .. versionadded:: 2.1
+
+    """
+
+    __slots__ = (
+        "statement_slot",
+        "parameter_group_index",
+        "parameter_group_range",
+        "expanded_from",
+        "expanded_index",
+    )
+
+    def __init__(
+        self,
+        statement_slot: Optional[str] = None,
+        parameter_group_index: Optional[int] = None,
+        parameter_group_range: Optional[Tuple[int, int]] = None,
+        expanded_from: Optional[str] = None,
+        expanded_index: Optional[int] = None,
+    ):
+        self.statement_slot = statement_slot
+        self.parameter_group_index = parameter_group_index
+        self.parameter_group_range = parameter_group_range
+        self.expanded_from = expanded_from
+        self.expanded_index = expanded_index
+
+    statement_slot: Optional[str]
+    """Name of the bound parameter ("statement slot") that was being
+    bound when the error occurred, if known.  For an element of an
+    "expanding" parameter, this is the generated per-element name."""
+
+    parameter_group_index: Optional[int]
+    """Zero-based index of the parameter group within a multi-parameter
+    ("executemany" style) execution that was being bound when the error
+    occurred, if the error can be attributed to a single group."""
+
+    parameter_group_range: Optional[Tuple[int, int]]
+    """Half-open ``(start, stop)`` range of parameter groups known to
+    contain the failure, used when the error cannot be attributed to a
+    single parameter group (e.g. a driver-level ``executemany()``
+    failure)."""
+
+    expanded_from: Optional[str]
+    """For "expanding" parameters, the name of the original list-valued
+    bind parameter from which :attr:`.statement_slot` was expanded."""
+
+    expanded_index: Optional[int]
+    """For "expanding" parameters, the zero-based position within the
+    original list value corresponding to :attr:`.statement_slot`."""
+
+    def describe(self) -> str:
+        """Return a human-readable description of this context.
+
+        The returned string contains structural information only and
+        never includes parameter values, so it is safe to include in
+        logged error text.
+        """
+        parts: List[str] = []
+        if self.parameter_group_index is not None:
+            parts.append("in parameter group %d" % self.parameter_group_index)
+        elif self.parameter_group_range is not None:
+            start, stop = self.parameter_group_range
+            parts.append("in parameter group range [%d, %d)" % (start, stop))
+        if self.statement_slot is not None:
+            if self.expanded_from is not None:
+                parts.append(
+                    "for bind parameter %r, element %d of expanding "
+                    "parameter %r"
+                    % (
+                        self.statement_slot,
+                        self.expanded_index,
+                        self.expanded_from,
+                    )
+                )
+            else:
+                parts.append("for bind parameter %r" % self.statement_slot)
+        if not parts:
+            return "parameter binding context unavailable"
+        return " ".join(parts)
+
+    def __repr__(self) -> str:
+        return "%s(%s)" % (
+            self.__class__.__name__,
+            ", ".join(
+                "%s=%r" % (slot, getattr(self, slot))
+                for slot in self.__slots__
+            ),
+        )
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {slot: getattr(self, slot) for slot in self.__slots__}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        for slot in self.__slots__:
+            setattr(self, slot, state[slot])
+
+
+_BIND_CONTEXT_ATTR = "__sqlalchemy_bind_context__"
+
+
+def _annotate_with_bind_context(
+    err: BaseException, bind_context: BindParameterContext
+) -> None:
+    """Privately annotate a raised exception with a
+    :class:`.BindParameterContext`, so that the error handling layer
+    can pick it up and attach it to the wrapping
+    :class:`.StatementError`.
+
+    An existing annotation is not overwritten, so that the innermost
+    (most specific) binding context is preserved.
+
+    """
+    if not hasattr(err, _BIND_CONTEXT_ATTR):
+        setattr(err, _BIND_CONTEXT_ATTR, bind_context)
+
+
+def _get_bind_context(err: BaseException) -> Optional[BindParameterContext]:
+    """Return the :class:`.BindParameterContext` previously attached to
+    the given exception via :func:`._annotate_with_bind_context`, if any.
+    """
+    return getattr(err, _BIND_CONTEXT_ATTR, None)
+
+
 class StatementError(SQLAlchemyError):
     """An error occurred during execution of a SQL statement.
 
@@ -541,6 +683,21 @@ class StatementError(SQLAlchemyError):
 
     connection_invalidated: bool = False
 
+    bind_context: Optional[BindParameterContext] = None
+    """Value-free structural context describing where in the parameter
+    binding process the error occurred, if known.
+
+    This attribute is populated when the error was raised while
+    SQLAlchemy was binding parameters to the statement, or when a
+    driver-level error occurred during a multi-parameter execution.
+    It contains no parameter values, only structural information such
+    as parameter group numbers and bind parameter names, so it is safe
+    to log or record even when ``hide_parameters`` is enabled.
+
+    .. versionadded:: 2.1
+
+    """
+
     def __init__(
         self,
         message: str,
@@ -563,6 +720,9 @@ class StatementError(SQLAlchemyError):
         self.detail.append(msg)
 
     def __reduce__(self) -> Union[str, Tuple[Any, ...]]:
+        state: Dict[str, Any] = {"detail": self.detail}
+        if self.bind_context is not None:
+            state["bind_context"] = self.bind_context
         return (
             self.__class__,
             (
@@ -574,7 +734,7 @@ class StatementError(SQLAlchemyError):
                 self.__dict__.get("code"),
                 self.ismulti,
             ),
-            {"detail": self.detail},
+            state,
         )
 
     @_preloaded.preload_module("sqlalchemy.sql.util")
@@ -744,6 +904,9 @@ class DBAPIError(StatementError):
         )
 
     def __reduce__(self) -> Union[str, Tuple[Any, ...]]:
+        state: Dict[str, Any] = {"detail": self.detail}
+        if self.bind_context is not None:
+            state["bind_context"] = self.bind_context
         return (
             self.__class__,
             (
@@ -755,7 +918,7 @@ class DBAPIError(StatementError):
                 self.__dict__.get("code"),
                 self.ismulti,
             ),
-            {"detail": self.detail},
+            state,
         )
 
     def __init__(

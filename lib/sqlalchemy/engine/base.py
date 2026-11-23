@@ -2283,6 +2283,27 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             else:
                 sqlalchemy_exception = None
 
+            if isinstance(sqlalchemy_exception, exc.StatementError):
+                bind_context = exc._get_bind_context(e)
+                if (
+                    bind_context is None
+                    and context is not None
+                    and context.executemany
+                    and isinstance(parameters, (list, tuple))
+                ):
+                    # a driver-level failure within an executemany()
+                    # call can't be attributed to a single parameter
+                    # group; express the known range of groups instead
+                    bind_context = exc.BindParameterContext(
+                        parameter_group_range=(0, len(parameters))
+                    )
+                if bind_context is not None:
+                    sqlalchemy_exception.bind_context = bind_context
+                    sqlalchemy_exception.add_detail(
+                        "error occurred while binding parameters "
+                        + bind_context.describe()
+                    )
+
             newraise = None
 
             if (self.dialect._has_events) and not self._execution_options.get(

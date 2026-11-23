@@ -1744,15 +1744,26 @@ class DefaultExecutionContext(ExecutionContext):
         if compiled.positional:
             core_positional_parameters: MutableSequence[Sequence[Any]] = []
             assert positiontup is not None
-            for compiled_params in self.compiled_parameters:
-                l_param: List[Any] = [
-                    (
-                        flattened_processors[key](compiled_params[key])
-                        if key in flattened_processors
-                        else compiled_params[key]
-                    )
-                    for key in positiontup
-                ]
+            for group_number, compiled_params in enumerate(
+                self.compiled_parameters
+            ):
+                l_param: List[Any] = []
+                for key in positiontup:
+                    if key in flattened_processors:
+                        try:
+                            l_param.append(
+                                flattened_processors[key](
+                                    compiled_params[key]
+                                )
+                            )
+                        except Exception as bind_err:
+                            exc._annotate_with_bind_context(
+                                bind_err,
+                                self._bind_error_context(key, group_number),
+                            )
+                            raise
+                    else:
+                        l_param.append(compiled_params[key])
                 core_positional_parameters.append(
                     dialect.execute_sequence_format(l_param)
                 )
@@ -1768,31 +1779,82 @@ class DefaultExecutionContext(ExecutionContext):
             # #8056 where self.compiled_parameters is meant to contain unquoted
             # param names.
             d_param: Dict[str, Any]
-            for compiled_params in self.compiled_parameters:
+            for group_number, compiled_params in enumerate(
+                self.compiled_parameters
+            ):
                 if escaped_names:
-                    d_param = {
-                        escaped_names.get(key, key): (
-                            flattened_processors[key](compiled_params[key])
-                            if key in flattened_processors
-                            else compiled_params[key]
-                        )
-                        for key in compiled_params
-                    }
+                    d_param = {}
+                    for key in compiled_params:
+                        if key in flattened_processors:
+                            try:
+                                value = flattened_processors[key](
+                                    compiled_params[key]
+                                )
+                            except Exception as bind_err:
+                                exc._annotate_with_bind_context(
+                                    bind_err,
+                                    self._bind_error_context(
+                                        key, group_number
+                                    ),
+                                )
+                                raise
+                        else:
+                            value = compiled_params[key]
+                        d_param[escaped_names.get(key, key)] = value
                 else:
-                    d_param = {
-                        key: (
-                            flattened_processors[key](compiled_params[key])
-                            if key in flattened_processors
-                            else compiled_params[key]
-                        )
-                        for key in compiled_params
-                    }
+                    d_param = {}
+                    for key in compiled_params:
+                        if key in flattened_processors:
+                            try:
+                                value = flattened_processors[key](
+                                    compiled_params[key]
+                                )
+                            except Exception as bind_err:
+                                exc._annotate_with_bind_context(
+                                    bind_err,
+                                    self._bind_error_context(
+                                        key, group_number
+                                    ),
+                                )
+                                raise
+                        else:
+                            value = compiled_params[key]
+                        d_param[key] = value
 
                 core_dict_parameters.append(d_param)
 
             self.parameters = core_dict_parameters
 
         return self
+
+    def _bind_error_context(
+        self, key: str, group_number: int
+    ) -> exc.BindParameterContext:
+        """Return a value-free :class:`.BindParameterContext` describing
+        the statement slot and parameter group that was being bound when
+        a bind processor raised.
+
+        For "expanding" parameters, the generated per-element slot name
+        is mapped back to the original list-valued parameter and the
+        position within that list, using the expansion state recorded
+        for this execution.
+
+        """
+        expanded_from: Optional[str] = None
+        expanded_index: Optional[int] = None
+        expanded_parameters = self._expanded_parameters
+        if expanded_parameters:
+            for original_name, expand_keys in expanded_parameters.items():
+                if key in expand_keys:
+                    expanded_from = original_name
+                    expanded_index = expand_keys.index(key)
+                    break
+        return exc.BindParameterContext(
+            statement_slot=key,
+            parameter_group_index=group_number,
+            expanded_from=expanded_from,
+            expanded_index=expanded_index,
+        )
 
     @classmethod
     def _init_statement(

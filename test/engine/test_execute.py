@@ -947,6 +947,195 @@ class ExecuteDriverTest(fixtures.TablesTest):
         )
 
 
+class BindParameterErrorContextTest(fixtures.TablesTest):
+    """Test the value-free structural bind context attached to
+    StatementError when parameter binding fails, in particular with
+    hide_parameters enabled."""
+
+    __backend__ = True
+
+    @classmethod
+    def define_tables(cls, metadata):
+        Table(
+            "bind_ctx",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", String(50)),
+        )
+
+    def setup_test(self):
+        self.eng = engines.testing_engine(options={"hide_parameters": True})
+
+    def teardown_test(self):
+        self.eng.dispose()
+
+    def _assert_no_values_leaked(self, err, *tokens):
+        error_text = str(err)
+        for token in tokens:
+            assert token not in error_text, (
+                "token %r was found in the recordable error text: %s"
+                % (token, error_text)
+            )
+        bind_context = err.bind_context
+        for slot in (
+            "statement_slot",
+            "parameter_group_index",
+            "parameter_group_range",
+            "expanded_from",
+            "expanded_index",
+        ):
+            value = getattr(bind_context, slot)
+            for token in tokens:
+                if isinstance(value, str):
+                    assert token not in value
+                else:
+                    assert token != value
+
+    def test_executemany_bind_processor_error(self):
+        """A bind processor failing for one group of an executemany()
+        is attributed to that parameter group and statement slot, with
+        no raw or processed values in the recordable text."""
+
+        raw_values = ["raw_sensitive_0", "raw_sensitive_1", "raw_sensitive_2"]
+
+        class SensitiveType(TypeDecorator):
+            impl = String
+            cache_ok = True
+
+            def process_bind_param(self, value, dialect):
+                if value == "raw_sensitive_1":
+                    raise SomeException("cannot bind this value")
+                return "processed_%s" % value
+
+        bind_ctx = self.tables.bind_ctx
+
+        stmt = bind_ctx.insert().values(
+            data=bindparam("data", type_=SensitiveType())
+        )
+
+        with self.eng.connect() as conn:
+            err = assert_raises_message(
+                tsa.exc.StatementError,
+                r"error occurred while binding parameters in parameter "
+                r"group 1 for bind parameter 'data'",
+                conn.execute,
+                stmt,
+                [{"data": value} for value in raw_values],
+            )
+
+        # existing exception type and original cause are preserved
+        is_(type(err), tsa.exc.StatementError)
+        is_(type(err.orig), SomeException)
+        is_true(err.hide_parameters)
+
+        bind_context = err.bind_context
+        is_not(bind_context, None)
+        eq_(bind_context.parameter_group_index, 1)
+        eq_(bind_context.parameter_group_range, None)
+        eq_(bind_context.statement_slot, "data")
+        eq_(bind_context.expanded_from, None)
+        eq_(bind_context.expanded_index, None)
+
+        # neither the raw values nor their processed forms appear in
+        # the recordable diagnostics
+        self._assert_no_values_leaked(
+            err, "raw_sensitive", "processed_raw_sensitive"
+        )
+
+    def test_expanding_bind_processor_error(self):
+        """A bind processor failing for one element of an expanding
+        parameter is attributed to the original list slot and the
+        definite expansion position."""
+
+        raw_values = ["raw_expand_0", "raw_expand_1", "raw_expand_2"]
+
+        class SensitiveType(TypeDecorator):
+            impl = String
+            cache_ok = True
+
+            def process_bind_param(self, value, dialect):
+                if value == "raw_expand_2":
+                    raise SomeException("cannot bind this element")
+                return "processed_%s" % value
+
+        stmt = select(column("data")).where(
+            column("data").in_(
+                bindparam("q", expanding=True, type_=SensitiveType())
+            )
+        )
+
+        with self.eng.connect() as conn:
+            err = assert_raises_message(
+                tsa.exc.StatementError,
+                r"error occurred while binding parameters in parameter "
+                r"group 0 for bind parameter 'q_\d+', element 2 of "
+                r"expanding parameter 'q'",
+                conn.execute,
+                stmt,
+                {"q": raw_values},
+            )
+
+        is_(type(err), tsa.exc.StatementError)
+        is_(type(err.orig), SomeException)
+
+        bind_context = err.bind_context
+        is_not(bind_context, None)
+        eq_(bind_context.parameter_group_index, 0)
+        eq_(bind_context.expanded_from, "q")
+        eq_(bind_context.expanded_index, 2)
+        # the statement slot is the generated per-element name, not the
+        # original list slot
+        is_not(bind_context.statement_slot, "q")
+        assert bind_context.statement_slot.startswith("q_")
+
+        self._assert_no_values_leaked(
+            err, "raw_expand", "processed_raw_expand"
+        )
+
+    def test_executemany_driver_error_group_range(self):
+        """A driver-level executemany() failure that cannot be
+        attributed to a single parameter group expresses the known
+        range of groups instead."""
+
+        with self.eng.connect() as conn:
+            err = assert_raises_message(
+                tsa.exc.DBAPIError,
+                r"error occurred while binding parameters in parameter "
+                r"group range \[0, 5\)",
+                conn.execute,
+                text(
+                    "INSERT INTO nonexistent_bind_ctx (data) VALUES (:data)"
+                ),
+                [{"data": "raw_hidden_%d" % i} for i in range(5)],
+            )
+
+        bind_context = err.bind_context
+        is_not(bind_context, None)
+        eq_(bind_context.parameter_group_index, None)
+        eq_(bind_context.parameter_group_range, (0, 5))
+        eq_(bind_context.statement_slot, None)
+
+        self._assert_no_values_leaked(err, "raw_hidden")
+
+    def test_bind_context_pickleable(self):
+        err = tsa.exc.StatementError(
+            "some error", "select 1", {"data": "x"}, Exception("orig")
+        )
+        err.bind_context = tsa.exc.BindParameterContext(
+            statement_slot="data",
+            parameter_group_index=1,
+            expanded_from="q",
+            expanded_index=2,
+        )
+        for loads, dumps in picklers():
+            repickled = loads(dumps(err))
+            is_not(repickled.bind_context, None)
+            eq_(repickled.bind_context.statement_slot, "data")
+            eq_(repickled.bind_context.parameter_group_index, 1)
+            eq_(repickled.bind_context.expanded_from, "q")
+            eq_(repickled.bind_context.expanded_index, 2)
+
+
 class CompiledCacheTest(fixtures.TestBase):
     __sparse_driver_backend__ = True
 
