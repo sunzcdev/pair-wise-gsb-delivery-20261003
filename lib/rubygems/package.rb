@@ -45,6 +45,7 @@ require_relative "user_interaction"
 #   the_gem.extract_files destination_directory # extract the gem into a directory
 #   the_gem.spec # get the spec out of the gem
 #   the_gem.verify # check the gem is OK (contains valid gem specification, contains a not corrupt contents archive)
+#   the_gem.integrity_report # what the read actually verified, without raising
 #
 # #files are the files in the .gem tar file, not the Ruby files in the gem
 # #extract_files and #contents automatically call #verify
@@ -98,6 +99,243 @@ class Gem::Package
       message += " This is a problem with the '#{gem_name}' gem, not Rubygems." if gem_name
       message += " Please report this issue to the gem author."
       super message
+    end
+  end
+
+  ##
+  # One integrity check performed while reading a package, as reported by
+  # Gem::Package#integrity_report.
+  #
+  # The +status+ separates the three things that can happen to a check:
+  #
+  # [VERIFIED] the package supplied the evidence for this check and it
+  #            matched what was read
+  # [FAILED] the package supplied evidence that did not match, or the data
+  #          needed to finish the check could not be read
+  # [NOT_PROVIDED] the package does not carry this evidence at all, so
+  #                there was nothing to verify. This is not a failure: gems
+  #                built before checksums.yaml.gz existed have no checksums
+  #                to check.
+  #
+  # The +kind+ names the stage that produced the check:
+  #
+  # [:package] the read could not start or ended unexpectedly
+  # [:read] a package member was read from start to end
+  # [:structure] the package carries the members a gem must have
+  # [:specification] the metadata was parsed into a Gem::Specification
+  # [:manifest] checksums.yaml.gz was present and parsed
+  # [:checksum] a member digest was compared against checksums.yaml.gz
+  # [:signature] signatures were verified by the security policy
+
+  class IntegrityCheck
+    VERIFIED = :verified
+    FAILED = :failed
+    NOT_PROVIDED = :not_provided
+
+    STATUSES = [VERIFIED, FAILED, NOT_PROVIDED].freeze
+    KINDS = [:package, :read, :structure, :specification, :manifest, :checksum, :signature].freeze
+    private_constant :STATUSES, :KINDS
+
+    ##
+    # The stage that produced this check, one of the kinds listed above.
+
+    attr_reader :kind
+
+    ##
+    # What was checked, for example "data.tar.gz", "specification", or
+    # "signatures".
+
+    attr_reader :subject
+
+    ##
+    # One of VERIFIED, FAILED, or NOT_PROVIDED.
+
+    attr_reader :status
+
+    ##
+    # Human readable explanation of the status, or nil.
+
+    attr_reader :detail
+
+    def initialize(kind, subject, status, detail = nil)
+      unless KINDS.include? kind
+        raise ArgumentError, "unknown integrity check kind #{kind.inspect}"
+      end
+      unless STATUSES.include? status
+        raise ArgumentError, "unknown integrity check status #{status.inspect}"
+      end
+
+      @kind = kind
+      @subject = subject
+      @status = status
+      @detail = detail
+    end
+
+    def verified?
+      status == VERIFIED
+    end
+
+    def failed?
+      status == FAILED
+    end
+
+    def not_provided?
+      status == NOT_PROVIDED
+    end
+
+    def to_h
+      { kind: kind, subject: subject, status: status, detail: detail }
+    end
+
+    def to_s
+      detail ? "#{kind} #{subject}: #{status} (#{detail})" : "#{kind} #{subject}: #{status}"
+    end
+  end
+
+  ##
+  # The result of reading a package, as returned by
+  # Gem::Package#integrity_report.
+  #
+  # Unlike Gem::Package#verify it does not raise. A failure #verify would
+  # have raised is available from #error, and every check the read reached
+  # is listed in #checks with its own IntegrityCheck status, so callers can
+  # tell evidence that did not match from evidence the package never
+  # supplied.
+  #
+  # A package that failed its read is not installable, even if its metadata
+  # was readable before the failure: #installable? is the judgement callers
+  # should use before delivering the package as a normal installation.
+
+  class IntegrityReport
+    ##
+    # Accumulates checks while a package is read. Internal to
+    # Gem::Package#integrity_report.
+
+    class Recorder # :nodoc:
+      attr_reader :checks
+
+      def initialize
+        @checks = []
+      end
+
+      def record(kind, subject, status, detail = nil)
+        @checks << IntegrityCheck.new(kind, subject, status, detail)
+        self
+      end
+
+      def failure(kind, subject, error)
+        record kind, subject, IntegrityCheck::FAILED, error.message
+      end
+
+      def failed?
+        @checks.any?(&:failed?)
+      end
+
+      def recorded?(kind, subject)
+        @checks.any? {|check| check.kind == kind && check.subject == subject }
+      end
+    end
+
+    ##
+    # Overall status of a package whose read completed and whose supplied
+    # evidence all matched, but which did not supply every kind of evidence
+    # (for example, a gem with no checksums.yaml.gz).
+
+    UNVERIFIED = :unverified
+
+    ##
+    # The IntegrityCheck objects recorded by the read, in the order the
+    # read reached them.
+
+    attr_reader :checks
+
+    ##
+    # The exception Gem::Package#verify would have raised, or nil when the
+    # read completed.
+
+    attr_reader :error
+
+    def initialize(checks, error = nil)
+      @checks = checks.freeze
+      @error = error
+    end
+
+    ##
+    # The overall outcome: :failed if any check failed or the read raised,
+    # :verified if every check was verified, and :unverified when the read
+    # completed and every piece of supplied evidence matched but some
+    # evidence was not supplied. A read that recorded no checks at all, such
+    # as the old format which has no evidence to offer, is :unverified.
+
+    def status
+      return IntegrityCheck::FAILED if failed?
+      return UNVERIFIED if checks.empty?
+      return IntegrityCheck::VERIFIED if checks.all?(&:verified?)
+
+      UNVERIFIED
+    end
+
+    def verified?
+      status == IntegrityCheck::VERIFIED
+    end
+
+    def failed?
+      !error.nil? || checks.any?(&:failed?)
+    end
+
+    ##
+    # Whether the package may be delivered as a normally installable gem.
+    #
+    # A package whose read failed is not installable even when its metadata
+    # was readable, because the rest of it could not be checked. A package
+    # that merely omitted evidence, such as a gem built before
+    # checksums.yaml.gz existed, is still installable, as it always has
+    # been; it is just not fully verified.
+
+    def installable?
+      !failed?
+    end
+
+    def checks_for(kind, subject = nil)
+      checks.select do |check|
+        check.kind == kind && (subject.nil? || check.subject == subject)
+      end
+    end
+
+    def verified_subjects(kind = nil)
+      subjects_with_status IntegrityCheck::VERIFIED, kind
+    end
+
+    def failed_subjects(kind = nil)
+      subjects_with_status IntegrityCheck::FAILED, kind
+    end
+
+    def not_provided_subjects(kind = nil)
+      subjects_with_status IntegrityCheck::NOT_PROVIDED, kind
+    end
+
+    def to_h
+      {
+        status: status,
+        installable: installable?,
+        error: error ? { class: error.class.name, message: error.message } : nil,
+        checks: checks.map(&:to_h),
+      }
+    end
+
+    def to_s
+      lines = ["integrity: #{status}", "installable: #{installable?}"]
+      checks.each {|check| lines << "  #{check}" }
+      lines << "  error: #{error.class}: #{error.message}" if error
+      lines.join "\n"
+    end
+
+    private
+
+    def subjects_with_status(status, kind)
+      selected = checks.select {|check| check.status == status }
+      selected = selected.select {|check| check.kind == kind } if kind
+      selected.map(&:subject).uniq
     end
   end
 
@@ -252,6 +490,8 @@ class Gem::Package
     @signatures      = {}
     @signer          = nil
     @spec            = nil
+
+    @integrity_recorder = nil
   end
 
   ##
@@ -452,13 +692,9 @@ EOM
   # the security policy.
 
   def digest(entry) # :nodoc:
-    algorithms = if @checksums
-      @checksums.to_h {|algorithm, _| [algorithm, Gem::Security.create_digest(algorithm)] }
-    elsif Gem::Security::DIGEST_NAME
-      { Gem::Security::DIGEST_NAME => Gem::Security.create_digest(Gem::Security::DIGEST_NAME) }
-    end
+    algorithms = digest_algorithms
 
-    return @digests if algorithms.nil? || algorithms.empty?
+    return @digests if algorithms.empty?
 
     buf = String.new(capacity: 16_384, encoding: Encoding::BINARY)
     until entry.eof?
@@ -665,15 +901,32 @@ EOM
 
   ##
   # Reads and loads checksums.yaml.gz from the tar file +gem+
+  #
+  # The checksums file is the package's own evidence that the parts named in
+  # it are intact. A package built before checksums.yaml.gz existed has none,
+  # which #integrity_report reports as not provided rather than as a failure.
 
   def read_checksums(gem)
     Gem.load_yaml
 
+    present = false
+
     @checksums = gem.seek "checksums.yaml.gz" do |entry|
+      present = true
       Zlib::GzipReader.wrap entry do |gz_io|
         Gem::SafeYAML.safe_load limit_read(gz_io, "checksums.yaml.gz", 10 * 1024 * 1024)
       end
     end
+
+    if present
+      integrity_record :manifest, "checksums.yaml.gz", IntegrityCheck::VERIFIED
+    else
+      integrity_record :manifest, "checksums.yaml.gz", IntegrityCheck::NOT_PROVIDED,
+                        "package has no checksum manifest"
+    end
+  rescue StandardError => e
+    integrity_record :manifest, "checksums.yaml.gz", IntegrityCheck::FAILED, e.message
+    raise
   end
 
   ##
@@ -722,11 +975,47 @@ EOM
   #
   # After verification the gem specification from the gem is available from
   # #spec
+  #
+  # Raises Gem::Package::FormatError or Gem::Security::Exception when the
+  # package is not intact. Use #integrity_report for the same checks without
+  # exceptions.
 
   def verify
     @files     = []
     @spec      = nil
 
+    read_package
+
+    verify_checksums @digests, @checksums
+
+    record_unchecked_members
+
+    verify_package_signatures
+
+    true
+  rescue Gem::Security::Exception
+    reset_verification
+    raise
+  rescue Errno::ENOENT => e
+    reset_verification
+    raise Gem::Package::FormatError.new e.message
+  rescue Zlib::GzipFile::Error, EOFError, Gem::Package::TarInvalidError => e
+    reset_verification
+    raise Gem::Package::FormatError.new e.message, @gem
+  rescue StandardError
+    # Any other integrity failure, including a checksum mismatch or missing
+    # member found while reading. The metadata may already be loaded by now,
+    # but the package as a whole was not verified, so drop it rather than
+    # leaving #spec able to return metadata from a package that failed.
+    reset_verification
+    raise
+  end
+
+  ##
+  # Reads the package members, the checksum manifest, and the metadata into
+  # the package state used by #verify.
+
+  def read_package # :nodoc:
     @gem.with_read_io do |io|
       Gem::Package::TarReader.new io do |reader|
         read_checksums reader
@@ -734,23 +1023,94 @@ EOM
         verify_files reader
       end
     end
+  end
 
-    verify_checksums @digests, @checksums
+  ##
+  # Discards the partially loaded state of a failed verification so that
+  # #spec does not hand back metadata from a package whose integrity check
+  # failed.
 
-    @security_policy&.verify_signatures @spec, @digests, @signatures
-
-    true
-  rescue Gem::Security::Exception
-    @spec = nil
+  def reset_verification # :nodoc:
+    @spec  = nil
     @files = []
-    raise
-  rescue Errno::ENOENT => e
-    raise Gem::Package::FormatError.new e.message
-  rescue Zlib::GzipFile::Error, EOFError, Gem::Package::TarInvalidError => e
-    raise Gem::Package::FormatError.new e.message, @gem
+  end
+
+  ##
+  # The digest algorithms to compute for each member, from the algorithms
+  # recorded in checksums.yaml.gz, or the security default when there is no
+  # manifest.
+
+  def digest_algorithms # :nodoc:
+    if @checksums
+      @checksums.to_h {|algorithm, _| [algorithm, Gem::Security.create_digest(algorithm)] }
+    elsif Gem::Security::DIGEST_NAME
+      { Gem::Security::DIGEST_NAME => Gem::Security.create_digest(Gem::Security::DIGEST_NAME) }
+    else
+      {}
+    end
+  end
+
+  ##
+  # Reports what reading this package actually checked, without raising for
+  # an integrity problem.
+  #
+  # The report is produced by the same read #verify performs, so it reflects
+  # the stages the read reached and the checks it ran. Each check has one of
+  # three statuses: verified when the package supplied matching evidence,
+  # failed when evidence did not match or the data needed for the check could
+  # not be read, and not_provided when the package carries no such evidence
+  # at all (gems built before checksums.yaml.gz existed have no checksums to
+  # check, which is not the same as corrupt data).
+  #
+  # A package whose metadata is readable but whose read fails afterwards is
+  # reported as failed, and #installable? is false for it. The metadata it
+  # managed to read is not left behind for #spec either, so a caller cannot
+  # mistake that package for a normal installable result. Packages that
+  # merely omit evidence remain installable, as they are for #verify, but
+  # are not fully verified.
+  #
+  # Any exception #verify would have raised is available from
+  # Gem::Package::IntegrityReport#error.
+
+  def integrity_report
+    recorder = IntegrityReport::Recorder.new
+    @integrity_recorder = recorder
+
+    error = nil
+    begin
+      verify
+    rescue StandardError => e
+      error = e
+      # The check that failed usually recorded itself with the stage that
+      # produced it, which is more specific than the exception. Only add a
+      # package-level failure when nothing else did.
+      recorder.failure(:package, "package", e) unless recorder.failed?
+    ensure
+      @integrity_recorder = nil
+    end
+
+    IntegrityReport.new recorder.checks, error
   end
 
   private
+
+  ##
+  # Records a check in the report being built by #integrity_report. Does
+  # nothing when no report is being built, so the read path is unchanged for
+  # #verify and its callers.
+
+  def integrity_record(kind, subject, status, detail = nil)
+    @integrity_recorder&.record kind, subject, status, detail
+  end
+
+  ##
+  # Whether the report being built already has a check for +subject+ in
+  # +kind+. Used to record each member once even when multiple readers reach
+  # it.
+
+  def integrity_recorded?(kind, subject)
+    @integrity_recorder&.recorded? kind, subject
+  end
 
   ##
   # The +required_rubygems_version+ for a content-addressable build: the
@@ -855,8 +1215,39 @@ EOM
   end
 
   ##
+  # Verifies signatures with the security policy, if any.
+  #
+  # The policy always runs when one is configured, so policies that refuse
+  # unsigned packages keep doing so. An unsigned package is recorded as
+  # not_provided when the policy allows it through, since there was no
+  # signature evidence to check.
+
+  def verify_package_signatures # :nodoc:
+    return unless @security_policy
+
+    unsigned = @signatures.empty?
+
+    @security_policy.verify_signatures @spec, @digests, @signatures
+
+    if unsigned
+      integrity_record :signature, "signatures", IntegrityCheck::NOT_PROVIDED,
+                       "package has no signatures"
+    else
+      integrity_record :signature, "signatures", IntegrityCheck::VERIFIED
+    end
+  rescue Gem::Security::Exception => e
+    integrity_record :signature, "signatures", IntegrityCheck::FAILED, e.message
+    raise
+  end
+
+  ##
   # Verifies the +checksums+ against the +digests+.  This check is not
   # cryptographically secure.  Missing checksums are ignored.
+  #
+  # Each manifest entry is recorded as its own check, because a member may
+  # be covered by several algorithms and they can disagree: one can match
+  # while another does not. The subject names both, as
+  # "data.tar.gz (SHA256)".
 
   def verify_checksums(digests, checksums) # :nodoc:
     return unless checksums
@@ -865,32 +1256,117 @@ EOM
       gem_digests.sort.each do |file_name, gem_hexdigest|
         computed_digest = digests[algorithm][file_name]
 
-        unless computed_digest.hexdigest == gem_hexdigest
-          raise Gem::Package::FormatError.new \
-            "#{algorithm} checksum mismatch for #{file_name}", @gem
+        if computed_digest.hexdigest == gem_hexdigest
+          integrity_record :checksum, "#{file_name} (#{algorithm})", IntegrityCheck::VERIFIED
+        else
+          detail = "#{algorithm} checksum mismatch for #{file_name}"
+          integrity_record :checksum, "#{file_name} (#{algorithm})", IntegrityCheck::FAILED, detail
+          raise Gem::Package::FormatError.new detail, @gem
         end
       end
     end
   end
 
   ##
+  # Records, for every member without checksum evidence, that the package
+  # did not supply any. Gems built before checksums.yaml.gz existed have no
+  # checksums for metadata.gz or data.tar.gz, which is different from having
+  # checksums that do not match.
+
+  def record_unchecked_members # :nodoc:
+    return unless @integrity_recorder
+
+    checked = @checksums ? @checksums.flat_map {|_algorithm, members| members.keys } : []
+
+    @files.each do |file_name|
+      next if file_name.end_with? ".sig"
+      next if file_name == "checksums.yaml.gz"
+      next if checked.include? file_name
+
+      integrity_record :checksum, file_name, IntegrityCheck::NOT_PROVIDED,
+                       "package has no checksum for this member"
+    end
+  end
+
+  ##
   # Verifies +entry+ in a .gem file.
+  #
+  # Reading a member to its declared end and parsing its metadata are
+  # recorded separately, so a report can say whether the bytes of a member
+  # were actually read even when parsing the metadata that was read fails.
 
   def verify_entry(entry)
     file_name = entry.full_name
     @files << file_name
 
-    case file_name
-    when /\.sig$/ then
-      @signatures[$`] = limit_read(entry, file_name, 1024 * 1024) if @security_policy
+    if file_name.end_with? ".sig"
+      read_signature_member entry, file_name
       return
-    else
-      digest entry
     end
 
-    load_spec_from_metadata entry
+    read_member entry, file_name
+    parse_metadata_member entry, file_name
   rescue StandardError
     warn "Exception while verifying #{@gem.path}"
+    raise
+  end
+
+  ##
+  # Reads a non-signature member to its declared end, so a truncated or
+  # otherwise unreadable member is distinguished from a checksum mismatch.
+  #
+  # The report only claims the member was read when the read path actually
+  # consumed it. #digest skips reading when the package offers no digest
+  # algorithm to feed, so such a member is reported as not provided rather
+  # than verified.
+
+  def read_member(entry, file_name) # :nodoc:
+    if digest_algorithms.empty?
+      integrity_record :read, file_name, IntegrityCheck::NOT_PROVIDED,
+                       "no digest algorithm to read this member with"
+      return
+    end
+
+    digest entry
+
+    integrity_record :read, file_name, IntegrityCheck::VERIFIED
+  rescue StandardError => e
+    integrity_record :read, file_name, IntegrityCheck::FAILED, e.message
+    raise
+  end
+
+  ##
+  # Reads a signature member. Signatures are only read when a security
+  # policy will verify them, so without one the member is reported as not
+  # provided rather than read.
+
+  def read_signature_member(entry, file_name) # :nodoc:
+    unless @security_policy
+      integrity_record :read, file_name, IntegrityCheck::NOT_PROVIDED,
+                       "no security policy to verify signatures"
+      return
+    end
+
+    @signatures[file_name.delete_suffix(".sig")] = limit_read(entry, file_name, 1024 * 1024)
+
+    integrity_record :read, file_name, IntegrityCheck::VERIFIED
+  rescue StandardError => e
+    integrity_record :read, file_name, IntegrityCheck::FAILED, e.message
+    raise
+  end
+
+  ##
+  # Parses the spec out of a metadata member, recording the malformed
+  # metadata separately from a failure to read the member at all.
+
+  def parse_metadata_member(entry, file_name) # :nodoc:
+    load_spec_from_metadata entry
+
+    return unless @spec && %w[metadata metadata.gz].include?(file_name)
+
+    integrity_record :specification, "metadata", IntegrityCheck::VERIFIED
+  rescue StandardError => e
+    integrity_record :specification, "metadata", IntegrityCheck::FAILED, e.message
     raise
   end
 
@@ -903,17 +1379,24 @@ EOM
     end
 
     unless @spec
+      integrity_record :structure, "metadata", IntegrityCheck::FAILED, "package metadata is missing"
       raise Gem::Package::FormatError.new "package metadata is missing", @gem
     end
 
     unless @files.include? "data.tar.gz"
+      integrity_record :structure, "data.tar.gz", IntegrityCheck::FAILED,
+                       "package content (data.tar.gz) is missing"
       raise Gem::Package::FormatError.new \
         "package content (data.tar.gz) is missing", @gem
     end
 
     if (duplicates = @files.group_by {|f| f }.select {|_k,v| v.size > 1 }.map(&:first)) && duplicates.any?
+      integrity_record :structure, "package", IntegrityCheck::FAILED,
+                       "duplicate files in the package: (#{duplicates.map(&:inspect).join(", ")})"
       raise Gem::Security::Exception, "duplicate files in the package: (#{duplicates.map(&:inspect).join(", ")})"
     end
+
+    integrity_record :structure, "package", IntegrityCheck::VERIFIED
   end
 
   if RUBY_ENGINE == "truffleruby"

@@ -1823,6 +1823,236 @@ class TestGemPackage < Gem::Package::TarTestCase
 
   # end #verify tests
 
+  ##
+  # The three way comparison #integrity_report exists for, all built from
+  # the same local gem: an intact package, one that merely omits evidence
+  # gems built before checksums.yaml.gz did not have, and one whose metadata
+  # is readable but whose data member is cut short.
+
+  def test_integrity_report_verified
+    package = Gem::Package.new @gem
+
+    report = package.integrity_report
+
+    assert report.verified?
+    assert report.installable?
+    assert_equal :verified, report.status
+    assert_nil report.error
+
+    # The intact package actually verified every part it carries: the
+    # manifest was read, each member was read to its end, the metadata
+    # parsed, the structure was complete, and every manifest entry matched.
+    assert_equal %w[checksums.yaml.gz data.tar.gz metadata.gz], report.verified_subjects(:read).sort
+    assert_equal ["metadata"], report.verified_subjects(:specification)
+    assert_equal ["package"], report.verified_subjects(:structure)
+    assert_equal ["checksums.yaml.gz"], report.verified_subjects(:manifest)
+    # Each manifest entry is checked and named with its algorithm, since the
+    # same member is normally covered by more than one.
+    assert_equal ["data.tar.gz (SHA256)", "data.tar.gz (SHA512)",
+                  "metadata.gz (SHA256)", "metadata.gz (SHA512)"],
+                 report.verified_subjects(:checksum).sort
+
+    assert_empty report.failed_subjects
+    assert_empty report.not_provided_subjects
+  end
+
+  def test_integrity_report_omitted_evidence_is_not_a_failure
+    package = Gem::Package.new legacy_gem_without_checksums
+
+    report = package.integrity_report
+
+    # Omitting checksums is not the same as failing: the gem is still
+    # installable, it just cannot be fully verified.
+    assert_equal :unverified, report.status
+    refute report.verified?
+    assert report.installable?
+    assert_nil report.error
+
+    assert_equal ["checksums.yaml.gz"], report.not_provided_subjects(:manifest)
+    assert_equal %w[data.tar.gz metadata.gz], report.not_provided_subjects(:checksum).sort
+
+    assert_empty report.failed_subjects
+
+    # The parts it does carry were still actually read.
+    assert_equal %w[data.tar.gz metadata.gz], report.verified_subjects(:read).sort
+    assert_equal ["metadata"], report.verified_subjects(:specification)
+
+    # #verify agrees: it does not raise for evidence the package never had.
+    assert package.verify
+  end
+
+  def test_integrity_report_truncated_data_fails_though_metadata_read
+    package = Gem::Package.new gem_truncated_inside_data
+
+    report = package.integrity_report
+
+    assert_equal :failed, report.status
+    refute report.verified?
+    refute report.installable?
+    refute_nil report.error
+
+    # The metadata was read and parsed before the read hit the truncated
+    # data, so the read got that far but the data member could not be read
+    # to its end.
+    assert_equal ["metadata"], report.verified_subjects(:specification)
+    assert_equal ["metadata.gz"], report.verified_subjects(:read)
+    assert_equal ["data.tar.gz"], report.failed_subjects(:read)
+
+    detail = report.failed_subjects(:checksum)
+    refute_includes detail, "checksums.yaml.gz"
+
+    failure = report.checks_for(:read, "data.tar.gz").first
+    assert failure.failed?
+    assert_match(/end of file reached/i, failure.detail)
+  end
+
+  def test_integrity_report_failure_prevents_installable_result_despite_readable_metadata
+    path = gem_truncated_inside_data
+    package = Gem::Package.new path
+
+    # The metadata is readable on its own, the way a caller that only wants
+    # the spec would read it...
+    metadata = read_metadata_member path
+    refute_nil metadata
+    assert_equal @spec.name, Gem::Specification.from_yaml(metadata).name
+
+    # ...but the integrity read fails later, and must not leave the package
+    # deliverable as a normal installable result.
+    report = package.integrity_report
+
+    refute report.installable?
+    assert_equal ["data.tar.gz"], report.failed_subjects(:read)
+    refute report.verified?
+
+    # The failed read does not leave the metadata behind for #spec either.
+    assert_raise Gem::Package::FormatError do
+      package.spec
+    end
+  end
+
+  def test_integrity_report_error_matches_verify_exception
+    path = gem_truncated_inside_data
+
+    verify_error = assert_raise Gem::Package::FormatError do
+      Gem::Package.new(path).verify
+    end
+
+    report = Gem::Package.new(path).integrity_report
+
+    refute report.installable?
+    assert_instance_of verify_error.class, report.error
+    assert_equal verify_error.message, report.error.message
+  end
+
+  def test_integrity_report_does_not_raise_for_broken_package
+    package = Gem::Package.new "nonexistent.gem"
+
+    report = package.integrity_report
+
+    assert_equal :failed, report.status
+    refute report.installable?
+    assert_instance_of Gem::Package::FormatError, report.error
+    # The report still names where the read stopped.
+    refute_empty report.checks
+    assert report.checks.any?(&:failed?)
+  end
+
+  def test_integrity_report_nonexistent_package_still_raises_for_verify
+    package = Gem::Package.new "nonexistent.gem"
+
+    package.integrity_report
+
+    assert_raise Gem::Package::FormatError do
+      package.verify
+    end
+  end
+
+  def test_integrity_report_to_h
+    package = Gem::Package.new @gem
+
+    hash = package.integrity_report.to_h
+
+    assert_equal :verified, hash[:status]
+    assert_equal true, hash[:installable]
+    assert_nil hash[:error]
+    assert_kind_of Array, hash[:checks]
+    assert hash[:checks].all? {|check| check.key?(:kind) && check.key?(:status) }
+  end
+
+  def test_integrity_report_of_old_format_package
+    pend "jruby can't require the simple_gem file" if Gem.java_platform?
+    require_relative "simple_gem"
+    File.open "old_format.gem", "wb" do |io|
+      io.write SIMPLE_GEM
+    end
+
+    report = Gem::Package.new("old_format.gem").integrity_report
+
+    # Old format gems offer no integrity evidence at all, so there is
+    # nothing to verify, but they are not corrupt either.
+    assert_equal :unverified, report.status
+    assert report.installable?
+    assert_nil report.error
+  end
+
+  def test_integrity_report_structure_missing_data
+    package = Gem::Package.new gem_without_data_member
+
+    report = package.integrity_report
+
+    assert_equal :failed, report.status
+    refute report.installable?
+    assert_equal ["metadata"], report.verified_subjects(:specification)
+    assert_equal ["data.tar.gz"], report.failed_subjects(:structure)
+  end
+
+  def test_integrity_report_checksum_mismatch
+    package = Gem::Package.new gem_with_wrong_checksums
+
+    report = package.integrity_report
+
+    assert_equal :failed, report.status
+    refute report.installable?
+    assert_equal ["data.tar.gz (SHA256)"], report.failed_subjects(:checksum)
+
+    failure = report.checks_for(:checksum, "data.tar.gz (SHA256)").first
+    assert_match(/checksum mismatch/, failure.detail)
+  end
+
+  def test_checksum_failure_does_not_leave_readable_spec_behind
+    package = Gem::Package.new gem_with_wrong_checksums
+
+    assert_raise Gem::Package::FormatError do
+      package.verify
+    end
+
+    # The metadata was readable, but a package whose manifest says the
+    # contents do not match must not hand that metadata back as if the
+    # package were a normal installable result.
+    assert_raise Gem::Package::FormatError do
+      package.spec
+    end
+  end
+
+  def test_integrity_report_is_consumable_data
+    report = Gem::Package.new(@gem).integrity_report
+
+    # Callers can serialize or print the report without reaching into
+    # internals, and the status values travel as plain symbols.
+    hash = report.to_h
+
+    assert_equal :verified, hash[:status]
+    assert_equal true, hash[:installable]
+    assert_nil hash[:error]
+
+    check = hash[:checks].first
+    assert_kind_of Symbol, check[:kind]
+    assert_kind_of Symbol, check[:status]
+    assert_kind_of String, check[:subject]
+
+    assert_match(/^integrity: verified$/, report.to_s.lines.first.chomp)
+  end
+
   def test_missing_metadata
     invalid_metadata = ["metadataxgz", "foobar\nmetadata", "metadata\nfoobar"]
     invalid_metadata.each do |fname|
@@ -1950,5 +2180,136 @@ class TestGemPackage < Gem::Package::TarTestCase
     assert_match(%r{filename 'lib/file:name\.rb' contains characters that are invalid on Windows}, ui.error)
     assert_match(/This gem may fail to install on Windows/, ui.error)
     assert_path_exist spec.file_name
+  end
+
+  ##
+  # Builds a gem the way RubyGems did before checksums.yaml.gz existed:
+  # metadata and data only, no checksum manifest for either.
+
+  def legacy_gem_without_checksums
+    data_tgz = util_tar_gz do |tar|
+      tar.add_file "lib/code.rb", 0o444 do |io|
+        io.write "# lib/code.rb"
+      end
+    end
+
+    File.open "legacy.gem", "wb" do |io|
+      Gem::Package::TarWriter.new io do |gem|
+        gem.add_file "metadata.gz", 0o444 do |member|
+          member.write util_gzip(@spec.to_yaml)
+        end
+
+        gem.add_file "data.tar.gz", 0o444 do |member|
+          member.write data_tgz.string
+        end
+      end
+    end
+
+    "legacy.gem"
+  end
+
+  ##
+  # Builds an intact gem, then cuts it off halfway through the bytes of
+  # data.tar.gz, keeping metadata.gz intact ahead of it.
+
+  def gem_truncated_inside_data
+    data = Gem.read_binary @gem
+    name, size, content_start = first_entry_data(data) {|entry| entry == "data.tar.gz" }
+    raise "no data.tar.gz in #{@gem}" unless name
+
+    File.open "truncated.gem", "wb" do |io|
+      io.write data[0, content_start + (size / 2)]
+    end
+
+    "truncated.gem"
+  end
+
+  def gem_without_data_member
+    File.open "no_data.gem", "wb" do |io|
+      Gem::Package::TarWriter.new io do |gem|
+        gem.add_file "metadata.gz", 0o444 do |member|
+          member.write util_gzip(@spec.to_yaml)
+        end
+      end
+    end
+
+    "no_data.gem"
+  end
+
+  def gem_with_wrong_checksums
+    data = Gem.read_binary @gem
+    members = {}
+    each_tar_member(data) {|name, bytes| members[name] = bytes }
+
+    bogus = { "SHA256" => { "metadata.gz" => "0" * 64, "data.tar.gz" => "0" * 64 } }
+
+    File.open "mismatch.gem", "wb" do |io|
+      Gem::Package::TarWriter.new io do |gem|
+        gem.add_file "metadata.gz", 0o444 do |member|
+          member.write members["metadata.gz"]
+        end
+
+        gem.add_file "data.tar.gz", 0o444 do |member|
+          member.write members["data.tar.gz"]
+        end
+
+        gem.add_file "checksums.yaml.gz", 0o444 do |member|
+          member.write util_gzip(Psych.dump(bogus))
+        end
+      end
+    end
+
+    "mismatch.gem"
+  end
+
+  def each_tar_member(data)
+    offset = 0
+
+    while offset + 512 <= data.bytesize
+      header = data[offset, 512]
+      break if header == "\0" * 512
+
+      name = header[0, 100].delete("\0")
+      size = header[124, 12].strip.to_i(8)
+      yield name, data[offset + 512, size]
+
+      offset += 512 + (((size + 511) / 512) * 512)
+    end
+  end
+
+  def first_entry_data(data)
+    offset = 0
+
+    while offset + 512 <= data.bytesize
+      header = data[offset, 512]
+      break if header == "\0" * 512
+
+      name = header[0, 100].delete("\0")
+      size = header[124, 12].strip.to_i(8)
+
+      return [name, size, offset + 512] if yield(name)
+
+      offset += 512 + (((size + 511) / 512) * 512)
+    end
+
+    nil
+  end
+
+  ##
+  # Reads the metadata member of +path+ the way a caller that only wants the
+  # spec would, without reading the rest of the package.
+
+  def read_metadata_member(path)
+    File.open path, "rb" do |io|
+      Gem::Package::TarReader.new io do |tar|
+        tar.each do |entry|
+          next unless entry.full_name == "metadata.gz"
+
+          return Zlib::GzipReader.wrap(entry) {|gz| gz.read }
+        end
+      end
+    end
+
+    nil
   end
 end
