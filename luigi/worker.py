@@ -95,8 +95,11 @@ GetWorkResponse = collections.namedtuple(
         "n_unique_pending",
         "n_pending_last_scheduled",
         "worker_state",
+        "run_id",
+        "batch_run_ids",
     ),
 )
+GetWorkResponse.__new__.__defaults__ = (None, {})
 
 
 class TaskProcess(multiprocessing.Process):
@@ -317,11 +320,14 @@ class TaskStatusReporter:
     where fork method needs to pickle the process object (e.g.  Windows).
     """
 
-    def __init__(self, scheduler, task_id, worker_id, scheduler_messages):
+    def __init__(self, scheduler, task_id, worker_id, scheduler_messages, run_id=None):
         self._task_id = task_id
         self._worker_id = worker_id
         self._scheduler = scheduler
         self.scheduler_messages = scheduler_messages
+        # The run (attempt) of the task this reporter belongs to. Used to make
+        # sure scheduler messages from a previous attempt are never delivered.
+        self.run_id = run_id
 
     def update_tracking_url(self, tracking_url):
         self._scheduler.add_task(task_id=self._task_id, worker=self._worker_id, status=RUNNING, tracking_url=tracking_url)
@@ -345,12 +351,13 @@ class SchedulerMessage:
     received and passed to the message queue of a :py:class:`Task`.
     """
 
-    def __init__(self, scheduler, task_id, message_id, content, **payload):
+    def __init__(self, scheduler, task_id, message_id, content, run_id=None, **payload):
         super(SchedulerMessage, self).__init__()
 
         self._scheduler = scheduler
         self._task_id = task_id
         self._message_id = message_id
+        self.run_id = run_id
 
         self.content = content
         self.payload = payload
@@ -590,6 +597,8 @@ class Worker:
         self._task_result_queue = multiprocessing.Queue()
         self._running_tasks = {}
         self._idle_since = None
+        # task_id -> run_id of the currently (or about to be) running attempt
+        self._run_ids = {}
 
         # mp-safe dictionary for caching completation checks across task processes
         self._task_completion_cache = None
@@ -1021,6 +1030,8 @@ class Worker:
             #  That is you can user a newer client than server (Sep 2016)
             n_pending_last_scheduled=r.get("n_pending_last_scheduled", 0),
             worker_state=r.get("worker_state", WORKER_STATE_ACTIVE),
+            run_id=r.get("run_id"),
+            batch_run_ids=r.get("batch_run_ids", {}),
         )
 
     def _run_task(self, task_id):
@@ -1044,7 +1055,8 @@ class Worker:
 
     def _create_task_process(self, task):
         message_queue = multiprocessing.Queue() if task.accepts_messages else None
-        reporter = TaskStatusReporter(self._scheduler, task.task_id, self._id, message_queue)
+        run_id = self._run_ids.get(task.task_id)
+        reporter = TaskStatusReporter(self._scheduler, task.task_id, self._id, message_queue, run_id=run_id)
         use_multiprocessing = self._config.force_multiprocessing or bool(self.worker_processes > 1)
         return ContextManagedTaskProcess(
             self._config.task_process_context,
@@ -1131,6 +1143,7 @@ class Worker:
             )
 
             self._running_tasks.pop(task_id)
+            self._run_ids.pop(task_id, None)
 
             # re-add task to reschedule missing dependencies
             if missing:
@@ -1238,6 +1251,12 @@ class Worker:
 
             # task_id is not None:
             logger.debug("Pending tasks: %s", get_work_response.n_pending_tasks)
+            # Remember which run (attempt) the scheduler assigned, including
+            # every task belonging to a batched assignment.
+            if get_work_response.run_id is not None:
+                self._run_ids[get_work_response.task_id] = get_work_response.run_id
+            for batch_task_id, batch_run_id in (get_work_response.batch_run_ids or {}).items():
+                self._run_ids[batch_task_id] = batch_run_id
             self._run_task(get_work_response.task_id)
 
         while len(self._running_tasks):
@@ -1274,10 +1293,23 @@ class Worker:
         self._scheduler.add_worker(self._id, {"workers": self.worker_processes})
 
     @rpc_message_callback
-    def dispatch_scheduler_message(self, task_id, message_id, content, **kwargs):
+    def dispatch_scheduler_message(self, task_id, message_id, content, run_id=None, **kwargs):
         task_id = str(task_id)
         if task_id in self._running_tasks:
             task_process = self._running_tasks[task_id]
             if task_process.status_reporter.scheduler_messages:
-                message = SchedulerMessage(self._scheduler, task_id, message_id, content, **kwargs)
+                # Only deliver messages that belong to the currently running
+                # attempt. A message from a previous run must never reach a
+                # retried task even if it lingers in the rpc queue.
+                current_run_id = task_process.status_reporter.run_id
+                if run_id is not None and current_run_id is not None and run_id != current_run_id:
+                    logger.warning(
+                        "Discarding scheduler message %s for task %s: it belongs to run %s but the current run is %s",
+                        message_id,
+                        task_id,
+                        run_id,
+                        current_run_id,
+                    )
+                    return
+                message = SchedulerMessage(self._scheduler, task_id, message_id, content, run_id=run_id, **kwargs)
                 task_process.status_reporter.scheduler_messages.put(message)

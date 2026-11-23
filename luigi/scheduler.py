@@ -69,6 +69,18 @@ STATUS_TO_UPSTREAM_MAP = {
 WORKER_STATE_DISABLED = "disabled"
 WORKER_STATE_ACTIVE = "active"
 
+# Lifecycle states of a scheduler message (see :class:`SchedulerMessageRecord`).
+# A freshly created message is PENDING until it has been handed to a worker.
+SCHEDULER_MESSAGE_PENDING = "PENDING"
+# The worker has fetched the message through its rpc message queue.
+SCHEDULER_MESSAGE_DISPATCHED = "DISPATCHED"
+# The running task has replied to the message and the response is available
+# (or already consumed) through ``get_scheduler_message_response``.
+SCHEDULER_MESSAGE_RESPONDED = "RESPONDED"
+# The message can never be answered anymore because the task run it belonged
+# to ended (failure, success or a dead worker) or the task was pruned.
+SCHEDULER_MESSAGE_EXPIRED = "EXPIRED"
+
 TASK_FAMILY_RE = re.compile(r"([^(_]+)[(_]")
 
 RPC_METHODS = {}
@@ -224,6 +236,72 @@ class OrderedSet(MutableSet):
         return set(self) == set(other)
 
 
+class SchedulerMessageRecord:
+    """
+    Bookkeeping for a single message sent from the scheduler to a running task.
+
+    Messages are tied to a specific *run* (``run_id``) of a task. When a task
+    fails and is retried with the same ``task_id`` it gets a fresh run, so
+    messages (and their responses) from the previous attempt can never get
+    mixed into the new one. Messages whose run has ended are marked as
+    :data:`SCHEDULER_MESSAGE_EXPIRED`, which lets callers stop waiting for a
+    response that can never arrive instead of polling forever.
+    """
+
+    def __init__(self, message_id, task_id, content, run_id, worker):
+        self.message_id = message_id
+        self.task_id = task_id
+        self.content = content
+        # The run (attempt) of the task that the message was sent to.
+        self.run_id = run_id
+        # The worker the message was dispatched through.
+        self.worker = worker
+        self.status = SCHEDULER_MESSAGE_PENDING
+        self.response = None
+        self.created = time.time()
+        self.dispatched = None
+        self.responded = None
+        self.expired = None
+
+    def mark_dispatched(self):
+        if self.status == SCHEDULER_MESSAGE_PENDING:
+            self.status = SCHEDULER_MESSAGE_DISPATCHED
+            self.dispatched = time.time()
+
+    def mark_responded(self, response):
+        # A late reply for an expired run is recorded but does not resurrect
+        # the message as pending, so nobody will wait on it again.
+        self.response = response
+        self.responded = time.time()
+        if self.status != SCHEDULER_MESSAGE_EXPIRED:
+            self.status = SCHEDULER_MESSAGE_RESPONDED
+
+    def mark_expired(self):
+        if self.status in (SCHEDULER_MESSAGE_PENDING, SCHEDULER_MESSAGE_DISPATCHED):
+            self.status = SCHEDULER_MESSAGE_EXPIRED
+            self.expired = time.time()
+
+    @property
+    def is_open(self):
+        """Whether a response may still arrive for this message."""
+        return self.status in (SCHEDULER_MESSAGE_PENDING, SCHEDULER_MESSAGE_DISPATCHED)
+
+    def to_dict(self):
+        return {
+            "message_id": self.message_id,
+            "task_id": self.task_id,
+            "content": self.content,
+            "run_id": self.run_id,
+            "worker": self.worker,
+            "status": self.status,
+            "response": self.response,
+            "created": self.created,
+            "dispatched": self.dispatched,
+            "responded": self.responded,
+            "expired": self.expired,
+        }
+
+
 class Task:
     DEFAULT_PRIORITY = 0
 
@@ -275,6 +353,15 @@ class Task:
         self.tracking_url = tracking_url
         self.status_message = status_message
         self.progress_percentage = progress_percentage
+        # Identifier of the current run (attempt) of the task. A new id is
+        # assigned every time the task starts running, so messages belonging
+        # to a failed attempt can be told apart from the retried attempt even
+        # though the task_id stays the same.
+        self.run_id = None
+        # message_id -> SchedulerMessageRecord for all messages sent while
+        # this task was active.
+        self.scheduler_messages = {}
+        # Kept for backwards compatibility with pickled scheduler state.
         self.scheduler_message_responses = {}
         self.scheduler_disable_time = None
         self.runnable = False
@@ -283,6 +370,17 @@ class Task:
 
     def __repr__(self):
         return "Task(%r)" % vars(self)
+
+    def __setstate__(self, state):
+        # Backwards compatibility: scheduler state pickled before scheduler
+        # messages were tracked as full records lacks these attributes.
+        self.__dict__.update(state)
+        if not hasattr(self, "run_id"):
+            self.run_id = None
+        if not hasattr(self, "scheduler_messages"):
+            self.scheduler_messages = {}
+        if not hasattr(self, "scheduler_message_responses"):
+            self.scheduler_message_responses = {}
 
     def set_params(self, params):
         self.params = _get_default(params, {})
@@ -341,6 +439,33 @@ class Task:
         """
         self.failures.clear()
         self.first_failure_time = None
+
+    def start_new_run(self):
+        """
+        Begin a new run (attempt) of this task.
+
+        Any messages that were still waiting for a response from the previous
+        run can never be answered, so expire them. Responses that already
+        arrived stay available so that callers which poll after the fact can
+        still observe them.
+        """
+        self.expire_open_scheduler_messages()
+        self.run_id = str(uuid.uuid4())
+        return self.run_id
+
+    def expire_open_scheduler_messages(self):
+        for record in self.scheduler_messages.values():
+            record.mark_expired()
+
+    def add_scheduler_message(self, record):
+        self.scheduler_messages[record.message_id] = record
+        # Mirror the response into the legacy mapping for old pickled state /
+        # external code that touches the attribute directly.
+        if record.response is not None:
+            self.scheduler_message_responses[record.message_id] = record.response
+
+    def get_scheduler_message(self, message_id):
+        return self.scheduler_messages.get(message_id)
 
     @property
     def pretty_id(self):
@@ -417,9 +542,12 @@ class Worker:
         # the message has the format {'name': <function_name>, 'kwargs': <function_kwargs>}
         self.rpc_messages.append({"name": name, "kwargs": kwargs})
 
-    def fetch_rpc_messages(self):
+    def fetch_rpc_messages(self, on_dispatch=None):
         messages = self.rpc_messages[:]
         del self.rpc_messages[:]
+        if on_dispatch is not None:
+            for message in messages:
+                on_dispatch(message)
         return messages
 
     def __str__(self):
@@ -574,6 +702,14 @@ class SimpleTaskState:
             task.scheduler_disable_time = None
 
         if new_status != task.status:
+            # Leaving a running state means the current run is over. Messages
+            # that have not been answered can never get a response from this
+            # run, so expire them instead of letting callers wait forever.
+            if task.status in (RUNNING, BATCH_RUNNING) and new_status != RUNNING:
+                task.expire_open_scheduler_messages()
+                # The next time the task starts it must get a fresh run id,
+                # even though worker_running may linger after a failure.
+                task.run_id = None
             self._status_tasks[task.status].pop(task.id)
             self._status_tasks[new_status][task.id] = task
             task.status = new_status
@@ -880,6 +1016,16 @@ class Scheduler:
 
         if batch_id is not None:
             task.batch_id = batch_id
+        # A new run starts whenever a non-running task is reported as RUNNING.
+        # We key off the status transition (not worker_running) because after
+        # a failure worker_running may still point at the previous worker.
+        # Batched tasks were already assigned their run id in get_work().
+        starting_new_run = status == RUNNING and task.status not in (RUNNING, BATCH_RUNNING)
+        if starting_new_run and task.run_id is None:
+            # Fresh run id and make sure messages from any previous attempt
+            # (e.g. before a failure and retry with the same task_id) cannot
+            # leak into this run.
+            task.start_new_run()
         if status == RUNNING and not task.worker_running:
             task.worker_running = worker_id
             if batch_id:
@@ -995,7 +1141,24 @@ class Scheduler:
             return {"message_id": None}
 
         message_id = str(uuid.uuid4())
-        self._state.get_worker(worker).add_rpc_message("dispatch_scheduler_message", task_id=task, message_id=message_id, content=content)
+        run_id = None
+        if self._state.has_task(task):
+            task_obj = self._state.get_task(task)
+            # Attribute the message to the run that is currently executing.
+            # If the task is not running there is no run to attach it to; the
+            # message is still delivered (the worker may pick the task up
+            # momentarily) but run_id stays None.
+            run_id = task_obj.run_id
+            record = SchedulerMessageRecord(message_id, task, content, run_id, worker)
+            task_obj.add_scheduler_message(record)
+
+        self._state.get_worker(worker).add_rpc_message(
+            "dispatch_scheduler_message",
+            task_id=task,
+            message_id=message_id,
+            content=content,
+            run_id=run_id,
+        )
 
         return {"message_id": message_id}
 
@@ -1003,15 +1166,63 @@ class Scheduler:
     def add_scheduler_message_response(self, task_id, message_id, response):
         if self._state.has_task(task_id):
             task = self._state.get_task(task_id)
+            record = task.get_scheduler_message(message_id)
+            if record is not None:
+                record.mark_responded(response)
+            # Keep the legacy mapping in sync for pickled state / direct users.
             task.scheduler_message_responses[message_id] = response
 
     @rpc_method()
     def get_scheduler_message_response(self, task_id, message_id):
         response = None
+        status = None
         if self._state.has_task(task_id):
             task = self._state.get_task(task_id)
-            response = task.scheduler_message_responses.pop(message_id, None)
-        return {"response": response}
+            record = task.get_scheduler_message(message_id)
+            if record is not None:
+                status = record.status
+                response = record.response
+                # Consume the response on first read, mirroring the old
+                # pop()-based behaviour.
+                if response is not None:
+                    record.response = None
+                    task.scheduler_message_responses.pop(message_id, None)
+            else:
+                # Fallback for state created before messages were tracked as
+                # full records.
+                response = task.scheduler_message_responses.pop(message_id, None)
+        return {"response": response, "status": status}
+
+    @rpc_method()
+    def get_scheduler_message_status(self, task_id, message_id):
+        """
+        Return the lifecycle status (PENDING/DISPATCHED/RESPONDED/EXPIRED) of
+        a single scheduler message.
+
+        Lets the admin UI distinguish two messages sent to the same task_id
+        across retries and stop waiting once a message has expired.
+        """
+        status = None
+        if self._state.has_task(task_id):
+            record = self._state.get_task(task_id).get_scheduler_message(message_id)
+            if record is not None:
+                status = record.status
+        return {"task_id": task_id, "message_id": message_id, "status": status}
+
+    @rpc_method()
+    def get_scheduler_messages(self, task_id):
+        """
+        Return all scheduler messages recorded for a task, newest first.
+
+        Each entry carries the run (attempt) it belongs to, its lifecycle
+        status and timing information, so messages from different runs of the
+        same task_id can be told apart.
+        """
+        messages = []
+        if self._state.has_task(task_id):
+            records = self._state.get_task(task_id).scheduler_messages.values()
+            messages = [record.to_dict() for record in sorted(records, key=lambda r: r.created, reverse=True)]
+        return {"task_id": task_id, "messages": messages}
 
     @rpc_method()
     def has_task_history(self):
@@ -1253,6 +1464,7 @@ class Scheduler:
             batch_id = hashlib.new("md5", batch_string.encode("utf-8"), usedforsecurity=False).hexdigest()
             for task in batched_tasks:
                 self._state.set_batch_running(task, batch_id, worker_id)
+                task.start_new_run()
 
             combined_params = best_task.params.copy()
             combined_params.update(batched_params)
@@ -1263,16 +1475,19 @@ class Scheduler:
             reply["task_params"] = combined_params
             reply["batch_id"] = batch_id
             reply["batch_task_ids"] = [task.id for task in batched_tasks]
+            reply["batch_run_ids"] = {task.id: task.run_id for task in batched_tasks}
 
         elif best_task:
             self.update_metrics_task_started(best_task)
             self._state.set_status(best_task, RUNNING, self._config)
             best_task.worker_running = worker_id
+            best_task.start_new_run()
             best_task.resources_running = best_task.resources.copy()
             best_task.time_running = time.time()
             self._update_task_history(best_task, RUNNING, host=host)
 
             reply["task_id"] = best_task.id
+            reply["run_id"] = best_task.run_id
             reply["task_family"] = best_task.family
             reply["task_module"] = getattr(best_task, "module", None)
             reply["task_params"] = best_task.params
@@ -1286,7 +1501,19 @@ class Scheduler:
     def ping(self, **kwargs):
         worker_id = kwargs["worker"]
         worker = self._update_worker(worker_id)
-        return {"rpc_messages": worker.fetch_rpc_messages()}
+
+        def _mark_dispatched(rpc_message):
+            if rpc_message["name"] != "dispatch_scheduler_message":
+                return
+            message_kwargs = rpc_message["kwargs"]
+            task_id = message_kwargs.get("task_id")
+            message_id = message_kwargs.get("message_id")
+            if self._state.has_task(task_id):
+                record = self._state.get_task(task_id).get_scheduler_message(message_id)
+                if record is not None:
+                    record.mark_dispatched()
+
+        return {"rpc_messages": worker.fetch_rpc_messages(on_dispatch=_mark_dispatched)}
 
     def _upstream_status(self, task_id, upstream_status_table):
         if task_id in upstream_status_table:
@@ -1340,7 +1567,20 @@ class Scheduler:
             ret["deps"] = list(task.deps if deps is None else deps)
         if self._config.send_messages and task.status == RUNNING:
             ret["accepts_messages"] = task.accepts_messages
+        if self._config.send_messages:
+            ret["run_id"] = getattr(task, "run_id", None)
+            ret["scheduler_messages"] = self._summarize_scheduler_messages(task)
         return ret
+
+    @staticmethod
+    def _summarize_scheduler_messages(task):
+        """
+        Compact per-status summary of scheduler messages for the task views.
+        """
+        summary = collections.Counter()
+        for record in getattr(task, "scheduler_messages", {}).values():
+            summary[record.status] += 1
+        return dict(summary)
 
     @rpc_method()
     def graph(self, **kwargs):

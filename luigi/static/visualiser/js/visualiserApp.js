@@ -389,14 +389,22 @@ function visualiserApp(luigi) {
                 if (awaitResponse) {
                     $responseContainer.show();
                     $responseSpinner.show();
-                    $responseContent.empty();
+                    $responseContent.empty().removeClass("text-warning");
                     luigi.sendSchedulerMessage(data.worker, data.taskId, content, function(messageId) {
                         var interval = window.setInterval(function() {
-                            luigi.getSchedulerMessageResponse(data.taskId, messageId, function(response) {
+                            luigi.getSchedulerMessageResponse(data.taskId, messageId, function(response, status) {
                                 if (response != null) {
                                     clearInterval(interval);
                                     $responseSpinner.hide();
                                     $responseContent.text(response);
+                                } else if (status === "EXPIRED") {
+                                    // The run this message belonged to has ended
+                                    // (e.g. the task failed and was retried), so
+                                    // a response can never arrive - stop waiting.
+                                    clearInterval(interval);
+                                    $responseSpinner.hide();
+                                    $responseContent.addClass("text-warning")
+                                        .text("Message expired without a response (the task run ended).");
                                 }
                             });
                         }, 1000);

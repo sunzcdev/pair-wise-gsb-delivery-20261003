@@ -354,6 +354,22 @@ messages:
 Messages can be sent right from the scheduler UI which also displays responses (if any). Note that
 this feature is only available when the scheduler is configured to send messages (see the :ref:`scheduler-config` config), and the task is configured to accept them.
 
+Every time a task starts running it gets a unique ``run_id`` (its *attempt*), and each message is
+attributed to the run that was active when the message was sent. If the task fails and is retried
+with the same task id, the new attempt receives its own messages only: messages that were never
+answered by the previous attempt are marked ``EXPIRED`` instead of being delivered to (or mixed
+into) the new run. The lifecycle status of a message is one of:
+
+* ``PENDING`` - created, waiting to be fetched by the worker,
+* ``DISPATCHED`` - fetched by the worker and handed to the running task,
+* ``RESPONDED`` - the task replied (the response can be read once),
+* ``EXPIRED`` - the run it belonged to has ended, so a response can never arrive.
+
+Callers that wait on a response (for example the scheduler UI) stop waiting as soon as the message
+becomes ``EXPIRED`` rather than polling indefinitely. The status of a single message and the full
+list of a task's messages - including which run each one belongs to - are available through
+``get_scheduler_message_status`` and ``get_scheduler_messages``.
+
 Gathering custom metrics from tasks' executions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

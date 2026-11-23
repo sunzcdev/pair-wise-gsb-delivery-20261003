@@ -176,7 +176,21 @@ var LuigiAPI = (function() {
     LuigiAPI.prototype.getSchedulerMessageResponse = function(taskId, messageId, callback) {
         var data = {task_id: taskId, message_id: messageId};
         jsonRPC(this.urlRoot + "/get_scheduler_message_response", data, function(response) {
-            callback(response.response.response);
+            callback(response.response.response, response.response.status);
+        });
+    };
+
+    LuigiAPI.prototype.getSchedulerMessageStatus = function(taskId, messageId, callback) {
+        var data = {task_id: taskId, message_id: messageId};
+        jsonRPC(this.urlRoot + "/get_scheduler_message_status", data, function(response) {
+            callback(response.response.status);
+        });
+    };
+
+    LuigiAPI.prototype.getSchedulerMessages = function(taskId, callback) {
+        var data = {task_id: taskId};
+        jsonRPC(this.urlRoot + "/get_scheduler_messages", data, function(response) {
+            callback(response.response.messages);
         });
     };
 
