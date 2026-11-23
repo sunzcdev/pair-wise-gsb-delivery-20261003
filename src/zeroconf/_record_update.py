@@ -13,11 +13,15 @@ _DNSRecord = DNSRecord
 
 
 class RecordUpdate:
-    __slots__ = ("new", "old")
+    __slots__ = ("new", "old", "source")
 
-    def __init__(self, new: DNSRecord, old: DNSRecord | None = None) -> None:
-        """RecordUpdate represents a change in a DNS record."""
-        self._fast_init(new, old)
+    def __init__(self, new: DNSRecord, old: DNSRecord | None = None, source: str | None = None) -> None:
+        """RecordUpdate represents a change in a DNS record.
+
+        source is the sender address of the packet that carried the
+        record, or None when the update did not come off the wire.
+        """
+        self._fast_init(new, old, source)
 
     def __getitem__(self, index: int) -> DNSRecord | None:
         """Get the new or old record."""
@@ -27,7 +31,8 @@ class RecordUpdate:
             return self.old
         raise IndexError(index)
 
-    def _fast_init(self, new: _DNSRecord, old: _DNSRecord | None) -> None:
+    def _fast_init(self, new: _DNSRecord, old: _DNSRecord | None, source: str | None = None) -> None:
         """Fast init for RecordUpdate."""
         self.new = new
         self.old = old
+        self.source = source

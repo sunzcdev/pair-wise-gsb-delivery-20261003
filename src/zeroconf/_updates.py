@@ -64,3 +64,14 @@ class RecordUpdateListener:
         update_records should be implemented instead.
         """
         raise RuntimeError("update_record is deprecated and will be removed in a future version.")
+
+
+class InterfaceRecordUpdateListener(RecordUpdateListener):
+    """A RecordUpdateListener that observes each source interface separately.
+
+    Every RecordUpdate carries the sender address of the packet that
+    delivered the record in ``RecordUpdate.source``. Unlike a plain
+    RecordUpdateListener, this listener also receives goodbyes that
+    other sources still supersede, so removal notifications follow the
+    source interface they arrived on.
+    """

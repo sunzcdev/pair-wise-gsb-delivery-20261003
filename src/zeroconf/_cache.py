@@ -57,13 +57,14 @@ class DNSCache:
         self.cache: _DNSRecordCacheType = {}
         self._expire_heap: list[tuple[float, DNSRecord]] = []
         self._expirations: dict[DNSRecord, float] = {}
+        self._sources: dict[DNSRecord, set[str]] = {}
         self.service_cache: _DNSRecordCacheType = {}
         self._total_records: int = 0
 
     # Functions prefixed with async_ are NOT threadsafe and must
     # be run in the event loop.
 
-    def async_add_records(self, entries: Iterable[DNSRecord]) -> bool:
+    def async_add_records(self, entries: Iterable[DNSRecord], source: str | None = None) -> bool:
         """Add multiple records.
 
         Returns true if any of the records were not in the cache.
@@ -72,7 +73,7 @@ class DNSCache:
         """
         new = False
         for entry in entries:
-            if self._async_add(entry):
+            if self._async_add(entry, source):
                 new = True
         return new
 
@@ -174,6 +175,24 @@ class DNSCache:
                     # Expire in 1s
                     self._async_set_created_ttl(record, now, 1)
 
+    def async_remove_record_source(self, record: DNSRecord, source: str | None) -> bool:
+        """Drop one source's claim on a cached record.
+
+        Returns True when no sources remain — or the record is not
+        tracked per source — and the record should be removed from
+        the cache.
+        """
+        if source is None:
+            return True
+        sources = self._sources.get(record)
+        if sources is None:
+            return True
+        sources.discard(source)
+        if sources:
+            return False
+        del self._sources[record]
+        return True
+
     def async_remove_records(self, entries: Iterable[DNSRecord]) -> None:
         """Remove multiple records.
 
@@ -245,7 +264,7 @@ class DNSCache:
         """Return a copy of the list of current cache names."""
         return list(self.cache)
 
-    def _async_add(self, record: _DNSRecord) -> bool:
+    def _async_add(self, record: _DNSRecord, source: str | None = None) -> bool:
         """Store a record, returning True when it was not cached before.
 
         Event loop only; not threadsafe.
@@ -290,6 +309,14 @@ class DNSCache:
             if (service_store := self.service_cache.get(service_record.server_key)) is None:
                 service_store = self.service_cache[service_record.server_key] = {}
             service_store[service_record] = service_record
+        if source is not None:
+            # Remember which sender announced the record so a goodbye
+            # from one source interface cannot withdraw a record that
+            # another source still announces.
+            sources = self._sources.get(record)
+            if sources is None:
+                sources = self._sources[record] = set()
+            sources.add(source)
         return new
 
     def _async_evict_oldest(self) -> None:
@@ -309,6 +336,7 @@ class DNSCache:
             _remove_key(self.service_cache, service_record.server_key, service_record)
         _remove_key(self.cache, record.key, record)
         self._expirations.pop(record, None)
+        self._sources.pop(record, None)
         self._total_records -= 1
 
     def _async_set_created_ttl(self, record: DNSRecord, now: _float, ttl: _int) -> None:

@@ -14,7 +14,7 @@ from .._dns import DNSAddress, DNSQuestion, DNSRecord
 from .._logger import log
 from .._protocol.incoming import DNSIncoming
 from .._record_update import RecordUpdate
-from .._updates import RecordUpdateListener
+from .._updates import InterfaceRecordUpdateListener, RecordUpdateListener
 from .._utils.time import current_time_millis
 from ..const import _ADDRESS_RECORD_TYPES, _DNS_PTR_MIN_TTL, _TYPE_AAAA, _TYPE_PTR
 
@@ -67,10 +67,15 @@ class RecordManager:
         except ValueError as e:
             log.exception("Failed to remove listener: %r", e)
 
-    def async_updates(self, now: _float, records: list[_RecordUpdate]) -> None:
+    def async_updates(
+        self, now: _float, records: list[_RecordUpdate], interface_records: list[_RecordUpdate] | None = None
+    ) -> None:
         """Notify listeners of updated records, before the cache commits them."""
         for listener in self.listeners.copy():
-            listener.async_update_records(self.zc, now, records)
+            if interface_records and isinstance(listener, InterfaceRecordUpdateListener):
+                listener.async_update_records(self.zc, now, [*records, *interface_records])
+            else:
+                listener.async_update_records(self.zc, now, records)
 
     def async_updates_complete(self, notify: bool) -> None:
         """Notify listeners that a batch landed, after the cache committed it."""
@@ -85,6 +90,7 @@ class RecordManager:
         Runs in the event loop; not threadsafe.
         """
         updates: list[RecordUpdate] = []
+        interface_updates: list[RecordUpdate] = []
         address_adds: list[DNSRecord] = []
         other_adds: list[DNSRecord] = []
         removes: set[DNSRecord] = set()
@@ -92,6 +98,8 @@ class RecordManager:
         unique_types: set[tuple[str, int, int]] = set()
         cache = self.cache
         answers = msg.answers()
+        msg_source = msg.source
+        source = msg_source[0] if msg_source is not None else None
 
         for record in answers:
             # Protect zeroconf from records that can cause denial of service.
@@ -129,21 +137,27 @@ class RecordManager:
                 else:
                     other_adds.append(record)
                 rec_update = RecordUpdate.__new__(RecordUpdate)
-                rec_update._fast_init(record, maybe_entry)
+                rec_update._fast_init(record, maybe_entry, source)
                 updates.append(rec_update)
             # This is likely a goodbye since the record is
             # expired and exists in the cache
             elif maybe_entry is not None:
                 rec_update = RecordUpdate.__new__(RecordUpdate)
-                rec_update._fast_init(record, maybe_entry)
-                updates.append(rec_update)
-                removes.add(record)
+                rec_update._fast_init(record, maybe_entry, source)
+                if cache.async_remove_record_source(maybe_entry, source):
+                    updates.append(rec_update)
+                    removes.add(record)
+                else:
+                    # Another source interface still announces this
+                    # record; only per-interface listeners observe the
+                    # goodbye, and the cache keeps the record.
+                    interface_updates.append(rec_update)
 
         if unique_types:
             cache.async_mark_unique_records_older_than_1s_to_expire(unique_types, answers, now)
 
-        if updates:
-            self.async_updates(now, updates)
+        if updates or interface_updates:
+            self.async_updates(now, updates, interface_updates)
         # The cache adds must be processed AFTER we trigger
         # the updates since we compare existing data
         # with the new data and updating the cache
@@ -161,15 +175,15 @@ class RecordManager:
         # processed.
         new = False
         if other_adds or address_adds:
-            new = cache.async_add_records(address_adds)
-            if cache.async_add_records(other_adds):
+            new = cache.async_add_records(address_adds, source)
+            if cache.async_add_records(other_adds, source):
                 new = True
         # Removes are processed last since
         # ServiceInfo could generate an un-needed query
         # because the data was not yet populated.
         if removes:
             cache.async_remove_records(removes)
-        if updates:
+        if updates or interface_updates:
             self.async_updates_complete(new)
 
     def _async_merge_address(self, record: DNSAddress) -> DNSAddress | None:

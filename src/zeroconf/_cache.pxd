@@ -32,9 +32,12 @@ cdef class DNSCache:
     cdef public cython.dict service_cache
     cdef public list _expire_heap
     cdef public dict _expirations
+    cdef public dict _sources
     cdef public unsigned int _total_records
 
-    cpdef bint async_add_records(self, object entries)
+    cpdef bint async_add_records(self, object entries, object source)
+
+    cpdef bint async_remove_record_source(self, DNSRecord record, object source)
 
     cpdef void async_remove_records(self, object entries)
 
@@ -68,7 +71,7 @@ cdef class DNSCache:
         new=bint,
         is_new=bint
     )
-    cdef bint _async_add(self, DNSRecord record)
+    cdef bint _async_add(self, DNSRecord record, object source)
 
     @cython.locals(record=DNSRecord, when_record=tuple)
     cdef void _async_evict_oldest(self)

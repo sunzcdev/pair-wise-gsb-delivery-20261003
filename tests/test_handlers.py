@@ -1904,3 +1904,108 @@ async def test_aaaa_goodbye_under_another_scope_removes_cached(cached_scope: int
     assert zc.cache.async_all_by_details("host.local.", const._TYPE_AAAA, const._CLASS_IN) == []
     assert [(update.new.ttl, update.old is not None) for update in updates] == [(0, True)]
     await aiozc.async_close()
+
+
+def _multi_source_service_packet(type_: str, name: str, host: str, addr: str, ttl: int) -> bytes:
+    """Build a response packet announcing a service instance from one source."""
+    out = r.DNSOutgoing(const._FLAGS_QR_RESPONSE)
+    out.add_answer_at_time(r.DNSPointer(type_, const._TYPE_PTR, const._CLASS_IN, ttl, name), 0)
+    out.add_answer_at_time(
+        r.DNSService(name, const._TYPE_SRV, const._CLASS_IN | const._CLASS_UNIQUE, ttl, 0, 0, 8080, host),
+        0,
+    )
+    out.add_answer_at_time(
+        r.DNSText(name, const._TYPE_TXT, const._CLASS_IN | const._CLASS_UNIQUE, ttl, b"path=/"), 0
+    )
+    out.add_answer_at_time(
+        r.DNSAddress(host, const._TYPE_A, const._CLASS_IN | const._CLASS_UNIQUE, ttl, socket.inet_aton(addr)),
+        0,
+    )
+    return out.packets()[0]
+
+
+@pytest.mark.asyncio
+async def test_goodbye_from_one_source_keeps_other_sources_records() -> None:
+    """A goodbye from one source interface leaves another source's identical records cached."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    zc = aiozc.zeroconf
+    type_ = "_perif._tcp.local."
+    name = f"instance.{type_}"
+    host = "perif-host.local."
+    source_a = "10.0.0.5"
+    source_b = "192.168.0.5"
+
+    updates: list[r.RecordUpdate] = []
+    interface_updates: list[r.RecordUpdate] = []
+
+    class AggregateListener(r.RecordUpdateListener):
+        def async_update_records(self, zc: Zeroconf, now: float, records: list[r.RecordUpdate]) -> None:
+            updates.extend(records)
+
+    class PerInterfaceListener(r.InterfaceRecordUpdateListener):
+        def async_update_records(self, zc: Zeroconf, now: float, records: list[r.RecordUpdate]) -> None:
+            interface_updates.extend(records)
+
+    zc.record_manager.async_add_listener(AggregateListener(), None)
+    zc.record_manager.async_add_listener(PerInterfaceListener(), None)
+
+    # The same-named instance is announced on two isolated source interfaces
+    zc.record_manager.async_updates_from_response(
+        r.DNSIncoming(_multi_source_service_packet(type_, name, host, source_a, 120), (source_a, 5353))
+    )
+    zc.record_manager.async_updates_from_response(
+        r.DNSIncoming(_multi_source_service_packet(type_, name, host, source_b, 120), (source_b, 5353))
+    )
+    assert {update.source for update in updates} == {source_a, source_b}
+    assert {update.source for update in interface_updates} == {source_a, source_b}
+
+    # Goodbye arrives on source A only
+    zc.record_manager.async_updates_from_response(
+        r.DNSIncoming(_multi_source_service_packet(type_, name, host, source_a, 0), (source_a, 5353))
+    )
+
+    # The shared PTR/SRV/TXT records survive; only source A's own address is gone
+    ptr = r.DNSPointer(type_, const._TYPE_PTR, const._CLASS_IN, 0, name)
+    assert zc.cache.async_get_unique(ptr) is not None
+    assert zc.cache.async_get_unique(
+        r.DNSService(name, const._TYPE_SRV, const._CLASS_IN | const._CLASS_UNIQUE, 0, 0, 0, 8080, host)
+    ) is not None
+    addresses = zc.cache.async_all_by_details(host, const._TYPE_A, const._CLASS_IN)
+    assert [cast(r.DNSAddress, record).address for record in addresses] == [socket.inet_aton(source_b)]
+
+    # The aggregate listener only saw source A's address leave; the
+    # per-interface listener saw every goodbye tagged with its source
+    aggregate_goodbyes = [update for update in updates if update.new.is_expired(current_time_millis())]
+    assert [(update.new.type, update.source) for update in aggregate_goodbyes] == [(const._TYPE_A, source_a)]
+    interface_goodbyes = [
+        update for update in interface_updates if update.new.is_expired(current_time_millis())
+    ]
+    assert {update.new.type for update in interface_goodbyes} == {
+        const._TYPE_PTR,
+        const._TYPE_SRV,
+        const._TYPE_TXT,
+        const._TYPE_A,
+    }
+    assert {update.source for update in interface_goodbyes} == {source_a}
+
+    # The remaining source's records still resolve the instance
+    info = ServiceInfo(type_, name)
+    assert info.load_from_cache(zc)
+    assert info.parsed_addresses() == [source_b]
+
+    # Once the last source says goodbye the records leave the cache and
+    # the aggregate listener is notified
+    zc.record_manager.async_updates_from_response(
+        r.DNSIncoming(_multi_source_service_packet(type_, name, host, source_b, 0), (source_b, 5353))
+    )
+    assert zc.cache.async_get_unique(r.DNSPointer(type_, const._TYPE_PTR, const._CLASS_IN, 0, name)) is None
+    assert zc.cache.async_all_by_details(host, const._TYPE_A, const._CLASS_IN) == []
+    aggregate_goodbyes = [update for update in updates if update.new.is_expired(current_time_millis())]
+    assert {(update.new.type, update.source) for update in aggregate_goodbyes} == {
+        (const._TYPE_A, source_a),
+        (const._TYPE_PTR, source_b),
+        (const._TYPE_SRV, source_b),
+        (const._TYPE_TXT, source_b),
+        (const._TYPE_A, source_b),
+    }
+    await aiozc.async_close()

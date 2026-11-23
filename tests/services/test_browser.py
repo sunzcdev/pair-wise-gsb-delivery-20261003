@@ -1724,3 +1724,62 @@ def test_service_browser_aaaa_scope_variant_does_not_trigger_update(zc: Zeroconf
         assert updates == [registration_name]
     finally:
         browser.cancel()
+
+
+def test_service_browser_goodbye_from_one_source_keeps_service(zc: Zeroconf) -> None:
+    """A goodbye from one source interface does not remove a service announced on another."""
+    type_ = "_perif._tcp.local."
+    registration_name = f"xxxyyy.{type_}"
+    host = "perif-host.local."
+    source_a = "10.0.0.5"
+    source_b = "192.168.0.5"
+    added = Event()
+    removed: list[str] = []
+
+    class MyServiceListener(r.ServiceListener):
+        def add_service(self, zc, type_, name) -> None:  # type: ignore[no-untyped-def]
+            if name == registration_name:
+                added.set()
+
+        def remove_service(self, zc, type_, name) -> None:  # type: ignore[no-untyped-def]
+            if name == registration_name:
+                removed.append(name)
+
+        def update_service(self, zc, type_, name) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+    def _packet(addr: str, ttl: int) -> bytes:
+        unique = const._CLASS_IN | const._CLASS_UNIQUE
+        out = r.DNSOutgoing(const._FLAGS_QR_RESPONSE)
+        out.add_answer_at_time(
+            r.DNSPointer(type_, const._TYPE_PTR, const._CLASS_IN, ttl, registration_name), 0
+        )
+        out.add_answer_at_time(
+            r.DNSService(registration_name, const._TYPE_SRV, unique, ttl, 0, 0, 8080, host), 0
+        )
+        out.add_answer_at_time(r.DNSText(registration_name, const._TYPE_TXT, unique, ttl, b"path=/"), 0)
+        out.add_answer_at_time(r.DNSAddress(host, const._TYPE_A, unique, ttl, socket.inet_aton(addr)), 0)
+        return out.packets()[0]
+
+    browser = r.ServiceBrowser(zc, type_, None, MyServiceListener())
+    try:
+        # The same-named instance is announced on two isolated source interfaces
+        _inject_response(zc, r.DNSIncoming(_packet(source_a, 4500), (source_a, 5353)))
+        _inject_response(zc, r.DNSIncoming(_packet(source_b, 4500), (source_b, 5353)))
+        assert added.wait(timeout=5)
+
+        # Goodbye on source A only: the aggregate browser must not see a removal
+        _inject_response(zc, r.DNSIncoming(_packet(source_a, 0), (source_a, 5353)))
+        time.sleep(0.5)
+        assert removed == []
+
+        # The other source's records still resolve the instance
+        info = r.ServiceInfo(type_, registration_name)
+        assert info.load_from_cache(zc)
+        assert info.parsed_addresses() == [source_b]
+
+        # Goodbye from the last source removes the service
+        _inject_response(zc, r.DNSIncoming(_packet(source_b, 0), (source_b, 5353)))
+        assert _wait_for(lambda: removed == [registration_name])
+    finally:
+        browser.cancel()

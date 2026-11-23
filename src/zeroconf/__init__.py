@@ -54,7 +54,7 @@ from ._services.registry import (  # noqa # import needed for backwards compat
     ServiceRegistry,
 )
 from ._services.types import ZeroconfServiceTypes
-from ._updates import RecordUpdateListener
+from ._updates import InterfaceRecordUpdateListener, RecordUpdateListener
 from ._utils.name import service_type_name  # noqa # import needed for backwards compat
 from ._utils.net import (  # noqa # import needed for backwards compat
     InterfaceChoice,
@@ -87,6 +87,7 @@ __all__ = [
     "IPVersion",
     "IncomingDecodeError",
     "InterfaceChoice",
+    "InterfaceRecordUpdateListener",
     "NamePartTooLongException",
     "NonUniqueNameException",
     "NotRunningException",
