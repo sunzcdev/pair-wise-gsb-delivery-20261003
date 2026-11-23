@@ -1,0 +1,2402 @@
+# test_patch.py -- tests for patch.py
+# Copyright (C) 2010 Jelmer Vernooij <jelmer@jelmer.uk>
+#
+# SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+# Dulwich is dual-licensed under the Apache License, Version 2.0 and the GNU
+# General Public License as published by the Free Software Foundation; version 2.0
+# or (at your option) any later version. You can redistribute it and/or
+# modify it under the terms of either of these two licenses.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# You should have received a copy of the licenses; if not, see
+# <http://www.gnu.org/licenses/> for a copy of the GNU General Public License
+# and <http://www.apache.org/licenses/LICENSE-2.0> for a copy of the Apache
+# License, Version 2.0.
+#
+
+"""Tests for patch.py."""
+
+import os
+import shutil
+import stat
+import sys
+import tempfile
+import time
+import zlib
+from io import BytesIO, StringIO
+from typing import NoReturn
+from unittest.mock import patch
+
+from dulwich.index import index_entry_from_stat
+from dulwich.object_store import MemoryObjectStore
+from dulwich.objects import S_IFGITLINK, ZERO_SHA, Blob, Commit, Tree
+from dulwich.patch import (
+    DiffAlgorithmNotAvailable,
+    FilePatch,
+    PatchHunk,
+    apply_patch_hunks,
+    apply_patches,
+    commit_patch_id,
+    get_summary,
+    git_am_patch_split,
+    git_base85_decode,
+    mailinfo,
+    parse_unified_diff,
+    patch_id,
+    unified_diff_with_algorithm,
+    write_blob_diff,
+    write_commit_patch,
+    write_object_diff,
+    write_tree_diff,
+)
+from dulwich.repo import Repo
+from dulwich.tests.utils import make_commit
+
+from . import DependencyMissing, SkipTest, TestCase, skipIf
+
+
+class WriteCommitPatchTests(TestCase):
+    def test_simple_bytesio(self) -> None:
+        f = BytesIO()
+        c = make_commit(
+            author=b"Jelmer <jelmer@samba.org>",
+            committer=b"Jelmer <jelmer@samba.org>",
+            author_time=1271350201,
+            commit_time=1271350201,
+            author_timezone=0,
+            commit_timezone=0,
+            message=b"This is the first line\nAnd this is the second line.\n",
+            tree=Tree().id,
+        )
+        write_commit_patch(f, c, b"CONTENTS", (1, 1), version="custom")
+        f.seek(0)
+        lines = f.readlines()
+        self.assertTrue(
+            lines[0].startswith(b"From 0b0d34d1b5b596c928adc9a727a4b9e03d025298")
+        )
+        self.assertEqual(lines[1], b"From: Jelmer <jelmer@samba.org>\n")
+        self.assertTrue(lines[2].startswith(b"Date: "))
+        self.assertEqual(
+            [
+                b"Subject: [PATCH 1/1] This is the first line"
+                b" And this is the second line.\n",
+                b"\n",
+                b"---\n",
+            ],
+            lines[3:6],
+        )
+        self.assertEqual([b"CONTENTS-- \n", b"custom\n"], lines[-2:])
+        if len(lines) >= 10:
+            # diffstat may not be present
+            self.assertEqual(lines[6], b" 0 files changed\n")
+
+    def _write_patch(self, c: Commit) -> bytes:
+        # Pin the Date header and disable diffstat so the output is fixed.
+        f = BytesIO()
+        with (
+            patch("time.strftime", return_value="Thu, 01 Jan 1970 00:00:00 UTC"),
+            patch("subprocess.Popen", side_effect=OSError),
+        ):
+            write_commit_patch(f, c, b"CONTENTS", (1, 1), version="custom")
+        return f.getvalue()
+
+    def test_subject_body_split(self) -> None:
+        c = make_commit(
+            author=b"Jelmer <jelmer@samba.org>",
+            commit_time=1271350201,
+            message=b"Summary line\n\nBody paragraph.\n",
+            tree=Tree().id,
+        )
+        self.assertEqual(
+            b"From " + c.id + b" " + time.ctime(1271350201).encode() + b"\n"
+            b"From: Jelmer <jelmer@samba.org>\n"
+            b"Date: Thu, 01 Jan 1970 00:00:00 UTC\n"
+            b"Subject: [PATCH 1/1] Summary line\n"
+            b"\n"
+            b"Body paragraph.\n"
+            b"---\n"
+            b"CONTENTS-- \n"
+            b"custom\n",
+            self._write_patch(c),
+        )
+
+    def test_multiline_subject_folded(self) -> None:
+        # Lines of the first paragraph are folded into the Subject rather
+        # than being written as separate header lines.
+        c = make_commit(
+            author=b"Jelmer <jelmer@samba.org>",
+            commit_time=1271350201,
+            message=b"Fix thing\nCc: someone@example.com\nBcc: other@example.com\n",
+            tree=Tree().id,
+        )
+        self.assertEqual(
+            b"From " + c.id + b" " + time.ctime(1271350201).encode() + b"\n"
+            b"From: Jelmer <jelmer@samba.org>\n"
+            b"Date: Thu, 01 Jan 1970 00:00:00 UTC\n"
+            b"Subject: [PATCH 1/1] Fix thing Cc: someone@example.com"
+            b" Bcc: other@example.com\n"
+            b"\n"
+            b"---\n"
+            b"CONTENTS-- \n"
+            b"custom\n",
+            self._write_patch(c),
+        )
+
+
+class ReadGitAmPatch(TestCase):
+    def test_extract_string(self) -> None:
+        text = b"""\
+From ff643aae102d8870cac88e8f007e70f58f3a7363 Mon Sep 17 00:00:00 2001
+From: Jelmer Vernooij <jelmer@samba.org>
+Date: Thu, 15 Apr 2010 15:40:28 +0200
+Subject: [PATCH 1/2] Remove executable bit from prey.ico (triggers a warning).
+
+---
+ pixmaps/prey.ico |  Bin 9662 -> 9662 bytes
+ 1 files changed, 0 insertions(+), 0 deletions(-)
+ mode change 100755 => 100644 pixmaps/prey.ico
+
+-- 
+1.7.0.4
+"""
+        c, diff, version = git_am_patch_split(StringIO(text.decode("utf-8")), "utf-8")
+        self.assertEqual(b"Jelmer Vernooij <jelmer@samba.org>", c.committer)
+        self.assertEqual(b"Jelmer Vernooij <jelmer@samba.org>", c.author)
+        self.assertEqual(
+            b"Remove executable bit from prey.ico (triggers a warning).\n",
+            c.message,
+        )
+        self.assertEqual(
+            b""" pixmaps/prey.ico |  Bin 9662 -> 9662 bytes
+ 1 files changed, 0 insertions(+), 0 deletions(-)
+ mode change 100755 => 100644 pixmaps/prey.ico
+
+""",
+            diff,
+        )
+        self.assertEqual(b"1.7.0.4", version)
+
+    def test_extract_bytes(self) -> None:
+        text = b"""\
+From ff643aae102d8870cac88e8f007e70f58f3a7363 Mon Sep 17 00:00:00 2001
+From: Jelmer Vernooij <jelmer@samba.org>
+Date: Thu, 15 Apr 2010 15:40:28 +0200
+Subject: [PATCH 1/2] Remove executable bit from prey.ico (triggers a warning).
+
+---
+ pixmaps/prey.ico |  Bin 9662 -> 9662 bytes
+ 1 files changed, 0 insertions(+), 0 deletions(-)
+ mode change 100755 => 100644 pixmaps/prey.ico
+
+-- 
+1.7.0.4
+"""
+        c, diff, version = git_am_patch_split(BytesIO(text))
+        self.assertEqual(b"Jelmer Vernooij <jelmer@samba.org>", c.committer)
+        self.assertEqual(b"Jelmer Vernooij <jelmer@samba.org>", c.author)
+        self.assertEqual(
+            b"Remove executable bit from prey.ico (triggers a warning).\n",
+            c.message,
+        )
+        self.assertEqual(
+            b""" pixmaps/prey.ico |  Bin 9662 -> 9662 bytes
+ 1 files changed, 0 insertions(+), 0 deletions(-)
+ mode change 100755 => 100644 pixmaps/prey.ico
+
+""",
+            diff,
+        )
+        self.assertEqual(b"1.7.0.4", version)
+
+    def test_extract_spaces(self) -> None:
+        text = b"""From ff643aae102d8870cac88e8f007e70f58f3a7363 Mon Sep 17 00:00:00 2001
+From: Jelmer Vernooij <jelmer@samba.org>
+Date: Thu, 15 Apr 2010 15:40:28 +0200
+Subject:  [Dulwich-users] [PATCH] Added unit tests for
+ dulwich.object_store.tree_lookup_path.
+
+* dulwich/tests/test_object_store.py
+  (TreeLookupPathTests): This test case contains a few tests that ensure the
+   tree_lookup_path function works as expected.
+---
+ pixmaps/prey.ico |  Bin 9662 -> 9662 bytes
+ 1 files changed, 0 insertions(+), 0 deletions(-)
+ mode change 100755 => 100644 pixmaps/prey.ico
+
+-- 
+1.7.0.4
+"""
+        c, _diff, _version = git_am_patch_split(BytesIO(text), "utf-8")
+        self.assertEqual(
+            b"""\
+Added unit tests for dulwich.object_store.tree_lookup_path.
+
+* dulwich/tests/test_object_store.py
+  (TreeLookupPathTests): This test case contains a few tests that ensure the
+   tree_lookup_path function works as expected.
+""",
+            c.message,
+        )
+
+    def test_extract_pseudo_from_header(self) -> None:
+        text = b"""From ff643aae102d8870cac88e8f007e70f58f3a7363 Mon Sep 17 00:00:00 2001
+From: Jelmer Vernooij <jelmer@samba.org>
+Date: Thu, 15 Apr 2010 15:40:28 +0200
+Subject:  [Dulwich-users] [PATCH] Added unit tests for
+ dulwich.object_store.tree_lookup_path.
+
+From: Jelmer Vernooij <jelmer@debian.org>
+
+* dulwich/tests/test_object_store.py
+  (TreeLookupPathTests): This test case contains a few tests that ensure the
+   tree_lookup_path function works as expected.
+---
+ pixmaps/prey.ico |  Bin 9662 -> 9662 bytes
+ 1 files changed, 0 insertions(+), 0 deletions(-)
+ mode change 100755 => 100644 pixmaps/prey.ico
+
+-- 
+1.7.0.4
+"""
+        c, _diff, _version = git_am_patch_split(BytesIO(text), "utf-8")
+        self.assertEqual(b"Jelmer Vernooij <jelmer@debian.org>", c.author)
+        self.assertEqual(
+            b"""\
+Added unit tests for dulwich.object_store.tree_lookup_path.
+
+* dulwich/tests/test_object_store.py
+  (TreeLookupPathTests): This test case contains a few tests that ensure the
+   tree_lookup_path function works as expected.
+""",
+            c.message,
+        )
+
+    def test_extract_no_version_tail(self) -> None:
+        text = b"""\
+From ff643aae102d8870cac88e8f007e70f58f3a7363 Mon Sep 17 00:00:00 2001
+From: Jelmer Vernooij <jelmer@samba.org>
+Date: Thu, 15 Apr 2010 15:40:28 +0200
+Subject:  [Dulwich-users] [PATCH] Added unit tests for
+ dulwich.object_store.tree_lookup_path.
+
+From: Jelmer Vernooij <jelmer@debian.org>
+
+---
+ pixmaps/prey.ico |  Bin 9662 -> 9662 bytes
+ 1 files changed, 0 insertions(+), 0 deletions(-)
+ mode change 100755 => 100644 pixmaps/prey.ico
+
+"""
+        _c, _diff, version = git_am_patch_split(BytesIO(text), "utf-8")
+        self.assertEqual(None, version)
+
+    def test_extract_mercurial(self) -> NoReturn:
+        raise SkipTest(
+            "git_am_patch_split doesn't handle Mercurial patches properly yet"
+        )
+        expected_diff = """\
+diff --git a/dulwich/tests/test_patch.py b/dulwich/tests/test_patch.py
+--- a/dulwich/tests/test_patch.py
++++ b/dulwich/tests/test_patch.py
+@@ -158,7 +158,7 @@
+ 
+ '''
+         c, diff, version = git_am_patch_split(BytesIO(text))
+-        self.assertIs(None, version)
++        self.assertEqual(None, version)
+ 
+ 
+ class DiffTests(TestCase):
+"""
+        text = f"""\
+From dulwich-users-bounces+jelmer=samba.org@lists.launchpad.net \
+Mon Nov 29 00:58:18 2010
+Date: Sun, 28 Nov 2010 17:57:27 -0600
+From: Augie Fackler <durin42@gmail.com>
+To: dulwich-users <dulwich-users@lists.launchpad.net>
+Subject: [Dulwich-users] [PATCH] test_patch: fix tests on Python 2.6
+Content-Transfer-Encoding: 8bit
+
+Change-Id: I5e51313d4ae3a65c3f00c665002a7489121bb0d6
+
+{expected_diff}
+
+_______________________________________________
+Mailing list: https://launchpad.net/~dulwich-users
+Post to     : dulwich-users@lists.launchpad.net
+Unsubscribe : https://launchpad.net/~dulwich-users
+More help   : https://help.launchpad.net/ListHelp
+
+"""
+        _c, diff, version = git_am_patch_split(BytesIO(text))
+        self.assertEqual(expected_diff, diff)
+        self.assertEqual(None, version)
+
+
+class DiffTests(TestCase):
+    """Tests for write_blob_diff and write_tree_diff."""
+
+    def test_blob_diff(self) -> None:
+        f = BytesIO()
+        write_blob_diff(
+            f,
+            (b"foo.txt", 0o644, Blob.from_string(b"old\nsame\n")),
+            (b"bar.txt", 0o644, Blob.from_string(b"new\nsame\n")),
+        )
+        self.assertEqual(
+            [
+                b"diff --git a/foo.txt b/bar.txt",
+                b"index 3b0f961..a116b51 644",
+                b"--- a/foo.txt",
+                b"+++ b/bar.txt",
+                b"@@ -1,2 +1,2 @@",
+                b"-old",
+                b"+new",
+                b" same",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+    def test_blob_add(self) -> None:
+        f = BytesIO()
+        write_blob_diff(
+            f,
+            (None, None, None),
+            (b"bar.txt", 0o644, Blob.from_string(b"new\nsame\n")),
+        )
+        self.assertEqual(
+            [
+                b"diff --git a/bar.txt b/bar.txt",
+                b"new file mode 644",
+                b"index 0000000..a116b51",
+                b"--- /dev/null",
+                b"+++ b/bar.txt",
+                b"@@ -0,0 +1,2 @@",
+                b"+new",
+                b"+same",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+    def test_blob_remove(self) -> None:
+        f = BytesIO()
+        write_blob_diff(
+            f,
+            (b"bar.txt", 0o644, Blob.from_string(b"new\nsame\n")),
+            (None, None, None),
+        )
+        self.assertEqual(
+            [
+                b"diff --git a/bar.txt b/bar.txt",
+                b"deleted file mode 644",
+                b"index a116b51..0000000",
+                b"--- a/bar.txt",
+                b"+++ /dev/null",
+                b"@@ -1,2 +0,0 @@",
+                b"-new",
+                b"-same",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+    def test_blob_diff_no_newline_on_unchanged_last_line(self) -> None:
+        # Regression test for #2543: when the last line of a file has no
+        # trailing newline and is unchanged context, the "\ No newline at
+        # end of file" marker must still be emitted so git apply accepts
+        # the patch.
+        f = BytesIO()
+        write_blob_diff(
+            f,
+            (b"f", 0o100644, Blob.from_string(b"x\ny\nlast")),
+            (b"f", 0o100644, Blob.from_string(b"x\nY\nlast")),
+        )
+        self.assertEqual(
+            [
+                b"diff --git a/f b/f",
+                b"index 7424e00..92175ef 100644",
+                b"--- a/f",
+                b"+++ b/f",
+                b"@@ -1,3 +1,3 @@",
+                b" x",
+                b"-y",
+                b"+Y",
+                b" last",
+                b"\\ No newline at end of file",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+    def test_tree_diff(self) -> None:
+        f = BytesIO()
+        store = MemoryObjectStore()
+        added = Blob.from_string(b"add\n")
+        removed = Blob.from_string(b"removed\n")
+        changed1 = Blob.from_string(b"unchanged\nremoved\n")
+        changed2 = Blob.from_string(b"unchanged\nadded\n")
+        unchanged = Blob.from_string(b"unchanged\n")
+        tree1 = Tree()
+        tree1.add(b"removed.txt", 0o644, removed.id)
+        tree1.add(b"changed.txt", 0o644, changed1.id)
+        tree1.add(b"unchanged.txt", 0o644, changed1.id)
+        tree2 = Tree()
+        tree2.add(b"added.txt", 0o644, added.id)
+        tree2.add(b"changed.txt", 0o644, changed2.id)
+        tree2.add(b"unchanged.txt", 0o644, changed1.id)
+        store.add_objects(
+            [
+                (o, None)
+                for o in [
+                    tree1,
+                    tree2,
+                    added,
+                    removed,
+                    changed1,
+                    changed2,
+                    unchanged,
+                ]
+            ]
+        )
+        write_tree_diff(f, store, tree1.id, tree2.id)
+        self.assertEqual(
+            [
+                b"diff --git a/added.txt b/added.txt",
+                b"new file mode 644",
+                b"index 0000000..76d4bb8",
+                b"--- /dev/null",
+                b"+++ b/added.txt",
+                b"@@ -0,0 +1 @@",
+                b"+add",
+                b"diff --git a/changed.txt b/changed.txt",
+                b"index bf84e48..1be2436 644",
+                b"--- a/changed.txt",
+                b"+++ b/changed.txt",
+                b"@@ -1,2 +1,2 @@",
+                b" unchanged",
+                b"-removed",
+                b"+added",
+                b"diff --git a/removed.txt b/removed.txt",
+                b"deleted file mode 644",
+                b"index 2c3f0b3..0000000",
+                b"--- a/removed.txt",
+                b"+++ /dev/null",
+                b"@@ -1 +0,0 @@",
+                b"-removed",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+    def test_tree_diff_submodule(self) -> None:
+        f = BytesIO()
+        store = MemoryObjectStore()
+        tree1 = Tree()
+        tree1.add(
+            b"asubmodule",
+            S_IFGITLINK,
+            b"06d0bdd9e2e20377b3180e4986b14c8549b393e4",
+        )
+        tree2 = Tree()
+        tree2.add(
+            b"asubmodule",
+            S_IFGITLINK,
+            b"cc975646af69f279396d4d5e1379ac6af80ee637",
+        )
+        store.add_objects([(o, None) for o in [tree1, tree2]])
+        write_tree_diff(f, store, tree1.id, tree2.id)
+        self.assertEqual(
+            [
+                b"diff --git a/asubmodule b/asubmodule",
+                b"index 06d0bdd..cc97564 160000",
+                b"--- a/asubmodule",
+                b"+++ b/asubmodule",
+                b"@@ -1 +1 @@",
+                b"-Subproject commit 06d0bdd9e2e20377b3180e4986b14c8549b393e4",
+                b"+Subproject commit cc975646af69f279396d4d5e1379ac6af80ee637",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+    def test_object_diff_blob(self) -> None:
+        f = BytesIO()
+        b1 = Blob.from_string(b"old\nsame\n")
+        b2 = Blob.from_string(b"new\nsame\n")
+        store = MemoryObjectStore()
+        store.add_objects([(b1, None), (b2, None)])
+        write_object_diff(
+            f, store, (b"foo.txt", 0o644, b1.id), (b"bar.txt", 0o644, b2.id)
+        )
+        self.assertEqual(
+            [
+                b"diff --git a/foo.txt b/bar.txt",
+                b"index 3b0f961..a116b51 644",
+                b"--- a/foo.txt",
+                b"+++ b/bar.txt",
+                b"@@ -1,2 +1,2 @@",
+                b"-old",
+                b"+new",
+                b" same",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+    def test_object_diff_add_blob(self) -> None:
+        f = BytesIO()
+        store = MemoryObjectStore()
+        b2 = Blob.from_string(b"new\nsame\n")
+        store.add_object(b2)
+        write_object_diff(f, store, (None, None, None), (b"bar.txt", 0o644, b2.id))
+        self.assertEqual(
+            [
+                b"diff --git a/bar.txt b/bar.txt",
+                b"new file mode 644",
+                b"index 0000000..a116b51",
+                b"--- /dev/null",
+                b"+++ b/bar.txt",
+                b"@@ -0,0 +1,2 @@",
+                b"+new",
+                b"+same",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+    def test_object_diff_remove_blob(self) -> None:
+        f = BytesIO()
+        b1 = Blob.from_string(b"new\nsame\n")
+        store = MemoryObjectStore()
+        store.add_object(b1)
+        write_object_diff(f, store, (b"bar.txt", 0o644, b1.id), (None, None, None))
+        self.assertEqual(
+            [
+                b"diff --git a/bar.txt b/bar.txt",
+                b"deleted file mode 644",
+                b"index a116b51..0000000",
+                b"--- a/bar.txt",
+                b"+++ /dev/null",
+                b"@@ -1,2 +0,0 @@",
+                b"-new",
+                b"-same",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+    def test_object_diff_bin_blob_force(self) -> None:
+        f = BytesIO()
+        # Prepare two slightly different PNG headers
+        b1 = Blob.from_string(
+            b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"
+            b"\x00\x00\x00\x0d\x49\x48\x44\x52"
+            b"\x00\x00\x01\xd5\x00\x00\x00\x9f"
+            b"\x08\x04\x00\x00\x00\x05\x04\x8b"
+        )
+        b2 = Blob.from_string(
+            b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"
+            b"\x00\x00\x00\x0d\x49\x48\x44\x52"
+            b"\x00\x00\x01\xd5\x00\x00\x00\x9f"
+            b"\x08\x03\x00\x00\x00\x98\xd3\xb3"
+        )
+        store = MemoryObjectStore()
+        store.add_objects([(b1, None), (b2, None)])
+        write_object_diff(
+            f,
+            store,
+            (b"foo.png", 0o644, b1.id),
+            (b"bar.png", 0o644, b2.id),
+            diff_binary=True,
+        )
+        self.assertEqual(
+            [
+                b"diff --git a/foo.png b/bar.png",
+                b"index f73e47d..06364b7 644",
+                b"--- a/foo.png",
+                b"+++ b/bar.png",
+                b"@@ -1,4 +1,4 @@",
+                b" \x89PNG",
+                b" \x1a",
+                b" \x00\x00\x00",
+                b"-IHDR\x00\x00\x01\xd5\x00\x00\x00"
+                b"\x9f\x08\x04\x00\x00\x00\x05\x04\x8b",
+                b"\\ No newline at end of file",
+                b"+IHDR\x00\x00\x01\xd5\x00\x00\x00\x9f"
+                b"\x08\x03\x00\x00\x00\x98\xd3\xb3",
+                b"\\ No newline at end of file",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+    def test_object_diff_bin_blob(self) -> None:
+        f = BytesIO()
+        # Prepare two slightly different PNG headers
+        b1 = Blob.from_string(
+            b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"
+            b"\x00\x00\x00\x0d\x49\x48\x44\x52"
+            b"\x00\x00\x01\xd5\x00\x00\x00\x9f"
+            b"\x08\x04\x00\x00\x00\x05\x04\x8b"
+        )
+        b2 = Blob.from_string(
+            b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"
+            b"\x00\x00\x00\x0d\x49\x48\x44\x52"
+            b"\x00\x00\x01\xd5\x00\x00\x00\x9f"
+            b"\x08\x03\x00\x00\x00\x98\xd3\xb3"
+        )
+        store = MemoryObjectStore()
+        store.add_objects([(b1, None), (b2, None)])
+        write_object_diff(
+            f, store, (b"foo.png", 0o644, b1.id), (b"bar.png", 0o644, b2.id)
+        )
+        self.assertEqual(
+            [
+                b"diff --git a/foo.png b/bar.png",
+                b"index f73e47d..06364b7 644",
+                b"Binary files a/foo.png and b/bar.png differ",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+    def test_object_diff_add_bin_blob(self) -> None:
+        f = BytesIO()
+        b2 = Blob.from_string(
+            b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"
+            b"\x00\x00\x00\x0d\x49\x48\x44\x52"
+            b"\x00\x00\x01\xd5\x00\x00\x00\x9f"
+            b"\x08\x03\x00\x00\x00\x98\xd3\xb3"
+        )
+        store = MemoryObjectStore()
+        store.add_object(b2)
+        write_object_diff(f, store, (None, None, None), (b"bar.png", 0o644, b2.id))
+        self.assertEqual(
+            [
+                b"diff --git a/bar.png b/bar.png",
+                b"new file mode 644",
+                b"index 0000000..06364b7",
+                b"Binary files /dev/null and b/bar.png differ",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+    def test_object_diff_remove_bin_blob(self) -> None:
+        f = BytesIO()
+        b1 = Blob.from_string(
+            b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"
+            b"\x00\x00\x00\x0d\x49\x48\x44\x52"
+            b"\x00\x00\x01\xd5\x00\x00\x00\x9f"
+            b"\x08\x04\x00\x00\x00\x05\x04\x8b"
+        )
+        store = MemoryObjectStore()
+        store.add_object(b1)
+        write_object_diff(f, store, (b"foo.png", 0o644, b1.id), (None, None, None))
+        self.assertEqual(
+            [
+                b"diff --git a/foo.png b/foo.png",
+                b"deleted file mode 644",
+                b"index f73e47d..0000000",
+                b"Binary files a/foo.png and /dev/null differ",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+    def test_object_diff_kind_change(self) -> None:
+        f = BytesIO()
+        b1 = Blob.from_string(b"new\nsame\n")
+        store = MemoryObjectStore()
+        store.add_object(b1)
+        write_object_diff(
+            f,
+            store,
+            (b"bar.txt", 0o644, b1.id),
+            (
+                b"bar.txt",
+                0o160000,
+                b"06d0bdd9e2e20377b3180e4986b14c8549b393e4",
+            ),
+        )
+        self.assertEqual(
+            [
+                b"diff --git a/bar.txt b/bar.txt",
+                b"old file mode 644",
+                b"new file mode 160000",
+                b"index a116b51..06d0bdd 160000",
+                b"--- a/bar.txt",
+                b"+++ b/bar.txt",
+                b"@@ -1,2 +1 @@",
+                b"-new",
+                b"-same",
+                b"+Subproject commit 06d0bdd9e2e20377b3180e4986b14c8549b393e4",
+            ],
+            f.getvalue().splitlines(),
+        )
+
+
+class GetSummaryTests(TestCase):
+    def _make_commit(self, message: bytes) -> Commit:
+        return make_commit(
+            author=b"Jelmer <jelmer@samba.org>",
+            committer=b"Jelmer <jelmer@samba.org>",
+            author_time=1271350201,
+            commit_time=1271350201,
+            author_timezone=0,
+            commit_timezone=0,
+            message=message,
+            tree=Tree().id,
+        )
+
+    def test_simple(self) -> None:
+        c = self._make_commit(
+            b"This is the first line\nAnd this is the second line.\n",
+        )
+        self.assertEqual("This-is-the-first-line", get_summary(c))
+
+    def test_empty_message(self) -> None:
+        c = self._make_commit(b"")
+        self.assertEqual("", get_summary(c))
+
+    def test_path_traversal_unix(self) -> None:
+        c = self._make_commit(b"x/../../x\n")
+        # Path separators and consecutive dots must be sanitized so the
+        # result cannot escape the requested output directory.
+        summary = get_summary(c)
+        self.assertNotIn("/", summary)
+        self.assertNotIn("..", summary)
+        self.assertEqual("x-.-.-x", summary)
+
+    def test_path_traversal_windows(self) -> None:
+        c = self._make_commit(b"x\\..\\..\\x\n")
+        summary = get_summary(c)
+        self.assertNotIn("\\", summary)
+        self.assertNotIn("..", summary)
+        self.assertEqual("x-.-.-x", summary)
+
+    def test_colon_sanitized(self) -> None:
+        c = self._make_commit(b"feature: do something\n")
+        summary = get_summary(c)
+        self.assertNotIn(":", summary)
+        self.assertEqual("feature-do-something", summary)
+
+    def test_long_subject_truncated(self) -> None:
+        c = self._make_commit(b"a" * 500 + b"\n")
+        summary = get_summary(c)
+        self.assertLessEqual(len(summary), 64)
+
+    def test_trailing_dots_and_dashes_stripped(self) -> None:
+        c = self._make_commit(b"hello...\n")
+        self.assertEqual("hello", get_summary(c))
+
+    def test_only_problematic_chars(self) -> None:
+        c = self._make_commit(b"/\\:..\n")
+        # After sanitization there is nothing usable left.
+        self.assertEqual("", get_summary(c))
+
+
+class DiffAlgorithmTests(TestCase):
+    """Tests for diff algorithm selection."""
+
+    def test_unified_diff_with_myers(self) -> None:
+        """Test unified_diff_with_algorithm with default myers algorithm."""
+        a = [b"line1\n", b"line2\n", b"line3\n"]
+        b = [b"line1\n", b"line2 modified\n", b"line3\n"]
+
+        result = list(
+            unified_diff_with_algorithm(
+                a, b, fromfile=b"a.txt", tofile=b"b.txt", algorithm="myers"
+            )
+        )
+
+        # Should contain diff headers and the change
+        self.assertTrue(any(b"---" in line for line in result))
+        self.assertTrue(any(b"+++" in line for line in result))
+        self.assertTrue(any(b"-line2" in line for line in result))
+        self.assertTrue(any(b"+line2 modified" in line for line in result))
+
+    def test_unified_diff_with_patience_not_available(self) -> None:
+        """Test that DiffAlgorithmNotAvailable is raised when patience not available."""
+        # Temporarily mock _get_sequence_matcher to simulate ImportError
+        import dulwich.patch
+
+        original = dulwich.patch._get_sequence_matcher
+
+        def mock_get_sequence_matcher(algorithm, a, b):
+            if algorithm == "patience":
+                raise DiffAlgorithmNotAvailable(
+                    "patience", "Install with: pip install 'dulwich[patiencediff]'"
+                )
+            return original(algorithm, a, b)
+
+        try:
+            dulwich.patch._get_sequence_matcher = mock_get_sequence_matcher
+
+            a = [b"line1\n", b"line2\n", b"line3\n"]
+            b = [b"line1\n", b"line2 modified\n", b"line3\n"]
+
+            with self.assertRaises(DiffAlgorithmNotAvailable) as cm:
+                list(
+                    unified_diff_with_algorithm(
+                        a, b, fromfile=b"a.txt", tofile=b"b.txt", algorithm="patience"
+                    )
+                )
+
+            self.assertIn("patience", str(cm.exception))
+            self.assertIn("pip install", str(cm.exception))
+        finally:
+            dulwich.patch._get_sequence_matcher = original
+
+
+class PatienceDiffTests(TestCase):
+    """Tests for patience diff algorithm support."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Skip all patience diff tests if patiencediff is not available
+        try:
+            import patiencediff  # noqa: F401
+        except ImportError:
+            raise DependencyMissing("patiencediff")
+
+    def test_unified_diff_with_patience_available(self) -> None:
+        """Test unified_diff_with_algorithm with patience if available."""
+        a = [b"line1\n", b"line2\n", b"line3\n"]
+        b = [b"line1\n", b"line2 modified\n", b"line3\n"]
+
+        result = list(
+            unified_diff_with_algorithm(
+                a, b, fromfile=b"a.txt", tofile=b"b.txt", algorithm="patience"
+            )
+        )
+
+        # Should contain diff headers and the change
+        self.assertTrue(any(b"---" in line for line in result))
+        self.assertTrue(any(b"+++" in line for line in result))
+        self.assertTrue(any(b"-line2" in line for line in result))
+        self.assertTrue(any(b"+line2 modified" in line for line in result))
+
+    def test_unified_diff_with_patience_not_available(self) -> None:
+        """Test that DiffAlgorithmNotAvailable is raised when patience not available."""
+        # Temporarily mock _get_sequence_matcher to simulate ImportError
+        import dulwich.patch
+
+        original = dulwich.patch._get_sequence_matcher
+
+        def mock_get_sequence_matcher(algorithm, a, b):
+            if algorithm == "patience":
+                raise DiffAlgorithmNotAvailable(
+                    "patience", "Install with: pip install 'dulwich[patiencediff]'"
+                )
+            return original(algorithm, a, b)
+
+        try:
+            dulwich.patch._get_sequence_matcher = mock_get_sequence_matcher
+
+            a = [b"line1\n", b"line2\n", b"line3\n"]
+            b = [b"line1\n", b"line2 modified\n", b"line3\n"]
+
+            with self.assertRaises(DiffAlgorithmNotAvailable) as cm:
+                list(
+                    unified_diff_with_algorithm(
+                        a, b, fromfile=b"a.txt", tofile=b"b.txt", algorithm="patience"
+                    )
+                )
+
+            self.assertIn("patience", str(cm.exception))
+            self.assertIn("pip install", str(cm.exception))
+        finally:
+            dulwich.patch._get_sequence_matcher = original
+
+    def test_write_blob_diff_with_patience(self) -> None:
+        """Test write_blob_diff with patience algorithm if available."""
+        f = BytesIO()
+        old_blob = Blob()
+        old_blob.data = b"line1\nline2\nline3\n"
+        new_blob = Blob()
+        new_blob.data = b"line1\nline2 modified\nline3\n"
+
+        write_blob_diff(
+            f,
+            (b"file.txt", 0o100644, old_blob),
+            (b"file.txt", 0o100644, new_blob),
+            diff_algorithm="patience",
+        )
+
+        diff = f.getvalue()
+        self.assertIn(b"diff --git", diff)
+        self.assertIn(b"-line2", diff)
+        self.assertIn(b"+line2 modified", diff)
+
+    def test_write_object_diff_with_patience(self) -> None:
+        """Test write_object_diff with patience algorithm if available."""
+        f = BytesIO()
+        store = MemoryObjectStore()
+
+        old_blob = Blob()
+        old_blob.data = b"line1\nline2\nline3\n"
+        store.add_object(old_blob)
+
+        new_blob = Blob()
+        new_blob.data = b"line1\nline2 modified\nline3\n"
+        store.add_object(new_blob)
+
+        write_object_diff(
+            f,
+            store,
+            (b"file.txt", 0o100644, old_blob.id),
+            (b"file.txt", 0o100644, new_blob.id),
+            diff_algorithm="patience",
+        )
+
+        diff = f.getvalue()
+        self.assertIn(b"diff --git", diff)
+        self.assertIn(b"-line2", diff)
+        self.assertIn(b"+line2 modified", diff)
+
+
+class PatchIdTests(TestCase):
+    """Tests for patch_id and commit_patch_id functions."""
+
+    def test_patch_id_simple(self) -> None:
+        """Test patch_id computation with a simple diff."""
+        diff = b"""diff --git a/file.txt b/file.txt
+index 3b0f961..a116b51 644
+--- a/file.txt
++++ b/file.txt
+@@ -1,2 +1,2 @@
+-old
++new
+ same
+"""
+        pid = patch_id(diff)
+        # Patch ID should be a 40-byte hex string
+        self.assertEqual(40, len(pid))
+        self.assertTrue(all(c in b"0123456789abcdef" for c in pid))
+
+    def test_patch_id_same_for_equivalent_diffs(self) -> None:
+        """Test that equivalent patches have the same ID."""
+        # Two diffs with different line numbers but same changes
+        diff1 = b"""diff --git a/file.txt b/file.txt
+--- a/file.txt
++++ b/file.txt
+@@ -1,3 +1,3 @@
+ context
+-old line
++new line
+ context
+"""
+        diff2 = b"""diff --git a/file.txt b/file.txt
+--- a/file.txt
++++ b/file.txt
+@@ -10,3 +10,3 @@
+ context
+-old line
++new line
+ context
+"""
+        pid1 = patch_id(diff1)
+        pid2 = patch_id(diff2)
+        # Same patch content should give same patch ID
+        self.assertEqual(pid1, pid2)
+
+    def test_commit_patch_id(self) -> None:
+        """Test commit_patch_id computation."""
+        store = MemoryObjectStore()
+
+        # Create two trees
+        blob1 = Blob.from_string(b"content1\n")
+        blob2 = Blob.from_string(b"content2\n")
+        store.add_objects([(blob1, None), (blob2, None)])
+
+        tree1 = Tree()
+        tree1.add(b"file.txt", 0o644, blob1.id)
+        store.add_object(tree1)
+
+        tree2 = Tree()
+        tree2.add(b"file.txt", 0o644, blob2.id)
+        store.add_object(tree2)
+
+        # Create a commit
+        commit = Commit()
+        commit.tree = tree2.id
+        commit.parents = [ZERO_SHA]  # Fake parent
+        commit.author = commit.committer = b"Test <test@example.com>"
+        commit.author_time = commit.commit_time = 1234567890
+        commit.author_timezone = commit.commit_timezone = 0
+        commit.message = b"Test commit\n"
+        commit.encoding = b"UTF-8"
+        store.add_object(commit)
+
+        # Create parent commit
+        parent_commit = Commit()
+        parent_commit.tree = tree1.id
+        parent_commit.parents = []
+        parent_commit.author = parent_commit.committer = b"Test <test@example.com>"
+        parent_commit.author_time = parent_commit.commit_time = 1234567880
+        parent_commit.author_timezone = parent_commit.commit_timezone = 0
+        parent_commit.message = b"Parent commit\n"
+        parent_commit.encoding = b"UTF-8"
+        store.add_object(parent_commit)
+
+        # Update commit to have real parent
+        commit.parents = [parent_commit.id]
+        store.add_object(commit)
+
+        # Compute patch ID
+        pid = commit_patch_id(store, commit.id)
+        self.assertEqual(40, len(pid))
+        self.assertTrue(all(c in b"0123456789abcdef" for c in pid))
+
+
+class MailinfoTests(TestCase):
+    """Tests for mailinfo functionality."""
+
+    def test_basic_parsing(self):
+        """Test basic email parsing."""
+        email_content = b"""From: John Doe <john@example.com>
+Date: Mon, 1 Jan 2024 12:00:00 +0000
+Subject: [PATCH] Add new feature
+Message-ID: <test@example.com>
+
+This is the commit message.
+
+More details here.
+
+---
+ file.txt | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/file.txt b/file.txt
+--- a/file.txt
++++ b/file.txt
+@@ -1 +1,2 @@
+ line1
++line2
+--
+2.39.0
+"""
+        result = mailinfo(BytesIO(email_content))
+
+        self.assertEqual("John Doe", result.author_name)
+        self.assertEqual("john@example.com", result.author_email)
+        self.assertEqual("Add new feature", result.subject)
+        self.assertIn("This is the commit message.", result.message)
+        self.assertIn("More details here.", result.message)
+        self.assertIn("diff --git a/file.txt b/file.txt", result.patch)
+
+    def test_subject_munging(self):
+        """Test subject line munging."""
+        # Test with [PATCH] tag
+        email = b"""From: Test <test@example.com>
+Subject: [PATCH 1/2] Fix bug
+
+Body
+"""
+        result = mailinfo(BytesIO(email))
+        self.assertEqual("Fix bug", result.subject)
+
+        # Test with Re: prefix
+        email = b"""From: Test <test@example.com>
+Subject: Re: [PATCH] Fix bug
+
+Body
+"""
+        result = mailinfo(BytesIO(email))
+        self.assertEqual("Fix bug", result.subject)
+
+        # Test with multiple brackets
+        email = b"""From: Test <test@example.com>
+Subject: [RFC][PATCH] New feature
+
+Body
+"""
+        result = mailinfo(BytesIO(email))
+        self.assertEqual("New feature", result.subject)
+
+    def test_keep_subject(self):
+        """Test -k flag (keep subject intact)."""
+        email = b"""From: Test <test@example.com>
+Subject: [PATCH 1/2] Fix bug
+
+Body
+"""
+        result = mailinfo(BytesIO(email), keep_subject=True)
+        self.assertEqual("[PATCH 1/2] Fix bug", result.subject)
+
+    def test_keep_non_patch(self):
+        """Test -b flag (only strip [PATCH])."""
+        email = b"""From: Test <test@example.com>
+Subject: [RFC][PATCH] New feature
+
+Body
+"""
+        result = mailinfo(BytesIO(email), keep_non_patch=True)
+        self.assertEqual("[RFC] New feature", result.subject)
+
+    def test_scissors(self):
+        """Test scissors line handling."""
+        email = b"""From: Test <test@example.com>
+Subject: Test
+
+Ignore this part
+
+-- >8 --
+
+Keep this part
+
+---
+diff --git a/file.txt b/file.txt
+"""
+        result = mailinfo(BytesIO(email), scissors=True)
+        self.assertIn("Keep this part", result.message)
+        self.assertNotIn("Ignore this part", result.message)
+
+    def test_scissors_formats(self):
+        """Recognized scissors line formats keep matching after the rewrite."""
+        from dulwich.patch import _find_scissors_line
+
+        for marker in [
+            b"-- >8 --",
+            b"--- 8< ---",
+            b"-->8--",
+            b"-- cut here --",
+            b"-- scissors --",
+            b"------------",
+        ]:
+            self.assertEqual(
+                0, _find_scissors_line([marker]), f"should match {marker!r}"
+            )
+        for non_marker in [b"", b"plain text", b"> quoted reply"]:
+            self.assertIsNone(
+                _find_scissors_line([non_marker]), f"should not match {non_marker!r}"
+            )
+
+    def test_scissors_line_not_quadratic(self):
+        """A long perforation-like line must not backtrack quadratically.
+
+        The previous pattern split one run of dashes between two unbounded
+        ``-+`` groups, so a non-matching line of N dashes took O(N**2) time
+        through ``git am --scissors`` on an untrusted mailbox.
+        """
+        import time
+
+        from dulwich.patch import _find_scissors_line
+
+        line = b"-" * 200000 + b"x"
+        start = time.monotonic()
+        self.assertIsNone(_find_scissors_line([line]))
+        self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_message_id(self):
+        """Test -m flag (include Message-ID)."""
+        email = b"""From: Test <test@example.com>
+Subject: Test
+Message-ID: <12345@example.com>
+
+Body text
+"""
+        result = mailinfo(BytesIO(email), message_id=True)
+        self.assertIn("Message-ID: <12345@example.com>", result.message)
+        self.assertEqual("<12345@example.com>", result.message_id)
+
+    def test_encoding(self):
+        """Test encoding handling."""
+        # Use explicit UTF-8 bytes with MIME encoded subject
+        email = (
+            b"From: Test <test@example.com>\n"
+            b"Subject: =?utf-8?q?Test_with_UTF-8=3A_caf=C3=A9?=\n"
+            b"Content-Type: text/plain; charset=utf-8\n"
+            b"Content-Transfer-Encoding: 8bit\n"
+            b"\n"
+            b"Body with UTF-8: " + "naïve".encode() + b"\n"
+        )
+
+        result = mailinfo(BytesIO(email), encoding="utf-8")
+        # The subject should be decoded from MIME encoding
+        self.assertIn("caf", result.subject)
+        self.assertIn("na", result.message)
+
+    def test_patch_separation(self):
+        """Test separation of message from patch."""
+        email = b"""From: Test <test@example.com>
+Subject: Test
+
+Commit message line 1
+Commit message line 2
+
+---
+ file.txt | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/file.txt b/file.txt
+"""
+        result = mailinfo(BytesIO(email))
+        self.assertIn("Commit message line 1", result.message)
+        self.assertIn("Commit message line 2", result.message)
+        self.assertIn("---", result.patch)
+        self.assertIn("diff --git", result.patch)
+        self.assertNotIn("---", result.message)
+
+    def test_no_subject(self):
+        """Test handling of missing subject."""
+        email = b"""From: Test <test@example.com>
+
+Body text
+"""
+        result = mailinfo(BytesIO(email))
+        self.assertEqual("(no subject)", result.subject)
+
+    def test_missing_from_header(self):
+        """Test error on missing From header."""
+        email = b"""Subject: Test
+
+Body text
+"""
+        with self.assertRaises(ValueError) as cm:
+            mailinfo(BytesIO(email))
+        self.assertIn("From", str(cm.exception))
+
+
+class ParseUnifiedDiffTests(TestCase):
+    def test_simple_patch(self) -> None:
+        """Test parsing a simple unified diff."""
+        diff = b"""diff --git a/test.txt b/test.txt
+index 1234567..abcdefg 100644
+--- a/test.txt
++++ b/test.txt
+@@ -1,3 +1,3 @@
+ line 1
+-line 2
++line two
+ line 3
+"""
+        patches = parse_unified_diff(diff)
+        self.assertEqual(len(patches), 1)
+        patch = patches[0]
+        self.assertEqual(patch.old_path, b"a/test.txt")
+        self.assertEqual(patch.new_path, b"b/test.txt")
+        self.assertFalse(patch.binary)
+        self.assertEqual(len(patch.hunks), 1)
+
+        hunk = patch.hunks[0]
+        self.assertEqual(hunk.old_start, 1)
+        self.assertEqual(hunk.old_count, 3)
+        self.assertEqual(hunk.new_start, 1)
+        self.assertEqual(hunk.new_count, 3)
+
+    def test_new_file(self) -> None:
+        """Test parsing a patch for a new file."""
+        diff = b"""diff --git a/newfile.txt b/newfile.txt
+new file mode 100644
+index 0000000..1234567
+--- /dev/null
++++ b/newfile.txt
+@@ -0,0 +1,2 @@
++new line 1
++new line 2
+"""
+        patches = parse_unified_diff(diff)
+        self.assertEqual(len(patches), 1)
+        patch = patches[0]
+        self.assertIsNone(patch.old_path)
+        self.assertEqual(patch.new_path, b"b/newfile.txt")
+        self.assertEqual(patch.new_mode, 0o100644)
+
+    def test_deleted_file(self) -> None:
+        """Test parsing a patch for a deleted file."""
+        diff = b"""diff --git a/oldfile.txt b/oldfile.txt
+deleted file mode 100644
+index 1234567..0000000
+--- a/oldfile.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-old line 1
+-old line 2
+"""
+        patches = parse_unified_diff(diff)
+        self.assertEqual(len(patches), 1)
+        patch = patches[0]
+        self.assertEqual(patch.old_path, b"a/oldfile.txt")
+        self.assertIsNone(patch.new_path)
+        self.assertEqual(patch.old_mode, 0o100644)
+
+    def test_binary_patch(self) -> None:
+        """Test parsing a binary patch."""
+        diff = b"""diff --git a/image.png b/image.png
+index 1234567..abcdefg 100644
+Binary files a/image.png and b/image.png differ
+"""
+        patches = parse_unified_diff(diff)
+        self.assertEqual(len(patches), 1)
+        patch = patches[0]
+        self.assertTrue(patch.binary)
+
+
+class ApplyPatchTests(TestCase):
+    def _apply_diff(self, diff: bytes, original: list[bytes]) -> list[bytes] | None:
+        return apply_patch_hunks(parse_unified_diff(diff)[0], original)
+
+    def test_no_newline_at_end_of_file(self) -> None:
+        # Produced by git diff after changing b"one\ntwo" to b"one\nthree".
+        diff = (
+            b"diff --git a/f b/f\n"
+            b"index 9ed40b4..7279b45 100644\n"
+            b"--- a/f\n"
+            b"+++ b/f\n"
+            b"@@ -1,2 +1,2 @@\n"
+            b" one\n"
+            b"-two\n"
+            b"\\ No newline at end of file\n"
+            b"+three\n"
+            b"\\ No newline at end of file\n"
+        )
+        self.assertEqual(
+            [b"one\n", b"three"], self._apply_diff(diff, [b"one\n", b"two"])
+        )
+        self.assertIsNone(self._apply_diff(diff, [b"one\n", b"two\n"]))
+
+    def test_add_newline_at_end_of_file(self) -> None:
+        # Produced by git diff after changing b"one\ntwo" to b"one\nthree\n".
+        diff = (
+            b"diff --git a/f b/f\n"
+            b"index 9ed40b4..4c7442b 100644\n"
+            b"--- a/f\n"
+            b"+++ b/f\n"
+            b"@@ -1,2 +1,2 @@\n"
+            b" one\n"
+            b"-two\n"
+            b"\\ No newline at end of file\n"
+            b"+three\n"
+        )
+        self.assertEqual(
+            [b"one\n", b"three\n"], self._apply_diff(diff, [b"one\n", b"two"])
+        )
+
+    def test_no_newline_on_context_line(self) -> None:
+        diff = (
+            b"--- a/f\n"
+            b"+++ b/f\n"
+            b"@@ -1,2 +1,2 @@\n"
+            b"-one\n"
+            b"+uno\n"
+            b" two\n"
+            b"\\ No newline at end of file\n"
+        )
+        self.assertEqual(
+            [b"uno\n", b"two"],
+            self._apply_diff(b"diff --git a/f b/f\n" + diff, [b"one\n", b"two"]),
+        )
+
+    def test_zero_context_insertions(self) -> None:
+        # Produced by git diff -U0 after changing b"a\nb\nc\n" to
+        # b"X\na\nb\nY\nc\nZ\n".
+        diff = (
+            b"diff --git a/f b/f\n"
+            b"index de98044..2d934a2 100644\n"
+            b"--- a/f\n"
+            b"+++ b/f\n"
+            b"@@ -0,0 +1 @@\n"
+            b"+X\n"
+            b"@@ -2,0 +4 @@ b\n"
+            b"+Y\n"
+            b"@@ -3,0 +6 @@ c\n"
+            b"+Z\n"
+        )
+        self.assertEqual(
+            [b"X\n", b"a\n", b"b\n", b"Y\n", b"c\n", b"Z\n"],
+            self._apply_diff(diff, [b"a\n", b"b\n", b"c\n"]),
+        )
+
+    def test_simple_modification(self) -> None:
+        """Test applying a simple modification patch."""
+        original = [b"line 1\n", b"line 2\n", b"line 3\n"]
+        hunk = PatchHunk(
+            old_start=1,
+            old_count=3,
+            new_start=1,
+            new_count=3,
+            lines=[b" line 1\n", b"-line 2\n", b"+line two\n", b" line 3\n"],
+        )
+        patch = FilePatch(
+            old_path=b"test.txt",
+            new_path=b"test.txt",
+            old_mode=0o100644,
+            new_mode=0o100644,
+            hunks=[hunk],
+        )
+
+        result = apply_patch_hunks(patch, original)
+        self.assertIsNotNone(result)
+        self.assertEqual(result, [b"line 1\n", b"line two\n", b"line 3\n"])
+
+    def test_add_lines(self) -> None:
+        """Test applying a patch that adds lines."""
+        original = [b"line 1\n", b"line 2\n"]
+        hunk = PatchHunk(
+            old_start=1,
+            old_count=2,
+            new_start=1,
+            new_count=4,
+            lines=[
+                b" line 1\n",
+                b"+inserted 1\n",
+                b"+inserted 2\n",
+                b" line 2\n",
+            ],
+        )
+        patch = FilePatch(
+            old_path=b"test.txt",
+            new_path=b"test.txt",
+            old_mode=0o100644,
+            new_mode=0o100644,
+            hunks=[hunk],
+        )
+
+        result = apply_patch_hunks(patch, original)
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result, [b"line 1\n", b"inserted 1\n", b"inserted 2\n", b"line 2\n"]
+        )
+
+    def test_delete_lines(self) -> None:
+        """Test applying a patch that deletes lines."""
+        original = [b"line 1\n", b"line 2\n", b"line 3\n", b"line 4\n"]
+        hunk = PatchHunk(
+            old_start=1,
+            old_count=4,
+            new_start=1,
+            new_count=2,
+            lines=[b" line 1\n", b"-line 2\n", b"-line 3\n", b" line 4\n"],
+        )
+        patch = FilePatch(
+            old_path=b"test.txt",
+            new_path=b"test.txt",
+            old_mode=0o100644,
+            new_mode=0o100644,
+            hunks=[hunk],
+        )
+
+        result = apply_patch_hunks(patch, original)
+        self.assertIsNotNone(result)
+        self.assertEqual(result, [b"line 1\n", b"line 4\n"])
+
+    def test_context_mismatch(self) -> None:
+        """Test that patch returns None when context doesn't match."""
+        original = [b"line 1\n", b"wrong line\n", b"line 3\n"]
+        hunk = PatchHunk(
+            old_start=1,
+            old_count=3,
+            new_start=1,
+            new_count=3,
+            lines=[b" line 1\n", b"-line 2\n", b"+line two\n", b" line 3\n"],
+        )
+        patch = FilePatch(
+            old_path=b"test.txt",
+            new_path=b"test.txt",
+            old_mode=0o100644,
+            new_mode=0o100644,
+            hunks=[hunk],
+        )
+
+        result = apply_patch_hunks(patch, original)
+        self.assertIsNone(result)
+
+    def test_multiple_hunks(self) -> None:
+        """Test applying a patch with multiple hunks."""
+        original = [
+            b"line 1\n",
+            b"line 2\n",
+            b"line 3\n",
+            b"line 4\n",
+            b"line 5\n",
+        ]
+        hunk1 = PatchHunk(
+            old_start=1,
+            old_count=2,
+            new_start=1,
+            new_count=2,
+            lines=[b"-line 1\n", b"+LINE 1\n", b" line 2\n"],
+        )
+        hunk2 = PatchHunk(
+            old_start=4,
+            old_count=2,
+            new_start=4,
+            new_count=2,
+            lines=[b" line 4\n", b"-line 5\n", b"+LINE 5\n"],
+        )
+        patch = FilePatch(
+            old_path=b"test.txt",
+            new_path=b"test.txt",
+            old_mode=0o100644,
+            new_mode=0o100644,
+            hunks=[hunk1, hunk2],
+        )
+
+        result = apply_patch_hunks(patch, original)
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result, [b"LINE 1\n", b"line 2\n", b"line 3\n", b"line 4\n", b"LINE 5\n"]
+        )
+
+    def test_new_file(self) -> None:
+        """Test applying a patch that creates a new file."""
+        hunk = PatchHunk(
+            old_start=0,
+            old_count=0,
+            new_start=1,
+            new_count=2,
+            lines=[b"+new line 1\n", b"+new line 2\n"],
+        )
+        patch = FilePatch(
+            old_path=None,
+            new_path=b"newfile.txt",
+            old_mode=None,
+            new_mode=0o100644,
+            hunks=[hunk],
+        )
+
+        result = apply_patch_hunks(patch, [])
+        self.assertIsNotNone(result)
+        self.assertEqual(result, [b"new line 1\n", b"new line 2\n"])
+
+    def test_delete_file(self) -> None:
+        """Test applying a patch that deletes an entire file."""
+        original = [b"line 1\n", b"line 2\n"]
+        hunk = PatchHunk(
+            old_start=1,
+            old_count=2,
+            new_start=0,
+            new_count=0,
+            lines=[b"-line 1\n", b"-line 2\n"],
+        )
+        patch = FilePatch(
+            old_path=b"test.txt",
+            new_path=None,
+            old_mode=0o100644,
+            new_mode=None,
+            hunks=[hunk],
+        )
+
+        result = apply_patch_hunks(patch, original)
+        self.assertIsNotNone(result)
+        self.assertEqual(result, [])
+
+
+class ParseUnifiedDiffMultiFileTests(TestCase):
+    def test_multiple_files(self) -> None:
+        """Test parsing a diff with multiple files."""
+        diff = b"""diff --git a/file1.txt b/file1.txt
+index 1234567..abcdefg 100644
+--- a/file1.txt
++++ b/file1.txt
+@@ -1,3 +1,3 @@
+ line 1
+-line 2
++line two
+ line 3
+diff --git a/file2.txt b/file2.txt
+index 1234567..abcdefg 100644
+--- a/file2.txt
++++ b/file2.txt
+@@ -1,2 +1,2 @@
+-hello
++goodbye
+ world
+"""
+        patches = parse_unified_diff(diff)
+        self.assertEqual(len(patches), 2)
+        self.assertEqual(patches[0].old_path, b"a/file1.txt")
+        self.assertEqual(patches[0].new_path, b"b/file1.txt")
+        self.assertEqual(len(patches[0].hunks), 1)
+        self.assertEqual(patches[1].old_path, b"a/file2.txt")
+        self.assertEqual(patches[1].new_path, b"b/file2.txt")
+        self.assertEqual(len(patches[1].hunks), 1)
+
+
+class GitBase85DecodeTests(TestCase):
+    """Tests for git_base85_decode function."""
+
+    def test_decode_line_lengths(self) -> None:
+        # The first byte of each line is the decoded length: A-Z for 1-26,
+        # a-z for 27-52. Lengths that aren't a multiple of 4 must not leak
+        # the padding bytes of the last group.
+        decoded = git_base85_decode(b"McmYdfNM=X@00VacDF6Tf")
+        self.assertEqual(13, len(decoded))
+        self.assertEqual(b"a\0c\0d", zlib.decompress(decoded))
+        decoded = git_base85_decode(b"Kcmb<ms0083<N)#j\n")
+        self.assertEqual(11, len(decoded))
+        self.assertEqual(b"x\0y", zlib.decompress(decoded))
+
+    def test_decode_multiple_lines(self) -> None:
+        data = bytes(range(256)) * 2
+        # Produced by git diff --binary.
+        encoded = (
+            b"zcmZQzWMXDvWn<^y<l^Sx<>MC+6cQE@6%&_`l#-T_m6KOcR8m$^Ra4i{)Y8_`)zddH\n"
+            b"zG%_|ZH8Z!cw6eCbwX=6{baHlab#wRd^z!!c_45x13<?ej4GWKmjEatljf+o6OiE5k\n"
+            b"zO-s+n%*xKm&C4$+EGjN3Ei136tg5c5t*dWnY-(<4ZENr7?CS36?dzW~anj@|Q>RUz\n"
+            b"zF>}`JIdkXDU$Ah|;w4L$Enl&6)#^2C*R9{Mant54TeofBv2)k%J$v`<KXCBS;Uh<n\n"
+            b"z9Y1mM)af&4&z-+;@zUihSFc^aar4&gJ9qEhfAH|p<0ns_J%91?)$2EJ-@X6v@zduo\n"
+            b"VU%!3-@$=X3KY#!IXBgrB2LR)2{{a91\n"
+        )
+        self.assertEqual(data, zlib.decompress(git_base85_decode(encoded)))
+
+    def test_invalid_length_byte(self) -> None:
+        self.assertRaises(ValueError, git_base85_decode, b"0cmYdf\n")
+
+    def test_truncated_line(self) -> None:
+        self.assertRaises(ValueError, git_base85_decode, b"McmYdfNM=X@00Vac\n")
+
+    def test_empty_decode(self):
+        # Test empty input
+        result = git_base85_decode(b"")
+        self.assertEqual(result, b"")
+
+
+class ParseUnifiedDiffRenameTests(TestCase):
+    """Tests for parse_unified_diff with rename/copy headers."""
+
+    def test_parse_pure_rename_followed_by_patch(self) -> None:
+        # A rename without content changes has no ---/+++ lines; the next
+        # diff --git line must start a new patch rather than be swallowed.
+        patches = parse_unified_diff(
+            b"diff --git a/old b/new\n"
+            b"similarity index 100%\n"
+            b"rename from old\n"
+            b"rename to new\n"
+            b"diff --git a/x b/x\n"
+            b"--- a/x\n"
+            b"+++ b/x\n"
+            b"@@ -1 +1 @@\n"
+            b"-a\n"
+            b"+b\n"
+        )
+        self.assertEqual(
+            [(None, None, b"old", b"new", 0), (b"a/x", b"b/x", None, None, 1)],
+            [
+                (p.old_path, p.new_path, p.rename_from, p.rename_to, len(p.hunks))
+                for p in patches
+            ],
+        )
+
+    def test_parse_rename(self):
+        diff = b"""diff --git a/old.txt b/new.txt
+similarity index 100%
+rename from old.txt
+rename to new.txt
+"""
+        patches = parse_unified_diff(diff)
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(patches[0].rename_from, b"old.txt")
+        self.assertEqual(patches[0].rename_to, b"new.txt")
+
+    def test_parse_copy(self):
+        diff = b"""diff --git a/original.txt b/copy.txt
+similarity index 100%
+copy from original.txt
+copy to copy.txt
+"""
+        patches = parse_unified_diff(diff)
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(patches[0].copy_from, b"original.txt")
+        self.assertEqual(patches[0].copy_to, b"copy.txt")
+
+    def test_parse_rename_with_modification(self):
+        diff = b"""diff --git a/old.txt b/new.txt
+similarity index 90%
+rename from old.txt
+rename to new.txt
+--- a/old.txt
++++ b/new.txt
+@@ -1,2 +1,2 @@
+ line1
+-line2
++modified line2
+"""
+        patches = parse_unified_diff(diff)
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(patches[0].rename_from, b"old.txt")
+        self.assertEqual(patches[0].rename_to, b"new.txt")
+        self.assertEqual(len(patches[0].hunks), 1)
+
+
+class ParseUnifiedDiffBinaryTests(TestCase):
+    """Tests for parse_unified_diff with binary patches."""
+
+    def test_parse_binary_patch(self):
+        diff = b"""diff --git a/test.bin b/test.bin
+index 1234567..abcdefg 100644
+GIT binary patch
+literal 10
+ATest
+
+"""
+        patches = parse_unified_diff(diff)
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(patches[0].binary, True)
+        self.assertIsNotNone(patches[0].binary_new)
+
+    def test_parse_binary_files_differ(self):
+        diff = b"""diff --git a/test.bin b/test.bin
+index 1234567..abcdefg 100644
+Binary files a/test.bin and b/test.bin differ
+"""
+        patches = parse_unified_diff(diff)
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(patches[0].binary, True)
+        self.assertIsNone(patches[0].binary_new)  # No patch data
+        self.assertEqual(b"a/test.bin", patches[0].old_path)
+        self.assertEqual(b"b/test.bin", patches[0].new_path)
+
+    def test_parse_binary_paths(self) -> None:
+        # Binary patches carry no ---/+++ lines, so the paths come from the
+        # diff --git header.
+        patches = parse_unified_diff(BINARY_DIFF)
+        self.assertEqual(
+            [
+                (b"a/del.bin", None),
+                (b"a/mod.bin", b"b/mod.bin"),
+                (None, b"b/new.bin"),
+            ],
+            [(p.old_path, p.new_path) for p in patches],
+        )
+        self.assertEqual(
+            [b"HcmV?d00001\n", b"McmYdfNM=X@00VacDF6Tf\n", b"Lcmc~xEoT4#1K9yf\n"],
+            [p.binary_new for p in patches],
+        )
+        self.assertEqual(
+            [b"Kcmb<ms0083<N)#j\n", b"KcmYdfNCE%>hycU@\n", b"HcmV?d00001\n"],
+            [p.binary_old for p in patches],
+        )
+
+    def test_parse_binary_delta(self) -> None:
+        patch = parse_unified_diff(QUOTED_DELTA_DIFF)[0]
+        self.assertEqual(
+            (
+                b"YcmbQuJDYcdI5Ufnr=RO)Y32rI04(nWn*aa+\n",
+                True,
+                b"YcmbQuJDYcdI5SI5W?t%MY32rI05Gow8vp<R\n",
+                True,
+            ),
+            (
+                patch.binary_new,
+                patch.binary_new_delta,
+                patch.binary_old,
+                patch.binary_old_delta,
+            ),
+        )
+
+    def test_parse_quoted_paths(self) -> None:
+        patches = parse_unified_diff(QUOTED_DELTA_DIFF)
+        self.assertEqual(
+            [
+                (b"a/big.bin", b"b/big.bin"),
+                (None, None),
+                (b'a/q"uote.txt', b'b/q"uote.txt'),
+                (b"a/t\xc3\xa9st.bin", b"b/t\xc3\xa9st.bin"),
+            ],
+            [(p.old_path, p.new_path) for p in patches],
+        )
+
+    def test_parse_quoted_rename(self) -> None:
+        patch = parse_unified_diff(
+            b'diff --git "a/\\tx" "b/\\303\\251"\n'
+            b"similarity index 100%\n"
+            b'rename from "\\tx"\n'
+            b'rename to "\\303\\251"\n'
+        )[0]
+        self.assertEqual((b"\tx", b"\xc3\xa9"), (patch.rename_from, patch.rename_to))
+
+    def test_parse_unterminated_quoted_path(self) -> None:
+        self.assertRaises(
+            ValueError,
+            parse_unified_diff,
+            b'diff --git "a/x b/x\n--- "a/x\n+++ "b/x\n@@ -1 +1 @@\n-a\n+b\n',
+        )
+
+
+# Produced by git diff --cached --binary after deleting del.bin, changing
+# mod.bin from b"a\0b" to b"a\0c\0d" and adding new.bin as b"new\0".
+BINARY_DIFF = b"""\
+diff --git a/del.bin b/del.bin
+deleted file mode 100644
+index d5d0b8b4c4c9e936890870f6799cfbb5ba984470..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 3
+Kcmb<ms0083<N)#j
+
+diff --git a/mod.bin b/mod.bin
+index 20b5be91886d0b6f26dc98a225c0dac05fe2c86e..57e6c150e8aebdd17192d6375e3b2d2b210191fc 100644
+GIT binary patch
+literal 5
+McmYdfNM=X@00VacDF6Tf
+
+literal 3
+KcmYdfNCE%>hycU@
+
+diff --git a/new.bin b/new.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..c984a0442d5fba744241e9c2dd75d27f612d6cb2
+GIT binary patch
+literal 4
+Lcmc~xEoT4#1K9yf
+
+literal 0
+HcmV?d00001
+
+"""
+
+
+# Produced by git diff --cached --binary -M after changing one line of
+# big.bin, renaming mv.bin to moved.bin while changing one line, and
+# changing q"uote.txt and t\xc3\xa9st.bin.
+QUOTED_DELTA_DIFF = b"""\
+diff --git a/big.bin b/big.bin
+index 545f69f6be9b35797266c4d45678eec252f53b4e..0355e27919340457dd4994851d2abfb248510928 100644
+GIT binary patch
+delta 17
+YcmbQuJDYcdI5Ufnr=RO)Y32rI04(nWn*aa+
+
+delta 17
+YcmbQuJDYcdI5SI5W?t%MY32rI05Gow8vp<R
+
+diff --git a/mv.bin b/moved.bin
+similarity index 98%
+rename from mv.bin
+rename to moved.bin
+index cfa570a71ea5217b14a8cacdf3ca8cbc0efe982d..7bc0b17cddb93157835768510813377e01ab7543 100644
+GIT binary patch
+delta 16
+XcmdnYx|wxDC?j)_fB5DI#%M+WE&c@B
+
+delta 16
+XcmdnYx|wxDC?j)Ge);AI#%M+WFrEcE
+
+diff --git "a/q\\"uote.txt" "b/q\\"uote.txt"
+index ce01362..cc628cc 100644
+--- "a/q\\"uote.txt"
++++ "b/q\\"uote.txt"
+@@ -1 +1 @@
+-hello
++world
+diff --git "a/t\\303\\251st.bin" "b/t\\303\\251st.bin"
+index 2f2e261d9ec59b91a348276980246106e50c117c..a6d0698394b7e0069a7eeff0dc3e8da3963aae74 100644
+GIT binary patch
+literal 3
+KcmXS9C<Xul$pGa5
+
+literal 3
+KcmXS9C;|Wh$N=O3
+
+"""
+
+BIG_OLD = b"\0" + b"".join(b"line %d\n" % i for i in range(200))
+BIG_NEW = BIG_OLD.replace(b"line 100\n", b"LINE 100\n")
+MV_OLD = b"\0" + b"".join(b"row %d\n" % i for i in range(100))
+MV_NEW = MV_OLD.replace(b"row 50\n", b"ROW 50\n")
+
+
+class ApplyBinaryPatchesTests(TestCase):
+    def _make_repo(self, files: dict[bytes, bytes]) -> Repo:
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        r = Repo.init(path)
+        self.addCleanup(r.close)
+        for name, content in files.items():
+            with open(os.path.join(os.fsencode(path), name), "wb") as f:
+                f.write(content)
+        r.get_worktree().stage(list(files))
+        return r
+
+    def _assert_files(self, r: Repo, files: dict[bytes, bytes]) -> None:
+        path = os.fsencode(r.path)
+        contents = {}
+        for name in os.listdir(path):
+            if name != b".git":
+                with open(os.path.join(path, name), "rb") as f:
+                    contents[name] = f.read()
+        self.assertEqual(files, contents)
+        self.assertEqual(
+            sorted(
+                (name, Blob.from_string(content).id, 0o100644)
+                for name, content in files.items()
+            ),
+            sorted(r.open_index().iterobjects()),
+        )
+
+    def test_apply(self) -> None:
+        r = self._make_repo({b"mod.bin": b"a\0b", b"del.bin": b"x\0y"})
+        apply_patches(r, parse_unified_diff(BINARY_DIFF), strip=1)
+        self._assert_files(r, {b"mod.bin": b"a\0c\0d", b"new.bin": b"new\0"})
+
+    def test_apply_delta_rename_and_quoted(self) -> None:
+        r = self._make_repo(
+            {
+                b"big.bin": BIG_OLD,
+                b"mv.bin": MV_OLD,
+                b"t\xc3\xa9st.bin": b"q\0r",
+            }
+        )
+        patches = parse_unified_diff(QUOTED_DELTA_DIFF)
+        apply_patches(r, [patches[0], patches[1], patches[3]], strip=1)
+        self._assert_files(
+            r,
+            {
+                b"big.bin": BIG_NEW,
+                b"moved.bin": MV_NEW,
+                b"t\xc3\xa9st.bin": b"q\0s",
+            },
+        )
+        # Check the results against the blob ids git recorded.
+        index = r.open_index()
+        self.assertEqual(
+            b"0355e27919340457dd4994851d2abfb248510928", index.get_sha1(b"big.bin")
+        )
+        self.assertEqual(
+            b"7bc0b17cddb93157835768510813377e01ab7543", index.get_sha1(b"moved.bin")
+        )
+
+    @skipIf(sys.platform == "win32", 'Windows does not allow " in file names')
+    def test_apply_escaped_quote(self) -> None:
+        r = self._make_repo({b'q"uote.txt': b"hello\n"})
+        patches = parse_unified_diff(QUOTED_DELTA_DIFF)
+        apply_patches(r, patches[2:3], strip=1)
+        self._assert_files(r, {b'q"uote.txt': b"world\n"})
+
+    def test_apply_reverse(self) -> None:
+        r = self._make_repo({b"big.bin": BIG_NEW, b"t\xc3\xa9st.bin": b"q\0s"})
+        patches = parse_unified_diff(QUOTED_DELTA_DIFF)
+        apply_patches(r, [patches[0], patches[3]], strip=1, reverse=True)
+        self._assert_files(r, {b"big.bin": BIG_OLD, b"t\xc3\xa9st.bin": b"q\0r"})
+
+    def test_delta_against_wrong_base(self) -> None:
+        r = self._make_repo({b"big.bin": b"something else"})
+        patches = parse_unified_diff(QUOTED_DELTA_DIFF)
+        self.assertRaises(ValueError, apply_patches, r, patches[:1], strip=1)
+        with open(os.path.join(r.path, "big.bin"), "rb") as f:
+            self.assertEqual(b"something else", f.read())
+
+
+class ApplyPatchesPathTests(TestCase):
+    """Tests that apply_patches refuses paths outside the working tree."""
+
+    def _make_repo(self):
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        return Repo.init(path)
+
+    def test_rejects_parent_traversal(self) -> None:
+        r = self._make_repo()
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        target = os.path.join(outside, "pwned")
+        rel = os.path.relpath(target, r.path).encode()
+        diff = (
+            b"diff --git a/x b/x\n"
+            b"new file mode 100644\n"
+            b"--- /dev/null\n"
+            b"+++ b/" + rel + b"\n"
+            b"@@ -0,0 +1 @@\n"
+            b"+owned\n"
+        )
+        self.assertRaises(
+            ValueError, apply_patches, r, parse_unified_diff(diff), strip=1
+        )
+        self.assertFalse(os.path.exists(target))
+
+    def test_rejects_dotgit_target(self) -> None:
+        # A target inside the .git control directory stays within the work tree
+        # so the parent-traversal check alone would allow it, but writing e.g.
+        # .git/hooks/pre-commit installs a hook that later runs as the user.
+        # git refuses such a patch with "invalid path".
+        r = self._make_repo()
+        diff = (
+            b"diff --git a/.git/hooks/pre-commit b/.git/hooks/pre-commit\n"
+            b"new file mode 100755\n"
+            b"--- /dev/null\n"
+            b"+++ b/.git/hooks/pre-commit\n"
+            b"@@ -0,0 +1 @@\n"
+            b"+#!/bin/sh\n"
+        )
+        self.assertRaises(
+            ValueError, apply_patches, r, parse_unified_diff(diff), strip=1
+        )
+        self.assertFalse(
+            os.path.exists(os.path.join(r.path, ".git", "hooks", "pre-commit"))
+        )
+
+    @skipIf(sys.platform == "win32", "Requires symlink support")
+    def test_rejects_symlinked_leading_dir(self) -> None:
+        # A patch that first creates ``sub`` as a symlink to .git/hooks and then
+        # writes ``sub/pre-commit`` would land the second write in the control
+        # directory through the link. Refuse it.
+        r = self._make_repo()
+        os.symlink(".git/hooks", os.path.join(r.path, "sub"))
+        diff = (
+            b"diff --git a/sub/pre-commit b/sub/pre-commit\n"
+            b"new file mode 100755\n"
+            b"--- /dev/null\n"
+            b"+++ b/sub/pre-commit\n"
+            b"@@ -0,0 +1 @@\n"
+            b"+#!/bin/sh\n"
+        )
+        self.assertRaises(
+            ValueError, apply_patches, r, parse_unified_diff(diff), strip=1
+        )
+        self.assertFalse(
+            os.path.exists(os.path.join(r.path, ".git", "hooks", "pre-commit"))
+        )
+
+    def _assert_refused_through_symlink(self, patches: list[FilePatch]) -> None:
+        # A tracked symlink ``trap`` pointing into .git stays within the work
+        # tree, so writing a patch target of that name must not follow it.
+        r = self._make_repo()
+        hook = os.path.join(r.path, ".git", "hooks", "pre-commit")
+        os.symlink(".git/hooks/pre-commit", os.path.join(r.path, "trap"))
+        self.assertRaises(ValueError, apply_patches, r, patches, strip=1)
+        self.assertFalse(os.path.exists(hook))
+        self.assertTrue(os.path.islink(os.path.join(r.path, "trap")))
+
+    @skipIf(sys.platform == "win32", "Requires symlink support")
+    def test_rejects_symlinked_target_text(self) -> None:
+        self._assert_refused_through_symlink(
+            parse_unified_diff(
+                b"diff --git a/trap b/trap\n"
+                b"new file mode 100755\n"
+                b"--- /dev/null\n"
+                b"+++ b/trap\n"
+                b"@@ -0,0 +1 @@\n"
+                b"+#!/bin/sh\n"
+            )
+        )
+
+    @skipIf(sys.platform == "win32", "Requires symlink support")
+    def test_rejects_symlinked_target_binary(self) -> None:
+        self._assert_refused_through_symlink(
+            [
+                FilePatch(
+                    old_path=None,
+                    new_path=b"b/trap",
+                    old_mode=None,
+                    new_mode=0o100755,
+                    hunks=[],
+                    binary=True,
+                    binary_new=b"ScmY#Z)KALH(=X28VgLXU0|LPS\n",
+                )
+            ]
+        )
+
+    @skipIf(sys.platform == "win32", "Requires symlink support")
+    def test_rejects_symlinked_copy_destination(self) -> None:
+        r = self._make_repo()
+        with open(os.path.join(r.path, "src"), "wb") as f:
+            f.write(b"#!/bin/sh\n")
+        hook = os.path.join(r.path, ".git", "hooks", "pre-commit")
+        os.symlink(".git/hooks/pre-commit", os.path.join(r.path, "trap"))
+        diff = (
+            b"diff --git a/src b/trap\n"
+            b"similarity index 100%\n"
+            b"copy from src\n"
+            b"copy to trap\n"
+        )
+        self.assertRaises(
+            ValueError, apply_patches, r, parse_unified_diff(diff), strip=1
+        )
+        self.assertFalse(os.path.exists(hook))
+
+    @skipIf(sys.platform == "win32", "Requires symlink support")
+    def test_deletes_symlink_target(self) -> None:
+        # Deleting a symlink removes the link itself, so it stays allowed.
+        r = self._make_repo()
+        hook = os.path.join(r.path, ".git", "hooks", "pre-commit")
+        with open(hook, "wb") as f:
+            f.write(b"#!/bin/sh\n")
+        os.symlink(".git/hooks/pre-commit", os.path.join(r.path, "trap"))
+        diff = (
+            b"diff --git a/trap b/trap\n"
+            b"deleted file mode 120000\n"
+            b"--- a/trap\n"
+            b"+++ /dev/null\n"
+            b"@@ -1 +0,0 @@\n"
+            b"-.git/hooks/pre-commit\n"
+            b"\\ No newline at end of file\n"
+        )
+        apply_patches(r, parse_unified_diff(diff), strip=1)
+        self.assertFalse(os.path.lexists(os.path.join(r.path, "trap")))
+        self.assertTrue(os.path.exists(hook))
+
+    @skipIf(sys.platform == "win32", "Requires symlink support")
+    def test_rejects_regular_file_patch_to_symlink(self) -> None:
+        # The index line says trap is a regular file, but it is a symlink in
+        # the work tree. git refuses this with "wrong type".
+        self._assert_refused_through_symlink(
+            parse_unified_diff(
+                b"diff --git a/trap b/trap\n"
+                b"index 1234567..89abcde 100755\n"
+                b"--- a/trap\n"
+                b"+++ b/trap\n"
+                b"@@ -0,0 +1 @@\n"
+                b"+#!/bin/sh\n"
+            )
+        )
+
+    @skipIf(sys.platform == "win32", "Requires symlink support")
+    def test_patch_without_mode_updates_symlink(self) -> None:
+        # Without mode information the work tree decides the type, so the
+        # patch applies to the link target rather than through the link.
+        r = self._make_repo()
+        hook = os.path.join(r.path, ".git", "hooks", "pre-commit")
+        trap = os.path.join(r.path, "trap")
+        os.symlink(".git/hooks/pre-commit", trap)
+        diff = (
+            b"--- a/trap\n"
+            b"+++ b/trap\n"
+            b"@@ -1 +1 @@\n"
+            b"-.git/hooks/pre-commit\n"
+            b"\\ No newline at end of file\n"
+            b"+elsewhere\n"
+            b"\\ No newline at end of file\n"
+        )
+        apply_patches(r, parse_unified_diff(b"diff --git a/trap b/trap\n" + diff))
+        self.assertFalse(os.path.exists(hook))
+        self.assertEqual("elsewhere", os.readlink(trap))
+
+    def test_allows_in_tree_path(self) -> None:
+        r = self._make_repo()
+        diff = (
+            b"diff --git a/sub/x b/sub/x\n"
+            b"new file mode 100644\n"
+            b"--- /dev/null\n"
+            b"+++ b/sub/x\n"
+            b"@@ -0,0 +1 @@\n"
+            b"+hi\n"
+        )
+        apply_patches(r, parse_unified_diff(diff), strip=1)
+        self.assertTrue(os.path.exists(os.path.join(r.path, "sub", "x")))
+
+    @skipIf(sys.platform == "win32", "Requires POSIX file modes")
+    def test_canonicalizes_new_file_mode(self) -> None:
+        # The mode in a patch's "new file mode" header is attacker-controlled
+        # (e.g. an emailed patch applied via git am). Like git, apply_patches
+        # must only honor the 0o644/0o755 distinction, never setuid/setgid or
+        # world-writable bits.
+        r = self._make_repo()
+        diff = (
+            b"diff --git a/x b/x\n"
+            b"new file mode 104777\n"
+            b"--- /dev/null\n"
+            b"+++ b/x\n"
+            b"@@ -0,0 +1 @@\n"
+            b"+owned\n"
+        )
+        apply_patches(r, parse_unified_diff(diff), strip=1)
+        mode = os.lstat(os.path.join(r.path, "x")).st_mode
+        self.assertEqual(stat.S_IMODE(mode), 0o755)
+        self.assertFalse(mode & stat.S_ISUID)
+        self.assertFalse(mode & stat.S_IWOTH)
+
+
+# Produced by git diff --cached -M after retargeting mod, deleting del,
+# adding added, renaming mvsrc to mvdst and turning the regular file tc into
+# a symlink.
+SYMLINK_DIFF = b"""\
+diff --git a/added b/added
+new file mode 120000
+index 0000000..12a8d8a
+--- /dev/null
++++ b/added
+@@ -0,0 +1 @@
++target1
+\\ No newline at end of file
+diff --git a/del b/del
+deleted file mode 120000
+index bc99ab0..0000000
+--- a/del
++++ /dev/null
+@@ -1 +0,0 @@
+-gone
+\\ No newline at end of file
+diff --git a/mod b/mod
+index 3defea2..f63c08c 120000
+--- a/mod
++++ b/mod
+@@ -1 +1 @@
+-old-target
+\\ No newline at end of file
++new-target
+\\ No newline at end of file
+diff --git a/mvsrc b/mvdst
+similarity index 100%
+rename from mvsrc
+rename to mvdst
+diff --git a/tc b/tc
+deleted file mode 100644
+index d95f3ad..0000000
+--- a/tc
++++ /dev/null
+@@ -1 +0,0 @@
+-content
+diff --git a/tc b/tc
+new file mode 120000
+index 0000000..12a8d8a
+--- /dev/null
++++ b/tc
+@@ -0,0 +1 @@
++target1
+\\ No newline at end of file
+"""
+
+
+@skipIf(sys.platform == "win32", "Requires symlink support")
+class ApplySymlinkPatchesTests(TestCase):
+    def _make_repo(self) -> Repo:
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        r = Repo.init(path)
+        self.addCleanup(r.close)
+        return r
+
+    def test_apply(self) -> None:
+        r = self._make_repo()
+        with open(os.path.join(r.path, "target1"), "wb") as f:
+            f.write(b"hi\n")
+        with open(os.path.join(r.path, "tc"), "wb") as f:
+            f.write(b"content\n")
+        for name, target in [
+            ("mod", "old-target"),
+            ("del", "gone"),
+            ("mvsrc", "moving"),
+        ]:
+            os.symlink(target, os.path.join(r.path, name))
+        r.get_worktree().stage([b"target1", b"tc", b"mod", b"del", b"mvsrc"])
+
+        apply_patches(r, parse_unified_diff(SYMLINK_DIFF), strip=1)
+
+        links = {
+            "added": "target1",
+            "mod": "new-target",
+            "mvdst": "moving",
+            "tc": "target1",
+        }
+        self.assertEqual(
+            sorted(["target1", *links]),
+            sorted(n for n in os.listdir(r.path) if n != ".git"),
+        )
+        for name, target in links.items():
+            self.assertEqual(target, os.readlink(os.path.join(r.path, name)))
+        self.assertEqual(
+            sorted(
+                [(b"target1", Blob.from_string(b"hi\n").id, 0o100644)]
+                + [
+                    (name.encode(), Blob.from_string(target.encode()).id, 0o120000)
+                    for name, target in links.items()
+                ]
+            ),
+            sorted(r.open_index().iterobjects()),
+        )
+
+    def test_apply_without_symlink_support(self) -> None:
+        # With core.symlinks=false the link is checked out as a plain file
+        # holding the target, and stays a plain file after patching.
+        r = self._make_repo()
+        config = r.get_config()
+        config.set((b"core",), b"symlinks", False)
+        config.write_to_path()
+        mod = os.path.join(r.path, "mod")
+        with open(mod, "wb") as f:
+            f.write(b"old-target")
+        index = r.open_index()
+        index[b"mod"] = index_entry_from_stat(
+            os.lstat(mod), Blob.from_string(b"old-target").id, mode=0o120000
+        )
+        index.write()
+
+        apply_patches(r, parse_unified_diff(SYMLINK_DIFF)[2:3], strip=1)
+
+        self.assertFalse(os.path.islink(mod))
+        with open(mod, "rb") as f:
+            self.assertEqual(b"new-target", f.read())
+        self.assertEqual(
+            [(b"mod", Blob.from_string(b"new-target").id, 0o120000)],
+            list(r.open_index().iterobjects()),
+        )
+
+    def test_rejects_addition_over_existing_path(self) -> None:
+        r = self._make_repo()
+        with open(os.path.join(r.path, "added"), "wb") as f:
+            f.write(b"untracked\n")
+        self.assertRaises(
+            ValueError,
+            apply_patches,
+            r,
+            parse_unified_diff(SYMLINK_DIFF)[:1],
+            strip=1,
+        )
+        with open(os.path.join(r.path, "added"), "rb") as f:
+            self.assertEqual(b"untracked\n", f.read())
+
+
+# Produced by git diff --cached --no-renames after adding the empty file
+# new-empty, deleting the empty file old-empty and making script executable.
+NO_HUNKS_DIFF = b"""\
+diff --git a/new-empty b/new-empty
+new file mode 100644
+index 0000000..e69de29
+diff --git a/old-empty b/old-empty
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/script b/script
+old mode 100644
+new mode 100755
+"""
+
+
+class ApplyPatchesWithoutHunksTests(TestCase):
+    def _make_repo(self) -> Repo:
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        r = Repo.init(path)
+        self.addCleanup(r.close)
+        return r
+
+    def test_parse_paths(self) -> None:
+        # These patches have no ---/+++ lines, so the paths come from the
+        # diff --git header.
+        self.assertEqual(
+            [
+                (None, b"b/new-empty", None, 0o100644),
+                (b"a/old-empty", None, 0o100644, None),
+                (b"a/script", b"b/script", 0o100644, 0o100755),
+            ],
+            [
+                (p.old_path, p.new_path, p.old_mode, p.new_mode)
+                for p in parse_unified_diff(NO_HUNKS_DIFF)
+            ],
+        )
+
+    def test_empty_files(self) -> None:
+        r = self._make_repo()
+        with open(os.path.join(r.path, "old-empty"), "wb"):
+            pass
+        r.get_worktree().stage([b"old-empty"])
+        apply_patches(r, parse_unified_diff(NO_HUNKS_DIFF)[:2])
+        self.assertEqual(["new-empty"], [n for n in os.listdir(r.path) if n != ".git"])
+        with open(os.path.join(r.path, "new-empty"), "rb") as f:
+            self.assertEqual(b"", f.read())
+        self.assertEqual(
+            [(b"new-empty", Blob.from_string(b"").id, 0o100644)],
+            list(r.open_index().iterobjects()),
+        )
+
+    @skipIf(sys.platform == "win32", "Requires POSIX file modes")
+    def test_mode_only_change(self) -> None:
+        r = self._make_repo()
+        script = os.path.join(r.path, "script")
+        with open(script, "wb") as f:
+            f.write(b"#!/bin/sh\n")
+        os.chmod(script, 0o644)
+        r.get_worktree().stage([b"script"])
+        apply_patches(r, parse_unified_diff(NO_HUNKS_DIFF)[2:])
+        self.assertEqual(0o755, stat.S_IMODE(os.lstat(script).st_mode))
+        self.assertEqual(
+            [(b"script", Blob.from_string(b"#!/bin/sh\n").id, 0o100755)],
+            list(r.open_index().iterobjects()),
+        )

@@ -1,0 +1,6 @@
+- 'git annotate' equivalent
+- reflog handling
+
+Performance:
+ - more efficient pack iteration
+ - more efficient delta generation

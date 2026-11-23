@@ -1,0 +1,5010 @@
+# test_index.py -- Tests for the git index
+# Copyright (C) 2008-2009 Jelmer Vernooij <jelmer@jelmer.uk>
+#
+# SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+# Dulwich is dual-licensed under the Apache License, Version 2.0 and the GNU
+# General Public License as published by the Free Software Foundation; version 2.0
+# or (at your option) any later version. You can redistribute it and/or
+# modify it under the terms of either of these two licenses.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# You should have received a copy of the licenses; if not, see
+# <http://www.gnu.org/licenses/> for a copy of the GNU General Public License
+# and <http://www.apache.org/licenses/LICENSE-2.0> for a copy of the Apache
+# License, Version 2.0.
+#
+
+"""Tests for the index."""
+
+import errno
+import gc
+import os
+import platform
+import shutil
+import stat
+import struct
+import sys
+import tempfile
+import unicodedata
+import weakref
+from io import BytesIO
+from pathlib import Path
+
+import dulwich.index
+from dulwich.config import ConfigDict, ConfigFile
+from dulwich.diff_tree import (
+    CHANGE_ADD,
+    CHANGE_COPY,
+    CHANGE_DELETE,
+    CHANGE_MODIFY,
+    CHANGE_RENAME,
+    TreeChange,
+    tree_changes,
+)
+from dulwich.index import (
+    EXTENDED_FLAG_SKIP_WORKTREE,
+    FLAG_EXTENDED,
+    FLAG_VALID,
+    SDIR_EXTENSION,
+    ConflictedIndexEntry,
+    Index,
+    IndexEntry,
+    InvalidPathError,
+    SerializedIndexEntry,
+    SparseDirExtension,
+    _compress_path,
+    _decode_utf8_with_fallback,
+    _decode_varint,
+    _decompress_path,
+    _encode_varint,
+    _ensure_parent_dir_exists,
+    _fs_to_tree_path,
+    _has_directory_changed,
+    _has_dos_drive_prefix,
+    _is_reserved_windows_device_name,
+    _tree_to_fs_path,
+    apply_stat_refresh,
+    build_file_from_blob,
+    build_index_from_tree,
+    cleanup_mode,
+    commit_tree,
+    detect_case_only_renames,
+    get_path_element_validator,
+    get_unstaged_changes,
+    index_entry_from_directory,
+    index_entry_from_path,
+    index_entry_from_stat,
+    iter_fresh_entries,
+    make_path_normalizer,
+    read_cache_entry,
+    read_index,
+    read_index_dict,
+    read_submodule_head,
+    update_working_tree,
+    validate_path,
+    validate_path_element_default,
+    validate_path_element_hfs,
+    validate_path_element_ntfs,
+    write_cache_entry,
+    write_cache_time,
+    write_index,
+    write_index_dict,
+)
+from dulwich.line_ending import BlobNormalizer
+from dulwich.object_store import MemoryObjectStore
+from dulwich.objects import S_IFGITLINK, ZERO_SHA, Blob, ObjectID, Tree, TreeEntry
+from dulwich.repo import Repo
+from dulwich.tests.utils import make_commit
+
+from . import TestCase, skipIf
+
+
+def can_symlink() -> bool:
+    """Return whether running process can create symlinks."""
+    if sys.platform != "win32":
+        # Platforms other than Windows should allow symlinks without issues.
+        return True
+
+    test_source = tempfile.mkdtemp()
+    test_target = test_source + "can_symlink"
+    try:
+        os.symlink(test_source, test_target)
+    except (NotImplementedError, OSError):
+        return False
+    return True
+
+
+class DeprecatedReexportTests(TestCase):
+    def test_sha1writer(self) -> None:
+        from dulwich.pack import SHA1Writer
+
+        with self.assertWarns(DeprecationWarning):
+            from dulwich.index import SHA1Writer as IndexSHA1Writer
+        self.assertIs(SHA1Writer, IndexSHA1Writer)
+
+    def test_sha1reader(self) -> None:
+        from dulwich.pack import SHA1Reader
+
+        with self.assertWarns(DeprecationWarning):
+            from dulwich.index import SHA1Reader as IndexSHA1Reader
+        self.assertIs(SHA1Reader, IndexSHA1Reader)
+
+    def test_unknown(self) -> None:
+        with self.assertRaises(AttributeError):
+            dulwich.index.NoSuchThing
+
+
+class IndexTestCase(TestCase):
+    datadir = os.path.join(os.path.dirname(__file__), "../testdata/indexes")
+
+    def get_simple_index(self, name):
+        return Index(os.path.join(self.datadir, name))
+
+
+class SimpleIndexTestCase(IndexTestCase):
+    def test_len(self) -> None:
+        self.assertEqual(1, len(self.get_simple_index("index")))
+
+    def test_iter(self) -> None:
+        self.assertEqual([b"bla"], list(self.get_simple_index("index")))
+
+    def test_iter_skip_hash(self) -> None:
+        self.assertEqual([b"bla"], list(self.get_simple_index("index_skip_hash")))
+
+    def test_iterobjects(self) -> None:
+        self.assertEqual(
+            [(b"bla", b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", 33188)],
+            list(self.get_simple_index("index").iterobjects()),
+        )
+
+    def test_getitem(self) -> None:
+        self.assertEqual(
+            IndexEntry(
+                (1230680220, 0),
+                (1230680220, 0),
+                2050,
+                3761020,
+                33188,
+                1000,
+                1000,
+                0,
+                b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+                0,
+                0,
+            ),
+            self.get_simple_index("index")[b"bla"],
+        )
+
+    def test_empty(self) -> None:
+        i = self.get_simple_index("notanindex")
+        self.assertEqual(0, len(i))
+        self.assertFalse(os.path.exists(i._filename))
+
+    def test_against_empty_tree(self) -> None:
+        i = self.get_simple_index("index")
+        changes = list(i.changes_from_tree(MemoryObjectStore(), None))
+        self.assertEqual(1, len(changes))
+        (_oldname, newname), (_oldmode, _newmode), (_oldsha, newsha) = changes[0]
+        self.assertEqual(b"bla", newname)
+        self.assertEqual(b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", newsha)
+
+    def test_index_pathlib(self) -> None:
+        # Create a temporary index file
+        with tempfile.NamedTemporaryFile(suffix=".index", delete=False) as f:
+            temp_path = f.name
+
+        self.addCleanup(os.unlink, temp_path)
+
+        # Test creating Index with pathlib.Path
+        path_obj = Path(temp_path)
+        index = Index(path_obj, read=False)
+        self.assertEqual(str(path_obj), index.path)
+
+        # Add an entry and write
+        index[b"test"] = IndexEntry(
+            ctime=(0, 0),
+            mtime=(0, 0),
+            dev=0,
+            ino=0,
+            mode=33188,
+            uid=0,
+            gid=0,
+            size=0,
+            sha=b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        index.write()
+
+        # Read it back with pathlib.Path
+        index2 = Index(path_obj)
+        self.assertIn(b"test", index2)
+
+
+class IndexPathNormalizerTestCase(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tempdir)
+
+    def _entry(self, sha: ObjectID = b"0" * 40) -> IndexEntry:
+        return IndexEntry(
+            ctime=(0, 0),
+            mtime=(0, 0),
+            dev=0,
+            ino=0,
+            mode=0o100644,
+            uid=0,
+            gid=0,
+            size=0,
+            sha=sha,
+        )
+
+    def test_no_normalizer_is_case_sensitive(self) -> None:
+        index = Index(os.path.join(self.tempdir, "idx"), read=False)
+        index[b"foo.txt"] = self._entry()
+        self.assertIn(b"foo.txt", index)
+        self.assertNotIn(b"Foo.txt", index)
+
+    def test_ignorecase_contains_matches_existing_entry(self) -> None:
+        index = Index(
+            os.path.join(self.tempdir, "idx"),
+            read=False,
+            path_normalizer=lambda p: p.lower(),
+        )
+        index[b"foo.txt"] = self._entry()
+        self.assertIn(b"Foo.txt", index)
+        self.assertIn(b"FOO.TXT", index)
+
+    def test_ignorecase_getitem_matches_existing_entry(self) -> None:
+        index = Index(
+            os.path.join(self.tempdir, "idx"),
+            read=False,
+            path_normalizer=lambda p: p.lower(),
+        )
+        entry = self._entry()
+        index[b"foo.txt"] = entry
+        self.assertIs(entry, index[b"Foo.txt"])
+        self.assertIs(entry, index[b"FOO.TXT"])
+
+    def test_unknown_path_still_raises(self) -> None:
+        index = Index(
+            os.path.join(self.tempdir, "idx"),
+            read=False,
+            path_normalizer=lambda p: p.lower(),
+        )
+        index[b"foo.txt"] = self._entry()
+        self.assertNotIn(b"other.txt", index)
+        self.assertRaises(KeyError, lambda: index[b"other.txt"])
+
+    def test_setitem_reuses_canonical_key(self) -> None:
+        index = Index(
+            os.path.join(self.tempdir, "idx"),
+            read=False,
+            path_normalizer=lambda p: p.lower(),
+        )
+        index[b"foo.txt"] = self._entry()
+        index[b"Foo.txt"] = self._entry()
+        self.assertEqual([b"foo.txt"], list(index))
+
+    def test_delitem_matches_case_insensitively(self) -> None:
+        index = Index(
+            os.path.join(self.tempdir, "idx"),
+            read=False,
+            path_normalizer=lambda p: p.lower(),
+        )
+        index[b"foo.txt"] = self._entry()
+        del index[b"Foo.txt"]
+        self.assertEqual([], list(index))
+        self.assertNotIn(b"foo.txt", index)
+
+    def test_delete_then_reinsert_uses_new_casing(self) -> None:
+        index = Index(
+            os.path.join(self.tempdir, "idx"),
+            read=False,
+            path_normalizer=lambda p: p.lower(),
+        )
+        index[b"foo.txt"] = self._entry()
+        del index[b"foo.txt"]
+        index[b"Foo.txt"] = self._entry()
+        self.assertEqual([b"Foo.txt"], list(index))
+
+    def test_canonical_path_returns_stored_key(self) -> None:
+        index = Index(
+            os.path.join(self.tempdir, "idx"),
+            read=False,
+            path_normalizer=lambda p: p.lower(),
+        )
+        index[b"foo.txt"] = self._entry()
+        self.assertEqual(b"foo.txt", index.canonical_path(b"Foo.txt"))
+        self.assertEqual(b"foo.txt", index.canonical_path(b"foo.txt"))
+        # Unknown paths pass through unchanged.
+        self.assertEqual(b"bar.txt", index.canonical_path(b"bar.txt"))
+
+    def test_canonical_path_without_normalizer_is_identity(self) -> None:
+        index = Index(os.path.join(self.tempdir, "idx"), read=False)
+        index[b"foo.txt"] = self._entry()
+        self.assertEqual(b"Foo.txt", index.canonical_path(b"Foo.txt"))
+
+    def test_changes_from_tree_case_only_rename(self) -> None:
+        store = MemoryObjectStore()
+        blob = Blob.from_string(b"x\n")
+        store.add_object(blob)
+        tree = Tree()
+        tree.add(b"Foo.txt", 0o100644, blob.id)
+        store.add_object(tree)
+        index = Index(
+            os.path.join(self.tempdir, "idx"),
+            read=False,
+            path_normalizer=lambda p: p.lower(),
+        )
+        index[b"foo.txt"] = self._entry(blob.id)
+        self.assertEqual(
+            [
+                ((b"Foo.txt", None), (0o100644, None), (blob.id, None)),
+                ((None, b"foo.txt"), (None, 0o100644), (None, blob.id)),
+            ],
+            list(index.changes_from_tree(store, tree.id)),
+        )
+
+    def test_normalized_cache_rebuilds_after_read(self) -> None:
+        path = os.path.join(self.tempdir, "idx")
+        index = Index(
+            path,
+            read=False,
+            path_normalizer=lambda p: p.lower(),
+        )
+        index[b"foo.txt"] = self._entry()
+        index.write()
+
+        reopened = Index(path, path_normalizer=lambda p: p.lower())
+        self.assertIn(b"Foo.txt", reopened)
+        self.assertEqual(b"foo.txt", reopened.canonical_path(b"FOO.TXT"))
+
+    def test_set_verbatim_keeps_case_differing_entries(self) -> None:
+        index = Index(
+            os.path.join(self.tempdir, "idx"),
+            read=False,
+            path_normalizer=lambda p: p.lower(),
+        )
+        index.set_verbatim(b"Foo.py", self._entry())
+        index.set_verbatim(b"foo.py", self._entry())
+        self.assertEqual([b"Foo.py", b"foo.py"], sorted(index))
+        # Normalized lookup still finds the first entry inserted.
+        self.assertEqual(b"Foo.py", index.canonical_path(b"FOO.PY"))
+
+    def test_read_preserves_case_differing_entries(self) -> None:
+        path = os.path.join(self.tempdir, "idx")
+        index = Index(path, read=False)
+        entry_lower = IndexEntry(
+            ctime=(0, 0),
+            mtime=(0, 0),
+            dev=0,
+            ino=0,
+            mode=0o100644,
+            uid=0,
+            gid=0,
+            size=0,
+            sha=b"1" * 40,
+        )
+        index[b"Foo.py"] = self._entry()
+        index[b"foo.py"] = entry_lower
+        index.write()
+
+        reopened = Index(path, path_normalizer=lambda p: p.lower())
+        self.assertEqual([b"Foo.py", b"foo.py"], sorted(reopened))
+        self.assertEqual(b"0" * 40, reopened[b"Foo.py"].sha)
+        self.assertEqual(b"1" * 40, reopened[b"foo.py"].sha)
+
+
+class MakePathNormalizerTests(TestCase):
+    def _config(self, **kwargs: bytes) -> ConfigFile:
+        cf = ConfigFile()
+        for key, value in kwargs.items():
+            cf.set((b"core",), key.encode(), value)
+        return cf
+
+    def test_returns_none_when_disabled(self) -> None:
+        self.assertIsNone(make_path_normalizer(self._config()))
+
+    def test_ignorecase(self) -> None:
+        normalize = make_path_normalizer(self._config(ignorecase=b"true"))
+        self.assertIsNotNone(normalize)
+        assert normalize is not None  # narrow for type checker
+        self.assertEqual(b"foo.txt", normalize(b"Foo.TXT"))
+
+    def test_precomposeunicode(self) -> None:
+        normalize = make_path_normalizer(self._config(precomposeunicode=b"true"))
+        self.assertIsNotNone(normalize)
+        assert normalize is not None
+        nfd = unicodedata.normalize("NFD", "täst.txt").encode("utf-8")
+        nfc = unicodedata.normalize("NFC", "täst.txt").encode("utf-8")
+        self.assertEqual(nfc, normalize(nfd))
+
+    def test_both(self) -> None:
+        normalize = make_path_normalizer(
+            self._config(ignorecase=b"true", precomposeunicode=b"true")
+        )
+        self.assertIsNotNone(normalize)
+        assert normalize is not None
+        # ASCII case-folding + NFC normalization (matches git's ignorecase,
+        # which folds ASCII only).
+        nfd = unicodedata.normalize("NFD", "Täst.TXT").encode("utf-8")
+        expected = unicodedata.normalize("NFC", "täst.txt").encode("utf-8")
+        self.assertEqual(expected, normalize(nfd))
+
+    def test_precomposeunicode_invalid_utf8_passes_through(self) -> None:
+        normalize = make_path_normalizer(self._config(precomposeunicode=b"true"))
+        self.assertIsNotNone(normalize)
+        assert normalize is not None
+        self.assertEqual(b"\xff\xfe", normalize(b"\xff\xfe"))
+
+
+class SimpleIndexWriterTestCase(IndexTestCase):
+    def setUp(self) -> None:
+        IndexTestCase.setUp(self)
+        self.tempdir = tempfile.mkdtemp()
+
+    def tearDown(self) -> None:
+        IndexTestCase.tearDown(self)
+        shutil.rmtree(self.tempdir)
+
+    def test_simple_write(self) -> None:
+        entries = [
+            (
+                SerializedIndexEntry(
+                    b"barbla",
+                    (1230680220, 0),
+                    (1230680220, 0),
+                    2050,
+                    3761020,
+                    33188,
+                    1000,
+                    1000,
+                    0,
+                    b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+                    0,
+                    0,
+                )
+            )
+        ]
+        filename = os.path.join(self.tempdir, "test-simple-write-index")
+        with open(filename, "wb+") as x:
+            write_index(x, entries)
+
+        with open(filename, "rb") as x:
+            self.assertEqual(entries, list(read_index(x)))
+
+
+class ReadIndexDictTests(IndexTestCase):
+    def setUp(self) -> None:
+        IndexTestCase.setUp(self)
+        self.tempdir = tempfile.mkdtemp()
+
+    def tearDown(self) -> None:
+        IndexTestCase.tearDown(self)
+        shutil.rmtree(self.tempdir)
+
+    def test_simple_write(self) -> None:
+        entries = {
+            b"barbla": IndexEntry(
+                (1230680220, 0),
+                (1230680220, 0),
+                2050,
+                3761020,
+                33188,
+                1000,
+                1000,
+                0,
+                b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+                0,
+                0,
+            )
+        }
+        filename = os.path.join(self.tempdir, "test-simple-write-index")
+        with open(filename, "wb+") as x:
+            write_index_dict(x, entries)
+
+        with open(filename, "rb") as x:
+            self.assertEqual(entries, read_index_dict(x))
+
+
+class CommitTreeTests(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.store = MemoryObjectStore()
+
+    def test_single_blob(self) -> None:
+        blob = Blob()
+        blob.data = b"foo"
+        self.store.add_object(blob)
+        blobs = [(b"bla", blob.id, stat.S_IFREG)]
+        rootid = commit_tree(self.store, blobs)
+        self.assertEqual(rootid, b"1a1e80437220f9312e855c37ac4398b68e5c1d50")
+        self.assertEqual((stat.S_IFREG, blob.id), self.store[rootid][b"bla"])
+        self.assertEqual({rootid, blob.id}, set(self.store._data.keys()))
+
+    def test_nested(self) -> None:
+        blob = Blob()
+        blob.data = b"foo"
+        self.store.add_object(blob)
+        blobs = [(b"bla/bar", blob.id, stat.S_IFREG)]
+        rootid = commit_tree(self.store, blobs)
+        self.assertEqual(rootid, b"d92b959b216ad0d044671981196781b3258fa537")
+        dirid = self.store[rootid][b"bla"][1]
+        self.assertEqual(dirid, b"c1a1deb9788150829579a8b4efa6311e7b638650")
+        self.assertEqual((stat.S_IFDIR, dirid), self.store[rootid][b"bla"])
+        self.assertEqual((stat.S_IFREG, blob.id), self.store[dirid][b"bar"])
+        self.assertEqual({rootid, dirid, blob.id}, set(self.store._data.keys()))
+
+    def test_store_freed_without_cycle_collector(self) -> None:
+        gc.disable()
+        self.addCleanup(gc.enable)
+        blob = Blob.from_string(b"foo")
+        self.store.add_object(blob)
+        commit_tree(self.store, [(b"bla/bar", blob.id, stat.S_IFREG)])
+        ref = weakref.ref(self.store)
+        del self.store
+        self.assertIsNone(ref())
+
+
+class CleanupModeTests(TestCase):
+    def assertModeEqual(self, expected, got) -> None:
+        self.assertEqual(expected, got, f"{expected:o} != {got:o}")
+
+    def test_file(self) -> None:
+        self.assertModeEqual(0o100644, cleanup_mode(0o100000))
+
+    def test_executable(self) -> None:
+        self.assertModeEqual(0o100755, cleanup_mode(0o100711))
+        self.assertModeEqual(0o100755, cleanup_mode(0o100700))
+
+    def test_symlink(self) -> None:
+        self.assertModeEqual(0o120000, cleanup_mode(0o120711))
+
+    def test_dir(self) -> None:
+        self.assertModeEqual(0o040000, cleanup_mode(0o40531))
+
+    def test_submodule(self) -> None:
+        self.assertModeEqual(0o160000, cleanup_mode(0o160744))
+
+
+class WriteCacheTimeTests(TestCase):
+    def test_write_string(self) -> None:
+        f = BytesIO()
+        self.assertRaises(TypeError, write_cache_time, f, "foo")
+
+    def test_write_int(self) -> None:
+        f = BytesIO()
+        write_cache_time(f, 434343)
+        self.assertEqual(struct.pack(">LL", 434343, 0), f.getvalue())
+
+    def test_write_tuple(self) -> None:
+        f = BytesIO()
+        write_cache_time(f, (434343, 21))
+        self.assertEqual(struct.pack(">LL", 434343, 21), f.getvalue())
+
+    def test_write_float(self) -> None:
+        f = BytesIO()
+        write_cache_time(f, 434343.000000021)
+        self.assertEqual(struct.pack(">LL", 434343, 21), f.getvalue())
+
+
+class IndexEntryFromStatTests(TestCase):
+    def test_simple(self) -> None:
+        st = os.stat_result(
+            (
+                16877,
+                131078,
+                64769,
+                154,
+                1000,
+                1000,
+                12288,
+                1323629595,
+                1324180496,
+                1324180496,
+            )
+        )
+        entry = index_entry_from_stat(st, b"22" * 20)
+        self.assertEqual(
+            entry,
+            IndexEntry(
+                1324180496,
+                1324180496,
+                64769,
+                131078,
+                16384,
+                1000,
+                1000,
+                12288,
+                b"2222222222222222222222222222222222222222",
+                0,
+                0,
+            ),
+        )
+
+    def test_override_mode(self) -> None:
+        st = os.stat_result(
+            (
+                stat.S_IFREG + 0o644,
+                131078,
+                64769,
+                154,
+                1000,
+                1000,
+                12288,
+                1323629595,
+                1324180496,
+                1324180496,
+            )
+        )
+        entry = index_entry_from_stat(st, b"22" * 20, mode=stat.S_IFREG + 0o755)
+        self.assertEqual(
+            entry,
+            IndexEntry(
+                1324180496,
+                1324180496,
+                64769,
+                131078,
+                33261,
+                1000,
+                1000,
+                12288,
+                b"2222222222222222222222222222222222222222",
+                0,
+                0,
+            ),
+        )
+
+    def test_flags(self) -> None:
+        st = os.stat_result(
+            (
+                stat.S_IFREG + 0o644,
+                131078,
+                64769,
+                154,
+                1000,
+                1000,
+                12288,
+                1323629595,
+                1324180496,
+                1324180496,
+            )
+        )
+        entry = index_entry_from_stat(
+            st,
+            b"22" * 20,
+            flags=FLAG_VALID | FLAG_EXTENDED,
+            extended_flags=EXTENDED_FLAG_SKIP_WORKTREE,
+        )
+        self.assertEqual(FLAG_VALID | FLAG_EXTENDED, entry.flags)
+        self.assertEqual(EXTENDED_FLAG_SKIP_WORKTREE, entry.extended_flags)
+
+
+@skipIf(sys.platform == "win32", "Requires POSIX file modes")
+class BuildFileFromBlobTests(TestCase):
+    def _write(self, content: bytes, perms: int) -> bytes:
+        path = os.path.join(os.fsencode(self.mkdtemp()), b"f")
+        with open(path, "wb") as f:
+            f.write(content)
+        os.chmod(path, perms)
+        return path
+
+    def mkdtemp(self) -> str:
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path)
+        return path
+
+    def test_mode_change_with_unchanged_content(self) -> None:
+        path = self._write(b"x\n", 0o644)
+        st = build_file_from_blob(Blob.from_string(b"x\n"), 0o100755, path)
+        self.assertEqual(0o755, stat.S_IMODE(os.lstat(path).st_mode))
+        self.assertEqual(0o755, stat.S_IMODE(st.st_mode))
+
+        st = build_file_from_blob(Blob.from_string(b"x\n"), 0o100644, path)
+        self.assertEqual(0o644, stat.S_IMODE(os.lstat(path).st_mode))
+        self.assertEqual(0o644, stat.S_IMODE(st.st_mode))
+
+    def test_mode_ignored_without_honor_filemode(self) -> None:
+        path = self._write(b"x\n", 0o644)
+        build_file_from_blob(
+            Blob.from_string(b"x\n"), 0o100755, path, honor_filemode=False
+        )
+        self.assertEqual(0o644, stat.S_IMODE(os.lstat(path).st_mode))
+
+
+class BuildIndexTests(TestCase):
+    def assertReasonableIndexEntry(self, index_entry, mode, filesize, sha) -> None:
+        self.assertEqual(index_entry.mode, mode)  # mode
+        self.assertEqual(index_entry.size, filesize)  # filesize
+        self.assertEqual(index_entry.sha, sha)  # sha
+
+    def assertFileContents(self, path, contents, symlink=False) -> None:
+        if symlink:
+            self.assertEqual(os.readlink(path), contents)
+        else:
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), contents)
+
+    def test_empty(self) -> None:
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            tree = Tree()
+            repo.object_store.add_object(tree)
+
+            build_index_from_tree(
+                repo.path, repo.index_path(), repo.object_store, tree.id
+            )
+
+            # Verify index entries
+            index = repo.open_index()
+            self.assertEqual(len(index), 0)
+
+            # Verify no files
+            self.assertEqual([".git"], os.listdir(repo.path))
+
+    def test_git_dir(self) -> None:
+        # A ``.git/`` path is invalid and must abort the whole checkout
+        # rather than being silently skipped while other entries are
+        # written.
+
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Populate repo
+            filea = Blob.from_string(b"file a")
+            filee = Blob.from_string(b"d")
+
+            tree = Tree()
+            tree[b".git/a"] = (stat.S_IFREG | 0o644, filea.id)
+            tree[b"c/e"] = (stat.S_IFREG | 0o644, filee.id)
+
+            repo.object_store.add_objects([(o, None) for o in [filea, filee, tree]])
+
+            self.assertRaises(
+                InvalidPathError,
+                build_index_from_tree,
+                repo.path,
+                repo.index_path(),
+                repo.object_store,
+                tree.id,
+            )
+
+            # Nothing was written, including the otherwise-valid entry.
+            self.assertFalse(os.path.exists(os.path.join(repo.path, ".git", "a")))
+            self.assertFalse(os.path.exists(os.path.join(repo.path, "c", "e")))
+
+    @skipIf(sys.platform == "win32", "Requires POSIX file modes")
+    def test_canonicalize_file_mode(self) -> None:
+        # A tree entry's mode is attacker-controlled for an untrusted repo.
+        # git reduces every regular-file mode to 0o644/0o755 on checkout, so
+        # setuid/setgid/sticky and world-writable bits from a hostile tree
+        # must never reach the working tree.
+
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            blob = Blob.from_string(b"#!/bin/sh\n")
+            tree = Tree()
+            # setuid + world-writable executable
+            tree[b"evil"] = (0o104777, blob.id)
+            # world-writable, non-executable
+            tree[b"plain"] = (0o100666, blob.id)
+            repo.object_store.add_objects([(o, None) for o in [blob, tree]])
+
+            build_index_from_tree(
+                repo.path, repo.index_path(), repo.object_store, tree.id
+            )
+
+            evil_mode = os.lstat(os.path.join(repo.path, "evil")).st_mode
+            self.assertEqual(stat.S_IMODE(evil_mode), 0o755)
+            self.assertFalse(evil_mode & stat.S_ISUID)
+            self.assertFalse(evil_mode & stat.S_IWOTH)
+
+            plain_mode = os.lstat(os.path.join(repo.path, "plain")).st_mode
+            self.assertEqual(stat.S_IMODE(plain_mode), 0o644)
+
+    def test_ntfs_malicious_entry_aborts_checkout(self) -> None:
+        # A tree authored on POSIX containing an entry that would resolve to
+        # ``.git`` on NTFS (a ``.git\`` prefix, the ``git~1`` 8.3 short
+        # name, or a ``.git::`` alternate-data-stream form) must abort the
+        # checkout under the NTFS validator rather than silently skip it;
+        # otherwise an attacker could plant ``.git\hooks\pre-commit.exe`` on
+        # a Windows clone. Each is checked on its own so a single benign
+        # entry alongside it never gets written.
+
+        evil_names = [
+            b".git\\hooks\\pre-commit.exe",
+            b"git~1",
+            b".git::$INDEX_ALLOCATION",
+        ]
+        for evil_name in evil_names:
+            repo_dir = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, repo_dir)
+            with Repo.init(repo_dir) as repo:
+                evil = Blob.from_string(b"payload")
+                benign = Blob.from_string(b"ok")
+                tree = Tree()
+                tree[evil_name] = (stat.S_IFREG | 0o644, evil.id)
+                tree[b"ok.txt"] = (stat.S_IFREG | 0o644, benign.id)
+                repo.object_store.add_objects([(o, None) for o in [evil, benign, tree]])
+
+                self.assertRaises(
+                    InvalidPathError,
+                    build_index_from_tree,
+                    repo.path,
+                    repo.index_path(),
+                    repo.object_store,
+                    tree.id,
+                    validate_path_element=validate_path_element_ntfs,
+                )
+
+                # Nothing was written, including the benign entry.
+                self.assertEqual(os.listdir(repo.path), [".git"])
+
+    @skipIf(os.name != "nt", "drive prefix is only rejected on Windows")
+    def test_dos_drive_prefix_aborts_checkout(self) -> None:
+        # A "C:" entry at the top of the tree makes Windows' os.path.join
+        # discard the work-tree root. Nested trees because a single tree
+        # entry cannot contain a slash.
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            blob = Blob.from_string(b"payload\n")
+            inner = Tree()
+            inner[b"evil.txt"] = (stat.S_IFREG | 0o644, blob.id)
+            outer = Tree()
+            outer[b"C:"] = (stat.S_IFDIR, inner.id)
+            repo.object_store.add_objects([(o, None) for o in [blob, inner, outer]])
+
+            self.assertRaises(
+                InvalidPathError,
+                build_index_from_tree,
+                repo.path,
+                repo.index_path(),
+                repo.object_store,
+                outer.id,
+                validate_path_element=validate_path_element_ntfs,
+            )
+
+            self.assertEqual(os.listdir(repo.path), [".git"])
+
+    def test_ntfs_colon_filename_checked_out(self) -> None:
+        # A file whose name merely contains a colon (an NTFS-hostile
+        # character in general, but not a ``.git`` alternate-data-stream
+        # form) must still be checked out, matching C git which only
+        # rejects the ``.git``/``git~1`` ADS spellings. See issue #2205.
+
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            blob = Blob.from_string(b"foo\n")
+            tree = Tree()
+            tree[b"with:colon.txt"] = (stat.S_IFREG | 0o644, blob.id)
+            repo.object_store.add_objects([(o, None) for o in [blob, tree]])
+
+            build_index_from_tree(
+                repo.path,
+                repo.index_path(),
+                repo.object_store,
+                tree.id,
+                validate_path_element=validate_path_element_ntfs,
+            )
+
+            index = repo.open_index()
+            self.assertEqual(list(index), [b"with:colon.txt"])
+            # The file must actually land in the work tree; the original
+            # symptom (issue #2205) was the file being silently skipped.
+            colon_path = os.path.join(repo.path, "with:colon.txt")
+            self.assertTrue(os.path.exists(colon_path))
+            self.assertFileContents(colon_path, b"foo\n")
+
+    @skipIf(os.name == "nt", "'aux' is a device name on Windows")
+    def test_reserved_device_name_checked_out_off_windows(self) -> None:
+        # ``aux`` is a reserved device only on Windows; on POSIX it is an
+        # ordinary filename that C git checks out happily, so rejecting it
+        # made whole repositories unclonable. See issue #2351.
+
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            blob = Blob.from_string(b"#!/bin/sh\n")
+            tree = Tree()
+            tree[b"aux"] = (stat.S_IFREG | 0o644, blob.id)
+            repo.object_store.add_objects([(o, None) for o in [blob, tree]])
+
+            build_index_from_tree(
+                repo.path,
+                repo.index_path(),
+                repo.object_store,
+                tree.id,
+                validate_path_element=validate_path_element_ntfs,
+            )
+
+            index = repo.open_index()
+            self.assertEqual(list(index), [b"aux"])
+            aux_path = os.path.join(repo.path, "aux")
+            self.assertTrue(os.path.exists(aux_path))
+            self.assertFileContents(aux_path, b"#!/bin/sh\n")
+
+    @skipIf(not can_symlink(), "Requires symlink support")
+    def test_regular_file_replaces_symlink(self) -> None:
+        # A symlink left in the work tree by an earlier checkout must be
+        # replaced when the same path becomes a regular file, not written
+        # through. Otherwise a tree that first materializes ``foo`` as a
+        # symlink pointing outside the work tree and then as a regular file
+        # would overwrite the link target, an arbitrary file. C git never
+        # writes a tracked file through a symlink.
+
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        outside_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside_dir)
+        outside_file = os.path.join(outside_dir, "secret")
+        with open(outside_file, "wb") as f:
+            f.write(b"original")
+
+        with Repo.init(repo_dir) as repo:
+            link = Blob.from_string(os.fsencode(outside_file))
+            regular = Blob.from_string(b"payload")
+
+            tree_link = Tree()
+            tree_link[b"foo"] = (stat.S_IFLNK, link.id)
+            tree_file = Tree()
+            tree_file[b"foo"] = (stat.S_IFREG | 0o644, regular.id)
+            repo.object_store.add_objects(
+                [(o, None) for o in [link, regular, tree_link, tree_file]]
+            )
+
+            # First checkout leaves ``foo`` as a symlink pointing outside.
+            build_index_from_tree(
+                repo.path, repo.index_path(), repo.object_store, tree_link.id
+            )
+            foo_path = os.path.join(repo.path, "foo")
+            self.assertTrue(os.path.islink(foo_path))
+
+            # Second checkout makes ``foo`` a regular file.
+            build_index_from_tree(
+                repo.path, repo.index_path(), repo.object_store, tree_file.id
+            )
+
+            # The link target outside the work tree is untouched and the
+            # path is now a real file holding the blob content.
+            self.assertFalse(os.path.islink(foo_path))
+            self.assertFileContents(foo_path, b"payload")
+            with open(outside_file, "rb") as f:
+                self.assertEqual(f.read(), b"original")
+
+    @skipIf(not can_symlink(), "Requires symlink support")
+    def test_leading_symlink_not_followed(self) -> None:
+        # A tree that first materializes a symlink ``link`` pointing outside
+        # the work tree and then a descendant regular file ``link/payload``
+        # must not write the file through the symlink to an arbitrary path.
+        # C git rejects such a tree; dulwich must refuse it rather than
+        # resolving the leading component through the link.
+
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        outside_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside_dir)
+        outside_file = os.path.join(outside_dir, "payload")
+        self.assertFalse(os.path.exists(outside_file))
+
+        with Repo.init(repo_dir) as repo:
+            link = Blob.from_string(os.fsencode(outside_dir))
+            regular = Blob.from_string(b"pwned")
+
+            tree = Tree()
+            tree[b"link"] = (stat.S_IFLNK, link.id)
+            tree[b"link/payload"] = (stat.S_IFREG | 0o644, regular.id)
+            repo.object_store.add_objects([(o, None) for o in [link, regular, tree]])
+
+            self.assertRaises(
+                InvalidPathError,
+                build_index_from_tree,
+                repo.path,
+                repo.index_path(),
+                repo.object_store,
+                tree.id,
+            )
+
+            # Nothing was written through the symlink to the outside path.
+            self.assertFalse(os.path.exists(outside_file))
+
+    @skipIf(not can_symlink(), "Requires symlink support")
+    def test_symlinked_gitmodules_refused(self) -> None:
+        # Refused at any depth and regardless of case.
+        for name in [b".gitmodules", b"sub/.GitModules"]:
+            repo_dir = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, repo_dir)
+            with Repo.init(repo_dir) as repo:
+                link = Blob.from_string(b"/etc/passwd")
+                tree = Tree()
+                tree[name] = (stat.S_IFLNK, link.id)
+                repo.object_store.add_objects([(o, None) for o in [link, tree]])
+
+                self.assertRaises(
+                    InvalidPathError,
+                    build_index_from_tree,
+                    repo.path,
+                    repo.index_path(),
+                    repo.object_store,
+                    tree.id,
+                )
+                self.assertFalse(
+                    os.path.lexists(os.path.join(repo.path, os.fsdecode(name)))
+                )
+
+    def test_nonempty(self) -> None:
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Populate repo
+            filea = Blob.from_string(b"file a")
+            fileb = Blob.from_string(b"file b")
+            filed = Blob.from_string(b"file d")
+
+            tree = Tree()
+            tree[b"a"] = (stat.S_IFREG | 0o644, filea.id)
+            tree[b"b"] = (stat.S_IFREG | 0o644, fileb.id)
+            tree[b"c/d"] = (stat.S_IFREG | 0o644, filed.id)
+
+            repo.object_store.add_objects(
+                [(o, None) for o in [filea, fileb, filed, tree]]
+            )
+
+            build_index_from_tree(
+                repo.path, repo.index_path(), repo.object_store, tree.id
+            )
+
+            # Verify index entries
+            index = repo.open_index()
+            self.assertEqual(len(index), 3)
+
+            # filea
+            apath = os.path.join(repo.path, "a")
+            self.assertTrue(os.path.exists(apath))
+            self.assertReasonableIndexEntry(
+                index[b"a"], stat.S_IFREG | 0o644, 6, filea.id
+            )
+            self.assertFileContents(apath, b"file a")
+
+            # fileb
+            bpath = os.path.join(repo.path, "b")
+            self.assertTrue(os.path.exists(bpath))
+            self.assertReasonableIndexEntry(
+                index[b"b"], stat.S_IFREG | 0o644, 6, fileb.id
+            )
+            self.assertFileContents(bpath, b"file b")
+
+            # filed
+            dpath = os.path.join(repo.path, "c", "d")
+            self.assertTrue(os.path.exists(dpath))
+            self.assertReasonableIndexEntry(
+                index[b"c/d"], stat.S_IFREG | 0o644, 6, filed.id
+            )
+            self.assertFileContents(dpath, b"file d")
+
+            # Verify no extra files
+            self.assertEqual([".git", "a", "b", "c"], sorted(os.listdir(repo.path)))
+            self.assertEqual(["d"], sorted(os.listdir(os.path.join(repo.path, "c"))))
+
+    @skipIf(not getattr(os, "sync", None), "Requires sync support")
+    def test_norewrite(self) -> None:
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Populate repo
+            filea = Blob.from_string(b"file a")
+            filea_path = os.path.join(repo_dir, "a")
+            tree = Tree()
+            tree[b"a"] = (stat.S_IFREG | 0o644, filea.id)
+
+            repo.object_store.add_objects([(o, None) for o in [filea, tree]])
+
+            # First Write
+            build_index_from_tree(
+                repo.path, repo.index_path(), repo.object_store, tree.id
+            )
+            # Use sync as metadata can be cached on some FS
+            os.sync()
+            mtime = os.stat(filea_path).st_mtime
+
+            # Test Rewrite
+            build_index_from_tree(
+                repo.path, repo.index_path(), repo.object_store, tree.id
+            )
+            os.sync()
+            self.assertEqual(mtime, os.stat(filea_path).st_mtime)
+
+            # Modify content
+            with open(filea_path, "wb") as fh:
+                fh.write(b"test a")
+            os.sync()
+            mtime = os.stat(filea_path).st_mtime
+
+            # Test rewrite
+            build_index_from_tree(
+                repo.path, repo.index_path(), repo.object_store, tree.id
+            )
+            os.sync()
+            with open(filea_path, "rb") as fh:
+                self.assertEqual(b"file a", fh.read())
+
+    @skipIf(not can_symlink(), "Requires symlink support")
+    def test_symlink(self) -> None:
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Populate repo
+            filed = Blob.from_string(b"file d")
+            filee = Blob.from_string(b"d")
+
+            tree = Tree()
+            tree[b"c/d"] = (stat.S_IFREG | 0o644, filed.id)
+            tree[b"c/e"] = (stat.S_IFLNK, filee.id)  # symlink
+
+            repo.object_store.add_objects([(o, None) for o in [filed, filee, tree]])
+
+            build_index_from_tree(
+                repo.path, repo.index_path(), repo.object_store, tree.id
+            )
+
+            # Verify index entries
+            index = repo.open_index()
+
+            # symlink to d
+            epath = os.path.join(repo.path, "c", "e")
+            self.assertTrue(os.path.exists(epath))
+            self.assertReasonableIndexEntry(
+                index[b"c/e"],
+                stat.S_IFLNK,
+                0 if sys.platform == "win32" else 1,
+                filee.id,
+            )
+            self.assertFileContents(epath, "d", symlink=True)
+
+    def test_no_decode_encode(self) -> None:
+        repo_dir = tempfile.mkdtemp()
+        repo_dir_bytes = os.fsencode(repo_dir)
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Populate repo
+            file = Blob.from_string(b"foo")
+
+            tree = Tree()
+            latin1_name = "À".encode("latin1")
+            try:
+                latin1_path = os.path.join(repo_dir_bytes, latin1_name)
+            except UnicodeDecodeError:
+                self.skipTest("can not decode as latin1")
+            utf8_name = "À".encode()
+            utf8_path = os.path.join(repo_dir_bytes, utf8_name)
+            tree[latin1_name] = (stat.S_IFREG | 0o644, file.id)
+            tree[utf8_name] = (stat.S_IFREG | 0o644, file.id)
+
+            repo.object_store.add_objects([(o, None) for o in [file, tree]])
+
+            try:
+                build_index_from_tree(
+                    repo.path, repo.index_path(), repo.object_store, tree.id
+                )
+            except OSError as e:
+                if e.errno == 92 and sys.platform == "darwin":
+                    # Our filename isn't supported by the platform :(
+                    self.skipTest(f"can not write filename {e.filename!r}")
+                elif e.errno == errno.EILSEQ:
+                    # Filesystem rejects non-UTF8 filenames
+                    # (e.g. OpenZFS with utf8only=on).
+                    self.skipTest(
+                        f"filesystem rejects non-UTF8 filename {e.filename!r}"
+                    )
+                else:
+                    raise
+
+            # Verify index entries
+            index = repo.open_index()
+            self.assertIn(latin1_name, index)
+            self.assertIn(utf8_name, index)
+
+            if sys.platform == "win32":
+                # On Windows, the latin-1 byte 0xc0 is not valid UTF-8 and
+                # gets remapped 1:1 to U+00C0 by xutftowcsn, so the on-disk
+                # filename is the UTF-8 encoding of U+00C0 (b"\xc3\x80"),
+                # not the raw latin-1 byte. Both tree entries therefore
+                # land on the same on-disk filename.
+                self.assertTrue(os.path.exists(utf8_path))
+            else:
+                self.assertTrue(os.path.exists(latin1_path))
+                self.assertTrue(os.path.exists(utf8_path))
+
+    def test_windows_unicode_filename_encoding(self) -> None:
+        """Test that Unicode filenames are handled correctly on Windows.
+
+        This test verifies the fix for GitHub issue #203, where filenames
+        containing Unicode characters like 'À' were incorrectly encoded/decoded
+        on Windows, resulting in corruption like 'À' -> 'Ã€'.
+        """
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+
+        with Repo.init(repo_dir) as repo:
+            # Create a blob
+            file_content = b"test file content"
+            blob = Blob.from_string(file_content)
+
+            # Create a tree with a Unicode filename
+            tree = Tree()
+            unicode_filename = "À"  # This is the character from GitHub issue #203
+            utf8_filename_bytes = unicode_filename.encode(
+                "utf-8"
+            )  # This is how it's stored in git trees
+
+            tree[utf8_filename_bytes] = (stat.S_IFREG | 0o644, blob.id)
+            repo.object_store.add_objects([(blob, None), (tree, None)])
+
+            # Build index from tree (this is what happens during checkout/clone)
+            try:
+                build_index_from_tree(
+                    repo.path, repo.index_path(), repo.object_store, tree.id
+                )
+            except (OSError, UnicodeError) as e:
+                if sys.platform == "win32" and "cannot" in str(e).lower():
+                    self.skipTest(f"Platform doesn't support filename: {e}")
+                raise
+
+            # Check that the file was created correctly
+            expected_file_path = os.path.join(repo.path, unicode_filename)
+            self.assertTrue(
+                os.path.exists(expected_file_path),
+                f"File should exist at {expected_file_path}",
+            )
+
+            # Verify the file content is correct
+            with open(expected_file_path, "rb") as f:
+                actual_content = f.read()
+            self.assertEqual(actual_content, file_content)
+
+            # Test the reverse: adding a Unicode filename to the index
+            if sys.platform == "win32":
+                # On Windows, test that _tree_to_fs_path and _fs_to_tree_path
+                # handle UTF-8 encoded tree paths correctly
+
+                repo_path_bytes = os.fsencode(repo.path)
+
+                # Test tree path to filesystem path conversion
+                fs_path = _tree_to_fs_path(repo_path_bytes, utf8_filename_bytes)
+                expected_fs_path = os.path.join(
+                    repo_path_bytes, os.fsencode(unicode_filename)
+                )
+                self.assertEqual(fs_path, expected_fs_path)
+
+                # Test filesystem path to tree path conversion
+                # _fs_to_tree_path expects relative paths, not absolute paths
+                # Extract just the filename from the full path
+                filename_only = os.path.basename(fs_path)
+                reconstructed_tree_path = _fs_to_tree_path(
+                    filename_only, tree_encoding="utf-8"
+                )
+                self.assertEqual(reconstructed_tree_path, utf8_filename_bytes)
+
+    def test_windows_invalid_utf8_filename_xutftowcsn(self) -> None:
+        """On Windows, a tree path with invalid UTF-8 must check out using
+        the xutftowcsn fallback mapping, matching C git on Windows."""
+        if sys.platform != "win32":
+            self.skipTest("xutftowcsn fallback only applies on Windows")
+
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+
+        with Repo.init(repo_dir) as repo:
+            blob = Blob.from_string(b"contents")
+            tree = Tree()
+            # b"caf\xe9" is latin-1 for U+00E9; the trailing 0xe9 is
+            # invalid UTF-8 and must map 1:1 to U+00E9 under xutftowcsn.
+            invalid_utf8_name = b"caf\xe9"
+            tree[invalid_utf8_name] = (stat.S_IFREG | 0o644, blob.id)
+            repo.object_store.add_objects([(blob, None), (tree, None)])
+
+            try:
+                build_index_from_tree(
+                    repo.path, repo.index_path(), repo.object_store, tree.id
+                )
+            except OSError as e:
+                if "cannot" in str(e).lower():
+                    self.skipTest(f"Platform doesn't support filename: {e}")
+                raise
+
+            # The on-disk filename is the lossy decode of b"caf\xe9", not
+            # the raw invalid-UTF-8 bytes.
+            expected_path = os.path.join(repo.path, "café")
+            self.assertTrue(
+                os.path.exists(expected_path),
+                f"Expected lossy filename at {expected_path}",
+            )
+
+    def test_windows_low_byte_filename_xutftowcsn(self) -> None:
+        """On Windows, invalid bytes in 0x80-0x9f must expand to two hex
+        digits in the on-disk filename, matching C git's xutftowcsn."""
+        if sys.platform != "win32":
+            self.skipTest("xutftowcsn fallback only applies on Windows")
+
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+
+        with Repo.init(repo_dir) as repo:
+            blob = Blob.from_string(b"contents")
+            tree = Tree()
+            tree[b"\x80foo"] = (stat.S_IFREG | 0o644, blob.id)
+            repo.object_store.add_objects([(blob, None), (tree, None)])
+
+            build_index_from_tree(
+                repo.path, repo.index_path(), repo.object_store, tree.id
+            )
+
+            # 0x80 expands to "80" -> on-disk filename "80foo".
+            expected_path = os.path.join(repo.path, "80foo")
+            self.assertTrue(
+                os.path.exists(expected_path),
+                f"Expected lossy filename at {expected_path}",
+            )
+
+    def test_git_submodule(self) -> None:
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            filea = Blob.from_string(b"file alalala")
+
+            subtree = Tree()
+            subtree[b"a"] = (stat.S_IFREG | 0o644, filea.id)
+
+            c = make_commit(
+                tree=subtree.id,
+                author=b"Somebody <somebody@example.com>",
+                committer=b"Somebody <somebody@example.com>",
+                author_time=42342,
+                commit_time=42342,
+                author_timezone=0,
+                commit_timezone=0,
+                parents=[],
+                message=b"Subcommit",
+            )
+
+            tree = Tree()
+            tree[b"c"] = (S_IFGITLINK, c.id)
+
+            repo.object_store.add_objects([(o, None) for o in [tree]])
+
+            build_index_from_tree(
+                repo.path, repo.index_path(), repo.object_store, tree.id
+            )
+
+            # Verify index entries
+            index = repo.open_index()
+            self.assertEqual(len(index), 1)
+
+            # filea
+            apath = os.path.join(repo.path, "c/a")
+            self.assertFalse(os.path.exists(apath))
+
+            # dir c
+            cpath = os.path.join(repo.path, "c")
+            self.assertTrue(os.path.isdir(cpath))
+            self.assertEqual(index[b"c"].mode, S_IFGITLINK)  # mode
+            self.assertEqual(index[b"c"].sha, c.id)  # sha
+
+    def test_git_submodule_exists(self) -> None:
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            filea = Blob.from_string(b"file alalala")
+
+            subtree = Tree()
+            subtree[b"a"] = (stat.S_IFREG | 0o644, filea.id)
+
+            c = make_commit(
+                tree=subtree.id,
+                author=b"Somebody <somebody@example.com>",
+                committer=b"Somebody <somebody@example.com>",
+                author_time=42342,
+                commit_time=42342,
+                author_timezone=0,
+                commit_timezone=0,
+                parents=[],
+                message=b"Subcommit",
+            )
+
+            tree = Tree()
+            tree[b"c"] = (S_IFGITLINK, c.id)
+
+            os.mkdir(os.path.join(repo_dir, "c"))
+            repo.object_store.add_objects([(o, None) for o in [tree]])
+
+            build_index_from_tree(
+                repo.path, repo.index_path(), repo.object_store, tree.id
+            )
+
+            # Verify index entries
+            index = repo.open_index()
+            self.assertEqual(len(index), 1)
+
+            # filea
+            apath = os.path.join(repo.path, "c/a")
+            self.assertFalse(os.path.exists(apath))
+
+            # dir c
+            cpath = os.path.join(repo.path, "c")
+            self.assertTrue(os.path.isdir(cpath))
+            self.assertEqual(index[b"c"].mode, S_IFGITLINK)  # mode
+            self.assertEqual(index[b"c"].sha, c.id)  # sha
+
+    def test_with_line_ending_normalization(self) -> None:
+        """Test that build_index_from_tree applies line-ending normalization."""
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+
+        with Repo.init(repo_dir) as repo:
+            # Set up autocrlf config
+            config = repo.get_config()
+            config.set((b"core",), b"autocrlf", b"true")
+            config.write_to_path()
+
+            # Create blob with LF line endings
+            content_lf = b"line1\nline2\nline3\n"
+            blob = Blob.from_string(content_lf)
+
+            tree = Tree()
+            tree[b"test.txt"] = (stat.S_IFREG | 0o644, blob.id)
+
+            repo.object_store.add_objects([(blob, None), (tree, None)])
+
+            # Create blob normalizer
+            autocrlf = config.get((b"core",), b"autocrlf")
+            blob_normalizer = BlobNormalizer(config, {}, autocrlf=autocrlf)
+
+            # Build index with normalization
+            build_index_from_tree(
+                repo.path,
+                repo.index_path(),
+                repo.object_store,
+                tree.id,
+                blob_normalizer=blob_normalizer,
+            )
+
+            # On Windows with autocrlf=true, file should have CRLF line endings
+            test_file = os.path.join(repo.path, "test.txt")
+            with open(test_file, "rb") as f:
+                content = f.read()
+
+            # autocrlf=true means LF -> CRLF on checkout (on all platforms for testing)
+            expected_content = b"line1\r\nline2\r\nline3\r\n"
+            self.assertEqual(content, expected_content)
+
+
+class GetUnstagedChangesTests(TestCase):
+    def test_get_unstaged_changes(self) -> None:
+        """Unit test for get_unstaged_changes."""
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Commit a dummy file then modify it
+            foo1_fullpath = os.path.join(repo_dir, "foo1")
+            with open(foo1_fullpath, "wb") as f:
+                f.write(b"origstuff")
+
+            foo2_fullpath = os.path.join(repo_dir, "foo2")
+            with open(foo2_fullpath, "wb") as f:
+                f.write(b"origstuff")
+
+            repo.get_worktree().stage(["foo1", "foo2"])
+            repo.get_worktree().commit(
+                message=b"test status",
+                committer=b"committer <email>",
+                author=b"author <email>",
+            )
+
+            with open(foo1_fullpath, "wb") as f:
+                f.write(b"newstuff")
+
+            # modify access and modify time of path
+            os.utime(foo1_fullpath, (0, 0))
+
+            changes = get_unstaged_changes(repo.open_index(), repo_dir)
+
+            self.assertEqual(list(changes), [b"foo1"])
+
+    def test_get_unstaged_changes_max_stat(self) -> None:
+        """Test that max_stat limits the number of entries checked."""
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Create multiple files
+            files = []
+            for i in range(5):
+                filename = f"foo{i}"
+                fullpath = os.path.join(repo_dir, filename)
+                with open(fullpath, "wb") as f:
+                    f.write(b"origstuff")
+                files.append(filename)
+
+            repo.get_worktree().stage(files)
+            repo.get_worktree().commit(
+                b"test status",
+                author=b"author <email>",
+                committer=b"committer <email>",
+            )
+
+            # Modify all files
+            for filename in files:
+                fullpath = os.path.join(repo_dir, filename)
+                with open(fullpath, "wb") as f:
+                    f.write(b"newstuff")
+                os.utime(fullpath, (0, 0))
+
+            # Without max_stat, all 5 files should be detected as changed
+            all_changes = list(get_unstaged_changes(repo.open_index(), repo_dir))
+            self.assertEqual(len(all_changes), 5)
+
+            # With max_stat=2, at most 2 files should be detected
+            limited_changes = list(
+                get_unstaged_changes(repo.open_index(), repo_dir, max_stat=2)
+            )
+            self.assertLessEqual(len(limited_changes), 2)
+
+    def test_get_unstaged_changes_max_stat_preload(self) -> None:
+        """Test that max_stat works with preload_index=True."""
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            files = []
+            for i in range(5):
+                filename = f"foo{i}"
+                fullpath = os.path.join(repo_dir, filename)
+                with open(fullpath, "wb") as f:
+                    f.write(b"origstuff")
+                files.append(filename)
+
+            repo.get_worktree().stage(files)
+            repo.get_worktree().commit(
+                b"test status",
+                author=b"author <email>",
+                committer=b"committer <email>",
+            )
+
+            for filename in files:
+                fullpath = os.path.join(repo_dir, filename)
+                with open(fullpath, "wb") as f:
+                    f.write(b"newstuff")
+                os.utime(fullpath, (0, 0))
+
+            limited_changes = list(
+                get_unstaged_changes(
+                    repo.open_index(), repo_dir, preload_index=True, max_stat=2
+                )
+            )
+            self.assertLessEqual(len(limited_changes), 2)
+
+    def test_get_unstaged_changes_with_preload(self) -> None:
+        """Unit test for get_unstaged_changes with preload_index=True."""
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Create multiple files to test parallel processing
+            files = []
+            for i in range(10):
+                filename = f"foo{i}"
+                fullpath = os.path.join(repo_dir, filename)
+                with open(fullpath, "wb") as f:
+                    f.write(b"origstuff" + str(i).encode())
+                files.append(filename)
+
+            repo.get_worktree().stage(files)
+            repo.get_worktree().commit(
+                b"test status",
+                author=b"author <email>",
+                committer=b"committer <email>",
+            )
+
+            # Modify some files
+            modified_files = [b"foo1", b"foo3", b"foo5", b"foo7"]
+            for filename in modified_files:
+                fullpath = os.path.join(repo_dir, filename.decode())
+                with open(fullpath, "wb") as f:
+                    f.write(b"newstuff")
+                os.utime(fullpath, (0, 0))
+
+            # Test with preload_index=False (serial)
+            changes_serial = list(
+                get_unstaged_changes(repo.open_index(), repo_dir, preload_index=False)
+            )
+            changes_serial.sort()
+
+            # Test with preload_index=True (parallel)
+            changes_parallel = list(
+                get_unstaged_changes(repo.open_index(), repo_dir, preload_index=True)
+            )
+            changes_parallel.sort()
+
+            # Both should return the same results
+            self.assertEqual(changes_serial, changes_parallel)
+            self.assertEqual(changes_serial, sorted(modified_files))
+
+    def test_get_unstaged_changes_nanosecond_precision(self) -> None:
+        """Test that nanosecond precision mtime is used for change detection."""
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Commit a file
+            foo_fullpath = os.path.join(repo_dir, "foo")
+            with open(foo_fullpath, "wb") as f:
+                f.write(b"original content")
+
+            repo.get_worktree().stage(["foo"])
+            repo.get_worktree().commit(
+                message=b"initial commit",
+                committer=b"committer <email>",
+                author=b"author <email>",
+            )
+
+            # Get the current index entry
+            index = repo.open_index()
+            entry = index[b"foo"]
+
+            # Modify the file with the same size but different content
+            # This simulates a very fast change within the same second
+            with open(foo_fullpath, "wb") as f:
+                f.write(b"modified content")
+
+            # Set mtime to match the index entry exactly (same second)
+            # but with different nanoseconds if the filesystem supports it
+            st = os.stat(foo_fullpath)
+            if isinstance(entry.mtime, tuple) and hasattr(st, "st_mtime_ns"):
+                # Set the mtime to the same second as the index entry
+                # but with a slightly different nanosecond value
+                entry_sec = entry.mtime[0]
+                entry_nsec = entry.mtime[1]
+                new_mtime_ns = entry_sec * 1_000_000_000 + entry_nsec + 1000
+                new_mtime = new_mtime_ns / 1_000_000_000
+                os.utime(foo_fullpath, (st.st_atime, new_mtime))
+
+                # The file should be detected as changed due to nanosecond difference
+                changes = list(get_unstaged_changes(repo.open_index(), repo_dir))
+                self.assertEqual(changes, [b"foo"])
+            else:
+                # If nanosecond precision is not available, skip this test
+                self.skipTest("Nanosecond precision not available on this system")
+
+    def test_get_unstaged_deleted_changes(self) -> None:
+        """Unit test for get_unstaged_changes."""
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Commit a dummy file then remove it
+            foo1_fullpath = os.path.join(repo_dir, "foo1")
+            with open(foo1_fullpath, "wb") as f:
+                f.write(b"origstuff")
+
+            repo.get_worktree().stage(["foo1"])
+            repo.get_worktree().commit(
+                message=b"test status",
+                committer=b"committer <email>",
+                author=b"author <email>",
+            )
+
+            os.unlink(foo1_fullpath)
+
+            changes = get_unstaged_changes(repo.open_index(), repo_dir)
+
+            self.assertEqual(list(changes), [b"foo1"])
+
+    def test_get_unstaged_changes_removed_replaced_by_directory(self) -> None:
+        """Unit test for get_unstaged_changes."""
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Commit a dummy file then modify it
+            foo1_fullpath = os.path.join(repo_dir, "foo1")
+            with open(foo1_fullpath, "wb") as f:
+                f.write(b"origstuff")
+
+            repo.get_worktree().stage(["foo1"])
+            repo.get_worktree().commit(
+                message=b"test status",
+                committer=b"committer <email>",
+                author=b"author <email>",
+            )
+
+            os.remove(foo1_fullpath)
+            os.mkdir(foo1_fullpath)
+
+            changes = get_unstaged_changes(repo.open_index(), repo_dir)
+
+            self.assertEqual(list(changes), [b"foo1"])
+
+    @skipIf(not can_symlink(), "Requires symlink support")
+    def test_get_unstaged_changes_removed_replaced_by_link(self) -> None:
+        """Unit test for get_unstaged_changes."""
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Commit a dummy file then modify it
+            foo1_fullpath = os.path.join(repo_dir, "foo1")
+            with open(foo1_fullpath, "wb") as f:
+                f.write(b"origstuff")
+
+            repo.get_worktree().stage(["foo1"])
+            repo.get_worktree().commit(
+                message=b"test status",
+                committer=b"committer <email>",
+                author=b"author <email>",
+            )
+
+            os.remove(foo1_fullpath)
+            os.symlink(os.path.dirname(foo1_fullpath), foo1_fullpath)
+
+            changes = get_unstaged_changes(repo.open_index(), repo_dir)
+
+            self.assertEqual(list(changes), [b"foo1"])
+
+    def test_get_unstaged_changes_trust_ctime_false(self) -> None:
+        """Test that core.trustctime=false avoids re-checking files with only ctime changes."""
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Commit a file
+            foo_fullpath = os.path.join(repo_dir, "foo")
+            with open(foo_fullpath, "wb") as f:
+                f.write(b"test content")
+
+            repo.get_worktree().stage(["foo"])
+            repo.get_worktree().commit(
+                message=b"initial commit",
+                committer=b"committer <email>",
+                author=b"author <email>",
+            )
+
+            # Get the current index entry and its timestamps
+            index = repo.open_index()
+            entry = index[b"foo"]
+
+            # Get original stat
+            st_before = os.stat(foo_fullpath)
+
+            # Modify file metadata (chmod) to change ctime without changing content
+            # Keep the change to ensure ctime persists
+            new_mode = (
+                st_before.st_mode | 0o111
+                if not (st_before.st_mode & 0o111)
+                else st_before.st_mode & ~0o111
+            )
+            os.chmod(foo_fullpath, new_mode)
+
+            # Now set mtime to exactly match the index entry
+            # This way mtime matches but ctime doesn't
+            if isinstance(entry.mtime, tuple) and hasattr(st_before, "st_mtime_ns"):
+                mtime_ns = entry.mtime[0] * 1_000_000_000 + entry.mtime[1]
+                mtime = mtime_ns / 1_000_000_000
+                os.utime(foo_fullpath, (st_before.st_atime, mtime))
+            else:
+                mtime = (
+                    entry.mtime
+                    if not isinstance(entry.mtime, tuple)
+                    else entry.mtime[0]
+                )
+                os.utime(foo_fullpath, (st_before.st_atime, mtime))
+
+            # Verify ctime actually changed
+            st_after = os.stat(foo_fullpath)
+            if hasattr(st_after, "st_ctime_ns") and isinstance(entry.ctime, tuple):
+                entry_ctime_ns = entry.ctime[0] * 1_000_000_000 + entry.ctime[1]
+                ctime_changed = st_after.st_ctime_ns != entry_ctime_ns
+            else:
+                ctime_changed = int(st_after.st_ctime) != (
+                    entry.ctime
+                    if not isinstance(entry.ctime, tuple)
+                    else entry.ctime[0]
+                )
+
+            if not ctime_changed:
+                # If ctime didn't change, skip this test
+                self.skipTest("ctime did not change on this filesystem")
+
+            # Git's behavior: With trust_ctime=True, a ctime mismatch triggers
+            # a content check. Since content hasn't actually changed, no unstaged
+            # changes are reported (the stat optimization is bypassed, but the
+            # file is still clean after content comparison).
+            #
+            # With trust_ctime=False, the ctime mismatch is ignored, and the
+            # mtime+size match allows the stat optimization to avoid reading the file.
+            #
+            # Both should return empty since content hasn't changed.
+            changes_with_ctime = list(
+                get_unstaged_changes(repo.open_index(), repo_dir, trust_ctime=True)
+            )
+            changes_without_ctime = list(
+                get_unstaged_changes(repo.open_index(), repo_dir, trust_ctime=False)
+            )
+
+            # Neither should report changes since content is unchanged
+            self.assertEqual(changes_with_ctime, [])
+            self.assertEqual(changes_without_ctime, [])
+
+
+class StatRefreshTests(TestCase):
+    def _make_repo_with_file(self) -> tuple[Repo, str]:
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        repo = Repo.init(repo_dir)
+        self.addCleanup(repo.close)
+        fullpath = os.path.join(repo_dir, "foo")
+        with open(fullpath, "wb") as f:
+            f.write(b"stuff")
+        repo.get_worktree().stage(["foo"])
+        repo.get_worktree().commit(
+            message=b"initial",
+            committer=b"committer <email>",
+            author=b"author <email>",
+        )
+        return repo, fullpath
+
+    def test_collects_stat_drift(self) -> None:
+        repo, fullpath = self._make_repo_with_file()
+        os.utime(fullpath, (0, 0))
+        refresh: list[tuple[bytes, os.stat_result]] = []
+        list(get_unstaged_changes(repo.open_index(), repo.path, refresh_stat=refresh))
+        self.assertEqual([p for p, _ in refresh], [b"foo"])
+
+    def test_no_drift_no_collection(self) -> None:
+        repo, _ = self._make_repo_with_file()
+        refresh: list[tuple[bytes, os.stat_result]] = []
+        list(get_unstaged_changes(repo.open_index(), repo.path, refresh_stat=refresh))
+        self.assertEqual(refresh, [])
+
+    def test_modified_content_not_collected(self) -> None:
+        repo, fullpath = self._make_repo_with_file()
+        with open(fullpath, "wb") as f:
+            f.write(b"different")
+        refresh: list[tuple[bytes, os.stat_result]] = []
+        changes = list(
+            get_unstaged_changes(repo.open_index(), repo.path, refresh_stat=refresh)
+        )
+        self.assertEqual(changes, [b"foo"])
+        self.assertEqual(refresh, [])
+
+    def test_apply_stat_refresh_updates_index(self) -> None:
+        repo, fullpath = self._make_repo_with_file()
+        os.utime(fullpath, (0, 0))
+        index = repo.open_index()
+        stale_mtime = index[b"foo"].mtime
+        refresh: list[tuple[bytes, os.stat_result]] = []
+        list(get_unstaged_changes(index, repo.path, refresh_stat=refresh))
+        self.assertTrue(apply_stat_refresh(index, refresh))
+        self.assertNotEqual(index[b"foo"].mtime, stale_mtime)
+
+    def test_apply_stat_refresh_preserves_flags(self) -> None:
+        repo, fullpath = self._make_repo_with_file()
+        index = repo.open_index()
+        entry = index[b"foo"]
+        assert isinstance(entry, IndexEntry)
+        entry.flags |= FLAG_VALID
+        entry.set_skip_worktree(True)
+        os.utime(fullpath, (0, 0))
+        self.assertTrue(apply_stat_refresh(index, [(b"foo", os.lstat(fullpath))]))
+        refreshed = index[b"foo"]
+        assert isinstance(refreshed, IndexEntry)
+        self.assertEqual((0, 0), refreshed.mtime)
+        self.assertEqual(FLAG_VALID | FLAG_EXTENDED, refreshed.flags)
+        self.assertEqual(EXTENDED_FLAG_SKIP_WORKTREE, refreshed.extended_flags)
+
+    def test_apply_stat_refresh_empty(self) -> None:
+        repo, _ = self._make_repo_with_file()
+        index = repo.open_index()
+        self.assertFalse(apply_stat_refresh(index, []))
+
+
+class TestValidatePathElement(TestCase):
+    def test_default(self) -> None:
+        self.assertTrue(validate_path_element_default(b"bla"))
+        self.assertTrue(validate_path_element_default(b".bla"))
+        self.assertFalse(validate_path_element_default(b".git"))
+        self.assertFalse(validate_path_element_default(b".giT"))
+        self.assertFalse(validate_path_element_default(b".."))
+        self.assertTrue(validate_path_element_default(b"git~1"))
+
+    def test_ntfs(self) -> None:
+        self.assertTrue(validate_path_element_ntfs(b"bla"))
+        self.assertTrue(validate_path_element_ntfs(b".bla"))
+        self.assertFalse(validate_path_element_ntfs(b".git"))
+        self.assertFalse(validate_path_element_ntfs(b".giT"))
+        self.assertFalse(validate_path_element_ntfs(b".."))
+        self.assertFalse(validate_path_element_ntfs(b"git~1"))
+        # git only collapses ``git~1`` onto ``.git``; other short-name
+        # indices are ordinary filenames.
+        self.assertTrue(validate_path_element_ntfs(b"git~2"))
+        # A bare colon is allowed; C git only rejects the ``.git``
+        # alternate-data-stream spellings (issue #2205).
+        self.assertTrue(validate_path_element_ntfs(b"with:colon.txt"))
+        self.assertFalse(validate_path_element_ntfs(b".git::$INDEX_ALLOCATION"))
+        # Trailing dots/spaces on ``.git`` collapse back to ``.git``.
+        self.assertFalse(validate_path_element_ntfs(b".git."))
+        self.assertFalse(validate_path_element_ntfs(b".git "))
+        self.assertFalse(validate_path_element_ntfs(b".git . ."))
+        # A backslash is a separator for the ``.git`` scan, so a ``.git``
+        # ADS form behind one is still rejected.
+        self.assertFalse(validate_path_element_ntfs(b".git\\hooks"))
+        self.assertFalse(validate_path_element_ntfs(b"a\\.git::$INDEX_ALLOCATION"))
+
+    def test_hfs(self) -> None:
+        # Normal paths should pass
+        self.assertTrue(validate_path_element_hfs(b"bla"))
+        self.assertTrue(validate_path_element_hfs(b".bla"))
+
+        # Basic .git variations should fail
+        self.assertFalse(validate_path_element_hfs(b".git"))
+        self.assertFalse(validate_path_element_hfs(b".giT"))
+        self.assertFalse(validate_path_element_hfs(b".GIT"))
+        self.assertFalse(validate_path_element_hfs(b".."))
+
+        # git~1 should also fail on HFS+
+        self.assertFalse(validate_path_element_hfs(b"git~1"))
+
+        # Test HFS+ Unicode normalization attacks
+        # .g\u200cit (zero-width non-joiner)
+        self.assertFalse(validate_path_element_hfs(b".g\xe2\x80\x8cit"))
+
+        # .gi\u200dt (zero-width joiner)
+        self.assertFalse(validate_path_element_hfs(b".gi\xe2\x80\x8dt"))
+
+        # Test other ignorable characters
+        # .g\ufeffit (zero-width no-break space)
+        self.assertFalse(validate_path_element_hfs(b".g\xef\xbb\xbfit"))
+
+        # Valid Unicode that shouldn't be confused with .git
+        self.assertTrue(validate_path_element_hfs(b".g\xc3\xaft"))  # .gït
+        self.assertTrue(validate_path_element_hfs(b"git"))  # git without dot
+
+    def test_ntfs_backslash_separates_dotgit_check(self) -> None:
+        # C git treats a backslash as a directory separator when scanning
+        # for the ``.git`` NTFS spellings, so a ``.git`` form behind one is
+        # rejected even though the bare backslash itself is not (it is only
+        # rejected when actually running on Windows).
+        self.assertFalse(validate_path_element_ntfs(b".git\\hooks\\pre-commit"))
+        self.assertFalse(validate_path_element_ntfs(b"a\\.git::$INDEX_ALLOCATION"))
+        # A backslash in an ordinary filename is a literal byte on POSIX, but
+        # an actual path separator on Windows, where it is rejected so a tree
+        # authored on POSIX cannot escape the work tree.
+        bare_backslash_ok = os.name != "nt"
+        self.assertEqual(bare_backslash_ok, validate_path_element_ntfs(b"..\\outside"))
+        self.assertEqual(bare_backslash_ok, validate_path_element_ntfs(b"a\\b"))
+
+    def test_non_ntfs_validators_accept_backslash(self) -> None:
+        # On POSIX/HFS a backslash is a valid filename byte. The
+        # protection is gated on the NTFS validator (selected by
+        # core.protectNTFS), so the other validators still accept it.
+        self.assertTrue(validate_path_element_default(b"a\\b"))
+        self.assertTrue(validate_path_element_hfs(b"a\\b"))
+
+    def test_ntfs_only_git_tilde_one_short_name(self) -> None:
+        # C git's is_ntfs_dotgit only collapses the exact ``git~1`` 8.3
+        # short name (case-insensitive) onto ``.git``; other ``git~<n>``
+        # forms are ordinary filenames.
+        for name in (b"git~1", b"GIT~1", b"git~1.", b"git~1 "):
+            self.assertFalse(
+                validate_path_element_ntfs(name),
+                f"{name!r} should be rejected on NTFS",
+            )
+        for name in (b"git~2", b"git~10", b"gIt~3", b"git~foo", b"mygit~1"):
+            self.assertTrue(
+                validate_path_element_ntfs(name),
+                f"{name!r} should be accepted on NTFS",
+            )
+
+    def test_ntfs_rejects_dotgit_alternate_data_stream(self) -> None:
+        # NTFS alternate data streams are addressed as ``name:stream``;
+        # the ``.git::$INDEX_ALLOCATION`` form smuggles a write to the
+        # ``.git`` directory. A colon elsewhere is an ordinary character
+        # and must be accepted (issue #2205).
+        self.assertFalse(validate_path_element_ntfs(b".git::$INDEX_ALLOCATION"))
+        self.assertFalse(validate_path_element_ntfs(b".git:evil"))
+        self.assertTrue(validate_path_element_ntfs(b"foo:bar"))
+        self.assertTrue(validate_path_element_ntfs(b"with:colon.txt"))
+
+    def test_reserved_device_names_only_rejected_on_windows(self) -> None:
+        # CON, PRN, AUX, NUL and COM1..9 / LPT1..9 are reserved
+        # devices on Windows. Opening them resolves to the device
+        # rather than a disk file, with or without an extension and
+        # regardless of case. Elsewhere they are ordinary filenames
+        # and must be checked out (issue #2351).
+        expected = os.name != "nt"
+        for name in (
+            b"NUL",
+            b"nul",
+            b"NuL",
+            b"CON",
+            b"PRN",
+            b"AUX",
+            b"COM1",
+            b"COM9",
+            b"LPT1",
+            b"LPT9",
+        ):
+            self.assertEqual(
+                expected,
+                validate_path_element_ntfs(name),
+                f"{name!r} should be rejected only on Windows",
+            )
+
+    def test_reserved_device_names_with_extension(self) -> None:
+        # Extensions do not make a reserved name safe on Windows:
+        # ``NUL.txt`` still opens the NUL device.
+        expected = os.name != "nt"
+        for name in (
+            b"NUL.txt",
+            b"aux.foo",
+            b"COM1.bar",
+            # Multiple extensions still match the stem.
+            b"nul.tar.gz",
+            # Trailing dots/spaces are stripped by NTFS before resolution.
+            b"NUL.",
+            b"NUL ",
+            b"NUL ...",
+            # A trailing space on the stem itself is also stripped, so
+            # ``NUL .txt`` still resolves to the NUL device.
+            b"NUL .txt",
+        ):
+            self.assertEqual(
+                expected,
+                validate_path_element_ntfs(name),
+                f"{name!r} should be rejected only on Windows",
+            )
+
+    def test_reserved_device_name_stem_matching(self) -> None:
+        # The stem match itself is platform-independent; only its
+        # enforcement in the validator is gated on Windows.
+        for name in (b"nul", b"nul.txt", b"nul ", b"aux.foo.bar", b"com1"):
+            self.assertTrue(
+                _is_reserved_windows_device_name(name),
+                f"{name!r} should match a reserved device name",
+            )
+        for name in (b"null", b"myaux", b"com0", b"com10", b"lpt0"):
+            self.assertFalse(
+                _is_reserved_windows_device_name(name),
+                f"{name!r} should not match a reserved device name",
+            )
+
+    def test_ntfs_accepts_names_that_only_resemble_devices(self) -> None:
+        # Only the exact reserved names are devices; longer names
+        # that merely start with one of them are fine.
+        self.assertTrue(validate_path_element_ntfs(b"null"))
+        self.assertTrue(validate_path_element_ntfs(b"console"))
+        self.assertTrue(validate_path_element_ntfs(b"prnt"))
+        self.assertTrue(validate_path_element_ntfs(b"myaux"))
+        # COM0/LPT0 and COM10+ are not in the reserved range.
+        self.assertTrue(validate_path_element_ntfs(b"com0"))
+        self.assertTrue(validate_path_element_ntfs(b"com10"))
+        self.assertTrue(validate_path_element_ntfs(b"lpt0"))
+
+    def test_ntfs_element_accepts_bare_drive_letter(self) -> None:
+        # The drive-letter check lives in validate_path against the whole
+        # path, matching where C git's verify_path applies it. Individual
+        # elements may still contain a colon (see issue #2205).
+        self.assertTrue(validate_path_element_ntfs(b"C:"))
+        self.assertTrue(validate_path_element_ntfs(b"C:foo"))
+
+
+class TestHasDosDrivePrefix(TestCase):
+    def test_bare_drive_letter(self) -> None:
+        for name in (b"C:", b"c:", b"D:", b"Z:", b"a:"):
+            self.assertTrue(_has_dos_drive_prefix(name), repr(name))
+
+    def test_drive_letter_with_tail(self) -> None:
+        self.assertTrue(_has_dos_drive_prefix(b"C:foo"))
+        self.assertTrue(_has_dos_drive_prefix(b"C:/foo"))
+        self.assertTrue(_has_dos_drive_prefix(b"C:\\foo"))
+
+    def test_non_alphabetic_drive(self) -> None:
+        # subst allows any ASCII byte as a drive letter.
+        self.assertTrue(_has_dos_drive_prefix(b"1:"))
+        self.assertTrue(_has_dos_drive_prefix(b"!:"))
+
+    def test_high_bit_first_byte_not_treated_as_ascii(self) -> None:
+        # C git also handles subst-created Unicode drives; not emulated.
+        self.assertFalse(_has_dos_drive_prefix(b"\xc3\xa9:"))
+
+    def test_no_colon(self) -> None:
+        self.assertFalse(_has_dos_drive_prefix(b"C"))
+        self.assertFalse(_has_dos_drive_prefix(b"CD"))
+        self.assertFalse(_has_dos_drive_prefix(b""))
+
+    def test_colon_not_at_position_one(self) -> None:
+        self.assertFalse(_has_dos_drive_prefix(b":foo"))
+        self.assertFalse(_has_dos_drive_prefix(b"ab:cd"))
+
+
+class TestValidatePath(TestCase):
+    @skipIf(os.name != "nt", "drive prefix is only rejected on Windows")
+    def test_rejects_drive_letter_prefix_on_windows(self) -> None:
+        self.assertFalse(validate_path(b"C:/Users/victim/evil.txt"))
+        self.assertFalse(validate_path(b"C:"))
+        self.assertFalse(validate_path(b"c:evil"))
+
+    @skipIf(os.name != "nt", "drive prefix is only rejected on Windows")
+    def test_rejects_drive_letter_prefix_regardless_of_validator(self) -> None:
+        # Not gated on core.protectNTFS, matching C git.
+        for v in (
+            validate_path_element_default,
+            validate_path_element_hfs,
+            validate_path_element_ntfs,
+        ):
+            self.assertFalse(
+                validate_path(b"C:/x", v),
+                f"validator {v.__name__} should reject drive-prefix path",
+            )
+
+    @skipIf(os.name == "nt", "on POSIX C:x is just an unusual filename")
+    def test_accepts_drive_letter_prefix_on_posix(self) -> None:
+        # POSIX' os.path.join does not absolutize on a drive-letter prefix.
+        self.assertTrue(validate_path(b"C:/Users/victim/evil.txt"))
+        self.assertTrue(validate_path(b"C:"))
+        self.assertTrue(validate_path(b"c:evil"))
+
+    def test_accepts_colon_mid_path(self) -> None:
+        # See issue #2205.
+        self.assertTrue(
+            validate_path(b"foo/C:bar", validate_path_element_ntfs),
+        )
+        self.assertTrue(
+            validate_path(b"with:colon.txt", validate_path_element_ntfs),
+        )
+
+
+class TestGetPathElementValidator(TestCase):
+    # ``.gi`` + U+200C ZERO WIDTH NON-JOINER + ``t``. HFS+ drops the
+    # ignorable code point, so this file lands as ``.git`` on macOS.
+    HFS_DOTGIT = b".gi\xe2\x80\x8ct"
+
+    def test_ntfs_only_leaves_hfs_spelling(self) -> None:
+        config = ConfigDict()
+        config.set((b"core",), b"protectNTFS", b"true")
+        config.set((b"core",), b"protectHFS", b"false")
+        validator = get_path_element_validator(config)
+        # The NTFS check does not strip HFS+ ignorable characters, matching
+        # git without core.protectHFS.
+        self.assertTrue(validator(self.HFS_DOTGIT))
+
+    def test_both_enabled_rejects_hfs_spelling(self) -> None:
+        config = ConfigDict()
+        config.set((b"core",), b"protectNTFS", b"true")
+        config.set((b"core",), b"protectHFS", b"true")
+        validator = get_path_element_validator(config)
+        # protectNTFS and protectHFS apply together; the HFS spelling of
+        # ``.git`` must still be rejected when NTFS protection is also on.
+        self.assertFalse(validator(self.HFS_DOTGIT))
+        self.assertFalse(validator(b".git"))
+        self.assertTrue(validator(b"README.md"))
+
+    def test_hfs_only_rejects_hfs_spelling(self) -> None:
+        config = ConfigDict()
+        config.set((b"core",), b"protectNTFS", b"false")
+        config.set((b"core",), b"protectHFS", b"true")
+        validator = get_path_element_validator(config)
+        self.assertFalse(validator(self.HFS_DOTGIT))
+
+    def test_both_disabled_uses_default(self) -> None:
+        config = ConfigDict()
+        config.set((b"core",), b"protectNTFS", b"false")
+        config.set((b"core",), b"protectHFS", b"false")
+        validator = get_path_element_validator(config)
+        self.assertIs(validator, validate_path_element_default)
+        self.assertTrue(validator(self.HFS_DOTGIT))
+
+
+class TestDecodeUTF8WithFallback(TestCase):
+    """Tests for the xutftowcsn-style lossy UTF-8 decoder."""
+
+    def test_ascii(self) -> None:
+        self.assertEqual("hello", _decode_utf8_with_fallback(b"hello"))
+
+    def test_empty(self) -> None:
+        self.assertEqual("", _decode_utf8_with_fallback(b""))
+
+    def test_valid_two_byte(self) -> None:
+        # U+00E9 LATIN SMALL LETTER E WITH ACUTE = c3 a9
+        self.assertEqual("café", _decode_utf8_with_fallback(b"caf\xc3\xa9"))
+
+    def test_valid_three_byte(self) -> None:
+        # U+20AC EURO SIGN = e2 82 ac
+        self.assertEqual("€", _decode_utf8_with_fallback(b"\xe2\x82\xac"))
+
+    def test_valid_four_byte(self) -> None:
+        # U+1F600 GRINNING FACE = f0 9f 98 80
+        self.assertEqual("\U0001f600", _decode_utf8_with_fallback(b"\xf0\x9f\x98\x80"))
+
+    def test_invalid_high_byte_maps_one_to_one(self) -> None:
+        # 0xff is never a valid UTF-8 byte; should map to U+00FF.
+        self.assertEqual("ÿ", _decode_utf8_with_fallback(b"\xff"))
+        # 0xa0 is the boundary of the 1:1 fallback range.
+        self.assertEqual("\xa0", _decode_utf8_with_fallback(b"\xa0"))
+
+    def test_invalid_low_byte_expands_to_hex(self) -> None:
+        # 0x80-0x9f -> two lowercase hex digits.
+        self.assertEqual("80", _decode_utf8_with_fallback(b"\x80"))
+        self.assertEqual("9f", _decode_utf8_with_fallback(b"\x9f"))
+
+    def test_latin1_mixed(self) -> None:
+        # Latin-1 "café" is 63 61 66 e9; the trailing e9 is invalid UTF-8
+        # alone and should fall through as U+00E9.
+        self.assertEqual("café", _decode_utf8_with_fallback(b"caf\xe9"))
+
+    def test_truncated_two_byte(self) -> None:
+        # c3 with no trail byte: lead falls through to 1:1 (c3 >= a0).
+        self.assertEqual("Ã", _decode_utf8_with_fallback(b"\xc3"))
+
+    def test_truncated_then_ascii(self) -> None:
+        # c3 followed by 'a' (not a valid trail): c3 -> U+00C3, then 'a'.
+        self.assertEqual("Ãa", _decode_utf8_with_fallback(b"\xc3a"))
+
+    def test_overlong_two_byte_rejected(self) -> None:
+        # c0 af is overlong-encoded '/'. c0 < c2 so it never enters the
+        # 2-byte branch; c0 >= a0 so it maps to U+00C0. Then af -> U+00AF.
+        self.assertEqual("À¯", _decode_utf8_with_fallback(b"\xc0\xaf"))
+
+    def test_overlong_three_byte_rejected(self) -> None:
+        # e0 80 80 is an overlong NUL. The guard `data[1] < 0xa0` rejects
+        # the 3-byte branch; e0 -> U+00E0, then 80 -> "80", then 80 -> "80".
+        self.assertEqual("à8080", _decode_utf8_with_fallback(b"\xe0\x80\x80"))
+
+    def test_codepoint_beyond_max_rejected(self) -> None:
+        # f4 90 80 80 would decode to U+110000 (beyond U+10FFFF).
+        # Guard rejects, f4 falls through to U+00F4, trails go to hex/1:1.
+        self.assertEqual(
+            "ô90" + "80" + "80",
+            _decode_utf8_with_fallback(b"\xf4\x90\x80\x80"),
+        )
+
+    def test_five_byte_lead_falls_through(self) -> None:
+        # 0xf5..0xff never match any multi-byte branch -> 1:1.
+        self.assertEqual("õ", _decode_utf8_with_fallback(b"\xf5"))
+        self.assertEqual("þ", _decode_utf8_with_fallback(b"\xfe"))
+
+    def test_roundtrip_through_fsencode(self) -> None:
+        # The decoder's output must be a real str that os.fsencode can
+        # handle; that's what _tree_to_fs_path relies on.
+        decoded = _decode_utf8_with_fallback(b"caf\xe9/foo")
+        self.assertIsInstance(decoded, str)
+        os.fsencode(decoded)
+
+
+class TestTreeFSPathConversion(TestCase):
+    def test_tree_to_fs_path(self) -> None:
+        tree_path = "délwíçh/foo".encode()
+        fs_path = _tree_to_fs_path(b"/prefix/path", tree_path)
+        self.assertEqual(
+            fs_path,
+            os.fsencode(os.path.join("/prefix/path", "délwíçh", "foo")),
+        )
+
+    def test_tree_to_fs_path_windows_separator(self) -> None:
+        tree_path = b"path/with/slash"
+        original_sep = os.sep.encode("ascii")
+        # Temporarily modify os_sep_bytes to test Windows path conversion
+        # This simulates Windows behavior on all platforms for testing
+
+        dulwich.index.os_sep_bytes = b"\\"
+        self.addCleanup(setattr, dulwich.index, "os_sep_bytes", original_sep)
+
+        fs_path = _tree_to_fs_path(b"/prefix/path", tree_path)
+
+        # The function should join the prefix path with the converted tree path
+        # The expected behavior is that the path separators in the tree_path are
+        # converted to the platform-specific separator (which we've set to backslash)
+        expected_path = os.path.join(b"/prefix/path", b"path\\with\\slash")
+        self.assertEqual(fs_path, expected_path)
+
+    def test_fs_to_tree_path_str(self) -> None:
+        fs_path = os.path.join(os.path.join("délwíçh", "foo"))
+        tree_path = _fs_to_tree_path(fs_path)
+        self.assertEqual(tree_path, "délwíçh/foo".encode())
+
+    def test_fs_to_tree_path_bytes(self) -> None:
+        fs_path = os.path.join(os.fsencode(os.path.join("délwíçh", "foo")))
+        tree_path = _fs_to_tree_path(fs_path)
+        self.assertEqual(tree_path, "délwíçh/foo".encode())
+
+    def test_fs_to_tree_path_windows_separator(self) -> None:
+        # Test conversion of Windows paths to tree paths
+        fs_path = b"path\\with\\backslash"
+        original_sep = os.sep.encode("ascii")
+        # Temporarily modify os_sep_bytes to test Windows path conversion
+
+        dulwich.index.os_sep_bytes = b"\\"
+        self.addCleanup(setattr, dulwich.index, "os_sep_bytes", original_sep)
+
+        tree_path = _fs_to_tree_path(fs_path)
+        self.assertEqual(tree_path, b"path/with/backslash")
+
+    def test_tree_to_fs_path_windows_invalid_utf8(self) -> None:
+        # On Windows, invalid UTF-8 in a tree path must not raise and must
+        # not fall back to raw bytes; it should go through the
+        # xutftowcsn-style mapping (matching git-for-windows behaviour).
+        original_platform = sys.platform
+        sys.platform = "win32"
+        self.addCleanup(setattr, sys, "platform", original_platform)
+
+        # b"caf\xe9" is latin-1 "café". The 0xe9 is invalid UTF-8 and should
+        # map 1:1 to U+00E9.
+        fs_path = _tree_to_fs_path(b"/prefix", b"caf\xe9")
+        self.assertEqual(fs_path, os.path.join(b"/prefix", os.fsencode("café")))
+
+        # b"\x80" is an invalid low byte, and should expand to two hex digits.
+        fs_path = _tree_to_fs_path(b"/prefix", b"\x80")
+        self.assertEqual(fs_path, os.path.join(b"/prefix", os.fsencode("80")))
+
+    def test_fs_to_tree_path_windows_str_unicode(self) -> None:
+        # On Windows, a Unicode str filename should be encoded as UTF-8 in
+        # the tree (not via the filesystem mbcs codec).
+        original_platform = sys.platform
+        sys.platform = "win32"
+        self.addCleanup(setattr, sys, "platform", original_platform)
+
+        tree_path = _fs_to_tree_path("café")
+        self.assertEqual(tree_path, "café".encode())
+
+    def test_fs_to_tree_path_windows_roundtrip_valid_utf8(self) -> None:
+        # Round-trip: valid-UTF-8 tree path -> filesystem -> tree path.
+        original_platform = sys.platform
+        sys.platform = "win32"
+        self.addCleanup(setattr, sys, "platform", original_platform)
+
+        original_tree = "café".encode()
+        # Forward: tree bytes -> fs bytes (joined under a fake prefix).
+        fs = _tree_to_fs_path(b"/prefix", original_tree)
+        # Strip the prefix the way a real caller (after listdir) would,
+        # then go back through _fs_to_tree_path.
+        filename = fs[len(b"/prefix/") :]
+        self.assertEqual(_fs_to_tree_path(filename), original_tree)
+
+    def test_fs_to_tree_path_windows_invalid_utf8_is_one_way(self) -> None:
+        # Document C git's one-way semantics: a tree path with invalid UTF-8
+        # produces a file with a lossy name on disk, and reading that
+        # filename back yields the lossy form, NOT the original bytes.
+        original_platform = sys.platform
+        sys.platform = "win32"
+        self.addCleanup(setattr, sys, "platform", original_platform)
+
+        # Tree path b"\x80foo" -> on-disk name "80foo".
+        fs = _tree_to_fs_path(b"/prefix", b"\x80foo")
+        filename = fs[len(b"/prefix/") :]
+        # The lossy filename round-trips to b"80foo", not b"\x80foo".
+        self.assertEqual(_fs_to_tree_path(filename), b"80foo")
+
+
+class TestIndexEntryFromPath(TestCase):
+    def setUp(self):
+        super().setUp()
+        self.tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tempdir)
+
+    def test_index_entry_from_path_file(self) -> None:
+        """Test creating index entry from a regular file."""
+        # Create a test file
+        test_file = os.path.join(self.tempdir, "testfile")
+        with open(test_file, "wb") as f:
+            f.write(b"test content")
+
+        # Get the index entry
+        entry = index_entry_from_path(os.fsencode(test_file))
+
+        # Verify the entry was created with the right mode
+        self.assertIsNotNone(entry)
+        self.assertEqual(cleanup_mode(os.stat(test_file).st_mode), entry.mode)
+
+    @skipIf(not can_symlink(), "Requires symlink support")
+    def test_index_entry_from_path_symlink(self) -> None:
+        """Test creating index entry from a symlink."""
+        # Create a target file
+        target_file = os.path.join(self.tempdir, "target")
+        with open(target_file, "wb") as f:
+            f.write(b"target content")
+
+        # Create a symlink
+        link_file = os.path.join(self.tempdir, "symlink")
+        os.symlink(target_file, link_file)
+
+        # Get the index entry
+        entry = index_entry_from_path(os.fsencode(link_file))
+
+        # Verify the entry was created with the right mode
+        self.assertIsNotNone(entry)
+        self.assertEqual(cleanup_mode(os.lstat(link_file).st_mode), entry.mode)
+
+    def test_index_entry_from_path_directory(self) -> None:
+        """Test creating index entry from a directory (should return None)."""
+        # Create a directory
+        test_dir = os.path.join(self.tempdir, "testdir")
+        os.mkdir(test_dir)
+
+        # Get the index entry for a directory
+        entry = index_entry_from_path(os.fsencode(test_dir))
+
+        # Should return None for regular directories
+        self.assertIsNone(entry)
+
+    def test_index_entry_from_directory_regular(self) -> None:
+        """Test index_entry_from_directory with a regular directory."""
+        # Create a directory
+        test_dir = os.path.join(self.tempdir, "testdir")
+        os.mkdir(test_dir)
+
+        # Get stat for the directory
+        st = os.lstat(test_dir)
+
+        # Get the index entry for a regular directory
+        entry = index_entry_from_directory(st, os.fsencode(test_dir))
+
+        # Should return None for regular directories
+        self.assertIsNone(entry)
+
+    def test_index_entry_from_directory_git_submodule(self) -> None:
+        """Test index_entry_from_directory with a Git submodule."""
+        # Create a git repository that will be a submodule
+        sub_repo_dir = os.path.join(self.tempdir, "subrepo")
+        os.mkdir(sub_repo_dir)
+
+        # Create the .git directory to make it look like a git repo
+        git_dir = os.path.join(sub_repo_dir, ".git")
+        os.mkdir(git_dir)
+
+        # Create HEAD file with a fake commit SHA
+        head_sha = b"1234567890" * 4  # 40-char fake SHA
+        with open(os.path.join(git_dir, "HEAD"), "wb") as f:
+            f.write(head_sha)
+
+        # Get stat for the submodule directory
+        st = os.lstat(sub_repo_dir)
+
+        # Get the index entry for a git submodule directory
+        entry = index_entry_from_directory(st, os.fsencode(sub_repo_dir))
+
+        # Since we don't have a proper git setup, this might still return None
+        # This test just ensures the code path is executed
+        if entry is not None:
+            # If an entry is returned, it should have the gitlink mode
+            self.assertEqual(entry.mode, S_IFGITLINK)
+
+    def test_index_entry_from_path_with_object_store(self) -> None:
+        """Test creating index entry with object store."""
+        # Create a test file
+        test_file = os.path.join(self.tempdir, "testfile")
+        with open(test_file, "wb") as f:
+            f.write(b"test content")
+
+        # Create a memory object store
+        object_store = MemoryObjectStore()
+
+        # Get the index entry and add to object store
+        entry = index_entry_from_path(os.fsencode(test_file), object_store)
+
+        # Verify we can access the blob from the object store
+        self.assertIsNotNone(entry)
+        blob = object_store[entry.sha]
+        self.assertEqual(b"test content", blob.data)
+
+    def test_iter_fresh_entries(self) -> None:
+        """Test iterating over fresh entries."""
+        # Create some test files
+        file1 = os.path.join(self.tempdir, "file1")
+        with open(file1, "wb") as f:
+            f.write(b"file1 content")
+
+        file2 = os.path.join(self.tempdir, "file2")
+        with open(file2, "wb") as f:
+            f.write(b"file2 content")
+
+        # Create a memory object store
+        object_store = MemoryObjectStore()
+
+        # Get fresh entries
+        paths = [b"file1", b"file2", b"nonexistent"]
+        entries = dict(
+            iter_fresh_entries(paths, os.fsencode(self.tempdir), object_store)
+        )
+
+        # Verify both files got entries but nonexistent file is None
+        self.assertIn(b"file1", entries)
+        self.assertIn(b"file2", entries)
+        self.assertIn(b"nonexistent", entries)
+        self.assertIsNotNone(entries[b"file1"])
+        self.assertIsNotNone(entries[b"file2"])
+        self.assertIsNone(entries[b"nonexistent"])
+
+        # Check that blobs were added to object store
+        blob1 = object_store[entries[b"file1"].sha]
+        self.assertEqual(b"file1 content", blob1.data)
+
+        blob2 = object_store[entries[b"file2"].sha]
+        self.assertEqual(b"file2 content", blob2.data)
+
+    def test_read_submodule_head(self) -> None:
+        """Test reading the HEAD of a submodule."""
+        # Create a test repo that will be our "submodule"
+        sub_repo_dir = os.path.join(self.tempdir, "subrepo")
+        os.mkdir(sub_repo_dir)
+        submodule_repo = Repo.init(sub_repo_dir)
+
+        # Create a file and commit it to establish a HEAD
+        test_file = os.path.join(sub_repo_dir, "testfile")
+        with open(test_file, "wb") as f:
+            f.write(b"test content")
+
+        submodule_repo.get_worktree().stage(["testfile"])
+        commit_id = submodule_repo.get_worktree().commit(
+            message=b"Test commit for submodule",
+        )
+
+        # Test reading the HEAD
+        head_sha = read_submodule_head(sub_repo_dir)
+        self.assertEqual(commit_id, head_sha)
+
+        # Test with bytes path
+        head_sha_bytes = read_submodule_head(os.fsencode(sub_repo_dir))
+        self.assertEqual(commit_id, head_sha_bytes)
+
+        # Test with non-existent path
+        non_repo_dir = os.path.join(self.tempdir, "nonrepo")
+        os.mkdir(non_repo_dir)
+        self.assertIsNone(read_submodule_head(non_repo_dir))
+
+        # Test with path that doesn't have a .git directory
+        not_git_dir = os.path.join(self.tempdir, "notgit")
+        os.mkdir(not_git_dir)
+        self.assertIsNone(read_submodule_head(not_git_dir))
+
+    def test_has_directory_changed(self) -> None:
+        """Test checking if a directory has changed."""
+        # Setup mock IndexEntry
+        mock_entry = IndexEntry(
+            (1230680220, 0),
+            (1230680220, 0),
+            2050,
+            3761020,
+            33188,
+            1000,
+            1000,
+            0,
+            b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+            0,
+            0,
+        )
+
+        # Test with a regular directory (not a submodule)
+        reg_dir = os.path.join(self.tempdir, "regular_dir")
+        os.mkdir(reg_dir)
+
+        # Should return True for regular directory
+        self.assertTrue(_has_directory_changed(os.fsencode(reg_dir), mock_entry))
+
+        # Create a git repository to test submodule scenarios
+        sub_repo_dir = os.path.join(self.tempdir, "subrepo")
+        os.mkdir(sub_repo_dir)
+        submodule_repo = Repo.init(sub_repo_dir)
+
+        # Create a file and commit it to establish a HEAD
+        test_file = os.path.join(sub_repo_dir, "testfile")
+        with open(test_file, "wb") as f:
+            f.write(b"test content")
+
+        submodule_repo.get_worktree().stage(["testfile"])
+        commit_id = submodule_repo.get_worktree().commit(
+            message=b"Test commit for submodule",
+        )
+
+        # Create an entry with the correct commit SHA
+        correct_entry = IndexEntry(
+            (1230680220, 0),
+            (1230680220, 0),
+            2050,
+            3761020,
+            33188,
+            1000,
+            1000,
+            0,
+            commit_id,
+            0,
+            0,
+        )
+
+        # Create an entry with an incorrect commit SHA
+        incorrect_entry = IndexEntry(
+            (1230680220, 0),
+            (1230680220, 0),
+            2050,
+            3761020,
+            33188,
+            1000,
+            1000,
+            0,
+            b"0000000000000000000000000000000000000000",
+            0,
+            0,
+        )
+
+        # Should return False for submodule with correct SHA
+        self.assertFalse(
+            _has_directory_changed(os.fsencode(sub_repo_dir), correct_entry)
+        )
+
+        # Should return True for submodule with incorrect SHA
+        self.assertTrue(
+            _has_directory_changed(os.fsencode(sub_repo_dir), incorrect_entry)
+        )
+
+    def test_get_unstaged_changes(self) -> None:
+        """Test detecting unstaged changes in a working tree."""
+        # Create a test repo
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+
+        # Create test index
+        index = Index(os.path.join(repo_dir, "index"))
+
+        # Create an actual hash of our test content
+
+        test_blob = Blob()
+        test_blob.data = b"initial content"
+
+        # Create some test files with known contents
+        file1_path = os.path.join(repo_dir, "file1")
+        with open(file1_path, "wb") as f:
+            f.write(b"initial content")
+
+        file2_path = os.path.join(repo_dir, "file2")
+        with open(file2_path, "wb") as f:
+            f.write(b"initial content")
+
+        # Add them to index
+        entry1 = IndexEntry(
+            (1230680220, 0),
+            (1230680220, 0),
+            2050,
+            3761020,
+            33188,
+            1000,
+            1000,
+            0,
+            b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",  # Not matching actual content
+            0,
+            0,
+        )
+
+        entry2 = IndexEntry(
+            (1230680220, 0),
+            (1230680220, 0),
+            2050,
+            3761020,
+            33188,
+            1000,
+            1000,
+            0,
+            test_blob.id,  # Will be content's real hash
+            0,
+            0,
+        )
+
+        # Add a file that has a conflict
+        entry_conflict = ConflictedIndexEntry(b"conflict", {0: None, 1: None, 2: None})
+
+        index._byname = {
+            b"file1": entry1,
+            b"file2": entry2,
+            b"file3": IndexEntry(
+                (1230680220, 0),
+                (1230680220, 0),
+                2050,
+                3761020,
+                33188,
+                1000,
+                1000,
+                0,
+                b"0000000000000000000000000000000000000000",
+                0,
+                0,
+            ),
+            b"conflict": entry_conflict,
+        }
+
+        # Get unstaged changes
+        changes = list(get_unstaged_changes(index, repo_dir))
+
+        # File1 should be unstaged (content doesn't match hash)
+        # File3 doesn't exist (deleted)
+        # Conflict is always unstaged
+        self.assertEqual(sorted(changes), [b"conflict", b"file1", b"file3"])
+
+        # Create directory where there should be a file
+        os.mkdir(os.path.join(repo_dir, "file4"))
+        index._byname[b"file4"] = entry1
+
+        # Get unstaged changes again
+        changes = list(get_unstaged_changes(index, repo_dir))
+
+        # Now file4 should also be unstaged because it's a directory instead of a file
+        self.assertEqual(sorted(changes), [b"conflict", b"file1", b"file3", b"file4"])
+
+        # Create a custom blob filter function
+        def filter_blob_callback(blob, path):
+            # Modify blob data to make it look changed
+            result_blob = Blob()
+            result_blob.data = b"modified " + blob.data
+            return result_blob
+
+        # Get unstaged changes with blob filter
+        changes = list(get_unstaged_changes(index, repo_dir, filter_blob_callback))
+
+        # Now both file1 and file2 should be unstaged due to the filter
+        self.assertEqual(
+            sorted(changes), [b"conflict", b"file1", b"file2", b"file3", b"file4"]
+        )
+
+    def test_get_unstaged_changes_with_blob_filter(self) -> None:
+        """Test get_unstaged_changes with filter that expects Blob objects.
+
+        This reproduces issue #2010 where passing blob.data instead of blob
+        to the filter callback causes AttributeError when the callback expects
+        a Blob object (like checkin_normalize does).
+        """
+        repo_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo_dir)
+        with Repo.init(repo_dir) as repo:
+            # Create and commit a test file
+            test_file = os.path.join(repo_dir, "test.txt")
+            with open(test_file, "wb") as f:
+                f.write(b"original content")
+
+            repo.get_worktree().stage(["test.txt"])
+            repo.get_worktree().commit(
+                message=b"Initial commit",
+                committer=b"Test <test@example.com>",
+                author=b"Test <test@example.com>",
+            )
+
+            # Create a .gitattributes file
+            gitattributes_file = os.path.join(repo_dir, ".gitattributes")
+            with open(gitattributes_file, "wb") as f:
+                f.write(b"*.txt text\n")
+
+            # Modify the test file
+            with open(test_file, "wb") as f:
+                f.write(b"modified content")
+
+            # Force mtime change to ensure stat doesn't match
+            os.utime(test_file, (0, 0))
+
+            # Create a filter callback that expects Blob objects (like checkin_normalize)
+            def blob_filter_callback(blob: Blob, path: bytes) -> Blob:
+                """Filter that expects a Blob object, not bytes."""
+                # This should receive a Blob object with a .data attribute
+                self.assertIsInstance(blob, Blob)
+                self.assertTrue(hasattr(blob, "data"))
+                # Return the blob unchanged for this test
+                return blob
+
+            # This should not raise AttributeError: 'bytes' object has no attribute 'data'
+            changes = list(
+                get_unstaged_changes(repo.open_index(), repo_dir, blob_filter_callback)
+            )
+
+            # Should detect the change in test.txt
+            self.assertIn(b"test.txt", changes)
+
+
+class TestManyFilesFeature(TestCase):
+    """Tests for the manyFiles feature (index version 4 and skipHash)."""
+
+    def setUp(self):
+        super().setUp()
+        self.tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tempdir)
+
+    def test_index_version_4_parsing(self):
+        """Test that index version 4 files can be parsed."""
+        index_path = os.path.join(self.tempdir, "index")
+
+        # Create an index with version 4
+        index = Index(index_path, read=False, version=4)
+
+        # Add some entries
+        entry = IndexEntry(
+            ctime=(1234567890, 0),
+            mtime=(1234567890, 0),
+            dev=1,
+            ino=1,
+            mode=0o100644,
+            uid=1000,
+            gid=1000,
+            size=5,
+            sha=ZERO_SHA,
+        )
+        index[b"test.txt"] = entry
+
+        # Write and read back
+        index.write()
+
+        # Read the index back
+        index2 = Index(index_path)
+        self.assertEqual(index2._version, 4)
+        self.assertIn(b"test.txt", index2)
+
+    def test_skip_hash_feature(self):
+        """Test that skipHash feature works correctly."""
+        index_path = os.path.join(self.tempdir, "index")
+
+        # Create an index with skipHash enabled
+        index = Index(index_path, read=False, skip_hash=True)
+
+        # Add some entries
+        entry = IndexEntry(
+            ctime=(1234567890, 0),
+            mtime=(1234567890, 0),
+            dev=1,
+            ino=1,
+            mode=0o100644,
+            uid=1000,
+            gid=1000,
+            size=5,
+            sha=ZERO_SHA,
+        )
+        index[b"test.txt"] = entry
+
+        # Write the index
+        index.write()
+
+        # Verify the file was written with zero hash
+        with open(index_path, "rb") as f:
+            f.seek(-20, 2)  # Seek to last 20 bytes
+            trailing_hash = f.read(20)
+            self.assertEqual(trailing_hash, b"\x00" * 20)
+
+        # Verify we can still read it back
+        index2 = Index(index_path)
+        self.assertIn(b"test.txt", index2)
+
+    def test_version_4_no_padding(self):
+        """Test that version 4 entries have no padding."""
+        # Create entries with names that would show compression benefits
+        entries = [
+            SerializedIndexEntry(
+                name=b"src/main/java/com/example/Service.java",
+                ctime=(1234567890, 0),
+                mtime=(1234567890, 0),
+                dev=1,
+                ino=1,
+                mode=0o100644,
+                uid=1000,
+                gid=1000,
+                size=5,
+                sha=ZERO_SHA,
+                flags=0,
+                extended_flags=0,
+            ),
+            SerializedIndexEntry(
+                name=b"src/main/java/com/example/Controller.java",
+                ctime=(1234567890, 0),
+                mtime=(1234567890, 0),
+                dev=1,
+                ino=2,
+                mode=0o100644,
+                uid=1000,
+                gid=1000,
+                size=5,
+                sha=b"1" * 40,
+                flags=0,
+                extended_flags=0,
+            ),
+        ]
+
+        # Test version 2 (with padding, full paths)
+        buf_v2 = BytesIO()
+
+        previous_path = b""
+        for entry in entries:
+            # Set proper flags for v2
+            entry_v2 = SerializedIndexEntry(
+                entry.name,
+                entry.ctime,
+                entry.mtime,
+                entry.dev,
+                entry.ino,
+                entry.mode,
+                entry.uid,
+                entry.gid,
+                entry.size,
+                entry.sha,
+                len(entry.name),
+                entry.extended_flags,
+            )
+            write_cache_entry(buf_v2, entry_v2, version=2, previous_path=previous_path)
+            previous_path = entry.name
+        v2_data = buf_v2.getvalue()
+
+        # Test version 4 (path compression, no padding)
+        buf_v4 = BytesIO()
+        previous_path = b""
+        for entry in entries:
+            write_cache_entry(buf_v4, entry, version=4, previous_path=previous_path)
+            previous_path = entry.name
+        v4_data = buf_v4.getvalue()
+
+        # Version 4 should be shorter due to compression and no padding
+        self.assertLess(len(v4_data), len(v2_data))
+
+        # Both should parse correctly
+        buf_v2.seek(0)
+
+        previous_path = b""
+        parsed_v2_entries = []
+        for _ in entries:
+            parsed = read_cache_entry(buf_v2, version=2, previous_path=previous_path)
+            parsed_v2_entries.append(parsed)
+            previous_path = parsed.name
+
+        buf_v4.seek(0)
+        previous_path = b""
+        parsed_v4_entries = []
+        for _ in entries:
+            parsed = read_cache_entry(buf_v4, version=4, previous_path=previous_path)
+            parsed_v4_entries.append(parsed)
+            previous_path = parsed.name
+
+        # Both should have the same paths
+        for v2_entry, v4_entry in zip(parsed_v2_entries, parsed_v4_entries):
+            self.assertEqual(v2_entry.name, v4_entry.name)
+            self.assertEqual(v2_entry.sha, v4_entry.sha)
+
+
+class TestManyFilesRepoIntegration(TestCase):
+    """Tests for manyFiles feature integration with Repo."""
+
+    def setUp(self):
+        super().setUp()
+        self.tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tempdir)
+
+    def test_repo_with_manyfiles_config(self):
+        """Test that a repository with feature.manyFiles=true uses the right settings."""
+        # Create a new repository
+        repo = Repo.init(self.tempdir)
+
+        # Set feature.manyFiles=true in config
+        config = repo.get_config()
+        config.set(b"feature", b"manyFiles", b"true")
+        config.write_to_path()
+
+        # Open the index - should have skipHash enabled and version 4
+        index = repo.open_index()
+        self.assertTrue(index._skip_hash)
+        self.assertEqual(index._version, 4)
+
+    def test_repo_with_explicit_index_settings(self):
+        """Test that explicit index.version and index.skipHash work."""
+        # Create a new repository
+        repo = Repo.init(self.tempdir)
+
+        # Set explicit index settings
+        config = repo.get_config()
+        config.set(b"index", b"version", b"3")
+        config.set(b"index", b"skipHash", b"false")
+        config.write_to_path()
+
+        # Open the index - should respect explicit settings
+        index = repo.open_index()
+        self.assertFalse(index._skip_hash)
+        self.assertEqual(index._version, 3)
+
+
+class TestPathPrefixCompression(TestCase):
+    """Tests for index version 4 path prefix compression."""
+
+    def setUp(self):
+        super().setUp()
+        self.tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tempdir)
+
+    def test_varint_encoding_decoding(self):
+        """Test variable-width integer encoding and decoding."""
+        test_values = [0, 1, 127, 128, 255, 256, 16383, 16384, 65535, 65536]
+
+        for value in test_values:
+            encoded = _encode_varint(value)
+            decoded, _ = _decode_varint(encoded, 0)
+            self.assertEqual(value, decoded, f"Failed for value {value}")
+
+    def test_path_compression_simple(self):
+        """Test simple path compression cases."""
+        # Test case 1: No common prefix
+        compressed = _compress_path(b"file1.txt", b"")
+        decompressed, _ = _decompress_path(compressed, 0, b"")
+        self.assertEqual(b"file1.txt", decompressed)
+
+        # Test case 2: Common prefix
+        compressed = _compress_path(b"src/file2.txt", b"src/file1.txt")
+        decompressed, _ = _decompress_path(compressed, 0, b"src/file1.txt")
+        self.assertEqual(b"src/file2.txt", decompressed)
+
+        # Test case 3: Completely different paths
+        compressed = _compress_path(b"docs/readme.md", b"src/file1.txt")
+        decompressed, _ = _decompress_path(compressed, 0, b"src/file1.txt")
+        self.assertEqual(b"docs/readme.md", decompressed)
+
+    def test_path_compression_deep_directories(self):
+        """Test compression with deep directory structures."""
+        path1 = b"src/main/java/com/example/service/UserService.java"
+        path2 = b"src/main/java/com/example/service/OrderService.java"
+        path3 = b"src/main/java/com/example/model/User.java"
+
+        # Compress path2 relative to path1
+        compressed = _compress_path(path2, path1)
+        decompressed, _ = _decompress_path(compressed, 0, path1)
+        self.assertEqual(path2, decompressed)
+
+        # Compress path3 relative to path2
+        compressed = _compress_path(path3, path2)
+        decompressed, _ = _decompress_path(compressed, 0, path2)
+        self.assertEqual(path3, decompressed)
+
+    def test_index_version_4_with_compression(self):
+        """Test full index version 4 write/read with path compression."""
+        index_path = os.path.join(self.tempdir, "index")
+
+        # Create an index with version 4
+        index = Index(index_path, read=False, version=4)
+
+        # Add multiple entries with common prefixes
+        paths = [
+            b"src/main/java/App.java",
+            b"src/main/java/Utils.java",
+            b"src/main/resources/config.properties",
+            b"src/test/java/AppTest.java",
+            b"docs/README.md",
+            b"docs/INSTALL.md",
+        ]
+
+        for i, path in enumerate(paths):
+            entry = IndexEntry(
+                ctime=(1234567890, 0),
+                mtime=(1234567890, 0),
+                dev=1,
+                ino=i + 1,
+                mode=0o100644,
+                uid=1000,
+                gid=1000,
+                size=10,
+                sha=f"{i:040d}".encode(),
+            )
+            index[path] = entry
+
+        # Write and read back
+        index.write()
+
+        # Read the index back
+        index2 = Index(index_path)
+        self.assertEqual(index2._version, 4)
+
+        # Verify all paths were preserved correctly
+        for path in paths:
+            self.assertIn(path, index2)
+
+        # Verify the index file is smaller than version 2 would be
+        with open(index_path, "rb") as f:
+            v4_size = len(f.read())
+
+        # Create equivalent version 2 index for comparison
+        index_v2_path = os.path.join(self.tempdir, "index_v2")
+        index_v2 = Index(index_v2_path, read=False, version=2)
+        for path in paths:
+            entry = IndexEntry(
+                ctime=(1234567890, 0),
+                mtime=(1234567890, 0),
+                dev=1,
+                ino=1,
+                mode=0o100644,
+                uid=1000,
+                gid=1000,
+                size=10,
+                sha=ZERO_SHA,
+            )
+            index_v2[path] = entry
+        index_v2.write()
+
+        with open(index_v2_path, "rb") as f:
+            v2_size = len(f.read())
+
+        # Version 4 should be smaller due to compression
+        self.assertLess(
+            v4_size, v2_size, "Version 4 index should be smaller than version 2"
+        )
+
+    def test_path_compression_edge_cases(self):
+        """Test edge cases in path compression."""
+        # Empty paths
+        compressed = _compress_path(b"", b"")
+        decompressed, _ = _decompress_path(compressed, 0, b"")
+        self.assertEqual(b"", decompressed)
+
+        # Path identical to previous
+        compressed = _compress_path(b"same.txt", b"same.txt")
+        decompressed, _ = _decompress_path(compressed, 0, b"same.txt")
+        self.assertEqual(b"same.txt", decompressed)
+
+        # Path shorter than previous
+        compressed = _compress_path(b"short", b"very/long/path/file.txt")
+        decompressed, _ = _decompress_path(compressed, 0, b"very/long/path/file.txt")
+        self.assertEqual(b"short", decompressed)
+
+
+class TestDetectCaseOnlyRenames(TestCase):
+    """Tests for detect_case_only_renames function."""
+
+    def setUp(self):
+        super().setUp()
+        self.config = ConfigDict()
+
+    def test_no_renames(self):
+        """Test when there are no renames."""
+        changes = [
+            TreeChange(
+                CHANGE_DELETE,
+                TreeEntry(b"file1.txt", 0o100644, b"a" * 40),
+                None,
+            ),
+            TreeChange(
+                CHANGE_ADD,
+                None,
+                TreeEntry(b"file2.txt", 0o100644, b"b" * 40),
+            ),
+        ]
+
+        result = detect_case_only_renames(changes, self.config)
+        # No case-only renames, so should return original changes
+        self.assertEqual(changes, result)
+
+    def test_simple_case_rename(self):
+        """Test simple case-only rename detection."""
+        # Default config uses case-insensitive comparison
+        changes = [
+            TreeChange(
+                CHANGE_DELETE,
+                TreeEntry(b"README.txt", 0o100644, b"a" * 40),
+                None,
+            ),
+            TreeChange(
+                CHANGE_ADD,
+                None,
+                TreeEntry(b"readme.txt", 0o100644, b"a" * 40),
+            ),
+        ]
+
+        result = detect_case_only_renames(changes, self.config)
+        # Should return one CHANGE_RENAME instead of ADD/DELETE pair
+        self.assertEqual(1, len(result))
+        self.assertEqual(CHANGE_RENAME, result[0].type)
+        self.assertEqual(b"README.txt", result[0].old.path)
+        self.assertEqual(b"readme.txt", result[0].new.path)
+
+    def test_nested_path_case_rename(self):
+        """Test case-only rename in nested paths."""
+        changes = [
+            TreeChange(
+                CHANGE_DELETE,
+                TreeEntry(b"src/Main.java", 0o100644, b"a" * 40),
+                None,
+            ),
+            TreeChange(
+                CHANGE_ADD,
+                None,
+                TreeEntry(b"src/main.java", 0o100644, b"a" * 40),
+            ),
+        ]
+
+        result = detect_case_only_renames(changes, self.config)
+        # Should return one CHANGE_RENAME instead of ADD/DELETE pair
+        self.assertEqual(1, len(result))
+        self.assertEqual(CHANGE_RENAME, result[0].type)
+        self.assertEqual(b"src/Main.java", result[0].old.path)
+        self.assertEqual(b"src/main.java", result[0].new.path)
+
+    def test_multiple_case_renames(self):
+        """Test multiple case-only renames."""
+        changes = [
+            TreeChange(
+                CHANGE_DELETE,
+                TreeEntry(b"File1.txt", 0o100644, b"a" * 40),
+                None,
+            ),
+            TreeChange(
+                CHANGE_DELETE,
+                TreeEntry(b"File2.TXT", 0o100644, b"b" * 40),
+                None,
+            ),
+            TreeChange(
+                CHANGE_ADD,
+                None,
+                TreeEntry(b"file1.txt", 0o100644, b"a" * 40),
+            ),
+            TreeChange(
+                CHANGE_ADD,
+                None,
+                TreeEntry(b"file2.txt", 0o100644, b"b" * 40),
+            ),
+        ]
+
+        result = detect_case_only_renames(changes, self.config)
+        # Should return two CHANGE_RENAME instead of ADD/DELETE pairs
+        self.assertEqual(2, len(result))
+        rename_changes = [c for c in result if c.type == CHANGE_RENAME]
+        self.assertEqual(2, len(rename_changes))
+        # Check that the renames are correct (order may vary)
+        rename_map = {c.old.path: c.new.path for c in rename_changes}
+        self.assertEqual(
+            {b"File1.txt": b"file1.txt", b"File2.TXT": b"file2.txt"}, rename_map
+        )
+
+    def test_case_rename_with_modify(self):
+        """Test case rename detection with CHANGE_MODIFY."""
+        changes = [
+            TreeChange(
+                CHANGE_DELETE,
+                TreeEntry(b"README.md", 0o100644, b"a" * 40),
+                None,
+            ),
+            TreeChange(
+                CHANGE_MODIFY,
+                TreeEntry(b"readme.md", 0o100644, b"a" * 40),
+                TreeEntry(b"readme.md", 0o100644, b"b" * 40),
+            ),
+        ]
+
+        result = detect_case_only_renames(changes, self.config)
+        # Should return one CHANGE_RENAME instead of DELETE/MODIFY pair
+        self.assertEqual(1, len(result))
+        self.assertEqual(CHANGE_RENAME, result[0].type)
+        self.assertEqual(b"README.md", result[0].old.path)
+        self.assertEqual(b"readme.md", result[0].new.path)
+
+    def test_hfs_normalization(self):
+        """Test case rename detection with HFS+ normalization."""
+        # Configure for HFS+ (macOS)
+        self.config.set((b"core",), b"protectHFS", b"true")
+        self.config.set((b"core",), b"protectNTFS", b"false")
+
+        # Test with composed vs decomposed Unicode
+        changes = [
+            TreeChange(
+                CHANGE_DELETE,
+                TreeEntry("café.txt".encode(), 0o100644, b"a" * 40),
+                None,
+            ),
+            TreeChange(
+                CHANGE_ADD,
+                None,
+                TreeEntry("CAFÉ.txt".encode(), 0o100644, b"a" * 40),
+            ),
+        ]
+
+        result = detect_case_only_renames(changes, self.config)
+
+        # Should return one CHANGE_RENAME for the case-only rename
+        self.assertEqual(1, len(result))
+        self.assertEqual(CHANGE_RENAME, result[0].type)
+        self.assertEqual("café.txt".encode(), result[0].old.path)
+        self.assertEqual("CAFÉ.txt".encode(), result[0].new.path)
+
+    def test_ntfs_normalization(self):
+        """Test case rename detection with NTFS normalization."""
+        # Configure for NTFS (Windows)
+        self.config.set((b"core",), b"protectNTFS", b"true")
+        self.config.set((b"core",), b"protectHFS", b"false")
+
+        # NTFS strips trailing dots and spaces
+        changes = [
+            TreeChange(
+                CHANGE_DELETE,
+                TreeEntry(b"file.txt.", 0o100644, b"a" * 40),
+                None,
+            ),
+            TreeChange(
+                CHANGE_ADD,
+                None,
+                TreeEntry(b"FILE.TXT", 0o100644, b"a" * 40),
+            ),
+        ]
+
+        result = detect_case_only_renames(changes, self.config)
+        # Should return one CHANGE_RENAME for the case-only rename
+        self.assertEqual(1, len(result))
+        self.assertEqual(CHANGE_RENAME, result[0].type)
+        self.assertEqual(b"file.txt.", result[0].old.path)
+        self.assertEqual(b"FILE.TXT", result[0].new.path)
+
+    def test_invalid_utf8_handling(self):
+        """Test handling of invalid UTF-8 in paths."""
+        # Invalid UTF-8 sequence
+        invalid_path = b"\xff\xfe"
+
+        changes = [
+            TreeChange(
+                CHANGE_DELETE,
+                TreeEntry(invalid_path, 0o100644, b"a" * 40),
+                None,
+            ),
+            TreeChange(
+                CHANGE_ADD,
+                None,
+                TreeEntry(b"valid.txt", 0o100644, b"b" * 40),
+            ),
+        ]
+
+        # Should not crash, just skip invalid paths
+        result = detect_case_only_renames(changes, self.config)
+        # No case-only renames detected, returns original changes
+        self.assertEqual(changes, result)
+
+    def test_rename_and_copy_changes(self):
+        """Test case rename detection with CHANGE_RENAME and CHANGE_COPY."""
+        changes = [
+            TreeChange(
+                CHANGE_DELETE,
+                TreeEntry(b"OldFile.txt", 0o100644, b"a" * 40),
+                None,
+            ),
+            TreeChange(
+                CHANGE_RENAME,
+                TreeEntry(b"other.txt", 0o100644, b"b" * 40),
+                TreeEntry(b"oldfile.txt", 0o100644, b"a" * 40),
+            ),
+            TreeChange(
+                CHANGE_COPY,
+                TreeEntry(b"source.txt", 0o100644, b"c" * 40),
+                TreeEntry(b"OLDFILE.TXT", 0o100644, b"a" * 40),
+            ),
+        ]
+
+        result = detect_case_only_renames(changes, self.config)
+        # The DELETE of OldFile.txt and COPY to OLDFILE.TXT are detected as a case-only rename
+        # The original RENAME (other.txt -> oldfile.txt) remains
+        # The COPY is consumed by the case-only rename detection
+        self.assertEqual(2, len(result))
+
+        # Find the changes
+        rename_changes = [c for c in result if c.type == CHANGE_RENAME]
+        self.assertEqual(2, len(rename_changes))
+
+        # Check for the case-only rename
+        case_rename = None
+        for change in rename_changes:
+            if change.old.path == b"OldFile.txt" and change.new.path == b"OLDFILE.TXT":
+                case_rename = change
+                break
+
+        self.assertIsNotNone(case_rename)
+        self.assertEqual(b"OldFile.txt", case_rename.old.path)
+        self.assertEqual(b"OLDFILE.TXT", case_rename.new.path)
+
+
+class TestUpdateWorkingTree(TestCase):
+    def setUp(self):
+        super().setUp()
+        self.tempdir = tempfile.mkdtemp()
+
+        def cleanup_tempdir():
+            """Remove tempdir, handling read-only files on Windows."""
+
+            def remove_readonly(func, path, excinfo):
+                """Error handler for Windows read-only files."""
+                if sys.platform == "win32" and excinfo[0] is PermissionError:
+                    os.chmod(path, stat.S_IWRITE)
+                    func(path)
+                else:
+                    raise
+
+            shutil.rmtree(self.tempdir, onerror=remove_readonly)
+
+        self.addCleanup(cleanup_tempdir)
+
+        self.repo = Repo.init(self.tempdir)
+
+    def test_update_working_tree_with_blob_normalizer(self):
+        """Test update_working_tree with a blob normalizer."""
+
+        # Create a simple blob normalizer that converts CRLF to LF
+        class TestBlobNormalizer:
+            def checkout_normalize(self, blob, path):
+                # Convert CRLF to LF during checkout
+                new_blob = Blob()
+                new_blob.data = blob.data.replace(b"\r\n", b"\n")
+                return new_blob
+
+        # Create a tree with a file containing CRLF
+        blob = Blob()
+        blob.data = b"Hello\r\nWorld\r\n"
+        self.repo.object_store.add_object(blob)
+
+        tree = Tree()
+        tree[b"test.txt"] = (0o100644, blob.id)
+        self.repo.object_store.add_object(tree)
+
+        # Update working tree with normalizer
+        normalizer = TestBlobNormalizer()
+        changes = tree_changes(self.repo.object_store, None, tree.id)
+        update_working_tree(
+            self.repo,
+            None,  # old_tree_id
+            tree.id,  # new_tree_id
+            change_iterator=changes,
+            blob_normalizer=normalizer,
+        )
+
+        # Check that the file was written with LF line endings
+        test_file = os.path.join(self.tempdir, "test.txt")
+        with open(test_file, "rb") as f:
+            content = f.read()
+
+        self.assertEqual(b"Hello\nWorld\n", content)
+
+        # Check that the index has the original blob SHA
+        index = self.repo.open_index()
+        self.assertEqual(blob.id, index[b"test.txt"].sha)
+
+    def test_update_working_tree_without_blob_normalizer(self):
+        """Test update_working_tree without a blob normalizer."""
+        # Create a tree with a file containing CRLF
+        blob = Blob()
+        blob.data = b"Hello\r\nWorld\r\n"
+        self.repo.object_store.add_object(blob)
+
+        tree = Tree()
+        tree[b"test.txt"] = (0o100644, blob.id)
+        self.repo.object_store.add_object(tree)
+
+        # Update working tree without normalizer
+        changes = tree_changes(self.repo.object_store, None, tree.id)
+        update_working_tree(
+            self.repo,
+            None,  # old_tree_id
+            tree.id,  # new_tree_id
+            change_iterator=changes,
+            blob_normalizer=None,
+        )
+
+        # Check that the file was written with original CRLF line endings
+        test_file = os.path.join(self.tempdir, "test.txt")
+        with open(test_file, "rb") as f:
+            content = f.read()
+
+        self.assertEqual(b"Hello\r\nWorld\r\n", content)
+
+        # Check that the index has the blob SHA
+        index = self.repo.open_index()
+        self.assertEqual(blob.id, index[b"test.txt"].sha)
+
+    def test_update_working_tree_delete_file_missing_from_disk(self):
+        # https://github.com/jelmer/dulwich/issues/2485
+        blob = Blob.from_string(b"x\n")
+        self.repo.object_store.add_object(blob)
+        old_tree = Tree()
+        old_tree[b"x.txt"] = (0o100644, blob.id)
+        self.repo.object_store.add_object(old_tree)
+        new_tree = Tree()
+        self.repo.object_store.add_object(new_tree)
+
+        update_working_tree(
+            self.repo,
+            None,
+            old_tree.id,
+            change_iterator=tree_changes(self.repo.object_store, None, old_tree.id),
+        )
+        os.unlink(os.path.join(self.tempdir, "x.txt"))
+
+        update_working_tree(
+            self.repo,
+            old_tree.id,
+            new_tree.id,
+            change_iterator=tree_changes(
+                self.repo.object_store, old_tree.id, new_tree.id
+            ),
+        )
+
+        self.assertEqual([], list(self.repo.open_index()))
+
+    def test_update_working_tree_without_honor_filemode_new_file(self):
+        blob = Blob.from_string(b"echo hi\n")
+        self.repo.object_store.add_object(blob)
+        tree = Tree()
+        tree[b"run.sh"] = (0o100755, blob.id)
+        self.repo.object_store.add_object(tree)
+
+        changes = tree_changes(self.repo.object_store, None, tree.id)
+        update_working_tree(
+            self.repo, None, tree.id, change_iterator=changes, honor_filemode=False
+        )
+
+        index = self.repo.open_index()
+        self.assertEqual(0o100755, index[b"run.sh"].mode)
+
+    def test_update_working_tree_without_honor_filemode_unchanged_file(self):
+        blob = Blob.from_string(b"echo hi\n")
+        self.repo.object_store.add_object(blob)
+        tree = Tree()
+        tree[b"run.sh"] = (0o100755, blob.id)
+        self.repo.object_store.add_object(tree)
+
+        path = os.path.join(self.tempdir, "run.sh")
+        with open(path, "wb") as f:
+            f.write(blob.data)
+        os.chmod(path, 0o644)
+
+        changes = tree_changes(self.repo.object_store, None, tree.id)
+        update_working_tree(
+            self.repo, None, tree.id, change_iterator=changes, honor_filemode=False
+        )
+
+        index = self.repo.open_index()
+        self.assertEqual(0o100755, index[b"run.sh"].mode)
+
+    def test_update_working_tree_remove_directory(self):
+        """Test that update_working_tree properly removes directories."""
+        # Create initial tree with a directory containing files
+        blob1 = Blob()
+        blob1.data = b"content1"
+        self.repo.object_store.add_object(blob1)
+
+        blob2 = Blob()
+        blob2.data = b"content2"
+        self.repo.object_store.add_object(blob2)
+
+        tree1 = Tree()
+        tree1[b"dir/file1.txt"] = (0o100644, blob1.id)
+        tree1[b"dir/file2.txt"] = (0o100644, blob2.id)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree1 (create directory with files)
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        # Verify directory and files exist
+        dir_path = os.path.join(self.tempdir, "dir")
+        self.assertTrue(os.path.isdir(dir_path))
+        self.assertTrue(os.path.exists(os.path.join(dir_path, "file1.txt")))
+        self.assertTrue(os.path.exists(os.path.join(dir_path, "file2.txt")))
+
+        # Create empty tree (remove everything)
+        tree2 = Tree()
+        self.repo.object_store.add_object(tree2)
+
+        # Update to empty tree
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        # Verify directory was removed
+        self.assertFalse(os.path.exists(dir_path))
+
+    def test_update_working_tree_submodule_to_file(self):
+        """Test replacing a submodule directory with a file."""
+        # Create tree with submodule
+        submodule_sha = b"a" * 40
+        tree1 = Tree()
+        tree1[b"submodule"] = (S_IFGITLINK, submodule_sha)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree with submodule
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        # Verify submodule directory exists with .git file
+        submodule_path = os.path.join(self.tempdir, "submodule")
+        self.assertTrue(os.path.isdir(submodule_path))
+        self.assertTrue(os.path.exists(os.path.join(submodule_path, ".git")))
+
+        # Create tree with file at same path
+        blob = Blob()
+        blob.data = b"file content"
+        self.repo.object_store.add_object(blob)
+
+        tree2 = Tree()
+        tree2[b"submodule"] = (0o100644, blob.id)
+        self.repo.object_store.add_object(tree2)
+
+        # Update to tree with file (should remove submodule directory and create file)
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        # Verify it's now a file
+        self.assertTrue(os.path.isfile(submodule_path))
+        with open(submodule_path, "rb") as f:
+            self.assertEqual(b"file content", f.read())
+
+    def test_update_working_tree_directory_with_nested_subdir(self):
+        """Test removing directory with nested subdirectories."""
+        # Create tree with nested directories
+        blob = Blob()
+        blob.data = b"deep content"
+        self.repo.object_store.add_object(blob)
+
+        tree1 = Tree()
+        tree1[b"a/b/c/file.txt"] = (0o100644, blob.id)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree1
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        # Verify nested structure exists
+        path_a = os.path.join(self.tempdir, "a")
+        path_b = os.path.join(path_a, "b")
+        path_c = os.path.join(path_b, "c")
+        file_path = os.path.join(path_c, "file.txt")
+
+        self.assertTrue(os.path.exists(file_path))
+
+        # Create empty tree
+        tree2 = Tree()
+        self.repo.object_store.add_object(tree2)
+
+        # Update to empty tree
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        # Verify all directories were removed
+        self.assertFalse(os.path.exists(path_a))
+
+    def test_update_working_tree_file_replaced_by_dir_not_removed(self):
+        """Test that a directory replacing a git file is left alone if not empty."""
+        # Create tree with a file
+        blob = Blob()
+        blob.data = b"file content"
+        self.repo.object_store.add_object(blob)
+
+        tree1 = Tree()
+        tree1[b"path"] = (0o100644, blob.id)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree1
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        # Verify file exists
+        file_path = os.path.join(self.tempdir, "path")
+        self.assertTrue(os.path.isfile(file_path))
+
+        # Manually replace file with directory containing untracked file
+        os.remove(file_path)
+        os.mkdir(file_path)
+        with open(os.path.join(file_path, "untracked.txt"), "w") as f:
+            f.write("untracked content")
+
+        # Create empty tree
+        tree2 = Tree()
+        self.repo.object_store.add_object(tree2)
+
+        # Update should succeed but leave the directory alone
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        # Directory should still exist with its contents
+        self.assertTrue(os.path.isdir(file_path))
+        self.assertTrue(os.path.exists(os.path.join(file_path, "untracked.txt")))
+
+    def test_update_working_tree_file_replaced_by_empty_dir_removed(self):
+        """Test that an empty directory replacing a git file is removed."""
+        # Create tree with a file
+        blob = Blob()
+        blob.data = b"file content"
+        self.repo.object_store.add_object(blob)
+
+        tree1 = Tree()
+        tree1[b"path"] = (0o100644, blob.id)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree1
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        # Verify file exists
+        file_path = os.path.join(self.tempdir, "path")
+        self.assertTrue(os.path.isfile(file_path))
+
+        # Manually replace file with empty directory
+        os.remove(file_path)
+        os.mkdir(file_path)
+
+        # Create empty tree
+        tree2 = Tree()
+        self.repo.object_store.add_object(tree2)
+
+        # Update should remove the empty directory
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        # Directory should be gone
+        self.assertFalse(os.path.exists(file_path))
+
+    def test_update_working_tree_directory_becomes_file(self):
+        """Test switching to a tree where a directory is replaced by a file."""
+        blob_inner = Blob()
+        blob_inner.data = b"inner\n"
+        self.repo.object_store.add_object(blob_inner)
+
+        tree_with_dir = Tree()
+        tree_with_dir[b"plain/inner"] = (0o100644, blob_inner.id)
+        self.repo.object_store.add_object(tree_with_dir)
+
+        changes = tree_changes(self.repo.object_store, None, tree_with_dir.id)
+        update_working_tree(self.repo, None, tree_with_dir.id, change_iterator=changes)
+
+        plain_path = os.path.join(self.tempdir, "plain")
+        inner_path = os.path.join(plain_path, "inner")
+        self.assertTrue(os.path.isdir(plain_path))
+        self.assertTrue(os.path.isfile(inner_path))
+
+        blob_plain = Blob()
+        blob_plain.data = b"plain\n"
+        self.repo.object_store.add_object(blob_plain)
+
+        tree_with_file = Tree()
+        tree_with_file[b"plain"] = (0o100644, blob_plain.id)
+        self.repo.object_store.add_object(tree_with_file)
+
+        changes = tree_changes(
+            self.repo.object_store, tree_with_dir.id, tree_with_file.id
+        )
+        update_working_tree(
+            self.repo,
+            tree_with_dir.id,
+            tree_with_file.id,
+            change_iterator=changes,
+        )
+
+        self.assertTrue(os.path.isfile(plain_path))
+        with open(plain_path, "rb") as f:
+            self.assertEqual(b"plain\n", f.read())
+
+    def test_update_working_tree_symlink_transitions(self):
+        """Test transitions involving symlinks."""
+        # Skip on Windows where symlinks might not be supported
+        if sys.platform == "win32":
+            self.skipTest("Symlinks not fully supported on Windows")
+
+        # Create tree with symlink
+        blob1 = Blob()
+        blob1.data = b"target/path"
+        self.repo.object_store.add_object(blob1)
+
+        tree1 = Tree()
+        tree1[b"link"] = (0o120000, blob1.id)  # Symlink mode
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree with symlink
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        link_path = os.path.join(self.tempdir, "link")
+        self.assertTrue(os.path.islink(link_path))
+        self.assertEqual(b"target/path", os.readlink(link_path).encode())
+
+        # Test 1: Replace symlink with regular file
+        blob2 = Blob()
+        blob2.data = b"file content"
+        self.repo.object_store.add_object(blob2)
+
+        tree2 = Tree()
+        tree2[b"link"] = (0o100644, blob2.id)
+        self.repo.object_store.add_object(tree2)
+
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        self.assertFalse(os.path.islink(link_path))
+        self.assertTrue(os.path.isfile(link_path))
+        with open(link_path, "rb") as f:
+            self.assertEqual(b"file content", f.read())
+
+        # Test 2: Replace file with symlink
+        changes = tree_changes(self.repo.object_store, tree2.id, tree1.id)
+        update_working_tree(self.repo, tree2.id, tree1.id, change_iterator=changes)
+
+        self.assertTrue(os.path.islink(link_path))
+        self.assertEqual(b"target/path", os.readlink(link_path).encode())
+
+        # Test 3: Replace symlink with directory (manually)
+        os.unlink(link_path)
+        os.mkdir(link_path)
+
+        # Create empty tree
+        tree3 = Tree()
+        self.repo.object_store.add_object(tree3)
+
+        # Should remove empty directory
+        changes = tree_changes(self.repo.object_store, tree1.id, tree3.id)
+        update_working_tree(self.repo, tree1.id, tree3.id, change_iterator=changes)
+        self.assertFalse(os.path.exists(link_path))
+
+    def test_update_working_tree_leading_symlink_not_followed(self):
+        """An entry below an on-disk symlink must not be written through it."""
+        if sys.platform == "win32":
+            self.skipTest("Symlinks not fully supported on Windows")
+
+        outside_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside_dir)
+        outside_file = os.path.join(outside_dir, "payload")
+
+        link = Blob.from_string(os.fsencode(outside_dir))
+        self.repo.object_store.add_object(link)
+
+        tree1 = Tree()
+        tree1[b"link"] = (0o120000, link.id)
+        self.repo.object_store.add_object(tree1)
+
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+        self.assertTrue(os.path.islink(os.path.join(self.tempdir, "link")))
+
+        # The symlink is retained and a descendant "link/payload" is added.
+        regular = Blob.from_string(b"pwned")
+        self.repo.object_store.add_object(regular)
+        tree2 = Tree()
+        tree2[b"link"] = (0o120000, link.id)
+        tree2[b"link/payload"] = (0o100644, regular.id)
+        self.repo.object_store.add_object(tree2)
+
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        self.assertRaises(
+            InvalidPathError,
+            update_working_tree,
+            self.repo,
+            tree1.id,
+            tree2.id,
+            change_iterator=changes,
+        )
+        self.assertFalse(os.path.exists(outside_file))
+
+    def test_update_working_tree_leading_symlink_not_followed_on_delete(self):
+        """An entry below an on-disk symlink must not be removed through it."""
+        if sys.platform == "win32":
+            self.skipTest("Symlinks not fully supported on Windows")
+
+        outside_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside_dir)
+        outside_file = os.path.join(outside_dir, "payload")
+        with open(outside_file, "wb") as f:
+            f.write(b"precious")
+
+        tracked = Blob.from_string(b"tracked")
+        self.repo.object_store.add_object(tracked)
+        tree1 = Tree()
+        tree1[b"d/payload"] = (0o100644, tracked.id)
+        self.repo.object_store.add_object(tree1)
+
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        # The tracked directory is replaced by a symlink pointing outside.
+        shutil.rmtree(os.path.join(self.tempdir, "d"))
+        os.symlink(outside_dir, os.path.join(self.tempdir, "d"))
+
+        keep = Blob.from_string(b"keep")
+        self.repo.object_store.add_object(keep)
+        tree2 = Tree()
+        tree2[b"keep"] = (0o100644, keep.id)
+        self.repo.object_store.add_object(tree2)
+
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(
+            self.repo,
+            tree1.id,
+            tree2.id,
+            change_iterator=changes,
+            allow_overwrite_modified=True,
+        )
+
+        self.assertTrue(os.path.exists(outside_file))
+        self.assertTrue(os.path.islink(os.path.join(self.tempdir, "d")))
+        self.assertEqual([b"keep"], sorted(self.repo.open_index().paths()))
+
+    def test_update_working_tree_modified_file_to_dir_transition(self):
+        """Test that modified files are not removed when they should be directories."""
+        # Create tree with file
+        blob1 = Blob()
+        blob1.data = b"original content"
+        self.repo.object_store.add_object(blob1)
+
+        tree1 = Tree()
+        tree1[b"path"] = (0o100644, blob1.id)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree1
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        file_path = os.path.join(self.tempdir, "path")
+
+        # Modify the file locally
+        with open(file_path, "w") as f:
+            f.write("modified content")
+
+        # Create tree where path is a directory with file
+        blob2 = Blob()
+        blob2.data = b"subfile content"
+        self.repo.object_store.add_object(blob2)
+
+        tree2 = Tree()
+        tree2[b"path/subfile"] = (0o100644, blob2.id)
+        self.repo.object_store.add_object(tree2)
+
+        # Update should fail because can't create directory where modified file exists
+        with self.assertRaises(IOError):
+            changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+            update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        # File should still exist with modifications
+        self.assertTrue(os.path.isfile(file_path))
+        with open(file_path) as f:
+            self.assertEqual("modified content", f.read())
+
+    def test_update_working_tree_executable_transitions(self):
+        """Test transitions involving executable bit changes."""
+        # Skip on Windows where executable bit is not supported
+        if sys.platform == "win32":
+            self.skipTest("Executable bit not supported on Windows")
+
+        # Create tree with non-executable file
+        blob = Blob()
+        blob.data = b"#!/bin/sh\necho hello"
+        self.repo.object_store.add_object(blob)
+
+        tree1 = Tree()
+        tree1[b"script.sh"] = (0o100644, blob.id)  # Non-executable
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree1
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        script_path = os.path.join(self.tempdir, "script.sh")
+        self.assertTrue(os.path.isfile(script_path))
+
+        # Check it's not executable
+        mode = os.stat(script_path).st_mode
+        self.assertFalse(mode & stat.S_IXUSR)
+
+        # Create tree with executable file (same content)
+        tree2 = Tree()
+        tree2[b"script.sh"] = (0o100755, blob.id)  # Executable
+        self.repo.object_store.add_object(tree2)
+
+        # Update to tree2
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        # Check it's now executable
+        mode = os.stat(script_path).st_mode
+        self.assertTrue(mode & stat.S_IXUSR)
+
+    def test_update_working_tree_submodule_with_untracked_files(self):
+        """Test that submodules with untracked files are not removed."""
+        # Create tree with submodule
+        submodule_sha = b"a" * 40
+        tree1 = Tree()
+        tree1[b"submodule"] = (S_IFGITLINK, submodule_sha)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree with submodule
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        # Add untracked file to submodule directory
+        submodule_path = os.path.join(self.tempdir, "submodule")
+        untracked_path = os.path.join(submodule_path, "untracked.txt")
+        with open(untracked_path, "w") as f:
+            f.write("untracked content")
+
+        # Create empty tree
+        tree2 = Tree()
+        self.repo.object_store.add_object(tree2)
+
+        # Update should not remove submodule directory with untracked files
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        # Directory should still exist with untracked file
+        self.assertTrue(os.path.isdir(submodule_path))
+        self.assertTrue(os.path.exists(untracked_path))
+
+    def test_update_working_tree_dir_to_file_with_subdir(self):
+        """Test replacing directory structure with a file."""
+        # Create tree with nested directory structure
+        blob1 = Blob()
+        blob1.data = b"content1"
+        self.repo.object_store.add_object(blob1)
+
+        blob2 = Blob()
+        blob2.data = b"content2"
+        self.repo.object_store.add_object(blob2)
+
+        tree1 = Tree()
+        tree1[b"dir/subdir/file1"] = (0o100644, blob1.id)
+        tree1[b"dir/subdir/file2"] = (0o100644, blob2.id)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree1
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        # Verify structure exists
+        dir_path = os.path.join(self.tempdir, "dir")
+        self.assertTrue(os.path.isdir(dir_path))
+
+        # Add an untracked file to make directory truly non-empty
+        untracked_path = os.path.join(dir_path, "untracked.txt")
+        with open(untracked_path, "w") as f:
+            f.write("untracked content")
+
+        # Create tree with file at "dir" path
+        blob3 = Blob()
+        blob3.data = b"replacement file"
+        self.repo.object_store.add_object(blob3)
+
+        tree2 = Tree()
+        tree2[b"dir"] = (0o100644, blob3.id)
+        self.repo.object_store.add_object(tree2)
+
+        # Update should fail because directory is not empty
+        with self.assertRaises(IsADirectoryError):
+            changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+            update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        # Directory should still exist
+        self.assertTrue(os.path.isdir(dir_path))
+
+    def test_update_working_tree_case_sensitivity(self):
+        """Test handling of case-sensitive filename changes."""
+        # Detect if filesystem is case-insensitive by testing
+        test_file = os.path.join(self.tempdir, "TeSt.tmp")
+        with open(test_file, "w") as f:
+            f.write("test")
+        is_case_insensitive = os.path.exists(os.path.join(self.tempdir, "test.tmp"))
+        os.unlink(test_file)
+
+        # Set core.ignorecase to match actual filesystem behavior
+        # (This ensures test works correctly regardless of platform defaults)
+        config = self.repo.get_config()
+        config.set((b"core",), b"ignorecase", is_case_insensitive)
+        config.write_to_path()
+
+        # Create tree with lowercase file
+        blob1 = Blob()
+        blob1.data = b"lowercase content"
+        self.repo.object_store.add_object(blob1)
+
+        tree1 = Tree()
+        tree1[b"readme.txt"] = (0o100644, blob1.id)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree1
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        # Create tree with uppercase file (different content)
+        blob2 = Blob()
+        blob2.data = b"uppercase content"
+        self.repo.object_store.add_object(blob2)
+
+        tree2 = Tree()
+        tree2[b"README.txt"] = (0o100644, blob2.id)
+        self.repo.object_store.add_object(tree2)
+
+        # Update to tree2
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        # Check what exists (behavior depends on filesystem)
+        lowercase_path = os.path.join(self.tempdir, "readme.txt")
+        uppercase_path = os.path.join(self.tempdir, "README.txt")
+
+        if is_case_insensitive:
+            # On case-insensitive filesystems, should have one file with new content
+            # The exact case of the filename may vary by OS
+            self.assertTrue(
+                os.path.exists(lowercase_path) or os.path.exists(uppercase_path)
+            )
+            # Verify content is the new content
+            if os.path.exists(lowercase_path):
+                with open(lowercase_path, "rb") as f:
+                    self.assertEqual(b"uppercase content", f.read())
+            else:
+                with open(uppercase_path, "rb") as f:
+                    self.assertEqual(b"uppercase content", f.read())
+        else:
+            # On case-sensitive filesystems, only the uppercase file should exist
+            self.assertFalse(os.path.exists(lowercase_path))
+            self.assertTrue(os.path.exists(uppercase_path))
+            with open(uppercase_path, "rb") as f:
+                self.assertEqual(b"uppercase content", f.read())
+
+    def test_update_working_tree_case_rename_updates_filename(self):
+        """Test that case-only renames update the actual filename on case-insensitive FS."""
+        # Detect if filesystem is case-insensitive by testing
+        test_file = os.path.join(self.tempdir, "TeSt.tmp")
+        with open(test_file, "w") as f:
+            f.write("test")
+        is_case_insensitive = os.path.exists(os.path.join(self.tempdir, "test.tmp"))
+        os.unlink(test_file)
+
+        if not is_case_insensitive:
+            self.skipTest("Test only relevant on case-insensitive filesystems")
+
+        # Set core.ignorecase to match actual filesystem behavior
+        config = self.repo.get_config()
+        config.set((b"core",), b"ignorecase", True)
+        config.write_to_path()
+
+        # Create tree with lowercase file
+        blob1 = Blob()
+        blob1.data = b"same content"  # Using same content to test pure case rename
+        self.repo.object_store.add_object(blob1)
+
+        tree1 = Tree()
+        tree1[b"readme.txt"] = (0o100644, blob1.id)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree1
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        # Verify initial state
+        files = [f for f in os.listdir(self.tempdir) if not f.startswith(".git")]
+        self.assertEqual(["readme.txt"], files)
+
+        # Create tree with uppercase file (same content, same blob)
+        tree2 = Tree()
+        tree2[b"README.txt"] = (0o100644, blob1.id)  # Same blob!
+        self.repo.object_store.add_object(tree2)
+
+        # Update to tree2 (case-only rename)
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        # On case-insensitive filesystems, should have one file with updated case
+        files = [f for f in os.listdir(self.tempdir) if not f.startswith(".git")]
+        self.assertEqual(
+            1, len(files), "Should have exactly one file after case rename"
+        )
+
+        # The file should now have the new case in the directory listing
+        actual_filename = files[0]
+        self.assertEqual(
+            "README.txt",
+            actual_filename,
+            "Filename case should be updated in directory listing",
+        )
+
+        # Verify content is preserved
+        file_path = os.path.join(self.tempdir, actual_filename)
+        with open(file_path, "rb") as f:
+            self.assertEqual(b"same content", f.read())
+
+        # Both old and new case should access the same file
+        lowercase_path = os.path.join(self.tempdir, "readme.txt")
+        uppercase_path = os.path.join(self.tempdir, "README.txt")
+        self.assertTrue(os.path.exists(lowercase_path))
+        self.assertTrue(os.path.exists(uppercase_path))
+
+    def test_update_working_tree_deeply_nested_removal(self):
+        """Test removal of deeply nested directory structures."""
+        # Create deeply nested structure
+        blob = Blob()
+        blob.data = b"deep content"
+        self.repo.object_store.add_object(blob)
+
+        tree1 = Tree()
+        # Create a very deep path
+        deep_path = b"/".join([b"level%d" % i for i in range(10)])
+        tree1[deep_path + b"/file.txt"] = (0o100644, blob.id)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree1
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        # Verify deep structure exists
+        current_path = self.tempdir
+        for i in range(10):
+            current_path = os.path.join(current_path, f"level{i}")
+            self.assertTrue(os.path.isdir(current_path))
+
+        # Create empty tree
+        tree2 = Tree()
+        self.repo.object_store.add_object(tree2)
+
+        # Update should remove all empty directories
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        # Verify top level directory is gone
+        top_level = os.path.join(self.tempdir, "level0")
+        self.assertFalse(os.path.exists(top_level))
+
+    def test_update_working_tree_read_only_files(self):
+        """Test handling of read-only files during updates."""
+        # Create tree with file
+        blob1 = Blob()
+        blob1.data = b"original content"
+        self.repo.object_store.add_object(blob1)
+
+        tree1 = Tree()
+        tree1[b"readonly.txt"] = (0o100644, blob1.id)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree1
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        # Make file read-only
+        file_path = os.path.join(self.tempdir, "readonly.txt")
+        os.chmod(file_path, 0o444)  # Read-only
+
+        # Create tree with modified file
+        blob2 = Blob()
+        blob2.data = b"new content"
+        self.repo.object_store.add_object(blob2)
+
+        tree2 = Tree()
+        tree2[b"readonly.txt"] = (0o100644, blob2.id)
+        self.repo.object_store.add_object(tree2)
+
+        # Update should handle read-only file
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        # Verify content was updated
+        with open(file_path, "rb") as f:
+            self.assertEqual(b"new content", f.read())
+
+    def test_update_working_tree_invalid_filenames(self):
+        """Test handling of invalid filenames for the platform."""
+        # Create tree with potentially problematic filenames
+        blob = Blob()
+        blob.data = b"content"
+        self.repo.object_store.add_object(blob)
+
+        tree = Tree()
+        # Add files with names that might be invalid on some platforms
+        tree[b"valid.txt"] = (0o100644, blob.id)
+        if sys.platform != "win32":
+            # These are invalid on Windows but valid on Unix
+            tree[b"file:with:colons.txt"] = (0o100644, blob.id)
+            tree[b"file<with>brackets.txt"] = (0o100644, blob.id)
+        self.repo.object_store.add_object(tree)
+
+        # Update should skip invalid files based on validation
+        changes = tree_changes(self.repo.object_store, None, tree.id)
+        update_working_tree(self.repo, None, tree.id, change_iterator=changes)
+
+        # Valid file should exist
+        self.assertTrue(os.path.exists(os.path.join(self.tempdir, "valid.txt")))
+
+    def test_update_working_tree_symlink_to_directory(self):
+        """Test replacing a symlink pointing to a directory with a real directory."""
+        if sys.platform == "win32":
+            self.skipTest("Symlinks not fully supported on Windows")
+
+        # Create a target directory
+        target_dir = os.path.join(self.tempdir, "target")
+        os.mkdir(target_dir)
+        with open(os.path.join(target_dir, "file.txt"), "w") as f:
+            f.write("target file")
+
+        # Create tree with symlink pointing to directory
+        blob1 = Blob()
+        blob1.data = b"target"  # Relative path to target directory
+        self.repo.object_store.add_object(blob1)
+
+        tree1 = Tree()
+        tree1[b"link"] = (0o120000, blob1.id)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree1
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        link_path = os.path.join(self.tempdir, "link")
+        self.assertTrue(os.path.islink(link_path))
+
+        # Create tree with actual directory at same path
+        blob2 = Blob()
+        blob2.data = b"new file content"
+        self.repo.object_store.add_object(blob2)
+
+        tree2 = Tree()
+        tree2[b"link/newfile.txt"] = (0o100644, blob2.id)
+        self.repo.object_store.add_object(tree2)
+
+        # Update should replace symlink with actual directory
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+
+        self.assertFalse(os.path.islink(link_path))
+        self.assertTrue(os.path.isdir(link_path))
+        self.assertTrue(os.path.exists(os.path.join(link_path, "newfile.txt")))
+
+    def test_update_working_tree_all_type_transitions(self):
+        """Test all possible file type transitions."""
+        # Skip on Windows where symlinks might not be supported
+        if sys.platform == "win32":
+            self.skipTest("Symlinks not fully supported on Windows")
+
+        # Create blobs for different file types
+        file_blob = Blob()
+        file_blob.data = b"regular file content"
+        self.repo.object_store.add_object(file_blob)
+
+        exec_blob = Blob()
+        exec_blob.data = b"#!/bin/sh\necho executable"
+        self.repo.object_store.add_object(exec_blob)
+
+        link_blob = Blob()
+        link_blob.data = b"target/path"
+        self.repo.object_store.add_object(link_blob)
+
+        submodule_sha = b"a" * 40
+
+        # Test 1: Regular file → Submodule
+        tree1 = Tree()
+        tree1[b"item"] = (0o100644, file_blob.id)
+        self.repo.object_store.add_object(tree1)
+
+        tree2 = Tree()
+        tree2[b"item"] = (S_IFGITLINK, submodule_sha)
+        self.repo.object_store.add_object(tree2)
+
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+        self.assertTrue(os.path.isfile(os.path.join(self.tempdir, "item")))
+
+        changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+        update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+        self.assertTrue(os.path.isdir(os.path.join(self.tempdir, "item")))
+
+        # Test 2: Submodule → Executable file
+        tree3 = Tree()
+        tree3[b"item"] = (0o100755, exec_blob.id)
+        self.repo.object_store.add_object(tree3)
+
+        changes = tree_changes(self.repo.object_store, tree2.id, tree3.id)
+        update_working_tree(self.repo, tree2.id, tree3.id, change_iterator=changes)
+        item_path = os.path.join(self.tempdir, "item")
+        self.assertTrue(os.path.isfile(item_path))
+        if sys.platform != "win32":
+            self.assertTrue(os.access(item_path, os.X_OK))
+
+        # Test 3: Executable file → Symlink
+        tree4 = Tree()
+        tree4[b"item"] = (0o120000, link_blob.id)
+        self.repo.object_store.add_object(tree4)
+
+        changes = tree_changes(self.repo.object_store, tree3.id, tree4.id)
+        update_working_tree(self.repo, tree3.id, tree4.id, change_iterator=changes)
+        self.assertTrue(os.path.islink(item_path))
+
+        # Test 4: Symlink → Submodule
+        tree5 = Tree()
+        tree5[b"item"] = (S_IFGITLINK, submodule_sha)
+        self.repo.object_store.add_object(tree5)
+
+        changes = tree_changes(self.repo.object_store, tree4.id, tree5.id)
+        update_working_tree(self.repo, tree4.id, tree5.id, change_iterator=changes)
+        self.assertTrue(os.path.isdir(item_path))
+
+        # Test 5: Clean up - Submodule → absent
+        tree6 = Tree()
+        self.repo.object_store.add_object(tree6)
+
+        changes = tree_changes(self.repo.object_store, tree5.id, tree6.id)
+        update_working_tree(self.repo, tree5.id, tree6.id, change_iterator=changes)
+        self.assertFalse(os.path.exists(item_path))
+
+        # Test 6: Symlink → Executable file
+        tree7 = Tree()
+        tree7[b"item2"] = (0o120000, link_blob.id)
+        self.repo.object_store.add_object(tree7)
+
+        changes = tree_changes(self.repo.object_store, tree6.id, tree7.id)
+        update_working_tree(self.repo, tree6.id, tree7.id, change_iterator=changes)
+        item2_path = os.path.join(self.tempdir, "item2")
+        self.assertTrue(os.path.islink(item2_path))
+
+        tree8 = Tree()
+        tree8[b"item2"] = (0o100755, exec_blob.id)
+        self.repo.object_store.add_object(tree8)
+
+        changes = tree_changes(self.repo.object_store, tree7.id, tree8.id)
+        update_working_tree(self.repo, tree7.id, tree8.id, change_iterator=changes)
+        self.assertTrue(os.path.isfile(item2_path))
+        if sys.platform != "win32":
+            self.assertTrue(os.access(item2_path, os.X_OK))
+
+    def test_update_working_tree_partial_update_failure(self):
+        """Test handling when update fails partway through."""
+        # Create initial tree
+        blob1 = Blob()
+        blob1.data = b"file1 content"
+        self.repo.object_store.add_object(blob1)
+
+        blob2 = Blob()
+        blob2.data = b"file2 content"
+        self.repo.object_store.add_object(blob2)
+
+        tree1 = Tree()
+        tree1[b"file1.txt"] = (0o100644, blob1.id)
+        tree1[b"file2.txt"] = (0o100644, blob2.id)
+        self.repo.object_store.add_object(tree1)
+
+        # Update to tree1
+        changes = tree_changes(self.repo.object_store, None, tree1.id)
+        update_working_tree(self.repo, None, tree1.id, change_iterator=changes)
+
+        # Create a directory where file2.txt is, to cause a conflict
+        file2_path = os.path.join(self.tempdir, "file2.txt")
+        os.remove(file2_path)
+        os.mkdir(file2_path)
+        # Add untracked file to prevent removal
+        with open(os.path.join(file2_path, "blocker.txt"), "w") as f:
+            f.write("blocking content")
+
+        # Create tree with updates to both files
+        blob3 = Blob()
+        blob3.data = b"file1 updated"
+        self.repo.object_store.add_object(blob3)
+
+        blob4 = Blob()
+        blob4.data = b"file2 updated"
+        self.repo.object_store.add_object(blob4)
+
+        tree2 = Tree()
+        tree2[b"file1.txt"] = (0o100644, blob3.id)
+        tree2[b"file2.txt"] = (0o100644, blob4.id)
+        self.repo.object_store.add_object(tree2)
+
+        # Update should partially succeed - file1 updated, file2 blocked
+        try:
+            changes = tree_changes(self.repo.object_store, tree1.id, tree2.id)
+            update_working_tree(self.repo, tree1.id, tree2.id, change_iterator=changes)
+        except IsADirectoryError:
+            # Expected to fail on file2 because it's a directory
+            pass
+
+        # file1 should be updated
+        with open(os.path.join(self.tempdir, "file1.txt"), "rb") as f:
+            self.assertEqual(b"file1 updated", f.read())
+
+        # file2 should still be a directory
+        self.assertTrue(os.path.isdir(file2_path))
+
+    def test_ensure_parent_dir_exists_windows_drive(self):
+        """Test that _ensure_parent_dir_exists handles Windows drive letters correctly."""
+        # Create a temporary directory to work with
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Test normal case (creates directory)
+            test_path = os.path.join(tmpdir, "subdir", "file.txt").encode()
+            _ensure_parent_dir_exists(test_path)
+            self.assertTrue(os.path.exists(os.path.dirname(test_path)))
+
+            # Test when parent is a file (should raise error)
+            file_path = os.path.join(tmpdir, "testfile").encode()
+            with open(file_path, "wb") as f:
+                f.write(b"test")
+
+            invalid_path = os.path.join(
+                tmpdir.encode(), b"testfile", b"subdir", b"file.txt"
+            )
+            with self.assertRaisesRegex(
+                OSError, "Cannot create directory, parent path is a file"
+            ):
+                _ensure_parent_dir_exists(invalid_path)
+
+            # Test with nested subdirectories
+            nested_path = os.path.join(tmpdir, "a", "b", "c", "d", "file.txt").encode()
+            _ensure_parent_dir_exists(nested_path)
+            self.assertTrue(os.path.exists(os.path.dirname(nested_path)))
+
+            # Test that various path formats are handled correctly by os.path.dirname
+            # This includes Windows drive letters, UNC paths, etc.
+            # The key is that we're using os.path.dirname which handles these correctly
+
+            if platform.system() == "Windows":
+                # Test Windows-specific paths only on Windows
+                test_cases = [
+                    b"C:\\temp\\test\\file.txt",
+                    b"D:\\file.txt",
+                    b"\\\\server\\share\\folder\\file.txt",
+                ]
+                for path in test_cases:
+                    # Just verify os.path.dirname handles these without errors
+                    parent = os.path.dirname(path)
+                    # We're not creating these directories, just testing the logic doesn't fail
+                    self.assertIsInstance(parent, bytes)
+
+    def _enable_sparse_checkout(self, patterns):
+        self.repo.get_worktree().set_sparse_checkout_patterns(patterns)
+        config = self.repo.get_config()
+        config.set((b"core",), b"sparseCheckout", True)
+        config.write_to_path()
+
+    def _list_worktree(self):
+        return sorted(name for name in os.listdir(self.tempdir) if name != ".git")
+
+    def _make_tree(self, files):
+        tree = Tree()
+        for path, data in files.items():
+            blob = Blob.from_string(data)
+            self.repo.object_store.add_object(blob)
+            tree[path] = (0o100644, blob.id)
+        self.repo.object_store.add_object(tree)
+        return tree
+
+    def _set_index_flags(self, path, flags, extended_flags=0):
+        index = self.repo.open_index()
+        entry = index[path]
+        entry.flags |= flags
+        entry.extended_flags |= extended_flags
+        index.write()
+
+    def test_update_working_tree_keeps_flags_of_unchanged_entry(self):
+        tree = self._make_tree({b"same": b"a\n", b"changed": b"b\n"})
+        update_working_tree(
+            self.repo,
+            None,
+            tree.id,
+            change_iterator=tree_changes(self.repo.object_store, None, tree.id),
+        )
+        self._set_index_flags(b"same", FLAG_VALID)
+        self._set_index_flags(b"changed", FLAG_VALID)
+
+        new_tree = self._make_tree({b"same": b"a\n", b"changed": b"b2\n"})
+        update_working_tree(
+            self.repo,
+            tree.id,
+            new_tree.id,
+            change_iterator=tree_changes(self.repo.object_store, None, new_tree.id),
+        )
+
+        index = self.repo.open_index()
+        self.assertEqual(FLAG_VALID, index[b"same"].flags)
+        self.assertEqual(0, index[b"changed"].flags)
+
+    def test_sparse_checkout_clears_skip_worktree_of_included_path(self):
+        self._enable_sparse_checkout(["/inc"])
+        tree = self._make_tree({b"inc": b"a\n", b"exc": b"b\n"})
+        update_working_tree(
+            self.repo,
+            None,
+            tree.id,
+            change_iterator=tree_changes(self.repo.object_store, None, tree.id),
+        )
+        self.assertTrue(self.repo.open_index()[b"exc"].skip_worktree)
+
+        self._enable_sparse_checkout(["/inc", "/exc"])
+        update_working_tree(
+            self.repo,
+            tree.id,
+            tree.id,
+            change_iterator=tree_changes(self.repo.object_store, None, tree.id),
+        )
+
+        self.assertEqual(["exc", "inc"], self._list_worktree())
+        entry = self.repo.open_index()[b"exc"]
+        self.assertFalse(entry.skip_worktree)
+        self.assertEqual(0, entry.flags & FLAG_EXTENDED)
+
+    def test_sparse_checkout_excluded_paths(self):
+        self._enable_sparse_checkout(["/inc"])
+        old_tree = self._make_tree({b"inc": b"a\n", b"exc": b"b\n"})
+        new_tree = self._make_tree(
+            {b"inc": b"a2\n", b"exc": b"b2\n", b"exc_new": b"c\n"}
+        )
+
+        update_working_tree(
+            self.repo,
+            None,
+            old_tree.id,
+            change_iterator=tree_changes(self.repo.object_store, None, old_tree.id),
+        )
+        self.assertEqual(["inc"], self._list_worktree())
+
+        update_working_tree(
+            self.repo,
+            old_tree.id,
+            new_tree.id,
+            change_iterator=tree_changes(
+                self.repo.object_store, old_tree.id, new_tree.id
+            ),
+        )
+
+        self.assertEqual(["inc"], self._list_worktree())
+        with open(os.path.join(self.tempdir, "inc"), "rb") as f:
+            self.assertEqual(b"a2\n", f.read())
+        index = self.repo.open_index()
+        self.assertEqual(
+            {
+                b"exc": (new_tree[b"exc"][1], True),
+                b"exc_new": (new_tree[b"exc_new"][1], True),
+                b"inc": (new_tree[b"inc"][1], False),
+            },
+            {path: (entry.sha, entry.skip_worktree) for path, entry in index.items()},
+        )
+
+    def test_sparse_checkout_removes_newly_excluded_file(self):
+        old_tree = self._make_tree({b"inc": b"a\n", b"exc": b"b\n"})
+        new_tree = self._make_tree({b"inc": b"a\n", b"exc": b"b2\n"})
+        update_working_tree(
+            self.repo,
+            None,
+            old_tree.id,
+            change_iterator=tree_changes(self.repo.object_store, None, old_tree.id),
+        )
+        self._enable_sparse_checkout(["/inc"])
+
+        update_working_tree(
+            self.repo,
+            old_tree.id,
+            new_tree.id,
+            change_iterator=tree_changes(
+                self.repo.object_store, old_tree.id, new_tree.id
+            ),
+        )
+
+        self.assertEqual(["inc"], self._list_worktree())
+        self.assertTrue(self.repo.open_index()[b"exc"].skip_worktree)
+
+    def test_sparse_checkout_keeps_untracked_file_at_excluded_path(self):
+        self._enable_sparse_checkout(["/inc"])
+        with open(os.path.join(self.tempdir, "exc"), "wb") as f:
+            f.write(b"untracked\n")
+        tree = self._make_tree({b"inc": b"a\n", b"exc": b"b\n"})
+
+        update_working_tree(
+            self.repo,
+            None,
+            tree.id,
+            change_iterator=tree_changes(self.repo.object_store, None, tree.id),
+        )
+
+        with open(os.path.join(self.tempdir, "exc"), "rb") as f:
+            self.assertEqual(b"untracked\n", f.read())
+        self.assertTrue(self.repo.open_index()[b"exc"].skip_worktree)
+
+    def test_sparse_checkout_empty_patterns_exclude_everything(self):
+        self._enable_sparse_checkout(["# only a comment"])
+        tree = self._make_tree({b"a": b"a\n", b"b": b"b\n"})
+
+        update_working_tree(
+            self.repo,
+            None,
+            tree.id,
+            change_iterator=tree_changes(self.repo.object_store, None, tree.id),
+        )
+
+        self.assertEqual([], self._list_worktree())
+        index = self.repo.open_index()
+        self.assertEqual(
+            {b"a": True, b"b": True},
+            {path: entry.skip_worktree for path, entry in index.items()},
+        )
+
+    def test_sparse_checkout_missing_patterns_file_ignored(self):
+        config = self.repo.get_config()
+        config.set((b"core",), b"sparseCheckout", True)
+        config.write_to_path()
+        tree = self._make_tree({b"a": b"a\n"})
+
+        update_working_tree(
+            self.repo,
+            None,
+            tree.id,
+            change_iterator=tree_changes(self.repo.object_store, None, tree.id),
+        )
+
+        self.assertEqual(["a"], self._list_worktree())
+        self.assertFalse(self.repo.open_index()[b"a"].skip_worktree)
+
+    def test_sparse_checkout_honours_core_ignorecase(self):
+        self._enable_sparse_checkout(["/INC"])
+        config = self.repo.get_config()
+        config.set((b"core",), b"ignorecase", True)
+        config.write_to_path()
+        tree = self._make_tree({b"inc": b"a\n", b"exc": b"b\n"})
+
+        update_working_tree(
+            self.repo,
+            None,
+            tree.id,
+            change_iterator=tree_changes(self.repo.object_store, None, tree.id),
+        )
+
+        self.assertEqual(["inc"], self._list_worktree())
+
+    def test_sparse_checkout_disabled_ignores_patterns(self):
+        self.repo.get_worktree().set_sparse_checkout_patterns(["/inc"])
+        tree = self._make_tree({b"inc": b"a\n", b"exc": b"b\n"})
+
+        update_working_tree(
+            self.repo,
+            None,
+            tree.id,
+            change_iterator=tree_changes(self.repo.object_store, None, tree.id),
+        )
+
+        self.assertEqual(["exc", "inc"], self._list_worktree())
+        self.assertFalse(self.repo.open_index()[b"exc"].skip_worktree)
+
+
+class TestSparseIndex(TestCase):
+    """Tests for sparse index support."""
+
+    def test_serialized_index_entry_is_sparse_dir(self):
+        """Test SerializedIndexEntry.is_sparse_dir() method."""
+        # Regular file entry - not sparse
+        regular_entry = SerializedIndexEntry(
+            name=b"file.txt",
+            ctime=0,
+            mtime=0,
+            dev=0,
+            ino=0,
+            mode=0o100644,
+            uid=0,
+            gid=0,
+            size=0,
+            sha=b"\x00" * 20,
+            flags=0,
+            extended_flags=0,
+        )
+        self.assertFalse(regular_entry.is_sparse_dir())
+
+        # Directory mode but no skip-worktree flag - not sparse
+        dir_entry = SerializedIndexEntry(
+            name=b"dir/",
+            ctime=0,
+            mtime=0,
+            dev=0,
+            ino=0,
+            mode=stat.S_IFDIR,
+            uid=0,
+            gid=0,
+            size=0,
+            sha=b"\x00" * 20,
+            flags=0,
+            extended_flags=0,
+        )
+        self.assertFalse(dir_entry.is_sparse_dir())
+
+        # Skip-worktree flag but not directory - not sparse
+        skip_file = SerializedIndexEntry(
+            name=b"file.txt",
+            ctime=0,
+            mtime=0,
+            dev=0,
+            ino=0,
+            mode=0o100644,
+            uid=0,
+            gid=0,
+            size=0,
+            sha=b"\x00" * 20,
+            flags=0,
+            extended_flags=EXTENDED_FLAG_SKIP_WORKTREE,
+        )
+        self.assertFalse(skip_file.is_sparse_dir())
+
+        # Directory mode + skip-worktree + trailing slash - sparse!
+        sparse_dir = SerializedIndexEntry(
+            name=b"sparse_dir/",
+            ctime=0,
+            mtime=0,
+            dev=0,
+            ino=0,
+            mode=stat.S_IFDIR,
+            uid=0,
+            gid=0,
+            size=0,
+            sha=b"\x00" * 20,
+            flags=0,
+            extended_flags=EXTENDED_FLAG_SKIP_WORKTREE,
+        )
+        self.assertTrue(sparse_dir.is_sparse_dir())
+
+    def test_index_entry_is_sparse_dir(self):
+        """Test IndexEntry.is_sparse_dir() method."""
+        # Regular file - not sparse
+        regular = IndexEntry(
+            ctime=0,
+            mtime=0,
+            dev=0,
+            ino=0,
+            mode=0o100644,
+            uid=0,
+            gid=0,
+            size=0,
+            sha=b"\x00" * 20,
+            extended_flags=0,
+        )
+        self.assertFalse(regular.is_sparse_dir(b"file.txt"))
+
+        # Sparse directory entry
+        sparse = IndexEntry(
+            ctime=0,
+            mtime=0,
+            dev=0,
+            ino=0,
+            mode=stat.S_IFDIR,
+            uid=0,
+            gid=0,
+            size=0,
+            sha=b"\x00" * 20,
+            extended_flags=EXTENDED_FLAG_SKIP_WORKTREE,
+        )
+        self.assertTrue(sparse.is_sparse_dir(b"dir/"))
+        self.assertFalse(sparse.is_sparse_dir(b"dir"))  # No trailing slash
+
+    def test_sparse_dir_extension(self):
+        """Test SparseDirExtension serialization."""
+        ext = SparseDirExtension()
+        self.assertEqual(ext.signature, SDIR_EXTENSION)
+        self.assertEqual(ext.to_bytes(), b"")
+
+        # Test round-trip
+        ext2 = SparseDirExtension.from_bytes(b"")
+        self.assertEqual(ext2.signature, SDIR_EXTENSION)
+        self.assertEqual(ext2.to_bytes(), b"")
+
+    def test_index_is_sparse(self):
+        """Test Index.is_sparse() method."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index_path = os.path.join(tmpdir, "index")
+            idx = Index(index_path, read=False)
+
+            # Initially not sparse
+            self.assertFalse(idx.is_sparse())
+
+            # Add sparse directory extension
+            idx._extensions.append(SparseDirExtension())
+            self.assertTrue(idx.is_sparse())
+
+    def test_index_expansion(self):
+        """Test Index.ensure_full_index() expands sparse directories."""
+        # Create a tree structure
+        store = MemoryObjectStore()
+
+        blob1 = Blob()
+        blob1.data = b"file1"
+        store.add_object(blob1)
+
+        blob2 = Blob()
+        blob2.data = b"file2"
+        store.add_object(blob2)
+
+        subtree = Tree()
+        subtree[b"file1.txt"] = (0o100644, blob1.id)
+        subtree[b"file2.txt"] = (0o100644, blob2.id)
+        store.add_object(subtree)
+
+        # Create an index with a sparse directory entry
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index_path = os.path.join(tmpdir, "index")
+            idx = Index(index_path, read=False)
+
+            # Add sparse directory entry
+            sparse_entry = IndexEntry(
+                ctime=0,
+                mtime=0,
+                dev=0,
+                ino=0,
+                mode=stat.S_IFDIR,
+                uid=0,
+                gid=0,
+                size=0,
+                sha=subtree.id,
+                extended_flags=EXTENDED_FLAG_SKIP_WORKTREE,
+            )
+            idx[b"subdir/"] = sparse_entry
+            idx._extensions.append(SparseDirExtension())
+
+            self.assertTrue(idx.is_sparse())
+            self.assertEqual(len(idx), 1)
+
+            # Expand the index
+            idx.ensure_full_index(store)
+
+            # Should no longer be sparse
+            self.assertFalse(idx.is_sparse())
+
+            # Should have 2 entries now (the files)
+            self.assertEqual(len(idx), 2)
+            self.assertIn(b"subdir/file1.txt", idx)
+            self.assertIn(b"subdir/file2.txt", idx)
+
+            # Entries should point to the correct blobs
+            self.assertEqual(idx[b"subdir/file1.txt"].sha, blob1.id)
+            self.assertEqual(idx[b"subdir/file2.txt"].sha, blob2.id)
+
+    def test_index_collapse(self):
+        """Test Index.convert_to_sparse() collapses directories."""
+        # Create a tree structure
+        store = MemoryObjectStore()
+
+        blob1 = Blob()
+        blob1.data = b"file1"
+        store.add_object(blob1)
+
+        blob2 = Blob()
+        blob2.data = b"file2"
+        store.add_object(blob2)
+
+        subtree = Tree()
+        subtree[b"file1.txt"] = (0o100644, blob1.id)
+        subtree[b"file2.txt"] = (0o100644, blob2.id)
+        store.add_object(subtree)
+
+        tree = Tree()
+        tree[b"subdir"] = (stat.S_IFDIR, subtree.id)
+        store.add_object(tree)
+
+        # Create an index with full entries
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index_path = os.path.join(tmpdir, "index")
+            idx = Index(index_path, read=False)
+
+            idx[b"subdir/file1.txt"] = IndexEntry(
+                ctime=0,
+                mtime=0,
+                dev=0,
+                ino=0,
+                mode=0o100644,
+                uid=0,
+                gid=0,
+                size=5,
+                sha=blob1.id,
+                extended_flags=0,
+            )
+            idx[b"subdir/file2.txt"] = IndexEntry(
+                ctime=0,
+                mtime=0,
+                dev=0,
+                ino=0,
+                mode=0o100644,
+                uid=0,
+                gid=0,
+                size=5,
+                sha=blob2.id,
+                extended_flags=0,
+            )
+
+            self.assertEqual(len(idx), 2)
+            self.assertFalse(idx.is_sparse())
+
+            # Collapse subdir to sparse
+            idx.convert_to_sparse(store, tree.id, {b"subdir/"})
+
+            # Should now be sparse
+            self.assertTrue(idx.is_sparse())
+
+            # Should have 1 entry (the sparse dir)
+            self.assertEqual(len(idx), 1)
+            self.assertIn(b"subdir/", idx)
+
+            # Entry should be a sparse directory
+            entry = idx[b"subdir/"]
+            self.assertTrue(entry.is_sparse_dir(b"subdir/"))
+            self.assertEqual(entry.sha, subtree.id)

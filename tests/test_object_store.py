@@ -1,0 +1,2155 @@
+# test_object_store.py -- tests for object_store.py
+# Copyright (C) 2008 Jelmer Vernooij <jelmer@jelmer.uk>
+#
+# SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+# Dulwich is dual-licensed under the Apache License, Version 2.0 and the GNU
+# General Public License as published by the Free Software Foundation; version 2.0
+# or (at your option) any later version. You can redistribute it and/or
+# modify it under the terms of either of these two licenses.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# You should have received a copy of the licenses; if not, see
+# <http://www.gnu.org/licenses/> for a copy of the GNU General Public License
+# and <http://www.apache.org/licenses/LICENSE-2.0> for a copy of the Apache
+# License, Version 2.0.
+#
+
+"""Tests for the object store interface."""
+
+import mmap
+import os
+import shutil
+import stat
+import sys
+import tempfile
+import time
+from contextlib import closing
+from io import BytesIO
+from unittest.mock import patch
+
+import dulwich.pack
+from dulwich.config import ConfigDict
+from dulwich.errors import (
+    ApplyDeltaError,
+    ChecksumMismatch,
+    NotTreeError,
+    ObjectFormatException,
+)
+from dulwich.file import GitFile
+from dulwich.gc import garbage_collect
+from dulwich.index import commit_tree
+from dulwich.midx import write_midx_file
+from dulwich.object_format import DEFAULT_OBJECT_FORMAT, SHA256
+from dulwich.object_store import (
+    DEFAULT_TEMPFILE_GRACE_PERIOD,
+    DiskObjectStore,
+    GraphTraversalReachability,
+    MemoryObjectStore,
+    ObjectStoreGraphWalker,
+    OverlayObjectStore,
+    PackInputTooLarge,
+    commit_tree_changes,
+    find_shallow,
+    get_depth,
+    read_packs_file,
+    tree_lookup_path,
+)
+from dulwich.objects import (
+    S_IFGITLINK,
+    Blob,
+    Commit,
+    EmptyFileException,
+    SubmoduleEncountered,
+    Tree,
+    TreeEntry,
+    hex_to_sha,
+    sha_to_hex,
+)
+from dulwich.pack import (
+    DEFAULT_DELTA_BASE_CACHE_LIMIT,
+    OFS_DELTA,
+    REF_DELTA,
+    HashWriter,
+    Pack,
+    SHA1Writer,
+    UnresolvedDeltas,
+    create_delta,
+    load_pack_index,
+    write_pack_header,
+    write_pack_object,
+    write_pack_objects,
+)
+from dulwich.repo import Repo
+from dulwich.tests.test_object_store import ObjectStoreTests, PackBasedObjectStoreTests
+from dulwich.tests.utils import build_pack, make_object, make_tag
+
+from . import TestCase
+
+testobject = make_object(Blob, data=b"yummy data")
+
+
+class OverlayObjectStoreTests(ObjectStoreTests, TestCase):
+    def setUp(self) -> None:
+        TestCase.setUp(self)
+        self.bases = [MemoryObjectStore(), MemoryObjectStore()]
+        self.store = OverlayObjectStore(self.bases, self.bases[0])
+
+
+class MemoryObjectStoreTests(ObjectStoreTests, TestCase):
+    def setUp(self) -> None:
+        TestCase.setUp(self)
+        self.store = MemoryObjectStore()
+
+    def test_peel_cache_invalidated_on_delete(self) -> None:
+        """Deleting objects drops memoized peel results."""
+        base = testobject
+        self.store.add_object(base)
+        tag = make_tag(base, name=b"1")
+        self.store.add_object(tag)
+
+        self.assertEqual((tag, base), self.store.peel(tag.id))
+        self.assertEqual(base.id, self.store._peel_cache.get(tag.id))
+
+        del self.store[tag.id]
+        self.assertEqual(None, self.store._peel_cache.get(tag.id))
+
+    def test_add_pack(self) -> None:
+        o = MemoryObjectStore()
+        f, commit, abort = o.add_pack()
+        try:
+            b = make_object(Blob, data=b"more yummy data")
+            write_pack_objects(
+                f.write, [(b, None)], object_format=DEFAULT_OBJECT_FORMAT
+            )
+        except BaseException:
+            abort()
+            raise
+        else:
+            commit()
+
+    def test_add_pack_emtpy(self) -> None:
+        o = MemoryObjectStore()
+        _f, commit, _abort = o.add_pack()
+        commit()
+
+    def test_add_thin_pack(self) -> None:
+        o = MemoryObjectStore()
+        blob = make_object(Blob, data=b"yummy data")
+        o.add_object(blob)
+
+        f = BytesIO()
+        entries = build_pack(
+            f,
+            [
+                (REF_DELTA, (blob.id, b"more yummy data")),
+            ],
+            store=o,
+        )
+        o.add_thin_pack(f.read, None)
+        packed_blob_sha = sha_to_hex(entries[0][3])
+        self.assertEqual(
+            (Blob.type_num, b"more yummy data"), o.get_raw(packed_blob_sha)
+        )
+
+    def test_add_thin_pack_empty(self) -> None:
+        o = MemoryObjectStore()
+
+        f = BytesIO()
+        entries = build_pack(f, [], store=o)
+        self.assertEqual([], entries)
+        o.add_thin_pack(f.read, None)
+
+    def test_add_thin_pack_max_input_size(self) -> None:
+        o = MemoryObjectStore()
+        blob = make_object(Blob, data=b"yummy data")
+        o.add_object(blob)
+
+        f = BytesIO()
+        entries = build_pack(f, [(REF_DELTA, (blob.id, b"more yummy data"))], store=o)
+
+        with self.assertRaises(PackInputTooLarge):
+            o.add_thin_pack(f.read, None, max_input_size=8)
+        self.assertNotIn(sha_to_hex(entries[0][3]), o)
+
+    def test_add_pack_rejects_truncated_checksum(self) -> None:
+        # A pack stream that lost the last few bytes of its trailing
+        # checksum must be rejected by MemoryObjectStore.add_pack;
+        # otherwise a MemoryRepo non-thin fetch would silently accept
+        # truncated network input. add_thin_pack already validates via
+        # PackStreamCopier.verify().
+        o = MemoryObjectStore()
+        f, commit, abort = o.add_pack()
+        try:
+            scratch = BytesIO()
+            build_pack(scratch, [(Blob.type_num, b"hello world")])
+            data = scratch.getvalue()
+            # Drop a few bytes of the 20-byte trailing checksum.
+            f.write(data[:-5])
+            self.assertRaises(ChecksumMismatch, commit)
+        except BaseException:
+            abort()
+            raise
+        # The truncated pack must not have leaked objects into the store.
+        self.assertEqual([], list(o))
+
+    def test_add_pack_data_with_deltas(self) -> None:
+        """Test that add_pack_data properly handles delta objects.
+
+        This test verifies that MemoryObjectStore.add_pack_data can handle
+        pack data containing delta objects. Before the fix for issue #1179,
+        this would fail with AssertionError when trying to call sha_file()
+        on unresolved delta objects.
+
+        The fix routes through add_pack() which properly resolves deltas.
+        """
+        o1 = MemoryObjectStore()
+        o2 = MemoryObjectStore()
+        base_blob = make_object(Blob, data=b"base data")
+        o1.add_object(base_blob)
+
+        # Create a pack with a delta object
+        f = BytesIO()
+        entries = build_pack(
+            f,
+            [
+                (REF_DELTA, (base_blob.id, b"more data")),
+            ],
+            store=o1,
+        )
+
+        # Use add_thin_pack which internally calls add_pack_data
+        # This demonstrates the scenario where delta resolution is needed
+        f.seek(0)
+        o2.add_object(base_blob)  # Need base object for thin pack
+        o2.add_thin_pack(f.read, None)
+
+        # Verify the delta object was properly resolved and added
+        packed_blob_sha = sha_to_hex(entries[0][3])
+        self.assertIn(packed_blob_sha, o2)
+        self.assertEqual((Blob.type_num, b"more data"), o2.get_raw(packed_blob_sha))
+
+
+class DiskObjectStoreTests(PackBasedObjectStoreTests, TestCase):
+    def setUp(self) -> None:
+        TestCase.setUp(self)
+        self.store_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.store_dir)
+        self.store = DiskObjectStore.init(self.store_dir)
+
+    def tearDown(self) -> None:
+        TestCase.tearDown(self)
+        PackBasedObjectStoreTests.tearDown(self)
+
+    def test_contains_rejects_invalid_sha(self) -> None:
+        # A malformed object id (e.g. one advertised by a malicious server)
+        # must not be turned into a path that escapes the objects directory.
+        for bad in (b"../../config", b"../../../../etc/passwd"):
+            self.assertRaises(ValueError, self.store.__contains__, bad)
+
+    def test_get_shafile_path_rejects_invalid_sha(self) -> None:
+        self.assertRaises(
+            ValueError, self.store._get_shafile_path, b"../../../../etc/passwd"
+        )
+
+    def test_add_object_freshens_existing_object(self) -> None:
+        # Re-adding an object that is already on disk must refresh its mtime.
+        # Otherwise it stays a candidate for age-based pruning and a
+        # concurrent "git gc" can remove it before the caller has created a
+        # reference to it.
+        b = make_object(Blob, data=b"freshen me")
+        self.store.add_object(b)
+        path = self.store._get_shafile_path(b.id)
+        stale = time.time() - 30 * 24 * 60 * 60
+        os.utime(path, (stale, stale))
+        self.store.add_object(b)
+        self.assertGreater(os.stat(path).st_mtime, stale)
+
+    def test_add_object_writes_when_object_is_missing(self) -> None:
+        # The freshen attempt must not swallow the write when the object
+        # turned out not to be on disk after all.
+        b = make_object(Blob, data=b"write me")
+        self.store.add_object(b)
+        path = self.store._get_shafile_path(b.id)
+        os.unlink(path)
+        self.store.add_object(b)
+        self.assertTrue(os.path.exists(path))
+
+    def test_add_object_writes_when_freshening_fails(self) -> None:
+        # A failing utime() (e.g. EPERM on an object owned by another user in
+        # a shared repository) leaves the mtime stale, so the object has to be
+        # written out rather than skipped.
+        b = make_object(Blob, data=b"rewrite me")
+        self.store.add_object(b)
+        path = self.store._get_shafile_path(b.id)
+        stale = time.time() - 30 * 24 * 60 * 60
+        os.utime(path, (stale, stale))
+        with patch("dulwich.object_store.os.utime", side_effect=PermissionError):
+            self.store.add_object(b)
+        # Rewriting the object gives it a fresh mtime of its own.
+        self.assertGreater(os.stat(path).st_mtime, stale)
+        self.assertEqual(b.data, self.store[b.id].data)
+
+    def test_loose_compression_level(self) -> None:
+        alternate_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, alternate_dir)
+        alternate_store = DiskObjectStore(alternate_dir, loose_compression_level=6)
+        self.addCleanup(alternate_store.close)
+        b2 = make_object(Blob, data=b"yummy data")
+        alternate_store.add_object(b2)
+
+    def test_alternates(self) -> None:
+        alternate_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, alternate_dir)
+        alternate_store = DiskObjectStore(alternate_dir)
+        self.addCleanup(alternate_store.close)
+        b2 = make_object(Blob, data=b"yummy data")
+        alternate_store.add_object(b2)
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        self.assertRaises(KeyError, store.__getitem__, b2.id)
+        store.add_alternate_path(alternate_dir)
+        self.assertIn(b2.id, store)
+        self.assertEqual(b2, store[b2.id])
+
+    def test_alternates_kwarg(self) -> None:
+        # An explicit alternates= list is consulted alongside the on-disk
+        # alternates file (used to plumb GIT_ALTERNATE_OBJECT_DIRECTORIES).
+        alternate_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, alternate_dir)
+        alternate_store = DiskObjectStore(alternate_dir)
+        self.addCleanup(alternate_store.close)
+        b2 = make_object(Blob, data=b"kwarg alternate")
+        alternate_store.add_object(b2)
+
+        store = DiskObjectStore(self.store_dir, alternates=[alternate_dir])
+        self.addCleanup(store.close)
+        self.assertIn(b2.id, store)
+        self.assertEqual(b2, store[b2.id])
+
+    def test_alternates_kwarg_after_file_entries(self) -> None:
+        # File entries are consulted first; kwarg entries are appended.
+        file_alt = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, file_alt)
+        DiskObjectStore(file_alt).close()
+        kw_alt = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, kw_alt)
+        DiskObjectStore(kw_alt).close()
+
+        store = DiskObjectStore(self.store_dir, alternates=[kw_alt])
+        self.addCleanup(store.close)
+        store.add_alternate_path(file_alt)
+        # add_alternate_path force-appends; but the important assertion is
+        # that the kwarg entry is still present.
+        paths = [alt.path for alt in store.alternates]
+        self.assertIn(kw_alt, paths)
+
+    def test_read_alternate_paths(self) -> None:
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+
+        abs_path = os.path.abspath(os.path.normpath("/abspath"))
+        # ensures in particular existence of the alternates file
+        store.add_alternate_path(abs_path)
+        self.assertEqual(set(store._read_alternate_paths()), {abs_path})
+
+        store.add_alternate_path("relative-path")
+        self.assertIn(
+            os.path.join(store.path, "relative-path"),
+            set(store._read_alternate_paths()),
+        )
+
+        # arguably, add_alternate_path() could strip comments.
+        # Meanwhile it's more convenient to use it than to import INFODIR
+        store.add_alternate_path("# comment")
+        for alt_path in store._read_alternate_paths():
+            self.assertNotIn("#", alt_path)
+
+    def test_file_modes(self) -> None:
+        self.store.add_object(testobject)
+        path = self.store._get_shafile_path(testobject.id)
+        mode = os.stat(path).st_mode
+
+        packmode = "0o100444" if sys.platform != "win32" else "0o100666"
+        self.assertEqual(oct(mode), packmode)
+
+    def test_corrupted_object_raise_exception(self) -> None:
+        """Corrupted sha1 disk file should raise specific exception."""
+        self.store.add_object(testobject)
+        self.assertEqual(
+            (Blob.type_num, b"yummy data"), self.store.get_raw(testobject.id)
+        )
+        self.assertTrue(self.store.contains_loose(testobject.id))
+        self.assertIsNotNone(self.store._get_loose_object(testobject.id))
+
+        path = self.store._get_shafile_path(testobject.id)
+        old_mode = os.stat(path).st_mode
+        os.chmod(path, 0o600)
+        with open(path, "wb") as f:  # corrupt the file
+            f.write(b"")
+        os.chmod(path, old_mode)
+
+        expected_error_msg = "Corrupted empty file detected"
+        try:
+            self.store.contains_loose(testobject.id)
+        except EmptyFileException as e:
+            self.assertEqual(str(e), expected_error_msg)
+
+        try:
+            self.store._get_loose_object(testobject.id)
+        except EmptyFileException as e:
+            self.assertEqual(str(e), expected_error_msg)
+
+        # this does not change iteration on loose objects though
+        self.assertEqual([testobject.id], list(self.store._iter_loose_objects()))
+
+    def test_getitem_verifies_sha(self) -> None:
+        """Retrieving a loose object stored under a wrong sha is rejected."""
+        self.store.add_object(testobject)
+        wrong_sha = b"1" * 40
+        path = self.store._get_shafile_path(wrong_sha)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with GitFile(path, "wb") as f:
+            f.write(testobject.as_legacy_object())
+        self.assertRaises(ChecksumMismatch, self.store.__getitem__, wrong_sha)
+
+    def test_tempfile_in_loose_store(self) -> None:
+        self.store.add_object(testobject)
+        self.assertEqual([testobject.id], list(self.store._iter_loose_objects()))
+
+        # add temporary files to the loose store
+        for i in range(256):
+            dirname = os.path.join(self.store_dir, f"{i:02x}")
+            if not os.path.isdir(dirname):
+                os.makedirs(dirname)
+            fd, _n = tempfile.mkstemp(prefix="tmp_obj_", dir=dirname)
+            os.close(fd)
+
+        self.assertEqual([testobject.id], list(self.store._iter_loose_objects()))
+
+    def test_repack_identical_does_not_leak_tempfile(self) -> None:
+        pack_dir = self.store.pack_dir
+        b = make_object(Blob, data=b"yummy data")
+        self.store.add_objects([(b, None)])
+        self.assertEqual(1, len(self.store.packs))
+
+        self.store.repack()
+        self.assertEqual(1, len(self.store.packs))
+
+        leftover = [
+            n
+            for n in os.listdir(pack_dir)
+            if n.endswith(".pack") and not n.startswith("pack-")
+        ]
+        self.assertEqual([], leftover)
+
+    def test_add_alternate_path(self) -> None:
+        store = DiskObjectStore(self.store_dir)
+        self.assertEqual([], list(store._read_alternate_paths()))
+        store.add_alternate_path(os.path.abspath("/foo/path"))
+        self.assertEqual(
+            [os.path.abspath("/foo/path")], list(store._read_alternate_paths())
+        )
+        if sys.platform == "win32":
+            store.add_alternate_path("D:\\bar\\path")
+        else:
+            store.add_alternate_path("/bar/path")
+
+        if sys.platform == "win32":
+            self.assertEqual(
+                [os.path.abspath("/foo/path"), "D:\\bar\\path"],
+                list(store._read_alternate_paths()),
+            )
+        else:
+            self.assertEqual(
+                [os.path.abspath("/foo/path"), "/bar/path"],
+                list(store._read_alternate_paths()),
+            )
+
+    def test_rel_alternative_path(self) -> None:
+        alternate_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, alternate_dir)
+        alternate_store = DiskObjectStore(alternate_dir)
+        self.addCleanup(alternate_store.close)
+        b2 = make_object(Blob, data=b"yummy data")
+        alternate_store.add_object(b2)
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        self.assertRaises(KeyError, store.__getitem__, b2.id)
+        store.add_alternate_path(os.path.relpath(alternate_dir, self.store_dir))
+        self.assertEqual(list(alternate_store), list(store.alternates[0]))
+        self.assertIn(b2.id, store)
+        self.assertEqual(b2, store[b2.id])
+
+    def test_pack_dir(self) -> None:
+        o = DiskObjectStore(self.store_dir)
+        self.assertEqual(os.path.join(self.store_dir, "pack"), o.pack_dir)
+
+    def test_add_pack(self) -> None:
+        o = DiskObjectStore(self.store_dir)
+        self.addCleanup(o.close)
+        f, commit, abort = o.add_pack()
+        try:
+            b = make_object(Blob, data=b"more yummy data")
+            write_pack_objects(
+                f.write, [(b, None)], object_format=DEFAULT_OBJECT_FORMAT
+            )
+        except BaseException:
+            abort()
+            raise
+        else:
+            commit()
+
+    def test_add_pack_unmaps_before_rename(self) -> None:
+        """The pack must not still be mapped when it is renamed into place.
+
+        commit() maps the temporary pack to index it, then hands the same
+        file to _complete_pack to append bases to and rename. Windows
+        refuses both while a mapping is alive.
+        """
+        o = DiskObjectStore(self.store_dir)
+        self.addCleanup(o.close)
+
+        mappings = []
+        real_load = dulwich.pack._load_file_contents
+
+        def tracking_load(f, size=None):
+            contents, size = real_load(f, size)
+            mappings.append(contents)
+            return contents, size
+
+        open_at_rename = []
+        real_rename = os.rename
+
+        def checking_rename(src, dst):
+            open_at_rename.extend(
+                m for m in mappings if isinstance(m, mmap.mmap) and not m.closed
+            )
+            return real_rename(src, dst)
+
+        f, commit, abort = o.add_pack()
+        try:
+            b = make_object(Blob, data=b"more yummy data")
+            write_pack_objects(
+                f.write, [(b, None)], object_format=DEFAULT_OBJECT_FORMAT
+            )
+        except BaseException:
+            abort()
+            raise
+        with (
+            patch.object(dulwich.pack, "_load_file_contents", tracking_load),
+            patch("dulwich.object_store.os.rename", checking_rename),
+        ):
+            commit()
+        self.assertEqual([], open_at_rename)
+
+    def test_add_thin_pack(self) -> None:
+        o = DiskObjectStore(self.store_dir)
+        self.addCleanup(o.close)
+
+        blob = make_object(Blob, data=b"yummy data")
+        o.add_object(blob)
+
+        f = BytesIO()
+        entries = build_pack(
+            f,
+            [
+                (REF_DELTA, (blob.id, b"more yummy data")),
+            ],
+            store=o,
+        )
+
+        with o.add_thin_pack(f.read, None) as pack:
+            packed_blob_sha = sha_to_hex(entries[0][3])
+            pack.check_length_and_checksum()
+            self.assertEqual(sorted([blob.id, packed_blob_sha]), list(pack))
+            self.assertTrue(o.contains_packed(packed_blob_sha))
+            self.assertTrue(o.contains_packed(blob.id))
+            self.assertEqual(
+                (Blob.type_num, b"more yummy data"),
+                o.get_raw(packed_blob_sha),
+            )
+
+    def test_add_thin_pack_empty(self) -> None:
+        with closing(DiskObjectStore(self.store_dir)) as o:
+            f = BytesIO()
+            entries = build_pack(f, [], store=o)
+            self.assertEqual([], entries)
+            o.add_thin_pack(f.read, None)
+
+    def _assert_nothing_left_behind(self, o: DiskObjectStore) -> None:
+        self.assertEqual([], os.listdir(o.pack_dir))
+        self.assertEqual(
+            [], [n for n in os.listdir(o.path) if n.startswith("tmp_pack_")]
+        )
+
+    def test_add_thin_pack_delta_chain(self) -> None:
+        # A chain of depth 3 that starts at a base outside the pack: a ref
+        # delta to the external blob, an ofs delta on that, and an in-pack
+        # ref delta on the ofs delta, plus a full object.
+        o = DiskObjectStore(self.store_dir)
+        self.addCleanup(o.close)
+        blob = make_object(Blob, data=b"yummy data")
+        o.add_object(blob)
+
+        f = BytesIO()
+        entries = build_pack(
+            f,
+            [
+                (REF_DELTA, (blob.id, b"yummy data, one")),
+                (OFS_DELTA, (0, b"yummy data, one, two")),
+                (REF_DELTA, (1, b"yummy data, one, two, three")),
+                (Blob.type_num, b"standalone"),
+            ],
+            store=o,
+        )
+
+        with o.add_thin_pack(f.read, None) as pack:
+            pack.check()
+            shas = [sha_to_hex(e[3]) for e in entries]
+            self.assertEqual(sorted([blob.id, *shas]), sorted(pack))
+            for (_, type_num, data, _, _), sha in zip(entries, shas):
+                self.assertEqual((type_num, data), o.get_raw(sha))
+            # The external base is appended to complete the pack.
+            self.assertEqual((Blob.type_num, b"yummy data"), pack.get_raw(blob.id))
+
+    def test_add_thin_pack_tree_delta(self) -> None:
+        o = DiskObjectStore(self.store_dir)
+        self.addCleanup(o.close)
+        blob = make_object(Blob, data=b"yummy data")
+        tree = Tree()
+        tree.add(b"a", 0o100644, blob.id)
+        o.add_objects([(blob, None), (tree, None)])
+        new_tree = Tree()
+        new_tree.add(b"a", 0o100644, blob.id)
+        new_tree.add(b"b", 0o100644, blob.id)
+
+        f = BytesIO()
+        build_pack(f, [(REF_DELTA, (tree.id, new_tree.as_raw_string()))], store=o)
+
+        with o.add_thin_pack(f.read, None) as pack:
+            self.assertIn(new_tree.id, pack)
+            self.assertEqual(new_tree, o[new_tree.id])
+
+    def test_add_thin_pack_walks_pack_once(self) -> None:
+        o = DiskObjectStore(self.store_dir)
+        self.addCleanup(o.close)
+        blob = make_object(Blob, data=b"yummy data")
+        o.add_object(blob)
+
+        f = BytesIO()
+        build_pack(
+            f,
+            [
+                (REF_DELTA, (blob.id, b"yummy data, one")),
+                (OFS_DELTA, (0, b"yummy data, one, two")),
+                (Blob.type_num, b"standalone"),
+            ],
+            store=o,
+        )
+
+        with patch.object(dulwich.pack.PackInflater, "for_pack_data") as inflate:
+            o.add_thin_pack(f.read, None).close()
+        inflate.assert_not_called()
+
+    def test_add_thin_pack_sha256_tree_delta(self) -> None:
+        store_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, store_dir)
+        o = DiskObjectStore.init(store_dir, object_format=SHA256)
+        self.addCleanup(o.close)
+        blob = make_object(Blob, data=b"yummy data")
+        o.add_object(blob)
+        blob_id = blob.get_id(SHA256)
+        tree = Tree()
+        tree.add(b"a", 0o100644, blob_id)
+        o.add_object(tree)
+        new_tree = Tree()
+        new_tree.add(b"a", 0o100644, blob_id)
+        new_tree.add(b"b", 0o100644, blob_id)
+
+        f = BytesIO()
+        sf = HashWriter(f, SHA256.hash_func)
+        write_pack_header(sf.write, 1)
+        delta = list(create_delta(tree.as_raw_string(), new_tree.as_raw_string()))
+        write_pack_object(
+            sf.write,
+            REF_DELTA,
+            (hex_to_sha(tree.get_id(SHA256)), delta),
+            object_format=SHA256,
+        )
+        sf.write_hash()
+        f.seek(0)
+
+        new_id = new_tree.get_id(SHA256)
+        with o.add_thin_pack(f.read, None) as pack:
+            self.assertIn(new_id, pack)
+            self.assertEqual(new_tree.items(), o[new_id].items())
+
+    def test_add_thin_pack_rejects_malformed_tree_delta(self) -> None:
+        # A delta that resolves to a tree which cannot be parsed must not be
+        # ingested, as for a full object in test_add_pack_rejects_malformed_tree.
+        o = DiskObjectStore(self.store_dir)
+        self.addCleanup(o.close)
+        tree = Tree()
+        tree.add(b"a", 0o100644, make_object(Blob, data=b"yummy data").id)
+        o.add_object(tree)
+
+        f = BytesIO()
+        build_pack(f, [(REF_DELTA, (tree.id, b"this is not a tree at all"))], store=o)
+
+        self.assertRaises(ObjectFormatException, o.add_thin_pack, f.read, None)
+        self._assert_nothing_left_behind(o)
+
+    def test_add_thin_pack_rejects_corrupt_delta(self) -> None:
+        o = DiskObjectStore(self.store_dir)
+        self.addCleanup(o.close)
+        blob = make_object(Blob, data=b"yummy data")
+        o.add_object(blob)
+
+        # A delta made against a different base: its source size does not
+        # match the blob it claims to apply to.
+        f = BytesIO()
+        sf = SHA1Writer(f)
+        write_pack_header(sf.write, 1)
+        delta = list(create_delta(b"some other base data", b"more yummy data"))
+        write_pack_object(
+            sf.write,
+            REF_DELTA,
+            (hex_to_sha(blob.id), delta),
+            object_format=DEFAULT_OBJECT_FORMAT,
+        )
+        sf.write_sha()
+        f.seek(0)
+
+        self.assertRaises(ApplyDeltaError, o.add_thin_pack, f.read, None)
+        self._assert_nothing_left_behind(o)
+
+    def test_add_thin_pack_missing_external_base(self) -> None:
+        o = DiskObjectStore(self.store_dir)
+        self.addCleanup(o.close)
+        other = MemoryObjectStore()
+        blob = make_object(Blob, data=b"yummy data")
+        other.add_object(blob)
+
+        f = BytesIO()
+        build_pack(f, [(REF_DELTA, (blob.id, b"more yummy data"))], store=other)
+
+        self.assertRaises(UnresolvedDeltas, o.add_thin_pack, f.read, None)
+        self._assert_nothing_left_behind(o)
+
+    def test_add_pack_rejects_malformed_tree(self) -> None:
+        # A pack containing a "tree" whose body cannot be parsed must not
+        # be ingested: MemoryObjectStore and ``git fsck`` already reject
+        # such objects, so DiskObjectStore must too. Otherwise a malicious
+        # remote can poison the repository.
+        o = DiskObjectStore(self.store_dir)
+        self.addCleanup(o.close)
+        f, commit, abort = o.add_pack()
+        try:
+            build_pack(f, [(Tree.type_num, b"this is not a tree at all")])
+            # build_pack rewinds f; commit() detects the pack only when
+            # f.tell() > 0, so re-seek to the end of the written pack.
+            f.seek(0, os.SEEK_END)
+            self.assertRaises(ObjectFormatException, commit)
+        except BaseException:
+            abort()
+            raise
+        # No pack/index files should have been left behind.
+        self.assertEqual([], os.listdir(o.pack_dir))
+
+    def test_add_thin_pack_max_input_size(self) -> None:
+        """Bounding wire input rejects packs exceeding the cap.
+
+        Mirrors git's ``receive.maxInputSize`` semantics.
+        """
+        o = DiskObjectStore(self.store_dir)
+        self.addCleanup(o.close)
+
+        blob = make_object(Blob, data=b"yummy data")
+        o.add_object(blob)
+
+        f = BytesIO()
+        build_pack(
+            f,
+            [(REF_DELTA, (blob.id, b"more yummy data"))],
+            store=o,
+        )
+
+        with self.assertRaises(PackInputTooLarge):
+            o.add_thin_pack(f.read, None, max_input_size=8)
+        self._assert_nothing_left_behind(o)
+
+    def test_big_file_threshold_config(self) -> None:
+        # core.bigFileThreshold caps single-object decompression to guard
+        # against zip-bomb attacks on loose objects.
+        config = ConfigDict()
+        config[(b"core",)] = {b"bigFileThreshold": b"4096"}
+
+        store_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, store_dir)
+        os.makedirs(os.path.join(store_dir, "pack"))
+        store = DiskObjectStore.from_config(store_dir, config)
+        self.addCleanup(store.close)
+        self.assertEqual(4096, store.loose_object_size_limit)
+
+    def test_big_file_threshold_default(self) -> None:
+        from dulwich.objects import DEFAULT_LOOSE_OBJECT_SIZE_LIMIT
+
+        store_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, store_dir)
+        os.makedirs(os.path.join(store_dir, "pack"))
+        store = DiskObjectStore.from_config(store_dir, ConfigDict())
+        self.addCleanup(store.close)
+        self.assertEqual(DEFAULT_LOOSE_OBJECT_SIZE_LIMIT, store.loose_object_size_limit)
+
+    def test_loose_object_size_limit_enforced(self) -> None:
+        # A loose object that inflates past loose_object_size_limit is rejected.
+        store = self.store
+        store.loose_object_size_limit = 1024
+        b = make_object(Blob, data=b"x" * 2048)
+        store.add_object(b)
+        # Bypass the size cap to confirm the object exists on disk normally.
+        store.loose_object_size_limit = 512 * 1024 * 1024
+        self.assertEqual(b.data, store[b.id].data)
+        # Now re-enforce a small cap and expect a decompression error.
+        store.loose_object_size_limit = 1024
+        import zlib
+
+        self.assertRaises(zlib.error, store._get_loose_object, b.id)
+
+    def test_pack_index_version_config(self) -> None:
+        # Test that pack.indexVersion configuration is respected
+        # Create config with pack.indexVersion = 1
+        config = ConfigDict()
+        config[(b"pack",)] = {b"indexVersion": b"1"}
+
+        # Create object store with config
+        store_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, store_dir)
+        os.makedirs(os.path.join(store_dir, "pack"))
+        store = DiskObjectStore.from_config(store_dir, config)
+        self.addCleanup(store.close)
+
+        # Create some objects to pack
+        b1 = make_object(Blob, data=b"blob1")
+        b2 = make_object(Blob, data=b"blob2")
+        store.add_objects([(b1, None), (b2, None)])
+
+        # Add a pack
+        f, commit, abort = store.add_pack()
+        try:
+            # build_pack expects (type_num, data) tuples
+            objects_spec = [
+                (b1.type_num, b1.as_raw_string()),
+                (b2.type_num, b2.as_raw_string()),
+            ]
+            build_pack(f, objects_spec, store=store)
+            commit()
+        except:
+            abort()
+            raise
+
+        # Find the created pack index
+        pack_dir = os.path.join(store_dir, "pack")
+        idx_files = [f for f in os.listdir(pack_dir) if f.endswith(".idx")]
+        self.assertEqual(1, len(idx_files))
+
+        # Load and verify it's version 1
+        idx_path = os.path.join(pack_dir, idx_files[0])
+        idx = load_pack_index(idx_path, DEFAULT_OBJECT_FORMAT)
+        self.addCleanup(idx.close)
+        self.assertEqual(1, idx.version)
+
+        # Test version 3
+        config[(b"pack",)] = {b"indexVersion": b"3"}
+        store_dir2 = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, store_dir2)
+        os.makedirs(os.path.join(store_dir2, "pack"))
+        store2 = DiskObjectStore.from_config(store_dir2, config)
+        self.addCleanup(store2.close)
+
+        b3 = make_object(Blob, data=b"blob3")
+        store2.add_objects([(b3, None)])
+
+        f2, commit2, abort2 = store2.add_pack()
+        try:
+            objects_spec2 = [(b3.type_num, b3.as_raw_string())]
+            build_pack(f2, objects_spec2, store=store2)
+            commit2()
+        except:
+            abort2()
+            raise
+
+        # Find and verify version 3 index
+        pack_dir2 = os.path.join(store_dir2, "pack")
+        idx_files2 = [f for f in os.listdir(pack_dir2) if f.endswith(".idx")]
+        self.assertEqual(1, len(idx_files2))
+
+        idx_path2 = os.path.join(pack_dir2, idx_files2[0])
+        idx2 = load_pack_index(idx_path2, DEFAULT_OBJECT_FORMAT)
+        self.addCleanup(idx2.close)
+        self.assertEqual(3, idx2.version)
+
+    def test_prune_orphaned_tempfiles(self) -> None:
+        # Create an orphaned temporary pack file in the repository directory
+        tmp_pack_path = os.path.join(self.store_dir, "tmp_pack_test123")
+        with open(tmp_pack_path, "wb") as f:
+            f.write(b"temporary pack data")
+
+        # Create an orphaned .pack file without .idx in pack directory
+        pack_dir = os.path.join(self.store_dir, "pack")
+        orphaned_pack_path = os.path.join(pack_dir, "pack-orphaned.pack")
+        with open(orphaned_pack_path, "wb") as f:
+            f.write(b"orphaned pack data")
+
+        # Make files appear old by modifying mtime (older than grace period)
+        old_time = time.time() - (
+            DEFAULT_TEMPFILE_GRACE_PERIOD + 3600
+        )  # grace period + 1 hour
+        os.utime(tmp_pack_path, (old_time, old_time))
+        os.utime(orphaned_pack_path, (old_time, old_time))
+
+        # Create a recent temporary file that should NOT be cleaned
+        recent_tmp_path = os.path.join(self.store_dir, "tmp_pack_recent")
+        with open(recent_tmp_path, "wb") as f:
+            f.write(b"recent temp data")
+
+        # Run prune
+        self.store.prune()
+
+        # Check that old orphaned files were removed
+        self.assertFalse(os.path.exists(tmp_pack_path))
+        self.assertFalse(os.path.exists(orphaned_pack_path))
+
+        # Check that recent file was NOT removed
+        self.assertTrue(os.path.exists(recent_tmp_path))
+
+        # Cleanup the recent file
+        os.remove(recent_tmp_path)
+
+    def test_prune_with_custom_grace_period(self) -> None:
+        """Test that prune respects custom grace period."""
+        # Create a temporary file that's 1 hour old
+        tmp_pack_path = os.path.join(self.store_dir, "tmp_pack_1hour")
+        with open(tmp_pack_path, "wb") as f:
+            f.write(b"1 hour old data")
+
+        # Make it 1 hour old
+        old_time = time.time() - 3600  # 1 hour ago
+        os.utime(tmp_pack_path, (old_time, old_time))
+
+        # Prune with default grace period (2 weeks) - should NOT remove
+        self.store.prune()
+        self.assertTrue(os.path.exists(tmp_pack_path))
+
+        # Prune with 30 minute grace period - should remove
+        self.store.prune(grace_period=1800)  # 30 minutes
+        self.assertFalse(os.path.exists(tmp_pack_path))
+
+    def test_gc_prunes_tempfiles(self) -> None:
+        """Test that garbage collection prunes temporary files."""
+        # Create a repository with the store
+        repo = Repo.init(self.store_dir)
+
+        # Create an old orphaned temporary file in the objects directory
+        tmp_pack_path = os.path.join(repo.object_store.path, "tmp_pack_old")
+        with open(tmp_pack_path, "wb") as f:
+            f.write(b"old temporary data")
+
+        # Make it old (older than grace period)
+        old_time = time.time() - (
+            DEFAULT_TEMPFILE_GRACE_PERIOD + 3600
+        )  # grace period + 1 hour
+        os.utime(tmp_pack_path, (old_time, old_time))
+
+        # Run garbage collection
+        garbage_collect(repo)
+
+        # Verify the orphaned file was cleaned up
+        self.assertFalse(os.path.exists(tmp_pack_path))
+
+    def test_commit_graph_enabled_by_default(self) -> None:
+        """Test that commit graph is enabled by default."""
+        config = ConfigDict()
+        store = DiskObjectStore.from_config(self.store_dir, config)
+        self.addCleanup(store.close)
+
+        # Should be enabled by default
+        self.assertTrue(store._use_commit_graph)
+
+    def test_commit_graph_disabled_by_config(self) -> None:
+        """Test that commit graph can be disabled via config."""
+        config = ConfigDict()
+        config[(b"core",)] = {b"commitGraph": b"false"}
+        store = DiskObjectStore.from_config(self.store_dir, config)
+        self.addCleanup(store.close)
+
+        # Should be disabled
+        self.assertFalse(store._use_commit_graph)
+
+        # get_commit_graph should return None when disabled
+        self.assertIsNone(store.get_commit_graph())
+
+    def test_commit_graph_enabled_by_config(self) -> None:
+        """Test that commit graph can be explicitly enabled via config."""
+        config = ConfigDict()
+        config[(b"core",)] = {b"commitGraph": b"true"}
+        store = DiskObjectStore.from_config(self.store_dir, config)
+        self.addCleanup(store.close)
+
+        # Should be enabled
+        self.assertTrue(store._use_commit_graph)
+
+    def test_commit_graph_usage_in_find_shallow(self) -> None:
+        """Test that find_shallow uses commit graph when available."""
+        # Create a simple commit chain: c1 -> c2 -> c3
+        ts = int(time.time())
+        c1 = make_object(
+            Commit,
+            message=b"commit 1",
+            tree=b"1" * 40,
+            parents=[],
+            author=b"Test Author <test@example.com>",
+            committer=b"Test Committer <test@example.com>",
+            commit_time=ts,
+            commit_timezone=0,
+            author_time=ts,
+            author_timezone=0,
+        )
+
+        c2 = make_object(
+            Commit,
+            message=b"commit 2",
+            tree=b"2" * 40,
+            parents=[c1.id],
+            author=b"Test Author <test@example.com>",
+            committer=b"Test Committer <test@example.com>",
+            commit_time=ts + 1,
+            commit_timezone=0,
+            author_time=ts + 1,
+            author_timezone=0,
+        )
+
+        c3 = make_object(
+            Commit,
+            message=b"commit 3",
+            tree=b"3" * 40,
+            parents=[c2.id],
+            author=b"Test Author <test@example.com>",
+            committer=b"Test Committer <test@example.com>",
+            commit_time=ts + 2,
+            commit_timezone=0,
+            author_time=ts + 2,
+            author_timezone=0,
+        )
+
+        self.store.add_objects([(c1, None), (c2, None), (c3, None)])
+
+        # Write a commit graph
+        self.store.write_commit_graph([c1.id, c2.id, c3.id])
+
+        # Verify commit graph was written
+        commit_graph = self.store.get_commit_graph()
+        self.assertIsNotNone(commit_graph)
+        self.assertEqual(3, len(commit_graph))
+
+        # Test find_shallow with depth
+        # With depth 2 starting from c3:
+        # - depth 1 includes c3 itself (not shallow)
+        # - depth 2 includes c3 and c2 (not shallow)
+        # - c1 is at depth 3, so it's marked as shallow
+        shallow, not_shallow = find_shallow(self.store, [c3.id], 2)
+
+        # c2 should be marked as shallow since it's at the depth boundary
+        self.assertEqual({c2.id}, shallow)
+        self.assertEqual({c3.id}, not_shallow)
+
+    def test_commit_graph_end_to_end(self) -> None:
+        """Test end-to-end commit graph generation and usage."""
+        # Create a more complex commit history:
+        #   c1 -- c2 -- c4
+        #     \        /
+        #      \-- c3 -/
+
+        ts = int(time.time())
+
+        # Create some blobs and trees for the commits
+        blob1 = make_object(Blob, data=b"content 1")
+        blob2 = make_object(Blob, data=b"content 2")
+        blob3 = make_object(Blob, data=b"content 3")
+        blob4 = make_object(Blob, data=b"content 4")
+
+        tree1 = make_object(Tree)
+        tree1[b"file1.txt"] = (0o100644, blob1.id)
+
+        tree2 = make_object(Tree)
+        tree2[b"file1.txt"] = (0o100644, blob1.id)
+        tree2[b"file2.txt"] = (0o100644, blob2.id)
+
+        tree3 = make_object(Tree)
+        tree3[b"file1.txt"] = (0o100644, blob1.id)
+        tree3[b"file3.txt"] = (0o100644, blob3.id)
+
+        tree4 = make_object(Tree)
+        tree4[b"file1.txt"] = (0o100644, blob1.id)
+        tree4[b"file2.txt"] = (0o100644, blob2.id)
+        tree4[b"file3.txt"] = (0o100644, blob3.id)
+        tree4[b"file4.txt"] = (0o100644, blob4.id)
+
+        # Add all objects to store
+        self.store.add_objects(
+            [
+                (blob1, None),
+                (blob2, None),
+                (blob3, None),
+                (blob4, None),
+                (tree1, None),
+                (tree2, None),
+                (tree3, None),
+                (tree4, None),
+            ]
+        )
+
+        # Create commits
+        c1 = make_object(
+            Commit,
+            message=b"Initial commit",
+            tree=tree1.id,
+            parents=[],
+            author=b"Test Author <test@example.com>",
+            committer=b"Test Committer <test@example.com>",
+            commit_time=ts,
+            commit_timezone=0,
+            author_time=ts,
+            author_timezone=0,
+        )
+
+        c2 = make_object(
+            Commit,
+            message=b"Second commit",
+            tree=tree2.id,
+            parents=[c1.id],
+            author=b"Test Author <test@example.com>",
+            committer=b"Test Committer <test@example.com>",
+            commit_time=ts + 10,
+            commit_timezone=0,
+            author_time=ts + 10,
+            author_timezone=0,
+        )
+
+        c3 = make_object(
+            Commit,
+            message=b"Branch commit",
+            tree=tree3.id,
+            parents=[c1.id],
+            author=b"Test Author <test@example.com>",
+            committer=b"Test Committer <test@example.com>",
+            commit_time=ts + 20,
+            commit_timezone=0,
+            author_time=ts + 20,
+            author_timezone=0,
+        )
+
+        c4 = make_object(
+            Commit,
+            message=b"Merge commit",
+            tree=tree4.id,
+            parents=[c2.id, c3.id],
+            author=b"Test Author <test@example.com>",
+            committer=b"Test Committer <test@example.com>",
+            commit_time=ts + 30,
+            commit_timezone=0,
+            author_time=ts + 30,
+            author_timezone=0,
+        )
+
+        self.store.add_objects([(c1, None), (c2, None), (c3, None), (c4, None)])
+
+        # First, verify operations work without commit graph
+        # Check depth calculation
+        depth_before = get_depth(self.store, c4.id)
+        self.assertEqual(3, depth_before)  # c4 -> c2/c3 -> c1
+
+        # Generate commit graph
+        self.store.write_commit_graph([c1.id, c2.id, c3.id, c4.id])
+
+        # Verify commit graph file was created
+        graph_path = os.path.join(self.store.path, "info", "commit-graph")
+        self.assertTrue(os.path.exists(graph_path))
+
+        # Load and verify commit graph
+        commit_graph = self.store.get_commit_graph()
+        self.assertIsNotNone(commit_graph)
+        self.assertEqual(4, len(commit_graph))
+
+        # Verify commit graph contains correct parent information
+        c1_entry = commit_graph.get_entry_by_oid(c1.id)
+        self.assertIsNotNone(c1_entry)
+        self.assertEqual([], c1_entry.parents)
+
+        c2_entry = commit_graph.get_entry_by_oid(c2.id)
+        self.assertIsNotNone(c2_entry)
+        self.assertEqual([c1.id], c2_entry.parents)
+
+        c3_entry = commit_graph.get_entry_by_oid(c3.id)
+        self.assertIsNotNone(c3_entry)
+        self.assertEqual([c1.id], c3_entry.parents)
+
+        c4_entry = commit_graph.get_entry_by_oid(c4.id)
+        self.assertIsNotNone(c4_entry)
+        self.assertEqual([c2.id, c3.id], c4_entry.parents)
+
+        # Test that operations now use the commit graph
+        # Check depth calculation again - should use commit graph
+        depth_after = get_depth(self.store, c4.id)
+        self.assertEqual(3, depth_after)
+
+        # Test with commit graph disabled
+        self.store._use_commit_graph = False
+        self.assertIsNone(self.store.get_commit_graph())
+
+        # Operations should still work without commit graph
+        depth_disabled = get_depth(self.store, c4.id)
+        self.assertEqual(3, depth_disabled)
+
+    def test_find_shallow_merge_heavy_history(self) -> None:
+        # A "diamond" history: m_i has parents [a_i, b_i] and a_i/b_i both have
+        # parent m_{i+1}, so ~3*levels commits expose 2**levels distinct paths.
+        # Without state deduplication find_shallow/get_depth re-expand every
+        # path and hang here; the result is unchanged, only the walk is bounded.
+        ts = int(time.time())
+        seq = [0]
+
+        def commit(parents):
+            seq[0] += 1
+            c = make_object(
+                Commit,
+                message=b"c%d" % seq[0],
+                tree=b"1" * 40,
+                parents=parents,
+                author=b"Test <test@example.com>",
+                committer=b"Test <test@example.com>",
+                commit_time=ts,
+                commit_timezone=0,
+                author_time=ts,
+                author_timezone=0,
+            )
+            self.store.add_object(c)
+            return c.id
+
+        levels = 24
+        head = tail = commit([])
+        for _ in range(levels):
+            a = commit([head])
+            b = commit([head])
+            head = commit([a, b])
+
+        all_ids = set(self.store)
+        # Depth larger than the longest path: every commit is not_shallow.
+        shallow, not_shallow = find_shallow(self.store, [head], 10**9)
+        self.assertEqual(set(), shallow)
+        self.assertEqual(all_ids, not_shallow)
+        # Longest path head -> a/b -> m ... -> tail is 2*levels + 1 commits.
+        self.assertEqual(2 * levels + 1, get_depth(self.store, head))
+        # Boundary depth still marks the commit reached exactly at the boundary.
+        shallow, not_shallow = find_shallow(self.store, [tail], 1)
+        self.assertEqual({tail}, shallow)
+        self.assertEqual(set(), not_shallow)
+
+    def test_fsync_object_files_disabled_by_default(self) -> None:
+        """Test that fsync is disabled by default for object files."""
+        config = ConfigDict()
+        store = DiskObjectStore.from_config(self.store_dir, config)
+        self.addCleanup(store.close)
+
+        # Should be disabled by default
+        self.assertFalse(store.fsync_object_files)
+
+    def test_fsync_object_files_enabled_by_config(self) -> None:
+        """Test that fsync can be enabled via core.fsyncObjectFiles config."""
+        config = ConfigDict()
+        config[(b"core",)] = {b"fsyncObjectFiles": b"true"}
+        store = DiskObjectStore.from_config(self.store_dir, config)
+        self.addCleanup(store.close)
+
+        # Should be enabled
+        self.assertTrue(store.fsync_object_files)
+
+        # Test that fsync is actually called when adding objects
+        blob = make_object(Blob, data=b"test fsync data")
+        with patch("os.fsync") as mock_fsync:
+            store.add_object(blob)
+            # fsync should have been called
+            mock_fsync.assert_called_once()
+
+    def test_fsync_object_files_disabled_by_config(self) -> None:
+        """Test that fsync can be explicitly disabled via config."""
+        config = ConfigDict()
+        config[(b"core",)] = {b"fsyncObjectFiles": b"false"}
+        store = DiskObjectStore.from_config(self.store_dir, config)
+        self.addCleanup(store.close)
+
+        # Should be disabled
+        self.assertFalse(store.fsync_object_files)
+
+        # Test that fsync is NOT called when adding objects
+        blob = make_object(Blob, data=b"test no fsync data")
+        with patch("os.fsync") as mock_fsync:
+            store.add_object(blob)
+            # fsync should NOT have been called
+            mock_fsync.assert_not_called()
+
+    def test_fsync_object_files_for_pack_files(self) -> None:
+        """Test that fsync config applies to pack files."""
+        # Test with fsync enabled
+        config = ConfigDict()
+        config[(b"core",)] = {b"fsyncObjectFiles": b"true"}
+        store = DiskObjectStore.from_config(self.store_dir, config)
+        self.addCleanup(store.close)
+
+        self.assertTrue(store.fsync_object_files)
+
+        # Add some objects via pack
+        blob = make_object(Blob, data=b"pack test data")
+        with patch("os.fsync") as mock_fsync:
+            f, commit, abort = store.add_pack()
+            try:
+                write_pack_objects(
+                    f.write, [(blob, None)], object_format=DEFAULT_OBJECT_FORMAT
+                )
+            except BaseException:
+                abort()
+                raise
+            else:
+                commit()
+            # fsync should have been called at least once (for pack file and index)
+            self.assertGreater(mock_fsync.call_count, 0)
+
+    def test_packed_git_limit_config(self) -> None:
+        config = ConfigDict()
+        config[(b"core",)] = {b"packedGitLimit": b"1048576"}
+        store = DiskObjectStore.from_config(self.store_dir, config)
+        self.addCleanup(store.close)
+        self.assertEqual(1048576, store.packed_git_limit)
+
+    def test_packed_git_limit_evicts_lru_packs(self) -> None:
+        store = DiskObjectStore(self.store_dir, packed_git_limit=1)
+        self.addCleanup(store.close)
+
+        # Add two blobs in separate packs
+        b1 = make_object(Blob, data=b"data for pack one")
+        f, commit, abort = store.add_pack()
+        try:
+            write_pack_objects(
+                f.write, [(b1, None)], object_format=DEFAULT_OBJECT_FORMAT
+            )
+        except BaseException:
+            abort()
+            raise
+        else:
+            commit()
+
+        b2 = make_object(Blob, data=b"data for pack two")
+        f, commit, abort = store.add_pack()
+        try:
+            write_pack_objects(
+                f.write, [(b2, None)], object_format=DEFAULT_OBJECT_FORMAT
+            )
+        except BaseException:
+            abort()
+            raise
+        else:
+            commit()
+
+        # Access b1: this triggers mmap and eviction due to tiny limit
+        self.assertEqual((Blob.type_num, b"data for pack one"), store.get_raw(b1.id))
+
+        # Access b2: the first pack should have been evicted, but b2 is still
+        # accessible because _update_pack_cache will re-open it if needed
+        self.assertEqual((Blob.type_num, b"data for pack two"), store.get_raw(b2.id))
+
+    def test_packed_git_limit_no_limit(self) -> None:
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        self.assertIsNone(store.packed_git_limit)
+
+        # Add and access objects; no eviction should happen
+        b1 = make_object(Blob, data=b"data one")
+        f, commit, abort = store.add_pack()
+        try:
+            write_pack_objects(
+                f.write, [(b1, None)], object_format=DEFAULT_OBJECT_FORMAT
+            )
+        except BaseException:
+            abort()
+            raise
+        else:
+            commit()
+
+        self.assertEqual((Blob.type_num, b"data one"), store.get_raw(b1.id))
+
+    def test_pack_mmap_size(self) -> None:
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+
+        b1 = make_object(Blob, data=b"test mmap size data")
+        f, commit, abort = store.add_pack()
+        try:
+            write_pack_objects(
+                f.write, [(b1, None)], object_format=DEFAULT_OBJECT_FORMAT
+            )
+        except BaseException:
+            abort()
+            raise
+        else:
+            commit()
+
+        # Force pack data/index to load
+        store.get_raw(b1.id)
+
+        for pack in store.packs:
+            if isinstance(pack, Pack):
+                # After accessing data, mmap_size should be > 0
+                self.assertGreater(pack.mmap_size, 0)
+
+    def test_delta_base_cache_limit_config(self) -> None:
+        config = ConfigDict()
+        config[(b"core",)] = {b"deltaBaseCacheLimit": b"2097152"}
+        store = DiskObjectStore.from_config(self.store_dir, config)
+        self.addCleanup(store.close)
+        self.assertEqual(2097152, store.delta_base_cache_limit)
+
+    def test_delta_base_cache_limit_default(self) -> None:
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        self.assertIsNone(store.delta_base_cache_limit)
+
+    def test_delta_base_cache_limit_passed_to_pack(self) -> None:
+        store = DiskObjectStore(self.store_dir, delta_base_cache_limit=1024)
+        self.addCleanup(store.close)
+
+        b1 = make_object(Blob, data=b"delta base cache test data")
+        f, commit, abort = store.add_pack()
+        try:
+            write_pack_objects(
+                f.write, [(b1, None)], object_format=DEFAULT_OBJECT_FORMAT
+            )
+        except BaseException:
+            abort()
+            raise
+        else:
+            commit()
+
+        # Access the object to force pack loading
+        store.get_raw(b1.id)
+
+        # Check that each pack received the configured cache limit
+        for pack in store.packs:
+            self.assertEqual(1024, pack.delta_base_cache_limit)
+            self.assertEqual(1024, pack.data._offset_cache._max_size)
+
+    def _add_blob_in_pack(self, store, data):
+        b = make_object(Blob, data=data)
+        f, commit, abort = store.add_pack()
+        try:
+            write_pack_objects(
+                f.write, [(b, None)], object_format=DEFAULT_OBJECT_FORMAT
+            )
+        except BaseException:
+            abort()
+            raise
+        else:
+            commit()
+        return b
+
+    def test_get_pack_by_name_uses_basename_key(self) -> None:
+        """_get_pack_by_name and _update_pack_cache must agree on cache keys.
+
+        Otherwise both populate _pack_cache for the same file under different
+        keys, causing duplicate Pack objects and spurious eviction in
+        _update_pack_cache's "remove disappeared pack files" loop (the same
+        class of bug as commit d86353e4).
+        """
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+
+        b = self._add_blob_in_pack(store, b"midx test")
+        # Force _update_pack_cache to populate the cache.
+        store.get_raw(b.id)
+
+        # _pack_cache is keyed by the full pack basename.
+        for key in store._pack_cache:
+            self.assertTrue(
+                key.startswith("pack-"),
+                f"_pack_cache key {key!r} should be a pack basename",
+            )
+
+        cached_keys = set(store._pack_cache)
+        self.assertEqual(1, len(cached_keys))
+
+        # Looking up the same pack via _get_pack_by_name (the path used by
+        # MIDXObjectStore.get_raw) must hit the existing cache entry rather
+        # than creating a duplicate keyed differently.
+        pack = next(iter(store._pack_cache.values()))
+        pack_name = os.path.basename(pack._basename) + ".idx"
+        same_pack = store._get_pack_by_name(pack_name)
+        self.assertIs(pack, same_pack)
+        self.assertEqual(cached_keys, set(store._pack_cache))
+
+    def test_get_pack_by_name_does_not_cause_eviction(self) -> None:
+        """After _get_pack_by_name, _update_pack_cache must not evict the pack.
+
+        This is the failure mode that surfaced as a KeyError during reads:
+        a duplicate cache entry under a `pack-HASH` key looked like a
+        "disappeared" pack on the next rescan and got closed while still
+        in use.
+        """
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+
+        b = self._add_blob_in_pack(store, b"eviction test")
+        store.get_raw(b.id)
+
+        pack = next(iter(store._pack_cache.values()))
+        pack_name = os.path.basename(pack._basename) + ".idx"
+        store._get_pack_by_name(pack_name)
+
+        # Trigger _update_pack_cache; nothing on disk has changed, so no
+        # pack should be evicted.
+        store._update_pack_cache()
+        self.assertEqual((Blob.type_num, b"eviction test"), store.get_raw(b.id))
+
+    def test_delta_base_cache_limit_uses_default(self) -> None:
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+
+        b1 = make_object(Blob, data=b"default cache test data")
+        f, commit, abort = store.add_pack()
+        try:
+            write_pack_objects(
+                f.write, [(b1, None)], object_format=DEFAULT_OBJECT_FORMAT
+            )
+        except BaseException:
+            abort()
+            raise
+        else:
+            commit()
+
+        # Access the object to force pack loading
+        store.get_raw(b1.id)
+
+        # When no limit is set, should use the default
+        for pack in store.packs:
+            self.assertEqual(
+                DEFAULT_DELTA_BASE_CACHE_LIMIT,
+                pack.data._offset_cache._max_size,
+            )
+
+    def test_pack_disappeared_during_lookup_recovers(self) -> None:
+        """A concurrent repack that deletes a pack must not raise KeyError.
+
+        Regression for https://github.com/jelmer/dulwich/issues/2159: when a
+        pack is removed between the moment ``_update_pack_cache`` snapshots
+        the pack directory and the moment its index is lazily opened, the
+        store should drop the stale Pack, rescan, and find the object in
+        the replacement pack.
+        """
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+
+        # Two packs that overlap on b1. The "doomed" pack also contains b2
+        # so it has a distinct hash from the survivor (otherwise add_pack
+        # would dedupe).
+        b1 = make_object(Blob, data=b"shared-object")
+        b2 = make_object(Blob, data=b"only-in-doomed")
+
+        f, commit, _abort = store.add_pack()
+        write_pack_objects(
+            f.write, [(b1, None), (b2, None)], object_format=DEFAULT_OBJECT_FORMAT
+        )
+        doomed = commit()
+        self.assertIsNotNone(doomed)
+
+        f, commit, _abort = store.add_pack()
+        write_pack_objects(f.write, [(b1, None)], object_format=DEFAULT_OBJECT_FORMAT)
+        survivor = commit()
+        self.assertIsNotNone(survivor)
+
+        assert doomed is not None
+        # Drop file handles (mimicking eviction or process restart) before
+        # deleting on disk, so the next access goes through lazy load.
+        doomed.close()
+        os.remove(doomed._idx_path)
+        os.remove(doomed._data_path)
+
+        # b1 must still be found via the survivor pack rather than raising
+        # KeyError because of the disappeared doomed pack.
+        type_num, data = store.get_raw(b1.id)
+        self.assertEqual(Blob.type_num, type_num)
+        self.assertEqual(b"shared-object", data)
+
+    def test_contains_packed_recovers_after_pack_disappears(self) -> None:
+        """contains_packed must not return False if a replacement pack exists."""
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+
+        b1 = make_object(Blob, data=b"contains-after-repack")
+        b2 = make_object(Blob, data=b"only-in-doomed-2")
+
+        f, commit, _abort = store.add_pack()
+        write_pack_objects(
+            f.write, [(b1, None), (b2, None)], object_format=DEFAULT_OBJECT_FORMAT
+        )
+        doomed = commit()
+        self.assertIsNotNone(doomed)
+
+        f, commit, _abort = store.add_pack()
+        write_pack_objects(f.write, [(b1, None)], object_format=DEFAULT_OBJECT_FORMAT)
+        survivor = commit()
+        self.assertIsNotNone(survivor)
+
+        assert doomed is not None
+        doomed.close()
+        os.remove(doomed._idx_path)
+        os.remove(doomed._data_path)
+
+        self.assertTrue(store.contains_packed(b1.id))
+
+    def test_iter_handles_disappeared_pack(self) -> None:
+        """Iterating SHAs must not crash when a cached pack file vanishes."""
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+
+        b1 = make_object(Blob, data=b"iter-after-repack")
+        f, commit, _abort = store.add_pack()
+        write_pack_objects(f.write, [(b1, None)], object_format=DEFAULT_OBJECT_FORMAT)
+        original = commit()
+        self.assertIsNotNone(original)
+
+        assert original is not None
+        original.close()
+        os.remove(original._idx_path)
+        os.remove(original._data_path)
+
+        # Should not raise; the disappeared pack is silently dropped.
+        self.assertEqual([], list(store))
+
+    def test_write_midx_handles_disappeared_pack(self) -> None:
+        """write_midx must not crash if a pack disappears mid-collection."""
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+
+        b1 = make_object(Blob, data=b"midx-after-repack")
+        b2 = make_object(Blob, data=b"midx-survivor")
+
+        f, commit, _abort = store.add_pack()
+        write_pack_objects(f.write, [(b1, None)], object_format=DEFAULT_OBJECT_FORMAT)
+        doomed = commit()
+        self.assertIsNotNone(doomed)
+
+        f, commit, _abort = store.add_pack()
+        write_pack_objects(f.write, [(b2, None)], object_format=DEFAULT_OBJECT_FORMAT)
+        survivor = commit()
+        self.assertIsNotNone(survivor)
+
+        assert doomed is not None
+        doomed.close()
+        os.remove(doomed._idx_path)
+        os.remove(doomed._data_path)
+
+        # No exception. The midx is written from the surviving pack.
+        store.write_midx()
+        midx_path = os.path.join(store.pack_dir, "multi-pack-index")
+        self.assertTrue(os.path.exists(midx_path))
+
+    def test_get_reachability_provider_handles_disappeared_pack(self) -> None:
+        """The bitmap probe must not raise when a cached pack file vanishes.
+
+        Regression for https://github.com/jelmer/dulwich/issues/2344: the
+        probe guarded only ``FileNotFoundError``, but ``Pack.bitmap`` reaches
+        ``Pack.index``, which raises ``PackFileDisappeared``. The pack here
+        has no bitmap at all, so the bug is not limited to repositories that
+        use bitmaps.
+        """
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+
+        b1 = make_object(Blob, data=b"reachability-after-repack")
+        f, commit, _abort = store.add_pack()
+        write_pack_objects(f.write, [(b1, None)], object_format=DEFAULT_OBJECT_FORMAT)
+        doomed = commit()
+        self.assertIsNotNone(doomed)
+
+        assert doomed is not None
+        doomed.close()
+        os.remove(doomed._idx_path)
+        os.remove(doomed._data_path)
+
+        # Should not raise; the vanished pack is skipped and the store falls
+        # back to graph traversal.
+        provider = store.get_reachability_provider()
+        self.assertIsInstance(provider, GraphTraversalReachability)
+
+    def test_contains_packed_hex_sha_with_midx(self) -> None:
+        """contains_packed must accept hex SHAs even when a MIDX is loaded.
+
+        Regression test for #2178: BaseRepo.__contains__ passes 40-char hex
+        SHAs down to contains_packed, which then consults MIDX. MIDX has a
+        binary-only contract, so contains_packed must normalise hex SHAs
+        before the MIDX lookup. Previously this raised
+        ``ValueError: SHA size mismatch: expected 20, got 40``.
+        """
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+
+        b = self._add_blob_in_pack(store, b"hex-sha-midx-lookup")
+        store.write_midx()
+
+        # Drop any cached state so the freshly written MIDX is loaded.
+        store.close()
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        self.assertIsNotNone(store.get_midx())
+
+        # Hex SHA (what BaseRepo.__contains__ hands down) must work.
+        self.assertTrue(store.contains_packed(b.id))
+        # Binary SHA must still work.
+        self.assertTrue(store.contains_packed(hex_to_sha(b.id)))
+        # Unknown hex SHA: clean False, no exception.
+        self.assertFalse(store.contains_packed(b"0" * 40))
+
+    def test_contains_packed_midx_entry_for_removed_pack(self) -> None:
+        """A MIDX entry whose pack is gone must not report the object present.
+
+        ``repack`` and ``prune`` write new packs and remove the old ones
+        without rewriting ``multi-pack-index``, so the MIDX outlives the packs
+        it names. git re-checks the pack in ``fill_midx_entry`` for the same
+        reason.
+        """
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+
+        b = make_object(Blob, data=b"midx-pack-removed")
+        f, commit, _abort = store.add_pack()
+        write_pack_objects(f.write, [(b, None)], object_format=DEFAULT_OBJECT_FORMAT)
+        doomed = commit()
+        self.assertIsNotNone(doomed)
+        store.write_midx()
+
+        assert doomed is not None
+        doomed.close()
+        os.remove(doomed._idx_path)
+        os.remove(doomed._data_path)
+
+        # Drop any cached state so the MIDX written above is loaded from disk.
+        store.close()
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        self.assertIsNotNone(store.get_midx())
+
+        self.assertFalse(store.contains_packed(b.id))
+        self.assertNotIn(b.id, store)
+        # determine_wants_all computes a fetch's wants from this answer.
+        self.assertEqual([b.id], store.determine_wants_all({b"refs/heads/x": b.id}))
+
+    def _rename_pack_to_loose(self, store) -> str:
+        """Rename the single pack in the store from pack-<h> to loose-<h>.
+
+        Mirrors the packs that ``git maintenance run --task=loose-objects``
+        writes. Returns the new "loose-<hash>" basename.
+        """
+        pack_dir = store.pack_dir
+        names = os.listdir(pack_dir)
+        pack_file = next(n for n in names if n.startswith("pack-"))
+        old_base = os.path.splitext(pack_file)[0]
+        new_base = "loose-" + old_base[len("pack-") :]
+        for ext in (".pack", ".idx"):
+            os.rename(
+                os.path.join(pack_dir, old_base + ext),
+                os.path.join(pack_dir, new_base + ext),
+            )
+        return new_base
+
+    def test_loose_named_pack_is_discovered(self) -> None:
+        """A "loose-<hash>" pack must be readable without any MIDX.
+
+        Regression for the underlying cause of issue #2229: git maintenance
+        writes valid packs named "loose-<hash>.pack", but the store only
+        discovered "pack-<hash>.pack". Objects living only in such a pack
+        were invisible to contains/get_raw.
+        """
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        b = self._add_blob_in_pack(store, b"loose pack discovery")
+        store.close()
+
+        self._rename_pack_to_loose(DiskObjectStore(self.store_dir))
+
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        self.assertEqual(
+            ["loose-"],
+            sorted({os.path.basename(p._basename)[:6] for p in store.packs}),
+        )
+        self.assertTrue(store.contains_packed(b.id))
+        self.assertEqual((Blob.type_num, b"loose pack discovery"), store.get_raw(b.id))
+
+    def test_midx_referencing_loose_named_pack(self) -> None:
+        """get_raw via a MIDX that references a "loose-<hash>" pack must work.
+
+        Regression for issue #2229: _get_pack_by_name asserted that every
+        MIDX pack name began with "pack-", crashing with AssertionError on
+        the "loose-<hash>.idx" names git maintenance writes into the MIDX.
+        """
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        b = self._add_blob_in_pack(store, b"midx loose pack")
+        store.close()
+
+        new_base = self._rename_pack_to_loose(DiskObjectStore(self.store_dir))
+
+        # Build a MIDX that references the pack by its "loose-<hash>.idx" name.
+        pack_dir = os.path.join(self.store_dir, "pack")
+        with load_pack_index(
+            os.path.join(pack_dir, new_base + ".idx"), DEFAULT_OBJECT_FORMAT
+        ) as idx:
+            entries = list(idx.iterentries())
+        write_midx_file(
+            os.path.join(pack_dir, "multi-pack-index"),
+            [(new_base + ".idx", entries)],
+        )
+
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        midx = store.get_midx()
+        self.assertIsNotNone(midx)
+        self.assertEqual([new_base + ".idx"], midx.pack_names)
+        self.assertEqual((Blob.type_num, b"midx loose pack"), store.get_raw(b.id))
+
+    def test_repack_does_not_duplicate_loose_named_pack(self) -> None:
+        """repack must reuse an existing loose-<hash> pack, not duplicate it.
+
+        _complete_pack dedups by content (pack.name()), so repacking a store
+        whose objects already live in a loose-<hash> pack recognises that
+        pack instead of writing a second pack-<hash> with identical objects.
+        """
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        b = self._add_blob_in_pack(store, b"repack dedup")
+        store.close()
+
+        self._rename_pack_to_loose(DiskObjectStore(self.store_dir))
+
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        store.repack()
+        store.repack()
+
+        pack_dir = os.path.join(self.store_dir, "pack")
+        packs = sorted(n for n in os.listdir(pack_dir) if n.endswith(".pack"))
+        self.assertEqual(1, len(packs), packs)
+        self.assertTrue(packs[0].startswith("loose-"), packs[0])
+        self.assertEqual((Blob.type_num, b"repack dedup"), store.get_raw(b.id))
+
+    def test_get_pack_by_name_rejects_path_separators(self) -> None:
+        """A MIDX pack name with a path separator must not be joined as a path.
+
+        The MIDX is read from disk; a corrupt or hostile PNAM entry like
+        "../evil.idx" must be rejected rather than being resolved relative to
+        pack_dir and escaping it. Plant a real pack one level above pack_dir
+        and confirm the traversal name does not reach it.
+        """
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        self._add_blob_in_pack(store, b"traversal target")
+        store.close()
+
+        # Move the pack up one directory (into the objects dir) so that a
+        # "../<name>" traversal from pack_dir would resolve onto it.
+        pack_dir = os.path.join(self.store_dir, "pack")
+        new_base = self._rename_pack_to_loose(DiskObjectStore(self.store_dir))
+        for ext in (".pack", ".idx"):
+            os.rename(
+                os.path.join(pack_dir, new_base + ext),
+                os.path.join(self.store_dir, new_base + ext),
+            )
+
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        # Without the separator check this would resolve to ../<new_base>.pack
+        # (which exists) and open a pack outside pack_dir.
+        self.assertRaises(KeyError, store._get_pack_by_name, "../" + new_base + ".idx")
+        self.assertRaises(KeyError, store._get_pack_by_name, "..\\" + new_base + ".idx")
+
+    def test_add_pack_dedup_removes_temp_pack(self) -> None:
+        """A deduplicated add_pack must not leave its temp pack in pack_dir.
+
+        _complete_pack returns the existing pack early when the objects are
+        already packed; it must drop the temporary "tmp*.pack" it was about
+        to move in.
+        """
+        store = DiskObjectStore(self.store_dir)
+        self.addCleanup(store.close)
+        b = make_object(Blob, data=b"temp pack cleanup")
+        self._add_blob_in_pack(store, b.data)
+        # Adding the same object again hits the dedup early-return.
+        self._add_blob_in_pack(store, b.data)
+
+        pack_dir = os.path.join(self.store_dir, "pack")
+        leftovers = [n for n in os.listdir(pack_dir) if n.startswith("tmp")]
+        self.assertEqual([], leftovers)
+
+
+class TreeLookupPathTests(TestCase):
+    def setUp(self) -> None:
+        TestCase.setUp(self)
+        self.store = MemoryObjectStore()
+        blob_a = make_object(Blob, data=b"a")
+        blob_b = make_object(Blob, data=b"b")
+        blob_c = make_object(Blob, data=b"c")
+        for blob in [blob_a, blob_b, blob_c]:
+            self.store.add_object(blob)
+
+        blobs = [
+            (b"a", blob_a.id, 0o100644),
+            (b"ad/b", blob_b.id, 0o100644),
+            (b"ad/bd/c", blob_c.id, 0o100755),
+            (b"ad/c", blob_c.id, 0o100644),
+            (b"c", blob_c.id, 0o100644),
+            (b"d", blob_c.id, S_IFGITLINK),
+        ]
+        self.tree_id = commit_tree(self.store, blobs)
+
+    def get_object(self, sha):
+        return self.store[sha]
+
+    def test_lookup_blob(self) -> None:
+        o_id = tree_lookup_path(self.get_object, self.tree_id, b"a")[1]
+        self.assertIsInstance(self.store[o_id], Blob)
+
+    def test_lookup_tree(self) -> None:
+        o_id = tree_lookup_path(self.get_object, self.tree_id, b"ad")[1]
+        self.assertIsInstance(self.store[o_id], Tree)
+        o_id = tree_lookup_path(self.get_object, self.tree_id, b"ad/bd")[1]
+        self.assertIsInstance(self.store[o_id], Tree)
+        o_id = tree_lookup_path(self.get_object, self.tree_id, b"ad/bd/")[1]
+        self.assertIsInstance(self.store[o_id], Tree)
+
+    def test_lookup_submodule(self) -> None:
+        tree_lookup_path(self.get_object, self.tree_id, b"d")[1]
+        self.assertRaises(
+            SubmoduleEncountered,
+            tree_lookup_path,
+            self.get_object,
+            self.tree_id,
+            b"d/a",
+        )
+
+    def test_lookup_nonexistent(self) -> None:
+        self.assertRaises(
+            KeyError, tree_lookup_path, self.get_object, self.tree_id, b"j"
+        )
+
+    def test_lookup_not_tree(self) -> None:
+        self.assertRaises(
+            NotTreeError,
+            tree_lookup_path,
+            self.get_object,
+            self.tree_id,
+            b"ad/b/j",
+        )
+
+    def test_lookup_empty_path(self) -> None:
+        # Empty path should return the tree itself
+        mode, sha = tree_lookup_path(self.get_object, self.tree_id, b"")
+        self.assertEqual(sha, self.tree_id)
+        self.assertEqual(mode, stat.S_IFDIR)
+
+
+class ObjectStoreGraphWalkerTests(TestCase):
+    def get_walker(self, heads, parent_map):
+        new_parent_map = {
+            k * 40: [(p * 40) for p in ps] for (k, ps) in parent_map.items()
+        }
+        return ObjectStoreGraphWalker(
+            [x * 40 for x in heads], new_parent_map.__getitem__
+        )
+
+    def test_ack_invalid_value(self) -> None:
+        gw = self.get_walker([], {})
+        self.assertRaises(ValueError, gw.ack, "tooshort")
+
+    def test_empty(self) -> None:
+        gw = self.get_walker([], {})
+        self.assertIs(None, next(gw))
+        gw.ack(b"a" * 40)
+        self.assertIs(None, next(gw))
+
+    def test_descends(self) -> None:
+        gw = self.get_walker([b"a"], {b"a": [b"b"], b"b": []})
+        self.assertEqual(b"a" * 40, next(gw))
+        self.assertEqual(b"b" * 40, next(gw))
+
+    def test_present(self) -> None:
+        gw = self.get_walker([b"a"], {b"a": [b"b"], b"b": []})
+        gw.ack(b"a" * 40)
+        self.assertIs(None, next(gw))
+
+    def test_parent_present(self) -> None:
+        gw = self.get_walker([b"a"], {b"a": [b"b"], b"b": []})
+        self.assertEqual(b"a" * 40, next(gw))
+        gw.ack(b"a" * 40)
+        self.assertIs(None, next(gw))
+
+    def test_child_ack_later(self) -> None:
+        gw = self.get_walker([b"a"], {b"a": [b"b"], b"b": [b"c"], b"c": []})
+        self.assertEqual(b"a" * 40, next(gw))
+        self.assertEqual(b"b" * 40, next(gw))
+        gw.ack(b"a" * 40)
+        self.assertIs(None, next(gw))
+
+    def test_only_once(self) -> None:
+        # a  b
+        # |  |
+        # c  d
+        # \ /
+        #  e
+        gw = self.get_walker(
+            [b"a", b"b"],
+            {
+                b"a": [b"c"],
+                b"b": [b"d"],
+                b"c": [b"e"],
+                b"d": [b"e"],
+                b"e": [],
+            },
+        )
+        walk = []
+        acked = False
+        walk.append(next(gw))
+        walk.append(next(gw))
+        # A branch (a, c) or (b, d) may be done after 2 steps or 3 depending on
+        # the order walked: 3-step walks include (a, b, c) and (b, a, d), etc.
+        if walk == [b"a" * 40, b"c" * 40] or walk == [b"b" * 40, b"d" * 40]:
+            gw.ack(walk[0])
+            acked = True
+
+        walk.append(next(gw))
+        if not acked and walk[2] == b"c" * 40:
+            gw.ack(b"a" * 40)
+        elif not acked and walk[2] == b"d" * 40:
+            gw.ack(b"b" * 40)
+        walk.append(next(gw))
+        self.assertIs(None, next(gw))
+
+        self.assertEqual([b"a" * 40, b"b" * 40, b"c" * 40, b"d" * 40], sorted(walk))
+        self.assertLess(walk.index(b"a" * 40), walk.index(b"c" * 40))
+        self.assertLess(walk.index(b"b" * 40), walk.index(b"d" * 40))
+
+
+class CommitTreeChangesTests(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.store = MemoryObjectStore()
+        self.blob_a = make_object(Blob, data=b"a")
+        self.blob_b = make_object(Blob, data=b"b")
+        self.blob_c = make_object(Blob, data=b"c")
+        for blob in [self.blob_a, self.blob_b, self.blob_c]:
+            self.store.add_object(blob)
+
+        blobs = [
+            (b"a", self.blob_a.id, 0o100644),
+            (b"ad/b", self.blob_b.id, 0o100644),
+            (b"ad/bd/c", self.blob_c.id, 0o100755),
+            (b"ad/c", self.blob_c.id, 0o100644),
+            (b"c", self.blob_c.id, 0o100644),
+        ]
+        self.tree_id = commit_tree(self.store, blobs)
+
+    def test_no_changes(self) -> None:
+        # When no changes, should return the same tree SHA
+        self.assertEqual(
+            self.tree_id,
+            commit_tree_changes(self.store, self.store[self.tree_id], []),
+        )
+
+    def test_add_blob(self) -> None:
+        blob_d = make_object(Blob, data=b"d")
+        new_tree_id = commit_tree_changes(
+            self.store, self.store[self.tree_id], [(b"d", 0o100644, blob_d.id)]
+        )
+        new_tree = self.store[new_tree_id]
+        self.assertEqual(
+            new_tree[b"d"],
+            (33188, b"c59d9b6344f1af00e504ba698129f07a34bbed8d"),
+        )
+
+    def test_add_blob_in_dir(self) -> None:
+        blob_d = make_object(Blob, data=b"d")
+        new_tree_id = commit_tree_changes(
+            self.store,
+            self.store[self.tree_id],
+            [(b"e/f/d", 0o100644, blob_d.id)],
+        )
+        new_tree = self.store[new_tree_id]
+        self.assertEqual(
+            new_tree.items(),
+            [
+                TreeEntry(path=b"a", mode=stat.S_IFREG | 0o100644, sha=self.blob_a.id),
+                TreeEntry(
+                    path=b"ad",
+                    mode=stat.S_IFDIR,
+                    sha=b"0e2ce2cd7725ff4817791be31ccd6e627e801f4a",
+                ),
+                TreeEntry(path=b"c", mode=stat.S_IFREG | 0o100644, sha=self.blob_c.id),
+                TreeEntry(
+                    path=b"e",
+                    mode=stat.S_IFDIR,
+                    sha=b"6ab344e288724ac2fb38704728b8896e367ed108",
+                ),
+            ],
+        )
+        e_tree = self.store[new_tree[b"e"][1]]
+        self.assertEqual(
+            e_tree.items(),
+            [
+                TreeEntry(
+                    path=b"f",
+                    mode=stat.S_IFDIR,
+                    sha=b"24d2c94d8af232b15a0978c006bf61ef4479a0a5",
+                )
+            ],
+        )
+        f_tree = self.store[e_tree[b"f"][1]]
+        self.assertEqual(
+            f_tree.items(),
+            [TreeEntry(path=b"d", mode=stat.S_IFREG | 0o100644, sha=blob_d.id)],
+        )
+
+    def test_delete_blob(self) -> None:
+        new_tree_id = commit_tree_changes(
+            self.store, self.store[self.tree_id], [(b"ad/bd/c", None, None)]
+        )
+        new_tree = self.store[new_tree_id]
+        self.assertEqual(set(new_tree), {b"a", b"ad", b"c"})
+        ad_tree = self.store[new_tree[b"ad"][1]]
+        self.assertEqual(set(ad_tree), {b"b", b"c"})
+
+
+class TestReadPacksFile(TestCase):
+    def test_read_packs(self) -> None:
+        self.assertEqual(
+            ["pack-1.pack"],
+            list(
+                read_packs_file(
+                    BytesIO(
+                        b"""P pack-1.pack
+"""
+                    )
+                )
+            ),
+        )

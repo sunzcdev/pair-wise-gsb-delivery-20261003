@@ -1,0 +1,2282 @@
+# test_objects.py -- tests for objects.py
+# Copyright (C) 2007 James Westby <jw+debian@jameswestby.net>
+#
+# SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+# Dulwich is dual-licensed under the Apache License, Version 2.0 and the GNU
+# General Public License as published by the Free Software Foundation; version 2.0
+# or (at your option) any later version. You can redistribute it and/or
+# modify it under the terms of either of these two licenses.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# You should have received a copy of the licenses; if not, see
+# <http://www.gnu.org/licenses/> for a copy of the GNU General Public License
+# and <http://www.apache.org/licenses/LICENSE-2.0> for a copy of the Apache
+# License, Version 2.0.
+#
+
+"""Tests for git base objects."""
+
+# TODO: Round-trip parse-serialize-parse and serialize-parse-serialize tests.
+
+import datetime
+import os
+import stat
+from contextlib import contextmanager
+from io import BytesIO
+from itertools import permutations
+
+from dulwich.errors import ObjectFormatException
+from dulwich.object_format import SHA256
+from dulwich.objects import (
+    MAX_TIME,
+    SIGNATURE_PGP,
+    SIGNATURE_SSH,
+    ZERO_SHA,
+    Blob,
+    Commit,
+    ShaFile,
+    Tag,
+    Tree,
+    TreeEntry,
+    _parse_message,
+    _parse_tree_py,
+    _sorted_tree_items_py,
+    check_hexsha,
+    check_identity,
+    format_timezone,
+    hex_to_filename,
+    hex_to_sha,
+    key_entry,
+    object_class,
+    parse_commit_broken,
+    parse_time_entry_broken,
+    parse_timezone,
+    pretty_format_tree_entry,
+    sha_to_hex,
+)
+
+try:
+    from dulwich.objects import _parse_tree_rs, _sorted_tree_items_rs
+except ImportError:
+    _sorted_tree_items_rs = _parse_tree_rs = None
+from dulwich.tests.utils import (
+    ext_functest_builder,
+    functest_builder,
+    make_commit,
+    make_object,
+)
+
+from . import TestCase
+
+a_sha = b"6f670c0fb53f9463760b7295fbb814e965fb20c8"
+b_sha = b"2969be3e8ee1c0222396a5611407e4769f14e54b"
+c_sha = b"954a536f7819d40e6f637f849ee187dd10066349"
+tree_sha = b"70c190eb48fa8bbb50ddc692a17b44cb781af7f6"
+tag_sha = b"71033db03a03c6a36721efcf1968dd8f8e0cf023"
+
+
+class TestHexToSha(TestCase):
+    def test_simple(self) -> None:
+        self.assertEqual(b"\xab\xcd" * 10, hex_to_sha(b"abcd" * 10))
+
+    def test_reverse(self) -> None:
+        self.assertEqual(b"abcd" * 10, sha_to_hex(b"\xab\xcd" * 10))
+
+
+class BlobReadTests(TestCase):
+    """Test decompression of blobs."""
+
+    def get_sha_file(self, cls, base, sha):
+        dir = os.path.join(os.path.dirname(__file__), "..", "testdata", base)
+        return cls.from_path(hex_to_filename(dir, sha))
+
+    def get_blob(self, sha):
+        """Return the blob named sha from the test data dir."""
+        return self.get_sha_file(Blob, "blobs", sha)
+
+    def get_tree(self, sha):
+        return self.get_sha_file(Tree, "trees", sha)
+
+    def get_tag(self, sha):
+        return self.get_sha_file(Tag, "tags", sha)
+
+    def commit(self, sha):
+        return self.get_sha_file(Commit, "commits", sha)
+
+    def test_decompress_simple_blob(self) -> None:
+        b = self.get_blob(a_sha)
+        self.assertEqual(b.data, b"test 1\n")
+        self.assertEqual(b.sha().hexdigest().encode("ascii"), a_sha)
+
+    def test_hash(self) -> None:
+        b = self.get_blob(a_sha)
+        self.assertEqual(hash(b.id), hash(b))
+
+    def test_parse_empty_blob_object(self) -> None:
+        sha = b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        b = self.get_blob(sha)
+        self.assertEqual(b.data, b"")
+        self.assertEqual(b.id, sha)
+        self.assertEqual(b.sha().hexdigest().encode("ascii"), sha)
+
+    def test_create_blob_from_string(self) -> None:
+        string = b"test 2\n"
+        b = Blob.from_string(string)
+        self.assertEqual(b.data, string)
+        self.assertEqual(b.sha().hexdigest().encode("ascii"), b_sha)
+
+    def test_legacy_from_file(self) -> None:
+        b1 = Blob.from_string(b"foo")
+        b_raw = b1.as_legacy_object()
+        b2 = b1.from_file(BytesIO(b_raw))
+        self.assertEqual(b1, b2)
+
+    def test_legacy_from_file_compression_level(self) -> None:
+        b1 = Blob.from_string(b"foo")
+        b_raw = b1.as_legacy_object(compression_level=6)
+        b2 = b1.from_file(BytesIO(b_raw))
+        self.assertEqual(b1, b2)
+
+    def test_chunks(self) -> None:
+        string = b"test 5\n"
+        b = Blob.from_string(string)
+        self.assertEqual([string], b.chunked)
+
+    def test_splitlines(self) -> None:
+        for case in [
+            [],
+            [b"foo\nbar\n"],
+            [b"bl\na", b"blie"],
+            [b"bl\na", b"blie", b"bloe\n"],
+            [b"", b"bl\na", b"blie", b"bloe\n"],
+            [b"", b"", b"", b"bla\n"],
+            [b"", b"", b"", b"bla\n", b""],
+            [b"bl", b"", b"a\naaa"],
+            [b"a\naaa", b"a"],
+        ]:
+            b = Blob()
+            b.chunked = case
+            self.assertEqual(b.data.splitlines(True), b.splitlines())
+
+    def test_set_chunks(self) -> None:
+        b = Blob()
+        b.chunked = [b"te", b"st", b" 5\n"]
+        self.assertEqual(b"test 5\n", b.data)
+        b.chunked = [b"te", b"st", b" 6\n"]
+        self.assertEqual(b"test 6\n", b.as_raw_string())
+        self.assertEqual(b"test 6\n", bytes(b))
+
+    def test_parse_legacy_blob(self) -> None:
+        string = b"test 3\n"
+        b = self.get_blob(c_sha)
+        self.assertEqual(b.data, string)
+        self.assertEqual(b.sha().hexdigest().encode("ascii"), c_sha)
+
+    def test_eq(self) -> None:
+        blob1 = self.get_blob(a_sha)
+        blob2 = self.get_blob(a_sha)
+        self.assertEqual(blob1, blob2)
+
+    def test_read_tree_from_file(self) -> None:
+        t = self.get_tree(tree_sha)
+        self.assertEqual(t.items()[0], (b"a", 33188, a_sha))
+        self.assertEqual(t.items()[1], (b"b", 33188, b_sha))
+
+    def test_read_tree_from_file_parse_count(self) -> None:
+        old_deserialize = Tree._deserialize
+
+        def reset_deserialize() -> None:
+            Tree._deserialize = old_deserialize
+
+        self.addCleanup(reset_deserialize)
+        self.deserialize_count = 0
+
+        def counting_deserialize(*args, **kwargs):
+            self.deserialize_count += 1
+            return old_deserialize(*args, **kwargs)
+
+        Tree._deserialize = counting_deserialize
+        t = self.get_tree(tree_sha)
+        self.assertEqual(t.items()[0], (b"a", 33188, a_sha))
+        self.assertEqual(t.items()[1], (b"b", 33188, b_sha))
+        self.assertEqual(self.deserialize_count, 1)
+
+    def test_read_tag_from_file(self) -> None:
+        t = self.get_tag(tag_sha)
+        self.assertEqual(
+            t.object, (Commit, b"51b668fd5bf7061b7d6fa525f88803e6cfadaa51")
+        )
+        self.assertEqual(t.name, b"signed")
+        self.assertEqual(t.tagger, b"Ali Sabil <ali.sabil@gmail.com>")
+        self.assertEqual(t.tag_time, 1231203091)
+        self.assertEqual(t.message, b"This is a signed tag\n")
+        self.assertEqual(
+            t.signature,
+            b"-----BEGIN PGP SIGNATURE-----\n"
+            b"Version: GnuPG v1.4.9 (GNU/Linux)\n"
+            b"\n"
+            b"iEYEABECAAYFAkliqx8ACgkQqSMmLy9u/"
+            b"kcx5ACfakZ9NnPl02tOyYP6pkBoEkU1\n"
+            b"5EcAn0UFgokaSvS371Ym/4W9iJj6vh3h\n"
+            b"=ql7y\n"
+            b"-----END PGP SIGNATURE-----\n",
+        )
+        self.assertEqual(t.raw_without_sig() + t.signature, bytes(t))
+
+    def test_read_commit_from_file(self) -> None:
+        sha = b"60dacdc733de308bb77bb76ce0fb0f9b44c9769e"
+        c = self.commit(sha)
+        self.assertEqual(c.tree, tree_sha)
+        self.assertEqual(c.parents, [b"0d89f20333fbb1d2f3a94da77f4981373d8f4310"])
+        self.assertEqual(c.author, b"James Westby <jw+debian@jameswestby.net>")
+        self.assertEqual(c.committer, b"James Westby <jw+debian@jameswestby.net>")
+        self.assertEqual(c.commit_time, 1174759230)
+        self.assertEqual(c.commit_timezone, 0)
+        self.assertEqual(c.author_timezone, 0)
+        self.assertEqual(c.message, b"Test commit\n")
+
+    def test_read_commit_no_parents(self) -> None:
+        sha = b"0d89f20333fbb1d2f3a94da77f4981373d8f4310"
+        c = self.commit(sha)
+        self.assertEqual(c.tree, b"90182552c4a85a45ec2a835cadc3451bebdfe870")
+        self.assertEqual(c.parents, [])
+        self.assertEqual(c.author, b"James Westby <jw+debian@jameswestby.net>")
+        self.assertEqual(c.committer, b"James Westby <jw+debian@jameswestby.net>")
+        self.assertEqual(c.commit_time, 1174758034)
+        self.assertEqual(c.commit_timezone, 0)
+        self.assertEqual(c.author_timezone, 0)
+        self.assertEqual(c.message, b"Test commit\n")
+
+    def test_read_commit_two_parents(self) -> None:
+        sha = b"5dac377bdded4c9aeb8dff595f0faeebcc8498cc"
+        c = self.commit(sha)
+        self.assertEqual(c.tree, b"d80c186a03f423a81b39df39dc87fd269736ca86")
+        self.assertEqual(
+            c.parents,
+            [
+                b"ab64bbdcc51b170d21588e5c5d391ee5c0c96dfd",
+                b"4cffe90e0a41ad3f5190079d7c8f036bde29cbe6",
+            ],
+        )
+        self.assertEqual(c.author, b"James Westby <jw+debian@jameswestby.net>")
+        self.assertEqual(c.committer, b"James Westby <jw+debian@jameswestby.net>")
+        self.assertEqual(c.commit_time, 1174773719)
+        self.assertEqual(c.commit_timezone, 0)
+        self.assertEqual(c.author_timezone, 0)
+        self.assertEqual(c.message, b"Merge ../b\n")
+
+    def test_stub_sha(self) -> None:
+        sha = b"5" * 40
+        c = make_commit(id=sha, message=b"foo")
+        self.assertIsInstance(c, Commit)
+        self.assertEqual(sha, c.id)
+        self.assertNotEqual(sha, c.sha())
+
+
+class ShaFileCheckTests(TestCase):
+    def assertCheckFails(self, cls, data) -> None:
+        obj = cls()
+
+        def do_check() -> None:
+            obj.set_raw_string(data)
+            obj.check()
+
+        self.assertRaises(ObjectFormatException, do_check)
+
+    def assertCheckSucceeds(self, cls, data) -> None:
+        obj = cls()
+        obj.set_raw_string(data)
+        self.assertEqual(None, obj.check())
+
+
+small_buffer_zlib_object = (
+    b"\x48\x89\x15\xcc\x31\x0e\xc2\x30\x0c\x40\x51\xe6"
+    b"\x9c\xc2\x3b\xaa\x64\x37\xc4\xc1\x12\x42\x5c\xc5"
+    b"\x49\xac\x52\xd4\x92\xaa\x78\xe1\xf6\x94\xed\xeb"
+    b"\x0d\xdf\x75\x02\xa2\x7c\xea\xe5\x65\xd5\x81\x8b"
+    b"\x9a\x61\xba\xa0\xa9\x08\x36\xc9\x4c\x1a\xad\x88"
+    b"\x16\xba\x46\xc4\xa8\x99\x6a\x64\xe1\xe0\xdf\xcd"
+    b"\xa0\xf6\x75\x9d\x3d\xf8\xf1\xd0\x77\xdb\xfb\xdc"
+    b"\x86\xa3\x87\xf1\x2f\x93\xed\x00\xb7\xc7\xd2\xab"
+    b"\x2e\xcf\xfe\xf1\x3b\x50\xa4\x91\x53\x12\x24\x38"
+    b"\x23\x21\x86\xf0\x03\x2f\x91\x24\x52"
+)
+
+
+class ShaFileTests(TestCase):
+    def test_deflated_smaller_window_buffer(self) -> None:
+        # zlib on some systems uses smaller buffers,
+        # resulting in a different header.
+        # See https://github.com/libgit2/libgit2/pull/464
+        sf = ShaFile.from_file(BytesIO(small_buffer_zlib_object))
+        self.assertEqual(sf.type_name, b"tag")
+        self.assertEqual(sf.tagger, b" <@localhost>")
+
+    def test_from_file_rejects_decompression_bomb(self) -> None:
+        # Regression: a loose object whose zlib stream inflates far past the
+        # caller-supplied max_size must be rejected without allocating the
+        # full inflated payload (decompression-bomb DoS).
+        import tracemalloc
+        import zlib
+
+        payload = b"blob 5\x00hello" + b"\x00" * (4 * 1024 * 1024)
+        stream = zlib.compress(payload)
+        self.assertLess(len(stream), len(payload) // 100)
+        tracemalloc.start()
+        try:
+            self.assertRaises(
+                zlib.error,
+                ShaFile.from_file,
+                BytesIO(stream),
+                max_size=1024,
+            )
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, len(payload) // 4)
+
+    def test_legacy_from_file_large(self) -> None:
+        # Regression (#2292): a loose object whose content inflates past the
+        # 8192-byte header scan window must still parse; only the header, not
+        # the whole payload, is bounded by that window.
+        b1 = Blob.from_string(b"x" * 200000)
+        b2 = ShaFile.from_file(BytesIO(b1.as_legacy_object()))
+        self.assertEqual(b1, b2)
+
+    def test_legacy_from_file_rejects_oversized_header(self) -> None:
+        import zlib
+
+        # A legacy object whose header has no NUL within the scan window is
+        # rejected without inflating the whole stream.
+        payload = b"blob " + b"9" * 20000 + b"\x00rest"
+        stream = zlib.compress(payload)
+        self.assertRaises(zlib.error, ShaFile.from_file, BytesIO(stream))
+
+    def test_from_file_has_default_size_limit(self) -> None:
+        # DEFAULT_LOOSE_OBJECT_SIZE_LIMIT must match Git's core.bigFileThreshold
+        # default (512 MiB). Callers that do not pass max_size inherit this cap.
+        import inspect
+
+        from dulwich.objects import DEFAULT_LOOSE_OBJECT_SIZE_LIMIT
+
+        self.assertEqual(DEFAULT_LOOSE_OBJECT_SIZE_LIMIT, 512 * 1024 * 1024)
+        sig = inspect.signature(ShaFile.from_file)
+        self.assertEqual(
+            sig.parameters["max_size"].default, DEFAULT_LOOSE_OBJECT_SIZE_LIMIT
+        )
+
+
+class CommitSerializationTests(TestCase):
+    def make_commit(self, **kwargs):
+        attrs = {
+            "tree": b"d80c186a03f423a81b39df39dc87fd269736ca86",
+            "parents": [
+                b"ab64bbdcc51b170d21588e5c5d391ee5c0c96dfd",
+                b"4cffe90e0a41ad3f5190079d7c8f036bde29cbe6",
+            ],
+            "author": b"James Westby <jw+debian@jameswestby.net>",
+            "committer": b"James Westby <jw+debian@jameswestby.net>",
+            "commit_time": 1174773719,
+            "author_time": 1174773719,
+            "commit_timezone": 0,
+            "author_timezone": 0,
+            "message": b"Merge ../b\n",
+        }
+        attrs.update(kwargs)
+        return make_commit(**attrs)
+
+    def test_encoding(self) -> None:
+        c = self.make_commit(encoding=b"iso8859-1")
+        self.assertIn(b"encoding iso8859-1\n", c.as_raw_string())
+
+    def test_short_timestamp(self) -> None:
+        c = self.make_commit(commit_time=30)
+        c1 = Commit()
+        c1.set_raw_string(c.as_raw_string())
+        self.assertEqual(30, c1.commit_time)
+
+    def test_full_tree(self) -> None:
+        c = self.make_commit(commit_time=30)
+        t = Tree()
+        t.add(b"data-x", 0o644, Blob().id)
+        c.tree = t
+        c1 = Commit()
+        c1.set_raw_string(c.as_raw_string())
+        self.assertEqual(t.id, c1.tree)
+        self.assertEqual(c.as_raw_string(), c1.as_raw_string())
+
+    def test_raw_length(self) -> None:
+        c = self.make_commit()
+        self.assertEqual(len(c.as_raw_string()), c.raw_length())
+
+    def test_simple(self) -> None:
+        c = self.make_commit()
+        self.assertEqual(c.id, b"5dac377bdded4c9aeb8dff595f0faeebcc8498cc")
+        self.assertEqual(
+            b"tree d80c186a03f423a81b39df39dc87fd269736ca86\n"
+            b"parent ab64bbdcc51b170d21588e5c5d391ee5c0c96dfd\n"
+            b"parent 4cffe90e0a41ad3f5190079d7c8f036bde29cbe6\n"
+            b"author James Westby <jw+debian@jameswestby.net> "
+            b"1174773719 +0000\n"
+            b"committer James Westby <jw+debian@jameswestby.net> "
+            b"1174773719 +0000\n"
+            b"\n"
+            b"Merge ../b\n",
+            c.as_raw_string(),
+        )
+
+    def test_timezone(self) -> None:
+        c = self.make_commit(commit_timezone=(5 * 60))
+        self.assertIn(b" +0005\n", c.as_raw_string())
+
+    def test_neg_timezone(self) -> None:
+        c = self.make_commit(commit_timezone=(-1 * 3600))
+        self.assertIn(b" -0100\n", c.as_raw_string())
+
+    def test_deserialize(self) -> None:
+        c = self.make_commit()
+        d = Commit()
+        d._deserialize(c.as_raw_chunks())
+        self.assertEqual(c, d)
+
+    def test_serialize_gpgsig(self) -> None:
+        gpgsig = b"""-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1
+
+iQIcBAABCgAGBQJULCdfAAoJEACAbyvXKaRXuKwP/RyP9PA49uAvu8tQVCC/uBa8
+vi975+xvO14R8Pp8k2nps7lSxCdtCd+xVT1VRHs0wNhOZo2YCVoU1HATkPejqSeV
+NScTHcxnk4/+bxyfk14xvJkNp7FlQ3npmBkA+lbV0Ubr33rvtIE5jiJPyz+SgWAg
+xdBG2TojV0squj00GoH/euK6aX7GgZtwdtpTv44haCQdSuPGDcI4TORqR6YSqvy3
+GPE+3ZqXPFFb+KILtimkxitdwB7CpwmNse2vE3rONSwTvi8nq3ZoQYNY73CQGkUy
+qoFU0pDtw87U3niFin1ZccDgH0bB6624sLViqrjcbYJeg815Htsu4rmzVaZADEVC
+XhIO4MThebusdk0AcNGjgpf3HRHk0DPMDDlIjm+Oao0cqovvF6VyYmcb0C+RmhJj
+dodLXMNmbqErwTk3zEkW0yZvNIYXH7m9SokPCZa4eeIM7be62X6h1mbt0/IU6Th+
+v18fS0iTMP/Viug5und+05C/v04kgDo0CPphAbXwWMnkE4B6Tl9sdyUYXtvQsL7x
+0+WP1gL27ANqNZiI07Kz/BhbBAQI/+2TFT7oGr0AnFPQ5jHp+3GpUf6OKuT1wT3H
+ND189UFuRuubxb42vZhpcXRbqJVWnbECTKVUPsGZqat3enQUB63uM4i6/RdONDZA
+fDeF1m4qYs+cUXKNUZ03
+=X6RT
+-----END PGP SIGNATURE-----"""
+        pre_sig = b"""\
+tree d80c186a03f423a81b39df39dc87fd269736ca86
+parent ab64bbdcc51b170d21588e5c5d391ee5c0c96dfd
+parent 4cffe90e0a41ad3f5190079d7c8f036bde29cbe6
+author James Westby <jw+debian@jameswestby.net> 1174773719 +0000
+committer James Westby <jw+debian@jameswestby.net> 1174773719 +0000
+"""
+        git_sig = b"""\
+gpgsig -----BEGIN PGP SIGNATURE-----
+ Version: GnuPG v1
+ 
+ iQIcBAABCgAGBQJULCdfAAoJEACAbyvXKaRXuKwP/RyP9PA49uAvu8tQVCC/uBa8
+ vi975+xvO14R8Pp8k2nps7lSxCdtCd+xVT1VRHs0wNhOZo2YCVoU1HATkPejqSeV
+ NScTHcxnk4/+bxyfk14xvJkNp7FlQ3npmBkA+lbV0Ubr33rvtIE5jiJPyz+SgWAg
+ xdBG2TojV0squj00GoH/euK6aX7GgZtwdtpTv44haCQdSuPGDcI4TORqR6YSqvy3
+ GPE+3ZqXPFFb+KILtimkxitdwB7CpwmNse2vE3rONSwTvi8nq3ZoQYNY73CQGkUy
+ qoFU0pDtw87U3niFin1ZccDgH0bB6624sLViqrjcbYJeg815Htsu4rmzVaZADEVC
+ XhIO4MThebusdk0AcNGjgpf3HRHk0DPMDDlIjm+Oao0cqovvF6VyYmcb0C+RmhJj
+ dodLXMNmbqErwTk3zEkW0yZvNIYXH7m9SokPCZa4eeIM7be62X6h1mbt0/IU6Th+
+ v18fS0iTMP/Viug5und+05C/v04kgDo0CPphAbXwWMnkE4B6Tl9sdyUYXtvQsL7x
+ 0+WP1gL27ANqNZiI07Kz/BhbBAQI/+2TFT7oGr0AnFPQ5jHp+3GpUf6OKuT1wT3H
+ ND189UFuRuubxb42vZhpcXRbqJVWnbECTKVUPsGZqat3enQUB63uM4i6/RdONDZA
+ fDeF1m4qYs+cUXKNUZ03
+ =X6RT
+ -----END PGP SIGNATURE-----
+"""
+        post_sig = b"""\
+
+Merge ../b
+"""
+        commit = self.make_commit(gpgsig=gpgsig)
+        self.maxDiff = None
+        self.assertEqual(pre_sig + git_sig + post_sig, commit.as_raw_string())
+        self.assertEqual(pre_sig + post_sig, commit.raw_without_sig())
+        self.assertEqual(gpgsig, commit.gpgsig)
+        self.assertEqual(b"Merge ../b\n", commit.message)
+
+    def test_serialize_mergetag(self) -> None:
+        tag = make_object(
+            Tag,
+            object=(Commit, b"a38d6181ff27824c79fc7df825164a212eff6a3f"),
+            object_type_name=b"commit",
+            name=b"v2.6.22-rc7",
+            tag_time=1183319674,
+            tag_timezone=0,
+            tagger=b"Linus Torvalds <torvalds@woody.linux-foundation.org>",
+            message=default_message,
+        )
+        commit = self.make_commit(mergetag=[tag])
+
+        self.assertEqual(
+            b"""tree d80c186a03f423a81b39df39dc87fd269736ca86
+parent ab64bbdcc51b170d21588e5c5d391ee5c0c96dfd
+parent 4cffe90e0a41ad3f5190079d7c8f036bde29cbe6
+author James Westby <jw+debian@jameswestby.net> 1174773719 +0000
+committer James Westby <jw+debian@jameswestby.net> 1174773719 +0000
+mergetag object a38d6181ff27824c79fc7df825164a212eff6a3f
+ type commit
+ tag v2.6.22-rc7
+ tagger Linus Torvalds <torvalds@woody.linux-foundation.org> 1183319674 +0000
+ 
+ Linux 2.6.22-rc7
+ -----BEGIN PGP SIGNATURE-----
+ Version: GnuPG v1.4.7 (GNU/Linux)
+ 
+ iD8DBQBGiAaAF3YsRnbiHLsRAitMAKCiLboJkQECM/jpYsY3WPfvUgLXkACgg3ql
+ OK2XeQOiEeXtT76rV4t2WR4=
+ =ivrA
+ -----END PGP SIGNATURE-----
+
+Merge ../b
+""",
+            commit.as_raw_string(),
+        )
+
+    def test_serialize_mergetags(self) -> None:
+        tag = make_object(
+            Tag,
+            object=(Commit, b"a38d6181ff27824c79fc7df825164a212eff6a3f"),
+            object_type_name=b"commit",
+            name=b"v2.6.22-rc7",
+            tag_time=1183319674,
+            tag_timezone=0,
+            tagger=b"Linus Torvalds <torvalds@woody.linux-foundation.org>",
+            message=default_message,
+        )
+        commit = self.make_commit(mergetag=[tag, tag])
+
+        self.assertEqual(
+            b"""tree d80c186a03f423a81b39df39dc87fd269736ca86
+parent ab64bbdcc51b170d21588e5c5d391ee5c0c96dfd
+parent 4cffe90e0a41ad3f5190079d7c8f036bde29cbe6
+author James Westby <jw+debian@jameswestby.net> 1174773719 +0000
+committer James Westby <jw+debian@jameswestby.net> 1174773719 +0000
+mergetag object a38d6181ff27824c79fc7df825164a212eff6a3f
+ type commit
+ tag v2.6.22-rc7
+ tagger Linus Torvalds <torvalds@woody.linux-foundation.org> 1183319674 +0000
+ 
+ Linux 2.6.22-rc7
+ -----BEGIN PGP SIGNATURE-----
+ Version: GnuPG v1.4.7 (GNU/Linux)
+ 
+ iD8DBQBGiAaAF3YsRnbiHLsRAitMAKCiLboJkQECM/jpYsY3WPfvUgLXkACgg3ql
+ OK2XeQOiEeXtT76rV4t2WR4=
+ =ivrA
+ -----END PGP SIGNATURE-----
+mergetag object a38d6181ff27824c79fc7df825164a212eff6a3f
+ type commit
+ tag v2.6.22-rc7
+ tagger Linus Torvalds <torvalds@woody.linux-foundation.org> 1183319674 +0000
+ 
+ Linux 2.6.22-rc7
+ -----BEGIN PGP SIGNATURE-----
+ Version: GnuPG v1.4.7 (GNU/Linux)
+ 
+ iD8DBQBGiAaAF3YsRnbiHLsRAitMAKCiLboJkQECM/jpYsY3WPfvUgLXkACgg3ql
+ OK2XeQOiEeXtT76rV4t2WR4=
+ =ivrA
+ -----END PGP SIGNATURE-----
+
+Merge ../b
+""",
+            commit.as_raw_string(),
+        )
+
+    def test_deserialize_mergetag(self) -> None:
+        tag = make_object(
+            Tag,
+            object=(Commit, b"a38d6181ff27824c79fc7df825164a212eff6a3f"),
+            object_type_name=b"commit",
+            name=b"v2.6.22-rc7",
+            tag_time=1183319674,
+            tag_timezone=0,
+            tagger=b"Linus Torvalds <torvalds@woody.linux-foundation.org>",
+            message=default_message,
+        )
+        commit = self.make_commit(mergetag=[tag])
+
+        d = Commit()
+        d._deserialize(commit.as_raw_chunks())
+        self.assertEqual(commit, d)
+
+    def test_deserialize_mergetags(self) -> None:
+        tag = make_object(
+            Tag,
+            object=(Commit, b"a38d6181ff27824c79fc7df825164a212eff6a3f"),
+            object_type_name=b"commit",
+            name=b"v2.6.22-rc7",
+            tag_time=1183319674,
+            tag_timezone=0,
+            tagger=b"Linus Torvalds <torvalds@woody.linux-foundation.org>",
+            message=default_message,
+        )
+        commit = self.make_commit(mergetag=[tag, tag])
+
+        d = Commit()
+        d._deserialize(commit.as_raw_chunks())
+        self.assertEqual(commit, d)
+
+
+default_committer = b"James Westby <jw+debian@jameswestby.net> 1174773719 +0000"
+
+
+class CommitParseTests(ShaFileCheckTests):
+    def make_commit_lines(
+        self,
+        tree=b"d80c186a03f423a81b39df39dc87fd269736ca86",
+        parents=[
+            b"ab64bbdcc51b170d21588e5c5d391ee5c0c96dfd",
+            b"4cffe90e0a41ad3f5190079d7c8f036bde29cbe6",
+        ],
+        author=default_committer,
+        committer=default_committer,
+        encoding=None,
+        message=b"Merge ../b\n",
+        extra=None,
+    ):
+        lines = []
+        if tree is not None:
+            lines.append(b"tree " + tree)
+        if parents is not None:
+            lines.extend(b"parent " + p for p in parents)
+        if author is not None:
+            lines.append(b"author " + author)
+        if committer is not None:
+            lines.append(b"committer " + committer)
+        if encoding is not None:
+            lines.append(b"encoding " + encoding)
+        if extra is not None:
+            for name, value in sorted(extra.items()):
+                lines.append(name + b" " + value)
+        lines.append(b"")
+        if message is not None:
+            lines.append(message)
+        return lines
+
+    def make_commit_text(self, **kwargs):
+        return b"\n".join(self.make_commit_lines(**kwargs))
+
+    def test_simple(self) -> None:
+        c = Commit.from_string(self.make_commit_text())
+        self.assertEqual(b"Merge ../b\n", c.message)
+        self.assertEqual(b"James Westby <jw+debian@jameswestby.net>", c.author)
+        self.assertEqual(b"James Westby <jw+debian@jameswestby.net>", c.committer)
+        self.assertEqual(b"d80c186a03f423a81b39df39dc87fd269736ca86", c.tree)
+        self.assertEqual(
+            [
+                b"ab64bbdcc51b170d21588e5c5d391ee5c0c96dfd",
+                b"4cffe90e0a41ad3f5190079d7c8f036bde29cbe6",
+            ],
+            c.parents,
+        )
+        expected_time = datetime.datetime(2007, 3, 24, 22, 1, 59)
+        self.assertEqual(
+            expected_time,
+            datetime.datetime.fromtimestamp(
+                c.commit_time, datetime.timezone.utc
+            ).replace(tzinfo=None),
+        )
+        self.assertEqual(0, c.commit_timezone)
+        self.assertEqual(
+            expected_time,
+            datetime.datetime.fromtimestamp(
+                c.author_time, datetime.timezone.utc
+            ).replace(tzinfo=None),
+        )
+        self.assertEqual(0, c.author_timezone)
+        self.assertEqual(None, c.encoding)
+
+    def test_custom(self) -> None:
+        c = Commit.from_string(self.make_commit_text(extra={b"extra-field": b"data"}))
+        self.assertEqual([(b"extra-field", b"data")], c._extra)
+
+    def test_encoding(self) -> None:
+        c = Commit.from_string(self.make_commit_text(encoding=b"UTF-8"))
+        self.assertEqual(b"UTF-8", c.encoding)
+
+    def test_check(self) -> None:
+        self.assertCheckSucceeds(Commit, self.make_commit_text())
+        self.assertCheckSucceeds(Commit, self.make_commit_text(parents=None))
+        self.assertCheckSucceeds(Commit, self.make_commit_text(encoding=b"UTF-8"))
+
+        self.assertCheckFails(Commit, self.make_commit_text(tree=b"xxx"))
+        self.assertCheckFails(Commit, self.make_commit_text(parents=[a_sha, b"xxx"]))
+        bad_committer = b"some guy without an email address 1174773719 +0000"
+        self.assertCheckFails(Commit, self.make_commit_text(committer=bad_committer))
+        self.assertCheckFails(Commit, self.make_commit_text(author=bad_committer))
+        self.assertCheckFails(Commit, self.make_commit_text(author=None))
+        self.assertCheckFails(Commit, self.make_commit_text(committer=None))
+        self.assertCheckFails(
+            Commit, self.make_commit_text(author=None, committer=None)
+        )
+
+    def test_check_duplicates(self) -> None:
+        # duplicate each of the header fields
+        for i in range(5):
+            lines = self.make_commit_lines(parents=[a_sha], encoding=b"UTF-8")
+            lines.insert(i, lines[i])
+            text = b"\n".join(lines)
+            if lines[i].startswith(b"parent"):
+                # duplicate parents are ok for now
+                self.assertCheckSucceeds(Commit, text)
+            else:
+                self.assertCheckFails(Commit, text)
+
+    def test_parse_duplicate_tree(self) -> None:
+        lines = self.make_commit_lines(parents=[a_sha])
+        lines.insert(1, b"tree " + b_sha)
+        text = b"\n".join(lines)
+        tree = b"d80c186a03f423a81b39df39dc87fd269736ca86"
+        self.assertEqual(tree, Commit.from_string(text).tree)
+        self.assertEqual(tree, parse_commit_broken(text).tree)
+
+    def test_parse_parents_after_second_tree(self) -> None:
+        lines = self.make_commit_lines(parents=[a_sha])
+        lines.insert(2, b"tree " + b_sha)
+        lines.insert(3, b"parent " + b_sha)
+        text = b"\n".join(lines)
+        self.assertEqual([a_sha], Commit.from_string(text).parents)
+        self.assertEqual([a_sha], parse_commit_broken(text).parents)
+
+    def test_parse_parent_after_author(self) -> None:
+        lines = self.make_commit_lines(parents=[a_sha])
+        lines.insert(3, b"parent " + b_sha)
+        text = b"\n".join(lines)
+        self.assertEqual([a_sha], Commit.from_string(text).parents)
+        self.assertEqual([a_sha], parse_commit_broken(text).parents)
+
+    def test_parse_duplicate_encoding(self) -> None:
+        lines = self.make_commit_lines(encoding=b"ISO-8859-1")
+        lines.insert(6, b"encoding UTF-8")
+        text = b"\n".join(lines)
+        self.assertEqual(b"ISO-8859-1", Commit.from_string(text).encoding)
+        self.assertEqual(b"ISO-8859-1", parse_commit_broken(text).encoding)
+
+    def test_parse_duplicate_author(self) -> None:
+        lines = self.make_commit_lines(parents=[a_sha])
+        lines.insert(3, b"author Other <other@example.com> 1 +0000")
+        text = b"\n".join(lines)
+        self.assertEqual(
+            default_committer.rsplit(b" ", 2)[0], Commit.from_string(text).author
+        )
+
+    def test_parse_duplicate_committer(self) -> None:
+        lines = self.make_commit_lines(parents=[a_sha])
+        lines.insert(4, b"committer Other <other@example.com> 1 +0000")
+        text = b"\n".join(lines)
+        self.assertEqual(
+            default_committer.rsplit(b" ", 2)[0], Commit.from_string(text).committer
+        )
+
+    def test_parse_tree_not_first(self) -> None:
+        lines = self.make_commit_lines(parents=[a_sha])
+        lines[0], lines[1] = lines[1], lines[0]
+        with self.assertRaises(ObjectFormatException):
+            Commit.from_string(b"\n".join(lines))
+
+    def test_parse_missing_tree(self) -> None:
+        with self.assertRaises(ObjectFormatException):
+            Commit.from_string(self.make_commit_text(tree=None))
+
+    def test_parse_invalid_tree(self) -> None:
+        with self.assertRaises(ObjectFormatException):
+            Commit.from_string(self.make_commit_text(tree=b"xxx"))
+
+    def test_parse_invalid_parent(self) -> None:
+        with self.assertRaises(ObjectFormatException):
+            Commit.from_string(self.make_commit_text(parents=[a_sha, b"xxx"]))
+
+    def test_parse_invalid_mergetag(self) -> None:
+        text = self.make_commit_text(extra={b"mergetag": b"not a tag"})
+        c = Commit.from_string(text)
+        self.assertEqual([], c.mergetag)
+        self.assertEqual([(b"mergetag", b"not a tag")], c._extra)
+        self.assertEqual(text, c.as_raw_string())
+
+    def test_check_order(self) -> None:
+        lines = self.make_commit_lines(parents=[a_sha], encoding=b"UTF-8")
+        headers = lines[:5]
+        rest = lines[5:]
+        # of all possible permutations, ensure only the original succeeds
+        for perm in permutations(headers):
+            perm = list(perm)
+            text = b"\n".join(perm + rest)
+            if perm == headers:
+                self.assertCheckSucceeds(Commit, text)
+            else:
+                self.assertCheckFails(Commit, text)
+
+    def test_check_commit_with_unparseable_time(self) -> None:
+        identity_with_wrong_time = (
+            b"Igor Sysoev <igor@sysoev.ru> 18446743887488505614+42707004"
+        )
+
+        # Those fail at reading time
+        self.assertCheckFails(
+            Commit,
+            self.make_commit_text(
+                author=default_committer, committer=identity_with_wrong_time
+            ),
+        )
+        self.assertCheckFails(
+            Commit,
+            self.make_commit_text(
+                author=identity_with_wrong_time, committer=default_committer
+            ),
+        )
+
+    def test_check_commit_with_overflow_date(self) -> None:
+        """Date with overflow should raise an ObjectFormatException when checked."""
+        identity_with_wrong_time = (
+            b"Igor Sysoev <igor@sysoev.ru> 18446743887488505614 +42707004"
+        )
+        commit0 = Commit.from_string(
+            self.make_commit_text(
+                author=identity_with_wrong_time, committer=default_committer
+            )
+        )
+        commit1 = Commit.from_string(
+            self.make_commit_text(
+                author=default_committer, committer=identity_with_wrong_time
+            )
+        )
+
+        # Those fails when triggering the check() method
+        for commit in [commit0, commit1]:
+            with self.assertRaises(ObjectFormatException):
+                commit.check()
+
+    def test_mangled_author_line(self) -> None:
+        """Mangled author line should successfully parse."""
+        author_line = (
+            b'Karl MacMillan <kmacmill@redhat.com> <"Karl MacMillan '
+            b'<kmacmill@redhat.com>"> 1197475547 -0500'
+        )
+        expected_identity = (
+            b'Karl MacMillan <kmacmill@redhat.com> <"Karl MacMillan '
+            b'<kmacmill@redhat.com>">'
+        )
+        commit = Commit.from_string(self.make_commit_text(author=author_line))
+
+        # The commit parses properly
+        self.assertEqual(commit.author, expected_identity)
+
+        # But the check fails because the author identity is bogus
+        with self.assertRaises(ObjectFormatException):
+            commit.check()
+
+    def test_parse_gpgsig(self) -> None:
+        pre_sig = b"""tree aaff74984cccd156a469afa7d9ab10e4777beb24
+author Jelmer Vernooij <jelmer@samba.org> 1412179807 +0200
+committer Jelmer Vernooij <jelmer@samba.org> 1412179807 +0200
+"""
+        git_sig = b"""\
+gpgsig -----BEGIN PGP SIGNATURE-----
+ Version: GnuPG v1
+ 
+ iQIcBAABCgAGBQJULCdfAAoJEACAbyvXKaRXuKwP/RyP9PA49uAvu8tQVCC/uBa8
+ vi975+xvO14R8Pp8k2nps7lSxCdtCd+xVT1VRHs0wNhOZo2YCVoU1HATkPejqSeV
+ NScTHcxnk4/+bxyfk14xvJkNp7FlQ3npmBkA+lbV0Ubr33rvtIE5jiJPyz+SgWAg
+ xdBG2TojV0squj00GoH/euK6aX7GgZtwdtpTv44haCQdSuPGDcI4TORqR6YSqvy3
+ GPE+3ZqXPFFb+KILtimkxitdwB7CpwmNse2vE3rONSwTvi8nq3ZoQYNY73CQGkUy
+ qoFU0pDtw87U3niFin1ZccDgH0bB6624sLViqrjcbYJeg815Htsu4rmzVaZADEVC
+ XhIO4MThebusdk0AcNGjgpf3HRHk0DPMDDlIjm+Oao0cqovvF6VyYmcb0C+RmhJj
+ dodLXMNmbqErwTk3zEkW0yZvNIYXH7m9SokPCZa4eeIM7be62X6h1mbt0/IU6Th+
+ v18fS0iTMP/Viug5und+05C/v04kgDo0CPphAbXwWMnkE4B6Tl9sdyUYXtvQsL7x
+ 0+WP1gL27ANqNZiI07Kz/BhbBAQI/+2TFT7oGr0AnFPQ5jHp+3GpUf6OKuT1wT3H
+ ND189UFuRuubxb42vZhpcXRbqJVWnbECTKVUPsGZqat3enQUB63uM4i6/RdONDZA
+ fDeF1m4qYs+cUXKNUZ03
+ =X6RT
+ -----END PGP SIGNATURE-----
+"""
+        post_sig = b"""\
+
+foo
+"""
+        c = Commit.from_string(pre_sig + git_sig + post_sig)
+        self.assertEqual(pre_sig + post_sig, c.raw_without_sig())
+        self.assertEqual(pre_sig + git_sig + post_sig, bytes(c))
+        self.assertEqual(b"foo\n", c.message)
+        self.assertEqual([], c._extra)
+        self.assertEqual(
+            b"""-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1
+
+iQIcBAABCgAGBQJULCdfAAoJEACAbyvXKaRXuKwP/RyP9PA49uAvu8tQVCC/uBa8
+vi975+xvO14R8Pp8k2nps7lSxCdtCd+xVT1VRHs0wNhOZo2YCVoU1HATkPejqSeV
+NScTHcxnk4/+bxyfk14xvJkNp7FlQ3npmBkA+lbV0Ubr33rvtIE5jiJPyz+SgWAg
+xdBG2TojV0squj00GoH/euK6aX7GgZtwdtpTv44haCQdSuPGDcI4TORqR6YSqvy3
+GPE+3ZqXPFFb+KILtimkxitdwB7CpwmNse2vE3rONSwTvi8nq3ZoQYNY73CQGkUy
+qoFU0pDtw87U3niFin1ZccDgH0bB6624sLViqrjcbYJeg815Htsu4rmzVaZADEVC
+XhIO4MThebusdk0AcNGjgpf3HRHk0DPMDDlIjm+Oao0cqovvF6VyYmcb0C+RmhJj
+dodLXMNmbqErwTk3zEkW0yZvNIYXH7m9SokPCZa4eeIM7be62X6h1mbt0/IU6Th+
+v18fS0iTMP/Viug5und+05C/v04kgDo0CPphAbXwWMnkE4B6Tl9sdyUYXtvQsL7x
+0+WP1gL27ANqNZiI07Kz/BhbBAQI/+2TFT7oGr0AnFPQ5jHp+3GpUf6OKuT1wT3H
+ND189UFuRuubxb42vZhpcXRbqJVWnbECTKVUPsGZqat3enQUB63uM4i6/RdONDZA
+fDeF1m4qYs+cUXKNUZ03
+=X6RT
+-----END PGP SIGNATURE-----""",
+            c.gpgsig,
+        )
+
+    def test_parse_header_trailing_newline(self) -> None:
+        pre_sig = b"""\
+tree a7d6277f78d3ecd0230a1a5df6db00b1d9c521ac
+parent c09b6dec7a73760fbdb478383a3c926b18db8bbe
+author Neil Matatall <oreoshake@github.com> 1461964057 -1000
+committer Neil Matatall <oreoshake@github.com> 1461964057 -1000
+"""
+        git_sig = b"""\
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ wsBcBAABCAAQBQJXI80ZCRA6pcNDcVZ70gAAarcIABs72xRX3FWeox349nh6ucJK
+ CtwmBTusez2Zwmq895fQEbZK7jpaGO5TRO4OvjFxlRo0E08UFx3pxZHSpj6bsFeL
+ hHsDXnCaotphLkbgKKRdGZo7tDqM84wuEDlh4MwNe7qlFC7bYLDyysc81ZX5lpMm
+ 2MFF1TvjLAzSvkT7H1LPkuR3hSvfCYhikbPOUNnKOo0sYjeJeAJ/JdAVQ4mdJIM0
+ gl3REp9+A+qBEpNQI7z94Pg5Bc5xenwuDh3SJgHvJV6zBWupWcdB3fAkVd4TPnEZ
+ nHxksHfeNln9RKseIDcy4b2ATjhDNIJZARHNfr6oy4u3XPW4svRqtBsLoMiIeuI=
+ =ms6q
+ -----END PGP SIGNATURE-----
+ 
+"""
+        post_sig = b"""\
+
+3.3.0 version bump and docs
+"""
+        gpgsig = b"""\
+-----BEGIN PGP SIGNATURE-----
+
+wsBcBAABCAAQBQJXI80ZCRA6pcNDcVZ70gAAarcIABs72xRX3FWeox349nh6ucJK
+CtwmBTusez2Zwmq895fQEbZK7jpaGO5TRO4OvjFxlRo0E08UFx3pxZHSpj6bsFeL
+hHsDXnCaotphLkbgKKRdGZo7tDqM84wuEDlh4MwNe7qlFC7bYLDyysc81ZX5lpMm
+2MFF1TvjLAzSvkT7H1LPkuR3hSvfCYhikbPOUNnKOo0sYjeJeAJ/JdAVQ4mdJIM0
+gl3REp9+A+qBEpNQI7z94Pg5Bc5xenwuDh3SJgHvJV6zBWupWcdB3fAkVd4TPnEZ
+nHxksHfeNln9RKseIDcy4b2ATjhDNIJZARHNfr6oy4u3XPW4svRqtBsLoMiIeuI=
+=ms6q
+-----END PGP SIGNATURE-----\n"""
+
+        c = Commit.from_string(pre_sig + git_sig + post_sig)
+        self.assertEqual([], c._extra)
+        self.assertEqual(pre_sig + git_sig + post_sig, c.as_raw_string())
+        self.assertEqual(pre_sig + post_sig, c.raw_without_sig())
+        self.assertEqual(gpgsig, c.gpgsig)
+        self.assertEqual(b"3.3.0 version bump and docs\n", c.message)
+
+    def test_parse_header_many_continuation_lines(self) -> None:
+        # A header value may be split across indented continuation lines. A
+        # value spread over a large number of them must still be reassembled
+        # exactly, and in linear time (the accumulation used to be quadratic).
+        n = 50000
+        body = b"".join(b" line%d\n" % i for i in range(n))
+        text = b"tree " + b"0" * 40 + b"\ngpgsig first\n" + body + b"\nthe message\n"
+        fields = dict((k, v) for (k, v) in _parse_message([text]) if k is not None)
+        expected = b"first\n" + b"".join(b"line%d\n" % i for i in range(n))
+        expected = expected[:-1]  # trailing newline is stripped from the value
+        self.assertEqual(expected, fields[b"gpgsig"])
+
+    def test_commit_extract_signature_pgp(self) -> None:
+        gpgsig = b"""-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1
+
+iQIcBAABCgAGBQJULCdfAAoJEACAbyvXKaRXuKwP/RyP9PA49uAvu8tQVCC/uBa8
+vi975+xvO14R8Pp8k2nps7lSxCdtCd+xVT1VRHs0wNhOZo2YCVoU1HATkPejqSeV
+NScTHcxnk4/+bxyfk14xvJkNp7FlQ3npmBkA+lbV0Ubr33rvtIE5jiJPyz+SgWAg
+-----END PGP SIGNATURE-----"""
+
+        c = Commit()
+        c.tree = b"d80c186a03f423a81b39df39dc87fd269736ca86"
+        c.parents = [
+            b"ab64bbdcc51b170d21588e5c5d391ee5c0c96dfd",
+            b"4cffe90e0a41ad3f5190079d7c8f036bde29cbe6",
+        ]
+        c.author = c.committer = b"James Westby <jw+debian@jameswestby.net>"
+        c.commit_time = c.author_time = 1174773719
+        c.commit_timezone = c.author_timezone = 0
+        c.message = b"Merge ../b\n"
+        c.gpgsig = gpgsig
+
+        payload, signature, sig_type = c.extract_signature()
+        self.assertEqual(payload, c.raw_without_sig())
+        self.assertEqual(signature, gpgsig)
+        self.assertEqual(sig_type, SIGNATURE_PGP)
+
+    def test_commit_extract_signature_ssh(self) -> None:
+        ssh_sig = b"""-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJwKO3yOmR5JlXCyN5bys
+ZTpDKBGsVP6ydcKdZxAvJlUAAAAEZmlsZQAAAAAAAAAGc2hhNTEyAAAAUwAAAAtz
+-----END SSH SIGNATURE-----"""
+
+        c = Commit()
+        c.tree = b"d80c186a03f423a81b39df39dc87fd269736ca86"
+        c.parents = []
+        c.author = c.committer = b"Test User <test@example.com>"
+        c.commit_time = c.author_time = 1234567890
+        c.commit_timezone = c.author_timezone = 0
+        c.message = b"Test commit with SSH signature\n"
+        c.gpgsig = ssh_sig
+
+        payload, signature, sig_type = c.extract_signature()
+        self.assertEqual(payload, c.raw_without_sig())
+        self.assertEqual(signature, ssh_sig)
+        self.assertEqual(sig_type, SIGNATURE_SSH)
+
+    def test_commit_extract_signature_none(self) -> None:
+        c = Commit()
+        c.tree = b"d80c186a03f423a81b39df39dc87fd269736ca86"
+        c.parents = []
+        c.author = c.committer = b"Test User <test@example.com>"
+        c.commit_time = c.author_time = 1234567890
+        c.commit_timezone = c.author_timezone = 0
+        c.message = b"Test commit without signature\n"
+
+        payload, signature, sig_type = c.extract_signature()
+        self.assertEqual(payload, c.as_raw_string())
+        self.assertIsNone(signature)
+        self.assertIsNone(sig_type)
+
+    def test_commit_extract_signature_unknown(self) -> None:
+        unknown_sig = b"UNKNOWN SIGNATURE FORMAT DATA"
+
+        c = Commit()
+        c.tree = b"d80c186a03f423a81b39df39dc87fd269736ca86"
+        c.parents = []
+        c.author = c.committer = b"Test User <test@example.com>"
+        c.commit_time = c.author_time = 1234567890
+        c.commit_timezone = c.author_timezone = 0
+        c.message = b"Test commit with unknown signature\n"
+        c.gpgsig = unknown_sig
+
+        # Unknown signature format should raise an exception
+        with self.assertRaises(ObjectFormatException):
+            c.extract_signature()
+
+    def test_commit_signature_payload_keeps_header_order(self) -> None:
+        payload = (
+            b"tree d80c186a03f423a81b39df39dc87fd269736ca86\n"
+            b"tree 2969be3e8ee1c0222396a5611407e4769f14e54b\n"
+            b"author A <a@example.com> 1 +0000\n"
+            b"committer C <c@example.com> 1 +0000\n"
+            b"extra value\n"
+        )
+        signature = b"gpgsig -----BEGIN SSH SIGNATURE-----\n sig\n -----END SSH SIGNATURE-----\n"
+        body = b"encoding UTF-8\n\nmessage\n"
+        c = Commit.from_string(payload + signature + body)
+        self.assertEqual(payload + body, c.raw_without_sig())
+        self.assertEqual(
+            b"-----BEGIN SSH SIGNATURE-----\nsig\n-----END SSH SIGNATURE-----",
+            c.gpgsig,
+        )
+
+    def test_commit_multiple_signatures(self) -> None:
+        lines = [
+            b"tree d80c186a03f423a81b39df39dc87fd269736ca86",
+            b"author A <a@example.com> 1 +0000",
+            b"committer C <c@example.com> 1 +0000",
+            b"gpgsig -----BEGIN SSH SIGNATURE-----",
+            b" one",
+            b"gpgsig two",
+            b"",
+            b"message",
+        ]
+        c = Commit.from_string(b"\n".join(lines))
+        self.assertEqual(b"-----BEGIN SSH SIGNATURE-----\none\ntwo", c.gpgsig)
+        self.assertEqual(b"\n".join(lines[:3] + lines[6:]), c.raw_without_sig())
+
+    def test_commit_signature_payload_only_splits_on_newline(self) -> None:
+        lines = [
+            b"tree d80c186a03f423a81b39df39dc87fd269736ca86",
+            b"author A <a@example.com> 1 +0000",
+            b"committer C <c@example.com> 1 +0000",
+            b"extra a\rgpgsig b",
+            b"gpgsig sig",
+            b"",
+            b"message",
+        ]
+        c = Commit.from_string(b"\n".join(lines))
+        self.assertEqual(b"sig", c.gpgsig)
+        self.assertEqual(b"\n".join(lines[:4] + lines[5:]), c.raw_without_sig())
+
+    def test_commit_other_signature_header_excluded_from_payload(self) -> None:
+        lines = [
+            b"tree d80c186a03f423a81b39df39dc87fd269736ca86",
+            b"author A <a@example.com> 1 +0000",
+            b"committer C <c@example.com> 1 +0000",
+            b"gpgsig-sha256 -----BEGIN SSH SIGNATURE-----",
+            b" other",
+            b"",
+            b"message",
+        ]
+        c = Commit.from_string(b"\n".join(lines))
+        self.assertIsNone(c.gpgsig)
+        self.assertEqual(b"\n".join(lines[:3] + lines[5:]), c.raw_without_sig())
+
+    def test_commit_sha256_signature_header(self) -> None:
+        lines = [
+            b"tree " + b"a" * 64,
+            b"author A <a@example.com> 1 +0000",
+            b"committer C <c@example.com> 1 +0000",
+            b"gpgsig sha1-signature",
+            b"gpgsig-sha256 sha256-signature",
+            b"",
+            b"message",
+        ]
+        text = b"\n".join(lines)
+        c = ShaFile.from_raw_string(Commit.type_num, text, object_format=SHA256)
+        self.assertEqual(b"sha256-signature", c.gpgsig)
+        self.assertEqual(b"sha256-signature", c.copy().gpgsig)
+        self.assertEqual(b"\n".join(lines[:3] + lines[5:]), c.raw_without_sig())
+        c.message = b"other\n"
+        self.assertEqual(b"\n".join([*lines[:6], b"other\n"]), c.as_raw_string())
+
+    def test_parse_time_entry_broken_negative_date(self) -> None:
+        author_line = b"Jane Doe <jdoe@example.org> -12345 +0100"
+        expected_identity = b"Jane Doe <jdoe@example.org>"
+        expected_time = -12345
+        expected_timezone = +1 * 60 * 60
+
+        person, time, (timezone, timezone_neg_utc) = parse_time_entry_broken(
+            author_line
+        )
+
+        self.assertEqual(person, expected_identity)
+        self.assertEqual(time, expected_time)
+        self.assertEqual(timezone, expected_timezone)
+        self.assertFalse(timezone_neg_utc)
+
+    def test_parse_time_entry_broken_double_negative_timezone(self) -> None:
+        author_line = b"Jane Doe <jdoe@example.org> 12345 --700"
+        expected_identity = b"Jane Doe <jdoe@example.org>"
+        expected_time = 12345
+        expected_timezone = +7 * 60 * 60
+
+        person, time, (timezone, timezone_neg_utc) = parse_time_entry_broken(
+            author_line
+        )
+
+        self.assertEqual(person, expected_identity)
+        self.assertEqual(time, expected_time)
+        self.assertEqual(timezone, expected_timezone)
+        self.assertTrue(timezone_neg_utc)
+
+    def test_parse_time_entry_broken_long_timezone(self) -> None:
+        author_line = (
+            b"Geoff Cant <nem@lisp.geek.nz> 1170648114 -72000"  # codespell:ignore
+        )
+        expected_identity = b"Geoff Cant <nem@lisp.geek.nz>"  # codespell:ignore
+        expected_time = 1170648114
+        expected_timezone = -720 * 60 * 60
+
+        person, time, (timezone, _timezone_neg_utc) = parse_time_entry_broken(
+            author_line
+        )
+
+        self.assertEqual(person, expected_identity)
+        self.assertEqual(time, expected_time)
+        self.assertEqual(timezone, expected_timezone)
+
+    def test_parse_time_entry_broken_short_timezone(self) -> None:
+        author_line = (
+            b"Pl\xc3\xa1cidoMonteiro <Pl\xc3\xa1cidoMonteiro@.(none)> 1380083482 +02"
+        )
+        expected_identity = b"Pl\xc3\xa1cidoMonteiro <Pl\xc3\xa1cidoMonteiro@.(none)>"
+        expected_time = 1380083482
+        expected_timezone = +2 * 60
+
+        person, time, (timezone, _timezone_neg_utc) = parse_time_entry_broken(
+            author_line
+        )
+
+        self.assertEqual(person, expected_identity)
+        self.assertEqual(time, expected_time)
+        self.assertEqual(timezone, expected_timezone)
+
+    def test_parse_time_entry_broken_unsigned_timezone(self) -> None:
+        author_line = (
+            b"applehq <applehq@203d044e-caa7-11dc-91ec-67e1038599e7> 1205785941 0000"
+        )
+        expected_identity = b"applehq <applehq@203d044e-caa7-11dc-91ec-67e1038599e7>"
+        expected_time = 1205785941
+        expected_timezone = 0
+
+        person, time, (timezone, _timezone_neg_utc) = parse_time_entry_broken(
+            author_line
+        )
+
+        self.assertEqual(person, expected_identity)
+        self.assertEqual(time, expected_time)
+        self.assertEqual(timezone, expected_timezone)
+
+    def test_parse_time_entry_broken_nonsensical_timezone(self) -> None:
+        """Timezone is 'UTC + 5 hours and 75 minutes'."""
+        author_line = b"acpmasquerade <d@picovico.com> 1460127297 +0575"
+        expected_identity = b"acpmasquerade <d@picovico.com>"
+        expected_time = 1460127297
+        expected_timezone = +6 * 60 * 60 + 15 * 60
+
+        person, time, (timezone, _timezone_neg_utc) = parse_time_entry_broken(
+            author_line
+        )
+
+        self.assertEqual(person, expected_identity)
+        self.assertEqual(time, expected_time)
+        self.assertEqual(timezone, expected_timezone)
+
+    def test_parse_time_entry_broken_missing_brackets(self) -> None:
+        author_line = b"kapil.foss@gmail.com 1297013737 -0500"
+        expected_identity = b"kapil.foss@gmail.com"
+        expected_time = 1297013737
+        expected_timezone = -5 * 60 * 60
+
+        person, time, (timezone, _timezone_neg_utc) = parse_time_entry_broken(
+            author_line
+        )
+
+        self.assertEqual(person, expected_identity)
+        self.assertEqual(time, expected_time)
+        self.assertEqual(timezone, expected_timezone)
+
+
+class BrokenCommitParseTests(TestCase):
+    """Tests for parsing commits with broken author/committer lines using parse_commit_broken."""
+
+    def make_commit_text(
+        self,
+        tree=b"d80c186a03f423a81b39df39dc87fd269736ca86",
+        parents=None,
+        author=b"Test User <test@example.com> 1234567890 +0000",
+        committer=b"Test User <test@example.com> 1234567890 +0000",
+        encoding=None,
+        message=b"Test commit\n",
+        extra=None,
+    ):
+        lines = []
+        if tree is not None:
+            lines.append(b"tree " + tree)
+        if parents is not None:
+            lines.extend(b"parent " + p for p in parents)
+        if author is not None:
+            lines.append(b"author " + author)
+        if committer is not None:
+            lines.append(b"committer " + committer)
+        if encoding is not None:
+            lines.append(b"encoding " + encoding)
+        if extra is not None:
+            for name, value in sorted(extra.items()):
+                lines.append(name + b" " + value)
+        lines.append(b"")
+        if message is not None:
+            lines.append(message)
+        return b"\n".join(lines)
+
+    def test_negative_timestamp(self) -> None:
+        author_line = b"Jane Doe <jdoe@example.org> -12345 +0100"
+        commit_text = self.make_commit_text(author=author_line, committer=author_line)
+        commit = parse_commit_broken(commit_text)
+
+        self.assertEqual(commit.author, b"Jane Doe <jdoe@example.org>")
+        self.assertEqual(commit.author_time, -12345)
+        self.assertEqual(commit.author_timezone, +1 * 60 * 60)
+
+    def test_double_negative_timezone(self) -> None:
+        author_line = b"Jane Doe <jdoe@example.org> 12345 --700"
+        commit_text = self.make_commit_text(author=author_line, committer=author_line)
+        commit = parse_commit_broken(commit_text)
+
+        self.assertEqual(commit.author, b"Jane Doe <jdoe@example.org>")
+        self.assertEqual(commit.author_time, 12345)
+        self.assertEqual(commit.author_timezone, +7 * 60 * 60)
+        self.assertTrue(commit._author_timezone_neg_utc)
+
+    def test_long_timezone(self) -> None:
+        # Real example from https://github.com/lisp/geek-nz
+        author_line = (
+            b"Geoff Cant <nem@lisp.geek.nz> 1170648114 -72000"  # codespell:ignore
+        )
+        commit_text = self.make_commit_text(author=author_line, committer=author_line)
+        commit = parse_commit_broken(commit_text)
+
+        self.assertEqual(
+            commit.author,
+            b"Geoff Cant <nem@lisp.geek.nz>",  # codespell:ignore
+        )
+        self.assertEqual(commit.author_time, 1170648114)
+        self.assertEqual(commit.author_timezone, -720 * 60 * 60)
+
+    def test_short_timezone(self) -> None:
+        author_line = (
+            b"Pl\xc3\xa1cidoMonteiro <Pl\xc3\xa1cidoMonteiro@.(none)> 1380083482 +02"
+        )
+        commit_text = self.make_commit_text(author=author_line, committer=author_line)
+        commit = parse_commit_broken(commit_text)
+
+        self.assertEqual(
+            commit.author, b"Pl\xc3\xa1cidoMonteiro <Pl\xc3\xa1cidoMonteiro@.(none)>"
+        )
+        self.assertEqual(commit.author_time, 1380083482)
+        self.assertEqual(commit.author_timezone, +2 * 60)
+
+    def test_unsigned_timezone(self) -> None:
+        author_line = (
+            b"applehq <applehq@203d044e-caa7-11dc-91ec-67e1038599e7> 1205785941 0000"
+        )
+        commit_text = self.make_commit_text(author=author_line, committer=author_line)
+        commit = parse_commit_broken(commit_text)
+
+        self.assertEqual(
+            commit.author, b"applehq <applehq@203d044e-caa7-11dc-91ec-67e1038599e7>"
+        )
+        self.assertEqual(commit.author_time, 1205785941)
+        self.assertEqual(commit.author_timezone, 0)
+
+    def test_nonsensical_timezone(self) -> None:
+        # Timezone is 'UTC + 5 hours and 75 minutes'
+        author_line = b"acpmasquerade <d@picovico.com> 1460127297 +0575"
+        commit_text = self.make_commit_text(author=author_line, committer=author_line)
+        commit = parse_commit_broken(commit_text)
+
+        self.assertEqual(commit.author, b"acpmasquerade <d@picovico.com>")
+        self.assertEqual(commit.author_time, 1460127297)
+        self.assertEqual(commit.author_timezone, +6 * 60 * 60 + 15 * 60)
+
+    def test_missing_angle_brackets(self) -> None:
+        # Real example from https://github.com/noderabbit-team/tasks
+        author_line = b"kapil.foss@gmail.com 1297013737 -0500"
+        commit_text = self.make_commit_text(author=author_line, committer=author_line)
+        commit = parse_commit_broken(commit_text)
+
+        self.assertEqual(commit.author, b"kapil.foss@gmail.com")
+        self.assertEqual(commit.author_time, 1297013737)
+        self.assertEqual(commit.author_timezone, -5 * 60 * 60)
+
+
+_TREE_ITEMS = {
+    b"a-c": (0o100755, b"d80c186a03f423a81b39df39dc87fd269736ca86"),
+    b"a.c": (0o100755, b"d80c186a03f423a81b39df39dc87fd269736ca86"),
+    b"aoc": (0o100755, b"d80c186a03f423a81b39df39dc87fd269736ca86"),
+    b"a": (stat.S_IFDIR, b"d80c186a03f423a81b39df39dc87fd269736ca86"),
+    b"a/c": (stat.S_IFDIR, b"d80c186a03f423a81b39df39dc87fd269736ca86"),
+}
+
+_SORTED_TREE_ITEMS = [
+    TreeEntry(b"a-c", 0o100755, b"d80c186a03f423a81b39df39dc87fd269736ca86"),
+    TreeEntry(b"a.c", 0o100755, b"d80c186a03f423a81b39df39dc87fd269736ca86"),
+    TreeEntry(b"a", stat.S_IFDIR, b"d80c186a03f423a81b39df39dc87fd269736ca86"),
+    TreeEntry(b"a/c", stat.S_IFDIR, b"d80c186a03f423a81b39df39dc87fd269736ca86"),
+    TreeEntry(b"aoc", 0o100755, b"d80c186a03f423a81b39df39dc87fd269736ca86"),
+]
+
+
+_TREE_ITEMS_BUG_1325 = {
+    b"dir": (stat.S_IFDIR | 0o644, b"5944b31ff85b415573d1a43eb942e2dea30ab8be"),
+    b"dira": (0o100644, b"cf7a729ca69bfabd0995fc9b083e86a18215bd91"),
+}
+
+
+_SORTED_TREE_ITEMS_BUG_1325 = [
+    TreeEntry(
+        path=b"dir",
+        mode=stat.S_IFDIR | 0o644,
+        sha=b"5944b31ff85b415573d1a43eb942e2dea30ab8be",
+    ),
+    TreeEntry(
+        path=b"dira", mode=0o100644, sha=b"cf7a729ca69bfabd0995fc9b083e86a18215bd91"
+    ),
+]
+
+
+class TreeTests(ShaFileCheckTests):
+    def test_add(self) -> None:
+        myhexsha = b"d80c186a03f423a81b39df39dc87fd269736ca86"
+        x = Tree()
+        x.add(b"myname", 0o100755, myhexsha)
+        self.assertEqual(x[b"myname"], (0o100755, myhexsha))
+        self.assertEqual(b"100755 myname\0" + hex_to_sha(myhexsha), x.as_raw_string())
+
+    def test_simple(self) -> None:
+        myhexsha = b"d80c186a03f423a81b39df39dc87fd269736ca86"
+        x = Tree()
+        x[b"myname"] = (0o100755, myhexsha)
+        self.assertEqual(b"100755 myname\0" + hex_to_sha(myhexsha), x.as_raw_string())
+        self.assertEqual(b"100755 myname\0" + hex_to_sha(myhexsha), bytes(x))
+
+    def test_tree_update_id(self) -> None:
+        x = Tree()
+        x[b"a.c"] = (0o100755, b"d80c186a03f423a81b39df39dc87fd269736ca86")
+        self.assertEqual(b"0c5c6bc2c081accfbc250331b19e43b904ab9cdd", x.id)
+        x[b"a.b"] = (stat.S_IFDIR, b"d80c186a03f423a81b39df39dc87fd269736ca86")
+        self.assertEqual(b"07bfcb5f3ada15bbebdfa3bbb8fd858a363925c8", x.id)
+
+    def test_tree_iteritems_dir_sort(self) -> None:
+        x = Tree()
+        for name, item in _TREE_ITEMS.items():
+            x[name] = item
+        self.assertEqual(_SORTED_TREE_ITEMS, x.items())
+
+    def test_tree_items_dir_sort(self) -> None:
+        x = Tree()
+        for name, item in _TREE_ITEMS.items():
+            x[name] = item
+        self.assertEqual(_SORTED_TREE_ITEMS, x.items())
+
+    def _do_test_parse_tree(self, parse_tree) -> None:
+        dir = os.path.join(os.path.dirname(__file__), "..", "testdata", "trees")
+        o = Tree.from_path(hex_to_filename(dir, tree_sha))
+        self.assertEqual(
+            [(b"a", 0o100644, a_sha), (b"b", 0o100644, b_sha)],
+            list(parse_tree(o.as_raw_string(), 20)),
+        )
+        # test a broken tree that has a leading 0 on the file mode
+        broken_tree = b"0100644 foo\0" + hex_to_sha(a_sha)
+
+        def eval_parse_tree(*args, **kwargs):
+            return list(parse_tree(*args, **kwargs))
+
+        self.assertEqual([(b"foo", 0o100644, a_sha)], eval_parse_tree(broken_tree, 20))
+        self.assertRaises(
+            ObjectFormatException, eval_parse_tree, broken_tree, 20, strict=True
+        )
+
+    test_parse_tree = functest_builder(_do_test_parse_tree, _parse_tree_py)
+    test_parse_tree_extension = ext_functest_builder(
+        _do_test_parse_tree, _parse_tree_rs
+    )
+
+    def _do_test_sorted_tree_items(self, sorted_tree_items) -> None:
+        def do_sort(entries, name_order):
+            return list(sorted_tree_items(entries, name_order))
+
+        actual = do_sort(_TREE_ITEMS, False)
+        self.assertEqual(_SORTED_TREE_ITEMS, actual)
+        self.assertIsInstance(actual[0], TreeEntry)
+
+        actual = do_sort(_TREE_ITEMS_BUG_1325, False)
+        self.assertEqual(
+            key_entry((b"a", (0o40644, b"cf7a729ca69bfabd0995fc9b083e86a18215bd91"))),
+            b"a/",
+        )
+        self.assertEqual(_SORTED_TREE_ITEMS_BUG_1325, actual)
+        self.assertIsInstance(actual[0], TreeEntry)
+
+        # C/Python implementations may differ in specific error types, but
+        # should all error on invalid inputs.
+        # For example, the Rust implementation has stricter type checks, so may
+        # raise TypeError where the Python implementation raises
+        # AttributeError.
+        errors = (TypeError, ValueError, AttributeError)
+        self.assertRaises(errors, do_sort, b"foo", False)
+        self.assertRaises(errors, do_sort, {b"foo": (1, 2, 3)}, False)
+
+        myhexsha = b"d80c186a03f423a81b39df39dc87fd269736ca86"
+        self.assertRaises(errors, do_sort, {b"foo": (b"xxx", myhexsha)}, False)
+        self.assertRaises(errors, do_sort, {b"foo": (0o100755, 12345)}, False)
+
+    test_sorted_tree_items = functest_builder(
+        _do_test_sorted_tree_items, _sorted_tree_items_py
+    )
+    if _sorted_tree_items_rs is not None:
+        assert _sorted_tree_items_rs != _sorted_tree_items_py
+        test_sorted_tree_items_extension = ext_functest_builder(
+            _do_test_sorted_tree_items, _sorted_tree_items_rs
+        )
+
+    def _do_test_sorted_tree_items_slash_in_names(self, sorted_tree_items) -> None:
+        # Names containing '/' are invalid, but must still sort consistently
+        # rather than tripping up the sort implementation.
+        names = [
+            b"a/aa/", b"a", b"aaa/a", b"a/a//a", b"a//", b"aaa", b"a//a/a",
+            b"a/a/a", b"a/aa/a", b"a/a//", b"a//a", b"a//aa", b"aa/a", b"a///a",
+            b"a/a/a/a", b"a/a/", b"a/a/aa", b"a///", b"aa/", b"a/a/a/", b"a/aaa",
+        ]  # fmt: skip
+        dirs = {
+            b"a", b"aaa/a", b"a/a//a", b"a//", b"a//a/a", b"a/a/a", b"a/aa/a",
+            b"aa/a", b"a///a", b"a///", b"a/aaa",
+        }  # fmt: skip
+        sha = b"0" * 40
+        entries = {n: (stat.S_IFDIR if n in dirs else 0o100644, sha) for n in names}
+        expected = [
+            TreeEntry(n, entries[n][0], sha)
+            for n in sorted(names, key=lambda n: n + b"/" if n in dirs else n)
+        ]
+        self.assertEqual(expected, list(sorted_tree_items(entries, False)))
+
+    test_sorted_tree_items_slash_in_names = functest_builder(
+        _do_test_sorted_tree_items_slash_in_names, _sorted_tree_items_py
+    )
+    if _sorted_tree_items_rs is not None:
+        test_sorted_tree_items_slash_in_names_extension = ext_functest_builder(
+            _do_test_sorted_tree_items_slash_in_names, _sorted_tree_items_rs
+        )
+
+    def _do_test_sorted_tree_items_name_order(self, sorted_tree_items) -> None:
+        self.assertEqual(
+            [
+                TreeEntry(
+                    b"a",
+                    stat.S_IFDIR,
+                    b"d80c186a03f423a81b39df39dc87fd269736ca86",
+                ),
+                TreeEntry(
+                    b"a-c",
+                    0o100755,
+                    b"d80c186a03f423a81b39df39dc87fd269736ca86",
+                ),
+                TreeEntry(
+                    b"a.c",
+                    0o100755,
+                    b"d80c186a03f423a81b39df39dc87fd269736ca86",
+                ),
+                TreeEntry(
+                    b"a/c",
+                    stat.S_IFDIR,
+                    b"d80c186a03f423a81b39df39dc87fd269736ca86",
+                ),
+                TreeEntry(
+                    b"aoc",
+                    0o100755,
+                    b"d80c186a03f423a81b39df39dc87fd269736ca86",
+                ),
+            ],
+            list(sorted_tree_items(_TREE_ITEMS, True)),
+        )
+
+    test_sorted_tree_items_name_order = functest_builder(
+        _do_test_sorted_tree_items_name_order, _sorted_tree_items_py
+    )
+    if _sorted_tree_items_rs is not None:
+        test_sorted_tree_items_name_order_extension = ext_functest_builder(
+            _do_test_sorted_tree_items_name_order, _sorted_tree_items_rs
+        )
+
+    def _do_test_sorted_tree_items_issue_1325(self, sorted_tree_items) -> None:
+        """Test case to reproduce issue #1325: submodules incorrectly sorted as directories.
+
+        The bug: Rust uses (mode & 0o40000 != 0) which incorrectly matches
+        submodules (0o160000) since 0o160000 & 0o40000 = 0o40000
+        """
+        # Test case 1: Minimal test - submodule vs file
+        entries = {
+            b"sub": (
+                0o160000,
+                b"a03f423a81b39df39dc87fd269736ca86d80c186",
+            ),  # submodule
+            b"sub.txt": (0o100644, b"81b39df39dc87fd269736ca86d80c186a03f423a"),  # file
+        }
+
+        result = list(sorted_tree_items(entries, False))
+        paths = [entry.path for entry in result]
+
+        # Submodules should sort as regular files, not directories
+        # Expected order: sub, sub.txt
+        # Bug causes: sub.txt, sub (because sub is treated as sub/)
+        self.assertEqual([b"sub", b"sub.txt"], paths)
+
+        # Test case 2: Scenario from issue - file rename + submodule
+        # This simulates the "gamma" scenario mentioned in the issue
+        entries2 = {
+            b"alpha": (0o100644, b"a03f423a81b39df39dc87fd269736ca86d80c186"),
+            b"beta": (0o100644, b"81b39df39dc87fd269736ca86d80c186a03f423a"),
+            b"gamma": (
+                0o160000,
+                b"d80c186a03f423a81b39df39dc87fd269736ca86",
+            ),  # submodule (was file)
+            b"delta": (0o100644, b"cf7a729ca69bfabd0995fc9b083e86a18215bd91"),
+        }
+
+        result2 = list(sorted_tree_items(entries2, False))
+        paths2 = [entry.path for entry in result2]
+
+        # All entries should sort in alphabetical order since none are directories
+        self.assertEqual([b"alpha", b"beta", b"delta", b"gamma"], paths2)
+
+    test_sorted_tree_items_issue_1325 = functest_builder(
+        _do_test_sorted_tree_items_issue_1325, _sorted_tree_items_py
+    )
+    if _sorted_tree_items_rs is not None:
+        test_sorted_tree_items_issue_1325_extension = ext_functest_builder(
+            _do_test_sorted_tree_items_issue_1325, _sorted_tree_items_rs
+        )
+
+    def test_sorted_tree_items_issue_1325_comparison(self) -> None:
+        """Direct comparison test to show the difference between Python and Rust implementations."""
+        if _sorted_tree_items_rs is None:
+            self.skipTest("Rust extension not available")
+
+        # Minimal test case: submodule vs file
+        entries = {
+            b"sub": (
+                0o160000,
+                b"a03f423a81b39df39dc87fd269736ca86d80c186",
+            ),  # submodule
+            b"sub.txt": (0o100644, b"81b39df39dc87fd269736ca86d80c186a03f423a"),  # file
+        }
+
+        # Get results from both implementations
+        py_result = list(_sorted_tree_items_py(entries, False))
+        rs_result = list(_sorted_tree_items_rs(entries, False))
+
+        # Show the actual ordering from each
+        py_paths = [entry.path for entry in py_result]
+        rs_paths = [entry.path for entry in rs_result]
+
+        # This test shows the bug: Rust treats submodules as directories
+        self.assertEqual(
+            py_paths, rs_paths, "Bug: Rust treats submodules (0o160000) as directories"
+        )
+
+    def test_check(self) -> None:
+        t = Tree
+        sha = hex_to_sha(a_sha)
+
+        # filenames
+        self.assertCheckSucceeds(t, b"100644 .a\0" + sha)
+        self.assertCheckFails(t, b"100644 \0" + sha)
+        self.assertCheckFails(t, b"100644 .\0" + sha)
+        self.assertCheckFails(t, b"100644 a/a\0" + sha)
+        self.assertCheckFails(t, b"100644 ..\0" + sha)
+        self.assertCheckFails(t, b"100644 .git\0" + sha)
+
+        # modes
+        self.assertCheckSucceeds(t, b"100644 a\0" + sha)
+        self.assertCheckSucceeds(t, b"100755 a\0" + sha)
+        self.assertCheckSucceeds(t, b"160000 a\0" + sha)
+        # TODO more whitelisted modes
+        self.assertCheckFails(t, b"123456 a\0" + sha)
+        self.assertCheckFails(t, b"123abc a\0" + sha)
+        # should fail check, but parses ok
+        self.assertCheckFails(t, b"0100644 foo\0" + sha)
+
+        # shas
+        self.assertCheckFails(t, b"100644 a\0" + (b"x" * 5))
+        self.assertCheckFails(t, b"100644 a\0" + (b"x" * 18) + b"\0")
+        self.assertCheckFails(t, b"100644 a\0" + (b"x" * 21) + b"\n100644 b\0" + sha)
+
+        # ordering
+        sha2 = hex_to_sha(b_sha)
+        self.assertCheckSucceeds(t, b"100644 a\0" + sha + b"100644 b\0" + sha)
+        self.assertCheckSucceeds(t, b"100644 a\0" + sha + b"100644 b\0" + sha2)
+        self.assertCheckFails(t, b"100644 a\0" + sha + b"100755 a\0" + sha2)
+        self.assertCheckFails(t, b"100644 b\0" + sha2 + b"100644 a\0" + sha)
+
+    def test_iter(self) -> None:
+        t = Tree()
+        t[b"foo"] = (0o100644, a_sha)
+        self.assertEqual({b"foo"}, set(t))
+
+
+class TagSerializeTests(TestCase):
+    def test_serialize_simple(self) -> None:
+        x = make_object(
+            Tag,
+            tagger=b"Jelmer Vernooij <jelmer@samba.org>",
+            name=b"0.1",
+            message=b"Tag 0.1",
+            object=(Blob, b"d80c186a03f423a81b39df39dc87fd269736ca86"),
+            tag_time=423423423,
+            tag_timezone=0,
+        )
+        self.assertEqual(
+            (
+                b"object d80c186a03f423a81b39df39dc87fd269736ca86\n"
+                b"type blob\n"
+                b"tag 0.1\n"
+                b"tagger Jelmer Vernooij <jelmer@samba.org> "
+                b"423423423 +0000\n"
+                b"\n"
+                b"Tag 0.1"
+            ),
+            x.as_raw_string(),
+        )
+
+    def test_serialize_none_message(self) -> None:
+        x = make_object(
+            Tag,
+            tagger=b"Jelmer Vernooij <jelmer@samba.org>",
+            name=b"0.1",
+            message=None,
+            object=(Blob, b"d80c186a03f423a81b39df39dc87fd269736ca86"),
+            tag_time=423423423,
+            tag_timezone=0,
+        )
+        self.assertEqual(
+            (
+                b"object d80c186a03f423a81b39df39dc87fd269736ca86\n"
+                b"type blob\n"
+                b"tag 0.1\n"
+                b"tagger Jelmer Vernooij <jelmer@samba.org> "
+                b"423423423 +0000\n\n"
+            ),
+            x.as_raw_string(),
+        )
+
+
+default_tagger = (
+    b"Linus Torvalds <torvalds@woody.linux-foundation.org> 1183319674 -0700"
+)
+default_message = b"""Linux 2.6.22-rc7
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.7 (GNU/Linux)
+
+iD8DBQBGiAaAF3YsRnbiHLsRAitMAKCiLboJkQECM/jpYsY3WPfvUgLXkACgg3ql
+OK2XeQOiEeXtT76rV4t2WR4=
+=ivrA
+-----END PGP SIGNATURE-----
+"""
+
+
+class TagParseTests(ShaFileCheckTests):
+    def make_tag_lines(
+        self,
+        object_sha=b"a38d6181ff27824c79fc7df825164a212eff6a3f",
+        object_type_name=b"commit",
+        name=b"v2.6.22-rc7",
+        tagger=default_tagger,
+        message=default_message,
+    ):
+        lines = []
+        if object_sha is not None:
+            lines.append(b"object " + object_sha)
+        if object_type_name is not None:
+            lines.append(b"type " + object_type_name)
+        if name is not None:
+            lines.append(b"tag " + name)
+        if tagger is not None:
+            lines.append(b"tagger " + tagger)
+        if message is not None:
+            lines.append(b"")
+            lines.append(message)
+        return lines
+
+    def make_tag_text(self, **kwargs):
+        return b"\n".join(self.make_tag_lines(**kwargs))
+
+    def test_parse(self) -> None:
+        x = Tag()
+        x.set_raw_string(self.make_tag_text())
+        self.assertEqual(
+            b"Linus Torvalds <torvalds@woody.linux-foundation.org>", x.tagger
+        )
+        self.assertEqual(b"v2.6.22-rc7", x.name)
+        object_type, object_sha = x.object
+        self.assertEqual(b"a38d6181ff27824c79fc7df825164a212eff6a3f", object_sha)
+        self.assertEqual(Commit, object_type)
+        self.assertEqual(
+            datetime.datetime.fromtimestamp(x.tag_time, datetime.timezone.utc).replace(
+                tzinfo=None
+            ),
+            datetime.datetime(2007, 7, 1, 19, 54, 34),
+        )
+        self.assertEqual(-25200, x.tag_timezone)
+
+    def test_parse_no_tagger(self) -> None:
+        x = Tag()
+        x.set_raw_string(self.make_tag_text(tagger=None))
+        self.assertEqual(None, x.tagger)
+        self.assertEqual(b"v2.6.22-rc7", x.name)
+        self.assertEqual(None, x.tag_time)
+
+    def test_parse_no_message(self) -> None:
+        x = Tag()
+        x.set_raw_string(self.make_tag_text(message=None))
+        self.assertEqual(None, x.message)
+        self.assertEqual(
+            b"Linus Torvalds <torvalds@woody.linux-foundation.org>", x.tagger
+        )
+        self.assertEqual(
+            datetime.datetime.fromtimestamp(x.tag_time, datetime.timezone.utc).replace(
+                tzinfo=None
+            ),
+            datetime.datetime(2007, 7, 1, 19, 54, 34),
+        )
+        self.assertEqual(-25200, x.tag_timezone)
+        self.assertEqual(b"v2.6.22-rc7", x.name)
+
+    def test_check(self) -> None:
+        self.assertCheckSucceeds(Tag, self.make_tag_text())
+        self.assertCheckFails(Tag, self.make_tag_text(object_sha=None))
+        self.assertCheckFails(Tag, self.make_tag_text(object_type_name=None))
+        self.assertCheckFails(Tag, self.make_tag_text(name=None))
+        self.assertCheckFails(Tag, self.make_tag_text(name=b""))
+        self.assertCheckFails(Tag, self.make_tag_text(object_type_name=b"foobar"))
+        self.assertCheckFails(
+            Tag,
+            self.make_tag_text(
+                tagger=b"some guy without an email address 1183319674 -0700"
+            ),
+        )
+        self.assertCheckFails(
+            Tag,
+            self.make_tag_text(
+                tagger=(
+                    b"Linus Torvalds <torvalds@woody.linux-foundation.org> "
+                    b"Sun 7 Jul 2007 12:54:34 +0700"
+                )
+            ),
+        )
+        self.assertCheckFails(Tag, self.make_tag_text(object_sha=b"xxx"))
+
+    def test_check_tag_with_unparseable_field(self) -> None:
+        self.assertCheckFails(
+            Tag,
+            self.make_tag_text(
+                tagger=(
+                    b"Linus Torvalds <torvalds@woody.linux-foundation.org> 423423+0000"
+                )
+            ),
+        )
+
+    def test_check_tag_with_overflow_time(self) -> None:
+        """Date with overflow should raise an ObjectFormatException when checked."""
+        author = f"Some Dude <some@dude.org> {MAX_TIME + 1} +0000"
+        tag = Tag.from_string(self.make_tag_text(tagger=(author.encode())))
+        with self.assertRaises(ObjectFormatException):
+            tag.check()
+
+    def test_check_duplicates(self) -> None:
+        # duplicate each of the header fields
+        for i in range(4):
+            lines = self.make_tag_lines()
+            lines.insert(i, lines[i])
+            self.assertCheckFails(Tag, b"\n".join(lines))
+
+    def test_parse_duplicate_object(self) -> None:
+        lines = self.make_tag_lines()
+        lines.insert(1, b"object " + a_sha)
+        with self.assertRaises(ObjectFormatException):
+            Tag.from_string(b"\n".join(lines))
+
+    def test_parse_duplicate_type(self) -> None:
+        lines = self.make_tag_lines()
+        lines.insert(2, b"type tree")
+        with self.assertRaises(ObjectFormatException):
+            Tag.from_string(b"\n".join(lines))
+
+    def test_parse_duplicate_name(self) -> None:
+        lines = self.make_tag_lines()
+        lines.insert(3, b"tag other")
+        self.assertEqual(b"v2.6.22-rc7", Tag.from_string(b"\n".join(lines)).name)
+
+    def test_parse_duplicate_tagger(self) -> None:
+        lines = self.make_tag_lines()
+        lines.insert(4, b"tagger Other <other@example.com> 1 +0000")
+        tag = Tag.from_string(b"\n".join(lines))
+        self.assertEqual(default_tagger.rsplit(b" ", 2)[0], tag.tagger)
+
+    def test_parse_missing_tag_name(self) -> None:
+        with self.assertRaises(ObjectFormatException):
+            Tag.from_string(self.make_tag_text(name=None))
+
+    def test_parse_out_of_order(self) -> None:
+        lines = self.make_tag_lines()
+        lines[1], lines[2] = lines[2], lines[1]
+        with self.assertRaises(ObjectFormatException):
+            Tag.from_string(b"\n".join(lines))
+
+    def test_parse_invalid_object(self) -> None:
+        with self.assertRaises(ObjectFormatException):
+            Tag.from_string(self.make_tag_text(object_sha=b"xxx"))
+
+    def test_parse_extra_header(self) -> None:
+        lines = self.make_tag_lines()
+        lines.insert(4, b"gpgsig-sha256 sig")
+        text = b"\n".join(lines)
+        tag = Tag.from_string(text)
+        self.assertEqual([(b"gpgsig-sha256", b"sig")], tag._extra)
+        tag.message = tag.message
+        self.assertEqual(text, tag.as_raw_string())
+
+    def test_check_order(self) -> None:
+        lines = self.make_tag_lines()
+        headers = lines[:4]
+        rest = lines[4:]
+        # of all possible permutations, ensure only the original succeeds
+        for perm in permutations(headers):
+            perm = list(perm)
+            text = b"\n".join(perm + rest)
+            if perm == headers:
+                self.assertCheckSucceeds(Tag, text)
+            else:
+                self.assertCheckFails(Tag, text)
+
+    def test_signature_uses_last_marker(self) -> None:
+        # A message quoting a signature, itself followed by a real one.
+        message = b"quote:\n-----BEGIN PGP SIGNATURE-----\nnot a sig\n\n"
+        sig = b"-----BEGIN SSH SIGNATURE-----\nreal\n-----END SSH SIGNATURE-----\n"
+        text = self.make_tag_text(message=message) + sig
+        tag = Tag.from_string(text)
+        self.assertEqual(message, tag.message)
+        self.assertEqual(sig, tag.signature)
+        self.assertEqual(SIGNATURE_SSH, tag.extract_signature()[2])
+
+    def test_x509_signature_split_from_message(self) -> None:
+        message = b"Tag message\n"
+        sig = b"-----BEGIN SIGNED MESSAGE-----\nsig\n-----END SIGNED MESSAGE-----\n"
+        tag = Tag.from_string(self.make_tag_text(message=message) + sig)
+        self.assertEqual(message, tag.message)
+        self.assertEqual(sig, tag.signature)
+
+    def test_tree_copy_after_update(self) -> None:
+        """Check Tree.id is correctly updated when the tree is copied after updated."""
+        shas = []
+        tree = Tree()
+        shas.append(tree.id)
+        tree.add(b"data", 0o644, Blob().id)
+        copied = tree.copy()
+        shas.append(tree.id)
+        shas.append(copied.id)
+
+        self.assertNotIn(shas[0], shas[1:])
+        self.assertEqual(shas[1], shas[2])
+
+    def test_tag_withough_sig(self) -> None:
+        x = Tag()
+        x.set_raw_string(self.make_tag_text())
+        self.assertEqual(bytes(x), x.raw_without_sig() + x.signature)
+        self.assertEqual(
+            b"""\
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.7 (GNU/Linux)
+
+iD8DBQBGiAaAF3YsRnbiHLsRAitMAKCiLboJkQECM/jpYsY3WPfvUgLXkACgg3ql
+OK2XeQOiEeXtT76rV4t2WR4=
+=ivrA
+-----END PGP SIGNATURE-----
+""",
+            x.signature,
+        )
+
+    def test_tag_extract_signature_pgp(self) -> None:
+        x = Tag()
+        x.set_raw_string(self.make_tag_text())
+        payload, signature, sig_type = x.extract_signature()
+        self.assertEqual(payload, x.raw_without_sig())
+        self.assertEqual(signature, x.signature)
+        self.assertEqual(sig_type, SIGNATURE_PGP)
+
+    def test_tag_extract_signature_ssh(self) -> None:
+        tag_text_lines = self.make_tag_lines()
+        # Replace PGP signature with SSH signature
+        tag_text_lines[-1] = b"""\
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJwKO3yOmR5JlXCyN5bys
+ZTpDKBGsVP6ydcKdZxAvJlUAAAAEZmlsZQAAAAAAAAAGc2hhNTEyAAAAUwAAAAtz
+-----END SSH SIGNATURE-----
+"""
+        tag_text = b"\n".join(tag_text_lines)
+        x = Tag()
+        x.set_raw_string(tag_text)
+        payload, signature, sig_type = x.extract_signature()
+        self.assertEqual(payload, x.raw_without_sig())
+        self.assertEqual(signature, x.signature)
+        self.assertEqual(sig_type, SIGNATURE_SSH)
+
+    def test_tag_extract_signature_none(self) -> None:
+        tag_lines = self.make_tag_lines(message=b"Test tag\n")
+        x = Tag()
+        x.set_raw_string(b"\n".join(tag_lines))
+        payload, signature, sig_type = x.extract_signature()
+        self.assertEqual(payload, bytes(x))
+        self.assertIsNone(signature)
+        self.assertIsNone(sig_type)
+
+    def test_tag_extract_signature_unknown(self) -> None:
+        # Create a tag with a signature that has an unknown format
+        # It needs to look like a signature to be detected but not be PGP or SSH
+        tag_text = b"""object a38d6181ff27824c79fc7df825164a212eff6a3f
+type commit
+tag v2.6.22-rc7
+tagger Linus Torvalds <torvalds@woody.linux-foundation.org> 1183319674 +0000
+
+Linux 2.6.22-rc7
+-----BEGIN UNKNOWN SIGNATURE-----
+Some unknown signature format
+-----END UNKNOWN SIGNATURE-----
+"""
+        x = Tag()
+        # First we need to manually set the signature to test the extract_signature method
+        x.set_raw_string(tag_text[: tag_text.index(b"-----BEGIN")])
+        x._signature = b"-----BEGIN UNKNOWN SIGNATURE-----\nSome unknown signature format\n-----END UNKNOWN SIGNATURE-----\n"
+        x._needs_serialization = False
+
+        # Unknown signature format should raise an exception
+        with self.assertRaises(ObjectFormatException):
+            x.extract_signature()
+
+
+class CheckTests(TestCase):
+    def test_check_hexsha(self) -> None:
+        check_hexsha(a_sha, "failed to check good sha")
+        self.assertRaises(
+            ObjectFormatException, check_hexsha, b"1" * 39, "sha too short"
+        )
+        self.assertRaises(
+            ObjectFormatException, check_hexsha, b"1" * 41, "sha too long"
+        )
+        self.assertRaises(
+            ObjectFormatException,
+            check_hexsha,
+            b"x" * 40,
+            "invalid characters",
+        )
+
+    def test_check_identity(self) -> None:
+        check_identity(
+            b"Dave Borowitz <dborowitz@google.com>",
+            "failed to check good identity",
+        )
+        check_identity(b" <dborowitz@google.com>", "failed to check good identity")
+        self.assertRaises(
+            ObjectFormatException,
+            check_identity,
+            b"<dborowitz@google.com>",
+            "no space before email",
+        )
+        self.assertRaises(
+            ObjectFormatException, check_identity, b"Dave Borowitz", "no email"
+        )
+        self.assertRaises(
+            ObjectFormatException,
+            check_identity,
+            b"Dave Borowitz <dborowitz",
+            "incomplete email",
+        )
+        self.assertRaises(
+            ObjectFormatException,
+            check_identity,
+            b"dborowitz@google.com>",
+            "incomplete email",
+        )
+        self.assertRaises(
+            ObjectFormatException,
+            check_identity,
+            b"Dave Borowitz <<dborowitz@google.com>",
+            "typo",
+        )
+        self.assertRaises(
+            ObjectFormatException,
+            check_identity,
+            b"Dave Borowitz <dborowitz@google.com>>",
+            "typo",
+        )
+        self.assertRaises(
+            ObjectFormatException,
+            check_identity,
+            b"Dave Borowitz <dborowitz@google.com>xxx",
+            "trailing characters",
+        )
+        self.assertRaises(
+            ObjectFormatException,
+            check_identity,
+            b"Dave Borowitz <dborowitz@google.com>xxx",
+            "trailing characters",
+        )
+        self.assertRaises(
+            ObjectFormatException,
+            check_identity,
+            b"Dave<Borowitz <dborowitz@google.com>",
+            "reserved byte in name",
+        )
+        self.assertRaises(
+            ObjectFormatException,
+            check_identity,
+            b"Dave>Borowitz <dborowitz@google.com>",
+            "reserved byte in name",
+        )
+        self.assertRaises(
+            ObjectFormatException,
+            check_identity,
+            b"Dave\0Borowitz <dborowitz@google.com>",
+            "null byte",
+        )
+        self.assertRaises(
+            ObjectFormatException,
+            check_identity,
+            b"Dave\nBorowitz <dborowitz@google.com>",
+            "newline byte",
+        )
+
+
+class TimezoneTests(TestCase):
+    def test_parse_timezone_utc(self) -> None:
+        self.assertEqual((0, False), parse_timezone(b"+0000"))
+
+    def test_parse_timezone_utc_negative(self) -> None:
+        self.assertEqual((0, True), parse_timezone(b"-0000"))
+
+    def test_generate_timezone_utc(self) -> None:
+        self.assertEqual(b"+0000", format_timezone(0))
+
+    def test_generate_timezone_utc_negative(self) -> None:
+        self.assertEqual(b"-0000", format_timezone(0, True))
+
+    def test_parse_timezone_cet(self) -> None:
+        self.assertEqual((60 * 60, False), parse_timezone(b"+0100"))
+
+    def test_format_timezone_cet(self) -> None:
+        self.assertEqual(b"+0100", format_timezone(60 * 60))
+
+    def test_format_timezone_pdt(self) -> None:
+        self.assertEqual(b"-0400", format_timezone(-4 * 60 * 60))
+
+    def test_parse_timezone_pdt(self) -> None:
+        self.assertEqual((-4 * 60 * 60, False), parse_timezone(b"-0400"))
+
+    def test_format_timezone_pdt_half(self) -> None:
+        self.assertEqual(b"-0440", format_timezone(((-4 * 60) - 40) * 60))
+
+    def test_format_timezone_double_negative(self) -> None:
+        self.assertEqual(b"--700", format_timezone(((7 * 60) * 60), True))
+
+    def test_parse_timezone_pdt_half(self) -> None:
+        self.assertEqual((((-4 * 60) - 40) * 60, False), parse_timezone(b"-0440"))
+
+    def test_parse_timezone_double_negative(self) -> None:
+        self.assertEqual((((7 * 60) * 60), False), parse_timezone(b"+700"))
+        self.assertEqual((((7 * 60) * 60), True), parse_timezone(b"--700"))
+
+
+class ShaFileCopyTests(TestCase):
+    def assert_copy(self, orig) -> None:
+        oclass = object_class(orig.type_num)
+
+        copy = orig.copy()
+        self.assertIsInstance(copy, oclass)
+        self.assertEqual(copy, orig)
+        self.assertIsNot(copy, orig)
+
+    def test_commit_copy(self) -> None:
+        attrs = {
+            "tree": b"d80c186a03f423a81b39df39dc87fd269736ca86",
+            "parents": [
+                b"ab64bbdcc51b170d21588e5c5d391ee5c0c96dfd",
+                b"4cffe90e0a41ad3f5190079d7c8f036bde29cbe6",
+            ],
+            "author": b"James Westby <jw+debian@jameswestby.net>",
+            "committer": b"James Westby <jw+debian@jameswestby.net>",
+            "commit_time": 1174773719,
+            "author_time": 1174773719,
+            "commit_timezone": 0,
+            "author_timezone": 0,
+            "message": b"Merge ../b\n",
+        }
+        commit = make_commit(**attrs)
+        self.assert_copy(commit)
+
+    def test_blob_copy(self) -> None:
+        blob = make_object(Blob, data=b"i am a blob")
+        self.assert_copy(blob)
+
+    def test_tree_copy(self) -> None:
+        blob = make_object(Blob, data=b"i am a blob")
+        tree = Tree()
+        tree[b"blob"] = (stat.S_IFREG, blob.id)
+        self.assert_copy(tree)
+
+    def test_tag_copy(self) -> None:
+        tag = make_object(
+            Tag,
+            name=b"tag",
+            message=b"",
+            tagger=b"Tagger <test@example.com>",
+            tag_time=12345,
+            tag_timezone=0,
+            object=(Commit, ZERO_SHA),
+        )
+        self.assert_copy(tag)
+
+
+class ShaFileSerializeTests(TestCase):
+    """`ShaFile` objects only gets serialized once if they haven't changed."""
+
+    @contextmanager
+    def assert_serialization_on_change(
+        self, obj, needs_serialization_after_change=True
+    ):
+        old_id = obj.id
+        self.assertFalse(obj._needs_serialization)
+
+        yield obj
+
+        if needs_serialization_after_change:
+            self.assertTrue(obj._needs_serialization)
+        else:
+            self.assertFalse(obj._needs_serialization)
+        new_id = obj.id
+        self.assertFalse(obj._needs_serialization)
+        self.assertNotEqual(old_id, new_id)
+
+    def test_commit_serialize(self) -> None:
+        attrs = {
+            "tree": b"d80c186a03f423a81b39df39dc87fd269736ca86",
+            "parents": [
+                b"ab64bbdcc51b170d21588e5c5d391ee5c0c96dfd",
+                b"4cffe90e0a41ad3f5190079d7c8f036bde29cbe6",
+            ],
+            "author": b"James Westby <jw+debian@jameswestby.net>",
+            "committer": b"James Westby <jw+debian@jameswestby.net>",
+            "commit_time": 1174773719,
+            "author_time": 1174773719,
+            "commit_timezone": 0,
+            "author_timezone": 0,
+            "message": b"Merge ../b\n",
+        }
+        commit = make_commit(**attrs)
+
+        with self.assert_serialization_on_change(commit):
+            commit.parents = [b"ab64bbdcc51b170d21588e5c5d391ee5c0c96dfd"]
+
+    def test_blob_serialize(self) -> None:
+        blob = make_object(Blob, data=b"i am a blob")
+
+        with self.assert_serialization_on_change(
+            blob, needs_serialization_after_change=False
+        ):
+            blob.data = b"i am another blob"
+
+    def test_tree_serialize(self) -> None:
+        blob = make_object(Blob, data=b"i am a blob")
+        tree = Tree()
+        tree[b"blob"] = (stat.S_IFREG, blob.id)
+
+        with self.assert_serialization_on_change(tree):
+            tree[b"blob2"] = (stat.S_IFREG, blob.id)
+
+    def test_tag_serialize(self) -> None:
+        tag = make_object(
+            Tag,
+            name=b"tag",
+            message=b"",
+            tagger=b"Tagger <test@example.com>",
+            tag_time=12345,
+            tag_timezone=0,
+            object=(Commit, ZERO_SHA),
+        )
+
+        with self.assert_serialization_on_change(tag):
+            tag.message = b"new message"
+
+    def test_tag_serialize_time_error(self) -> None:
+        with self.assertRaises(ObjectFormatException):
+            tag = make_object(
+                Tag,
+                name=b"tag",
+                message=b"some message",
+                tagger=b"Tagger <test@example.com> 1174773719+0000",
+                object=(Commit, ZERO_SHA),
+            )
+            tag._deserialize(tag._serialize())
+
+
+class PrettyFormatTreeEntryTests(TestCase):
+    def test_format(self) -> None:
+        self.assertEqual(
+            "40000 tree 40820c38cfb182ce6c8b261555410d8382a5918b\tfoo\n",
+            pretty_format_tree_entry(
+                b"foo", 0o40000, b"40820c38cfb182ce6c8b261555410d8382a5918b"
+            ),
+        )

@@ -1,0 +1,19 @@
+include NEWS
+include README.rst
+include Makefile
+include COPYING
+include CONTRIBUTING.rst
+include TODO
+include dulwich/contrib/README.swift.rst
+include dulwich/py.typed
+recursive-include docs conf.py *.txt Makefile make.bat
+recursive-include examples *.py
+recursive-include crates *.rs Cargo.toml
+recursive-include contrib *.py *.sh *.txt *.md *.rst
+graft tests/
+graft testdata/
+include tox.ini
+include dulwich.cfg
+include .testr.conf
+include Cargo.toml
+include Cargo.lock

@@ -1,0 +1,843 @@
+# test_ignore.py -- Tests for ignore files.
+# Copyright (C) 2017 Jelmer Vernooij <jelmer@jelmer.uk>
+#
+# SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+# Dulwich is dual-licensed under the Apache License, Version 2.0 and the GNU
+# General Public License as published by the Free Software Foundation; version 2.0
+# or (at your option) any later version. You can redistribute it and/or
+# modify it under the terms of either of these two licenses.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# You should have received a copy of the licenses; if not, see
+# <http://www.gnu.org/licenses/> for a copy of the GNU General Public License
+# and <http://www.apache.org/licenses/LICENSE-2.0> for a copy of the Apache
+# License, Version 2.0.
+#
+
+"""Tests for ignore files."""
+
+import os
+import re
+import shutil
+import sys
+import tempfile
+from io import BytesIO
+from pathlib import Path
+from unittest import skipIf
+
+from dulwich.ignore import (
+    IgnoreFilter,
+    IgnoreFilterManager,
+    IgnoreFilterStack,
+    Pattern,
+    match_pattern,
+    read_ignore_patterns,
+    translate,
+)
+from dulwich.repo import Repo
+from dulwich.wildmatch import MalformedPattern
+
+from . import TestCase
+
+POSITIVE_MATCH_TESTS = [
+    (b"foo.c", b"*.c"),
+    (b".c", b"*.c"),
+    (b"foo/foo.c", b"*.c"),
+    (b"foo/foo.c", b"foo.c"),
+    (b"foo.c", b"/*.c"),
+    (b"foo.c", b"/foo.c"),
+    (b"foo.c", b"foo.c"),
+    (b"foo.c", b"foo.[ch]"),
+    (b"foo/bar/bla.c", b"foo/**"),
+    (b"foo/bar/", b"foo/**/"),
+    (b"foo/bar/bla/", b"foo/**/"),
+    (b"foo/bar/bla/blie.c", b"foo/**/blie.c"),
+    (b"foo/bar/bla.c", b"**/bla.c"),
+    (b"bla.c", b"**/bla.c"),
+    (b"foo/bar", b"foo/**/bar"),
+    (b"foo/bla/bar", b"foo/**/bar"),
+    (b"foo/bar/", b"bar/"),
+    (b"foo/bar/", b"bar"),
+    (b"foo/bar/something", b"foo/bar/*"),
+    (b"foo.d", b"foo.[^ch]"),
+    (b"foo.5", b"foo.[[:digit:]]"),
+    (b"a-c", b"a[a\\-c]c"),
+    (b"a]c", b"a[]x]c"),
+]
+
+NEGATIVE_MATCH_TESTS = [
+    (b"foo.c", b"foo.[dh]"),
+    (b"foo/foo.c", b"/foo.c"),
+    (b"foo/foo.c", b"/*.c"),
+    (b"foo/bar/", b"/bar/"),
+    (b"foo/bar/", b"foo/bar/*"),
+    (b"foo/bar", b"foo?bar"),
+    (b"foo.c", b"foo.[^ch]"),
+    (b"foo.x", b"foo.[[:digit:]]"),
+    (b"a/b", b"a[!x]b"),
+    (b"foo/bla.c", b"foo/**/"),
+    (b"foo/", b"foo/**/"),
+]
+
+
+TRANSLATE_TESTS = [
+    (b"*.c", b"(?ms)(.*/)?[^/]*\\.c/?\\Z"),
+    (b"foo.c", b"(?ms)(.*/)?foo\\.c/?\\Z"),
+    (b"/*.c", b"(?ms)[^/]*\\.c/?\\Z"),
+    (b"/foo.c", b"(?ms)foo\\.c/?\\Z"),
+    (b"foo.c", b"(?ms)(.*/)?foo\\.c/?\\Z"),
+    (b"foo.[ch]", b"(?ms)(.*/)?foo\\.[ch]/?\\Z"),
+    (b"bar/", b"(?ms)(.*/)?bar\\/\\Z"),
+    (b"foo/**", b"(?ms)foo/.*/?\\Z"),
+    (b"foo/**/", b"(?ms)foo/.*/\\Z"),
+    (b"foo/**/blie.c", b"(?ms)foo/(?:[^/]+/)*blie\\.c/?\\Z"),
+    (b"**/bla.c", b"(?ms)(.*/)?bla\\.c/?\\Z"),
+    (b"foo/**/bar", b"(?ms)foo/(?:[^/]+/)*bar/?\\Z"),
+    (b"foo/bar/*", b"(?ms)foo\\/bar\\/[^/]+/?\\Z"),
+    (b"/foo\\[bar\\]", b"(?ms)foo\\[bar\\]/?\\Z"),
+    (b"/foo[bar]", b"(?ms)foo[bar]/?\\Z"),
+    (b"/foo[0-9]", b"(?ms)foo[0-9]/?\\Z"),
+    (b"/[!a-c]", b"(?ms)[^/a-c]/?\\Z"),
+    (b"/[^a-c]", b"(?ms)[^/a-c]/?\\Z"),
+    (b"/[[:digit:]]", b"(?ms)[0-9]/?\\Z"),
+    (b"/[![:digit:]x]", b"(?ms)[^/x0-9]/?\\Z"),
+    (b"/[a\\-c]", b"(?ms)[a\\-c]/?\\Z"),
+    (b"/[]a]", b"(?ms)[\\]a]/?\\Z"),
+    (b"/[a/c]", b"(?ms)[ac]/?\\Z"),
+]
+
+
+class TranslateTests(TestCase):
+    def test_translate(self) -> None:
+        for pattern, regex in TRANSLATE_TESTS:
+            if re.escape(b"/") == b"/":
+                # Slash is no longer escaped in Python3.7, so undo the escaping
+                # in the expected return value..
+                regex = regex.replace(b"\\/", b"/")
+            self.assertEqual(
+                regex,
+                translate(pattern),
+                f"orig pattern: {pattern!r}, regex: {translate(pattern)!r}, expected: {regex!r}",
+            )
+
+    def test_malformed_raises(self) -> None:
+        self.assertRaises(MalformedPattern, translate, b"/[abc")
+        self.assertRaises(MalformedPattern, translate, b"/[[:foo:]]")
+
+    def test_double_slash_matches_nothing(self) -> None:
+        # Git has no special case for "//"; the empty segment becomes a
+        # literal slash that no path can match.
+        for pattern in [b"a//b", b"//foo", b"foo//"]:
+            self.assertFalse(Pattern(pattern, False).match(b"a/b"))
+            self.assertFalse(Pattern(pattern, False).match(b"foo"))
+
+    def test_collapses_consecutive_stars(self) -> None:
+        # A run of '*' in a segment is redundant and must collapse to a
+        # single quantifier so the regex does not contain adjacent
+        # unbounded quantifiers that backtrack catastrophically.
+        self.assertEqual(b"(?ms)(.*/)?[^/]*x/?\\Z", translate(b"****x"))
+
+    def test_consecutive_stars_no_redos(self) -> None:
+        # A pattern of many '*' matched against a long non-matching path
+        # used to backtrack exponentially; it must now return promptly.
+        pattern = Pattern(b"*" * 50 + b"x", False)
+        self.assertFalse(pattern.match(b"a" * 80))
+
+
+class ReadIgnorePatterns(TestCase):
+    def test_read_file(self) -> None:
+        f = BytesIO(
+            b"""
+# a comment
+\x20\x20
+# and an empty line:
+
+\\#not a comment
+!negative
+with trailing whitespace 
+with escaped trailing whitespace\\ 
+"""
+        )
+        self.assertEqual(
+            list(read_ignore_patterns(f)),
+            [
+                b"\\#not a comment",
+                b"!negative",
+                b"with trailing whitespace",
+                b"with escaped trailing whitespace ",
+            ],
+        )
+
+
+class MatchPatternTests(TestCase):
+    def test_matches(self) -> None:
+        for path, pattern in POSITIVE_MATCH_TESTS:
+            self.assertTrue(
+                match_pattern(path, pattern),
+                f"path: {path!r}, pattern: {pattern!r}",
+            )
+
+    def test_no_matches(self) -> None:
+        for path, pattern in NEGATIVE_MATCH_TESTS:
+            self.assertFalse(
+                match_pattern(path, pattern),
+                f"path: {path!r}, pattern: {pattern!r}",
+            )
+
+
+class BracketExpressionTests(TestCase):
+    """Bracket expressions follow Git's wildmatch(), not fnmatch.
+
+    The same patterns are checked against the real ``git check-ignore`` in
+    tests/compat/test_check_ignore.py.
+    """
+
+    def assertMatches(
+        self, pattern: bytes, matching: list[bytes], non_matching: list[bytes]
+    ) -> None:
+        for path in matching:
+            self.assertTrue(
+                match_pattern(path, pattern),
+                f"{pattern!r} should match {path!r}",
+            )
+        for path in non_matching:
+            self.assertFalse(
+                match_pattern(path, pattern),
+                f"{pattern!r} should not match {path!r}",
+            )
+
+    def test_caret_negates_class(self) -> None:
+        # wildmatch.c has NEGATE_CLASS '!' and NEGATE_CLASS2 '^'; both spellings
+        # invert the class rather than adding a literal member.
+        for pattern in (b"[!a-c]", b"[^a-c]"):
+            self.assertMatches(
+                pattern, [b"d", b"0", b"!", b"^", b"]"], [b"a", b"b", b"c"]
+            )
+        self.assertMatches(b"[^0-9]", [b"a", b"^"], [b"0", b"5", b"9"])
+
+    def test_posix_classes(self) -> None:
+        cases = [
+            (b"[[:alnum:]]", [b"a", b"Q", b"0"], [b"_", b"-"]),
+            (b"[[:alpha:]]", [b"a", b"Q"], [b"0", b"_"]),
+            (b"[[:blank:]]", [b" ", b"\t"], [b"a", b"\r"]),
+            (b"[[:cntrl:]]", [b"\x01", b"\x7f"], [b"a", b" "]),
+            (b"[[:digit:]]", [b"0", b"9"], [b"a", b"_"]),
+            (b"[[:graph:]]", [b"a", b"!", b"~"], [b" ", b"\t"]),
+            (b"[[:lower:]]", [b"a", b"z"], [b"Q", b"0"]),
+            (b"[[:print:]]", [b"a", b" "], [b"\x01", b"\x7f"]),
+            (b"[[:punct:]]", [b"!", b"_", b"]"], [b"a", b"0", b" "]),
+            (b"[[:space:]]", [b" ", b"\t", b"\r"], [b"a", b"0"]),
+            (b"[[:upper:]]", [b"Q"], [b"a", b"0"]),
+            (b"[[:xdigit:]]", [b"0", b"f", b"F"], [b"g", b"_"]),
+        ]
+        for pattern, matching, non_matching in cases:
+            self.assertMatches(pattern, matching, non_matching)
+
+    def test_posix_class_combined_with_members(self) -> None:
+        self.assertMatches(b"[[:digit:]abc]", [b"0", b"a"], [b"d", b"_"])
+        self.assertMatches(b"[![:digit:]]", [b"a", b"_"], [b"0", b"9"])
+        self.assertMatches(b"[[:digit:][:upper:]]", [b"0", b"Q"], [b"a"])
+
+    def test_posix_class_ascii_only(self) -> None:
+        # Git classifies through sane-ctype.h, whose table has no entries
+        # above 0x7f, so no high byte belongs to any class.
+        self.assertMatches(b"[[:alpha:]]", [b"a"], [b"\xc3", b"\xa9"])
+
+    def test_closing_bracket_first(self) -> None:
+        # A ']' straight after '[' or after the negation character is a member.
+        self.assertMatches(b"[]]", [b"]"], [b"a", b"["])
+        self.assertMatches(b"[]a]", [b"]", b"a"], [b"b"])
+        self.assertMatches(b"[!]]", [b"a", b"["], [b"]"])
+        self.assertMatches(b"[^]]", [b"a", b"["], [b"]"])
+
+    def test_backslash_escapes_member(self) -> None:
+        # A backslash escapes the next member, so [a\-c] is a, - and c -- not
+        # the range '\' to 'c'.
+        self.assertMatches(b"[a\\-c]", [b"a", b"-", b"c"], [b"b", b"\\", b"]"])
+        self.assertMatches(b"[\\]]", [b"]"], [b"\\", b"a"])
+        self.assertMatches(b"[x\\]y]", [b"x", b"]", b"y"], [b"\\"])
+        self.assertMatches(b"[\\\\]", [b"\\"], [b"a"])
+
+    def test_dash_is_literal_at_either_end(self) -> None:
+        self.assertMatches(b"[a-]", [b"a", b"-"], [b"b"])
+        self.assertMatches(b"[-a]", [b"a", b"-"], [b"b"])
+        self.assertMatches(b"[a-c-]", [b"a", b"b", b"c", b"-"], [b"d"])
+
+    def test_inverted_range(self) -> None:
+        # wildmatch() takes 'z' as a plain member before it reaches the '-',
+        # then the inverted range adds nothing, so only 'z' matches. re would
+        # reject the range outright.
+        self.assertMatches(b"[z-a]", [b"z"], [b"a", b"b", b"-"])
+        self.assertMatches(b"[9-0]", [b"9"], [b"0", b"5", b"-"])
+        self.assertMatches(b"[!z-a]", [b"a", b"-"], [b"z"])
+
+    def test_range_low_end_is_also_a_member(self) -> None:
+        self.assertMatches(b"[/-9]", [b"0", b"9"], [b"a", b"a/b"])
+        self.assertMatches(b"[\\a-c]", [b"a", b"b", b"c"], [b"\\"])
+
+    def test_never_matches_slash(self) -> None:
+        # WM_PATHNAME makes a bracket expression fail on '/' whether it is
+        # negated or lists the slash explicitly.
+        self.assertMatches(b"a[!x]b", [b"acb"], [b"a/b"])
+        self.assertMatches(b"a[^x]b", [b"acb"], [b"a/b"])
+        self.assertMatches(b"/[a/c]", [b"a", b"c"], [b"b"])
+        self.assertMatches(b"/[!/]", [b"a", b"0"], [b"a/b"])
+
+    def test_malformed_raises(self) -> None:
+        # wildmatch() returns WM_ABORT_ALL on these; constructing a Pattern
+        # from one raises rather than silently matching nothing.
+        for pattern in (b"[abc", b"[", b"[]", b"[!]", b"[^]", b"foo["):
+            self.assertRaises(MalformedPattern, match_pattern, b"a", pattern)
+
+    def test_unknown_posix_class_raises(self) -> None:
+        self.assertRaises(MalformedPattern, match_pattern, b"a", b"[[:foo:]]")
+
+
+class ParentExclusionTests(TestCase):
+    """Tests for parent directory exclusion helper functions."""
+
+    def test_directory_exclusion_blocks_file_negation(self) -> None:
+        # A file cannot be re-included while its parent directory is excluded.
+        filter = IgnoreFilter([b"dir/", b"!dir/file.txt"])
+        self.assertIs(True, filter.is_ignored(b"dir/file.txt"))
+        self.assertIs(True, filter.is_ignored(b"dir/subdir/file.txt"))
+        self.assertIs(None, filter.is_ignored(b"other/file.txt"))
+
+    def test_no_negation_leaves_exclusion_alone(self) -> None:
+        filter = IgnoreFilter([b"*.log", b"build/"])
+        self.assertIs(True, filter.is_ignored(b"build/file.txt"))
+
+    def test_double_asterisk_directory_blocks_negation(self) -> None:
+        filter = IgnoreFilter([b"**/node_modules/**", b"!foo/node_modules/bar/f"])
+        self.assertIs(True, filter.is_ignored(b"foo/node_modules/bar/f"))
+        self.assertIs(True, filter.is_ignored(b"node_modules/file.txt"))
+        self.assertIs(None, filter.is_ignored(b"foo/bar/file.txt"))
+
+    def test_glob_contents_allow_file_negation(self) -> None:
+        # "logs/**" covers the contents of logs rather than naming it, so a
+        # file below it can still be re-included, but a directory cannot.
+        filter = IgnoreFilter([b"logs/**", b"!logs/file.txt"])
+        self.assertIs(False, filter.is_ignored(b"logs/file.txt"))
+        filter = IgnoreFilter([b"logs/**", b"!logs/keep/"])
+        self.assertIs(True, filter.is_ignored(b"logs/keep/"))
+
+
+class MayPruneDirectoryTests(TestCase):
+    """Tests for deciding whether a walk can skip a directory."""
+
+    def test_named_directory_is_prunable(self) -> None:
+        # The pattern names the directory, so git stops there and the
+        # negation below it is never reached.
+        filter = IgnoreFilter([b"build/", b"!build/keep.txt"])
+        self.assertIs(True, filter.may_prune_directory(b"build/"))
+        filter = IgnoreFilter([b"build", b"!build/keep.txt"])
+        self.assertIs(True, filter.may_prune_directory(b"build/"))
+
+    def test_contents_pattern_is_not_prunable(self) -> None:
+        # "__tmp/*" describes what the directory holds rather than naming it,
+        # so git descends and "!__tmp/keep" still applies. check-ignore calls
+        # the directory ignored anyway, because "*" also matches the empty
+        # string, so the two answers differ here.
+        filter = IgnoreFilter([b"__tmp/*", b"!__tmp/keep"])
+        self.assertIs(True, filter.is_ignored(b"__tmp/"))
+        self.assertIs(False, filter.may_prune_directory(b"__tmp/"))
+        self.assertIs(False, filter.is_ignored(b"__tmp/keep"))
+
+    def test_double_asterisk_contents_is_not_prunable(self) -> None:
+        filter = IgnoreFilter([b"logs/**", b"!logs/important.log"])
+        self.assertIs(True, filter.is_ignored(b"logs/"))
+        self.assertIs(False, filter.may_prune_directory(b"logs/"))
+
+    def test_unmentioned_directory_is_not_prunable(self) -> None:
+        filter = IgnoreFilter([b"*.log"])
+        self.assertIs(False, filter.may_prune_directory(b"src/"))
+
+    def test_excluded_parent_makes_child_prunable(self) -> None:
+        filter = IgnoreFilter([b"build/"])
+        self.assertIs(True, filter.may_prune_directory(b"build/sub/"))
+
+
+class IgnoreFilterTests(TestCase):
+    def test_included(self) -> None:
+        filter = IgnoreFilter([b"a.c", b"b.c"])
+        self.assertTrue(filter.is_ignored(b"a.c"))
+        self.assertIs(None, filter.is_ignored(b"c.c"))
+        self.assertEqual([Pattern(b"a.c")], list(filter.find_matching(b"a.c")))
+        self.assertEqual([], list(filter.find_matching(b"c.c")))
+
+    def test_malformed_pattern_raises(self) -> None:
+        self.assertRaises(MalformedPattern, Pattern, b"a[bc")
+
+    def test_malformed_pattern_skipped_with_warning(self) -> None:
+        with self.assertLogs("dulwich.ignore", level="WARNING"):
+            filter = IgnoreFilter([b"a.c", b"a[bc", b"b.c"])
+        # The malformed pattern is dropped; the good ones on either side load.
+        self.assertTrue(filter.is_ignored(b"a.c"))
+        self.assertTrue(filter.is_ignored(b"b.c"))
+
+    def test_included_ignorecase(self) -> None:
+        filter = IgnoreFilter([b"a.c", b"b.c"], ignorecase=False)
+        self.assertTrue(filter.is_ignored(b"a.c"))
+        self.assertFalse(filter.is_ignored(b"A.c"))
+        filter = IgnoreFilter([b"a.c", b"b.c"], ignorecase=True)
+        self.assertTrue(filter.is_ignored(b"a.c"))
+        self.assertTrue(filter.is_ignored(b"A.c"))
+        self.assertTrue(filter.is_ignored(b"A.C"))
+
+    def test_excluded(self) -> None:
+        filter = IgnoreFilter([b"a.c", b"b.c", b"!c.c"])
+        self.assertFalse(filter.is_ignored(b"c.c"))
+        self.assertIs(None, filter.is_ignored(b"d.c"))
+        self.assertEqual([Pattern(b"!c.c")], list(filter.find_matching(b"c.c")))
+        self.assertEqual([], list(filter.find_matching(b"d.c")))
+
+    def test_empty_pattern_never_matches(self) -> None:
+        # Lines that carry no pattern once the negation prefix and the
+        # directory suffix are stripped are inert in git; a bare "!" in
+        # particular does not re-include an earlier ignored directory.
+        for line in [b"!", b"!/", b"/", b"//", b"!//"]:
+            filter = IgnoreFilter([b"build/", line])
+            self.assertIs(True, filter.is_ignored(b"build/"), line)
+            self.assertIs(True, filter.is_ignored(b"build/f"), line)
+            self.assertEqual([], list(filter.find_matching(b"other/")), line)
+
+    def test_include_exclude_include(self) -> None:
+        filter = IgnoreFilter([b"a.c", b"!a.c", b"a.c"])
+        self.assertTrue(filter.is_ignored(b"a.c"))
+        self.assertEqual(
+            [Pattern(b"a.c"), Pattern(b"!a.c"), Pattern(b"a.c")],
+            list(filter.find_matching(b"a.c")),
+        )
+
+    def test_manpage(self) -> None:
+        # A specific example from the gitignore manpage
+        filter = IgnoreFilter([b"/*", b"!/foo", b"/foo/*", b"!/foo/bar"])
+        self.assertTrue(filter.is_ignored(b"a.c"))
+        self.assertTrue(filter.is_ignored(b"foo/blie"))
+        self.assertFalse(filter.is_ignored(b"foo"))
+        self.assertFalse(filter.is_ignored(b"foo/bar"))
+        self.assertFalse(filter.is_ignored(b"foo/bar/"))
+        self.assertFalse(filter.is_ignored(b"foo/bar/bloe"))
+
+    def test_regex_special(self) -> None:
+        # See https://github.com/dulwich/dulwich/issues/930#issuecomment-1026166429
+        filter = IgnoreFilter([b"/foo\\[bar\\]", b"/foo"])
+        self.assertTrue(filter.is_ignored("foo"))
+        self.assertTrue(filter.is_ignored("foo[bar]"))
+
+    def test_from_path_pathlib(self) -> None:
+        # Create a temporary .gitignore file
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".gitignore", delete=False
+        ) as f:
+            f.write("*.pyc\n__pycache__/\n")
+            temp_path = f.name
+
+        self.addCleanup(os.unlink, temp_path)
+
+        # Test with pathlib.Path
+        path_obj = Path(temp_path)
+        ignore_filter = IgnoreFilter.from_path(path_obj)
+
+        # Test that it loaded the patterns correctly
+        self.assertTrue(ignore_filter.is_ignored("test.pyc"))
+        self.assertTrue(ignore_filter.is_ignored("__pycache__/"))
+        self.assertFalse(ignore_filter.is_ignored("test.py"))
+
+
+class IgnoreFilterStackTests(TestCase):
+    def test_stack_first(self) -> None:
+        filter1 = IgnoreFilter([b"[a].c", b"[b].c", b"![d].c"])
+        filter2 = IgnoreFilter([b"[a].c", b"![b],c", b"[c].c", b"[d].c"])
+        stack = IgnoreFilterStack([filter1, filter2])
+        self.assertIs(True, stack.is_ignored(b"a.c"))
+        self.assertIs(True, stack.is_ignored(b"b.c"))
+        self.assertIs(True, stack.is_ignored(b"c.c"))
+        self.assertIs(False, stack.is_ignored(b"d.c"))
+        self.assertIs(None, stack.is_ignored(b"e.c"))
+
+
+class IgnoreFilterManagerTests(TestCase):
+    def test_load_ignore(self) -> None:
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"/foo/bar\n")
+            f.write(b"/dir2\n")
+            f.write(b"/dir3/\n")
+        os.mkdir(os.path.join(repo.path, "dir"))
+        with open(os.path.join(repo.path, "dir", ".gitignore"), "wb") as f:
+            f.write(b"/blie\n")
+        with open(os.path.join(repo.path, "dir", "blie"), "wb") as f:
+            f.write(b"IGNORED")
+        p = os.path.join(repo.controldir(), "info", "exclude")
+        with open(p, "wb") as f:
+            f.write(b"/excluded\n")
+        m = IgnoreFilterManager.from_repo(repo)
+        self.assertTrue(m.is_ignored("dir/blie"))
+        self.assertIs(None, m.is_ignored(os.path.join("dir", "bloe")))
+        self.assertIs(None, m.is_ignored("dir"))
+        self.assertTrue(m.is_ignored(os.path.join("foo", "bar")))
+        self.assertTrue(m.is_ignored(os.path.join("excluded")))
+        self.assertTrue(m.is_ignored(os.path.join("dir2", "fileinignoreddir")))
+        self.assertFalse(m.is_ignored("dir3"))
+        self.assertTrue(m.is_ignored("dir3/"))
+        self.assertTrue(m.is_ignored("dir3/bla"))
+
+    @skipIf(sys.platform == "win32", "requires symlink support")
+    def test_symlinked_gitignore_is_not_followed(self) -> None:
+        # A tree can ship .gitignore as a symlink pointing anywhere on the
+        # filesystem. Reading it would let a file outside the work tree decide
+        # what is ignored, so treat it as absent, as git does.
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        outside = os.path.join(tmp_dir, "outside")
+        with open(outside, "wb") as f:
+            f.write(b"/secret\n")
+        repo = Repo.init(os.path.join(tmp_dir, "repo"), mkdir=True)
+        self.addCleanup(repo.close)
+        link = os.path.join(repo.path, ".gitignore")
+        os.symlink(outside, link)
+
+        m = IgnoreFilterManager.from_repo(repo)
+        with self.assertLogs("dulwich.ignore", "WARNING") as cm:
+            self.assertIs(None, m.is_ignored("secret"))
+        self.assertEqual(
+            [f"WARNING:dulwich.ignore:Ignoring {link}: it is a symbolic link"],
+            cm.output,
+        )
+
+    def test_trailing_double_asterisk_slash_is_directory_only(self) -> None:
+        # "foo/**/" is a directory pattern: Git ignores the directories below
+        # foo, but not a file sitting directly in foo.
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"foo/**/\n")
+        os.makedirs(os.path.join(repo.path, "foo", "sub"))
+        m = IgnoreFilterManager.from_repo(repo)
+        self.assertFalse(m.is_ignored("foo/keep.txt"))
+        self.assertTrue(m.is_ignored("foo/sub/"))
+        self.assertTrue(m.is_ignored("foo/sub/bla.txt"))
+
+    def test_nested_gitignores(self) -> None:
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"/*\n")
+            f.write(b"!/foo\n")
+
+        os.mkdir(os.path.join(repo.path, "foo"))
+        with open(os.path.join(repo.path, "foo", ".gitignore"), "wb") as f:
+            f.write(b"/bar\n")
+
+        with open(os.path.join(repo.path, "foo", "bar"), "wb") as f:
+            f.write(b"IGNORED")
+
+        m = IgnoreFilterManager.from_repo(repo)
+        self.assertTrue(m.is_ignored("foo/bar"))
+
+    def test_subdirectory_gitignore_overrides_root(self) -> None:
+        # Git gives a .gitignore in a subdirectory precedence over one closer
+        # to the root, so the root negation does not win here.
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"!deps/v8/**\n")
+
+        os.makedirs(os.path.join(repo.path, "deps", "v8", "inner"))
+        with open(
+            os.path.join(repo.path, "deps", "v8", "inner", ".gitignore"), "wb"
+        ) as f:
+            f.write(b"Cargo.lock\n")
+
+        m = IgnoreFilterManager.from_repo(repo)
+        self.assertIs(True, m.is_ignored("deps/v8/inner/Cargo.lock"))
+
+    def test_subdirectory_gitignore_reincludes(self) -> None:
+        # The same precedence applies the other way round: a negation in a
+        # subdirectory beats an exclusion at the root.
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b".idea/\n")
+
+        os.makedirs(os.path.join(repo.path, "testbed", ".idea"))
+        with open(os.path.join(repo.path, "testbed", ".gitignore"), "wb") as f:
+            f.write(b"!.idea/\n")
+
+        m = IgnoreFilterManager.from_repo(repo)
+        self.assertIs(False, m.is_ignored("testbed/.idea/"))
+
+    def test_excluded_parent_blocks_nested_reinclude(self) -> None:
+        # A file cannot be re-included while a parent directory stays excluded,
+        # even when the negation lives in a deeper .gitignore.
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b".vscode\n")
+
+        os.makedirs(os.path.join(repo.path, "app", ".vscode"))
+        with open(os.path.join(repo.path, "app", ".gitignore"), "wb") as f:
+            f.write(b"!.vscode/extensions.json\n")
+
+        m = IgnoreFilterManager.from_repo(repo)
+        self.assertIs(True, m.is_ignored("app/.vscode/extensions.json"))
+
+    def test_load_ignore_ignorecase(self) -> None:
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+        config = repo.get_config()
+        config.set(b"core", b"ignorecase", True)
+        config.write_to_path()
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"/foo/bar\n")
+            f.write(b"/dir\n")
+        m = IgnoreFilterManager.from_repo(repo)
+        self.assertTrue(m.is_ignored(os.path.join("dir", "blie")))
+        self.assertTrue(m.is_ignored(os.path.join("DIR", "blie")))
+
+    def test_ignored_contents(self) -> None:
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"a/*\n")
+            f.write(b"!a/*.txt\n")
+        m = IgnoreFilterManager.from_repo(repo)
+        os.mkdir(os.path.join(repo.path, "a"))
+        self.assertIs(None, m.is_ignored("a"))
+        # Asking about "a/" asks about what it holds, which "a/*" excludes.
+        self.assertIs(True, m.is_ignored("a/"))
+        self.assertFalse(m.is_ignored("a/b.txt"))
+        self.assertTrue(m.is_ignored("a/c.dat"))
+
+    def test_reincluded_parent_allows_file_reinclude(self) -> None:
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"dist/\n")
+            f.write(b"!dist/\n")
+            f.write(b"dist/*\n")
+            f.write(b"!dist/keep.txt\n")
+
+        os.mkdir(os.path.join(repo.path, "dist"))
+        with open(os.path.join(repo.path, "dist", "drop.txt"), "wb") as f:
+            f.write(b"ignored")
+        with open(os.path.join(repo.path, "dist", "keep.txt"), "wb") as f:
+            f.write(b"visible")
+
+        m = IgnoreFilterManager.from_repo(repo)
+        # "dist/" asks about the contents too, and "dist/*" excludes them.
+        self.assertTrue(m.is_ignored("dist/"))
+        self.assertTrue(m.is_ignored("dist/drop.txt"))
+        self.assertFalse(m.is_ignored("dist/keep.txt"))
+
+    def test_reincluded_file_under_glob_contents_is_walked(self) -> None:
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"__tmp/*\n")
+            f.write(b"!__tmp/keep\n")
+        os.mkdir(os.path.join(repo.path, "__tmp"))
+
+        m = IgnoreFilterManager.from_repo(repo)
+        # check-ignore reports the directory as ignored, but the walk has to
+        # enter it for "!__tmp/keep" to take effect.
+        self.assertIs(True, m.is_ignored("__tmp/"))
+        self.assertIs(False, m.may_prune_directory("__tmp/"))
+        self.assertIs(False, m.is_ignored("__tmp/keep"))
+        self.assertIs(True, m.is_ignored("__tmp/other"))
+
+    def test_named_directory_may_be_pruned(self) -> None:
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"__tmp/\n")
+            f.write(b"!__tmp/keep\n")
+        os.mkdir(os.path.join(repo.path, "__tmp"))
+
+        m = IgnoreFilterManager.from_repo(repo)
+        self.assertIs(True, m.may_prune_directory("__tmp/"))
+
+    def test_issue_1203_directory_negation(self) -> None:
+        """Test for issue #1203: gitignore patterns with directory negation."""
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+
+        # Create .gitignore with the patterns from the issue
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"data/**\n")
+            f.write(b"!data/*/\n")
+
+        # Create directory structure
+        os.makedirs(os.path.join(repo.path, "data", "subdir"))
+
+        m = IgnoreFilterManager.from_repo(repo)
+
+        # Test the expected behavior
+        self.assertTrue(
+            m.is_ignored("data/test.dvc")
+        )  # File in data/ should be ignored
+        self.assertFalse(m.is_ignored("data/"))  # data/ directory should not be ignored
+        self.assertTrue(
+            m.is_ignored("data/subdir/")
+        )  # Subdirectory should be ignored (matches Git behavior)
+
+    def test_issue_1721_directory_negation_with_double_asterisk(self) -> None:
+        """Test for issue #1721: regression with negated subdirectory patterns using **."""
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+
+        # Create .gitignore with the patterns from issue #1721
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"data/**\n")
+            f.write(b"!data/**/\n")
+            f.write(b"!data/**/*.csv\n")
+
+        # Create directory structure
+        os.makedirs(os.path.join(repo.path, "data", "subdir"))
+
+        m = IgnoreFilterManager.from_repo(repo)
+
+        # Test the expected behavior - issue #1721 was that data/myfile was not ignored
+        self.assertTrue(
+            m.is_ignored("data/myfile")
+        )  # File should be ignored (fixes issue #1721)
+        self.assertFalse(m.is_ignored("data/"))  # data/ is matched by !data/**/
+        self.assertFalse(
+            m.is_ignored("data/subdir/")
+        )  # Subdirectory is matched by !data/**/
+        # With data/** pattern, Git allows CSV files to be re-included via !data/**/*.csv
+        self.assertFalse(m.is_ignored("data/test.csv"))  # CSV files are not ignored
+        self.assertFalse(
+            m.is_ignored("data/subdir/test.csv")
+        )  # CSV files in subdirs are not ignored
+        self.assertTrue(
+            m.is_ignored("data/subdir/other.txt")
+        )  # Non-CSV files in subdirs are ignored
+
+    def test_parent_directory_exclusion(self) -> None:
+        """Test Git's parent directory exclusion rule.
+
+        Git rule: "It is not possible to re-include a file if a parent directory of that file is excluded."
+        """
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+
+        # Test case 1: Direct parent directory exclusion
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"parent/\n")
+            f.write(b"!parent/file.txt\n")
+            f.write(b"!parent/child/\n")
+
+        m = IgnoreFilterManager.from_repo(repo)
+
+        # parent/ is excluded, so files inside cannot be re-included
+        self.assertTrue(m.is_ignored("parent/"))
+        self.assertTrue(m.is_ignored("parent/file.txt"))  # Cannot re-include
+        self.assertTrue(m.is_ignored("parent/child/"))  # Cannot re-include
+        self.assertTrue(m.is_ignored("parent/child/file.txt"))
+
+    def test_parent_exclusion_with_wildcards(self) -> None:
+        """Test parent directory exclusion with wildcard patterns."""
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+
+        # Test case 2: Parent excluded by wildcard
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"*/build/\n")
+            f.write(b"!*/build/important.txt\n")
+
+        m = IgnoreFilterManager.from_repo(repo)
+
+        self.assertTrue(m.is_ignored("src/build/"))
+        self.assertTrue(m.is_ignored("src/build/important.txt"))  # Cannot re-include
+        self.assertTrue(m.is_ignored("test/build/"))
+        self.assertTrue(m.is_ignored("test/build/important.txt"))  # Cannot re-include
+
+    def test_parent_exclusion_with_double_asterisk(self) -> None:
+        """Test parent directory exclusion with ** patterns."""
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+
+        # Test case 3: Complex ** pattern with parent exclusion
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"**/node_modules/\n")
+            f.write(b"!**/node_modules/keep.txt\n")
+
+        m = IgnoreFilterManager.from_repo(repo)
+
+        self.assertTrue(m.is_ignored("node_modules/"))
+        self.assertTrue(m.is_ignored("node_modules/keep.txt"))  # Cannot re-include
+        self.assertTrue(m.is_ignored("src/node_modules/"))
+        self.assertTrue(m.is_ignored("src/node_modules/keep.txt"))  # Cannot re-include
+        self.assertTrue(m.is_ignored("deep/nested/node_modules/"))
+        self.assertTrue(
+            m.is_ignored("deep/nested/node_modules/keep.txt")
+        )  # Cannot re-include
+
+    def test_no_parent_exclusion_with_glob_contents(self) -> None:
+        """Test that dir/** allows specific file negations for immediate children."""
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+
+        # Test: dir/** allows specific file negations (unlike dir/ which doesn't)
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"logs/**\n")
+            f.write(b"!logs/important.log\n")
+            f.write(b"!logs/keep/\n")
+
+        m = IgnoreFilterManager.from_repo(repo)
+
+        # logs/ itself is excluded by logs/**
+        self.assertTrue(m.is_ignored("logs/"))
+        # Specific file negation works with dir/** patterns
+        self.assertFalse(m.is_ignored("logs/important.log"))
+        # Directory negations still don't work (parent exclusion)
+        self.assertTrue(m.is_ignored("logs/keep/"))
+        # Nested paths are ignored
+        self.assertTrue(m.is_ignored("logs/subdir/"))
+        self.assertTrue(m.is_ignored("logs/subdir/file.txt"))
+
+    def test_parent_exclusion_ordering(self) -> None:
+        """Test that parent exclusion depends on pattern ordering."""
+        tmp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp_dir)
+        repo = Repo.init(tmp_dir)
+
+        # Test case 5: Order matters for parent exclusion
+        with open(os.path.join(repo.path, ".gitignore"), "wb") as f:
+            f.write(b"!data/important/\n")  # This comes first but won't work
+            f.write(b"data/\n")  # This excludes the parent
+
+        m = IgnoreFilterManager.from_repo(repo)
+
+        self.assertTrue(m.is_ignored("data/"))
+        self.assertTrue(m.is_ignored("data/important/"))  # Cannot re-include
+        self.assertTrue(m.is_ignored("data/important/file.txt"))

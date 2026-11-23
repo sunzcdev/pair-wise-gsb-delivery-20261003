@@ -1,0 +1,10 @@
+[package]
+name = "diff-tree-py"
+version = { workspace = true }
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true, features = ["extension-module"]}

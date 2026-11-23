@@ -1,0 +1,316 @@
+# test_stash.py -- tests for stash
+# Copyright (C) 2018 Jelmer Vernooij <jelmer@jelmer.uk>
+#
+# SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+# Dulwich is dual-licensed under the Apache License, Version 2.0 and the GNU
+# General Public License as published by the Free Software Foundation; version 2.0
+# or (at your option) any later version. You can redistribute it and/or
+# modify it under the terms of either of these two licenses.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# You should have received a copy of the licenses; if not, see
+# <http://www.gnu.org/licenses/> for a copy of the GNU General Public License
+# and <http://www.apache.org/licenses/LICENSE-2.0> for a copy of the Apache
+# License, Version 2.0.
+#
+
+"""Tests for stashes."""
+
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+
+from dulwich.index import FLAG_VALID, InvalidPathError
+from dulwich.objects import Blob, Tree
+from dulwich.repo import Repo
+from dulwich.stash import DEFAULT_STASH_REF, Stash
+from dulwich.worktree import add_worktree
+
+from . import TestCase
+
+
+class StashTests(TestCase):
+    """Tests for stash."""
+
+    def setUp(self):
+        super().setUp()
+        self.test_dir = tempfile.mkdtemp()
+        self.repo_dir = os.path.join(self.test_dir, "repo")
+        os.makedirs(self.repo_dir)
+        self.repo = Repo.init(self.repo_dir)
+
+        # Create initial commit so we can have a HEAD
+        blob = Blob()
+        blob.data = b"initial data"
+        self.repo.object_store.add_object(blob)
+
+        tree = Tree()
+        tree.add(b"initial.txt", 0o100644, blob.id)
+        tree_id = self.repo.object_store.add_object(tree)
+
+        self.commit_id = self.repo.get_worktree().commit(
+            message=b"Initial commit",
+            tree=tree_id,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_obtain(self) -> None:
+        stash = Stash.from_repo(self.repo)
+        self.assertIsInstance(stash, Stash)
+
+    def test_empty_stash(self) -> None:
+        stash = Stash.from_repo(self.repo)
+        # Make sure logs directory exists for reflog
+        os.makedirs(os.path.join(self.repo.commondir(), "logs"), exist_ok=True)
+
+        self.assertEqual(0, len(stash))
+        self.assertEqual([], list(stash.stashes()))
+
+    def test_push_stash(self) -> None:
+        stash = Stash.from_repo(self.repo)
+
+        # Make sure logs directory exists for reflog
+        os.makedirs(os.path.join(self.repo.commondir(), "logs"), exist_ok=True)
+
+        # Create a file and add it to the index
+        file_path = os.path.join(self.repo_dir, "testfile.txt")
+        with open(file_path, "wb") as f:
+            f.write(b"test data")
+        self.repo.get_worktree().stage(["testfile.txt"])
+
+        # Push to stash
+        commit_id = stash.push(message=b"Test stash message")
+        self.assertIsNotNone(commit_id)
+
+        # Verify stash was created
+        self.assertEqual(1, len(stash))
+
+        # Verify stash entry
+        entry = stash[0]
+        self.assertEqual(commit_id, entry.new_sha)
+        self.assertTrue(b"Test stash message" in entry.message)
+
+    def test_pop_keeps_flags_of_unchanged_entry(self) -> None:
+        stash = Stash.from_repo(self.repo)
+        os.makedirs(os.path.join(self.repo.commondir(), "logs"), exist_ok=True)
+        with open(os.path.join(self.repo_dir, "initial.txt"), "wb") as f:
+            f.write(b"initial data")
+        self.repo.get_worktree().stage(["initial.txt"])
+        self.repo.get_worktree().commit(message=b"Add initial.txt")
+        with open(os.path.join(self.repo_dir, "testfile.txt"), "wb") as f:
+            f.write(b"test data")
+        self.repo.get_worktree().stage(["testfile.txt"])
+        stash.push()
+        index = self.repo.open_index()
+        index[b"initial.txt"].flags |= FLAG_VALID
+        index.write()
+
+        stash.pop(0)
+
+        self.assertEqual(FLAG_VALID, self.repo.open_index()[b"initial.txt"].flags)
+
+    def test_drop_stash(self) -> None:
+        stash = Stash.from_repo(self.repo)
+
+        # Make sure logs directory exists for reflog
+        logs_dir = os.path.join(self.repo.commondir(), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+
+        # Create a couple of files and stash them
+        file1_path = os.path.join(self.repo_dir, "testfile1.txt")
+        with open(file1_path, "wb") as f:
+            f.write(b"test data 1")
+        self.repo.get_worktree().stage(["testfile1.txt"])
+        commit_id1 = stash.push(message=b"Test stash 1")
+
+        file2_path = os.path.join(self.repo_dir, "testfile2.txt")
+        with open(file2_path, "wb") as f:
+            f.write(b"test data 2")
+        self.repo.get_worktree().stage(["testfile2.txt"])
+        stash.push(message=b"Test stash 2")
+
+        self.assertEqual(2, len(stash))
+
+        # Drop the newest stash
+        stash.drop(0)
+        self.assertEqual(1, len(stash))
+        self.assertEqual(commit_id1, stash[0].new_sha)
+
+        # Drop the remaining stash
+        stash.drop(0)
+        self.assertEqual(0, len(stash))
+        self.assertNotIn(DEFAULT_STASH_REF, self.repo.refs)
+
+    def test_custom_ref(self) -> None:
+        custom_ref = b"refs/custom_stash"
+        stash = Stash(self.repo, ref=custom_ref)
+        self.assertEqual(custom_ref, stash._ref)
+
+    def test_pop_stash(self) -> None:
+        stash = Stash.from_repo(self.repo)
+
+        # Make sure logs directory exists for reflog
+        os.makedirs(os.path.join(self.repo.commondir(), "logs"), exist_ok=True)
+
+        # Create a file and add it to the index
+        file_path = os.path.join(self.repo_dir, "testfile.txt")
+        with open(file_path, "wb") as f:
+            f.write(b"test data")
+        self.repo.get_worktree().stage(["testfile.txt"])
+
+        # Push to stash
+        stash.push(message=b"Test stash message")
+        self.assertEqual(1, len(stash))
+
+        # After stash push, the file should be removed from working tree
+        # (matching git's behavior)
+        self.assertFalse(os.path.exists(file_path))
+
+        # Pop the stash
+        stash.pop(0)
+
+        # Verify file is restored
+        self.assertTrue(os.path.exists(file_path))
+        with open(file_path, "rb") as f:
+            self.assertEqual(b"test data", f.read())
+
+        # Verify stash is empty
+        self.assertEqual(0, len(stash))
+
+        # Verify the file is in the index
+        index = self.repo.open_index()
+        self.assertIn(b"testfile.txt", index)
+
+    def test_pop_stash_with_index_changes(self) -> None:
+        stash = Stash.from_repo(self.repo)
+
+        # Make sure logs directory exists for reflog
+        os.makedirs(os.path.join(self.repo.commondir(), "logs"), exist_ok=True)
+
+        # First commit a file so we have tracked files
+        tracked_path = os.path.join(self.repo_dir, "tracked.txt")
+        with open(tracked_path, "wb") as f:
+            f.write(b"original content")
+        self.repo.get_worktree().stage(["tracked.txt"])
+        self.repo.get_worktree().commit(
+            message=b"Add tracked file",
+        )
+
+        # Modify the tracked file and stage it
+        with open(tracked_path, "wb") as f:
+            f.write(b"staged changes")
+        self.repo.get_worktree().stage(["tracked.txt"])
+
+        # Modify it again but don't stage
+        with open(tracked_path, "wb") as f:
+            f.write(b"working tree changes")
+
+        # Create a new file and stage it
+        new_file_path = os.path.join(self.repo_dir, "new.txt")
+        with open(new_file_path, "wb") as f:
+            f.write(b"new file content")
+        self.repo.get_worktree().stage(["new.txt"])
+
+        # Push to stash
+        stash.push(message=b"Test stash with index")
+        self.assertEqual(1, len(stash))
+
+        # After stash push, new file should be removed and tracked file reset
+        self.assertFalse(os.path.exists(new_file_path))
+        with open(tracked_path, "rb") as f:
+            self.assertEqual(b"original content", f.read())
+
+        # Pop the stash
+        stash.pop(0)
+
+        # Verify tracked file has working tree changes
+        self.assertTrue(os.path.exists(tracked_path))
+        with open(tracked_path, "rb") as f:
+            self.assertEqual(b"working tree changes", f.read())
+
+        # Verify new file is restored
+        self.assertTrue(os.path.exists(new_file_path))
+        with open(new_file_path, "rb") as f:
+            self.assertEqual(b"new file content", f.read())
+
+        # Verify index has the staged changes
+        index = self.repo.open_index()
+        self.assertIn(b"new.txt", index)
+
+    @unittest.skipIf(
+        sys.platform == "win32", "symlink creation requires privileges on Windows"
+    )
+    def test_pop_rejects_symlink_traversal(self) -> None:
+        """A stash whose parent path is a symlink must not write through it.
+
+        Regression test for CVE-style path traversal via ``stash.pop``: an
+        intermediate directory component that is a symlink (e.g.
+        ``link -> .git/hooks``) previously passed ``os.path.exists`` and the
+        subsequent ``open`` followed the symlink, writing attacker content
+        outside the worktree.
+        """
+        stash = Stash.from_repo(self.repo)
+
+        os.makedirs(os.path.join(self.repo.commondir(), "logs"), exist_ok=True)
+        hooks_dir = os.path.join(self.repo.commondir(), "hooks")
+        os.makedirs(hooks_dir, exist_ok=True)
+
+        # Point the symlink at the hooks directory relative to the worktree.
+        link_target = os.path.relpath(hooks_dir, self.repo_dir)
+        os.symlink(link_target, os.path.join(self.repo_dir, "link"))
+
+        payload = Blob()
+        payload.data = b"#!/bin/sh\necho pwned\n"
+        self.repo.object_store.add_object(payload)
+
+        subtree = Tree()
+        subtree.add(b"post-checkout", 0o100755, payload.id)
+        self.repo.object_store.add_object(subtree)
+
+        stash_tree = Tree()
+        stash_tree.add(b"link", 0o040000, subtree.id)
+        self.repo.object_store.add_object(stash_tree)
+
+        index_commit_id = self.repo.get_worktree().commit(
+            tree=stash_tree.id,
+            message=b"Index stash",
+            merge_heads=[self.repo.head()],
+            no_verify=True,
+            sign=False,
+            ref=None,
+        )
+        self.repo.refs[DEFAULT_STASH_REF] = self.repo.head()
+        stash_commit_id = self.repo.get_worktree().commit(
+            ref=DEFAULT_STASH_REF,
+            tree=stash_tree.id,
+            message=b"malicious stash",
+            merge_heads=[index_commit_id],
+            no_verify=True,
+            sign=False,
+        )
+        self.assertIsNotNone(stash_commit_id)
+        self.assertEqual(1, len(stash))
+
+        with self.assertRaises(InvalidPathError):
+            stash.pop(0)
+
+        # The payload must not have been written through the symlink.
+        self.assertFalse(os.path.exists(os.path.join(hooks_dir, "post-checkout")))
+
+
+class StashInWorktreeTest(StashTests):
+    """Tests for stash in a worktree."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo_dir = os.path.join(self.test_dir, "wt")
+        self.repo = add_worktree(self.repo, self.repo_dir, "worktree")
