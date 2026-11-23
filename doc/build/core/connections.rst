@@ -2794,6 +2794,9 @@ Result Set API
 .. autoclass:: FrozenResult
     :members:
 
+.. autoclass:: FrozenFilterResult
+    :members:
+
 .. autoclass:: IteratorResult
     :members:
 

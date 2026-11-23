@@ -6,6 +6,7 @@ from sqlalchemy import column
 from sqlalchemy.engine import Result
 from sqlalchemy.engine import Row
 from sqlalchemy.engine import RowMapping
+from sqlalchemy.engine.result import FrozenFilterResult
 from sqlalchemy.engine.result import FrozenResult
 from sqlalchemy.engine.result import MappingResult
 from sqlalchemy.engine.result import ScalarResult
@@ -50,6 +51,16 @@ def result_one(res: Result[int, str]) -> None:
     assert_type(res.scalars(1), ScalarResult[Any])
     assert_type(res.mappings(), MappingResult)
     assert_type(res.freeze(), FrozenResult[int, str])
+
+    frozen_scalar = assert_type(
+        res.scalars().freeze(), FrozenFilterResult[int]
+    )
+    assert_type(frozen_scalar(), ScalarResult[int])
+
+    frozen_mapping = assert_type(
+        res.mappings().freeze(), FrozenFilterResult[RowMapping]
+    )
+    assert_type(frozen_mapping(), MappingResult)
 
     assert_type(res.scalar_one(), int)
     assert_type(res.scalar_one_or_none(), int | None)

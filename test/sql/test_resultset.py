@@ -160,6 +160,94 @@ class CursorResultTest(fixtures.TablesTest):
             ],
         )
 
+    def test_freeze_scalars_unique_partial_w_closed_cursor(self, connection):
+        """a ScalarResult that was partially consumed via unique filtering
+        can be frozen; the already-delivered unique value is retained and
+        the underlying cursor may be closed before thawed copies are read.
+
+        """
+        users = self.tables.users
+        connection.execute(
+            users.insert(),
+            [
+                dict(user_id=1, user_name="a"),
+                dict(user_id=2, user_name="a"),
+                dict(user_id=3, user_name="b"),
+            ],
+        )
+
+        # arraysize of one row per fetch so that the duplicate value is in
+        # a subsequent fetch batch relative to the first row
+        result = connection.execution_options(
+            stream_results=True, yield_per=1
+        ).execute(select(users.c.user_name).order_by(users.c.user_id))
+        is_false(result.closed)
+
+        scalars = result.scalars().unique()
+
+        eq_(next(scalars), "a")
+
+        frozen = scalars.freeze()
+
+        # freezing consumed the remaining rows, so the cursor can be closed
+        result.close()
+        is_true(result.closed)
+
+        reader_one = frozen()
+        reader_two = frozen()
+
+        # the two readers are independent ScalarResult objects with
+        # independent progress
+        eq_(next(reader_one), "b")
+        eq_(next(reader_two), "b")
+        eq_(list(reader_one), [])
+        eq_(list(reader_two), [])
+
+        # every copy starts from the same frozen state, and the "a" value
+        # delivered before the freeze is never delivered again
+        eq_(list(frozen()), ["b"])
+        eq_(list(frozen()), ["b"])
+
+    def test_freeze_mappings_unique_partial_w_closed_cursor(self, connection):
+        """the mappings equivalent of
+        :meth:`test_freeze_scalars_unique_partial_w_closed_cursor`.
+
+        """
+        users = self.tables.users
+        connection.execute(
+            users.insert(),
+            [
+                dict(user_id=1, user_name="a"),
+                dict(user_id=2, user_name="a"),
+                dict(user_id=3, user_name="b"),
+            ],
+        )
+
+        result = connection.execution_options(
+            stream_results=True, yield_per=1
+        ).execute(select(users.c.user_name).order_by(users.c.user_id))
+        is_false(result.closed)
+
+        mappings = result.mappings().unique()
+
+        eq_(next(mappings), {"user_name": "a"})
+
+        frozen = mappings.freeze()
+
+        result.close()
+        is_true(result.closed)
+
+        reader_one = frozen()
+        reader_two = frozen()
+
+        eq_(next(reader_one), {"user_name": "b"})
+        eq_(next(reader_two), {"user_name": "b"})
+        eq_(list(reader_one), [])
+        eq_(list(reader_two), [])
+
+        eq_(list(frozen()), [{"user_name": "b"}])
+        eq_(list(frozen()), [{"user_name": "b"}])
+
     @testing.requires.insert_executemany_returning
     @testing.variation("filters", ["unique", "sliced", "plain"])
     def test_splice_horizontally(self, connection, filters):

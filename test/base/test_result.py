@@ -4,6 +4,7 @@ import sys
 from sqlalchemy import exc
 from sqlalchemy import testing
 from sqlalchemy.engine import result
+from sqlalchemy.engine import result as result_mod
 from sqlalchemy.testing import assert_raises
 from sqlalchemy.testing import assert_raises_message
 from sqlalchemy.testing import config
@@ -1021,6 +1022,164 @@ class ResultTest(fixtures.TestBase):
 
         r2 = frozen().scalars(1).unique()
         eq_(r2.fetchall(), [1, 3])
+
+    def test_scalars_freeze_preserves_type(self):
+        result = self._fixture()
+
+        frozen = result.scalars(1).freeze()
+
+        assert isinstance(frozen, result_mod.FrozenFilterResult)
+        r1 = frozen()
+        assert isinstance(r1, result_mod.ScalarResult)
+        eq_(r1.fetchall(), [1, 1, 3, 1])
+
+        # repeated thawing produces independent copies over the same data
+        r2 = frozen()
+        eq_(r2.fetchall(), [1, 1, 3, 1])
+        eq_(r1.fetchall(), [])
+
+    def test_scalars_unique_freeze_unconsumed(self):
+        result = self._fixture()
+
+        frozen = result.scalars(1).unique().freeze()
+
+        eq_(frozen().fetchall(), [1, 3])
+        eq_(frozen().fetchall(), [1, 3])
+
+        r1 = frozen()
+        r2 = frozen()
+        eq_(next(r1), 1)
+        eq_(next(r2), 1)
+        eq_(r1.fetchall(), [3])
+        eq_(r2.fetchall(), [3])
+
+    def test_scalars_unique_freeze_partial_retains_delivered(self):
+        result = self._fixture()
+
+        scalars = result.scalars(1).unique()
+        eq_(next(scalars), 1)
+
+        frozen = scalars.freeze()
+
+        # the "1" delivered before freezing is filtered out of every copy;
+        # each copy has its own independent progress
+        eq_(frozen().fetchall(), [3])
+
+        r1 = frozen()
+        r2 = frozen()
+        eq_(next(r1), 3)
+        eq_(next(r2), 3)
+        eq_(r1.fetchall(), [])
+        eq_(r2.fetchall(), [])
+
+    def test_scalars_unique_freeze_w_strategy(self):
+        result = self._fixture()
+
+        # the user strategy on a row-backed ScalarResult is called with
+        # the interim Row; thawed copies are scalar backed, so the strategy
+        # calling form is adapted by the freeze
+        scalars = result.scalars(0).unique(
+            strategy=lambda row: row[0] % 2
+        )
+        eq_(next(scalars), 1)
+
+        frozen = scalars.freeze()
+
+        eq_(frozen().all(), [2])
+        eq_(frozen().all(), [2])
+
+    def test_scalars_unique_freeze_w_default_filters(self):
+        result = self._fixture(default_filters=[id, None, None])
+
+        scalars = result.scalars(0).unique()
+        eq_(next(scalars), 1)
+
+        frozen = scalars.freeze()
+
+        eq_(frozen().all(), [2, 4])
+        eq_(frozen().all(), [2, 4])
+
+    def test_mappings_unique_freeze_w_strategy(self):
+        result = self._fixture()
+
+        # the user strategy on a MappingResult is called with the interim
+        # Row; thawed copies deliver RowMapping objects, so the positional
+        # row-based calling convention is adapted by the freeze
+        mappings = result.mappings().unique(strategy=lambda row: row[1])
+        eq_(next(mappings), {"a": 1, "b": 1, "c": 1})
+
+        frozen = mappings.freeze()
+
+        eq_(frozen().all(), [{"a": 1, "b": 3, "c": 2}])
+        eq_(frozen().all(), [{"a": 1, "b": 3, "c": 2}])
+
+    def test_mappings_freeze_preserves_type(self):
+        result = self._fixture()
+
+        frozen = result.mappings().freeze()
+
+        assert isinstance(frozen, result_mod.FrozenFilterResult)
+        r1 = frozen()
+        assert isinstance(r1, result_mod.MappingResult)
+        eq_(
+            r1.fetchall(),
+            [
+                {"a": 1, "b": 1, "c": 1},
+                {"a": 2, "b": 1, "c": 2},
+                {"a": 1, "b": 3, "c": 2},
+                {"a": 4, "b": 1, "c": 2},
+            ],
+        )
+        eq_(list(r1.keys()), ["a", "b", "c"])
+
+        r2 = frozen()
+        eq_(r2.fetchone(), {"a": 1, "b": 1, "c": 1})
+        eq_(
+            r2.fetchmany(2),
+            [{"a": 2, "b": 1, "c": 2}, {"a": 1, "b": 3, "c": 2}],
+        )
+        eq_(r2.fetchall(), [{"a": 4, "b": 1, "c": 2}])
+
+    def test_mappings_unique_freeze_partial_retains_delivered(self):
+        result = self._fixture()
+
+        mappings = result.mappings().columns("b", "c").unique()
+        eq_(next(mappings), {"b": 1, "c": 1})
+
+        frozen = mappings.freeze()
+
+        expected = [{"b": 1, "c": 2}, {"b": 3, "c": 2}]
+        eq_(frozen().fetchall(), expected)
+
+        r1 = frozen()
+        r2 = frozen()
+        eq_(next(r1), {"b": 1, "c": 2})
+        eq_(next(r2), {"b": 1, "c": 2})
+        eq_(list(r1), [{"b": 3, "c": 2}])
+        eq_(list(r2), [{"b": 3, "c": 2}])
+
+    def test_row_freeze_still_available(self):
+        result = self._fixture()
+
+        frozen = result.freeze()
+
+        assert isinstance(frozen, result_mod.FrozenResult)
+        r1 = frozen()
+        assert isinstance(r1, result_mod.Result)
+        eq_(
+            r1.fetchall(),
+            [(1, 1, 1), (2, 1, 2), (1, 3, 2), (4, 1, 2)],
+        )
+
+    def test_freeze_exhausted_filter_result(self):
+        result = self._fixture()
+
+        scalars = result.scalars(1).unique()
+        eq_(scalars.fetchall(), [1, 3])
+
+        frozen = scalars.freeze()
+        eq_(frozen().fetchall(), [])
+        eq_(frozen().fetchall(), [])
 
     def test_ambiguous_key_raises(self):
         meta = result.SimpleResultMetaData(

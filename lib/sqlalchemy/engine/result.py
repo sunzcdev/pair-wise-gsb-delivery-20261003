@@ -1289,6 +1289,31 @@ class FilterResult(ResultInternal[_R]):
     ) -> List[_InterimRowType[Row[Unpack[TupleAny]]]]:
         return self._real_result._fetchmany_impl(size=size)
 
+    def freeze(self) -> FrozenFilterResult[_R]:
+        """Return a callable object that will produce copies of this
+        :class:`_engine.FilterResult` when invoked.
+
+        Behaves in the same way as :meth:`_engine.Result.freeze`, including
+        that the current state of the result is consumed fully when the
+        method is called.  The resulting :class:`_engine.FrozenFilterResult`
+        will produce new :class:`_engine.ScalarResult` or
+        :class:`_engine.MappingResult` objects, as appropriate, each time it
+        is invoked.
+
+        If this result has unique filtering enabled via
+        :meth:`_engine.ScalarResult.unique` or
+        :meth:`_engine.MappingResult.unique`, the set of values already
+        delivered is retained within the frozen object, so that values
+        consumed before freezing are not delivered again by copies produced
+        from the frozen object.
+
+        .. seealso::
+
+            :meth:`_engine.Result.freeze`
+
+        """
+        return FrozenFilterResult(self)
+
 
 class ScalarResult(FilterResult[_R]):
     """A wrapper for a :class:`_engine.Result` that returns scalar values
@@ -1812,6 +1837,173 @@ class FrozenResult(Generic[Unpack[_Ts]]):
         result._attributes = self._attributes
         result._source_supports_scalars = self._source_supports_scalars
         return result
+
+
+class _FrozenStrategyRowMapping:
+    """Proxy presenting a :class:`_engine.RowMapping` delivered by a thawed
+    :class:`_engine.MappingResult` using the row-based calling convention
+    (positional and attribute access) expected by a user-defined unique
+    strategy.
+
+    """
+
+    __slots__ = ("_mapping", "_keys")
+
+    def __init__(self, mapping: RowMapping, keys: Sequence[str]) -> None:
+        self._mapping = mapping
+        self._keys = keys
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, int):
+            key = self._keys[key]
+        return self._mapping[key]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._mapping, name)
+
+
+def _wrap_scalar_unique_strategy(
+    strategy: _UniqueFilterType,
+) -> _UniqueFilterType:
+    """Adapt a row-backed :class:`_engine.ScalarResult` unique strategy for
+    a thawed copy that delivers plain scalar values.
+
+    """
+
+    def wrapped(value: Any) -> Any:
+        return strategy((value,))
+
+    return wrapped
+
+
+def _wrap_mapping_unique_strategy(
+    strategy: _UniqueFilterType, keys: Sequence[str]
+) -> _UniqueFilterType:
+    """Adapt a row-backed :class:`_engine.MappingResult` unique strategy for
+    a thawed copy that delivers :class:`_engine.RowMapping` objects.
+
+    """
+
+    def wrapped(value: Any) -> Any:
+        return strategy(_FrozenStrategyRowMapping(value, keys))
+
+    return wrapped
+
+
+class FrozenFilterResult(Generic[_R]):
+    """Represents a :class:`_engine.FilterResult` object, such as a
+    :class:`_engine.ScalarResult` or :class:`_engine.MappingResult`, in a
+    "frozen" state suitable for caching.
+
+    The :class:`_engine.FrozenFilterResult` object is returned from the
+    :meth:`_engine.FilterResult.freeze` method of a
+    :class:`_engine.ScalarResult` or :class:`_engine.MappingResult` object.
+
+    As with :class:`_engine.FrozenResult`, a new iterable result object of
+    the same public type as the original is generated from a fixed set of
+    data each time the :class:`_engine.FrozenFilterResult` is invoked as a
+    callable.  When the original result had unique filtering applied, the
+    unique values that had already been delivered before freezing are
+    retained, so that frozen copies continue to filter against those values.
+
+    .. versionadded:: 2.1
+
+    .. seealso::
+
+        :class:`_engine.FrozenResult`
+
+    """
+
+    __slots__ = (
+        "metadata",
+        "_source_supports_scalars",
+        "_is_scalar_result",
+        "_unique_filter_state",
+        "data",
+        "_filter_result_type",
+    )
+
+    data: Sequence[Any]
+
+    def __init__(self, result: FilterResult[_R]):
+        # the data stored is already in the projected form delivered by the
+        # filter: scalar values for ScalarResult, RowMapping objects for
+        # MappingResult.  Thawed copies run as scalar-source results, so the
+        # stored objects are passed straight through with only the unique
+        # filter applied.
+        self.metadata = result._metadata._for_freeze()
+        self._filter_result_type: Type[FilterResult[Any]] = type(result)
+        self._source_supports_scalars = True
+        self._is_scalar_result = isinstance(result, ScalarResult)
+
+        # _allrows() applies the current unique filter as it consumes the
+        # remaining rows, so the unique set within this state reflects all
+        # values that were delivered both before and during the freeze.
+        # Copy the state so that each thawed copy gets its own progress,
+        # while starting from the same set of already-delivered values.
+        if result._unique_filter_state is not None:
+            uniques, strategy = result._unique_filter_state
+
+            if (
+                strategy is not None
+                and not result._real_result._source_supports_scalars
+            ):
+                # a user-defined unique strategy on a row-backed filter is
+                # called with the interim Row produced by the underlying row
+                # result.  A thawed copy instead delivers the already
+                # projected objects: plain scalar values for ScalarResult,
+                # RowMapping objects for MappingResult.  Adapt the strategy
+                # to the new calling form so that its existing calling
+                # conventions keep working.
+                if self._is_scalar_result:
+                    strategy = _wrap_scalar_unique_strategy(strategy)
+                else:
+                    strategy = _wrap_mapping_unique_strategy(
+                        strategy, tuple(self.metadata.keys)
+                    )
+
+            self._unique_filter_state = (set(uniques), strategy)
+        else:
+            self._unique_filter_state = None
+
+        self.data = result._allrows()
+
+    def __call__(self) -> FilterResult[_R]:
+        real_result = IteratorResult(
+            self.metadata,
+            iter(self.data),
+            _source_supports_scalars=self._source_supports_scalars,
+        )
+
+        if self._is_scalar_result:
+            # reconstruct using the original concrete ScalarResult subclass
+            scalar_result = self._filter_result_type.__new__(
+                self._filter_result_type
+            )
+            scalar_result._real_result = real_result
+            scalar_result._metadata = self.metadata
+            # the stored data already consists of scalar values
+            scalar_result._post_creational_filter = None
+            frozen_result = scalar_result
+        else:
+            mapping_result = self._filter_result_type.__new__(
+                self._filter_result_type
+            )
+            mapping_result._real_result = real_result
+            mapping_result._metadata = self.metadata
+            # the stored data already consists of RowMapping objects; run
+            # as a scalar source so they are delivered as-is
+            mapping_result._generate_rows = False
+            mapping_result._post_creational_filter = None
+            frozen_result = mapping_result
+
+        if self._unique_filter_state is not None:
+            uniques, strategy = self._unique_filter_state
+            frozen_result._unique_filter_state = (set(uniques), strategy)
+        else:
+            frozen_result._unique_filter_state = None
+
+        return frozen_result
 
 
 class IteratorResult(Result[Unpack[_Ts]]):

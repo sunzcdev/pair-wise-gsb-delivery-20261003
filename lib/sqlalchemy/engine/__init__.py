@@ -45,6 +45,7 @@ from .reflection import ObjectKind as ObjectKind
 from .reflection import ObjectScope as ObjectScope
 from .result import ChunkedIteratorResult as ChunkedIteratorResult
 from .result import FilterResult as FilterResult
+from .result import FrozenFilterResult as FrozenFilterResult
 from .result import FrozenResult as FrozenResult
 from .result import IteratorResult as IteratorResult
 from .result import MappingResult as MappingResult

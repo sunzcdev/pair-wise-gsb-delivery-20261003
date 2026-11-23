@@ -1,0 +1,16 @@
+.. change::
+    :tags: feature, engine
+
+    Added :meth:`_engine.ScalarResult.freeze` and
+    :meth:`_engine.MappingResult.freeze`, which return a new
+    :class:`_engine.FrozenFilterResult` callable.  As with
+    :meth:`_engine.Result.freeze`, the remaining contents of the result are
+    fully consumed when the method is called, after which the underlying
+    cursor may be closed; invoking the frozen object any number of times
+    produces new :class:`_engine.ScalarResult` or
+    :class:`_engine.MappingResult` objects with independent iteration
+    progress over the same stored data.  When unique filtering was applied
+    via :meth:`_engine.ScalarResult.unique` or
+    :meth:`_engine.MappingResult.unique`, the unique values already
+    delivered before freezing are retained, so that they are not delivered
+    again by any copy produced from the frozen object.
