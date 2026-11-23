@@ -290,6 +290,127 @@ class TestGemSourceGit < Gem::TestCase
     end
   end
 
+  def test_specs_local_locked_objects
+    # Lock a branch and a tag with the same name, both pointing at
+    # version 1 of the gem.
+    branch =
+      Dir.chdir @repository do
+        branch = Gem::Util.popen(@git, "branch", "--show-current").strip
+
+        system @git, "tag", branch
+
+        branch
+      end
+
+    @source.cache
+
+    # Move the branch to version 2, the tag keeps pointing at version 1.
+    _, _, _, branch_head = git_gem "a", 2
+
+    @source.cache
+
+    Dir.chdir @source.repo_cache_dir do
+      assert_equal branch_head, Gem::Util.popen(@git, "rev-parse", "refs/heads/#{branch}").strip
+      assert_equal @head,       Gem::Util.popen(@git, "rev-parse", "refs/tags/#{branch}").strip
+    end
+
+    refs_before =
+      Dir.chdir @source.repo_cache_dir do
+        Gem::Util.popen @git, "for-each-ref"
+      end
+
+    # The repository is no longer reachable, proving the reads below only
+    # use the local cache.
+    FileUtils.mv @repository, "#{@repository}.moved"
+
+    # Two lock entries: the moved branch and the commit the same-named tag
+    # points at.
+    branch_source = Gem::Source::Git.new @name, @repository, branch, false
+    branch_source.remote = false
+
+    tag_source = Gem::Source::Git.new @name, @repository, @head, false
+    tag_source.remote = false
+
+    capture_output do
+      assert_equal %w[a-2], branch_source.specs.map(&:full_name)
+
+      assert_equal %w[a-1], tag_source.specs.map(&:full_name)
+
+      # The previously fetched locked object is still usable.
+      assert_equal %w[a-2], branch_source.specs.map(&:full_name)
+    end
+
+    assert_equal branch_head, branch_source.rev_parse
+    assert_equal @head,       tag_source.rev_parse
+
+    refute_equal branch_source.install_dir, tag_source.install_dir
+
+    assert_path_exist File.join(branch_source.install_dir, "a.gemspec")
+    assert_path_exist File.join(tag_source.install_dir, "a.gemspec")
+
+    # Reading the specs did not update the cached refs.
+    refs_after =
+      Dir.chdir @source.repo_cache_dir do
+        Gem::Util.popen @git, "for-each-ref"
+      end
+
+    assert_equal refs_before, refs_after
+  end
+
+  def test_checkout_local_rebinds_checkout_from_other_resolution
+    _, _, _, head = git_gem "a", 2
+
+    @source.cache
+
+    source = Gem::Source::Git.new @name, @repository, @head, false
+    source.remote = false
+
+    # A checkout left behind by another resolution, bound to a different
+    # commit than the locked object.
+    system @git, "clone", "--quiet", @source.repo_cache_dir, source.install_dir
+
+    Dir.chdir source.install_dir do
+      assert_equal head, Gem::Util.popen(@git, "rev-parse", "HEAD").strip
+    end
+
+    capture_output do
+      assert_equal %w[a-1], source.specs.map(&:full_name)
+    end
+
+    Dir.chdir source.install_dir do
+      assert_equal @head, Gem::Util.popen(@git, "rev-parse", "HEAD").strip
+    end
+  end
+
+  def test_checkout_local_missing_object
+    @source.cache
+
+    missing = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+    source = Gem::Source::Git.new @name, @repository, missing, false
+    source.remote = false
+
+    refs = lambda do
+      Dir.chdir @source.repo_cache_dir do
+        Gem::Util.popen @git, "for-each-ref"
+      end
+    end
+
+    refs_before = refs.call
+
+    # The repository is no longer reachable, proving no remote is consulted.
+    FileUtils.mv @repository, "#{@repository}.moved"
+
+    e = assert_raise Gem::Exception do
+      capture_subprocess_io { source.checkout }
+    end
+
+    assert_equal "unable to find reference #{missing} in #{@repository}",
+                 e.message
+
+    assert_equal refs_before, refs.call
+  end
+
   def test_uri
     assert_equal Gem::URI(@repository), @source.uri
   end

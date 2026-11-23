@@ -86,21 +86,38 @@ class Gem::Source::Git < Gem::Source
 
   ##
   # Checks out the files for the repository into the install_dir.
+  #
+  # The checkout is always bound to the locked commit selected by rev_parse.
+  # When the cache must not be updated (@remote is false) no refs are
+  # fetched and an existing checkout is only reused as-is when it is already
+  # bound to that commit; otherwise it is re-bound from the local cache.
 
   def checkout # :nodoc:
     cache
 
     return false unless File.exist? repo_cache_dir
 
-    unless File.exist? install_dir
+    revision = rev_parse
+
+    previously_cloned = File.exist? install_dir
+
+    unless previously_cloned
       system git_command, "clone", "--quiet", "--no-checkout",
              repo_cache_dir, install_dir
     end
 
     Dir.chdir install_dir do
-      system git_command, "fetch", "--quiet", "--force", "--tags", install_dir
+      if @remote
+        system git_command, "fetch", "--quiet", "--force", "--tags",
+               repo_cache_dir
+      elsif previously_cloned &&
+            revision == Gem::Util.popen(git_command, "rev-parse", "HEAD").strip
+        # The checkout is already bound to the locked object, so it can be
+        # reused without updating any refs.
+        return true
+      end
 
-      success = system git_command, "reset", "--quiet", "--hard", rev_parse
+      success = system git_command, "reset", "--quiet", "--hard", revision
 
       if @need_submodules
         require "open3"
@@ -180,25 +197,62 @@ class Gem::Source::Git < Gem::Source
 
   ##
   # Converts the git reference for the repository into a commit hash.
+  #
+  # A full commit SHA selects that locked object directly, even when no ref
+  # in the cached repository points at it.  Branch and tag names are
+  # resolved through their explicit refs so that a branch and a tag sharing
+  # the same name stay distinct.
+  #
+  # Raises Gem::Exception when the object cannot be found in the cached
+  # repository.
 
   def rev_parse # :nodoc:
     hash = nil
 
     Dir.chdir repo_cache_dir do
-      hash = Gem::Util.popen(git_command, "rev-parse", @reference).strip
+      hash = ref_to_commit @reference
     end
 
-    # Process.last_status instead of $?, which Ruby::Box leaves uninitialized
-    # (https://bugs.ruby-lang.org/issues/22280)
     raise Gem::Exception,
-          "unable to find reference #{@reference} in #{@repository}" unless
-            Process.last_status.success?
+          "unable to find reference #{@reference} in #{@repository}" unless hash
 
     hash
   end
 
   ##
+  # Resolves +reference+ to a commit hash in the repository in the current
+  # directory.  Returns nil when the object is not present locally; nothing
+  # is fetched and no refs are updated.
+
+  def ref_to_commit(reference) # :nodoc:
+    candidates =
+      if /\A[0-9a-f]{40}\z/i.match? reference
+        # A full commit SHA names the locked object itself.
+        ["#{reference}^{commit}"]
+      else
+        # Resolve branches and tags through their explicit refs so a branch
+        # and a tag with the same name do not shadow each other.
+        ["refs/heads/#{reference}", "refs/tags/#{reference}", reference]
+      end
+
+    candidates.each do |candidate|
+      hash = Gem::Util.popen git_command, "rev-parse", "--verify", "--quiet",
+                             "#{candidate}^{commit}"
+
+      hash = hash.strip if hash
+
+      return hash unless hash.nil? || hash.empty?
+    end
+
+    nil
+  end
+
+  ##
   # Loads all gemspecs in the repository
+  #
+  # The gemspecs (and thus the gem name, version and dependencies) are read
+  # from the checkout of the locked commit selected by rev_parse, so each
+  # locked object yields the metadata recorded in that commit.
 
   def specs
     checkout
@@ -211,7 +265,10 @@ class Gem::Source::Git < Gem::Source
         file      = File.basename spec_file
 
         Dir.chdir directory do
-          spec = Gem::Specification.load file
+          # Expand the path so Gem::Specification.load caches the gemspec
+          # under the checkout of this locked object, not under a relative
+          # name another checkout may reuse.
+          spec = Gem::Specification.load File.expand_path(file)
           if spec
             spec.base_dir = base_dir
 
