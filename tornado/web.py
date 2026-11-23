@@ -113,6 +113,7 @@ from collections.abc import Awaitable, Callable, Generator, Iterable
 from types import TracebackType
 from typing import (
     Any,
+    BinaryIO,
     Optional,
     Type,
     TypeVar,
@@ -3027,6 +3028,15 @@ class StaticFileHandler(RequestHandler):
 
     .. versionchanged:: 6.5.10
        ``allowed_symlink_directory`` may now be a list of directories.
+
+    .. versionchanged:: 6.7
+       A GET response now opens the file once, at the start of the
+       request, and derives both the metadata (size and modification
+       time) and the body from that open file. If the file is replaced
+       while the request is being processed, the response still describes
+       a single version of the file instead of mixing the old metadata
+       with the new content; the replacement is served to the next
+       request.
     """
 
     CACHE_MAX_AGE = 86400 * 365 * 10  # 10 years
@@ -3088,89 +3098,176 @@ class StaticFileHandler(RequestHandler):
         if self.absolute_path is None:
             return
 
-        self.modified = self.get_modified_time()
-        self.set_headers()
+        # Open the file before computing any metadata, and read the
+        # response body from this open file rather than opening the path
+        # again later. If a deployment replaces the file while this
+        # request is being processed, the size, modification time and
+        # body of this response still all describe a single version of
+        # the file; the replacement is picked up by the next request,
+        # which opens the path anew. HEAD requests open nothing (as
+        # before), and subclasses that override get_content are
+        # responsible for their own content, so the file is only opened
+        # here when the default filesystem-based get_content would be.
+        self._file: BinaryIO | None = None
+        if include_body and self._uses_default_get_content():
+            try:
+                file = open(self.absolute_path, "rb")
+            except OSError:
+                # The file was removed (or made unreadable) after
+                # validate_absolute_path checked it.
+                raise HTTPError(404)
+            try:
+                stat_result = os.fstat(file.fileno())
+            except OSError:
+                file.close()
+                raise HTTPError(404)
+            if not stat.S_ISREG(stat_result.st_mode):
+                # The path was replaced by something that is not a
+                # regular file after validate_absolute_path checked it.
+                file.close()
+                raise HTTPError(403, "%s is not a file", self.path)
+            self._file = file
+            # Metadata for this request describes the open file, not
+            # whatever the path may point to by the time it is read.
+            self._stat_result = stat_result
 
-        if self.should_return_304():
-            self.set_status(304)
-            return
+        try:
+            self.modified = self.get_modified_time()
+            self.set_headers()
 
-        request_range = None
-        range_header = self.request.headers.get("Range")
-        if range_header and not self._if_range_matches():
-            # RFC 9110 13.1.5: the whole file is sent when If-Range does not match.
-            range_header = None
-        if range_header:
-            # As per RFC 2616 14.16, if an invalid Range header is specified,
-            # the request will be treated as if the header didn't exist.
-            request_range = httputil._parse_request_range(range_header)
-
-        size = self.get_content_size()
-        if request_range:
-            start, end = request_range
-            if start is not None and start < 0:
-                start += size
-                if start < 0:
-                    start = 0
-            if (
-                start is not None
-                and (start >= size or (end is not None and start >= end))
-            ) or end == 0:
-                # As per RFC 2616 14.35.1, a range is not satisfiable only: if
-                # the first requested byte is equal to or greater than the
-                # content, or when a suffix with length 0 is specified.
-                # https://tools.ietf.org/html/rfc7233#section-2.1
-                # A byte-range-spec is invalid if the last-byte-pos value is present
-                # and less than the first-byte-pos.
-                self.set_status(416)  # Range Not Satisfiable
-                self.set_header("Content-Type", "text/plain")
-                self.set_header("Content-Range", f"bytes */{size}")
+            if self.should_return_304():
+                self.set_status(304)
                 return
-            if end is not None and end > size:
-                # Clients sometimes blindly use a large range to limit their
-                # download size; cap the endpoint at the actual file size.
-                end = size
-            # Note: only return HTTP 206 if less than the entire range has been
-            # requested. Not only is this semantically correct, but Chrome
-            # refuses to play audio if it gets an HTTP 206 in response to
-            # ``Range: bytes=0-``.
-            if size != (end or size) - (start or 0):
-                self.set_status(206)  # Partial Content
-                self.set_header(
-                    "Content-Range", httputil._get_content_range(start, end, size)
-                )
-        else:
-            start = end = None
 
-        if start is not None and end is not None:
-            content_length = end - start
-        elif end is not None:
-            content_length = end
-        elif start is not None:
-            content_length = size - start
-        else:
-            content_length = size
-        self.set_header("Content-Length", content_length)
+            request_range = None
+            range_header = self.request.headers.get("Range")
+            if range_header and not self._if_range_matches():
+                # RFC 9110 13.1.5: the whole file is sent when If-Range does not match.
+                range_header = None
+            if range_header:
+                # As per RFC 2616 14.16, if an invalid Range header is specified,
+                # the request will be treated as if the header didn't exist.
+                request_range = httputil._parse_request_range(range_header)
 
-        if include_body:
-            content = self.get_content(self.absolute_path, start, end)
-            if isinstance(content, bytes):
-                content = [content]
-            remaining = content_length
-            for chunk in content:
-                # The file may have grown since Content-Length was calculated.
-                chunk = chunk[:remaining]
-                if chunk:
-                    try:
-                        self.write(chunk)
-                        await self.flush()
-                    except iostream.StreamClosedError:
-                        return
-                    remaining -= len(chunk)
-                if remaining == 0:
+            size = self.get_content_size()
+            if request_range:
+                start, end = request_range
+                if start is not None and start < 0:
+                    start += size
+                    if start < 0:
+                        start = 0
+                if (
+                    start is not None
+                    and (start >= size or (end is not None and start >= end))
+                ) or end == 0:
+                    # As per RFC 2616 14.35.1, a range is not satisfiable only: if
+                    # the first requested byte is equal to or greater than the
+                    # content, or when a suffix with length 0 is specified.
+                    # https://tools.ietf.org/html/rfc7233#section-2.1
+                    # A byte-range-spec is invalid if the last-byte-pos value is present
+                    # and less than the first-byte-pos.
+                    self.set_status(416)  # Range Not Satisfiable
+                    self.set_header("Content-Type", "text/plain")
+                    self.set_header("Content-Range", f"bytes */{size}")
                     return
+                if end is not None and end > size:
+                    # Clients sometimes blindly use a large range to limit their
+                    # download size; cap the endpoint at the actual file size.
+                    end = size
+                # Note: only return HTTP 206 if less than the entire range has been
+                # requested. Not only is this semantically correct, but Chrome
+                # refuses to play audio if it gets an HTTP 206 in response to
+                # ``Range: bytes=0-``.
+                if size != (end or size) - (start or 0):
+                    self.set_status(206)  # Partial Content
+                    self.set_header(
+                        "Content-Range", httputil._get_content_range(start, end, size)
+                    )
+            else:
+                start = end = None
+
+            if start is not None and end is not None:
+                content_length = end - start
+            elif end is not None:
+                content_length = end
+            elif start is not None:
+                content_length = size - start
+            else:
+                content_length = size
+            self.set_header("Content-Length", content_length)
+
+            if include_body:
+                if self._file is not None:
+                    content = self._read_file_chunks(self._file, start, end)
+                else:
+                    content = self.get_content(self.absolute_path, start, end)
+                if isinstance(content, bytes):
+                    content = [content]
+                remaining = content_length
+                for chunk in content:
+                    # The file may have grown since Content-Length was calculated.
+                    chunk = chunk[:remaining]
+                    if chunk:
+                        try:
+                            self.write(chunk)
+                            await self.flush()
+                        except iostream.StreamClosedError:
+                            return
+                        remaining -= len(chunk)
+                    if remaining == 0:
+                        return
+            else:
+                assert self.request.method == "HEAD"
+        finally:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+
+    def _uses_default_get_content(self) -> bool:
+        """Returns True if this class uses the default `get_content`.
+
+        The default implementation reads from the filesystem, which lets
+        `get` open the file itself and keep the whole response on one
+        version of the file. Subclasses that override `get_content` (to
+        serve content from a database, say) are reached through the
+        override instead, exactly as before. The override is not
+        necessarily a classmethod, so compare the underlying functions.
+        """
+        get_content = type(self).get_content
+        default_get_content = StaticFileHandler.get_content
+        return getattr(get_content, "__func__", get_content) is getattr(
+            default_get_content, "__func__", default_get_content
+        )
+
+    @staticmethod
+    def _read_file_chunks(
+        file: BinaryIO, start: int | None, end: int | None
+    ) -> Generator[bytes, None, None]:
+        """Yields the content of the open ``file`` between ``start`` and ``end``.
+
+        This reads from a file that is already open, so the content comes
+        from the same file that was stat'ed for this request's metadata,
+        even if the path it was opened from has since been replaced.
+        """
+        if start is not None:
+            file.seek(start)
+        if end is not None:
+            remaining: int | None = end - (start or 0)
         else:
-            assert self.request.method == "HEAD"
+            remaining = None
+        while True:
+            chunk_size = 64 * 1024
+            if remaining is not None and remaining < chunk_size:
+                chunk_size = remaining
+            chunk = file.read(chunk_size)
+            if chunk:
+                if remaining is not None:
+                    remaining -= len(chunk)
+                yield chunk
+            else:
+                if remaining is not None:
+                    assert remaining == 0
+                return
 
     def compute_etag(self) -> str | None:
         """Sets the ``Etag`` header based on static url version.
@@ -3501,25 +3598,7 @@ class StaticFileHandler(RequestHandler):
         # method with nothing but get_absolute_path in between.
         cls._stat_regular_file(abspath, abspath)
         with open(abspath, "rb") as file:
-            if start is not None:
-                file.seek(start)
-            if end is not None:
-                remaining: int | None = end - (start or 0)
-            else:
-                remaining = None
-            while True:
-                chunk_size = 64 * 1024
-                if remaining is not None and remaining < chunk_size:
-                    chunk_size = remaining
-                chunk = file.read(chunk_size)
-                if chunk:
-                    if remaining is not None:
-                        remaining -= len(chunk)
-                    yield chunk
-                else:
-                    if remaining is not None:
-                        assert remaining == 0
-                    return
+            yield from cls._read_file_chunks(file, start, end)
 
     @classmethod
     def get_content_version(cls, abspath: str) -> str:
@@ -3560,10 +3639,12 @@ class StaticFileHandler(RequestHandler):
 
     def _stat(self) -> os.stat_result:
         assert self.absolute_path is not None
-        # validate_absolute_path normally populates this, so that the size
-        # and modification time reported here describe the same file that
-        # was validated. Subclasses that override validate_absolute_path
-        # without calling super() fall back to stat'ing here.
+        # validate_absolute_path normally populates this, and get() may
+        # then replace it with an fstat of the file it opened, so that
+        # the size and modification time reported here describe the same
+        # file that was validated (and that the response body is read
+        # from). Subclasses that override validate_absolute_path without
+        # calling super() fall back to stat'ing here.
         if not hasattr(self, "_stat_result"):
             self._stat_result = os.stat(self.absolute_path)
         return self._stat_result

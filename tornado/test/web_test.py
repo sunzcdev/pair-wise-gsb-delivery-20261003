@@ -19,6 +19,7 @@ import typing
 import unittest
 import urllib.parse
 from io import BytesIO
+from unittest import mock
 
 from tornado import gen, locale
 from tornado.concurrent import Future
@@ -1325,6 +1326,10 @@ class StaticFileTest(WebTestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
+        # When set to a callable, ReplacingStaticFileHandler invokes it
+        # with the served path after the request's metadata has been
+        # computed but before its body is read.
+        self._replace_file: typing.Optional[typing.Callable[[str], None]] = None
         super().setUp()
 
     def get_handlers(self):
@@ -1365,6 +1370,21 @@ class StaticFileTest(WebTestCase):
                     file.write(b"-grew")
                 return size
 
+        test_case = self
+
+        class ReplacingStaticFileHandler(StaticFileHandler):
+            def get_content_size(self):
+                size = super().get_content_size()
+                # Simulate a publisher replacing the file after this
+                # request's metadata (ETag, Content-Length, Content-Range)
+                # has been computed, but before its body is read.
+                if test_case._replace_file is not None:
+                    replace_file = test_case._replace_file
+                    test_case._replace_file = None
+                    assert self.absolute_path is not None
+                    replace_file(self.absolute_path)
+                return size
+
         return [
             ("/static_url/(.*)", StaticUrlHandler),
             ("/abs_static_url/(.*)", AbsoluteStaticUrlHandler),
@@ -1372,6 +1392,11 @@ class StaticFileTest(WebTestCase):
             (
                 "/growing_static/(.*)",
                 GrowingStaticFileHandler,
+                dict(path=self.temp_dir.name),
+            ),
+            (
+                "/replacing_static/(.*)",
+                ReplacingStaticFileHandler,
                 dict(path=self.temp_dir.name),
             ),
             ("/root_static/(.*)", StaticFileHandler, dict(path="/")),
@@ -1400,6 +1425,103 @@ class StaticFileTest(WebTestCase):
             response.headers.get("Content-Length"), str(len(initial_content))
         )
         self.assertEqual(response.body, initial_content)
+
+    @unittest.skipIf(os.name == "nt", "Windows cannot replace an open file")
+    def test_static_file_replaced_during_request(self):
+        # A publisher replaces the file after the request's metadata has
+        # been computed but before its body is read. The response must
+        # still describe a single version of the file: the one that was
+        # current when the request started.
+        old_content = b"old-version-of-the-file"
+        new_content = b"new-version-of-the-file, which is longer"
+        path = os.path.join(self.temp_dir.name, "data.txt")
+        new_path = os.path.join(self.temp_dir.name, "data.txt.new")
+        with open(path, "wb") as file:
+            file.write(old_content)
+
+        response1 = self.fetch("/replacing_static/data.txt")
+        self.assertEqual(response1.code, 200)
+        self.assertEqual(response1.body, old_content)
+        etag = response1.headers["Etag"]
+
+        with open(new_path, "wb") as file:
+            file.write(new_content)
+        self._replace_file = lambda path: os.replace(new_path, path)
+
+        response2 = self.fetch(
+            "/replacing_static/data.txt",
+            headers={"Range": "bytes=0-6", "If-Range": etag},
+        )
+        # The If-Range validator still matches the version this response
+        # comes from, so the range is served from that same version.
+        self.assertEqual(response2.code, 206)
+        self.assertEqual(
+            response2.headers["Content-Range"], f"bytes 0-6/{len(old_content)}"
+        )
+        self.assertEqual(response2.headers["Etag"], etag)
+        self.assertEqual(response2.body, old_content[:7])
+
+        # The next request opens the path anew and immediately sees the
+        # replacement.
+        response3 = self.fetch("/replacing_static/data.txt")
+        self.assertEqual(response3.code, 200)
+        self.assertEqual(response3.headers["Content-Length"], str(len(new_content)))
+        self.assertEqual(response3.body, new_content)
+
+    def test_static_file_reread_during_request(self):
+        # Same scenario as test_static_file_replaced_during_request, but
+        # the replacement is simulated by making any new read of the path
+        # return different content, which works on every platform.
+        old_content = b"old-version-of-the-file"
+        new_content = b"new-version-of-the-file, which is longer"
+        path = os.path.join(self.temp_dir.name, "data.txt")
+        with open(path, "wb") as file:
+            file.write(old_content)
+
+        response1 = self.fetch("/replacing_static/data.txt")
+        self.assertEqual(response1.code, 200)
+        self.assertEqual(response1.body, old_content)
+        etag = response1.headers["Etag"]
+
+        def fake_get_content(cls, abspath, start=None, end=None):
+            yield new_content[start:end]
+
+        patcher = None
+
+        def replace_file(path):
+            nonlocal patcher
+            patcher = mock.patch.object(
+                StaticFileHandler, "get_content", classmethod(fake_get_content)
+            )
+            patcher.start()
+
+        self._replace_file = replace_file
+        try:
+            response2 = self.fetch(
+                "/replacing_static/data.txt",
+                headers={"Range": "bytes=0-6", "If-Range": etag},
+            )
+            # The response comes entirely from the version that was
+            # current when the request started, even though re-reading
+            # the path now returns the new content.
+            self.assertEqual(response2.code, 206)
+            self.assertEqual(
+                response2.headers["Content-Range"], f"bytes 0-6/{len(old_content)}"
+            )
+            self.assertEqual(response2.headers["Etag"], etag)
+            self.assertEqual(response2.body, old_content[:7])
+        finally:
+            if patcher is not None:
+                patcher.stop()
+
+        # The next request opens the path anew and immediately sees the
+        # replacement.
+        with open(path, "wb") as file:
+            file.write(new_content)
+        response3 = self.fetch("/replacing_static/data.txt")
+        self.assertEqual(response3.code, 200)
+        self.assertEqual(response3.headers["Content-Length"], str(len(new_content)))
+        self.assertEqual(response3.body, new_content)
 
     def test_static_files_cacheable(self):
         # Test that the version parameter triggers cache-control headers. This
