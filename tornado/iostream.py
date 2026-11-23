@@ -53,6 +53,15 @@ if typing.TYPE_CHECKING:
 
 _IOStreamType = TypeVar("_IOStreamType", bound="IOStream")
 
+
+def _discard_future_result(future: "Future[Any]") -> None:
+    # Avoid "Future exception was never retrieved" warnings. A cancelled
+    # future has no result or exception, so ignore the CancelledError that
+    # `.exception()` raises in that case.
+    if not future.cancelled():
+        future.exception()
+
+
 # These errnos indicate that a connection has been abruptly terminated.
 # They should be caught and handled less noisily than other errors.
 _ERRNO_CONNRESET = (errno.ECONNRESET, errno.ECONNABORTED, errno.EPIPE, errno.ETIMEDOUT)
@@ -209,6 +218,91 @@ class _StreamBuffer:
         assert size == 0
         self._first_pos = pos
 
+    def remove_range(self, start: int, end: int) -> None:
+        """
+        Remove the logical bytes in the half-open range ``[start, end)``.
+
+        The range must lie entirely within the buffered data (i.e. it may
+        only reference bytes that have not yet been advanced past). Unlike
+        `advance`, the removed range does not have to start at the current
+        buffer position; bytes before and after the range are preserved in
+        order.
+        """
+        assert 0 <= start <= end <= self._size
+        if start == end:
+            return
+        self._size -= end - start
+
+        new_buffers: collections.deque[tuple[bool, bytearray | memoryview]] = (
+            collections.deque()
+        )
+        # Logical position of the beginning of the current chunk. The first
+        # chunk may have a non-zero ``_first_pos`` because of bytes already
+        # consumed by `advance`; its logical length is reduced accordingly.
+        chunk_start = 0
+        first_chunk_kept_whole = False
+        for index, (is_memview, b) in enumerate(self._buffers):
+            physical_start = self._first_pos if index == 0 else 0
+            logical_len = len(b) - physical_start
+            chunk_end = chunk_start + logical_len
+            if chunk_end <= start or chunk_start >= end:
+                # The whole chunk is outside the removed range; keep it.
+                new_buffers.append((is_memview, b))
+                if index == 0:
+                    first_chunk_kept_whole = True
+            else:
+                keep_prefix = start - chunk_start
+                keep_suffix = chunk_end - end
+                if keep_prefix > 0:
+                    prefix_end = physical_start + keep_prefix
+                    if is_memview:
+                        new_buffers.append(
+                            (
+                                True,
+                                typing.cast(memoryview, b)[
+                                    physical_start:prefix_end
+                                ],
+                            )
+                        )
+                    else:
+                        new_buffers.append(
+                            (
+                                False,
+                                bytearray(
+                                    typing.cast(bytearray, b)[
+                                        physical_start:prefix_end
+                                    ]
+                                ),
+                            )
+                        )
+                if keep_suffix > 0:
+                    suffix_start = len(b) - keep_suffix
+                    if is_memview:
+                        new_buffers.append(
+                            (True, typing.cast(memoryview, b)[suffix_start:])
+                        )
+                    else:
+                        ba = bytearray(typing.cast(bytearray, b))
+                        del ba[:suffix_start]
+                        new_buffers.append((False, ba))
+                if is_memview and keep_prefix <= 0 and keep_suffix <= 0:
+                    # Nothing of this view survived, so we can release our
+                    # reference to the caller's data. When part of the view
+                    # survives we keep the original view alive; the slices
+                    # above share its underlying buffer and would be
+                    # invalidated by releasing it.
+                    typing.cast(memoryview, b).release()
+            chunk_start = chunk_end
+
+        # _first_pos only carries over when the original first chunk was
+        # kept whole. Any freshly sliced chunk already starts at zero.
+        if first_chunk_kept_whole:
+            new_first_pos = self._first_pos
+        else:
+            new_first_pos = 0
+        self._buffers = new_buffers
+        self._first_pos = new_first_pos
+
     def clear(self) -> None:
         """
         Discard all buffered data, releasing our views of large buffers.
@@ -282,9 +376,9 @@ class BaseIOStream:
         self._read_partial = False
         self._read_until_close = False
         self._read_future: Future[Any] | None = None
-        self._write_futures: collections.deque[tuple[int, Future[None]]] = (
-            collections.deque()
-        )
+        self._write_futures: collections.deque[
+            tuple[int, int, Future[None]]
+        ] = collections.deque()
         self._close_callback: Callable[[], None] | None = None
         self._connect_future: Future[IOStream] | None = None
         # _ssl_connect_future should be defined in SSLIOStream
@@ -540,6 +634,7 @@ class BaseIOStream:
 
         """
         self._check_closed()
+        start_index = self._total_write_index
         if data:
             if isinstance(data, memoryview):
                 # Make sure that ``len(data) == data.nbytes``
@@ -552,14 +647,68 @@ class BaseIOStream:
             self._write_buffer.append(data)
             self._total_write_index += len(data)
         future: Future[None] = Future()
-        future.add_done_callback(lambda f: f.exception())
-        self._write_futures.append((self._total_write_index, future))
+        future.add_done_callback(_discard_future_result)
+        self._write_futures.append((start_index, self._total_write_index, future))
         if not self._connecting:
             self._handle_write()
             if self._write_buffer:
                 self._add_io_state(self.io_loop.WRITE)
             self._maybe_add_error_listener()
         return future
+
+    def remove_write_future(self, future: "Future[None]") -> bool:
+        """Withdraw a pending `.write` that has not started going to the wire.
+
+        ``future`` must be a `.Future` previously returned by `write`.
+        A write can only be removed while it is still fully buffered,
+        i.e. before any of its bytes have been passed to `write_to_fd`.
+        If even a single byte of the write has already been sent (or if
+        the future has otherwise completed), the request is refused and
+        the write is left alone so that the already-transmitted prefix
+        can be accounted for normally.
+
+        On success the buffered bytes belonging to the write are removed
+        without touching the buffers of neighboring writes, the future is
+        cancelled, and this method returns ``True``. If the write could not
+        be removed it returns ``False`` and the future is left untouched.
+
+        Note that cancelling the future returned by `write` directly only
+        cancels the notification; it does not prevent the data from being
+        sent. This method is the way to actually withdraw buffered data.
+        """
+        for start_index, end_index, queued_future in self._write_futures:
+            if queued_future is not future:
+                continue
+            if start_index < self._total_write_done_index or future.done():
+                # Some of this write has already reached the wire (or the
+                # future is done), so it cannot be withdrawn safely.
+                return False
+            length = end_index - start_index
+            if length:
+                # Translate the stream-wide indices into positions in the
+                # current (not yet written) buffer.
+                buffer_start = start_index - self._total_write_done_index
+                self._write_buffer.remove_range(
+                    buffer_start, buffer_start + length
+                )
+            # Drop the matching entry (deque.remove matches on Future
+            # identity, since futures do not override equality).
+            self._write_futures.remove((start_index, end_index, future))
+            # The withdrawn bytes no longer occupy any index, so shift the
+            # bookkeeping indices of every write queued behind it.
+            self._total_write_index -= length
+            self._write_futures = collections.deque(
+                (
+                    (s - length, e - length, f)
+                    if s >= end_index
+                    else (s, e, f)
+                )
+                for s, e, f in self._write_futures
+            )
+            # The done callback swallows the cancellation without logging.
+            future.cancel()
+            return True
+        return False
 
     def set_close_callback(self, callback: Callable[[], None] | None) -> None:
         """Call the given callback when the stream is closed.
@@ -640,7 +789,7 @@ class BaseIOStream:
         if self._read_future is not None:
             futures.append(self._read_future)
             self._read_future = None
-        futures += [future for _, future in self._write_futures]
+        futures += [future for _, _, future in self._write_futures]
         self._write_futures.clear()
         if self._connect_future is not None:
             futures.append(self._connect_future)
@@ -1026,8 +1175,8 @@ class BaseIOStream:
                 return
 
         while self._write_futures:
-            index, future = self._write_futures[0]
-            if index > self._total_write_done_index:
+            start_index, end_index, future = self._write_futures[0]
+            if end_index > self._total_write_done_index:
                 break
             self._write_futures.popleft()
             future_set_result_unless_cancelled(future, None)

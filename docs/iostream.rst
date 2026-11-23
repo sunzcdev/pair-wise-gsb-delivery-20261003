@@ -12,6 +12,7 @@
    ^^^^^^^^^^^^^^
 
    .. automethod:: BaseIOStream.write
+   .. automethod:: BaseIOStream.remove_write_future
    .. automethod:: BaseIOStream.read_bytes
    .. automethod:: BaseIOStream.read_into
    .. automethod:: BaseIOStream.read_until

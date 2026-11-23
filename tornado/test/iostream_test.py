@@ -18,6 +18,7 @@ from tornado.httpclient import AsyncHTTPClient, HTTPResponse
 from tornado.httputil import HTTPHeaders
 from tornado.ioloop import IOLoop
 from tornado.iostream import (
+    BaseIOStream,
     IOStream,
     PipeIOStream,
     SSLIOStream,
@@ -1783,6 +1784,73 @@ class TestStreamBuffer(TestCase):
         self.assert_resizable(b)
         self.assertEqual(len(buf), 0)
 
+    def drain(self, buf):
+        out = b""
+        while len(buf):
+            with buf.peek(len(buf)) as view:
+                chunk = view.tobytes()
+            out += chunk
+            buf.advance(len(chunk))
+        return out
+
+    def check_remove_range(self, chunks, start, end, expected, threshold=10):
+        buf = self.make_streambuffer(threshold)
+        for chunk in chunks:
+            buf.append(chunk)
+        buf.remove_range(start, end)
+        self.assertEqual(len(buf), len(expected))
+        self.assertEqual(self.drain(buf), expected)
+
+    def test_remove_range_small_chunks(self):
+        chunks = [b"12", b"345", b"67"]
+        self.check_remove_range(chunks, 2, 5, b"1267")
+        self.check_remove_range(chunks, 0, 2, b"34567")
+        self.check_remove_range(chunks, 5, 7, b"12345")
+        self.check_remove_range(chunks, 0, 7, b"")
+        # An empty range is a no-op.
+        self.check_remove_range(chunks, 3, 3, b"1234567")
+
+    def test_remove_range_large_chunks(self):
+        chunks = [b"x" * 11, b"y" * 11, b"z" * 11]
+        # Spans all three chunks.
+        self.check_remove_range(chunks, 5, 28, b"x" * 5 + b"z" * 5)
+        # Drop a whole chunk.
+        self.check_remove_range(chunks, 0, 11, b"y" * 11 + b"z" * 11)
+        self.check_remove_range(chunks, 11, 22, b"x" * 11 + b"z" * 11)
+        # No-op at the very end.
+        self.check_remove_range(chunks, 33, 33, b"x" * 11 + b"y" * 11 + b"z" * 11)
+
+    def test_remove_range_mixed_chunks(self):
+        # Layout: a0 b1 x2..12 c13 d14.
+        self.check_remove_range([b"ab", b"x" * 11, b"cd"], 1, 14, b"ad")
+        # Remove only the big middle chunk.
+        self.check_remove_range([b"ab", b"x" * 11, b"cd"], 2, 13, b"abcd")
+
+    def test_remove_range_after_advance(self):
+        # Non-zero _first_pos on a memoryview head.
+        buf = self.make_streambuffer(10)
+        for chunk in [b"x" * 11, b"y" * 11]:
+            buf.append(chunk)
+        buf.advance(3)
+        buf.remove_range(2, 5)
+        self.assertEqual(self.drain(buf), b"x" * 5 + b"y" * 11)
+
+        # Non-zero _first_pos on a bytearray head.
+        buf = self.make_streambuffer(10)
+        for chunk in [b"abcd", b"ef"]:
+            buf.append(chunk)
+        buf.advance(1)
+        buf.remove_range(0, 2)
+        self.assertEqual(self.drain(buf), b"def")
+
+        # Advance into the head, then drop everything that remains of it.
+        buf = self.make_streambuffer(10)
+        for chunk in [b"x" * 11, b"y" * 11]:
+            buf.append(chunk)
+        buf.advance(3)
+        buf.remove_range(0, 8)
+        self.assertEqual(self.drain(buf), b"y" * 11)
+
     def test_clear(self):
         buf = self.make_streambuffer(10)
         large = bytearray(b"x" * 20)
@@ -1837,3 +1905,204 @@ class TestStreamBuffer(TestCase):
             for obj in inputs:
                 if isinstance(obj, bytearray):
                     self.assert_resizable(obj)
+
+
+class _ShortWriteStream(BaseIOStream):
+    """A fake `BaseIOStream` whose socket only accepts short writes.
+
+    Each call to `write_to_fd` accepts at most ``write_limit`` bytes; once
+    the running budget is exhausted it raises `.BlockingIOError` until more
+    budget is granted, mimicking a non-blocking socket whose send buffer is
+    full. Everything that makes it onto the fake wire is collected in
+    ``sent`` so tests can play the peer reading from the other end.
+    """
+
+    def __init__(self, write_limit: int = 2) -> None:
+        super().__init__()
+        self.write_limit = write_limit
+        self.budget = write_limit
+        self.sent = bytearray()
+
+    def fileno(self) -> int:
+        return -1
+
+    def close_fd(self) -> None:
+        pass
+
+    def read_from_fd(self, buf: bytearray | memoryview) -> int | None:
+        return None
+
+    def write_to_fd(self, data: memoryview) -> int:
+        if self.budget <= 0:
+            raise BlockingIOError()
+        n = min(self.budget, len(data))
+        self.sent += bytes(data[:n])
+        self.budget -= n
+        return n
+
+    def _add_io_state(self, state: int) -> None:
+        # This fake transport is pumped manually, so there is no real IOLoop
+        # handler to register.
+        pass
+
+    def pump(self, budget: int | None = None) -> None:
+        """Grant more send budget and push as much buffered data as fits."""
+        if budget is not None:
+            self.budget += budget
+        self._handle_write()
+
+
+class TestRemoveWriteFuture(AsyncTestCase):
+    def make_stream(self, write_limit=2):
+        return _ShortWriteStream(write_limit=write_limit)
+
+    @gen_test
+    def test_retract_only_unstarted_write(self):
+        # The fake socket writes at most two bytes at a time, and its
+        # initial budget is exactly two bytes.
+        stream = self.make_stream()
+        first = stream.write(b"AAAA")
+        second = stream.write(b"BBBB")
+
+        # The first record has exposed a two-byte prefix on the wire; the
+        # second record has not started at all.
+        self.assertEqual(bytes(stream.sent), b"AA")
+        self.assertFalse(first.done())
+        self.assertFalse(second.done())
+
+        # A write with a prefix already on the wire cannot be withdrawn.
+        self.assertFalse(stream.remove_write_future(first))
+        self.assertFalse(first.cancelled())
+
+        # The untouched record can be withdrawn.
+        self.assertTrue(stream.remove_write_future(second))
+        self.assertTrue(second.cancelled())
+        # Only the unstarted record disappeared from the buffer.
+        self.assertEqual(len(stream._write_buffer), 2)
+
+        # Drain the rest: the partially-written record is still fully
+        # accounted for, and nothing of the withdrawn record is sent.
+        stream.pump(budget=100)
+        self.assertEqual(bytes(stream.sent), b"AAAA")
+        self.assertTrue(first.done())
+        self.assertFalse(first.cancelled())
+        self.assertIsNone(first.result())
+        stream.close()
+
+    @gen_test
+    def test_neighboring_writes_keep_their_positions(self):
+        stream = self.make_stream()
+        first = stream.write(b"AAAA")
+        second = stream.write(b"BBBB")
+        third = stream.write(b"CCCC")
+
+        self.assertEqual(bytes(stream.sent), b"AA")
+        # Withdraw the middle (untouched) record.
+        self.assertTrue(stream.remove_write_future(second))
+        self.assertTrue(second.cancelled())
+
+        # The bookkeeping indices of the surviving neighbors must still
+        # line up with the bytes that reach the peer.
+        first_start, first_end, _ = stream._write_futures[0]
+        third_start, third_end, _ = stream._write_futures[1]
+        self.assertEqual((first_start, first_end), (0, 4))
+        self.assertEqual((third_start, third_end), (4, 8))
+
+        stream.pump(budget=100)
+        # The peer sees the first and third records back to back, in order.
+        self.assertEqual(bytes(stream.sent), b"AAAACCCC")
+        self.assertTrue(first.done())
+        self.assertTrue(third.done())
+        self.assertIsNone(first.result())
+        self.assertIsNone(third.result())
+        stream.close()
+
+    @gen_test
+    def test_completion_order_matches_peer_reads(self):
+        # Even when the fake socket keeps accepting only a couple of bytes
+        # per pump, future completion must track the bytes the peer reads.
+        stream = self.make_stream(write_limit=2)
+        first = stream.write(b"AAAA")
+        second = stream.write(b"BBBB")
+        third = stream.write(b"CCCC")
+
+        # Withdraw the second record before any of it is sent.
+        self.assertTrue(stream.remove_write_future(second))
+
+        completion_order = []
+        first.add_done_callback(lambda f: completion_order.append("first"))
+        third.add_done_callback(lambda f: completion_order.append("third"))
+
+        # Pump two bytes at a time and read them back as the peer would.
+        received = bytearray()
+        for _ in range(4):
+            stream.budget = 2
+            stream.pump()
+            received += stream.sent[len(received) :]
+
+        # Future done-callbacks are dispatched on the next loop iteration.
+        yield gen.sleep(0)
+
+        self.assertEqual(bytes(received), b"AAAACCCC")
+        # The first future completes once its four bytes are out; the third
+        # only after its own four bytes follow, so the completion order
+        # matches the order the peer receives the two records.
+        self.assertEqual(completion_order, ["first", "third"])
+        self.assertTrue(first.done())
+        self.assertTrue(third.done())
+        self.assertIsNone(first.result())
+        self.assertIsNone(third.result())
+        self.assertTrue(second.cancelled())
+        stream.close()
+
+    @gen_test
+    def test_retract_large_memoryview_write(self):
+        # Writes above the buffer's large threshold go through memoryview
+        # chunks rather than merged bytearrays.
+        stream = self.make_stream()
+        first = stream.write(b"a" * 4096)
+        second = stream.write(b"b" * 4096)
+        self.assertEqual(bytes(stream.sent), b"aa")
+
+        self.assertTrue(stream.remove_write_future(second))
+        self.assertTrue(second.cancelled())
+
+        stream.pump(budget=100000)
+        self.assertEqual(bytes(stream.sent), b"a" * 4096)
+        self.assertTrue(first.done())
+        self.assertIsNone(first.result())
+        stream.close()
+
+    @gen_test
+    def test_unknown_or_finished_write_is_refused(self):
+        stream = self.make_stream()
+        first = stream.write(b"AAAA")
+        second = stream.write(b"BBBB")
+
+        # A future that never came from write() is not recognized.
+        foreign = Future()
+        self.assertFalse(stream.remove_write_future(foreign))
+
+        # Once the writes have fully reached the wire they can no longer be
+        # withdrawn.
+        stream.pump(budget=100)
+        self.assertTrue(first.done())
+        self.assertTrue(second.done())
+        self.assertFalse(stream.remove_write_future(first))
+        self.assertFalse(stream.remove_write_future(second))
+        stream.close()
+
+    @gen_test
+    def test_direct_cancel_does_not_withdraw_data(self):
+        # Cancelling the Future itself only cancels the notification; the
+        # buffered data must still be sent and accounted for.
+        stream = self.make_stream()
+        first = stream.write(b"AAAA")
+        second = stream.write(b"BBBB")
+        self.assertTrue(second.cancel())
+
+        stream.pump(budget=100)
+        self.assertEqual(bytes(stream.sent), b"AAAABBBB")
+        self.assertTrue(first.done())
+        self.assertIsNone(first.result())
+        stream.close()
