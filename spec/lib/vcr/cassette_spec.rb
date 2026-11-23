@@ -707,4 +707,46 @@ RSpec.describe VCR::Cassette do
       end
     end
   end
+
+  describe 're_record_mode' do
+    let(:interval) { 7.days }
+
+    it 'defaults to :overwrite' do
+      expect(VCR::Cassette.new('name').re_record_mode).to eq(:overwrite)
+    end
+
+    it 'can be set via the default cassette options' do
+      VCR.configuration.default_cassette_options[:re_record_mode] = :complete
+      expect(VCR::Cassette.new('name').re_record_mode).to eq(:complete)
+    ensure
+      VCR.configuration.default_cassette_options.delete(:re_record_mode)
+    end
+
+    it 'rejects unknown modes' do
+      expect { VCR::Cassette.new('name', re_record_mode: :sometimes) }
+        .to raise_error(ArgumentError, /not a valid cassette re-record mode/)
+    end
+
+    it 'is only active for interval-triggered re-records' do
+      expect(VCR::Cassette.new('name', re_record_mode: :complete).re_recording?).to be(false)
+
+      VCR.configuration.cassette_library_dir = "#{VCR::SPEC_ROOT}/fixtures/cassette_spec"
+      allow(VCR::InternetConnection).to receive(:available?).and_return(true)
+
+      cassette = VCR::Cassette.new('example', re_record_interval: interval, re_record_mode: :complete)
+      expect(cassette.re_recording?).to be(true)
+      expect(cassette.complete_re_record?).to be(true)
+      expect(cassette.record_mode).to eq(:all)
+
+      overwrite = VCR::Cassette.new('example', re_record_interval: interval)
+      expect(overwrite.re_recording?).to be(true)
+      expect(overwrite.complete_re_record?).to be(false)
+    end
+
+    it 'exposes no diagnostics when no complete re-record was attempted' do
+      VCR.configuration.cassette_library_dir = "#{VCR::SPEC_ROOT}/fixtures/cassette_spec"
+      cassette = VCR::Cassette.new('example', re_record_interval: interval, re_record_mode: :complete)
+      expect(cassette.re_record_diagnostics).to be_nil
+    end
+  end
 end

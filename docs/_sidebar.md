@@ -5,6 +5,7 @@
   - Cassettes
     - [Allow unused http interactions](/cassettes/allow_unused_http_interactions.md)
     - [Automatic re recording](/cassettes/automatic_re_recording.md)
+    - [Complete re recording](/cassettes/complete_re_recording.md)
     - [Custom metadata](/cassettes/custom_metadata.md)
     - [Decompress](/cassettes/decompress.md)
     - [Drop unused requests](/cassettes/drop_unused_requests.md)

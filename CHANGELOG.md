@@ -3,6 +3,7 @@ Changelog
 
 ## Unreleased
 
+- [new] Add `re_record_mode: :complete` so an interval-triggered re-record only replaces the cassette once every previously recorded interaction has been recorded again; incomplete attempts keep the old cassette playable, keep its original `recorded_at` values, and stage the partial attempt plus missing-interaction diagnostics in a sibling `<cassette>-pending` file
 - [fix] `uri_without_params` ignores percent-encoded query params given by their decoded name, e.g. `uri_without_params('date[gte]')` now ignores `date%5Bgte%5D` (#633)
 - [fix] Leave the Content-Length header of HEAD and 304 responses untouched when `update_content_length_header` is enabled (#779)
 

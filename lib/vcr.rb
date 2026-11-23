@@ -77,6 +77,17 @@ module VCR
   #  any object that responds to #call.
   # @option options :re_record_interval [Integer] When given, the
   #  cassette will be re-recorded at the given interval, in seconds.
+  # @option options :re_record_mode [:overwrite, :complete] How an
+  #  interval-triggered re-record is persisted. Defaults to `:overwrite`,
+  #  which writes the new interactions over the cassette file on eject just
+  #  like a `:all` run. With `:complete`, the previous cassette file is only
+  #  replaced once every interaction it contained has been recorded again
+  #  during the same run; an interrupted or failing refresh keeps the old
+  #  cassette available for offline playback and writes the partial attempt
+  #  plus diagnostics about the missing interactions to a sibling
+  #  `<cassette>-pending` file. The cassette will be refreshed again on the
+  #  next run until the attempt completes. Ignored unless
+  #  `:re_record_interval` triggers a re-record.
   # @option options :tag [Symbol] Used to apply tagged `before_record`
   #  and `before_playback` hooks to the cassette.
   # @option options :tags [Array<Symbol>] Used to apply multiple tags to
