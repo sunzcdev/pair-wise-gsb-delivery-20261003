@@ -484,7 +484,10 @@ module VCR
   # @attr [Request] request the request
   # @attr [Response] response the response
   # @attr [Time] recorded_at when this HTTP interaction was recorded
-  class HTTPInteraction < Struct.new(:request, :response, :recorded_at)
+  # @attr [nil, String] playback_group the playback group this interaction
+  #   belongs to, if any. Interactions recorded before playback groups
+  #   existed (or recorded without a group selected) have a nil group.
+  class HTTPInteraction < Struct.new(:request, :response, :recorded_at, :playback_group)
     def initialize(*args)
       super
       self.recorded_at ||= Time.now
@@ -500,7 +503,9 @@ module VCR
         'request'     => request.to_hash,
         'response'    => response.to_hash,
         'recorded_at' => recorded_at.httpdate
-      }
+      }.tap do |hash|
+        hash['playback_group'] = playback_group if playback_group
+      end
     end
 
     # Constructs a new instance from a hash.
@@ -510,7 +515,8 @@ module VCR
     def self.from_hash(hash)
       new Request.from_hash(hash.fetch('request', {})),
           Response.from_hash(hash.fetch('response', {})),
-          Time.httpdate(hash.fetch('recorded_at'))
+          Time.httpdate(hash.fetch('recorded_at')),
+          hash['playback_group']
     end
 
     # @return [HookAware] an instance with additional capabilities

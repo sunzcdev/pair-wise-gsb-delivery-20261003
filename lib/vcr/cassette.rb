@@ -53,6 +53,12 @@ module VCR
     #  {VCR::Configuration#before_playback} hooks with a corresponding tag will apply.
     attr_reader :tags
 
+    # @return [nil, String] The currently selected playback group. Newly recorded
+    #  HTTP interactions are tagged with this group, and only interactions
+    #  belonging to this group are eligible for playback. When nil (the
+    #  default), all interactions are eligible, as before.
+    attr_reader :playback_group
+
     # @param (see VCR#insert_cassette)
     # @see VCR#insert_cassette
     def initialize(name, options = {})
@@ -65,6 +71,18 @@ module VCR
       raise_error_unless_valid_record_mode
 
       log "Initialized with options: #{format_options_for_log(@options)}"
+    end
+
+    # Selects the playback group used for recording and playback. Can be
+    # changed while the cassette is in use; the new group applies to any
+    # subsequent recording and playback.
+    #
+    # @param group [nil, String] the playback group to select
+    def playback_group=(group)
+      @mutex.synchronize do
+        @playback_group = group
+        @http_interactions.playback_group = group if @http_interactions
+      end
     end
 
     # Ejects the current cassette. The cassette will no longer be used.
@@ -108,13 +126,15 @@ module VCR
           match_requests_on,
           @allow_playback_repeats,
           @parent_list,
-          log_prefix
+          log_prefix,
+          @playback_group
       end
     end
 
     # @private
     def record_http_interaction(interaction)
       VCR::CassetteMutex.synchronize do
+        interaction.playback_group = @playback_group if @playback_group
         log "Recorded HTTP interaction #{request_summary(interaction.request)} => #{response_summary(interaction.response)}"
         new_recorded_interactions << interaction
       end
@@ -187,7 +207,7 @@ module VCR
         :update_content_length_header, :allow_playback_repeats, :allow_unused_http_interactions,
         :exclusive, :serialize_with, :preserve_exact_body_bytes, :decode_compressed_response,
         :recompress_response, :persist_with, :persister_options, :clean_outdated_http_interactions,
-        :drop_unused_requests
+        :drop_unused_requests, :playback_group
       ]
 
       if invalid_options.size > 0
@@ -197,7 +217,8 @@ module VCR
 
     def extract_options
       [:record_on_error, :erb, :match_requests_on, :re_record_interval, :clean_outdated_http_interactions,
-       :allow_playback_repeats, :allow_unused_http_interactions, :exclusive, :drop_unused_requests].each do |name|
+       :allow_playback_repeats, :allow_unused_http_interactions, :exclusive, :drop_unused_requests,
+       :playback_group].each do |name|
         instance_variable_set("@#{name}", @options[name])
       end
 
@@ -289,7 +310,7 @@ module VCR
       if should_remove_matching_existing_interactions?
         new_interaction_list = HTTPInteractionList.new(new_recorded_interactions, match_requests_on)
         old_interactions = old_interactions.reject do |i|
-          new_interaction_list.response_for(i.request)
+          interaction_in_playback_group?(i) && new_interaction_list.response_for(i.request)
         end
       end
 
@@ -298,6 +319,14 @@ module VCR
       else
         up_to_date_interactions(old_interactions) + new_recorded_interactions
       end
+    end
+
+    # @return [Boolean] Whether the interaction belongs to the selected playback
+    #  group. When no group is selected, every interaction is in scope (the
+    #  original behavior for historical cassettes and group-less usage).
+    def interaction_in_playback_group?(interaction)
+      return true unless @playback_group
+      interaction.playback_group.to_s == @playback_group.to_s
     end
 
     def up_to_date_interactions(interactions)

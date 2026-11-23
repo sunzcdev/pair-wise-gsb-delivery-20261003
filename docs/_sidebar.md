@@ -54,6 +54,7 @@
     - [Identical request sequence](/request_matching/identical_request_sequence.md)
     - [Method](/request_matching/method.md)
     - [Path](/request_matching/path.md)
+    - [Playback groups](/request_matching/playback_groups.md)
     - [Playback repeats](/request_matching/playback_repeats.md)
     - [Query](/request_matching/query.md)
     - [Uri](/request_matching/uri.md)

@@ -3,6 +3,7 @@ Changelog
 
 ## Unreleased
 
+- [feat] Add the `:playback_group` cassette option so parallel tests can share one cassette file: newly recorded interactions are tagged with the selected group, and once a group is selected only that group's unused (and, with `:allow_playback_repeats`, used) interactions are eligible for playback. Cassettes recorded without groups and usages that select no group behave as before.
 - [fix] `uri_without_params` ignores percent-encoded query params given by their decoded name, e.g. `uri_without_params('date[gte]')` now ignores `date%5Bgte%5D` (#633)
 - [fix] Leave the Content-Length header of HEAD and 304 responses untouched when `update_content_length_header` is enabled (#779)
 

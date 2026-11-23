@@ -39,6 +39,12 @@ module VCR
           response(body)
       end
 
+      def grouped_interaction(body, group, request_values)
+        interaction(body, request_values).tap do |i|
+          i.playback_group = group
+        end
+      end
+
       let(:original_list_array) do [
         interaction('put response', method: :put),
         interaction('post response 1', method: :post),
@@ -287,6 +293,114 @@ module VCR
           original_dup = original_list_array.dup
           list.response_for(request_with(method: :post))
           expect(original_list_array).to eq original_dup
+        end
+      end
+
+      context "with a playback group selected" do
+        let(:grouped_list_array) do [
+          grouped_interaction('group a response 1', 'a', method: :post),
+          grouped_interaction('group b response 1', 'b', method: :post),
+          grouped_interaction('group a response 2', 'a', method: :post),
+          grouped_interaction('group b response 2', 'b', method: :post)
+        ] end
+
+        def list_for(group, repeats = false)
+          HTTPInteractionList.new(grouped_list_array, [:method], repeats,
+                                  HTTPInteractionList::NullList, '', group)
+        end
+
+        it 'only plays back unused interactions from the selected group, in order' do
+          list = list_for('a')
+          expect(list.response_for(request_with(method: :post))).to respond_with('group a response 1')
+          expect(list.response_for(request_with(method: :post))).to respond_with('group a response 2')
+          expect(list.response_for(request_with(method: :post))).to respond_with(nil)
+        end
+
+        it 'keeps each group\'s playback sequence independent' do
+          list_a = list_for('a')
+          list_b = list_for('b')
+
+          expect(list_a.response_for(request_with(method: :post))).to respond_with('group a response 1')
+          expect(list_b.response_for(request_with(method: :post))).to respond_with('group b response 1')
+          expect(list_b.response_for(request_with(method: :post))).to respond_with('group b response 2')
+          expect(list_a.response_for(request_with(method: :post))).to respond_with('group a response 2')
+        end
+
+        it 'treats symbol and string groups as equivalent' do
+          list = list_for(:a)
+          expect(list.response_for(request_with(method: :post))).to respond_with('group a response 1')
+        end
+
+        it 'does not consider used interactions from other groups when repeats are allowed' do
+          list = list_for('a', true)
+          list.response_for(request_with(method: :post))
+          list.response_for(request_with(method: :post))
+
+          results = 3.times.map { list.response_for(request_with(method: :post)) }
+          expect(results.map(&:body)).to eq(['group a response 2'] * 3)
+        end
+
+        it 'scopes #has_used_interaction_matching? to the selected group' do
+          list = list_for('a')
+          list.response_for(request_with(method: :post))
+          expect(list).to have_used_interaction_matching(request_with(method: :post))
+
+          list.playback_group = 'b'
+          expect(list).not_to have_used_interaction_matching(request_with(method: :post))
+        end
+
+        it 'scopes #remaining_unused_interaction_count to the selected group' do
+          list = list_for('a')
+          expect(list.remaining_unused_interaction_count).to eq(2)
+          list.response_for(request_with(method: :post))
+          expect(list.remaining_unused_interaction_count).to eq(1)
+        end
+
+        it 'scopes #assert_no_unused_interactions! to the selected group' do
+          list = list_for('a')
+          2.times { list.response_for(request_with(method: :post)) }
+          expect { list.assert_no_unused_interactions! }.not_to raise_error
+        end
+
+        it 'only lists the selected group\'s unused interactions in the assertion error' do
+          allow(config).to receive(:logger).and_return(Logger::Null)
+          list = list_for('a')
+          list.response_for(request_with(method: :post))
+
+          expect { list.assert_no_unused_interactions! }.to raise_error(Errors::UnusedHTTPInteractionError) { |error|
+            expect(error.message).to include('group a response 2')
+            expect(error.message).not_to include('group b response')
+          }
+        end
+
+        it 'does not play back interactions from other groups even when they are the only ones left' do
+          list = list_for('a')
+          2.times { list.response_for(request_with(method: :post)) }
+          expect(list.remaining_unused_interaction_count).to eq(0)
+          expect(list.response_for(request_with(method: :post))).to respond_with(nil)
+        end
+
+        it 'allows the group to be changed after the list is built' do
+          list = list_for('a')
+          expect(list.response_for(request_with(method: :post))).to respond_with('group a response 1')
+
+          list.playback_group = 'b'
+          expect(list.response_for(request_with(method: :post))).to respond_with('group b response 1')
+        end
+      end
+
+      context "without a playback group" do
+        it 'considers interactions from all groups, as before' do
+          list = HTTPInteractionList.new([
+            grouped_interaction('group a response', 'a', method: :post),
+            grouped_interaction('group b response', 'b', method: :post),
+            interaction('ungrouped response', method: :post)
+          ], [:method])
+
+          expect(list.remaining_unused_interaction_count).to eq(3)
+          expect(list.response_for(request_with(method: :post))).to respond_with('group a response')
+          expect(list.response_for(request_with(method: :post))).to respond_with('group b response')
+          expect(list.response_for(request_with(method: :post))).to respond_with('ungrouped response')
         end
       end
     end

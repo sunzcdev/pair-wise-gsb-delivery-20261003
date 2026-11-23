@@ -48,6 +48,7 @@
   - identical_request_sequence.feature
   - custom_matcher.feature
   - uri_without_param.feature
+  - playback_groups.feature
   - playback_repeats.feature
 - test_frameworks:
   - test_unit.feature

@@ -92,6 +92,15 @@ module VCR
   # @option options :allow_playback_repeats [Boolean] Whether or not to
   #  allow a single HTTP interaction to be played back multiple times.
   #  Defaults to false.
+  # @option options :playback_group [String, Symbol] Selects the playback
+  #  group for this cassette. Newly recorded HTTP interactions are tagged
+  #  with the group, and once a group is selected, only interactions
+  #  belonging to that group are eligible for playback (both unused
+  #  interactions and, when `:allow_playback_repeats` is set, used ones).
+  #  This is useful when parallel tests share one cassette file and the
+  #  same request represents a different playback sequence in each test.
+  #  Cassettes recorded without groups and cassette usages that do not
+  #  select a group behave as before. Defaults to nil (no group).
   # @option options :allow_unused_http_interactions [Boolean] If set to
   #  false, an error will be raised if a cassette is ejected before all
   #  previously recorded HTTP interactions have been used.

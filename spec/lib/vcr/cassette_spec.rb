@@ -56,6 +56,82 @@ RSpec.describe VCR::Cassette do
       cassette.record_http_interaction(the_interaction)
       expect(cassette.new_recorded_interactions).to eq([the_interaction])
     end
+
+    it 'tags the interaction with the selected playback group' do
+      cassette = VCR::Cassette.new(:test_cassette, playback_group: 'a')
+      interaction = http_interaction
+      cassette.record_http_interaction(interaction)
+      expect(interaction.playback_group).to eq('a')
+    end
+
+    it 'does not tag the interaction when no playback group is selected' do
+      cassette = VCR::Cassette.new(:test_cassette)
+      interaction = http_interaction
+      cassette.record_http_interaction(interaction)
+      expect(interaction.playback_group).to be_nil
+    end
+  end
+
+  describe '#playback_group' do
+    it 'is nil by default' do
+      expect(VCR::Cassette.new(:test_cassette).playback_group).to be_nil
+    end
+
+    it 'returns the group given via the :playback_group option' do
+      expect(VCR::Cassette.new(:test_cassette, playback_group: 'a').playback_group).to eq('a')
+    end
+
+    it 'is passed to the http interaction list' do
+      cassette = VCR::Cassette.new(:test_cassette, playback_group: 'a')
+      expect(cassette.http_interactions.playback_group).to eq('a')
+    end
+
+    it 'can be changed while the cassette is in use' do
+      cassette = VCR::Cassette.new(:test_cassette, playback_group: 'a')
+      cassette.http_interactions # force the list to be built
+      cassette.playback_group = 'b'
+      expect(cassette.playback_group).to eq('b')
+      expect(cassette.http_interactions.playback_group).to eq('b')
+    end
+  end
+
+  describe 'playback group persistence' do
+    def grouped_interaction(response_body, uri, group = nil)
+      http_interaction do |i|
+        i.response.body = response_body
+        i.request.uri = uri
+        i.playback_group = group
+      end
+    end
+
+    it 'writes the playback group of recorded interactions to the cassette' do
+      cassette = VCR::Cassette.new('example', playback_group: 'a')
+      cassette.record_http_interaction(grouped_interaction('foo', 'http://foo.com/'))
+      expect(cassette.serializable_hash['http_interactions'].first['playback_group']).to eq('a')
+    end
+
+    it 'does not add a playback_group key for interactions recorded without a group' do
+      cassette = VCR::Cassette.new('example')
+      cassette.record_http_interaction(grouped_interaction('foo', 'http://foo.com/'))
+      expect(cassette.serializable_hash['http_interactions'].first).not_to have_key('playback_group')
+    end
+
+    context 'with record: :all' do
+      it 'only replaces previously recorded interactions from the selected group' do
+        old_a = grouped_interaction('old a', 'http://foo.com/', 'a')
+        old_b = grouped_interaction('old b', 'http://foo.com/', 'b')
+
+        cassette = VCR::Cassette.new('example', record: :all, match_requests_on: [:uri], playback_group: 'a')
+        allow(cassette).to receive(:previously_recorded_interactions).and_return([old_a, old_b])
+        cassette.record_http_interaction(grouped_interaction('new a', 'http://foo.com/'))
+        cassette.eject
+
+        saved_bodies = YAML.load_file(cassette.file)['http_interactions'].map { |h|
+          VCR::HTTPInteraction.from_hash(h).response.body
+        }
+        expect(saved_bodies).to eq(['old b', 'new a'])
+      end
+    end
   end
 
   describe "#serializable_hash" do

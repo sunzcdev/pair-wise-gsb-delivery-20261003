@@ -15,11 +15,16 @@ module VCR
 
       attr_reader :interactions, :request_matchers, :allow_playback_repeats, :parent_list
 
-      def initialize(interactions, request_matchers, allow_playback_repeats = false, parent_list = NullList, log_prefix = '')
+      # @return [nil, String] The currently selected playback group. When set,
+      #  only interactions recorded into this group are eligible for playback.
+      attr_accessor :playback_group
+
+      def initialize(interactions, request_matchers, allow_playback_repeats = false, parent_list = NullList, log_prefix = '', playback_group = nil)
         @interactions           = interactions.dup
         @request_matchers       = request_matchers
         @allow_playback_repeats = allow_playback_repeats
         @parent_list            = parent_list
+        @playback_group         = playback_group
         @used_interactions      = []
         @log_prefix             = log_prefix
         @mutex                  = Mutex.new
@@ -52,11 +57,11 @@ module VCR
       end
 
       def has_used_interaction_matching?(request)
-        @used_interactions.any? { |i| interaction_matches_request?(request, i) }
+        @used_interactions.any? { |i| interaction_in_selected_group?(i) && interaction_matches_request?(request, i) }
       end
 
       def remaining_unused_interaction_count
-        @interactions.size
+        @interactions.count { |i| interaction_in_selected_group?(i) }
       end
 
       # Checks if there are no unused interactions left.
@@ -66,7 +71,7 @@ module VCR
         return unless has_unused_interactions?
         logger = Logger.new(nil)
 
-        descriptions = @interactions.map do |i|
+        descriptions = unused_interactions.map do |i|
           "  - #{logger.request_summary(i.request, @request_matchers)} => #{logger.response_summary(i.response)}"
         end.join("\n")
 
@@ -75,9 +80,22 @@ module VCR
 
     private
 
+      # @return [Array] The unused interactions eligible for the selected playback group.
+      def unused_interactions
+        @interactions.select { |i| interaction_in_selected_group?(i) }
+      end
+
       # @return [Boolean] Whether or not there are unused interactions left in the list.
       def has_unused_interactions?
-        @interactions.size > 0
+        unused_interactions.size > 0
+      end
+
+      # @return [Boolean] Whether the interaction belongs to the selected playback
+      #  group. When no group is selected, every interaction is eligible (the
+      #  original behavior for historical cassettes and group-less usage).
+      def interaction_in_selected_group?(interaction)
+        return true unless @playback_group
+        interaction.playback_group.to_s == @playback_group.to_s
       end
 
       def request_summary(request)
@@ -85,12 +103,12 @@ module VCR
       end
 
       def matching_interaction_index_for(request)
-        @interactions.index { |i| interaction_matches_request?(request, i) }
+        @interactions.index { |i| interaction_in_selected_group?(i) && interaction_matches_request?(request, i) }
       end
 
       def matching_used_interaction_for(request)
         return nil unless @allow_playback_repeats
-        @used_interactions.find { |i| interaction_matches_request?(request, i) }
+        @used_interactions.find { |i| interaction_in_selected_group?(i) && interaction_matches_request?(request, i) }
       end
 
       def interaction_matches_request?(request, interaction)

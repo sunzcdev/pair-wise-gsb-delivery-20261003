@@ -114,6 +114,15 @@ module VCR
         expect(HTTPInteraction.from_hash(hash).recorded_at).to eq(recorded_at)
       end
 
+      it 'initializes the playback group from the hash if it is included' do
+        hash['playback_group'] = 'a'
+        expect(HTTPInteraction.from_hash(hash).playback_group).to eq('a')
+      end
+
+      it 'leaves the playback group nil for hashes recorded without one' do
+        expect(HTTPInteraction.from_hash(hash).playback_group).to be_nil
+      end
+
       it 'initializes the response http_version from the hash if it is included' do
         hash['response']['http_version'] = '1.1'
         interaction = HTTPInteraction.from_hash(hash)
@@ -292,6 +301,16 @@ module VCR
       it 'includes the response adapter metadata when it is not empty' do
         interaction.response.adapter_metadata['foo'] = 17
         expect(hash['response']['adapter_metadata']).to eq('foo' => 17)
+      end
+
+      it 'includes the playback group when one is set' do
+        interaction.playback_group = 'a'
+        expect(hash['playback_group']).to eq('a')
+      end
+
+      it 'does not include the playback group when none is set' do
+        expect(interaction.playback_group).to be_nil
+        expect(hash.keys).not_to include('playback_group')
       end
 
       it 'does not include the response adapter metadata when it is empty' do
