@@ -15,6 +15,7 @@
   - decompress.feature
   - persistence.feature
   - allow_unused_http_interactions.feature
+  - rehearsal.feature
 - record_modes:
   - once.feature
   - new_episodes.feature

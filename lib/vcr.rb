@@ -348,6 +348,47 @@ module VCR
     VCR::Cassette::HTTPInteractionList::NullList
   end
 
+  # Builds a read-only rehearsal (dry run) of the current cassette's playback
+  # state against an expected request sequence.
+  #
+  # The rehearsal uses the current cassette's `:match_requests_on` matchers,
+  # its `:allow_playback_repeats` setting, and the same fallback to outer
+  # cassettes that a real request would use, but it consumes interactions only
+  # virtually. Playback counters, cassette hooks (`before_playback`,
+  # `before_record`), `before_http_request`/`after_http_request` hooks and the
+  # HTTP connection state are not touched, and no request is sent over the
+  # network.
+  #
+  # @example Check an expected request sequence before releasing a client
+  #   VCR.use_cassette('release') do
+  #     report = VCR.rehearsal.rehearse_all(requests)
+  #     report.assert_all_available!
+  #     puts report
+  #   end
+  #
+  # @param match_requests_on [Array<Symbol, #call>, nil] matchers to use for the
+  #  rehearsal. Defaults to nil, which uses each cassette's own matchers.
+  # @return [VCR::Cassette::Rehearsal] the rehearsal. When no cassette is in use
+  #  the rehearsal is empty, so every request reports as exhausted.
+  def rehearsal(match_requests_on: nil)
+    cassette = current_cassette
+    return Cassette::Rehearsal.new(http_interactions, match_requests_on: match_requests_on) unless cassette
+    cassette.rehearsal(match_requests_on: match_requests_on)
+  end
+
+  # Rehearses an expected request sequence against the current cassette without
+  # consuming any playback state. Shorthand for
+  # `VCR.rehearsal.rehearse_all(requests)`.
+  #
+  # @param requests [Array<VCR::Request>] the expected requests, in order.
+  # @return [VCR::Cassette::Rehearsal::Transcript]
+  # @see #rehearsal
+  def rehearse_all(requests, match_requests_on: nil)
+    rehearsal(match_requests_on: match_requests_on).rehearse_all(requests)
+  end
+  alias dry_run rehearse_all
+  alias preflight rehearse_all
+
   # @private
   def real_http_connections_allowed?
     return current_cassette.recording? if current_cassette

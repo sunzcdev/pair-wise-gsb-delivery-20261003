@@ -3,6 +3,7 @@ Changelog
 
 ## Unreleased
 
+- [new] Add a read-only rehearsal (`VCR::Cassette#rehearsal` / `VCR.rehearsal`) to check an expected request sequence against a cassette without consuming playback state, running hooks or touching connections. Sequential rehearsals follow `:match_requests_on`, `:allow_playback_repeats` and parent-cassette fallback exactly like real playback, and report the virtual number of interactions left
 - [fix] `uri_without_params` ignores percent-encoded query params given by their decoded name, e.g. `uri_without_params('date[gte]')` now ignores `date%5Bgte%5D` (#633)
 - [fix] Leave the Content-Length header of HEAD and 304 responses untouched when `update_content_length_header` is enabled (#779)
 

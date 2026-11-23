@@ -51,6 +51,33 @@ module VCR
     # @see VCR::HTTPInteractionList#assert_no_unused_interactions!
     class UnusedHTTPInteractionError < Error; end
 
+    # Error raised when a rehearsal (dry run) of a request sequence finds a
+    # request that has no playable HTTP interaction left.
+    #
+    # A rehearsal is read only: raising this does not consume the cassette, and
+    # the real playback state remains untouched.
+    #
+    # @see VCR::Cassette::Rehearsal
+    # @see VCR::Cassette::Rehearsal::Transcript#assert_all_available!
+    class RehearsalExhaustedError < Error
+      # @return [VCR::Request, nil] the request that could not be played back.
+      attr_reader :request
+
+      # @param request [VCR::Request, nil] the request that ran out of interactions.
+      # @param message [String, nil] an optional message.
+      def initialize(request = nil, message = nil)
+        @request = request
+        super(message || "No playable HTTP interaction left for #{describe_request}")
+      end
+
+    private
+
+      def describe_request
+        return "the rehearsed request" unless request
+        "#{request.method.to_s.upcase} #{request.uri}"
+      end
+    end
+
     # Error raised when you attempt to eject a cassette inserted by another
     # thread.
     class EjectLinkedCassetteError         < Error; end

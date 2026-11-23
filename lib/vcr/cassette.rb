@@ -1,4 +1,5 @@
 require 'vcr/cassette/http_interaction_list'
+require 'vcr/cassette/rehearsal'
 require 'vcr/cassette/erb_renderer'
 require 'vcr/cassette/serializers'
 
@@ -108,8 +109,31 @@ module VCR
           match_requests_on,
           @allow_playback_repeats,
           @parent_list,
-          log_prefix
+          log_prefix,
+          label: name.to_s
       end
+    end
+
+    # Builds a read-only rehearsal of this cassette's playback state.
+    #
+    # The rehearsal follows the same fallback chain a real request would (this
+    # cassette, then any outer cassettes) and uses the same request matchers and
+    # `:allow_playback_repeats` rules, but it consumes interactions only
+    # virtually. Playback counters, `before_playback`/`before_record` hooks,
+    # `after_http_request` hooks and the HTTP connection state are untouched, and
+    # no request is ever sent.
+    #
+    # @example
+    #   VCR.use_cassette('inner') do |cassette|
+    #     report = cassette.rehearsal.rehearse_all(requests)
+    #     puts report
+    #   end
+    #
+    # @param match_requests_on [Array<Symbol, #call>, nil] matchers to use for the
+    #  rehearsal. Defaults to nil, which uses each cassette's own matchers.
+    # @return [VCR::Cassette::Rehearsal]
+    def rehearsal(match_requests_on: nil)
+      Rehearsal.new(http_interactions, match_requests_on: match_requests_on)
     end
 
     # @private
