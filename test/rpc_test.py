@@ -156,6 +156,21 @@ class RPCTest(scheduler_api_test.SchedulerApiTest, ServerTestBase):
         """This would be too slow to run through network"""
         pass
 
+    def test_legacy_update_resources_raises_typed_conflict_on_stale_base_version(self):
+        # over HTTP a typed in-process exception surfaces as an RPC error;
+        # the remote-friendly conflict contract is covered by the
+        # update_resources_grouped tests instead.
+        import luigi.rpc
+
+        self.sch.update_resources(A=1, B=3)
+        self.assertRaises(
+            luigi.rpc.RPCError,
+            self.sch.update_resources,
+            base_version=0,
+            A=5,
+            B=9,
+        )
+
 
 class RequestsFetcherTest(ServerTestBase):
     def test_fork_changes_session(self):

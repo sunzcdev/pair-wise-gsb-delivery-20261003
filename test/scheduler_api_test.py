@@ -23,7 +23,7 @@ import pytest
 from helpers import unittest
 
 import luigi.notifications
-from luigi.scheduler import BATCH_RUNNING, DISABLED, DONE, FAILED, PENDING, RUNNING, UNKNOWN, UPSTREAM_RUNNING, Scheduler
+from luigi.scheduler import BATCH_RUNNING, DISABLED, DONE, FAILED, PENDING, RUNNING, UNKNOWN, UPSTREAM_RUNNING, ResourceVersionConflict, Scheduler
 
 luigi.notifications.DEBUG = True
 WORKER = "myworker"
@@ -1177,6 +1177,175 @@ class SchedulerApiTest(unittest.TestCase):
         self.assertEqual("A", self.sch.get_work(worker=WORKER)["task_id"])
         # C doesn't block B, so it can go first
         self.check_task_order("C")
+
+    def test_initial_resource_version_is_zero(self):
+        self.assertEqual(0, self.sch.get_resource_version())
+        self.assertEqual({}, self.sch.get_resources())
+
+    def test_grouped_resource_change_bumps_version_and_returns_it(self):
+        result = self.sch.update_resources_grouped(base_version=0, resources={"A": 2, "B": 5})
+        self.assertEqual({"status": "ok", "version": 1}, result)
+        self.assertEqual(1, self.sch.get_resource_version())
+        self.assertEqual({"A": 2, "B": 5}, self.sch.get_resources())
+
+    def test_legacy_update_resources_still_works_without_version(self):
+        # the legacy entry point needs no version and still applies the group
+        self.sch.update_resources(A=3)
+        self.assertEqual(1, self.sch.get_resource_version())
+        self.sch.update_resources(B=4)  # a second legacy call bumps the version again
+        self.assertEqual({"A": 3, "B": 4}, self.sch.get_resources())
+        self.assertEqual(2, self.sch.get_resource_version())
+
+    def test_legacy_update_resource_still_works_and_bumps_version(self):
+        self.assertTrue(self.sch.update_resource("new_resource", 1))
+        self.assertEqual(1, self.sch.get_resource_version())
+        self.assertTrue(self.sch.update_resource("new_resource", 2))
+        self.assertEqual(2, self.sch.get_resource_version())
+        self.validate_resource_count("new_resource", 2)
+        # invalid amounts are rejected and must not bump the version
+        self.assertFalse(self.sch.update_resource("new_resource", -1))
+        self.assertEqual(2, self.sch.get_resource_version())
+
+    def test_stale_grouped_change_is_rejected_atomically(self):
+        # first grouped change based on the initial version (version 0 -> 1)
+        self.assertEqual(
+            {"status": "ok", "version": 1},
+            self.sch.update_resources_grouped(base_version=0, resources={"A": 1, "B": 3}),
+        )
+
+        # a second grouped change also generated from the initial version
+        # arrives late and must conflict, applying neither of its limits
+        self.assertEqual(
+            {"status": "version_conflict", "expected_version": 0, "current_version": 1},
+            self.sch.update_resources_grouped(base_version=0, resources={"A": 5, "B": 9}),
+        )
+
+        # nothing from the rejected change took effect; version unchanged
+        self.assertEqual(1, self.sch.get_resource_version())
+        self.assertEqual({"A": 1, "B": 3}, self.sch.get_resources())
+
+    def test_conflict_does_not_invalidate_the_first_confirmed_change(self):
+        first = self.sch.update_resources_grouped(base_version=0, resources={"A": 4, "B": 8})
+        self.assertEqual({"status": "ok", "version": 1}, first)
+        # late stale change based on the same initial version
+        self.assertEqual(
+            {"status": "version_conflict", "expected_version": 0, "current_version": 1},
+            self.sch.update_resources_grouped(base_version=0, resources={"A": 9, "B": 1}),
+        )
+        # the already confirmed first change must survive untouched
+        self.assertEqual(1, self.sch.get_resource_version())
+        self.assertEqual({"A": 4, "B": 8}, self.sch.get_resources())
+
+        # re-reading the current version and retrying on top of it succeeds
+        current = self.sch.get_resource_version()
+        self.assertEqual(
+            {"status": "ok", "version": current + 1},
+            self.sch.update_resources_grouped(base_version=current, resources={"A": 6, "B": 2}),
+        )
+        self.assertEqual({"A": 6, "B": 2}, self.sch.get_resources())
+
+    def test_legacy_single_resource_change_invalidates_stale_grouped_change(self):
+        self.assertEqual(
+            {"status": "ok", "version": 1},
+            self.sch.update_resources_grouped(base_version=0, resources={"A": 4}),
+        )
+        # the old single-resource entry point is still usable and bumps the version
+        self.assertTrue(self.sch.update_resource("B", 7))
+        self.assertEqual(2, self.sch.get_resource_version())
+        # a grouped change generated against version 1 is now stale
+        self.assertEqual(
+            {"status": "version_conflict", "expected_version": 1, "current_version": 2},
+            self.sch.update_resources_grouped(base_version=1, resources={"A": 1, "B": 1}),
+        )
+        self.assertEqual(7, self.sch.get_resources()["B"])
+
+    def test_resource_list_exposes_version(self):
+        self.sch.update_resources(A=2)
+        entries = {entry["name"]: entry for entry in self.sch.resource_list()}
+        self.assertEqual(1, entries["A"]["version"])
+
+    def test_versioned_resource_changes_govern_new_work_while_running_permits_are_settled(self):
+        # initial quota: A offers 3 permits and B offers 2
+        self.sch.update_resources(A=3, B=2)
+        initial_version = self.sch.get_resource_version()
+        self.assertEqual(1, initial_version)
+
+        # two running tasks each hold one A and one B permit (permits granted
+        # under a previous quota are settled as usual)
+        self.sch.add_worker("X", {"workers": 1})
+        self.sch.add_worker("Y", {"workers": 1})
+        self.sch.add_task(worker="X", task_id="run1", resources={"A": 1, "B": 1})
+        self.sch.add_task(worker="Y", task_id="run2", resources={"A": 1, "B": 1})
+        self.assertEqual("run1", self.sch.get_work(worker="X")["task_id"])
+        self.assertEqual("run2", self.sch.get_work(worker="Y")["task_id"])
+        self.sch.add_task(worker="X", task_id="run1", status=RUNNING, resources={"A": 1, "B": 1})
+        self.sch.add_task(worker="Y", task_id="run2", status=RUNNING, resources={"A": 1, "B": 1})
+
+        # first adjustment from the initial version: lower A to 2, raise B to 4
+        new_version = self.sch.update_resources_grouped(
+            base_version=initial_version, resources={"A": 2, "B": 4}
+        )
+        self.assertEqual({"status": "ok", "version": initial_version + 1}, new_version)
+
+        # a second adjustment also generated from the initial version: restore
+        # A to its old value and touch B. It arrives after the first one took
+        # effect, so it must report a version conflict and change neither.
+        self.assertEqual(
+            {"status": "version_conflict", "expected_version": initial_version, "current_version": initial_version + 1},
+            self.sch.update_resources_grouped(base_version=initial_version, resources={"A": 3, "B": 5}),
+        )
+        self.assertEqual(initial_version + 1, self.sch.get_resource_version())
+        self.assertEqual({"A": 2, "B": 4}, self.sch.get_resources())
+
+        # new task needing both A and B keeps waiting: the running tasks still
+        # hold both A permits of the lowered quota
+        self.sch.add_worker("Z", [])
+        self.sch.add_task(worker="Z", task_id="combo", resources={"A": 1, "B": 1})
+        self.assertIsNone(self.sch.get_work(worker="Z")["task_id"])
+
+        # new task needing only B starts against the latest quota, which has
+        # plenty of B room even with the running permits settled
+        self.sch.add_worker("W", [])
+        self.sch.add_task(worker="W", task_id="bonly", resources={"B": 1})
+        self.assertEqual("bonly", self.sch.get_work(worker="W")["task_id"])
+        self.sch.add_task(worker="W", task_id="bonly", status=RUNNING, resources={"B": 1})
+
+        # the combo task is still blocked while both A permits are held
+        self.assertIsNone(self.sch.get_work(worker="Z")["task_id"])
+
+        # only after releasing an actually held permit can the combo task be
+        # granted against the current (single) quota version
+        self.sch.add_task(worker="X", task_id="run1", status=DONE, resources={"A": 1, "B": 1})
+        self.assertEqual("combo", self.sch.get_work(worker="Z")["task_id"])
+
+    def test_grouped_change_applies_atomically_or_not_at_all(self):
+        self.sch.update_resources(A=1, B=1)
+        stale_version = self.sch.get_resource_version()
+        self.sch.update_resource("C", 3)  # any confirmed change moves the version
+        self.assertEqual(
+            {"status": "version_conflict", "expected_version": stale_version, "current_version": stale_version + 1},
+            self.sch.update_resources_grouped(base_version=stale_version, resources={"A": 9, "B": 9}),
+        )
+        self.assertEqual({"A": 1, "B": 1, "C": 3}, self.sch.get_resources())
+
+    def test_grouped_rpc_entry_can_retry_on_refreshed_version(self):
+        self.sch.update_resources(A=1, B=3)
+        current = self.sch.get_resource_version()
+        result = self.sch.update_resources_grouped(base_version=current, resources={"A": 7})
+        self.assertEqual({"status": "ok", "version": current + 1}, result)
+        self.assertEqual({"A": 7, "B": 3}, self.sch.get_resources())
+
+    def test_legacy_update_resources_raises_typed_conflict_on_stale_base_version(self):
+        # the version-aware keyword path on the legacy entry point raises the
+        # typed exception for in-process callers
+        self.assertEqual(1, self.sch.update_resources(base_version=0, A=1, B=3))
+        with self.assertRaises(ResourceVersionConflict) as ctx:
+            self.sch.update_resources(base_version=0, A=5, B=9)
+        self.assertEqual(0, ctx.exception.expected_version)
+        self.assertEqual(1, ctx.exception.current_version)
+        # nothing from the rejected change took effect
+        self.assertEqual({"A": 1, "B": 3}, self.sch.get_resources())
+        self.assertEqual(1, self.sch.get_resource_version())
 
     def test_do_not_allow_stowaway_resources(self):
         self.sch.add_task_batcher(worker=WORKER, task_family="A", batched_args=["a"])

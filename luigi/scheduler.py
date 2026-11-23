@@ -85,6 +85,29 @@ def _get_empty_retry_policy():
     return RetryPolicy(*[None] * len(_retry_policy_fields))
 
 
+class ResourceVersionConflict(Exception):
+    """
+    Raised when a grouped resource change is submitted against a resource
+    quota version that is no longer current.
+
+    Resource limits carry a monotonically increasing version number. Every
+    confirmed change (through either operations entry point) bumps the
+    version. A grouped change must declare the version it was based on; if
+    another confirmed change landed in the meantime, the whole grouped
+    change is rejected atomically so that an already confirmed resource
+    adjustment can never be undone by a late-arriving adjustment based on
+    stale data.
+    """
+
+    def __init__(self, expected_version, current_version):
+        self.expected_version = expected_version
+        self.current_version = current_version
+        super(ResourceVersionConflict, self).__init__(
+            "Resource quota version conflict: change was based on version {} but the "
+            "current version is {}".format(expected_version, current_version)
+        )
+
+
 def rpc_method(**request_args):
     def _rpc_method(fn):
         # If request args are passed, return this function again for use as
@@ -698,6 +721,11 @@ class Scheduler:
         else:
             self._task_history = history.NopHistory()
         self._resources = resources or configuration.get_config().getintdict("resources")  # TODO: Can we make this a Parameter?
+        # Monotonic version of the resource quota. It starts at 0 and is
+        # bumped once per confirmed resource limit change, regardless of
+        # which operations entry point submitted the change. Grouped changes
+        # use it for optimistic concurrency control.
+        self._resource_version = 0
         self._make_task = functools.partial(Task, retry_policy=self._config._get_retry_policy())
         self._worker_requests = {}
         self._paused = False
@@ -1036,17 +1064,81 @@ class Scheduler:
             self._paused = False
 
     @rpc_method()
-    def update_resources(self, **resources):
-        if self._resources is None:
-            self._resources = {}
-        self._resources.update(resources)
+    def update_resources(self, base_version=None, **resources):
+        """
+        Apply a grouped change of resource limits.
+
+        When ``base_version`` is given, the whole group is applied atomically
+        only if the current resource quota version still matches it. If
+        another change has been confirmed in the meantime, a
+        :class:`ResourceVersionConflict` is raised and none of the new limits
+        take effect. When ``base_version`` is omitted the call behaves as the
+        legacy unversioned update.
+
+        Returns the resource quota version in effect after the change.
+        """
+        self._apply_resource_change(resources, base_version)
+        return self._resource_version
 
     @rpc_method()
     def update_resource(self, resource, amount):
         if not isinstance(amount, int) or amount < 0:
             return False
         self._resources[resource] = amount
+        # The legacy single-resource entry point stays available; every
+        # confirmed change still bumps the quota version so that stale
+        # grouped changes cannot overwrite it.
+        self._resource_version += 1
         return True
+
+    def _apply_resource_change(self, resources, base_version=None):
+        """
+        Apply a grouped resource change with optimistic concurrency control.
+
+        The check and the update happen together so a stale grouped change is
+        rejected atomically: on a version mismatch nothing is written and a
+        :class:`ResourceVersionConflict` is raised.
+        """
+        if self._resources is None:
+            self._resources = {}
+        if base_version is not None and base_version != self._resource_version:
+            raise ResourceVersionConflict(base_version, self._resource_version)
+        self._resources.update(resources)
+        self._resource_version += 1
+
+    @rpc_method()
+    def update_resources_grouped(self, base_version, resources=None):
+        """
+        Operations entry point for a grouped resource quota change.
+
+        The whole group (a mapping of resource name to new limit) is based on
+        the quota version ``base_version``. On success it returns
+        ``{"status": "ok", "version": <new version>}``. On a stale base
+        version nothing is applied and it returns
+        ``{"status": "version_conflict", "expected_version": ...,
+        "current_version": ...}`` so that remote callers can refresh the
+        quota and retry instead of receiving an opaque server error.
+        """
+        resources = resources or {}
+        try:
+            self._apply_resource_change(resources, base_version)
+        except ResourceVersionConflict as conflict:
+            return {
+                "status": "version_conflict",
+                "expected_version": conflict.expected_version,
+                "current_version": conflict.current_version,
+            }
+        return {"status": "ok", "version": self._resource_version}
+
+    @rpc_method()
+    def get_resource_version(self):
+        """Return the current version of the resource quota."""
+        return self._resource_version
+
+    @rpc_method()
+    def get_resources(self):
+        """Return a copy of the current resource quota limits."""
+        return dict(self._resources or {})
 
     def _generate_retry_policy(self, task_retry_policy_dict):
         retry_policy_dict = self._config._get_retry_policy()._asdict()
@@ -1532,6 +1624,7 @@ class Scheduler:
                 tasks = consumers[resource["name"]]
                 resource["num_consumer"] = len(tasks)
                 resource["running"] = tasks
+                resource["version"] = self._resource_version
         return resources
 
     def resources(self):
