@@ -53,6 +53,7 @@ from tornado.concurrent import (
 )
 from tornado.escape import native_str, utf8
 from tornado.ioloop import IOLoop
+from tornado.iostream import IOStream
 from tornado.util import Configurable, _restore_exception
 
 
@@ -618,6 +619,16 @@ class HTTPResponse:
       plus ``queue``, which is the delay (if any) introduced by waiting for
       a slot under `AsyncHTTPClient`'s ``max_clients`` setting.
 
+    * ``stream``: the detached `.IOStream` when the request asked for a
+      protocol upgrade (via an ``Upgrade`` header) and the server
+      responded with ``101 Switching Protocols``. The stream is positioned
+      immediately after the response headers; any bytes of the new
+      protocol that arrived in the same packet as the end of the response
+      are still buffered and will be returned by the next read. The
+      caller takes ownership of the stream and is responsible for closing
+      it. Only ``simple_httpclient`` supports this; other clients always
+      leave it as ``None``.
+
     .. versionadded:: 5.1
 
        Added the ``start_time`` attribute.
@@ -628,6 +639,10 @@ class HTTPResponse:
        for ``simple_httpclient``, but not in ``curl_httpclient``. Now queueing time
        is excluded in both implementations. ``request_time`` is now more accurate for
        ``curl_httpclient`` because it uses a monotonic clock when available.
+
+    .. versionadded:: 6.7
+
+       Added the ``stream`` attribute.
     """
 
     # I'm not sure why these don't get type-inferred from the references in __init__.
@@ -676,6 +691,7 @@ class HTTPResponse:
         self.start_time = start_time
         self.request_time = request_time
         self.time_info = time_info or {}
+        self.stream: IOStream | None = None
 
     @property
     def body(self) -> bytes:

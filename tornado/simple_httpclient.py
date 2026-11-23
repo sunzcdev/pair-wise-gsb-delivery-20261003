@@ -638,6 +638,39 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                 self.request.header_callback(f"{k}: {v}\r\n")
             self.request.header_callback("\r\n")
 
+        if first_line.code == 101 and "Upgrade" in self.request.headers:
+            # The server accepted a protocol upgrade. Detach the stream
+            # from the HTTP connection and hand it to the caller via the
+            # response; everything after the 101 response headers
+            # (including any bytes of the new protocol that were
+            # coalesced with the end of the response in the same packet)
+            # belongs to the new protocol.
+            self._detach_upgrade()
+            return
+
+    def _detach_upgrade(self) -> None:
+        # From this point on the stream belongs to the upgraded protocol,
+        # so the timeout and close callback of this HTTP request cycle
+        # must no longer affect it. HTTP1Connection.detach() clears the
+        # stream's close callback; remove our request timeout as well.
+        self._remove_timeout()
+        stream = self.connection.detach()
+        original_request = getattr(self.request, "original_request", self.request)
+        response = HTTPResponse(
+            original_request,
+            cast(int, self.code),
+            reason=getattr(self, "reason", None),
+            headers=self.headers,
+            request_time=self.io_loop.time() - self.start_time,
+            start_time=self.start_wall_time,
+            effective_url=self.request.url,
+        )
+        # A completed protocol switch is a success, not an error, even
+        # though 101 is outside the 2xx range.
+        response.error = None
+        response.stream = stream
+        self._run_callback(response)
+
     def _should_follow_redirect(self) -> bool:
         if self.request.follow_redirects:
             assert self.request.max_redirects is not None

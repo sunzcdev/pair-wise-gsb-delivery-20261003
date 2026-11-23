@@ -59,7 +59,7 @@ from tornado.test.util import (
     refusing_port,
     skipIfNoIPv6,
 )
-from tornado.testing import ExpectLog, gen_test
+from tornado.testing import ExpectLog, bind_unused_port, gen_test
 from tornado.web import Application, RequestHandler, stream_request_body, url
 
 
@@ -842,6 +842,82 @@ class HTTP1xxLimitTestCase(AsyncHTTPTestCase):
         ):
             with self.assertRaises(HTTPStreamClosedError):
                 self.fetch("/?num=%d" % (_MAX_1XX_RESPONSES + 1), raise_error=True)
+
+
+class HTTPUpgradeTestCase(AsyncTestCase):
+    """A 101 response to an upgrade request hands the stream to the caller.
+
+    The last line of the 101 response and the first segment of the new
+    protocol may share a TCP packet, so the caller must be able to read
+    bytes that were already buffered when the response was received.
+    """
+
+    FIRST_SEGMENT = b"protocol-one:"
+    SECOND_SEGMENT = b"protocol-two"
+
+    def setUp(self):
+        super().setUp()
+        self.server = self.UpgradeServer(self)
+        sock, self.port = bind_unused_port()
+        self.server.add_socket(sock)
+        self.http_client = self.create_client()
+
+    def tearDown(self):
+        self.http_client.close()
+        self.server.stop()
+        super().tearDown()
+
+    def create_client(self, **kwargs):
+        return SimpleAsyncHTTPClient(force_instance=True, **kwargs)
+
+    class UpgradeServer(TCPServer):
+        def __init__(self, test):
+            super().__init__()
+            self.test = test
+            self.stream = None
+
+        async def handle_stream(self, stream, address):
+            self.stream = stream
+            await stream.read_until(b"\r\n\r\n")
+            # Write the last line of the 101 response and the first
+            # segment of the new protocol in a single write, so that they
+            # may be coalesced into one TCP packet. The second segment
+            # follows in a separate write.
+            await stream.write(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Upgrade: test-protocol\r\n"
+                b"\r\n"
+                + self.test.FIRST_SEGMENT
+            )
+            await stream.write(self.test.SECOND_SEGMENT)
+            # Keep the connection open; the client closes it.
+
+    @gen_test
+    async def test_upgrade_stream_handoff(self):
+        response = await self.http_client.fetch(
+            "http://127.0.0.1:%d/" % self.port,
+            headers={"Connection": "Upgrade", "Upgrade": "test-protocol"},
+            request_timeout=0.2,
+        )
+        self.assertEqual(response.code, 101)
+        self.assertIsNone(response.error)
+        stream = response.stream
+        self.assertIsNotNone(stream)
+        assert stream is not None
+        # The read starts from the beginning of the first segment of the
+        # new protocol, even though it was buffered together with the
+        # last line of the 101 response.
+        data = await stream.read_bytes(len(self.FIRST_SEGMENT))
+        self.assertEqual(data, self.FIRST_SEGMENT)
+        # The second segment, sent separately, follows it.
+        data = await stream.read_bytes(len(self.SECOND_SEGMENT))
+        self.assertEqual(data, self.SECOND_SEGMENT)
+        # The old request cycle's timeout must not close the upgraded
+        # stream once it has been handed off.
+        await gen.sleep(0.4)
+        self.assertFalse(stream.closed())
+        stream.close()
 
 
 def gzip_members() -> list[bytes]:
