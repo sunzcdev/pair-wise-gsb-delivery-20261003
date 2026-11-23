@@ -1694,6 +1694,339 @@ async def test_response_aggregation_random_delay():
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("quick_timing", "quick_aggregation_timing")
+async def test_aggregated_response_reflects_registry_at_send_time(run_isolated: None) -> None:
+    """Verify an aggregated response queued before an update and an unregister sends only current records."""
+    type_ = "_mservice._tcp.local."
+
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    await aiozc.zeroconf.async_wait_for_start()
+    for queue in (aiozc.zeroconf.out_queue, aiozc.zeroconf.out_delay_queue):
+        queue._multicast_delay_random_min = 1
+        queue._multicast_delay_random_max = 5
+
+    name = "xxxyyy"
+    name2 = "zzzyyy"
+    registration_name = f"{name}.{type_}"
+    registration_name2 = f"{name2}.{type_}"
+
+    desc = {"path": "/healthz/"}
+    info = make_service_info(type_, registration_name, properties=desc, server="ash-1.local.", port=8000)
+    info2 = make_service_info(
+        type_,
+        registration_name2,
+        properties=desc,
+        server="ash-2.local.",
+        port=8001,
+        addresses=[socket.inet_aton("10.7.4.3")],
+    )
+    zc = aiozc.zeroconf
+    zc.registry.async_add(info)
+    zc.registry.async_add(info2)
+
+    query = r.DNSOutgoing(const._FLAGS_QR_QUERY, multicast=True)
+    query.add_question(r.DNSQuestion(type_, const._TYPE_PTR, const._CLASS_IN))
+
+    protocol = zc.engine.protocols[0]
+    sent_answer_groups: list[dict] = []
+    real_construct = construct_outgoing_multicast_answers
+
+    def spy_construct_outgoing_multicast_answers(answers):
+        sent_answer_groups.append(answers)
+        return real_construct(answers)
+
+    with (
+        patch.object(zc, "async_send") as send_mock,
+        patch(
+            "zeroconf._handlers.multicast_outgoing_queue.construct_outgoing_multicast_answers",
+            spy_construct_outgoing_multicast_answers,
+        ),
+    ):
+        protocol.datagram_received(query.packets()[0], ("127.0.0.1", const._MDNS_PORT))
+
+        # The aggregated response is queued with the records as they
+        # were registered at query time (old port for the first instance)
+        assert len(zc.out_queue.queue) == 1
+        group = zc.out_queue.queue[0]
+        assert info.dns_service() in group.answers[info.dns_pointer()]
+        assert info2.dns_pointer() in group.answers
+        send_after = group.send_after
+        send_before = group.send_before
+
+        # Update the port of the first instance and unregister the
+        # second one before the queue flushes
+        info_updated = make_service_info(
+            type_, registration_name, properties=desc, server="ash-1.local.", port=9000
+        )
+        update_done = await aiozc.async_update_service(info_updated)
+        unregister_done = await aiozc.async_unregister_service(info2)
+
+        # The updates must not move the pending group's deadlines
+        assert zc.out_queue.queue[0] is group
+        assert group.send_after == send_after
+        assert group.send_before == send_before
+
+        await asyncio.gather(update_done, unregister_done)
+        await asyncio.sleep(0.1)
+
+        # Exactly one aggregated response went out
+        assert len(sent_answer_groups) == 1
+        flushed = sent_answer_groups[0]
+
+        # The still-registered instance is answered with the current
+        # records: the SRV additional carries the new port, not the old one
+        assert info_updated.dns_pointer() in flushed
+        assert info_updated.dns_service() in flushed[info_updated.dns_pointer()]
+        assert info.dns_service() not in flushed[info_updated.dns_pointer()]
+
+        # The unregistered instance is gone from the aggregated response
+        all_flushed = set(flushed)
+        for additionals in flushed.values():
+            all_flushed.update(additionals)
+        assert info2.dns_pointer() not in all_flushed
+        assert info2.dns_service() not in all_flushed
+        assert info2.dns_text() not in all_flushed
+        assert not any(record.name == info2.server for record in all_flushed)
+
+        # On the wire: the stale SRV (old port) never goes out, the
+        # current one does, and the unregistered instance only appears
+        # in goodbye (ttl=0) records
+        sent_records = []
+        for call in send_mock.mock_calls:
+            outgoing = call.args[0]
+            for packet in outgoing.packets():
+                sent_records.extend(r.DNSIncoming(packet).answers())
+        assert info.dns_service() not in sent_records
+        assert info_updated.dns_service() in sent_records
+        goodbyes = [record for record in sent_records if record.ttl == 0]
+        assert info2.dns_pointer() in goodbyes
+        assert info2.dns_service() in goodbyes
+        assert info2.dns_pointer() not in [record for record in sent_records if record.ttl != 0]
+
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("quick_timing", "quick_aggregation_timing")
+async def test_aggregated_response_dropped_when_service_unregistered_before_send(
+    run_isolated: None,
+) -> None:
+    """Verify a queued aggregated response is dropped when nothing it holds is still registered."""
+    type_ = "_mservice._tcp.local."
+
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    await aiozc.zeroconf.async_wait_for_start()
+    for queue in (aiozc.zeroconf.out_queue, aiozc.zeroconf.out_delay_queue):
+        queue._multicast_delay_random_min = 1
+        queue._multicast_delay_random_max = 5
+
+    registration_name = f"xxxyyy.{type_}"
+    info = make_service_info(
+        type_, registration_name, properties={"path": "/healthz/"}, server="ash-1.local."
+    )
+    zc = aiozc.zeroconf
+    zc.registry.async_add(info)
+
+    query = r.DNSOutgoing(const._FLAGS_QR_QUERY, multicast=True)
+    query.add_question(r.DNSQuestion(type_, const._TYPE_PTR, const._CLASS_IN))
+
+    protocol = zc.engine.protocols[0]
+    sent_answer_groups: list[dict] = []
+    real_construct = construct_outgoing_multicast_answers
+
+    def spy_construct_outgoing_multicast_answers(answers):
+        sent_answer_groups.append(answers)
+        return real_construct(answers)
+
+    with (
+        patch.object(zc, "async_send") as send_mock,
+        patch(
+            "zeroconf._handlers.multicast_outgoing_queue.construct_outgoing_multicast_answers",
+            spy_construct_outgoing_multicast_answers,
+        ),
+    ):
+        protocol.datagram_received(query.packets()[0], ("127.0.0.1", const._MDNS_PORT))
+        assert len(zc.out_queue.queue) == 1
+
+        # Withdraw the service before the queued response goes out
+        unregister_done = await aiozc.async_unregister_service(info)
+        await unregister_done
+        await asyncio.sleep(0.1)
+
+        # Nothing current remains to send, so the queue flushes empty
+        assert sent_answer_groups == []
+        assert len(zc.out_queue.queue) == 0
+
+        # The withdrawal itself was announced with goodbye records
+        sent_records = []
+        for call in send_mock.mock_calls:
+            for packet in call.args[0].packets():
+                sent_records.extend(r.DNSIncoming(packet).answers())
+        goodbyes = [record for record in sent_records if record.ttl == 0]
+        assert info.dns_pointer() in goodbyes
+        assert info.dns_service() in goodbyes
+
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("quick_timing", "quick_aggregation_timing")
+async def test_aggregated_enumeration_response_reflects_registry_at_send_time(
+    run_isolated: None,
+) -> None:
+    """Verify a queued service type enumeration response drops types that are unregistered."""
+    type_ = "_mservice._tcp.local."
+    type_2 = "_mservice2._tcp.local."
+
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    await aiozc.zeroconf.async_wait_for_start()
+    for queue in (aiozc.zeroconf.out_queue, aiozc.zeroconf.out_delay_queue):
+        queue._multicast_delay_random_min = 1
+        queue._multicast_delay_random_max = 5
+
+    desc = {"path": "/healthz/"}
+    info = make_service_info(type_, f"xxxyyy.{type_}", properties=desc, server="ash-1.local.")
+    info2 = make_service_info(
+        type_2,
+        f"xxxyyy.{type_2}",
+        properties=desc,
+        server="ash-2.local.",
+        addresses=[socket.inet_aton("10.7.4.3")],
+    )
+    zc = aiozc.zeroconf
+    zc.registry.async_add(info)
+    zc.registry.async_add(info2)
+
+    query = r.DNSOutgoing(const._FLAGS_QR_QUERY, multicast=True)
+    query.add_question(
+        r.DNSQuestion(const._SERVICE_TYPE_ENUMERATION_NAME, const._TYPE_PTR, const._CLASS_IN)
+    )
+
+    protocol = zc.engine.protocols[0]
+    sent_answer_groups: list[dict] = []
+    real_construct = construct_outgoing_multicast_answers
+
+    def spy_construct_outgoing_multicast_answers(answers):
+        sent_answer_groups.append(answers)
+        return real_construct(answers)
+
+    enum_ptr_type = r.DNSPointer(
+        const._SERVICE_TYPE_ENUMERATION_NAME, const._TYPE_PTR, const._CLASS_IN, 4500, type_
+    )
+    enum_ptr_type2 = r.DNSPointer(
+        const._SERVICE_TYPE_ENUMERATION_NAME, const._TYPE_PTR, const._CLASS_IN, 4500, type_2
+    )
+
+    with (
+        patch.object(zc, "async_send"),
+        patch(
+            "zeroconf._handlers.multicast_outgoing_queue.construct_outgoing_multicast_answers",
+            spy_construct_outgoing_multicast_answers,
+        ),
+    ):
+        protocol.datagram_received(query.packets()[0], ("127.0.0.1", const._MDNS_PORT))
+        assert len(zc.out_queue.queue) == 1
+        group = zc.out_queue.queue[0]
+        assert enum_ptr_type in group.answers
+        assert enum_ptr_type2 in group.answers
+
+        # Withdraw the only service of the first type before the queue flushes
+        unregister_done = await aiozc.async_unregister_service(info)
+        await unregister_done
+        await asyncio.sleep(0.1)
+
+        # Only the type that is still registered is enumerated
+        assert len(sent_answer_groups) == 1
+        flushed = sent_answer_groups[0]
+        assert enum_ptr_type2 in flushed
+        assert enum_ptr_type not in flushed
+
+    await aiozc.async_close()
+
+
+def test_outgoing_queue_current_record_against_registry(zc: Zeroconf) -> None:
+    """Verify queued records are validated against the registry before they are sent."""
+    type_ = "_mservice._tcp.local."
+    registration_name = f"xxxyyy.{type_}"
+    info = make_service_info(
+        type_, registration_name, properties={"path": "/healthz/"}, server="ash-1.local."
+    )
+    zc.registry.async_add(info)
+    queue = zc.out_queue
+
+    # Current records are kept
+    pointer = info.dns_pointer()
+    assert queue._current_record(pointer) is pointer
+    assert queue._current_record(info.dns_service()) == info.dns_service()
+    assert queue._current_record(info.dns_text()) == info.dns_text()
+    address = info.dns_addresses()[0]
+    assert queue._current_record(address) is address
+    nsec = info.dns_address_nsec()
+    assert nsec is not None
+    assert queue._current_record(nsec) is nsec
+
+    # A stale SRV (old port) is replaced with the current record
+    stale_srv = r.DNSService(
+        registration_name, const._TYPE_SRV, const._CLASS_IN, 120, 0, 0, 9999, "ash-1.local."
+    )
+    current_srv = queue._current_record(stale_srv)
+    assert current_srv == info.dns_service()
+    assert current_srv != stale_srv
+
+    # Records for names that are no longer registered are dropped
+    gone_name = f"gone.{type_}"
+    gone_ptr = r.DNSPointer(type_, const._TYPE_PTR, const._CLASS_IN, 4500, gone_name)
+    assert queue._current_record(gone_ptr) is None
+    gone_srv = r.DNSService(gone_name, const._TYPE_SRV, const._CLASS_IN, 120, 0, 0, 80, "ash-9.local.")
+    assert queue._current_record(gone_srv) is None
+    gone_txt = r.DNSText(gone_name, const._TYPE_TXT, const._CLASS_IN, 4500, b"path=/")
+    assert queue._current_record(gone_txt) is None
+
+    # A service type enumeration pointer is only kept while the type is registered
+    enum_ptr = r.DNSPointer(
+        const._SERVICE_TYPE_ENUMERATION_NAME, const._TYPE_PTR, const._CLASS_IN, 4500, type_
+    )
+    assert queue._current_record(enum_ptr) is enum_ptr
+    gone_enum_ptr = r.DNSPointer(
+        const._SERVICE_TYPE_ENUMERATION_NAME,
+        const._TYPE_PTR,
+        const._CLASS_IN,
+        4500,
+        "_nothere._tcp.local.",
+    )
+    assert queue._current_record(gone_enum_ptr) is None
+
+    # Addresses that are not current for the server are dropped
+    stale_address = r.DNSAddress(
+        "ash-1.local.", const._TYPE_A, const._CLASS_IN, 120, socket.inet_aton("10.0.0.99")
+    )
+    assert queue._current_record(stale_address) is None
+    gone_address = r.DNSAddress(
+        "no-such-host.local.", const._TYPE_A, const._CLASS_IN, 120, socket.inet_aton("10.0.0.1")
+    )
+    assert queue._current_record(gone_address) is None
+
+    # NSEC records that no longer match the server are dropped
+    wrong_nsec = r.DNSNsec(
+        "ash-1.local.", const._TYPE_NSEC, const._CLASS_IN, 120, "ash-1.local.", [const._TYPE_AAAA]
+    )
+    assert queue._current_record(wrong_nsec) is None
+    gone_nsec = r.DNSNsec(
+        "no-such-host.local.",
+        const._TYPE_NSEC,
+        const._CLASS_IN,
+        120,
+        "no-such-host.local.",
+        [const._TYPE_A],
+    )
+    assert queue._current_record(gone_nsec) is None
+
+    # Record types the queue does not know about are kept as-is
+    hinfo = r.DNSHinfo("ash-1.local.", const._TYPE_HINFO, const._CLASS_IN, 120, "cpu", "os")
+    assert queue._current_record(hinfo) is hinfo
+
+
+@pytest.mark.asyncio
 async def test_future_answers_are_removed_on_send():
     """Verify any future answers scheduled to be sent are removed when we send."""
     type_ = "_mservice._tcp.local."

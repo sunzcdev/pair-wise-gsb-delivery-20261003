@@ -24,4 +24,8 @@ cdef class MulticastOutgoingQueue:
     @cython.locals(pending=AnswerGroup)
     cdef void _remove_answers_from_queue(self, cython.dict answers)
 
+    cdef cython.dict _current_answers(self, cython.dict answers)
+
+    cdef object _current_record(self, object record)
+
     cpdef void async_ready(self)
