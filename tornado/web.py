@@ -2081,6 +2081,29 @@ class RequestHandler:
         """
         raise NotImplementedError()
 
+    def send_continue(self) -> None:
+        """Sends an interim ``100 (Continue)`` response to the client.
+
+        When a client sends ``Expect: 100-continue``, it waits for this
+        response before sending the request body. Ordinarily the server sends
+        it automatically once `prepare` has returned, but a streaming handler
+        (one using `.stream_request_body`) can call this method during
+        `prepare` to let the client start sending while the handler finishes
+        its own initialization. The body is still delivered to
+        `data_received` only when the handler is ready to receive it, i.e.
+        after `prepare` has completed.
+
+        Calling this method has no effect if the client did not send
+        ``Expect: 100-continue``, if the continue response has already been
+        sent, or if the response has already begun (as when the handler
+        rejects the request in `prepare`). It may therefore be called
+        unconditionally.
+
+        .. versionadded:: 6.7
+        """
+        assert self.request.connection is not None
+        self.request.connection.send_continue()
+
     def _log(self) -> None:
         """Logs the current request.
 
@@ -2193,6 +2216,10 @@ def stream_request_body(cls: type[_RequestHandlerType]) -> type[_RequestHandlerT
       until those futures have completed.
     * The regular HTTP method (``post``, ``put``, etc) will be called after
       the entire body has been read.
+    * `.RequestHandler.send_continue` may be called from ``prepare`` to let a
+      client that sent ``Expect: 100-continue`` start sending the body before
+      ``prepare`` returns. ``data_received`` is still called only after
+      ``prepare`` has finished.
 
     See the `file receiver demo <https://github.com/tornadoweb/tornado/tree/stable/demos/file_upload/>`_
     for example usage.

@@ -131,6 +131,7 @@ tornado.http1connection.HTTP1Connection.is_client: attribute
 tornado.http1connection.HTTP1Connection.no_keep_alive: attribute
 tornado.http1connection.HTTP1Connection.params: attribute
 tornado.http1connection.HTTP1Connection.read_response: method(self, delegate)
+tornado.http1connection.HTTP1Connection.send_continue: method(self)
 tornado.http1connection.HTTP1Connection.set_body_timeout: method(self, timeout)
 tornado.http1connection.HTTP1Connection.set_close_callback: method(self, callback)
 tornado.http1connection.HTTP1Connection.set_max_body_size: method(self, max_body_size)
@@ -255,6 +256,7 @@ tornado.httpserver.HTTPServer.xheaders: attribute
 [tornado.httputil]
 tornado.httputil.HTTPConnection: class()
 tornado.httputil.HTTPConnection.finish: method(self)
+tornado.httputil.HTTPConnection.send_continue: method(self)
 tornado.httputil.HTTPConnection.write: method(self, chunk)
 tornado.httputil.HTTPConnection.write_headers: method(self, start_line, headers, chunk=None)
 tornado.httputil.HTTPFile: class(tornado.util.ObjectDict)
@@ -1044,6 +1046,7 @@ tornado.web.RequestHandler.render_string: method(self, template_name, **kwargs)
 tornado.web.RequestHandler.request: attribute
 tornado.web.RequestHandler.require_setting: method(self, name, feature='this feature')
 tornado.web.RequestHandler.reverse_url: method(self, name, *args)
+tornado.web.RequestHandler.send_continue: method(self)
 tornado.web.RequestHandler.send_error: method(self, status_code=500, **kwargs)
 tornado.web.RequestHandler.set_cookie: method(self, name, value, domain=None, expires=None, path='/', expires_days=None, *, max_age=None, httponly=False, secure=False, samesite=None, **kwargs)
 tornado.web.RequestHandler.set_default_headers: method(self)

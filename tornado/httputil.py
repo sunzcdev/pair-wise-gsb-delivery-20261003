@@ -804,6 +804,28 @@ class HTTPConnection:
         """Indicates that the last body data has been written."""
         raise NotImplementedError()
 
+    def send_continue(self) -> None:
+        """Tells the client that it may start sending the request body.
+
+        A request handler that is not yet ready to receive the body may call
+        this method (as `.RequestHandler.send_continue
+        <tornado.web.RequestHandler.send_continue>`) to send an interim
+        ``100 (Continue)`` response to a client that asked for one with the
+        ``Expect: 100-continue`` header. This lets the client start sending
+        the body while the handler finishes its own initialization.
+
+        Calling this method has no effect if the client did not ask to wait
+        for a continue response, if one has already been sent (whether by
+        the handler or automatically by the connection), or if the response
+        has already started.
+
+        The default implementation does nothing, since this response is not
+        used by all protocols.
+
+        .. versionadded:: 6.7
+        """
+        pass
+
 
 def url_concat(
     url: str,

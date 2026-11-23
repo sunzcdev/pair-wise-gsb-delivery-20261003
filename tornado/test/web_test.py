@@ -3589,10 +3589,50 @@ class StreamingRequestBodyTest(WebTestCase):
                 super().on_connection_close()
                 self.test.close_future.set_result(None)
 
+        @stream_request_body
+        class ContinueHandler(RequestHandler):
+            def initialize(self, test, confirm):
+                self.test = test
+                self.confirm = confirm
+
+            async def prepare(self):
+                # Check the request headers before deciding to accept the
+                # upload, then (optionally) tell the client it may start
+                # sending while the rest of the initialization is pending.
+                self.test.assertEqual(
+                    self.request.headers["Expect"], "100-continue"
+                )
+                if self.confirm:
+                    self.send_continue()
+                self.test.confirmed.set()
+                await self.test.gate.wait()
+
+            def data_received(self, chunk):
+                self.test.chunks.append(chunk)
+
+            def post(self):
+                self.write("accepted")
+
+        @stream_request_body
+        class RejectHandler(RequestHandler):
+            def initialize(self, test):
+                self.test = test
+
+            def prepare(self):
+                # Reject the upload before any continue response is sent.
+                self.set_status(413)
+                self.finish("too large")
+
+            def data_received(self, chunk):
+                self.test.chunks.append(chunk)
+
         return [
             ("/stream_body", StreamingBodyHandler, dict(test=self)),
             ("/early_return", EarlyReturnHandler),
             ("/close_detection", CloseDetectionHandler, dict(test=self)),
+            ("/continue", ContinueHandler, dict(test=self, confirm=True)),
+            ("/continue_default", ContinueHandler, dict(test=self, confirm=False)),
+            ("/reject", RejectHandler, dict(test=self)),
         ]
 
     def connect(self, url, connection_close):
@@ -3648,6 +3688,98 @@ class StreamingRequestBodyTest(WebTestCase):
         stream = self.connect(b"/close_detection", connection_close=False)
         stream.close()
         yield self.close_future
+
+    async def raw_upload(self, path, body=b""):
+        # Open a raw connection so the test controls when each piece of the
+        # body is sent, and reads the interim responses directly.
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", self.get_http_port()
+        )
+        writer.write(
+            b"POST "
+            + path.encode()
+            + b" HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Length: 4\r\n"
+            b"Expect: 100-continue\r\n"
+            b"Connection: close\r\n\r\n" + body
+        )
+        await writer.drain()
+        return reader, writer
+
+    @gen_test
+    async def test_explicit_continue_before_prepare(self):
+        # The handler confirms the upload and then blocks in prepare. The
+        # continue response is sent as soon as the handler asks for it, and
+        # the body (including a chunk that arrived early) is delivered only
+        # once prepare has finished. The automatic continue response must
+        # not be sent a second time.
+        self.chunks: list[bytes] = []
+        self.gate = Event()
+        self.confirmed = Event()
+
+        reader, writer = await self.raw_upload("/continue", body=b"pi")
+        await asyncio.wait_for(self.confirmed.wait(), 5)
+
+        data = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+        self.assertTrue(data.startswith(b"HTTP/1.1 100 "), data)
+        # The handler is not ready to receive yet, even though the client
+        # has already sent the first chunk.
+        self.assertEqual(self.chunks, [])
+
+        writer.write(b"ng")
+        await writer.drain()
+        self.gate.set()
+
+        rest = await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+        await writer.wait_closed()
+        self.assertTrue(rest.startswith(b"HTTP/1.1 200 "), rest)
+        self.assertTrue(rest.endswith(b"accepted"), rest)
+        # Only one continue response was sent.
+        self.assertNotIn(b"HTTP/1.1 100", rest)
+        self.assertEqual(b"".join(self.chunks), b"ping")
+
+    @gen_test
+    async def test_default_continue_waits_for_prepare(self):
+        # Without an explicit confirmation, the continue response keeps its
+        # old behavior and is not sent until prepare has finished.
+        self.chunks: list[bytes] = []
+        self.gate = Event()
+        self.confirmed = Event()
+
+        reader, writer = await self.raw_upload("/continue_default")
+        await asyncio.wait_for(self.confirmed.wait(), 5)
+        with self.assertRaises(TimeoutError):
+            await asyncio.wait_for(reader.read(1), 0.1)
+
+        self.gate.set()
+        data = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+        self.assertTrue(data.startswith(b"HTTP/1.1 100 "), data)
+
+        writer.write(b"ping")
+        await writer.drain()
+        rest = await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+        await writer.wait_closed()
+        self.assertTrue(rest.startswith(b"HTTP/1.1 200 "), rest)
+        self.assertNotIn(b"HTTP/1.1 100", rest)
+        self.assertEqual(b"".join(self.chunks), b"ping")
+
+    @gen_test
+    async def test_reject_before_continue(self):
+        # A handler that rejects the upload before sending a continue
+        # response does not confirm it, even though the first chunk has
+        # already arrived, and data_received is never called.
+        self.chunks: list[bytes] = []
+
+        reader, writer = await self.raw_upload("/reject", body=b"pi")
+        data = await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+        await writer.wait_closed()
+        self.assertTrue(data.startswith(b"HTTP/1.1 413 "), data)
+        self.assertNotIn(b"HTTP/1.1 100", data)
+        self.assertEqual(self.chunks, [])
 
 
 # Each method in this handler returns a yieldable object and yields to the

@@ -17,6 +17,7 @@
    .. automethod:: RequestHandler.initialize
    .. automethod:: RequestHandler.prepare
    .. automethod:: RequestHandler.on_finish
+   .. automethod:: RequestHandler.send_continue
 
    .. _verbs:
 

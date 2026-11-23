@@ -204,6 +204,9 @@ class HTTP1Connection(httputil.HTTPConnection):
         self._expected_content_remaining: int | None = None
         # A Future for our outgoing writes, returned by IOStream.write.
         self._pending_write: Future[None] | None = None
+        # True if the interim 100 (Continue) response has been sent (or was
+        # unnecessary because the client did not ask for one).
+        self._continue_sent = False
 
     def read_response(self, delegate: httputil.HTTPMessageDelegate) -> Awaitable[bool]:
         """Read a single HTTP response.
@@ -336,8 +339,12 @@ class HTTP1Connection(httputil.HTTPConnection):
                     need_delegate_close = False
                     return await self._read_message_inner(delegate, num_1xx + 1)
             else:
-                if headers.get("Expect") == "100-continue" and not self._write_finished:
-                    self.stream.write(b"HTTP/1.1 100 (Continue)\r\n\r\n")
+                # Send the continue response now unless the delegate has
+                # already sent it (which is allowed while the request is
+                # still waiting for the delegate's headers_received future,
+                # so that a streaming handler can let the client start
+                # sending before it is ready to receive the body).
+                self.send_continue()
             if not skip_body:
                 body_future = self._read_body(
                     resp_start_line.code if self.is_client else 0, headers, delegate
@@ -590,6 +597,38 @@ class HTTP1Connection(httputil.HTTPConnection):
             self._pending_write = self.stream.write(self._format_chunk(chunk))
             future_add_done_callback(self._pending_write, self._on_write_complete)
         return future
+
+    def send_continue(self) -> None:
+        """Implements `.HTTPConnection.send_continue`.
+
+        Sends an interim ``100 (Continue)`` response if the client asked for
+        one and we have not already sent it. This may be called from the
+        delegate's ``headers_received`` (before it returns) so that the
+        client can start sending the request body while the application is
+        still preparing to receive it.
+
+        The response is sent at most once, and never after the real response
+        has begun.
+        """
+        if self.is_client or self._continue_sent:
+            return
+        if self._request_headers is None:
+            return
+        if self._request_headers.get("Expect") != "100-continue":
+            # Nothing was requested; mark as done so a later call is a no-op.
+            self._continue_sent = True
+            return
+        if (
+            self._write_finished
+            or self._response_start_line is not None
+            or self.stream is None
+            or self.stream.closed()
+        ):
+            # The response has already started (or the connection is gone),
+            # so an interim response is no longer possible.
+            return
+        self._continue_sent = True
+        self.stream.write(b"HTTP/1.1 100 (Continue)\r\n\r\n")
 
     def finish(self) -> None:
         """Implements `.HTTPConnection.finish`."""

@@ -3,7 +3,12 @@ import socket
 
 from tornado import gen
 from tornado.http1connection import HTTP1Connection, HTTP1ServerConnection
-from tornado.httputil import HTTPMessageDelegate, HTTPServerConnectionDelegate
+from tornado.httputil import (
+    HTTPHeaders,
+    HTTPMessageDelegate,
+    HTTPServerConnectionDelegate,
+    ResponseStartLine,
+)
 from tornado.iostream import IOStream
 from tornado.locks import Event
 from tornado.log import app_log, gen_log
@@ -212,3 +217,206 @@ class HTTP1ConnectionTest(AsyncTestCase):
         yield server_conn._serving_future
         self.assertTrue(self.server_stream.closed())
         self.assertEqual(closed, [server_conn])
+
+
+class ServerContinueTest(AsyncTestCase):
+    """Tests for ``send_continue`` on a server-side `HTTP1Connection`."""
+
+    def setUp(self):
+        super().setUp()
+        self.asyncSetUp()
+
+    @gen_test
+    async def asyncSetUp(self):
+        self.server_socket, client_socket = socket.socketpair()
+        self.addCleanup(self.server_socket.close)
+        self.server_stream = IOStream(self.server_socket)
+        self.addCleanup(self.server_stream.close)
+        self.client_stream = IOStream(client_socket)
+        self.addCleanup(self.client_stream.close)
+        self.body = []
+
+    async def send_request(self, extra_headers=b"", body=b"", length=4):
+        head = (
+            b"POST / HTTP/1.1\r\nHost: example.com\r\n"
+            b"Content-Length: " + str(length).encode() + b"\r\n"
+            b"Connection: close\r\n"
+        )
+        await self.client_stream.write(head + extra_headers + b"\r\n" + body)
+
+    async def read_response_head(self):
+        data = await self.client_stream.read_until(b"\r\n\r\n")
+        lines = data.decode("latin1").split("\r\n")
+        status = int(lines[0].split(" ")[1])
+        return status, HTTPHeaders.parse("\r\n".join(lines[1:]))
+
+    async def assert_nothing_sent(self, timeout=0.05):
+        await gen.sleep(timeout)
+        self.assertEqual(self.client_stream._read_buffer, b"")
+
+    def respond(self, conn, status=200, body=b"done"):
+        conn.write_headers(
+            ResponseStartLine("HTTP/1.1", status, "OK"),
+            HTTPHeaders({"Content-Length": str(len(body))}),
+            body,
+        )
+        conn.finish()
+
+    @gen_test
+    async def test_send_continue_before_body_is_ready(self):
+        # send_continue from headers_received lets the client start sending
+        # before the delegate is ready to receive. The early body is not
+        # delivered until headers_received returns, and the automatic
+        # continue response does not send a second one.
+        conn = HTTP1Connection(self.server_stream, False)
+        ready = Event()
+        test = self
+
+        class Delegate(HTTPMessageDelegate):
+            def headers_received(self, start_line, headers):
+                conn.send_continue()
+                return ready.wait()
+
+            def data_received(self, chunk):
+                test.body.append(chunk)
+
+            def finish(self):
+                test.respond(conn)
+
+        reading = gen.convert_yielded(conn.read_response(Delegate()))
+        await self.send_request(extra_headers=b"Expect: 100-continue\r\n")
+
+        status, _ = await self.read_response_head()
+        self.assertEqual(status, 100)
+        await self.client_stream.write(b"ping")
+        await self.assert_nothing_sent()
+        self.assertEqual(self.body, [])
+
+        ready.set()
+        status, headers = await self.read_response_head()
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            await self.client_stream.read_bytes(int(headers["Content-Length"])),
+            b"done",
+        )
+        self.assertEqual(b"".join(self.body), b"ping")
+        await reading
+
+    @gen_test
+    async def test_default_continue_after_headers(self):
+        # Without an explicit call the continue response is deferred until
+        # headers_received completes.
+        conn = HTTP1Connection(self.server_stream, False)
+        ready = Event()
+        test = self
+
+        class Delegate(HTTPMessageDelegate):
+            def headers_received(self, start_line, headers):
+                return ready.wait()
+
+            def data_received(self, chunk):
+                test.body.append(chunk)
+
+            def finish(self):
+                test.respond(conn)
+
+        reading = gen.convert_yielded(conn.read_response(Delegate()))
+        await self.send_request(extra_headers=b"Expect: 100-continue\r\n")
+        await self.assert_nothing_sent()
+
+        ready.set()
+        status, _ = await self.read_response_head()
+        self.assertEqual(status, 100)
+        await self.client_stream.write(b"ping")
+        status, headers = await self.read_response_head()
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            await self.client_stream.read_bytes(int(headers["Content-Length"])),
+            b"done",
+        )
+        self.assertEqual(b"".join(self.body), b"ping")
+        await reading
+
+    @gen_test
+    async def test_send_continue_is_idempotent(self):
+        # Calling send_continue repeatedly, then letting the automatic path
+        # run, still sends exactly one continue response.
+        conn = HTTP1Connection(self.server_stream, False)
+        test = self
+
+        class Delegate(HTTPMessageDelegate):
+            def headers_received(self, start_line, headers):
+                conn.send_continue()
+                conn.send_continue()
+                conn.send_continue()
+
+            def data_received(self, chunk):
+                test.body.append(chunk)
+
+            def finish(self):
+                test.respond(conn)
+
+        reading = gen.convert_yielded(conn.read_response(Delegate()))
+        await self.send_request(
+            extra_headers=b"Expect: 100-continue\r\n", body=b"ping"
+        )
+        status, _ = await self.read_response_head()
+        self.assertEqual(status, 100)
+        status, headers = await self.read_response_head()
+        self.assertEqual(status, 200)
+        await self.client_stream.read_bytes(int(headers["Content-Length"]))
+        self.assertEqual(b"".join(self.body), b"ping")
+        await reading
+
+    @gen_test
+    async def test_no_continue_without_expect(self):
+        # send_continue has no effect when the client did not ask for one.
+        conn = HTTP1Connection(self.server_stream, False)
+        test = self
+
+        class Delegate(HTTPMessageDelegate):
+            def headers_received(self, start_line, headers):
+                conn.send_continue()
+
+            def data_received(self, chunk):
+                test.body.append(chunk)
+
+            def finish(self):
+                test.respond(conn)
+
+        reading = gen.convert_yielded(conn.read_response(Delegate()))
+        await self.send_request(body=b"ping")
+        status, headers = await self.read_response_head()
+        self.assertEqual(status, 200)
+        await self.client_stream.read_bytes(int(headers["Content-Length"]))
+        self.assertEqual(b"".join(self.body), b"ping")
+        await reading
+
+    @gen_test
+    async def test_no_continue_after_response_started(self):
+        # A delegate that rejects the request before confirming it does not
+        # get a continue response afterwards, and the body is not delivered.
+        conn = HTTP1Connection(self.server_stream, False)
+        test = self
+
+        class Delegate(HTTPMessageDelegate):
+            def headers_received(self, start_line, headers):
+                conn.write_headers(
+                    ResponseStartLine("HTTP/1.1", 413, "Payload Too Large"),
+                    HTTPHeaders({"Content-Length": "9"}),
+                    b"too large",
+                )
+                conn.send_continue()
+                conn.finish()
+
+            def data_received(self, chunk):
+                raise AssertionError("data_received should not be called")
+
+        reading = gen.convert_yielded(conn.read_response(Delegate()))
+        await self.send_request(
+            extra_headers=b"Expect: 100-continue\r\n", body=b"ping"
+        )
+        status, headers = await self.read_response_head()
+        self.assertEqual(status, 413)
+        self.assertEqual(await self.client_stream.read_bytes(9), b"too large")
+        await reading
