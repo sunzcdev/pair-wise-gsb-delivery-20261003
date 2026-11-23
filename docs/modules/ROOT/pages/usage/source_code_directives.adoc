@@ -1,0 +1,422 @@
+= Source Code Directives
+
+RuboCop can be controlled within your source code using special comments.
+These directives let you disable or enable cops for specific sections of a file,
+without changing your `.rubocop.yml` configuration.
+
+== Disabling Cops within Source Code
+
+One or more individual cops can be disabled locally in a section of a
+file by adding a comment such as
+
+[source,ruby]
+----
+# rubocop:disable Layout/LineLength, Style/StringLiterals
+[...]
+# rubocop:enable Layout/LineLength, Style/StringLiterals
+----
+
+You can also disable entire departments by giving a department name in the comment.
+
+[source,ruby]
+----
+# rubocop:disable Metrics, Layout/LineLength
+[...]
+# rubocop:enable Metrics, Layout/LineLength
+----
+
+You can also disable _all_ cops with
+
+[source,ruby]
+----
+# rubocop:disable all
+[...]
+# rubocop:enable all
+----
+
+In cases where you want to differentiate intentionally-disabled cops vs. cops
+you'd like to revisit later, you can use `rubocop:todo` as an alias of
+`rubocop:disable`.
+
+[source,ruby]
+----
+# rubocop:todo Layout/LineLength, Style/StringLiterals
+[...]
+# rubocop:enable Layout/LineLength, Style/StringLiterals
+----
+
+One or more cops can be disabled on a single line with an end-of-line
+comment.
+
+[source,ruby]
+----
+for x in (0..19) # rubocop:disable Style/For
+----
+
+== Disabling Cops for the Next Statement
+
+A `disable-next` directive on its own line disables the listed cops for the
+whole statement that follows it - however many lines that statement spans.
+This avoids both the end-of-line comment (which can push a line over the
+length limit) and a `disable`/`enable` pair around a single construct.
+
+[source,ruby]
+----
+# rubocop:disable-next Metrics/MethodLength
+def complicated_method
+  # the whole method definition is covered
+end
+----
+
+The scope is the next _statement_, so a method definition, a class body or a
+loop are each covered in full by a single directive. Everything the other
+directives support works here too: multiple cops, department names, `all`,
+and a trailing `--` comment. `todo-next` is the equivalent of `rubocop:todo`.
+
+Directives on consecutive comment lines stack onto the same statement, which
+is useful for giving each cop its own justification:
+
+[source,ruby]
+----
+# rubocop:disable-next Metrics/MethodLength -- legacy, tracked in #123
+# rubocop:disable-next Metrics/AbcSize -- ditto
+def complicated_method
+end
+----
+
+A blank line breaks the attachment: the directive applies to nothing, and
+`Lint/RedundantCopDisableDirective` will flag it, as it does any
+`disable-next` whose statement produces no offenses. Unlike `disable`,
+a `disable-next` cannot appear at the end of a code line.
+
+Since only blank lines break the attachment, a `disable-next` also chains
+past other directive comments - including `rubocop:push` and `rubocop:pop` -
+and composes with them: inside a pushed scope, a statement is covered by
+both the pushed settings and any `disable-next` above it.
+
+If you want to disable a cop that inspects comments, you can do so by
+adding an "inner comment" on the comment line.
+
+[source,ruby]
+----
+# coding: utf-8 # rubocop:disable Style/Encoding
+----
+
+Running `rubocop --autocorrect --disable-uncorrectable` will
+create comments to disable all offenses that can't be automatically
+corrected.
+
+You can add a comment to the disabling/enabling directive by prefixing it with `--`. For example:
+
+[source,ruby]
+----
+# rubocop:disable Layout/LineLength -- A comment explaining why the cop is disabled
+----
+
+The syntax of directives can be checked using the cop `Lint/CopDirectiveSyntax`.
+
+To see what the directives in a codebase actually suppress, run with
+`--display-suppressed`: suppressed offenses are reported tagged `[Suppressed]`
+(including their `--` justification in the JSON formatter) without affecting
+the exit code. Relatedly, `--ignore-disable-comments` runs cops as if no
+directives existed at all.
+
+== Toggling Cops for the Next Statement
+
+The `next` directive combines the statement scope of `disable-next` with the
+`+`/`-` argument syntax of `push`: each `-` argument disables a cop for the
+next statement, and each `+` argument enables one there. It shines when a
+single statement needs settings toggled in both directions:
+
+[source,ruby]
+----
+# rubocop:disable Metrics/MethodLength
+def big_method
+  # ...
+
+  # rubocop:next +Metrics/MethodLength -Style/GuardClause -- this part is settled
+  def helper
+    return unless valid?
+
+    process
+  end
+
+  # ...
+end
+# rubocop:enable Metrics/MethodLength
+----
+
+`# rubocop:next -Cop` is equivalent to `# rubocop:disable-next Cop`. A `+`
+argument suspends the enclosing disable - whether it comes from a `disable`
+directive, a pushed `-` setting, or the cop being disabled in the
+configuration - for exactly one statement, with no `enable`/`disable` or
+`pop` bookkeeping. Attachment follows the `disable-next` rules: the
+directive must sit on its own comment line, chains past other comment
+lines, and a blank line detaches it.
+
+When you only enable, `enable-next` says the same thing without the sign
+soup - it is to `next +Cop` what `disable-next` is to `next -Cop`, and it
+also accepts `all`:
+
+[source,ruby]
+----
+# rubocop:disable Metrics/AbcSize
+# ...
+
+# rubocop:enable-next Metrics/AbcSize -- this method is settled
+def finished_method
+  # checked again from here on
+end
+
+# ...
+# rubocop:enable Metrics/AbcSize
+----
+
+== Temporarily Enabling Cops in Source Code
+
+In a similar way to disabling cops within source code, you can also temporarily enable specific
+cops if you want to enforce specific rules for part of a file.
+
+Let's use the cop `Style/AsciiComments`, which is by default `Enabled: false`. Say you want a
+specific file to have ASCII-only comments to be compatible with some post-processing tool:
+
+[source,ruby]
+----
+# rubocop:enable Style/AsciiComments
+# If applicable, leave a comment to others explaining the rationale:
+# We need the comments to remain ASCII only for compatibility with lib/post_processor.rb
+
+class Restaurant
+  # This comment has to be ASCII-only because of the rubocop:enable directive
+  def menu
+    return dishes.map(&:humanize)
+  end
+end
+----
+
+You can also enforce the same for part of a file by disabling the cop afterwards
+
+[source,ruby]
+----
+class Dish
+  def humanize
+    return [
+      "Delicious #{self.name}"
+      *ingredients
+    ].join("\n")
+  end
+end
+
+# rubocop:enable Style/AsciiComments
+# If applicable, leave a comment to others explaining the rationale:
+# We need the comments to remain ASCII only for compatibility with lib/post_processor.rb
+
+class Restaurant
+  # This comment has to be ASCII-only because of the rubocop:enable directive
+  def menu
+    return dishes.map(&:humanize)
+  end
+end
+
+# rubocop:disable Style/AsciiComments
+
+class Ingredient
+  # Notice how the comment below is non-ASCII
+  # Gets rid of odd characters like 😀, ͸
+  def sanitize
+    self.name.gsub(/[^a-z]/, '')
+  end
+end
+----
+
+NOTE: If a file is excluded via configuration (e.g., in `.rubocop.yml` or `.rubocop_todo.yml`),
+`rubocop:enable` comments within that file will have no effect. Configuration-based exclusions take
+precedence over in-source opt-in directives.
+
+== Scoped Disabling with Push/Pop Directives
+
+When you want to temporarily change cop settings for a specific section of code
+and then automatically restore the previous state, you can use `rubocop:push` and
+`rubocop:pop` directives. This is particularly useful when you need to disable
+cops for a block of code without affecting the rest of the file.
+
+=== Basic Push/Pop Usage
+
+The `push` directive saves the current state of all cop settings, and `pop`
+restores them:
+
+[source,ruby]
+----
+def process_data(input)
+  result = input.upcase
+  # rubocop:push
+  # rubocop:disable Style/GuardClause
+  if result.present?
+    return result.strip
+  end
+  # rubocop:pop
+  nil
+end
+----
+
+After `pop`, the `Style/GuardClause` cop is automatically re-enabled, returning
+to its state before `push`.
+
+=== Inline Push Arguments
+
+For convenience, you can combine `push` with enable/disable operations using
+inline arguments. Use `-` to disable a cop and `+` to enable a cop:
+
+[source,ruby]
+----
+def process_data(input)
+  result = input.upcase
+  # rubocop:push -Style/GuardClause
+  if result.present?
+    return result.strip
+  end
+  # rubocop:pop
+  nil
+end
+----
+
+You can specify multiple cops with different operations:
+
+[source,ruby]
+----
+# rubocop:disable Style/For
+for x in [1, 2, 3]
+  puts x
+end
+# rubocop:push +Style/For -Style/GuardClause
+for y in [4, 5, 6]  # Style/For is re-enabled here
+  if y > 0
+    return y        # Style/GuardClause is disabled here
+  end
+end
+# rubocop:pop
+# Back to original state: Style/For disabled, Style/GuardClause enabled
+----
+
+=== Nested Push/Pop
+
+Push/pop directives can be nested for complex scenarios:
+
+[source,ruby]
+----
+# rubocop:disable Metrics/MethodLength
+def complex_method
+  step1
+  # rubocop:push
+  # rubocop:enable Metrics/MethodLength
+  # rubocop:disable Style/GuardClause
+  def helper_method
+    # rubocop:push
+    # rubocop:enable Style/GuardClause
+    if condition
+      return value
+    end
+    # rubocop:pop
+    other_code
+  end
+  # rubocop:pop
+  step2
+end
+----
+
+Each `pop` restores the state to what it was at the corresponding `push`.
+
+== Choosing a Directive Form
+
+The forms are ordered here from the tightest scope to the widest - prefer
+the tightest one that fits, since it suppresses the least and cannot drift
+as the code around it changes:
+
+* *End-of-line `disable`* - a single offense on a single line. The most
+  common form. Reach for the next one when the comment would push the line
+  over the length limit, or when several cops need separate justifications.
+* *`disable-next`* - everything about one statement, however many lines it
+  spans: a method definition, a class body, a loop. The scope is derived
+  from the code itself, so it never needs re-adjusting when the statement
+  grows or shrinks.
+* *`enable-next`* - the mirror image of `disable-next`: re-enables a cop
+  for one statement inside a disabled region.
+* *`next`* - the same statement scope, with `push`-style `+`/`-` arguments,
+  for the rare statement that needs settings toggled in both directions at
+  once. `next -Cop` is `disable-next Cop`; `next +Cop` is
+  `enable-next Cop`.
+* *`disable` / `enable` pair* - an explicit region spanning several
+  statements. The boundaries are yours to maintain:
+  `Lint/MissingCopEnableDirective` guards against forgetting the closing
+  `enable`.
+* *`push` / `pop`* - a region where you change several settings at once
+  (disabling some cops, enabling others) and want the previous state
+  restored exactly, including inside nested scopes. Unlike a
+  `disable`/`enable` pair, `pop` cannot get the restored state wrong,
+  because it never states it - it restores whatever was saved.
+
+`todo` and `todo-next` are aliases of `disable` and `disable-next` that mark
+a suppression you intend to revisit rather than a deliberate exception.
+
+The `Style/DirectiveScope` cop can enforce the tightest-form preference: it
+flags `disable`/`enable` and `enable`/`disable` pairs as well as `push`/`pop`
+scopes with signed arguments that wrap a single statement, and converts them
+to the matching next-statement form (`disable-next`, `enable-next` or
+`next`).
+
+== Cops That Check Directives
+
+Directives are code too, and a handful of cops keep them honest. All but the
+last two are on by default, so most of this happens without any configuration.
+
+|===
+| Cop | What it reports | Default
+
+| xref:cops_lint.adoc#lintcopdirectivesyntax[`Lint/CopDirectiveSyntax`]
+| A directive RuboCop cannot act on: a missing or misspelled mode, cop names
+  that are not comma-separated, a trailing comment that does not start with
+  `--`, a second directive on the same line, or a cop name that does not
+  exist. These suppress nothing, silently, which is what makes them worth
+  reporting.
+| Enabled
+
+| xref:cops_migration.adoc#migrationdepartmentname[`Migration/DepartmentName`]
+| A cop named without its department, such as `# rubocop:disable LineLength`.
+| Enabled
+
+| xref:cops_lint.adoc#lintredundantcopdisabledirective[`Lint/RedundantCopDisableDirective`]
+| A `disable` that is no longer suppressing anything - the offense it was
+  hiding is gone. Autocorrection removes the directive along with its `--`
+  reason.
+| Enabled
+
+| xref:cops_lint.adoc#lintredundantcopenabledirective[`Lint/RedundantCopEnableDirective`]
+| An `enable` for a cop that was not disabled at that point.
+| Enabled
+
+| xref:cops_lint.adoc#lintmissingcopenabledirective[`Lint/MissingCopEnableDirective`]
+| A `disable` that is never closed, so it runs to the end of the file.
+  `MaxRangeSize` bounds how many lines a region may span before it is
+  reported.
+| Enabled
+
+| xref:cops_style.adoc#styledirectivescope[`Style/DirectiveScope`]
+| A `disable`/`enable` pair or a `push`/`pop` scope that wraps a single
+  statement and could use the tighter next-statement form.
+| Pending
+
+| xref:cops_style.adoc#styledisablecopswithinsourcecodedirective[`Style/DisableCopsWithinSourceCodeDirective`]
+| Directives themselves, for projects that would rather not have them. It can
+  forbid them outright, restrict which cops may be suppressed with
+  `AllowedCops`/`DisallowedCops`, exempt whole directive forms with
+  `AllowedDirectives`, or - with `AllowWithReason` - permit any directive that
+  carries a `--` justification.
+| Disabled
+|===
+
+Two of these are deliberately hard to silence with a directive, for the obvious
+reason. `Lint/RedundantCopDisableDirective` is not covered by
+`# rubocop:disable all` or by disabling the `Lint` department - a pointless
+directive is exactly what it exists to report - so it has to be named to be
+turned off. `Style/DisableCopsWithinSourceCodeDirective` goes further: once it is
+explicitly enabled, no directive can disable it at all.

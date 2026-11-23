@@ -1,0 +1,128 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::Cop::Badge do
+  subject(:badge) { described_class.new(%w[Test ModuleMustBeAClassCop]) }
+
+  it 'exposes department name' do
+    expect(badge.department).to be(:Test)
+  end
+
+  it 'exposes cop name' do
+    expect(badge.cop_name).to eql('ModuleMustBeAClassCop')
+  end
+
+  describe '.new' do
+    shared_examples 'assignment of department and name' do |class_name_parts, department, name|
+      it 'assigns department' do
+        expect(described_class.new(class_name_parts).department).to eq(department)
+      end
+
+      it 'assigns name' do
+        expect(described_class.new(class_name_parts).cop_name).to eq(name)
+      end
+    end
+
+    it_behaves_like 'assignment of department and name', %w[Foo], nil, 'Foo'
+    it_behaves_like 'assignment of department and name', %w[Foo Bar], :Foo, 'Bar'
+    it_behaves_like 'assignment of department and name', %w[Foo Bar Baz], :'Foo/Bar', 'Baz'
+    it_behaves_like 'assignment of department and name', %w[Foo Bar Baz Qux], :'Foo/Bar/Baz', 'Qux'
+  end
+
+  describe '.parse' do
+    shared_examples 'cop identifier parsing' do |identifier, class_name_parts|
+      it 'parses identifier' do
+        expect(described_class.parse(identifier)).to eq(described_class.new(class_name_parts))
+      end
+    end
+
+    it_behaves_like 'cop identifier parsing', 'bar', %w[Bar]
+    it_behaves_like 'cop identifier parsing', 'Bar', %w[Bar]
+    it_behaves_like 'cop identifier parsing', 'snake_case/example', %w[SnakeCase Example]
+    it_behaves_like 'cop identifier parsing', 'Foo/Bar', %w[Foo Bar]
+    it_behaves_like 'cop identifier parsing', 'Foo/Bar/Baz', %w[Foo Bar Baz]
+    it_behaves_like 'cop identifier parsing', 'Foo/Bar/Baz/Qux', %w[Foo Bar Baz Qux]
+  end
+
+  describe '.for' do
+    shared_examples 'cop class name parsing' do |class_name, class_name_parts|
+      it 'parses cop class name' do
+        expect(described_class.for(class_name)).to eq(described_class.new(class_name_parts))
+      end
+    end
+
+    it_behaves_like 'cop class name parsing', 'Foo', %w[Foo]
+    it_behaves_like 'cop class name parsing', 'Foo::Bar', %w[Foo Bar]
+    it_behaves_like 'cop class name parsing', 'RuboCop::Cop::Foo', %w[Cop Foo]
+    it_behaves_like 'cop class name parsing', 'RuboCop::Cop::Foo::Bar', %w[Foo Bar]
+    it_behaves_like 'cop class name parsing', 'RuboCop::Cop::Foo::Bar::Baz', %w[Foo Bar Baz]
+  end
+
+  it 'compares by value' do
+    badge1 = described_class.new(%w[Foo Bar])
+    badge2 = described_class.new(%w[Foo Bar])
+
+    expect(Set.new([badge1, badge2])).to be_one
+  end
+
+  it 'does not treat badges with colliding hashes as equal' do
+    colliding = Class.new(described_class) do
+      def hash
+        0
+      end
+    end
+
+    expect(colliding.new(%w[Foo Bar])).not_to eq(colliding.new(%w[Baz Qux]))
+  end
+
+  it 'can be converted to a string with the Department/CopName format' do
+    expect(described_class.new(%w[Foo Bar]).to_s).to eql('Foo/Bar')
+  end
+
+  describe '#qualified?' do
+    it 'says `CopName` is not qualified' do
+      expect(described_class.parse('Bar')).not_to be_qualified
+    end
+
+    it 'says `Department/CopName` is qualified' do
+      expect(described_class.parse('Department/Bar')).to be_qualified
+    end
+
+    it 'says `Deep/Department/CopName` is qualified' do
+      expect(described_class.parse('Deep/Department/Bar')).to be_qualified
+    end
+  end
+
+  describe '#match_name?' do
+    subject(:badge) { described_class.parse('Foo/Bar') }
+
+    it 'returns true when the given names include the qualified name' do
+      expect(badge).to be_match_name(['Foo/Bar'])
+    end
+
+    it 'returns true when the given names include the department name' do
+      expect(badge).to be_match_name(['Foo'])
+    end
+
+    it 'returns false when the given names include neither' do
+      expect(badge).not_to be_match_name(['Foo/Baz'])
+    end
+
+    it 'returns false when no names are given' do
+      expect(badge).not_to be_match_name(nil)
+    end
+  end
+
+  describe '#camel_case' do
+    it 'converts "lint" to CamelCase' do
+      expect(described_class.camel_case('lint')).to eq('Lint')
+    end
+
+    it 'converts "foo_bar" to CamelCase' do
+      expect(described_class.camel_case('foo_bar')).to eq('FooBar')
+    end
+
+    it 'converts "rspec" to CamelCase' do
+      expect(described_class.camel_case('rspec')).to eq('RSpec')
+    end
+  end
+end

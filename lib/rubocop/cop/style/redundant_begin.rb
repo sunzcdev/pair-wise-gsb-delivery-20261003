@@ -1,0 +1,379 @@
+# frozen_string_literal: true
+
+module RuboCop
+  module Cop
+    module Style
+      # Checks for redundant `begin` blocks. A `begin` block is redundant
+      # when the `rescue`/`ensure` can be handled by the enclosing method
+      # or block definition directly, avoiding unnecessary indentation.
+      #
+      # @example
+      #
+      #   # bad
+      #   def redundant
+      #     begin
+      #       ala
+      #       bala
+      #     rescue StandardError => e
+      #       something
+      #     end
+      #   end
+      #
+      #   # good
+      #   def preferred
+      #     ala
+      #     bala
+      #   rescue StandardError => e
+      #     something
+      #   end
+      #
+      #   # bad
+      #   begin
+      #     do_something
+      #   end
+      #
+      #   # good
+      #   do_something
+      #
+      #   # bad
+      #   # When using Ruby 2.5 or later.
+      #   do_something do
+      #     begin
+      #       something
+      #     rescue => ex
+      #       anything
+      #     end
+      #   end
+      #
+      #   # good
+      #   # In Ruby 2.5 or later, you can omit `begin` in `do-end` block.
+      #   do_something do
+      #     something
+      #   rescue => ex
+      #     anything
+      #   end
+      #
+      #   # good
+      #   # Stabby lambdas don't support implicit `begin` in `do-end` blocks.
+      #   -> do
+      #     begin
+      #       foo
+      #     rescue Bar
+      #       baz
+      #     end
+      #   end
+      class RedundantBegin < Base # rubocop:disable Metrics/ClassLength
+        include RangeHelp
+        extend AutoCorrector
+
+        MSG = 'Redundant `begin` block detected.'
+        SPACE_INSIDE_PARENS_STYLES = %w[space compact].freeze
+        VALUE_PARENT_TYPES = %i[return next break optarg kwoptarg].freeze
+        STATEMENT_CONTAINER_TYPES = %i[
+          begin kwbegin any_block any_def class module sclass rescue resbody ensure
+        ].freeze
+
+        def self.autocorrect_incompatible_with
+          [
+            Style::TrailingCommaInArguments,
+            Style::TrailingCommaInArrayLiteral,
+            Style::TrailingCommaInHashLiteral
+          ]
+        end
+
+        # @!method offensive_kwbegins(node)
+        def_node_search :offensive_kwbegins, <<~PATTERN
+          [(kwbegin ...) !#allowable_kwbegin?]
+        PATTERN
+
+        def on_def(node)
+          return unless node.body&.kwbegin_type?
+          return if node.endless?
+
+          register_offense(node.body)
+        end
+        alias on_defs on_def
+
+        def on_if(node)
+          return if node.modifier_form?
+
+          inspect_branches(node)
+        end
+
+        def on_case(node)
+          inspect_branches(node)
+        end
+        alias on_case_match on_case
+
+        def on_while(node)
+          return if node.modifier_form?
+
+          body = node.body
+
+          return unless body&.kwbegin_type?
+          return if body.ensure_node || body.rescue_node
+
+          register_offense(body)
+        end
+        alias on_until on_while
+
+        def on_block(node)
+          return if target_ruby_version < 2.5
+          return if node.send_node.lambda_literal?
+          return if node.braces?
+          return unless node.body&.kwbegin_type?
+
+          register_offense(node.body)
+        end
+
+        alias on_numblock on_block
+        alias on_itblock on_block
+
+        def on_kwbegin(node)
+          return unless (target_node = offensive_kwbegins(node).to_a.last)
+
+          register_offense(target_node)
+        end
+
+        private
+
+        def allowable_kwbegin?(node)
+          empty_begin?(node) ||
+            begin_block_has_multiline_statements?(node) ||
+            contain_rescue_or_ensure?(node) ||
+            valid_context_using_only_begin?(node) ||
+            ternary_operand_requiring_begin?(node)
+        end
+
+        def register_offense(node)
+          return if end_cannot_join_statement_line?(node)
+
+          offense_range = node.loc.begin
+
+          add_offense(offense_range) do |corrector|
+            if node.parent&.assignment? || node.parent&.type?(*VALUE_PARENT_TYPES)
+              replace_begin_with_statement(corrector, offense_range, node)
+            else
+              remove_begin(corrector, offense_range, node)
+            end
+
+            correct_end(corrector, node)
+          end
+        end
+
+        def end_cannot_join_statement_line?(node)
+          return false unless code_after_end_on_its_own_line?(node)
+
+          range_with_end_line_break(node).begin_pos != statement_end_pos(node)
+        end
+
+        def use_modifier_form_after_multiline_begin_block?(node)
+          return false unless (parent = node.parent)
+          return false unless node.multiline? && parent.if_type? && parent.modifier_form?
+
+          !parent.condition.equal?(node)
+        end
+
+        def code_after_end_on_its_own_line?(node)
+          return false unless begins_its_line?(node.loc.end)
+
+          rest_of_line = rest_of_line(closing_range(node)).lstrip
+
+          !rest_of_line.empty? && !rest_of_line.start_with?('#')
+        end
+
+        def closing_range(node)
+          return node.loc.end unless use_modifier_form_after_multiline_begin_block?(node)
+
+          node.loc.end.join(condition_range(node.parent))
+        end
+
+        def rest_of_line(range)
+          range.source_buffer.source_line(range.last_line)[range.last_column..]
+        end
+
+        def range_with_end_line_break(node)
+          range_with_surrounding_space(node.loc.end, side: :left, newlines: true)
+        end
+
+        def statement_end_pos(node)
+          return node.loc.begin.end_pos if node.children.empty?
+
+          node.children.last.source_range.end_pos
+        end
+
+        def replace_begin_with_statement(corrector, offense_range, node)
+          first_child = node.children.first
+
+          source = first_child.source
+          source = "(#{source})" if parentheses_required?(first_child, node.parent)
+
+          corrector.replace(offense_range, source)
+          corrector.remove(range_between(offense_range.end_pos, first_child.source_range.end_pos))
+
+          restore_removed_comments(corrector, offense_range, node, first_child)
+        end
+
+        def parentheses_required?(statement, parent)
+          return true if low_precedence_statement?(statement)
+          return false unless command_call?(statement)
+          return parent.type?(:optarg, :kwoptarg) unless parent.assignment?
+
+          parent = parent.parent while parent.parent&.assignment?
+          !statement_position?(parent)
+        end
+
+        def low_precedence_statement?(node)
+          return node.modifier_form? if node.basic_conditional?
+          return node.prefix_not? if node.send_type?
+
+          node.operator_keyword? && node.semantic_operator?
+        end
+
+        def command_call?(node)
+          node = node.send_node if node.any_block_type?
+          return false unless node.type?(:call, :super, :yield)
+
+          node.arguments? && !node.parenthesized? && !node.operator_method? && !node.setter_method?
+        end
+
+        def statement_position?(node)
+          parent = node.parent
+          return true if parent.nil? || parent.type?(*STATEMENT_CONTAINER_TYPES)
+          return parent.body.equal?(node) if parent.type?(:when, :in_pattern, :for)
+          return false if parent.if_type? && parent.ternary?
+
+          parent.type?(:if, :while, :until, :case, :case_match) && !parent.condition.equal?(node)
+        end
+
+        def remove_begin(corrector, offense_range, node)
+          if node.parent.respond_to?(:endless?) && node.parent.endless?
+            offense_range = range_with_surrounding_space(offense_range, newlines: true)
+          end
+
+          corrector.remove(offense_range)
+        end
+
+        # Restore comments that occur between "begin" and "first_child".
+        # These comments will be moved to above the assignment line.
+        def restore_removed_comments(corrector, offense_range, node, first_child)
+          comments_range = range_between(offense_range.end_pos, first_child.source_range.begin_pos)
+          comments = comments_range.source
+
+          corrector.insert_before(node.parent, comments) unless comments.blank?
+        end
+
+        def correct_end(corrector, node)
+          if use_modifier_form_after_multiline_begin_block?(node)
+            correct_modifier_form_after_multiline_begin_block(corrector, node)
+          elsif code_after_end_on_its_own_line?(node)
+            corrector.remove(range_with_end_line_break(node))
+          else
+            corrector.remove(node.loc.end)
+          end
+        end
+
+        def correct_modifier_form_after_multiline_begin_block(corrector, node)
+          condition_range = condition_range(node.parent)
+
+          corrector.insert_after(node.children.first, " #{condition_range.source}")
+          corrector.remove(modifier_form_closing_removal_range(node))
+        end
+
+        def modifier_form_closing_removal_range(node)
+          closing_range = closing_range(node)
+
+          if range_with_end_line_break(node).begin_pos == statement_end_pos(node)
+            range_with_surrounding_space(closing_range, side: :left, newlines: true)
+          elsif rest_of_line(closing_range).strip.empty?
+            range_by_whole_lines(closing_range, include_final_newline: true)
+          else
+            # Only a comment can follow here, and it stays on its own line.
+            range_with_surrounding_space(closing_range, side: :right, newlines: false)
+          end
+        end
+
+        def condition_range(node)
+          range_between(node.loc.keyword.begin_pos, node.condition.source_range.end_pos)
+        end
+
+        def empty_begin?(node)
+          node.children.empty?
+        end
+
+        def begin_block_has_multiline_statements?(node)
+          return false unless node.parent
+
+          node.children.count >= 2
+        end
+
+        def contain_rescue_or_ensure?(node)
+          first_child = node.children.first
+
+          first_child.type?(:rescue, :ensure)
+        end
+
+        def valid_context_using_only_begin?(node)
+          parent = node.parent
+
+          valid_begin_assignment?(node) || parent&.post_condition_loop? ||
+            parent&.send_type? || parent&.operator_keyword?
+        end
+
+        def ternary_operand_requiring_begin?(node)
+          return false unless node.parent&.if_type? && node.parent.ternary?
+
+          !node.children.one? || low_precedence_statement?(node.children.first)
+        end
+
+        def valid_begin_assignment?(node)
+          return false unless node.parent&.assignment?
+
+          !node.children.one? || too_long_when_joined?(node) || multiline_memoization?(node)
+        end
+
+        def too_long_when_joined?(node)
+          statement = node.children.first
+          max = config.for_enabled_cop('Layout/LineLength')['Max']
+          return false unless max && statement.single_line?
+
+          length = statement.source.length
+          length += parentheses_width if low_precedence_statement?(statement)
+
+          node.loc.column + length > max
+        end
+
+        def parentheses_width
+          space_inside_parens? ? 4 : 2
+        end
+
+        def space_inside_parens?
+          return false unless config.cop_enabled?('Layout/SpaceInsideParens')
+
+          style = config.for_cop('Layout/SpaceInsideParens')['EnforcedStyle']
+
+          SPACE_INSIDE_PARENS_STYLES.include?(style)
+        end
+
+        def multiline_memoization?(node)
+          if !node.parent.or_asgn_type? || !config.cop_enabled?('Style/MultilineMemoization')
+            return false
+          end
+
+          statement = node.children.first
+          statement.multiline? && low_precedence_statement?(statement)
+        end
+
+        def inspect_branches(node)
+          node.branches.each do |branch|
+            next unless branch&.kwbegin_type?
+            next if branch.ensure_node || branch.rescue_node
+            next if ternary_operand_requiring_begin?(branch)
+
+            register_offense(branch)
+          end
+        end
+      end
+    end
+  end
+end

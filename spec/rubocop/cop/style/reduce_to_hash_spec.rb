@@ -1,0 +1,428 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::Cop::Style::ReduceToHash, :config do
+  context 'when targeting Ruby 2.6+', :ruby26 do
+    context 'with `each_with_object({})` pattern' do
+      it 'registers an offense and corrects with inline block' do
+        expect_offense(<<~RUBY)
+          array.each_with_object({}) { |elem, hash| hash[elem.id] = elem.name }
+                ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { |elem| [elem.id, elem.name] }
+        RUBY
+      end
+
+      it 'registers an offense for the inner call when nested without raising a clobbering error' do
+        expect_offense(<<~RUBY)
+          tables.each_with_object({}) { |table, h|
+            h[table.node] = table.columns.each_with_object({}) { |column, i| i[column.name] = column.alias }
+                                          ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+          }
+        RUBY
+
+        expect_correction(<<~RUBY)
+          tables.to_h { |table|
+            [table.node, table.columns.to_h { |column| [column.name, column.alias] }]
+          }
+        RUBY
+      end
+
+      it 'registers an offense and corrects with do...end block' do
+        expect_offense(<<~RUBY)
+          array.each_with_object({}) do |elem, hash|
+                ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+            hash[elem.id] = elem.name
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h do |elem|
+            [elem.id, elem.name]
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects with safe navigation' do
+        expect_offense(<<~RUBY)
+          array&.each_with_object({}) { |elem, hash| hash[elem.id] = elem.name }
+                 ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array&.to_h { |elem| [elem.id, elem.name] }
+        RUBY
+      end
+
+      it 'registers an offense and corrects without receiver' do
+        expect_offense(<<~RUBY)
+          each_with_object({}) { |elem, hash| hash[elem] = elem.to_s }
+          ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          to_h { |elem| [elem, elem.to_s] }
+        RUBY
+      end
+
+      it 'registers an offense and corrects with simple element as key' do
+        expect_offense(<<~RUBY)
+          array.each_with_object({}) { |x, h| h[x] = true }
+                ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { |x| [x, true] }
+        RUBY
+      end
+
+      it 'does not register an offense when block body has multiple statements' do
+        expect_no_offenses(<<~RUBY)
+          array.each_with_object({}) do |elem, hash|
+            hash[elem.id] = elem.name
+            puts elem
+          end
+        RUBY
+      end
+
+      it 'does not register an offense with destructured block arguments' do
+        expect_no_offenses(<<~RUBY)
+          hash.each_with_object({}) { |(k, v), h| h[k.to_s] = v }
+        RUBY
+      end
+
+      it 'does not register an offense when initial value is not an empty hash' do
+        expect_no_offenses(<<~RUBY)
+          array.each_with_object(Hash.new(0)) { |elem, hash| hash[elem] += 1 }
+        RUBY
+      end
+
+      it 'does not register an offense when using methods other than []=' do
+        expect_no_offenses(<<~RUBY)
+          array.each_with_object({}) { |elem, hash| hash.merge!(elem => true) }
+        RUBY
+      end
+
+      it 'does not register an offense when the hash variable is not the one being assigned to' do
+        expect_no_offenses(<<~RUBY)
+          array.each_with_object({}) { |elem, hash| other[elem] = true }
+        RUBY
+      end
+
+      it 'does not register an offense when the accumulator is read in the value' do
+        expect_no_offenses(<<~RUBY)
+          array.each_with_object({}) do |elem, hash|
+            hash[elem.id] = hash[elem.id].to_i + 1
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the accumulator is read in the key' do
+        expect_no_offenses(<<~RUBY)
+          array.each_with_object({}) do |elem, hash|
+            hash[hash.size] = elem
+          end
+        RUBY
+      end
+    end
+
+    context 'with `inject({})` pattern' do
+      it 'registers an offense and corrects with inline block' do
+        expect_offense(<<~RUBY)
+          array.inject({}) { |hash, elem| hash[elem.id] = elem.name; hash }
+                ^^^^^^ Use `to_h { ... }` instead of `inject`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { |elem| [elem.id, elem.name] }
+        RUBY
+      end
+
+      it 'registers an offense and corrects with do...end block' do
+        expect_offense(<<~RUBY)
+          array.inject({}) do |hash, elem|
+                ^^^^^^ Use `to_h { ... }` instead of `inject`.
+            hash[elem.id] = elem.name
+            hash
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h do |elem|
+            [elem.id, elem.name]
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects with safe navigation' do
+        expect_offense(<<~RUBY)
+          array&.inject({}) { |hash, elem| hash[elem.id] = elem.name; hash }
+                 ^^^^^^ Use `to_h { ... }` instead of `inject`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array&.to_h { |elem| [elem.id, elem.name] }
+        RUBY
+      end
+
+      it 'does not register an offense when the accumulator is not returned' do
+        expect_no_offenses(<<~RUBY)
+          array.inject({}) { |hash, elem| hash[elem] = true; other }
+        RUBY
+      end
+
+      it 'does not register an offense when block body has extra statements' do
+        expect_no_offenses(<<~RUBY)
+          array.inject({}) do |hash, elem|
+            puts elem
+            hash[elem] = true
+            hash
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the accumulator is read in the value' do
+        expect_no_offenses(<<~RUBY)
+          array.inject({}) do |hash, elem|
+            hash[elem.id] = hash[elem.id].to_i + 1
+            hash
+          end
+        RUBY
+      end
+    end
+
+    context 'with `reduce({})` pattern' do
+      it 'registers an offense and corrects' do
+        expect_offense(<<~RUBY)
+          array.reduce({}) { |hash, elem| hash[elem.id] = elem.name; hash }
+                ^^^^^^ Use `to_h { ... }` instead of `reduce`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { |elem| [elem.id, elem.name] }
+        RUBY
+      end
+    end
+
+    context 'when the key or the value cannot be an array element as it is' do
+      it 'parenthesizes a value that is a command call' do
+        expect_offense(<<~RUBY)
+          array.each_with_object({}) { |elem, hash| hash[elem.id] = do_something elem }
+                ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { |elem| [elem.id, (do_something elem)] }
+        RUBY
+      end
+
+      it 'parenthesizes a key that is a command call with a receiver' do
+        expect_offense(<<~RUBY)
+          array.reduce({}) { |hash, elem| hash[obj.do_something elem] = elem.name; hash }
+                ^^^^^^ Use `to_h { ... }` instead of `reduce`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { |elem| [(obj.do_something elem), elem.name] }
+        RUBY
+      end
+
+      it 'parenthesizes a value that is a `yield` with arguments' do
+        expect_offense(<<~RUBY)
+          array.each_with_object({}) { |elem, hash| hash[elem.id] = yield elem }
+                ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { |elem| [elem.id, (yield elem)] }
+        RUBY
+      end
+
+      it 'wraps a value that is an array without brackets in brackets' do
+        expect_offense(<<~RUBY)
+          array.each_with_object({}) { |elem, hash| hash[elem.id] = elem.name, elem.value }
+                ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { |elem| [elem.id, [elem.name, elem.value]] }
+        RUBY
+      end
+
+      it 'wraps a value that is a splat without brackets in brackets' do
+        expect_offense(<<~RUBY)
+          array.each_with_object({}) { |elem, hash| hash[elem.id] = *elem }
+                ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { |elem| [elem.id, [*elem]] }
+        RUBY
+      end
+
+      it 'parenthesizes a value that is an assignment' do
+        expect_offense(<<~RUBY)
+          array.each_with_object({}) { |elem, hash| hash[elem.id] = x = do_something elem }
+                ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { |elem| [elem.id, (x = do_something elem)] }
+        RUBY
+      end
+
+      it 'parenthesizes a value that has a `rescue` modifier' do
+        expect_offense(<<~RUBY)
+          array.each_with_object({}) { |elem, hash| hash[elem.id] = do_something(elem) rescue nil }
+                ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { |elem| [elem.id, (do_something(elem) rescue nil)] }
+        RUBY
+      end
+
+      it 'does not parenthesize a key that is an operator method call or a value that is a parenthesized call' do
+        expect_offense(<<~RUBY)
+          array.each_with_object({}) { |elem, hash| hash[elem.id + 1] = do_something(elem) }
+                ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { |elem| [elem.id + 1, do_something(elem)] }
+        RUBY
+      end
+    end
+
+    context 'with a heredoc' do
+      it 'registers an offense and keeps the heredoc body when the receiver has a heredoc argument' do
+        expect_offense(<<~RUBY)
+          foo(<<~EOS).each_with_object({}) do |elem, hash|
+                      ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+            text
+          EOS
+            hash[elem.id] = elem.name
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          foo(<<~EOS).to_h do |elem|
+            text
+          EOS
+            [elem.id, elem.name]
+          end
+        RUBY
+      end
+
+      it 'registers an offense and keeps the heredoc body when the value is a heredoc' do
+        expect_offense(<<~RUBY)
+          array.each_with_object({}) do |elem, hash|
+                ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+            hash[elem] = <<~EOS
+              text
+            EOS
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h do |elem|
+            [elem, <<~EOS]
+              text
+            EOS
+          end
+        RUBY
+      end
+
+      it 'registers an offense and keeps the heredoc body when the value is a heredoc in `inject`' do
+        expect_offense(<<~RUBY)
+          array.inject({}) do |hash, elem|
+                ^^^^^^ Use `to_h { ... }` instead of `inject`.
+            hash[elem] = <<~EOS
+              text
+            EOS
+            hash
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h do |elem|
+            [elem, <<~EOS]
+              text
+            EOS
+          end
+        RUBY
+      end
+
+      it 'registers an offense and keeps the heredoc body when the accumulator follows a heredoc on the same line in `inject`' do
+        expect_offense(<<~RUBY)
+          array.inject({}) { |hash, elem| hash[elem] = <<~EOS; hash }
+                ^^^^^^ Use `to_h { ... }` instead of `inject`.
+            text
+          EOS
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { |elem| [elem, <<~EOS] }
+            text
+          EOS
+        RUBY
+      end
+    end
+
+    context 'with numbered parameters', :ruby27 do
+      it 'registers an offense and corrects each_with_object with numbered params' do
+        expect_offense(<<~RUBY)
+          array.each_with_object({}) { _2[_1.id] = _1.name }
+                ^^^^^^^^^^^^^^^^ Use `to_h { ... }` instead of `each_with_object`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { [_1.id, _1.name] }
+        RUBY
+      end
+
+      it 'does not register an offense when the accumulator is read in the value with numbered params' do
+        expect_no_offenses(<<~RUBY)
+          array.each_with_object({}) { _2[_1.id] = _2[_1.id].to_i + 1 }
+        RUBY
+      end
+
+      it 'registers an offense and corrects inject with numbered params' do
+        expect_offense(<<~RUBY)
+          array.inject({}) { _1[_2.id] = _2.name; _1 }
+                ^^^^^^ Use `to_h { ... }` instead of `inject`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          array.to_h { [_1.id, _1.name] }
+        RUBY
+      end
+
+      it 'does not register an offense when the value is a heredoc in `inject` with numbered params' do
+        expect_no_offenses(<<~RUBY)
+          array.inject({}) do
+            _1[_2] = <<~EOS
+              \#{_2}
+            EOS
+            _1
+          end
+        RUBY
+      end
+    end
+  end
+
+  context 'when targeting Ruby 2.5', :ruby25, unsupported_on: :prism do
+    it 'does not register an offense for each_with_object pattern' do
+      expect_no_offenses(<<~RUBY)
+        array.each_with_object({}) { |elem, hash| hash[elem.id] = elem.name }
+      RUBY
+    end
+
+    it 'does not register an offense for inject pattern' do
+      expect_no_offenses(<<~RUBY)
+        array.inject({}) { |hash, elem| hash[elem.id] = elem.name; hash }
+      RUBY
+    end
+  end
+end

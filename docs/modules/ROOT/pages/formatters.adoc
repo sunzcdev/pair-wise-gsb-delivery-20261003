@@ -1,0 +1,529 @@
+= Formatters
+
+You can change the output format of RuboCop by specifying formatters with the `-f/--format` option.
+RuboCop ships with several built-in formatters, and also you can create your custom formatter.
+
+Additionally the output can be redirected to a file instead of `$stdout` with the `-o/--out` option.
+
+Some of the built-in formatters produce *machine-parsable* output
+and they are considered public APIs.
+The rest of the formatters are for humans, so parsing their outputs is discouraged.
+
+You can enable multiple formatters at the same time by specifying `-f/--format` multiple times.
+The `-o/--out` option applies to the previously specified `-f/--format`,
+or the default `progress` format if no `-f/--format` is specified before the `-o/--out` option.
+
+=== Quick reference
+
+|===
+| Formatter | Flag | Use case
+
+| Progress (default) | `progress` | Interactive terminal use
+| Clang | `clang` | Detailed offenses with source context
+| Simple | `simple` | Compact human-readable output
+| Quiet | `quiet` | Only show output when there are offenses
+| Fuubar | `fuubar` | Progress bar with real-time offense reporting
+| Pacman | `pacman` | Fun progress indicator
+| Emacs | `emacs` | Emacs-compatible output (machine-parsable)
+| JSON | `json` | Machine consumption / custom tooling (machine-parsable)
+| JUnit | `junit` | CI systems like Jenkins (machine-parsable)
+| TAP | `tap` | Test Anything Protocol consumers (machine-parsable)
+| GitHub Actions | `github` | GitHub Actions annotations
+| SARIF | `sarif` | GitHub code scanning and other SARIF consumers (machine-parsable)
+| HTML | `html` | HTML report for sharing / CI artifacts
+| Markdown | `markdown` | Markdown report for PR comments
+| File List | `files` | Pipe file names to other tools (machine-parsable)
+| Offense Count | `offenses` | Overview of which cops trigger the most
+| Worst Offenders | `worst` | Find files needing the most attention
+|===
+
+[source,sh]
+----
+# Simple format to $stdout.
+$ rubocop --format simple
+
+# Progress (default) format to the file result.txt.
+$ rubocop --out result.txt
+
+# Both progress and offense count formats to $stdout.
+# The offense count formatter outputs only the final summary,
+# so you'll mostly see the outputs from the progress formatter,
+# and at the end the offense count summary will be output.
+$ rubocop --format progress --format offenses
+
+# Progress format to $stdout and JSON format to the file rubocop.json.
+$ rubocop --format progress --format json --out rubocop.json
+#         ~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~~~ ~~~~~~~~~~~~~~~~~~
+#                 |_______________|               |
+#                   default format             $stdout
+
+# Progress format to result.txt and simple format to $stdout.
+$ rubocop --out result.txt --format simple
+#         ~~~~~~~~~~~~~~~~ ~~~~~~~~~~~~~~~
+#                 |               |
+#              $stdout     default format
+----
+
+You can also load xref:development.adoc#custom-formatters[custom formatters].
+
+== Progress Formatter (default)
+
+The default `progress` formatter outputs a character for each inspected file,
+and at the end it displays all detected offenses in the `clang` format.
+A `.` represents a clean file, and each of the capital letters means
+the severest offense (convention, warning, error, or fatal) found in a file.
+
+[source,sh]
+----
+$ rubocop
+Inspecting 26 files
+..W.C....C..CWCW.C...WC.CC
+
+Offenses:
+
+lib/foo.rb:6:5: C: Style/Documentation: Missing top-level class documentation comment.
+    class Foo
+    ^^^^^
+
+...
+
+26 files inspected, 46 offenses detected
+----
+
+== Auto Gen Formatter
+
+Behaves like Progress Formatter except that it will not show any offenses.
+
+[source,sh]
+----
+$ rubocop --format autogenconf
+Inspecting 26 files
+..W.C....C..CWCW.C...WC.CC
+
+26 files inspected, 46 offenses detected
+----
+
+== Clang Style Formatter
+
+The `clang` formatter displays the offenses in a manner similar to `clang`:
+
+[source,sh]
+----
+$ rubocop --format clang test.rb
+Inspecting 1 file
+W
+
+Offenses:
+
+test.rb:1:5: C: Naming/MethodName: Use snake_case for method names.
+def badName
+    ^^^^^^^
+test.rb:2:3: C: Style/GuardClause: Use a guard clause instead of wrapping the code inside a conditional expression.
+  if something
+  ^^
+test.rb:2:3: C: Style/IfUnlessModifier: Favor modifier if usage when having a single-line body. Another good alternative is the usage of control flow &&/||.
+  if something
+  ^^
+test.rb:4:5: W: Layout/DefEndAlignment: end at 4, 4 is not aligned with if at 2, 2
+    end
+    ^^^
+
+1 file inspected, 4 offenses detected
+----
+
+== Fuubar Style Formatter
+
+The `fuubar` style formatter displays a progress bar
+and shows details of offenses in the `clang` format as soon as they are detected.
+This is inspired by the https://github.com/thekompanee/fuubar[Fuubar] formatter for RSpec.
+
+[source,sh]
+----
+$ rubocop --format fuubar
+lib/foo.rb.rb:1:1: C: Naming/MethodName: Use snake_case for method names.
+def badName
+    ^^^^^^^
+lib/bar.rb:13:14: W: Lint/UnreachableCode: Unreachable code detected.
+        x + 1
+        ^^^^^
+ 22/53 files |======== 43 ========>                           |  ETA: 00:00:02
+----
+
+== Pacman Style Formatter
+
+The `pacman` style formatter prints a PACDOT per every file to be analyzed. Pacman will "eat" one PACDOT per file when no offense is detected. Otherwise it will print a Ghost.
+This is inspired by the https://github.com/go-labs/rspec_pacman_formatter[Pacman] formatter for RSpec.
+
+[source,sh]
+----
+$ rubocop --format pacman
+Eating 31 files
+src/foo.rb:1:1: C: Style/FrozenStringLiteralComment: Missing magic comment # frozen_string_literal: true.
+src/bar.rb:14:15: C: Style/MutableConstant: Freeze mutable objects assigned to constants.
+      GHOST = 'ᗣ'
+              ^^^
+....ᗣ...ᗣ...ᗧ••••••••••••••••••
+31 examples, 2 failures
+----
+
+== Emacs Style Formatter
+
+*Machine-parsable*
+
+The `emacs` formatter displays the offenses in a format suitable for consumption by `Emacs` (and possibly other tools).
+
+[source,sh]
+----
+$ rubocop --format emacs test.rb
+/Users/bozhidar/projects/test.rb:1:1: C: Naming/MethodName: Use snake_case for method names.
+/Users/bozhidar/projects/test.rb:2:3: C: Style/IfUnlessModifier: Favor modifier if/unless usage when you have a single-line body. Another good alternative is the usage of control flow &&/||.
+/Users/bozhidar/projects/test.rb:4:5: W: Layout/DefEndAlignment: end at 4, 4 is not aligned with if at 2, 2
+----
+
+== Simple Formatter
+
+The name of the formatter says it all :-)
+
+[source,sh]
+----
+$ rubocop --format simple test.rb
+== test.rb ==
+C:  1:  5: Naming/MethodName: Use snake_case for method names.
+C:  2:  3: Style/GuardClause: Use a guard clause instead of wrapping the code inside a conditional expression.
+C:  2:  3: Style/IfUnlessModifier: Favor modifier if usage when having a single-line body. Another good alternative is the usage of control flow &&/||.
+W:  4:  5: Layout/DefEndAlignment: end at 4, 4 is not aligned with if at 2, 2
+
+1 file inspected, 4 offenses detected
+----
+
+== Quiet Formatter
+
+Behaves like Simple Formatter if there are offenses. Completely quiet otherwise:
+
+[source,sh]
+----
+$ rubocop --format quiet
+----
+
+== File List Formatter
+
+*Machine-parsable*
+
+Sometimes you might want to just open all files with offenses in your
+favorite editor. This formatter outputs just the names of the files
+with offenses in them and makes it possible to do something like:
+
+[source,sh]
+----
+$ rubocop --format files | xargs vim
+----
+
+== JSON Formatter
+
+*Machine-parsable*
+
+You can get RuboCop's inspection result in JSON format by passing `--format json` option in command line.
+The JSON structure is like the following example:
+
+[source,javascript]
+----
+{
+  "metadata": {
+    "rubocop_version": "1.84.2",
+    "ruby_engine": "ruby",
+    "ruby_version": "3.4.8",
+    "ruby_patchlevel": "72",
+    "ruby_platform": "arm64-darwin24"
+  },
+  "files": [{
+      "path": "lib/foo.rb",
+      "offenses": []
+    }, {
+      "path": "lib/bar.rb",
+      "offenses": [{
+          "severity": "convention",
+          "message": "Line is too long. [81/80]",
+          "cop_name": "Layout/LineLength",
+          "corrected": true,
+          "correctable": true,
+          "location": {
+            "start_line": 546,
+            "start_column": 80,
+            "last_line": 546,
+            "last_column": 84,
+            "length": 4,
+            "line": 546,
+            "column": 80
+          },
+          "correction": {
+            "safe": true,
+            "edits": [{
+                "start_line": 546,
+                "start_column": 80,
+                "last_line": 546,
+                "last_column": 84,
+                "begin_pos": 17046,
+                "end_pos": 17050,
+                "replacement": ""
+              }
+            ]
+          }
+        }, {
+          "severity": "warning",
+          "message": "Unreachable code detected.",
+          "cop_name": "Lint/UnreachableCode",
+          "corrected": false,
+          "correctable": false,
+          "location": {
+            "start_line": 15,
+            "start_column": 9,
+            "last_line": 15,
+            "last_column": 19,
+            "length": 10,
+            "line": 15,
+            "column": 9
+          }
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "offense_count": 2,
+    "target_file_count": 2,
+    "inspected_file_count": 2
+  }
+}
+----
+
+=== Corrections
+
+An offense that autocorrection knows how to fix carries a `correction` object
+describing the edits it would make, so a consumer can apply or review them
+without running autocorrection itself. The key is absent when there is nothing
+to apply.
+
+Each edit replaces the source between `begin_pos` and `end_pos` with
+`replacement`. Both positions count characters, not bytes, so in a file with
+multibyte characters the edits apply to the decoded text rather than to its raw
+bytes. An insertion has an empty range, a removal an empty replacement. The line
+and column fields describe the same range and follow the convention used by
+`location`.
+
+`safe` says whether a normal `rubocop -a` run would apply the correction. A cop
+marked `Safe: false` or `SafeAutoCorrect: false` still reports its edits, but
+only `-A` applies them, so a consumer applying edits itself has to make the same
+distinction.
+
+Two things to keep in mind when applying edits yourself:
+
+* The edits describe a *single* pass. Autocorrection runs repeatedly until the
+  file stops changing, so one correction can expose another. Re-run RuboCop
+  after applying a batch, the way `-a` does internally.
+* Edits from different offenses can overlap, and RuboCop resolves those
+  conflicts while correcting. Apply a batch from the end of the file backwards
+  and skip any edit that overlaps one already applied, then re-run.
+
+=== Errors and Warnings
+
+A cop that crashes on a file is listed in that file's `errors` and counted in
+the summary's `error_count`, and so are corrections that go into an infinite
+loop. The other cops still report the file's offenses. Warnings a cop raises
+are listed the same way, under `warnings` and `warning_count`. These keys are
+absent when there's nothing to report.
+
+A cop crashes on every node of the kind it fails on, so messages that differ
+only in their line and column are listed once, at the first place they
+happened. That makes `error_count` lower than the number of errors the
+command line prints.
+
+[source,javascript]
+----
+{
+  "path": "lib/bar.rb",
+  "offenses": [],
+  "errors": [
+    "An error occurred while Style/Example cop was inspecting lib/bar.rb:12:5."
+  ]
+}
+----
+
+== JUnit Style Formatter
+
+*Machine-parsable*
+
+The `junit` style formatter provides the JUnit formatting.
+This formatter is based on the https://github.com/mikian/rubocop-junit-formatter[rubocop-junit-formatter gem].
+
+[source,sh]
+----
+$ rubocop --format junit
+<?xml version='1.0'?>
+<testsuites>
+  <testsuite name='rubocop' tests='2' failures='2'>
+    <testcase classname='example' name='Style/FrozenStringLiteralComment'>
+      <failure type='Style/FrozenStringLiteralComment' message='Style/FrozenStringLiteralComment: Missing frozen string literal comment.'>
+        /tmp/src/example.rb:1:1
+      </failure>
+    </testcase>
+    <testcase classname='example' name='Naming/MethodName'>
+      <failure type='Naming/MethodName' message='Naming/MethodName: Use snake_case for method names.'>
+        /tmp/src/example.rb:1:5
+      </failure>
+    </testcase>
+    <testcase classname='example' name='Lint/DeprecatedClassMethods'>
+      <failure type='Lint/DeprecatedClassMethods' message='Lint/DeprecatedClassMethods: `File.exists?` is deprecated in favor of `File.exist?`.'>
+        /tmp/src/example.rb:2:8
+      </failure>
+    </testcase>
+  </testsuite>
+</testsuites>
+----
+
+The `junit` style formatter is very useful for continuous integration systems
+such as Jenkins, most of which support junit formatting when parsing test
+results. A typical invocation in this type of scenario might look like:
+
+[source,sh]
+----
+$ rubocop --format junit --out test-reports/junit.xml
+----
+
+Since there is one XML node for each enabled cop for each file, the size of the resulting XML can get quite large.
+If it is too large for you, you can restrict the output to just failures by adding the `--display-only-failed` option.
+
+== Offense Count Formatter
+
+Sometimes when first applying RuboCop to a codebase, it's nice to be able to
+see where most of your style cleanup is going to be spent.
+
+With this in mind, you can use the offense count formatter to outline the offended
+cops and the number of offenses found for each by running:
+
+[source,sh]
+----
+$ rubocop --format offenses
+
+36   Layout/LineLength [Safe Correctable]
+18   Style/StringLiterals [Safe Correctable]
+13   Style/Documentation
+10   Style/ExpandPathArguments [Safe Correctable]
+8    Style/EmptyMethod [Safe Correctable]
+6    Layout/IndentationConsistency [Safe Correctable]
+4    Lint/SuppressedException
+3    Layout/EmptyLinesAroundAccessModifier [Safe Correctable]
+2    Layout/ExtraSpacing [Safe Correctable]
+1    Layout/AccessModifierIndentation [Safe Correctable]
+1    Style/ClassAndModuleChildren [Unsafe Correctable]
+--
+102  Total in 31 files
+----
+
+== Worst Offenders Formatter
+
+Similar to the Offense Count formatter, but lists the files which need the most attention:
+
+[source,sh]
+----
+$ rubocop --format worst
+
+89  this/file/is/really/bad.rb
+2   much/better.rb
+--
+91  Total in 2 files
+----
+
+== HTML Formatter
+
+Useful for CI environments. It will create an HTML report like https://github.com/rubocop/rubocop/blob/master/spec/fixtures/html_formatter/expected.html[this].
+
+[source,sh]
+----
+$ rubocop --format html -o rubocop.html
+----
+
+== Markdown Formatter
+
+Useful for CI environments, especially if posting comments back to pull requests. It will create a markdown report like https://github.com/rubocop/rubocop/blob/master/spec/fixtures/markdown_formatter/expected.md[this].
+
+[source,sh]
+----
+$ rubocop --format markdown -o rubocop.md
+----
+
+== TAP Formatter
+
+*Machine-parsable*
+
+Useful for CI environments, it will format report following the https://testanything.org[Test Anything Protocol].
+
+[source,sh]
+----
+$ rubocop --format tap
+1..3
+not ok 1 - lib/rubocop.rb
+# lib/rubocop.rb:2:3: C: foo
+# This is line 2.
+#   ^
+ok 2 - spec/spec_helper.rb
+not ok 3 - exe/rubocop
+# exe/rubocop:5:2: E: bar
+# This is line 5.
+#  ^
+# exe/rubocop:6:1: C: foo
+# This is line 6.
+# ^
+
+3 files inspected, 3 offenses detected
+----
+
+== GitHub Actions Formatter
+
+Useful for https://docs.github.com/en/free-pro-team@latest/actions[GitHub Actions].
+Formats offenses as https://docs.github.com/en/free-pro-team@latest/actions/reference/workflow-commands-for-github-actions#setting-a-warning-message[workflow commands]
+to create annotations in GitHub UI.
+
+The formatter uses fail_level to determine which GitHub level to use for each
+annotation. By default, all RuboCop severities are errors. If fail level is
+set and severity is below fail level, a warning will be created instead.
+
+[source,sh]
+----
+$ rubocop --format github
+
+::error file=lib/foo.rb,line=6,col=5::Style/Documentation: Missing top-level class documentation comment.
+----
+
+== SARIF Formatter
+
+Formats offenses as https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html[SARIF 2.1.0],
+the standard interchange format for static analysis results. It's understood by
+https://docs.github.com/en/code-security/code-scanning[GitHub code scanning], Azure DevOps and
+other tools that aggregate analyzer output.
+
+[source,sh]
+----
+$ rubocop --format sarif --out rubocop.sarif
+----
+
+The point of it is getting offenses into a tool that collects results from
+several analyzers. On GitHub that means uploading the file, after which offenses
+show up as code scanning alerts on the pull request, annotated on the diff:
+
+[source,yaml]
+----
+# .github/workflows/rubocop.yml
+- run: bundle exec rubocop --format sarif --out rubocop.sarif
+  continue-on-error: true # let the upload happen even when there are offenses
+- uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: rubocop.sarif
+----
+
+SARIF only defines three severity levels, so RuboCop's `info`, `refactor` and `convention`
+severities are all reported as `note`, `warning` stays `warning`, and `error` and `fatal`
+become `error`.
+
+Each cop that reported an offense is described once under `runs[].tool.driver.rules`, with its
+description and a link to its documentation. Offenses suppressed by a `rubocop:disable` directive
+(shown with `--display-suppressed`) are reported as SARIF suppressions, along with the reason
+given in the directive.

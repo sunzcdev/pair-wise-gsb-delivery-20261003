@@ -1,0 +1,243 @@
+= CLI Reference
+
+Full reference for the `rubocop` command-line interface. For a tutorial introduction, see xref:usage/getting_started.adoc[Getting Started].
+
+== Command-line flags
+
+For more details check the available command-line options:
+
+[source,sh]
+----
+$ rubocop -h
+----
+
+To specify multiple cops for one flag, separate cops with commas and no spaces:
+
+[source,sh]
+----
+$ rubocop --only Rails/Blank,Layout/HeredocIndentation,Naming/FileName
+----
+
+|===
+| Command flag | Description
+
+| `-a/--autocorrect`
+| Autocorrect offenses (only when it's safe). See xref:usage/autocorrect.adoc[Autocorrect].
+
+| `--auto-correct`
+| Deprecated alias of `-a/--autocorrect`.
+
+| `-A/--autocorrect-all`
+| Autocorrect offenses (safe and unsafe). See xref:usage/autocorrect.adoc[Autocorrect].
+
+| `--auto-correct-all`
+| Deprecated alias of `-A/--autocorrect-all`.
+
+| `--auto-gen-config`
+| Generate a configuration file acting as a TODO list.
+
+| `--[no-]color`
+| Force color output on or off.
+
+| `-c/--config`
+| Run with specified config file.
+
+| `-C/--cache`
+| Store and reuse results for faster operation.
+
+| `--changed[=REVISION]`
+| Inspect only the files that differ from a git revision, defaulting to `HEAD`. Untracked files count as changed.
+
+| `-d/--debug`
+| Displays some extra debug output.
+
+| `--disable-all-cops`
+| Run with all cops disabled by default, except `Lint/Syntax`. Overrides `AllCops/EnabledByDefault` and `AllCops/DisabledByDefault` in configuration files.
+
+| `--disable-pending-cops`
+| Run without pending cops.
+
+| `--disable-uncorrectable`
+| Used with --autocorrect to annotate any offenses that do not support autocorrect with `rubocop:todo` comments.
+
+| `--diff`
+| Print a unified diff of what autocorrection would change, without writing any files. See xref:usage/autocorrect.adoc[Autocorrect].
+
+| `-D/--[no-]display-cop-names`
+| Displays cop names in offense messages. Default is true.
+
+| `--display-time`
+| Display elapsed time in seconds.
+
+| `--display-only-fail-level-offenses`
+| Only output offense messages at the specified `--fail-level` or above.
+
+| `--display-only-correctable`
+| Only output correctable offense messages.
+
+| `--display-only-safe-correctable`
+| Only output safe correctable offense messages.
+
+| `--display-suppressed`
+| Also output offenses suppressed by directive comments, tagged `[Suppressed]` (with their `--` justification in the JSON formatter). Suppressed offenses do not affect the exit code.
+
+| `--max-offenses-per-cop=COUNT`
+| Report at most `COUNT` offenses per cop across the whole run. Like the other display filters, offenses beyond the limit are not reported and do not count towards the totals; a note on stderr says how many were held back and which cops they came from.
+
+| `--enable-all-cops`
+| Run with all cops enabled, including those disabled by default. Overrides `AllCops/EnabledByDefault` and `AllCops/DisabledByDefault` in configuration files.
+
+| `--enable-pending-cops`
+| Run with pending cops.
+
+| `--except`
+| Run all cops enabled by configuration except the specified cop(s) and/or departments.
+
+| `--exclude-limit`
+| Limit how many individual files `--auto-gen-config` can list in `Exclude` parameters, default is 15.
+
+| `-E/--extra-details`
+| Displays extra details in offense messages.
+
+| `-f/--format`
+| Choose a formatter, see xref:formatters.adoc[Formatters].
+
+| `-F/--fail-fast`
+| Inspect files in order of modification time and stop after the first file with offenses.
+
+| `--fail-level`
+| Minimum xref:configuration/cop_settings.adoc#severity[severity] for exit with error code. Full severity name or upper case initial can be given. Normally, autocorrected offenses are ignored. Use `A` or `autocorrect` if you'd like any autocorrectable offense to trigger failure, regardless of severity. Overrides `AllCops: FailLevel` in the configuration.
+
+| `--force-exclusion`
+| Force excluding files specified in the configuration `Exclude` even if they are explicitly passed as arguments.
+
+| `--only-recognized-file-types`
+| Inspect files given on the command line only if they are listed in `AllCops`/`Include` parameters of user configuration or default configuration.
+
+| `-h/--help`
+| Print usage information.
+
+| `--ignore-disable-comments`
+| Report offenses even if they have been manually disabled with a `rubocop:disable` or `rubocop:todo` directive.
+
+| `--ignore-parent-exclusion`
+| Ignores all Exclude: settings from all .rubocop.yml files present in parent folders. This is useful when you are importing submodules when you want to test them without being affected by the parent module's rubocop settings.
+
+| `--ignore-unrecognized-cops`
+| Ignore unrecognized cops or departments in the config.
+
+| `--init`
+| Generate a .rubocop.yml file in the current directory.
+
+| `-l/--lint`
+| Run only lint cops.
+
+| `-L/--list-target-files`
+| List all files RuboCop will inspect.
+
+| `--[no-]auto-gen-only-exclude`
+| Generate only `Exclude` parameters and not `Max` when running `--auto-gen-config`, except if the number of files with offenses is bigger than `exclude-limit`. Default is false.
+
+| `--[no-]auto-gen-timestamp`
+| Include the date and time when `--auto-gen-config` was run in the config file it generates. Default is true.
+
+| `--[no-]offense-counts`
+| Show offense counts in config file generated by `--auto-gen-config`. Default is true.
+
+| `--only`
+| Run only the specified cop(s) and/or cops in the specified departments.
+
+| `-o/--out`
+| Write output to a file instead of STDOUT.
+
+| `--[no-]parallel`
+| Use available CPUs to execute inspection in parallel. Default is parallel.
+
+| `--raise-cop-error`
+| Raise cop-related errors with cause and location. This is used to prevent cops from failing silently. Default is false.
+
+| `--[no-]preview`
+| Opt in to unstable behavior: cops that are `Enabled: preview`, and changes to existing cops that are not the default yet. See xref:versioning.adoc#preview[Preview].
+
+| `--plugin`
+| Plugin RuboCop extension file (see xref:plugins.adoc#loading-plugin-extensions[Loading Plugin Extensions]).
+
+| `-r/--require`
+| Require Ruby file (see xref:plugins.adoc#loading-legacy-extensions-via-require[Loading Legacy Extensions]).
+
+| `--regenerate-todo`
+| Regenerate the TODO list using the same options as the last time it was generated with `--auto-gen-config` (generation options can be overridden).
+
+| `--report-unused-todo-entries`
+| Also report `.rubocop_todo.yml` `Exclude` entries that are no longer needed - files the cop would not flag anymore, or files that no longer exist - and fail the run when any are found. Unlike `--regenerate-todo` it never absorbs new offenses, which makes it safe as a CI ratchet; see xref:usage/auto_gen_config.adoc#keeping-the-todo-from-rotting[Keeping the TODO from rotting].
+
+| `--safe`
+| Run only safe cops.
+
+| `--safe-auto-correct`
+| Deprecated alias of `-a/--autocorrect`.
+
+| `--show-cops`
+| Shows available cops and their configuration. You can use `*` as a wildcard.
+
+| `--show-docs-url`
+| Shows URLs for documentation pages of supplied cops.
+
+| `--explain COP1,COP2,...`
+| Explain what the given cops do: their description, properties, configuration, the examples from their own documentation, and links to the style guide and docs. Unlike `--show-cops` and `--show-docs-url`, an unrecognized name is reported rather than skipped.
+
+| `--stderr`
+| Write all output to stderr except for the autocorrected source. This is especially useful when combined with `--autocorrect` and `--stdin`.
+
+| `-s/--stdin`
+| Pipe source from STDIN. This is useful for editor integration. Takes one argument, a path, relative to the root of the project. RuboCop will use this path to determine which cops are enabled (via eg. Include/Exclude), and so that certain cops like Naming/FileName can be checked.
+
+| `--editor-mode`
+| Optimize real-time feedback in editors, adjusting behaviors for editing experience. Editors that run RuboCop directly (e.g., by shelling out) encounter the same issues as with `--lsp`. This option is designed for such editors.
+
+| `-S/--display-style-guide`
+| Display style guide URLs in offense messages.
+
+| `-x/--fix-layout`
+| Autocorrect only code layout (formatting) offenses.
+
+| `-v/--version`
+| Displays the current version and exits.
+
+| `-V/--verbose-version`
+| Displays the current version plus the version of Parser and Ruby.
+|===
+
+Default command-line options are loaded from `.rubocop` and `RUBOCOP_OPTS` and are combined with command-line options that are explicitly passed to `rubocop`.
+Thus, the options have the following order of precedence (from highest to lowest):
+
+. Explicit command-line options
+. Options from `RUBOCOP_OPTS` environment variable
+. Options from `.rubocop` file.
+
+== Exit codes
+
+RuboCop exits with the following status codes:
+
+* `0` if no offenses are found or if the severity of all offenses are less than
+`--fail-level`. (By default, if you use `--autocorrect`, offenses which are
+autocorrected do not cause RuboCop to fail.)
+* `1` if one or more offenses equal or greater to `--fail-level` are found. (By
+default, this is any offense which is not autocorrected.)
+* `2` if RuboCop terminates abnormally due to invalid configuration, invalid CLI
+options, or an internal error.
+
+== Parallel Processing
+
+RuboCop enables the `--parallel` option by default. This option allows for
+parallel processing using the number of available CPUs based on `Etc.nprocessors`.
+If the default number of parallel processes causes excessive consumption of CPU and memory,
+you can adjust the number of parallel processes using the `$PARALLEL_PROCESSOR_COUNT` environment variable.
+Here is how to set the parallel processing to use two CPUs:
+
+[source,sh]
+----
+$ PARALLEL_PROCESSOR_COUNT=2 bundle exec rubocop
+----
+
+Alternatively, specifying `--no-parallel` will disable parallel processing.

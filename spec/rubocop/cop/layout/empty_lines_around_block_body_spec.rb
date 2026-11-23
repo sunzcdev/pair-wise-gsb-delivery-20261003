@@ -1,0 +1,333 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::Cop::Layout::EmptyLinesAroundBlockBody, :config do
+  let(:beginning_offense_annotation) { '^{} Extra empty line detected at block body beginning.' }
+
+  # Test blocks using both {} and do..end
+  [%w[{ }], %w[do end]].each do |open, close|
+    context "when EnforcedStyle is no_empty_lines for #{open} #{close} block" do
+      let(:cop_config) { { 'EnforcedStyle' => 'no_empty_lines' } }
+
+      it 'registers an offense for block body starting with a blank' do
+        expect_offense(<<~RUBY)
+          some_method #{open}
+
+          #{beginning_offense_annotation}
+            do_something
+          #{close}
+        RUBY
+
+        expect_correction(<<~RUBY)
+          some_method #{open}
+            do_something
+          #{close}
+        RUBY
+      end
+
+      it 'registers an offense for block body ending with a blank' do
+        expect_offense(<<~RUBY)
+          some_method #{open}
+            do_something
+
+          ^{} Extra empty line detected at block body end.
+            #{close}
+        RUBY
+
+        expect_correction(<<~RUBY)
+          some_method #{open}
+            do_something
+            #{close}
+        RUBY
+      end
+
+      context 'Ruby 2.7', :ruby27 do
+        it 'registers an offense for block body ending with a blank' do
+          expect_offense(<<~RUBY)
+            some_method #{open}
+              _1
+
+            ^{} Extra empty line detected at block body end.
+              #{close}
+          RUBY
+
+          expect_correction(<<~RUBY)
+            some_method #{open}
+              _1
+              #{close}
+          RUBY
+        end
+      end
+
+      context 'Ruby 3.4', :ruby34 do
+        it 'registers an offense for block body ending with a blank' do
+          expect_offense(<<~RUBY)
+            some_method #{open}
+              it
+
+            ^{} Extra empty line detected at block body end.
+              #{close}
+          RUBY
+
+          expect_correction(<<~RUBY)
+            some_method #{open}
+              it
+              #{close}
+          RUBY
+        end
+      end
+
+      it 'accepts block body starting with a line with spaces' do
+        expect_no_offenses(<<~RUBY)
+          some_method #{open}
+           #{trailing_whitespace}
+            do_something
+          #{close}
+        RUBY
+      end
+
+      it 'registers an offense for block body starting with a blank passed to ' \
+         'a multi-line method call' do
+        expect_offense(<<~RUBY)
+          some_method arg,
+            another_arg #{open}
+
+          #{beginning_offense_annotation}
+            do_something
+          #{close}
+        RUBY
+      end
+
+      it 'is not fooled by single line blocks' do
+        expect_no_offenses(<<~RUBY)
+          some_method #{open} do_something #{close}
+
+          something_else
+        RUBY
+      end
+    end
+
+    context "when EnforcedStyle is empty_lines for #{open} #{close} block" do
+      let(:cop_config) { { 'EnforcedStyle' => 'empty_lines' } }
+
+      it 'registers an offense for block body not starting or ending with a blank' do
+        expect_offense(<<~RUBY)
+          some_method #{open}
+            do_something
+          ^ Empty line missing at block body beginning.
+          #{close}
+          ^ Empty line missing at block body end.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          some_method #{open}
+
+            do_something
+
+          #{close}
+        RUBY
+      end
+
+      it 'ignores block with an empty body' do
+        expect_no_offenses("some_method #{open}\n#{close}")
+      end
+
+      it 'is not fooled by single line blocks' do
+        expect_no_offenses(<<~RUBY)
+          some_method #{open} do_something #{close}
+          something_else
+        RUBY
+      end
+    end
+  end
+
+  context 'when `EnforcedStyle` is `empty_lines` and the body is a chained method call' do
+    let(:cop_config) { { 'EnforcedStyle' => 'empty_lines' } }
+
+    it 'accepts a leading dot at the beginning of the body' do
+      expect_no_offenses(<<~RUBY)
+        aa { bb { cc }
+        .dd }
+      RUBY
+    end
+
+    it 'accepts a leading safe navigation dot at the beginning of the body' do
+      expect_no_offenses(<<~RUBY)
+        aa { bb
+        &.cc }
+      RUBY
+    end
+
+    it 'accepts a leading dot at the end of the body' do
+      expect_no_offenses(<<~RUBY)
+        aa {
+
+          bb
+          .cc }
+      RUBY
+    end
+  end
+
+  context 'when `EnforcedStyle` is `empty_lines` and the body starts on the opening line' do
+    let(:cop_config) { { 'EnforcedStyle' => 'empty_lines' } }
+
+    it 'does not register an offense when the body continues on the closing line' do
+      expect_no_offenses(<<~RUBY)
+        -> { foo \\
+          if bar }
+      RUBY
+    end
+
+    it 'registers an offense only at the body end when the body ends before the closing line' do
+      expect_offense(<<~RUBY)
+        foo do |bar| baz \\
+          if bar
+        end
+        ^ Empty line missing at block body end.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        foo do |bar| baz \\
+          if bar
+
+        end
+      RUBY
+    end
+  end
+
+  context 'when `EnforcedStyle` is `empty_lines` and the body ends on the closing line' do
+    let(:cop_config) { { 'EnforcedStyle' => 'empty_lines' } }
+
+    it 'registers an offense only at the body beginning' do
+      expect_offense(<<~RUBY)
+        foo {
+          bar \\
+        ^ Empty line missing at block body beginning.
+            if baz }
+      RUBY
+
+      expect_correction(<<~RUBY)
+        foo {
+
+          bar \\
+            if baz }
+      RUBY
+    end
+  end
+
+  context 'when `EnforcedStyle` is `no_empty_lines` and the body starts on the opening line' do
+    let(:cop_config) { { 'EnforcedStyle' => 'no_empty_lines' } }
+
+    it 'registers an offense and removes the blank line after the opening line' do
+      expect_offense(<<~RUBY)
+        foo { bar(
+
+        ^{} Extra empty line detected at block body beginning.
+          baz) }
+      RUBY
+
+      expect_correction(<<~RUBY)
+        foo { bar(
+          baz) }
+      RUBY
+    end
+  end
+
+  context 'when `EnforcedStyle` is `empty_lines` and `do` follows a line continuation' do
+    let(:cop_config) { { 'EnforcedStyle' => 'empty_lines' } }
+
+    it 'registers an offense and inserts the blank line after `do`' do
+      expect_offense(<<~RUBY)
+        foo :bar \\
+        do
+          baz
+        ^ Empty line missing at block body beginning.
+        end
+        ^ Empty line missing at block body end.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        foo :bar \\
+        do
+
+          baz
+
+        end
+      RUBY
+    end
+  end
+
+  context 'when `EnforcedStyle` is `no_empty_lines` and `do` follows a line continuation' do
+    let(:cop_config) { { 'EnforcedStyle' => 'no_empty_lines' } }
+
+    it 'registers an offense and removes the blank line after `do`' do
+      expect_offense(<<~RUBY)
+        foo :bar \\
+        do
+
+        ^{} Extra empty line detected at block body beginning.
+          baz
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        foo :bar \\
+        do
+          baz
+        end
+      RUBY
+    end
+  end
+
+  context 'when `EnforcedStyle` is `empty_lines` and the block arguments span multiple lines' do
+    let(:cop_config) { { 'EnforcedStyle' => 'empty_lines' } }
+
+    it 'registers an offense and inserts the blank line after the block arguments' do
+      expect_offense(<<~RUBY)
+        foo do |bar,
+                baz|
+          do_something
+        ^ Empty line missing at block body beginning.
+        end
+        ^ Empty line missing at block body end.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        foo do |bar,
+                baz|
+
+          do_something
+
+        end
+      RUBY
+    end
+
+    it 'does not register an offense when the block arguments and the body are on the line after `{`' do
+      expect_no_offenses(<<~RUBY)
+        foo {
+          |bar| do_something }
+      RUBY
+    end
+  end
+
+  context 'when `EnforcedStyle` is `no_empty_lines` and the block arguments span multiple lines' do
+    let(:cop_config) { { 'EnforcedStyle' => 'no_empty_lines' } }
+
+    it 'registers an offense and removes the blank line after the block arguments' do
+      expect_offense(<<~RUBY)
+        foo do |bar,
+                baz|
+
+        ^{} Extra empty line detected at block body beginning.
+          do_something
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        foo do |bar,
+                baz|
+          do_something
+        end
+      RUBY
+    end
+  end
+end

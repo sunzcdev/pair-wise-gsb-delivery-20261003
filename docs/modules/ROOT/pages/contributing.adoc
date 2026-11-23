@@ -1,0 +1,130 @@
+= Contributing
+
+== Issues
+
+Report issues and suggest features and improvements on the
+https://github.com/rubocop/rubocop/issues[GitHub issue tracker].
+
+If you want to file an issue (bug report or feature request), please provide all
+the necessary info listed in our issue reporting template (it's loaded
+automatically when you create a new GitHub issue).
+
+NOTE: Please, don't ask support-like questions on the issue tracker (e.g. "How
+can I configure RuboCop to do X?") - use the xref:support.adoc[support channels]
+instead.
+
+== Code contributions
+
+Patches in any form are always welcome! GitHub pull requests are even better! :-)
+
+Before submitting a pull request make sure all tests are
+passing and that your patch is in line with the https://github.com/rubocop/rubocop/blob/master/CONTRIBUTING.md[contribution
+guidelines].
+
+=== Quick start
+
+[source,sh]
+----
+$ git clone https://github.com/rubocop/rubocop.git
+$ cd rubocop
+$ bundle install
+$ bundle exec rake              # run the full CI suite
+----
+
+A typical contribution workflow:
+
+. Pick an issue from the https://github.com/rubocop/rubocop/issues[issue tracker] (look for `good first issue` or `help wanted` labels).
+. Create a feature branch: `git checkout -b fix-1234-short-description`.
+. Make your changes and add tests (see xref:development.adoc[Development]).
+. Run the full test suite: `bundle exec rake`.
+. Add a changelog entry: `bundle exec rake changelog:fix` (or `changelog:new` / `changelog:change`).
+. Open a pull request.
+
+== Documentation
+
+Good documentation is just as important as good code.
+Please, help us improve RuboCop's documentation.
+
+You should also check out the
+xref:development.adoc#documentation[cop documentation section] of the docs and consider
+adding or improving Cop descriptions.
+
+=== Working on the Docs
+
+The manual is generated from the AsciiDoc files in the https://github.com/rubocop/rubocop/tree/master/docs[docs] folder of RuboCop's GitHub repo and is published to https://docs.rubocop.org.
+https://antora.org[Antora] is used to convert the manual into HTML.
+The filesystem layout is described at https://docs.antora.org/antora/3.1/standard-directories/.
+
+To make changes to the manual you simply have to change the files under `docs`.
+The manual will be regenerated manually periodically.
+
+The site configuration and build infrastructure live in a separate repo: https://github.com/rubocop/docs.rubocop.org[docs.rubocop.org].
+
+==== Installing Antora
+
+NOTE: The instructions here assume you already have (the right version of) node.js installed.
+
+Installing Antora is super simple — just clone the docs site repo and run:
+
+[source,sh]
+----
+$ cd docs.rubocop.org
+$ make install
+----
+
+Check out https://docs.antora.org/antora/3.1/install/install-antora/[the detailed installation instructions]
+if you run into any problems.
+
+==== Building the Site
+
+You can build the documentation locally from the https://github.com/rubocop/docs.rubocop.org[docs.rubocop.org] repo.
+
+[source,sh]
+----
+$ cd docs.rubocop.org
+$ make build
+----
+
+TIP: You can preview your changes by opening `build/site/index.html` in your favourite browser.
+
+The site is automatically deployed to GitHub Pages via a GitHub Action on push to `master`.
+
+If you want to make changes to the manual's page structure you'll have to edit
+https://github.com/rubocop/rubocop/blob/master/docs/modules/ROOT/nav.adoc[nav.adoc].
+
+=== Working on rubocop.org
+
+The https://rubocop.org[rubocop.org] landing page is a separate project, built with https://www.bridgetownrb.com/[Bridgetown] and https://tailwindcss.com/[Tailwind CSS]. Its source lives at https://github.com/rubocop/rubocop.org[github.com/rubocop/rubocop.org].
+
+To run the site locally you'll need Ruby (>= 3.2) and Node.js (>= 20):
+
+[source,sh]
+----
+$ cd rubocop.org
+$ bundle install && npm install
+$ bin/bridgetown start
+----
+
+Then visit http://localhost:4000[localhost:4000] to preview your changes.
+
+The site is automatically deployed to GitHub Pages on push to `main`.
+
+== Funding
+
+While RuboCop is free software and will always be, the project would benefit immensely from some funding.
+Raising a monthly budget of a couple of thousand dollars would make it possible to pay people to work on
+certain complex features, fund other development related stuff (e.g. hardware, conference trips) and so on.
+Raising a monthly budget of over $5000 would open the possibility of someone working full-time on the project
+which would speed up the pace of development significantly.
+
+We welcome both individual and corporate sponsors! We also offer a wide array of funding channels to account
+for your preferences (although currently https://opencollective.com/rubocop[Open Collective] is our preferred funding platform).
+
+If you're working in a company that's making significant use of RuboCop we'd appreciate it if you suggest to your company
+to become a RuboCop sponsor.
+
+You can support the development of RuboCop via
+https://github.com/sponsors/bbatsov[GitHub Sponsors],
+https://www.patreon.com/bbatsov[Patreon],
+https://paypal.me/bbatsov[PayPal],
+and https://opencollective.com/rubocop[Open Collective].

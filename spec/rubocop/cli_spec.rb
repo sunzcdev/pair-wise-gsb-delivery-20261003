@@ -1,0 +1,2695 @@
+# frozen_string_literal: true
+
+require 'timeout'
+
+RSpec.describe RuboCop::CLI, :isolated_environment do
+  subject(:cli) { described_class.new }
+
+  include_context 'cli spec behavior'
+
+  context 'when interrupted' do
+    it 'returns 130' do
+      allow_any_instance_of(RuboCop::Runner).to receive(:aborting?).and_return(true)
+      create_empty_file('example.rb')
+      expect(cli.run(['example.rb'])).to eq(130)
+    end
+  end
+
+  context 'when given a file/directory that is not under the current dir' do
+    shared_examples 'checks Rakefile' do
+      it 'checks a Rakefile but Style/FileName does not report' do
+        create_file('Rakefile', <<~RUBY)
+          # frozen_string_literal: true
+
+          x = 1
+        RUBY
+        create_empty_file('other/empty')
+        Dir.chdir('other') { expect(cli.run(['--format', 'simple', checked_path])).to eq(1) }
+        expect($stdout.string).to eq(<<~RESULT)
+          == #{abs('Rakefile')} ==
+          W:  3:  1: [Correctable] Lint/UselessAssignment: Useless assignment to variable - x.
+
+          1 file inspected, 1 offense detected, 1 offense autocorrectable
+        RESULT
+      end
+    end
+
+    context 'and the directory is absolute' do
+      let(:checked_path) { abs('..') }
+
+      it_behaves_like 'checks Rakefile'
+    end
+
+    context 'and the directory is relative' do
+      let(:checked_path) { '..' }
+
+      it_behaves_like 'checks Rakefile'
+    end
+
+    context 'and the Rakefile path is absolute' do
+      let(:checked_path) { abs('../Rakefile') }
+
+      it_behaves_like 'checks Rakefile'
+    end
+
+    context 'and the Rakefile path is relative' do
+      let(:checked_path) { '../Rakefile' }
+
+      it_behaves_like 'checks Rakefile'
+    end
+  end
+
+  context 'when lines end with CR+LF' do
+    it 'reports an offense' do
+      create_file('example.rb', <<~RUBY)
+        x = 0\r
+        puts x\r
+      RUBY
+      # Make Style/EndOfLine give same output regardless of platform.
+      create_file('.rubocop.yml', <<~YAML)
+        EndOfLine:
+          EnforcedStyle: lf
+      YAML
+      result = cli.run(['--format', 'simple', 'example.rb'])
+      expect(result).to eq(1)
+      expect($stdout.string)
+        .to eq(<<~RESULT)
+          == example.rb ==
+          C:  1:  1: Layout/EndOfLine: Carriage return character detected.
+          C:  1:  1: [Correctable] Style/FrozenStringLiteralComment: Missing frozen string literal comment.
+
+          1 file inspected, 2 offenses detected, 1 offense autocorrectable
+      RESULT
+      expect($stderr.string).to eq(<<~RESULT)
+        .rubocop.yml: Warning: no department given for EndOfLine.
+      RESULT
+    end
+  end
+
+  context 'when using an invalid encoding string' do
+    it 'does not crash and reports an offense' do
+      create_file('example.rb', <<~'RUBY')
+        "\xE3\xD3\x8B\xE3\x83\xBC\x83\xE3\x83\xE3\x82\xB3\xA3\x82\x99"
+      RUBY
+      result = cli.run(['--format', 'simple', 'example.rb'])
+      expect(result).to eq(1)
+      expect($stdout.string)
+        .to eq(<<~RESULT)
+          == example.rb ==
+          C:  1:  1: [Correctable] Style/FrozenStringLiteralComment: Missing frozen string literal comment.
+
+          1 file inspected, 1 offense detected, 1 offense autocorrectable
+      RESULT
+      expect($stderr.string).to eq ''
+    end
+  end
+
+  context 'when checking a correct file' do
+    it 'returns 0' do
+      create_file('example.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        x = 0
+        puts x
+      RUBY
+      expect(cli.run(['--format', 'simple', 'example.rb'])).to eq(0)
+      expect($stdout.string)
+        .to eq(<<~RESULT)
+
+          1 file inspected, no offenses detected
+      RESULT
+    end
+
+    context 'when super is used with a block' do
+      it 'still returns 0' do
+        create_file('example.rb', <<~RUBY)
+          # frozen_string_literal: true
+
+          # this is a class
+          class Thing
+            def super_with_block
+              super { |response| }
+            end
+
+            def and_with_args
+              super(arg1, arg2) { |response| }
+            end
+          end
+        RUBY
+        create_file('.rubocop.yml', <<~YAML)
+          Lint/UnusedBlockArgument:
+            IgnoreEmptyBlocks: true
+        YAML
+        expect(cli.run(['--format', 'simple', 'example.rb'])).to eq(0)
+        expect($stdout.string)
+          .to eq(<<~RESULT)
+
+            1 file inspected, no offenses detected
+        RESULT
+      end
+    end
+  end
+
+  it 'checks a given file with faults and returns 1' do
+    create_file('example.rb', ['# frozen_string_literal: true', '', 'x = 0 ', 'puts x'])
+    expect(cli.run(['--format', 'simple', 'example.rb'])).to eq(1)
+    expect($stdout.string)
+      .to eq <<~RESULT
+        == example.rb ==
+        C:  3:  6: [Correctable] Layout/TrailingWhitespace: Trailing whitespace detected.
+
+        1 file inspected, 1 offense detected, 1 offense autocorrectable
+    RESULT
+  end
+
+  it 'registers an offense for a syntax error' do
+    create_file('example.rb', ['class Test', 'en'])
+    expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(1)
+    expect($stderr.string).to eq ''
+    expect($stdout.string)
+      .to eq(["#{abs('example.rb')}:2:3: F: Lint/Syntax: unexpected " \
+              'token $end (Using Ruby 2.7 parser; configure using ' \
+              '`TargetRubyVersion` parameter, under `AllCops`)',
+              ''].join("\n"))
+  end
+
+  it 'registers an offense for Parser warnings' do
+    create_file('example.rb', [
+                  '# frozen_string_literal: true',
+                  '',
+                  'puts *test',
+                  'if a then b else c end'
+                ])
+    aggregate_failures('CLI output') do
+      expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(1)
+      expect($stdout.string)
+        .to eq(["#{abs('example.rb')}:3:6: W: [Correctable] Lint/AmbiguousOperator: " \
+                'Ambiguous splat operator. Parenthesize the method arguments ' \
+                "if it's surely a splat operator, or add a whitespace to the " \
+                'right of the `*` if it should be a multiplication.',
+                "#{abs('example.rb')}:4:1: C: [Correctable] Style/OneLineConditional: " \
+                'Favor the ternary operator (`?:`) over single-line `if/then/else/end` constructs.',
+                ''].join("\n"))
+    end
+  end
+
+  it 'can process a file with an invalid UTF-8 byte sequence' do
+    create_file('example.rb', ["# #{'f9'.hex.chr}#{'29'.hex.chr}"])
+    expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(1)
+    expect($stderr.string).to eq ''
+    expect($stdout.string)
+      .to eq(<<~RESULT)
+        #{abs('example.rb')}:1:1: F: Lint/Syntax: Invalid byte sequence in utf-8.
+    RESULT
+  end
+
+  context 'when errors are raised while processing files due to bugs' do
+    let(:errors) { ['An error occurred while Encoding cop was inspecting file.rb.'] }
+
+    before { allow_any_instance_of(RuboCop::Runner).to receive(:errors).and_return(errors) }
+
+    it 'displays an error message to stderr' do
+      cli.run([])
+      expect($stderr.string).to include('1 error occurred:').and include(errors.first)
+    end
+  end
+
+  if RUBY_ENGINE == 'ruby' && !RuboCop::Platform.windows?
+    # NOTE: It has been tested for parallelism with `--debug` option.
+    #       In other words, even if no option is specified, it will be parallelized by default.
+    describe 'when parallel static by default' do
+      context 'when specifying `--debug` option only`' do
+        it 'uses parallel inspection' do
+          create_file('example1.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            puts 'hello'
+          RUBY
+          expect(cli.run(['--debug'])).to eq(0)
+          expect($stdout.string).to include('Use parallel by default.')
+        end
+      end
+
+      context 'when specifying configuration file' do
+        it 'uses parallel inspection' do
+          create_file('example1.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            puts 'hello'
+          RUBY
+          create_empty_file('.rubocop.yml')
+          expect(cli.run(['--debug', '--config', '.rubocop.yml'])).to eq(0)
+          expect($stdout.string).to include('Use parallel by default.')
+        end
+      end
+
+      context 'when specifying `--force-exclusion` option' do
+        it 'uses parallel inspection' do
+          create_file('example1.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            puts 'hello'
+          RUBY
+          expect(cli.run(['--debug', '--force-exclusion'])).to eq(0)
+          expect($stdout.string).to include('Use parallel by default.')
+        end
+      end
+
+      context 'when specifying `--display-cop-names` option' do
+        it 'uses parallel inspection' do
+          create_file('example1.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            puts 'hello'
+          RUBY
+          expect(cli.run(['--debug', '--display-cop-names'])).to eq(0)
+          expect($stdout.string).to include('Use parallel by default.')
+        end
+      end
+
+      context 'when specifying `--report-unused-todo-entries` option' do
+        it 'uses parallel inspection' do
+          create_file('example1.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            puts 'hello'
+          RUBY
+          expect(cli.run(['--debug', '--report-unused-todo-entries'])).to eq(0)
+          expect($stdout.string).to include('Use parallel by default.')
+        end
+      end
+
+      context 'when specifying `--debug` and `-a` options`' do
+        it 'uses parallel inspection when correcting the file' do
+          create_file('example1.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            puts "hello"
+          RUBY
+          expect(cli.run(['--debug', '-a'])).to eq(0)
+          expect($stdout.string).to include('Use parallel by default.')
+          expect(File.read('example1.rb')).to eq(<<~RUBY)
+            # frozen_string_literal: true
+
+            puts 'hello'
+          RUBY
+        end
+      end
+
+      context 'when setting `UseCache: true`' do
+        it 'uses parallel inspection' do
+          create_file('example.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            puts 'hello'
+          RUBY
+          create_file('.rubocop.yml', <<~YAML)
+            AllCops:
+              UseCache: true
+          YAML
+          expect(cli.run(['--debug'])).to eq(0)
+          expect($stdout.string).to include('Use parallel by default.')
+        end
+      end
+
+      context 'when setting `UseCache: false`' do
+        it 'does not use parallel inspection' do
+          create_file('example.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            puts 'hello'
+          RUBY
+          create_file('.rubocop.yml', <<~YAML)
+            AllCops:
+              UseCache: false
+          YAML
+          expect(cli.run(['--debug'])).to eq(0)
+          expect($stdout.string).not_to include('Use parallel by default.')
+        end
+      end
+    end
+
+    context 'when a directory is named `*`' do
+      before do
+        FileUtils.mkdir('*')
+      end
+
+      after do
+        FileUtils.rmdir('*')
+      end
+
+      it 'does not crash' do
+        expect(cli.run([])).to eq(0)
+      end
+    end
+  end
+
+  describe 'for a disabled cop' do
+    it 'reports an offense when explicitly enabled on part of a file' do
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          SuggestExtensions: false
+        Lint/UselessAssignment:
+          Enabled: false
+      YAML
+
+      create_file('example.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        a = 1
+        # rubocop:enable Lint/UselessAssignment
+        b = 2
+        # rubocop:disable Lint/UselessAssignment
+        c = 3
+      RUBY
+
+      expect(cli.run(['--format', 'simple', 'example.rb'])).to eq(1)
+      expect($stdout.string).to eq(<<~RESULT)
+        == example.rb ==
+        W:  5:  1: [Correctable] Lint/UselessAssignment: Useless assignment to variable - b.
+
+        1 file inspected, 1 offense detected, 1 offense autocorrectable
+      RESULT
+    end
+
+    it '`Lint/Syntax` must be enabled when `Lint` is given `Enabled: false`' do
+      create_file('.rubocop.yml', <<~YAML)
+        Lint:
+          Enabled: false
+      YAML
+
+      create_file('example.rb', <<~RUBY)
+        1 /// 2
+      RUBY
+
+      expect(cli.run(['--format', 'simple', 'example.rb'])).to eq(1)
+      expect($stdout.string).to include('F:  1:  7: Lint/Syntax: unexpected token tINTEGER')
+    end
+
+    it '`Lint/Syntax` must be enabled when `DisabledByDefault: true`' do
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          DisabledByDefault: true
+      YAML
+
+      create_file('example.rb', <<~RUBY)
+        1 /// 2
+      RUBY
+
+      expect(cli.run(['--format', 'simple', 'example.rb'])).to eq(1)
+      expect($stdout.string).to include('F:  1:  7: Lint/Syntax: unexpected token tINTEGER')
+    end
+
+    it '`Lint/Syntax` must be enabled when disabled by directive comment' do
+      create_file('example.rb', <<~RUBY)
+        # rubocop:disable Lint/Syntax
+        1 /// 2
+      RUBY
+
+      expect(cli.run(['--format', 'simple', 'example.rb'])).to eq(1)
+      expect($stdout.string).to include('F:  2:  7: Lint/Syntax: unexpected token tINTEGER')
+    end
+
+    it '`Lint/Syntax` must be enabled when disabled by directive department comment' do
+      create_file('example.rb', <<~RUBY)
+        # rubocop:disable Lint
+        1 /// 2
+      RUBY
+
+      expect(cli.run(['--format', 'simple', 'example.rb'])).to eq(1)
+      expect($stdout.string).to include('F:  2:  7: Lint/Syntax: unexpected token tINTEGER')
+    end
+
+    it '`Lint/Syntax` must be enabled when disabled by directive all comment' do
+      create_file('example.rb', <<~RUBY)
+        # rubocop:disable all
+        1 /// 2
+      RUBY
+
+      expect(cli.run(['--format', 'simple', 'example.rb'])).to eq(1)
+      expect($stdout.string).to include('F:  2:  7: Lint/Syntax: unexpected token tINTEGER')
+    end
+
+    it '`Naming/FileName` must be disabled for global offenses' do
+      create_file('Example.rb', <<~RUBY)
+        # rubocop:disable Naming/FileName
+      RUBY
+
+      expect(cli.run(['--format', 'simple', 'Example.rb'])).to eq(1)
+      expect($stdout.string).not_to include('Naming/FileName:')
+    end
+
+    it '`Naming/FileName` must be enabled if directive comment is on unrelated line' do
+      create_file('Example.rb', <<~RUBY)
+        # Prelude
+        # rubocop:disable Naming/FileName
+      RUBY
+
+      expect(cli.run(['--format', 'simple', 'Example.rb'])).to eq(1)
+      expect($stdout.string).to include('C:  1:  1: Naming/FileName:')
+    end
+  end
+
+  describe 'for a cop enabled only for a subset of files' do
+    it "doesn't enable the cop for all files when department disables are present" do
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          DisabledByDefault: true
+
+        Style/HashSyntax:
+          Enabled: true
+          Exclude:
+            - example1.rb
+      YAML
+
+      source = <<~RUBY
+        { :a => :b }
+        # rubocop:disable Style
+        { :a => :b }
+        # rubocop:enable Style
+        # rubocop:disable all
+        { :a => :b }
+        # rubocop:enable all
+      RUBY
+
+      create_file('example1.rb', source)
+      create_file('example2.rb', source)
+
+      expect(cli.run(['--format', 'simple', 'example1.rb', 'example2.rb'])).to eq(1)
+      expect($stdout.string).to eq(<<~RESULT)
+        == example2.rb ==
+        C:  1:  3: [Correctable] Style/HashSyntax: Use the new Ruby 1.9 hash syntax.
+
+        2 files inspected, 1 offense detected, 1 offense autocorrectable
+      RESULT
+    end
+  end
+
+  describe 'rubocop:disable comment' do
+    it 'can disable all cops in a code section' do
+      src = ['# rubocop:disable all',
+             '#' * 130,
+             'x(123456)',
+             'y("123")',
+             'def func',
+             '  # rubocop: enable Layout/LineLength,Style/StringLiterals',
+             "  #{'#' * 130}",
+             '  x(123456)',
+             '  y("123")',
+             'end']
+      create_file('example.rb', src)
+      expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(1)
+      # all cops were disabled, then 2 were enabled again, so we
+      # should get 2 offenses reported.
+      expect($stdout.string).to eq(<<~RESULT)
+        #{abs('example.rb')}:7:121: C: Layout/LineLength: Line is too long. [132/120]
+        #{abs('example.rb')}:9:5: C: [Correctable] Style/StringLiterals: Prefer single-quoted strings when you don't need string interpolation or special symbols.
+      RESULT
+    end
+
+    describe 'Specify `--init` option to `rubocop` command' do
+      context 'when .rubocop.yml does not exist' do
+        it 'generate a .rubocop.yml file' do
+          expect(cli.run(['--init'])).to eq(0)
+          expect($stdout.string).to start_with('Writing new .rubocop.yml to')
+          expect(File.read('.rubocop.yml')).to eq(<<~YAML)
+            # The behavior of RuboCop can be controlled via the .rubocop.yml
+            # configuration file. It makes it possible to enable/disable
+            # certain cops (checks) and to alter their behavior if they accept
+            # any parameters. The file can be placed either in your home
+            # directory or in some project directory.
+            #
+            # RuboCop will start looking for the configuration file in the directory
+            # where the inspected file is and continue its way up to the root directory.
+            #
+            # See https://docs.rubocop.org/rubocop/configuration
+          YAML
+        end
+      end
+
+      context 'when .rubocop.yml already exists' do
+        it 'fails with an error message' do
+          create_empty_file('.rubocop.yml')
+
+          expect(cli.run(['--init'])).to eq(2)
+          expect($stderr.string).to start_with('.rubocop.yml already exists at')
+        end
+      end
+    end
+
+    context 'when --autocorrect-all is given' do
+      it 'does not trigger RedundantCopDisableDirective due to lines moving around' do
+        src = ['a = 1 # rubocop:disable Lint/UselessAssignment']
+        create_file('example.rb', src)
+        create_file('.rubocop.yml', <<~YAML)
+          Style/FrozenStringLiteralComment:
+            Enabled: true
+            EnforcedStyle: always
+          Layout/EmptyLineAfterMagicComment:
+            Enabled: false
+        YAML
+        expect(cli.run(['--format', 'offenses', '-A', 'example.rb'])).to eq(0)
+        expect($stdout.string).to eq(<<~RESULT)
+
+          1  Style/FrozenStringLiteralComment [Unsafe Correctable]
+          --
+          1  Total in 1 file
+
+        RESULT
+        expect(File.read('example.rb'))
+          .to eq(<<~RUBY)
+            # frozen_string_literal: true
+            a = 1 # rubocop:disable Lint/UselessAssignment
+        RUBY
+      end
+    end
+
+    it 'can disable selected cops in a code section' do
+      create_file('example.rb',
+                  ['# frozen_string_literal: true',
+                   '',
+                   '# rubocop:disable Style/LineLength,' \
+                   'Style/NumericLiterals,Style/StringLiterals',
+                   '#' * 130,
+                   'x(123456)',
+                   'y("123")',
+                   'def func',
+                   '  # rubocop: enable Layout/LineLength, ' \
+                   'Style/StringLiterals',
+                   "  #{'#' * 130}",
+                   '  x(123456)',
+                   '  y("123")',
+                   '  # rubocop: enable Style/NumericLiterals',
+                   'end'])
+      expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(1)
+      expect($stderr.string).to be_empty
+      # 2 real cops were disabled; the wrongly-namespaced `Style/LineLength` is
+      # not honored and gets reported with a suggestion instead.
+      # 2 real cops were enabled, but only 1 had been disabled correctly.
+      expect($stdout.string).to eq(<<~RESULT)
+        #{abs('example.rb')}:3:19: W: Lint/RedundantCopDisableDirective: Unnecessary disabling of `Style/LineLength` (did you mean `Layout/LineLength`?).
+        #{abs('example.rb')}:4:121: C: Layout/LineLength: Line is too long. [130/120]
+        #{abs('example.rb')}:8:21: W: [Correctable] Lint/RedundantCopEnableDirective: Unnecessary enabling of Layout/LineLength.
+        #{abs('example.rb')}:9:121: C: Layout/LineLength: Line is too long. [132/120]
+        #{abs('example.rb')}:11:5: C: [Correctable] Style/StringLiterals: Prefer single-quoted strings when you don't need string interpolation or special symbols.
+      RESULT
+    end
+
+    it 'can disable cops for the following statement with `disable-next`' do
+      create_file('example.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        # rubocop:disable-next Lint/UselessAssignment -- kept for documentation purposes
+        useless = compute(1,
+                          2)
+        also_useless = 3
+      RUBY
+      expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(1)
+      expect($stdout.string).to include('6:1: W: [Correctable] Lint/UselessAssignment')
+      expect($stdout.string).not_to include('4:1')
+    end
+
+    it 'carries a `disable-next` justification into `--display-suppressed` JSON output' do
+      create_file('example.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        # rubocop:disable-next Lint/UselessAssignment -- kept for documentation purposes
+        useless = 1
+      RUBY
+      expect(cli.run(['--format', 'json', '--display-suppressed', 'example.rb'])).to eq(0)
+      expect($stdout.string).to include('"justification":"kept for documentation purposes"')
+    end
+
+    it 'keeps the justification when the offense is served from the result cache' do
+      create_file('example.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        # rubocop:disable-next Lint/UselessAssignment -- kept for documentation purposes
+        useless = 1
+      RUBY
+      args = ['--format', 'json', '--display-suppressed', '--cache', 'true',
+              '--cache-root', '.cache', 'example.rb']
+
+      expect(cli.run(args)).to eq(0)
+      expect($stdout.string).to include('"justification":"kept for documentation purposes"')
+
+      $stdout.string.clear
+      expect(cli.run(args)).to eq(0)
+      expect($stdout.string).to include('"justification":"kept for documentation purposes"')
+    end
+
+    it 'reports a detached `disable-next` even when no cop is disabled in the config' do
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          EnabledByDefault: true
+      YAML
+      create_file('example.rb', <<~RUBY)
+        puts 1
+        # rubocop:disable-next Lint/UselessAssignment
+      RUBY
+      expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(1)
+      expect($stdout.string).to include('Unnecessary disabling of `Lint/UselessAssignment`')
+    end
+
+    it 'reports suppressed offenses with `--display-suppressed` without affecting the exit code' do
+      create_file('example.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        x = 1 # rubocop:disable Lint/UselessAssignment -- demo data
+      RUBY
+      expect(cli.run(['--format', 'emacs', '--display-suppressed', 'example.rb'])).to eq(0)
+      expect($stdout.string)
+        .to include('[Suppressed] Lint/UselessAssignment: Useless assignment to variable - `x`')
+
+      $stdout.string.clear
+      expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(0)
+      expect($stdout.string).not_to include('Suppressed')
+    end
+
+    it 'can disable all cops on a single line' do
+      create_file('example.rb', 'y("123", 123456) # rubocop:disable all')
+      expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(0)
+      expect($stdout.string).to be_empty
+    end
+
+    it 'can disable selected cops on a single line' do
+      create_file('example.rb',
+                  ['# frozen_string_literal: true',
+                   '',
+                   "#{'a' * 130} # rubocop:disable Layout/LineLength",
+                   '#' * 130,
+                   'y("123", 123456) # rubocop:disable Style/StringLiterals,' \
+                   'Style/NumericLiterals'])
+      expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(1)
+      expect($stdout.string)
+        .to eq(<<~RESULT)
+          #{abs('example.rb')}:4:121: C: Layout/LineLength: Line is too long. [130/120]
+      RESULT
+    end
+
+    context 'without using namespace' do
+      it 'can disable selected cops on a single line but prints a warning' do
+        create_file('example.rb',
+                    ['# frozen_string_literal: true',
+                     '',
+                     "#{'a' * 130} # rubocop:disable LineLength",
+                     '#' * 130,
+                     'y("123") # rubocop:disable StringLiterals'])
+        expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(1)
+        expect($stderr.string).to eq(<<~OUTPUT)
+          example.rb: Warning: no department given for LineLength. Run `rubocop -a --only Migration/DepartmentName` to fix.
+          example.rb: Warning: no department given for StringLiterals. Run `rubocop -a --only Migration/DepartmentName` to fix.
+        OUTPUT
+        expect($stdout.string)
+          .to eq(<<~RESULT)
+            #{abs('example.rb')}:3:150: C: [Correctable] Migration/DepartmentName: Department name is missing.
+            #{abs('example.rb')}:4:121: C: Layout/LineLength: Line is too long. [130/120]
+            #{abs('example.rb')}:5:28: C: [Correctable] Migration/DepartmentName: Department name is missing.
+        RESULT
+      end
+    end
+
+    context 'when not necessary' do
+      it 'causes an offense to be reported' do
+        create_file('example.rb',
+                    ['# frozen_string_literal: true',
+                     '',
+                     '#' * 130,
+                     '# rubocop:disable all',
+                     "#{'a' * 10} # rubocop:disable Layout/LineLength,Metrics/ClassLength",
+                     'y(123) # rubocop:disable all',
+                     '# rubocop:enable all'])
+        expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(1)
+        expect($stderr.string).to eq('')
+        expect($stdout.string).to eq(<<~RESULT)
+          #{abs('example.rb')}:3:121: C: Layout/LineLength: Line is too long. [130/120]
+          #{abs('example.rb')}:4:1: W: [Correctable] Lint/RedundantCopDisableDirective: Unnecessary disabling of all cops.
+          #{abs('example.rb')}:5:12: W: [Correctable] Lint/RedundantCopDisableDirective: Unnecessary disabling of `Layout/LineLength`, `Metrics/ClassLength`.
+          #{abs('example.rb')}:6:8: W: [Correctable] Lint/RedundantCopDisableDirective: Unnecessary disabling of all cops.
+        RESULT
+      end
+
+      context 'and there are no other offenses' do
+        it 'exits with error code' do
+          create_file('example.rb', "#{'a' * 10} # rubocop:disable LineLength")
+          expect(cli.run(['example.rb'])).to eq(1)
+        end
+      end
+
+      context 'when using `rubocop:disable` line comment for `Lint/EmptyBlock`' do
+        it 'does not register an offense for `Lint/RedundantCopDisableDirective`' do
+          create_file('.rubocop.yml', <<~YAML)
+            Lint/EmptyBlock:
+              Enabled: true
+            Lint/RedundantCopDisableDirective:
+              Enabled: true
+          YAML
+          create_file('example.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            assert_equal nil, combinator {}.call # rubocop:disable Lint/EmptyBlock
+          RUBY
+          expect(cli.run(['example.rb'])).to eq(0)
+          expect($stdout.string).to include('1 file inspected, no offenses detected')
+        end
+      end
+
+      context 'when using `rubocop:disable` line comment for `Style/RedundantInitialize`' do
+        it 'does not register an offense for `Lint/RedundantCopDisableDirective`' do
+          create_file('.rubocop.yml', <<~YAML)
+            Style/RedundantInitialize:
+              Enabled: true
+            Lint/RedundantCopDisableDirective:
+              Enabled: true
+          YAML
+          create_file('example.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            Class.new do
+              def initialize; end # rubocop:disable Style/RedundantInitialize
+            end
+          RUBY
+          expect(cli.run(['example.rb'])).to eq(0)
+          expect($stdout.string).to include('1 file inspected, no offenses detected')
+        end
+      end
+
+      context 'when using `rubocop:disable` line comment for `Lint/EmptyWhen`' do
+        it 'does not register an offense for `Lint/RedundantCopDisableDirective`' do
+          create_file('.rubocop.yml', <<~YAML)
+            Lint/EmptyWhen:
+              Enabled: true
+            Lint/RedundantCopDisableDirective:
+              Enabled: true
+          YAML
+          create_file('example.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            case x
+            when 1 # rubocop:disable Lint/EmptyWhen
+            when 2
+              :ok
+            end
+          RUBY
+          expect(cli.run(['example.rb'])).to eq(0)
+          expect($stdout.string).to include('1 file inspected, no offenses detected')
+        end
+      end
+
+      context 'when using `rubocop:disable` line comment for `Lint/EmptyConditionalBody`' do
+        it 'does not register an offense for `Lint/RedundantCopDisableDirective`' do
+          create_file('.rubocop.yml', <<~YAML)
+            Lint/EmptyConditionalBody:
+              Enabled: true
+            Lint/RedundantCopDisableDirective:
+              Enabled: true
+          YAML
+          create_file('example.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            if condition # rubocop:disable Lint/EmptyConditionalBody
+            end
+          RUBY
+          expect(cli.run(['example.rb'])).to eq(0)
+          expect($stdout.string).to include('1 file inspected, no offenses detected')
+        end
+      end
+
+      context 'when using `rubocop:disable` line comment for `Lint/EmptyInPattern`' do
+        it 'does not register an offense for `Lint/RedundantCopDisableDirective`' do
+          create_file('.rubocop.yml', <<~YAML)
+            Lint/EmptyInPattern:
+              Enabled: true
+            Lint/RedundantCopDisableDirective:
+              Enabled: true
+          YAML
+          create_file('example.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            case [1]
+            in [a] # rubocop:disable Lint/EmptyInPattern
+            in [a, b]
+              :ok
+            end
+          RUBY
+          expect(cli.run(['example.rb'])).to eq(0)
+          expect($stdout.string).to include('1 file inspected, no offenses detected')
+        end
+      end
+
+      context 'when using `rubocop:disable` line comment for `Style/SymbolProc`' do
+        it 'does not register an offense for `Lint/RedundantCopDisableDirective`' do
+          create_file('.rubocop.yml', <<~YAML)
+            Style/SymbolProc:
+              Enabled: true
+              AllowComments: true
+            Lint/RedundantCopDisableDirective:
+              Enabled: true
+          YAML
+          create_file('example.rb', <<~RUBY)
+            # frozen_string_literal: true
+
+            something do |e| # rubocop:disable Style/SymbolProc
+              e.upcase
+            end
+          RUBY
+          expect(cli.run(['example.rb'])).to eq(0)
+          expect($stdout.string).to include('1 file inspected, no offenses detected')
+        end
+      end
+
+      shared_examples 'RedundantCopDisableDirective not run' do |state, config|
+        context "and RedundantCopDisableDirective is #{state}" do
+          it 'does not report RedundantCopDisableDirective offenses' do
+            create_file('example.rb',
+                        ['# frozen_string_literal: true',
+                         '',
+                         '#' * 130,
+                         '# rubocop:disable all',
+                         "#{'a' * 10} # rubocop:disable LineLength,ClassLength",
+                         'y(123) # rubocop:disable all'])
+            create_file('.rubocop.yml', config)
+            expect(cli.run(['--format', 'emacs'])).to eq(1)
+            expect($stderr.string).to eq(<<~OUTPUT)
+              example.rb: Warning: no department given for LineLength. Run `rubocop -a --only Migration/DepartmentName` to fix.
+              example.rb: Warning: no department given for ClassLength. Run `rubocop -a --only Migration/DepartmentName` to fix.
+            OUTPUT
+            expect($stdout.string)
+              .to eq(<<~RESULT)
+                #{abs('example.rb')}:3:121: C: Layout/LineLength: Line is too long. [130/120]
+              RESULT
+          end
+        end
+      end
+
+      it_behaves_like 'RedundantCopDisableDirective not run',
+                      'individually disabled', <<~YAML
+                        Lint/RedundantCopDisableDirective:
+                          Enabled: false
+                      YAML
+      it_behaves_like 'RedundantCopDisableDirective not run',
+                      'individually excluded', <<~YAML
+                        Lint/RedundantCopDisableDirective:
+                          Exclude:
+                            - example.rb
+                      YAML
+      it_behaves_like 'RedundantCopDisableDirective not run',
+                      'disabled through department', <<~YAML
+                        Lint:
+                          Enabled: false
+                      YAML
+    end
+  end
+
+  it 'finds a file with no .rb extension but has a shebang line' do
+    allow_any_instance_of(File::Stat).to receive(:executable?).and_return(true)
+    create_file('example', ['#!/usr/bin/env ruby', 'x = 0', 'puts x'])
+    create_file('.rubocop.yml', <<~YAML)
+      Style/FrozenStringLiteralComment:
+        Enabled: false
+    YAML
+    expect(cli.run(%w[--format simple])).to eq(0)
+    expect($stdout.string).to eq(['', '1 file inspected, no offenses detected', ''].join("\n"))
+  end
+
+  it 'does not register any offenses for an empty file' do
+    create_empty_file('example.rb')
+    expect(cli.run(%w[--format simple])).to eq(0)
+    expect($stdout.string).to eq(['', '1 file inspected, no offenses detected', ''].join("\n"))
+  end
+
+  describe 'style guide only usage' do
+    context 'via the cli option' do
+      describe '--only-guide-cops' do
+        it 'skips cops that have no link to a style guide' do
+          create_file('example.rb', 'raise')
+          create_file('.rubocop.yml', <<~YAML)
+            Layout/LineLength:
+              Enabled: true
+              StyleGuide: ~
+              Max: 2
+          YAML
+
+          expect(cli.run(['--format', 'simple', '--only-guide-cops', 'example.rb'])).to eq(0)
+        end
+
+        it 'runs cops for rules that link to a style guide' do
+          create_file('example.rb', 'raise')
+          create_file('.rubocop.yml', <<~YAML)
+            Layout/LineLength:
+              Enabled: true
+              StyleGuide: "http://an.example/url"
+              Max: 2
+          YAML
+
+          expect(cli.run(['--format', 'simple', '--only-guide-cops', 'example.rb'])).to eq(1)
+
+          expect($stdout.string)
+            .to eq(<<~RESULT)
+              == example.rb ==
+              C:  1:  3: Layout/LineLength: Line is too long. [5/2]
+
+              1 file inspected, 1 offense detected
+            RESULT
+        end
+
+        it 'overrides configuration of AllCops/StyleGuideCopsOnly' do
+          create_file('example.rb', 'raise')
+          create_file('.rubocop.yml', <<~YAML)
+            AllCops:
+              StyleGuideCopsOnly: false
+            Layout/LineLength:
+              Enabled: true
+              StyleGuide: ~
+              Max: 2
+          YAML
+
+          expect(cli.run(['--format', 'simple', '--only-guide-cops', 'example.rb'])).to eq(0)
+        end
+      end
+    end
+
+    context 'via the config' do
+      before do
+        create_file('example.rb', <<~RUBY)
+          if foo and bar
+            do_something
+          end
+        RUBY
+        create_file('.rubocop.yml', <<~YAML)
+          AllCops:
+            StyleGuideCopsOnly: #{guide_cops_only}
+            DisabledByDefault: #{disabled_by_default}
+          Layout/LineLength:
+            Enabled: true
+            StyleGuide: ~
+            Max: 2
+          Style/FrozenStringLiteralComment:
+            Enabled: false
+        YAML
+      end
+
+      describe 'AllCops/StyleGuideCopsOnly' do
+        let(:disabled_by_default) { 'false' }
+
+        context 'when it is true' do
+          let(:guide_cops_only) { 'true' }
+
+          it 'skips cops that have no link to a style guide' do
+            expect(cli.run(['--format', 'offenses', 'example.rb'])).to eq(1)
+
+            expect($stdout.string).to eq(<<~RESULT)
+
+              1  Style/AndOr [Unsafe Correctable]
+              --
+              1  Total in 1 file
+
+            RESULT
+          end
+        end
+
+        context 'when it is false' do
+          let(:guide_cops_only) { 'false' }
+
+          it 'runs cops for rules regardless of any link to the style guide' do
+            expect(cli.run(['--format', 'offenses', 'example.rb'])).to eq(1)
+
+            expect($stdout.string).to eq(<<~RESULT)
+
+              3  Layout/LineLength [Safe Correctable]
+              1  Style/AndOr [Unsafe Correctable]
+              --
+              4  Total in 1 file
+
+            RESULT
+          end
+        end
+      end
+
+      describe 'AllCops/DisabledByDefault' do
+        let(:guide_cops_only) { 'false' }
+
+        context 'when it is true' do
+          let(:disabled_by_default) { 'true' }
+
+          it 'runs only the cop configured in .rubocop.yml' do
+            expect(cli.run(['--format', 'offenses', 'example.rb'])).to eq(1)
+
+            expect($stdout.string).to eq(<<~RESULT)
+
+              3  Layout/LineLength [Safe Correctable]
+              --
+              3  Total in 1 file
+
+            RESULT
+          end
+        end
+
+        context 'when it is false' do
+          let(:disabled_by_default) { 'false' }
+
+          it 'runs all cops that are enabled in default configuration' do
+            expect(cli.run(['--format', 'offenses', 'example.rb'])).to eq(1)
+
+            expect($stdout.string).to eq(<<~RESULT)
+
+              3  Layout/LineLength [Safe Correctable]
+              1  Style/AndOr [Unsafe Correctable]
+              --
+              4  Total in 1 file
+
+            RESULT
+          end
+        end
+      end
+    end
+  end
+
+  describe 'cops can exclude files based on config' do
+    it 'ignores excluded files' do
+      create_file('example.rb', 'x = 0')
+      create_file('regexp.rb', 'x = 0')
+      create_file('exclude_glob.rb', ['#!/usr/bin/env ruby', 'x = 0'])
+      create_file('dir/thing.rb', 'x = 0')
+      create_file('.rubocop.yml', <<~'YAML')
+        Lint/UselessAssignment:
+          Exclude:
+            - example.rb
+            - !ruby/regexp /regexp.rb\z/
+            - "exclude_*"
+            - "dir/*"
+        Style/FrozenStringLiteralComment:
+          Enabled: false
+      YAML
+      allow_any_instance_of(File::Stat).to receive(:executable?).and_return(true)
+      expect(cli.run(%w[--format simple])).to eq(0)
+      expect($stdout.string).to eq(['', '4 files inspected, no offenses detected', ''].join("\n"))
+    end
+  end
+
+  describe 'configuration from file' do
+    before { RuboCop::ConfigLoader.default_configuration = nil }
+
+    context 'when a value in a hash is overridden with nil' do
+      it 'acts as if the key/value pair was removed' do
+        create_file('.rubocop.yml', <<~YAML)
+          Style/InverseMethods:
+            InverseMethods:
+              :even?: ~
+          Style/CollectionMethods:
+            Enabled: true
+            PreferredMethods:
+              collect: ~
+          Style/FrozenStringLiteralComment:
+            Enabled: false
+        YAML
+        create_file('example.rb', 'array.collect { |e| !e.odd? }')
+        expect(cli.run([])).to eq(0)
+      end
+    end
+
+    context 'when configured for indented_internal_methods style indentation' do
+      it 'accepts indented_internal_methods style indentation' do
+        create_file('.rubocop.yml', <<~YAML)
+          Layout/IndentationConsistency:
+            EnforcedStyle: indented_internal_methods
+          Style/FrozenStringLiteralComment:
+            Enabled: false
+        YAML
+        create_file('example.rb', <<~RUBY)
+          # A feline creature
+          class Cat
+            def meow
+              puts('Meow!')
+            end
+
+            protected
+
+              def can_we_be_friends?(another_cat)
+                some_logic(another_cat)
+              end
+
+            private
+
+              def meow_at_3am?
+                rand < 0.8
+              end
+          end
+        RUBY
+        result = cli.run(%w[--format simple])
+        expect($stderr.string).to eq('')
+        expect(result).to eq(0)
+        expect($stdout.string).to eq(['', '1 file inspected, no offenses detected', ''].join("\n"))
+      end
+
+      %w[class module].each do |parent|
+        it "registers an offense for normal indentation in #{parent}" do
+          create_file('.rubocop.yml', <<~YAML)
+            Layout/IndentationConsistency:
+              EnforcedStyle: indented_internal_methods
+            Style/FrozenStringLiteralComment:
+              Enabled: false
+          YAML
+          create_file('example.rb', <<~RUBY)
+            # A feline creature
+            #{parent} Cat
+              def meow
+                puts('Meow!')
+              end
+
+              protected
+
+              def can_we_be_friends?(another_cat)
+                some_logic(another_cat)
+              end
+
+              private
+
+              def meow_at_3am?
+                rand < 0.8
+              end
+
+              def meow_at_4am?
+                rand < 0.8
+              end
+            end
+          RUBY
+          result = cli.run(%w[--format simple])
+          expect($stderr.string).to eq('')
+          expect(result).to eq(1)
+          expect($stdout.string)
+            .to eq(<<~RESULT)
+              == example.rb ==
+              C:  9:  3: [Correctable] Layout/IndentationWidth: Use 2 (not 0) spaces for indented_internal_methods indentation.
+              C: 15:  3: [Correctable] Layout/IndentationWidth: Use 2 (not 0) spaces for indented_internal_methods indentation.
+
+              1 file inspected, 2 offenses detected, 2 offenses autocorrectable
+          RESULT
+        end
+      end
+    end
+
+    context 'when obsolete MultiSpaceAllowedForOperators param is used' do
+      it 'displays a warning' do
+        create_file('.rubocop.yml', <<~YAML)
+          Layout/SpaceAroundOperators:
+            MultiSpaceAllowedForOperators:
+              - "="
+        YAML
+        expect(cli.run([])).to eq(2)
+        expect($stderr.string).to include('obsolete parameter `MultiSpaceAllowedForOperators` ' \
+                                          '(for `Layout/SpaceAroundOperators`) found')
+      end
+    end
+
+    context 'when MultilineMethodCallIndentation is used with aligned ' \
+            'style and IndentationWidth parameter' do
+      it 'fails with an error message' do
+        create_file('example.rb', 'puts 1')
+        create_file('.rubocop.yml', <<~YAML)
+          Layout/MultilineMethodCallIndentation:
+            EnforcedStyle: aligned
+            IndentationWidth: 1
+        YAML
+        expect(cli.run(['example.rb'])).to eq(2)
+        expect($stderr.string.strip).to eq(
+          'Error: The `Layout/MultilineMethodCallIndentation` cop only ' \
+          'accepts an `IndentationWidth` configuration parameter when ' \
+          '`EnforcedStyle` is `indented`.'
+        )
+      end
+    end
+
+    context 'when MultilineOperationIndentation is used with aligned ' \
+            'style and IndentationWidth parameter' do
+      it 'fails with an error message' do
+        create_file('example.rb', 'puts 1')
+        create_file('.rubocop.yml', <<~YAML)
+          Layout/MultilineOperationIndentation:
+            EnforcedStyle: aligned
+            IndentationWidth: 1
+        YAML
+        expect(cli.run(['example.rb'])).to eq(2)
+        expect($stderr.string.strip).to eq(
+          'Error: The `Layout/MultilineOperationIndentation` cop only accepts ' \
+          'an `IndentationWidth` configuration parameter when ' \
+          '`EnforcedStyle` is `indented`.'
+        )
+      end
+    end
+
+    context 'when Naming/PredicatePrefix has predicate prefix forbidden which is not listed in NamePrefix' do
+      it 'fails with an error message' do
+        create_file('example.rb', 'puts 1')
+        create_file('.rubocop.yml', <<~YAML)
+          Naming/PredicatePrefix:
+            NamePrefix:
+              - is_
+              - has_
+            ForbiddenPrefixes:
+              - is_
+              - has_
+              - seems_to_be_
+        YAML
+        expect(cli.run(['example.rb'])).to eq(2)
+        expect($stderr.string.strip).to eq(
+          'Error: The `Naming/PredicatePrefix` cop is misconfigured. Prefix seems_to_be_ must be ' \
+          'included in NamePrefix because it is included in ForbiddenPrefixes.'
+        )
+      end
+    end
+
+    it 'allows the default configuration file as the -c argument' do
+      create_file('example.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        x = 0
+        puts x
+      RUBY
+      create_file('.rubocop.yml', [])
+
+      expect(cli.run(%w[--format simple -c .rubocop.yml])).to eq(0)
+      expect($stdout.string).to eq(['', '1 file inspected, no offenses detected', ''].join("\n"))
+    end
+
+    context 'when --force-default-config option is specified' do
+      shared_examples 'ignores config file' do
+        it 'ignores config file' do
+          create_file('example.rb', ['# frozen_string_literal: true', '', 'x = 0 ', 'puts x'])
+          create_file('.rubocop.yml', <<~YAML)
+            Layout/TrailingWhitespace:
+              Enabled: false
+          YAML
+
+          expect(cli.run(args)).to eq(1)
+          expect($stdout.string)
+            .to eq(<<~RESULT)
+              == example.rb ==
+              C:  3:  6: [Correctable] Layout/TrailingWhitespace: Trailing whitespace detected.
+
+              1 file inspected, 1 offense detected, 1 offense autocorrectable
+            RESULT
+        end
+      end
+
+      context 'when no config file specified' do
+        let(:args) { %w[--format simple --force-default-config] }
+
+        it_behaves_like 'ignores config file'
+      end
+
+      context 'when config file specified with -c' do
+        let(:args) { %w[--format simple --force-default-config -c .rubocop.yml] }
+
+        it_behaves_like 'ignores config file'
+      end
+
+      context 'when config file has invalid inherit_from' do
+        it 'ignores config file with invalid inherit_from' do
+          create_file('example.rb', ['# frozen_string_literal: true', '', 'x = 0', 'puts x'])
+          create_file('.rubocop.yml', <<~YAML)
+            inherit_from: config/nonexistent.yml
+          YAML
+
+          expect(cli.run(%w[--format simple --force-default-config])).to eq(0)
+          expect($stdout.string).to include('1 file inspected, no offenses detected')
+        end
+      end
+    end
+
+    it 'displays cop names if DisplayCopNames is false' do
+      source = ['# frozen_string_literal: true', '', 'x = 0 ', 'puts x']
+      create_file('example1.rb', source)
+
+      # DisplayCopNames: false inherited from config/default.yml
+      create_file('.rubocop.yml', [])
+
+      create_file('dir/example2.rb', source)
+      create_file('dir/.rubocop.yml', <<~YAML)
+        AllCops:
+          DisplayCopNames: false
+      YAML
+
+      expect(cli.run(%w[--format simple])).to eq(1)
+      expect($stdout.string).to eq(<<~RESULT)
+        == dir/example2.rb ==
+        C:  3:  6: [Correctable] Trailing whitespace detected.
+        == example1.rb ==
+        C:  3:  6: [Correctable] Layout/TrailingWhitespace: Trailing whitespace detected.
+
+        2 files inspected, 2 offenses detected, 2 offenses autocorrectable
+      RESULT
+    end
+
+    it 'displays style guide URLs if DisplayStyleGuide is true' do
+      source = ['# frozen_string_literal: true', '', 'x = 0 ', 'puts x']
+      create_file('example1.rb', source)
+
+      # DisplayCopNames: false inherited from config/default.yml
+      create_file('.rubocop.yml', [])
+
+      create_file('dir/example2.rb', source)
+      create_file('dir/.rubocop.yml', <<~YAML)
+        AllCops:
+          DisplayStyleGuide: true
+      YAML
+
+      url = 'https://rubystyle.guide#no-trailing-whitespace'
+
+      expect(cli.run(%w[--format simple])).to eq(1)
+      expect($stdout.string).to eq(<<~RESULT)
+        == dir/example2.rb ==
+        C:  3:  6: [Correctable] Layout/TrailingWhitespace: Trailing whitespace detected. (#{url})
+        == example1.rb ==
+        C:  3:  6: [Correctable] Layout/TrailingWhitespace: Trailing whitespace detected.
+
+        2 files inspected, 2 offenses detected, 2 offenses autocorrectable
+      RESULT
+    end
+
+    it 'uses the DefaultFormatter if another formatter is not specified' do
+      source = ['# frozen_string_literal: true', '', 'x = 0 ', 'puts x']
+      create_file('example1.rb', source)
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          DefaultFormatter: offenses
+      YAML
+
+      expect(cli.run([])).to eq(1)
+      expect($stdout.string)
+        .to eq(<<~RESULT)
+
+          1  Layout/TrailingWhitespace [Safe Correctable]
+          --
+          1  Total in 1 file
+
+        RESULT
+    end
+
+    it 'finds included files' do
+      create_file('file.rb', 'x=0') # Included by default
+      create_file('example', 'x=0')
+      create_file('regexp', 'x=0')
+      create_file('vendor/bundle/ruby/2.7.0/gems/backports-3.6.8/.irbrc', 'x=0')
+      create_file('.dot1/file.rb', 'x=0') # Hidden but explicitly included
+      create_file('.dot2/file.rb', 'x=0') # Hidden, excluded by default
+      create_file('.dot3/file.rake', 'x=0') # Hidden, not included by wildcard
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          Include:
+            - "**/.irbrc"
+            - example
+            - "**/*.rb"
+            - "**/*.rake"
+            - !ruby/regexp /regexp$/
+            - .dot1/**/*
+          Exclude:
+            - vendor/bundle/**/*
+      YAML
+      expect(cli.run(%w[--format files])).to eq(1)
+      expect($stderr.string).to eq('')
+      expect($stdout.string.split($RS).sort).to eq([abs('.dot1/file.rb'),
+                                                    abs('example'),
+                                                    abs('file.rb'),
+                                                    abs('regexp')])
+    end
+
+    context 'when a .rubocop.yml is included from an ancestor directory' do
+      before do
+        create_file('child/grandkid/.rubocop.yml', <<~YAML)
+          inherit_from:
+            - ../../.rubocop.yml
+          Style/FrozenStringLiteralComment:
+            Include:
+              - '*.rb'
+        YAML
+      end
+
+      context 'and it specifies an Include pattern' do
+        before do
+          create_file('.rubocop.yml', <<~YAML)
+            AllCops:
+              Include:
+                - "**/*.rbi"
+          YAML
+        end
+
+        it 'finds files included through inheritance' do
+          create_file('child/grandkid/file.rbi', 'x=0')
+          Dir.chdir('child/grandkid') { expect(cli.run(['-L'])).to eq(0) }
+          expect($stdout.string).to eq("file.rbi\n")
+        end
+      end
+    end
+
+    context 'when a .rubocop.yml is inherited from a parent directory' do
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          AllCops:
+            DisabledByDefault: true
+          Style/FrozenStringLiteralComment:
+            Enabled: true
+        YAML
+        create_file('child/.rubocop.yml', <<~YAML)
+          inherit_from: ../.rubocop.yml
+          Style/FrozenStringLiteralComment:
+            Include:
+              - '*.rb'
+        YAML
+      end
+
+      it 'keeps the include pattern from the local configuration' do
+        Dir.chdir('child') do
+          expect(cli.run(['--show-cops', 'Style/FrozenStringLiteralComment'])).to eq(0)
+        end
+        expect($stderr.string).to eq('')
+        expect($stdout.string.lines.last(3).map(&:strip).join("\n")).to eq(<<~TEXT)
+          Include:
+          - "*.rb"
+        TEXT
+      end
+    end
+
+    it 'ignores excluded files' do
+      create_file('example.rb', ['x = 0', 'puts x'])
+      create_file('regexp.rb', ['x = 0', 'puts x'])
+      create_file('exclude_glob.rb', ['#!/usr/bin/env ruby', 'x = 0', 'puts x'])
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          Exclude:
+            - example.rb
+            - !ruby/regexp /regexp.rb$/
+            - "exclude_*"
+      YAML
+      expect(cli.run(%w[--format simple])).to eq(0)
+      expect($stdout.string).to eq(['', '0 files inspected, no offenses detected', ''].join("\n"))
+    end
+
+    it 'works when `AllCops:Exclude` is empty' do
+      create_file('example.rb', ['x = 0', 'puts x'])
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          Exclude:
+      YAML
+
+      expect(cli.run(%w[--format simple])).to eq(1)
+      expect($stdout.string).to eq(<<~STDOUT)
+        == example.rb ==
+        C:  1:  1: [Correctable] Style/FrozenStringLiteralComment: Missing frozen string literal comment.
+
+        1 file inspected, 1 offense detected, 1 offense autocorrectable
+      STDOUT
+      expect($stderr.string).to eq ''
+    end
+
+    it 'only reads configuration in explicitly included hidden directories' do
+      create_file('.hidden/example.rb', 'x=0')
+      # This file contains configuration for an unknown cop. This would cause a
+      # warning to be printed on stderr if the file was read. But it's in a
+      # hidden directory, so it's not read.
+      create_file('.hidden/.rubocop.yml', <<~YAML)
+        SymbolName:
+          Enabled: false
+      YAML
+
+      create_file('.other/example.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        x=0
+      RUBY
+      # The .other directory is explicitly included, so the configuration file
+      # is read, and modifies the behavior.
+      create_file('.other/.rubocop.yml', <<~YAML)
+        Layout/SpaceAroundOperators:
+          Enabled: false
+      YAML
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          Include:
+            - .other/**/*
+      YAML
+      expect(cli.run(%w[--format simple])).to eq(1)
+      expect($stderr.string).to eq('')
+      expect($stdout.string)
+        .to eq(<<~RESULT)
+          == .other/example.rb ==
+          W:  3:  1: [Correctable] Lint/UselessAssignment: Useless assignment to variable - x.
+
+          1 file inspected, 1 offense detected, 1 offense autocorrectable
+        RESULT
+    end
+
+    it 'does not consider Include parameters in subdirectories' do
+      create_file('dir/example.ruby3', <<~RUBY)
+        # frozen_string_literal: true
+
+        x=0
+      RUBY
+      create_file('dir/.rubocop.yml', <<~YAML)
+        AllCops:
+          Include:
+            - "*.ruby3"
+      YAML
+      expect(cli.run(%w[--format simple])).to eq(0)
+      expect($stderr.string).to eq('')
+      expect($stdout.string)
+        .to eq(<<~RESULT)
+
+          0 files inspected, no offenses detected
+        RESULT
+    end
+
+    it 'matches included/excluded files correctly when . argument is given' do
+      create_file('example.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        x = 0
+      RUBY
+      create_file('special.dsl', <<~RUBY)
+        # frozen_string_literal: true
+
+        setup { "stuff" }
+      RUBY
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          Include:
+            - "*.dsl"
+          Exclude:
+            - example.rb
+      YAML
+      expect(cli.run(%w[--format simple .])).to eq(1)
+      expect($stdout.string).to eq(<<~RESULT)
+        == special.dsl ==
+        C:  3:  9: [Correctable] Style/StringLiterals: Prefer single-quoted strings when you don't need string interpolation or special symbols.
+
+        1 file inspected, 1 offense detected, 1 offense autocorrectable
+      RESULT
+    end
+
+    it 'does not read files in excluded list' do
+      %w[rb.rb non-rb.ext without-ext].each do |filename|
+        create_file("example/ignored/#{filename}", '#' * 90)
+      end
+
+      create_file('example/.rubocop.yml', <<~YAML)
+        AllCops:
+          Exclude:
+            - ignored/**
+      YAML
+      expect(cli.run(%w[--format simple example])).to eq(0)
+      expect($stdout.string).to eq(<<~OUTPUT)
+
+        0 files inspected, no offenses detected
+      OUTPUT
+    end
+
+    it 'can be configured with option to disable a certain error' do
+      create_file('example1.rb', ['# frozen_string_literal: true', '', 'puts 0 '])
+      create_file('rubocop.yml', <<~YAML)
+        Style/Encoding:
+          Enabled: false
+
+        Layout/CaseIndentation:
+          Enabled: false
+      YAML
+      expect(cli.run(['--format', 'simple', '-c', 'rubocop.yml', 'example1.rb'])).to eq(1)
+      expect($stdout.string)
+        .to eq(<<~RESULT)
+          == example1.rb ==
+          C:  3:  7: [Correctable] Layout/TrailingWhitespace: Trailing whitespace detected.
+
+          1 file inspected, 1 offense detected, 1 offense autocorrectable
+        RESULT
+    end
+
+    context 'without using namespace' do
+      it 'can be configured with option to disable a certain error' do
+        create_file('example1.rb', ['# frozen_string_literal: true', '', 'puts 0 '])
+        create_file('rubocop.yml', <<~YAML)
+          Encoding:
+            Enabled: false
+
+          CaseIndentation:
+            Enabled: false
+        YAML
+        expect(cli.run(['--format', 'simple', '-c', 'rubocop.yml', 'example1.rb'])).to eq(1)
+        expect($stdout.string)
+          .to eq(<<~RESULT)
+            == example1.rb ==
+            C:  3:  7: [Correctable] Layout/TrailingWhitespace: Trailing whitespace detected.
+
+            1 file inspected, 1 offense detected, 1 offense autocorrectable
+          RESULT
+      end
+    end
+
+    it 'can disable parser-derived offenses with warning severity' do
+      # `-' interpreted as argument prefix
+      create_file('example.rb', ['# frozen_string_literal: true', '', 'puts -1'])
+      create_file('.rubocop.yml', <<~YAML)
+        Style/Encoding:
+          Enabled: false
+
+        Lint/AmbiguousOperator:
+          Enabled: false
+      YAML
+      expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(0)
+    end
+
+    it 'cannot disable Syntax offenses' do
+      create_file('example.rb', 'class Test')
+      create_file('.rubocop.yml', <<~YAML)
+        Style/Encoding:
+          Enabled: false
+
+        Syntax:
+          Enabled: false
+      YAML
+      expect(cli.run(['--format', 'emacs', 'example.rb'])).to eq(2)
+      expect($stderr.string).to include('Error: configuration for Lint/Syntax cop found')
+      expect($stderr.string).to include('It\'s not possible to disable this cop.')
+    end
+
+    it 'can be configured to merge a parameter that is a hash' do
+      create_file('example1.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        puts %w(a b c)
+        puts %q|hi|
+      RUBY
+      # We want to change the preferred delimiters for word arrays. The other
+      # settings from default.yml are unchanged.
+      create_file('rubocop.yml', <<~YAML)
+        Style/PercentLiteralDelimiters:
+          PreferredDelimiters:
+            '%w': '[]'
+            '%W': '[]'
+      YAML
+      cli.run(['--format', 'simple', '-c', 'rubocop.yml', 'example1.rb'])
+      expect($stdout.string).to eq(<<~RESULT)
+        == example1.rb ==
+        C:  3:  6: [Correctable] Style/PercentLiteralDelimiters: %w-literals should be delimited by [ and ].
+        C:  4:  6: [Correctable] Style/PercentLiteralDelimiters: %q-literals should be delimited by ( and ).
+        C:  4:  6: [Correctable] Style/RedundantPercentQ: Use %q only for strings that contain both single quotes and double quotes.
+
+        1 file inspected, 3 offenses detected, 3 offenses autocorrectable
+      RESULT
+    end
+
+    it 'can be configured to override a parameter that is a hash in a special case' do
+      create_file('example1.rb', <<~RUBY)
+        arr.select { |e| e > 0 }.collect { |e| e * 2 }
+        a2.find_all { |e| e > 0 }
+      RUBY
+      # We prefer find_all over select. This setting overrides the default
+      # select over find_all. Other preferred methods appearing in the default
+      # config (e.g., map over collect) are kept.
+      create_file('rubocop.yml', <<~YAML)
+        Style/CollectionMethods:
+          PreferredMethods:
+            select: find_all
+      YAML
+      cli.run(['--format',
+               'simple',
+               '-c',
+               'rubocop.yml',
+               '--only',
+               'CollectionMethods',
+               'example1.rb'])
+      expect($stdout.string)
+        .to eq(<<~RESULT)
+          == example1.rb ==
+          C:  1:  5: [Correctable] Style/CollectionMethods: Prefer find_all over select.
+          C:  1: 26: [Correctable] Style/CollectionMethods: Prefer map over collect.
+
+          1 file inspected, 2 offenses detected, 2 offenses autocorrectable
+        RESULT
+    end
+
+    it 'works when a cop that others depend on is disabled' do
+      create_file('example1.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        if a
+          b
+        end
+      RUBY
+      create_file('rubocop.yml', <<~YAML)
+        Style/Encoding:
+          Enabled: false
+
+        Layout/LineLength:
+          Enabled: false
+      YAML
+      result = cli.run(['--format', 'simple', '-c', 'rubocop.yml', 'example1.rb'])
+      expect($stdout.string).to eq(<<~RESULT)
+        == example1.rb ==
+        C:  3:  1: [Correctable] Style/IfUnlessModifier: Favor modifier if usage when having a single-line body. Another good alternative is the usage of control flow &&/||.
+
+        1 file inspected, 1 offense detected, 1 offense autocorrectable
+      RESULT
+      expect(result).to eq(1)
+    end
+
+    it 'can be configured with project config to disable a certain error' do
+      create_file('example_src/example1.rb', ['# frozen_string_literal: true', '', 'puts 0 '])
+      create_file('example_src/.rubocop.yml', <<~YAML)
+        Style/Encoding:
+          Enabled: false
+
+        Layout/CaseIndentation:
+          Enabled: false
+      YAML
+      expect(cli.run(['--format', 'simple', 'example_src/example1.rb'])).to eq(1)
+      expect($stdout.string)
+        .to eq(<<~RESULT)
+          == example_src/example1.rb ==
+          C:  3:  7: [Correctable] Layout/TrailingWhitespace: Trailing whitespace detected.
+
+          1 file inspected, 1 offense detected, 1 offense autocorrectable
+        RESULT
+    end
+
+    it 'can use an alternative max line length from a config file' do
+      create_file('example_src/example1.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        #{'#' * 90}
+      RUBY
+      create_file('example_src/.rubocop.yml', <<~YAML)
+        Layout/LineLength:
+          Enabled: true
+          Max: 100
+      YAML
+      expect(cli.run(['--format', 'simple', 'example_src/example1.rb'])).to eq(0)
+      expect($stdout.string).to eq(['', '1 file inspected, no offenses detected', ''].join("\n"))
+    end
+
+    it 'can have different config files in different directories' do
+      %w[src lib].each do |dir|
+        create_file("example/#{dir}/example1.rb", <<~RUBY)
+          # frozen_string_literal: true
+
+          #{'#' * 130}
+        RUBY
+      end
+      create_file('example/src/.rubocop.yml', <<~YAML)
+        Layout/LineLength:
+          Enabled: true
+          Max: 140
+      YAML
+      expect(cli.run(%w[--format simple example])).to eq(1)
+      expect($stdout.string).to eq(<<~RESULT)
+        == example/lib/example1.rb ==
+        C:  3:121: Layout/LineLength: Line is too long. [130/120]
+
+        2 files inspected, 1 offense detected
+      RESULT
+    end
+
+    it 'prefers a config file in ancestor directory to another in home' do
+      create_file('example_src/example1.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        #{'#' * 90}
+      RUBY
+      create_file('example_src/.rubocop.yml', <<~YAML)
+        Layout/LineLength:
+          Enabled: true
+          Max: 100
+      YAML
+      create_file("#{Dir.home}/.rubocop.yml", <<~YAML)
+        Layout/LineLength:
+          Enabled: true
+          Max: 80
+      YAML
+      expect(cli.run(['--format', 'simple', 'example_src/example1.rb'])).to eq(0)
+      expect($stdout.string).to eq(['', '1 file inspected, no offenses detected', ''].join("\n"))
+    end
+
+    it 'can exclude directories relative to .rubocop.yml' do
+      %w[src etc/test etc/spec tmp/test tmp/spec].each do |dir|
+        create_file("example/#{dir}/example1.rb", <<~RUBY)
+          # frozen_string_literal: true
+
+          #{'#' * 130}
+        RUBY
+      end
+
+      # Hidden subdirectories should also be excluded.
+      create_file('example/etc/.dot/example1.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        #{'#' * 130}
+      RUBY
+
+      create_file('example/.rubocop.yml', <<~YAML)
+        AllCops:
+          Exclude:
+            - src/**
+            - etc/**/*
+            - tmp/spec/**
+      YAML
+
+      expect(cli.run(%w[--format simple example])).to eq(1)
+      expect($stderr.string).to eq('')
+      expect($stdout.string).to eq(<<~RESULT)
+        == example/tmp/test/example1.rb ==
+        C:  3:121: Layout/LineLength: Line is too long. [130/120]
+
+        1 file inspected, 1 offense detected
+      RESULT
+    end
+
+    it 'can exclude a typical vendor directory' do
+      create_file(
+        'vendor/bundle/ruby/1.9.1/gems/parser-2.0.0/.rubocop.yml',
+        <<~YAML
+          AllCops:
+            Exclude:
+              - lib/parser/lexer.rb
+        YAML
+      )
+
+      create_file('vendor/bundle/ruby/1.9.1/gems/parser-2.0.0/lib/ex.rb', '#' * 90)
+
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          Exclude:
+            - vendor/**/*
+      YAML
+
+      cli.run(%w[--format simple])
+      expect($stdout.string).to eq(['', '0 files inspected, no offenses detected', ''].join("\n"))
+    end
+
+    it 'excludes the vendor directory by default' do
+      create_file('vendor/ex.rb', '#' * 90)
+
+      cli.run(%w[--format simple])
+      expect($stdout.string).to eq(['', '0 files inspected, no offenses detected', ''].join("\n"))
+    end
+
+    # Being immune to bad configuration files in excluded directories has
+    # become important due to a bug in rubygems
+    # (https://github.com/ruby/rubygems/issues/680) that makes
+    # installations of, for example, RuboCop lack their .rubocop.yml in the
+    # root directory.
+    it 'can exclude a vendor directory with an erroneous config file' do
+      create_file('vendor/bundle/ruby/1.9.1/gems/parser-2.0.0/.rubocop.yml',
+                  ['inherit_from: non_existent.yml'])
+
+      create_file('vendor/bundle/ruby/1.9.1/gems/parser-2.0.0/lib/ex.rb', '#' * 130)
+
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          Exclude:
+            - vendor/**/*
+      YAML
+
+      cli.run(%w[--format simple])
+      expect($stderr.string).to eq('')
+      expect($stdout.string).to eq(['', '0 files inspected, no offenses detected', ''].join("\n"))
+    end
+
+    # Relative exclude paths in .rubocop.yml files are relative to that file,
+    # but in configuration files with other names they will be relative to
+    # whatever file inherits from them.
+    it 'can exclude a vendor directory indirectly' do
+      create_file(
+        'vendor/bundle/ruby/1.9.1/gems/parser-2.0.0/.rubocop.yml',
+        <<~YAML
+          AllCops:
+            Exclude:
+              - lib/parser/lexer.rb
+        YAML
+      )
+
+      create_file('vendor/bundle/ruby/1.9.1/gems/parser-2.0.0/lib/ex.rb', '#' * 90)
+
+      create_file('.rubocop.yml', ['inherit_from: config/default.yml'])
+
+      create_file('config/default.yml', <<~YAML)
+        AllCops:
+          Exclude:
+            - vendor/**/*
+      YAML
+
+      cli.run(%w[--format simple])
+      expect($stdout.string).to eq(['', '0 files inspected, no offenses detected', ''].join("\n"))
+    end
+
+    it 'prints an error for an unrecognized cop name in .rubocop.yml' do
+      create_file('example/example1.rb', '#' * 90)
+
+      create_file('example/.rubocop.yml', <<~YAML)
+        Layout/LyneLenth:
+          Enabled: true
+          Max: 100
+        Linth:
+          Enabled: false
+        Lint/LiteralInCondition:
+          Enabled: true
+        Style/AlignHash:
+          Enabled: true
+      YAML
+
+      expect(cli.run(%w[--format simple example])).to eq(2)
+      expect($stderr.string)
+        .to eq(<<~OUTPUT)
+          Error: unrecognized cop or department Layout/LyneLenth found in example/.rubocop.yml
+          Did you mean `Layout/LineLength`?
+          unrecognized cop or department Linth found in example/.rubocop.yml
+          Did you mean `Lint`?
+          unrecognized cop or department Lint/LiteralInCondition found in example/.rubocop.yml
+          Did you mean `Lint/LiteralAsCondition`?
+          unrecognized cop or department Style/AlignHash found in example/.rubocop.yml
+          Did you mean `Style/Alias`, `Style/OptionHash`?
+        OUTPUT
+    end
+
+    it 'runs without errors for an unrecognized cop name in .rubocop.yml and `--ignore-unrecognized-cops` option is given' do
+      create_file('example/example1.rb', '# frozen_string_literal: true')
+
+      create_file('example/.rubocop.yml', <<~YAML)
+        Layout/LyneLenth:
+          Enabled: true
+          Max: 100
+        Linth:
+          Enabled: false
+        Lint/LiteralInCondition:
+          Enabled: true
+        Style/AlignHash:
+          Enabled: true
+      YAML
+
+      expect(cli.run(%w[--format simple example --ignore-unrecognized-cops])).to eq(0)
+      expect($stderr.string)
+        .to eq(<<~OUTPUT)
+          The following cops or departments are not recognized and will be ignored:
+          unrecognized cop or department Layout/LyneLenth found in example/.rubocop.yml
+          Did you mean `Layout/LineLength`?
+          unrecognized cop or department Linth found in example/.rubocop.yml
+          Did you mean `Lint`?
+          unrecognized cop or department Lint/LiteralInCondition found in example/.rubocop.yml
+          Did you mean `Lint/LiteralAsCondition`?
+          unrecognized cop or department Style/AlignHash found in example/.rubocop.yml
+          Did you mean `Style/Alias`, `Style/OptionHash`?
+        OUTPUT
+    end
+
+    it 'prints a warning for an unrecognized configuration parameter, ignoring permitted ones' do
+      create_file('example/example1.rb', '#' * 90)
+
+      create_file('example/.rubocop.yml', <<~YAML)
+        # Default config includes none of Min, References, or StyleGuide
+        Layout/AssignmentIndentation:
+          Enabled: true
+          Min: 10
+          StyleGuide: '#assignment-indentation'
+
+        # Default config includes StyleGuide, but neither Min nor Reference nor References
+        Layout/LineLength:
+          Enabled: true
+          Min: 10
+          Reference:
+            - 'https://example.com#layout-line-length-decision-log'
+          References:
+            - 'https://example.com#layout-line-length-decision-log'
+
+        # Default config includes References and StyleGuide, but not Min
+        Style/GlobalVars:
+          Enabled: true
+          Min: 10
+      YAML
+
+      expect(cli.run(%w[--format simple example])).to eq(1)
+
+      expect($stderr.string).to eq(<<~RESULT)
+        Warning: Layout/AssignmentIndentation does not support Min parameter.
+
+        Supported parameters are:
+
+          - Enabled
+          - IndentationWidth
+        Warning: Layout/LineLength does not support Min parameter.
+
+        Supported parameters are:
+
+          - Enabled
+          - Max
+          - AllowHeredoc
+          - AllowURI
+          - AllowQualifiedName
+          - URISchemes
+          - AllowRBSInlineAnnotation
+          - AllowCopDirectives
+          - AllowedPatterns
+          - SplitStrings
+        Warning: Style/GlobalVars does not support Min parameter.
+
+        Supported parameters are:
+
+          - Enabled
+          - AllowedVariables
+      RESULT
+    end
+
+    it 'prints an error message for an unrecognized EnforcedStyle' do
+      create_file('example/example1.rb', 'puts "hello"')
+      create_file('example/.rubocop.yml', <<~YAML)
+        Layout/AccessModifierIndentation:
+          EnforcedStyle: ident
+      YAML
+
+      expect(cli.run(%w[--format simple example])).to eq(2)
+      expect($stderr.string)
+        .to eq(["Error: invalid EnforcedStyle 'ident' for " \
+                'Layout/AccessModifierIndentation found in ' \
+                'example/.rubocop.yml',
+                'Valid choices are: outdent, indent',
+                ''].join("\n"))
+    end
+
+    it 'works when a configuration file passed by -c specifies Exclude with regexp' do
+      create_file('example/example1.rb', '#' * 90)
+
+      create_file('rubocop.yml', <<~'YAML')
+        AllCops:
+          Exclude:
+            - !ruby/regexp /example1\.rb$/
+      YAML
+
+      cli.run(%w[--format simple -c rubocop.yml])
+      expect($stdout.string).to eq(['', '0 files inspected, no offenses detected', ''].join("\n"))
+    end
+
+    it 'works when a configuration file passed by -c specifies Exclude with strings' do
+      create_file('example/example1.rb', '#' * 90)
+
+      create_file('rubocop.yml', <<~YAML)
+        AllCops:
+          Exclude:
+            - example/**
+      YAML
+
+      cli.run(%w[--format simple -c rubocop.yml])
+      expect($stdout.string).to eq(['', '0 files inspected, no offenses detected', ''].join("\n"))
+    end
+
+    shared_examples 'specified Severity' do |key|
+      it 'works when a configuration file specifies Severity for ' \
+         "Metrics/ParameterLists and #{key}" do
+        create_file('example/example1.rb', <<~RUBY)
+          # frozen_string_literal: true
+
+          def method(foo, bar, qux, fred, arg5, f) end #{'#' * 85}
+        RUBY
+
+        create_file('rubocop.yml', <<~YAML)
+          #{key}:
+            Severity: error
+          Metrics/ParameterLists:
+            Severity: convention
+        YAML
+
+        cli.run(%w[--format simple -c rubocop.yml])
+        expect($stdout.string).to eq(<<~RESULT)
+          == example/example1.rb ==
+          C:  3: 11: Metrics/ParameterLists: Avoid parameter lists longer than 5 parameters. [6/5]
+          C:  3: 39: Naming/MethodParameterName: Method parameter must be at least 3 characters long.
+          C:  3: 46: [Correctable] Style/CommentedKeyword: Do not place comments on the same line as the def keyword.
+          E:  3:121: Layout/LineLength: Line is too long. [130/120]
+
+          1 file inspected, 4 offenses detected, 1 offense autocorrectable
+        RESULT
+        expect($stderr.string).to eq('')
+      end
+    end
+
+    it_behaves_like 'specified Severity', 'Layout/LineLength'
+    it_behaves_like 'specified Severity', 'Layout'
+
+    it 'fails when a configuration file specifies an invalid Severity' do
+      create_file('example/example1.rb', '#' * 130)
+
+      create_file('rubocop.yml', <<~YAML)
+        Layout/LineLength:
+          Severity: superbad
+      YAML
+
+      cli.run(%w[--format simple -c rubocop.yml])
+      expect($stderr.string)
+        .to eq(["Warning: Invalid severity 'superbad'. " \
+                'Valid severities are info, refactor, convention, ' \
+                'warning, error, fatal.',
+                ''].join("\n"))
+    end
+
+    it 'fails when a configuration file has invalid YAML syntax' do
+      create_file('example/.rubocop.yml', <<~YAML)
+        AllCops:
+          Exclude:
+            - **/*_old.rb
+      YAML
+
+      cli.run(['example'])
+      # MRI and JRuby return slightly different error messages.
+      expect($stderr.string)
+        .to match(%r{^\(\S+example/\.rubocop\.yml\):\ (did\ not\ find\ )?
+                  (expected\ alphabetic\ or \ numeric\ character|unexpected\ character)}x)
+    end
+
+    context 'when a file inherits from a higher level' do
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          Layout/LineLength:
+            Exclude:
+              - dir/example.rb
+        YAML
+        create_file('dir/.rubocop.yml', 'inherit_from: ../.rubocop.yml')
+        create_file('dir/example.rb', <<~RUBY)
+          # frozen_string_literal: true
+
+          #{'#' * 90}
+        RUBY
+      end
+
+      it 'inherits relative excludes correctly' do
+        expect(cli.run([])).to eq(0)
+      end
+    end
+
+    context 'when configuration is taken from $HOME/.rubocop.yml' do
+      before do
+        create_file("#{Dir.home}/.rubocop.yml", <<~YAML)
+          Layout/LineLength:
+            Exclude:
+              - dir/example.rb
+        YAML
+        create_file('dir/example.rb', <<~RUBY)
+          # frozen_string_literal: true
+
+          #{'#' * 90}
+        RUBY
+      end
+
+      it 'handles relative excludes correctly when run from project root' do
+        expect(cli.run([])).to eq(0)
+      end
+    end
+
+    it 'shows an error if the input file cannot be found' do
+      cli.run(%w[/tmp/not_a_file])
+    rescue SystemExit => e
+      expect(e.status).to eq(1)
+      expect(e.message).to eq 'rubocop: No such file or directory -- /tmp/not_a_file'
+    end
+  end
+
+  describe 'configuration of `AutoCorrect`' do
+    context 'when setting `AutoCorrect: disabled` for `Style/StringLiterals`' do
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          Style/StringLiterals:
+            AutoCorrect: disabled
+        YAML
+      end
+
+      it 'does not suggest `1 offense autocorrectable` for `Style/StringLiterals`' do
+        create_file('example.rb', <<~RUBY)
+          # frozen_string_literal: true
+
+          a = "Hello"
+        RUBY
+
+        expect(cli.run(['--format', 'simple', 'example.rb'])).to eq(1)
+        expect($stdout.string.lines.to_a.last).to eq(
+          "1 file inspected, 2 offenses detected, 1 offense autocorrectable\n"
+        )
+      end
+
+      it 'reports no edits for `Style/StringLiterals` in JSON output' do
+        create_file('example.rb', <<~RUBY)
+          # frozen_string_literal: true
+
+          puts "Hello"
+        RUBY
+
+        expect(cli.run(['--format', 'json', 'example.rb'])).to eq(1)
+        offense = JSON.parse($stdout.string, symbolize_names: true)[:files][0][:offenses][0]
+        expect(offense).to include(cop_name: 'Style/StringLiterals', correctable: false)
+        expect(offense).not_to have_key(:correction)
+      end
+    end
+
+    # For backward compatibility, `false` is treated the same as `'disabled'`.
+    context 'when setting `AutoCorrect: false` for `Style/StringLiterals`' do
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          Style/StringLiterals:
+            AutoCorrect: false
+        YAML
+      end
+
+      it 'does not suggest `1 offense autocorrectable` for `Style/StringLiterals`' do
+        create_file('example.rb', <<~RUBY)
+          # frozen_string_literal: true
+
+          a = "Hello"
+        RUBY
+
+        expect(cli.run(['--format', 'simple', 'example.rb'])).to eq(1)
+        expect($stdout.string.lines.to_a.last).to eq(
+          "1 file inspected, 2 offenses detected, 1 offense autocorrectable\n"
+        )
+      end
+
+      it 'reports no edits for `Style/StringLiterals` in JSON output' do
+        create_file('example.rb', <<~RUBY)
+          # frozen_string_literal: true
+
+          puts "Hello"
+        RUBY
+
+        expect(cli.run(['--format', 'json', 'example.rb'])).to eq(1)
+        offense = JSON.parse($stdout.string, symbolize_names: true)[:files][0][:offenses][0]
+        expect(offense).to include(cop_name: 'Style/StringLiterals', correctable: false)
+        expect(offense).not_to have_key(:correction)
+      end
+    end
+  end
+
+  describe 'configuration of target Ruby versions' do
+    context 'when configured with an unknown version' do
+      it 'fails with an error message' do
+        create_file('.rubocop.yml', <<~YAML)
+          AllCops:
+            TargetRubyVersion: 5.0
+        YAML
+        expect(cli.run([])).to eq(2)
+        expect($stderr.string.strip).to start_with(
+          'Error: RuboCop found unknown Ruby version 5.0 in `TargetRubyVersion`'
+        )
+        expect($stderr.string.strip).to match(
+          Regexp.new(<<~MESSAGE.chomp.tr("\n", ' '))
+            Supported versions:
+            2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7,
+            3.0, 3.1, 3.2, 3.3, 3.4,
+            4.0, 4.1
+          MESSAGE
+        )
+      end
+    end
+
+    context 'when configured with an unsupported ruby' do
+      it 'fails with an error message' do
+        create_file('.rubocop.yml', <<~YAML)
+          AllCops:
+            TargetRubyVersion: 1.9
+        YAML
+
+        expect(cli.run([])).to eq(2)
+        expect($stderr.string.strip).to start_with(
+          'Error: RuboCop found unsupported Ruby version 1.9 in ' \
+          '`TargetRubyVersion`'
+        )
+
+        expect($stderr.string.strip).to include(
+          '1.9-compatible analysis was dropped after version 0.41'
+        )
+
+        expect($stderr.string.strip).to match(/Supported versions: 2.0/)
+      end
+    end
+  end
+
+  context 'configuration of `require`' do
+    context 'unknown library is specified' do
+      it 'exits with 2' do
+        create_file('.rubocop.yml', <<~YAML)
+          require: unknownlibrary
+        YAML
+
+        expect(cli.run([])).to eq(2)
+        expect($stderr.string).to include('cannot load such file -- unknownlibrary')
+      end
+    end
+
+    context 'when using `plugins` to enable a plugin' do
+      it 'exits with 0 without warning' do
+        create_file('.rubocop.yml', <<~YAML)
+          plugins:
+            - rubocop-internal_affairs
+        YAML
+
+        expect(cli.run([])).to eq(0)
+        expect($stderr.string).to be_blank
+      end
+    end
+
+    context 'when using `plugins` to enable a plugin in a subdirectory' do
+      it 'does not apply the plugin cops to files outside the subdirectory' do
+        create_file('spec/.rubocop.yml', <<~YAML)
+          plugins:
+            - rubocop-internal_affairs
+        YAML
+        create_file('spec/example_spec.rb', <<~RUBY)
+          # frozen_string_literal: true
+
+          expect(cop.messages).to eq([described_class::MSG])
+        RUBY
+        create_file('example.rb', <<~RUBY)
+          # frozen_string_literal: true
+
+          expect(cop.messages).to eq([described_class::MSG])
+        RUBY
+
+        expect(cli.run(['--format', 'simple', 'spec', 'example.rb'])).to eq(1)
+        expect($stdout.string).to eq(<<~RESULT)
+          == spec/example_spec.rb ==
+          C:  3: 29: InternalAffairs/UselessMessageAssertion: Do not specify cop behavior using described_class::MSG.
+
+          2 files inspected, 1 offense detected
+        RESULT
+      end
+    end
+
+    context 'when using `require` to enable a plugin' do
+      it 'exits with 0 with warning' do
+        create_file('.rubocop.yml', <<~YAML)
+          require:
+            - rubocop/cop/internal_affairs
+        YAML
+
+        expect(cli.run([])).to eq(0)
+        expect($stderr.string).to start_with(
+          'rubocop/cop/internal_affairs extension supports plugin'
+        )
+      end
+    end
+  end
+
+  describe 'obsolete cops' do
+    context 'when configuration for TrailingComma is given' do
+      it 'fails with an error message' do
+        create_file('example1.rb', "puts 'hello'")
+        create_file('.rubocop.yml', <<~YAML)
+          Style/TrailingComma:
+            Enabled: true
+        YAML
+        expect(cli.run(['example1.rb'])).to eq(2)
+        expect($stderr.string.strip).to eq(
+          ['Error: The `Style/TrailingComma` cop has been removed. Please ' \
+           'use `Style/TrailingCommaInArguments`, ' \
+           '`Style/TrailingCommaInArrayLiteral` and/or ' \
+           '`Style/TrailingCommaInHashLiteral` instead.',
+           '(obsolete configuration found in .rubocop.yml, ' \
+           'please update it)'].join("\n")
+        )
+      end
+    end
+  end
+
+  describe 'unknown cop' do
+    context 'in configuration file is given' do
+      it 'prints the error and exists with code 2' do
+        create_file('example1.rb', "puts 'no offenses here'")
+        create_file('.rubocop.yml', <<~YAML)
+          Syntax/Whatever:
+            Enabled: true
+        YAML
+        expect(cli.run(['example1.rb'])).to eq(2)
+        expect($stderr.string.strip).to eq(
+          'Error: unrecognized cop or department Syntax/Whatever found in .rubocop.yml'
+        )
+      end
+    end
+  end
+
+  describe 'info severity' do
+    let(:code) do
+      <<~RUBY
+        # frozen_string_literal: true
+
+        'this line is longer than the accepted maximum'
+      RUBY
+    end
+
+    before do
+      create_file('.rubocop.yml', <<~YAML)
+        Lint/LineLength:
+          Max: 30
+          Severity: info
+      YAML
+
+      create_file('test.rb', code)
+    end
+
+    context 'when there are only info offenses' do
+      it 'returns a 0 code' do
+        expect(cli.run(['--format', 'simple', 'test.rb'])).to eq(0)
+        expect($stdout.string).to eq <<~RESULT
+          == test.rb ==
+          I:  3: 31: Layout/LineLength: Line is too long. [47/30]
+
+          1 file inspected, 1 offense detected
+        RESULT
+      end
+    end
+
+    context 'when there are not only info offenses' do
+      let(:code) do
+        <<~RUBY
+          'this line is longer than the accepted maximum'
+        RUBY
+      end
+
+      it 'returns a 1 code' do
+        expect(cli.run(['--format', 'simple', 'test.rb'])).to eq(1)
+        expect($stdout.string).to eq <<~RESULT
+          == test.rb ==
+          C:  1:  1: [Correctable] Style/FrozenStringLiteralComment: Missing frozen string literal comment.
+          I:  1: 31: Layout/LineLength: Line is too long. [47/30]
+
+          1 file inspected, 2 offenses detected, 1 offense autocorrectable
+        RESULT
+      end
+    end
+
+    context 'when given `--fail-level info`' do
+      it 'returns a 1 code' do
+        expect(cli.run(['--format', 'simple', '--fail-level', 'info', 'test.rb'])).to eq(1)
+        expect($stdout.string).to eq <<~RESULT
+          == test.rb ==
+          I:  3: 31: Layout/LineLength: Line is too long. [47/30]
+
+          1 file inspected, 1 offense detected
+        RESULT
+      end
+    end
+
+    context 'when given `--display-only-fail-level-offenses`' do
+      it 'returns a 0 code but does not list offenses' do
+        expect(cli.run(['--format', 'simple', '--display-only-fail-level-offenses', 'test.rb']))
+          .to eq(0)
+        expect($stdout.string).to eq <<~RESULT
+
+          1 file inspected, no offenses detected
+        RESULT
+      end
+    end
+
+    context 'when `Lint/Syntax` is given `Severity: info`' do
+      let(:code) do
+        <<~RUBY
+          1 /// 2
+        RUBY
+      end
+
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          Lint/Syntax:
+            Severity: info
+        YAML
+      end
+
+      it 'is an invalid configuration' do
+        expect(cli.run(['--format', 'simple', 'test.rb'])).to eq(2)
+        expect(
+          $stderr.string
+        ).to include('Error: configuration for Lint/Syntax cop found in .rubocop.yml')
+      end
+    end
+
+    context 'when `Lint` is given `Severity: info`' do
+      let(:code) do
+        <<~RUBY
+          1 /// 2
+        RUBY
+      end
+
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          Lint:
+            Severity: info
+        YAML
+      end
+
+      it '`Lint/Syntax` severity `fatal` cannot be changed by configuration' do
+        expect(cli.run(['--format', 'simple', 'test.rb'])).to eq(1)
+        expect($stdout.string).to include('F:  1:  7: Lint/Syntax: unexpected token tINTEGER')
+      end
+    end
+  end
+
+  describe '--display-only-correctable' do
+    it 'returns 0 if there are no offenses shown' do
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          SuggestExtensions: false
+      YAML
+      create_file('example.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        @@var = 0
+      RUBY
+      expect(cli.run(['--display-only-correctable', 'example.rb'])).to eq(0)
+      expect($stderr.string).to eq('')
+      expect($stdout.string).to eq(<<~RESULT)
+        Inspecting 1 file
+        .
+
+        1 file inspected, no offenses detected
+      RESULT
+    end
+  end
+
+  describe '--display-only-safe-correctable' do
+    it 'returns 0 if there are no offenses shown' do
+      create_file('.rubocop.yml', <<~YAML)
+        AllCops:
+          SuggestExtensions: false
+      YAML
+      create_file('example.rb', <<~RUBY)
+        # frozen_string_literal: true
+
+        a.foo..b.bar # Lint/AmbiguousRange offense is not safe correctable
+      RUBY
+      expect(cli.run(['--display-only-safe-correctable', 'example.rb'])).to eq(0)
+      expect($stderr.string).to eq('')
+      expect($stdout.string).to eq(<<~RESULT)
+        Inspecting 1 file
+        .
+
+        1 file inspected, no offenses detected
+      RESULT
+    end
+  end
+
+  if RUBY_ENGINE == 'ruby' && !RuboCop::Platform.windows?
+    describe 'profiling' do
+      let(:cpu_profile) { File.join('tmp', 'rubocop-stackprof.dump') }
+      let(:memory_profile) { File.join('tmp', 'rubocop-memory_profiler.txt') }
+
+      before do
+        # Force reload of project root
+        RuboCop::ConfigFinder.project_root = nil
+
+        FileUtils.rm_f(cpu_profile)
+        FileUtils.rm_f(memory_profile)
+
+        create_file('example1.rb', <<~RUBY)
+          # frozen_string_literal: true
+
+          'string'
+        RUBY
+        create_empty_file('Gemfile')
+      end
+
+      after do
+        # Don't leak project root change
+        RuboCop::ConfigFinder.project_root = nil
+      end
+
+      it 'does not create profile files by default' do
+        expect(cli.run(['example1.rb'])).to eq(0)
+        expect($stdout.string).not_to include('Profile report generated')
+        expect(File).not_to exist(cpu_profile)
+      end
+
+      it 'creates cpu profile file' do
+        expect(cli.run(['--profile', 'example1.rb'])).to eq(0)
+        expect($stdout.string).to include('Profile report generated')
+        expect(File).to exist(cpu_profile)
+      end
+
+      it 'creates memory profile file' do
+        expect(cli.run(['--profile', '--memory', 'example1.rb'])).to eq(0)
+        expect($stdout.string).to include('Building memory report...')
+        expect(File).to exist(memory_profile)
+      end
+    end
+  end
+
+  describe 'cache root warning' do
+    let(:warning) { 'Warning: Remote configuration cache files were stored' }
+
+    before do
+      create_file('example.rb', ['# frozen_string_literal: true', '', 'puts 1'])
+    end
+
+    context 'when cache roots match' do
+      it 'does not print a warning when using default cache root without overrides' do
+        create_file('.rubocop.yml', <<~YAML)
+          AllCops:
+            DisabledByDefault: true
+        YAML
+
+        expect(cli.run(['example.rb'])).to eq(0)
+        expect($stderr.string).not_to include(warning)
+      end
+
+      context 'when --cache-root is given' do
+        it 'does not print a warning with no CacheRootDirectory in the configuration file' do
+          create_file('.rubocop.yml', <<~YAML)
+            AllCops:
+              DisabledByDefault: true
+          YAML
+
+          expect(cli.run(['--cache-root', '/tmp/.rubocop_cache', 'example.rb'])).to eq(0)
+          expect($stderr.string).not_to include(warning)
+        end
+
+        it 'does not print a warning with different CacheRootDirectory as --cache-root overrides it' do
+          create_file('.rubocop.yml', <<~YAML)
+            AllCops:
+              DisabledByDefault: true
+              CacheRootDirectory: /tmp/some-other-cache
+          YAML
+
+          expect(cli.run(['--cache-root', '/tmp/.rubocop_cache', 'example.rb'])).to eq(0)
+          expect($stderr.string).not_to include(warning)
+        end
+      end
+    end
+
+    context 'when cache roots differ' do
+      it 'prints a warning when non-default CacheRootDirectory is set in a inherited file' do
+        create_file('.rubocop.yml', <<~YAML)
+          inherit_from: inherited.yml
+          AllCops:
+            DisabledByDefault: true
+        YAML
+
+        create_file('inherited.yml', <<~YAML)
+          AllCops:
+            CacheRootDirectory: /tmp/inherited-cache
+        YAML
+
+        expect(cli.run(['example.rb'])).to eq(0)
+        expect($stderr.string).to include(warning)
+      end
+    end
+  end
+end

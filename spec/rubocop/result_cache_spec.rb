@@ -1,0 +1,671 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::ResultCache, :isolated_environment do
+  include EncodingHelper
+  include FileHelper
+
+  subject(:cache) { described_class.new(file, team, options, config_store, cache_root) }
+
+  let(:registry) { RuboCop::Cop::Registry.global }
+  let(:team) do
+    RuboCop::Cop::Team.mobilize(registry, RuboCop::ConfigLoader.default_configuration, options)
+  end
+
+  let(:file) { 'example.rb' }
+  let(:options) { {} }
+  let(:config_store) { instance_double(RuboCop::ConfigStore, for_pwd: RuboCop::Config.new) }
+  let(:cache_root) { "#{Dir.pwd}/.cache" }
+  let(:rubocop_cache_dir) { "#{Dir.pwd}/.cache/rubocop_cache" }
+  let(:offenses) do
+    [RuboCop::Cop::Offense.new(:warning, location, 'unused var', 'Lint/UselessAssignment')]
+  end
+  let(:location) do
+    source_buffer = Parser::Source::Buffer.new(file)
+    source_buffer.read
+    Parser::Source::Range.new(source_buffer, 0, 2)
+  end
+
+  def abs(path)
+    File.expand_path(path)
+  end
+
+  before do
+    create_file('example.rb', <<~RUBY)
+      # Hello
+      x = 1
+    RUBY
+    allow(config_store).to receive(:for_file).with('example.rb').and_return(RuboCop::Config.new)
+    allow(team).to receive(:external_dependency_checksum).and_return('foo')
+  end
+
+  describe 'cached result that was saved with no command line option' do
+    shared_examples 'valid' do
+      it 'is valid and can be loaded' do
+        cache.save(offenses)
+        cache2 = described_class.new(file, team, options2, config_store, cache_root)
+        expect(cache2).to be_valid
+        saved_offenses = cache2.load
+        expect(saved_offenses).to eq(offenses)
+      end
+    end
+
+    # Fixes https://github.com/rubocop/rubocop/issues/6274
+    context 'when offenses are saved' do
+      context 'an offense with status corrected' do
+        let(:offense) do
+          RuboCop::Cop::Offense.new(
+            :warning, location, 'unused var', 'Lint/UselessAssignment', :corrected
+          )
+        end
+
+        it 'serializes them with uncorrected status' do
+          cache.save([offense])
+          expect(cache.load[0].status).to eq(:uncorrected)
+        end
+      end
+
+      context 'an offense with status corrected_with_todo' do
+        let(:offense) do
+          RuboCop::Cop::Offense.new(
+            :warning, location, 'unused var', 'Lint/UselessAssignment', :corrected_with_todo
+          )
+        end
+
+        it 'serializes them with uncorrected status' do
+          cache.save([offense])
+          expect(cache.load[0].status).to eq(:uncorrected)
+        end
+      end
+
+      context 'an offense with status uncorrected' do
+        let(:offense) do
+          RuboCop::Cop::Offense.new(
+            :warning, location, 'unused var', 'Lint/UselessAssignment', :uncorrected
+          )
+        end
+
+        it 'serializes them with uncorrected status' do
+          cache.save([offense])
+          expect(cache.load[0].status).to eq(:uncorrected)
+        end
+      end
+
+      context 'an offense with status unsupported' do
+        let(:offense) do
+          RuboCop::Cop::Offense.new(
+            :warning, location, 'unused var', 'Lint/UselessAssignment', :unsupported
+          )
+        end
+
+        it 'serializes them with unsupported status' do
+          cache.save([offense])
+          expect(cache.load[0].status).to eq(:unsupported)
+        end
+      end
+
+      context 'an offense with status new_status' do
+        let(:offense) do
+          RuboCop::Cop::Offense.new(
+            :warning, location, 'unused var', 'Lint/UselessAssignment', :new_status
+          )
+        end
+
+        it 'serializes them with new_status status' do
+          cache.save([offense])
+          expect(cache.load[0].status).to eq(:new_status)
+        end
+      end
+
+      context 'an offense suppressed by a directive carrying a justification' do
+        let(:offense) do
+          RuboCop::Cop::Offense.new(
+            :warning, location, 'unused var', 'Lint/UselessAssignment', :disabled,
+            justification: 'kept for the vendored payload'
+          )
+        end
+
+        it 'serializes them with the justification' do
+          cache.save([offense])
+          expect(cache.load[0].justification).to eq('kept for the vendored payload')
+        end
+      end
+
+      context 'an offense that carries no justification' do
+        it 'serializes them with a nil justification' do
+          cache.save(offenses)
+          expect(cache.load[0].justification).to be_nil
+        end
+      end
+
+      context 'a global offense' do
+        let(:no_location) { RuboCop::Cop::Offense::NO_LOCATION }
+        let(:global_offense) do
+          RuboCop::Cop::Offense.new(:warning, no_location, 'empty file', 'Lint/EmptyFile',
+                                    :unsupported)
+        end
+
+        it 'serializes the range correctly' do
+          cache.save([global_offense])
+          expect(cache.load[0].location).to eq(no_location)
+        end
+      end
+
+      context 'a global Lint/Syntax offense, caused by a parser error' do
+        before do
+          create_file('example.rb', ['# encoding: unknown'])
+        end
+
+        let(:no_location) { RuboCop::Cop::Offense::NO_LOCATION }
+        let(:global_offense) do
+          RuboCop::Cop::Offense.new(:warning, no_location, 'empty file', 'Lint/Syntax',
+                                    :unsupported)
+        end
+
+        it 'serializes the range correctly' do
+          cache.save([global_offense])
+          expect(cache.load[0].location).to eq(no_location)
+        end
+      end
+    end
+
+    context 'when no option is given' do
+      let(:options2) { {} }
+
+      it_behaves_like 'valid'
+
+      context 'when file contents have changed' do
+        it 'is invalid' do
+          cache.save(offenses)
+          create_file('example.rb', ['x = 2'])
+          cache2 = described_class.new(file, team, options, config_store, cache_root)
+          expect(cache2).not_to be_valid
+        end
+      end
+
+      context 'when file permission have changed' do
+        unless RuboCop::Platform.windows?
+          it 'is invalid' do
+            cache.save(offenses)
+            FileUtils.chmod('+x', file)
+            cache2 = described_class.new(file, team, options, config_store, cache_root)
+            expect(cache2).not_to be_valid
+          end
+        end
+      end
+
+      context 'when end of line characters have changed' do
+        it 'is invalid' do
+          cache.save(offenses)
+          contents = File.binread(file)
+          File.open(file, 'wb') do |f|
+            if contents.include?("\r")
+              f.write(contents.delete("\r"))
+            else
+              f.write(contents.gsub("\n", "\r\n"))
+            end
+          end
+          cache2 = described_class.new(file, team, options, config_store, cache_root)
+          expect(cache2).not_to be_valid
+        end
+      end
+
+      context 'when team external_dependency_checksum changes' do
+        it 'is invalid' do
+          cache.save(offenses)
+          allow(team).to(receive(:external_dependency_checksum).and_return('bar'))
+          cache2 = described_class.new(file, team, options, config_store, cache_root)
+          expect(cache2).not_to be_valid
+        end
+      end
+
+      context 'when team external_dependency_checksum is the same' do
+        it 'is valid' do
+          cache.save(offenses)
+          allow(team).to(receive(:external_dependency_checksum).and_return('foo'))
+          cache2 = described_class.new(file, team, options, config_store, cache_root)
+          expect(cache2).to be_valid
+        end
+      end
+
+      context 'when a symlink is present in the cache location' do
+        include_context 'mock console output'
+
+        let(:cache2) { described_class.new(file, team, options, config_store, cache_root) }
+
+        let(:attack_target_dir) { Dir.mktmpdir }
+
+        before do
+          # Avoid getting "symlink() function is unimplemented on this
+          # machine" on Windows.
+          skip 'Symlinks not implemented on Windows' if RuboCop::Platform.windows?
+
+          cache.save(offenses)
+          result = Dir["#{cache_root}/*/*"]
+          path = result.first
+          FileUtils.rm_rf(path)
+          FileUtils.ln_s(attack_target_dir, path)
+        end
+
+        after do
+          FileUtils.rm_rf(attack_target_dir)
+        end
+
+        context 'and symlink attack protection is enabled' do
+          it 'prevents caching and prints a warning' do
+            cache2.save(offenses)
+            # The cache file has not been created because there was a symlink in
+            # its path.
+            expect(cache2).not_to be_valid
+            expect($stderr.string).to match(/Warning: .* is a symlink, which is not allowed.\n/)
+          end
+        end
+
+        context 'and symlink attack protection is disabled' do
+          before do
+            allow(config_store).to receive(:for_pwd).and_return(
+              RuboCop::Config.new(
+                'AllCops' => {
+                  'AllowSymlinksInCacheRootDirectory' => true
+                }
+              )
+            )
+          end
+
+          it 'permits caching and prints no warning' do
+            cache2.save(offenses)
+
+            expect(cache2).to be_valid
+            expect($stderr.string).not_to match(/Warning: .* is a symlink, which is not allowed.\n/)
+          end
+        end
+      end
+    end
+
+    context 'when --cache-root is given' do
+      it 'takes the cache_root from the options' do
+        cache2 = described_class.new(file, team, { cache_root: 'some/path' }, config_store)
+
+        expect(cache2.path).to start_with('some/path/rubocop_cache')
+      end
+    end
+
+    context 'when --format is given' do
+      let(:options2) { { format: 'simple' } }
+
+      it_behaves_like 'valid'
+    end
+
+    context 'when --only is given' do
+      it 'is invalid' do
+        cache.save(offenses)
+        cache2 = described_class.new(file, team,
+                                     { only: ['Layout/LineLength'] },
+                                     config_store, cache_root)
+        expect(cache2).not_to be_valid
+      end
+    end
+
+    context 'when --display-cop-names is given' do
+      it 'is invalid' do
+        cache.save(offenses)
+        cache2 = described_class.new(file, team, { display_cop_names: true },
+                                     config_store, cache_root)
+        expect(cache2).not_to be_valid
+      end
+    end
+
+    context 'when a cache source is read' do
+      it 'has utf8 encoding' do
+        cache.save(offenses)
+        result = cache.load
+        loaded_encoding = result[0].location.source.encoding
+
+        expect(loaded_encoding).to eql(Encoding::UTF_8)
+      end
+    end
+  end
+
+  describe 'when the file checksum cannot be computed' do
+    it 'neither writes nor reads the cache entry shared with other such files' do
+      missing_cache = described_class.new('nonexistent.rb', team, options, config_store, cache_root)
+      missing_cache.save(offenses)
+
+      other_missing_cache = described_class.new(
+        'other_nonexistent.rb', team, options, config_store, cache_root
+      )
+
+      expect(missing_cache).not_to be_valid
+      expect(other_missing_cache).not_to be_valid
+    end
+  end
+
+  describe 'when the file is not a regular file' do
+    let(:file) { File::NULL }
+
+    before do
+      skip 'Device files are not stat-able on Windows' if RuboCop::Platform.windows?
+
+      allow(config_store).to receive(:for_file).with(file).and_return(RuboCop::Config.new)
+    end
+
+    it 'is neither saved nor considered valid' do
+      cache.save(offenses)
+
+      expect(cache).not_to be_valid
+    end
+  end
+
+  describe '#save' do
+    context 'when the default internal encoding is UTF-8' do
+      let(:offenses) do
+        [
+          "unused var \xF0",
+          (+'unused var あ').force_encoding(Encoding::ASCII_8BIT)
+        ].map do |message|
+          RuboCop::Cop::Offense.new(:warning, location, message, 'Lint/UselessAssignment')
+        end
+      end
+
+      around do |example|
+        with_default_internal_encoding(Encoding::UTF_8) { example.run }
+      end
+
+      it 'writes non UTF-8 encodable data to file with no exception' do
+        expect { cache.save(offenses) }.not_to raise_error
+      end
+
+      it 'reads back a binary-tagged message that holds valid UTF-8' do
+        cache.save(offenses)
+
+        expect(cache.load.map(&:message)).to eq(["unused var \uFFFD", 'unused var あ'])
+      end
+    end
+
+    shared_examples 'invalid cache location' do |error, message|
+      include_context 'mock console output'
+
+      it 'doesn\'t raise an exception' do
+        allow(FileUtils).to receive(:mkdir_p).with(start_with(cache_root)).and_raise(error)
+        expect { cache.save([]) }.not_to raise_error
+        expect($stderr.string).to eq(<<~WARN)
+          Couldn't create cache directory. Continuing without cache.
+            #{message}
+        WARN
+      end
+    end
+
+    context 'when the @path is not writable' do
+      let(:cache_root) { '/permission_denied_dir' }
+
+      it_behaves_like 'invalid cache location', Errno::EACCES, 'Permission denied'
+      it_behaves_like 'invalid cache location', Errno::EPERM, 'Operation not permitted'
+      it_behaves_like 'invalid cache location', Errno::EROFS, 'Read-only file system'
+    end
+
+    shared_examples 'unwritable cache file' do |error, message|
+      include_context 'mock console output'
+
+      it 'warns and leaves no cache file behind' do
+        allow(File).to receive(:open).and_call_original
+        allow(File).to receive(:open).with(start_with(cache.path), 'w', any_args) do |path|
+          # Fail partway through writing the preliminary file.
+          File.write(path, '{')
+          raise error
+        end
+
+        expect { cache.save(offenses) }.not_to raise_error
+        expect($stderr.string).to eq(<<~WARN)
+          Couldn't write cache file. Continuing without cache.
+            #{message}
+        WARN
+        expect(Dir.children(File.dirname(cache.path))).to be_empty
+      end
+    end
+
+    context 'when the cache file is not writable' do
+      it_behaves_like 'unwritable cache file', Errno::EACCES, 'Permission denied'
+      it_behaves_like 'unwritable cache file', Errno::EPERM, 'Operation not permitted'
+      it_behaves_like 'unwritable cache file', Errno::EROFS, 'Read-only file system'
+    end
+  end
+
+  describe '.cleanup' do
+    include_context 'mock console output'
+
+    let(:max_files_in_cache) { 1 }
+
+    before do
+      cfg = RuboCop::Config.new('AllCops' => { 'MaxFilesInCache' => max_files_in_cache })
+      allow(config_store).to receive(:for_pwd).and_return(cfg)
+      allow(config_store).to receive(:for_file).with('other.rb').and_return(cfg)
+      allow(config_store).to receive(:for_file).with('some.rb').and_return(cfg)
+      create_file('other.rb', ['x = 1'])
+      create_file('some.rb', ['y = 2'])
+    end
+
+    it 'removes the oldest files in the standard cache_root if needed' do
+      cache.save(offenses)
+      underscore_dir = Dir["#{rubocop_cache_dir}/*/*"].first
+      expect(Dir["#{underscore_dir}/*"].size).to eq(1)
+      cache.class.cleanup(config_store, :verbose, cache_root)
+      expect($stdout.string).to eq('')
+
+      cache2 = described_class.new('other.rb', team, options, config_store, cache_root)
+      cache2.save(offenses)
+      underscore_dir = Dir["#{rubocop_cache_dir}/*/*"].first
+      expect(Dir["#{underscore_dir}/*"].size).to eq(2)
+
+      cache.class.cleanup(config_store, :verbose, cache_root)
+      expect(File).not_to exist(underscore_dir)
+      expect($stdout.string).to eq("Removing the 2 oldest files from #{rubocop_cache_dir}\n")
+    end
+
+    it 'removes the oldest files in a custom cache_root if needed' do
+      custom_cache_root = "#{Dir.pwd}/.custom_cache"
+      custom_rubocop_cache_dir = "#{Dir.pwd}/.custom_cache/rubocop_cache"
+
+      custom_cache = described_class.new('other.rb', team, options, config_store, custom_cache_root)
+      custom_cache.save(offenses)
+      custom_cache2 = described_class.new('some.rb', team, options, config_store, custom_cache_root)
+      custom_cache2.save(offenses)
+      underscore_dir = Dir["#{custom_rubocop_cache_dir}/*/*"].first
+      expect(Dir["#{underscore_dir}/*"].size).to eq(2)
+
+      custom_cache.class.cleanup(config_store, :verbose, custom_cache_root)
+      expect(File).not_to exist(underscore_dir)
+      expect($stdout.string).to eq("Removing the 2 oldest files from #{custom_rubocop_cache_dir}\n")
+    end
+
+    context 'when the server has state files in the cache root' do
+      let(:server_dir) { "#{rubocop_cache_dir}/server/foo+project" }
+
+      before do
+        %w[version lock pid port token].each do |name|
+          path = create_file("#{server_dir}/#{name}", name)
+          # Make the server state files older than any cache entry, so that
+          # they would be the first to go if they were treated as entries.
+          FileUtils.touch(path, mtime: Time.now - 3600)
+        end
+      end
+
+      it 'leaves the server state files alone' do
+        cache.save(offenses)
+        described_class.new('other.rb', team, options, config_store, cache_root).save(offenses)
+        underscore_dir = File.dirname(cache.path)
+        expect(Dir["#{underscore_dir}/*"].size).to eq(2)
+
+        cache.class.cleanup(config_store, :verbose, cache_root)
+
+        expect(Dir["#{server_dir}/*"].size).to eq(5)
+        expect(File).not_to exist(underscore_dir)
+        expect($stdout.string).to eq("Removing the 2 oldest files from #{rubocop_cache_dir}\n")
+      end
+    end
+
+    shared_examples 'unwritable cache' do |error|
+      it 'leaves the cache as it is' do
+        cache.save(offenses)
+        described_class.new('other.rb', team, options, config_store, cache_root).save(offenses)
+        allow(File).to receive(:delete).and_raise(error)
+
+        expect { cache.class.cleanup(config_store, false, cache_root) }.not_to raise_error
+        expect(Dir["#{rubocop_cache_dir}/*/*/*"].size).to eq(2)
+      end
+    end
+
+    context 'when the cache is not writable' do
+      it_behaves_like 'unwritable cache', Errno::EACCES
+      it_behaves_like 'unwritable cache', Errno::EPERM
+      it_behaves_like 'unwritable cache', Errno::EROFS
+    end
+
+    context 'when MaxFilesInCache is `false`' do
+      let(:max_files_in_cache) { false }
+
+      it 'removes nothing' do
+        cache.save(offenses)
+        underscore_dir = Dir["#{rubocop_cache_dir}/*/*"].first
+        expect(Dir["#{underscore_dir}/*"].size).to eq(1)
+        cache.class.cleanup(config_store, :verbose, cache_root)
+        expect($stdout.string).to eq('')
+
+        cache2 = described_class.new('other.rb', team, options, config_store, cache_root)
+        cache2.save(offenses)
+        underscore_dir = Dir["#{rubocop_cache_dir}/*/*"].first
+        expect(Dir["#{underscore_dir}/*"].size).to eq(2)
+
+        cache.class.cleanup(config_store, :verbose, cache_root)
+        expect(File).to exist(underscore_dir)
+        expect($stdout.string).not_to include('Removing')
+      end
+    end
+  end
+
+  describe '.relevant_options_digest' do
+    before do
+      described_class.instance_variable_set(:@relevant_options_digest, nil)
+    end
+
+    it 'calculates a digest' do
+      options = { only: ['Layout/EmptyLines'] }
+
+      digest = described_class.relevant_options_digest(options)
+
+      expect(digest).to eq('_only_Layout_EmptyLines_')
+    end
+
+    it 'caches options digest' do
+      options = { only: ['Layout/EmptyLines'] }
+
+      expect(options).to receive(:reject).once.and_call_original
+
+      described_class.relevant_options_digest(options)
+      described_class.relevant_options_digest(options)
+    end
+
+    # Keying the memoization by the caller's live Hash lets a caller that mutates its options
+    # between runs (like `--auto-gen-config`, which adds and removes `:only` between its two phases)
+    # be served the digest of the pre-mutation options: a small-Hash lookup compares
+    # a one-byte hash hint and then `eql?`, which short-circuits on object identity,
+    # so the stale entry matches whenever the hint collides (roughly 1 in 256 processes).
+    it 'does not key the memoization by the mutable options object itself' do
+      options = { only: ['Layout/EmptyLines'] }
+
+      described_class.relevant_options_digest(options)
+
+      memo = described_class.instance_variable_get(:@relevant_options_digest)
+      expect(memo.keys).to be_none { |key| key.equal?(options) }
+    end
+  end
+
+  describe 'the cache path' do
+    let(:config_store) { instance_double(RuboCop::ConfigStore) }
+    let(:puid) { Process.uid.to_s }
+
+    before do
+      all_cops = { 'AllCops' => { 'CacheRootDirectory' => cache_root_directory } }
+      config = RuboCop::Config.new(all_cops)
+      allow(config_store).to receive(:for_pwd).and_return(config)
+    end
+
+    context 'when CacheRootDirectory not set' do
+      let(:cache_root_directory) { nil }
+
+      context 'and XDG_CACHE_HOME is not set' do
+        before { ENV['XDG_CACHE_HOME'] = nil }
+
+        it 'contains $HOME/.cache' do
+          cacheroot = described_class.cache_root(config_store)
+          expect(cacheroot).to eq(File.join(Dir.home, '.cache', 'rubocop_cache'))
+        end
+
+        it 'contains the root in path only once' do
+          cache = described_class.new(file, team, options, config_store)
+          expect(cache.path).to start_with(File.join(Dir.home, '.cache', 'rubocop_cache'))
+
+          count = cache.path.scan('rubocop_cache').count
+          expect(count).to eq(1)
+        end
+      end
+
+      context 'and XDG_CACHE_HOME is set' do
+        around do |example|
+          ENV['XDG_CACHE_HOME'] = '/etc/rccache'
+          begin
+            example.run
+          ensure
+            ENV.delete('XDG_CACHE_HOME')
+          end
+        end
+
+        it 'contains the given path and UID' do
+          cacheroot = described_class.cache_root(config_store)
+          expect(cacheroot).to eq(File.join(ENV.fetch('XDG_CACHE_HOME'), puid, 'rubocop_cache'))
+        end
+
+        it 'contains the root in path only once' do
+          cache = described_class.new(file, team, options, config_store)
+          expect(cache.path).to start_with(
+            File.join(ENV.fetch('XDG_CACHE_HOME'), puid, 'rubocop_cache')
+          )
+
+          count = cache.path.scan('rubocop_cache').count
+          expect(count).to eq(1)
+        end
+      end
+    end
+
+    context 'when CacheRootDirectory is set' do
+      let(:cache_root_directory) { '/opt' }
+
+      it 'contains the given root' do
+        cacheroot = described_class.cache_root(config_store)
+        expect(cacheroot).to eq(File.join('/opt', 'rubocop_cache'))
+      end
+
+      context 'and RUBOCOP_CACHE_ROOT is set' do
+        around do |example|
+          ENV['RUBOCOP_CACHE_ROOT'] = '/tmp/cache-from-env'
+          begin
+            example.run
+          ensure
+            ENV.delete('RUBOCOP_CACHE_ROOT')
+          end
+        end
+
+        it 'contains the root from RUBOCOP_CACHE_ROOT' do
+          cacheroot = described_class.cache_root(config_store)
+          expect(cacheroot).to eq(File.join('/tmp/cache-from-env', 'rubocop_cache'))
+        end
+
+        it 'contains the root in path only once' do
+          cache = described_class.new(file, team, options, config_store)
+          expect(cache.path).to start_with(File.join('/tmp/cache-from-env', 'rubocop_cache'))
+
+          count = cache.path.scan('rubocop_cache').count
+          expect(count).to eq(1)
+        end
+      end
+    end
+  end
+end

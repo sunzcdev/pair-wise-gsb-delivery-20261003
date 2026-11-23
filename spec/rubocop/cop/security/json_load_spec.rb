@@ -1,0 +1,100 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::Cop::Security::JSONLoad, :config do
+  it 'registers an offense and corrects JSON.load' do
+    expect_offense(<<~RUBY)
+      JSON.load(arg)
+           ^^^^ Prefer `JSON.parse` over `JSON.load`.
+      ::JSON.load(arg)
+             ^^^^ Prefer `JSON.parse` over `JSON.load`.
+    RUBY
+
+    expect_correction(<<~RUBY)
+      JSON.parse(arg)
+      ::JSON.parse(arg)
+    RUBY
+  end
+
+  it 'registers no offense when `create_additions` option is passed as the third argument' do
+    expect_no_offenses(<<~RUBY)
+      JSON.load(arg, nil, create_additions: false)
+      ::JSON.load(arg, nil, create_additions: true)
+      JSON.load(arg, proc {}, create_additions: false, max_nesting: 19)
+      ::JSON.load(arg, proc {}, create_additions: false, max_nesting: 19)
+      JSON.load(arg, -> {}, { max_nesting: 19, create_additions: false, allow_nan: true })
+      ::JSON.load(arg, -> {}, { max_nesting: 19, create_additions: false, allow_nan: true })
+    RUBY
+  end
+
+  it 'registers an offense when `create_additions` option is passed as the second argument' do
+    expect_offense(<<~RUBY)
+      JSON.load(arg, create_additions: false)
+           ^^^^ Prefer `JSON.parse` over `JSON.load`.
+      ::JSON.load(arg, { create_additions: false })
+             ^^^^ Prefer `JSON.parse` over `JSON.load`.
+      JSON.load(arg, create_additions: true)
+           ^^^^ Prefer `JSON.parse` over `JSON.load`.
+      JSON.load(arg, { allow_nan: false, create_additions: true })
+           ^^^^ Prefer `JSON.parse` over `JSON.load`.
+      JSON.restore(arg, create_additions: false)
+           ^^^^^^^ Prefer `JSON.parse` over `JSON.restore`.
+    RUBY
+
+    expect_correction(<<~RUBY)
+      JSON.parse(arg, create_additions: false)
+      ::JSON.parse(arg, { create_additions: false })
+      JSON.parse(arg, create_additions: true)
+      JSON.parse(arg, { allow_nan: false, create_additions: true })
+      JSON.parse(arg, create_additions: false)
+    RUBY
+  end
+
+  it 'registers an offense when an unrelated option is passed' do
+    expect_offense(<<~RUBY)
+      JSON.load(arg, max_nesting: 1)
+           ^^^^ Prefer `JSON.parse` over `JSON.load`.
+      ::JSON.load(arg, max_nesting: 1)
+             ^^^^ Prefer `JSON.parse` over `JSON.load`.
+    RUBY
+
+    expect_correction(<<~RUBY)
+      JSON.parse(arg, max_nesting: 1)
+      ::JSON.parse(arg, max_nesting: 1)
+    RUBY
+  end
+
+  it 'registers an offense and corrects JSON.restore' do
+    expect_offense(<<~RUBY)
+      JSON.restore(arg)
+           ^^^^^^^ Prefer `JSON.parse` over `JSON.restore`.
+      ::JSON.restore(arg)
+             ^^^^^^^ Prefer `JSON.parse` over `JSON.restore`.
+    RUBY
+
+    expect_correction(<<~RUBY)
+      JSON.parse(arg)
+      ::JSON.parse(arg)
+    RUBY
+  end
+
+  it 'does not register an offense for JSON under another namespace' do
+    expect_no_offenses(<<~RUBY)
+      SomeModule::JSON.load(arg)
+      SomeModule::JSON.restore(arg)
+    RUBY
+  end
+
+  it 'allows JSON.parse' do
+    expect_no_offenses(<<~RUBY)
+      JSON.parse(arg)
+      ::JSON.parse(arg)
+    RUBY
+  end
+
+  it 'allows JSON.dump' do
+    expect_no_offenses(<<~RUBY)
+      JSON.dump(arg)
+      ::JSON.dump(arg)
+    RUBY
+  end
+end

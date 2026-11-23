@@ -1,0 +1,295 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::Formatter::JSONFormatter do
+  subject(:formatter) { described_class.new(output) }
+
+  let(:output) { StringIO.new }
+  let(:files) { %w[/path/to/file1 /path/to/file2] }
+  let(:location) do
+    source_buffer = Parser::Source::Buffer.new('test', 1)
+    source_buffer.source = %w[a b cdefghi].join("\n")
+    Parser::Source::Range.new(source_buffer, 2, 10)
+  end
+  let(:offense) do
+    RuboCop::Cop::Offense.new(:convention, location, 'This is message', 'CopName', :corrected)
+  end
+
+  describe '#started' do
+    let(:summary) { formatter.output_hash[:summary] }
+
+    it 'sets target file count in summary' do
+      expect(summary[:target_file_count]).to be_nil
+      formatter.started(%w[/path/to/file1 /path/to/file2])
+      expect(summary[:target_file_count]).to eq(2)
+    end
+  end
+
+  describe '#file_finished' do
+    before do
+      count = 0
+      allow(formatter).to receive(:hash_for_file) do
+        count += 1
+      end
+    end
+
+    let(:summary) { formatter.output_hash[:summary] }
+
+    it 'adds detected offense count in summary' do
+      expect(summary[:offense_count]).to eq(0)
+
+      formatter.file_started(files[0], {})
+      expect(summary[:offense_count]).to eq(0)
+      formatter.file_finished(files[0], [
+                                instance_double(RuboCop::Cop::Offense),
+                                instance_double(RuboCop::Cop::Offense)
+                              ])
+      expect(summary[:offense_count]).to eq(2)
+    end
+
+    it 'adds value of #hash_for_file to #output_hash[:files]' do
+      expect(formatter.output_hash[:files]).to be_empty
+
+      formatter.file_started(files[0], {})
+      expect(formatter.output_hash[:files]).to be_empty
+      formatter.file_finished(files[0], [])
+      expect(formatter.output_hash[:files]).to eq([1])
+
+      formatter.file_started(files[1], {})
+      expect(formatter.output_hash[:files]).to eq([1])
+      formatter.file_finished(files[1], [])
+      expect(formatter.output_hash[:files]).to eq([1, 2])
+    end
+  end
+
+  describe '#file_problems' do
+    let(:file) { File.expand_path('lib/foo.rb') }
+    let(:other_file) { File.expand_path('lib/bar.rb') }
+    let(:entries) { formatter.output_hash[:files].to_h { |entry| [entry[:path], entry] } }
+    let(:summary) { formatter.output_hash[:summary] }
+
+    def crash_message(location)
+      "An error occurred while Style/Foo cop was inspecting #{location}."
+    end
+
+    before do
+      formatter.file_problems(file, [crash_message("#{file}:1:2"), crash_message("#{file}:3:4")],
+                              ["Careful (from file: #{file}:5:6)"])
+      formatter.file_finished(file, [])
+      formatter.file_finished(other_file, [])
+      formatter.finished([file, other_file])
+    end
+
+    it 'adds them to the entry of the file they belong to, listing repeats once' do
+      expect(entries['lib/foo.rb']).to include(
+        errors: [crash_message('lib/foo.rb:1:2')],
+        warnings: ['Careful (from file: lib/foo.rb:5:6)']
+      )
+    end
+
+    it 'keeps a file name that looks like a backreference intact' do
+      skip 'Windows paths use backslashes as separators' if RuboCop::Platform.windows?
+
+      file = File.expand_path('lib/a\\1b.rb')
+
+      expect(formatter.hash_for_problems(file, [crash_message("#{file}:1:2")], [])).to eq(
+        errors: [crash_message('lib/a\\1b.rb:1:2')]
+      )
+    end
+
+    it 'leaves the keys out of the entry of a file without any' do
+      expect(entries['lib/bar.rb'].keys).to eq(%i[path offenses])
+    end
+
+    it 'counts them in the summary' do
+      expect(summary).to include(error_count: 1, warning_count: 1)
+    end
+  end
+
+  describe '#finished' do
+    let(:summary) { formatter.output_hash[:summary] }
+
+    it 'leaves error and warning counts out of the summary when there are none' do
+      formatter.finished(files)
+      expect(summary.keys).not_to include(:error_count, :warning_count)
+    end
+
+    it 'sets inspected file count in summary' do
+      expect(summary[:inspected_file_count]).to be_nil
+      formatter.finished(%w[/path/to/file1 /path/to/file2])
+      expect(summary[:inspected_file_count]).to eq(2)
+    end
+
+    it 'outputs #output_hash as JSON' do
+      formatter.finished(files)
+      json = output.string
+      restored_hash = JSON.parse(json, symbolize_names: true)
+      expect(restored_hash).to eq(formatter.output_hash)
+    end
+  end
+
+  describe '#hash_for_file' do
+    subject(:hash) { formatter.hash_for_file(file, offenses) }
+
+    let(:file) { File.expand_path('spec/spec_helper.rb') }
+    let(:offenses) do
+      [
+        instance_double(RuboCop::Cop::Offense),
+        instance_double(RuboCop::Cop::Offense)
+      ]
+    end
+
+    before do
+      count = 0
+      allow(formatter).to receive(:hash_for_offense) do
+        count += 1
+      end
+    end
+
+    it 'sets relative file path for :path key' do
+      expect(hash[:path]).to eq('spec/spec_helper.rb')
+    end
+
+    it 'sets an array of #hash_for_offense values for :offenses key' do
+      expect(hash[:offenses]).to eq([1, 2])
+    end
+  end
+
+  describe '#hash_for_offense' do
+    subject(:hash) { formatter.hash_for_offense(offense) }
+
+    it 'sets Offense#severity value for :severity key' do
+      expect(hash[:severity]).to eq(:convention)
+    end
+
+    it 'sets Offense#message value for :message key' do
+      expect(hash[:message]).to eq('This is message')
+    end
+
+    it 'sets Offense#cop_name value for :cop_name key' do
+      expect(hash[:cop_name]).to eq('CopName')
+    end
+
+    it 'sets Offense#correctable? value for :correctable key' do
+      expect(hash[:correctable]).to be(true)
+    end
+
+    it 'sets Offense#corrected? value for :corrected key' do
+      expect(hash[:corrected]).to be(true)
+    end
+
+    it 'does not include suppression keys for a regular offense' do
+      expect(hash).not_to have_key(:suppressed)
+      expect(hash).not_to have_key(:justification)
+    end
+
+    context 'for an offense suppressed by a directive' do
+      let(:offense) do
+        RuboCop::Cop::Offense.new(:convention, location, 'This is message', 'CopName', :disabled,
+                                  nil, justification: 'a fine reason')
+      end
+
+      it 'includes the suppression keys' do
+        expect(hash[:suppressed]).to be(true)
+        expect(hash[:justification]).to eq('a fine reason')
+      end
+    end
+
+    it 'does not include a :correction key when the offense has no correction' do
+      expect(hash).not_to have_key(:correction)
+    end
+
+    context 'for an offense that has a correction' do
+      let(:corrector) do
+        RuboCop::Cop::Corrector.new(location.source_buffer).tap do |c|
+          c.replace(location, 'replacement')
+        end
+      end
+      let(:offense) do
+        RuboCop::Cop::Offense.new(:convention, location, 'This is message', 'CopName',
+                                  :uncorrected, corrector)
+      end
+
+      it 'includes the edits autocorrection would make' do
+        expect(hash[:correction][:edits]).to eq(
+          [{ start_line: 2, start_column: 1, last_line: 3, last_column: 6,
+             begin_pos: 2, end_pos: 10, replacement: 'replacement' }]
+        )
+      end
+
+      it 'reports the correction as safe by default' do
+        expect(hash[:correction][:safe]).to be(true)
+      end
+
+      context 'when the cop is not safe to autocorrect' do
+        let(:offense) do
+          RuboCop::Cop::Offense.new(:convention, location, 'This is message', 'CopName',
+                                    :uncorrected, corrector, correction_safe: false)
+        end
+
+        it 'reports the correction as unsafe' do
+          expect(hash[:correction][:safe]).to be(false)
+        end
+      end
+
+      context 'when multibyte characters precede the edit' do
+        let(:source) { "x = 'é'\ny = \"b\"" }
+        let(:location) do
+          source_buffer = Parser::Source::Buffer.new('test', 1)
+          source_buffer.source = source
+          Parser::Source::Range.new(source_buffer, 12, 15)
+        end
+
+        it 'counts positions in characters, not bytes' do
+          edit = hash[:correction][:edits].first
+
+          expect(source[edit[:begin_pos]...edit[:end_pos]]).to eq('"b"')
+        end
+      end
+    end
+
+    it 'sets value of #hash_for_location for :location key' do
+      location_hash = {
+        start_line: 2,
+        start_column: 1,
+        last_line: 3,
+        last_column: 6,
+        length: 8,
+        line: 2,
+        column: 1
+      }
+      expect(hash[:location]).to eq(location_hash)
+    end
+  end
+
+  describe '#hash_for_location' do
+    subject(:hash) { formatter.hash_for_location(offense) }
+
+    it 'sets line value for :line key' do
+      expect(hash[:line]).to eq(2)
+    end
+
+    it 'sets column value for :column key' do
+      expect(hash[:column]).to eq(1)
+    end
+
+    it 'sets length value for :length key' do
+      expect(hash[:length]).to eq(8)
+    end
+
+    context 'when the location is pseudo' do
+      let(:location) { RuboCop::Cop::Offense::NO_LOCATION }
+
+      it 'returns a valid hash' do
+        expect(hash).to eq({
+                             start_line: 1,
+                             start_column: 1,
+                             last_line: 1,
+                             last_column: 1,
+                             length: 0,
+                             line: 1,
+                             column: 1
+                           })
+      end
+    end
+  end
+end

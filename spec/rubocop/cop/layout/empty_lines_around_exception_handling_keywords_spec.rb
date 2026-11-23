@@ -1,0 +1,620 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::Cop::Layout::EmptyLinesAroundExceptionHandlingKeywords, :config do
+  let(:message) { '^{} Extra empty line detected' }
+
+  shared_examples 'accepts' do |name, code|
+    it "accepts #{name}" do
+      expect_no_offenses(code)
+    end
+  end
+
+  it 'registers an offense for above rescue keyword with a blank' do
+    expect_offense(<<~RUBY)
+      begin
+        f1
+
+      #{message} before the `rescue`.
+      rescue
+        f2
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      begin
+        f1
+      rescue
+        f2
+      end
+    RUBY
+  end
+
+  it 'registers an offense for rescue section starting with a blank' do
+    expect_offense(<<~RUBY)
+      begin
+        f1
+      rescue
+
+      #{message} after the `rescue`.
+        f2
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      begin
+        f1
+      rescue
+        f2
+      end
+    RUBY
+  end
+
+  it 'registers an offense for rescue section ending with a blank' do
+    expect_offense(<<~RUBY)
+      begin
+        f1
+      rescue
+        f2
+
+      #{message} before the `else`.
+      else
+        f3
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      begin
+        f1
+      rescue
+        f2
+      else
+        f3
+      end
+    RUBY
+  end
+
+  it 'registers an offense for rescue section ending for method definition a blank' do
+    expect_offense(<<~RUBY)
+      def foo
+        f1
+      rescue
+        f2
+
+      #{message} before the `else`.
+      else
+        f3
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      def foo
+        f1
+      rescue
+        f2
+      else
+        f3
+      end
+    RUBY
+  end
+
+  it 'registers an offense when there is a blank line above `rescue` keyword in a block', :ruby25 do
+    expect_offense(<<~RUBY)
+      foo do
+        f1
+
+      #{message} before the `rescue`.
+      rescue
+        f2
+      else
+        f3
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      foo do
+        f1
+      rescue
+        f2
+      else
+        f3
+      end
+    RUBY
+  end
+
+  it 'registers an offense when `rescue` section starts with a blank line in a block', :ruby25 do
+    expect_offense(<<~RUBY)
+      foo do
+        f1
+      rescue
+
+      #{message} after the `rescue`.
+        f2
+      else
+        f3
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      foo do
+        f1
+      rescue
+        f2
+      else
+        f3
+      end
+    RUBY
+  end
+
+  it 'registers an offense when `rescue` section ends with a blank line in a block', :ruby25 do
+    expect_offense(<<~RUBY)
+      foo do
+        f1
+      rescue
+        f2
+
+      #{message} before the `else`.
+      else
+        f3
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      foo do
+        f1
+      rescue
+        f2
+      else
+        f3
+      end
+    RUBY
+  end
+
+  it 'registers an offense when there is a blank line above `rescue` keyword in a numbered block', :ruby27 do
+    expect_offense(<<~RUBY)
+      foo do
+        f1(_1)
+
+      #{message} before the `rescue`.
+      rescue
+        f2
+      else
+        f3
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      foo do
+        f1(_1)
+      rescue
+        f2
+      else
+        f3
+      end
+    RUBY
+  end
+
+  it 'registers an offense when `rescue` section starts with a blank line in a numbered block', :ruby27 do
+    expect_offense(<<~RUBY)
+      foo do
+        f1(_1)
+      rescue
+
+      #{message} after the `rescue`.
+        f2
+      else
+        f3
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      foo do
+        f1(_1)
+      rescue
+        f2
+      else
+        f3
+      end
+    RUBY
+  end
+
+  it 'registers an offense when `rescue` section ends with a blank line in a numbered block', :ruby27 do
+    expect_offense(<<~RUBY)
+      foo do
+        f1(_1)
+      rescue
+        f2
+
+      #{message} before the `else`.
+      else
+        f3
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      foo do
+        f1(_1)
+      rescue
+        f2
+      else
+        f3
+      end
+    RUBY
+  end
+
+  it 'registers an offense when there is a blank line above `rescue` keyword in an `it` block', :ruby34 do
+    expect_offense(<<~RUBY)
+      foo do
+        f1(it)
+
+      #{message} before the `rescue`.
+      rescue
+        f2
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      foo do
+        f1(it)
+      rescue
+        f2
+      end
+    RUBY
+  end
+
+  it_behaves_like 'accepts', 'no empty line', <<~RUBY
+    begin
+      f1
+    rescue
+      f2
+    else
+      f3
+    ensure
+      f4
+    end
+  RUBY
+
+  it_behaves_like 'accepts', 'empty lines around begin body', <<~RUBY
+    begin
+
+      f1
+
+    end
+  RUBY
+
+  it_behaves_like 'accepts', 'empty begin', <<~RUBY
+    begin
+    end
+  RUBY
+
+  it_behaves_like 'accepts', 'empty method definition', <<~RUBY
+    def foo
+    end
+  RUBY
+
+  it_behaves_like 'accepts', '`begin` and `rescue` are on the same line', <<~RUBY
+    begin; foo; rescue => e; end
+  RUBY
+
+  it_behaves_like 'accepts', '`rescue` and `end` are on the same line', <<~RUBY
+    begin
+      foo
+    rescue => e; end
+  RUBY
+
+  it_behaves_like 'accepts', 'last `rescue` and `end` are on the same line', <<~RUBY
+    begin
+      foo
+    rescue => x
+    rescue => y; end
+  RUBY
+
+  it_behaves_like 'accepts', '`def` and `rescue` are on the same line', <<~RUBY
+    def do_something; foo; rescue => e; end
+  RUBY
+
+  it_behaves_like 'accepts', '`ensure` and `end` are on the same line', <<~RUBY
+    def do_something
+    ensure end
+  RUBY
+
+  it_behaves_like 'accepts', '`else` and `end` are on the same line', <<~RUBY
+    def do_something
+    rescue
+    else end
+  RUBY
+
+  it_behaves_like 'accepts', '`ensure` body expression and `end` are on the same line', <<~RUBY
+    def do_something
+    foo
+    ensure bar end
+  RUBY
+
+  it_behaves_like 'accepts', '`else` body expression and `end` are on the same line', <<~RUBY
+    def do_something
+    rescue
+    else foo end
+  RUBY
+
+  it 'does not register an offense for a `rescue` modifier after a multiline endless method body', :ruby30 do
+    expect_no_offenses(<<~RUBY)
+      def foo = if bar
+        baz
+      end rescue nil
+    RUBY
+  end
+
+  it 'registers an offense for an empty line between an empty `rescue` and `end` in a block' do
+    expect_offense(<<~RUBY)
+      do_something do
+        foo
+      rescue
+
+      #{message} after the `rescue`.
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      do_something do
+        foo
+      rescue
+      end
+    RUBY
+  end
+
+  it 'registers an offense for an empty line between the beginning of a block and `rescue`' do
+    expect_offense(<<~RUBY)
+      do_something do
+
+      #{message} before the `rescue`.
+      rescue
+        foo
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      do_something do
+      rescue
+        foo
+      end
+    RUBY
+  end
+
+  context 'when `Layout/EmptyLinesAroundBlockBody` is `EnforcedStyle: empty_lines`' do
+    let(:other_cops) do
+      { 'Layout/EmptyLinesAroundBlockBody' => { 'EnforcedStyle' => 'empty_lines' } }
+    end
+
+    it_behaves_like 'accepts', 'an empty line between an empty `rescue` and `end` in a block', <<~RUBY
+      do_something do
+        foo
+      rescue
+
+      end
+    RUBY
+
+    it_behaves_like 'accepts', 'an empty line between the beginning of a block and `rescue`', <<~RUBY
+      do_something do |foo|
+
+      rescue
+        bar
+      end
+    RUBY
+
+    it_behaves_like 'accepts', 'an empty line between multiline block arguments and `ensure`', <<~RUBY
+      do_something do |foo,
+                       bar|
+
+      ensure
+        baz
+      end
+    RUBY
+
+    it 'registers an offense for an empty line between the beginning of a method definition and `rescue`' do
+      expect_offense(<<~RUBY)
+        def do_something
+
+        #{message} before the `rescue`.
+        rescue
+          foo
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def do_something
+        rescue
+          foo
+        end
+      RUBY
+    end
+
+    it 'registers an offense for an empty line between the beginning of a `begin` block and `rescue`' do
+      expect_offense(<<~RUBY)
+        begin
+
+        #{message} before the `rescue`.
+        rescue
+          foo
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        begin
+        rescue
+          foo
+        end
+      RUBY
+    end
+
+    it 'registers an offense for an empty line between the beginning of a block and `rescue` with a comment' do
+      expect_offense(<<~RUBY)
+        do_something do
+          # comment
+
+        #{message} before the `rescue`.
+        rescue
+          foo
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        do_something do
+          # comment
+        rescue
+          foo
+        end
+      RUBY
+    end
+
+    it 'registers an offense for an empty line between an empty `ensure` and `end` in a method definition' do
+      expect_offense(<<~RUBY)
+        def do_something
+          foo
+        ensure
+
+        #{message} after the `ensure`.
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def do_something
+          foo
+        ensure
+        end
+      RUBY
+    end
+
+    it 'registers an offense for an empty line between an empty `rescue` and `end` in a `begin` block' do
+      expect_offense(<<~RUBY)
+        begin
+          foo
+        rescue
+
+        #{message} after the `rescue`.
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        begin
+          foo
+        rescue
+        end
+      RUBY
+    end
+  end
+
+  it 'with complex begin-end - registers many offenses' do
+    expect_offense(<<~RUBY)
+      begin
+
+        do_something1
+
+      #{message} before the `rescue`.
+      rescue RuntimeError
+
+      #{message} after the `rescue`.
+        do_something2
+
+      #{message} before the `rescue`.
+      rescue ArgumentError => ex
+
+      #{message} after the `rescue`.
+        do_something3
+
+      #{message} before the `rescue`.
+      rescue
+
+      #{message} after the `rescue`.
+        do_something3
+
+      #{message} before the `else`.
+      else
+
+      #{message} after the `else`.
+        do_something4
+
+      #{message} before the `ensure`.
+      ensure
+
+      #{message} after the `ensure`.
+        do_something4
+
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      begin
+
+        do_something1
+      rescue RuntimeError
+        do_something2
+      rescue ArgumentError => ex
+        do_something3
+      rescue
+        do_something3
+      else
+        do_something4
+      ensure
+        do_something4
+
+      end
+    RUBY
+  end
+
+  it 'with complex method definition - registers many offenses' do
+    expect_offense(<<~RUBY)
+      def foo
+
+        do_something1
+
+      #{message} before the `rescue`.
+      rescue RuntimeError
+
+      #{message} after the `rescue`.
+        do_something2
+
+      #{message} before the `rescue`.
+      rescue ArgumentError => ex
+
+      #{message} after the `rescue`.
+        do_something3
+
+      #{message} before the `rescue`.
+      rescue
+
+      #{message} after the `rescue`.
+        do_something3
+
+      #{message} before the `else`.
+      else
+
+      #{message} after the `else`.
+        do_something4
+
+      #{message} before the `ensure`.
+      ensure
+
+      #{message} after the `ensure`.
+        do_something4
+
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      def foo
+
+        do_something1
+      rescue RuntimeError
+        do_something2
+      rescue ArgumentError => ex
+        do_something3
+      rescue
+        do_something3
+      else
+        do_something4
+      ensure
+        do_something4
+
+      end
+    RUBY
+  end
+end

@@ -1,0 +1,1155 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::Cop::Style::For, :config do
+  context 'when each is the enforced style' do
+    let(:cop_config) { { 'EnforcedStyle' => 'each' } }
+
+    it 'registers an offense for for' do
+      expect_offense(<<~RUBY)
+        def func
+          for n in [1, 2, 3] do
+          ^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+            puts n
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def func
+          [1, 2, 3].each do |n|
+            puts n
+          end
+        end
+      RUBY
+    end
+
+    it 'registers an offense for opposite + correct style' do
+      expect_offense(<<~RUBY)
+        def func
+          for n in [1, 2, 3] do
+          ^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+            puts n
+          end
+          [1, 2, 3].each do |n|
+            puts n
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def func
+          [1, 2, 3].each do |n|
+            puts n
+          end
+          [1, 2, 3].each do |n|
+            puts n
+          end
+        end
+      RUBY
+    end
+
+    it 'registers multiple offenses' do
+      expect_offense(<<~RUBY)
+        for n in [1, 2, 3] do
+        ^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+          puts n
+        end
+        [1, 2, 3].each do |n|
+          puts n
+        end
+        for n in [1, 2, 3] do
+        ^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+          puts n
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        [1, 2, 3].each do |n|
+          puts n
+        end
+        [1, 2, 3].each do |n|
+          puts n
+        end
+        [1, 2, 3].each do |n|
+          puts n
+        end
+      RUBY
+    end
+
+    it 'registers and corrects an offense for `for` in the collection of another `for`' do
+      expect_offense(<<~RUBY)
+        for y in for x in foo do
+                 ^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+        ^^^^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+          bar(x)
+        end do
+          baz(y)
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        foo.each do |x|
+          bar(x)
+        end.each do |y|
+          baz(y)
+        end
+      RUBY
+    end
+
+    context 'autocorrect' do
+      it 'does not autocorrect when the body uses a numbered parameter' do
+        expect_offense(<<~RUBY)
+          for _ in [1, 2, 3] do
+          ^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+            puts _1
+          end
+        RUBY
+
+        expect_no_corrections
+      end
+
+      it 'does not autocorrect when the body uses `it`', :ruby34 do
+        expect_offense(<<~RUBY)
+          for _ in [1, 2, 3] do
+          ^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+            puts it
+          end
+        RUBY
+
+        expect_no_corrections
+      end
+
+      it 'does not autocorrect when the body uses the numbered parameter of an enclosing block' do
+        expect_offense(<<~RUBY)
+          [[9]].each do
+            for x in [1]
+            ^^^^^^^^^^^^ Prefer `each` over `for`.
+              p _1, x
+            end
+          end
+        RUBY
+
+        expect_no_corrections
+      end
+
+      it 'does not autocorrect when the body uses `it` of an enclosing block', :ruby34 do
+        expect_offense(<<~RUBY)
+          [[9]].each do
+            for x in [1]
+            ^^^^^^^^^^^^ Prefer `each` over `for`.
+              p it, x
+            end
+          end
+        RUBY
+
+        expect_no_corrections
+      end
+
+      it 'corrects when a numbered parameter belongs to an inner block' do
+        expect_offense(<<~RUBY)
+          for x in [1, 2, 3] do
+          ^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+            [x].each { puts _1 }
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          [1, 2, 3].each do |x|
+            [x].each { puts _1 }
+          end
+        RUBY
+      end
+
+      it 'does not autocorrect when the loop variable is not a local variable' do
+        expect_offense(<<~RUBY)
+          for @item in items do
+          ^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+            puts @item
+          end
+        RUBY
+
+        expect_no_corrections
+      end
+
+      it 'does not autocorrect when the loop variable is an attribute' do
+        expect_offense(<<~RUBY)
+          for foo.bar in items do
+          ^^^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+          end
+        RUBY
+
+        expect_no_corrections
+      end
+
+      it 'corrects nested destructuring of local variables' do
+        expect_offense(<<~RUBY)
+          for a, (b, *c) in items do
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+            puts a, b, c
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          items.each do |a, (b, *c)|
+            puts a, b, c
+          end
+        RUBY
+      end
+
+      it 'corrects destructuring with a trailing comma in parentheses' do
+        expect_offense(<<~RUBY)
+          for (a,) in items do
+          ^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+            puts a
+          end
+          for b, (c, d,) in items do
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+            puts b
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          items.each do |(a)|
+            puts a
+          end
+          items.each do |b, (c, d)|
+            puts b
+          end
+        RUBY
+      end
+
+      it 'keeps a single-variable trailing comma without copying the comment' do
+        expect_offense(<<~RUBY)
+          for a, # note
+          ^^^^^^^^^^^^^ Prefer `each` over `for`.
+           in items
+            puts a
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          items.each do |a,|
+            puts a
+          end
+        RUBY
+      end
+
+      it 'drops a trailing comma after multiple variables' do
+        expect_offense(<<~RUBY)
+          for a, b, in items
+          ^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+            puts a
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          items.each do |a, b|
+            puts a
+          end
+        RUBY
+      end
+
+      it 'keeps a trailing comma after the loop variable' do
+        expect_offense(<<~RUBY)
+          for a, in items do
+          ^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+            puts a
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          items.each do |a,|
+            puts a
+          end
+        RUBY
+      end
+
+      context 'with range' do
+        let(:expected_each_with_range) do
+          <<~RUBY
+            def func
+              (1...value).each do |n|
+                puts n
+              end
+            end
+          RUBY
+        end
+
+        it 'changes for to each' do
+          expect_offense(<<~RUBY)
+            def func
+              for n in (1...value) do
+              ^^^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+                puts n
+              end
+            end
+          RUBY
+
+          expect_correction(expected_each_with_range)
+        end
+
+        it 'changes for that does not have do or semicolon to each' do
+          expect_offense(<<~RUBY)
+            def func
+              for n in (1...value)
+              ^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+                puts n
+              end
+            end
+          RUBY
+
+          expect_correction(expected_each_with_range)
+        end
+
+        context 'without parentheses' do
+          it 'changes for to each' do
+            expect_offense(<<~RUBY)
+              def func
+                for n in 1...value do
+                ^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+                  puts n
+                end
+              end
+            RUBY
+
+            expect_correction(expected_each_with_range)
+          end
+
+          it 'changes for that does not have do or semicolon to each' do
+            expect_offense(<<~RUBY)
+              def func
+                for n in 1...value
+                ^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+                  puts n
+                end
+              end
+            RUBY
+
+            expect_correction(expected_each_with_range)
+          end
+        end
+      end
+
+      it 'corrects a tuple of items' do
+        expect_offense(<<~RUBY)
+          def func
+            for (a, b) in {a: 1, b: 2, c: 3} do
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+              puts a, b
+            end
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def func
+            {a: 1, b: 2, c: 3}.each do |(a, b)|
+              puts a, b
+            end
+          end
+        RUBY
+      end
+
+      it 'changes for that does not have do or semicolon to each' do
+        expect_offense(<<~RUBY)
+          def func
+            for n in [1, 2, 3]
+            ^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+              puts n
+            end
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def func
+            [1, 2, 3].each do |n|
+              puts n
+            end
+          end
+        RUBY
+      end
+
+      it 'corrects an array with `+` operator' do
+        expect_offense(<<~RUBY)
+          def func
+            a = [1, 2]
+            b = [3, 4]
+            c = [5]
+
+            for n in a + b + c
+            ^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+              puts n
+            end
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def func
+            a = [1, 2]
+            b = [3, 4]
+            c = [5]
+
+            (a + b + c).each do |n|
+              puts n
+            end
+          end
+        RUBY
+      end
+
+      it 'corrects an array with `-` operator' do
+        expect_offense(<<~RUBY)
+          def func
+            a = [1, 2, 3, 4]
+            b = [3]
+
+            for n in a - b
+            ^^^^^^^^^^^^^^ Prefer `each` over `for`.
+              puts n
+            end
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def func
+            a = [1, 2, 3, 4]
+            b = [3]
+
+            (a - b).each do |n|
+              puts n
+            end
+          end
+        RUBY
+      end
+
+      it 'corrects an array with `*` operator' do
+        expect_offense(<<~RUBY)
+          def func
+            for n in [1, 2, 3, 4] * 3
+            ^^^^^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+              puts n
+            end
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def func
+            ([1, 2, 3, 4] * 3).each do |n|
+              puts n
+            end
+          end
+        RUBY
+      end
+
+      it 'corrects an array with `|` operator' do
+        expect_offense(<<~RUBY)
+          def func
+            a = [1, 2, 3, 4]
+            b = [4, 5]
+
+            for n in a | b
+            ^^^^^^^^^^^^^^ Prefer `each` over `for`.
+              puts n
+            end
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def func
+            a = [1, 2, 3, 4]
+            b = [4, 5]
+
+            (a | b).each do |n|
+              puts n
+            end
+          end
+        RUBY
+      end
+
+      it 'corrects an array with `&` operator' do
+        expect_offense(<<~RUBY)
+          def func
+            a = [1, 2, 3, 4]
+            b = [4, 5]
+
+            for n in a & b
+            ^^^^^^^^^^^^^^ Prefer `each` over `for`.
+              puts n
+            end
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def func
+            a = [1, 2, 3, 4]
+            b = [4, 5]
+
+            (a & b).each do |n|
+              puts n
+            end
+          end
+        RUBY
+      end
+
+      it 'corrects an array with `&&` operator' do
+        expect_offense(<<~RUBY)
+          def func
+            a = []
+            b = [1, 2, 3]
+
+            for n in a && b
+            ^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+              puts n
+            end
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def func
+            a = []
+            b = [1, 2, 3]
+
+            (a && b).each do |n|
+              puts n
+            end
+          end
+        RUBY
+      end
+
+      it 'corrects an array with `||` operator' do
+        expect_offense(<<~RUBY)
+          def func
+            a = nil
+            b = [1, 2, 3]
+
+            for n in a || b
+            ^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+              puts n
+            end
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def func
+            a = nil
+            b = [1, 2, 3]
+
+            (a || b).each do |n|
+              puts n
+            end
+          end
+        RUBY
+      end
+
+      it 'corrects to `each` without parenthesize collection if non-operator method called' do
+        expect_offense(<<~RUBY)
+          def func
+            for n in [1, 2, nil].compact
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+              puts n
+            end
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def func
+            [1, 2, nil].compact.each do |n|
+              puts n
+            end
+          end
+        RUBY
+      end
+
+      it 'corrects to `each` with safe navigation if collection ends with safe navigation' do
+        expect_offense(<<~RUBY)
+          for item in foo&.items
+          ^^^^^^^^^^^^^^^^^^^^^^ Prefer `each` over `for`.
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          foo&.items&.each do |item|
+          end
+        RUBY
+      end
+    end
+
+    it 'accepts multiline each' do
+      expect_no_offenses(<<~RUBY)
+        def func
+          [1, 2, 3].each do |n|
+            puts n
+          end
+        end
+      RUBY
+    end
+
+    it 'accepts :for' do
+      expect_no_offenses('[:for, :ala, :bala]')
+    end
+
+    it 'accepts def for' do
+      expect_no_offenses('def for; end')
+    end
+  end
+
+  context 'when for is the enforced style' do
+    let(:cop_config) { { 'EnforcedStyle' => 'for' } }
+
+    it 'does not register an offense for a block with a `rescue` body' do
+      expect_no_offenses(<<~RUBY)
+        [1, 2, 3].each do |n|
+          puts n
+        rescue StandardError
+          handle
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a block with an `ensure` body' do
+      expect_no_offenses(<<~RUBY)
+        [1, 2, 3].each do |n|
+          puts n
+        ensure
+          cleanup
+        end
+      RUBY
+    end
+
+    it 'does not register an offense when the receiver has a `do`...`end` block' do
+      expect_no_offenses(<<~RUBY)
+        foo.select do |x|
+          x.bar?
+        end.each do |n|
+          puts n
+        end
+      RUBY
+    end
+
+    it 'registers an offense when the receiver has a brace block' do
+      expect_offense(<<~RUBY)
+        foo.select { |x| x.bar? }.each do |n|
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+          puts n
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for n in foo.select { |x| x.bar? } do
+          puts n
+        end
+      RUBY
+    end
+
+    it 'registers an offense when the receiver is a multiline `each` with braces' do
+      expect_offense(<<~RUBY)
+        foo.each { |x|
+        ^^^^^^^^^^^^^^ Prefer `for` over `each`.
+          bar(x)
+        }.each { |y|
+        ^^^^^^^^^^^^ Prefer `for` over `each`.
+          baz(y)
+        }
+      RUBY
+
+      expect_correction(<<~RUBY, loop: false)
+        for y in for x in foo do
+          bar(x)
+        end do
+          baz(y)
+        end
+      RUBY
+    end
+
+    it 'registers an offense on the line of `each` when the receiver spans multiple lines' do
+      expect_offense(<<~RUBY)
+        foo(
+          bar
+        ).each do |x|
+        ^^^^^^^^^^^^^ Prefer `for` over `each`.
+          baz(x)
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for x in foo(
+          bar
+        ) do
+          baz(x)
+        end
+      RUBY
+    end
+
+    it 'accepts for' do
+      expect_no_offenses(<<~RUBY)
+        def func
+          for n in [1, 2, 3] do
+            puts n
+          end
+        end
+      RUBY
+    end
+
+    it 'registers an offense for multiline each' do
+      expect_offense(<<~RUBY)
+        def func
+          [1, 2, 3].each do |n|
+          ^^^^^^^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+            puts n
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def func
+          for n in [1, 2, 3] do
+            puts n
+          end
+        end
+      RUBY
+    end
+
+    it 'registers an offense for each without an item and uses _ as the item' do
+      expect_offense(<<~RUBY)
+        def func
+          [1, 2, 3].each do
+          ^^^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+            something
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def func
+          for _ in [1, 2, 3] do
+            something
+          end
+        end
+      RUBY
+    end
+
+    it 'keeps all block arguments when each has multiple items' do
+      expect_offense(<<~RUBY)
+        def func
+          [[1, 2]].each do |a, b|
+          ^^^^^^^^^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+            puts a + b
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def func
+          for a, b in [[1, 2]] do
+            puts a + b
+          end
+        end
+      RUBY
+    end
+
+    it 'adds a trailing comma to a destructuring block parameter with a single variable' do
+      expect_offense(<<~RUBY)
+        foo.each do |(x)|
+        ^^^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+          bar(x)
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for (x,) in foo do
+          bar(x)
+        end
+      RUBY
+    end
+
+    it 'adds a trailing comma to a nested destructuring block parameter with a single variable' do
+      expect_offense(<<~RUBY)
+        foo.each do |x, (y)|
+        ^^^^^^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+          bar(x, y)
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for x, (y,) in foo do
+          bar(x, y)
+        end
+      RUBY
+    end
+
+    it 'does not add a trailing comma to a destructuring block parameter with a single splat' do
+      expect_offense(<<~RUBY)
+        foo.each do |(*x)|
+        ^^^^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+          bar(x)
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for (*x) in foo do
+          bar(x)
+        end
+      RUBY
+    end
+
+    it 'keeps the trailing comma of a block parameter' do
+      expect_offense(<<~RUBY)
+        foo.each do |x,|
+        ^^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+          bar(x)
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for x, in foo do
+          bar(x)
+        end
+      RUBY
+    end
+
+    it 'does not register an offense when a block parameter has a default value' do
+      expect_no_offenses(<<~RUBY)
+        foo.each do |x = 1|
+          bar(x)
+        end
+      RUBY
+    end
+
+    it 'does not register an offense when a block has a keyword parameter' do
+      expect_no_offenses(<<~RUBY)
+        foo.each do |x, y:|
+          bar(x, y)
+        end
+      RUBY
+    end
+
+    it 'does not register an offense when a block has a keyword rest parameter' do
+      expect_no_offenses(<<~RUBY)
+        foo.each do |x, **y|
+          bar(x, y)
+        end
+      RUBY
+    end
+
+    it 'does not register an offense when a block has a block parameter' do
+      expect_no_offenses(<<~RUBY)
+        foo.each do |x, &y|
+          bar(x, y)
+        end
+      RUBY
+    end
+
+    it 'does not register an offense when a block has a block-local variable' do
+      expect_no_offenses(<<~RUBY)
+        foo.each do |x; y|
+          bar(x)
+        end
+      RUBY
+    end
+
+    it 'does not register an offense when a block has only a splat parameter' do
+      expect_no_offenses(<<~RUBY)
+        foo.each do |*x|
+          bar(x)
+        end
+      RUBY
+    end
+
+    it 'registers an offense when a block has a splat parameter with another parameter' do
+      expect_offense(<<~RUBY)
+        foo.each do |*x, y|
+        ^^^^^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+          bar(x, y)
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for *x, y in foo do
+          bar(x, y)
+        end
+      RUBY
+    end
+
+    it 'does not register an offense when a block parameter name is later called as a method with arguments' do
+      expect_no_offenses(<<~RUBY)
+        foo.each do |x|
+          bar(x)
+        end
+        x :baz do
+        end
+      RUBY
+    end
+
+    it 'does not register an offense when a block parameter name is later called as a method in a nested block' do
+      expect_no_offenses(<<~RUBY)
+        foo.each do |x|
+          bar(x)
+        end
+        baz do
+          x
+        end
+      RUBY
+    end
+
+    it 'does not register an offense when a variable assigned in the block is later called as a method' do
+      expect_no_offenses(<<~RUBY)
+        foo.each do |x|
+          y = x
+        end
+        y :bar
+      RUBY
+    end
+
+    it 'registers an offense when a block parameter name is later called as a method with parentheses' do
+      expect_offense(<<~RUBY)
+        foo.each do |x|
+        ^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+          bar(x)
+        end
+        x(:baz)
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for x in foo do
+          bar(x)
+        end
+        x(:baz)
+      RUBY
+    end
+
+    it 'registers an offense when a block parameter name is called as a method outside the enclosing block' do
+      expect_offense(<<~RUBY)
+        foo do
+          bar.each do |x|
+          ^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+            baz(x)
+          end
+        end
+        x :qux
+      RUBY
+
+      expect_correction(<<~RUBY)
+        foo do
+          for x in bar do
+            baz(x)
+          end
+        end
+        x :qux
+      RUBY
+    end
+
+    it 'registers an offense when a block parameter name is called as a method in a later method definition' do
+      expect_offense(<<~RUBY)
+        foo.each do |x|
+        ^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+          bar(x)
+        end
+        def baz
+          x :qux
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for x in foo do
+          bar(x)
+        end
+        def baz
+          x :qux
+        end
+      RUBY
+    end
+
+    it 'registers an offense when a block parameter name is called as a method before the block' do
+      expect_offense(<<~RUBY)
+        x :baz
+        foo.each do |x|
+        ^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+          bar(x)
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        x :baz
+        for x in foo do
+          bar(x)
+        end
+      RUBY
+    end
+
+    it 'registers an offense and corrects a multiline `each` with braces' do
+      expect_offense(<<~RUBY)
+        c.each { |d|
+        ^^^^^^^^^^^^ Prefer `for` over `each`.
+          e
+        }
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for d in c do
+          e
+        end
+      RUBY
+    end
+
+    it 'registers an offense and corrects when the body abuts the opening brace' do
+      expect_offense(<<~RUBY)
+        c.each {d
+        ^^^^^^^^^ Prefer `for` over `each`.
+          f }
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for _ in c do d
+          f end
+      RUBY
+    end
+
+    it 'registers an offense and corrects when the body abuts the closing brace' do
+      expect_offense(<<~RUBY)
+        c.each { d
+        ^^^^^^^^^^ Prefer `for` over `each`.
+          f}
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for _ in c do d
+          f end
+      RUBY
+    end
+
+    it 'registers an offense and corrects a multiline `each` with braces and without an item' do
+      expect_offense(<<~RUBY)
+        c.each {
+        ^^^^^^^^ Prefer `for` over `each`.
+          e
+        }
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for _ in c do
+          e
+        end
+      RUBY
+    end
+
+    context 'Ruby 2.7', :ruby27 do
+      it 'does not register an offense for each with a numbered parameter' do
+        expect_no_offenses(<<~RUBY)
+          def func
+            [1, 2, 3].each do
+              puts _1
+            end
+          end
+        RUBY
+      end
+    end
+
+    context 'Ruby 3.4', :ruby34 do
+      it 'does not register an offense for each with an `it` parameter' do
+        expect_no_offenses(<<~RUBY)
+          def func
+            [1, 2, 3].each do
+              puts it
+            end
+          end
+        RUBY
+      end
+    end
+
+    it 'registers an offense for correct + opposite style' do
+      expect_offense(<<~RUBY)
+        def func
+          for n in [1, 2, 3] do
+            puts n
+          end
+          [1, 2, 3].each do |n|
+          ^^^^^^^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+            puts n
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def func
+          for n in [1, 2, 3] do
+            puts n
+          end
+          for n in [1, 2, 3] do
+            puts n
+          end
+        end
+      RUBY
+    end
+
+    it 'registers no offense when there is no receiver' do
+      expect_no_offenses(<<~RUBY)
+        each do |n|
+          puts n
+        end
+      RUBY
+    end
+
+    it 'registers multiple offenses' do
+      expect_offense(<<~RUBY)
+        for n in [1, 2, 3] do
+          puts n
+        end
+        [1, 2, 3].each do |n|
+        ^^^^^^^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+          puts n
+        end
+        [1, 2, 3].each do |n|
+        ^^^^^^^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+          puts n
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        for n in [1, 2, 3] do
+          puts n
+        end
+        for n in [1, 2, 3] do
+          puts n
+        end
+        for n in [1, 2, 3] do
+          puts n
+        end
+      RUBY
+    end
+
+    it 'registers an offense for a tuple of items' do
+      expect_offense(<<~RUBY)
+        def func
+          {a: 1, b: 2, c: 3}.each do |(a, b)|
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Prefer `for` over `each`.
+            puts a, b
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def func
+          for (a, b) in {a: 1, b: 2, c: 3} do
+            puts a, b
+          end
+        end
+      RUBY
+    end
+
+    it 'accepts single line each' do
+      expect_no_offenses(<<~RUBY)
+        def func
+          [1, 2, 3].each { |n| puts n }
+        end
+      RUBY
+    end
+
+    context 'when using safe navigation operator', :ruby23 do
+      it 'does not break' do
+        expect_no_offenses(<<~RUBY)
+          def func
+            [1, 2, 3]&.each { |n| puts n }
+          end
+        RUBY
+      end
+    end
+  end
+end

@@ -1,0 +1,334 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::Cop::Offense do
+  subject(:offense) do
+    described_class.new(:convention, location, 'message', 'CopName', :corrected)
+  end
+
+  let(:location) do
+    source_buffer = Parser::Source::Buffer.new('test', 1)
+    source_buffer.source = "a\n"
+    Parser::Source::Range.new(source_buffer, 0, 1)
+  end
+
+  it 'has a few required attributes' do
+    expect(offense.severity).to eq(:convention)
+    expect(offense.line).to eq(1)
+    expect(offense.message).to eq('message')
+    expect(offense.cop_name).to eq('CopName')
+    expect(offense).to be_correctable
+    expect(offense).to be_corrected
+    expect(offense.highlighted_area.source).to eq('a')
+  end
+
+  describe 'corrections' do
+    let(:corrector) do
+      RuboCop::Cop::Corrector.new(location.source_buffer).tap { |c| c.replace(location, 'b') }
+    end
+
+    it 'has no corrections when the offense has no corrector' do
+      offense = described_class.new(:convention, location, 'message', 'CopName')
+
+      expect(offense.corrections).to be_empty
+      expect(offense.corrections).to be_frozen
+    end
+
+    it 'extracts the edits the corrector would make' do
+      offense = described_class.new(:convention, location, 'message', 'CopName',
+                                    :uncorrected, corrector)
+
+      expect(offense.corrections.map(&:to_a)).to eq([[0, 1, 'b']])
+    end
+
+    it 'reports a correction as safe unless told otherwise' do
+      offense = described_class.new(:convention, location, 'message', 'CopName',
+                                    :uncorrected, corrector)
+
+      expect(offense.correction_safe).to be(true)
+    end
+
+    it 'carries the unsafety of a cop that only `-A` would correct' do
+      offense = described_class.new(:convention, location, 'message', 'CopName',
+                                    :uncorrected, corrector, correction_safe: false)
+
+      expect(offense.correction_safe).to be(false)
+    end
+
+    # A corrector cannot be marshalled, so parallel workers would otherwise hand
+    # back offenses that have lost their edits.
+    it 'survives a marshal round trip' do
+      offense = described_class.new(:convention, location, 'message', 'CopName',
+                                    :uncorrected, corrector, correction_safe: false)
+
+      restored = Marshal.load(Marshal.dump(offense))
+
+      expect(restored.corrections.map(&:to_a)).to eq([[0, 1, 'b']])
+      expect(restored.correction_safe).to be(false)
+    end
+
+    it 'defaults to safe when loading an offense dumped without the flag' do
+      offense = described_class.new(:convention, location, 'message', 'CopName')
+      dumped = offense.marshal_dump[0..5]
+
+      restored = described_class.allocate.tap { |o| o.marshal_load(dumped) }
+
+      expect(restored.corrections).to be_empty
+      expect(restored.correction_safe).to be(true)
+    end
+  end
+
+  it 'overrides #to_s' do
+    expect(offense.to_s).to eq('C:  1:  1: message')
+  end
+
+  it 'does not blow up if a message contains %' do
+    offense = described_class.new(:convention, location, 'message % test', 'CopName')
+
+    expect(offense.to_s).to eq('C:  1:  1: message % test')
+  end
+
+  it 'redefines == to compare offenses based on their contents' do
+    o1 = described_class.new(:convention, location, 'message', 'CopName')
+    o2 = described_class.new(:convention, location, 'message', 'CopName')
+
+    expect(o1 == o2).to be(true)
+  end
+
+  it 'is frozen' do
+    expect(offense).to be_frozen
+  end
+
+  %i[severity location message cop_name].each do |a|
+    describe "##{a}" do
+      it 'is frozen' do
+        expect(offense.public_send(a)).to be_frozen
+      end
+    end
+  end
+
+  context 'when unknown severity is passed' do
+    it 'raises error' do
+      expect do
+        described_class.new(:foobar, location, 'message', 'CopName')
+      end.to raise_error(ArgumentError)
+    end
+  end
+
+  describe '#highlighted_area' do
+    subject(:highlighted_area) { offense.highlighted_area }
+
+    it 'returns a range with correct column and length' do
+      expect(highlighted_area).to be_a Parser::Source::Range
+      expect(highlighted_area.column).to eq(0)
+      expect(highlighted_area.length).to eq(1)
+    end
+  end
+
+  describe '#real_last_column' do
+    let(:location) do
+      source_buffer = Parser::Source::Buffer.new('test', 1)
+      source_buffer.source = "abc\n"
+      Parser::Source::Range.new(source_buffer, 0, 3)
+    end
+
+    it 'returns the 1-based column of the last character' do
+      expect(offense.real_last_column).to eq 3
+    end
+  end
+
+  describe '#severity_level' do
+    subject(:severity_level) do
+      described_class.new(severity, location, 'message', 'CopName').severity.level
+    end
+
+    context 'when severity is :info' do
+      let(:severity) { :info }
+
+      it 'is 1' do
+        expect(severity_level).to eq(1)
+      end
+    end
+
+    context 'when severity is :refactor' do
+      let(:severity) { :refactor }
+
+      it 'is 2' do
+        expect(severity_level).to eq(2)
+      end
+    end
+
+    context 'when severity is :fatal' do
+      let(:severity) { :fatal }
+
+      it 'is 6' do
+        expect(severity_level).to eq(6)
+      end
+    end
+  end
+
+  describe '#<=>' do
+    def offense(hash = {})
+      attrs = { sev: :convention, line: 5, col: 5, mes: 'message', cop: 'CopName' }.merge(hash)
+
+      described_class.new(
+        attrs[:sev],
+        location(attrs[:line], attrs[:col],
+                 %w[aaaaaa bbbbbb cccccc dddddd eeeeee ffffff]),
+        attrs[:mes],
+        attrs[:cop]
+      )
+    end
+
+    def location(line, column, source)
+      source_buffer = Parser::Source::Buffer.new('test', 1)
+      source_buffer.source = source.join("\n")
+      begin_pos = source[0...(line - 1)].reduce(0) { |a, e| a + e.length + 1 } + column
+      Parser::Source::Range.new(source_buffer, begin_pos, begin_pos + 1)
+    end
+
+    # We want a nice table layout, so we allow space inside empty hashes.
+    # rubocop:disable Layout/SpaceInsideHashLiteralBraces, Layout/ExtraSpacing -- the spacing under test is what it is
+    [
+      [{                           }, {                           }, 0],
+
+      [{ line: 6                   }, { line: 5                   }, 1],
+
+      [{ line: 5, col: 6           }, { line: 5, col: 5           }, 1],
+      [{ line: 6, col: 4           }, { line: 5, col: 5           }, 1],
+
+      [{                  cop: 'B' }, {                  cop: 'A' }, 1],
+      [{ line: 6,         cop: 'A' }, { line: 5,         cop: 'B' }, 1],
+      [{          col: 6, cop: 'A' }, {          col: 5, cop: 'B' }, 1]
+    ].each do |one, other, expectation|
+      # rubocop:enable Layout/SpaceInsideHashLiteralBraces, Layout/ExtraSpacing
+      context "when receiver has #{one} and other has #{other}" do
+        it "returns #{expectation}" do
+          an_offense = offense(one)
+          other_offense = offense(other)
+          expect(an_offense <=> other_offense).to eq(expectation)
+        end
+      end
+    end
+  end
+
+  context 'offenses that span multiple lines' do
+    subject(:offense) do
+      described_class.new(:convention, location, 'message', 'CopName', :corrected)
+    end
+
+    let(:location) do
+      source_buffer = Parser::Source::Buffer.new('test', 1)
+      source_buffer.source = <<~RUBY
+        def foo
+          something
+          something_else
+        end
+      RUBY
+      Parser::Source::Range.new(source_buffer, 0, source_buffer.source.length)
+    end
+
+    it 'highlights the first line' do
+      expect(offense.location.source).to eq(location.source_buffer.source)
+      expect(offense.highlighted_area.source).to eq('def foo')
+    end
+  end
+
+  context 'offenses that span part of a line' do
+    subject(:offense) do
+      described_class.new(:convention, location, 'message', 'CopName', :corrected)
+    end
+
+    let(:location) do
+      source_buffer = Parser::Source::Buffer.new('test', 1)
+      source_buffer.source = <<~RUBY
+        def Foo
+          something
+          something_else
+        end
+      RUBY
+      Parser::Source::Range.new(source_buffer, 4, 7)
+    end
+
+    it 'highlights the first line' do
+      expect(offense.highlighted_area.source).to eq('Foo')
+    end
+  end
+
+  context 'when the location is pseudo' do
+    let(:location) { described_class::NO_LOCATION }
+
+    it 'returns a location with valid size and length' do
+      expect(offense.location.size).to eq 0
+      expect(offense.location.length).to eq 0
+    end
+
+    it 'returns a line' do
+      expect(offense.line).to eq 1
+    end
+
+    it 'returns a column' do
+      expect(offense.column).to eq 0
+    end
+
+    it 'returns a source line' do
+      expect(offense.source_line).to eq ''
+    end
+
+    it 'returns a column length' do
+      expect(offense.column_length).to eq 0
+    end
+
+    it 'returns the first line' do
+      expect(offense.first_line).to eq 1
+    end
+
+    it 'returns the last line' do
+      expect(offense.last_line).to eq 1
+    end
+
+    it 'returns the last column' do
+      expect(offense.last_column).to eq 0
+    end
+
+    it 'returns a column range' do
+      expect(offense.column_range).to eq 0...0
+    end
+
+    it 'returns a real column' do
+      expect(offense.real_column).to eq 1
+    end
+
+    it 'returns a real last column' do
+      expect(offense.real_last_column).to eq 1
+    end
+
+    it 'returns a highlighted area' do
+      expect(offense.highlighted_area).to be_a Parser::Source::Range
+      expect(offense.highlighted_area.column).to eq 0
+      expect(offense.highlighted_area.length).to eq 0
+    end
+  end
+
+  context 'when the offense is suppressed by a directive' do
+    subject(:offense) do
+      described_class.new(:convention, location, 'message', 'CopName', :disabled, nil,
+                          justification: 'a good reason')
+    end
+
+    it 'exposes the directive justification' do
+      expect(offense.justification).to eq('a good reason')
+    end
+
+    it 'is not correctable' do
+      expect(offense).not_to be_correctable
+    end
+
+    it 'round-trips the justification through marshalling' do
+      expect(Marshal.load(Marshal.dump(offense)).justification).to eq('a good reason')
+    end
+  end
+
+  it 'defaults justification to nil' do
+    expect(offense.justification).to be_nil
+  end
+end

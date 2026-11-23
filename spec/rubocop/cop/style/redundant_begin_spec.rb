@@ -1,0 +1,1568 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::Cop::Style::RedundantBegin, :config do
+  it 'reports an offense for single line def with redundant begin block' do
+    expect_offense(<<~RUBY)
+      def func; begin; x; y; rescue; z end; end
+                ^^^^^ Redundant `begin` block detected.
+    RUBY
+
+    expect_correction(<<~RUBY)
+      def func; ; x; y; rescue; z ; end
+    RUBY
+  end
+
+  it 'reports an offense for def with redundant begin block' do
+    expect_offense(<<~RUBY)
+      def func
+        begin
+        ^^^^^ Redundant `begin` block detected.
+          ala
+        rescue => e
+          bala
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      def func
+       #{trailing_whitespace}
+          ala
+        rescue => e
+          bala
+       #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  it 'reports an offense for defs with redundant begin block' do
+    expect_offense(<<~RUBY)
+      def Test.func
+        begin
+        ^^^^^ Redundant `begin` block detected.
+          ala
+        rescue => e
+          bala
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      def Test.func
+       #{trailing_whitespace}
+          ala
+        rescue => e
+          bala
+       #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  it 'accepts a def with required begin block' do
+    expect_no_offenses(<<~RUBY)
+      def func
+        begin
+          ala
+        rescue => e
+          bala
+        end
+        something
+      end
+    RUBY
+  end
+
+  it 'accepts a defs with required begin block' do
+    expect_no_offenses(<<~RUBY)
+      def Test.func
+        begin
+          ala
+        rescue => e
+          bala
+        end
+        something
+      end
+    RUBY
+  end
+
+  it 'accepts a def with a begin block after a statement' do
+    expect_no_offenses(<<~RUBY)
+      def Test.func
+        something
+        begin
+          ala
+        rescue => e
+          bala
+        end
+      end
+    RUBY
+  end
+
+  it "doesn't modify spacing when autocorrecting" do
+    expect_offense(<<~RUBY)
+      def method
+        begin
+        ^^^^^ Redundant `begin` block detected.
+          BlockA do |strategy|
+            foo
+          end
+
+          BlockB do |portfolio|
+            foo
+          end
+
+        rescue => e # some problem
+          bar
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      def method
+       #{trailing_whitespace}
+          BlockA do |strategy|
+            foo
+          end
+
+          BlockB do |portfolio|
+            foo
+          end
+
+        rescue => e # some problem
+          bar
+       #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  it 'autocorrects when there are trailing comments' do
+    expect_offense(<<~RUBY)
+      def method
+        begin # comment 1
+        ^^^^^ Redundant `begin` block detected.
+          do_some_stuff
+        rescue # comment 2
+        end # comment 3
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      def method
+         # comment 1
+          do_some_stuff
+        rescue # comment 2
+         # comment 3
+      end
+    RUBY
+  end
+
+  it 'registers an offense and corrects when using `begin` without `rescue` or `ensure`' do
+    expect_offense(<<~RUBY)
+      begin
+      ^^^^^ Redundant `begin` block detected.
+        do_something
+      end
+    RUBY
+
+    expect_correction("\n  do_something\n\n")
+  end
+
+  it 'registers an offense and corrects when using `begin` with multiple statements without `rescue` or `ensure`' do
+    expect_offense(<<~RUBY)
+      begin
+      ^^^^^ Redundant `begin` block detected.
+        foo
+        bar
+      end
+    RUBY
+
+    expect_correction("\n  foo\n  bar\n\n")
+  end
+
+  it 'does not register an offense when using `begin` with `rescue`' do
+    expect_no_offenses(<<~RUBY)
+      begin
+        do_something
+      rescue
+        handle_exception
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` with `ensure`' do
+    expect_no_offenses(<<~RUBY)
+      begin
+        do_something
+      ensure
+        finalize
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` for assignment' do
+    expect_no_offenses(<<~RUBY)
+      var = begin
+        foo
+        bar
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when using `begin` with single statement for or assignment' do
+    expect_offense(<<~RUBY)
+      # outer comment
+      var ||= begin # inner comment 1
+              ^^^^^ Redundant `begin` block detected.
+        # inner comment 2
+        foo
+        # inner comment 3
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      # outer comment
+       # inner comment 1
+        # inner comment 2
+        var ||= foo
+        # inner comment 3
+
+    RUBY
+  end
+
+  it 'registers and corrects an offense when using `begin` with single statement that called a block for or assignment' do
+    expect_offense(<<~RUBY)
+      var ||= begin
+              ^^^^^ Redundant `begin` block detected.
+        foo do |arg|
+          bar
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      var ||= foo do |arg|
+          bar
+        end
+
+    RUBY
+  end
+
+  it 'registers and corrects an offense when using `begin` with a command call for or assignment' do
+    expect_offense(<<~RUBY)
+      var ||= begin
+              ^^^^^ Redundant `begin` block detected.
+        foo bar
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      var ||= foo bar
+
+    RUBY
+  end
+
+  it 'registers and corrects an offense when using `begin` with a command call for or assignment in a method argument' do
+    expect_offense(<<~RUBY)
+      do_something var ||= begin
+                           ^^^^^ Redundant `begin` block detected.
+        foo bar
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      do_something var ||= (foo bar)
+
+    RUBY
+  end
+
+  it 'registers and corrects an offense when using `begin` with a command call for chained assignment in a method argument' do
+    expect_offense(<<~RUBY)
+      do_something(x = var = begin
+                             ^^^^^ Redundant `begin` block detected.
+        foo bar
+      end)
+    RUBY
+
+    expect_correction(<<~RUBY)
+      do_something(x = var = (foo bar))
+    RUBY
+  end
+
+  it 'registers and corrects an offense when using `begin` with a command call for assignment in a `for` body' do
+    expect_offense(<<~RUBY)
+      for x in y
+        var = begin
+              ^^^^^ Redundant `begin` block detected.
+          foo bar
+        end
+      end
+    RUBY
+
+    expect_correction("for x in y\n  var = foo bar\n  \nend\n")
+  end
+
+  it 'registers and corrects an offense when using `begin` with a command call for assignment in a `when` condition' do
+    expect_offense(<<~RUBY)
+      case x
+      when var = begin
+                 ^^^^^ Redundant `begin` block detected.
+        foo bar
+      end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      case x
+      when var = (foo bar)
+
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when using `begin` with a command call for an optional argument' do
+    expect_offense(<<~RUBY)
+      def m(a = begin
+                ^^^^^ Redundant `begin` block detected.
+        foo bar
+      end, b: begin
+              ^^^^^ Redundant `begin` block detected.
+        foo bar
+      end)
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      def m(a = (foo bar), b: (foo bar))
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when using `begin` with a command call with a block for assignment in a condition' do
+    expect_offense(<<~RUBY)
+      if var = begin
+               ^^^^^ Redundant `begin` block detected.
+        foo bar do
+        end
+      end
+        baz
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      if var = (foo bar do
+        end)
+
+        baz
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when using modifier `if` single statement in `begin` block' do
+    expect_offense(<<~RUBY)
+      var ||= begin
+              ^^^^^ Redundant `begin` block detected.
+        foo if condition
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      var ||= (foo if condition)
+
+    RUBY
+  end
+
+  it 'does not register an offense when using a multiline modifier `while` single statement in a memoization `begin` block' do
+    expect_no_offenses(<<~RUBY)
+      var ||= begin
+        foo while bar &&
+                  baz
+      end
+    RUBY
+  end
+
+  context 'when `Style/MultilineMemoization` is disabled' do
+    let(:other_cops) { { 'Style/MultilineMemoization' => { 'Enabled' => false } } }
+
+    it 'registers and corrects an offense when using a multiline modifier `while` single statement in a memoization `begin` block' do
+      expect_offense(<<~RUBY)
+        var ||= begin
+                ^^^^^ Redundant `begin` block detected.
+          foo while bar &&
+                    baz
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        var ||= (foo while bar &&
+                    baz)
+
+      RUBY
+    end
+  end
+
+  context 'when the statement would not fit on the assignment line' do
+    let(:other_cops) { { 'Layout/LineLength' => { 'Enabled' => true, 'Max' => 30 } } }
+
+    it 'does not register an offense for a modifier `if` single statement' do
+      expect_no_offenses(<<~RUBY)
+        var ||= begin
+          foo_bar_baz if condition
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for an `and` single statement that fits only without parentheses' do
+      expect_no_offenses(<<~RUBY)
+        var ||= begin
+          foo_bar_b and baz_quxx
+        end
+      RUBY
+    end
+
+    it 'still registers an offense when the statement fits' do
+      expect_offense(<<~RUBY)
+        var ||= begin
+                ^^^^^ Redundant `begin` block detected.
+          foo if condition
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        var ||= (foo if condition)
+
+      RUBY
+    end
+
+    context 'when `Layout/SpaceInsideParens` is `space`' do
+      let(:other_cops) do
+        super().merge(
+          'Layout/SpaceInsideParens' => { 'Enabled' => true, 'EnforcedStyle' => 'space' }
+        )
+      end
+
+      it 'does not register an offense for a modifier `if` single statement that fits only without spaces inside parentheses' do
+        expect_no_offenses(<<~RUBY)
+          var ||= begin
+            foo_bar if condition
+          end
+        RUBY
+      end
+    end
+
+    context 'when `Layout/SpaceInsideParens` is `no_space`' do
+      let(:other_cops) do
+        super().merge(
+          'Layout/SpaceInsideParens' => { 'Enabled' => true, 'EnforcedStyle' => 'no_space' }
+        )
+      end
+
+      it 'registers an offense for a modifier `if` single statement that fits without spaces inside parentheses' do
+        expect_offense(<<~RUBY)
+          var ||= begin
+                  ^^^^^ Redundant `begin` block detected.
+            foo_bar if condition
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          var ||= (foo_bar if condition)
+
+        RUBY
+      end
+    end
+  end
+
+  it 'registers and corrects an offense when using multi-line `if` in `begin` block' do
+    expect_offense(<<~RUBY)
+      var ||= begin
+              ^^^^^ Redundant `begin` block detected.
+        if condition
+          foo
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      var ||= if condition
+          foo
+        end\n
+    RUBY
+  end
+
+  it 'registers and corrects an offense when `end` of the assigned `begin` block is followed by a comma' do
+    expect_offense(<<~RUBY)
+      do_something(
+        var ||= begin
+                ^^^^^ Redundant `begin` block detected.
+          foo if condition
+        end,
+      )
+    RUBY
+
+    expect_correction(<<~RUBY)
+      do_something(
+        var ||= (foo if condition),
+      )
+    RUBY
+  end
+
+  it 'registers and corrects an offense when `end` of the assigned `begin` block is followed by a modifier `if`' do
+    expect_offense(<<~RUBY)
+      var = begin
+            ^^^^^ Redundant `begin` block detected.
+        foo
+      end if condition
+    RUBY
+
+    expect_correction(<<~RUBY)
+      var = foo if condition
+    RUBY
+  end
+
+  it 'registers and corrects an offense when `end` of the `begin` block in an array is followed by a comma' do
+    expect_offense(<<~RUBY)
+      [
+        begin
+        ^^^^^ Redundant `begin` block detected.
+          foo
+        end,
+      ]
+    RUBY
+
+    expect_correction(<<~RUBY)
+      [
+       #{trailing_whitespace}
+          foo,
+      ]
+    RUBY
+  end
+
+  it 'does not register an offense when `end` followed by a comma comes after a comment' do
+    expect_no_offenses(<<~RUBY)
+      do_something(
+        var ||= begin
+          foo # comment
+        end,
+      )
+    RUBY
+  end
+
+  it 'does not register an offense when `end` followed by a comma comes after a heredoc body' do
+    expect_no_offenses(<<~RUBY)
+      do_something(
+        var ||= begin
+          foo(<<~TEXT)
+            text
+          TEXT
+        end,
+      )
+    RUBY
+  end
+
+  it 'registers and corrects an offense when a multiline `begin` block is inside `if`' do
+    expect_offense(<<~RUBY)
+      if condition
+        begin
+        ^^^^^ Redundant `begin` block detected.
+          foo
+          bar
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      if condition
+       #{trailing_whitespace}
+          foo
+          bar
+       #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when a multiline `begin` block is inside `unless`' do
+    expect_offense(<<~RUBY)
+      unless condition
+        begin
+        ^^^^^ Redundant `begin` block detected.
+          foo
+          bar
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      unless condition
+       #{trailing_whitespace}
+          foo
+          bar
+       #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when a multiline `begin` block is inside `elsif`' do
+    expect_offense(<<~RUBY)
+      if condition
+        foo
+      elsif condition2
+        begin
+        ^^^^^ Redundant `begin` block detected.
+          bar
+          baz
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      if condition
+        foo
+      elsif condition2
+       #{trailing_whitespace}
+          bar
+          baz
+       #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when a multiline `begin` block is inside `else`' do
+    expect_offense(<<~RUBY)
+      if condition
+        foo
+      else
+        begin
+        ^^^^^ Redundant `begin` block detected.
+          bar
+          baz
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      if condition
+        foo
+      else
+       #{trailing_whitespace}
+          bar
+          baz
+       #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when a single statement `begin` block is a ternary branch' do
+    expect_offense(<<~RUBY)
+      condition ? foo : begin
+                        ^^^^^ Redundant `begin` block detected.
+        bar
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      condition ? foo :#{trailing_whitespace}
+        bar
+
+    RUBY
+  end
+
+  it 'does not register an offense when a multiple statements `begin` block is a ternary branch' do
+    expect_no_offenses(<<~RUBY)
+      condition ? foo : begin
+        bar
+        baz
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when an empty `begin` block is a ternary branch' do
+    expect_no_offenses(<<~RUBY)
+      condition ? foo : begin
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when a modifier `if` statement `begin` block is a ternary branch' do
+    expect_no_offenses(<<~RUBY)
+      condition ? foo : begin
+        bar if baz
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when a `not` statement `begin` block is a ternary branch' do
+    expect_no_offenses(<<~RUBY)
+      condition ? foo : begin
+        not bar
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when an `and` statement `begin` block is a ternary branch' do
+    expect_no_offenses(<<~RUBY)
+      condition ? foo : begin
+        bar and baz
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when a multiline `begin` block is inside `case`/`when`' do
+    expect_offense(<<~RUBY)
+      case condition
+        when foo
+          begin
+          ^^^^^ Redundant `begin` block detected.
+            bar
+            baz
+          end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      case condition
+        when foo
+         #{trailing_whitespace}
+            bar
+            baz
+         #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when a multiline `begin` block is inside `case`/`when`/`else`' do
+    expect_offense(<<~RUBY)
+      case condition
+        when foo
+          bar
+        else
+          begin
+          ^^^^^ Redundant `begin` block detected.
+            baz
+            quux
+          end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      case condition
+        when foo
+          bar
+        else
+         #{trailing_whitespace}
+            baz
+            quux
+         #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when a multiline `begin` block is inside `case`/`in`' do
+    expect_offense(<<~RUBY)
+      case condition
+        in foo
+          begin
+          ^^^^^ Redundant `begin` block detected.
+            bar
+            baz
+          end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      case condition
+        in foo
+         #{trailing_whitespace}
+            bar
+            baz
+         #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when a multiline `begin` block is inside `case`/`in`/`else`' do
+    expect_offense(<<~RUBY)
+      case condition
+        in foo
+          bar
+        else
+          begin
+          ^^^^^ Redundant `begin` block detected.
+            baz
+            quux
+          end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      case condition
+        in foo
+          bar
+        else
+         #{trailing_whitespace}
+            baz
+            quux
+         #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when a multiline `begin` block is inside `while`' do
+    expect_offense(<<~RUBY)
+      while condition
+        begin
+        ^^^^^ Redundant `begin` block detected.
+          foo
+          bar
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      while condition
+       #{trailing_whitespace}
+          foo
+          bar
+       #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when a multiline `begin` block is inside `until`' do
+    expect_offense(<<~RUBY)
+      until condition
+        begin
+        ^^^^^ Redundant `begin` block detected.
+          foo
+          bar
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      until condition
+       #{trailing_whitespace}
+          foo
+          bar
+       #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` with `rescue` inside an `if` statement' do
+    expect_no_offenses(<<~RUBY)
+      if condition
+        begin
+          foo
+          bar
+        rescue StandardError
+          baz
+        end
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` with `ensure` inside an `if` statement' do
+    expect_no_offenses(<<~RUBY)
+      if condition
+        begin
+          foo
+          bar
+        ensure
+          baz
+        end
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using an empty `begin` with `ensure` inside an `if` statement' do
+    expect_no_offenses(<<~RUBY)
+      if condition
+        begin
+        ensure
+          baz
+        end
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using an empty `begin` with `ensure` inside a `case` statement' do
+    expect_no_offenses(<<~RUBY)
+      case condition
+      when foo
+        begin
+        ensure
+          baz
+        end
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using an empty `begin` with `ensure` inside a `while` statement' do
+    expect_no_offenses(<<~RUBY)
+      while condition
+        begin
+        ensure
+          baz
+        end
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` with `rescue` inside an `case` statement' do
+    expect_no_offenses(<<~RUBY)
+      case condition
+        when foo
+          begin
+            bar
+            baz
+          rescue StandardError
+            quux
+          end
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` with `ensure` inside an `case` statement' do
+    expect_no_offenses(<<~RUBY)
+      case condition
+        when foo
+          begin
+            bar
+            baz
+          ensure
+            quux
+          end
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` with `rescue` inside an `while` statement' do
+    expect_no_offenses(<<~RUBY)
+      while condition
+        begin
+          foo
+          bar
+        rescue StandardError
+          baz
+        end
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` with `ensure` inside an `while` statement' do
+    expect_no_offenses(<<~RUBY)
+      while condition
+        begin
+          foo
+          bar
+        ensure
+          baz
+        end
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` with `rescue` inside an `until` statement' do
+    expect_no_offenses(<<~RUBY)
+      until condition
+        begin
+          foo
+          bar
+        rescue StandardError
+          baz
+        end
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` with `ensure` inside an `until` statement' do
+    expect_no_offenses(<<~RUBY)
+      until condition
+        begin
+          foo
+          bar
+        ensure
+          baz
+        end
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` with multiple statement for or assignment' do
+    expect_no_offenses(<<~RUBY)
+      var ||= begin
+        foo
+        bar
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` with no statements for or assignment' do
+    expect_no_offenses(<<~RUBY)
+      var ||= begin
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` with `while`' do
+    expect_no_offenses(<<~RUBY)
+      begin
+        do_first_thing
+        some_value = do_second_thing
+      end while some_value
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` with `until`' do
+    expect_no_offenses(<<~RUBY)
+      begin
+        do_first_thing
+        some_value = do_second_thing
+      end until some_value
+    RUBY
+  end
+
+  it 'does not register an offense when using body of `begin` is empty' do
+    expect_no_offenses(<<~RUBY)
+      begin
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` for or assignment and method call' do
+    expect_no_offenses(<<~RUBY)
+      var ||= begin
+        foo
+        bar
+      end.baz do
+        qux
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` for method argument' do
+    expect_no_offenses(<<~RUBY)
+      do_something begin
+        foo
+        bar
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` for logical operator conditions' do
+    expect_no_offenses(<<~RUBY)
+      condition && begin
+        foo
+        bar
+      end
+    RUBY
+  end
+
+  it 'does not register an offense when using `begin` for semantic operator conditions' do
+    expect_no_offenses(<<~RUBY)
+      condition and begin
+        foo
+        bar
+      end
+    RUBY
+  end
+
+  context '< Ruby 2.5', :ruby24, unsupported_on: :prism do
+    it 'accepts a do-end block with a begin-end' do
+      expect_no_offenses(<<~RUBY)
+        do_something do
+          begin
+            foo
+          rescue => e
+            bar
+          end
+        end
+      RUBY
+    end
+  end
+
+  context '>= ruby 2.5', :ruby25 do
+    it 'registers an offense for a do-end block with redundant begin-end' do
+      expect_offense(<<~RUBY)
+        do_something do
+          begin
+          ^^^^^ Redundant `begin` block detected.
+            foo
+          rescue => e
+            bar
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        do_something do
+         #{trailing_whitespace}
+            foo
+          rescue => e
+            bar
+         #{trailing_whitespace}
+        end
+      RUBY
+    end
+
+    it 'accepts a {} block with a begin-end' do
+      expect_no_offenses(<<~RUBY)
+        do_something {
+          begin
+            foo
+          rescue => e
+            bar
+          end
+        }
+      RUBY
+    end
+
+    it 'accepts a block with a begin block after a statement' do
+      expect_no_offenses(<<~RUBY)
+        do_something do
+          something
+          begin
+            ala
+          rescue => e
+            bala
+          end
+        end
+      RUBY
+    end
+
+    it 'accepts a stabby lambda with a begin-end' do
+      expect_no_offenses(<<~RUBY)
+        -> do
+          begin
+            foo
+          rescue => e
+            bar
+          end
+        end
+      RUBY
+    end
+
+    it 'accepts super with block' do
+      expect_no_offenses(<<~RUBY)
+        def a_method
+          super do |arg|
+            foo
+          rescue => e
+            bar
+          end
+        end
+      RUBY
+    end
+  end
+
+  it 'accepts when one-liner `begin` block has multiple statements with modifier condition' do
+    expect_no_offenses(<<~RUBY)
+      begin foo; bar; end unless condition
+    RUBY
+  end
+
+  it 'accepts when multi-line `begin` block has multiple statements with modifier condition' do
+    expect_no_offenses(<<~RUBY)
+      begin
+        foo; bar
+      end unless condition
+    RUBY
+  end
+
+  it 'reports an offense when one-liner `begin` block has single statement with modifier condition' do
+    expect_offense(<<~RUBY)
+      begin foo end unless condition
+      ^^^^^ Redundant `begin` block detected.
+    RUBY
+
+    expect_correction(" foo  unless condition\n")
+  end
+
+  it 'reports an offense when multi-line `begin` block has single statement with modifier condition' do
+    expect_offense(<<~RUBY)
+      begin
+      ^^^^^ Redundant `begin` block detected.
+        foo
+      end unless condition
+    RUBY
+
+    expect_correction("\n  foo unless condition\n")
+  end
+
+  it 'reports an offense when multi-line `begin` block has single statement with modifier condition followed by code' do
+    expect_offense(<<~'RUBY')
+      "#{begin
+         ^^^^^ Redundant `begin` block detected.
+        foo
+      end unless condition}"
+    RUBY
+
+    expect_correction(<<~'RUBY')
+      "#{
+        foo unless condition}"
+    RUBY
+  end
+
+  it 'reports an offense when multi-line `begin` block has single statement with modifier condition followed by a comment' do
+    expect_offense(<<~RUBY)
+      begin
+      ^^^^^ Redundant `begin` block detected.
+        foo
+      end unless condition # comment
+    RUBY
+
+    expect_correction("\n  foo unless condition # comment\n")
+  end
+
+  it 'reports an offense when multi-line `begin` block has a heredoc statement with modifier condition followed by a comment' do
+    expect_offense(<<~RUBY)
+      begin
+      ^^^^^ Redundant `begin` block detected.
+        foo(<<~EOS)
+          text
+        EOS
+      end if condition # comment
+    RUBY
+
+    expect_correction(<<~RUBY)
+
+        foo(<<~EOS) if condition
+          text
+        EOS
+      # comment
+    RUBY
+  end
+
+  it 'reports an offense when multi-line `begin` block has single statement and a comment with modifier condition followed by a comment' do
+    expect_offense(<<~RUBY)
+      begin
+      ^^^^^ Redundant `begin` block detected.
+        foo
+        # inner
+      end if condition # comment
+    RUBY
+
+    expect_correction(<<~RUBY)
+
+        foo if condition
+        # inner
+      # comment
+    RUBY
+  end
+
+  it 'does not register an offense when multi-line `begin` block has a heredoc statement with modifier condition followed by code' do
+    expect_no_offenses(<<~RUBY)
+      begin
+        foo(<<~EOS)
+          text
+        EOS
+      end if condition; bar
+    RUBY
+  end
+
+  it 'does not register an offense when multi-line `begin` block has single statement and a comment with modifier condition followed by code' do
+    expect_no_offenses(<<~'RUBY')
+      "#{begin
+        foo
+        # inner
+      end if condition}"
+    RUBY
+  end
+
+  it 'reports an offense when multi-line `begin` block is the condition of a modifier `if`' do
+    expect_offense(<<~RUBY)
+      foo if begin begin
+             ^^^^^ Redundant `begin` block detected.
+        bar
+      rescue
+        nil
+      end end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      foo if  begin
+        bar
+      rescue
+        nil
+      end#{' '}
+    RUBY
+  end
+
+  it 'reports an offense when multi-line `begin` block has single statement and it is inside condition' do
+    expect_offense(<<~RUBY)
+      unless condition
+        begin
+        ^^^^^ Redundant `begin` block detected.
+          foo
+        end
+      end
+    RUBY
+
+    expect_correction("unless condition\n  \n    foo\n  \nend\n")
+  end
+
+  it 'reports an offense when assigning nested `begin` blocks' do
+    expect_offense(<<~RUBY)
+      @foo ||= begin
+        @bar ||= begin
+                 ^^^^^ Redundant `begin` block detected.
+          baz
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      @foo ||= @bar ||= baz
+      #{trailing_whitespace * 2}
+
+    RUBY
+  end
+
+  it 'reports an offense when assigning nested blocks which contain `begin` blocks' do
+    expect_offense(<<~RUBY)
+      var = do_something do
+        begin
+        ^^^^^ Redundant `begin` block detected.
+          do_something do
+            begin
+            ^^^^^ Redundant `begin` block detected.
+              foo
+            ensure
+              bar
+            end
+          end
+        ensure
+          baz
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      var = do_something do
+       #{trailing_whitespace}
+          do_something do
+           #{trailing_whitespace}
+              foo
+            ensure
+              bar
+           #{trailing_whitespace}
+          end
+        ensure
+          baz
+       #{trailing_whitespace}
+      end
+    RUBY
+  end
+
+  context 'Ruby 2.7', :ruby27 do
+    it 'reports an offense when assigning nested blocks which contain `begin` blocks' do
+      expect_offense(<<~RUBY)
+        var = do_something do
+          begin
+          ^^^^^ Redundant `begin` block detected.
+            do_something do
+              begin
+              ^^^^^ Redundant `begin` block detected.
+                _1
+              ensure
+                bar
+              end
+            end
+          ensure
+            baz
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        var = do_something do
+         #{trailing_whitespace}
+            do_something do
+             #{trailing_whitespace}
+                _1
+              ensure
+                bar
+             #{trailing_whitespace}
+            end
+          ensure
+            baz
+         #{trailing_whitespace}
+        end
+      RUBY
+    end
+  end
+
+  context 'Ruby 3.4', :ruby34 do
+    it 'reports an offense when assigning nested blocks which contain `begin` blocks' do
+      expect_offense(<<~RUBY)
+        var = do_something do
+          begin
+          ^^^^^ Redundant `begin` block detected.
+            do_something do
+              begin
+              ^^^^^ Redundant `begin` block detected.
+                it
+              ensure
+                bar
+              end
+            end
+          ensure
+            baz
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        var = do_something do
+         #{trailing_whitespace}
+            do_something do
+             #{trailing_whitespace}
+                it
+              ensure
+                bar
+             #{trailing_whitespace}
+            end
+          ensure
+            baz
+         #{trailing_whitespace}
+        end
+      RUBY
+    end
+  end
+
+  context 'when using endless method definition', :ruby30 do
+    it 'registers when `begin` block has a single statement' do
+      expect_offense(<<~RUBY)
+        def foo = begin
+                  ^^^^^ Redundant `begin` block detected.
+          bar
+        end
+      RUBY
+
+      expect_correction("def foo =  bar\n\n")
+    end
+
+    it 'accepts when `begin` block has multiple statements' do
+      expect_no_offenses(<<~RUBY)
+        def foo = begin
+          bar
+          baz
+        end
+      RUBY
+    end
+
+    it 'accepts when `begin` block has no statements' do
+      expect_no_offenses(<<~RUBY)
+        def foo = begin
+        end
+      RUBY
+    end
+
+    it 'accepts when `begin` block includes `rescue` clause' do
+      expect_no_offenses(<<~RUBY)
+        def func = begin
+          foo
+        rescue
+          bar
+        end
+      RUBY
+    end
+  end
+
+  it 'registers and corrects an offense when using `and` single statement in `begin` block' do
+    expect_offense(<<~RUBY)
+      var = begin
+            ^^^^^ Redundant `begin` block detected.
+        a and b
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      var = (a and b)
+
+    RUBY
+  end
+
+  it 'registers and corrects an offense without adding parentheses when using `||` single statement in `begin` block' do
+    expect_offense(<<~RUBY)
+      var = begin
+            ^^^^^ Redundant `begin` block detected.
+        a || b
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      var = a || b
+
+    RUBY
+  end
+
+  it 'registers and corrects an offense when using modifier `until` single statement in `begin` block' do
+    expect_offense(<<~RUBY)
+      var = begin
+            ^^^^^ Redundant `begin` block detected.
+        i += 1 until i > 2
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      var = (i += 1 until i > 2)
+
+    RUBY
+  end
+
+  it 'registers and corrects an offense when using multi-line `begin` block as a `return` value' do
+    expect_offense(<<~RUBY)
+      def foo
+        return begin
+               ^^^^^ Redundant `begin` block detected.
+          bar
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      def foo
+        return bar
+      #{'  '}
+      end
+    RUBY
+  end
+
+  it 'registers and corrects an offense when using `not` single statement in `begin` block as a `return` value' do
+    expect_offense(<<~RUBY)
+      def foo
+        return begin
+               ^^^^^ Redundant `begin` block detected.
+          not a
+        end
+      end
+    RUBY
+
+    expect_correction(<<~RUBY)
+      def foo
+        return (not a)
+      #{'  '}
+      end
+    RUBY
+  end
+
+  %w[next break].each do |keyword|
+    it "registers and corrects an offense when using `or` single statement in `begin` block as a `#{keyword}` value" do
+      expect_offense(<<~RUBY, keyword: keyword)
+        loop do
+          %{keyword} begin
+          _{keyword} ^^^^^ Redundant `begin` block detected.
+            a or b
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        loop do
+          #{keyword} (a or b)
+        #{'  '}
+        end
+      RUBY
+    end
+  end
+end

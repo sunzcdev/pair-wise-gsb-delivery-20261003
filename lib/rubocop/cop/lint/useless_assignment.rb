@@ -1,0 +1,318 @@
+# frozen_string_literal: true
+
+module RuboCop
+  module Cop
+    module Lint
+      # Checks for every useless assignment to local variable in every
+      # scope.
+      # The basic idea for this cop was from the warning of `ruby -cw`:
+      #
+      # [source,console]
+      # ----
+      # assigned but unused variable - foo
+      # ----
+      #
+      # Currently this cop has advanced logic that detects unreferenced
+      # reassignments and properly handles varied cases such as branch, loop,
+      # rescue, ensure, etc.
+      #
+      # This cop's autocorrection avoids cases like `a ||= 1` because removing assignment from
+      # operator assignment can cause `NameError` if this assignment has been used to declare
+      # a local variable. For example, replacing `a ||= 1` with `a || 1` may cause
+      # "undefined local variable or method `a' for main:Object (NameError)".
+      #
+      # NOTE: Given the assignment `foo = 1, bar = 2`, removing unused variables
+      # can lead to a syntax error, so this case is not autocorrected.
+      #
+      # @example
+      #
+      #   # bad
+      #   def some_method
+      #     some_var = 1
+      #     do_something
+      #   end
+      #
+      #   # good
+      #   def some_method
+      #     some_var = 1
+      #     do_something(some_var)
+      #   end
+      class UselessAssignment < Base # rubocop:disable Metrics/ClassLength
+        extend AutoCorrector
+
+        MSG = 'Useless assignment to variable - `%<variable>s`.'
+
+        MODIFIER_KEYWORD = /\A(?:if|unless|while|until)\b/.freeze
+        AMBIGUOUS_COMMAND_ARGUMENT = %r{#{MODIFIER_KEYWORD}|\A(?:\{|[/+-]\s|/=|\.\.)}.freeze
+        CONDITIONAL_TYPES = %i[if while until case case_match].freeze
+        STATEMENTS_PARENT_TYPES = %i[
+          begin kwbegin any_block any_def class module sclass when in_pattern for resbody ensure
+        ].freeze
+
+        def self.joining_forces
+          VariableForce
+        end
+
+        def self.autocorrect_incompatible_with
+          [Style::MethodCallWithArgsParentheses, Style::RescueModifier]
+        end
+
+        def after_leaving_scope(scope, _variable_table)
+          scope.variables.each_value { |variable| check_for_unused_assignments(variable) }
+        end
+
+        def check_for_unused_assignments(variable)
+          return if variable.should_be_unused?
+
+          variable.assignments.reverse_each do |assignment|
+            check_for_unused_assignment(variable, assignment)
+          end
+        end
+
+        def check_for_unused_assignment(variable, assignment)
+          assignment_node = assignment.node
+
+          return if ignored_assignment?(variable, assignment_node, assignment)
+
+          message = message_for_useless_assignment(assignment)
+          range = offense_range(assignment)
+
+          add_offense(range, message: message) do |corrector|
+            next if uncorrectable_assignment?(assignment_node)
+
+            autocorrect(corrector, assignment)
+          end
+
+          ignore_node(assignment_node) if chained_assignment?(assignment_node)
+        end
+
+        # Autocorrect is skipped when removing a variable would cause a syntax error
+        # (`x = 1, y = 2`), or where rewriting `x ||= 1`/`x &&= 1` to `x = 1` would raise
+        # `NameError` because the variable is not declared before the operator assignment.
+        def uncorrectable_assignment?(assignment_node)
+          sequential_assignment?(assignment_node) ||
+            assignment_node.parent&.or_asgn_type? ||
+            assignment_node.parent&.and_asgn_type?
+        end
+
+        def ignored_assignment?(variable, assignment_node, assignment)
+          assignment.used? || part_of_ignored_node?(assignment_node) ||
+            variable_in_loop_condition?(assignment_node, variable)
+        end
+
+        def message_for_useless_assignment(assignment)
+          variable = assignment.variable
+
+          format(MSG, variable: variable.name) + message_specification(assignment, variable).to_s
+        end
+
+        def offense_range(assignment)
+          if assignment.regexp_named_capture?
+            assignment.node.children.first.source_range
+          else
+            assignment.node.loc.name
+          end
+        end
+
+        def sequential_assignment?(node)
+          if node.lvasgn_type? && node.expression&.array_type? &&
+             node.each_descendant.any?(&:assignment?)
+            return true
+          end
+          return false unless node.parent
+
+          sequential_assignment?(node.parent)
+        end
+
+        def chained_assignment?(node)
+          return true if node.lvasgn_type? && node.expression&.send_type?
+
+          node.respond_to?(:expression) && node.expression&.lvasgn_type?
+        end
+
+        def message_specification(assignment, variable)
+          if assignment.multiple_assignment?
+            multiple_assignment_message(variable.name)
+          elsif assignment.operator_assignment?
+            operator_assignment_message(variable.scope, assignment)
+          else
+            similar_name_message(variable)
+          end
+        end
+
+        def multiple_assignment_message(variable_name)
+          " Use `_` or `_#{variable_name}` as a variable name to indicate " \
+            "that it won't be used."
+        end
+
+        def operator_assignment_message(scope, assignment)
+          return_value_node = return_value_node_of_scope(scope)
+          return unless assignment.meta_assignment_node.equal?(return_value_node)
+
+          " Use `#{assignment.operator.delete_suffix('=')}` instead of `#{assignment.operator}`."
+        end
+
+        def similar_name_message(variable)
+          variable_like_names = collect_variable_like_names(variable.scope)
+          similar_name = NameSimilarity.find_similar_name(variable.name, variable_like_names)
+          " Did you mean `#{similar_name}`?" if similar_name
+        end
+
+        # TODO: More precise handling (rescue, ensure, nested begin, etc.)
+        def return_value_node_of_scope(scope)
+          body_node = scope.body_node
+          return if body_node.nil?
+
+          if body_node.begin_type?
+            body_node.children.last
+          else
+            body_node
+          end
+        end
+
+        def collect_variable_like_names(scope)
+          names = scope.each_node.with_object(Set.new) do |node, set|
+            set << node.method_name if variable_like_method_invocation?(node)
+          end
+
+          variable_names = scope.variables.each_value.map(&:name)
+          names.merge(variable_names)
+        end
+
+        def variable_like_method_invocation?(node)
+          return false unless node.send_type?
+
+          node.receiver.nil? && !node.arguments?
+        end
+
+        # rubocop:disable-next Metrics/AbcSize
+        def autocorrect(corrector, assignment)
+          if assignment.exception_assignment?
+            remove_exception_assignment_part(corrector, assignment.node)
+          elsif assignment.multiple_assignment? || assignment.rest_assignment? ||
+                assignment.for_assignment?
+            rename_variable_with_underscore(corrector, assignment.node)
+          elsif assignment.operator_assignment?
+            remove_trailing_character_from_operator(corrector, assignment.node)
+          elsif assignment.regexp_named_capture?
+            replace_named_capture_group_with_non_capturing_group(corrector, assignment.node,
+                                                                 assignment.variable.name)
+          else
+            remove_local_variable_assignment_part(corrector, assignment.node)
+          end
+        end
+
+        def remove_exception_assignment_part(corrector, node)
+          range = node.parent.children.first&.source_range || node.parent.location.keyword
+
+          corrector.remove(range.end.join(node.source_range.end))
+        end
+
+        def rename_variable_with_underscore(corrector, node)
+          corrector.replace(node, '_')
+        end
+
+        def remove_trailing_character_from_operator(corrector, node)
+          corrector.remove(node.parent.location.operator.end.adjust(begin_pos: -1))
+
+          value = node.parent.expression
+          corrector.wrap(value, '(', ')') if operand_requires_parentheses?(value)
+        end
+
+        def operand_requires_parentheses?(node)
+          if node.any_block_type?
+            return true unless node.braces?
+
+            node = node.send_node
+          end
+          return call_requires_parentheses?(node) if node.type?(:call, :yield, :super)
+
+          return node.op_asgn_type? if node.assignment?
+
+          !node.basic_literal? && !node.variable? &&
+            !node.type?(:const, :self, :begin, :kwbegin, :zsuper, :array, :hash, :dstr, :dsym,
+                        :xstr, :regexp)
+        end
+
+        def call_requires_parentheses?(node)
+          return true if node.prefix_not?
+          return false if node.call_type? && node.assignment_method?
+
+          node.arguments? && !node.parenthesized? && !node.method?(:[])
+        end
+
+        def replace_named_capture_group_with_non_capturing_group(corrector, node, variable_name)
+          corrector.replace(
+            node.children.first,
+            node.children.first.source.sub(/\(\?<#{variable_name}>/, '(?:')
+          )
+        end
+
+        def remove_local_variable_assignment_part(corrector, node)
+          expression = node.expression
+          assignment_part = node.loc.name.begin.join(expression.source_range.begin)
+
+          # `x = 1, 2` cannot become `1, 2`, so the values become an array literal.
+          if expression.array_type? && !expression.bracketed?
+            corrector.replace(assignment_part, '[')
+            corrector.insert_after(expression, ']')
+          elsif parentheses_required?(node, expression)
+            corrector.replace(assignment_part, '(')
+            corrector.insert_after(expression, ')')
+          else
+            corrector.remove(assignment_part)
+          end
+        end
+
+        def parentheses_required?(node, expression)
+          return !rescue_modifier_allowed?(node) if expression.rescue_type?
+
+          ambiguous_without_assignment?(node, expression)
+        end
+
+        def rescue_modifier_allowed?(node)
+          parent = node.parent
+          return true if parent.nil? || parent.assignment?
+          return !parent.condition.equal?(node) if parent.type?(*CONDITIONAL_TYPES)
+
+          parent.type?(*STATEMENTS_PARENT_TYPES)
+        end
+
+        def ambiguous_without_assignment?(node, expression)
+          return false unless first_command_argument?(node)
+
+          keyword = node.parent.type?(:return, :break, :next)
+          expression.source.match?(keyword ? MODIFIER_KEYWORD : AMBIGUOUS_COMMAND_ARGUMENT)
+        end
+
+        def first_command_argument?(node)
+          parent = node.parent
+          return false unless parent&.type?(:call, :super, :yield, :return, :break, :next)
+          return false if parent.parenthesized?
+          return false if parent.call_type? && (parent.operator_method? || parent.setter_method?)
+
+          parent.first_argument.equal?(node)
+        end
+
+        def variable_in_loop_condition?(assignment_node, variable)
+          # A method defined inside the loop has its own scope, so the loop condition
+          # can only read the variable if the loop is nearer than any method definition.
+          loop_node = assignment_node.each_ancestor(*VariableForce::LOOP_TYPES, :any_def).first
+          return false if !loop_node || loop_node.any_def_type?
+          return false unless loop_node.respond_to?(:condition)
+
+          condition_node = loop_node.condition
+          variable_name = variable.name
+
+          return true if condition_node.lvar_type? && condition_node.children.first == variable_name
+
+          condition_node.each_descendant(:lvar) do |lvar_node|
+            return true if lvar_node.children.first == variable_name
+          end
+
+          false
+        end
+      end
+    end
+  end
+end

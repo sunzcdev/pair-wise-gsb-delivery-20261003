@@ -1,0 +1,196 @@
+= Plugins
+
+:lint_roller: https://github.com/standardrb/lint_roller[lint_roller]
+
+RuboCop can be extended with additional cops and formatters. There are many
+official plugins maintained by RuboCop's team, as well as third-party ones.
+
+== Loading Plugins
+
+Since RuboCop 1.72, the recommended way to load extensions is through the
+*plugin* system, which is based on {lint_roller}. Older extensions that haven't
+been updated yet can still be loaded via `require`.
+
+Refer to the xref:plugin_migration_guide.adoc[Plugin Migration Guide] when
+migrating existing configurations from `require` to `plugins`.
+
+=== Loading Plugin Extensions
+
+NOTE: The plugin system was introduced in RuboCop 1.72.
+
+Besides the `--plugin` command line option you can also specify ruby
+files that should be loaded with the optional `plugins` directive in the
+`.rubocop.yml` file:
+
+[source,yaml]
+----
+plugins:
+  - rubocop-performance
+----
+
+Most extension gems with plugin support should work with the example above.
+
+The following is an example of a plugin that is not published as a gem:
+
+[source,yaml]
+----
+plugins:
+  - rubocop-extension:
+      require_path: path/to/extension/plugin
+      plugin_class_name: RuboCop::Extension::Plugin
+----
+
+There are other ways to specify this. For more details, please refer to the {lint_roller} documentation.
+
+=== Loading Legacy Extensions via `require`
+
+Besides the `--require` command line option you can also specify ruby
+files that should be loaded with the optional `require` directive in the
+`.rubocop.yml` file:
+
+[source,yaml]
+----
+require:
+  - ../my/custom/file.rb
+  - rubocop-extension
+----
+
+The extension loading via `require` remains compatible with the pre-plugin inject method.
+Since `require` is used for internal extensions such as custom cops and formatters,
+there are no plans to remove it in the future.
+However, it is recommended that publicly available extension cops in gems migrate to the plugin system.
+
+NOTE: The paths are directly passed to `Kernel.require`. If your
+extension file is not in `$LOAD_PATH`, you need to specify the path as
+relative path prefixed with `./` explicitly or absolute path. Paths
+starting with a `.` are resolved relative to `.rubocop.yml`.
+If a path containing `-` is given, it will be used as is, but if we
+cannot find the file to load, we will replace `-` with `/` and try it
+again as when Bundler loads gems.
+
+[[custom-allcops-settings]]
+== Custom `AllCops` Settings
+
+A plugin can introduce its own settings under `AllCops` (for example, `rubocop-rails` provides `AllCops: TargetRailsVersion`)
+by declaring the key with a nil value in the `AllCops` section of its own configuration file, shown here for a hypothetical
+`TargetFrameworkVersion` setting:
+
+[source,yaml]
+----
+# config/default.yml in the plugin gem.
+AllCops:
+  TargetFrameworkVersion: ~
+----
+
+When the plugin is loaded, its `AllCops` keys are merged into the default configuration, so users of the plugin can set
+the key in their project's configuration and pass configuration validation without
+"AllCops does not support X parameter" warnings:
+
+[source,yaml]
+----
+# A project's .rubocop.yml.
+plugins:
+  - rubocop-framework # The plugin declaring `TargetFrameworkVersion`
+
+AllCops:
+  TargetFrameworkVersion: 7.1
+----
+
+To skip cops that need a newer version of the gem than the one the setting names,
+see xref:development.adoc#honoring-a-target-version-setting[Honoring a target version setting].
+
+== Plugin Suggestions
+
+Depending on what gems you have in your bundle, RuboCop might suggest plugins
+that can be added to provide further functionality. For instance, if you are using
+`rspec` without the corresponding `rubocop-rspec` plugin, RuboCop will suggest
+enabling it.
+
+This message can be disabled by adding the following to your configuration:
+
+[source,yaml]
+----
+AllCops:
+  SuggestExtensions: false
+----
+
+Default extensions are suggested when `SuggestExtensions: true`.
+
+You can also opt-out of suggestions for a particular plugin as so (unspecified
+plugins will continue to be notified, as appropriate):
+
+[source,yaml]
+----
+AllCops:
+  SuggestExtensions:
+    rubocop-rake: false
+----
+
+[[custom-cops]]
+== Custom Cops
+
+You can configure the custom cops in your `.rubocop.yml` just like any
+other cop.
+
+If you'd like to create a plugin gem, you can use https://github.com/rubocop/rubocop-extension-generator[rubocop-extension-generator].
+
+For plugin specifications, please refer to {lint_roller}.
+
+See xref:development.adoc[Development] to learn how to implement a cop.
+
+== Available Plugins
+
+The main RuboCop gem focuses on the core Ruby language and doesn't
+include functionality related to any external Ruby libraries/frameworks.
+There are, however, many RuboCop plugins dedicated to those and
+a few of them are maintained by RuboCop's Core Team.
+
+=== Official Plugins
+
+* https://github.com/rubocop/rubocop-performance[rubocop-performance] -
+Performance optimization analysis
+* https://github.com/rubocop/rubocop-rails[rubocop-rails] -
+Rails-specific analysis
+* https://github.com/rubocop/rubocop-rspec[rubocop-rspec] -
+RSpec-specific analysis
+* https://github.com/rubocop/rubocop-minitest[rubocop-minitest] -
+Minitest-specific analysis
+* https://github.com/rubocop/rubocop-rake[rubocop-rake] -
+Rake-specific analysis
+* https://github.com/rubocop/rubocop-sequel[rubocop-sequel] -
+Code style checking for Sequel gem
+* https://github.com/rubocop/rubocop-thread_safety[rubocop-thread_safety] -
+Thread-safety analysis
+* https://github.com/rubocop/rubocop-capybara[rubocop-capybara] -
+Capybara-specific analysis
+* https://github.com/rubocop/rubocop-factory_bot[rubocop-factory_bot] -
+factory_bot-specific analysis
+* https://github.com/rubocop/rubocop-rspec_rails[rubocop-rspec_rails] -
+RSpec Rails-specific analysis
+* https://github.com/rubocop/rubocop-i18n[rubocop-i18n] -
+i18n wrapper function analysis (`gettext` and `rails-i18n`)
+
+=== Third-party Plugins
+
+* https://github.com/milch/rubocop-require_tools[rubocop-require_tools] -
+Dynamic analysis for missing `require` statements
+* https://github.com/chef/cookstyle[cookstyle] -
+Custom cops and config defaults for Chef Infra Cookbooks
+* https://github.com/utkarsh2102/rubocop-packaging[rubocop-packaging] -
+Upstream best practices and coding conventions for downstream (e.g. Debian packages) compatibility.
+* https://github.com/Shopify/rubocop-sorbet[rubocop-sorbet] -
+Sorbet-specific analysis
+* https://github.com/DmitryTsepelev/rubocop-graphql[rubocop-graphql] -
+GraphQL-specific analysis
+* https://github.com/dukaev/rubocop-changed[rubocop-changed] -
+Reduced CI time by analyzing only changed files
+* https://github.com/SketchUp/rubocop-sketchup[rubocop-sketchup] -
+SketchUp Ruby API specific analysis
+* https://github.com/dblock/rubocop-exception_messages[rubocop-exception_messages] -
+Standardizes the style of raised exception messages (casing, punctuation, quoting of interpolated values)
+* https://github.com/dblock/rubocop-spellcheck[rubocop-spellcheck] -
+Spelling checks for Ruby comments, Markdown prose, and plain text using offline dictionaries
+* https://github.com/carldaws/rubocop-guardrails[rubocop-guardrails] -
+Cops that keep Rails apps on the golden path
+
+Any plugins missing? Send us a Pull Request!

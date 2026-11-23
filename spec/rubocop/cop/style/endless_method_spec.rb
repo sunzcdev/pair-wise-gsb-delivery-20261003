@@ -1,0 +1,1753 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::Cop::Style::EndlessMethod, :config do
+  context 'Ruby >= 3.0', :ruby30 do
+    let(:other_cops) do
+      {
+        'Layout/LineLength' => {
+          'Enabled' => line_length_enabled,
+          'Max' => 80
+        }
+      }
+    end
+    let(:line_length_enabled) { true }
+
+    context 'EnforcedStyle: disallow' do
+      let(:cop_config) { { 'EnforcedStyle' => 'disallow' } }
+
+      it 'registers an offense and corrects nested endless method definitions' do
+        expect_offense(<<~RUBY)
+          def a = def b = 1
+          ^^^^^^^^^^^^^^^^^ Avoid endless method definitions.
+                  ^^^^^^^^^ Avoid endless method definitions.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def a
+            def b
+              1
+            end
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects an endless method definition nested in a method call argument' do
+        expect_offense(<<~RUBY)
+          def a = foo(def b = 1)
+          ^^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions.
+                      ^^^^^^^^^ Avoid endless method definitions.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def a
+            foo(def b
+                  1
+                end)
+          end
+        RUBY
+      end
+
+      it 'registers an offense for an endless method' do
+        expect_offense(<<~RUBY)
+          def my_method() = x
+          ^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method
+            x
+          end
+        RUBY
+      end
+
+      it 'registers an offense for an endless method on self' do
+        expect_offense(<<~RUBY)
+          def self.my_method() = x
+          ^^^^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def self.my_method
+            x
+          end
+        RUBY
+      end
+
+      it 'registers an offense for an endless method on self with ::' do
+        expect_offense(<<~RUBY)
+          def self::my_method() = x
+          ^^^^^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def self::my_method
+            x
+          end
+        RUBY
+      end
+
+      it 'registers an offense for an endless method with arguments' do
+        expect_offense(<<~RUBY)
+          def my_method(a, b) = x
+          ^^^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method(a, b)
+            x
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for a single line method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x
+          end
+        RUBY
+      end
+    end
+
+    context 'EnforcedStyle: allow_single_line' do
+      let(:cop_config) { { 'EnforcedStyle' => 'allow_single_line' } }
+
+      it 'does not register an offense for an endless method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method() = x
+        RUBY
+      end
+
+      it 'does not register an offense for an endless method on self' do
+        expect_no_offenses(<<~RUBY)
+          def self.my_method() = x
+        RUBY
+      end
+
+      it 'does not register an offense for an endless method with arguments' do
+        expect_no_offenses(<<~RUBY)
+          def my_method(a, b) = x
+        RUBY
+      end
+
+      it 'does not register an offense for a single line method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a multiline endless method with a parenthesized receiver' do
+        expect_offense(<<~RUBY)
+          def (foo.bar).baz = x
+          ^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions with multiple lines.
+            .qux
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def (foo.bar).baz
+            x
+            .qux
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a multiline endless method' do
+        expect_offense(<<~RUBY)
+          def my_method() = x.foo
+          ^^^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions with multiple lines.
+                             .bar
+                             .baz
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method
+            x.foo
+                             .bar
+                             .baz
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a multiline endless method on self' do
+        expect_offense(<<~RUBY)
+          def self.my_method() = x.foo
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions with multiple lines.
+                                 .bar
+                                 .baz
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def self.my_method
+            x.foo
+                                 .bar
+                                 .baz
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a multiline endless method on self with ::' do
+        expect_offense(<<~RUBY)
+          def self::my_method() = x.foo
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions with multiple lines.
+                                   .bar
+                                   .baz
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def self::my_method
+            x.foo
+                                   .bar
+                                   .baz
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a multiline endless method with begin' do
+        expect_offense(<<~RUBY)
+          def my_method() = begin
+          ^^^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions with multiple lines.
+            foo && bar
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method
+            begin
+            foo && bar
+          end
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a multiline endless method with arguments' do
+        expect_offense(<<~RUBY)
+          def my_method(a, b) = x.foo
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions with multiple lines.
+                                 .bar
+                                 .baz
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method(a, b)
+            x.foo
+                                 .bar
+                                 .baz
+          end
+        RUBY
+      end
+    end
+
+    context 'EnforcedStyle: allow_always' do
+      let(:cop_config) { { 'EnforcedStyle' => 'allow_always' } }
+
+      it 'does not register an offense for an endless method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method() = x
+        RUBY
+      end
+
+      it 'does not register an offense for an endless method on self' do
+        expect_no_offenses(<<~RUBY)
+          def self.my_method() = x
+        RUBY
+      end
+
+      it 'does not register an offense for an endless method with arguments' do
+        expect_no_offenses(<<~RUBY)
+          def my_method(a, b) = x
+        RUBY
+      end
+
+      it 'does not register an offense for a single line method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for a multiline endless method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method() = x.foo
+                             .bar
+                             .baz
+        RUBY
+      end
+
+      it 'does not register an offense for a multiline endless method with begin' do
+        expect_no_offenses(<<~RUBY)
+          def my_method() = begin
+            foo && bar
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for a multiline endless method with arguments' do
+        expect_no_offenses(<<~RUBY)
+          def my_method(a, b) = x.foo
+                                 .bar
+                                 .baz
+        RUBY
+      end
+    end
+
+    context 'EnforcedStyle: require_single_line' do
+      let(:cop_config) { { 'EnforcedStyle' => 'require_single_line' } }
+
+      it 'registers an offense and corrects a method definition nested in a multiline endless method' do
+        expect_offense(<<~RUBY)
+          def a = def b
+          ^^^^^^^^^^^^^ Avoid endless method definitions with multiple lines.
+                  ^^^^^ Use endless method definitions for single line methods.
+            1
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def a = def b = 1
+        RUBY
+      end
+
+      it 'registers an offense and corrects a method definition passed as an argument in a multiline endless method' do
+        expect_offense(<<~RUBY)
+          def a = foo(def b
+          ^^^^^^^^^^^^^^^^^ Avoid endless method definitions with multiple lines.
+                      ^^^^^ Use endless method definitions for single line methods.
+            1
+          end)
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def a = foo(def b = 1)
+        RUBY
+      end
+
+      it 'does not register an offense when the body is a modifier `if`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x if y
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the body is a keyword `and`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            super and x
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for a single line endless method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method() = x
+        RUBY
+      end
+
+      it 'does not register an offense for a single line endless method on self' do
+        expect_no_offenses(<<~RUBY)
+          def self.my_method() = x
+        RUBY
+      end
+
+      it 'does not register an offense for a single line endless method with arguments' do
+        expect_no_offenses(<<~RUBY)
+          def my_method(a, b) = x
+        RUBY
+      end
+
+      it 'registers an offense and corrects a method with unparenthesized parameters' do
+        expect_offense(<<~RUBY)
+          def my_method foo, bar
+          ^^^^^^^^^^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+            foo + bar
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method(foo, bar) = foo + bar
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a multiline endless method' do
+        expect_offense(<<~RUBY)
+          def my_method() = x.foo
+          ^^^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions with multiple lines.
+                             .bar
+                             .baz
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method
+            x.foo
+                             .bar
+                             .baz
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a multiline endless method on self' do
+        expect_offense(<<~RUBY)
+          def self.my_method() = x.foo
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions with multiple lines.
+                                  .bar
+                                  .baz
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def self.my_method
+            x.foo
+                                  .bar
+                                  .baz
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a multiline endless method on self with ::' do
+        expect_offense(<<~RUBY)
+          def self::my_method() = x.foo
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions with multiple lines.
+                                    .bar
+                                    .baz
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def self::my_method
+            x.foo
+                                    .bar
+                                    .baz
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for no statements method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for multiple statements method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x.foo
+            x.bar
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for multiple statements method with `begin`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            begin
+              foo && bar
+            end
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the body ends with an omitted hash value', :ruby31 do
+        expect_no_offenses(<<~RUBY)
+          def my_method(a:)
+            foo 1, a:
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects when an omitted hash value is enclosed', :ruby31 do
+        expect_offense(<<~RUBY)
+          def my_method(a:)
+          ^^^^^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+            foo(1, a:)
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method(a:) = foo(1, a:)
+        RUBY
+      end
+
+      it 'does not register an offense for a multiple assignment body' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            foo, bar = 1, 2
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for an assignment of multiple values' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            @foo = 1, 2
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for an assignment of a splat' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            @foo = *bar
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects a single assignment body' do
+        expect_offense(<<~RUBY)
+          def my_method
+          ^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+            foo = 1
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method = foo = 1
+        RUBY
+      end
+
+      it 'does not register an offense when the body ends with anonymous rest forwarding', :ruby32 do
+        expect_no_offenses(<<~RUBY)
+          def my_method(*); foo bar, *; end
+        RUBY
+      end
+
+      it 'does not register an offense when the body ends with anonymous keyword rest forwarding', :ruby32 do
+        expect_no_offenses(<<~RUBY)
+          def my_method(**)
+            foo bar, **
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the body ends with anonymous block forwarding', :ruby31 do
+        expect_no_offenses(<<~RUBY)
+          def my_method(&)
+            foo bar, &
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects when the forwarding is not last', :ruby32 do
+        expect_offense(<<~RUBY)
+          def my_method(**)
+          ^^^^^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+            foo(bar, **)
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method(**) = foo(bar, **)
+        RUBY
+      end
+
+      it 'registers an offense and corrects when the forwarded arguments are named', :ruby31 do
+        expect_offense(<<~RUBY)
+          def my_method(&blk)
+          ^^^^^^^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+            foo bar, &blk
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method(&blk) = foo bar, &blk
+        RUBY
+      end
+
+      it 'does not register an offense when heredoc is used only in regular method definition' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            <<~HEREDOC
+              hello
+            HEREDOC
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for heredoc is used in regular method definition' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            puts <<~HEREDOC
+              hello
+            HEREDOC
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when multiline heredoc is used only in regular method definition' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            <<~HEREDOC
+              foo
+              bar
+            HEREDOC
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when multiline heredoc is passed to a method call' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            puts <<~HEREDOC
+              foo
+              bar
+            HEREDOC
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when xstring heredoc is passed to a method call' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            puts <<~`HEREDOC`
+              command
+            HEREDOC
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects when an interpolated string is used' do
+        expect_offense(<<~'RUBY')
+          def my_method
+          ^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+            puts("#{foo}bar")
+          end
+        RUBY
+
+        expect_correction(<<~'RUBY')
+          def my_method = puts("#{foo}bar")
+        RUBY
+      end
+
+      it 'does not register an offense when xstring heredoc is used only in regular method definition' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            <<~`HEREDOC`
+              command
+            HEREDOC
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a single line method' do
+        expect_offense(<<~RUBY)
+          def my_method
+          ^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+            x
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method = x
+        RUBY
+      end
+
+      it 'does not register an offense for a method definition with a modifier `if`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x
+          end if y
+        RUBY
+      end
+
+      it 'does not register an offense for a method definition followed by `and`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x
+          end and y
+        RUBY
+      end
+
+      it 'does not register an offense for a method definition followed by `&&`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x
+          end && y
+        RUBY
+      end
+
+      it 'does not register an offense for a method definition followed by `||`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x
+          end || y
+        RUBY
+      end
+
+      it 'does not register an offense for a method definition with a modifier `while`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x
+          end while y
+        RUBY
+      end
+
+      it 'does not register an offense for a singleton method definition followed by `&&`' do
+        expect_no_offenses(<<~RUBY)
+          def self.my_method
+            x
+          end && y
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a single line method with access modifier' do
+        expect_offense(<<~RUBY)
+          private def my_method
+                  ^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+            x
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          private def my_method = x
+        RUBY
+      end
+
+      it 'does not register an offense for a single line setter method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method=(arg)
+            arg.foo
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the endless version excess Metrics/MaxLineLength[Max]' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            'this_string_ends_at_column_75_________________________________________'
+          end
+        RUBY
+      end
+
+      it 'takes the indentation into account' do
+        expect_no_offenses(<<~RUBY)
+          module A
+            module B
+              def my_method
+                'this_string_puts_the_endless_form_just_over_the_limit______'
+              end
+            end
+          end
+        RUBY
+      end
+
+      it 'registers an offense when the same body fits at the top level' do
+        expect_offense(<<~RUBY)
+          def my_method
+          ^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+            'this_string_puts_the_endless_form_just_over_the_limit______'
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method = 'this_string_puts_the_endless_form_just_over_the_limit______'
+        RUBY
+      end
+
+      it 'does not register an offense when a tab indent puts the endless version over `Layout/LineLength`' do
+        expect_no_offenses(<<~RUBY)
+          \tdef my_method
+          \t  'this_string_puts_the_endless_form_over_the_limit_____________'
+          \tend
+        RUBY
+      end
+
+      it 'registers an offense when a tab indent leaves the endless version within `Layout/LineLength`' do
+        expect_offense(<<~RUBY)
+          \tdef my_method
+           ^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+          \t  'this_string_keeps_the_endless_form_within_the_limit_________'
+          \tend
+        RUBY
+
+        expect_correction(<<~RUBY)
+          \tdef my_method = 'this_string_keeps_the_endless_form_within_the_limit_________'
+        RUBY
+      end
+
+      it 'does not register an offense when a trailing comment puts the endless version over `Layout/LineLength`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            'this_string_is_short'
+          end # this_trailing_comment_pushes_the_line_past_the_limit
+        RUBY
+      end
+
+      it 'does not register an offense when the endless with access modifier version excess Metrics/MaxLineLength[Max]' do
+        expect_no_offenses(<<~RUBY)
+          private def my_method
+            'this_string_ends_at_column_75_________________________________'
+          end
+        RUBY
+      end
+
+      context 'when Metrics/MaxLineLength is disabled' do
+        let(:line_length_enabled) { false }
+
+        it 'registers an offense and corrects for a long single line method that is long' do
+          expect_offense(<<~RUBY)
+            def my_method
+            ^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+              'this_string_ends_at_column_75_________________________________________'
+            end
+          RUBY
+
+          expect_correction(<<~RUBY)
+            def my_method = 'this_string_ends_at_column_75_________________________________________'
+          RUBY
+        end
+
+        it 'registers an offense and corrects for a long single line method with access modifier that is long' do
+          expect_offense(<<~RUBY)
+            private def my_method
+                    ^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+              'this_string_ends_at_column_75_________________________________'
+            end
+          RUBY
+
+          expect_correction(<<~RUBY)
+            private def my_method = 'this_string_ends_at_column_75_________________________________'
+          RUBY
+        end
+      end
+
+      it 'registers an offense and corrects for a single line method with arguments' do
+        expect_offense(<<~RUBY)
+          def my_method(a, b)
+          ^^^^^^^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+            x
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method(a, b) = x
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a multiline endless method with arguments' do
+        expect_offense(<<~RUBY)
+          def my_method(a, b) = x.foo
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^ Avoid endless method definitions with multiple lines.
+                                 .bar
+                                 .baz
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method(a, b)
+            x.foo
+                                 .bar
+                                 .baz
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when a comment follows the signature' do
+        expect_no_offenses(<<~RUBY)
+          def my_method # comment
+            x
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when a comment precedes the body' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            # comment
+            x
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when a comment follows the body' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x # comment
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when a comment sits between the body and `end`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x
+            # comment
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects when a comment follows `end`' do
+        expect_offense(<<~RUBY)
+          def my_method
+          ^^^^^^^^^^^^^ Use endless method definitions for single line methods.
+            x
+          end # comment
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method = x # comment
+        RUBY
+      end
+    end
+
+    context 'EnforcedStyle: require_always' do
+      let(:cop_config) { { 'EnforcedStyle' => 'require_always' } }
+
+      it 'does not register an offense when the body is a modifier `if`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x if y
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the body is a keyword `and`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            super and x
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the body is a one-line pattern match with `=>`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method(x)
+            x => Integer
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the body is a one-line pattern match with `in`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method?(x)
+            x in Integer
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the body is a `begin...end while` loop' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            begin x end while y
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the body is a `begin...end until` loop' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            begin x end until y
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for a method with a `rescue` body' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x
+          rescue StandardError
+            y
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for a method with an `ensure` body' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x
+          ensure
+            y
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects nested method definitions' do
+        expect_offense(<<~RUBY)
+          def a
+          ^^^^^ Use endless method definitions.
+            def b
+            ^^^^^ Use endless method definitions.
+              1
+            end
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def a = def b = 1
+        RUBY
+      end
+
+      it 'registers an offense and corrects a method with unparenthesized parameters' do
+        expect_offense(<<~RUBY)
+          def my_method foo, bar
+          ^^^^^^^^^^^^^^^^^^^^^^ Use endless method definitions.
+            foo + bar
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method(foo, bar) = foo + bar
+        RUBY
+      end
+
+      it 'registers an offense and corrects a singleton method with unparenthesized parameters' do
+        expect_offense(<<~RUBY)
+          def self.my_method foo
+          ^^^^^^^^^^^^^^^^^^^^^^ Use endless method definitions.
+            foo
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def self.my_method(foo) = foo
+        RUBY
+      end
+
+      it 'does not register an offense for an endless method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method() = x
+        RUBY
+      end
+
+      it 'does not register an offense for an endless method on self' do
+        expect_no_offenses(<<~RUBY)
+          def self.my_method() = x
+        RUBY
+      end
+
+      it 'does not register an offense for an endless method with arguments' do
+        expect_no_offenses(<<~RUBY)
+          def my_method(a, b) = x
+        RUBY
+      end
+
+      it 'does not register an offense for an multiline endless method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method = x.foo
+                           .bar
+                           .baz
+        RUBY
+      end
+
+      it 'does not register an offense for no statements method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for multiple statements method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x.foo
+            x.bar
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for multiple statements method with `begin`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            begin
+              foo && bar
+            end
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the body ends with an omitted hash value', :ruby31 do
+        expect_no_offenses(<<~RUBY)
+          def my_method(a:)
+            foo 1, a:
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects when an omitted hash value is enclosed', :ruby31 do
+        expect_offense(<<~RUBY)
+          def my_method(a:)
+          ^^^^^^^^^^^^^^^^^ Use endless method definitions.
+            foo(1, a:)
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method(a:) = foo(1, a:)
+        RUBY
+      end
+
+      it 'does not register an offense for a multiple assignment body' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            foo, bar = 1, 2
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for an assignment of multiple values' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            @foo = 1, 2
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for an assignment of a splat' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            @foo = *bar
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the body ends with anonymous keyword rest forwarding', :ruby32 do
+        expect_no_offenses(<<~RUBY)
+          def my_method(**)
+            foo bar, **
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when heredoc is used only in regular method definition' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            <<~HEREDOC
+              hello
+            HEREDOC
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for heredoc is used in regular method definition' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            puts <<~HEREDOC
+              hello
+            HEREDOC
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when multiline heredoc is used only in regular method definition' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            <<~HEREDOC
+              foo
+              bar
+            HEREDOC
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when xstring heredoc is used only in regular method definition' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            <<~`HEREDOC`
+              command
+            HEREDOC
+          end
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a single line method' do
+        expect_offense(<<~RUBY)
+          def my_method
+          ^^^^^^^^^^^^^ Use endless method definitions.
+            x
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method = x
+        RUBY
+      end
+
+      it 'does not register an offense for a method definition with a modifier `unless`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            x
+          end unless y
+        RUBY
+      end
+
+      it 'does not register an offense for a multiline method definition with a modifier `if`' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            bar(1,
+                2)
+          end if y
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a single line method on self' do
+        expect_offense(<<~RUBY)
+          def self.my_method
+          ^^^^^^^^^^^^^^^^^^ Use endless method definitions.
+            x
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def self.my_method = x
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a single line method on self with ::' do
+        expect_offense(<<~RUBY)
+          def self::my_method
+          ^^^^^^^^^^^^^^^^^^^ Use endless method definitions.
+            x
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def self::my_method = x
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a single line method with arguments' do
+        expect_offense(<<~RUBY)
+          def my_method(a, b)
+          ^^^^^^^^^^^^^^^^^^^ Use endless method definitions.
+            x
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method(a, b) = x
+        RUBY
+      end
+
+      it 'registers an offense and corrects for a multiline method' do
+        expect_offense(<<~RUBY)
+          def my_method
+          ^^^^^^^^^^^^^ Use endless method definitions.
+            x.foo
+             .bar
+             .baz
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method = x.foo
+             .bar
+             .baz
+        RUBY
+      end
+
+      it 'does not register an offense for a multiline setter method' do
+        expect_no_offenses(<<~RUBY)
+          def my_method=(arg)
+            x.foo
+             .bar
+             .baz
+          end
+        RUBY
+      end
+
+      it 'does not register an offense when the endless version excess Metrics/MaxLineLength[Max]' do
+        expect_no_offenses(<<~RUBY)
+          def my_method
+            'this_string_ends_at_column_75_________________________________________'
+          end
+        RUBY
+      end
+
+      context 'when Metrics/MaxLineLength is disabled' do
+        let(:line_length_enabled) { false }
+
+        it 'registers an offense and corrects for a long single line method that is long' do
+          expect_offense(<<~RUBY)
+            def my_method
+            ^^^^^^^^^^^^^ Use endless method definitions.
+              'this_string_ends_at_column_75_________________________________________'
+            end
+          RUBY
+
+          expect_correction(<<~RUBY)
+            def my_method = 'this_string_ends_at_column_75_________________________________________'
+          RUBY
+        end
+      end
+
+      it 'registers an offense and corrects for a multiline method with arguments' do
+        expect_offense(<<~RUBY)
+          def my_method(a, b)
+          ^^^^^^^^^^^^^^^^^^^ Use endless method definitions.
+            x.foo
+             .bar
+             .baz
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method(a, b) = x.foo
+             .bar
+             .baz
+        RUBY
+      end
+
+      it 'registers an offense and corrects when a comment sits inside the body' do
+        expect_offense(<<~RUBY)
+          def my_method
+          ^^^^^^^^^^^^^ Use endless method definitions.
+            x( # comment
+              1)
+          end
+        RUBY
+
+        expect_correction(<<~RUBY)
+          def my_method = x( # comment
+              1)
+        RUBY
+      end
+
+      it 'does not register an offense when a comment follows unparenthesized arguments' do
+        expect_no_offenses(<<~RUBY)
+          def my_method a # comment
+            x
+          end
+        RUBY
+      end
+    end
+  end
+
+  context 'when the body is a block spread over several lines', :ruby30 do
+    let(:cop_config) { { 'EnforcedStyle' => 'require_single_line' } }
+
+    it 'does not register an offense' do
+      expect_no_offenses(<<~RUBY)
+        def a
+          b
+            .c { d }
+        end
+      RUBY
+    end
+
+    it 'still registers an offense for a body that really is on one line' do
+      expect_offense(<<~RUBY)
+        def a
+        ^^^^^ Use endless method definitions for single line methods.
+          b { c }
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def a = b { c }
+      RUBY
+    end
+  end
+
+  context 'when the body is a command that an endless method body cannot hold', :ruby30 do
+    let(:cop_config) { { 'EnforcedStyle' => 'require_always' } }
+
+    it 'does not register an offense for an assignment whose value is a command call' do
+      expect_no_offenses(<<~RUBY)
+        def foo
+          @foo ||= bar baz
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a chained assignment whose value is a command call' do
+      expect_no_offenses(<<~RUBY)
+        def foo
+          foo = @foo = bar baz
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for an assignment whose value is a command call with a `rescue` modifier' do
+      expect_no_offenses(<<~RUBY)
+        def foo
+          @foo = bar baz rescue nil
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for an assignment whose value is a `yield` with arguments' do
+      expect_no_offenses(<<~RUBY)
+        def foo
+          @foo = yield baz
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a setter whose value is a command call' do
+      expect_no_offenses(<<~RUBY)
+        def foo
+          obj.foo = bar baz
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for an assignment whose value is a command call with a block' do
+      expect_no_offenses(<<~RUBY)
+        def foo
+          @foo = bar baz { qux }
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a command call with a `do` block' do
+      expect_no_offenses(<<~RUBY)
+        def foo(x)
+          bar x do
+            baz
+          end
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a method call on a command call with a `do` block' do
+      expect_no_offenses(<<~RUBY)
+        def foo(x)
+          bar x do
+            baz
+          end.qux
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a command call in a method definition passed as an argument' do
+      expect_no_offenses(<<~RUBY)
+        private def foo(x)
+          bar :baz, x
+        end
+      RUBY
+    end
+
+    it 'registers an offense for a command call in a method definition passed as the only argument', :ruby40 do
+      expect_offense(<<~RUBY)
+        private def foo(x)
+                ^^^^^^^^^^ Use endless method definitions.
+          bar :baz, x
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        private def foo(x) = bar :baz, x
+      RUBY
+    end
+
+    it 'does not register an offense for a command call in a method definition passed with other arguments', :ruby40 do
+      expect_no_offenses(<<~RUBY)
+        qux 1, def foo(x)
+          bar :baz, x
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a command call in a method definition in an array', :ruby40 do
+      expect_no_offenses(<<~RUBY)
+        [def foo
+          bar baz
+        end]
+      RUBY
+    end
+
+    it 'does not register an offense for a command call in a method definition in a hash value', :ruby40 do
+      expect_no_offenses(<<~RUBY)
+        { key: def foo
+          bar baz
+        end }
+      RUBY
+    end
+
+    it 'does not register an offense for a command call in a method definition in a ternary', :ruby40 do
+      expect_no_offenses(<<~RUBY)
+        condition ? def foo
+          bar baz
+        end : nil
+      RUBY
+    end
+
+    it 'does not register an offense for a command call in a method definition in an operand of `&&`', :ruby40 do
+      expect_no_offenses(<<~RUBY)
+        condition && def foo
+          bar baz
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a command call in a method definition in an operand of `and`', :ruby40 do
+      expect_no_offenses(<<~RUBY)
+        condition and def foo
+          bar baz
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a command call in a negated method definition', :ruby40 do
+      expect_no_offenses(<<~RUBY)
+        !def foo
+          bar baz
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a command call in a method definition in an `if` condition', :ruby40 do
+      expect_no_offenses(<<~RUBY)
+        if def foo
+          bar baz
+        end
+          qux
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a command call in a method definition in a multiple assignment', :ruby40 do
+      expect_no_offenses(<<~RUBY)
+        a, b = def foo
+          bar baz
+        end
+      RUBY
+    end
+
+    it 'registers an offense for a command call in a method definition assigned by a setter', :ruby34 do
+      expect_offense(<<~RUBY)
+        obj.attr = def foo
+                   ^^^^^^^ Use endless method definitions.
+          bar baz
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        obj.attr = def foo = bar baz
+      RUBY
+    end
+
+    it 'registers an offense for a command call in a parenthesized method definition', :ruby40 do
+      expect_offense(<<~RUBY)
+        (def foo
+         ^^^^^^^ Use endless method definitions.
+          bar baz
+        end)
+      RUBY
+
+      expect_correction(<<~RUBY)
+        (def foo = bar baz)
+      RUBY
+    end
+
+    it 'registers an offense for a command call in a method definition in a block', :ruby40 do
+      expect_offense(<<~RUBY)
+        do_something do
+          def foo
+          ^^^^^^^ Use endless method definitions.
+            bar baz
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        do_something do
+          def foo = bar baz
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a `return` with a value in a method definition in an array', :ruby40 do
+      expect_no_offenses(<<~RUBY)
+        [def foo
+          return bar
+        end]
+      RUBY
+    end
+
+    it 'does not register an offense for a `return` with values in a method definition in a ternary', :ruby40 do
+      expect_no_offenses(<<~RUBY)
+        condition ? def foo
+          return bar, baz
+        end : nil
+      RUBY
+    end
+
+    it 'registers an offense for a `return` without a value in a method definition in an array', :ruby40 do
+      expect_offense(<<~RUBY)
+        [def foo
+         ^^^^^^^ Use endless method definitions.
+          return
+        end]
+      RUBY
+
+      expect_correction(<<~RUBY)
+        [def foo = return]
+      RUBY
+    end
+
+    it 'registers an offense for a `return` with a value in a statement method definition', :ruby40 do
+      expect_offense(<<~RUBY)
+        def foo
+        ^^^^^^^ Use endless method definitions.
+          return bar, baz
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def foo = return bar, baz
+      RUBY
+    end
+
+    it 'registers an offense only for the outer method definition with a nested command call body', :ruby40 do
+      expect_offense(<<~RUBY)
+        def foo
+        ^^^^^^^ Use endless method definitions.
+          def bar
+            baz qux
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def foo = def bar
+            baz qux
+          end
+      RUBY
+    end
+
+    it 'does not register an offense for a method definition whose body is an endless method with a command call body', :ruby40 do
+      expect_no_offenses(<<~RUBY)
+        def foo
+          def bar = baz qux
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a `do...end` block in a method definition passed as an argument' do
+      expect_no_offenses(<<~RUBY)
+        private def foo
+          bar do
+            baz
+          end
+        end
+      RUBY
+    end
+
+    it 'does not register an offense for a nested `do...end` block in a method definition passed as an argument' do
+      expect_no_offenses(<<~RUBY)
+        private def foo
+          obj.bar do
+            baz
+          end.qux
+        end
+      RUBY
+    end
+
+    it 'registers an offense for a `do...end` block in a method definition passed as a parenthesized argument' do
+      expect_offense(<<~RUBY)
+        private(def foo
+                ^^^^^^^ Use endless method definitions.
+          bar do
+            baz
+          end
+        end)
+      RUBY
+
+      expect_correction(<<~RUBY)
+        private(def foo = bar do
+            baz
+          end)
+      RUBY
+    end
+
+    it 'registers an offense for a `{...}` block in a method definition passed as an argument' do
+      expect_offense(<<~RUBY)
+        private def foo
+                ^^^^^^^ Use endless method definitions.
+          bar { baz }
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        private def foo = bar { baz }
+      RUBY
+    end
+
+    it 'registers an offense for a lambda literal with `do...end` in a method definition passed as an argument' do
+      expect_offense(<<~RUBY)
+        private def foo
+                ^^^^^^^ Use endless method definitions.
+          -> do
+            baz
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        private def foo = -> do
+            baz
+          end
+      RUBY
+    end
+
+    it 'does not register an offense for a negated command call' do
+      expect_no_offenses(<<~RUBY)
+        def foo
+          !obj.do_something bar
+        end
+      RUBY
+    end
+
+    it 'registers an offense for a negated parenthesized call' do
+      expect_offense(<<~RUBY)
+        def foo
+        ^^^^^^^ Use endless method definitions.
+          !obj.do_something(bar)
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def foo = !obj.do_something(bar)
+      RUBY
+    end
+
+    it 'registers an offense for an assignment whose value is a parenthesized call' do
+      expect_offense(<<~RUBY)
+        def foo
+        ^^^^^^^ Use endless method definitions.
+          @foo ||= bar(baz)
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def foo = @foo ||= bar(baz)
+      RUBY
+    end
+
+    it 'registers an offense for a parenthesized call with a `do` block' do
+      expect_offense(<<~RUBY)
+        def foo(x)
+        ^^^^^^^^^^ Use endless method definitions.
+          bar(x) do
+            baz
+          end
+        end
+      RUBY
+
+      expect_correction(<<~RUBY)
+        def foo(x) = bar(x) do
+            baz
+          end
+      RUBY
+    end
+
+    context 'with `EnforcedStyle: require_single_line`' do
+      let(:cop_config) { { 'EnforcedStyle' => 'require_single_line' } }
+
+      it 'does not register an offense for an assignment whose value is a command call' do
+        expect_no_offenses(<<~RUBY)
+          def foo
+            @foo ||= bar baz
+          end
+        RUBY
+      end
+
+      it 'does not register an offense for a negated command call' do
+        expect_no_offenses(<<~RUBY)
+          def foo
+            !obj.do_something bar
+          end
+        RUBY
+      end
+    end
+  end
+end

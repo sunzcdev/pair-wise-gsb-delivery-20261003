@@ -1,0 +1,277 @@
+= Versioning
+
+RuboCop is stable between major versions, both in terms of API and cop
+configuration. We aim to ease the maintenance of RuboCop extensions
+(by keeping the API stable) and the upgrades between RuboCop releases
+(by not enabling new cops and changing the configuration of existing cops).
+All big (breaking) changes are reserved for major releases.
+
+== Release Policy
+
+We're following https://semver.org/[Semantic Versioning]. API
+compatibility between major releases is a big concern, as there are
+many RuboCop extensions that can be affected by breaking API changes.
+
+The development cycle for the next minor (feature) release starts
+immediately after the previous one has been shipped. Bug-fix (point)
+releases (if any) address only serious bugs and never contain new
+features.
+
+Here are a few examples:
+
+* 1.1.0 - Feature release
+* 1.1.1 - Bug-fix release
+* 1.1.2 - Bug-fix release
+* 1.2.0 - Feature release
+
+=== What goes in each release type
+
+|===
+| Change type | Release
+
+| Bug fixes to existing cops | Patch
+| New cops (added as *pending*) | Minor
+| New configuration options | Minor
+| New CLI flags or formatters | Minor
+| Renaming or moving cops (with backwards-compatible obsoletions) | Minor
+| Dropping runtime Ruby version support | Minor
+| Enabling pending cops by default | *Major* (one narrow exception, see below)
+| Changing cop defaults (e.g. `EnforcedStyle`) | *Major*
+| Changing what an existing cop reports or corrects, behind `Preview` | Minor
+| Removing cops without a replacement | *Major*
+| Breaking changes to the Ruby API | *Major*
+| Dropping analysis support for a Ruby version | *Major*
+|===
+
+NOTE: Dropping **runtime** support for a particular Ruby version is not considered a breaking change,
+as it doesn't affect clients in any way. They are simply restricted to the last version of
+RuboCop supporting their Ruby runtime.
+
+NOTE: Prior to RuboCop 1.0 bumps of the minor (second) version number
+were considered major releases and always included new features and/or
+changes to existing features.
+
+== Preview
+
+Some changes cannot ship as a pending cop. A cop that starts reporting a case it
+used to miss, or corrects one differently, changes results for everybody who has
+that cop enabled. A default that turns out to be wrong - a cop most projects
+disable, a threshold most projects raise - cannot move at all without a major
+release. Either way the change waits, whatever its merit.
+
+`Preview` is the channel for those changes: it is where the next major release's
+defaults live until that release ships. It is off by default:
+
+[source,yaml]
+----
+AllCops:
+  Preview: true
+----
+
+or `--preview` on the command line, which overrides the configuration either way
+(`--no-preview` turns it back off).
+
+It gates three things:
+
+* **Changes to a cop's defaults.** A cop's entry in the default configuration
+  can carry a `Preview` section holding the defaults it is expected to adopt in
+  the next major release. Under preview those replace the current ones; an
+  explicit setting in your own configuration still wins over both. `AllCops`
+  can carry one as well: under preview, `FailLevel` is `warning`, so style
+  offenses are reported without failing the build. Directives disabling a cop
+  that only the preview defaults turn off are not reported as redundant, since
+  they are needed again as soon as preview is off.
++
+[source,yaml]
+----
+Style/Documentation:
+  Enabled: true
+  Preview:
+    Enabled: false
+----
+* **Behavior changes to existing cops.** A cop can put an unstable change behind
+  `preview?` and ship it in a minor release. Nothing changes for anyone who has
+  not opted in.
++
+[source,ruby]
+----
+def on_send(node)
+  return unless offense?(node)
+  # Reporting the safe-navigation form is new, and not everyone will agree.
+  return if node.csend_type? && !preview?
+
+  add_offense(node)
+end
+----
+* **Cops that are not ready to be `pending` yet**, marked `Enabled: preview`.
+  Unlike pending cops, they are not reported as needing a decision - opting in is
+  the whole point, so there is nothing to nag about.
+
+[source,yaml]
+----
+Style/SomethingExperimental:
+  Enabled: preview
+----
+
+=== Preview or Pending?
+
+Both settings mean "not on by default", so the line between them matters:
+
+* If we already know something should become the default, it is `pending`. That
+  is a heads-up about a decision already made, which is why pending cops are
+  announced: deciding early beats being surprised at the next major release.
+* If we are asking users to help us find out, it is `preview`. There is no plan
+  to commit to yet, so there is nothing to announce.
+
+The intended lifecycle for a new cop is `preview` (for the brave) to `pending`
+(on for anyone with `NewCops: enable`) to enabled by default in the next major
+release. Not every cop needs the first step.
+
+=== Interaction With Other Settings
+
+The two halves of preview do not answer to the same switches, which is worth
+keeping straight.
+
+A cop marked `Enabled: preview` behaves like any other cop that is off:
+
+* `NewCops: enable` does not turn it on. Pending and preview are independent
+  channels, and opting in to one says nothing about the other.
+* `--only` runs it by name, whether or not preview is on.
+* `--enable-all-cops`, `AllCops: EnabledByDefault` and
+  `AllCops: DisabledByDefault` rewrite the *defaults*, so they cover a cop that
+  ships as `Enabled: preview` in RuboCop's own configuration. An
+  `Enabled: preview` you wrote in your own config is an explicit choice and wins
+  over them, exactly as an explicit `Enabled: false` does.
+
+Preview defaults are defaults, so everything that rewrites defaults applies to
+them too: `--enable-all-cops`, `EnabledByDefault` and `DisabledByDefault` all
+win, and a re-enabled department under `DisabledByDefault` comes back with its
+preview defaults rather than its regular ones.
+
+Behavior gated behind `preview?` answers to the `Preview` setting and nothing
+else. Neither `--only` nor `--enable-all-cops` reaches inside a cop to switch it
+on, so a cop running under `--only` still reports its stable behavior unless
+preview is also on.
+
+Trying preview on a project is one flag, which makes it cheap to report back on
+a change before it becomes the default:
+
+[source,sh]
+----
+$ rubocop --preview
+----
+
+NOTE: Preview is provisional by definition. What it contains is our current
+intent for the next major release, not a promise: an entry can change or be
+withdrawn in any minor release if it does not work out, and a withdrawal is
+recorded in the changelog like any other change. That is exactly what the flag
+buys us: a way to get a change in front of users early without committing to it.
+
+== Pending Cops
+
+In the early versions of RuboCop a common source of frustration was that
+new cops were added to pretty much every release, and as they were enabled
+by default, every upgrade resulted in broken CI builds and trying to figure
+out what exactly was changed. After considering many options to address
+this eventually we opted for an approach that limits these types of changes
+to major RuboCop releases.
+
+Now new cops introduced between major versions are set to a special pending
+status and are not enabled by default. A warning is emitted if such cops
+are not explicitly enabled or disabled in the user configuration. Here's
+one such message:
+
+----
+The following cops were added to RuboCop, but are not configured. Please
+set Enabled to either `true` or `false` in your `.rubocop.yml` file:
+ - Style/HashEachMethods (0.80)
+ - Style/HashTransformKeys (0.80)
+ - Style/HashTransformValues (0.80)
+For more information: https://docs.rubocop.org/rubocop/versioning.html
+----
+
+You can see that 3 new cops were added in RuboCop 0.80 and it's up to you
+to decide if you want to enable or disable them.
+
+NOTE: Occasionally, some new cops will be introduced as *disabled* by
+default. Usually, this means that we believe that the cop is useful,
+but not for everyone. Typical cases might be the enforcement of
+programming styles that are not very common in the wild, or cops that
+yield too many false positives (so you'd run them manually from time
+to time, instead of running them all the time).
+
+=== Enabling/Disabling Pending Cops in Bulk
+
+To suppress this message set `NewCops` to either `enable` or `disable` in your `.rubocop.yml` file.
+You can use the following configuration or the `--enable-pending-cops` command-line option to enable all pending cops in bulk:
+
+[source,yaml]
+----
+AllCops:
+  NewCops: enable
+----
+
+Alternatively, you can use the following configuration or the `--disable-pending-cops` command-line option to disable all pending cops in bulk:
+
+[source,yaml]
+----
+AllCops:
+  NewCops: disable
+----
+
+NOTE: The command-line option takes precedence over the `.rubocop.yml` file.
+
+=== Enabling/Disabling Pending Cops per Department
+
+A single version in `AllCops` cannot express which pending cops to enable, because extension gems follow their own version schemes.
+Instead, `NewCops` can be set for a department, in which case it takes precedence over the `AllCops` setting for the cops of that department.
+In addition to `enable`, `disable`, and `pending`, a department accepts a version, which enables all pending cops of the department
+that were added in the specified version or earlier:
+
+[source,yaml]
+----
+AllCops:
+  NewCops: disable # keywords only, as before
+
+Lint:
+  NewCops: enable  # a department overrides `AllCops`
+
+Style:
+  NewCops: '1.19'  # enables pending cops with `VersionAdded` <= 1.19
+
+Minitest:
+  NewCops: '0.10'  # an extension is pinned to its own version
+----
+
+Pending cops added in a later version keep emitting the warning, so you can review them and bump the version at your own pace.
+Since each department is pinned to its own version, this also works for extensions whose version schemes differ from RuboCop's.
+
+NOTE: Quote the version to avoid YAML interpreting it as a number (for example, an unquoted `1.20` is read as `1.2`).
+
+=== Enabling/Disabling Individual Pending Cops
+
+Finally, you can enable/disable individual pending cops by setting their `Enabled` configuration to either `true` or `false` in your `.rubocop.yml` file:
+
+`Style/ANewCop` is an example of a newly added pending cop:
+
+[source,yaml]
+----
+Style/ANewCop:
+  Enabled: true
+----
+
+or
+
+[source,yaml]
+----
+Style/ANewCop:
+  Enabled: false
+----
+
+IMPORTANT: On major RuboCop version updates (e.g. 1.0 -> 2.0), *all* pending cops are enabled in bulk.
+
+There's one narrow exception to waiting for a major release. A cop that reports configuration
+which silently does nothing (rather than code that could be written differently) may be enabled
+in a minor release, since leaving it pending means people keep believing settings work when they
+don't. `Lint/CopDirectiveSyntax`, which flags malformed `# rubocop:` directives, was enabled this
+way in 1.91.

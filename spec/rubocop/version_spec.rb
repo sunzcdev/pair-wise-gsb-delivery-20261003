@@ -1,0 +1,311 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::Version do
+  include FileHelper
+
+  describe '.version' do
+    subject { described_class.version(debug: debug) }
+
+    context 'debug is false (default)' do
+      let(:debug) { false }
+
+      it { is_expected.to match(/\d+\.\d+\.\d+/) }
+      it { is_expected.not_to match(/\d+\.\d+\.\d+ \(using Parser/) }
+    end
+
+    context 'debug is true' do
+      let(:debug) { true }
+
+      it { is_expected.to match(/\d+\.\d+\.\d+ \(using Parser/) }
+    end
+
+    it 'is the gem version when called without arguments' do
+      expect(described_class.version).to eq(described_class::STRING)
+    end
+  end
+
+  describe '.parser_version', :isolated_environment do
+    subject(:parser_version) { described_class.parser_version(target_ruby_version) }
+
+    before { RuboCop::ConfigLoader.clear_options }
+
+    context 'when the target Ruby version is one that Prism cannot parse' do
+      let(:target_ruby_version) { 3.2 }
+
+      it 'only has the version of Parser' do
+        expect(parser_version).to eq("Parser #{Parser::VERSION}")
+      end
+    end
+
+    context 'when the target Ruby version is one that Prism can parse' do
+      let(:target_ruby_version) { 3.4 }
+
+      it 'has the parser engine that is used by default' do
+        expect(parser_version)
+          .to match(/\AParser #{Parser::VERSION}, Prism #{Prism::VERSION}, (parser_)?prism\z/o)
+      end
+
+      it 'has the parser engine that is used when `ParserEngine` is `default`' do
+        create_file('.rubocop.yml', <<~YAML)
+          AllCops:
+            ParserEngine: default
+        YAML
+
+        expect(parser_version).to match(/, (parser_)?prism\z/)
+      end
+
+      it 'has the configured parser engine' do
+        create_file('.rubocop.yml', <<~YAML)
+          AllCops:
+            ParserEngine: parser_whitequark
+        YAML
+
+        expect(parser_version).to end_with(', parser_whitequark')
+      end
+    end
+  end
+
+  describe '.extension_versions', :isolated_environment, :restore_configuration, :restore_registry do
+    subject(:extension_versions) { described_class.extension_versions(env) }
+
+    let(:env) { instance_double(RuboCop::CLI::Environment, config_store: config_store) }
+    let(:config_store) { RuboCop::ConfigStore.new }
+
+    before { RuboCop::ConfigLoader.clear_options }
+
+    # Requiring an extension may only lazily register its cops (e.g. rubocop-performance 1.27+).
+    # Load them while the temporary global registry is still in place, so that their deferred class
+    # definitions cannot fire later and enlist into the frozen global registry.
+    after { RuboCop::Cop::Registry.global.load_all_lazy_cops }
+
+    context 'when no extensions are required' do
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          AllCops:
+            TargetRubyVersion: 2.7
+        YAML
+      end
+
+      it 'does not return any the extensions' do
+        expect(extension_versions).to eq([])
+      end
+    end
+
+    context 'when extensions are required' do
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          require:
+            - rubocop-performance
+            - rubocop-rspec
+        YAML
+      end
+
+      it 'returns the extensions' do
+        expect(extension_versions).to contain_exactly(
+          /- rubocop-performance \d+\.\d+\.\d+/,
+          /- rubocop-rspec \d+\.\d+\.\d+/
+        )
+      end
+    end
+
+    context 'when unknown extensions are required' do
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          require:
+            - ./rubocop-foobarbaz
+        YAML
+
+        create_file('rubocop-foobarbaz.rb', <<~RUBY)
+          module RuboCop
+            module FooBarBaz
+            end
+          end
+        RUBY
+      end
+
+      it 'does not return any the extensions' do
+        expect(extension_versions).to eq([])
+      end
+    end
+
+    context 'with an obsolete config' do
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          require:
+            - rubocop-performance
+            - rubocop-rspec
+
+          Style/MethodMissing:
+            Enabled: true
+        YAML
+      end
+
+      it 'returns the extensions' do
+        expect do
+          expect(extension_versions).to contain_exactly(
+            /- rubocop-performance \d+\.\d+\.\d+/,
+            /- rubocop-rspec \d+\.\d+\.\d+/
+          )
+        end.not_to raise_error
+      end
+    end
+
+    context 'when plugins are specified' do
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          plugins:
+            - rubocop-performance
+            - rubocop-rspec
+        YAML
+      end
+
+      it 'returns the extensions' do
+        expect(extension_versions).to contain_exactly(
+          /- rubocop-performance \d+\.\d+\.\d+/,
+          /- rubocop-rspec \d+\.\d+\.\d+/
+        )
+      end
+    end
+
+    context 'when a duplicate plugin is specified in an inherited config' do
+      before do
+        create_file('base.yml', <<~YAML)
+          plugins:
+            - rubocop-performance
+        YAML
+
+        create_file('.rubocop.yml', <<~YAML)
+          inherit_from:
+            - base.yml
+
+          plugins:
+            - rubocop-performance
+            - rubocop-rspec
+        YAML
+      end
+
+      it 'returns each extension exactly once' do
+        expect(extension_versions).to contain_exactly(
+          /- rubocop-performance \d+\.\d+\.\d+/,
+          /- rubocop-rspec \d+\.\d+\.\d+/
+        )
+      end
+    end
+
+    context 'with an invalid cop in config' do
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          require:
+            - rubocop-performance
+            - rubocop-rspec
+
+          Style/SomeCop:
+            Enabled: true
+        YAML
+      end
+
+      it 'returns the extensions' do
+        expect do
+          expect(extension_versions).to contain_exactly(
+            /- rubocop-performance \d+\.\d+\.\d+/,
+            /- rubocop-rspec \d+\.\d+\.\d+/
+          )
+        end.not_to raise_error
+      end
+    end
+
+    context 'with all known mappings' do
+      let(:config) { instance_double(RuboCop::Config) }
+
+      let(:known_features) do
+        %w[
+          rubocop-performance
+          rubocop-rspec
+          rubocop-graphql
+          rubocop-md
+          rubocop-thread_safety
+          rubocop-capybara
+          rubocop-factory_bot
+          rubocop-rspec_rails
+        ]
+      end
+
+      before do
+        allow(config).to receive_messages(loaded_plugins: [], loaded_features: known_features)
+        allow(config_store).to receive(:for_dir).and_return(config)
+
+        stub_const('RuboCop::GraphQL::Version::STRING', '1.0.0')
+        stub_const('RuboCop::Markdown::Version::STRING', '1.0.0')
+        stub_const('RuboCop::ThreadSafety::Version::STRING', '1.0.0')
+      end
+
+      it 'returns the extensions' do
+        expect(extension_versions).to contain_exactly(
+          /- rubocop-performance \d+\.\d+\.\d+/,
+          /- rubocop-rspec \d+\.\d+\.\d+/,
+          /- rubocop-graphql \d+\.\d+\.\d+/,
+          /- rubocop-md \d+\.\d+\.\d+/,
+          /- rubocop-thread_safety \d+\.\d+\.\d+/
+        )
+      end
+    end
+  end
+
+  describe '.rubydex_indicator', :isolated_environment, :restore_configuration, :restore_registry do
+    subject(:indicator) { described_class.rubydex_indicator(env) }
+
+    let(:env) { instance_double(RuboCop::CLI::Environment, config_store: config_store) }
+    let(:config_store) { RuboCop::ConfigStore.new }
+
+    before { RuboCop::ConfigLoader.clear_options }
+
+    context 'when env is nil' do
+      let(:env) { nil }
+
+      it { is_expected.to eq('') }
+    end
+
+    context 'when UseProjectIndex is false' do
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          AllCops:
+            UseProjectIndex: false
+        YAML
+      end
+
+      it { is_expected.to eq('') }
+    end
+
+    context 'when UseProjectIndex is true but the gem is unavailable' do
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          AllCops:
+            UseProjectIndex: true
+        YAML
+        allow(RuboCop::ProjectIndexLoader).to receive(:available?).and_return(false)
+      end
+
+      it { is_expected.to eq('') }
+    end
+
+    context 'when UseProjectIndex is true and the gem is available' do
+      before do
+        create_file('.rubocop.yml', <<~YAML)
+          AllCops:
+            UseProjectIndex: true
+        YAML
+        allow(RuboCop::ProjectIndexLoader).to receive(:available?).and_return(true)
+      end
+
+      it { is_expected.to eq(' +Rubydex') }
+    end
+
+    context 'when the config file is malformed' do
+      before do
+        create_file('.rubocop.yml', "AllCops:\n  UseProjectIndex: [\n")
+      end
+
+      it { is_expected.to be_blank }
+    end
+  end
+end

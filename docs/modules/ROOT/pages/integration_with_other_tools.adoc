@@ -1,0 +1,188 @@
+= Integration with Other Tools
+
+== Speeding up integrations
+
+RuboCop integrates with many other tools, including editors which may call
+`rubocop` repeatedly. Since `rubocop` has to require its entire environment on
+each invocation, this can result in noticeable slowness.
+
+The recommended solution is RuboCop's built-in xref:usage/server.adoc[Server]
+mode, which keeps a daemonized process running so that subsequent runs avoid
+the boot time overhead.
+
+NOTE: RuboCop's built-in xref:usage/caching.adoc[caching] should also be used to ensure
+that source files that have not been changed are not being re-evaluated unnecessarily.
+
+== Editor integration
+
+RuboCop includes a built-in xref:usage/lsp.adoc[Language Server Protocol (LSP)] server
+(since 1.53), which is the recommended way to integrate with any editor. LSP provides
+real-time linting, formatting, and autocorrection as you type.
+
+The following Ruby language servers use RuboCop internally:
+
+- https://github.com/Shopify/ruby-lsp[Ruby LSP] — the recommended option for most editors
+- https://solargraph.org/[Solargraph] — also provides code completion and documentation
+
+Any editor with an LSP client can use either of these. The per-editor sections below
+cover the recommended setup for each.
+
+For editors that don't support LSP, RuboCop can also be invoked by shelling out to the
+`rubocop` binary. In that case, use the xref:usage/server.adoc[Server] mode to avoid
+the startup overhead on each invocation.
+
+=== Visual Studio Code
+
+Use the https://marketplace.visualstudio.com/items?itemName=Shopify.ruby-lsp[Ruby LSP]
+extension. There is also the dedicated
+https://marketplace.visualstudio.com/items?itemName=rubocop.vscode-rubocop[vscode-rubocop]
+extension that uses RuboCop's built-in LSP server directly.
+
+=== Emacs
+
+Use https://github.com/joaotavora/eglot[Eglot] (built-in since Emacs 29) or
+https://github.com/emacs-lsp/lsp-mode[lsp-mode] as the LSP client.
+
+Alternative non-LSP options:
+https://github.com/rubocop/rubocop-emacs[rubocop.el] and
+https://github.com/flycheck/flycheck[flycheck].
+
+=== Vim / Neovim
+
+Neovim has a built-in LSP client. For Vim,
+https://github.com/dense-analysis/ale[ALE] supports both LSP and direct RuboCop invocation.
+
+Alternative non-LSP options:
+https://github.com/vim-syntastic/syntastic[syntastic] and
+https://github.com/neomake/neomake[neomake].
+
+=== RubyMine / IntelliJ IDEA
+
+RuboCop support is https://www.jetbrains.com/help/ruby/rubocop.html[built-in].
+
+=== Helix
+
+Helix has built-in LSP support. For formatting, see the
+https://github.com/helix-editor/helix/wiki/Formatter-configurations#rubocop[Formatter Configurations for RuboCop].
+
+=== Sublime Text
+
+Use the https://github.com/sublimelsp/LSP[LSP] package.
+See the https://lsp.sublimetext.io/language_servers/#ruby-ruby-on-rails[LSP documentation] for setup.
+
+Alternative non-LSP options:
+https://github.com/SublimeLinter/SublimeLinter-rubocop[SublimeLinter-rubocop].
+
+=== Other Editors
+
+Any editor with an LSP client can use RuboCop — see the language servers listed above.
+
+=== MCP
+
+RuboCop also provides a built-in https://modelcontextprotocol.io/[Model Context Protocol]
+server (since 1.85) for integration with AI-powered tools. See xref:usage/mcp.adoc[MCP]
+for details.
+
+== Git pre-commit hook integration with overcommit
+
+https://github.com/sds/overcommit[overcommit] is a fully configurable and
+extendable Git commit hook manager. To use RuboCop with overcommit, add the
+following to your `.overcommit.yml` file:
+
+[source,yaml]
+----
+PreCommit:
+  RuboCop:
+    enabled: true
+----
+
+== Git pre-commit hook integration with pre-commit
+
+https://pre-commit.com/[pre-commit] is a framework for managing and maintaining
+multi-language pre-commit hooks. To use RuboCop with pre-commit, add the
+following to your `.pre-commit-config.yaml` file:
+
+[source,yaml]
+----
+- repo: https://github.com/rubocop/rubocop
+  rev: v1.92.3
+  hooks:
+    - id: rubocop
+----
+
+If your RuboCop configuration uses extensions, be sure to include the gems as
+entries in `additional_dependencies`:
+
+[source,yaml]
+----
+- repo: https://github.com/rubocop/rubocop
+  rev: v1.92.3
+  hooks:
+    - id: rubocop
+      additional_dependencies:
+        - rubocop-rails
+        - rubocop-rspec
+----
+
+RuboCop supports pre-commit hook integration since version 1.9.
+
+== Git hook integration with hk
+
+https://hk.jdx.dev/[hk] is a fast, polyglot Git hooks manager with
+https://hk.jdx.dev/builtins.html#rubocop[built-in RuboCop support].
+
+== Guard integration
+
+If you're fond of https://github.com/guard/guard[Guard] you might
+like
+https://github.com/rubocop/guard-rubocop[guard-rubocop]. It
+allows you to automatically check Ruby code style with RuboCop when
+files are modified.
+
+== Mega-Linter integration
+
+You can use https://megalinter.io/latest/[Mega-Linter]
+to run RuboCop automatically on every PR, and also lint all file
+types detected in your repository.
+
+Please follow the
+https://megalinter.io/latest/install-assisted[installation instructions]
+to activate RuboCop without any additional configuration.
+
+https://megalinter.io/latest/flavors/ruby/[Mega-Linter's Ruby flavor]
+is optimized for Ruby linting.
+
+== Rake integration
+
+To use RuboCop in your `Rakefile` add the following:
+
+[source,ruby]
+----
+require 'rubocop/rake_task'
+
+RuboCop::RakeTask.new
+----
+
+If you run `rake -T`, the following two RuboCop tasks should show up:
+
+[source,sh]
+----
+$ rake rubocop                                 # Run RuboCop
+$ rake rubocop:autocorrect                     # Autocorrect RuboCop offenses
+----
+
+The above will use default values.
+
+[source,ruby]
+----
+require 'rubocop/rake_task'
+
+desc 'Run RuboCop on the lib directory'
+RuboCop::RakeTask.new(:rubocop) do |task|
+  task.patterns = ['lib/**/*.rb']
+  # only show the files with failures
+  task.formatters = ['files']
+  # don't abort rake on failure
+  task.fail_on_error = false
+end
+----

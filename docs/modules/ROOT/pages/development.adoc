@@ -1,0 +1,953 @@
+= Development
+
+This guide covers developing new cops for RuboCop. It walks through:
+
+* <<create-a-new-cop,Scaffolding>> a cop from a template
+* <<understanding-the-ast,Understanding the AST>> that RuboCop operates on
+* <<implementing-the-cop,Implementing>> detection with node patterns and callbacks
+* <<autocorrect,Autocorrect>> to fix offenses automatically
+* <<limit-by-ruby-or-gem-versions,Constraining>> cops by Ruby or gem version
+* <<common-patterns,Common patterns>> and conventions
+* <<running-tests,Testing>> your cop
+* <<documentation,Documenting>> the cop for users
+
+[[create-a-new-cop]]
+== Create a new cop
+
+NOTE: Clone the repository and run `bundle install` if not done yet.
+The following rake task can only be run inside the rubocop project directory itself.
+
+Use the bundled rake task `new_cop` to generate a cop template:
+
+[source,sh]
+----
+$ bundle exec rake 'new_cop[Department/Name]'
+[create] lib/rubocop/cop/department/name.rb
+[create] spec/rubocop/cop/department/name_spec.rb
+[modify] lib/rubocop/cop/department.rb - `register_cop :Name, "#{__dir__}/department/name"` was injected.
+[modify] A configuration for the cop is added into config/default.yml.
+Do 4 steps:
+  1. Modify the description of Department/Name in config/default.yml
+  2. Implement your new cop in the generated file!
+  3. Commit your new cop with a message such as
+     e.g. "Add new `Department/Name` cop"
+  4. Run `bundle exec rake changelog:new` to generate a changelog entry
+     for your new cop.
+
+----
+
+=== Cop lazy loading
+
+Cops are not required from `lib/rubocop.rb`. Instead, each department has a module file
+(e.g. `lib/rubocop/cop/style.rb`) that registers its cops with the global registry through
+`RuboCop::Cop::LazyLoader#register_cop`:
+
+[source,ruby]
+----
+module RuboCop
+  module Cop
+    # Cops for the `Style` department. ...
+    module Style
+      extend LazyLoader
+
+      register_cop :HashSyntax, "#{__dir__}/style/hash_syntax"
+      # ...
+    end
+  end
+end
+----
+
+A registered cop appears in the registry by name right away, but its file is loaded only
+when the cop class is needed, e.g. when the cop is enabled for an inspection run.
+This significantly speeds up loading RuboCop, since a typical run loads only the enabled cops.
+The path passed to `register_cop` must be absolute so that loading does not depend on `$LOAD_PATH`;
+interpolating `+__dir__+` as in the example above is the intended usage. Plugin authors can adopt
+the same mechanism for their own department modules.
+
+The `new_cop` rake task maintains the `register_cop` directives for you, so usually there is
+no need to edit the department module file by hand.
+
+[[understanding-the-ast]]
+== Understanding the AST
+
+RuboCop uses the https://github.com/whitequark/parser[parser] library to create the
+Abstract Syntax Tree (AST) representation of the code.
+
+You can install `parser` gem and use `ruby-parse` command line utility to check
+what the AST looks like in the output.
+
+[source,sh]
+----
+$ gem install parser
+----
+
+And then try to parse a simple integer representation with `ruby-parse`:
+
+[source,sh]
+----
+$ ruby-parse -e '1'
+(int 1)
+----
+
+Each expression surrounded by parentheses represents a node in the AST. The first
+element is the node type and the tail contains the children with all
+information needed to represent the code.
+
+Here's another example - a local variable `name` being assigned the
+string value "John":
+
+[source,sh]
+----
+$ ruby-parse -e 'name = "John"'
+(lvasgn :name
+  (str "John"))
+----
+
+=== Inspecting the AST
+
+Let's imagine we want to simplify statements from `!array.empty?` to
+`array.any?`:
+
+First, check what the bad code returns in the Abstract Syntax Tree
+representation.
+
+[source,sh]
+----
+$ ruby-parse -e '!array.empty?'
+(send
+  (send
+    (send nil :array) :empty?) :!)
+----
+
+Now, it's time to debug our expression using the REPL from RuboCop:
+
+[source,sh]
+----
+$ bin/console
+----
+
+First we need to declare the code that we want to match, and use the
+https://www.rubydoc.info/gems/rubocop-ast/RuboCop/AST/ProcessedSource[ProcessedSource]
+that is a simple wrap to make the parser interpret the code and build the AST:
+
+[source,ruby]
+----
+code = '!something.empty?'
+source = RuboCop::ProcessedSource.new(code, RUBY_VERSION.to_f)
+node = source.ast
+# => s(:send, s(:send, s(:send, nil, :something), :empty?), :!)
+----
+
+The node has a few attributes that can be useful in the journey:
+
+[source,ruby]
+----
+node.type # => :send
+node.children # => [s(:send, s(:send, nil, :something), :empty?), :!]
+node.source # => "!something.empty?"
+----
+
+[[implementing-the-cop]]
+== Implementing the cop
+
+=== Writing node pattern rules
+
+TIP: You can write cops without using `NodePattern` (and many older cops don't use it), but it
+generally simplifies the code a lot, as manual node matching and destructuring can be
+quite verbose.
+
+Now that you're familiar with AST, you can learn a bit about the
+https://www.rubydoc.info/gems/rubocop-ast/RuboCop/AST/NodePattern[node pattern]
+and use patterns to match with specific nodes that you want to match.
+
+You can learn more about Node Pattern https://github.com/rubocop/rubocop-ast/blob/master/docs/modules/ROOT/pages/node_pattern.adoc[here].
+
+Alias `NodePattern` to `RuboCop::AST::NodePattern` to make it easier to use:
+
+[source,ruby]
+----
+NodePattern = RuboCop::AST::NodePattern
+----
+
+Node pattern matches something very similar to the current output from AST
+representation, then let's start with something very generic:
+
+[source,ruby]
+----
+NodePattern.new('send').match(node) # => true
+----
+
+It matches because the root is a `send` type. Now let's match it deeply using
+parentheses to define details for sub-nodes. If you don't care about what an internal
+node is, you can use `+...+` to skip it and just consider "a node".
+
+[source,ruby]
+----
+NodePattern.new('(send ...)').match(node) # => true
+NodePattern.new('(send (send ...) :!)').match(node) # => true
+NodePattern.new('(send (send (send ...) :empty?) :!)').match(node) # => true
+----
+
+Sometimes it's hard to comprehend complex expressions you're building with the
+pattern, then, if you got lost with the node pattern parens surrounding deeply,
+try to use the `$` to capture the internal expression and check exactly each
+piece of the expression:
+
+[source,ruby]
+----
+NodePattern.new('(send (send (send $...) :empty?) :!)').match(node) # => [nil, :something]
+----
+
+It's not needed to strictly receive a send in the internal node because maybe
+it can also be a literal array like:
+
+[source,ruby]
+----
+![].empty?
+----
+
+The code above has the following representation:
+
+[source,ruby]
+----
+=> s(:send, s(:send, s(:array), :empty?), :!)
+----
+
+It's possible to skip the internal node with `+...+` to make sure that it's just
+another internal node:
+
+[source,ruby]
+----
+NodePattern.new('(send (send (...) :empty?) :!)').match(node) # => true
+----
+
+In other words, it says: "Match code calling ``!<expression>.empty?``".
+
+Great! Now, let's implement our cop to simplify such statements:
+
+[source,sh]
+----
+$ rake 'new_cop[Style/SimplifyNotEmptyWithAny]'
+----
+
+After the cop scaffold is generated, change the node matcher to match with
+the expression achieved previously:
+
+[source,ruby]
+----
+def_node_matcher :not_empty_call?, <<~PATTERN
+  (send (send $(...) :empty?) :!)
+PATTERN
+----
+
+Note that we added a `$` sign to capture the "expression" in `!<expression>.empty?`,
+it will become useful later.
+
+Get yourself familiar with the AST node hooks that
+https://www.rubydoc.info/gems/parser/Parser/AST/Processor[`parser`]
+and https://www.rubydoc.info/gems/rubocop-ast/RuboCop/AST/Traversal[`rubocop-ast`]
+provide.
+
+As it starts with a `send` type, it's needed to implement the `on_send` method, as the
+cop scaffold already suggested:
+
+[source,ruby]
+----
+def on_send(node)
+  return unless not_empty_call?(node)
+
+  add_offense(node)
+end
+----
+
+The `on_send` callback is the most used and can be optimized by restricting the acceptable
+method names with a constant `RESTRICT_ON_SEND`.
+
+The final cop code will look something like this:
+
+[source,ruby]
+----
+module RuboCop
+  module Cop
+    module Style
+      # `array.any?` is a simplified way to say `!array.empty?`
+      #
+      # @example
+      #   # bad
+      #   !array.empty?
+      #
+      #   # good
+      #   array.any?
+      #
+      class SimplifyNotEmptyWithAny < Base
+        MSG = 'Use `.any?` and remove the negation part.'
+        RESTRICT_ON_SEND = [:!].freeze # optimization: don't call `on_send` unless
+                                       # the method name is in this list
+
+        def_node_matcher :not_empty_call?, <<~PATTERN
+          (send (send $(...) :empty?) :!)
+        PATTERN
+
+        def on_send(node)
+          return unless not_empty_call?(node)
+
+          add_offense(node)
+        end
+      end
+    end
+  end
+end
+----
+
+Callback ordering: `on_send` is called on a node _before_ the `on_<type>`
+callbacks for its children. There is also an `after_send` callback that runs
+_after_ children are processed. Every node type has a corresponding
+`after_<type>` callback (except types that never have children).
+
+Update the spec to cover the expected syntax:
+
+[source,ruby]
+----
+describe RuboCop::Cop::Style::SimplifyNotEmptyWithAny, :config do
+  it 'registers an offense when using `!a.empty?`' do
+    expect_offense(<<~RUBY)
+      !array.empty?
+      ^^^^^^^^^^^^^ Use `.any?` and remove the negation part.
+    RUBY
+  end
+
+  it 'does not register an offense when using `.any?` or `.empty?`' do
+    expect_no_offenses(<<~RUBY)
+      array.any?
+      array.empty?
+    RUBY
+  end
+end
+----
+
+If your code has variables of different lengths, you can use the following
+markers to format your template by passing the variables as keyword
+arguments:
+
+- `%{foo}`: Interpolates `foo`
+- `^{foo}`: Inserts `'^' * foo.size` for dynamic offense range length
+- `_{foo}`: Inserts `' ' * foo.size` for dynamic offense range indentation
+
+You can also abbreviate offense messages with `[...]`.
+
+[source,ruby]
+----
+%w[raise fail].each do |keyword|
+  expect_offense(<<~RUBY, keyword: keyword)
+    %{keyword}(RuntimeError, msg)
+    ^{keyword}^^^^^^^^^^^^^^^^^^^ Redundant `RuntimeError` argument [...]
+  RUBY
+
+%w[has_one has_many].each do |type|
+  expect_offense(<<~RUBY, type: type)
+    class Book
+      %{type} :chapter, foreign_key: 'book_id'
+      _{type}           ^^^^^^^^^^^^^^^^^^^^^^ Specifying the default [...]
+    end
+  RUBY
+end
+----
+
+[[autocorrect]]
+=== Autocorrect
+
+Autocorrect lets cops automatically fix the offenses they detect.
+It's necessary to `extend AutoCorrector`.
+The method `add_offense` yields a corrector object that is a thin wrapper on
+https://www.rubydoc.info/gems/parser/Parser/Source/TreeRewriter[parser's TreeRewriter]
+to which you can give instructions about what to do with the
+offensive node.
+
+Let's start with a simple spec to cover it:
+
+[source,ruby]
+----
+it 'corrects `!a.empty?`' do
+  expect_offense(<<~RUBY)
+    !array.empty?
+    ^^^^^^^^^^^^^ Use `.any?` and remove the negation part.
+  RUBY
+
+  expect_correction(<<~RUBY)
+    array.any?
+  RUBY
+end
+----
+
+And then add the autocorrecting block on the cop side:
+
+[source,ruby]
+----
+extend AutoCorrector
+
+def on_send(node)
+  expression = not_empty_call?(node)
+  return unless expression
+
+  add_offense(node) do |corrector|
+    corrector.replace(node, "#{expression.source}.any?")
+  end
+end
+----
+
+The corrector allows you to `insert_after`, `insert_before`, `wrap` or
+`replace` a specific node or in any specific range of the code.
+
+Range can be determined on `node.location` where it brings specific
+ranges for expression or other internal information that the node holds.
+
+==== Preventing clobbering
+
+The corrector detects and prevents correcting overlapping nodes, to prevent one correction from clobbering another.
+Supporting nested corrections is done by taking multiple passes, and skipping corrections for nested nodes.
+This can be implemented using the `IgnoredNode` module:
+
+[source,diff]
+----
+ extend AutoCorrector
++include IgnoredNode
+
+ def on_send(node)
+   return unless some_condition?(node)
+
+   add_offense(node) do |corrector|
++    next if part_of_ignored_node?(node)
++
+     corrector.replace(node, "...")
+   end
++
++  ignore_node(node)
+ end
+----
+
+This works because file correction is implemented by repeating investigation and correction until the file no longer requires correction, meaning all nested nodes will eventually be processed.
+
+Note that `expect_correction` in `Cop` specs asserts the result after all passes.
+
+=== Limit by Ruby or gem versions
+
+Some cops apply changes that only apply in particular contexts, such as if the user has a minimum Ruby version. There are helpers that let you constrain your cops automatically, to only run where applicable.
+
+==== Requiring a minimum Ruby version
+
+If your cop uses new Ruby syntax or standard library APIs, it should only register offenses if the user has the proper target Ruby version, which you can require with https://www.rubydoc.info/gems/rubocop/RuboCop/Cop/TargetRubyVersion#minimum_target_ruby_version-instance_method[`TargetRubyVersion#minimum_target_ruby_version`].
+
+For example, the `Performance/SelectMap` cop requires Ruby 2.7, which introduced `Enumerable#filter_map`:
+
+[source,ruby]
+----
+class RuboCop::Cop::Performance::SelectMap < Base
+  extend TargetRubyVersion
+
+  minimum_target_ruby_version 2.7
+
+  # ...
+end
+----
+
+This cop won't register offenses on Ruby 2.6 or older.
+
+==== Requiring a maximum Ruby version
+
+Mirroring `minimum_target_ruby_version`, you can also specify a maximum Ruby version your cop should analyze.
+
+For example, the `Lint/CircularArgumentReference` cop only runs when analyzing code for Ruby before 2.7. The code it looks for can never be written in more recent Rubies — it would be a syntax error:
+
+[source,ruby]
+----
+class RuboCop::Cop::Lint::CircularArgumentReference < Base
+  extend TargetRubyVersion
+
+  maximum_target_ruby_version 2.6
+
+  # ...
+end
+----
+
+==== Requiring a gem
+
+If your cop depends on the presence of a gem, you can declare that with https://www.rubydoc.info/gems/rubocop/RuboCop/Cop/Base#requires_gem-class_method[`RuboCop::Cop::Base.requires_gem`].
+
+For example, to declare that `MyCop` should only apply if the bundle is using `my-gem` with a version between `1.2.3` and `4.5.6`:
+
+[source,ruby]
+----
+class MyCop < Base
+  requires_gem "my-gem", ">= 1.2.3", "< 4.5.6"
+
+  # ...
+end
+----
+
+You can specify any gem requirement using https://guides.rubygems.org/patterns/#declaring-dependencies[the same syntax as your `Gemfile`].
+
+You can also handle multiple versions of a gem with `target_gem_version`. It behaves similarly to `target_ruby_version`, allowing you to inspect a gem version at runtime:
+
+[source,ruby]
+----
+class MyCop < Base
+  requires_gem "my-gem"
+
+  def on_send(node)
+    if target_gem_version("my-gem") < "2.0"
+      # ...
+    else
+      # ...
+    end
+  end
+end
+----
+
+When writing tests, you can specify the gem version to run your example against through the `gem_versions` RSpec helper:
+
+[source,ruby]
+----
+describe RuboCop::Cop::Style::MyCop, :config do
+  context 'when `my-gem` is at version `1.X`' do
+    let(:gem_versions) { { 'my-gem' => '1.0.0' } }
+
+    it 'registers no offense' do
+      expect_no_offenses(<<~RUBY)
+        MyGem.foo
+      RUBY
+    end
+  end
+
+  context 'when `my-gem` is at version `2.X`' do
+    let(:gem_versions) { { 'my-gem' => '2.0.0' } }
+
+    it 'registers an offense' do
+      expect_offense(<<~RUBY)
+        MyGem.foo
+        ^^^^^^^^^ Instead of `foo`, use the newer `bar` method.
+      RUBY
+    end
+  end
+end
+----
+
+[[honoring-a-target-version-setting]]
+==== Honoring a target version setting
+
+`requires_gem` reads the gem version from the bundle. An extension can also let users state the version of the gem that the inspected code targets, the way `rubocop-rails` does with `AllCops: TargetRailsVersion`, so that the gate works without a lockfile and an explicit setting takes precedence over the locked version.
+
+First declare the setting in the plugin's own configuration, so that it passes configuration validation (see xref:plugins.adoc#custom-allcops-settings[Custom `AllCops` Settings]):
+
+[source,yaml]
+----
+# config/default.yml in the plugin gem.
+AllCops:
+  TargetFrameworkVersion: ~
+----
+
+Then override `target_gem_version` for the gem. The requirements declared with `requires_gem` are checked against the version it returns, so the setting takes effect for every cop that carries the override:
+
+[source,ruby]
+----
+module RuboCop::Cop::TargetFrameworkVersion
+  TARGET_GEM_NAME = 'framework'
+
+  def self.extended(cop_class)
+    cop_class.include(InstanceMethods)
+  end
+
+  def minimum_target_framework_version(version)
+    requires_gem(TARGET_GEM_NAME, ">= #{version}")
+  end
+
+  module InstanceMethods
+    def target_gem_version(gem_name)
+      return super unless gem_name == TARGET_GEM_NAME
+
+      version = config.for_all_cops['TargetFrameworkVersion']
+      version ? Gem::Version.new(version.to_s) : super
+    end
+  end
+end
+
+class RuboCop::Cop::Framework::MyCop < RuboCop::Cop::Base
+  extend RuboCop::Cop::TargetFrameworkVersion
+
+  minimum_target_framework_version 6.0
+
+  # ...
+end
+----
+
+In specs, set the version through `all_cops_config`, or through `gem_versions` when the lockfile fallback is what you test:
+
+[source,ruby]
+----
+describe RuboCop::Cop::Framework::MyCop, :config do
+  context 'when the target framework version is 5.0' do
+    let(:all_cops_config) { super().merge('TargetFrameworkVersion' => 5.0) }
+
+    it 'registers no offense' do
+      expect_no_offenses(<<~RUBY)
+        Framework.foo
+      RUBY
+    end
+  end
+end
+----
+
+`rubocop-rails` resolves `TargetRailsVersion` the same way in https://github.com/rubocop/rubocop-rails/blob/master/lib/rubocop/cop/mixin/target_rails_version.rb[`RuboCop::Cop::TargetRailsVersion`].
+
+=== Configuration
+
+Each cop can hold a configuration and you can refer to `cop_config` in the
+instance and it will bring a hash with options declared in the `.rubocop.yml`
+file.
+
+For example, let's imagine we want to make the replacement method configurable,
+so it works with a method other than `.any?`:
+
+[source,yml]
+----
+Style/SimplifyNotEmptyWithAny:
+  Enabled: true
+  ReplaceAnyWith: "size > 0"
+----
+
+And then in the autocorrect method, you just need to use `cop_config`:
+
+[source,ruby]
+----
+def on_send(node)
+  expression = not_empty_call?(node)
+  return unless expression
+
+  add_offense(node) do |corrector|
+    replacement = cop_config['ReplaceAnyWith'] || 'any?'
+    corrector.replace(node, "#{expression.source}.#{replacement}")
+  end
+end
+----
+
+=== Shipping unstable behavior with `preview?`
+
+Making an existing cop report a case it used to miss, or correct one
+differently, changes results for every project that has the cop enabled. Such a
+change normally has to wait for a major release. `preview?` is the way to ship
+it sooner, to the projects that ask for it:
+
+[source,ruby]
+----
+def on_send(node)
+  return unless redundant_call?(node)
+  # Flagging the safe-navigation form is new; it is behind preview until we
+  # have heard from enough projects to make it the default.
+  return if node.csend_type? && !preview?
+
+  add_offense(node)
+end
+----
+
+The gate is on for projects running with `AllCops: Preview: true` or
+`--preview`, and off for everyone else. Cover both sides in the specs, since the
+stable path is the one most users are on:
+
+[source,ruby]
+----
+context 'when preview is enabled' do
+  let(:all_cops_config) { super().merge('Preview' => true) }
+
+  it 'registers an offense for the safe-navigation form' do
+    expect_offense(<<~RUBY)
+      foo&.bar
+      ^^^^^^^^ Remove the redundant call.
+    RUBY
+  end
+end
+----
+
+Reach for this only when the change is genuinely contested. A change that is
+plainly a bug fix should just ship, and a whole new cop belongs in `pending`
+instead. See xref:versioning.adoc#preview["Preview"] for the full rule and the
+lifecycle a preview change follows afterwards.
+
+A change to a cop's *defaults* does not need `preview?` at all. Give the cop's
+entry in `config/default.yml` a `Preview` section with the values it is expected
+to adopt in the next major release, and the configuration loader applies them
+under preview. `AllCops` can carry such a section too, for settings like
+`FailLevel`:
+
+[source,yaml]
+----
+Style/Documentation:
+  Enabled: true
+  Preview:
+    Enabled: false
+----
+
+The section is rendered in the cop's documentation as a "Preview defaults" table
+and never appears in the resolved configuration, so the cop itself reads its
+settings the same way whether preview is on or off.
+
+[[common-patterns]]
+== Common patterns
+
+This section covers conventions and patterns you should follow when writing cops.
+
+=== Handling safe navigation (`&.`)
+
+If your cop defines `on_send`, you should almost always also handle the
+safe navigation operator by aliasing `on_csend`:
+
+[source,ruby]
+----
+def on_send(node)
+  # ...
+end
+alias on_csend on_send
+----
+
+Without this, your cop will silently ignore code like `foo&.bar`. Only skip
+this if the cop explicitly does not apply to safe navigation.
+
+=== Handling numbered-parameter and `it`-parameter blocks
+
+Similarly, if your cop defines `on_block`, alias the numbered-parameter and
+`it`-parameter variants:
+
+[source,ruby]
+----
+def on_block(node)
+  # ...
+end
+alias on_numblock on_block
+alias on_itblock on_block
+----
+
+=== Using `RESTRICT_ON_SEND`
+
+When your cop uses `on_send`, define a `RESTRICT_ON_SEND` constant listing
+the method names the cop cares about. This is a performance optimization —
+RuboCop will skip calling `on_send` entirely for method names not in the list:
+
+[source,ruby]
+----
+RESTRICT_ON_SEND = %i[bad_method other_bad_method].freeze
+----
+
+=== Documenting node matchers with `@!method`
+
+Every `def_node_matcher` and `def_node_search` should have a `@!method`
+YARD tag above it so that documentation tools can find the generated method:
+
+[source,ruby]
+----
+# @!method not_empty_call?(node)
+def_node_matcher :not_empty_call?, <<~PATTERN
+  (send (send $(...) :empty?) :!)
+PATTERN
+----
+
+=== Writing node patterns that match what you mean
+
+A node pattern that is slightly off doesn't fail, it just matches less or more
+than it should. These are the mistakes that come up most often:
+
+* Aliasing `on_csend`, `on_numblock` or `on_defs` only gets the callback
+  called. The pattern has to accept those nodes too, so write `call` (for
+  `send` and `csend`), `any_block` (for `block`, `numblock` and `itblock`) and
+  `any_def` (for `def` and `defs`) unless you really mean one of them.
+  `any_block` only helps when the pattern doesn't spell out the block
+  parameters: a `numblock` has `1` and an `itblock` has `:it` where a `block`
+  has `(args ...)`.
+* Match a top-level constant with `(const {nil? cbase} :Foo)`. With `nil?` alone
+  the pattern misses `::Foo`, and with `_` it also matches `Bar::Foo`.
+* `nil?` matches a child that is missing, like the receiver of `foo(1)`. `nil`
+  matches the `nil` literal.
+* A `def_node_search` whose name doesn't end in `?` returns an enumerator when
+  it is called without a block, and an enumerator is always truthy. Give the
+  search a name that ends in `?`, or call `any?` on what it returns, before
+  using it as a condition.
+* A search runs its pattern on every descendant of the node. Use a matcher
+  when the node you already have is the one to check.
+* A union of literals like `{:first :last}` is compiled to a `Set` lookup
+  whatever its size, so move the names to a constant and use `%NAMES` when that
+  reads better, not to make the pattern faster.
+
+`InternalAffairs/InvalidNodePattern` reports patterns that can never match, for
+example a sequence with the wrong number of children for its node type, and
+`InternalAffairs/NodePatternGroups` suggests the node groups above.
+
+=== Declaring autocorrect support
+
+If your cop provides a corrector block inside `add_offense`, you must declare
+`extend AutoCorrector` at the top of the class. Without it, RuboCop won't
+know the cop supports autocorrection.
+
+[[running-tests]]
+== Running tests
+
+RuboCop supports two parser engines: the Parser gem and Prism. By default, tests are executed with the Parser:
+
+[source,sh]
+----
+$ bundle exec rake spec
+----
+
+To run all tests with Prism, use `bundle exec rake prism_spec`. To run a single spec file with Prism,
+set the `PARSER_ENGINE` environment variable:
+
+[source,sh]
+----
+$ PARSER_ENGINE=parser_prism bundle exec rspec spec/rubocop/cop/style/hash_syntax_spec.rb
+----
+
+The experimental `prism` engine has its own task, `bundle exec rake native_prism_spec`. It needs Prism 2,
+which Ruby LSP does not support yet, so install the bundle with the same variable set to leave Ruby LSP out:
+
+[source,sh]
+----
+$ PARSER_ENGINE=prism bundle install
+$ PARSER_ENGINE=prism bundle exec rake spec
+----
+
+`bundle exec rake` runs the full CI suite: specs for both parser engines, self-linting, and documentation checks. Always run this before submitting a PR.
+
+[[documentation]]
+== Documentation
+
+Every cop needs YARD documentation with examples directly in the source file.
+The CI `documentation_syntax_check` task parses every `@example` block, so all
+examples must contain valid Ruby syntax.
+
+Key rules:
+
+* The first line of the YARD comment must be a complete sentence starting with
+  a verb and ending with a period (e.g., "Checks for ...", "Enforces ...").
+* Every cop must have at least one `# bad` / `# good` example pair.
+* For each `SupportedStyle` or unique configuration key, add a separate
+  `@example` block.
+* Mark the default style with `(default)`.
+* List config keys in alphabetical order.
+
+[source,ruby]
+----
+module RuboCop
+  module Cop
+    module Style
+      # Simplifies `!array.empty?` to `array.any?`.
+      #
+      # @example EnforcedStyle: any? (default)
+      #   # bad
+      #   !array.empty?
+      #
+      #   # good
+      #   array.any?
+      #
+      # @example EnforcedStyle: size
+      #   # bad
+      #   !array.empty?
+      #
+      #   # good
+      #   array.size > 0
+      #
+      class SimplifyNotEmptyWithAny < Base
+        # ...
+----
+
+Add additional `@example` blocks following the same pattern for each style or
+config value.
+
+== Testing your cop in a real codebase
+
+It's generally good practice to check if your cop is working properly over a
+significant codebase (e.g. Rails or some big project you're working on) to
+guarantee it's working in a range of different syntaxes.
+
+There are several ways to do this. Two common approaches:
+
+. From within your local `rubocop` repo, run `exe/rubocop ~/your/other/codebase`.
+. From within the other codebase's `Gemfile`, set a path to your local repo like this: `gem 'rubocop', path: '/full/path/to/rubocop'`. Then run `rubocop` within your codebase.
+
+With approach #2, you can use local versions of RuboCop extension repos such as `rubocop-rspec` as well.
+
+TIP: Use `--only` to run just your cop and avoid noise from other cops:
+
+[source,sh]
+----
+$ rubocop --only Style/SimplifyNotEmptyWithAny
+----
+
+[[custom-formatters]]
+== Custom formatters
+
+Beyond cops, RuboCop can also be extended with custom output formatters.
+
+=== Creating a custom formatter
+
+To implement a custom formatter, you need to subclass
+`RuboCop::Formatter::BaseFormatter` and override some methods,
+or implement all formatter API methods by duck typing.
+
+Please see the documents below for more formatter API details.
+
+* https://www.rubydoc.info/gems/rubocop/RuboCop/Formatter/BaseFormatter[RuboCop::Formatter::BaseFormatter]
+* https://www.rubydoc.info/gems/rubocop/RuboCop/Cop/Offense[RuboCop::Cop::Offense]
+* https://www.rubydoc.info/gems/parser/Parser/Source/Range[Parser::Source::Range]
+
+=== Using a custom formatter from the command line
+
+You can tell RuboCop to use your custom formatter with a combination of
+`--format` and `--require` option.
+For example, when you have defined `MyCustomFormatter` in
+`./path/to/my_custom_formatter.rb`, you would type this command:
+
+[source,sh]
+----
+$ rubocop --require ./path/to/my_custom_formatter --format MyCustomFormatter
+----
+
+== Template support
+
+RuboCop can also analyze Ruby embedded in templates (ERB, Haml, Slim, etc.)
+through a Ruby extractor API.
+
+A template file contains multiple embedded Ruby snippets, unlike a regular
+Ruby file. RuboCop solves this with `RuboCop::Runner.ruby_extractors` — a
+list of callable extractors that plugins can prepend to.
+
+A Ruby extractor takes a `RuboCop::ProcessedSource` and returns either an
+`Array` of `Hash`-es containing extracted Ruby source and offsets, or `nil`
+if the file is not relevant.
+
+[source,ruby]
+----
+ruby_extractor.call(processed_source)
+----
+
+An example returned value from a Ruby extractor would be as follows:
+
+[source,ruby]
+----
+[
+  {
+    offset: 2,
+    processed_source: #<RuboCop::ProcessedSource>
+  },
+  {
+    offset: 10,
+    processed_source: #<RuboCop::ProcessedSource>
+  }
+]
+----
+
+On the extension side, the code would be something like this:
+
+[source,ruby]
+----
+RuboCop::Runner.ruby_extractors.unshift(ruby_extractor)
+----
+
+`RuboCop::Runner.ruby_extractors` is processed from the beginning and ends when one of them returns a non-nil value. By default, there is a Ruby extractor that returns the given Ruby source code with offset 0, so you can unshift any Ruby extractor before it.
+
+WARNING: This is still an experimental feature and may change in the future.

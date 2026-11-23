@@ -1,0 +1,892 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::Cop::Registry do
+  subject(:registry) { described_class.new(cops, options) }
+
+  let(:cops) do
+    [
+      RuboCop::Cop::Lint::BooleanSymbol,
+      RuboCop::Cop::Lint::DuplicateMethods,
+      RuboCop::Cop::Layout::FirstArrayElementIndentation,
+      RuboCop::Cop::Metrics::MethodLength,
+      RuboCop::Cop::RSpec::Foo,
+      RuboCop::Cop::Test::FirstArrayElementIndentation
+    ]
+  end
+
+  let(:options) { {} }
+
+  before do
+    stub_const('RuboCop::Cop::Test::FirstArrayElementIndentation', Class.new(RuboCop::Cop::Base))
+    stub_const('RuboCop::Cop::RSpec::Foo', Class.new(RuboCop::Cop::Base))
+  end
+
+  # `RuboCop::Cop::Base` mutates its `registry` when inherited from.
+  # This can introduce nondeterministic failures in other parts of the
+  # specs if this mutation occurs before code that depends on this global cop
+  # store. The workaround is to replace the global cop store with a temporary
+  # store during these tests
+  around { |test| described_class.with_temporary_global { test.run } }
+
+  it 'can be cloned' do
+    klass = RuboCop::Cop::Metrics::AbcSize
+    copy = registry.dup
+    copy.enlist(klass)
+    expect(copy.cops).to include(klass)
+    expect(registry.cops).not_to include(klass)
+  end
+
+  context 'when cloning a registry with lazy-loaded cops' do
+    before { registry.lazy_load('LazyLoad/Unresolvable', 'RuboCop::Cop::LazyLoad::Unresolvable') }
+
+    it 'preserves lazy-loaded cops without loading them' do
+      copy = registry.dup
+
+      expect(copy.names).to include('LazyLoad/Unresolvable')
+    end
+
+    it 'loads lazy-loaded cops in the copy independently of the source' do
+      stub_const('RuboCop::Cop::LazyLoad::Foo', Class.new(RuboCop::Cop::Base))
+      registry.lazy_load('LazyLoad/Foo', 'RuboCop::Cop::LazyLoad::Foo')
+      copy = registry.dup
+
+      expect(copy.find_by_cop_name('LazyLoad/Foo')).to eq(RuboCop::Cop::LazyLoad::Foo)
+      expect(registry.names).to include('LazyLoad/Foo')
+    end
+  end
+
+  context 'when dismissing a cop class' do
+    let(:cop_class) { RuboCop::Cop::Metrics::AbcSize }
+
+    before { registry.enlist(cop_class) }
+
+    it 'allows it if done rapidly' do
+      registry.dismiss(cop_class)
+      expect(registry.cops).not_to include(cop_class)
+    end
+
+    it 'disallows it if done too late' do
+      expect(registry.cops).to include(cop_class)
+      expect { registry.dismiss(cop_class) }.to raise_error(RuntimeError)
+    end
+
+    it 'allows re-listing' do
+      registry.dismiss(cop_class)
+      expect(registry.cops).not_to include(cop_class)
+      registry.enlist(cop_class)
+      expect(registry.cops).to include(cop_class)
+    end
+  end
+
+  context 'when dismissing a lazy-loaded cop class' do
+    before do
+      stub_const('RuboCop::Cop::LazyLoad::Foo', Class.new(RuboCop::Cop::Base))
+      registry.lazy_load('LazyLoad/Foo', 'RuboCop::Cop::LazyLoad::Foo')
+      registry.enlist(RuboCop::Cop::LazyLoad::Foo)
+    end
+
+    it 'removes the lazy registration as well' do
+      registry.dismiss(RuboCop::Cop::LazyLoad::Foo)
+
+      expect(registry.names).not_to include('LazyLoad/Foo')
+    end
+  end
+
+  it 'exposes cop departments' do
+    expect(registry.departments).to eql(%i[Lint Layout Metrics RSpec Test])
+  end
+
+  it 'can filter down to one type' do
+    expect(registry.with_department(:Lint)).to eq(described_class.new(cops.first(2)))
+  end
+
+  it 'can filter down to all but one type' do
+    expect(registry.without_department(:Lint)).to eq(described_class.new(cops.drop(2)))
+  end
+
+  context 'when filtering by department with lazy-loaded cops' do
+    before { registry.lazy_load('LazyLoad/Unresolvable', 'RuboCop::Cop::LazyLoad::Unresolvable') }
+
+    it 'keeps lazy-loaded cops unloaded' do
+      expect(registry.with_department(:LazyLoad).names).to eq(['LazyLoad/Unresolvable'])
+      expect(registry.without_department(:LazyLoad).names).not_to include('LazyLoad/Unresolvable')
+    end
+  end
+
+  describe '#contains_cop_matching?' do
+    it 'can find cops matching a given name' do
+      result = registry.contains_cop_matching?(['Test/FirstArrayElementIndentation'])
+      expect(result).to be(true)
+    end
+
+    it 'returns false for cops not included in the store' do
+      expect(registry).not_to be_contains_cop_matching(['Style/NotReal'])
+    end
+  end
+
+  describe '.qualified_cop?' do
+    context 'when two departments share a cop name' do
+      let(:cops) do
+        [
+          RuboCop::Cop::Rails::Output,
+          RuboCop::Cop::RSpec::Output
+        ]
+      end
+
+      before do
+        stub_const('RuboCop::Cop::Rails::Output', Class.new(RuboCop::Cop::Base))
+        stub_const('RuboCop::Cop::RSpec::Output', Class.new(RuboCop::Cop::Base))
+      end
+
+      it 'returns true for the department registered first' do
+        described_class.with_temporary_global(registry) do
+          expect(described_class).to be_qualified_cop('Rails/Output')
+        end
+      end
+
+      it 'returns true for the department registered later' do
+        described_class.with_temporary_global(registry) do
+          expect(described_class).to be_qualified_cop('RSpec/Output')
+        end
+      end
+    end
+
+    it 'returns false for an unregistered cop name' do
+      described_class.with_temporary_global(registry) do
+        expect(described_class).not_to be_qualified_cop('Style/NotReal')
+      end
+    end
+
+    it 'returns false for an unqualified cop name' do
+      described_class.with_temporary_global(registry) do
+        expect(described_class).not_to be_qualified_cop('MethodLength')
+      end
+    end
+  end
+
+  describe '#qualified_cop_name' do
+    let(:origin) { '/app/.rubocop.yml' }
+
+    it 'gives back already properly qualified names' do
+      result = registry.qualified_cop_name('Layout/FirstArrayElementIndentation', origin)
+      expect(result).to eql('Layout/FirstArrayElementIndentation')
+    end
+
+    it 'qualifies names without a namespace' do
+      warning = "/app/.rubocop.yml: Warning: no department given for MethodLength.\n"
+      qualified = nil
+
+      expect do
+        qualified = registry.qualified_cop_name('MethodLength', origin)
+      end.to output(warning).to_stderr
+
+      expect(qualified).to eql('Metrics/MethodLength')
+    end
+
+    it 'qualifies names with the correct namespace' do
+      warning = "/app/.rubocop.yml: Warning: no department given for Foo.\n"
+      qualified = nil
+
+      expect do
+        qualified = registry.qualified_cop_name('Foo', origin)
+      end.to output(warning).to_stderr
+
+      expect(qualified).to eql('RSpec/Foo')
+    end
+
+    it 'emits a warning when namespace is incorrect' do
+      warning = '/app/.rubocop.yml: Warning: Style/MethodLength has the wrong ' \
+                "namespace - replace it with Metrics/MethodLength\n"
+      qualified = nil
+
+      expect do
+        qualified = registry.qualified_cop_name('Style/MethodLength', origin)
+      end.to output(warning).to_stderr
+
+      expect(qualified).to eql('Metrics/MethodLength')
+    end
+
+    context 'when namespace correction is not wanted' do
+      it 'returns a wrongly-namespaced name as is, without a warning' do
+        qualified = nil
+
+        expect do
+          qualified = registry.qualified_cop_name('Style/MethodLength', origin,
+                                                  correct_namespace: false)
+        end.not_to output.to_stderr
+
+        expect(qualified).to eql('Style/MethodLength')
+      end
+
+      it 'still qualifies names without a namespace' do
+        warning = "/app/.rubocop.yml: Warning: no department given for MethodLength.\n"
+        qualified = nil
+
+        expect do
+          qualified = registry.qualified_cop_name('MethodLength', origin, correct_namespace: false)
+        end.to output(warning).to_stderr
+
+        expect(qualified).to eql('Metrics/MethodLength')
+      end
+    end
+
+    context 'when cops share the same class name' do
+      let(:cops) do
+        [
+          RuboCop::Cop::Test::SameNameInMultipleNamespace,
+          RuboCop::Cop::Test::Foo::SameNameInMultipleNamespace,
+          RuboCop::Cop::Test::Bar::SameNameInMultipleNamespace
+        ]
+      end
+
+      it 'raises an error when a cop name is ambiguous' do
+        cop_name = 'SameNameInMultipleNamespace'
+        expect { registry.qualified_cop_name(cop_name, origin) }
+          .to raise_error(RuboCop::Cop::AmbiguousCopName)
+          .with_message(
+            'Ambiguous cop name `SameNameInMultipleNamespace` used in ' \
+            '/app/.rubocop.yml needs department qualifier. Did you mean ' \
+            'Test/SameNameInMultipleNamespace or ' \
+            'Test/Foo/SameNameInMultipleNamespace or ' \
+            'Test/Bar/SameNameInMultipleNamespace?'
+          )
+          .and output('/app/.rubocop.yml: Warning: no department given for ' \
+                      "SameNameInMultipleNamespace.\n").to_stderr
+      end
+
+      it 'qualifies names when the cop is unambiguous' do
+        qualified = registry.qualified_cop_name('Test/SameNameInMultipleNamespace', origin)
+        expect(qualified).to eql('Test/SameNameInMultipleNamespace')
+      end
+    end
+
+    context 'when there are lazy-loaded cops' do
+      before do
+        stub_const('RuboCop::Cop::LazyLoad::Foo', Class.new(RuboCop::Cop::Base))
+        registry.lazy_load('LazyLoad/Foo', 'RuboCop::Cop::LazyLoad::Foo')
+      end
+
+      it 'returns the qualified cop name' do
+        result = registry.qualified_cop_name('LazyLoad/Foo', origin)
+        expect(result).to eql('LazyLoad/Foo')
+      end
+    end
+
+    it 'returns the provided name if no namespace is found' do
+      expect(registry.qualified_cop_name('NotReal', origin)).to eql('NotReal')
+    end
+  end
+
+  describe '#to_h' do
+    it 'exposes a mapping of cop names to cop classes' do
+      expect(registry.to_h).to eql(
+        'Lint/BooleanSymbol' => [RuboCop::Cop::Lint::BooleanSymbol],
+        'Lint/DuplicateMethods' => [RuboCop::Cop::Lint::DuplicateMethods],
+        'Layout/FirstArrayElementIndentation' => [
+          RuboCop::Cop::Layout::FirstArrayElementIndentation
+        ],
+        'Metrics/MethodLength' => [RuboCop::Cop::Metrics::MethodLength],
+        'Test/FirstArrayElementIndentation' => [
+          RuboCop::Cop::Test::FirstArrayElementIndentation
+        ],
+        'RSpec/Foo' => [RuboCop::Cop::RSpec::Foo]
+      )
+    end
+
+    context 'when there are lazy-loaded cops' do
+      before do
+        stub_const('RuboCop::Cop::LazyLoad::Foo', Class.new(RuboCop::Cop::Base))
+        registry.lazy_load('LazyLoad/Foo', 'RuboCop::Cop::LazyLoad::Foo')
+      end
+
+      it 'loads them' do
+        expect(registry.to_h['LazyLoad/Foo']).to eq([RuboCop::Cop::LazyLoad::Foo])
+      end
+    end
+  end
+
+  describe '#cops' do
+    it 'exposes a list of cops' do
+      expect(registry.cops).to eql(cops)
+    end
+
+    context 'with cops having the same inner-most module' do
+      let(:cops) { [RuboCop::Cop::Foo::Bar, RuboCop::Cop::Baz::Foo::Bar] }
+
+      before do
+        stub_const('RuboCop::Cop::Foo::Bar', Class.new(RuboCop::Cop::Base))
+        stub_const('RuboCop::Cop::Baz::Foo::Bar', Class.new(RuboCop::Cop::Base))
+      end
+
+      it 'exposes both cops' do
+        expect(registry.cops).to contain_exactly(
+          RuboCop::Cop::Foo::Bar, RuboCop::Cop::Baz::Foo::Bar
+        )
+      end
+    end
+
+    context 'when there are lazy-loaded cops' do
+      before do
+        stub_const('RuboCop::Cop::LazyLoad::Foo', Class.new(RuboCop::Cop::Base))
+        registry.lazy_load('LazyLoad/Foo', 'RuboCop::Cop::LazyLoad::Foo')
+      end
+
+      it 'includes them in the list' do
+        expect(registry.cops).to include(RuboCop::Cop::LazyLoad::Foo)
+      end
+    end
+  end
+
+  describe '#length' do
+    it 'exposes the number of stored cops' do
+      expect(registry.length).to be(6)
+    end
+
+    context 'when there are lazy-loaded cops' do
+      before do
+        stub_const('RuboCop::Cop::LazyLoad::Foo', Class.new(RuboCop::Cop::Base))
+        registry.lazy_load('LazyLoad/Foo', 'RuboCop::Cop::LazyLoad::Foo')
+      end
+
+      it 'includes them' do
+        expect(registry.length).to be(7)
+      end
+    end
+
+    context 'when a lazy-loaded cop is also enlisted directly' do
+      before do
+        stub_const('RuboCop::Cop::LazyLoad::Foo', Class.new(RuboCop::Cop::Base))
+        registry.lazy_load('LazyLoad/Foo', 'RuboCop::Cop::LazyLoad::Foo')
+        registry.enlist(RuboCop::Cop::LazyLoad::Foo)
+      end
+
+      it 'does not count the cop twice' do
+        expect(registry.length).to be(7)
+      end
+    end
+  end
+
+  describe '#enabled' do
+    subject(:enabled_cops) { registry.enabled(config) }
+
+    let(:config) do
+      RuboCop::Config.new(
+        'Test/FirstArrayElementIndentation' => { 'Enabled' => false },
+        'RSpec/Foo' => { 'Safe' => false }
+      )
+    end
+
+    it 'selects cops which are enabled in the config' do
+      expect(registry.enabled(config)).to eql(cops.first(5))
+    end
+
+    it 'overrides config if :only includes the cop' do
+      options[:only] = ['Test/FirstArrayElementIndentation']
+      expect(enabled_cops).to eql(cops)
+    end
+
+    it 'selects only safe cops if :safe passed' do
+      options[:safe] = true
+      expect(enabled_cops).not_to include(RuboCop::Cop::RSpec::Foo)
+    end
+
+    context 'when a cop is in preview' do
+      let(:config) { RuboCop::Config.new('Lint/BooleanSymbol' => { 'Enabled' => 'preview' }) }
+
+      it 'does not include them' do
+        expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+      end
+
+      context 'when specifying the `--preview` command-line option' do
+        let(:options) { { preview: true } }
+
+        it 'includes them' do
+          expect(enabled_cops).to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+      end
+
+      context 'when specifying `Preview: true` in .rubocop.yml' do
+        let(:config) do
+          RuboCop::Config.new(
+            'AllCops' => { 'Preview' => true },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'preview' }
+          )
+        end
+
+        it 'includes them' do
+          expect(enabled_cops).to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+
+        context 'when specifying the `--no-preview` command-line option' do
+          let(:options) { { preview: false } }
+
+          it 'does not include them' do
+            expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+          end
+        end
+      end
+    end
+
+    context 'when new cops are introduced' do
+      let(:config) { RuboCop::Config.new('Lint/BooleanSymbol' => { 'Enabled' => 'pending' }) }
+
+      it 'does not include them' do
+        expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+      end
+
+      it 'overrides config if :only includes the cop' do
+        options[:only] = ['Lint/BooleanSymbol']
+        expect(enabled_cops).to eql(cops)
+      end
+
+      context 'when specifying `--disable-pending-cops` command-line option' do
+        let(:options) { { disable_pending_cops: true } }
+
+        it 'does not include them' do
+          expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+
+        context 'when specifying `NewCops: enable` option in .rubocop.yml' do
+          let(:config) do
+            RuboCop::Config.new(
+              'AllCops' => { 'NewCops' => 'enable' },
+              'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+            )
+          end
+
+          it 'does not include them because command-line option takes ' \
+             'precedence over .rubocop.yml' do
+            expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+          end
+        end
+      end
+
+      context 'when specifying `--enable-pending-cops` command-line option' do
+        let(:options) { { enable_pending_cops: true } }
+
+        it 'includes them' do
+          expect(enabled_cops).to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+
+        context 'when specifying `NewCops: disable` option in .rubocop.yml' do
+          let(:config) do
+            RuboCop::Config.new(
+              'AllCops' => { 'NewCops' => 'disable' },
+              'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+            )
+          end
+
+          it 'includes them because command-line option takes precedence over .rubocop.yml' do
+            expect(enabled_cops).to include(RuboCop::Cop::Lint::BooleanSymbol)
+          end
+        end
+      end
+
+      context 'when specifying `NewCops: pending` option in .rubocop.yml' do
+        let(:config) do
+          RuboCop::Config.new(
+            'AllCops' => { 'NewCops' => 'pending' },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+          )
+        end
+
+        it 'does not include them' do
+          expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+      end
+
+      context 'when specifying `NewCops: disable` option in .rubocop.yml' do
+        let(:config) do
+          RuboCop::Config.new(
+            'AllCops' => { 'NewCops' => 'disable' },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+          )
+        end
+
+        it 'does not include them' do
+          expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+      end
+
+      context 'when specifying `NewCops: enable` option in .rubocop.yml' do
+        let(:config) do
+          RuboCop::Config.new(
+            'AllCops' => { 'NewCops' => 'enable' },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+          )
+        end
+
+        it 'includes them' do
+          expect(enabled_cops).to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+      end
+
+      context 'when specifying `NewCops: enable` option for a department in .rubocop.yml' do
+        let(:config) do
+          RuboCop::Config.new(
+            'Lint' => { 'NewCops' => 'enable' },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+          )
+        end
+
+        it 'includes them' do
+          expect(enabled_cops).to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+      end
+
+      context 'when specifying `NewCops: enable` option for another department in .rubocop.yml' do
+        let(:config) do
+          RuboCop::Config.new(
+            'Style' => { 'NewCops' => 'enable' },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+          )
+        end
+
+        it 'does not include them' do
+          expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+      end
+
+      context 'when specifying `NewCops: disable` option for a department and ' \
+              '`NewCops: enable` option for `AllCops` in .rubocop.yml' do
+        let(:config) do
+          RuboCop::Config.new(
+            'AllCops' => { 'NewCops' => 'enable' },
+            'Lint' => { 'NewCops' => 'disable' },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+          )
+        end
+
+        it 'does not include them because the department takes precedence over `AllCops`' do
+          expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+      end
+
+      context 'when specifying `NewCops: enable` option for a department and `NewCops: disable` option for `AllCops` in .rubocop.yml' do
+        let(:config) do
+          RuboCop::Config.new(
+            'AllCops' => { 'NewCops' => 'disable' },
+            'Lint' => { 'NewCops' => 'enable' },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+          )
+        end
+
+        it 'includes them because the department takes precedence over `AllCops`' do
+          expect(enabled_cops).to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+      end
+
+      context 'when specifying `NewCops: pending` option for a department and `NewCops: enable` option for `AllCops` in .rubocop.yml' do
+        let(:config) do
+          RuboCop::Config.new(
+            'AllCops' => { 'NewCops' => 'enable' },
+            'Lint' => { 'NewCops' => 'pending' },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+          )
+        end
+
+        it 'does not include them because the department takes precedence over `AllCops`' do
+          expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+      end
+
+      context 'when specifying a version for `NewCops` option for a department in .rubocop.yml' do
+        let(:config) do
+          RuboCop::Config.new(
+            'Lint' => { 'NewCops' => '0.90' },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'pending', 'VersionAdded' => version_added }
+          )
+        end
+
+        context 'when the cop was added before the specified version' do
+          let(:version_added) { '0.89' }
+
+          it 'includes them' do
+            expect(enabled_cops).to include(RuboCop::Cop::Lint::BooleanSymbol)
+          end
+        end
+
+        context 'when the cop was added in the specified version' do
+          let(:version_added) { '0.90' }
+
+          it 'includes them' do
+            expect(enabled_cops).to include(RuboCop::Cop::Lint::BooleanSymbol)
+          end
+        end
+
+        context 'when the cop was added after the specified version' do
+          let(:version_added) { '0.91' }
+
+          it 'does not include them' do
+            expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+          end
+        end
+
+        context 'when the cop has `VersionAdded: N/A`' do
+          let(:version_added) { 'N/A' }
+
+          it 'does not include them' do
+            expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+          end
+        end
+
+        context 'when the cop has `VersionAdded: <<next>>`' do
+          let(:version_added) { '<<next>>' }
+
+          it 'does not include them' do
+            expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+          end
+        end
+
+        context 'when the cop has no `VersionAdded`' do
+          let(:config) do
+            RuboCop::Config.new(
+              'Lint' => { 'NewCops' => '0.90' },
+              'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+            )
+          end
+
+          it 'does not include them' do
+            expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+          end
+        end
+      end
+
+      context 'when specifying a version as an unquoted YAML value for `NewCops` option for a department in .rubocop.yml' do
+        let(:config) do
+          RuboCop::Config.new(
+            'Lint' => { 'NewCops' => 1.19 },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'pending', 'VersionAdded' => '1.19' }
+          )
+        end
+
+        it 'includes them' do
+          expect(enabled_cops).to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+      end
+
+      context 'when specifying `--disable-pending-cops` command-line option and `NewCops: enable` option for a department in .rubocop.yml' do
+        let(:options) { { disable_pending_cops: true } }
+        let(:config) do
+          RuboCop::Config.new(
+            'Lint' => { 'NewCops' => 'enable' },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+          )
+        end
+
+        it 'does not include them because command-line option takes precedence over .rubocop.yml' do
+          expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+      end
+
+      context 'when specifying `--enable-pending-cops` command-line option and ' \
+              '`NewCops: disable` option for a department in .rubocop.yml' do
+        let(:options) { { enable_pending_cops: true } }
+        let(:config) do
+          RuboCop::Config.new(
+            'Lint' => { 'NewCops' => 'disable' },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+          )
+        end
+
+        it 'includes them because command-line option takes precedence over .rubocop.yml' do
+          expect(enabled_cops).to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+      end
+
+      context 'when specifying `Enabled: false` and `NewCops: enable` options ' \
+              'for a department in .rubocop.yml' do
+        let(:config) do
+          RuboCop::Config.new(
+            'Lint' => { 'Enabled' => false, 'NewCops' => 'enable' },
+            'Lint/BooleanSymbol' => { 'Enabled' => 'pending' }
+          )
+        end
+
+        it 'does not include them because `Enabled: false` takes precedence' do
+          expect(enabled_cops).not_to include(RuboCop::Cop::Lint::BooleanSymbol)
+        end
+      end
+    end
+
+    context 'when there are lazy-loaded cops' do
+      let(:config) do
+        RuboCop::Config.new('LazyLoad/Unresolvable' => { 'Enabled' => false })
+      end
+
+      before do
+        stub_const('RuboCop::Cop::LazyLoad::Foo', Class.new(RuboCop::Cop::Base))
+        registry.lazy_load('LazyLoad/Foo', 'RuboCop::Cop::LazyLoad::Foo')
+        registry.lazy_load('LazyLoad/Unresolvable', 'RuboCop::Cop::LazyLoad::Unresolvable')
+      end
+
+      it 'loads only the enabled cops' do
+        expect(enabled_cops).to include(RuboCop::Cop::LazyLoad::Foo)
+      end
+    end
+  end
+
+  describe '#disabled_names' do
+    let(:config) do
+      RuboCop::Config.new('LazyLoad/Unresolvable' => { 'Enabled' => false })
+    end
+
+    before { registry.lazy_load('LazyLoad/Unresolvable', 'RuboCop::Cop::LazyLoad::Unresolvable') }
+
+    it 'returns the disabled cop names without loading lazy-loaded cops' do
+      expect(registry.disabled_names(config)).to eq(['LazyLoad/Unresolvable'])
+    end
+  end
+
+  describe '#names' do
+    it 'exposes a list of cop names' do
+      expect(registry.names).to eql(
+        [
+          'Lint/BooleanSymbol',
+          'Lint/DuplicateMethods',
+          'Layout/FirstArrayElementIndentation',
+          'Metrics/MethodLength',
+          'RSpec/Foo',
+          'Test/FirstArrayElementIndentation'
+        ]
+      )
+    end
+
+    context 'when there are lazy-loaded cops' do
+      before do
+        stub_const('RuboCop::Cop::LazyLoad::Foo', Class.new(RuboCop::Cop::Base))
+        registry.lazy_load('LazyLoad/Foo', 'RuboCop::Cop::LazyLoad::Foo')
+      end
+
+      it 'includes them in the list' do
+        expect(registry.names).to include('LazyLoad/Foo')
+      end
+    end
+  end
+
+  describe '#department?' do
+    it 'returns true for department name' do
+      expect(registry).to be_department('Lint')
+    end
+
+    it 'returns false for other names' do
+      expect(registry).not_to be_department('Foo')
+    end
+  end
+
+  describe 'names_for_department' do
+    it 'returns array of cops for specified department' do
+      expect(registry.names_for_department('Lint'))
+        .to eq %w[Lint/BooleanSymbol Lint/DuplicateMethods]
+    end
+
+    context 'when there are lazy-loaded cops' do
+      before { registry.lazy_load('LazyLoad/Unresolvable', 'RuboCop::Cop::LazyLoad::Unresolvable') }
+
+      it 'includes them without loading them' do
+        expect(registry.names_for_department('LazyLoad')).to eq(['LazyLoad/Unresolvable'])
+      end
+    end
+  end
+
+  describe '#find_by_cop_name' do
+    it 'returns cop class when it exists in the registry' do
+      expect(registry.find_by_cop_name('Lint/BooleanSymbol')).to eq(RuboCop::Cop::Lint::BooleanSymbol)
+    end
+
+    it 'returns nil when it does not exist in the registry' do
+      expect(registry.find_by_cop_name('Foo/Bar')).to be_nil
+    end
+
+    context 'when the cop is lazy-loaded' do
+      before do
+        stub_const('RuboCop::Cop::LazyLoad::Foo', Class.new(RuboCop::Cop::Base))
+        registry.lazy_load('LazyLoad/Foo', 'RuboCop::Cop::LazyLoad::Foo')
+      end
+
+      it 'loads it' do
+        expect(registry.find_by_cop_name('LazyLoad/Foo')).to eq(RuboCop::Cop::LazyLoad::Foo)
+      end
+    end
+
+    context 'when a lazy-loaded cop excludes itself from the global registry' do
+      it 'does not register the cop' do
+        described_class.with_temporary_global(registry) do
+          stub_const('RuboCop::Cop::LazyLoad::Foo', Class.new(RuboCop::Cop::Base))
+          RuboCop::Cop::LazyLoad::Foo.exclude_from_registry
+          registry.lazy_load('LazyLoad/Foo', 'RuboCop::Cop::LazyLoad::Foo')
+
+          expect(registry.find_by_cop_name('LazyLoad/Foo')).to be_nil
+          expect(registry.names).not_to include('LazyLoad/Foo')
+        end
+      end
+    end
+  end
+
+  describe '#unqualified_cop_names' do
+    it 'returns a set of cop names without the department' do
+      expect(registry.unqualified_cop_names).to eq(Set[
+        'BooleanSymbol', 'DuplicateMethods', 'FirstArrayElementIndentation', 'MethodLength',
+        'Foo', 'RedundantCopDisableDirective'
+     ])
+    end
+
+    context 'when there are lazy-loaded cops' do
+      before do
+        stub_const('RuboCop::Cop::LazyLoad::LazyLoadedCop', Class.new(RuboCop::Cop::Base))
+        registry.lazy_load('LazyLoad/LazyLoadedCop', 'RuboCop::Cop::LazyLoad::LazyLoadedCop')
+      end
+
+      it 'includes them' do
+        expect(registry.unqualified_cop_names).to include('LazyLoadedCop')
+      end
+    end
+  end
+
+  describe '#lazy_load' do
+    before do
+      stub_const('RuboCop::Cop::LazyLoad::Foo', Class.new(RuboCop::Cop::Base))
+    end
+
+    it 'adds lazy-loaded cop to departments' do
+      expect do
+        registry.lazy_load('LazyLoad/Foo', 'RuboCop::Cop::LazyLoad::Foo')
+      end.to change { registry.departments.include?(:LazyLoad) }.from(false).to(true)
+    end
+
+    it 'accepts a badge' do
+      badge = RuboCop::Cop::Badge.for('RuboCop::Cop::LazyLoad::Foo')
+      registry.lazy_load(badge, 'RuboCop::Cop::LazyLoad::Foo')
+
+      expect(registry.names).to include('LazyLoad/Foo')
+      expect(registry.find_by_cop_name('LazyLoad/Foo')).to eq(RuboCop::Cop::LazyLoad::Foo)
+    end
+  end
+
+  describe '#sort!' do
+    it 'sorts the cops by cop name' do
+      expected_order = cops.sort_by { |cop| cop.badge.cop_name }
+
+      expect(cops).not_to eq(expected_order)
+
+      expect do
+        registry.sort!
+      end.to change(registry, :cops).from(cops).to(expected_order)
+    end
+
+    context 'when there are lazy-loaded cops' do
+      before do
+        stub_const('RuboCop::Cop::LazyLoad::Foo', Class.new(RuboCop::Cop::Base))
+        registry.lazy_load('LazyLoad/Foo', 'RuboCop::Cop::LazyLoad::Foo')
+      end
+
+      it 'loads them' do
+        expected_order = (cops + [RuboCop::Cop::LazyLoad::Foo]).sort_by { |cop| cop.badge.cop_name }
+
+        expect do
+          registry.sort!
+        end.to change(registry, :cops).to(expected_order)
+      end
+    end
+  end
+end

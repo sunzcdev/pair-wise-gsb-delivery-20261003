@@ -1,0 +1,95 @@
+= MCP (Model Context Protocol)
+
+NOTE: The built-in MCP server was introduced in RuboCop 1.85.
+
+WARNING: This feature is experimental and should not be considered stable. Changes to its behavior or interface may occur.
+
+https://modelcontextprotocol.io/[Model Context Protocol] is an open-source standard for connecting AI applications to external systems.
+
+This feature enables interactions through MCP clients that communicate with RuboCop via the Model Context Protocol.
+
+Through MCP, RuboCop operations are initiated by an MCP client, with decisions made by an LLM.
+
+The MCP server runs as a long-lived process over stdio, allowing an MCP client to request analysis and autocorrection without spawning a new RuboCop process for each request.
+This is based on the same principles as xref:usage/server.adoc[Server Mode] and xref:usage/lsp.adoc[LSP].
+
+== Setup
+
+The `mcp` gem is required but is not included as a dependency of RuboCop. You must install it separately.
+
+If you use Bundler, add the following to your `Gemfile`:
+
+[source,ruby]
+----
+gem 'mcp'
+----
+
+Then run:
+
+[source,console]
+----
+$ bundle install
+----
+
+If you do not use Bundler:
+
+[source,console]
+----
+$ gem install mcp
+----
+
+== Available Tools
+
+The MCP server exposes these tools:
+
+`rubocop_inspection`::
+Inspect Ruby code for offenses. Accepts a `path` to check files on disk or `source_code` to check inline code. Each offense is reported the way xref:formatters.adoc#json-formatter[`--format json`] reports it, with 1-based lines and columns and the edits its correction would make. Either way the result has the same `files` and `summary`: inline code is reported as a single file, named after `path` when one is given and `example.rb` otherwise. An optional `max_offenses_per_cop` caps how many offenses each cop reports across the files inspected, as xref:usage/cli_reference.adoc[`--max-offenses-per-cop`] does, and the summary's `unreported_offenses` counts what each capped cop left out. A file missing from `files` under a cap can still have offenses; they were just counted rather than listed. A cop that crashes on a file does not fail the request: the crash is listed in that file's `errors`, counted in the summary's `error_count`, and the other cops still report. Warnings a cop raises are listed the same way, under `warnings` and `warning_count`.
+
+`rubocop_autocorrection`::
+Autocorrect RuboCop offenses in Ruby code. Accepts `path` or `source_code` like the inspection tool, plus a required `safety` boolean. When `safety` is `true`, only safe corrections are applied; set it to `false` to include unsafe corrections. Setting `contextual` to `true` also applies the corrections held back while code is being edited, described below. With `dry_run` set to `true` nothing is written: each file that would be corrected comes with the `diff` that would be applied, and the offenses left over are located in the code as it would be after it.
++
+When correcting files, the result lists each file that was corrected or still has offenses, with the offenses left over in the inspection tool's format, located in the corrected file. Those are what an agent has to fix itself, so it doesn't need to inspect again. They come back after the files are written, so each cop lists at most five of them unless `max_offenses_per_cop` says otherwise, and the summary's `unreported_offenses` counts the rest. Files with nothing to report are only counted, and a file with nothing to correct isn't written.
++
+A cop that crashes while correcting a file is listed in its `errors` and the other cops' corrections are still applied. A file whose corrections go back and forth between cops is left unchanged, with the loop listed in its `errors` and the offenses it still has. Inline `source_code` comes back as plain corrected text, so a crash there fails the call instead and nothing is written.
+
+`rubocop_explain`::
+Explain what cops do, the way xref:usage/cli_reference.adoc[`--explain`] does: the description, the bad and good examples from the cop's own documentation, its configuration as the project resolves it, and whether it autocorrects. Takes a `cop_names` list, plus an optional `path` to explain the configuration that applies to that file, which can differ from the project root's. An agent can ask about the cops an inspection reported instead of guessing their intent from a one-line message.
+
+An inspected offense tells an agent what autocorrection will do with it. `correctable` says whether `rubocop_autocorrection` fixes it at all, and `correction.safe` whether that takes `safety: false`. An offense can carry a `correction` without being `correctable`: cops with `AutoCorrect: contextual`, such as `Lint/UselessAssignment`, are not corrected while code is being edited, since the variable may be about to be used. Their edits are still reported, and an agent that has finished editing can have them applied by passing `contextual: true` to `rubocop_autocorrection`. xref:formatters.adoc#corrections[Corrections] covers what to watch for when applying edits directly.
+
+Both `rubocop_inspection` and `rubocop_autocorrection` can narrow what they do, the way the matching command-line options do. `only` and `except` take lists of cop or department names, as xref:usage/cli_reference.adoc[`--only` and `--except`] do, so an agent can check just `Lint`, or apply a single cop's corrections. When checking files, `changed` sticks to the files git says changed, like `--changed`: `true` for changes since the last commit, or a revision to compare against, such as `main`.
+
+== Client Configuration
+
+For a list of tools that support MCP, see https://modelcontextprotocol.io/clients[MCP Clients].
+
+=== Claude Code
+
+[source,console]
+----
+$ claude mcp add rubocop -- bundle exec rubocop --mcp
+----
+
+=== JSON Configuration
+
+Many MCP clients (e.g. VS Code, Cursor, Windsurf) accept a JSON configuration file. The exact file path varies by client -- consult your client's documentation.
+
+[source,json]
+----
+{
+  "mcpServers": {
+    "rubocop": {
+      "type": "stdio",
+      "command": "bundle",
+      "args": [
+        "exec",
+        "rubocop",
+        "--mcp"
+      ],
+      "cwd": "/path/to/your/project"
+    }
+  }
+}
+----
+
+NOTE: `rubocop --mcp` starts the MCP server and is intended to be invoked by an MCP client, not run manually by users.

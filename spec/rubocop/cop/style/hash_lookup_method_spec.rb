@@ -1,0 +1,395 @@
+# frozen_string_literal: true
+
+RSpec.describe RuboCop::Cop::Style::HashLookupMethod, :config do
+  context 'with EnforcedStyle: brackets (default)' do
+    let(:cop_config) { { 'EnforcedStyle' => 'brackets' } }
+
+    it 'registers an offense for fetch with one argument' do
+      expect_offense(<<~RUBY)
+        hash.fetch(key)
+             ^^^^^ Use `Hash#[]` instead of `Hash#fetch`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        hash[key]
+      RUBY
+    end
+
+    it 'registers an offense for fetch with one argument and receiver chain' do
+      expect_offense(<<~RUBY)
+        some_method.hash.fetch(key)
+                         ^^^^^ Use `Hash#[]` instead of `Hash#fetch`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        some_method.hash[key]
+      RUBY
+    end
+
+    it 'registers an offense for fetch with a leading dot on its own line' do
+      expect_offense(<<~RUBY)
+        do_something(
+          hash
+            .fetch(key)
+             ^^^^^ Use `Hash#[]` instead of `Hash#fetch`.
+        )
+      RUBY
+
+      expect_correction(<<~RUBY)
+        do_something(
+          hash[key]
+        )
+      RUBY
+    end
+
+    it 'does not register an offense for fetch with a comment before a leading dot' do
+      expect_no_offenses(<<~RUBY)
+        do_something(
+          hash # comment
+            .fetch(key)
+        )
+      RUBY
+    end
+
+    it 'accepts bracket access' do
+      expect_no_offenses('hash[key]')
+    end
+
+    it 'registers an offense for chained fetch calls without raising a clobbering error' do
+      expect_offense(<<~RUBY)
+        result.fetch(:foo).fetch(:bar)
+               ^^^^^ Use `Hash#[]` instead of `Hash#fetch`.
+                           ^^^^^ Use `Hash#[]` instead of `Hash#fetch`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        result[:foo][:bar]
+      RUBY
+    end
+
+    it 'accepts fetch with default value' do
+      expect_no_offenses('hash.fetch(key, default)')
+    end
+
+    it 'accepts fetch with block' do
+      expect_no_offenses('hash.fetch(key) { default }')
+    end
+
+    it 'accepts fetch with argument forwarding', :ruby27 do
+      expect_no_offenses(<<~RUBY)
+        def do_something(...)
+          hash.fetch(...)
+        end
+      RUBY
+    end
+
+    it 'accepts fetch with anonymous rest argument forwarding', :ruby32 do
+      expect_no_offenses(<<~RUBY)
+        def do_something(*)
+          hash.fetch(*)
+        end
+      RUBY
+    end
+
+    it 'accepts fetch with anonymous keyword rest argument forwarding', :ruby32 do
+      expect_no_offenses(<<~RUBY)
+        def do_something(**)
+          hash.fetch(**)
+        end
+      RUBY
+    end
+
+    it 'accepts fetch with anonymous block argument forwarding', :ruby31 do
+      expect_no_offenses(<<~RUBY)
+        def do_something(&)
+          hash.fetch(&)
+        end
+      RUBY
+    end
+
+    it 'accepts fetch with a splat argument' do
+      expect_no_offenses('hash.fetch(*args)')
+    end
+
+    it 'accepts fetch with a double splat argument' do
+      expect_no_offenses('hash.fetch(**options)')
+    end
+
+    it 'accepts fetch with a block argument' do
+      expect_no_offenses('hash.fetch(&block)')
+    end
+
+    it 'registers an offense when using fetch with a hash literal key containing a double splat' do
+      expect_offense(<<~RUBY)
+        hash.fetch({ **options })
+             ^^^^^ Use `Hash#[]` instead of `Hash#fetch`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        hash[{ **options }]
+      RUBY
+    end
+
+    it 'accepts `fetch` without receiver' do
+      expect_no_offenses('fetch(key)')
+    end
+
+    it 'accepts `fetch` without receiver and with block' do
+      expect_no_offenses('fetch(key) { default }')
+    end
+
+    context 'when `Style/FetchEnvVar` is enabled' do
+      let(:other_cops) { { 'Style/FetchEnvVar' => { 'Enabled' => true } } }
+
+      it 'accepts `ENV.fetch` with one argument' do
+        expect_no_offenses(<<~RUBY)
+          ENV.fetch(key)
+          ::ENV.fetch(key)
+        RUBY
+      end
+    end
+
+    context 'when `Style/FetchEnvVar` is pending' do
+      let(:other_cops) { { 'Style/FetchEnvVar' => { 'Enabled' => 'pending' } } }
+
+      it 'registers an offense for `ENV.fetch` with one argument' do
+        expect_offense(<<~RUBY)
+          ENV.fetch(key)
+              ^^^^^ Use `Hash#[]` instead of `Hash#fetch`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          ENV[key]
+        RUBY
+      end
+    end
+
+    context 'when `Style/FetchEnvVar` is pending and new cops are enabled' do
+      let(:all_cops_config) { super().merge('NewCops' => 'enable') }
+      let(:other_cops) { { 'Style/FetchEnvVar' => { 'Enabled' => 'pending' } } }
+
+      it 'accepts `ENV.fetch` with one argument' do
+        expect_no_offenses('ENV.fetch(key)')
+      end
+    end
+
+    context 'when `Style/FetchEnvVar` is disabled' do
+      let(:other_cops) { { 'Style/FetchEnvVar' => { 'Enabled' => false } } }
+
+      it 'registers an offense for `ENV.fetch` with one argument' do
+        expect_offense(<<~RUBY)
+          ENV.fetch(key)
+              ^^^^^ Use `Hash#[]` instead of `Hash#fetch`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          ENV[key]
+        RUBY
+      end
+    end
+
+    it 'registers an offense for the outer call when the key is itself a fetch' do
+      expect_offense(<<~RUBY)
+        a.fetch(b.fetch(:y))
+          ^^^^^ Use `Hash#[]` instead of `Hash#fetch`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        a[b[:y]]
+      RUBY
+    end
+
+    context 'when using safe navigation operator' do
+      it 'does not register an offense for fetch with one argument' do
+        # The bracket equivalent would be the unreadable `hash&.[](key)`.
+        expect_no_offenses(<<~RUBY)
+          hash&.fetch(key)
+        RUBY
+      end
+    end
+  end
+
+  context 'with EnforcedStyle: fetch' do
+    let(:cop_config) { { 'EnforcedStyle' => 'fetch' } }
+
+    it 'registers an offense for bracket access with one argument' do
+      expect_offense(<<~RUBY)
+        hash[key]
+        ^^^^^^^^^ Use `Hash#fetch` instead of `Hash#[]`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        hash.fetch(key)
+      RUBY
+    end
+
+    it 'registers an offense for bracket access with receiver chain' do
+      expect_offense(<<~RUBY)
+        some_method.hash[key]
+        ^^^^^^^^^^^^^^^^^^^^^ Use `Hash#fetch` instead of `Hash#[]`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        some_method.hash.fetch(key)
+      RUBY
+    end
+
+    it 'accepts fetch with one argument' do
+      expect_no_offenses('hash.fetch(key)')
+    end
+
+    it 'accepts fetch with default value' do
+      expect_no_offenses('hash.fetch(key, default)')
+    end
+
+    it 'accepts fetch with block' do
+      expect_no_offenses('hash.fetch(key) { default }')
+    end
+
+    it 'does not flag bracket access with multiple arguments' do
+      expect_no_offenses('array[1, 2]')
+    end
+
+    it 'does not register an offense for the `Array` constructor' do
+      expect_no_offenses(<<~RUBY)
+        Array[foo]
+        ::Array[foo]
+      RUBY
+    end
+
+    it 'does not register an offense for the `Hash` constructor' do
+      expect_no_offenses(<<~RUBY)
+        Hash[foo]
+        ::Hash[foo]
+      RUBY
+    end
+
+    it 'registers an offense for bracket access on a namespaced `Array` constant' do
+      expect_offense(<<~RUBY)
+        Foo::Array[key]
+        ^^^^^^^^^^^^^^^ Use `Hash#fetch` instead of `Hash#[]`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        Foo::Array.fetch(key)
+      RUBY
+    end
+
+    it 'registers an offense for chained bracket access without raising a clobbering error' do
+      expect_offense(<<~RUBY)
+        result[:foo][:bar]
+        ^^^^^^^^^^^^^^^^^^ Use `Hash#fetch` instead of `Hash#[]`.
+        ^^^^^^^^^^^^ Use `Hash#fetch` instead of `Hash#[]`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        result.fetch(:foo).fetch(:bar)
+      RUBY
+    end
+
+    context 'when using safe navigation operator' do
+      it 'registers an offense for bracket access' do
+        expect_offense(<<~RUBY)
+          hash&.[](key)
+          ^^^^^^^^^^^^^ Use `Hash#fetch` instead of `Hash#[]`.
+        RUBY
+
+        expect_correction(<<~RUBY)
+          hash&.fetch(key)
+        RUBY
+      end
+    end
+
+    it 'registers an offense for an explicit element reference call' do
+      expect_offense(<<~RUBY)
+        hash.[](key)
+        ^^^^^^^^^^^^ Use `Hash#fetch` instead of `Hash#[]`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        hash.fetch(key)
+      RUBY
+    end
+  end
+
+  context 'with EnforcedStyle: fetch and a key that is itself a lookup' do
+    let(:cop_config) { { 'EnforcedStyle' => 'fetch' } }
+
+    it 'registers an offense for the outer call and corrects both' do
+      expect_offense(<<~RUBY)
+        a[b[:y]]
+        ^^^^^^^^ Use `Hash#fetch` instead of `Hash#[]`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        a.fetch(b.fetch(:y))
+      RUBY
+    end
+
+    it 'registers both offenses when the nesting is in the receiver' do
+      expect_offense(<<~RUBY)
+        a[:x][:y]
+        ^^^^^ Use `Hash#fetch` instead of `Hash#[]`.
+        ^^^^^^^^^ Use `Hash#fetch` instead of `Hash#[]`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        a.fetch(:x).fetch(:y)
+      RUBY
+    end
+  end
+
+  context 'with `EnforcedStyle: fetch` and a compound assignment' do
+    let(:cop_config) { { 'EnforcedStyle' => 'fetch' } }
+
+    it 'does not register an offense when the lookup is the target of `||=`' do
+      expect_no_offenses(<<~RUBY)
+        a[:x] ||= b
+      RUBY
+    end
+
+    it 'does not register an offense when the lookup is the target of `&&=`' do
+      expect_no_offenses(<<~RUBY)
+        a[:x] &&= b
+      RUBY
+    end
+
+    it 'does not register an offense when the lookup is the target of `+=`' do
+      expect_no_offenses(<<~RUBY)
+        a[:x] += b
+      RUBY
+    end
+
+    it 'registers an offense when the lookup is the value of `||=`' do
+      expect_offense(<<~RUBY)
+        a[:x] ||= b[:y]
+                  ^^^^^ Use `Hash#fetch` instead of `Hash#[]`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        a[:x] ||= b.fetch(:y)
+      RUBY
+    end
+
+    it 'registers an offense when the lookup is the value of a plain assignment' do
+      expect_offense(<<~RUBY)
+        x = a[:y]
+            ^^^^^ Use `Hash#fetch` instead of `Hash#[]`.
+      RUBY
+
+      expect_correction(<<~RUBY)
+        x = a.fetch(:y)
+      RUBY
+    end
+  end
+
+  context "when `AllowedReceivers: ['Rails.cache']`" do
+    let(:cop_config) { { 'AllowedReceivers' => ['Rails.cache'] } }
+
+    it 'does not register an offense for `Rails.cache.fetch(name, options) { block }`' do
+      expect_no_offenses(<<~RUBY)
+        Rails.cache.fetch(name, options) { block }
+      RUBY
+    end
+  end
+end

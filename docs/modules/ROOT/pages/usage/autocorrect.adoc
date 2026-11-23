@@ -1,0 +1,129 @@
+= Autocorrect
+:page-aliases: auto_correct.adoc
+
+In autocorrect mode, RuboCop will try to automatically fix offenses.
+
+There are three autocorrect modes:
+
+|===
+| Flag | Description
+
+| `-a` / `--autocorrect`
+| Safe corrections only — won't change code semantics.
+
+| `-A` / `--autocorrect-all`
+| All corrections, including unsafe ones that may change semantics.
+
+| `-x` / `--fix-layout`
+| Layout (formatting) corrections only — never changes logic.
+|===
+
+TIP: Always review the diff and run your test suite after autocorrecting,
+especially when using `-A`.
+
+== Safe vs. unsafe
+
+RuboCop distinguishes between safe and unsafe cops and autocorrections:
+
+* *Safe* (`true/false`) — indicates whether the cop can yield false positives
+by design.
+* *SafeAutoCorrect* (`true/false`) — indicates whether the autocorrection
+preserves code semantics. If a cop itself is unsafe, its autocorrect is
+automatically considered unsafe as well.
+
+When you run `rubocop -a`, cops and autocorrections marked as unsafe are
+skipped. When you run `rubocop -A`, everything is applied.
+
+NOTE: Some cops may not yet be annotated for safety. Eventually, the safety
+of each cop will be specified in the default configuration.
+
+=== Example: unsafe cop
+
+[source,ruby]
+----
+class Miner
+  def dig(how_deep)
+    # ...
+  end
+end
+
+
+Miner.new.dig(42) # => Style/SingleArgumentDig
+                  # => Use Miner.new[] instead of dig
+----
+
+This is the wrong diagnostic; this (contrived) use of `dig` is not an issue,
+and there might not be an alternative. This cop is marked as `Safe: false`.
+
+=== Example: safe cop with unsafe autocorrect
+
+[source,ruby]
+----
+# example.rb:
+str = 'hello' # => Missing magic comment `# frozen_string_literal: true`
+str << 'world'
+
+# autocorrects to:
+# frozen_string_literal: true
+
+str = 'hello'
+str << 'world' # => now fails because `str` is frozen
+
+# must be manually corrected to:
+# frozen_string_literal: true
+
+str = +'hello' # => We want an unfrozen string literal here...
+str << 'world' # => ok
+----
+
+This diagnostic is valid since the magic comment is indeed missing (thus `Safe: true`),
+but the autocorrection is not; some string literals need to be prefixed with `+` to avoid
+having them frozen.
+
+== Disabling uncorrectable offenses
+
+[source,sh]
+----
+$ rubocop --autocorrect --disable-uncorrectable
+----
+
+The `--disable-uncorrectable` flag generates `# rubocop:todo` comments in the
+code to suppress reporting of offenses that could not be corrected
+automatically. This is useful for gradually adopting new cops.
+
+== Previewing corrections
+
+[source,sh]
+----
+$ rubocop --diff
+----
+
+The `--diff` flag prints a unified diff of what autocorrection would change and
+leaves every file untouched. It turns on safe autocorrection by itself, and
+follows the mode you pick when combined with `-A` or `-x`.
+
+The exit status is non-zero whenever there is something to correct - a patch
+means work is left, whatever `--fail-level` says. That makes it a useful CI
+check: the build fails with the patch that would fix it right there in the log.
+
+[source,sh]
+----
+# Fail the build when anything is not formatted the way the project wants,
+# and show what would change.
+$ rubocop --diff
+
+# Take the patch and apply it locally.
+$ rubocop --diff --format quiet | git apply
+----
+
+It cannot be combined with `--auto-gen-config`, which exists to write a file.
+
+NOTE: Offenses still show up in the report as corrected, because they were
+corrected in memory. Nothing is written to disk. Use `--format quiet` to see the
+diff on its own.
+
+== Configuring autocorrect per cop
+
+Individual cops can have their autocorrect behavior configured in `.rubocop.yml`.
+See xref:configuration/cop_settings.adoc#autocorrect[AutoCorrect] for the
+available settings: `always`, `contextual`, and `disabled`.

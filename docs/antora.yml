@@ -1,0 +1,6 @@
+name: rubocop
+title: RuboCop
+# No version here: docs.rubocop.org derives it from the release tag
+# (v1.93.0 becomes 1.93), so patch versions don't appear in the docs.
+nav:
+  - modules/ROOT/nav.adoc

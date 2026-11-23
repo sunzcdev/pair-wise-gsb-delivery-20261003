@@ -1,0 +1,156 @@
+# frozen_string_literal: true
+
+module RuboCop
+  module Cop
+    module Lint
+      # Checks for space between the name of a called method and a left
+      # parenthesis.
+      #
+      # @example
+      #
+      #   # bad
+      #   do_something (foo)
+      #
+      #   # good
+      #   do_something(foo)
+      #   do_something (2 + 3) * 4
+      #   do_something (foo * bar).baz
+      class ParenthesesAsGroupedExpression < Base
+        include RangeHelp
+        extend AutoCorrector
+
+        MSG = '`%<argument>s` interpreted as grouped expression.'
+
+        def self.autocorrect_incompatible_with
+          [Style::RedundantParentheses]
+        end
+
+        def on_send(node)
+          return if valid_context?(node)
+
+          space_length = spaces_before_left_parenthesis(node)
+          return unless space_length.positive?
+
+          range = space_range(node.first_argument.source_range, space_length)
+          message = format(MSG, argument: node.first_argument.source)
+
+          add_offense(range, message: message) { |corrector| corrector.remove(range) }
+        end
+        alias on_csend on_send
+
+        private
+
+        def valid_context?(node)
+          return true unless node.arguments.one? && node.first_argument.parenthesized_call?
+          return true if node.first_argument.any_block_type?
+
+          node.operator_method? || node.setter_method? || chained_calls?(node) ||
+            valid_first_argument?(node.first_argument)
+        end
+
+        def valid_first_argument?(first_arg)
+          first_arg.operator_keyword? || first_arg.hash_type? || ternary_expression?(first_arg) ||
+            compound_range?(first_arg) || invalid_bare_argument?(first_arg)
+        end
+
+        def compound_range?(first_arg)
+          first_arg.range_type? && first_arg.parenthesized_call?
+        end
+
+        def invalid_bare_argument?(node)
+          return true if multiple_statements?(node) || not_a_single_expression?(node)
+
+          node = innermost_expression(node)
+          return false unless node
+          return true if multiple_values_assignment?(node)
+
+          keyword_operator?(node) || modifier_expression?(node) || command_call_operand?(node)
+        end
+
+        def multiple_statements?(node)
+          node.begin_type? && node.children.size > 1
+        end
+
+        def not_a_single_expression?(node)
+          return false unless node.begin_type?
+
+          expression = node.children.first
+          return true unless expression
+
+          processed_source.tokens_within(node).any? do |token|
+            token.semicolon? && !expression.source_range.contains?(token.pos)
+          end
+        end
+
+        def innermost_expression(node)
+          node = node.children.first while node&.begin_type? && node.children.one?
+          node
+        end
+
+        def multiple_values_assignment?(node)
+          return true if node.masgn_type?
+          return false unless node.assignment? || (node.call_type? && node.assignment_method?)
+
+          value = node.children.last
+          value.array_type? && !value.bracketed?
+        end
+
+        def keyword_operator?(node)
+          (node.operator_keyword? && node.semantic_operator?) ||
+            node.rescue_type? || node.match_pattern_p_type? || (node.send_type? && node.prefix_not?)
+        end
+
+        def modifier_expression?(node)
+          node.type?(:if, :while, :until) && node.modifier_form?
+        end
+
+        def command_call_operand?(node)
+          if node.assignment? || (node.call_type? && node.assignment_method?)
+            command_call_value?(node.children.last)
+          elsif node.send_type? && node.prefix_bang?
+            command_call_value?(node.receiver)
+          else
+            command_call_with_do_block?(node)
+          end
+        end
+
+        def command_call_value?(node)
+          command_call?(node) || command_call_operand?(node)
+        end
+
+        def command_call?(node)
+          node = node.send_node if node.any_block_type?
+          return false unless node.type?(:call, :super, :yield)
+
+          node.arguments? && !node.parenthesized? && !node.operator_method?
+        end
+
+        def command_call_with_do_block?(node)
+          node = node.receiver while node.call_type? && node.receiver
+          return false unless node.any_block_type?
+
+          node.keywords? && command_call?(node)
+        end
+
+        def chained_calls?(node)
+          first_argument = node.first_argument
+          first_argument.call_type? && (node.children.last&.children&.count || 0) > 1
+        end
+
+        def ternary_expression?(node)
+          node.if_type? && node.ternary?
+        end
+
+        def spaces_before_left_parenthesis(node)
+          return 0 if node.parenthesized? || !node.first_argument.source.start_with?('(')
+
+          node.first_argument.source_range.begin_pos - node.loc.selector.end_pos
+        end
+
+        def space_range(expr, space_length)
+          range_between(expr.begin_pos - space_length, expr.begin_pos)
+        end
+      end
+    end
+  end
+end
