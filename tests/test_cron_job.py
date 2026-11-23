@@ -1,0 +1,532 @@
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
+
+from rq import Queue, cron_job_registry, utils
+from rq.cron import CronJob, CronScheduler, get_cron_job_history_key, get_cron_job_ids
+from rq.defaults import DEFAULT_CRON_JOB_HISTORY_TTL, DEFAULT_RESULT_TTL
+from rq.utils import NOT_JSON_SERIALIZABLE
+from rq.webhook import Webhook
+from tests import RQTestCase, system_timezone
+from tests.fixtures import echo, say_hello
+
+
+class TestCronJob(RQTestCase):
+    """Tests for the CronJob class"""
+
+    def setUp(self):
+        super().setUp()
+        self.queue = Queue(connection=self.connection)
+
+    def test_cron_job_initialization(self):
+        """CronJob correctly initializes with the provided parameters"""
+        # Test with minimum required parameters (interval)
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=60)
+        self.assertEqual(cron_job.func, say_hello)
+        self.assertEqual(cron_job.args, ())
+        self.assertEqual(cron_job.kwargs, {})
+        self.assertEqual(cron_job.interval, 60)
+        self.assertIsNone(cron_job.cron)
+        self.assertEqual(cron_job.queue_name, self.queue.name)
+
+        # Test with all parameters
+        args = (1, 2, 3)
+        kwargs = {'name': 'Test'}
+        interval = 60
+        timeout = 180
+        result_ttl = 600
+        ttl = 300
+        failure_ttl = 400
+        meta = {'key': 'value'}
+
+        cron_job = CronJob(
+            func=say_hello,
+            queue_name=self.queue.name,
+            args=args,
+            kwargs=kwargs,
+            interval=interval,
+            job_timeout=timeout,
+            result_ttl=result_ttl,
+            ttl=ttl,
+            failure_ttl=failure_ttl,
+            meta=meta,
+        )
+
+        self.assertEqual(cron_job.func, say_hello)
+        self.assertEqual(cron_job.args, args)
+        self.assertEqual(cron_job.kwargs, kwargs)
+        self.assertEqual(cron_job.interval, interval)
+        self.assertEqual(cron_job.queue_name, self.queue.name)
+
+        # Check job options dict
+        self.assertEqual(cron_job.job_options['job_timeout'], timeout)
+        self.assertEqual(cron_job.job_options['result_ttl'], result_ttl)
+        self.assertEqual(cron_job.job_options['ttl'], ttl)
+        self.assertEqual(cron_job.job_options['failure_ttl'], failure_ttl)
+        self.assertEqual(cron_job.job_options['meta'], meta)
+
+    def test_name(self):
+        """`name` defaults to func_name and round-trips through to_dict/from_dict"""
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=60)
+        self.assertEqual(cron_job.name, 'tests.fixtures.say_hello')
+
+        named_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=60, name='greeter')
+        self.assertEqual(named_job.name, 'greeter')
+
+        data = named_job.to_dict()
+        self.assertEqual(data['name'], 'greeter')
+        restored_job = CronJob.from_dict(data)
+        self.assertEqual(restored_job.name, 'greeter')
+
+        # Pre-existing serialized data has no name field; restore falls back to func_name
+        legacy_data = cron_job.to_dict()
+        del legacy_data['name']
+        legacy_job = CronJob.from_dict(legacy_data)
+        self.assertEqual(legacy_job.name, 'tests.fixtures.say_hello')
+
+    def test_cron_job_with_webhooks(self):
+        """CronJob stores webhooks in job_options and validates them at registration time"""
+        webhooks = [Webhook('http://example.com/done', 'finished')]
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=60, webhooks=webhooks)
+        self.assertEqual(cron_job.job_options['webhooks'], webhooks)
+
+        # A bare Webhook (not wrapped in a list)
+        with self.assertRaises(TypeError):
+            CronJob(
+                func=say_hello,
+                queue_name=self.queue.name,
+                interval=60,
+                webhooks=Webhook('http://example.com', 'finished'),
+            )
+
+        # A list containing a non-Webhook item
+        with self.assertRaises(TypeError):
+            CronJob(func=say_hello, queue_name=self.queue.name, interval=60, webhooks=['http://example.com'])
+
+        # An empty list is dropped (not stored), matching Job's behavior
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=60, webhooks=[])
+        self.assertNotIn('webhooks', cron_job.job_options)
+
+    def test_get_next_enqueue_time(self):
+        """Test that get_next_enqueue_time correctly calculates the next run time"""
+        # Test with cron job (returns far future for no latest_enqueue_time initially)
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, cron='0 9 * * *')
+        # Without latest_enqueue_time set, get_next_enqueue_time uses current time
+        next_run = cron_job.get_next_enqueue_time()
+        self.assertIsInstance(next_run, datetime)
+
+        # Test with a specific interval
+        interval = 60  # 60 seconds
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=interval)
+
+        now = utils.now()
+        cron_job.set_enqueue_time(now)
+        next_enqueue_time = cron_job.get_next_enqueue_time()
+
+        # Check that next_enqueue_time is about interval seconds from now
+        # Allow 2 seconds tolerance for test execution time
+        self.assertTrue(
+            now + timedelta(seconds=interval - 5) <= next_enqueue_time <= now + timedelta(seconds=interval + 5),
+            f'Next run time {next_enqueue_time} not within expected range',
+        )
+
+    def test_should_run(self):
+        """Test should_run method logic"""
+
+        # Job with interval that has not run yet always returns True
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=3600)
+        self.assertTrue(cron_job.should_run())
+
+        # Job with future next_enqueue_time should not run yet
+        cron_job.latest_enqueue_time = utils.now() - timedelta(seconds=5)
+        cron_job.next_enqueue_time = utils.now() + timedelta(minutes=5)
+        self.assertFalse(cron_job.should_run())
+
+        # Job with past next_enqueue_time should run
+        cron_job.next_enqueue_time = utils.now() - timedelta(seconds=5)
+        self.assertTrue(cron_job.should_run())
+
+    def test_enqueue(self):
+        """Test that enqueue correctly creates a job in the queue"""
+        cron_job = CronJob(
+            func=say_hello,
+            queue_name=self.queue.name,
+            args=('Hello',),
+            interval=60,
+        )
+        job = cron_job.enqueue(self.connection)
+
+        # Fetch job from queue and verify
+        jobs = self.queue.get_jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].id, job.id)
+
+    def test_enqueue_with_job_timeout(self):
+        """Test that job_timeout is properly set on the job and not passed to the function"""
+        timeout_value = 180
+        cron_job = CronJob(
+            func=say_hello,
+            queue_name=self.queue.name,
+            args=('World',),
+            interval=60,
+            job_timeout=timeout_value,
+        )
+        job = cron_job.enqueue(self.connection)
+        self.assertEqual(job.timeout, timeout_value)
+        # Verify job can be executed without TypeError
+        job.perform()
+
+    def test_enqueue_passes_kwargs_to_the_function(self):
+        """Test that kwargs are passed to the function, even when their names are also job options"""
+        kwargs = {'description': 'nightly', 'ttl': 15, 'result_ttl': 10}
+        cron_job = CronJob(func=echo, queue_name=self.queue.name, args=('Hello',), kwargs=kwargs, interval=60)
+        job = cron_job.enqueue(self.connection)
+
+        self.assertEqual(job.kwargs, kwargs)
+        self.assertIsNone(job.ttl)
+        self.assertEqual(job.result_ttl, DEFAULT_RESULT_TTL)
+        self.assertEqual(job.perform(), (('Hello',), kwargs))
+
+    def test_enqueue_records_job_history(self):
+        """enqueue() adds the spawned job to the history ZSET, queryable newest first"""
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=60)
+        first_job = cron_job.enqueue(self.connection)
+        second_job = cron_job.enqueue(self.connection)
+
+        self.assertEqual(cron_job.get_job_ids(self.connection), [second_job.id, first_job.id])
+
+        # start/end paginate the newest-first ordering, zrange-style inclusive
+        self.assertEqual(cron_job.get_job_ids(self.connection, start=0, end=0), [second_job.id])
+        self.assertEqual(cron_job.get_job_ids(self.connection, start=1, end=1), [first_job.id])
+        self.assertEqual(cron_job.get_job_ids(self.connection, start=2), [])
+
+    @patch('rq.cron.DEFAULT_CRON_JOB_HISTORY_LIMIT', 2)
+    def test_job_history_is_trimmed(self):
+        """History ZSET keeps only the newest DEFAULT_CRON_JOB_HISTORY_LIMIT entries"""
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=60)
+        cron_job.enqueue(self.connection)
+        second_job = cron_job.enqueue(self.connection)
+        third_job = cron_job.enqueue(self.connection)
+
+        self.assertEqual(cron_job.get_job_ids(self.connection), [third_job.id, second_job.id])
+
+    def test_job_history_ttl(self):
+        """History ZSET TTL is set on enqueue"""
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=60)
+        cron_job.enqueue(self.connection)
+
+        ttl = self.connection.ttl(cron_job.job_history_key)
+        self.assertTrue(0 < ttl <= DEFAULT_CRON_JOB_HISTORY_TTL)
+
+    def test_enqueue_records_name_in_registry(self):
+        """enqueue() records the cron job's name in the cron job registry"""
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=60, name='greeter')
+        job = cron_job.enqueue(self.connection)
+
+        self.assertEqual(cron_job_registry.get_names(self.connection), ['greeter'])
+        score = self.connection.zscore(cron_job_registry.get_registry_key(), 'greeter')
+        self.assertEqual(score, job.enqueued_at.timestamp())
+
+    def test_get_cron_job_ids_by_name(self):
+        """Module-level get_cron_job_ids() reads a history from just the cron job name"""
+        self.assertEqual(get_cron_job_history_key('greeter'), 'rq:cron_job:greeter:jobs')
+
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=60, name='greeter')
+        first_job = cron_job.enqueue(self.connection)
+        second_job = cron_job.enqueue(self.connection)
+
+        self.assertEqual(get_cron_job_ids('greeter', self.connection), [second_job.id, first_job.id])
+
+    def test_enqueue_with_webhooks(self):
+        """Webhooks are attached to the job produced by enqueue"""
+        webhooks = [Webhook('http://example.com/done', 'finished')]
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=60, webhooks=webhooks)
+        job = cron_job.enqueue(self.connection)
+        self.assertEqual(job.webhooks, webhooks)
+
+    def test_set_enqueue_time(self):
+        """Test that set_enqueue_time correctly sets latest run time and updates next run time"""
+        # Test with cron job
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, cron='0 9 * * *')
+        test_time = utils.now()
+        cron_job.set_enqueue_time(test_time)
+
+        # Check latest_enqueue_time is set correctly
+        self.assertEqual(cron_job.latest_enqueue_time, test_time)
+
+        # Since cron is set, next_enqueue_time should be calculated
+        self.assertIsNotNone(cron_job.next_enqueue_time)
+
+        # Test with an interval
+        interval = 60  # 60 seconds
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=interval)
+        cron_job.set_enqueue_time(test_time)
+
+        # Check latest_enqueue_time is set correctly
+        self.assertEqual(cron_job.latest_enqueue_time, test_time)
+
+        # Check that next_enqueue_time is calculated correctly
+        next_enqueue_time = test_time + timedelta(seconds=interval)
+        self.assertEqual(cron_job.next_enqueue_time, next_enqueue_time)
+
+        # Test updating the run time
+        test_time = test_time + timedelta(seconds=30)
+        cron_job.set_enqueue_time(test_time)
+
+        # Check latest_enqueue_time is updated
+        self.assertEqual(cron_job.latest_enqueue_time, test_time)
+
+        # Check that next_enqueue_time is recalculated
+        new_expected_next_run = test_time + timedelta(seconds=interval)
+        self.assertEqual(cron_job.next_enqueue_time, new_expected_next_run)
+
+    def test_cron_job_initialization_with_cron_string(self):
+        """CronJob correctly initializes with cron string parameters"""
+        cron_expr = '0 9 * * 1-5'  # 9 AM weekdays
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, cron=cron_expr)
+
+        self.assertEqual(cron_job.func, say_hello)
+        self.assertEqual(cron_job.cron, cron_expr)
+        self.assertIsNone(cron_job.interval)
+        self.assertEqual(cron_job.queue_name, self.queue.name)
+
+        # next_enqueue_time should be set immediately upon initialization
+        self.assertIsNotNone(cron_job.next_enqueue_time)
+
+        # latest_enqueue_time should still be None (hasn't run yet)
+        self.assertIsNone(cron_job.latest_enqueue_time)
+
+        # For comparison, interval jobs don't set next_enqueue_time during initialization
+        interval_job = CronJob(func=say_hello, queue_name=self.queue.name, interval=60)
+        self.assertIsNone(interval_job.next_enqueue_time)  # Not set until first run
+
+    @system_timezone('Asia/Jakarta')
+    def test_get_next_enqueue_time_with_cron_string(self):
+        """Cron fields match the system's local time (Asia/Jakarta is UTC+7)"""
+        # 00:00 UTC is 07:00 local, so 9 AM local is 02:00 UTC the same day
+        with patch('rq.cron.now', return_value=datetime(2023, 10, 27, 0, 0, tzinfo=timezone.utc)):
+            cron_job = CronJob(func=say_hello, queue_name=self.queue.name, cron='0 9 * * *')
+        self.assertEqual(cron_job.next_enqueue_time, datetime(2023, 10, 27, 2, 0, tzinfo=timezone.utc))
+
+        # 03:00 UTC is 10:00 local, past 9 AM, so the next run is tomorrow
+        cron_job.set_enqueue_time(datetime(2023, 10, 27, 3, 0, tzinfo=timezone.utc))
+        self.assertEqual(cron_job.next_enqueue_time, datetime(2023, 10, 28, 2, 0, tzinfo=timezone.utc))
+
+    @system_timezone('America/New_York')
+    def test_cron_string_fall_back(self):
+        """Ambiguous scheduled times use their first occurrence when clocks fall back"""
+        # Daily job keeps its local time across the change (07:00 EST is 12:00 UTC)
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, cron='0 7 * * *')
+        cron_job.set_enqueue_time(datetime(2026, 10, 31, 11, 0, tzinfo=timezone.utc))
+        self.assertEqual(cron_job.next_enqueue_time, datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc))
+
+        # Hourly job isn't scheduled again for the repeated 01:00: 01:30 EDT → 02:00 EST
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, cron='0 * * * *')
+        cron_job.set_enqueue_time(datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc))
+        self.assertEqual(cron_job.next_enqueue_time, datetime(2026, 11, 1, 7, 0, tzinfo=timezone.utc))
+
+        # 06:15 UTC is the second 01:15 (EST). The rest of the repeated hour was already
+        # scheduled during the first pass, so the next runs come after it
+        base_time = datetime(2026, 11, 1, 6, 15, tzinfo=timezone.utc)
+        with self.subTest('initialization'):
+            with patch('rq.cron.now', return_value=base_time):
+                every_minute_job = CronJob(func=say_hello, queue_name=self.queue.name, cron='* * * * *')
+                daily_job = CronJob(func=say_hello, queue_name=self.queue.name, cron='30 1 * * *')
+            self.assertEqual(every_minute_job.next_enqueue_time, datetime(2026, 11, 1, 7, 0, tzinfo=timezone.utc))
+            self.assertEqual(daily_job.next_enqueue_time, datetime(2026, 11, 2, 6, 30, tzinfo=timezone.utc))
+
+        with self.subTest('rescheduling'):
+            every_minute_job = CronJob(func=say_hello, queue_name=self.queue.name, cron='* * * * *')
+            every_minute_job.set_enqueue_time(base_time)
+            daily_job = CronJob(func=say_hello, queue_name=self.queue.name, cron='30 1 * * *')
+            daily_job.set_enqueue_time(base_time)
+            self.assertEqual(every_minute_job.next_enqueue_time, datetime(2026, 11, 1, 7, 0, tzinfo=timezone.utc))
+            self.assertEqual(daily_job.next_enqueue_time, datetime(2026, 11, 2, 6, 30, tzinfo=timezone.utc))
+
+    def test_cron_string_spring_forward(self):
+        """Runs in the skipped time move later by the size of the change when clocks spring forward"""
+        with system_timezone('America/New_York'):
+            # 02:30 doesn't exist on 2026-03-08, so it runs at 03:30 EDT (07:30 UTC)
+            cron_job = CronJob(func=say_hello, queue_name=self.queue.name, cron='30 2 * * *')
+            cron_job.set_enqueue_time(datetime(2026, 3, 7, 17, 0, tzinfo=timezone.utc))
+            self.assertEqual(cron_job.next_enqueue_time, datetime(2026, 3, 8, 7, 30, tzinfo=timezone.utc))
+
+        # Lord Howe clocks jump 30 minutes, from 02:00 to 02:30, on 2026-10-04
+        with system_timezone('Australia/Lord_Howe'):
+            cron_job = CronJob(func=say_hello, queue_name=self.queue.name, cron='15,30 2 * * *')
+            cron_job.set_enqueue_time(datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc))
+            # 02:15 is in the skipped time, so it runs at 02:45 (15:45 UTC)
+            self.assertEqual(cron_job.next_enqueue_time, datetime(2026, 10, 3, 15, 45, tzinfo=timezone.utc))
+
+            # 02:30 falls between 02:15 and its moved time 02:45, so it's skipped; next is 02:15 tomorrow
+            cron_job.set_enqueue_time(cron_job.next_enqueue_time)
+            self.assertEqual(cron_job.next_enqueue_time, datetime(2026, 10, 4, 15, 15, tzinfo=timezone.utc))
+
+    def test_should_run_with_cron_string(self):
+        """Test should_run method logic with cron expressions"""
+        # Job with cron that has not run yet should NOT run immediately (crontab behavior)
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, cron='0 9 * * *')
+        # next_enqueue_time should already be set during initialization
+        self.assertIsNotNone(cron_job.next_enqueue_time)
+
+        # Job with future next_enqueue_time should not run yet
+        cron_job.next_enqueue_time = utils.now() + timedelta(hours=1)
+        self.assertFalse(cron_job.should_run())
+
+        # Job with past next_enqueue_time should run
+        cron_job.next_enqueue_time = utils.now() - timedelta(minutes=5)
+        self.assertTrue(cron_job.should_run())
+
+    @system_timezone('UTC')
+    def test_cron_weekday_expressions(self):
+        """Test cron expressions with specific weekday patterns"""
+        # Monday to Friday at 9 AM
+        cron_job = CronJob(func=say_hello, queue_name=self.queue.name, cron='0 9 * * 1-5')
+
+        # From Friday 9 AM, the next run skips the weekend to Monday 9 AM
+        cron_job.set_enqueue_time(datetime(2023, 10, 27, 9, 0, tzinfo=timezone.utc))
+        self.assertEqual(cron_job.next_enqueue_time, datetime(2023, 10, 30, 9, 0, tzinfo=timezone.utc))
+
+    def test_cron_job_serialization_roundtrip(self):
+        """Test CronJob serialization and deserialization with both interval and cron jobs"""
+        # Test with interval job
+        interval_job = CronJob(
+            func=say_hello,
+            queue_name=self.queue.name,
+            args=('test', 'args'),
+            kwargs={'test': 'kwarg'},
+            interval=60,
+            job_timeout=30,
+            result_ttl=600,
+            meta={'test': 'meta'},
+        )
+
+        # Serialize and deserialize
+        interval_data = interval_job.to_dict()
+        restored_interval = CronJob.from_dict(interval_data)
+
+        # Check serialized data structure
+        self.assertEqual(interval_data['func_name'], 'tests.fixtures.say_hello')
+        self.assertEqual(interval_data['queue_name'], self.queue.name)
+        self.assertEqual(interval_data['interval'], 60)
+        self.assertIsNone(interval_data['cron'])
+        self.assertEqual(interval_data['job_timeout'], 30)
+        self.assertEqual(interval_data['result_ttl'], 600)
+        self.assertEqual(interval_data['meta'], '{"test": "meta"}')  # JSON string
+
+        # Check restored fields match original
+        self.assertEqual(restored_interval.queue_name, interval_job.queue_name)
+        self.assertEqual(restored_interval.interval, interval_job.interval)
+        self.assertEqual(restored_interval.cron, interval_job.cron)
+        self.assertEqual(restored_interval.job_options, interval_job.job_options)
+        self.assertIsNone(restored_interval.func)
+
+        # Test with cron job
+        cron_job = CronJob(
+            func=say_hello, queue_name='priority_queue', cron='0 9 * * MON-FRI', ttl=300, failure_ttl=1800
+        )
+
+        # Serialize and deserialize
+        cron_data = cron_job.to_dict()
+        restored_cron = CronJob.from_dict(cron_data)
+
+        # Check serialized data structure
+        self.assertEqual(cron_data['func_name'], 'tests.fixtures.say_hello')
+        self.assertEqual(cron_data['queue_name'], 'priority_queue')
+        self.assertIsNone(cron_data['interval'])
+        self.assertEqual(cron_data['cron'], '0 9 * * MON-FRI')
+        self.assertEqual(cron_data['ttl'], 300)
+        self.assertEqual(cron_data['failure_ttl'], 1800)
+        # result_ttl should have default value
+        self.assertEqual(cron_data['result_ttl'], 500)
+
+        # Check restored fields match original
+        self.assertEqual(restored_cron.queue_name, cron_job.queue_name)
+        self.assertEqual(restored_cron.interval, cron_job.interval)
+        self.assertEqual(restored_cron.cron, cron_job.cron)
+        self.assertEqual(restored_cron.job_options, cron_job.job_options)
+        self.assertIsNone(restored_cron.func)
+
+    def test_round_trip_serialization(self):
+        """Test that round-trip serialization preserves timing, args, kwargs, and job_options"""
+        original_job = CronJob(
+            queue_name='default',
+            func=say_hello,
+            args=('hello', 123),
+            kwargs={'name': 'world'},
+            cron='0 9 * * *',
+            job_timeout=300,
+            result_ttl=1000,
+            meta={'foo': 'bar'},
+        )
+
+        now_time = datetime.now(timezone.utc)
+        original_job.latest_enqueue_time = now_time
+        original_job.next_enqueue_time = now_time + timedelta(hours=1)
+
+        restored_job = CronJob.from_dict(original_job.to_dict())
+
+        # Assert timing preserved
+        self.assertEqual(
+            restored_job.latest_enqueue_time.replace(microsecond=0),
+            original_job.latest_enqueue_time.replace(microsecond=0),
+        )
+        self.assertEqual(
+            restored_job.next_enqueue_time.replace(microsecond=0), original_job.next_enqueue_time.replace(microsecond=0)
+        )
+        # Assert args and kwargs preserved
+        self.assertEqual(restored_job.args, original_job.args)
+        self.assertEqual(restored_job.kwargs, original_job.kwargs)
+        # Assert job_options preserved
+        self.assertEqual(restored_job.job_options, original_job.job_options)
+
+    def test_webhooks_serialization_roundtrip(self):
+        """Webhooks survive to_dict/from_dict, rebuilt as Webhook instances"""
+        webhooks = [
+            Webhook('http://example.com/done', 'finished', method='POST', timeout=5),
+            Webhook('http://example.com/fail', 'failed'),
+        ]
+        job = CronJob(func=say_hello, queue_name=self.queue.name, interval=60, webhooks=webhooks)
+
+        data = job.to_dict()
+        self.assertIsInstance(data['webhooks'], str)  # serialized to a JSON string for storage
+
+        restored = CronJob.from_dict(data)
+        self.assertEqual(restored.job_options['webhooks'], webhooks)
+
+    def test_non_serializable_arguments(self):
+        """Test that from_dict gracefully handles the non-serializable placeholder through Redis"""
+
+        scheduler = CronScheduler(connection=self.connection)
+        scheduler.register(
+            say_hello,
+            'default',
+            args=({1, 2, 3},),  # sets are not JSON serializable
+            kwargs={'bad': {4, 5, 6}},
+            interval=60,
+        )
+        scheduler.save()
+
+        # Fetch from Redis - this should NOT raise
+        fetched_scheduler = CronScheduler.fetch(scheduler.name, self.connection)
+        job = fetched_scheduler.get_jobs()[0]
+
+        # Non-serializable values should keep the placeholder for monitoring visibility
+        self.assertEqual(job.args, NOT_JSON_SERIALIZABLE)
+        self.assertEqual(job.kwargs, NOT_JSON_SERIALIZABLE)
+
+    def test_to_dict_returns_json_strings_for_serializable_values(self):
+        """Test that to_dict returns JSON strings for serializable args/kwargs"""
+        job = CronJob(
+            queue_name='default',
+            func=say_hello,
+            args=('hello', 123),
+            kwargs={'name': 'world'},
+            interval=60,
+            meta={'foo': 'bar'},
+        )
+
+        job_dict = job.to_dict()
+        # Now args/kwargs/meta are JSON strings, not raw Python objects
+        self.assertEqual(job_dict['args'], '["hello", 123]')
+        self.assertEqual(job_dict['kwargs'], '{"name": "world"}')
+        self.assertEqual(job_dict['meta'], '{"foo": "bar"}')
