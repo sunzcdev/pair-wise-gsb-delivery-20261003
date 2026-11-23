@@ -48,6 +48,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 
 from luigi import notifications
 from luigi.event import Event
@@ -982,6 +983,10 @@ class Worker:
                 host=self.host,
                 assistant=self._assistant,
                 current_tasks=list(self._running_tasks.keys()),
+                # Identity of this single get_work request. RPC retries resend the
+                # same identity, so the scheduler can replay a lost response instead
+                # of scheduling (and resourcing) the request twice.
+                get_work_id="{}-{}".format(self._id, uuid.uuid4().hex),
             )
         else:
             logger.debug("Checking if tasks are still pending")

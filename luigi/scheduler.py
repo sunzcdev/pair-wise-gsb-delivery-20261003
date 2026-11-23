@@ -133,6 +133,13 @@ class scheduler(Config):
 
     prune_on_get_work = parameter.BoolParameter(default=False)
 
+    get_work_claim_ttl = parameter.FloatParameter(
+        default=120.0,
+        description="How many seconds the scheduler remembers the assignment made for a get_work "
+        "request carrying a get_work_id, so that a retried request (e.g. after the response was "
+        "lost) reads back the same assignment instead of scheduling anew. Set to 0 to disable.",
+    )
+
     pause_enabled = parameter.BoolParameter(default=True)
 
     send_messages = parameter.BoolParameter(default=True)
@@ -700,6 +707,7 @@ class Scheduler:
         self._resources = resources or configuration.get_config().getintdict("resources")  # TODO: Can we make this a Parameter?
         self._make_task = functools.partial(Task, retry_policy=self._config._get_retry_policy())
         self._worker_requests = {}
+        self._get_work_claims = {}  # map from (worker_id, get_work_id) to a recorded assignment
         self._paused = False
 
         if self._config.batch_emails:
@@ -721,7 +729,18 @@ class Scheduler:
         self._prune_workers()
         self._prune_tasks()
         self._prune_emails()
+        self._prune_get_work_claims()
         logger.debug("Done pruning task graph")
+
+    def _prune_get_work_claims(self):
+        # Claims are kept (even past expiry, as tombstones) for as long as the tasks
+        # they reference are tracked, so that a late retry of an expired request gets
+        # a definitive empty response instead of a chance to re-own its task. Once none
+        # of the referenced tasks are tracked anymore, re-owning them is impossible and
+        # the record is dropped.
+        stale = [key for key, claim in self._get_work_claims.items() if not any(self._state.has_task(task_id) for task_id in claim["task_ids"])]
+        for key in stale:
+            del self._get_work_claims[key]
 
     def _prune_workers(self):
         remove_workers = []
@@ -1135,8 +1154,59 @@ class Scheduler:
             "running_tasks": running_tasks,
         }
 
+    def _replay_get_work_claim(self, get_work_id, worker_id):
+        """
+        Check whether this get_work request identity was already answered and, if so,
+        return the recorded outcome instead of scheduling new work. Returns None if the
+        request identity is unknown and normal scheduling should take place.
+        """
+        claim = self._get_work_claims.get((worker_id, get_work_id))
+        if claim is None:
+            return None
+
+        if time.time() >= claim["expires"]:
+            # The claim has expired: this request must not regain ownership of the task.
+            return self._void_get_work_claim_reply(get_work_id, worker_id, "expired")
+
+        if all(self._get_work_claim_holds(task_id, worker_id) for task_id in claim["task_ids"]):
+            # The assignment is still intact: read it back without consuming another slot.
+            reply = dict(claim["reply"])
+            reply["replayed"] = True
+            return reply
+
+        # The assignment was retracted or handed over to another worker: say so explicitly.
+        return self._void_get_work_claim_reply(get_work_id, worker_id, "revoked")
+
+    def _get_work_claim_holds(self, task_id, worker_id):
+        task = self._state.get_task(task_id)
+        return task is not None and task.status in (RUNNING, BATCH_RUNNING) and task.worker_running == worker_id
+
+    def _void_get_work_claim_reply(self, get_work_id, worker_id, reason):
+        reply = self.count_pending(worker_id)
+        reply["task_id"] = None
+        reply["get_work_id"] = get_work_id
+        reply["claim_status"] = reason
+        return reply
+
+    def _record_get_work_claim(self, get_work_id, worker_id, best_task, batched_tasks, reply):
+        ttl = self._config.get_work_claim_ttl
+        if ttl <= 0:
+            return
+        if len(batched_tasks) > 1:
+            task_ids = [task.id for task in batched_tasks]
+        elif best_task is not None:
+            task_ids = [best_task.id]
+        else:
+            # Nothing was assigned; there is no response worth replaying.
+            return
+        self._get_work_claims[(worker_id, get_work_id)] = {
+            "expires": time.time() + ttl,
+            "task_ids": task_ids,
+            "reply": dict(reply),
+        }
+
     @rpc_method(allow_null=False)
-    def get_work(self, host=None, assistant=False, current_tasks=None, worker=None, **kwargs):
+    def get_work(self, host=None, assistant=False, current_tasks=None, worker=None, get_work_id=None, **kwargs):
         # TODO: remove any expired nodes
 
         # Algo: iterate over all nodes, find the highest priority node no dependencies and available
@@ -1165,6 +1235,13 @@ class Scheduler:
                 "worker_state": worker.state,
             }
             return reply
+
+        if get_work_id is not None:
+            # A retry of a request we already answered: read the assignment back
+            # instead of scheduling (and consuming resources) a second time.
+            replay = self._replay_get_work_claim(get_work_id, worker_id)
+            if replay is not None:
+                return replay
 
         if assistant:
             self.add_worker(worker_id, [("assistant", assistant)])
@@ -1279,6 +1356,10 @@ class Scheduler:
 
         else:
             reply["task_id"] = None
+
+        if get_work_id is not None:
+            reply["get_work_id"] = get_work_id
+            self._record_get_work_claim(get_work_id, worker_id, best_task, batched_tasks, reply)
 
         return reply
 

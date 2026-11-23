@@ -47,6 +47,7 @@ class SchedulerApiTest(unittest.TestCase):
             "retry_count": 3,
             "disable_hard_timeout": 60 * 60,
             "stable_done_cooldown_secs": 0,
+            "get_work_claim_ttl": 10,
         }
 
     def tearDown(self):
@@ -165,6 +166,95 @@ class SchedulerApiTest(unittest.TestCase):
                 self.sch.prune()
 
         self.assertEqual(self.sch.get_work(worker="Y")["task_id"], "A")
+
+    def test_get_work_request_id_is_replayed(self):
+        # The response to a get_work request is lost; the worker retries with the
+        # same request identity and reads back the assignment it was given.
+        self.sch.add_task(worker=WORKER, task_id="A")
+        self.sch.add_task(worker=WORKER, task_id="B")
+
+        first = self.sch.get_work(worker=WORKER, get_work_id="req-1")
+        self.assertEqual(first["task_id"], "A")
+
+        retry = self.sch.get_work(worker=WORKER, get_work_id="req-1")
+        self.assertEqual(retry["task_id"], "A")
+        self.assertTrue(retry["replayed"])
+
+        # a new request identity takes the next task as usual
+        self.assertEqual(self.sch.get_work(worker=WORKER, get_work_id="req-2")["task_id"], "B")
+        self.assertEqual(self.sch.get_work(worker=WORKER, get_work_id="req-3")["task_id"], None)
+
+    def test_get_work_request_id_replay_uses_no_extra_slot(self):
+        # Resources only allow one more task to run; the retry of the first request
+        # must read back its own assignment instead of consuming the free slot.
+        sch = Scheduler(resources={"r": 2}, **self.get_scheduler_config())
+        sch.add_task(worker=WORKER, task_id="A", resources={"r": 1})
+        sch.add_task(worker=WORKER, task_id="B", resources={"r": 1})
+
+        first = sch.get_work(worker=WORKER, get_work_id="req-1")
+        self.assertEqual(first["task_id"], "A")
+
+        retry = sch.get_work(worker=WORKER, get_work_id="req-1")
+        self.assertEqual(retry["task_id"], "A")
+        self.assertTrue(retry["replayed"])
+
+        # the free slot is still there for a genuinely new request
+        self.assertEqual(sch.get_work(worker=WORKER, get_work_id="req-2")["task_id"], "B")
+        self.assertEqual(sch.get_work(worker=WORKER, get_work_id="req-3")["task_id"], None)
+
+    def test_get_work_request_id_revoked_when_reassigned(self):
+        # X's assignment is retracted and the task is handed to Y; X's retry must
+        # get a definitive empty result and must not take the task back.
+        sch = Scheduler(**self.get_scheduler_config())
+        sch.add_task(worker="X", task_id="A")
+        sch.add_task(worker="Y", task_id="A")
+
+        first = sch.get_work(worker="X", get_work_id="req-1")
+        self.assertEqual(first["task_id"], "A")
+
+        # the scheduler retracts the assignment and another worker takes over
+        task = sch._state.get_task("A")
+        sch._state.set_status(task, PENDING)
+        task.worker_running = None
+        self.assertEqual(sch.get_work(worker="Y")["task_id"], "A")
+
+        retry = sch.get_work(worker="X", get_work_id="req-1")
+        self.assertEqual(retry["task_id"], None)
+        self.assertEqual(retry["claim_status"], "revoked")
+        self.assertEqual([(t["task_id"], t["worker"]) for t in retry["running_tasks"]], [("A", "Y")])
+        self.assertEqual([t["task_id"] for t in sch.count_pending(worker="Y")["running_tasks"]], ["A"])
+
+    def test_get_work_request_id_expired_claim_does_not_reown_task(self):
+        # X's get_work response is lost. While X is gone, both the claim and X's
+        # hold on the task expire and Y takes over. X's late retry must get a
+        # definitive empty result and must not re-own the task.
+        self.setTime(0)
+        self.sch.add_task(task_id="A", worker="X")
+        self.sch.add_task(task_id="A", worker="Y")
+
+        first = self.sch.get_work(worker="X", get_work_id="req-1")
+        self.assertEqual(first["task_id"], "A")
+
+        # within the claim ttl, the retry reads the assignment back
+        self.setTime(5)
+        retry = self.sch.get_work(worker="X", get_work_id="req-1")
+        self.assertEqual(retry["task_id"], "A")
+        self.assertTrue(retry["replayed"])
+
+        # X disappears; the claim (ttl=10) and X's hold on A expire, Y takes over
+        for t in range(10, 200):
+            self.setTime(t)
+            self.sch.ping(worker="Y")
+            if t % 10 == 0:
+                self.sch.prune()
+        self.assertEqual(self.sch.get_work(worker="Y")["task_id"], "A")
+
+        # the expired request does not re-own the task
+        expired = self.sch.get_work(worker="X", get_work_id="req-1")
+        self.assertEqual(expired["task_id"], None)
+        self.assertEqual(expired["claim_status"], "expired")
+        self.assertEqual(expired["running_tasks"], [])
+        self.assertEqual([t["task_id"] for t in self.sch.count_pending(worker="Y")["running_tasks"]], ["A"])
 
     def test_get_work_single_batch_item(self):
         self.sch.add_task_batcher(worker=WORKER, task_family="A", batched_args=["a"])
