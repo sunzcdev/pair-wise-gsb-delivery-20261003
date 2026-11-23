@@ -617,6 +617,181 @@ class TestReadWriteMixin(AsyncTestCase):
             ws.close()
             rs.close()
 
+    # The tests below cover abandoning a read. A protocol may start with a
+    # delimited read (read_until_regex) and then decide, once it has seen a
+    # prefix, to switch to a fixed-length read instead. Cancelling the
+    # delimited read must hand its state over cleanly: bytes that have
+    # already arrived stay in the stream's buffer, the cancelled future is
+    # never resolved, and a stale wakeup for the old read can't settle the
+    # new one.
+    @gen_test
+    async def test_cancel_read_keeps_buffered_prefix(self):
+        async with self.iostream_pair() as (rs, ws):
+            fut = rs.read_until_regex(rb"\r\n\r\n")
+            await ws.write(b"GET ")
+            await gen.sleep(0.01)
+            # Not enough data to match the regex, so the read is waiting.
+            self.assertFalse(fut.done())
+            self.assertTrue(rs.reading())
+
+            self.assertTrue(rs.cancel_read())
+            self.assertTrue(fut.cancelled())
+            self.assertFalse(rs.reading())
+
+            # The rest of the message arrives after the cancellation; it is
+            # buffered along with the prefix for the next read.
+            await ws.write(b"/ HTTP/1.1\r\n\r\nbody")
+            await gen.sleep(0.01)
+            self.assertTrue(fut.cancelled())
+
+            # The fixed-length read starts with the prefix that was already
+            # in the buffer when the delimited read was abandoned.
+            self.assertEqual(await rs.read_bytes(4), b"GET ")
+            self.assertEqual(await rs.read_until(b"\r\n\r\n"), b"/ HTTP/1.1\r\n\r\n")
+            self.assertEqual(await rs.read_bytes(4), b"body")
+
+    @gen_test
+    async def test_cancel_read_via_future(self):
+        # Cancelling the future directly is equivalent to cancel_read().
+        async with self.iostream_pair() as (rs, ws):
+            fut = rs.read_until(b"done")
+            await ws.write(b"xyz")
+            await gen.sleep(0.01)
+            fut.cancel()
+            self.assertTrue(fut.cancelled())
+            self.assertFalse(rs.reading())
+            # The buffered bytes go to the next read.
+            self.assertEqual(await rs.read_bytes(3), b"xyz")
+            self.assertTrue(fut.cancelled())
+
+    @gen_test
+    async def test_cancel_read_stale_wakeup_does_not_settle_next_read(self):
+        async with self.iostream_pair() as (rs, ws):
+            old = rs.read_until_regex(rb"END")
+            await ws.write(b"AB")
+            await gen.sleep(0.01)
+            self.assertTrue(rs.cancel_read())
+
+            new = rs.read_bytes(4)
+            self.assertFalse(new.done())
+            self.assertEqual(rs._read_buffer_size, 2)
+
+            # A wakeup that was queued for the abandoned read must not
+            # complete the new read or consume buffered data for it.
+            rs._handle_read()
+            self.assertTrue(old.cancelled())
+            self.assertFalse(new.done())
+            self.assertEqual(rs._read_buffer_size, 2)
+
+            await ws.write(b"CD")
+            self.assertEqual(await new, b"ABCD")
+            self.assertTrue(old.cancelled())
+
+    @gen_test
+    async def test_cancel_read_stale_max_bytes_does_not_close_stream(self):
+        # max_bytes belongs to the abandoned read; it must not linger and
+        # make the next read fail the connection.
+        async with self.iostream_pair() as (rs, ws):
+            fut = rs.read_until_regex(rb"\r\n\r\n", max_bytes=5)
+            self.assertTrue(rs.cancel_read())
+            await ws.write(b"GET / HTTP/1.1\r\n\r\n")
+            self.assertEqual(await rs.read_bytes(4), b"GET ")
+            self.assertTrue(fut.cancelled())
+            self.assertFalse(rs.closed())
+
+    @gen_test
+    async def test_cancel_read_until_close_does_not_deliver(self):
+        async with self.iostream_pair() as (rs, ws):
+            fut = rs.read_until_close()
+            await ws.write(b"partial")
+            await gen.sleep(0.01)
+            self.assertTrue(rs.cancel_read())
+            self.assertTrue(fut.cancelled())
+
+            fut2 = rs.read_until_close()
+            ws.close()
+            self.assertEqual(await fut2, b"partial")
+            # The abandoned read keeps its cancelled status; the buffered
+            # data went to the read that replaced it.
+            self.assertTrue(fut.cancelled())
+
+    @gen_test
+    async def test_cancel_read_into_keeps_bytes(self):
+        async with self.iostream_pair() as (rs, ws):
+            buf = bytearray(8)
+            fut = rs.read_into(buf)
+            await ws.write(b"abc")
+            await gen.sleep(0.01)
+            self.assertTrue(rs.cancel_read())
+            self.assertTrue(fut.cancelled())
+            self.assertFalse(rs.reading())
+            await ws.write(b"defg")
+            self.assertEqual(await rs.read_bytes(7), b"abcdefg")
+
+    @gen_test
+    async def test_cancel_read_returns_false_when_nothing_to_cancel(self):
+        async with self.iostream_pair() as (rs, ws):
+            self.assertFalse(rs.cancel_read())
+            await ws.write(b"ab")
+            fut = rs.read_bytes(2)
+            self.assertTrue(fut.done())
+            self.assertFalse(rs.cancel_read())
+
+    @gen_test
+    async def test_cancel_read_does_not_permit_concurrent_reads(self):
+        # An abandoned read may be replaced, but a live one still can't be.
+        async with self.iostream_pair() as (rs, ws):
+            fut = rs.read_bytes(2)
+            with self.assertRaises(AssertionError):
+                rs.read_bytes(2)
+            self.assertTrue(rs.cancel_read())
+            self.assertFalse(rs.cancel_read())
+            await ws.write(b"hi")
+            self.assertEqual(await rs.read_bytes(2), b"hi")
+            self.assertTrue(fut.cancelled())
+
+    @gen_test
+    async def test_cancel_read_with_wait_for(self):
+        # asyncio.wait_for cancels the read on timeout; the state must be
+        # clean by the time the timeout is reported, so a new read can start
+        # immediately and sees the bytes that arrived meanwhile.
+        async with self.iostream_pair() as (rs, ws):
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(rs.read_until(b"\n"), 0.01)
+            self.assertFalse(rs.reading())
+            await ws.write(b"late\n")
+            self.assertEqual(await rs.read_until(b"\n"), b"late\n")
+
+    @gen_test
+    async def test_cancel_read_then_close(self):
+        # Closing a stream with an abandoned read must not deliver the
+        # buffered data to it (it is already cancelled), and must not raise
+        # on the way out.
+        async with self.iostream_pair() as (rs, ws):
+            fut = rs.read_until_close()
+            await ws.write(b"abc")
+            await gen.sleep(0.01)
+            self.assertTrue(rs.cancel_read())
+            rs.close()
+            self.assertTrue(fut.cancelled())
+            self.assertTrue(rs.closed())
+
+    @gen_test
+    async def test_cancel_read_while_closed(self):
+        # The abandoned read's data goes to a read made after the close.
+        async with self.iostream_pair() as (rs, ws):
+            fut = rs.read_until(b"\n")
+            await ws.write(b"abc")
+            await gen.sleep(0.01)
+            self.assertTrue(rs.cancel_read())
+            ws.close()
+            await gen.sleep(0.01)
+            self.assertTrue(fut.cancelled())
+            # A closed stream may still satisfy a read from its buffer.
+            self.assertEqual(await rs.read_bytes(3), b"abc")
+            with self.assertRaises(StreamClosedError):
+                await rs.read_bytes(1)
+
     @gen_test
     def test_small_reads_from_large_buffer(self):
         # 10KB buffer size, 100KB available to read.

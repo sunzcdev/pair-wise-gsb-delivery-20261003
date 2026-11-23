@@ -34,6 +34,7 @@ import socket
 import ssl
 import sys
 import typing
+import weakref
 from collections.abc import Awaitable, Callable
 from re import Pattern
 from types import TracebackType
@@ -106,6 +107,42 @@ class UnsatisfiableReadError(Exception):
 
 class StreamBufferFullError(Exception):
     """Exception raised by `IOStream` methods when the buffer is full."""
+
+
+class _ReadFuture(Future[Any]):
+    """The `.Future` returned by the ``read_*()`` methods.
+
+    Cancelling it abandons the read immediately, exactly like
+    `.BaseIOStream.cancel_read`. Doing the cleanup synchronously matters:
+    asyncio only runs cancellation callbacks on a later IOLoop iteration,
+    but the caller of `~BaseIOStream.read_into` may reuse (or resize) its
+    buffer as soon as ``cancel()`` returns, and a read that is aborted by
+    `asyncio.wait_for` must be fully torn down before its timeout is
+    reported.
+
+    The stream is referenced weakly so that a pending read does not create a
+    reference cycle with it.
+    """
+
+    def __init__(self, stream: "BaseIOStream") -> None:
+        super().__init__()
+        self._stream_ref: weakref.ReferenceType[BaseIOStream] | None = weakref.ref(
+            stream
+        )
+
+    def cancel(self, msg: Any = None) -> bool:
+        cancelled = super().cancel(msg)
+        if cancelled and self._stream_ref is not None:
+            stream_ref = self._stream_ref
+            self._stream_ref = None
+            stream = stream_ref()
+            if stream is not None:
+                stream._read_future_cancelled(self)
+        return cancelled
+
+    def clear_cancel_handler(self) -> None:
+        """Drops the reference to the stream once the read has finished."""
+        self._stream_ref = None
 
 
 class _StreamBuffer:
@@ -231,6 +268,15 @@ class BaseIOStream:
     stream is closed; `.BaseIOStream.set_close_callback` can also be used
     to be notified of a closed stream.
 
+    A pending read may be abandoned, either by cancelling the `.Future`
+    returned by the ``read_*()`` method or by calling `.cancel_read`.
+    Cancelled reads behave like this: the cancelled `.Future` stays
+    cancelled (it is never resolved with data), any bytes that have been
+    received but not yet returned to the caller stay in the stream's read
+    buffer, and the next read starts from those bytes. Only one read may
+    be pending at a time; starting a new read while another one is still
+    pending is an error unless the previous one has been cancelled.
+
     When a stream is closed due to an error, the IOStream's ``error``
     attribute contains the exception object.
 
@@ -352,6 +398,10 @@ class BaseIOStream:
         if more than ``max_bytes`` bytes have been read and the regex is
         not satisfied.
 
+        The returned `.Future` may be cancelled (or the read abandoned with
+        `.cancel_read`) if the result is no longer wanted. Bytes that arrive
+        afterwards are kept for the next read.
+
         .. versionchanged:: 4.0
             Added the ``max_bytes`` argument.  The ``callback`` argument is
             now optional and a `.Future` will be returned if it is omitted.
@@ -360,6 +410,11 @@ class BaseIOStream:
 
            The ``callback`` argument was removed. Use the returned
            `.Future` instead.
+
+        .. versionchanged:: 6.7
+
+           Cancelling the returned `.Future` now abandons the read cleanly
+           instead of leaving stale read state behind.
 
         """
         future = self._start_read()
@@ -390,6 +445,10 @@ class BaseIOStream:
         if more than ``max_bytes`` bytes have been read and the delimiter
         is not found.
 
+        The returned `.Future` may be cancelled (or the read abandoned with
+        `.cancel_read`) if the result is no longer wanted. Bytes that arrive
+        afterwards are kept for the next read.
+
         .. versionchanged:: 4.0
             Added the ``max_bytes`` argument.  The ``callback`` argument is
             now optional and a `.Future` will be returned if it is omitted.
@@ -398,6 +457,11 @@ class BaseIOStream:
 
            The ``callback`` argument was removed. Use the returned
            `.Future` instead.
+
+        .. versionchanged:: 6.7
+
+           Cancelling the returned `.Future` now abandons the read cleanly
+           instead of leaving stale read state behind.
         """
         future = self._start_read()
         self._read_delimiter = delimiter
@@ -420,6 +484,10 @@ class BaseIOStream:
         If ``partial`` is true, data is returned as soon as we have
         any bytes to return (but never more than ``num_bytes``)
 
+        The returned `.Future` may be cancelled (or the read abandoned with
+        `.cancel_read`) if the result is no longer wanted. Bytes that arrive
+        afterwards are kept for the next read.
+
         .. versionchanged:: 4.0
             Added the ``partial`` argument.  The callback argument is now
             optional and a `.Future` will be returned if it is omitted.
@@ -429,6 +497,11 @@ class BaseIOStream:
            The ``callback`` and ``streaming_callback`` arguments have
            been removed. Use the returned `.Future` (and
            ``partial=True`` for ``streaming_callback``) instead.
+
+        .. versionchanged:: 6.7
+
+           Cancelling the returned `.Future` now abandons the read cleanly
+           instead of leaving stale read state behind.
 
         """
         future = self._start_read()
@@ -457,6 +530,12 @@ class BaseIOStream:
 
            The ``callback`` argument was removed. Use the returned
            `.Future` instead.
+
+        .. versionchanged:: 6.7
+
+           Cancelling the returned `.Future` now abandons the read cleanly:
+           bytes that were already read into ``buf`` are kept for the next
+           read, and the caller's buffer is no longer in use by the stream.
 
         """
         future = self._start_read()
@@ -488,6 +567,37 @@ class BaseIOStream:
             future.add_done_callback(lambda f: f.exception())
             raise
         return future
+
+    def cancel_read(self) -> bool:
+        """Cancels the pending read, if any.
+
+        This abandons the current ``read_*()`` operation: the `.Future` it
+        returned stays cancelled instead of being resolved with data, and
+        any bytes that have already been received but not yet returned to
+        the caller are kept in the read buffer, so that the next read
+        starts with them. Cancelling that `.Future` directly has the same
+        effect; this method is a convenience that also reports whether
+        there was anything to cancel.
+
+        Returns ``True`` if a read was pending and has been cancelled,
+        ``False`` if there was nothing to cancel.
+
+        .. versionadded:: 6.7
+        """
+        future = self._read_future
+        if future is None:
+            return False
+        # Cancelling the future runs the cleanup synchronously (see
+        # `_ReadFuture`), which forgets the read and keeps its buffered data.
+        can_cancel = future.cancelled() or future.cancel()
+        if not can_cancel:
+            # The read has already been resolved, so there is nothing to
+            # abandon.
+            return False
+        # ``cancel()`` on an already-cancelled future is a no-op, so make sure
+        # a read that was cancelled some other way is cleaned up too.
+        self._check_read_cancellation()
+        return True
 
     def read_until_close(self) -> Awaitable[bytes]:
         """Asynchronously reads all data from the socket until it is closed.
@@ -605,6 +715,9 @@ class BaseIOStream:
                     exc_info = sys.exc_info()
                     if any(exc_info):
                         self.error = exc_info[1]
+            # A read that was abandoned is not waiting for anything, so don't
+            # let it consume the buffered data on the way out.
+            self._check_read_cancellation()
             if self._read_until_close:
                 self._read_until_close = False
                 if self.error is None or self._is_connreset(self.error):
@@ -638,8 +751,11 @@ class BaseIOStream:
     def _signal_closed(self) -> None:
         futures: list[Future[Any]] = []
         if self._read_future is not None:
-            futures.append(self._read_future)
+            future = self._read_future
             self._read_future = None
+            if isinstance(future, _ReadFuture):
+                future.clear_cancel_handler()
+            futures.append(future)
         futures += [future for _, future in self._write_futures]
         self._write_futures.clear()
         if self._connect_future is not None:
@@ -683,8 +799,16 @@ class BaseIOStream:
         self._write_buffer = None  # type: ignore
 
     def reading(self) -> bool:
-        """Returns ``True`` if we are currently reading from the stream."""
-        return self._read_future is not None
+        """Returns ``True`` if we are currently reading from the stream.
+
+        .. versionchanged:: 6.7
+           A read whose `.Future` was cancelled no longer counts as in
+           progress, even if its state has not been cleaned up yet.
+        """
+        # A cancelled future means the caller has abandoned the read, so it
+        # no longer counts as an active read even before the state has been
+        # cleaned up.
+        return self._read_future is not None and not self._read_future.cancelled()
 
     def writing(self) -> bool:
         """Returns ``True`` if we are currently writing to the stream."""
@@ -807,6 +931,14 @@ class BaseIOStream:
         return self._find_read_pos()
 
     def _handle_read(self) -> None:
+        # An event may still be queued for a read that the caller abandoned
+        # since it was scheduled. Forget that read's state first so this
+        # event can neither resolve the stale read nor use up data on its
+        # behalf: anything already received stays in the read buffer, and a
+        # read started after this point gets all of it. (When a new read has
+        # already taken over, the abandoned state is gone and this is a
+        # no-op.)
+        self._check_read_cancellation()
         try:
             pos = self._read_to_buffer_loop()
         except UnsatisfiableReadError:
@@ -820,7 +952,70 @@ class BaseIOStream:
         if pos is not None:
             self._read_from_buffer(pos)
 
+    def _read_is_cancelled(self) -> bool:
+        """Returns True if the pending read has been abandoned.
+
+        A read is abandoned when its `.Future` is cancelled, either by
+        `.cancel_read` or directly by the caller. The cancelled `.Future` is
+        left as it is: it is never resolved afterwards.
+        """
+        future = self._read_future
+        return future is not None and future.cancelled()
+
+    def _check_read_cancellation(self) -> bool:
+        """Drops the state of the pending read if it has been abandoned.
+
+        Returns True if a cancelled read was cleaned up. Bytes that were
+        already received are left in the read buffer, so the next read starts
+        with them. This is idempotent: calling it when no read is pending (or
+        when the pending read is still live) does nothing.
+        """
+        if not self._read_is_cancelled():
+            return False
+        self._abandon_read()
+        return True
+
+    def _read_future_cancelled(self, future: "_ReadFuture") -> None:
+        """Called synchronously when a read's future is cancelled directly."""
+        if future is self._read_future:
+            self._abandon_read()
+            self._maybe_add_error_listener()
+
+    def _abandon_read(self) -> None:
+        """Forgets the pending read, keeping buffered data for the next one.
+
+        The read's `.Future` keeps whatever state it already has (a
+        cancelled future stays cancelled), but the stream stops referencing
+        it, so an in-flight wakeup for the old read can't resolve it.
+        """
+        if isinstance(self._read_future, _ReadFuture):
+            self._read_future.clear_cancel_handler()
+        self._read_future = None
+        self._read_bytes = self._read_delimiter = self._read_regex = None
+        self._read_max_bytes = None
+        self._read_partial = False
+        self._read_until_close = False
+        # read_into() swaps in the caller's buffer. Nothing was delivered to
+        # the caller, so it gets its buffer back untouched, and the bytes
+        # that were read into it go back in front of the rest of the read
+        # buffer so they are not lost.
+        if self._user_read_buffer:
+            size = self._read_buffer_size
+            leftover = self._after_user_read_buffer or bytearray()
+            if size:
+                with memoryview(self._read_buffer) as m, m[:size] as view:
+                    leftover = bytearray(view) + leftover
+            self._read_buffer = leftover
+            self._read_buffer_size = len(leftover)
+            self._after_user_read_buffer = None
+            self._user_read_buffer = False
+
     def _start_read(self) -> Future[Any]:
+        # A read whose future was cancelled has been abandoned by its caller:
+        # its state must not be allowed to satisfy (or consume data for) the
+        # read that is starting now. If the read is still live, the check
+        # below reports "Already reading" as usual.
+        self._check_read_cancellation()
         if self._read_future is not None:
             # It is an error to start a read while a prior read is unresolved.
             # However, if the prior read is unresolved because the stream was
@@ -840,10 +1035,16 @@ class BaseIOStream:
             # when making changes here. See #2651 and #2719.
             self._check_closed()
             assert self._read_future is None, "Already reading"
-        self._read_future = Future()
-        return self._read_future
+        future = self._read_future = _ReadFuture(self)
+        return future
 
     def _finish_read(self, size: int) -> None:
+        if self._read_is_cancelled():
+            # The caller abandoned this read, so do not consume anything for
+            # it: the bytes stay buffered for the next read.
+            self._abandon_read()
+            self._maybe_add_error_listener()
+            return
         if self._user_read_buffer:
             self._read_buffer = self._after_user_read_buffer or bytearray()
             self._after_user_read_buffer = None
@@ -855,6 +1056,8 @@ class BaseIOStream:
         if self._read_future is not None:
             future = self._read_future
             self._read_future = None
+            if isinstance(future, _ReadFuture):
+                future.clear_cancel_handler()
             future_set_result_unless_cancelled(future, result)
         self._maybe_add_error_listener()
 
@@ -1299,6 +1502,9 @@ class IOStream(BaseIOStream):
            Cancelling the returned `.Future` before the handshake completes
            now closes the new stream and its socket.
         """
+        # An abandoned read is not outstanding, even if it hasn't been cleaned
+        # up yet.
+        self._check_read_cancellation()
         if (
             self._read_future
             or self._write_futures

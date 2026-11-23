@@ -17,6 +17,7 @@
    .. automethod:: BaseIOStream.read_until
    .. automethod:: BaseIOStream.read_until_regex
    .. automethod:: BaseIOStream.read_until_close
+   .. automethod:: BaseIOStream.cancel_read
    .. automethod:: BaseIOStream.close
    .. automethod:: BaseIOStream.set_close_callback
    .. automethod:: BaseIOStream.closed

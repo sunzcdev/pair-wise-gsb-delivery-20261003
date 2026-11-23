@@ -403,6 +403,7 @@ tornado.ioloop.TimeoutError: import of builtins.TimeoutError
 [tornado.iostream]
 tornado.iostream.BaseIOStream: class()
 tornado.iostream.BaseIOStream.__init__: method(self, max_buffer_size=None, read_chunk_size=None, max_write_buffer_size=None)
+tornado.iostream.BaseIOStream.cancel_read: method(self)
 tornado.iostream.BaseIOStream.close: method(self, exc_info=False)
 tornado.iostream.BaseIOStream.close_fd: method(self)
 tornado.iostream.BaseIOStream.closed: method(self)
