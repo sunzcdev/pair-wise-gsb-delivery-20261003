@@ -168,7 +168,18 @@ response consumption" attack in that it requires the server to buffer
 data that it cannot send to the client.
 
 To mitigate this Hypercorn responds to the backpressure and pauses
-(blocks) the coroutine writing the response.
+(blocks) the coroutine writing the response. On HTTP/2 the backpressure
+is applied at two levels. Each individual stream has its own high/low
+water mark, which pauses that stream's producer once it has buffered too
+much. As many streams could each buffer up to that amount, there is also
+a connection wide bound, configurable via
+``h2_connection_buffer_size``, on the total bytes queued across every
+stream of a connection. Once this shared budget is exhausted a producer
+blocks even if its own stream is under its high water mark, so the
+actual memory held by a single connection is always bounded. A stream
+whose flow control window is exhausted does not prevent other streams
+from consuming and releasing the shared budget, and when a stream is
+reset the budget held by its unsent data is returned immediately.
 
 Rapid reset
 ^^^^^^^^^^^

@@ -27,6 +27,8 @@ from ..events import Closed, Event, RawData, Updated
 from ..typing import AppWrapper, ConnectionState, Event as IOEvent, TaskGroup, WorkerContext
 from ..utils import filter_pseudo_headers
 
+# Per-stream high/low water marks. These bound how much a single stream
+# is allowed to buffer before the coroutine producing the body is paused.
 BUFFER_HIGH_WATER = 2 * 2**14  # Twice the default max frame size (two frames worth)
 BUFFER_LOW_WATER = BUFFER_HIGH_WATER / 2
 
@@ -35,10 +37,62 @@ class BufferCompleteError(Exception):
     pass
 
 
+class ConnectionBufferLimit:
+    """Connection wide bound on the total bytes queued across all streams.
+
+    The per-stream :class:`StreamBuffer` limits only bound how much a
+    single stream may buffer. With many concurrent streams their buffers
+    can still add up to an unbounded amount of memory. This limit is
+    shared between every stream on a connection so that the actual number
+    of bytes awaiting transmission is always bounded, regardless of how
+    many streams are active.
+
+    Bytes are *reserved* when they enter a stream buffer and *released*
+    either as they are handed to h2 for transmission or when the owning
+    stream is reset/closed. A stream whose flow control window is
+    exhausted therefore holds its reservation without blocking the other
+    streams, which continue to consume and release the shared budget.
+    """
+
+    def __init__(self, event_class: type[IOEvent], max_size: int) -> None:
+        self.max_size = max_size
+        self.queued = 0
+        self._available = event_class()
+
+    async def reserve(self, size: int) -> None:
+        # Wait until the shared budget has room. A single push that is itself
+        # larger than the limit is allowed through once the existing queue has
+        # drained (it temporarily exceeds the steady state bound, matching the
+        # per-stream behaviour), rather than deadlocking forever.
+        #
+        # Level triggered: clear only immediately before waiting and
+        # re-check the budget after every wake-up, so a release signal can
+        # never be lost to a stale wake-up.
+        while self.queued > 0 and self.queued + size > self.max_size:
+            await self._available.clear()
+            await self._available.wait()
+        self.queued += size
+
+    async def release(self, size: int) -> None:
+        self.queued -= size
+        if self.queued < 0:
+            self.queued = 0
+        # Signal any waiting producer that budget may have freed up.
+        await self._available.set()
+
+    @property
+    def exhausted(self) -> bool:
+        return self.queued >= self.max_size
+
+
 class StreamBuffer:
-    def __init__(self, event_class: type[IOEvent]) -> None:
+    def __init__(
+        self, event_class: type[IOEvent], connection_limit: ConnectionBufferLimit
+    ) -> None:
         self.buffer = bytearray()
         self._complete = False
+        self._closed = False
+        self._connection_limit = connection_limit
         self._is_empty = event_class()
         self._paused = event_class()
 
@@ -49,7 +103,15 @@ class StreamBuffer:
         self._complete = True
 
     async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._complete = True
+        # Return any budget still held by data that was never handed to
+        # h2. Frames already given to h2 keep flowing per the protocol and
+        # are not accounted for here.
+        if len(self.buffer) > 0:
+            await self._connection_limit.release(len(self.buffer))
         self.buffer = bytearray()
         await self._is_empty.set()
         await self._paused.set()
@@ -61,6 +123,9 @@ class StreamBuffer:
     async def push(self, data: bytes) -> None:
         if self._complete:
             raise BufferCompleteError()
+        # First reserve against the connection wide budget, so that one
+        # stalled stream cannot starve the others of memory.
+        await self._connection_limit.reserve(len(data))
         self.buffer.extend(data)
         await self._is_empty.clear()
         if len(self.buffer) >= BUFFER_HIGH_WATER:
@@ -71,6 +136,10 @@ class StreamBuffer:
         length = min(len(self.buffer), max_length)
         data = bytes(self.buffer[:length])
         del self.buffer[:length]
+        # The bytes have left the buffer and are now h2's responsibility,
+        # so release the shared reservation they held.
+        if length > 0:
+            await self._connection_limit.release(length)
         if len(data) < BUFFER_LOW_WATER:
             await self._paused.set()
         if len(self.buffer) == 0:
@@ -121,6 +190,11 @@ class H2Protocol:
         self.has_data = self.context.event_class()
         self.priority = priority.PriorityTree()
         self.stream_buffers: dict[int, StreamBuffer] = {}
+        # Shared, connection wide bound on the bytes queued in all the
+        # stream buffers combined.
+        self.connection_buffer_limit = ConnectionBufferLimit(
+            self.context.event_class, config.h2_connection_buffer_size
+        )
 
     @property
     def idle(self) -> bool:
@@ -155,10 +229,16 @@ class H2Protocol:
 
     async def _send_data(self, stream_id: int) -> None:
         try:
-            chunk_size = min(
-                self.connection.local_flow_control_window(stream_id),
-                self.connection.max_outbound_frame_size,
-            )
+            flow_window = self.connection.local_flow_control_window(stream_id)
+            if flow_window <= 0:
+                # This stream has exhausted its flow control window. Block
+                # it so that the sending task moves on to the other streams
+                # instead of busy spinning here. It is unblocked again when
+                # a WINDOW_UPDATE arrives.
+                self.priority.block(stream_id)
+                return
+
+            chunk_size = min(flow_window, self.connection.max_outbound_frame_size)
             chunk_size = max(0, chunk_size)
             data = await self.stream_buffers[stream_id].pop(chunk_size)
             if data:
@@ -175,9 +255,13 @@ class H2Protocol:
         except (h2.exceptions.StreamClosedError, KeyError, h2.exceptions.ProtocolError):
             # Stream or connection has closed whilst waiting to send
             # data, not a problem - just force close it.
-            await self.stream_buffers[stream_id].close()
-            del self.stream_buffers[stream_id]
-            self.priority.remove_stream(stream_id)
+            stream_buffer = self.stream_buffers.pop(stream_id, None)
+            if stream_buffer is not None:
+                await stream_buffer.close()
+            try:
+                self.priority.remove_stream(stream_id)
+            except priority.MissingStreamError:
+                pass
 
     async def handle(self, event: Event) -> None:
         if isinstance(event, RawData):
@@ -347,7 +431,9 @@ class H2Protocol:
                 self.stream_send,
                 request.stream_id,
             )
-        self.stream_buffers[request.stream_id] = StreamBuffer(self.context.event_class)
+        self.stream_buffers[request.stream_id] = StreamBuffer(
+            self.context.event_class, self.connection_buffer_limit
+        )
         try:
             self.priority.insert_stream(request.stream_id)
         except priority.DuplicateStreamError:
@@ -398,3 +484,15 @@ class H2Protocol:
             stream = self.streams.pop(stream_id)
             await stream.handle(StreamClosed(stream_id=stream_id))
             await self.has_data.set()
+        if stream_id in self.stream_buffers:
+            # The stream was reset (or the connection closed) with data
+            # still queued. Close the buffer to wake any producer blocked on
+            # backpressure and return the budget held by the unsent bytes.
+            # Frames already handed to h2 are unaffected and continue to be
+            # processed per the protocol.
+            await self.stream_buffers[stream_id].close()
+            del self.stream_buffers[stream_id]
+            try:
+                self.priority.remove_stream(stream_id)
+            except priority.MissingStreamError:
+                pass

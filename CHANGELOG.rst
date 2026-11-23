@@ -1,3 +1,13 @@
+Unreleased
+----------
+
+* Add an ``h2_connection_buffer_size`` config option bounding the total
+  response bytes queued across all streams of a single HTTP/2 connection.
+* Bugfix don't busy-spin the HTTP/2 sending task on a stream whose flow
+  control window is exhausted.
+* Bugfix return the connection buffer budget held by unsent data when an
+  HTTP/2 stream is reset or closed.
+
 0.18.0 2025-11-08
 -----------------
 

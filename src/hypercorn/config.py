@@ -83,6 +83,9 @@ class Config:
     h2_max_concurrent_streams = 100
     h2_max_header_list_size = 2**16
     h2_max_inbound_frame_size = 2**14 * OCTETS
+    # Maximum total bytes of response data queued across all the streams
+    # on a single HTTP/2 connection awaiting transmission.
+    h2_connection_buffer_size = 1024 * 1024 * BYTES
     include_date_header = True
     include_server_header = True
     keep_alive_timeout = 5 * SECONDS
