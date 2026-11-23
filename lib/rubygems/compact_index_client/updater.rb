@@ -26,7 +26,10 @@ class Gem::CompactIndexClient
     end
 
     def update(remote_path, local_path, etag_path)
-      append(remote_path, local_path, etag_path) || replace(remote_path, local_path, etag_path)
+      # Capture the baseline before touching the network so a concurrent
+      # update of the same cache can be detected when committing.
+      baseline = CacheFile.baseline(local_path)
+      append(remote_path, local_path, etag_path) || replace(remote_path, local_path, etag_path, baseline)
     rescue CacheFile::DigestMismatchError => e
       raise MismatchedChecksumError.new(remote_path, e.message)
     rescue Zlib::GzipFile::Error
@@ -45,27 +48,46 @@ class Gem::CompactIndexClient
         # Avoids 416 (Range Not Satisfiable) responses.
         response = @fetcher.call(remote_path, request_headers(etag, file.size - 1))
         break true if response.is_a?(Gem::Net::HTTPNotModified)
+        # The remote file is shorter than the local copy (e.g. a restored
+        # mirror serving a regenerated index), so there is nothing to
+        # resume: confirm a full representation instead.
+        break false if response.is_a?(Gem::Net::HTTPRangeNotSatisfiable)
 
         file.digests = parse_digests(response)
         # server may ignore Range and return the full response
-        if response.is_a?(Gem::Net::HTTPPartialContent)
-          tail = response.body.byteslice(1..-1)
-          break false unless tail && file.append(tail)
-        else
-          file.write(response.body)
-        end
-        CacheFile.write(etag_path, etag_from_response(response))
+        committed =
+          if response.is_a?(Gem::Net::HTTPPartialContent)
+            # A ranged response can only be resumed when its first byte
+            # overlaps the last byte of the local copy. When it does not,
+            # the remote file is a different generation and must be
+            # confirmed whole rather than appended to.
+            break false unless response.body.getbyte(0) == file.last_byte
+            tail = response.body.byteslice(1..-1)
+            break false unless tail && file.append(tail)
+            true
+          else
+            file.write(response.body)
+          end
+        # Publish the verification credentials together with the contents
+        # they belong to. When the commit was skipped because a concurrent
+        # update won, its contents and credentials are kept instead.
+        CacheFile.write(etag_path, etag_from_response(response)) if committed
         true
       end
     end
 
     # request without range header to get the full file or a 304 Not Modified
-    def replace(remote_path, local_path, etag_path)
+    def replace(remote_path, local_path, etag_path, baseline)
       etag = etag_path.read.tap(&:chomp!) if etag_path.file?
       response = @fetcher.call(remote_path, request_headers(etag))
       return true if response.is_a?(Gem::Net::HTTPNotModified)
-      CacheFile.write(local_path, response.body, parse_digests(response))
-      CacheFile.write(etag_path, etag_from_response(response))
+      # Publish only when the cache still holds the baseline this update
+      # started from. A concurrent update may have confirmed and published
+      # another generation (possibly a shorter index from a restored
+      # mirror) while this request was in flight, and its contents win.
+      committed = CacheFile.write(local_path, response.body, parse_digests(response), baseline: baseline)
+      CacheFile.write(etag_path, etag_from_response(response)) if committed
+      true
     end
 
     def request_headers(etag, range_start = nil)

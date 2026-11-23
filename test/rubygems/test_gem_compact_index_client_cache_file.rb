@@ -159,4 +159,106 @@ class TestGemCompactIndexClientCacheFile < Gem::TestCase
     assert_equal "new", @path.binread
     assert_equal 0, @path.stat.mode & 0o200, "expected CacheFile.write to preserve the original read-only permission"
   end
+
+  def test_baseline_returns_nil_for_missing_file
+    assert_nil CacheFile.baseline(@path)
+  end
+
+  def test_baseline_changes_with_the_file
+    @path.binwrite "a"
+    baseline = CacheFile.baseline(@path)
+
+    @path.binwrite "bb"
+
+    refute_equal baseline, CacheFile.baseline(@path)
+  end
+
+  def test_last_byte
+    @path.binwrite "abc"
+
+    CacheFile.copy(@path) do |file|
+      assert_equal "c".getbyte(0), file.last_byte
+    end
+  end
+
+  def test_last_byte_returns_nil_when_empty
+    CacheFile.new(@path) do |file|
+      assert_nil file.last_byte
+    end
+  end
+
+  def test_commit_returns_true_when_original_unchanged
+    @path.binwrite "abc"
+
+    committed = nil
+    CacheFile.copy(@path) do |file|
+      file.open {|f| f.write "abcdef" }
+      committed = file.commit
+    end
+
+    assert committed
+    assert_equal "abcdef", @path.read
+  end
+
+  def test_commit_returns_false_when_original_changed
+    @path.binwrite "abc"
+
+    committed = nil
+    CacheFile.copy(@path) do |file|
+      file.open {|f| f.write "abcdef" }
+      @path.binwrite "changed by another process"
+      committed = file.commit
+    end
+
+    refute committed
+    assert_equal "changed by another process", @path.read
+    assert_empty Dir.glob("#{@path}.*.tmp")
+  end
+
+  def test_commit_returns_false_when_original_was_removed
+    @path.binwrite "abc"
+
+    committed = nil
+    CacheFile.copy(@path) do |file|
+      file.open {|f| f.write "abcdef" }
+      @path.delete
+      committed = file.commit
+    end
+
+    refute committed
+    refute @path.exist?
+  end
+
+  def test_write_with_baseline_replaces_unchanged_file
+    @path.binwrite "original"
+    baseline = CacheFile.baseline(@path)
+
+    committed = CacheFile.write(@path, "new", nil, baseline: baseline)
+
+    assert committed
+    assert_equal "new", @path.read
+  end
+
+  def test_write_with_baseline_skips_file_changed_by_another_process
+    @path.binwrite "original"
+    baseline = CacheFile.baseline(@path)
+    @path.binwrite "changed by another process"
+
+    committed = CacheFile.write(@path, "stale", nil, baseline: baseline)
+
+    refute committed
+    assert_equal "changed by another process", @path.read
+  end
+
+  def test_write_with_nil_baseline_requires_missing_file
+    committed = CacheFile.write(@path, "new", nil, baseline: nil)
+
+    assert committed
+    assert_equal "new", @path.read
+
+    committed = CacheFile.write(@path, "other", nil, baseline: nil)
+
+    refute committed
+    assert_equal "new", @path.read
+  end
 end
