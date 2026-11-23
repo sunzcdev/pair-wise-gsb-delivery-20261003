@@ -9,6 +9,8 @@ module ActiveRecord
       def initialize
         @active = Concurrent::AtomicBoolean.new(true)
         @lock = Concurrent::ReadWriteLock.new
+        @cancel_listeners = []
+        @listeners_lock = Mutex.new
       end
 
       def active?
@@ -19,8 +21,37 @@ module ActiveRecord
         @lock.with_read_lock(&block)
       end
 
+      # Registers a block to run when the session is finalized. The block is
+      # only invoked if the session had not already been finalized; otherwise
+      # it is run immediately so late registrations are not silently dropped.
+      # Returns the block so callers can later remove it with
+      # #remove_cancel_listener once they no longer need finalization.
+      def on_cancel(&block)
+        @listeners_lock.synchronize do
+          if @active.true?
+            @cancel_listeners << block
+            return block
+          end
+        end
+
+        block.call
+        block
+      end
+
+      def remove_cancel_listener(block)
+        @listeners_lock.synchronize do
+          @cancel_listeners.delete(block)
+        end
+      end
+
       def finalize(wait = false)
         @active.make_false
+
+        listeners = @listeners_lock.synchronize do
+          @cancel_listeners.dup
+        end
+        listeners.each(&:call)
+
         if wait
           # Wait until all thread with a read lock are done
           @lock.with_write_lock { }

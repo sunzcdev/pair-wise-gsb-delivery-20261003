@@ -264,6 +264,22 @@ module ActiveRecord
         !@memory_database
       end
 
+      def supports_canceling_running_queries?
+        # sqlite3_interrupt() is explicitly designed to be called from a
+        # different thread than the one running the query.
+        true
+      end
+
+      # Interrupts an in-flight statement via sqlite3_interrupt(). The worker's
+      # blocked call raises SQLite3::InterruptException, translated to
+      # ActiveRecord::QueryCanceled. Only meaningful when the worker thread is
+      # actually inside a query; a late interrupt is harmless.
+      def cancel_running_query(intent) # :nodoc:
+        @raw_connection&.interrupt
+      rescue ::SQLite3::Exception
+        # A closed/raced connection is handled by the worker's own error path.
+      end
+
       def supports_virtual_columns?
         true
       end
@@ -825,6 +841,8 @@ module ActiveRecord
             ConnectionNotEstablished.new(exception, connection_pool: @pool)
           elsif exception.is_a?(::SQLite3::BusyException)
             StatementTimeout.new(message, sql: sql, binds: binds, connection_pool: @pool)
+          elsif exception.is_a?(::SQLite3::InterruptException)
+            QueryCanceled.new(message, sql: sql, binds: binds, connection_pool: @pool)
           else
             super
           end

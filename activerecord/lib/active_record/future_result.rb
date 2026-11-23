@@ -20,6 +20,12 @@ module ActiveRecord
         false
       end
 
+      # An already-materialized result cannot be withdrawn: there is no
+      # background work to reclaim.
+      def cancel
+        false
+      end
+
       def then(&block)
         Promise::Complete.new(@result.then(&block))
       end
@@ -47,6 +53,16 @@ module ActiveRecord
       Promise.new(self, block)
     end
 
+    # Explicitly withdraws this future result before it is consumed.
+    #
+    # See QueryIntent#cancel for the full semantics: a query that has not
+    # started never borrows a connection, while a running one is interrupted
+    # through the adapter's native mechanism when available. Accessing #result
+    # afterwards raises FutureResult::Canceled, keeping explicit withdrawals
+    # distinct from genuine database errors.
+    #
+    # Returns +true+ when the intent was canceled by this call, +false+ when
+    # it had already finished.
     def cancel
       @intent.cancel
     end
@@ -62,7 +78,7 @@ module ActiveRecord
     end
 
     def canceled?
-      @intent.canceled?
+      @intent.canceled? || @intent.session_finalized?
     end
   end
 end

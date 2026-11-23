@@ -476,6 +476,28 @@ module ActiveRecord
         end
       end
 
+      def supports_canceling_running_queries?
+        # PG::Connection#cancel issues the cancel request over a separate
+        # socket, so it is safe to call from another thread while the worker is
+        # blocked waiting for query results.
+        !(PG.library_version >= 18_00_00 && Gem::Version.new(PG::VERSION) < Gem::Version.new("1.6.0"))
+      end
+
+      # Interrupts the in-flight query through PostgreSQL's out-of-band cancel
+      # protocol. The worker thread's blocked call then fails with SQLSTATE
+      # 57014, which the adapter translates to ActiveRecord::QueryCanceled.
+      def cancel_running_query(intent) # :nodoc:
+        return unless supports_canceling_running_queries?
+
+        raw = @raw_connection
+        return unless raw
+
+        raw.cancel
+      rescue PG::Error
+        # The connection may already be gone; the worker's own error handling
+        # is responsible for recycling it in that case.
+      end
+
       def clear_cache!(new_connection: false)
         super
         @schema_search_path = nil if new_connection

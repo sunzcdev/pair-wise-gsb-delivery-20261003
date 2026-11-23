@@ -96,6 +96,7 @@ module ActiveRecord
       @records = nil
       @async = false
       @none = false
+      @canceled = false
     end
 
     def initialize_copy(other)
@@ -1232,6 +1233,35 @@ module ActiveRecord
       !!@future_result
     end
 
+    # Cancels a relation previously scheduled with #load_async when its result
+    # is no longer needed.
+    #
+    # A query that has not started yet never borrows a connection: it is simply
+    # removed from consideration and its worker skips it. A query already
+    # running is interrupted using the adapter's native mechanism when one is
+    # available, and its connection is released back to the pool.
+    #
+    # Iterating a canceled relation (or otherwise accessing its records) raises
+    # ActiveRecord::FutureResult::Canceled, which keeps an explicit withdrawal
+    # distinct from a genuine database error. Returns +true+ when the scheduled
+    # query was canceled, +false+ when there was nothing scheduled.
+    def cancel
+      if @future_result
+        @future_result.cancel
+        @future_result = nil
+        @canceled = true
+        true
+      else
+        false
+      end
+    end
+
+    # Returns +true+ if a scheduled query was explicitly withdrawn with
+    # #cancel.
+    def canceled?
+      @canceled
+    end
+
     # Causes the records to be loaded from the database if they have not
     # been loaded already. You can use this if for some reason you need
     # to explicitly load some records before actually using them. The
@@ -1239,6 +1269,10 @@ module ActiveRecord
     #
     #   Post.where(published: true).load # => #<ActiveRecord::Relation>
     def load(&block)
+      if @canceled
+        raise FutureResult::Canceled, "can't access records of a canceled asynchronous query"
+      end
+
       if !loaded? || scheduled?
         @records = exec_queries(&block)
         @loaded = true
@@ -1262,6 +1296,7 @@ module ActiveRecord
       @cache_keys = nil
       @cache_versions = nil
       @records = nil
+      @canceled = false
       self
     end
 
@@ -1471,6 +1506,10 @@ module ActiveRecord
       def exec_queries(&block)
         if lock_value && model.current_preventing_writes
           raise ActiveRecord::ReadOnlyError, "Lock query attempted while in readonly mode"
+        end
+
+        if @canceled
+          raise FutureResult::Canceled, "can't access records of a canceled asynchronous query"
         end
 
         skip_query_cache_if_necessary do

@@ -108,6 +108,16 @@ module ActiveRecord
         @finalized = false
 
         @retry_budget = nil
+
+        # Lifecycle state. The intent starts pending and moves exactly once to
+        # either :complete or :canceled. A pending intent may additionally have
+        # an explicit cancel request in flight against a running query.
+        @state_mutex = Mutex.new
+        @state_condition = ConditionVariable.new
+        @state = :pending
+        @cancel_requested = false
+        @running_connection = nil
+        @cancel_listener = nil
       end
 
       def self.unordered_select?(arel)
@@ -145,16 +155,27 @@ module ActiveRecord
 
       # Called by background thread to execute if not already done
       def execute_or_skip
-        return unless pending?
+        # A finalized session means the owning unit of work is gone. Don't even
+        # borrow a connection: mark the intent canceled and let the worker move
+        # on to the next scheduled query.
+        unless @session&.active?
+          mark_canceled!(reason: :session)
+          return
+        end
 
         @session.synchronize do
+          # Bail before borrowing a connection if the intent was canceled (or
+          # completed) while queued: a query that never started must not hold a
+          # pool connection, even for the instant it takes to skip it.
           return unless pending?
 
           @pool.with_connection do |connection|
             return unless @mutex.try_lock
             previous_instrumenter = ActiveSupport::IsolatedExecutionState[:active_record_instrumenter]
             begin
-              if pending?
+              # Re-check under the lifecycle lock: another thread may have
+              # canceled (or completed) the intent while we waited to start.
+              if begin_executing?(connection)
                 if connection.sql_notifications?
                   @event_buffer = EventBuffer.new(self, ActiveSupport::Notifications.instrumenter)
                   ActiveSupport::IsolatedExecutionState[:active_record_instrumenter] = @event_buffer
@@ -168,6 +189,7 @@ module ActiveRecord
             rescue => error
               @error = error
             ensure
+              finish_executing
               ActiveSupport::IsolatedExecutionState[:active_record_instrumenter] = previous_instrumenter
               @mutex.unlock
             end
@@ -177,17 +199,100 @@ module ActiveRecord
 
       # Is this intent still pending (result not yet available)?
       def pending?
-        !@raw_result_available && @session&.active?
+        @state_mutex.synchronize { @state == :pending }
       end
 
-      # Was this intent canceled?
+      # Was this intent canceled, either explicitly by its caller or by its
+      # asynchronous query session being finalized?
       def canceled?
+        @state_mutex.synchronize { @state == :canceled }
+      end
+
+      # True when the owning asynchronous query session has been finalized,
+      # even if the query itself finished in the background. Such an intent's
+      # unobserved result must surface as a cancellation rather than the
+      # background outcome.
+      def session_finalized?
         @session && !@session.active?
       end
 
+      # Explicitly withdraws the intent before its result is consumed.
+      #
+      # A query that has not started yet never borrows a connection: it is
+      # marked canceled and its background worker simply skips it. A query
+      # already running is interrupted through the adapter's native mechanism
+      # (when supported), and this method waits for the worker to release the
+      # connection it was using.
+      #
+      # Returns +true+ when the intent was canceled by this call, +false+ when
+      # it had already finished. A genuine database error on a finished intent
+      # is preserved: callers must be able to tell an explicit withdrawal apart
+      # from the database actually raising.
       def cancel
-        return unless pending?
-        @error = FutureResult::Canceled.new
+        connection =
+          @state_mutex.synchronize do
+            return false unless @state == :pending
+
+            @cancel_requested = true
+            @running_connection
+          end
+
+        if connection.nil?
+          # Still queued (or scheduled but never picked up): no connection is
+          # borrowed, so there is nothing to interrupt.
+          @state_mutex.synchronize { transition_to_canceled_locked }
+        else
+          # Query in flight: hand off to the adapter's native cancellation
+          # mechanism. Keep this outside the lifecycle lock so adapter
+          # internals can never deadlock against the worker.
+          interrupt_running_query(connection)
+
+          # Wait for the worker to observe the interruption (or simply finish),
+          # which also means it has checked its connection back in.
+          @state_mutex.synchronize do
+            @state_condition.wait(@state_mutex) while @state == :pending
+          end
+        end
+
+        true
+      end
+
+      # Withdraws the intent because its owning asynchronous query session was
+      # finalized (the surrounding unit of work ended, e.g. on an exception).
+      #
+      # Unlike the explicit #cancel, this supersedes any result that has not
+      # been observed yet, including a background query that already failed:
+      # nobody was going to consume that outcome, so a later #result raises
+      # FutureResult::Canceled instead of the background error. An intent whose
+      # result was already observed is left untouched.
+      def cancel_for_session_finalization!
+        @state_mutex.synchronize do
+          return if @outcome_handled
+
+          @cancel_requested = true
+
+          if (connection = @running_connection)
+            # Running right now: interrupt outside this lock, then wait.
+            @state_mutex.unlock
+            begin
+              interrupt_running_query(connection)
+            ensure
+              @state_mutex.lock
+            end
+            @state_condition.wait(@state_mutex) while @state == :pending
+          else
+            # Queued, or already finished in the background but not observed:
+            # finalization wins either way.
+            transition_to_canceled_locked(force: true)
+          end
+        end
+      end
+
+      # Set while the background worker holds a checked-out connection and is
+      # inside #run_query!. Exposed so adapter-specific cancellation hooks can
+      # identify the intent that needs interrupting.
+      def cancel_requested?
+        @state_mutex.synchronize { @cancel_requested }
       end
 
       # Returns raw SQL, compiling from arel if needed, memoized
@@ -252,6 +357,7 @@ module ActiveRecord
           mark_transaction_dirty
 
           @raw_result_available = true
+          mark_completed!
         end
 
         finish_log
@@ -297,6 +403,7 @@ module ActiveRecord
       # Ensure the result is available, blocking if necessary
       def ensure_result
         if @outcome_handled
+          raise FutureResult::Canceled if canceled? || @session&.active? == false
           raise @error if @error
           raise @warning_error if @warning_error
           return
@@ -305,6 +412,17 @@ module ActiveRecord
         if @session
           # Async was scheduled: wait for result (sets lock_wait)
           execute_or_wait
+        end
+
+        # An explicit (or session-level) cancellation wins over anything a
+        # late background attempt may have stored: callers must be able to
+        # tell a withdrawal apart from a genuine database error. Session
+        # finalization is checked directly because it can overtake a query
+        # that completed in the background but was never observed.
+        if canceled? || @session&.active? == false
+          @outcome_handled = true
+          @event_buffer&.flush
+          raise FutureResult::Canceled
         end
 
         @event_buffer&.flush
@@ -366,7 +484,7 @@ module ActiveRecord
         # connection owners call this before releasing their connection; otherwise
         # result observation takes responsibility for pumping retries.
         def pump_retries
-          while !@finalized && @error && adapter.attempt_retry(@error, @retry_budget)
+          while !@finalized && @error && !cancel_requested? && adapter.attempt_retry(@error, @retry_budget)
             reset_for_retry
             run_query!
           end
@@ -387,6 +505,93 @@ module ActiveRecord
           adapter.send(:dirty_current_transaction) if @materialize_transactions
         end
 
+        # Claims the intent for execution on +connection+. Returns false when the
+        # intent was canceled (or completed) before the worker got to run, in
+        # which case the caller must not touch the database.
+        def begin_executing?(connection)
+          @state_mutex.synchronize do
+            if @state == :pending
+              @running_connection = connection
+              true
+            else
+              false
+            end
+          end
+        end
+
+        # Releases the execution claim and finalizes the lifecycle once a worker
+        # attempt ends. An explicit cancellation supersedes whatever the attempt
+        # produced; otherwise a delivered result or error decides the state.
+        def finish_executing
+          @state_mutex.synchronize do
+            @running_connection = nil
+
+            if @cancel_requested
+              transition_to_canceled_locked(force: true)
+            elsif @raw_result_available || @error
+              transition_to_completed_locked
+            end
+
+            @state_condition.broadcast
+          end
+        end
+
+        def mark_completed!
+          @state_mutex.synchronize do
+            transition_to_completed_locked
+          end
+        end
+
+        def transition_to_completed_locked
+          return unless @state == :pending
+          @state = :complete
+          # Keep the session finalization listener registered: a completed
+          # intent whose result is never observed must still surface Canceled
+          # once the owning session is finalized. The listener is dropped when
+          # the result is observed, the intent is canceled, or the session
+          # finalizes.
+          @state_condition.broadcast
+        end
+
+        def transition_to_canceled_locked(force: false)
+          return unless force || @state == :pending
+          @state = :canceled
+          @error = FutureResult::Canceled.new
+          unregister_cancel_listener
+          @state_condition.broadcast
+        end
+
+        def mark_canceled!(reason:)
+          @state_mutex.synchronize do
+            if reason == :session
+              # The owning unit of work is gone: a queued intent must not run,
+              # even if a worker reaches it a moment later.
+              @cancel_requested = true
+              transition_to_canceled_locked(force: true)
+            else
+              transition_to_canceled_locked
+            end
+          end
+        end
+
+        # Invokes the adapter's native out-of-band cancellation. Failures are
+        # swallowed (and instrumented): the worker's own error handling remains
+        # the fallback for recycling a connection that could not be interrupted.
+        def interrupt_running_query(connection)
+          connection.cancel_running_query(self)
+        rescue => error
+          ActiveSupport::Notifications.instrument(
+            "async_query_cancel_failed.active_record",
+            { error: error, intent: self }
+          )
+        end
+
+        def unregister_cancel_listener
+          return unless @session && @cancel_listener
+          @session.remove_cancel_listener(@cancel_listener)
+          @cancel_listener = nil
+        end
+
         def async_schedule!(session)
           if adapter.current_transaction.joinable?
             raise AsynchronousQueryInsideTransactionError, "Asynchronous queries are not allowed inside transactions"
@@ -395,6 +600,17 @@ module ActiveRecord
           # Upgrade to real mutex now that we'll have concurrent access
           @mutex = Mutex.new
           @session = session
+
+          # If the session is already gone (e.g. an exception unwound the
+          # executor before the query was scheduled), skip the queue entirely.
+          unless session.active?
+            mark_canceled!(reason: :session)
+            return
+          end
+
+          # Session finalization must withdraw every intent it owns, including
+          # ones still waiting for a worker thread.
+          @cancel_listener = session.on_cancel { cancel_for_session_finalization! }
 
           # Force preprocessing on original thread before queuing
           processed_sql
@@ -453,10 +669,16 @@ module ActiveRecord
           @mutex.synchronize do
             if pending?
               @pool.with_connection do |connection|
-                @adapter = connection
-                @ran_async = false  # Foreground fallback, not actually async
-                run_query!
-                pump_retries
+                if begin_executing?(connection)
+                  begin
+                    @adapter = connection
+                    @ran_async = false  # Foreground fallback, not actually async
+                    run_query!
+                    pump_retries
+                  ensure
+                    finish_executing
+                  end
+                end
               end
             else
               # Result was computed by background thread while we waited for mutex
@@ -464,6 +686,7 @@ module ActiveRecord
             end
           rescue => error
             @error = error
+            finish_executing
           end
         end
 

@@ -131,6 +131,7 @@ module ActiveRecord
         {
           supports_advisory_locks?: supports_advisory_locks?,
           supports_bulk_alter?: supports_bulk_alter?,
+          supports_canceling_running_queries?: supports_canceling_running_queries?,
           supports_check_constraints?: supports_check_constraints?,
           supports_comments?: supports_comments?,
           supports_comments_in_create?: supports_comments_in_create?,
@@ -701,6 +702,25 @@ module ActiveRecord
 
       def supports_concurrent_connections?
         true
+      end
+
+      # Whether this adapter can interrupt a query running on one of its
+      # connections from another thread. Adapters without a native mechanism
+      # return +false+; an in-flight cancellation then simply lets the query
+      # run to completion and discards its result.
+      def supports_canceling_running_queries?
+        false
+      end
+
+      # Attempts to interrupt the query currently running for +intent+ on this
+      # connection. Called from the thread that canceled the intent, while the
+      # connection's own worker thread is blocked inside the query.
+      #
+      # The default implementation has no native mechanism: it does nothing, so
+      # the worker finishes naturally and the (now unwanted) result is
+      # discarded. Adapters that support out-of-band cancellation override this
+      # and translate the resulting driver error into ActiveRecord::QueryCanceled.
+      def cancel_running_query(intent) # :nodoc:
       end
 
       def supports_nulls_not_distinct?
