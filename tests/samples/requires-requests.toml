@@ -1,0 +1,11 @@
+[build-system]
+requires = ["flit"]
+
+[project]
+name = "module1"
+authors = [
+    {name = "Sir Robin", email = "robin@camelot.uk"}
+]
+readme = "EG_README.rst"
+dependencies = ["requests"]
+dynamic = ["version", "description"]
