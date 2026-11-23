@@ -1,0 +1,1 @@
+Added the `exit_timeout` parameter to `BlockingPortal.wrap_async_context_manager()` so that the synchronous `__exit__()` can stop waiting for a slow asynchronous `__aexit__()` after a deadline; the returned wrapper now exposes `timed_out` and `exit_future` for checking the timeout and retrieving the final cleanup result

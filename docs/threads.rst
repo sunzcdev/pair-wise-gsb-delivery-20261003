@@ -140,6 +140,21 @@ context managers as a synchronous one:
 .. note:: You cannot use wrapped async context managers in synchronous callbacks inside
    the event loop thread.
 
+If the asynchronous ``__aexit__()`` method may take a long time to clean up, pass
+``exit_timeout`` to bound how long the synchronous ``__exit__()`` waits for the cleanup
+to finish. When the deadline elapses, ``__exit__()`` returns immediately while the
+actual cleanup continues in the portal task. Any exception raised by the ``with`` body
+is still propagated as usual (it is neither swallowed nor replaced by the timeout), and
+you can inspect the outcome afterwards:
+
+* the wrapper's ``timed_out`` attribute tells you whether the wait deadline elapsed;
+* its ``exit_future`` attribute is a :class:`~concurrent.futures.Future` that resolves
+  to the value returned by the asynchronous ``__aexit__()`` (its exception suppression
+  decision), or carries the exception it raised.
+
+The underlying asynchronous context manager is always exited exactly once, by the
+portal task that entered it.
+
 Starting an on-demand, shared blocking portal
 +++++++++++++++++++++++++++++++++++++++++++++
 

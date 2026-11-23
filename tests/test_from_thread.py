@@ -888,6 +888,186 @@ class TestBlockingPortal:
             assert len(exc.value.exceptions) == 1
             assert isinstance(exc.value.exceptions[0], ZeroDivisionError)
 
+    def test_async_context_manager_exit_timeout_with_exception(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        """The body exception propagates even when ``__aexit__()`` is still running."""
+
+        release = threading.Event()
+        aexit_started = threading.Event()
+        aexit_calls = 0
+
+        class SlowExitCM:
+            async def __aenter__(self) -> None:
+                return None
+
+            async def __aexit__(
+                self,
+                exc_type: object,
+                exc_val: object,
+                exc_tb: object,
+            ) -> bool:
+                nonlocal aexit_calls
+                aexit_calls += 1
+                aexit_started.set()
+                await to_thread.run_sync(release.wait)
+                return True
+
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            wrapper = portal.wrap_async_context_manager(
+                SlowExitCM(), exit_timeout=0.1
+            )
+            with pytest.raises(ValueError, match="body failure"):
+                with wrapper:
+                    raise ValueError("body failure")
+
+            # The wait deadline elapsed while the asynchronous cleanup was running.
+            assert wrapper.timed_out
+            assert not wrapper.exit_future.done()
+            assert aexit_started.is_set()
+
+            # Let the portal task finish the (single) asynchronous exit.
+            release.set()
+            assert wrapper.exit_future.result(5) is True
+            assert aexit_calls == 1
+
+    def test_async_context_manager_exit_timeout_without_exception(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        release = threading.Event()
+        aexit_started = threading.Event()
+
+        class SlowExitCM:
+            async def __aenter__(self) -> None:
+                return None
+
+            async def __aexit__(
+                self,
+                exc_type: object,
+                exc_val: object,
+                exc_tb: object,
+            ) -> None:
+                aexit_started.set()
+                await to_thread.run_sync(release.wait)
+
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            wrapper = portal.wrap_async_context_manager(
+                SlowExitCM(), exit_timeout=0.1
+            )
+            with wrapper:
+                pass
+
+            assert wrapper.timed_out
+            assert not wrapper.exit_future.done()
+            assert aexit_started.is_set()
+
+            release.set()
+            assert wrapper.exit_future.result(5) is None
+
+    def test_async_context_manager_exit_timeout_not_exceeded(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        """When cleanup finishes in time, the original blocking behavior is kept."""
+
+        class QuickExitCM:
+            async def __aenter__(self) -> None:
+                return None
+
+            async def __aexit__(
+                self,
+                exc_type: object,
+                exc_val: object,
+                exc_tb: object,
+            ) -> bool:
+                return True
+
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            wrapper = portal.wrap_async_context_manager(
+                QuickExitCM(), exit_timeout=5
+            )
+            with wrapper:
+                raise ValueError("suppressed")
+
+            assert not wrapper.timed_out
+            assert wrapper.exit_future.done()
+            assert wrapper.exit_future.result() is True
+
+    def test_async_context_manager_exit_future_exception(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        """An exception raised by ``__aexit__()`` is reachable via ``exit_future``."""
+
+        release = threading.Event()
+
+        class FailingExitCM:
+            async def __aenter__(self) -> None:
+                return None
+
+            async def __aexit__(
+                self,
+                exc_type: object,
+                exc_val: object,
+                exc_tb: object,
+            ) -> None:
+                await to_thread.run_sync(release.wait)
+                raise RuntimeError("cleanup failed")
+
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            wrapper = portal.wrap_async_context_manager(
+                FailingExitCM(), exit_timeout=0.1
+            )
+            with wrapper:
+                pass
+
+            assert wrapper.timed_out
+            release.set()
+            with pytest.raises(RuntimeError, match="cleanup failed"):
+                wrapper.exit_future.result(5)
+
+    def test_async_context_manager_exit_only_once(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        aexit_calls = 0
+
+        class CountingExitCM:
+            async def __aenter__(self) -> None:
+                return None
+
+            async def __aexit__(
+                self,
+                exc_type: object,
+                exc_val: object,
+                exc_tb: object,
+            ) -> None:
+                nonlocal aexit_calls
+                aexit_calls += 1
+
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            wrapper = portal.wrap_async_context_manager(
+                CountingExitCM(), exit_timeout=0.1
+            )
+            with wrapper:
+                pass
+
+            # A second, explicit __exit__() must not trigger another __aexit__().
+            with pytest.raises(RuntimeError, match="cannot be exited more than once"):
+                wrapper.__exit__(None, None, None)
+
+            assert aexit_calls == 1
+
+    def test_async_context_manager_enter_only_once(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            wrapper = portal.wrap_async_context_manager(
+                TestBlockingPortal.AsyncCM(False)
+            )
+            with wrapper:
+                pass
+
+            with pytest.raises(RuntimeError, match="cannot be entered more than once"):
+                wrapper.__enter__()
+
     def test_start_no_value(
         self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
     ) -> None:

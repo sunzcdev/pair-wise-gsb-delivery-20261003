@@ -128,10 +128,17 @@ class _BlockingAsyncContextManager(AbstractContextManager, Generic[T_co]):
     ] = (None, None, None)
 
     def __init__(
-        self, async_cm: AbstractAsyncContextManager[T_co], portal: BlockingPortal
+        self,
+        async_cm: AbstractAsyncContextManager[T_co],
+        portal: BlockingPortal,
+        exit_timeout: float | None = None,
     ):
         self._async_cm = async_cm
         self._portal = portal
+        self._exit_timeout = exit_timeout
+        self._entered = False
+        self._exit_started = False
+        self._timed_out = False
 
     async def run_async_cm(self) -> bool | None:
         try:
@@ -158,6 +165,12 @@ class _BlockingAsyncContextManager(AbstractContextManager, Generic[T_co]):
         return result
 
     def __enter__(self) -> T_co:
+        if self._entered:
+            raise RuntimeError(
+                "This synchronous wrapper cannot be entered more than once"
+            )
+
+        self._entered = True
         self._enter_future = Future()
         self._exit_future = self._portal.start_task_soon(self.run_async_cm)
         return self._enter_future.result()
@@ -169,9 +182,53 @@ class _BlockingAsyncContextManager(AbstractContextManager, Generic[T_co]):
         traceback: TracebackType | None,
         /,
     ) -> bool | None:
+        if not self._entered:
+            raise RuntimeError(
+                "__exit__() called on a context manager that was never entered"
+            )
+
+        # The underlying asynchronous context manager must only be exited once, so
+        # the portal task is only signaled on the first call to __exit__().
+        if self._exit_started:
+            raise RuntimeError(
+                "This synchronous wrapper cannot be exited more than once"
+            )
+
+        self._exit_started = True
         self._exit_exc_info = exc_type, exc_value, traceback
         self._portal.call(self._exit_event.set)
-        return self._exit_future.result()
+        try:
+            return self._exit_future.result(self._exit_timeout)
+        except TimeoutError:
+            # The asynchronous ``__aexit__()`` is still running in the portal
+            # task. Do not swallow the exception raised by the ``with`` body (if
+            # any); the final suppression decision can be inspected later via
+            # ``exit_future``.
+            self._timed_out = True
+            return None
+
+    @property
+    def timed_out(self) -> bool:
+        """
+        ``True`` if the last call to :meth:`__exit__` returned because the exit
+        wait deadline (``exit_timeout``) elapsed before the asynchronous
+        ``__aexit__()`` method had finished.
+
+        """
+        return self._timed_out
+
+    @property
+    def exit_future(self) -> Future[bool | None]:
+        """
+        A future that resolves to the value returned by the asynchronous
+        ``__aexit__()`` method, or to the exception raised by it.
+
+        The future is created when the wrapper is entered and can be inspected
+        after :meth:`__exit__` has returned early due to an exit timeout, to
+        retrieve the final result of the still-running cleanup.
+
+        """
+        return self._exit_future
 
 
 class _BlockingPortalTaskStatus(TaskStatus):
@@ -527,8 +584,11 @@ class BlockingPortal:
         return f, task_status_future.result()
 
     def wrap_async_context_manager(
-        self, cm: AbstractAsyncContextManager[T_co]
-    ) -> AbstractContextManager[T_co]:
+        self,
+        cm: AbstractAsyncContextManager[T_co],
+        *,
+        exit_timeout: float | None = None,
+    ) -> _BlockingAsyncContextManager[T_co]:
         """
         Wrap an async context manager as a synchronous context manager via this portal.
 
@@ -536,12 +596,33 @@ class BlockingPortal:
         in the middle until the synchronous context manager exits.
 
         :param cm: an asynchronous context manager
-        :return: a synchronous context manager
+        :param exit_timeout: maximum time, in seconds, that :meth:`__exit__` waits for
+            the asynchronous ``__aexit__()`` call (the actual cleanup) to finish. When
+            the deadline elapses, :meth:`__exit__` returns immediately without waiting,
+            leaving the cleanup running in the portal task. Any exception raised by the
+            ``with`` body is then propagated as usual, and the final outcome of the
+            cleanup can later be inspected through the ``timed_out`` and
+            ``exit_future`` attributes of the returned wrapper. When
+            ``None`` (the default), :meth:`__exit__` waits until the cleanup has
+            finished, preserving the original behavior.
+        :return: a synchronous context manager. The returned object additionally
+            exposes:
+
+            * ``timed_out`` – ``True`` if :meth:`__exit__` gave up waiting because
+              ``exit_timeout`` elapsed;
+            * ``exit_future`` – a :class:`~concurrent.futures.Future` that resolves to
+              the value returned by the asynchronous ``__aexit__()``, or to the
+              exception it raised. It can be used to wait for and inspect the cleanup
+              result after a timeout.
 
         .. versionadded:: 2.1
 
+        .. versionchanged:: 4.17.0
+            Added the ``exit_timeout`` parameter and the ``timed_out`` and
+            ``exit_future`` attributes on the returned wrapper.
+
         """
-        return _BlockingAsyncContextManager(cm, self)
+        return _BlockingAsyncContextManager(cm, self, exit_timeout)
 
 
 @dataclass
