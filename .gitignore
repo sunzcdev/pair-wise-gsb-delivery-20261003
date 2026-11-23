@@ -1,0 +1,8 @@
+Gemfile.lock
+pkg/
+.env
+website/build
+coverage/
+node_modules
+.docusaurus
+gemfiles/*.lock

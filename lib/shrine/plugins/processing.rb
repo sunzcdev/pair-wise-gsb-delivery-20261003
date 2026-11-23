@@ -1,0 +1,48 @@
+# frozen_string_literal: true
+
+Shrine.deprecation("The processing plugin is deprecated and will be removed in Shrine 4. If you were using it with versions plugin, use the new derivatives plugin instead.")
+
+class Shrine
+  module Plugins
+    # Documentation can be found on https://shrinerb.com/docs/plugins/processing
+    module Processing
+      def self.configure(uploader)
+        uploader.opts[:processing] ||= {}
+      end
+
+      module ClassMethods
+        def process(action, &block)
+          opts[:processing][action] ||= []
+          opts[:processing][action] << block
+        end
+      end
+
+      module InstanceMethods
+        def upload(io, process: true, **)
+          if process
+            input = process(io, **)
+          else
+            input = io
+          end
+
+          super(input, **)
+        end
+
+        private
+
+        def process(io, **options)
+          pipeline = processing_pipeline(options[:action])
+          pipeline.inject(io) do |input, processor|
+            instance_exec(input, **options, &processor) || input
+          end
+        end
+
+        def processing_pipeline(key)
+          opts[:processing][key] || []
+        end
+      end
+    end
+
+    register_plugin(:processing, Processing)
+  end
+end

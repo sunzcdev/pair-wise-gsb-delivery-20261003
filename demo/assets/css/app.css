@@ -1,0 +1,7 @@
+.container {
+  width: 800px;
+}
+
+.file-upload-preview[src=""] {
+  visibility: hidden;
+}

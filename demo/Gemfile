@@ -1,0 +1,37 @@
+source "https://rubygems.org"
+
+# Web framework
+gem "puma"
+gem "roda", "~> 3.36"
+gem "rack-session"
+gem "rackup"
+gem "cgi"
+gem "base64"
+
+# Rendering
+gem "tilt", ">= 2.0.8"
+gem "erubi"
+gem "forme", "~> 1.8"
+
+# Database
+gem "sequel"
+gem "sqlite3"
+
+# Attachments
+gem "shrine", path: ".."
+gem "aws-sdk-s3", "~> 1.14"
+gem "dotenv"
+gem "image_processing", "~> 2.0"
+gem "mini_magick", "~> 5.0"
+gem "marcel"
+gem "fastimage"
+gem "dry-monitor"
+
+# Background jobs
+gem "sucker_punch", "~> 2.0"
+
+# Testing
+gem "minitest"
+gem "capybara", "~> 3.33"
+gem "cuprite"
+gem "rake"

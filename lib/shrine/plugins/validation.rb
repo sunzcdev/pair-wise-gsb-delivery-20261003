@@ -1,0 +1,81 @@
+# frozen_string_literal: true
+
+class Shrine
+  module Plugins
+    # Documentation can be found on https://shrinerb.com/docs/plugins/validation
+    module Validation
+      module AttacherClassMethods
+        # Block that is executed in context of Shrine::Attacher during
+        # validation. Example:
+        #
+        #     Shrine::Attacher.validate do
+        #       if file.size > 5*1024*1024
+        #         errors << "is too big (max is 5 MB)"
+        #       end
+        #     end
+        def validate(&block)
+          remove_method(:validate_block) if private_method_defined?(:validate_block, false)
+          private define_method(:validate_block, &block)
+        end
+      end
+
+      module AttacherMethods
+        # Returns an array of validation errors created on file assignment in
+        # the `Attacher.validate` block.
+        attr_reader :errors
+
+        # Initializes validation errors to an empty array.
+        def initialize(**)
+          super
+          @errors = []
+        end
+
+        # Performs validations after attaching cached file.
+        def attach_cached(value, validate: nil, **)
+          result = super(value, validate: false, **)
+          validation(validate)
+          result
+        end
+
+        # Performs validations after attaching file.
+        def attach(io, validate: nil, **)
+          result = super(io, **)
+          validation(validate)
+          result
+        end
+
+        # Runs the validation defined by `Attacher.validate`.
+        def validate(**options)
+          errors.clear
+          _validate(**options) if attached?
+        end
+
+        private
+
+        # Calls validation appropriately based on the :validate value.
+        def validation(argument)
+          case argument
+          when Hash  then validate(**argument)
+          when false then errors.clear # skip validation
+          else            validate
+          end
+        end
+
+        # Calls #validate_block, passing it accepted parameters.
+        def _validate(**)
+          if method(:validate_block).arity.zero?
+            validate_block
+          else
+            validate_block(**)
+          end
+        end
+
+        # Overridden by the `Attacher.validate` block.
+        def validate_block(**)
+        end
+      end
+    end
+
+    register_plugin(:validation, Validation)
+  end
+end

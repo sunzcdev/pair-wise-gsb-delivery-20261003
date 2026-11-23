@@ -1,0 +1,72 @@
+<% form album, { action: form_action, enctype: "multipart/form-data" }, labeler: :explicit do |f| %>
+  <%= f.input :hidden, name: "_method", value: form_method, obj: nil %> <%# # used in tandem with Rack::MethodOverride to enable PUT requests %>
+
+  <div class="mb-3">
+    <%= f.input :name, class: "form-control", label_attr: { class: "form-label" } %>
+  </div>
+
+  <div class="mb-3">
+    <!-- native file input, enhanced by Uppy -->
+    <%= f.input :cover_photo,
+      type: :file,
+      attr: {
+        accept: ImageUploader::ALLOWED_TYPES.join(","),
+        class: "form-control"
+      },
+      label_attr: {
+        class: "form-label"
+      },
+      data: {
+        upload_server: upload_server,
+        upload_csrf_token: csrf_token("/upload"),
+        preview_element: "preview-cover-photo",
+        upload_result_element: "album-cover-photo-upload-result"
+      },
+      dasherize_data: true %>
+
+    <!-- for storing cover photo uploaded file data -->
+    <%= f.input :cover_photo,
+      type: :hidden,
+      error_handler: false,
+      value: album.cached_cover_photo_data,
+      id: "album-cover-photo-upload-result" %>
+  </div>
+
+  <div class="d-inline-block mt-1 mb-3">
+    <!-- static link to the thumbnail generated on attachment -->
+    <img src="<%= album.cover_photo_url(:medium) %>"
+         width=300
+         class="img-thumbnail file-upload-preview"
+         id="preview-cover-photo" \>
+  </div>
+
+  <% unless album.new? %>
+    <div class="mb-3">
+      <!-- will be replaced by Uppy -->
+      <%= f.input :photos,
+        type: :file,
+        label: "Select photos",
+        attr: {
+          multiple: true,
+          accept: ImageUploader::ALLOWED_TYPES.join(",")
+        },
+        label_attr: {
+          class: "form-label"
+        },
+        data: {
+          upload_server: upload_server,
+          upload_csrf_token: csrf_token("/upload")
+        },
+        dasherize_data: true %>
+    </div>
+  <% end %>
+
+  <ul class="list-unstyled file-upload-list">
+    <% f.subform :photos, legend: nil do %>
+      <%= partial("albums/photo", locals: { photo: f.obj, f: f }) %>
+    <% end %>
+  </ul>
+
+  <input type="submit" value="Save" class="btn btn-primary" \>
+  <a href="<%= albums_path %>" class="btn btn-light">&larr; Back to albums</a>
+<% end %>
