@@ -1,0 +1,296 @@
+# frozen_string_literal: true
+
+require 'timecop'
+
+describe Kafka::OffsetManager do
+  let(:cluster) { double(:cluster) }
+  let(:group) { double(:group) }
+  let(:fetcher) { double(:fetcher) }
+  let(:logger) { LOGGER }
+
+  let(:offset_manager) {
+    Kafka::OffsetManager.new(
+      cluster: cluster,
+      group: group,
+      fetcher: fetcher,
+      logger: logger,
+      commit_interval: commit_interval,
+      commit_threshold: 0,
+      offset_retention_time: offset_retention_time
+    )
+  }
+  let(:offset_retention_time) { nil }
+  let(:commit_interval) { 0 }
+  let(:partition_assignments) { { 'greetings' => [0, 1, 2] } }
+
+  before do
+    allow(group).to receive(:commit_offsets)
+    allow(group).to receive(:assigned_to?) do |topic, partition|
+      (partition_assignments[topic] || []).include?(partition)
+    end
+    allow(fetcher).to receive(:seek)
+  end
+
+  describe "#commit_offsets" do
+    it "commits the processed offsets to the group" do
+      offset_manager.mark_as_processed("greetings", 0, 42)
+      offset_manager.mark_as_processed("greetings", 1, 13)
+
+      offset_manager.commit_offsets
+
+      expected_offsets = {
+        "greetings" => {
+          0 => 43,
+          1 => 14,
+        }
+      }
+
+      expect(group).to have_received(:commit_offsets).with(expected_offsets)
+    end
+
+    context "after calling #mark_as_processed with offsets from non-assigned partitions" do
+      it "only commits offsets from assigned partitions" do
+        offset_manager.mark_as_processed("greetings", 0, 42)
+        offset_manager.mark_as_processed("greetings", 1, 13)
+        offset_manager.mark_as_processed("greetings", 5, 75)
+        offset_manager.mark_as_processed("seasons-greetings", 3, 15)
+
+        offset_manager.commit_offsets
+
+        expected_offsets = {
+          "greetings" => {
+            0 => 43,
+            1 => 14,
+          }
+        }
+
+        expect(group).to have_received(:commit_offsets).with(expected_offsets)
+      end
+    end
+
+    context "after marking offsets as processed for the same partition but out of order" do
+      it "committs the newest offset" do
+        offset_manager.mark_as_processed("greetings", 0, 42)
+        offset_manager.mark_as_processed("greetings", 1, 579)
+        offset_manager.mark_as_processed("greetings", 0, 5)
+        offset_manager.mark_as_processed("greetings", 1, 95)
+
+        offset_manager.commit_offsets
+
+        expected_offsets = {
+          "greetings" => {
+            0 => 43,
+            1 => 580
+          }
+        }
+
+        expect(group).to have_received(:commit_offsets).with(expected_offsets)
+      end
+    end
+  end
+
+  describe "#commit_offsets_if_necessary" do
+    let(:fetched_offsets_response) do
+      Kafka::Protocol::OffsetFetchResponse.new(topics: {
+        "greetings" => {
+          0 => partition_offset_info(-1),
+          1 => partition_offset_info(24),
+          2 => partition_offset_info(4)
+        }
+      })
+    end
+
+    before do
+      allow(group).to receive(:fetch_offsets).and_return(fetched_offsets_response)
+    end
+
+    context "at the first commit" do
+      it "re-commits previously committed offsets" do
+        fetch_committed_offsets
+        offset_manager.mark_as_processed("greetings", 1, 25)
+
+        offset_manager.commit_offsets_if_necessary
+
+        expected_offsets = {
+          "greetings" => {
+            1 => 26,
+            2 => 4
+          }
+        }
+
+        expect(group).to have_received(:commit_offsets).with(expected_offsets)
+      end
+    end
+
+    context "commit intervals" do
+      let(:commit_interval) { 10 }
+      let(:offset_retention_time) { 300 }
+      let(:commits) { [] }
+
+      before do
+        allow(group).to receive(:commit_offsets) do |offsets|
+          commits << offsets
+        end
+        Timecop.freeze(Time.now)
+        # initial commit
+        fetch_committed_offsets
+        offset_manager.mark_as_processed("greetings", 0, 0)
+        offset_manager.commit_offsets_if_necessary
+        expect(commits.size).to eq(1)
+      end
+
+      after do
+        Timecop.return
+      end
+
+      context "before the commit timeout" do
+        before do
+          Timecop.travel(commit_interval - 1)
+        end
+
+        it "does not commit processed offsets to the group" do
+          expect do
+            offset_manager.mark_as_processed("greetings", 0, 1)
+            offset_manager.commit_offsets_if_necessary
+          end.not_to change(commits, :size)
+        end
+      end
+
+      context "after the commit timeout" do
+        before do
+          Timecop.travel(commit_interval + 1)
+        end
+
+        it "commits processed offsets without recommitting previously committed offsets" do
+          expect do
+            offset_manager.mark_as_processed("greetings", 0, 1)
+            offset_manager.commit_offsets_if_necessary
+          end.to change(commits, :size).by(1)
+
+          expected_offsets = {
+            "greetings" => { 0 => 2 }
+          }
+
+          expect(commits.last).to eq(expected_offsets)
+        end
+      end
+
+      context "after the recommit timeout" do
+        before do
+          Timecop.travel(offset_retention_time / 2 + 1)
+        end
+
+        it "commits processed offsets and recommits previously committed offsets" do
+          expect do
+            offset_manager.mark_as_processed("greetings", 0, 1)
+            offset_manager.commit_offsets_if_necessary
+          end.to change(commits, :size).by(1)
+
+          expected_offsets = {
+            "greetings" => {
+              0 => 2,
+              1 => 24,
+              2 => 4
+            }
+          }
+
+          expect(commits.last).to eq(expected_offsets)
+        end
+      end
+    end
+
+    def fetch_committed_offsets
+      offset_manager.next_offset_for("greetings", 1)
+    end
+
+    def partition_offset_info(offset)
+      Kafka::Protocol::OffsetFetchResponse::PartitionOffsetInfo.new(offset: offset, metadata: nil, error_code: 0)
+    end
+  end
+
+  describe "#next_offset_for" do
+    let(:fetched_offsets) { double(:fetched_offsets) }
+
+    before do
+      allow(group).to receive(:fetch_offsets).and_return(fetched_offsets)
+    end
+
+    it "returns the last committed offset" do
+      allow(fetched_offsets).to receive(:offset_for).with("greetings", 0) { 41 }
+
+      offset = offset_manager.next_offset_for("greetings", 0)
+
+      expect(offset).to eq 41
+    end
+
+    it "returns the default offset if none have been committed" do
+      allow(group).to receive(:assigned_partitions) { { "greetings" => [0] } }
+      allow(fetched_offsets).to receive(:offset_for).with("greetings", 0) { -1 }
+      allow(cluster).to receive(:resolve_offsets).with("greetings", [0], :latest) { { 0 => 42 } }
+      offset_manager.set_default_offset("greetings", :latest)
+
+      offset = offset_manager.next_offset_for("greetings", 0)
+
+      expect(offset).to eq 42
+    end
+  end
+
+  describe "#clear_offsets_excluding" do
+    let(:partition_assignments) { { 'x' => [0, 1] } }
+    it "clears offsets except for the partitions in the exclusion list" do
+      offset_manager.mark_as_processed("x", 0, 42)
+      offset_manager.mark_as_processed("x", 1, 13)
+
+      offset_manager.clear_offsets_excluding("x" => [0])
+      offset_manager.commit_offsets
+
+      expected_offsets = {
+        "x" => {
+          0 => 43,
+        }
+      }
+
+      expect(group).to have_received(:commit_offsets).with(expected_offsets)
+    end
+  end
+
+  describe "#seek_to" do
+    it "seeks to given topic-partition/offset" do
+      topic = "greetings"
+      partition = 0
+      seek_offset = 14
+
+      offset_manager.seek_to(topic, partition, seek_offset)
+
+      offset = offset_manager.next_offset_for(topic, partition)
+
+      expect(offset).to eq seek_offset
+    end
+
+    it "propagates the seek to the fetcher" do
+      topic = "greetings"
+      partition = 0
+      offset = 14
+
+      offset_manager.seek_to(topic, partition, offset)
+
+      expect(fetcher).to have_received(:seek).with(topic, partition, offset)
+    end
+  end
+
+  describe "#seek_to_default" do
+    it "seeks default offset" do
+      topic = "greetings"
+      partition = 0
+
+      offset_manager.set_default_offset(topic, :latest)
+      allow(group).to receive(:assigned_partitions) { { topic => [0] } }
+      allow(cluster).to receive(:resolve_offsets).with(topic, [0], :latest) { { 0 => 42 } }
+
+      offset_manager.seek_to_default(topic, partition)
+
+      offset = offset_manager.next_offset_for(topic, partition)
+      expect(offset).to eq 42
+    end
+  end
+end

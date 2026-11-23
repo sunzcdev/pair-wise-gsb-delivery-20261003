@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    env:
+      LOG_LEVEL: DEBUG
+
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby-version:
+          - "3.3"
+          - "3.4"
+          - "4.0"
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y cmake
+
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ matrix.ruby-version }}
+        bundler-cache: true
+
+    - name: Run RSpec
+      run: bundle exec rspec
+
+  rubocop:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y cmake
+
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        bundler-cache: true
+
+    - name: Run Rubocop
+      run: bundle exec rubocop
+
+  functional-confluent:
+    name: Functional (Kafka ${{ matrix.kafka-version }})
+    runs-on: ubuntu-latest
+    env:
+      LOG_LEVEL: DEBUG
+      CONFLUENT_VERSION: ${{ matrix.confluent-version }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kafka-version: "3.9"
+            confluent-version: "7.9.0"
+          - kafka-version: "4.0"
+            confluent-version: "8.0.0"
+          - kafka-version: "4.1"
+            confluent-version: "8.1.0"
+          - kafka-version: "4.2"
+            confluent-version: "8.2.0"
+          - kafka-version: "4.3"
+            confluent-version: "8.3.0"
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y cmake
+
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        bundler-cache: true
+
+    - name: Start Kafka brokers
+      run: docker compose up -d --wait --wait-timeout 180
+
+    - name: Run functional tests
+      run: bundle exec rspec --profile --tag functional spec/functional
+
+    - name: Stop Kafka brokers
+      if: always()
+      run: docker compose down -v

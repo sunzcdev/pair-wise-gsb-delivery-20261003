@@ -1,0 +1,51 @@
+AllCops:
+  DisplayCopNames: true
+
+Lint:
+  Enabled: false
+Metrics:
+  Enabled: false
+Style:
+  Enabled: false
+
+# Configured cops
+
+Layout/CaseIndentation:
+  EnforcedStyle: end
+Layout/FirstParameterIndentation:
+  EnforcedStyle: consistent
+Layout/FirstArrayElementIndentation:
+  EnforcedStyle: consistent
+Layout/FirstHashElementIndentation:
+  EnforcedStyle: consistent
+Layout/MultilineMethodCallIndentation:
+  EnforcedStyle: indented
+Layout/MultilineOperationIndentation:
+  EnforcedStyle: indented
+Layout/EndAlignment:
+  EnforcedStyleAlignWith: variable
+
+#
+# Disabled cops
+#
+
+Layout/HashAlignment:
+  Enabled: false
+Layout/ParameterAlignment:
+  Enabled: false
+Layout/EmptyLinesAroundClassBody:
+  Enabled: false
+Layout/EmptyLinesAroundModuleBody:
+  Enabled: false
+Layout/SpaceInsideBlockBraces:
+  Enabled: false
+Naming/AccessorMethodName:
+  Enabled: false
+Layout/LineLength:
+  Enabled: false
+Naming/PredicatePrefix:
+  Enabled: false
+Naming/FileName:
+  Exclude:
+    - lib/ruby-kafka.rb
+    - examples/**/*
