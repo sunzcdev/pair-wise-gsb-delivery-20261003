@@ -203,6 +203,7 @@ class AsyncBackend(metaclass=ABCMeta):
         args: tuple[*PosArgsT],
         abandon_on_cancel: bool = False,
         limiter: CapacityLimiter | None = None,
+        release_limiter_on_finish: bool = False,
     ) -> T_Retval:
         pass
 

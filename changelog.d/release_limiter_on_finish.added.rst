@@ -1,0 +1,1 @@
+Added the `release_limiter_on_finish` option to `anyio.to_thread.run_sync()`. When combined with `abandon_on_cancel=True`, the capacity limiter token is now released only once the abandoned function has actually finished running (whether by returning or raising), instead of when the waiting task is cancelled.

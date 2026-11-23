@@ -26,6 +26,7 @@ async def run_sync(
     abandon_on_cancel: bool = False,
     cancellable: bool | None = None,
     limiter: CapacityLimiter | None = None,
+    release_limiter_on_finish: bool = False,
 ) -> T_Retval:
     """
     Call the given function with the given arguments in a worker thread.
@@ -44,9 +45,18 @@ async def run_sync(
         ``abandon_on_cancel`` if both parameters are passed
     :param limiter: capacity limiter to use to limit the total amount of threads running
         (if omitted, the default limiter is used)
+    :param release_limiter_on_finish: if ``True`` and ``abandon_on_cancel`` is
+        enabled, the capacity limiter token will only be released once the
+        abandoned function has actually finished running (whether by returning
+        or by raising an exception), instead of when the host task is
+        cancelled; has no effect when ``abandon_on_cancel`` is ``False``, as
+        the token is then held until completion anyway
     :raises NoEventLoopError: if no supported asynchronous event loop is running in the
         current thread
     :return: an awaitable that yields the return value of the function.
+
+    .. versionadded:: 4.17.0
+        The ``release_limiter_on_finish`` parameter.
 
     """
     if cancellable is not None:
@@ -59,7 +69,11 @@ async def run_sync(
         )
 
     return await get_async_backend().run_sync_in_worker_thread(
-        func, args, abandon_on_cancel=abandon_on_cancel, limiter=limiter
+        func,
+        args,
+        abandon_on_cancel=abandon_on_cancel,
+        limiter=limiter,
+        release_limiter_on_finish=release_limiter_on_finish,
     )
 
 

@@ -21,6 +21,14 @@ thread to finish. You can pass the ``abandon_on_cancel=True`` parameter to allow
 be cancelled. Note, however, that the thread will still continue running – only its
 outcome will be ignored.
 
+When a capacity limiter is in effect (either a custom one or the default thread
+limiter), abandoning a call normally releases the limiter token right away, even though
+the abandoned function keeps running in the background. If the limiter is meant to
+reflect the number of functions actually executing, pass
+``release_limiter_on_finish=True`` along with ``abandon_on_cancel=True`` to hold the
+token until the abandoned function has finished (whether by returning or raising an
+exception).
+
 .. seealso:: :ref:`RunInProcess`
 
 Calling asynchronous code from a worker thread

@@ -20,10 +20,12 @@ from pytest_mock import MockerFixture
 
 import anyio.to_thread
 from anyio import (
+    CancelScope,
     CapacityLimiter,
     Event,
     create_task_group,
     from_thread,
+    get_cancelled_exc_class,
     to_thread,
     wait_all_tasks_blocked,
 )
@@ -498,6 +500,125 @@ async def test_cancel_wait_on_thread() -> None:
 
     await to_thread.run_sync(event.set)
     assert future.result(5)
+
+
+async def test_abandoned_thread_releases_limiter_on_finish() -> None:
+    """
+    Test that with abandon_on_cancel and release_limiter_on_finish, the limiter
+    token is held until the abandoned function actually finishes, so a second
+    call can only start once the first one has exited, while the first caller
+    is free to handle the cancellation right away.
+    """
+    limiter = CapacityLimiter(1)
+    first_started = threading.Event()
+    unblock_first = threading.Event()
+    second_started = threading.Event()
+    first_call_finished = Event()
+
+    def first_worker() -> None:
+        first_started.set()
+        assert unblock_first.wait(5)
+
+    def second_worker() -> None:
+        second_started.set()
+
+    async def run_first(scope: CancelScope) -> None:
+        with scope:
+            try:
+                await to_thread.run_sync(
+                    first_worker,
+                    abandon_on_cancel=True,
+                    release_limiter_on_finish=True,
+                    limiter=limiter,
+                )
+            finally:
+                first_call_finished.set()
+
+    async def run_second() -> None:
+        await to_thread.run_sync(
+            second_worker,
+            abandon_on_cancel=True,
+            release_limiter_on_finish=True,
+            limiter=limiter,
+        )
+
+    async with create_task_group() as tg:
+        scope = CancelScope()
+        tg.start_soon(run_first, scope)
+        while not first_started.is_set():
+            await checkpoint()
+
+        # Cancelling the waiting task must not release the limiter token, as
+        # the first function is still running in the abandoned thread
+        scope.cancel()
+        await first_call_finished.wait()
+        assert limiter.borrowed_tokens == 1
+
+        # The second call can only enter the worker once the first function
+        # has actually exited
+        tg.start_soon(run_second)
+        await wait_all_tasks_blocked()
+        assert not second_started.is_set()
+        assert limiter.borrowed_tokens == 1
+
+        unblock_first.set()
+
+    assert second_started.is_set()
+    assert limiter.borrowed_tokens == 0
+
+
+@pytest.mark.parametrize("raise_exception", [False, True])
+async def test_abandoned_thread_outcome_releases_limiter(
+    raise_exception: bool,
+) -> None:
+    """
+    Test that the limiter token is released when the abandoned function finishes,
+    regardless of whether it returns normally or raises an exception.
+    """
+    limiter = CapacityLimiter(1)
+    unblock_first = threading.Event()
+    first_started = threading.Event()
+    second_done = Event()
+
+    def first_worker() -> None:
+        first_started.set()
+        assert unblock_first.wait(5)
+        if raise_exception:
+            raise ValueError("foo")
+
+    async def run_first(scope: CancelScope) -> None:
+        with scope:
+            with pytest.raises(get_cancelled_exc_class()):
+                await to_thread.run_sync(
+                    first_worker,
+                    abandon_on_cancel=True,
+                    release_limiter_on_finish=True,
+                    limiter=limiter,
+                )
+
+    async def run_second() -> None:
+        await to_thread.run_sync(
+            bool,
+            abandon_on_cancel=True,
+            release_limiter_on_finish=True,
+            limiter=limiter,
+        )
+        second_done.set()
+
+    async with create_task_group() as tg:
+        scope = CancelScope()
+        tg.start_soon(run_first, scope)
+        while not first_started.is_set():
+            await checkpoint()
+
+        scope.cancel()
+        tg.start_soon(run_second)
+        await wait_all_tasks_blocked()
+        assert limiter.borrowed_tokens == 1
+        unblock_first.set()
+        await second_done.wait()
+
+    assert limiter.borrowed_tokens == 0
 
 
 async def test_deprecated_cancellable_param() -> None:

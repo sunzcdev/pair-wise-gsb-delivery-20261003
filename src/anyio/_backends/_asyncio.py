@@ -891,6 +891,7 @@ class WorkerThreadPool:
         func: Callable[[Unpack[PosArgsT]], T_Retval],
         args: tuple[*PosArgsT],
         cancel_scope: CancelScope,
+        on_finish: Callable[[], None] | None = None,
     ) -> asyncio.Future[T_Retval]:
         future = asyncio.Future[T_Retval]()
         with self.lock:
@@ -908,7 +909,9 @@ class WorkerThreadPool:
                     self.workers.remove(worker)
                     raise
 
-            worker.queue.put_nowait((context, func, args, future, cancel_scope))
+            worker.queue.put_nowait(
+                (context, func, args, future, cancel_scope, on_finish)
+            )
 
         return future
 
@@ -948,7 +951,15 @@ class WorkerThread(Thread):
         super().__init__(name="AnyIO worker thread", daemon=False, **kwargs)
         self.pool = pool
         self.queue: Queue[
-            tuple[Context, Callable, tuple, asyncio.Future, CancelScope] | None
+            tuple[
+                Context,
+                Callable,
+                tuple,
+                asyncio.Future,
+                CancelScope,
+                Callable[[], None] | None,
+            ]
+            | None
         ] = Queue(2)
 
     @staticmethod
@@ -967,21 +978,33 @@ class WorkerThread(Thread):
                 future.set_result(result)
 
     def _run_job(
-        self, item: tuple[Context, Callable, tuple, asyncio.Future, CancelScope]
+        self,
+        item: tuple[
+            Context,
+            Callable,
+            tuple,
+            asyncio.Future,
+            CancelScope,
+            Callable[[], None] | None,
+        ],
     ) -> bool:
-        context, func, args, future, cancel_scope = item
+        context, func, args, future, cancel_scope, on_finish = item
         loop = future.get_loop()
         result = None
         exception: BaseException | None = None
-        with claim_worker_thread(AsyncIOBackend, loop):
-            if not future.cancelled():
-                threadlocals.current_cancel_scope = cancel_scope
-                try:
-                    result = context.run(func, *args)
-                except BaseException as exc:
-                    exception = exc
-                finally:
-                    del threadlocals.current_cancel_scope
+        try:
+            with claim_worker_thread(AsyncIOBackend, loop):
+                if not future.cancelled():
+                    threadlocals.current_cancel_scope = cancel_scope
+                    try:
+                        result = context.run(func, *args)
+                    except BaseException as exc:
+                        exception = exc
+                    finally:
+                        del threadlocals.current_cancel_scope
+        finally:
+            if on_finish is not None:
+                on_finish()
 
         # Make the worker available before delivering the result, so sequential
         # calls can reuse it even if the event loop receives the result immediately.
@@ -2622,10 +2645,48 @@ class AsyncIOBackend(AsyncBackend):
         args: tuple[*PosArgsT],
         abandon_on_cancel: bool = False,
         limiter: BaseCapacityLimiter | None = None,
+        release_limiter_on_finish: bool = False,
     ) -> T_Retval:
         await cls.checkpoint()
 
-        async with limiter or cls.current_default_thread_limiter():
+        limiter = limiter or cls.current_default_thread_limiter()
+        if abandon_on_cancel and release_limiter_on_finish:
+            # The limiter token is released by the worker thread once the
+            # function has finished running, even if this task is cancelled
+            # while waiting for it.
+            borrower = current_task()
+            await limiter.acquire_on_behalf_of(borrower)
+            loop = get_running_loop()
+
+            def release_token() -> None:
+                try:
+                    loop.call_soon_threadsafe(limiter.release_on_behalf_of, borrower)
+                except RuntimeError:
+                    # The event loop is closed, so the limiter is of no use
+                    # anymore anyway
+                    pass
+
+            with CancelScope(shield=False) as scope:
+                context = copy_context()
+                context.run(set_current_async_library, None)
+                if scope._parent_scope is None:
+                    worker_scope = scope
+                else:
+                    worker_scope = scope._parent_scope
+
+                try:
+                    future = _threadpool.submit(
+                        context, func, args, worker_scope, on_finish=release_token
+                    )
+                except BaseException:
+                    # The job was never queued, so the worker thread will not
+                    # release the token either
+                    limiter.release_on_behalf_of(borrower)
+                    raise
+
+                return await future
+
+        async with limiter:
             with CancelScope(shield=not abandon_on_cancel) as scope:
                 context = copy_context()
                 context.run(set_current_async_library, None)

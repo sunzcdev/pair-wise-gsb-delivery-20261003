@@ -5,6 +5,7 @@ import math
 import os
 import socket
 import sys
+import threading
 import types
 import weakref
 from collections.abc import (
@@ -1071,6 +1072,22 @@ class TrioTaskInfo(TaskInfo):
             return False
 
 
+class _UnlimitedLimiter:
+    """
+    A duck-typed stand-in for ``trio.CapacityLimiter`` that never blocks.
+
+    Passed to ``trio.to_thread.run_sync()`` when the capacity limiter token is
+    managed by AnyIO itself, to ensure that the worker thread is started
+    without any intervening checkpoints.
+    """
+
+    async def acquire_on_behalf_of(self, borrower: object) -> None:
+        pass
+
+    def release_on_behalf_of(self, borrower: object) -> None:
+        pass
+
+
 class TrioBackend(AsyncBackend):
     @classmethod
     def run(
@@ -1154,12 +1171,62 @@ class TrioBackend(AsyncBackend):
         args: tuple[*PosArgsT],
         abandon_on_cancel: bool = False,
         limiter: BaseCapacityLimiter | None = None,
+        release_limiter_on_finish: bool = False,
     ) -> T_Retval:
+        token = TrioBackend.current_token()
+
+        if abandon_on_cancel and release_limiter_on_finish:
+            # The limiter token is released by the worker thread once the
+            # function has finished running, even if this task is cancelled
+            # while waiting for it.
+            limiter = limiter or cls.current_default_thread_limiter()
+            borrower = trio.lowlevel.current_task()
+            trio_token = cast("trio.lowlevel.TrioToken | None", token)
+            await limiter.acquire_on_behalf_of(borrower)
+            token_released = threading.Event()
+
+            def releasing_wrapper() -> T_Retval:
+                with claim_worker_thread(TrioBackend, token):
+                    try:
+                        return func(*args)
+                    finally:
+                        try:
+                            trio.from_thread.run_sync(
+                                limiter.release_on_behalf_of,
+                                borrower,
+                                trio_token=trio_token,
+                            )
+                        except trio.RunFinishedError:
+                            # The event loop is closed, so the limiter is of no
+                            # use anymore anyway
+                            pass
+                        finally:
+                            token_released.set()
+
+            try:
+                # The placeholder limiter ensures that the worker thread is
+                # started without any intervening checkpoints, so a
+                # cancellation always means that the wrapper will run (and
+                # thus release the token)
+                return await run_sync(
+                    releasing_wrapper,
+                    abandon_on_cancel=True,
+                    limiter=cast(trio.CapacityLimiter, _UnlimitedLimiter()),
+                )
+            except trio.Cancelled:
+                raise
+            except BaseException:
+                if not token_released.is_set():
+                    # The worker thread never started, so it will not release
+                    # the token either
+                    limiter.release_on_behalf_of(borrower)
+
+                raise
+
         def wrapper() -> T_Retval:
             with claim_worker_thread(TrioBackend, token):
                 return func(*args)
 
-        token = TrioBackend.current_token()
         return await run_sync(
             wrapper,
             abandon_on_cancel=abandon_on_cancel,
