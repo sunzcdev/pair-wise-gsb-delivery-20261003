@@ -1,0 +1,16 @@
+build
+dist
+env
+*.egg-info
+*.pyc
+*.pyo
+*.pyi
+*.key
+*.pem
+.venv
+.tox
+.coverage
+.idea
+.cache
+.mypy_cache
+.pytest_cache

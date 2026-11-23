@@ -1,0 +1,123 @@
+- !Image
+  name: py38
+  from: &py38 !DockerImage python:3.8.19-slim
+  repository: localhost/grpclib/py38
+  tasks:
+  - run: pip3 install --no-cache-dir -r {{runtime}}
+    runtime: !File "requirements/runtime.txt"
+
+- !Image
+  name: test38
+  from: *py38
+  repository: localhost/grpclib/test38
+  tasks:
+  - run: pip3 install --no-cache-dir -r {{test}}
+    test: !File "requirements/test.txt"
+
+- !Image
+  name: check38
+  from: *py38
+  repository: localhost/grpclib/check38
+  tasks:
+  - run: pip3 install --no-cache-dir -r {{check}}
+    check: !File "requirements/check.txt"
+
+- !Image
+  name: docs38
+  from: *py38
+  repository: localhost/grpclib/docs38
+  tasks:
+  - run: pip3 install --no-cache-dir -r {{docs}}
+    docs: !File "requirements/docs.txt"
+
+
+- !Command
+  name: server
+  image: py38
+  run: python3 -m helloworld.server
+  network-name: server
+  environ:
+    PYTHONPATH: examples
+  ports:
+  - !Expose { port: 50051, as: 50051 }
+
+- !Command
+  name: client
+  image: py38
+  run: python3 -m helloworld.client
+  environ:
+    PYTHONPATH: examples
+
+- !Command
+  name: docs
+  image: docs38
+  run: sphinx-build -b html docs build
+  environ:
+    PYTHONPATH: .
+
+- !Command
+  name: test38
+  image: test38
+  run: [py.test]
+  environ:
+    PYTHONPATH: .
+
+- !Command
+  name: test38
+  image: test38
+  run: [py.test]
+  environ:
+    PYTHONPATH: .
+
+- !Command
+  name: flake8
+  image: check38
+  run: [flake8]
+
+- !Command
+  name: mypy
+  image: check38
+  run: [mypy]
+
+
+- !Image
+  name: py312
+  from: &py312 !DockerImage python:3.12.3-slim
+  repository: localhost/grpclib/py312
+  tasks:
+  - run: pip3 install --no-cache-dir -r {{runtime}}
+    runtime: !File "requirements/runtime.txt"
+
+- !Image
+  name: test312
+  from: *py312
+  repository: localhost/grpclib/test312
+  tasks:
+  - run: pip3 install --no-cache-dir -r {{test}}
+    test: !File "requirements/test.txt"
+
+- !Command
+  name: test312
+  image: test312
+  run: [py.test]
+  environ:
+    PYTHONPATH: .
+
+
+- !Image
+  name: pip-compile
+  from: !DockerImage python:3.8.19-slim
+  repository: localhost/grpclib/pip-compile
+  tasks:
+  - run: pip3 install --no-cache-dir pip-tools
+
+- !Command
+  name: upgrade
+  image: pip-compile
+  run: |
+    pip-compile -U --annotation-style=line setup.py -o setup.txt
+    pip-compile -U --annotation-style=line requirements/runtime.in
+    pip-compile -U --annotation-style=line requirements/docs.in
+    pip-compile -U --annotation-style=line requirements/test.in
+    pip-compile -U --annotation-style=line requirements/check.in
+    pip-compile -U --annotation-style=line requirements/release.in
