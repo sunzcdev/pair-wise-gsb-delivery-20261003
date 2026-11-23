@@ -1223,18 +1223,31 @@ class RequestHandler:
         self._write_buffer = []
         if not self._headers_written:
             self._headers_written = True
-            for transform in self._transforms:
-                assert chunk is not None
-                (
-                    self._status_code,
-                    self._headers,
-                    chunk,
-                ) = transform.transform_first_chunk(
-                    self._status_code, self._headers, chunk, include_footers
-                )
-            # Ignore the chunk and only write the headers for HEAD requests
             if self.request.method == "HEAD":
+                # Only the headers are sent for a HEAD request, so run just
+                # the metadata half of the transform pipeline. A transform
+                # may report the status and headers that the corresponding
+                # GET would produce without encoding a body that is about to
+                # be discarded.
+                for transform in self._transforms:
+                    (
+                        self._status_code,
+                        self._headers,
+                    ) = transform.transform_headers(
+                        self._status_code, self._headers, chunk, include_footers
+                    )
+                # The body is never written for HEAD requests.
                 chunk = b""
+            else:
+                for transform in self._transforms:
+                    assert chunk is not None
+                    (
+                        self._status_code,
+                        self._headers,
+                        chunk,
+                    ) = transform.transform_first_chunk(
+                        self._status_code, self._headers, chunk, include_footers
+                    )
 
             # Finalize the cookie headers (which have been stored in a side
             # object so an outgoing cookie could be overwritten before it
@@ -1248,15 +1261,20 @@ class RequestHandler:
                 start_line, self._headers, chunk
             )
         else:
-            for transform in self._transforms:
-                chunk = transform.transform_chunk(chunk, include_footers)
-            # Ignore the chunk and only write the headers for HEAD requests
-            if self.request.method != "HEAD":
-                return self.request.connection.write(chunk)
-            else:
+            if self.request.method == "HEAD":
+                # A HEAD response has no body, but an ordinary transform
+                # still sees the chunks it would otherwise have discarded.
+                # Transforms that provided their metadata separately (via
+                # transform_headers) are already in their final state, so
+                # this is typically a no-op for them.
+                for transform in self._transforms:
+                    transform.transform_chunk(chunk, include_footers)
                 future: Future[None] = Future()
                 future.set_result(None)
                 return future
+            for transform in self._transforms:
+                chunk = transform.transform_chunk(chunk, include_footers)
+            return self.request.connection.write(chunk)
 
     def _should_not_send_content(self, status_code: int) -> bool:
         """Check if we should not send body content for given `status_code`"""
@@ -3773,6 +3791,33 @@ class OutputTransform:
     def __init__(self, request: httputil.HTTPServerRequest) -> None:
         pass
 
+    def transform_headers(
+        self,
+        status_code: int,
+        headers: httputil.HTTPHeaders,
+        chunk: bytes,
+        finishing: bool,
+    ) -> tuple[int, httputil.HTTPHeaders]:
+        """Returns the status and headers to be sent for a response with no body.
+
+        This is called instead of `transform_first_chunk` when the response
+        body will not be sent (i.e. for a HEAD request). The framework uses it
+        to build a response whose metadata matches the one a GET would have
+        produced without generating (and then throwing away) the body.
+
+        The default implementation runs `transform_first_chunk` and discards
+        the transformed body, so a transform that does not override this
+        method sees exactly the same chunk as before. Transforms that can
+        report their metadata without encoding the body may override this
+        method to avoid that work.
+
+        .. versionadded:: 6.7
+        """
+        status_code, headers, chunk = self.transform_first_chunk(
+            status_code, headers, chunk, finishing
+        )
+        return status_code, headers
+
     def transform_first_chunk(
         self,
         status_code: int,
@@ -3824,6 +3869,65 @@ class GZipContentEncoding(OutputTransform):
 
     def _compressible_type(self, ctype: str) -> bool:
         return ctype.startswith("text/") or ctype in self.CONTENT_TYPES
+
+    def transform_headers(
+        self,
+        status_code: int,
+        headers: httputil.HTTPHeaders,
+        chunk: bytes,
+        finishing: bool,
+    ) -> tuple[int, httputil.HTTPHeaders]:
+        # Report the content coding that the corresponding GET would use
+        # without encoding (and then discarding) a body. The MIN_LENGTH
+        # threshold that transform_first_chunk applies to a single-chunk body
+        # is reproduced here from what the handler told us about the body:
+        #
+        # * A body the handler wrote for the HEAD response has a known
+        #   length, so the threshold applies to it.
+        # * An explicit, positive Content-Length also describes the body.
+        # * Otherwise the length is not known here. This is the usual case:
+        #   a HEAD handler writes no body and only describes what GET would
+        #   generate. finish() may have recorded a zero length for the empty
+        #   buffer, but that is not the length of the representation, so it
+        #   must not be mistaken for one. Such a HEAD is treated like a
+        #   streamed GET, which is compressed regardless of size.
+        ctype = _unicode(headers.get("Content-Type", "")).split(";")[0]
+        compressible = self._compressible_type(ctype)
+        # Only a type that may be compressed depends on Accept-Encoding.
+        if compressible:
+            if "Vary" in headers:
+                headers["Vary"] += ", Accept-Encoding"
+            else:
+                headers["Vary"] = "Accept-Encoding"
+        # No body is encoded for this response. Clear the flag first so that
+        # a later flush of the same HEAD response does not try to encode
+        # (and does not need a gzip file that was never created).
+        gzipping = self._gzipping and compressible and "Content-Encoding" not in headers
+        self._gzipping = False
+        if not gzipping:
+            return status_code, headers
+        known_length: int | None = None
+        if chunk:
+            known_length = len(chunk)
+        elif "Content-Length" in headers:
+            try:
+                declared = int(headers["Content-Length"])
+            except ValueError:
+                declared = 0
+            if declared > 0:
+                known_length = declared
+        if known_length is not None and known_length < self.MIN_LENGTH:
+            # A short, single-chunk GET is not compressed, so neither is the
+            # HEAD response describing it. Any Content-Length still describes
+            # this representation, so leave the headers alone.
+            return status_code, headers
+        headers["Content-Encoding"] = "gzip"
+        if "Content-Length" in headers:
+            # The length of the encoded representation is not known without
+            # encoding it, so don't claim the original one (which may only be
+            # the zero that finish() recorded for the empty HEAD buffer).
+            del headers["Content-Length"]
+        return status_code, headers
 
     def transform_first_chunk(
         self,

@@ -1,0 +1,22 @@
+What's new in Tornado 6.7.0
+===========================
+
+In development
+--------------
+
+`tornado.web`
+~~~~~~~~~~~~~
+
+- Responses to ``HEAD`` requests now describe the representation that the
+  corresponding ``GET`` would return, including the content coding chosen by
+  ``compress_response`` (`.GZipContentEncoding`), without generating the body.
+  Previously a compressed ``GET`` was advertised as ``Content-Encoding: gzip``
+  while its ``HEAD`` omitted the coding and reported the uncompressed
+  ``Content-Length``. The body is still not produced for ``HEAD``, so a handler
+  whose body generation has side effects does not run them for a probe.
+- `.OutputTransform` has a new `.OutputTransform.transform_headers` method that a
+  transform may override to provide only the status and headers of a bodyless
+  response. The default implementation calls
+  `.OutputTransform.transform_first_chunk`, so ordinary transforms behave as
+  before, and no ``Content-Length`` is invented when the length of the encoded
+  representation is not known.

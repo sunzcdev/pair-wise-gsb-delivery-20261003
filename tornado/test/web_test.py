@@ -54,6 +54,7 @@ from tornado.web import (
     GZipContentEncoding,
     HTTPError,
     MissingArgumentError,
+    OutputTransform,
 )
 from tornado.web import RedirectHandler as WebRedirectHandler
 from tornado.web import (
@@ -3080,6 +3081,147 @@ class GzipTestCase(SimpleHandlerTestCase):
         response = self.fetch("/?content_type=image/png&vary=Accept-Language")
         self.assertNotIn("Content-Encoding", response.headers)
         self.assertEqual(response.headers["Vary"], "Accept-Language")
+
+
+class GzipHeadTestCase(SimpleHandlerTestCase):
+    """HEAD must describe the representation that the matching GET chooses.
+
+    The body is never generated for HEAD, so the transform is asked only for
+    its metadata (see `OutputTransform.transform_headers`).
+    """
+
+    class Handler(RequestHandler):
+        # Incremented each time the generator is actually pulled, so a test
+        # can tell whether the body was produced.
+        pulls = 0
+
+        def _body(self):
+            GzipHeadTestCase.Handler.pulls += 1
+            for i in range(300):
+                self.write(f"chunk {i} " * 8)
+
+        def get(self):
+            self.set_header("Content-Type", "text/plain")
+            self._body()
+
+        def head(self):
+            self.set_header("Content-Type", "text/plain")
+
+    def get_app_kwargs(self):
+        return dict(gzip=True)
+
+    def setUp(self):
+        super().setUp()
+        GzipHeadTestCase.Handler.pulls = 0
+
+    def _fetch(self, method):
+        return self.fetch(
+            "/",
+            method=method,
+            use_gzip=False,
+            headers={"Accept-Encoding": "gzip"},
+            raise_error=False,
+        )
+
+    def test_head_matches_get_encoding(self):
+        head = self._fetch("HEAD")
+        get = self._fetch("GET")
+        self.assertEqual(head.code, 200)
+        self.assertEqual(head.headers.get("Content-Encoding"), "gzip")
+        self.assertEqual(
+            head.headers.get("Content-Encoding"),
+            get.headers.get("Content-Encoding"),
+        )
+        self.assertEqual(head.body, b"")
+        # The GET was actually gzipped, and the body matches its framing.
+        self.assertTrue(get.body)
+        self.assertEqual(gzip.decompress(get.body)[:6], b"chunk ")
+
+    def test_head_does_not_run_generator(self):
+        self._fetch("HEAD")
+        self.assertEqual(GzipHeadTestCase.Handler.pulls, 0)
+        self._fetch("GET")
+        self.assertEqual(GzipHeadTestCase.Handler.pulls, 1)
+
+    def test_head_does_not_invent_length(self):
+        # The length of the gzipped representation is not known without
+        # encoding it, so the HEAD response does not carry a Content-Length.
+        # The matching GET does know it: it encoded the body and the header
+        # describes the bytes it actually wrote.
+        head = self._fetch("HEAD")
+        self.assertNotIn("Content-Length", head.headers)
+        get = self._fetch("GET")
+        self.assertEqual(get.headers["Content-Length"], str(len(get.body)))
+
+    def test_short_declared_length_not_compressed(self):
+        # An explicit Content-Length says the body is short, so the response
+        # is not compressed (as for a GET that finishes in one chunk). The
+        # declared length is then still accurate and is reported unchanged.
+        class LengthHandler(RequestHandler):
+            def get(self):
+                self.set_header("Content-Type", "text/plain")
+                self.set_header("Content-Length", "5")
+                self.write("hello")
+
+            def head(self):
+                self.set_header("Content-Type", "text/plain")
+                self.set_header("Content-Length", "5")
+
+        self.app.add_handlers(".*", [("/fixed", LengthHandler)])
+        head = self.fetch(
+            "/fixed", method="HEAD", use_gzip=False, headers={"Accept-Encoding": "gzip"}
+        )
+        self.assertNotIn("Content-Encoding", head.headers)
+        self.assertEqual(head.headers["Content-Length"], "5")
+        get = self.fetch(
+            "/fixed", method="GET", use_gzip=False, headers={"Accept-Encoding": "gzip"}
+        )
+        self.assertNotIn("Content-Encoding", get.headers)
+        self.assertEqual(get.body, b"hello")
+
+    def test_long_declared_length_compressed_without_length(self):
+        # A long declared length would be compressed as a GET, so the HEAD
+        # reports the coding but not the (now stale) uncompressed length.
+        class LengthHandler(RequestHandler):
+            def get(self):
+                self.set_header("Content-Type", "text/plain")
+                self.set_header("Content-Length", str(len(b"x" * 4096)))
+                self.write(b"x" * 4096)
+
+            def head(self):
+                self.set_header("Content-Type", "text/plain")
+                self.set_header("Content-Length", str(len(b"x" * 4096)))
+
+        self.app.add_handlers(".*", [("/big", LengthHandler)])
+        head = self.fetch(
+            "/big", method="HEAD", use_gzip=False, headers={"Accept-Encoding": "gzip"}
+        )
+        self.assertEqual(head.headers.get("Content-Encoding"), "gzip")
+        self.assertNotIn("Content-Length", head.headers)
+
+    def test_plain_transform_sees_chunks(self):
+        # A transform that does not implement transform_headers still works:
+        # the default implementation runs transform_first_chunk.
+        seen_chunks = []
+
+        class RecordingTransform(OutputTransform):
+            def transform_first_chunk(self, status_code, headers, chunk, finishing):
+                seen_chunks.append(chunk)
+                return status_code, headers, chunk
+
+        class Handler(RequestHandler):
+            def get(self):
+                self.write("hello")
+
+            def head(self):
+                pass
+
+        self.app.add_handlers(".*", [("/record", Handler)])
+        self.app.add_transform(RecordingTransform)
+        response = self.fetch("/record", method="HEAD")
+        self.assertEqual(response.code, 200)
+        # HEAD has no body to encode, so the transform saw an empty chunk.
+        self.assertEqual(seen_chunks, [b""])
 
 
 class PathArgsInPrepareTest(WebTestCase):
