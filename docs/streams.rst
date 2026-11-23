@@ -39,6 +39,30 @@ the buffer size to a value of your choosing when creating the stream. It is also
 possible to have an unbounded buffer by passing :data:`math.inf` as the buffer size but
 this is not recommended.
 
+Sharing a buffer quota between streams
+**************************************
+
+Several independent memory object streams can draw from a common buffer quota. Create
+a :class:`~.streams.memory.MemoryObjectStreamBuffer` with the desired total size and
+pass it as the buffer size when creating each stream::
+
+    from anyio import create_memory_object_stream
+    from anyio.streams.memory import MemoryObjectStreamBuffer
+
+    buffer = MemoryObjectStreamBuffer(10)
+    send1, receive1 = create_memory_object_stream[str](buffer)
+    send2, receive2 = create_memory_object_stream[str](buffer)
+
+The combined number of items buffered on all streams sharing the same
+:class:`~.streams.memory.MemoryObjectStreamBuffer` never exceeds its size, so one
+stream cannot be starved by unbounded buffering on the others. Each stream still
+keeps its own queue: the send/receive ordering and the closing semantics of each
+stream are unaffected by the sharing, and cloning works as usual. Items handed
+directly to a waiting receiver never consume buffer quota, so such deliveries
+complete even when another stream has used up the shared quota.
+
+.. versionadded:: 4.17
+
 Memory object streams can be cloned by calling the ``clone()`` method. Each clone can be
 closed separately, but each end of the stream is only considered closed once all of its
 clones have been closed. For example, if you have two clones of the receive stream, the

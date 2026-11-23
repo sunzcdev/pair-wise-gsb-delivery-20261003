@@ -1,0 +1,1 @@
+Added the `anyio.streams.memory.MemoryObjectStreamBuffer` class which can be passed as the buffer size to `create_memory_object_stream()` to let several independent memory object streams share a common buffer quota while keeping their own ordering and closing semantics

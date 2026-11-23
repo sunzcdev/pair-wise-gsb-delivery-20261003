@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import math
 from typing import TYPE_CHECKING, NoReturn
 
 import pytest
@@ -18,6 +19,7 @@ from anyio import (
 from anyio.streams.memory import (
     MemoryObjectReceiveStream,
     MemoryObjectSendStream,
+    MemoryObjectStreamBuffer,
     _MemoryObjectItemReceiver,
 )
 
@@ -37,6 +39,192 @@ def test_negative_max_buffer() -> None:
     pytest.raises(ValueError, create_memory_object_stream, -1).match(
         "max_buffer_size cannot be negative"
     )
+
+
+def test_shared_buffer_invalid_max_size() -> None:
+    pytest.raises(ValueError, MemoryObjectStreamBuffer, 1.0).match(
+        "max buffer size must be either an integer or math.inf"
+    )
+    pytest.raises(ValueError, MemoryObjectStreamBuffer, -1).match(
+        "max buffer size cannot be negative"
+    )
+
+
+async def test_shared_buffer_quota() -> None:
+    buffer = MemoryObjectStreamBuffer(2)
+    send1, receive1 = create_memory_object_stream[str](buffer)
+    send2, receive2 = create_memory_object_stream[str](buffer)
+    with send1, receive1, send2, receive2:
+        # The two streams draw from the same buffer quota
+        send1.send_nowait("foo")
+        send2.send_nowait("bar")
+        with pytest.raises(WouldBlock):
+            send1.send_nowait("baz")
+
+        # Receiving on one stream frees quota for the other
+        assert receive2.receive_nowait() == "bar"
+        send1.send_nowait("baz")
+        assert receive1.receive_nowait() == "foo"
+        assert receive1.receive_nowait() == "baz"
+
+
+async def test_shared_buffer_send_to_waiting_receiver_when_quota_exhausted() -> None:
+    """
+    Test that a direct handoff to a waiting receiver completes even when another
+    stream has exhausted the shared buffer quota, and that the delivery is not
+    counted against the buffer.
+    """
+
+    async def receiver() -> None:
+        received.append(await receive2.receive())
+
+    buffer = MemoryObjectStreamBuffer(1)
+    send1, receive1 = create_memory_object_stream[str](buffer)
+    send2, receive2 = create_memory_object_stream[str](buffer)
+    with send1, receive1, send2, receive2:
+        # Fill the shared buffer using the first stream (which has no consumers)
+        send1.send_nowait("first")
+        with pytest.raises(WouldBlock):
+            send2.send_nowait("second")
+
+        received: list[str] = []
+        async with create_task_group() as tg:
+            tg.start_soon(receiver)
+            await wait_all_tasks_blocked()
+            # The item is handed directly to the waiting receiver, bypassing the
+            # (full) shared buffer
+            send2.send_nowait("second")
+
+        assert received == ["second"]
+
+        # The buffer contents are still accounted to the first stream only
+        statistics1 = send1.statistics()
+        assert statistics1.current_buffer_used == 1
+        assert statistics1.max_buffer_size == 1
+        assert send2.statistics().current_buffer_used == 0
+        assert receive2.statistics().current_buffer_used == 0
+
+        assert receive1.receive_nowait() == "first"
+
+
+async def test_shared_buffer_send_unblocked_by_other_stream() -> None:
+    """
+    Test that a send blocked by shared quota consumed by another stream is unblocked
+    when a receive on that other stream frees quota.
+    """
+    buffer = MemoryObjectStreamBuffer(1)
+    send1, receive1 = create_memory_object_stream[str](buffer)
+    send2, receive2 = create_memory_object_stream[str](buffer)
+    with send1, receive1, send2, receive2:
+        send1.send_nowait("first")
+        async with create_task_group() as tg:
+            tg.start_soon(send2.send, "second")
+            await wait_all_tasks_blocked()
+            assert send2.statistics().tasks_waiting_send == 1
+
+            # Freeing shared quota on the first stream lets the blocked send through
+            assert receive1.receive_nowait() == "first"
+
+        assert send2.statistics().tasks_waiting_send == 0
+        assert receive2.receive_nowait() == "second"
+
+
+async def test_shared_buffer_cancel_send_leaves_no_placeholder() -> None:
+    """
+    Test that cancelling a send blocked on shared buffer quota does not leave a
+    placeholder behind that would consume quota.
+    """
+    buffer = MemoryObjectStreamBuffer(1)
+    send1, receive1 = create_memory_object_stream[str](buffer)
+    send2, receive2 = create_memory_object_stream[str](buffer)
+    with send1, receive1, send2, receive2:
+        send1.send_nowait("first")
+        async with create_task_group() as tg:
+            tg.start_soon(send2.send, "cancelled")
+            await wait_all_tasks_blocked()
+            tg.cancel_scope.cancel()
+
+        assert send2.statistics().tasks_waiting_send == 0
+
+        # The cancelled send must not have reserved any shared quota
+        assert receive1.receive_nowait() == "first"
+        send2.send_nowait("second")
+        assert receive2.receive_nowait() == "second"
+
+
+async def test_shared_buffer_close_receive_releases_quota() -> None:
+    """
+    Test that closing the receiving end of a stream releases the shared quota held
+    by buffered items that can no longer be received.
+    """
+    buffer = MemoryObjectStreamBuffer(1)
+    send1, receive1 = create_memory_object_stream[str](buffer)
+    send2, receive2 = create_memory_object_stream[str](buffer)
+    with send1, send2, receive2:
+        send1.send_nowait("dropped")
+        await receive1.aclose()
+
+        # The undeliverable buffered item no longer consumes shared quota
+        send2.send_nowait("second")
+        assert receive2.receive_nowait() == "second"
+
+
+async def test_shared_buffer_streams_close_independently() -> None:
+    """Test that closing one stream does not affect other streams sharing the
+    buffer."""
+    buffer = MemoryObjectStreamBuffer(1)
+    send1, receive1 = create_memory_object_stream[str](buffer)
+    send2, receive2 = create_memory_object_stream[str](buffer)
+    async with send2, receive2:
+        await send1.aclose()
+        await receive1.aclose()
+
+        # The second stream is unaffected by the closure of the first one
+        await send2.send("hello")
+        assert await receive2.receive() == "hello"
+
+
+async def test_shared_buffer_per_stream_order() -> None:
+    """Test that each stream sharing a buffer keeps its own send/receive order."""
+    buffer = MemoryObjectStreamBuffer(4)
+    send1, receive1 = create_memory_object_stream[str](buffer)
+    send2, receive2 = create_memory_object_stream[str](buffer)
+    with send1, receive1, send2, receive2:
+        send1.send_nowait("a")
+        send2.send_nowait("x")
+        send1.send_nowait("b")
+        send2.send_nowait("y")
+
+        assert receive1.receive_nowait() == "a"
+        assert receive1.receive_nowait() == "b"
+        assert receive2.receive_nowait() == "x"
+        assert receive2.receive_nowait() == "y"
+
+
+async def test_shared_buffer_clone() -> None:
+    """Test that clones of streams created with a shared buffer work as usual."""
+    buffer = MemoryObjectStreamBuffer(1)
+    send1, receive1 = create_memory_object_stream[str](buffer)
+    send2 = send1.clone()
+    receive2 = receive1.clone()
+    await send1.aclose()
+    await receive1.aclose()
+    with send2, receive2:
+        send2.send_nowait("hello")
+        assert receive2.receive_nowait() == "hello"
+
+
+async def test_shared_buffer_unlimited() -> None:
+    buffer = MemoryObjectStreamBuffer(math.inf)
+    send1, receive1 = create_memory_object_stream[int](buffer)
+    send2, receive2 = create_memory_object_stream[int](buffer)
+    with send1, receive1, send2, receive2:
+        for i in range(100):
+            send1.send_nowait(i)
+            send2.send_nowait(i)
+
+        assert send1.statistics().current_buffer_used == 100
+        assert send2.statistics().current_buffer_used == 100
 
 
 async def test_receive_then_send() -> None:

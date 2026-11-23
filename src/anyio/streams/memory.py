@@ -3,9 +3,11 @@ from __future__ import annotations
 __all__ = (
     "MemoryObjectReceiveStream",
     "MemoryObjectSendStream",
+    "MemoryObjectStreamBuffer",
     "MemoryObjectStreamStatistics",
 )
 
+import math
 import warnings
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -29,8 +31,10 @@ T_contra = TypeVar("T_contra", contravariant=True)
 
 
 class MemoryObjectStreamStatistics(NamedTuple):
-    current_buffer_used: int  #: number of items stored in the buffer
-    #: maximum number of items that can be stored on this stream (or :data:`math.inf`)
+    #: number of items stored in this stream's part of the buffer
+    current_buffer_used: int
+    #: maximum total number of items that can be stored in the (possibly shared)
+    #: buffer (or :data:`math.inf`)
     max_buffer_size: float
     open_send_streams: int  #: number of unclosed clones of the send stream
     open_receive_streams: int  #: number of unclosed clones of the receive stream
@@ -53,8 +57,70 @@ class _MemoryObjectItemReceiver(Generic[T_Item]):
 
 
 @dataclass(eq=False)
+class MemoryObjectStreamBuffer:
+    """
+    A buffer quota that can be shared by several memory object streams.
+
+    Pass an instance of this class as the ``max_buffer_size`` argument to
+    :func:`anyio.create_memory_object_stream` to make the created streams share a
+    common buffer quota. The combined number of items buffered on all streams sharing
+    the same instance never exceeds ``max_size``.
+
+    Each stream still keeps its own queue: the order in which items are sent and
+    received on any one stream, as well as the closing semantics of each stream, are
+    unaffected by the sharing. Items handed directly to a waiting receiver never
+    consume any buffer quota, so such deliveries can complete even when another
+    stream has exhausted the shared quota.
+
+    :param max_size: the maximum total number of items that can be buffered on all
+        the streams sharing this buffer (or :data:`math.inf` for an unbounded
+        buffer)
+
+    .. versionadded:: 4.17
+
+    """
+
+    max_size: float = field()
+    _used: int = field(init=False, default=0)
+    _states: list[_MemoryObjectStreamState] = field(init=False, default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.max_size != math.inf and not isinstance(self.max_size, int):
+            raise ValueError("max buffer size must be either an integer or math.inf")
+        if self.max_size < 0:
+            raise ValueError("max buffer size cannot be negative")
+
+    def _register(self, state: _MemoryObjectStreamState) -> None:
+        self._states.append(state)
+
+    def _unregister(self, state: _MemoryObjectStreamState) -> None:
+        try:
+            self._states.remove(state)
+        except ValueError:
+            pass
+
+    def _notify_senders(self) -> None:
+        """
+        Let blocked senders buffer their items after buffer quota has been freed.
+
+        This is necessary because a send operation can be blocked by quota consumed
+        by a different stream than the one being received from.
+        """
+        for state in list(self._states):
+            if not state.open_receive_channels:
+                # The buffered items would never be received on this stream
+                continue
+
+            while self._used < self.max_size and state.waiting_senders:
+                send_event, item = state.waiting_senders.popitem(last=False)
+                state.buffer.append(item)
+                self._used += 1
+                send_event.set()
+
+
+@dataclass(eq=False)
 class _MemoryObjectStreamState(Generic[T_Item]):
-    max_buffer_size: float = field()
+    buffer_pool: MemoryObjectStreamBuffer = field()
     buffer: deque[T_Item] = field(init=False, default_factory=deque)
     open_send_channels: int = field(init=False, default=0)
     open_receive_channels: int = field(init=False, default=0)
@@ -65,10 +131,13 @@ class _MemoryObjectStreamState(Generic[T_Item]):
         init=False, default_factory=OrderedDict
     )
 
+    def __post_init__(self) -> None:
+        self.buffer_pool._register(self)
+
     def statistics(self) -> MemoryObjectStreamStatistics:
         return MemoryObjectStreamStatistics(
             len(self.buffer),
-            self.max_buffer_size,
+            self.buffer_pool.max_size,
             self.open_send_channels,
             self.open_receive_channels,
             len(self.waiting_senders),
@@ -100,15 +169,31 @@ class MemoryObjectReceiveStream(ObjectReceiveStream[T_co], Generic[T_co]):
         if self._closed:
             raise ClosedResourceError
 
-        if self._state.waiting_senders:
-            # Get the item from the next sender
-            send_event, item = self._state.waiting_senders.popitem(last=False)
-            self._state.buffer.append(item)
-            send_event.set()
+        state = self._state
+        buffer_pool = state.buffer_pool
+        if state.buffer:
+            item = state.buffer.popleft()
+            buffer_pool._used -= 1
+            if state.waiting_senders:
+                # Move the next waiting sender's item into the freed slot
+                send_event, next_item = state.waiting_senders.popitem(last=False)
+                state.buffer.append(next_item)
+                buffer_pool._used += 1
+                send_event.set()
+            else:
+                # The freed slot may unblock senders on streams sharing the buffer
+                buffer_pool._notify_senders()
 
-        if self._state.buffer:
-            return self._state.buffer.popleft()
-        elif not self._state.open_send_channels:
+            return item
+
+        if state.waiting_senders:
+            # Deliver the item directly to the receiver, bypassing the buffer (and
+            # thus not consuming any of the potentially shared buffer quota)
+            send_event, item = state.waiting_senders.popitem(last=False)
+            send_event.set()
+            return item
+
+        if not state.open_send_channels:
             raise EndOfStream
 
         raise WouldBlock
@@ -169,9 +254,20 @@ class MemoryObjectReceiveStream(ObjectReceiveStream[T_co], Generic[T_co]):
             self._closed = True
             self._state.open_receive_channels -= 1
             if self._state.open_receive_channels == 0:
-                send_events = list(self._state.waiting_senders.keys())
+                state = self._state
+                buffer_pool = state.buffer_pool
+                if state.buffer:
+                    # Release the quota held by items that can no longer be received
+                    buffer_pool._used -= len(state.buffer)
+                    state.buffer.clear()
+                    buffer_pool._notify_senders()
+
+                send_events = list(state.waiting_senders.keys())
                 for event in send_events:
                     event.set()
+
+                if not state.open_send_channels:
+                    buffer_pool._unregister(state)
 
             if self._waiters is not None:
                 for event in self._waiters:
@@ -245,8 +341,10 @@ class MemoryObjectSendStream(ObjectSendStream[T_contra], Generic[T_contra]):
                 receive_event.set()
                 return
 
-        if len(self._state.buffer) < self._state.max_buffer_size:
+        buffer_pool = self._state.buffer_pool
+        if buffer_pool._used < buffer_pool.max_size:
             self._state.buffer.append(item)
+            buffer_pool._used += 1
         else:
             raise WouldBlock
 
@@ -319,6 +417,9 @@ class MemoryObjectSendStream(ObjectSendStream[T_contra], Generic[T_contra]):
                 self._state.waiting_receivers.clear()
                 for event in receive_events:
                     event.set()
+
+                if not self._state.open_receive_channels:
+                    self._state.buffer_pool._unregister(self._state)
 
             if self._waiters is not None:
                 withdrawn = set[Event]()
