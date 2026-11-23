@@ -221,6 +221,45 @@ class Gem::InstallerTestCase < Gem::TestCase
                        force: force)
   end
 
+  ##
+  # Builds and installs a gem named +name+ at +version+ providing a "tool"
+  # executable. The executable raises with "ran tool from <name> <version>"
+  # when loaded, which makes the gem actually backing a generated bin stub
+  # observable in tests.
+
+  def build_and_install_tool_gem(name, version, install_dir: @gemhome, force: false)
+    spec = quick_gem name, version do |s|
+      s.bindir = "bin"
+      s.files = ["lib/#{name}.rb", "bin/tool"]
+      s.executables = ["tool"]
+    end
+
+    write_file File.join(@tempdir, "lib", "#{name}.rb") do |io|
+      io.puts "# #{name}.rb"
+    end
+
+    write_file File.join(@tempdir, "bin", "tool") do |io|
+      io.puts "#!/usr/bin/ruby"
+      io.puts "raise 'ran tool from #{name} #{version}'"
+    end
+
+    gem_file = nil
+    use_ui Gem::MockGemUi.new do
+      Dir.chdir @tempdir do
+        gem_file = Gem::Package.build spec
+      end
+    end
+
+    use_ui Gem::MockGemUi.new do
+      Gem::Installer.at(gem_file,
+                        install_dir: install_dir,
+                        wrappers: true,
+                        force: force).install
+    end
+  ensure
+    Gem::Specification.reset
+  end
+
   def test_ensure_writable_dir_creates_missing_parent_directories
     installer = setup_base_installer(false)
 

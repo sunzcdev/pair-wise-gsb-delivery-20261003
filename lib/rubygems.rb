@@ -236,8 +236,8 @@ module Gem
     find_spec_for_exe(name, exec_name, requirements).bin_file exec_name
   end
 
-  def self.find_and_activate_spec_for_exe(name, exec_name, requirements)
-    spec = find_spec_for_exe name, exec_name, requirements
+  def self.find_and_activate_spec_for_exe(name, exec_name, requirements, owner: nil)
+    spec = find_spec_for_exe name, exec_name, requirements, owner: owner
     Gem::LOADED_SPECS_MUTEX.synchronize do
       spec.activate
       finish_resolve
@@ -246,8 +246,15 @@ module Gem
   end
   private_class_method :find_and_activate_spec_for_exe
 
-  def self.find_spec_for_exe(name, exec_name, requirements)
+  def self.find_spec_for_exe(name, exec_name, requirements, owner: nil)
     raise ArgumentError, "you must supply exec_name" unless exec_name
+
+    # The owner of a generated bin stub is recorded when the stub is created.
+    # Only that gem may back the executable, so that another gem shipping a
+    # same-named executable or a different gem path order cannot silently take
+    # over an existing stub. Ownership can only change when the stub is
+    # explicitly regenerated for another gem.
+    name = owner if owner
 
     dep = Gem::Dependency.new name, requirements
 
@@ -262,7 +269,13 @@ module Gem
     end if exec_name
 
     unless spec = specs.first
-      msg = "can't find gem #{dep} with executable #{exec_name}"
+      if owner
+        msg = "can't find gem #{dep} with executable #{exec_name}. " \
+              "The bin stub for \"#{exec_name}\" is owned by #{owner}, which has no installed version matching this requirement. " \
+              "Install a suitable version of #{owner}, or explicitly hand the stub over to another gem that provides \"#{exec_name}\""
+      else
+        msg = "can't find gem #{dep} with executable #{exec_name}"
+      end
       raise Gem::GemNotFoundException, msg
     end
 
@@ -281,8 +294,8 @@ module Gem
   #
   # This method should *only* be used in bin stub files.
 
-  def self.activate_and_load_bin_path(name, exec_name = nil, *requirements)
-    spec = find_and_activate_spec_for_exe name, exec_name, requirements
+  def self.activate_and_load_bin_path(name, exec_name = nil, *requirements, owner: nil)
+    spec = activate_spec_for_bin(name, exec_name, requirements, owner)
 
     if spec.name == "bundler"
       # Old versions of Bundler need a workaround to support nested `bundle
@@ -317,9 +330,22 @@ module Gem
   #
   # This method should *only* be used in bin stub files.
 
-  def self.activate_bin_path(name, exec_name = nil, *requirements) # :nodoc:
-    find_and_activate_spec_for_exe(name, exec_name, requirements).bin_file exec_name
+  def self.activate_bin_path(name, exec_name = nil, *requirements, owner: nil) # :nodoc:
+    activate_spec_for_bin(name, exec_name, requirements, owner).bin_file exec_name
   end
+
+  # Older Bundler versions override find_and_activate_spec_for_exe with a
+  # signature that does not accept the owner keyword. Only pass it when the
+  # active implementation supports it, so owner-aware bin stubs keep working
+  # inside bundles running against an older integration layer.
+  def self.activate_spec_for_bin(name, exec_name, requirements, owner)
+    if owner && method(:find_and_activate_spec_for_exe).parameters.assoc(:key)&.last == :owner
+      find_and_activate_spec_for_exe name, exec_name, requirements, owner: owner
+    else
+      find_and_activate_spec_for_exe name, exec_name, requirements
+    end
+  end
+  private_class_method :activate_spec_for_bin
 
   ##
   # The mode needed to read a file as straight binary.
