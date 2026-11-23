@@ -25,6 +25,8 @@
    .. autoclass:: WaitIterator
       :members:
 
+   .. autoclass:: WithdrawResult
+
    .. autofunction:: multi(Union[List[Yieldable], Dict[Any, Yieldable]], quiet_exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = ())
 
    .. autofunction:: multi_future(Union[List[Yieldable], Dict[Any, Yieldable]], quiet_exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = ())

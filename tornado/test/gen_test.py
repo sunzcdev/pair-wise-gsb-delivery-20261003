@@ -1078,6 +1078,297 @@ class WaitIteratorTest(AsyncTestCase):
             datetime.timedelta(seconds=0.1), gen.WaitIterator(gen.sleep(0)).next()
         )
 
+    @gen_test
+    def test_withdraw_before_completion(self):
+        f1: Future[int] = Future()
+        f2: Future[int] = Future()
+        g = gen.WaitIterator(f1, f2)
+
+        self.assertIs(g.withdraw(f1), gen.WithdrawResult.WITHDRAWN)
+        # Withdrawing the same observation twice reports that it was
+        # already withdrawn rather than claiming another change.
+        self.assertIs(g.withdraw(f1), gen.WithdrawResult.ALREADY_WITHDRAWN)
+        self.assertFalse(g.done())
+
+        f1.set_result(1)
+        f2.set_result(2)
+        yield gen.moment
+
+        result = yield g.next()
+        self.assertEqual(result, 2)
+        self.assertEqual(g.current_index, 1)
+        self.assertIs(g.current_future, f2)
+        self.assertTrue(g.done())
+
+    @gen_test
+    def test_withdraw_result_truthiness(self):
+        # The enum members double as booleans: a result that was not
+        # delivered reads as a successful withdrawal.
+        self.assertTrue(gen.WithdrawResult.WITHDRAWN)
+        self.assertTrue(gen.WithdrawResult.ALREADY_WITHDRAWN)
+        self.assertFalse(gen.WithdrawResult.DELIVERED)
+
+        f1: Future[int] = Future()
+        g = gen.WaitIterator(f1)
+        self.assertTrue(g.withdraw(f1))
+        # Withdrawing the only observation ends the iteration.
+        self.assertTrue(g.done())
+
+        async def collect():
+            return [r async for r in g]
+
+        self.assertEqual((yield collect()), [])
+
+    @gen_test
+    def test_withdraw_by_index_and_name(self):
+        f1: Future[int] = Future()
+        f2: Future[int] = Future()
+        g = gen.WaitIterator(f1, f2)
+        self.assertIs(g.withdraw(0), gen.WithdrawResult.WITHDRAWN)
+
+        g2 = gen.WaitIterator(first=f1, second=f2)
+        self.assertIs(g2.withdraw("second"), gen.WithdrawResult.WITHDRAWN)
+
+        f1.set_result(1)
+        f2.set_result(2)
+        yield gen.moment
+
+        self.assertEqual((yield g.next()), 2)
+        self.assertTrue(g.done())
+        self.assertEqual((yield g2.next()), 1)
+        self.assertTrue(g2.done())
+
+    def test_withdraw_unknown_observation(self):
+        g = gen.WaitIterator(Future(), Future())
+        with self.assertRaises(KeyError):
+            g.withdraw(2)
+        with self.assertRaises(KeyError):
+            g.withdraw("nope")
+        with self.assertRaises(KeyError):
+            g.withdraw(Future())
+
+    @gen_test
+    def test_withdraw_after_delivery(self):
+        f1: Future[int] = Future()
+        f2: Future[int] = Future()
+        g = gen.WaitIterator(f1, f2)
+        f1.set_result(1)
+        yield gen.moment
+
+        # f1 is queued but hasn't been delivered to the caller yet.
+        self.assertIs(g.withdraw(f1), gen.WithdrawResult.WITHDRAWN)
+        f2.set_result(2)
+        yield gen.moment
+        self.assertEqual((yield g.next()), 2)
+        self.assertTrue(g.done())
+
+        # Once a result has been delivered, withdrawing it reports that
+        # there is nothing left to withdraw.
+        f3: Future[int] = Future()
+        g2 = gen.WaitIterator(f3)
+        f3.set_result(3)
+        self.assertEqual((yield g2.next()), 3)
+        self.assertIs(g2.withdraw(f3), gen.WithdrawResult.DELIVERED)
+        self.assertIs(g2.withdraw(0), gen.WithdrawResult.DELIVERED)
+        self.assertIs(g2.withdraw(f3), gen.WithdrawResult.DELIVERED)
+
+    @gen_test
+    def test_withdraw_does_not_cancel_or_consume_source(self):
+        # The futures belong to other tasks; withdrawing an observation
+        # must not cancel them or otherwise disturb their state.
+        f1: Future[int] = Future()
+        f2: Future[int] = Future()
+        g = gen.WaitIterator(f1, f2)
+        self.assertIs(g.withdraw(f1), gen.WithdrawResult.WITHDRAWN)
+        self.assertFalse(f1.done())
+        self.assertFalse(f1.cancelled())
+
+        f1.set_result(1)
+        f2.set_result(2)
+        yield gen.moment
+        self.assertEqual(f1.result(), 1)
+
+    @gen_test
+    def test_withdraw_does_not_affect_other_iterator(self):
+        # Two iterators observe the same futures. Withdrawing from one
+        # leaves the other's view (and completion order) intact.
+        f1: Future[int] = Future()
+        f2: Future[int] = Future()
+        first = gen.WaitIterator(f1, f2)
+        other = gen.WaitIterator(f1, f2)
+
+        f2.set_result(2)
+        yield gen.moment
+        self.assertIs(first.withdraw(f2), gen.WithdrawResult.WITHDRAWN)
+
+        f1.set_result(1)
+        yield gen.moment
+
+        self.assertEqual((yield first.next()), 1)
+        self.assertEqual(first.current_index, 0)
+        self.assertTrue(first.done())
+
+        # The other iterator still sees both results in completion order.
+        self.assertEqual((yield other.next()), 2)
+        self.assertEqual(other.current_index, 1)
+        self.assertEqual((yield other.next()), 1)
+        self.assertEqual(other.current_index, 0)
+        self.assertTrue(other.done())
+
+    @gen_test
+    def test_withdraw_with_pending_callback(self):
+        # The classic race: A's completion callback has been scheduled
+        # but next() has not returned. The delivery point decides which
+        # state we end up in, and another iterator still gets A.
+        f_a: Future[str] = Future()
+        f_b: Future[str] = Future()
+        first = gen.WaitIterator(f_a, f_b)
+        other = gen.WaitIterator(f_a, f_b)
+
+        f_a.set_result("A")
+        # Flush the completion callbacks for A without letting the
+        # iterator's next() run. With no outstanding call to next(), A
+        # is queued rather than delivered.
+        yield gen.moment
+
+        self.assertIs(first.withdraw(f_a), gen.WithdrawResult.WITHDRAWN)
+        f_b.set_result("B")
+        yield gen.moment
+
+        self.assertEqual((yield first.next()), "B")
+        self.assertEqual(first.current_index, 1)
+        self.assertTrue(first.done())
+
+        self.assertEqual((yield other.next()), "A")
+        self.assertEqual((yield other.next()), "B")
+        self.assertTrue(other.done())
+
+    @gen_test
+    def test_withdraw_after_next_outstanding(self):
+        # If next() is already outstanding when the callback runs, the
+        # result is delivered at that moment and a later withdraw()
+        # reports that it was already delivered.
+        f1: Future[int] = Future()
+        g = gen.WaitIterator(f1)
+        running = g.next()
+        f1.set_result(1)
+        yield gen.moment
+        self.assertEqual((yield running), 1)
+        self.assertIs(g.withdraw(f1), gen.WithdrawResult.DELIVERED)
+        self.assertIs(g.withdraw(0), gen.WithdrawResult.DELIVERED)
+
+    @gen_test
+    def test_withdraw_duplicate_futures(self):
+        future: Future[int] = Future()
+        g = gen.WaitIterator(future, future)
+        # Each observation is withdrawn separately.
+        self.assertIs(g.withdraw(0), gen.WithdrawResult.WITHDRAWN)
+        self.assertIs(g.withdraw(1), gen.WithdrawResult.WITHDRAWN)
+        self.assertIs(g.withdraw(0), gen.WithdrawResult.ALREADY_WITHDRAWN)
+        future.set_result(42)
+        yield gen.moment
+        self.assertTrue(g.done())
+
+        g2 = gen.WaitIterator(future, future)
+        self.assertIs(g2.withdraw(future), gen.WithdrawResult.WITHDRAWN)
+        self.assertIs(g2.withdraw(future), gen.WithdrawResult.WITHDRAWN)
+        # With nothing outstanding for this future, the call reports the
+        # most recent terminal state for it.
+        self.assertIs(g2.withdraw(future), gen.WithdrawResult.ALREADY_WITHDRAWN)
+        self.assertTrue(g2.done())
+
+    @gen_test
+    def test_withdraw_while_next_outstanding(self):
+        # The completion callback has been scheduled but has not run, and
+        # next() is already outstanding. Nothing has been delivered yet,
+        # so withdrawing still works and the outstanding next() is
+        # satisfied by the next result instead.
+        f_a: Future[str] = Future()
+        f_b: Future[str] = Future()
+        g = gen.WaitIterator(f_a, f_b)
+        other = gen.WaitIterator(f_a, f_b)
+        running = g.next()
+
+        f_a.set_result("A")
+        self.assertIs(g.withdraw(f_a), gen.WithdrawResult.WITHDRAWN)
+        f_b.set_result("B")
+
+        self.assertEqual((yield running), "B")
+        self.assertEqual(g.current_index, 1)
+        self.assertTrue(g.done())
+
+        # The withdrawal was local to this iterator.
+        self.assertEqual((yield other.next()), "A")
+        self.assertEqual((yield other.next()), "B")
+
+    @gen_test
+    def test_withdraw_all_while_next_outstanding(self):
+        # If every remaining observation is withdrawn while next() is
+        # outstanding, that next() reports the end of the iteration
+        # instead of hanging forever.
+        f1: Future[int] = Future()
+        f2: Future[int] = Future()
+        g = gen.WaitIterator(f1, f2)
+        running = g.next()
+        self.assertIs(g.withdraw(f1), gen.WithdrawResult.WITHDRAWN)
+        self.assertIs(g.withdraw(f2), gen.WithdrawResult.WITHDRAWN)
+        self.assertTrue(g.done())
+        with self.assertRaises(StopAsyncIteration):
+            yield running
+
+        async def collect():
+            return [r async for r in g]
+
+        self.assertEqual((yield collect()), [])
+
+    @gen_test
+    def test_withdraw_scenario_two_iterators(self):
+        # The scenario from the feature request: A's completion callback
+        # has been queued but next() has not returned yet, and a second
+        # iterator observes the same futures. Whichever state we get is
+        # decided by the documented delivery point: A is still undelivered
+        # here, so it can be withdrawn, the other iterator still receives
+        # A, and B's relative position is unchanged.
+        f_a: Future[str] = Future()
+        f_b: Future[str] = Future()
+        first = gen.WaitIterator(f_a, f_b)
+        other = gen.WaitIterator(f_a, f_b)
+
+        f_a.set_result("A")
+        # Let A's callback run (avoiding the "already done" immediate
+        # callback path) without calling next() on `first`.
+        yield gen.moment
+
+        self.assertIs(first.withdraw(f_a), gen.WithdrawResult.WITHDRAWN)
+        # The second call reports the state of this observation now.
+        self.assertIs(first.withdraw(f_a), gen.WithdrawResult.ALREADY_WITHDRAWN)
+
+        f_b.set_result("B")
+        yield gen.moment
+
+        self.assertEqual((yield first.next()), "B")
+        self.assertTrue(first.done())
+
+        self.assertEqual((yield other.next()), "A")
+        self.assertEqual((yield other.next()), "B")
+        self.assertTrue(other.done())
+
+    @gen_test
+    def test_withdraw_async_iteration(self):
+        f1: Future[int] = Future()
+        f2: Future[int] = Future()
+        g = gen.WaitIterator(f1, f2)
+        self.assertTrue(g.withdraw(f2))
+        f1.set_result(1)
+        f2.set_result(2)
+        yield gen.moment
+
+        async def collect():
+            return [r async for r in g]
+
+        self.assertEqual((yield collect()), [1])
+        self.assertTrue(g.done())
+
 
 class RunnerGCTest(AsyncTestCase):
     def is_pypy3(self):

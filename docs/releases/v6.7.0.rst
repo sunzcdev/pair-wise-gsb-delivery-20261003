@@ -1,0 +1,16 @@
+What's new in Tornado 6.7.0
+===========================
+
+In development
+--------------
+
+`tornado.gen`
+~~~~~~~~~~~~~
+
+- `.WaitIterator` has a new `.WaitIterator.withdraw` method, which drops a single
+  observation by index, keyword name, or future. Withdrawing affects only that
+  iterator: the underlying future is neither cancelled nor consumed, other
+  iterators observing it still receive its result, and the completion order of
+  the remaining results is unchanged. The method returns a `WithdrawResult` so a
+  caller can tell a completed withdrawal from one that arrived after the result
+  had already been delivered.

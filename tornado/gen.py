@@ -67,6 +67,7 @@ import collections
 import concurrent.futures
 import contextvars
 import datetime
+import enum
 import functools
 import sys
 import types
@@ -311,6 +312,42 @@ class Return(Exception):
         self.args = (value,)
 
 
+class WithdrawResult(enum.IntEnum):
+    """The outcome of `WaitIterator.withdraw`.
+
+    .. attribute:: WITHDRAWN
+
+       This call removed an outstanding observation, so its result will
+       not be delivered.
+
+    .. attribute:: ALREADY_WITHDRAWN
+
+       The observation had already been withdrawn by an earlier call, so
+       this call changed nothing.
+
+    .. attribute:: DELIVERED
+
+       The result had already been delivered to the caller, so there was
+       nothing left to withdraw.
+
+    The two undelivered members are truthy and `DELIVERED` is falsy, so
+    both of these read naturally::
+
+      if wait_iterator.withdraw(future):  # Not delivered: nothing is lost.
+          ...
+
+      result = wait_iterator.withdraw(future)
+      if result is gen.WithdrawResult.DELIVERED:  # Already handed over.
+          ...
+
+    .. versionadded:: 6.7
+    """
+
+    DELIVERED = 0
+    WITHDRAWN = 1
+    ALREADY_WITHDRAWN = 2
+
+
 class WaitIterator(typing.Generic[_T]):
     """Provides an iterator to yield the results of awaitables as they finish.
 
@@ -359,40 +396,80 @@ class WaitIterator(typing.Generic[_T]):
               result, wait_iterator.current_future,
               wait_iterator.current_index))
 
+    Individual observations may be withdrawn with `WaitIterator.withdraw`
+    when their results are no longer wanted. Withdrawing affects only this
+    iterator: the underlying future is owned by whoever created it, so it
+    is neither cancelled nor consumed, and other `WaitIterator` instances
+    observing the same future still receive its result::
+
+      wait_iterator = gen.WaitIterator(slow, fast)
+      result = yield wait_iterator.next()
+      if result == something:
+          # We don't care about the other one any more.
+          wait_iterator.withdraw(slow)
+
+    An observation counts as delivered at the moment its result is bound
+    to the `.Future` returned by `WaitIterator.next` - either when
+    ``next()`` returns an already-completed observation or when the
+    completion callback fires while a call to ``next()`` is outstanding.
+    Withdrawing an observation after that point reports that the result
+    was already delivered, while withdrawing one whose completion
+    callback has been scheduled but not yet run still succeeds and keeps
+    the result out of the iteration. If every remaining observation is
+    withdrawn while a call to ``next()`` is outstanding, that call is
+    completed with `StopAsyncIteration` so the loop can end.
+
     .. versionadded:: 4.1
 
     .. versionchanged:: 4.3
        Added ``async for`` support in Python 3.5.
 
+    .. versionchanged:: 6.7
+       Added the `~WaitIterator.withdraw` method.
+
     """
 
-    _unfinished: dict[Future[_T], collections.deque[int | str]]
+    _observed: dict[int | str, Future[_T]]
+    _pending: set[int | str]
+    _dropped: set[int | str]
+    _finished: collections.deque[int | str]
 
     def __init__(self, *args: Future[_T], **kwargs: Future[_T]) -> None:
         if args and kwargs:
             raise ValueError("You must provide args or kwargs, not both")
 
-        self._unfinished = {}
+        # Every observation keyed by its input index or keyword name. The
+        # same future may appear under more than one key.
+        self._observed: dict[int | str, Future[_T]] = {}
         if kwargs:
-            futures: Sequence[Future[_T]] = list(kwargs.values())
             for key, future in kwargs.items():
-                self._unfinished.setdefault(future, collections.deque()).append(key)
+                self._observed[key] = future
         else:
-            futures = args
             for index, future in enumerate(args):
-                self._unfinished.setdefault(future, collections.deque()).append(index)
+                self._observed[index] = future
 
-        self._finished: collections.deque[Future[_T]] = collections.deque()
+        # Observations whose result has not been delivered to the caller
+        # yet. Keys leave this set when they are yielded or withdrawn.
+        self._pending = set(self._observed)
+        # Observations that were withdrawn before delivery, so a repeated
+        # withdraw() can distinguish that from a result already handed out.
+        self._dropped: set[int | str] = set()
+        # Keys that have completed but have not been consumed (or
+        # withdrawn) yet, in completion order.
+        self._finished: collections.deque[int | str] = collections.deque()
+
         self.current_index: str | int | None = None
         self.current_future: Future[_T] | None = None
         self._running_future: Future[_T] | None = None
 
-        for future in futures:
-            future_add_done_callback(future, self._done_callback)
+        for key, future in self._observed.items():
+            future_add_done_callback(
+                future, functools.partial(self._done_callback, key)
+            )
 
     def done(self) -> bool:
         """Returns True if this iterator has no more results."""
-        if self._finished or self._unfinished:
+        if self._finished or self._pending:
             return False
         # Clear the 'current' values when iteration is done.
         self.current_index = self.current_future = None
@@ -403,35 +480,144 @@ class WaitIterator(typing.Generic[_T]):
 
         Note that this `.Future` will not be the same object as any of
         the inputs.
+
+        The returned future is completed with `StopAsyncIteration` if
+        every remaining observation was withdrawn before a result could
+        be delivered to it.
         """
         self._running_future = Future()
 
         if self._finished:
             return self._return_result(self._finished.popleft())
+        if not self._pending:
+            # Everything was withdrawn or delivered already. Report the
+            # end of the iteration rather than waiting forever.
+            return self._end_iteration()
 
         return self._running_future
 
-    def _done_callback(self, done: Future[_T]) -> None:
-        if self._running_future and not self._running_future.done():
-            self._return_result(done)
-        else:
-            self._finished.append(done)
+    def withdraw(self, observation: int | str | Future[_T]) -> WithdrawResult:
+        """Withdraws a single observation of this iterator.
 
-    def _return_result(self, done: Future[_T]) -> Future[_T]:
+        ``observation`` identifies the observation to drop. It may be the
+        index (for positional arguments) or the keyword name used to
+        construct this iterator, or one of the underlying `.Future`
+        objects, in which case the first observation of that future whose
+        result has not been delivered yet is withdrawn. Since a future
+        may be observed more than once, each observation must be
+        withdrawn separately.
+
+        Returns a `WithdrawResult`. `~WithdrawResult.DELIVERED` means the
+        result had already been handed to the caller, so the withdrawal
+        came too late and there is nothing left to undo;
+        `~WithdrawResult.WITHDRAWN` and
+        `~WithdrawResult.ALREADY_WITHDRAWN` both mean the result will not
+        be delivered. Raises `KeyError` if this iterator never observed
+        the given index, keyword name, or future.
+
+        A result is delivered at the point where it is bound to the
+        `.Future` returned by `next`: either when ``next()`` returns an
+        observation that has already completed, or when the completion
+        callback runs while a call to ``next()`` is outstanding. A
+        completion callback that has only been scheduled (not yet run)
+        has therefore not delivered anything, and withdrawing it at that
+        point succeeds and keeps the result out of the iteration.
+
+        Withdrawing never cancels or consumes the underlying future,
+        which remains owned by whoever created it. Other `WaitIterator`
+        instances observing the same future are unaffected, as is the
+        completion order in which the remaining results are yielded.
+
+        .. versionadded:: 6.7
+        """
+        if is_future(observation):
+            future = typing.cast(Future[_T], observation)
+            key = self._oldest_key(future)
+            if key is None:
+                keys = self._keys_for(future)
+                if not keys:
+                    raise KeyError(observation)
+                # No observation of this future is outstanding. It reads
+                # as already withdrawn only if every observation of it
+                # was withdrawn; otherwise at least one result made it
+                # out to the caller.
+                if all(candidate in self._dropped for candidate in keys):
+                    return WithdrawResult.ALREADY_WITHDRAWN
+                return WithdrawResult.DELIVERED
+        else:
+            key = typing.cast("int | str", observation)
+            if key not in self._observed:
+                raise KeyError(observation)
+
+        if key in self._pending:
+            self._pending.remove(key)
+            self._dropped.add(key)
+            try:
+                self._finished.remove(key)
+            except ValueError:
+                pass
+            self._finish_if_empty()
+            return WithdrawResult.WITHDRAWN
+        if key in self._dropped:
+            return WithdrawResult.ALREADY_WITHDRAWN
+        return WithdrawResult.DELIVERED
+
+    def _finish_if_empty(self) -> None:
+        """Complete an outstanding `next` once nothing can be delivered."""
+        running = self._running_future
+        if running is None or running.done() or self._pending:
+            return
+        # Every observation was withdrawn while next() was waiting, so
+        # the iteration is over. Report that instead of leaving the
+        # caller waiting for a result that will never come.
+        self._end_iteration()
+
+    def _end_iteration(self) -> Future[_T]:
+        """Completes the running future with `StopAsyncIteration`."""
+        running = self._running_future
+        assert running is not None
+        self._running_future = None
+        running.set_exception(StopAsyncIteration())
+        return running
+
+    def _keys_for(self, future: Future[_T]) -> Iterable[int | str]:
+        """Returns every key that observes ``future``, in input order."""
+        return [key for key, observed in self._observed.items() if observed is future]
+
+    def _oldest_key(self, future: Future[_T]) -> int | str | None:
+        """Returns the first outstanding key observing ``future``, if any."""
+        for key, observed in self._observed.items():
+            if observed is future and key in self._pending:
+                return key
+        return None
+
+    def _done_callback(self, key: int | str, done: Future[_T]) -> None:
+        if key not in self._pending:
+            # This observation was withdrawn before its result was
+            # delivered, so it must not be yielded.
+            return
+        if self._running_future and not self._running_future.done():
+            self._return_result(key)
+        else:
+            self._finished.append(key)
+
+    def _return_result(self, key: int | str) -> Future[_T]:
         """Called set the returned future's state that of the future
         we yielded, and set the current future for the iterator.
         """
         if self._running_future is None:
             raise Exception("no future is running")
-        chain_future(done, self._running_future)
+        done = self._observed[key]
 
+        # This is the delivery point: from here on the observation is no
+        # longer outstanding and can no longer be withdrawn.
+        self._pending.remove(key)
+        self.current_future = done
+        self.current_index = key
+
+        chain_future(done, self._running_future)
         res = self._running_future
         self._running_future = None
-        self.current_future = done
-        indices = self._unfinished[done]
-        self.current_index = indices.popleft()
-        if not indices:
-            del self._unfinished[done]
 
         return res
 

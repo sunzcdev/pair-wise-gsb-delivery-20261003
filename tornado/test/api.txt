@@ -107,6 +107,11 @@ tornado.gen.WaitIterator.current_future: attribute
 tornado.gen.WaitIterator.current_index: attribute
 tornado.gen.WaitIterator.done: method(self)
 tornado.gen.WaitIterator.next: method(self)
+tornado.gen.WaitIterator.withdraw: method(self, observation)
+tornado.gen.WithdrawResult: class(enum.IntEnum)
+tornado.gen.WithdrawResult.ALREADY_WITHDRAWN: attribute
+tornado.gen.WithdrawResult.DELIVERED: attribute
+tornado.gen.WithdrawResult.WITHDRAWN: attribute
 tornado.gen.convert_yielded: function(yielded)
 tornado.gen.coroutine: function(func)
 tornado.gen.is_coroutine_function: function(func)
