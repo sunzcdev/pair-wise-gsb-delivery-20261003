@@ -1,0 +1,169 @@
+# frozen_string_literal: true
+
+# Released under the MIT License.
+# Copyright, 2019-2026, by Samuel Williams.
+
+require "protocol/http1/body/chunked"
+require "connection_context"
+
+describe Protocol::HTTP1::Body::Chunked do
+	let(:content) {"Hello World"}
+	let(:postfix) {nil}
+	let(:headers) {Protocol::HTTP::Headers.new}
+	let(:buffer) {StringIO.new("#{content.bytesize.to_s(16)}\r\n#{content}\r\n0\r\n#{postfix}\r\n")}
+	let(:connection) {Protocol::HTTP1::Connection.new(buffer, state: :open)}
+	let(:body) {subject.new(connection, headers)}
+	
+	with "#inspect" do
+		it "can be inspected" do
+			expect(body.inspect).to be =~ /0 bytes read in 0 chunks, reading/
+		end
+	end
+	
+	with "#as_json" do
+		it "returns JSON representation" do
+			expect(body.as_json).to have_keys(
+				class: be == "Protocol::HTTP1::Body::Chunked",
+				length: be_nil, # Not finished yet
+				stream: be == false,
+				ready: be == false,
+				empty: be == false,
+				count: be == 0,
+				finished: be == false,
+				state: be == "open"
+			)
+		end
+		
+		it "shows finished state after reading all chunks" do
+			body.read # Read the chunk
+			body.read # Read the end (returns nil)
+			expect(body.as_json).to have_keys(
+				length: be == 11,
+				count: be == 1,
+				finished: be == true,
+				empty: be == true,
+				state: be == "closed"
+			)
+		end
+	end
+	
+	with "#empty?" do
+		it "returns whether EOF was reached" do
+			expect(body.empty?).to be == false
+		end
+	end
+	
+	with "#close" do
+		it "invokes close_read on the stream if closing without reading all chunks" do
+			expect(buffer).to receive(:close_read)
+			
+			body.close
+			
+			expect(body).to be(:empty?)
+			expect(connection).to be(:half_closed_remote?)
+		end
+		
+		it "invokes close_read on the stream if closing with an error" do
+			expect(buffer).to receive(:close_read)
+			
+			body.close(EOFError)
+			
+			expect(body).to be(:empty?)
+			expect(connection).to be(:half_closed_remote?)
+		end
+	end
+	
+	with "#read" do
+		it "retrieves chunks of content" do
+			expect(body.read).to be == "Hello World"
+			expect(body.read).to be == nil
+			expect(body.read).to be == nil
+			
+			expect(connection).to be(:half_closed_remote?)
+		end
+		
+		it "updates number of bytes retrieved" do
+			expect(body).to have_attributes(length: be_nil, count: be == 0)
+			
+			expect(body.read).to be == "Hello World"
+			expect(body.read).to be_nil # there are no more chunks
+			
+			expect(body).to have_attributes(length: be == 11, count: be == 1)
+			
+			expect(body).to be(:empty?)
+			expect(connection).to be(:half_closed_remote?)
+		end
+		
+		it "bounds the amount of data returned" do
+			content = "x" * (subject::BLOCK_SIZE + 1)
+			buffer = StringIO.new("#{content.bytesize.to_s(16)}\r\n#{content}\r\n0\r\n\r\n")
+			body = subject.new(Protocol::HTTP1::Connection.new(buffer, state: :open), headers)
+			
+			expect(body.read.bytesize).to be == subject::BLOCK_SIZE
+			expect(body.read.bytesize).to be == 1
+			expect(body.read).to be_nil
+		end
+		
+		it "rejects an invalid chunk terminator" do
+			buffer = StringIO.new("#{content.bytesize.to_s(16)}\r\n#{content}XX")
+			body = subject.new(Protocol::HTTP1::Connection.new(buffer, state: :open), headers)
+			
+			expect(body.read).to be == content
+			expect{body.read}.to raise_exception(Protocol::HTTP1::BadRequest)
+		end
+		
+		with "trailer" do
+			let(:postfix) {"ETag: abcd\r\n"}
+			
+			it "can read trailing etag" do
+				headers.add("trailer", "etag")
+				
+				expect(body.read).to be == "Hello World"
+				expect(headers["etag"]).to be_nil
+				
+				expect(body.read).to be == nil
+				expect(headers["etag"]).to be == "abcd"
+				
+				expect(connection).to be(:half_closed_remote?)
+			end
+		end
+		
+		with "incomplete trailer" do
+			let(:buffer) {StringIO.new("0\r\n")}
+			
+			it "raises EOFError when the final CRLF is missing" do
+				expect{body.read}.to raise_exception(EOFError)
+				
+				expect(connection).to be(:half_closed_remote?)
+			end
+		end
+		
+		with "bad trailers" do
+			let(:postfix) {":ETag abcd\r\n"}
+			
+			it "raises error" do
+				headers.add("trailer", "etag")
+				
+				expect(body.read).to be == "Hello World"
+				expect(headers["etag"]).to be_nil
+				
+				expect{body.read}.to raise_exception(Protocol::HTTP1::BadHeader)
+				
+				body.close
+				
+				expect(connection).to be(:half_closed_remote?)
+			end
+		end
+		
+		with "invalid content length" do
+			let(:buffer) {StringIO.new("#{(content.bytesize + 1).to_s(16)}\r\n#{content}")}
+			
+			it "raises error" do
+				expect(body.read).to be == content
+				expect{body.read}.to raise_exception(EOFError)
+				
+				expect(connection).to be(:half_closed_remote?)
+			end
+		end
+	end
+end
