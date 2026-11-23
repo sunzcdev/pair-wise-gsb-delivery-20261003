@@ -66,6 +66,39 @@ module Dry
         @__config__ ||= __config_build__
       end
 
+      # Re-follow the configs of this class' configurable ancestors for every setting
+      # not overridden on this class' own config.
+      #
+      # Class inheritance copies the parent config once, at subclassing time, so later
+      # changes to an ancestor's config are not normally seen by subclasses. Calling
+      # this method refreshes the values that were never explicitly chosen here:
+      # settings that were only read (including cloneable defaults captured on read)
+      # follow the nearest ancestor overriding them, while settings explicitly
+      # assigned (including assignments of the default value or nil) or mutated in
+      # place remain local overrides.
+      #
+      # Ancestor configs are only read, never modified, and followed cloneable values
+      # are duplicated, so every class keeps its own mutable data.
+      #
+      # @return [Class] self
+      #
+      # @api public
+      def reinherit_config!
+        return self unless respond_to?(:config)
+
+        sources = []
+
+        ancestor = superclass
+        while ancestor&.respond_to?(:config)
+          sources << ancestor.config
+          ancestor = ancestor.superclass
+        end
+
+        config.reinherit!(sources)
+
+        self
+      end
+
       # @api private
       def __config_build__(settings = self.settings)
         __config_extension__.config_class.new(settings)

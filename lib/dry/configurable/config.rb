@@ -19,10 +19,20 @@ module Dry
       protected :_configured
 
       # @api private
+      attr_reader :_assigned
+      protected :_assigned
+
+      # @api private
+      attr_reader :_followed
+      protected :_followed
+
+      # @api private
       def initialize(settings, values: {})
         @_settings = settings
         @_values = values
         @_configured = Set.new
+        @_assigned = Set.new
+        @_followed = {}
       end
 
       # @api private
@@ -30,6 +40,8 @@ module Dry
         super
         @_values = source.__send__(:dup_values)
         @_configured = source._configured.dup
+        @_assigned = source._assigned.dup
+        @_followed = source._followed.dup
       end
 
       # @api private
@@ -74,6 +86,8 @@ module Dry
         end
 
         _configured.add(name)
+        _assigned.add(name)
+        _followed.delete(name)
 
         _values[name] = setting.constructor.(value)
       end
@@ -118,6 +132,109 @@ module Dry
 
         _configured.include?(key)
       end
+
+      # Re-follow the given (ancestor) configs for every setting that has not been
+      # overridden on this config.
+      #
+      # This restores the "defaults flow down" behavior that inheritance provides when a
+      # config is first copied, but for configs whose ancestors changed their values
+      # afterwards:
+      #
+      # - Settings explicitly assigned on this config keep their values. This includes
+      #   assignments of the default value and explicit `nil`s, which are overrides even
+      #   though they may compare equally to a default.
+      # - Cloneable (mutable) values changed in place after being read also remain
+      #   overrides.
+      # - Every other setting — including cloneable defaults that were only ever read —
+      #   follows the nearest given config in which the setting is itself overridden,
+      #   falling back to a fresh default when none of the given configs overrides it.
+      #
+      # Nested configs are re-inherited per setting, so overridden nested values are kept
+      # while the rest follow. The given configs are only read, never modified, and
+      # followed cloneable values are duplicated, so this config keeps its own mutable
+      # data. A followed setting keeps following on later re-inherits (until it is
+      # assigned or mutated here), so repeated ancestor updates keep propagating.
+      #
+      # @param sources [Config, Array<Config>] configs to follow, nearest ancestor first
+      #
+      # @return [Config] self
+      #
+      # @raise [FrozenConfigError] if the config is finalized
+      #
+      # @api public
+      def reinherit!(sources)
+        raise FrozenConfigError, "Cannot modify frozen config" if frozen?
+
+        sources = Array(sources)
+
+        _settings.each do |setting|
+          name = setting.name
+
+          # Explicitly assigned values (including nil and values equal to the default)
+          # remain local overrides
+          next if _assigned.include?(name)
+
+          # Settings unknown to every source have nothing to follow
+          setting_sources = sources.select { |source| source._settings.key?(name) }
+          next if setting_sources.empty?
+
+          current = _values[name]
+
+          if current.is_a?(Config)
+            # Re-inherit nested configs per setting, so overridden nested values are
+            # kept while the rest follow
+            _followed.delete(name)
+
+            nested_sources = setting_sources.filter_map { |source|
+              value = source[name]
+              value if value.is_a?(Config)
+            }
+            current.reinherit!(nested_sources)
+          elsif _overridden?(name)
+            # Cloneable values changed in place after being read remain overrides
+            next
+          else
+            source = setting_sources.find { |src| src._overridden?(name) }
+
+            _values[name] =
+              if source
+                value = source[name]
+                setting.cloneable? ? value.dup : value
+              else
+                setting.to_value
+              end
+
+            # Remember the followed value as the baseline for detecting later in-place
+            # mutations, so the setting can keep following until it is truly overridden
+            _followed[name] = _values[name].dup if setting.cloneable?
+            _configured.delete(name)
+          end
+        end
+
+        self
+      end
+
+      # Returns true if the value for the given key counts as a local override when
+      # re-inheriting: explicitly assigned on this config, or (for cloneable values)
+      # changed in place since it was captured on read or last followed.
+      #
+      # @api private
+      def _overridden?(name)
+        return true if _assigned.include?(name)
+
+        if _followed.key?(name)
+          if !_values.key?(name) || _values[name] != _followed[name]
+            # Changed in place since it last followed: an override from now on
+            _followed.delete(name)
+            return true
+          end
+
+          return false
+        end
+
+        configured?(name)
+      end
+      protected :_overridden?
 
       # Returns the current config values.
       #

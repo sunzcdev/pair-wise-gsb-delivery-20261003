@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Added `reinherit_config!` (class-level, for classes extending `Dry::Configurable`) and the underlying `Config#reinherit!`, letting an inherited config re-follow its ancestors' values for every setting not overridden locally. Values that were only read (including cloneable defaults captured on read) follow the nearest ancestor overriding them, while values explicitly assigned (including assignments of the default value or `nil`) or mutated in place remain local overrides. Followed cloneable values are duplicated, so every class keeps its own mutable data.
+
 ### Changed
 
 ### Deprecated
