@@ -1,0 +1,137 @@
+require_relative "test_helper"
+
+class AddReferenceTest < Minitest::Test
+  def test_basic
+    if postgresql?
+      assert_unsafe AddReference
+    else
+      assert_safe AddReference
+    end
+  end
+
+  def test_polymorphic
+    if postgresql?
+      assert_unsafe AddReferencePolymorphic
+    else
+      assert_safe AddReferencePolymorphic
+    end
+  end
+
+  def test_no_index
+    assert_safe AddReferenceNoIndex
+  end
+
+  def test_default
+    if postgresql?
+      assert_unsafe AddReferenceDefault
+    else
+      assert_safe AddReferenceDefault
+    end
+  end
+
+  def test_concurrently
+    skip unless postgresql?
+    assert_safe AddReferenceConcurrently
+  end
+
+  def test_foreign_key
+    if postgresql?
+      assert_unsafe AddReferenceForeignKey, "Then add the foreign key in separate migrations"
+    else
+      assert_unsafe AddReferenceForeignKey, "Then add the foreign key in a separate migration"
+    end
+  end
+
+  def test_foreign_key_validate_false
+    skip unless postgresql?
+    assert_safe AddReferenceForeignKeyValidateFalse
+  end
+
+  def test_add_belongs_to
+    if postgresql?
+      assert_unsafe AddBelongsTo
+    else
+      assert_safe AddBelongsTo
+    end
+  end
+
+  def test_auto_analyze
+    with_auto_analyze do
+      assert_analyzed postgresql? ? AddReferenceConcurrently : AddReference
+    end
+  end
+
+  def test_auto_analyze_false
+    refute_analyzed postgresql? ? AddReferenceConcurrently : AddReference
+  end
+
+  def test_auto_analyze_no_index
+    with_auto_analyze do
+      refute_analyzed AddReferenceNoIndex
+    end
+  end
+
+  def test_auto_analyze_default
+    with_auto_analyze do
+      with_safety_assured do
+        assert_analyzed AddReferenceDefault
+      end
+    end
+  end
+
+  def test_auto_analyze_add_belongs_to
+    with_auto_analyze do
+      with_safety_assured do
+        assert_analyzed AddBelongsTo
+      end
+    end
+  end
+
+  def test_extra_arguments
+    if postgresql?
+      assert_unsafe AddReferenceExtraArguments
+    else
+      assert_argument_error AddReferenceExtraArguments
+    end
+  end
+
+  def test_algorithm_copy
+    skip unless algorithm_option?
+    assert_unsafe AddReferenceAlgorithmCopy
+  end
+
+  def test_algorithm_instant
+    skip unless algorithm_option?
+    assert_safe AddReferenceAlgorithmInstant
+  end
+
+  def test_lock_shared
+    skip unless lock_option?
+    assert_unsafe AddReferenceLockShared
+  end
+
+  def test_lock_none
+    skip unless lock_option?
+    assert_safe AddReferenceLockNone
+  end
+
+  def test_index_algorithm_copy
+    skip unless mysql? || mariadb?
+    assert_unsafe AddReferenceIndexAlgorithmCopy
+  end
+
+  def test_index_algorithm_inplace
+    skip unless mysql? || mariadb?
+    assert_safe AddReferenceIndexAlgorithmInplace
+  end
+
+  def test_index_lock_shared
+    skip unless lock_option?
+    assert_unsafe AddReferenceIndexLockShared
+  end
+
+  def test_index_lock_none
+    skip unless lock_option?
+    assert_safe AddReferenceIndexLockNone
+  end
+end

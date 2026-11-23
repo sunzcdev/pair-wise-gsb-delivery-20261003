@@ -1,0 +1,153 @@
+require_relative "test_helper"
+
+class AddIndexTest < Minitest::Test
+  def test_non_concurrently
+    if postgresql?
+      assert_unsafe AddIndex, <<~EOF
+        Adding an index non-concurrently blocks writes. Instead, use:
+
+        class AddIndex < ActiveRecord::Migration[#{ActiveRecord::VERSION::MAJOR}.#{ActiveRecord::VERSION::MINOR}]
+          disable_ddl_transaction!
+
+          def change
+            add_index :users, :name, algorithm: :concurrently
+          end
+        end
+      EOF
+    else
+      assert_safe AddIndex
+    end
+  end
+
+  def test_up
+    if postgresql?
+      assert_unsafe AddIndexUp
+    else
+      assert_safe AddIndexUp
+    end
+  end
+
+  def test_safety_assured
+    assert_safe AddIndexSafetyAssured
+  end
+
+  def test_new_table
+    assert_safe AddIndexNewTable
+  end
+
+  def test_schema
+    assert_safe AddIndexSchema
+  end
+
+  def test_versioned_schema
+    # use define like db/schema.rb
+    ActiveRecord::Schema[migration_version].define do
+      add_index :users, :name, name: "boom2"
+      remove_index :users, name: "boom2"
+    end
+  end
+
+  def test_concurrently
+    skip unless postgresql?
+    assert_safe AddIndexConcurrently
+  end
+
+  def test_algorithm_copy
+    skip unless mysql? || mariadb?
+    assert_unsafe AddIndexAlgorithmCopy
+  end
+
+  def test_algorithm_inplace
+    skip unless mysql? || mariadb?
+    assert_safe AddIndexAlgorithmInplace
+  end
+
+  def test_lock_shared
+    skip unless lock_option?
+    assert_unsafe AddIndexLockShared
+  end
+
+  def test_lock_exclusive
+    skip unless lock_option?
+    assert_unsafe AddIndexLockExclusive
+  end
+
+  def test_lock_none
+    skip unless lock_option?
+    assert_safe AddIndexLockNone
+  end
+
+  def test_lock_default
+    skip unless lock_option?
+    assert_safe AddIndexLockDefault
+  end
+
+  def test_columns
+    assert_unsafe AddIndexColumns, "more than three columns"
+  end
+
+  def test_columns_unique
+    skip unless postgresql?
+    assert_safe AddIndexColumnsUnique
+  end
+
+  def test_auto_analyze
+    with_auto_analyze do
+      assert_analyzed AddIndexSafetyAssured
+    end
+  end
+
+  def test_auto_analyze_false
+    refute_analyzed AddIndexSafetyAssured
+  end
+
+  def test_extra_arguments
+    if postgresql?
+      assert_unsafe AddIndexExtraArguments
+    else
+      assert_argument_error AddIndexExtraArguments
+    end
+  end
+
+  def test_concurrently_extra_arguments
+    assert_argument_error AddIndexConcurrentlyExtraArguments
+  end
+
+  def test_corruption
+    # TODO fix
+    skip # unless postgresql?
+    outside_developer_env do
+      with_target_version(14.3) do
+        assert_unsafe AddIndexConcurrently, "can cause silent data corruption in Postgres 14.0 to 14.3"
+      end
+    end
+  end
+
+  def test_remove_invalid_indexes
+    skip unless postgresql?
+
+    with_locked_table("users") do
+      with_lock_timeout(0.1) do
+        assert_raises(ActiveRecord::LockWaitTimeout) do
+          migrate AddIndexConcurrently
+        end
+      end
+    end
+
+    assert_raises(ActiveRecord::StatementInvalid) do
+      migrate AddIndexConcurrently
+    end
+
+    with_option(:remove_invalid_indexes, true) do
+      migrate AddIndexConcurrently
+
+      # fail if trying to add the same index in a future migration
+      error = assert_raises(ActiveRecord::StatementInvalid) do
+        migrate AddIndexConcurrently
+      end
+      assert_kind_of PG::DuplicateTable, error.cause
+    end
+
+    migrate AddIndexConcurrently, direction: :down
+  end
+end
