@@ -45,11 +45,102 @@ class _MemoryObjectItemReceiver(Generic[T_Item]):
     task_info: TaskInfo = field(init=False, default_factory=get_current_task)
     item: T_Item = field(init=False)
 
+    def deliver(self, item: T_Item) -> None:
+        """Hand over an item to the task waiting on this receiver."""
+        self.item = item
+
     def __repr__(self) -> str:
         # When item is not defined, we get following error with default __repr__:
         # AttributeError: 'MemoryObjectItemReceiver' object has no attribute 'item'
         item = getattr(self, "item", None)
         return f"{self.__class__.__name__}(task_info={self.task_info}, item={item!r})"
+
+
+class _MemoryObjectSelection(Generic[T_Item]):
+    """
+    Coordinates a single atomic item selection across several receive streams.
+
+    One shared event is registered as the wakeup key on every candidate stream, so a
+    single notification covers all of them. The first stream to hand over an item
+    commits the whole selection: the remaining registrations are withdrawn immediately
+    (before the delivering task can yield), which guarantees that no second item can be
+    taken even when several streams become ready in the same scheduling round.
+    """
+
+    __slots__ = "_registered", "event", "result"
+
+    def __init__(self) -> None:
+        self.event: Event = Event()
+        self.result: tuple[MemoryObjectReceiveStream[T_Item], T_Item] | None = None
+        self._registered: list[MemoryObjectReceiveStream[T_Item]] = []
+
+    def register(self, stream: MemoryObjectReceiveStream[T_Item]) -> None:
+        stream._state.waiting_receivers[self.event] = _MemoryObjectSelectionReceiver(
+            stream, self
+        )
+        if stream._waiters is None:
+            stream._waiters = set[Event]()
+
+        stream._waiters.add(self.event)
+        self._registered.append(stream)
+
+    def deliver(
+        self, stream: MemoryObjectReceiveStream[T_Item], item: T_Item
+    ) -> None:
+        if self.result is None:
+            self.result = (stream, item)
+            self.withdraw()
+            self.event.set()
+
+    def withdraw(self) -> None:
+        for stream in self._registered:
+            stream._state.waiting_receivers.pop(self.event, None)
+            if stream._waiters is not None:
+                stream._waiters.discard(self.event)
+
+        self._registered.clear()
+
+
+class _MemoryObjectSelectionReceiver(_MemoryObjectItemReceiver[T_Item]):
+    """
+    A receiver registered on behalf of :meth:`MemoryObjectReceiveStream.receive_any`.
+
+    Delivering an item here commits the entire selection, withdrawing the registrations
+    on the other candidate streams so that only one item is ever consumed.
+    """
+
+    def __init__(
+        self,
+        stream: MemoryObjectReceiveStream[T_Item],
+        selection: _MemoryObjectSelection[T_Item],
+    ) -> None:
+        super().__init__()
+        self.stream = stream
+        self.selection = selection
+
+    def deliver(self, item: T_Item) -> None:
+        super().deliver(item)
+        self.selection.deliver(self.stream, item)
+
+
+def _restore_item(stream: MemoryObjectReceiveStream[T_Item], item: T_Item) -> None:
+    """
+    Put an item back on the given stream after a selection was abandoned.
+
+    A delivered item belongs solely to the selection (the sender has already completed),
+    so putting it back never duplicates it. It is offered to the next live waiting
+    receiver, mirroring what a sender would have done, or else placed at the front of
+    the buffer to preserve ordering.
+    """
+    state = stream._state
+    while state.waiting_receivers:
+        receive_event, receiver = state.waiting_receivers.popitem(last=False)
+        if not receiver.task_info.has_pending_cancellation():
+            receiver.deliver(item)
+            receive_event.set()
+            return
+
+    state.buffer.appendleft(item)
 
 
 @dataclass(eq=False)
@@ -141,6 +232,86 @@ class MemoryObjectReceiveStream(ObjectReceiveStream[T_co], Generic[T_co]):
                     raise ClosedResourceError from None
                 else:
                     raise EndOfStream from None
+
+    async def receive_any(self, *others: MemoryObjectReceiveStream[T_co]) -> T_co:
+        """
+        Receive the next item from this stream or any of the given streams, whichever
+        becomes available first.
+
+        The candidate streams are checked in the order they were given, with this
+        stream first. If more than one candidate is readable at the same time, the
+        earliest one in that order wins, and exactly one item is consumed overall.
+
+        Candidates that have been closed or exhausted are skipped as long as another
+        candidate can still deliver an item, so an empty closed stream never steals the
+        turn from a live one.
+
+        Cancelling the call never removes an item that another stream already had
+        queued: the registrations are withdrawn, and an item that had been handed over
+        but not yet returned is put back on its originating stream.
+
+        :param others: additional receive streams to compete with this one
+        :return: the item received from the winning stream
+        :raises ~anyio.ClosedResourceError: if every candidate stream has been
+            explicitly closed
+        :raises ~anyio.EndOfStream: if no candidate has an item available and all of
+            them have been closed from the sending end
+
+        .. versionadded:: 4.17.0
+        """
+        candidates = (self, *others)
+        await checkpoint()
+        while True:
+            blocked: list[MemoryObjectReceiveStream[T_co]] = []
+            end_of_stream = False
+            for stream in candidates:
+                if stream._closed:
+                    # An explicitly closed stream can never deliver; leave the live
+                    # candidates to decide the outcome
+                    continue
+
+                try:
+                    return stream.receive_nowait()
+                except WouldBlock:
+                    blocked.append(stream)
+                except EndOfStream:
+                    end_of_stream = True
+
+            if not blocked:
+                if end_of_stream:
+                    raise EndOfStream
+
+                raise ClosedResourceError
+
+            # Nothing is ready yet, so wait until any candidate either delivers an item
+            # or closes
+            selection = _MemoryObjectSelection[T_co]()
+            seen_states: set[int] = set()
+            for stream in blocked:
+                # Clones share their state, and the shared state can only hold one
+                # registration per event, so register each state just once
+                if id(stream._state) not in seen_states:
+                    seen_states.add(id(stream._state))
+                    selection.register(stream)
+
+            try:
+                await selection.event.wait()
+            except BaseException:
+                selection.withdraw()
+                if selection.result is not None:
+                    # Cancelled after an item had been handed to us but before we could
+                    # return it: give it back so the selection never consumes it
+                    stream, item = selection.result
+                    _restore_item(stream, item)
+
+                raise
+            else:
+                selection.withdraw()
+
+            if selection.result is not None:
+                return selection.result[1]
+
+            # We were woken up because a candidate closed, so scan the streams again
 
     def clone(self) -> MemoryObjectReceiveStream[T_co]:
         """
@@ -241,7 +412,7 @@ class MemoryObjectSendStream(ObjectSendStream[T_contra], Generic[T_contra]):
         while self._state.waiting_receivers:
             receive_event, receiver = self._state.waiting_receivers.popitem(last=False)
             if not receiver.task_info.has_pending_cancellation():
-                receiver.item = item
+                receiver.deliver(item)
                 receive_event.set()
                 return
 

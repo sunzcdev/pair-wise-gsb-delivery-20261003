@@ -1,0 +1,1 @@
+Added ``MemoryObjectReceiveStream.receive_any()`` for waiting on and receiving a single item from any of several memory object streams, preferring earlier streams when several are ready and skipping already-closed ones

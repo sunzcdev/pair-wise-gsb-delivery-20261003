@@ -69,6 +69,21 @@ for example, the receiving tasks will never see the end of the stream while the
 original send stream remains open. Receive clones distribute items among consumers;
 they do not broadcast every item to every consumer.
 
+Receiving from any of several streams
+**************************************
+
+When a single task consumes items from several memory object streams, it usually wants
+to wait for whichever stream becomes ready first without blocking on one of them. The
+:meth:`~.streams.memory.MemoryObjectReceiveStream.receive_any` method does exactly
+that: it registers a single waiter on all the given streams and returns the item of the
+first one to become readable. Only that one item is consumed; the other streams are left
+untouched, and cancelling the call never removes an item that another stream already had
+queued. When several streams are readable at the same time, the one passed earliest in
+the argument list wins, and an empty stream that has already been closed never preempts
+a stream that can still deliver.
+
+.. literalinclude:: snippets/streams/memory_stream_receive_any.py
+
 In contrast to other AnyIO streams (but in line with Trio's Channels), memory object
 streams can be closed synchronously, using either the ``close()`` method or by using the
 stream as a context manager:

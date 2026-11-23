@@ -546,3 +546,167 @@ async def test_memory_object_item_receiver_repr() -> None:
     receiver.item = "test_item"
     receiver_repr = repr(receiver)
     assert "item='test_item'" in receiver_repr
+
+
+async def test_receive_any_order() -> None:
+    """Items that are already readable are taken in the order the streams were given."""
+    send1, receive1 = create_memory_object_stream[str](1)
+    send2, receive2 = create_memory_object_stream[str](1)
+    with send1, send2, receive1, receive2:
+        send1.send_nowait("first")
+        send2.send_nowait("second")
+        assert await receive1.receive_any(receive2) == "first"
+        # Only one item was consumed, and the other stream still holds its own
+        assert receive2.receive_nowait() == "second"
+
+    send1, receive1 = create_memory_object_stream[str](1)
+    send2, receive2 = create_memory_object_stream[str](1)
+    with send1, send2, receive1, receive2:
+        send1.send_nowait("first")
+        send2.send_nowait("second")
+        # Passing the streams in a different order flips the winner
+        assert await receive2.receive_any(receive1) == "second"
+        assert receive1.receive_nowait() == "first"
+
+
+async def test_receive_any_skips_closed_empty_stream() -> None:
+    """An empty closed stream must not steal the turn from a live candidate."""
+    send1, receive1 = create_memory_object_stream[str](1)
+    send2, receive2 = create_memory_object_stream[str](1)
+    with send1, send2, receive1, receive2:
+        receive1.close()
+        send2.send_nowait("alive")
+        assert await receive1.receive_any(receive2) == "alive"
+
+
+async def test_receive_any_skips_exhausted_stream() -> None:
+    """A drained stream whose send end is closed is skipped for a live candidate."""
+    send1, receive1 = create_memory_object_stream[str](1)
+    send2, receive2 = create_memory_object_stream[str](1)
+    with send1, send2, receive1, receive2:
+        await send1.aclose()
+        send2.send_nowait("alive")
+        assert await receive1.receive_any(receive2) == "alive"
+
+
+async def test_receive_any_all_closed() -> None:
+    send1, receive1 = create_memory_object_stream[str](1)
+    send2, receive2 = create_memory_object_stream[str](1)
+    with send1, send2, receive1, receive2:
+        await send1.aclose()
+        await send2.aclose()
+        with pytest.raises(EndOfStream):
+            await receive1.receive_any(receive2)
+
+    send1, receive1 = create_memory_object_stream[str](1)
+    send2, receive2 = create_memory_object_stream[str](1)
+    with send1, send2, receive1, receive2:
+        receive1.close()
+        receive2.close()
+        with pytest.raises(ClosedResourceError):
+            await receive1.receive_any(receive2)
+
+
+async def test_receive_any_cancel_keeps_items() -> None:
+    """Cancelling a selection must not consume items from any of the streams."""
+    send1, receive1 = create_memory_object_stream[str](1)
+    send2, receive2 = create_memory_object_stream[str](1)
+    with send1, send2, receive1, receive2:
+        send1.send_nowait("first")
+        send2.send_nowait("second")
+        with CancelScope() as scope:
+            scope.cancel()
+            await receive1.receive_any(receive2)
+
+        assert receive1.receive_nowait() == "first"
+        assert receive2.receive_nowait() == "second"
+
+
+async def test_receive_any_two_blocked_senders() -> None:
+    """
+    Two unbuffered senders are blocked at the same checkpoint. Releasing a selection
+    must complete exactly one of them, and an ordinary receive must still pick up the
+    item from the other stream.
+    """
+    send1, receive1 = create_memory_object_stream[str](0)
+    send2, receive2 = create_memory_object_stream[str](0)
+    completed: list[str] = []
+
+    async def sender(stream: MemoryObjectSendStream[str], value: str) -> None:
+        await stream.send(value)
+        completed.append(value)
+
+    with send1, send2, receive1, receive2:
+        async with create_task_group() as tg:
+            tg.start_soon(sender, send1, "first")
+            tg.start_soon(sender, send2, "second")
+            await wait_all_tasks_blocked()
+
+            received = await receive1.receive_any(receive2)
+            await wait_all_tasks_blocked()
+            assert len(completed) == 1
+            assert completed[0] == received
+
+            if received == "first":
+                assert await receive2.receive() == "second"
+            else:
+                assert await receive1.receive() == "first"
+
+    assert sorted(completed) == ["first", "second"]
+
+
+async def test_receive_any_waiting_path() -> None:
+    """
+    The selector blocks first and is then woken by a single sender; the other stream
+    keeps its own item for a later ordinary receive.
+    """
+    send1, receive1 = create_memory_object_stream[str](0)
+    send2, receive2 = create_memory_object_stream[str](0)
+    results: list[str] = []
+
+    async def selector() -> None:
+        results.append(await receive1.receive_any(receive2))
+
+    with send1, send2, receive1, receive2:
+        async with create_task_group() as tg:
+            tg.start_soon(selector)
+            await wait_all_tasks_blocked()
+            await send2.send("second")
+            await wait_all_tasks_blocked()
+            assert results == ["second"]
+            tg.start_soon(send1.send, "first")
+            assert await receive1.receive() == "first"
+
+
+async def test_receive_any_cancel_then_ordinary_receive() -> None:
+    """
+    Cancelling a pending selection while two unbuffered senders are blocked must leave
+    both items deliverable to ordinary receives.
+    """
+    send1, receive1 = create_memory_object_stream[str](0)
+    send2, receive2 = create_memory_object_stream[str](0)
+    completed: list[str] = []
+
+    async def sender(stream: MemoryObjectSendStream[str], value: str) -> None:
+        await stream.send(value)
+        completed.append(value)
+
+    with send1, send2, receive1, receive2:
+        async with create_task_group() as tg:
+            tg.start_soon(sender, send1, "first")
+            tg.start_soon(sender, send2, "second")
+            await wait_all_tasks_blocked()
+
+            with CancelScope() as scope:
+                scope.cancel()
+                await receive1.receive_any(receive2)
+
+            # The cancelled selection consumed nothing, so both ordinary receives
+            # still pick up their respective items
+            assert {await receive1.receive(), await receive2.receive()} == {
+                "first",
+                "second",
+            }
+
+    assert sorted(completed) == ["first", "second"]
+
