@@ -1,0 +1,34 @@
+name: JRuby Build
+
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+
+jobs:
+  rspec:
+    runs-on: ubuntu-latest
+    # The failure rerun can push a bad run past 20 minutes, and a
+    # cancelled job stays red even with continue-on-error.
+    timeout-minutes: 30
+    env:
+      BUNDLE_JOBS: 4
+      BUNDLE_RETRY: 3
+      BUNDLE_GEMFILE: gemfiles/jruby.gemfile
+      CI: true
+      NATS_SERVER_VERSION: v2.15.0
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: jruby
+        bundler-cache: true
+    - name: Run RSpec
+      # Mark failures as warnings for now due to high level of flakiness
+      # and occasional OOM-s on CI
+      continue-on-error: true
+      env:
+        DEBUG_NATS_TEST: ${{ runner.debug }}
+      run: |
+        bundle exec rspec --force-color || bundle exec rspec --only-failures --force-color

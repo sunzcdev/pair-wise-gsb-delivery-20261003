@@ -1,0 +1,44 @@
+module NATS
+  class JetStream
+    module API
+      class Error < NATS::JetStream::Error::APIError
+      end
+
+      class SequenceInfo < Struct[Integer]
+      end
+
+      class PriorityGroupState < Struct[String | Time]
+      end
+
+      class ConsumerInfo < Struct[String | NATS::JetStream::API::ConsumerConfig | NATS::JetStream::API::SequenceInfo | Integer | Hash[Symbol, untyped] | Time | bool | Array[NATS::JetStream::API::PriorityGroupState]]
+      end
+
+      class ConsumerConfig < Struct[String | Integer | Time | Array[String]]
+        def to_json: (*Hash[untyped, untyped]) -> String
+      end
+
+      class ConsumerPauseResponse < Struct[bool | Time | Integer]
+      end
+
+      class ConsumerResetResponse < Struct[NATS::JetStream::API::ConsumerInfo | Integer]
+      end
+
+      class StreamConfig < Struct[String | Hash[Symbol, untyped] | NATS::JetStream::API::StreamState | bool | Integer]
+        def to_json: (*Hash[untyped, untyped]) -> String
+      end
+
+      class StreamInfo < Struct[String | Hash[Symbol, untyped] | Array[Hash[Symbol, untyped]] | Time]
+      end
+
+      class StreamState < Struct[Integer]
+      end
+
+      class StreamCreateResponse < Struct[String | NATS::JetStream::API::StreamConfig | NATS::JetStream::API::StreamState | bool]
+      end
+
+      class RawStreamMsg < Struct[String | Integer | Hash[Symbol, untyped]]
+        def sequence: () -> Integer
+      end
+    end
+  end
+end

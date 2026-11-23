@@ -1,0 +1,21 @@
+module NATS
+  class KeyValue
+    module BucketStatus
+      attr_reader bucket: String
+
+      @nfo: JetStream::API::StreamInfo
+
+      def initialize: (JetStream::API::StreamInfo, String) -> void
+
+      def values: () -> Integer
+
+      def history: () -> Integer
+
+      def ttl: () -> Float
+
+      def compressed?: () -> bool
+
+      def metadata: () -> Hash[Symbol, String]?
+    end
+  end
+end

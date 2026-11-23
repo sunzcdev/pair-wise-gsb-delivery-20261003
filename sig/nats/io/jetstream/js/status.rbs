@@ -1,0 +1,14 @@
+module NATS
+  class JetStream
+    module JS
+      module Status
+        CtrlMsg: '100'
+        NoMsgs: '404'
+        NotFound: '404'
+        RequestTimeout: '408'
+        PinIdMismatch: '423'
+        ServiceUnavailable: '503'
+      end
+    end
+  end
+end
