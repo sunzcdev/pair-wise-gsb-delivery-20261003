@@ -39,22 +39,20 @@ module Dry
 
       # Get config value by a key
       #
+      # Migration aliases are resolved to their canonical setting.
+      #
       # @param [String,Symbol] name
       #
       # @return Config value
       def [](name)
-        name = name.to_sym
+        setting = _settings.resolve(name)
 
-        unless (setting = _settings[name])
-          raise ArgumentError, "+#{name}+ is not a setting name"
-        end
-
-        _values.fetch(name) {
+        _values.fetch(setting.name) {
           # Mutable settings may be configured after read
-          _configured.add(name) if setting.cloneable?
+          _configured.add(setting.name) if setting.cloneable?
 
           setting.to_value.tap { |value|
-            _values[name] = value
+            _values[setting.name] = value
           }
         }
       end
@@ -62,20 +60,19 @@ module Dry
       # Set config value.
       # Note that finalized configs cannot be changed.
       #
+      # Migration aliases are resolved to their canonical setting, so assigning through
+      # an alias applies the same constructor and stores the value under the current key.
+      #
       # @param [String,Symbol] name
       # @param [Object] value
       def []=(name, value)
         raise FrozenConfigError, "Cannot modify frozen config" if frozen?
 
-        name = name.to_sym
+        setting = _settings.resolve(name)
 
-        unless (setting = _settings[name])
-          raise ArgumentError, "+#{name}+ is not a setting name"
-        end
+        _configured.add(setting.name)
 
-        _configured.add(name)
-
-        _values[name] = setting.constructor.(value)
+        _values[setting.name] = setting.constructor.(value)
       end
 
       # Update config with new values
@@ -98,6 +95,60 @@ module Dry
           end
         end
         self
+      end
+
+      # Imports a hash of values, migrating legacy keys through the aliases declared on
+      # the settings.
+      #
+      # Alias resolution is scoped to each settings section: a key is first matched
+      # against the section's setting names, then against its declared aliases. Values
+      # arriving through an alias go through exactly the same constructor (and therefore
+      # the same type checks) as values set through the canonical key.
+      #
+      # When the same setting is provided under both its canonical key and an alias (or
+      # under several aliases), the constructed values must compare equally (`#==`);
+      # otherwise an {AmbiguousValueError} is raised naming the section and the setting.
+      #
+      # The import is atomic: all alias resolution, constructor calls and ambiguity
+      # checks run on a detached copy of the config. If anything fails, this config is
+      # left untouched, so the caller can keep using its pre-import settings.
+      #
+      # @param values [Hash, #to_hash] A hash with new values, possibly using legacy keys
+      #
+      # @return [Config] self, updated in place
+      #
+      # @raise [AmbiguousValueError] if a setting is given conflicting values under
+      #   multiple keys
+      # @raise [ArgumentError] if a key is neither a setting name nor a declared alias
+      #   in its section, or a nested section receives a non-hash value
+      #
+      # @api public
+      def import(values)
+        raise FrozenConfigError, "Cannot modify frozen config" if frozen?
+
+        values = values.to_hash
+
+        draft = dup
+        draft.apply_import(values, [])
+
+        @_settings = draft._settings
+        @_values = draft._values
+        @_configured = draft._configured
+
+        self
+      end
+
+      # Exports the current config as a plain hash containing canonical setting keys only.
+      #
+      # Migration aliases are never exported; nested configs are converted recursively
+      # into hashes, and every value is the fully constructed value produced by the
+      # setting's constructor.
+      #
+      # @return [Hash]
+      #
+      # @api public
+      def export
+        to_h
       end
 
       # Returns true if the value for the given key has been set on this config.
@@ -222,6 +273,79 @@ module Dry
         self.class.new(_settings)
       end
 
+      # Recursively applies a (possibly legacy-keyed) hash onto this draft config.
+      #
+      # `path` holds the canonical setting names of the sections above this one, used to
+      # name the section in error messages. All work happens on the draft; the caller is
+      # responsible for swapping the state over only once the whole import succeeded.
+      #
+      # @api private
+      def apply_import(entries, path)
+        # Groups every provided key by the canonical setting it resolves to in this section
+        grouped = entries.group_by do |key, _value|
+          _settings.resolve(key).name
+        end
+
+        grouped.each do |setting_name, pairs|
+          setting = _settings[setting_name]
+          section_path = path + [setting_name]
+
+          if setting.children.any?
+            apply_nested_import(setting, pairs, section_path)
+          else
+            apply_leaf_import(setting, pairs, section_path)
+          end
+        end
+      end
+
+      # @api private
+      def apply_nested_import(setting, pairs, section_path)
+        # Multiple provided keys (canonical key plus aliases) for a nested section must
+        # describe the same sub-hash before it is merged one level deeper.
+        hashes = pairs.map do |_key, value|
+          unless value.respond_to?(:to_hash)
+            raise ArgumentError, "#{value.inspect} is not a valid setting value"
+          end
+
+          value.to_hash
+        end
+
+        reference = hashes.first
+
+        hashes.drop(1).each do |hash|
+          unless hash == reference
+            raise AmbiguousValueError, ambiguity_message(section_path, pairs.map(&:first))
+          end
+        end
+
+        self[setting.name].apply_import(reference, section_path)
+      end
+
+      # @api private
+      def apply_leaf_import(setting, pairs, section_path)
+        constructed = pairs.map { |_key, value| setting.constructor.(value) }
+
+        reference = constructed.first
+
+        constructed.drop(1).each do |value|
+          unless value == reference
+            raise AmbiguousValueError, ambiguity_message(section_path, pairs.map(&:first))
+          end
+        end
+
+        # The constructor already ran above, so store the constructed value directly and
+        # mark the setting as configured rather than constructing a second time.
+        @_configured.add(setting.name)
+        _values[setting.name] = reference
+      end
+
+      # @api private
+      def ambiguity_message(section_path, provided_keys)
+        "ambiguous values for setting :#{section_path.join(".")}: keys " \
+          "#{provided_keys.map(&:inspect).join(", ")} resolve to the same setting " \
+          "but do not produce the same constructed value"
+      end
+
       private
 
       def to_data_attrs
@@ -232,14 +356,19 @@ module Dry
 
       def method_missing(name, *args)
         setting_name = setting_name_from_method(name)
-        setting = _settings[setting_name]
+        setting =
+          begin
+            _settings.resolve(setting_name)
+          rescue ArgumentError
+            nil
+          end
 
         super unless setting
 
         if name.end_with?("=")
-          self[setting_name] = args[0]
+          self[setting.name] = args[0]
         else
-          self[setting_name]
+          self[setting.name]
         end
       end
 

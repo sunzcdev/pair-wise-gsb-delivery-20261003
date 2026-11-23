@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Added migration aliases for settings. Declare `aliases:` on a setting to accept legacy keys when importing a hash through `Config#import`; aliased values go through the setting's own constructor and type checks, and alias resolution is scoped to the settings section. `Config#export` (and `Config#to_h`) return canonical keys only. Imports are atomic: ambiguous values under multiple keys (`AmbiguousValueError`) or constructor failures leave the previous config untouched.
+
 ### Changed
 
 ### Deprecated

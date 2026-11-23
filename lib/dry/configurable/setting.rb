@@ -6,9 +6,9 @@ module Dry
     #
     # @api public
     class Setting
-      include Dry::Equalizer(:name, :default, :constructor, :children, :options, inspect: false)
+      include Dry::Equalizer(:name, :default, :constructor, :children, :aliases, :options, inspect: false)
 
-      OPTIONS = %i[default reader constructor mutable cloneable settings config_class].freeze
+      OPTIONS = %i[default reader constructor mutable cloneable settings config_class aliases].freeze
 
       DEFAULT_CONSTRUCTOR = -> v { v }.freeze
 
@@ -30,6 +30,9 @@ module Dry
       attr_reader :children
 
       # @api public
+      attr_reader :aliases
+
+      # @api public
       attr_reader :options
 
       # @api private
@@ -43,6 +46,7 @@ module Dry
         default:,
         constructor: DEFAULT_CONSTRUCTOR,
         children: EMPTY_ARRAY,
+        aliases: EMPTY_ARRAY,
         **options
       )
         @name = name
@@ -53,6 +57,7 @@ module Dry
         }
         @constructor = constructor
         @children = children
+        @aliases = Array(aliases).map { |aliased_name| aliased_name.to_sym }.freeze
         @options = options
       end
 

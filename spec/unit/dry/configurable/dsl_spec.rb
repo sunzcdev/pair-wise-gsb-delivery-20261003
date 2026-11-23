@@ -57,6 +57,30 @@ RSpec.describe Dry::Configurable::DSL do
     expect(setting.constructor.("sqlite")).to eq("jdbc:sqlite")
   end
 
+  it "compiles a setting with a single migration alias" do
+    setting = dsl.setting(:pool, aliases: :pool_size)
+
+    expect(setting.aliases).to eql(%i[pool_size])
+    expect(setting.aliases).to be_frozen
+  end
+
+  it "compiles a setting with several migration aliases and normalizes them to symbols" do
+    setting = dsl.setting(:pool, aliases: [:pool_size, "max_pool"])
+
+    expect(setting.aliases).to eql(%i[pool_size max_pool])
+  end
+
+  it "defaults to no aliases" do
+    setting = dsl.setting(:pool)
+
+    expect(setting.aliases).to eql([])
+  end
+
+  it "rejects unknown options alongside the aliases option" do
+    expect { dsl.setting :pool, aliases: :pool_size, bogus: true }
+      .to raise_error ArgumentError, "Invalid options: [:bogus]"
+  end
+
   it "rejects setting names that conflict with Data instance methods" do
     expect { dsl.setting :hash }.to raise_error(
       ArgumentError,
