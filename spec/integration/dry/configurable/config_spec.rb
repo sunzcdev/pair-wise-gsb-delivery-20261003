@@ -387,6 +387,141 @@ RSpec.describe Dry::Configurable::Config do
     end
   end
 
+  describe "#snapshot" do
+    it "returns a frozen, fully resolved view while the config remains mutable" do
+      klass.setting :db, default: "sqlite"
+      klass.setting :list, default: []
+
+      view = klass.config.snapshot
+
+      expect(view).to be_frozen
+      expect(view.db).to eql("sqlite")
+      expect(view.list).to eql([])
+      expect(view.values.keys).to contain_exactly(:db, :list)
+
+      expect { view.db = "mysql" }.to raise_error(Dry::Configurable::FrozenConfigError)
+      expect { view[:db] = "mysql" }.to raise_error(Dry::Configurable::FrozenConfigError)
+
+      expect(klass.config).not_to be_frozen
+      klass.config.db = "mysql"
+      expect(klass.config.db).to eql("mysql")
+      expect(view.db).to eql("sqlite")
+    end
+
+    it "returns a view equal to the config" do
+      klass.setting :db do
+        setting :ports, default: Set[123]
+      end
+
+      expect(klass.config.snapshot).to eql(klass.config)
+    end
+
+    it "copies nested configs recursively and freezes them" do
+      klass.setting :db do
+        setting :ports, default: [123]
+      end
+
+      view = klass.config.snapshot
+
+      expect(view.db).to be_frozen
+
+      expect(view.db.ports).to eql([123])
+
+      klass.config.db.ports << 456
+      expect(view.db.ports).to eql([123])
+
+      view.db.ports << 789
+      expect(klass.config.db.ports).to eql([123, 456])
+    end
+
+    it "honors custom copy behavior of values" do
+      value_class = Class.new do
+        attr_reader :copies
+
+        def initialize
+          @copies = 0
+        end
+
+        def initialize_copy(source)
+          super
+          @copies = source.copies + 1
+        end
+      end
+
+      value = value_class.new
+      klass.setting :custom, default: value
+
+      view = klass.config.snapshot
+
+      expect(view.custom).not_to equal(value)
+      expect(view.custom.copies).to eq(1)
+      expect(value.copies).to eq(0)
+    end
+
+    it "preserves shared references within each view while keeping views independent" do
+      shared = {mode: "a"}
+      klass.setting :first, default: [shared]
+      klass.setting :second, default: [shared]
+
+      # The config's own values share the sub-value through one array layer
+      expect(klass.config.first.first).to equal(klass.config.second.first)
+
+      first_view = klass.config.snapshot
+
+      # In-place mutation on the original config after the first view was taken
+      klass.config.first.first[:mode] = "b"
+
+      second_view = klass.config.snapshot
+
+      # Each view sees the same sharing relationship internally
+      expect(first_view.first.first).to equal(first_view.second.first)
+      expect(second_view.first.first).to equal(second_view.second.first)
+
+      # The first view retains the values in effect when it was taken
+      expect(first_view.first.first[:mode]).to eql("a")
+      expect(second_view.first.first[:mode]).to eql("b")
+
+      # Writes through a view do not propagate back to the config
+      first_view.first.first[:mode] = "z"
+      first_view.first << :extra
+      expect(klass.config.first.first[:mode]).to eql("b")
+      expect(klass.config.first).to eql([{mode: "b"}])
+
+      # Taking views did not freeze the source values
+      expect(klass.config.first.first).not_to be_frozen
+      klass.config.first.first[:mode] = "c"
+      expect(klass.config.second.first[:mode]).to eql("c")
+    end
+
+    it "does not freeze the config or its values" do
+      klass.setting :list, default: []
+
+      klass.config.snapshot
+
+      expect(klass.config).not_to be_frozen
+      expect(klass.config.list).not_to be_frozen
+      klass.config.list << "still mutable"
+      expect(klass.config.list).to eql(["still mutable"])
+    end
+
+    it "captures frozen values as-is" do
+      klass.setting :env, default: "prod".freeze
+
+      view = klass.config.snapshot
+
+      expect(view.env).to equal(klass.config.env)
+    end
+
+    it "still allows the config to be finalized afterwards" do
+      klass.setting :db, default: "sqlite"
+
+      klass.config.snapshot
+      klass.finalize!
+
+      expect(klass.config).to be_frozen
+    end
+  end
+
   describe "#method_missing" do
     it "provides access to reader methods" do
       klass.setting :hello

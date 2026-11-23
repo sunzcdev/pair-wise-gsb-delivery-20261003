@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Added `Config#snapshot` (also available as `#snapshot` on configurables), returning a frozen, self-contained view of the config's fully resolved values. Values are copied with `#dup` (honoring custom copy behavior), mutable containers and nested configs are copied recursively, references shared between values remain shared within the snapshot, and taking a snapshot never freezes the config or its values.
+
 ### Changed
 
 ### Deprecated

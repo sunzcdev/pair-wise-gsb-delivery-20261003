@@ -195,6 +195,64 @@ module Dry
         _settings.data_class.new(**to_data_attrs)
       end
 
+      # Returns a frozen, self-contained snapshot of the config's fully resolved values.
+      #
+      # The snapshot is a read-only view of the values in effect at call time, intended to be
+      # safely handed to other contexts (e.g. workers) while the original config remains
+      # mutable. Every setting is resolved and copied, so later writes to the config — or
+      # in-place mutation of its values — are not visible through the snapshot, and objects
+      # reached through the snapshot never propagate reads or writes back to the config.
+      #
+      # Values are copied with `#dup`, honoring any custom copy behavior they define (via
+      # `initialize_copy`). Mutable containers (arrays, hashes, sets) and nested configs are
+      # copied recursively. References shared between values at call time remain shared
+      # (between their copies) within the snapshot. Frozen values are captured as-is.
+      #
+      # Taking a snapshot never freezes the config or its values; use {#finalize!} for that.
+      #
+      # @return [Config] a frozen config
+      #
+      # @api public
+      def snapshot
+        snapshot_with({}.compare_by_identity).freeze
+      end
+
+      # @api private
+      def snapshot_with(copies)
+        self.class.new(_settings.dup).tap do |snapshot|
+          values.each do |name, value|
+            snapshot._values[name] = Config.snapshot_value(value, copies)
+          end
+          snapshot._configured.merge(_configured)
+        end
+      end
+
+      # @api private
+      def self.snapshot_value(value, copies)
+        return value if value.frozen?
+        return copies[value] if copies.key?(value)
+
+        case value
+        when Config
+          copies[value] = copy = value.snapshot_with(copies)
+          copy.freeze
+        when Array
+          copies[value] = copy = value.dup
+          copy.map! { |element| snapshot_value(element, copies) }
+          copy
+        when Hash
+          copies[value] = copy = value.dup
+          value.each_pair { |key, element| copy[key] = snapshot_value(element, copies) }
+          copy
+        when Set
+          copies[value] = copy = value.dup
+          copy.replace(value.map { |element| snapshot_value(element, copies) })
+          copy
+        else
+          copies[value] = value.dup
+        end
+      end
+
       # @api public
       def finalize!(freeze_values: false)
         return self if frozen?

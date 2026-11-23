@@ -14,6 +14,15 @@ module Dry
         self
       end
 
+      # Returns a frozen, self-contained snapshot of the config's current values
+      #
+      # @return [Dry::Configurable::Config]
+      #
+      # @api public
+      def snapshot
+        config.snapshot
+      end
+
       # Finalize and freeze configuration
       #
       # @return [Dry::Configurable::Config]
