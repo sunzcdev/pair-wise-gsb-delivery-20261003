@@ -537,6 +537,257 @@ class TestCondition:
 
         assert result == "foo"
 
+    async def test_generation_starts_at_zero(self) -> None:
+        condition = Condition()
+        assert condition.generation == 0
+
+    async def test_notify_advances_generation(self) -> None:
+        condition = Condition()
+        async with condition:
+            assert condition.generation == 0
+            condition.notify()
+            assert condition.generation == 1
+            condition.notify(2)
+            assert condition.generation == 2
+            condition.notify_all()
+            assert condition.generation == 3
+
+    async def test_wait_generation_returns_after_notify(self) -> None:
+        condition = Condition()
+        results: list[int] = []
+
+        async def observer() -> None:
+            async with condition:
+                last_generation = condition.generation
+                await wait_all_tasks_blocked()
+                new_generation = await condition.wait_generation(last_generation)
+                results.append(new_generation)
+                # The lock must be held again when the call returns
+                assert condition.locked()
+
+        async with create_task_group() as tg:
+            tg.start_soon(observer)
+            await wait_all_tasks_blocked()
+            async with condition:
+                condition.notify_all()
+
+        assert results == [1]
+        assert condition.generation == 1
+
+    async def test_wait_generation_sees_change_made_before_waiting(self) -> None:
+        # The observer records the generation, then the state changes twice before
+        # it gets to wait. It must still observe the new generation immediately.
+        condition = Condition()
+        results: list[int] = []
+
+        async def observer(started: Event) -> None:
+            async with condition:
+                last_generation = condition.generation
+                started.set()
+                # Let the publisher change the state before this task actually
+                # starts waiting (it still holds the lock until then).
+                await wait_all_tasks_blocked()
+                results.append(await condition.wait_generation(last_generation))
+
+        started = Event()
+        async with create_task_group() as tg:
+            tg.start_soon(observer, started)
+            await started.wait()
+            await wait_all_tasks_blocked()
+            async with condition:
+                condition.notify_all()
+            async with condition:
+                condition.notify_all()
+
+        assert results == [2]
+        assert condition.generation == 2
+
+    async def test_wait_generation_default_waits_for_next_notification(self) -> None:
+        condition = Condition()
+        results: list[int] = []
+
+        async def observer() -> None:
+            async with condition:
+                generation = await condition.wait_generation()
+                results.append(generation)
+
+        async with create_task_group() as tg:
+            tg.start_soon(observer)
+            await wait_all_tasks_blocked()
+            async with condition:
+                condition.notify_all()
+
+        assert results == [1]
+
+    async def test_wait_generation_with_stale_generation_returns_immediately(
+        self,
+    ) -> None:
+        condition = Condition()
+        async with condition:
+            condition.notify_all()
+            assert condition.generation == 1
+            # A caller that only knows the initial generation must not block
+            generation = await condition.wait_generation(0)
+            assert generation == 1
+            assert condition.locked()
+
+    async def test_wait_generation_no_lock(self) -> None:
+        condition = Condition()
+        with pytest.raises(
+            RuntimeError, match="The current task is not holding the underlying lock"
+        ):
+            await condition.wait_generation()
+
+    async def test_wait_generation_cancelled_before_notification(self) -> None:
+        condition = Condition()
+        woke_up = False
+
+        async def observer(scope: CancelScope) -> None:
+            nonlocal woke_up
+            with scope:
+                async with condition:
+                    await condition.wait_generation()
+                    woke_up = True
+
+        async with create_task_group() as tg:
+            scope = CancelScope()
+            tg.start_soon(observer, scope)
+            await wait_all_tasks_blocked()
+            assert condition.statistics().tasks_waiting == 1
+            scope.cancel()
+
+        assert not woke_up
+        # The cancelled waiter must have removed only its own entry
+        assert condition.statistics().tasks_waiting == 0
+
+        # Notifications still work normally afterwards
+        async with condition:
+            condition.notify_all()
+            assert condition.generation == 1
+
+    async def test_wait_generation_cancelled_between_notify_and_reacquire(self) -> None:
+        # A waiter is notified and then cancelled while it is trying to reacquire
+        # the lock. Another waiter starting from the old generation must see the new
+        # generation immediately, and the cancelled waiter must not disturb the lock
+        # or any pending notifications.
+        condition = Condition()
+        second_results: list[int] = []
+
+        async def first_observer(scope: CancelScope, released: Event) -> None:
+            with scope:
+                async with condition:
+                    last_generation = condition.generation
+                    released.set()
+                    await condition.wait_generation(last_generation)
+
+        async def second_observer(start: Event) -> None:
+            await start.wait()
+            async with condition:
+                # This waiter only knows the initial generation, so it must return
+                # at once even though the first notification was "consumed" by the
+                # cancelled waiter.
+                second_results.append(await condition.wait_generation(0))
+
+        released = Event()
+        second_start = Event()
+        async with create_task_group() as tg:
+            scope = CancelScope()
+            tg.start_soon(first_observer, scope, released)
+            await released.wait()
+            await wait_all_tasks_blocked()
+            tg.start_soon(second_observer, second_start)
+            await wait_all_tasks_blocked()
+
+            async with condition:
+                scope.cancel()
+                condition.notify_all()
+
+            second_start.set()
+
+        assert second_results == [1]
+        assert condition.generation == 1
+        assert not condition.locked()
+
+    async def test_wait_generation_mixed_thresholds(self) -> None:
+        # Two waiters block on different thresholds at the same time. A single
+        # notification wakes only the one whose threshold has been passed, even
+        # though the other entry is sitting ahead of it in the queue.
+        condition = Condition()
+        results: list[int] = []
+        next_waiter_blocked = Event()
+
+        async def next_generation_waiter() -> None:
+            async with condition:
+                # Waits for generation 2 while the current one is 1
+                next_waiter_blocked.set()
+                results.append(await condition.wait_generation(1))
+
+        async def skip_one_waiter() -> None:
+            await next_waiter_blocked.wait()
+            async with condition:
+                # Enqueued behind the first waiter; wants to skip one generation
+                results.append(await condition.wait_generation(2))
+
+        async with create_task_group() as tg:
+            async with condition:
+                condition.notify_all()
+                assert condition.generation == 1
+
+            tg.start_soon(next_generation_waiter)
+            await next_waiter_blocked.wait()
+            tg.start_soon(skip_one_waiter)
+            await wait_all_tasks_blocked()
+            assert condition.statistics().tasks_waiting == 2
+            async with condition:
+                condition.notify_all()
+
+            await wait_all_tasks_blocked()
+            assert condition.generation == 2
+            assert results == [2]
+            assert condition.statistics().tasks_waiting == 1
+
+            async with condition:
+                condition.notify_all()
+
+        assert condition.generation == 3
+        assert results == [2, 3]
+        assert condition.statistics().tasks_waiting == 0
+
+    async def test_generation_and_classic_waiters_are_independent(self) -> None:
+        condition = Condition()
+        classic_woke = generation_woke = False
+
+        async def classic_waiter() -> None:
+            nonlocal classic_woke
+            async with condition:
+                await condition.wait()
+                classic_woke = True
+
+        async def generation_waiter() -> None:
+            nonlocal generation_woke
+            async with condition:
+                await condition.wait_generation(0)
+                generation_woke = True
+
+        async with create_task_group() as tg:
+            tg.start_soon(classic_waiter)
+            tg.start_soon(generation_waiter)
+            await wait_all_tasks_blocked()
+            assert condition.statistics().tasks_waiting == 2
+            async with condition:
+                # notify(0) only advances the generation; the classic waiter must
+                # stay blocked
+                condition.notify(0)
+
+            await wait_all_tasks_blocked()
+            assert generation_woke
+            assert not classic_woke
+
+            async with condition:
+                condition.notify(1)
+
+        assert classic_woke
+
 
 class TestSemaphore:
     async def test_contextmanager(self) -> None:

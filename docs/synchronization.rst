@@ -77,6 +77,28 @@ Example:
 
 .. literalinclude:: snippets/synchronization/condition.py
 
+Waiting for state changes by generation
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A plain call to :meth:`~Condition.wait` only returns when a notification happens while
+the task is blocked on it. If the shared state is updated between the moment the task
+reads it and the moment it starts waiting, that update can be missed. This is a problem
+when a task needs to observe *every* new revision of some state (such as a
+configuration object).
+
+For this use case, :class:`Condition` keeps track of a generation counter, exposed as
+:attr:`~Condition.generation`. The counter starts at ``0`` and is incremented once by
+every call to :meth:`~Condition.notify` or :meth:`~Condition.notify_all`. A task can
+remember the generation it has already seen and call
+:meth:`~Condition.wait_generation` with it. If the state has already changed by the
+time the call is made, the call returns immediately instead of blocking; otherwise the
+task waits until the next notification. The old :meth:`~Condition.wait` and
+:meth:`~Condition.notify` based usage continues to work exactly as before.
+
+Example:
+
+.. literalinclude:: snippets/synchronization/condition_generation.py
+
 .. _capacity-limiters:
 
 Capacity limiters

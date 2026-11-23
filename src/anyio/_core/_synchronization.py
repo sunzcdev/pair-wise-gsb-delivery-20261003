@@ -271,11 +271,13 @@ class LockAdapter(Lock):
 
 
 class Condition:
-    __slots__ = "__weakref__", "_lock", "_waiters"
+    __slots__ = "__weakref__", "_generation", "_generation_waiters", "_lock", "_waiters"
 
     def __init__(self, lock: Lock | None = None):
         self._lock = lock or Lock()
         self._waiters: deque[Event] = deque()
+        self._generation_waiters: deque[tuple[Event, int]] = deque()
+        self._generation = 0
 
     async def __aenter__(self) -> None:
         await self.acquire()
@@ -291,6 +293,22 @@ class Condition:
     def _check_acquired(self) -> None:
         if self._lock.statistics().owner != get_current_task():
             raise RuntimeError("The current task is not holding the underlying lock")
+
+    @property
+    def generation(self) -> int:
+        """
+        The current generation of this condition.
+
+        The value starts at ``0`` and is incremented once for every call to
+        :meth:`notify` or :meth:`notify_all`. A task can remember the generation it
+        has already observed and pass it to :meth:`wait_generation` to wait for the
+        next one, avoiding the race where a change happens before the task starts
+        waiting.
+
+        .. versionadded:: 4.17.0
+
+        """
+        return self._generation
 
     async def acquire(self) -> None:
         """Acquire the underlying lock."""
@@ -313,9 +331,22 @@ class Condition:
         """Return True if the lock is set."""
         return self._lock.locked()
 
+    def _wake_generation_waiters(self) -> None:
+        """Wake every generation waiter waiting on the current generation."""
+        remaining: deque[tuple[Event, int]] = deque()
+        for event, last_generation in self._generation_waiters:
+            if last_generation < self._generation:
+                event.set()
+            else:
+                remaining.append((event, last_generation))
+
+        self._generation_waiters = remaining
+
     def notify(self, n: int = 1) -> None:
         """Notify exactly n listeners."""
         self._check_acquired()
+        self._generation += 1
+        self._wake_generation_waiters()
         for _ in range(n):
             try:
                 event = self._waiters.popleft()
@@ -327,6 +358,8 @@ class Condition:
     def notify_all(self) -> None:
         """Notify all the listeners."""
         self._check_acquired()
+        self._generation += 1
+        self._wake_generation_waiters()
         for event in self._waiters:
             event.set()
 
@@ -354,6 +387,57 @@ class Condition:
             with CancelScope(shield=True):
                 await self.acquire()
 
+    async def wait_generation(self, last_generation: int | None = None) -> int:
+        """
+        Wait until the condition moves to a later generation.
+
+        Unlike :meth:`wait`, this method does not depend on the notification
+        happening while the task is actually blocked. If the generation has already
+        been advanced (by a call to :meth:`notify` or :meth:`notify_all`) since the
+        caller last observed it, this method returns immediately. This makes it safe
+        to use for observing state changes even when one or more notifications take
+        place between reading the state and starting to wait.
+
+        :param last_generation: the generation the caller has already observed. If
+            omitted or ``None``, the current generation is used, so the call waits
+            for the next notification.
+        :return: the generation that woke the caller
+
+        .. versionadded:: 4.17.0
+
+        """
+        await checkpoint_if_cancelled()
+        self._check_acquired()
+        if last_generation is None:
+            last_generation = self._generation
+
+        # The state may already have changed before this call; do not block in that
+        # case, even if no one is currently waiting on a notification.
+        if last_generation < self._generation:
+            return self._generation
+
+        event = Event()
+        entry = (event, last_generation)
+        self._generation_waiters.append(entry)
+        self.release()
+        try:
+            await event.wait()
+        except BaseException:
+            # A cancelled waiter only removes its own entry. It never touches the
+            # underlying lock on behalf of other tasks, and notifications that have
+            # already been delivered stay delivered.
+            if not event.is_set():
+                self._generation_waiters.remove(entry)
+
+            raise
+        finally:
+            # Match the Condition contract: the lock is always held again before
+            # control is returned to the caller, even when cancelled.
+            with CancelScope(shield=True):
+                await self.acquire()
+
+        return self._generation
+
     async def wait_for(self, predicate: Callable[[], T]) -> T:
         """
         Wait until a predicate becomes true.
@@ -376,7 +460,10 @@ class Condition:
 
         .. versionadded:: 3.0
         """
-        return ConditionStatistics(len(self._waiters), self._lock.statistics())
+        return ConditionStatistics(
+            len(self._waiters) + len(self._generation_waiters),
+            self._lock.statistics(),
+        )
 
 
 class Semaphore:
