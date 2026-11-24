@@ -534,6 +534,26 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
           .. versionadded:: 2.0.28
 
+        :param correlate_returning_to_input: Boolean; when True, an
+          INSERT ... RETURNING statement that is executed with multiple
+          parameter sets (i.e. "executemany" style) on a backend that
+          supports the :ref:`engine_insertmanyvalues` feature will record
+          the information needed to explicitly correlate the RETURNING
+          rows produced by each executed batch to the input parameter
+          sets of that batch, including input rows that were skipped by
+          the database (e.g. by ``ON CONFLICT DO NOTHING``) and produced
+          no RETURNING row.  The correlated view is then available via
+          the :attr:`_engine.CursorResult.correlated_rows` accessor.
+          Batched execution of the statement is retained when the
+          backend supports it; statements that don't use this option are
+          unaffected.
+
+          .. versionadded:: 2.1
+
+          .. seealso::
+
+            :attr:`_engine.CursorResult.correlated_rows`
+
         .. seealso::
 
             :meth:`_engine.Engine.execution_options`

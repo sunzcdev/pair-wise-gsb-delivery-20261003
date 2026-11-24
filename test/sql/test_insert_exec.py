@@ -1218,6 +1218,244 @@ class InsertManyValuesTest(fixtures.RemovesEvents, fixtures.TablesTest):
                 conn.execute(stmt.returning(t.c.id), data)
 
 
+class InsertReturningCorrelationTest(
+    fixtures.RemovesEvents, fixtures.TablesTest
+):
+    """tests for the CursorResult.correlated_rows view, which explicitly
+    correlates INSERT .. RETURNING rows to the input parameter sets of an
+    executemany ("insertmanyvalues") execution, including rows that were
+    skipped by the database (e.g. ON CONFLICT DO NOTHING)."""
+
+    __sparse_driver_backend__ = True
+    __requires__ = ("insertmanyvalues",)
+
+    @classmethod
+    def define_tables(cls, metadata):
+        Table(
+            "sentinel_data",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", String(50), unique=True),
+            insert_sentinel("sentinel"),
+        )
+        Table(
+            "plain_data",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", String(50), unique=True),
+        )
+
+    def _on_conflict_do_nothing(self, connection, table):
+        if connection.dialect.name == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            return sqlite_insert(table).on_conflict_do_nothing()
+        elif connection.dialect.name == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+            return pg_insert(table).on_conflict_do_nothing()
+        else:
+            config.skip_test("backend does not support ON CONFLICT DO NOTHING")
+
+    def _count_inserts(self, connection):
+        statements = []
+
+        @event.listens_for(connection, "before_cursor_execute")
+        def go(conn, cursor, statement, parameters, context, executemany):
+            if statement.startswith("INSERT"):
+                statements.append(statement)
+
+        return statements
+
+    def test_correlated_rows_with_skips_across_batches(self, connection):
+        """valid / conflict / valid rows span two compiled batches; the
+        two returned primary keys are exactly correlated to their input
+        rows, and batched execution is retained."""
+        sentinel_data = self.tables.sentinel_data
+
+        connection.execute(sentinel_data.insert().values(data="conflict"))
+
+        statements = self._count_inserts(connection)
+
+        stmt = self._on_conflict_do_nothing(connection, sentinel_data)
+        stmt = stmt.returning(sentinel_data.c.id, sort_by_parameter_order=True)
+        params = [
+            {"data": "valid_one"},
+            {"data": "conflict"},
+            {"data": "valid_two"},
+        ]
+        result = connection.execute(
+            stmt,
+            params,
+            execution_options={
+                "insertmanyvalues_page_size": 2,
+                "correlate_returning_to_input": True,
+            },
+        )
+
+        # batched execution was retained; three rows were delivered in
+        # two compiled batches, not downgraded to row-at-a-time
+        eq_(len(statements), 2)
+
+        correlated = result.correlated_rows
+        eq_(len(correlated), 3)
+
+        expected_pks = {
+            data: id_
+            for id_, data in connection.execute(
+                select(sentinel_data.c.id, sentinel_data.c.data)
+            )
+        }
+
+        row_one, row_skipped, row_two = correlated
+
+        # the conflicting row was skipped and correlates to None; the two
+        # valid rows correlate exactly to their generated primary keys
+        is_(row_skipped, None)
+        eq_(row_one.id, expected_pks["valid_one"])
+        eq_(row_two.id, expected_pks["valid_two"])
+
+        # the regular result view is unaffected and contains exactly the
+        # rows the database returned
+        eq_(
+            result.all(),
+            [
+                (expected_pks["valid_one"],),
+                (expected_pks["valid_two"],),
+            ],
+        )
+
+    def test_correlated_rows_no_skips(self, connection):
+        sentinel_data = self.tables.sentinel_data
+
+        stmt = self._on_conflict_do_nothing(connection, sentinel_data)
+        stmt = stmt.returning(sentinel_data.c.id, sort_by_parameter_order=True)
+        params = [{"data": "d%d" % i} for i in range(5)]
+        result = connection.execute(
+            stmt,
+            params,
+            execution_options={
+                "insertmanyvalues_page_size": 2,
+                "correlate_returning_to_input": True,
+            },
+        )
+
+        correlated = result.correlated_rows
+        eq_(len(correlated), 5)
+        assert all(row is not None for row in correlated)
+        eq_(
+            [row.id for row in correlated],
+            [id_ for (id_,) in result.all()],
+        )
+
+    def test_correlated_rows_entire_batch_skipped(self, connection):
+        sentinel_data = self.tables.sentinel_data
+
+        connection.execute(sentinel_data.insert().values(data="conflict"))
+
+        stmt = self._on_conflict_do_nothing(connection, sentinel_data)
+        stmt = stmt.returning(sentinel_data.c.id, sort_by_parameter_order=True)
+        result = connection.execute(
+            stmt,
+            [{"data": "conflict"}, {"data": "conflict"}],
+            execution_options={
+                "insertmanyvalues_page_size": 2,
+                "correlate_returning_to_input": True,
+            },
+        )
+
+        eq_(result.correlated_rows, [None, None])
+        eq_(result.all(), [])
+
+    def test_correlated_rows_unreliable_raises(self, connection):
+        """without sentinel columns, a batch where only some rows were
+        skipped cannot be reliably correlated and reports explicitly"""
+        plain_data = self.tables.plain_data
+
+        connection.execute(plain_data.insert().values(data="conflict"))
+
+        stmt = self._on_conflict_do_nothing(connection, plain_data)
+        stmt = stmt.returning(plain_data.c.id)
+        result = connection.execute(
+            stmt,
+            [
+                {"data": "valid_one"},
+                {"data": "conflict"},
+                {"data": "valid_two"},
+            ],
+            execution_options={
+                "insertmanyvalues_page_size": 2,
+                "correlate_returning_to_input": True,
+            },
+        )
+
+        with expect_raises_message(
+            exc.InvalidRequestError,
+            "cannot be reliably correlated",
+        ):
+            result.correlated_rows
+
+    def test_correlated_rows_requires_execution_option(self, connection):
+        plain_data = self.tables.plain_data
+
+        stmt = plain_data.insert().returning(plain_data.c.id)
+        result = connection.execute(stmt, [{"data": "d1"}, {"data": "d2"}])
+
+        with expect_raises_message(
+            exc.InvalidRequestError,
+            "correlate_returning_to_input",
+        ):
+            result.correlated_rows
+
+        # the regular interface is unaffected
+        eq_(len(result.all()), 2)
+
+    def test_plain_inserts_not_downgraded(self, connection):
+        """executemany INSERTs that don't use the correlation option
+        keep their current batched execution"""
+        sentinel_data = self.tables.sentinel_data
+        plain_data = self.tables.plain_data
+
+        statements = self._count_inserts(connection)
+
+        result = connection.execute(
+            sentinel_data.insert().returning(sentinel_data.c.id),
+            [{"data": "s1"}, {"data": "s2"}, {"data": "s3"}],
+        )
+        eq_(len(result.all()), 3)
+
+        result = connection.execute(
+            plain_data.insert().returning(plain_data.c.id),
+            [{"data": "p1"}, {"data": "p2"}, {"data": "p3"}],
+        )
+        eq_(len(result.all()), 3)
+
+        # one batched INSERT per statement; no row-at-a-time downgrade
+        eq_(len(statements), 2)
+
+    def test_upsert_without_option_keeps_current_behavior(self, connection):
+        """without the correlation option, an upsert-style INSERT that
+        requests sorted RETURNING keeps its current behavior"""
+        sentinel_data = self.tables.sentinel_data
+
+        connection.execute(sentinel_data.insert().values(data="conflict"))
+
+        statements = self._count_inserts(connection)
+
+        stmt = self._on_conflict_do_nothing(connection, sentinel_data)
+        stmt = stmt.returning(sentinel_data.c.id, sort_by_parameter_order=True)
+        result = connection.execute(
+            stmt,
+            [{"data": "v1"}, {"data": "conflict"}, {"data": "v2"}],
+            execution_options={"insertmanyvalues_page_size": 2},
+        )
+        eq_(len(result.all()), 2)
+
+        # current behavior is retained: batches are downgraded to
+        # row-at-a-time so that sorted correlation remains exact
+        eq_(len(statements), 3)
+
+
 class IMVSentinelTest(fixtures.TestBase):
     __sparse_driver_backend__ = True
 

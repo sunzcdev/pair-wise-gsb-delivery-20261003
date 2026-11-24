@@ -5953,6 +5953,7 @@ class SQLCompiler(Compiled):
         batch_size: int,
         sort_by_parameter_order: bool,
         schema_translate_map: Optional[SchemaTranslateMapType],
+        allow_skipped_rows: bool = False,
     ) -> Iterator[_InsertManyValuesBatch]:
         imv = self._insertmanyvalues
         assert imv is not None
@@ -5988,6 +5989,10 @@ class SQLCompiler(Compiled):
                 or (
                     imv.includes_upsert_behaviors
                     and not imv.embed_values_counter
+                    and not (
+                        allow_skipped_rows
+                        and imv.sentinel_param_keys is not None
+                    )
                 )
             )
         ):
@@ -5996,6 +6001,11 @@ class SQLCompiler(Compiled):
             # use row at a time.  Note: if embed_values_counter is True,
             # the counter itself provides the ordering capability we need,
             # so we can use batch mode even with upsert behaviors.
+            # additionally, if the caller has indicated that skipped rows
+            # (e.g. from ON CONFLICT DO NOTHING) should be tolerated and
+            # client-side sentinel values are present, exact row-to-input
+            # correlation is possible within a multi-row batch by matching
+            # sentinel keys, so batch mode may be used in that case as well.
             use_row_at_a_time = True
             downgraded = True
         elif (

@@ -2085,6 +2085,76 @@ of **non-batched** mode when guaranteed RETURNING ordering is requested.
 
         https://dba.stackexchange.com/a/72099
 
+.. _engine_insertmanyvalues_correlated_rows:
+
+Explicitly Correlating RETURNING Rows to Input Rows, Including Skipped Rows
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 2.1
+
+INSERT statements that use upsert-style clauses such as
+``ON CONFLICT DO NOTHING`` may produce **fewer** RETURNING rows than there
+are input parameter sets, because the database skips conflicting rows.
+For applications that return server-generated values such as primary keys
+back to each individual input row, the
+:paramref:`_engine.Connection.execution_options.correlate_returning_to_input`
+execution option enables an explicit correlation view on the result,
+:attr:`_engine.CursorResult.correlated_rows`, which aligns the RETURNING
+rows of an executemany INSERT .. RETURNING execution with the input
+parameter sets, using ``None`` for input rows that were skipped by the
+database::
+
+    from sqlalchemy import insert_sentinel
+
+    data_table = Table(
+        "data",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("name", String, unique=True),
+        insert_sentinel("sentinel"),
+    )
+
+    # on_conflict_do_nothing() is provided by the dialect-specific
+    # insert() constructs, e.g. sqlalchemy.dialects.sqlite.insert or
+    # sqlalchemy.dialects.postgresql.insert
+    stmt = (
+        dialect_insert(data_table)
+        .on_conflict_do_nothing()
+        .returning(data_table.c.id, sort_by_parameter_order=True)
+    )
+    result = connection.execute(
+        stmt,
+        parameter_sets,
+        execution_options={"correlate_returning_to_input": True},
+    )
+    for parameters, row in zip(parameter_sets, result.correlated_rows):
+        if row is None:
+            print("input row was skipped:", parameters)
+        else:
+            print("generated primary key:", row.id)
+
+When the option is used, batched execution of the statement is retained
+on backends that support it, including when some rows within a single
+batch are skipped; statements that don't use the option are unaffected
+and keep their current behavior.
+
+Correlation is **exact** when the statement makes use of client-side
+:ref:`sentinel columns <engine_insertmanyvalues_sentinel_columns>` (e.g.
+via :func:`_schema.insert_sentinel`), as illustrated above; in this case
+skipped rows are identified individually even within a single batch.
+Without sentinel columns, correlation is positional within each executed
+batch, and is only possible if the database returned exactly as many rows
+as there are input rows in the batch (or no rows at all); otherwise the
+skipped rows cannot be reliably identified and
+:attr:`_engine.CursorResult.correlated_rows` raises
+:class:`~sqlalchemy.exc.InvalidRequestError`.
+
+.. seealso::
+
+    :attr:`_engine.CursorResult.correlated_rows`
+
+    :paramref:`_engine.Connection.execution_options.correlate_returning_to_input`
+
 
 .. _engine_insertmanyvalues_non_batch:
 

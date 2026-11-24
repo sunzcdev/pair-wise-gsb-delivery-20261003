@@ -1897,6 +1897,102 @@ class CursorResult(Result[Unpack[_Ts]]):
         else:
             return None
 
+    @property
+    def correlated_rows(self) -> List[Optional[Row[Unpack[TupleAny]]]]:
+        """Return RETURNING rows explicitly correlated to the input
+        parameter sets of an "insertmanyvalues" INSERT ... RETURNING
+        execution.
+
+        This accessor provides an explicit view that aligns the rows
+        returned by the database with the list of parameter sets that was
+        passed to :meth:`_engine.Connection.execute`, in the same order.
+        Each entry is either a :class:`_engine.Row` for the corresponding
+        input parameter set, or ``None`` for an input row that was skipped
+        by the database, as occurs for example with
+        ``INSERT ... ON CONFLICT DO NOTHING ... RETURNING`` when a
+        conflicting row is not inserted and produces no RETURNING row.
+
+        The view is only available for INSERT ... RETURNING statements
+        that are executed with multiple parameter sets (i.e.
+        "executemany" style) using the
+        :paramref:`_engine.Connection.execution_options.correlate_returning_to_input`
+        execution option, on backends that support the
+        :ref:`engine_insertmanyvalues` feature; batched execution of the
+        statement is retained when the option is used::
+
+            stmt = insert(table).returning(table.c.id)
+            result = connection.execute(
+                stmt,
+                list_of_parameter_sets,
+                execution_options={"correlate_returning_to_input": True},
+            )
+            for parameters, row in zip(
+                list_of_parameter_sets, result.correlated_rows
+            ):
+                if row is None:
+                    print("row was skipped:", parameters)
+                else:
+                    print("generated id:", row.id)
+
+        When the statement includes client-side
+        :ref:`sentinel columns <engine_insertmanyvalues_sentinel_columns>`
+        (e.g. via :func:`_schema.insert_sentinel`), correlation is exact
+        even when some input rows within a single batch are skipped by the
+        database.  Without sentinel columns, correlation is positional
+        within each executed batch; if the database returns fewer rows
+        than there are input rows in a batch (and more than zero), the
+        skipped rows cannot be reliably identified and
+        :class:`~sqlalchemy.exc.InvalidRequestError` is raised when this
+        accessor is used.
+
+        Raises :class:`~sqlalchemy.exc.InvalidRequestError` if the
+        statement was not executed with the
+        :paramref:`_engine.Connection.execution_options.correlate_returning_to_input`
+        execution option, if the statement was not an INSERT ... RETURNING
+        statement executed with multiple parameter sets, or if the
+        returned rows cannot be reliably correlated to the input parameter
+        sets.
+
+        .. versionadded:: 2.1
+
+        .. seealso::
+
+            :ref:`engine_insertmanyvalues`
+
+            :paramref:`_engine.Connection.execution_options.correlate_returning_to_input`
+
+        """
+        correlation = self.context._insertmanyvalues_correlation
+        if correlation is None:
+            raise exc.InvalidRequestError(
+                "This result does not provide input-correlated RETURNING "
+                "rows.  Use the 'correlate_returning_to_input' execution "
+                "option with an INSERT ... RETURNING statement executed "
+                "with multiple parameter sets to enable this view."
+            )
+
+        make_row = self._row_getter[0]
+        assert make_row is not None
+
+        correlated_rows: List[Optional[Row[Unpack[TupleAny]]]] = []
+        for batch_correlation in correlation:
+            if batch_correlation is None:
+                raise exc.InvalidRequestError(
+                    "Returned rows cannot be reliably correlated to input "
+                    "parameter sets; the database returned fewer rows "
+                    "than there are input rows in an executed batch, and "
+                    "no sentinel columns are available to determine which "
+                    "input rows were skipped.  Use a client-side sentinel "
+                    "column (e.g. via insert_sentinel()) to allow exact "
+                    "correlation of returned rows to input parameter "
+                    "sets."
+                )
+            correlated_rows.extend(
+                make_row(raw_row) if raw_row is not None else None
+                for raw_row in batch_correlation
+            )
+        return correlated_rows
+
     def last_updated_params(
         self,
     ) -> Union[

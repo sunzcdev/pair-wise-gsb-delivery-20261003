@@ -258,6 +258,33 @@ class _BackendsMultiReflection(Dialect):
         return self._value_or_raise(data, table_name, schema)
 
 
+def _positional_input_correlation(
+    rows: Sequence[Any], num_input_params: int
+) -> Optional[List[Optional[Tuple[Any, ...]]]]:
+    """Correlate RETURNING rows to input parameter sets positionally.
+
+    Returns a list aligned with the input parameter sets of a single
+    executed batch, where each entry is the raw RETURNING row for that
+    parameter set or ``None`` if the row was skipped (e.g. by
+    ON CONFLICT DO NOTHING).  Returns ``None`` if the rows returned for
+    the batch cannot be reliably correlated to the input parameter sets.
+
+    """
+    if len(rows) == num_input_params:
+        # one returned row per input parameter set; positional
+        # correlation is reliable
+        return list(rows)
+    elif not rows:
+        # no rows returned at all; every input row of the batch was
+        # skipped
+        return [None] * num_input_params
+    else:
+        # some, but not all, rows were skipped and there are no sentinel
+        # columns available to determine which ones; correlation is not
+        # reliable
+        return None
+
+
 class DefaultDialect(Dialect):
     """Default implementation of Dialect"""
 
@@ -1057,6 +1084,25 @@ class DefaultDialect(Dialect):
             sort_by_parameter_order = False
             result = None
 
+        correlate_to_input: Final[bool] = is_returning and bool(
+            context.execution_options.get(
+                "correlate_returning_to_input", False
+            )
+        )
+        input_correlation: Optional[
+            List[Optional[List[Optional[Tuple[Any, ...]]]]]
+        ]
+        if correlate_to_input:
+            # per executed batch, records either a list aligning each
+            # input parameter set of the batch to the raw RETURNING row
+            # it produced (None for rows that were skipped, e.g. by
+            # ON CONFLICT DO NOTHING), or None if the rows returned for
+            # that batch cannot be reliably correlated to the batch's
+            # input parameter sets.
+            input_correlation = context._insertmanyvalues_correlation = []
+        else:
+            input_correlation = None
+
         for imv_batch in compiled._deliver_insertmanyvalues_batches(
             statement,
             parameters,
@@ -1065,6 +1111,7 @@ class DefaultDialect(Dialect):
             batch_size,
             sort_by_parameter_order,
             schema_translate_map,
+            allow_skipped_rows=correlate_to_input,
         ):
             yield imv_batch
 
@@ -1092,9 +1139,16 @@ class DefaultDialect(Dialect):
                         # for implicit sentinel, which is currently single-col
                         # integer autoincrement, do a simple sort.
                         assert not composite_sentinel
-                        result.extend(
-                            sorted(rows, key=operator.itemgetter(-1))
+                        ordered_rows = sorted(
+                            rows, key=operator.itemgetter(-1)
                         )
+                        result.extend(ordered_rows)
+                        if input_correlation is not None:
+                            input_correlation.append(
+                                _positional_input_correlation(
+                                    ordered_rows, len(imv_batch.batch)
+                                )
+                            )
                         continue
 
                     # otherwise, create dictionaries to match up batches
@@ -1145,7 +1199,10 @@ class DefaultDialect(Dialect):
                     else:
                         rows_by_sentinel = {row[-1]: row for row in rows}
 
-                    if len(rows_by_sentinel) != len(imv_batch.batch):
+                    if len(rows_by_sentinel) != len(imv_batch.batch) and not (
+                        correlate_to_input
+                        and len(rows_by_sentinel) < len(imv_batch.batch)
+                    ):
                         # see test_insert_exec.py::
                         # IMVSentinelTest::test_sentinel_incorrect_rowcount
                         # for coverage / demonstration
@@ -1158,32 +1215,75 @@ class DefaultDialect(Dialect):
                             "all cases."
                         )
 
-                    try:
-                        ordered_rows = [
-                            rows_by_sentinel[sentinel_keys]
+                    if correlate_to_input:
+                        # rows may have been skipped by the database, e.g.
+                        # by ON CONFLICT DO NOTHING.  sentinel keys still
+                        # provide exact correlation between the rows that
+                        # were returned and the input parameter sets;
+                        # parameter sets whose sentinel key was not returned
+                        # are correlated to None.
+                        correlated_rows = [
+                            rows_by_sentinel.get(sentinel_keys)
                             for sentinel_keys in imv_batch.sentinel_values
                         ]
-                    except KeyError as ke:
-                        # see test_insert_exec.py::
-                        # IMVSentinelTest::test_sentinel_cant_match_keys
-                        # for coverage / demonstration
-                        raise exc.InvalidRequestError(
-                            f"Can't match sentinel values in result set to "
-                            f"parameter sets; key {ke.args[0]!r} was not "
-                            "found. "
-                            "There may be a mismatch between the datatype "
-                            "passed to the DBAPI driver vs. that which it "
-                            "returns in a result row.  Ensure the given "
-                            "Python value matches the expected result type "
-                            "*exactly*, taking care to not rely upon implicit "
-                            "conversions which may occur such as when using "
-                            "strings in place of UUID or integer values, etc. "
-                        ) from ke
+                        num_matched = sum(
+                            row is not None for row in correlated_rows
+                        )
+                        if num_matched != len(rows_by_sentinel):
+                            # a returned row's sentinel key did not match
+                            # any input parameter set; this indicates a
+                            # datatype mismatch rather than skipped rows
+                            raise exc.InvalidRequestError(
+                                "Can't match sentinel values in result set "
+                                "to parameter sets. There may be a mismatch "
+                                "between the datatype passed to the DBAPI "
+                                "driver vs. that which it returns in a "
+                                "result row.  Ensure the given Python value "
+                                "matches the expected result type *exactly*, "
+                                "taking care to not rely upon implicit "
+                                "conversions which may occur such as when "
+                                "using strings in place of UUID or integer "
+                                "values, etc. "
+                            )
+                        assert input_correlation is not None
+                        input_correlation.append(correlated_rows)
+                        result.extend(
+                            row for row in correlated_rows if row is not None
+                        )
+                    else:
+                        try:
+                            ordered_rows = [
+                                rows_by_sentinel[sentinel_keys]
+                                for sentinel_keys in imv_batch.sentinel_values
+                            ]
+                        except KeyError as ke:
+                            # see test_insert_exec.py::
+                            # IMVSentinelTest::test_sentinel_cant_match_keys
+                            # for coverage / demonstration
+                            raise exc.InvalidRequestError(
+                                f"Can't match sentinel values in result set "
+                                f"to parameter sets; key {ke.args[0]!r} was "
+                                "not found. "
+                                "There may be a mismatch between the "
+                                "datatype passed to the DBAPI driver vs. "
+                                "that which it returns in a result row.  "
+                                "Ensure the given Python value matches the "
+                                "expected result type *exactly*, taking care "
+                                "to not rely upon implicit conversions which "
+                                "may occur such as when using strings in "
+                                "place of UUID or integer values, etc. "
+                            ) from ke
 
-                    result.extend(ordered_rows)
+                        result.extend(ordered_rows)
 
                 else:
                     result.extend(rows)
+                    if input_correlation is not None:
+                        input_correlation.append(
+                            _positional_input_correlation(
+                                rows, len(imv_batch.batch)
+                            )
+                        )
 
     def do_executemany(self, cursor, statement, parameters, context=None):
         cursor.executemany(statement, parameters)
@@ -1515,6 +1615,9 @@ class DefaultExecutionContext(ExecutionContext):
 
     _insertmanyvalues_rows: Optional[List[Tuple[Any, ...]]] = None
     _num_sentinel_cols: int = 0
+    _insertmanyvalues_correlation: Optional[
+        List[Optional[List[Optional[Tuple[Any, ...]]]]]
+    ] = None
 
     @classmethod
     def _init_ddl(

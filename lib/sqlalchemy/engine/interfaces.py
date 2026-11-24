@@ -293,6 +293,7 @@ class _CoreKnownExecutionOptions(TypedDict, total=False):
     schema_translate_map: Optional[SchemaTranslateMapType]
     preserve_rowcount: bool
     driver_column_names: bool
+    correlate_returning_to_input: bool
 
 
 _ExecuteOptions = immutabledict[str, Any]
