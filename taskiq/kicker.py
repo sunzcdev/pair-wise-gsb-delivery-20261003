@@ -59,10 +59,34 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
         """
         Update function's labels before sending.
 
+        Overrides only apply to this kick: the kicker works on a copy
+        of the task's labels, so sending a message never writes back
+        into the registered task template. Calling `kicker()` again
+        produces a fresh kicker that follows the original template.
+
         :param labels: new labels.
         :return: kicker with new labels.
         """
         self.labels.update(labels)
+        return self
+
+    def without_labels(
+        self,
+        *label_names: str,
+    ) -> "AsyncKicker[_FuncParams, _ReturnType]":
+        """
+        Drop labels inherited from the task template for this kick.
+
+        This revokes business labels that the task was registered with,
+        so the resulting message is sent without them. Unknown names are
+        ignored. Like `with_labels`, the change is scoped to this kicker
+        instance only and never mutates the registered task template.
+
+        :param label_names: names of labels to revoke.
+        :return: kicker without the given labels.
+        """
+        for label_name in label_names:
+            self.labels.pop(label_name, None)
         return self
 
     def with_task_id(

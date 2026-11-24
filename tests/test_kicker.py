@@ -73,3 +73,80 @@ async def test_other_labels_still_serialized() -> None:
 
     assert message.labels["retries"] == "3"
     assert message.labels["queue"] == "high_priority"
+
+
+async def test_without_labels_revokes_inherited_labels() -> None:
+    """Labels dropped from the kicker are absent from the prepared message."""
+    broker = InMemoryBroker()
+
+    @broker.task(tenant="acme", priority=5, region="eu")
+    async def run_task() -> None:
+        pass
+
+    message = (
+        run_task.kicker()
+        .without_labels("tenant", "priority")
+        ._prepare_message()
+    )
+
+    assert "tenant" not in message.labels
+    assert "priority" not in message.labels
+    assert message.labels["region"] == "eu"
+
+
+async def test_without_labels_ignores_unknown_names() -> None:
+    """Revoking a label that was never set is a no-op, not an error."""
+    broker = InMemoryBroker()
+
+    @broker.task(tenant="acme")
+    async def run_task() -> None:
+        pass
+
+    message = run_task.kicker().without_labels("missing")._prepare_message()
+
+    assert message.labels == {"tenant": "acme"}
+
+
+async def test_kicker_label_changes_never_reach_task_template() -> None:
+    """with_labels/without_labels operate on a per-kick copy."""
+    broker = InMemoryBroker()
+
+    @broker.task(tenant="acme", priority=5)
+    async def run_task() -> None:
+        pass
+
+    original = dict(run_task.labels)
+
+    run_task.kicker().with_labels(tenant="other", extra="x")
+    run_task.kicker().without_labels("priority")
+
+    assert run_task.labels == original
+
+
+async def test_fresh_kicker_follows_template_after_revocations() -> None:
+    """A new kicker always inherits the untouched template labels."""
+    broker = InMemoryBroker()
+
+    @broker.task(tenant="acme", priority=5)
+    async def run_task() -> None:
+        pass
+
+    revoked_message = run_task.kicker().without_labels("tenant")._prepare_message()
+    assert "tenant" not in revoked_message.labels
+
+    fresh_message = run_task.kicker()._prepare_message()
+    assert fresh_message.labels == {"tenant": "acme", "priority": "5"}
+
+
+async def test_without_labels_returns_same_kicker_for_chaining() -> None:
+    """Revocation is chainable with the other kicker modifiers."""
+    broker = InMemoryBroker()
+    kicker: AsyncKicker[Any, Any] = AsyncKicker(
+        task_name="some_task",
+        broker=broker,
+        labels={"a": 1, "b": 2},
+    )
+
+    assert kicker.without_labels("a") is kicker
+    assert kicker.labels == {"b": 2}
+

@@ -58,6 +58,13 @@ class MultiBroker(AsyncBroker):
     A single `taskiq worker` command consumes messages
     from all inner brokers this way.
 
+    Labels have an explicit scope. The routing label only selects the inner
+    broker: it's stripped from every forwarded message and never reaches the
+    worker. All other labels are business labels and are forwarded untouched.
+    Per-kick overrides (`kicker().with_labels(...)`) and revocations
+    (`kicker().without_labels(...)`) work on a copy of the task's labels, so
+    they never mutate the registered task template.
+
     :param routing: mapping of routing label values to brokers,
         at least one entry is required. Brokers are deduplicated,
         every unique broker is listened to once.
@@ -138,6 +145,13 @@ class MultiBroker(AsyncBroker):
         Messages without the label go to the broker mapped
         to the default routing label.
 
+        Labels have an explicit scope: the routing label only selects
+        the inner broker, so it's stripped from the outgoing copy and
+        never reaches the actual worker. Every other label is a business
+        label and is forwarded untouched. The incoming message is never
+        mutated, so routing decisions cannot leak back into the template
+        that produced the message.
+
         :param message: message to send.
         :raises ValueError: if the message has no routing label
             and no default is configured, or the label value
@@ -157,7 +171,57 @@ class MultiBroker(AsyncBroker):
                 f"There is no broker mapped for queue '{label_value}'. "
                 f"Known queues: {sorted(self.routing)}.",
             )
-        await target_broker.kick(message)
+        await target_broker.kick(
+            self._strip_routing_label(message, target_broker),
+        )
+
+    def _strip_routing_label(
+        self,
+        message: BrokerMessage,
+        target_broker: AsyncBroker,
+    ) -> BrokerMessage:
+        """
+        Build a forwarding copy without the routing-only label.
+
+        The routing label only selects the inner broker, so it's removed
+        together with its serialized type. The payload is decoded with this
+        composite's formatter (the formatter that encoded the message on the
+        kick side) and re-encoded with the target broker's formatter, which
+        is the formatter the worker on that broker decodes with. Keeping one
+        formatter on each side of the round trip prevents double encoding
+        when the composite and the inner broker use different formatters.
+        A copy is returned on purpose: the caller keeps owning the original
+        message, which lets retries and requeues re-route it while reusing
+        the same business labels.
+
+        Payloads that cannot be decoded (for example, hand-crafted test
+        messages) keep their bytes; the outer routing label is still removed,
+        so the routing decision stays internal even for such messages.
+
+        :param message: message about to be forwarded.
+        :param target_broker: broker that will actually send the message.
+        :return: a new message without the routing-only label.
+        """
+        if self.routing_label not in message.labels:
+            return message
+        labels = dict(message.labels)
+        labels.pop(self.routing_label, None)
+        update: dict[str, Any] = {"labels": labels}
+        try:
+            payload = self.formatter.loads(message.message)
+        except Exception:
+            logger.exception(
+                "Cannot decode payload to strip the routing label '%s'. "
+                "The outer label is removed, but the payload is forwarded "
+                "unchanged.",
+                self.routing_label,
+            )
+        else:
+            payload.labels.pop(self.routing_label, None)
+            if payload.labels_types is not None:
+                payload.labels_types.pop(self.routing_label, None)
+            update["message"] = target_broker.formatter.dumps(payload).message
+        return message.model_copy(update=update)
 
     async def listen(self) -> AsyncGenerator["bytes | AckableMessage", None]:
         """

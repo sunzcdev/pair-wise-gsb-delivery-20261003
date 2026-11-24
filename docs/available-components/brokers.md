@@ -142,6 +142,49 @@ Tasks cannot be registered on inner brokers directly: the `MultiBroker`
 disables the `task` decorator of every broker it manages, so such mistakes
 fail loudly instead of silently breaking task lookup in the worker.
 
+### Label scope: routing labels vs business labels
+
+Labels have an explicit scope so that routing options never leak into the
+workers that execute the task:
+
+- **Routing labels are routing-only.** The routing label (`queue_name` by
+  default, or the value of `routing_label`) only selects the inner broker.
+  The `MultiBroker` removes it from the forwarded copy before the message
+  reaches the inner broker, so the actual worker never sees it. Every other
+  label is a **business label** and is forwarded untouched for the worker
+  (and middlewares) to read.
+- **Overrides and revocations apply to a single kick.**
+  `kicker().with_labels(...)` overrides a label for that send, and
+  `kicker().without_labels(...)` revokes labels inherited from the task
+  template for that send. The kicker always works on a copy of the
+  template's labels, so neither call ever writes back into the registered
+  task. The next `kicker()` (and every plain `kiq()`) follows the original
+  template again.
+
+```python
+@broker.task(queue_name="fast", tenant="acme", priority=5)
+async def my_task() -> None: ...
+
+# Send to the "slow" broker only for this kick; the worker still receives
+# tenant and priority, but never the routing-only queue_name label.
+await my_task.kicker().with_labels(queue_name="slow").kiq()
+
+# Keep the template route, but cancel an inherited business label once.
+await my_task.kicker().without_labels("tenant").kiq()
+
+# A plain kick still follows the untouched template.
+await my_task.kiq()
+assert my_task.labels == {
+    "queue_name": "fast",
+    "tenant": "acme",
+    "priority": 5,
+}
+```
+
+The same rules apply to redelivery: retries and `context.requeue()` keep the
+business labels of the original message, while the routing label stays
+internal to the `MultiBroker`.
+
 ### How it works
 
 - Every inner broker is a full broker with its own connection, queue
@@ -153,7 +196,11 @@ fail loudly instead of silently breaking task lookup in the worker.
   guarantees between queues: messages are processed as they arrive.
 - Kicks are routed by the `queue_name` label of the message: the composite
   looks the label value up in the `routing` mapping and kicks the message
-  with the mapped broker.
+  with the mapped broker. The routing label is routing-only: it's stripped
+  from the forwarded copy (and its serialized type) and never reaches the
+  worker, while all business labels pass through unchanged. The incoming
+  message is copied, never mutated, so routing decisions cannot leak back
+  into the task template.
 - Startup and shutdown are delegated to all inner brokers. A failing
   shutdown of one broker is logged and doesn't prevent the others
   from stopping. The `is_worker_process` and `is_scheduler_process`
