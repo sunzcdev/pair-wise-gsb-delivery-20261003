@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 T = TypeVar("T", bound=Callable[..., Any])
 
-__all__ = ["Call", "Func", "_copy_func"]
+__all__ = ["Call", "DependsOn", "Func", "_copy_func", "depends_on"]
 
 
 def __dir__() -> list[str]:
@@ -52,6 +52,90 @@ def _copy_func(src: T, name: str | None = None) -> T:
     dst = functools.update_wrapper(dst, src)  # type: ignore[assignment]
     dst.__kwdefaults__ = src.__kwdefaults__
     return cast("T", dst)
+
+
+class DependsOn:
+    """A dependency on one specific variant of a (possibly parametrized) session.
+
+    A ``requires=`` entry is normally a plain session name: it either names an
+    exact signature or, when it names a session that was parametrized, pulls in
+    *every* variant of that session. A :class:`DependsOn` (see
+    :func:`nox.depends_on`) instead declares which variant is wanted, by the
+    parameter values it was called with and, optionally, by its interpreter.
+    Only the matching variant is scheduled, so unrelated variants -- and any
+    failures of theirs -- cannot affect the requiring session.
+
+    Args:
+        session (str): The declared name of the session, e.g. ``"prepare"``.
+        python (str): The interpreter the variant must use. Defaults to the
+            requiring session's own interpreter when that is a single
+            version; otherwise the variant must match unambiguously.
+        params: The parameter values the variant must have, e.g.
+            ``kind="json"``.
+    """
+
+    __slots__ = ("params", "python", "session")
+
+    def __init__(
+        self, session: str, *, python: str | None = None, **params: Any
+    ) -> None:
+        if not isinstance(session, str) or not session:
+            msg = "depends_on() requires a non-empty session name."
+            raise ValueError(msg)
+        self.session = session
+        self.python = python
+        self.params = dict(params)
+
+    def __repr__(self) -> str:
+        parts = [repr(self.session)]
+        if self.python is not None:
+            parts.append(f"python={self.python!r}")
+        parts.extend(f"{key}={value!r}" for key, value in self.params.items())
+        return f"depends_on({', '.join(parts)})"
+
+
+def depends_on(session: str, *, python: str | None = None, **params: Any) -> DependsOn:
+    """Declare a dependency on exactly one variant of a session.
+
+    Use this inside ``requires=`` to pick a single variant out of a session
+    that is parametrized over one or more axes (including ``@nox.session``'s
+    ``python``). Plain names in ``requires=`` keep their usual meaning.
+
+    The variant is selected by the declared parameter values, e.g.
+    ``depends_on("prepare", kind="json")``, and by the interpreter. Without an
+    explicit ``python=`` the requiring session's own interpreter is used when
+    it has a single version, so a test matrix session depends only on the
+    ``prepare`` cell for its own Python and format.
+
+    If no variant matches, or more than one does, resolving the dependency
+    fails with a message listing the declared selectors and the available
+    variants, so the declaration can be corrected.
+
+    Args:
+        session (str): The name of the session to depend on, e.g.
+            ``"prepare"``.
+        python (str): The interpreter the variant must use, overriding the
+            requiring session's own interpreter.
+        params: Parameter values the variant must have, e.g. ``kind="json"``.
+
+    Example:
+
+    .. code-block:: python
+
+        @nox.session(python=["3.10", "3.11"])
+        @nox.parametrize("kind", ["json", "yaml"])
+        def prepare(session, kind):
+            ...
+
+        @nox.session(python=["3.10", "3.11"], requires=[nox.depends_on("prepare", kind="json")])
+        def check(session):
+            ...
+
+        @nox.session(requires=[nox.depends_on("prepare", python="3.11", kind="yaml")])
+        def lint(session):
+            ...
+    """
+    return DependsOn(session, python=python, **params)
 
 
 class Func:
@@ -76,7 +160,7 @@ class Func:
         tags: Sequence[str] | None = None,
         *,
         default: bool = True,
-        requires: Sequence[str] | None = None,
+        requires: Sequence[str | DependsOn] | None = None,
         download_python: Literal["auto", "never", "always"] | None = None,
         allow_parallel: bool | None = None,
     ) -> None:
@@ -118,16 +202,20 @@ class Func:
         )
 
     @property
-    def requires(self) -> list[str]:
+    def requires(self) -> list[str | DependsOn]:
         # Compute dynamically on lookup since ``self.python`` can be modified after
         # creation (e.g. on an instance from ``self.copy``).
         return list(map(self.format_dependency, self._requires))
 
     @requires.setter
-    def requires(self, value: Sequence[str]) -> None:
+    def requires(self, value: Sequence[str | DependsOn]) -> None:
         self._requires = list(value)
 
-    def format_dependency(self, dependency: str) -> str:
+    def format_dependency(self, dependency: str | DependsOn) -> str | DependsOn:
+        if isinstance(dependency, DependsOn):
+            # Variant selectors are interpreted against the manifest when the
+            # requiring session runs, so they are passed through unchanged.
+            return dependency
         if isinstance(self.python, (bool, str)) or self.python is None:
             formatted = dependency.format(python=self.python, py=self.python)
             if (

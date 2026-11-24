@@ -368,7 +368,10 @@ anything yet::
 Sessions are scheduled according to their dependencies: a session declared with
 ``requires=`` does not start until all of its prerequisites have completed
 successfully, and is reported as ``aborted`` (and never started) if any
-prerequisite fails. ``--stop-on-first-error`` stops launching new sessions after
+prerequisite fails. A prerequisite declared with :func:`nox.depends_on`
+selects exactly one variant of a parametrized session, so only that cell is
+scheduled -- failures in other cells cannot abort this session.
+``--stop-on-first-error`` stops launching new sessions after
 the first failure; sessions already running are allowed to finish, and their
 results still appear in the summary and in any ``--report`` file.
 

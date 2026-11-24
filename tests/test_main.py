@@ -738,6 +738,82 @@ def test_main_requries_modern_param(
     assert returncode == 0
 
 
+def test_main_requires_variant_selector(
+    run_nox: Callable[..., tuple[Any, Any, Any]],
+) -> None:
+    # ``consume`` is a 2-cell matrix; each cell only pulls in the ``prepare``
+    # cell for its own interpreter and format. The failing ``json`` cells (and
+    # the other interpreter's cell) must not be scheduled or executed, and the
+    # successful ``yaml`` prerequisite must not be truncated by them.
+    noxfile = os.path.join(RESOURCES, "noxfile_requires.py")
+    returncode, stdout, stderr = run_nox(f"--noxfile={noxfile}", "--session=consume")
+    assert returncode == 0
+
+    lines = stdout.rstrip("\n").split("\n")
+    # Only the matching prepare variants ran, once per consume cell.
+    assert lines == [
+        "prepare-3.10-yaml",
+        "consume-3.10",
+        "prepare-3.11-yaml",
+        "consume-3.11",
+    ]
+    # The unrelated failing variant is neither mentioned nor executed.
+    assert "json" not in stderr
+    assert "unrelated failure" not in stderr
+
+
+def test_main_requires_variant_selector_pinned(
+    run_nox: Callable[..., tuple[Any, Any, Any]],
+) -> None:
+    # ``lint`` pins interpreter and format explicitly: exactly one prepare cell.
+    noxfile = os.path.join(RESOURCES, "noxfile_requires.py")
+    returncode, stdout, _stderr = run_nox(f"--noxfile={noxfile}", "--session=lint")
+    assert returncode == 0
+    assert stdout.rstrip("\n").split("\n") == ["prepare-3.11-yaml", "lint"]
+
+
+def test_main_requires_variant_selector_ambiguous(
+    run_nox: Callable[..., tuple[Any, Any, Any]],
+) -> None:
+    # A selector matching more than one variant explains the conflict and
+    # names the available variants; nothing runs.
+    noxfile = os.path.join(RESOURCES, "noxfile_requires.py")
+    returncode, stdout, stderr = run_nox(f"--noxfile={noxfile}", "--session=ambiguous")
+    assert returncode != 0
+    assert stdout == ""
+    assert "depends_on('prepare', kind='yaml') is ambiguous" in stderr
+    assert "Available variants: prepare(kind='json', python='3.10')" in stderr
+    # The unrelated failing cell is only described, never executed.
+    assert "unrelated failure" not in stderr
+
+
+def test_main_requires_variant_selector_no_match(
+    run_nox: Callable[..., tuple[Any, Any, Any]],
+) -> None:
+    # A selector matching no variant lists them so the declaration can be fixed.
+    noxfile = os.path.join(RESOURCES, "noxfile_requires.py")
+    returncode, stdout, stderr = run_nox(
+        f"--noxfile={noxfile}", "--session=missing_variant"
+    )
+    assert returncode != 0
+    assert stdout == ""
+    assert "depends_on('prepare', kind='toml') matches no variant of prepare." in stderr
+    assert "Available variants:" in stderr
+
+
+def test_main_requires_variant_selector_missing_session(
+    run_nox: Callable[..., tuple[Any, Any, Any]],
+) -> None:
+    # A selector naming an unknown session keeps the familiar missing-session
+    # diagnostic rather than silently selecting nothing.
+    noxfile = os.path.join(RESOURCES, "noxfile_requires.py")
+    returncode, _, stderr = run_nox(
+        f"--noxfile={noxfile}", "--session=missing_session"
+    )
+    assert returncode != 0
+    assert "Session not found: does_not_exist" in stderr
+
+
 def test_main_list_with_empty_parametrize(
     run_nox: Callable[..., tuple[Any, Any, Any]],
 ) -> None:

@@ -511,6 +511,48 @@ More sophisticated tag assignment can be performed by passing a generator to the
 In this example, the ``quick`` tag is assigned to the single combination of the latest version of the dependency along with the SQLite database backend, allowing a developer to run the tests in a single configuration as a basic sanity test.  The ``standard`` tag, in contrast, selects combinations targeting either the latest version of the dependency *or* the SQLite database backend.  If the developer runs ``nox --tags standard``, the tests will be run against all supported versions of the dependency with the SQLite backend, as well as against all supported database backends under the latest version of the dependency, giving much more comprehensive test coverage while using only five of the potential nine test matrix combinations.
 
 
+.. _requiring-a-variant:
+
+Requiring one variant of a parametrized session
+-----------------------------------------------
+
+By default, a ``requires=`` entry naming a parametrized session pulls in *every*
+variant of that session. To depend on a single cell of a matrix instead, pass a
+:func:`nox.depends_on` selector:
+
+.. code-block:: python
+
+    @nox.session(python=["3.10", "3.11"])
+    @nox.parametrize("kind", ["json", "yaml"])
+    def prepare(session, kind):
+        ...
+
+    # Matches prepare for this session's own interpreter, with kind="json".
+    @nox.session(python=["3.10", "3.11"], requires=[nox.depends_on("prepare", kind="json")])
+    def check(session):
+        ...
+
+A dependency on a non-parametrized session still reads naturally, and an
+explicit ``python`` pins the interpreter when the requiring session is not
+itself parametrized over one:
+
+.. code-block:: python
+
+    @nox.session(requires=[nox.depends_on("prepare", python="3.11", kind="yaml")])
+    def lint(session):
+        ...
+
+Variants are matched by their declared parameter values (and interpreter), not
+by a prefix of their name. Only the matching variant is scheduled, so an
+unrelated variant -- even a failing one -- is neither run nor treated as a
+prerequisite of this session. A selector that matches no variant, or more than
+one, is reported before anything runs, naming the declared selectors and the
+available variants. Plain names in ``requires=`` keep their existing meaning,
+so older Noxfiles are unaffected.
+
+.. autofunction:: nox.depends_on
+
+
 The session object
 ------------------
 

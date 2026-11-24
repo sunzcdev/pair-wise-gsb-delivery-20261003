@@ -22,7 +22,7 @@ import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, overload
 
-from ._decorators import Func
+from ._decorators import DependsOn, Func
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -62,7 +62,7 @@ def session_decorator(
     tags: Sequence[str] | None = ...,
     *,
     default: bool = ...,
-    requires: Sequence[str] | None = ...,
+    requires: Sequence[str | DependsOn] | None = ...,
     download_python: Literal["auto", "never", "always"] | None = None,
     allow_parallel: bool | None = ...,
 ) -> Callable[[RawFunc | Func], Func]: ...
@@ -80,7 +80,7 @@ def session_decorator(
     tags: Sequence[str] | None = None,
     *,
     default: bool = True,
-    requires: Sequence[str] | None = None,
+    requires: Sequence[str | DependsOn] | None = None,
     download_python: Literal["auto", "never", "always"] | None = None,
     allow_parallel: bool | None = None,
 ) -> Func | Callable[[RawFunc | Func], Func]:

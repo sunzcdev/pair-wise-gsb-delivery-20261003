@@ -19,6 +19,7 @@ __lazy_modules__ = {
     "hashlib",
     "humanize",
     "inspect",
+    "nox._decorators",
     "nox.command",
     "nox.logger",
     "nox.virtualenv",
@@ -47,6 +48,7 @@ import humanize
 
 import nox.command
 import nox.virtualenv
+from nox._decorators import DependsOn
 from nox.logger import logger
 from nox.popen import DEFAULT_INTERRUPT_TIMEOUT, DEFAULT_TERMINATE_TIMEOUT
 from nox.virtualenv import (
@@ -1134,34 +1136,37 @@ class SessionRunner:
             sessions_by_id (Mapping[str, ~nox.sessions.SessionRunner] | None): An
                 optional mapping from both dependency signatures and names to
                 corresponding ``SessionRunner``s. If this is not provided,
-                ``self.manifest.all_sessions_by_signature`` will be used to find the
-                sessions corresponding to signatures in ``self.func.requires``, and
-                non-signature names (i.e. names of sessions that were parameterized with
-                multiple Pythons) in ``self.func.requires`` will be resolved via
-                ``self.manifest.parametrized_sessions_by_name``.
+                ``self.manifest`` will be used to resolve ``self.func.requires``.
+                A plain name/signature is looked up as before; a
+                ``depends_on(...)`` selector is resolved to exactly one variant.
 
         Returns:
             Iterator[~nox.session.SessionRunner]
 
         Raises:
             KeyError: If a dependency's session could not be found.
+            ~nox.manifest.DependencyVariantError: If a ``depends_on(...)``
+                selector matches no variant or more than one.
         """
         try:
-            if sessions_by_id is None:
-                sessions_by_signature = self.manifest.all_sessions_by_signature
-                parametrized_sessions_by_name = (
-                    self.manifest.parametrized_sessions_by_name
-                )
-                for requirement in self.func.requires:
-                    if requirement in sessions_by_signature:
-                        yield sessions_by_signature[requirement]
-                    else:
-                        yield from parametrized_sessions_by_name[requirement]
-            else:
-                yield from map(sessions_by_id.__getitem__, self.func.requires)
+            for requirement in self.func.requires:
+                if isinstance(requirement, DependsOn):
+                    # Variant selectors are resolved against the full manifest so
+                    # that only the declared variant is scheduled, regardless of
+                    # the flat signature mapping (which collapses duplicate
+                    # names like ``prepare-3.10`` onto the last variant).
+                    yield from self.manifest.resolve_dependency(requirement, self)
+                elif sessions_by_id is None:
+                    yield from self.manifest.resolve_dependency(requirement)
+                else:
+                    yield sessions_by_id[requirement]
         except KeyError as exc:
-            msg = f"Session not found: {exc.args[0]}"
-            raise KeyError(msg) from exc
+            # ``resolve_dependency`` already prefixes its message; a bare key
+            # from a direct mapping lookup does not.
+            text = str(exc.args[0] if exc.args else exc)
+            if not text.startswith("Session not found: "):
+                text = f"Session not found: {text}"
+            raise KeyError(text) from exc
 
     def _create_venv(self) -> None:
         self.venv = get_virtualenv(

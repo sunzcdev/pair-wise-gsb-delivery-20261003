@@ -103,6 +103,40 @@ def test_session_decorator_py_alias() -> None:
     assert unit_tests.python == ["3.5", "3.6"]
 
 
+def test_session_decorator_depends_on_passthrough() -> None:
+    # A ``depends_on`` selector in ``requires=`` is preserved verbatim; plain
+    # names keep their usual ``{python}`` formatting.
+    @registry.session_decorator(requires=[nox.depends_on("prepare", kind="json")])
+    def check(session: nox.Session) -> None:
+        pass
+
+    selector = check.requires[0]
+    assert isinstance(selector, nox.DependsOn)
+    assert selector.session == "prepare"
+    assert selector.params == {"kind": "json"}
+    assert selector.python is None
+
+    @registry.session_decorator(python="3.11", requires=["prepare-{python}"])
+    def templated(session: nox.Session) -> None:
+        pass
+
+    assert templated.requires == ["prepare-3.11"]
+
+
+def test_depends_on_repr() -> None:
+    assert repr(nox.depends_on("prepare", kind="json")) == (
+        "depends_on('prepare', kind='json')"
+    )
+    assert repr(nox.depends_on("prepare", python="3.11")) == (
+        "depends_on('prepare', python='3.11')"
+    )
+
+
+def test_depends_on_requires_name() -> None:
+    with pytest.raises(ValueError, match="non-empty session name"):
+        nox.depends_on("")
+
+
 def test_session_decorator_py_alias_error() -> None:
     with pytest.raises(ValueError, match="argument"):
 

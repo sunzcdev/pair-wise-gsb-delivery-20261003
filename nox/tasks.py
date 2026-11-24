@@ -41,7 +41,7 @@ from nox import _merge, registry
 from nox._resolver import CycleError
 from nox._version import InvalidVersionSpecifier, VersionCheckFailed, check_nox_version
 from nox.logger import logger
-from nox.manifest import WARN_PYTHONS_IGNORED, Manifest
+from nox.manifest import WARN_PYTHONS_IGNORED, DependencyVariantError, Manifest
 from nox.sessions import Result, Status, _duration_str, resolve_allow_parallel
 
 if TYPE_CHECKING:
@@ -263,7 +263,8 @@ def filter_manifest(manifest: Manifest, global_config: NoxConfig) -> Manifest | 
     # Add dependencies, unless --no-dependencies limits the run to only the
     # explicitly selected sessions (as the parallel runner's children do).
     # Even then, a ``requires=`` entry naming a session that doesn't exist is
-    # still an error, the prerequisites just aren't queued.
+    # still an error, the prerequisites just aren't queued. A ``depends_on(...)``
+    # selector that matches no variant (or several) is reported the same way.
     try:
         if global_config.no_dependencies:
             for session, selected in manifest.list_all_sessions():
@@ -271,9 +272,9 @@ def filter_manifest(manifest: Manifest, global_config: NoxConfig) -> Manifest | 
                     list(session.get_direct_dependencies())
         else:
             manifest.add_dependencies()
-    except (KeyError, CycleError) as exc:
+    except (KeyError, CycleError, DependencyVariantError) as exc:
         logger.error("Error while resolving session dependencies.")
-        logger.error(exc.args[0])
+        logger.error(exc.args[0] if exc.args else str(exc))
         return 3
 
     # Return the modified manifest.

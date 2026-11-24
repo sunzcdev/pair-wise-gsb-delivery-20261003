@@ -23,7 +23,7 @@ import operator
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
-from nox._decorators import Call, Func
+from nox._decorators import Call, DependsOn, Func
 from nox._resolver import CycleError, lazy_stable_topo_sort
 from nox.sessions import Session, SessionRunner
 
@@ -32,7 +32,12 @@ if TYPE_CHECKING:
 
     from nox._options import NoxConfig
 
-__all__ = ["WARN_PYTHONS_IGNORED", "Manifest", "keyword_match"]
+__all__ = [
+    "DependencyVariantError",
+    "WARN_PYTHONS_IGNORED",
+    "Manifest",
+    "keyword_match",
+]
 
 
 def __dir__() -> list[str]:
@@ -42,9 +47,76 @@ def __dir__() -> list[str]:
 WARN_PYTHONS_IGNORED = "python_ignored"
 
 
+class DependencyVariantError(ValueError):
+    """A ``depends_on(...)`` selector matched no variant, or more than one."""
+
+
 def _unique_list(*args: str) -> list[str]:
     """Return a list without duplicates, while preserving order."""
     return list(dict.fromkeys(args))
+
+
+def _variant_call_spec(session: SessionRunner) -> Mapping[str, Any]:
+    """The parameters a session variant was called with (empty if unparametrized)."""
+    return getattr(session.func, "call_spec", None) or {}
+
+
+def _variant_python(session: SessionRunner) -> Any:
+    """The interpreter a variant runs on, from either parametrization source.
+
+    ``@nox.session(python=...)`` sets ``func.python`` and is authoritative.
+    A session may also be parametrized with an argument named ``python`` (for
+    example under ``venv_backend="none"``), in which case the value lives in
+    the variant's call spec.
+    """
+    if isinstance(session.func.python, str):
+        return session.func.python
+    return _variant_call_spec(session).get("python")
+
+
+def _variant_matches(
+    dependency: DependsOn, session: SessionRunner, requirer_python: Any = None
+) -> bool:
+    """Whether a session variant satisfies a selector's interpreter and params.
+
+    An explicit ``python=`` on the selector is authoritative. Otherwise a
+    requiring session's own interpreter narrows the choice, but only when the
+    dependency actually has an interpreter axis (handled by the caller).
+    """
+    expected_python = (
+        dependency.python if dependency.python is not None else requirer_python
+    )
+    if expected_python is not None and _variant_python(session) != expected_python:
+        return False
+    call_spec = _variant_call_spec(session)
+    return all(
+        key in call_spec and call_spec[key] == value
+        for key, value in dependency.params.items()
+    )
+
+
+def _describe_selector(dependency: DependsOn) -> str:
+    """A readable rendering of the selectors a ``depends_on`` declares."""
+    parts: list[str] = []
+    if dependency.python is not None:
+        parts.append(f"python={dependency.python!r}")
+    parts.extend(f"{key}={value!r}" for key, value in dependency.params.items())
+    return ", ".join(parts) if parts else "(no selectors declared)"
+
+
+def _describe_variant(session: SessionRunner) -> str:
+    """A readable rendering of a session variant's selectors."""
+    parts: list[str] = []
+    python = _variant_python(session)
+    if python is not None:
+        parts.append(f"python={python!r}")
+    parts.extend(
+        f"{key}={value!r}"
+        for key, value in _variant_call_spec(session).items()
+        if key != "python" or python is None
+    )
+    label = session.friendly_name
+    return f"{label} [{', '.join(parts)}]" if parts else f"{label} [(unparametrized)]"
 
 
 class Manifest:
@@ -400,6 +472,100 @@ class Manifest:
 
         # Return the list of sessions.
         return sessions
+
+    def resolve_dependency(
+        self, dependency: str | DependsOn, requirer: SessionRunner | None = None
+    ) -> list[SessionRunner]:
+        """Resolve a single ``requires=`` entry to the sessions it names.
+
+        A plain string keeps its historical meaning: it is looked up as an
+        exact signature, or, when it names a session that was parametrized,
+        pulls in every variant of that session. A :class:`~nox._decorators.DependsOn`
+        instead selects exactly one variant by declared parameter values (and
+        optionally interpreter).
+
+        Args:
+            dependency: A ``requires=`` entry: a plain name/signature or a
+                ``depends_on(...)`` selector.
+            requirer: The session declaring the dependency, if any. Used to
+                narrow a variant selector to the requirer's own interpreter.
+
+        Returns:
+            list[~nox.sessions.SessionRunner]: The matching sessions.
+
+        Raises:
+            KeyError: If the named session does not exist at all.
+            ValueError: If a selector matches no variant or more than one.
+        """
+        sessions_by_signature = self.all_sessions_by_signature
+        if isinstance(dependency, DependsOn):
+            return self._resolve_variant(dependency, requirer)
+        if dependency in sessions_by_signature:
+            return [sessions_by_signature[dependency]]
+        try:
+            return list(self.parametrized_sessions_by_name[dependency])
+        except KeyError:
+            msg = f"Session not found: {dependency}"
+            raise KeyError(msg) from None
+
+    def _resolve_variant(
+        self, dependency: DependsOn, requirer: SessionRunner | None = None
+    ) -> list[SessionRunner]:
+        """Resolve a variant selector to exactly one matching session."""
+        name = dependency.session
+        # Scan every session by its declared name rather than the parametrized
+        # map: a session parametrized on one interpreter is not "multi" there,
+        # and a cross product of interpreters and parameters must still expose
+        # every cell to the selector.
+        named = [session for session in self._all_sessions if session.name == name]
+        if not named:
+            msg = f"Session not found: {name}"
+            raise KeyError(msg)
+
+        # Placeholder sessions from an empty @nox.parametrize have no
+        # signatures; they can be listed but cannot be addressed as a
+        # prerequisite (plain names cannot reach them either).
+        candidates = [session for session in named if session.signatures]
+
+        # A requiring session with a fixed interpreter pins the variant to that
+        # interpreter, but only when the dependency actually varies by
+        # interpreter. A dependency with a single unversioned variant stays
+        # selectable regardless of the requirer's interpreter.
+        requirer_python: Any = None
+        if dependency.python is None and isinstance(requirer, SessionRunner):
+            if isinstance(requirer.func.python, str) and any(
+                _variant_python(candidate) is not None for candidate in candidates
+            ):
+                requirer_python = requirer.func.python
+
+        matches = [
+            candidate
+            for candidate in candidates
+            if _variant_matches(dependency, candidate, requirer_python)
+        ]
+        if len(matches) == 1:
+            return matches
+
+        selectors = _describe_selector(dependency)
+        available = ", ".join(_describe_variant(candidate) for candidate in candidates)
+        if not candidates:
+            msg = (
+                f"{dependency!r} matches no variant of {name}: the session has no"
+                f" available variants. Selectors: {selectors}."
+            )
+        elif matches:
+            msg = (
+                f"{dependency!r} is ambiguous: it matches {len(matches)} variants of"
+                f" {name} ({', '.join(_describe_variant(match) for match in matches)})."
+                f" Selectors: {selectors}. Available variants: {available}."
+                " Add or narrow the selector."
+            )
+        else:
+            msg = (
+                f"{dependency!r} matches no variant of {name}."
+                f" Selectors: {selectors}. Available variants: {available}."
+            )
+        raise DependencyVariantError(msg)
 
     def notify(
         self, session: str | SessionRunner, posargs: Iterable[str] | None = None

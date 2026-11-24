@@ -984,6 +984,60 @@ class TestSession:
         assert manifest["test"].execute()
         assert manifest["lint"].execute()
 
+    def test_get_direct_dependencies_variant_selector_only_matching(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A ``depends_on`` selector on a requirer yields only the variant for
+        # that requirer's interpreter and declared parameters, so an unrelated
+        # failing cell can never become a prerequisite.
+        registry: dict[str, nox._decorators.Func] = {}
+        monkeypatch.setattr("nox.registry._REGISTRY", registry)
+
+        @nox.session(venv_backend="none")
+        @nox.parametrize("python", ["3.10", "3.11"])
+        @nox.parametrize("kind", ["json", "yaml"])
+        def prepare(session: nox.Session, kind: str) -> None:
+            pass
+
+        @nox.session(
+            venv_backend="none", requires=[nox.depends_on("prepare", kind="yaml")]
+        )
+        @nox.parametrize("python", ["3.10", "3.11"])
+        def check(session: nox.Session) -> None:
+            pass
+
+        config = _options.options.namespace(posargs=[], envdir=".nox")
+        manifest = nox.manifest.Manifest(registry, config)
+
+        requirer = manifest["check(python='3.10')"]
+        deps = list(requirer.get_direct_dependencies())
+        assert len(deps) == 1
+        assert deps[0].func.python == "3.10"
+        assert deps[0].func.call_spec == {"kind": "yaml"}
+
+    def test_get_direct_dependencies_plain_name_keeps_all_variants(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Backwards compatibility: a plain ``requires=`` name still pulls in
+        # every variant of a parametrized session.
+        registry: dict[str, nox._decorators.Func] = {}
+        monkeypatch.setattr("nox.registry._REGISTRY", registry)
+
+        @nox.session(venv_backend="none")
+        @nox.parametrize("python", ["3.10", "3.11"])
+        def prepare(session: nox.Session) -> None:
+            pass
+
+        @nox.session(venv_backend="none", requires=["prepare"])
+        def consume(session: nox.Session) -> None:
+            pass
+
+        config = _options.options.namespace(posargs=[], envdir=".nox")
+        manifest = nox.manifest.Manifest(registry, config)
+
+        deps = list(manifest["consume"].get_direct_dependencies())
+        assert [dep.func.python for dep in deps] == ["3.10", "3.11"]
+
     def test_log(self, caplog: pytest.LogCaptureFixture) -> None:
         caplog.set_level(logging.INFO)
         session, _ = self.make_session_and_runner()

@@ -128,3 +128,57 @@ def v(session):
 @nox.session(requires=["u"])
 def w(session):
     print(session.name)
+
+
+# A 2x2 matrix of interpreter and data format. ``yaml`` always succeeds; every
+# ``json`` cell fails, so a selector that picks the wrong cell is visible.
+@nox.session(venv_backend="none", default=False)
+@nox.parametrize("python", ["3.10", "3.11"])
+@nox.parametrize("kind", ["json", "yaml"])
+def prepare(session, kind):
+    print(f"prepare-{session.python}-{kind}")
+    if kind == "json":
+        msg = "unrelated failure"
+        session.error(msg)
+
+
+# Depends only on the ``prepare`` cell sharing its own interpreter, so the
+# failing ``json`` cell (and the other interpreter's cell) never runs.
+@nox.session(
+    venv_backend="none", default=False, requires=[nox.depends_on("prepare", kind="yaml")]
+)
+@nox.parametrize("python", ["3.10", "3.11"])
+def consume(session):
+    print(f"consume-{session.python}")
+
+
+# Explicitly pins both the interpreter and the format, regardless of its own.
+@nox.session(
+    venv_backend="none",
+    default=False,
+    requires=[nox.depends_on("prepare", python="3.11", kind="yaml")],
+)
+def lint(session):
+    print("lint")
+
+
+# A selector that matches more than one variant is rejected before anything runs.
+@nox.session(venv_backend="none", default=False, requires=[nox.depends_on("prepare", kind="yaml")])
+def ambiguous(session):
+    print("ambiguous")
+
+
+# A selector matching no variant is rejected before anything runs.
+@nox.session(
+    venv_backend="none", default=False, requires=[nox.depends_on("prepare", kind="toml")]
+)
+def missing_variant(session):
+    print("missing_variant")
+
+
+# A selector naming an unknown session is reported as a missing session.
+@nox.session(
+    venv_backend="none", default=False, requires=[nox.depends_on("does_not_exist")]
+)
+def missing_session(session):
+    print("missing_session")

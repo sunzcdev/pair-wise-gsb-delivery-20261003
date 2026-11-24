@@ -252,6 +252,24 @@ def test_filter_manifest_no_dependencies_ignores_unselected_requires() -> None:
     assert tasks.filter_manifest(manifest, config) is manifest
 
 
+def test_filter_manifest_no_dependencies_still_validates_variant_selector() -> None:
+    # A ``depends_on(...)`` selector that matches no variant is a declaration
+    # error even under --no-dependencies: the prerequisite isn't queued, but a
+    # selector that would silently pick nothing must still be reported.
+    broken = _make_session_func(requires=[nox.depends_on("prepare", kind="toml")])
+
+    @nox.session(venv_backend="none")
+    @nox.parametrize("kind", ["json", "yaml"])
+    def prepare(session: object, kind: str) -> None:
+        pass
+
+    config = _options.options.namespace(
+        sessions=None, pythons=(), keywords=None, posargs=[], no_dependencies=True
+    )
+    manifest = Manifest({"prepare": prepare, "broken": broken}, config)
+    assert tasks.filter_manifest(manifest, config) == 3
+
+
 def test_filter_manifest_not_found() -> None:
     config = _options.options.namespace(
         sessions=("baz",), pythons=(), keywords=None, posargs=[]

@@ -17,6 +17,7 @@ from __future__ import annotations
 __lazy_modules__ = {
     "nox",
     "nox._cli",
+    "nox._decorators",
     "nox._options",
     "nox._parametrize",
     "nox.registry",
@@ -28,6 +29,7 @@ from types import ModuleType
 
 from nox import project
 from nox._cli import main
+from nox._decorators import DependsOn, depends_on
 from nox._options import noxfile_options as options
 from nox._parametrize import Param as param  # noqa: N813
 from nox._parametrize import parametrize_decorator as parametrize
@@ -37,7 +39,9 @@ from nox.sessions import Session
 needs_version: str | None = None
 
 __all__ = [
+    "DependsOn",
     "Session",
+    "depends_on",
     "main",
     "needs_version",
     "options",

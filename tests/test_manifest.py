@@ -25,6 +25,7 @@ import nox
 from nox._decorators import Func
 from nox.manifest import (
     WARN_PYTHONS_IGNORED,
+    DependencyVariantError,
     KeywordLocals,
     Manifest,
     _normalize_arg,
@@ -536,6 +537,152 @@ def test_null_session_function() -> None:
     session = mock.Mock(spec=("skip",))
     _null_session_func(session)
     assert session.skip.called
+
+
+def _make_variant_manifest() -> Manifest:
+    """A manifest with one 2x2 ``prepare`` matrix and a ``check`` per cell."""
+
+    @nox.session(venv_backend="none")
+    @nox.parametrize("python", ["3.10", "3.11"])
+    @nox.parametrize("kind", ["json", "yaml"])
+    def prepare(session: nox.Session, kind: str) -> None:
+        pass
+
+    @nox.session(
+        venv_backend="none", requires=[nox.depends_on("prepare", kind="yaml")]
+    )
+    @nox.parametrize("python", ["3.10", "3.11"])
+    def check(session: nox.Session) -> None:
+        pass
+
+    return Manifest({"prepare": prepare, "check": check}, create_mock_config())
+
+
+def test_resolve_dependency_plain_name_pulls_all_variants() -> None:
+    manifest = _make_variant_manifest()
+    # A plain name keeps the old rule: every variant of the parametrized session.
+    resolved = manifest.resolve_dependency("prepare")
+    assert [s.func.python for s in resolved] == ["3.10", "3.10", "3.11", "3.11"]
+    assert [s.func.call_spec["kind"] for s in resolved] == [
+        "json",
+        "yaml",
+        "json",
+        "yaml",
+    ]
+
+
+def test_resolve_dependency_plain_signature() -> None:
+    manifest = _make_variant_manifest()
+    resolved = manifest.resolve_dependency("prepare(kind='yaml', python='3.10')")
+    assert len(resolved) == 1
+    assert resolved[0].func.python == "3.10"
+    assert resolved[0].func.call_spec == {"kind": "yaml"}
+
+
+def test_resolve_dependency_variant_selector_matches_one() -> None:
+    manifest = _make_variant_manifest()
+    selector = nox.depends_on("prepare", python="3.11", kind="yaml")
+    resolved = manifest.resolve_dependency(selector)
+    assert len(resolved) == 1
+    assert resolved[0].func.python == "3.11"
+    assert resolved[0].func.call_spec == {"kind": "yaml"}
+
+
+def test_resolve_dependency_variant_selector_uses_requirer_python() -> None:
+    manifest = _make_variant_manifest()
+    requirer = manifest["check(python='3.10')"]
+    resolved = manifest.resolve_dependency(
+        nox.depends_on("prepare", kind="yaml"), requirer
+    )
+    assert len(resolved) == 1
+    assert resolved[0].func.python == "3.10"
+    assert resolved[0].func.call_spec == {"kind": "yaml"}
+
+
+def test_resolve_dependency_variant_selector_ambiguous() -> None:
+    manifest = _make_variant_manifest()
+    with pytest.raises(DependencyVariantError) as excinfo:
+        manifest.resolve_dependency(nox.depends_on("prepare", kind="yaml"))
+    message = str(excinfo.value)
+    assert "ambiguous" in message
+    assert "Selectors: kind='yaml'" in message
+    assert "Available variants:" in message
+
+
+def test_resolve_dependency_variant_selector_no_match() -> None:
+    manifest = _make_variant_manifest()
+    with pytest.raises(DependencyVariantError) as excinfo:
+        manifest.resolve_dependency(nox.depends_on("prepare", kind="toml"))
+    message = str(excinfo.value)
+    assert "matches no variant of prepare" in message
+    assert "Available variants:" in message
+
+
+def test_resolve_dependency_variant_selector_missing_session() -> None:
+    manifest = _make_variant_manifest()
+    with pytest.raises(KeyError, match="Session not found: does_not_exist"):
+        manifest.resolve_dependency(nox.depends_on("does_not_exist"))
+
+
+def test_resolve_dependency_single_variant_session() -> None:
+    # A non-parametrized session is still selectable by a variant selector.
+    manifest = Manifest({}, create_mock_config())
+
+    def single(session: nox.Session) -> None:
+        pass
+
+    for session in manifest.make_session("single", Func(single, python=None)):
+        manifest.add_session(session)
+
+    resolved = manifest.resolve_dependency(nox.depends_on("single"))
+    assert len(resolved) == 1
+
+
+def test_resolve_dependency_variant_selector_empty_parametrize() -> None:
+    # A session whose parameters were empty has only a signature-less
+    # placeholder; a selector reports that rather than returning an
+    # unreachable prerequisite.
+    manifest = Manifest({}, create_mock_config())
+
+    @nox.parametrize("kind", [])
+    def empty(session: nox.Session, kind: str) -> None:
+        pass
+
+    for session in manifest.make_session("empty", Func(empty, python=None)):
+        manifest.add_session(session)
+
+    with pytest.raises(DependencyVariantError, match="no available variants"):
+        manifest.resolve_dependency(nox.depends_on("empty"))
+
+
+def test_resolve_dependency_variant_selector_python_as_param() -> None:
+    # When the session function itself takes a ``python`` argument, its value
+    # lives in the variant's call spec; a selector still matches on it.
+    manifest = Manifest({}, create_mock_config())
+
+    @nox.parametrize("python,dependency", [("3.10", "1.0"), ("3.11", "2.0")])
+    def build(session: nox.Session, python: str, dependency: str) -> None:
+        pass
+
+    for session in manifest.make_session("build", Func(build, python=None)):
+        manifest.add_session(session)
+
+    resolved = manifest.resolve_dependency(
+        nox.depends_on("build", python="3.10", dependency="1.0")
+    )
+    assert len(resolved) == 1
+    assert resolved[0].func.call_spec == {"python": "3.10", "dependency": "1.0"}
+
+
+def test_add_dependencies_with_variant_selector_only_one_cell() -> None:
+    manifest = _make_variant_manifest()
+    manifest.filter_by_name(("check(python='3.11')",))
+    manifest.add_dependencies()
+    # Only the selected ``check`` cell plus its own-interpreter ``prepare`` cell.
+    assert [session.friendly_name for session in manifest] == [
+        "prepare(kind='yaml', python='3.11')",
+        "check(python='3.11')",
+    ]
 
 
 def test_keyword_locals_length() -> None:

@@ -425,6 +425,37 @@ sessions are supported. You can also get the current Python version with
         session.install("coverage")
         session.run("coverage")
 
+Requiring one variant of a parametrized session
+-----------------------------------------------
+
+A plain name in ``requires=`` pulls in *every* variant of a parametrized
+session. When you want exactly one cell of a matrix -- the ``prepare`` run for
+your own interpreter and data format, say -- use :func:`nox.depends_on`:
+
+.. code-block:: python
+
+    @nox.session(python=["3.10", "3.11"])
+    @nox.parametrize("kind", ["json", "yaml"])
+    def prepare(session, kind):
+        ...
+
+    # Each check cell depends only on prepare for its own Python, with kind="json".
+    @nox.session(python=["3.10", "3.11"], requires=[nox.depends_on("prepare", kind="json")])
+    def check(session):
+        ...
+
+    # lint is not parametrized, so pin the interpreter explicitly.
+    @nox.session(requires=[nox.depends_on("prepare", python="3.11", kind="yaml")])
+    def lint(session):
+        ...
+
+The selected variant is matched by its declared parameters, not by a prefix of
+its name. Only that variant is scheduled, so an unrelated cell -- even a
+failing one -- cannot become a prerequisite or abort this session. If the
+selectors match no variant, or more than one, Nox explains the mismatch and
+lists the available variants. Plain names keep their usual meaning, so existing
+``requires=`` uses are unaffected.
+
 Testing against different and multiple Pythons
 ----------------------------------------------
 
