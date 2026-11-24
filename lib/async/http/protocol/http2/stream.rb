@@ -22,6 +22,9 @@ module Async
 						
 						@headers = nil
 						
+						# The application-facing header section. It is a snapshot taken when the initial headers are handed over, so protocol-side buffering of later trailer fields never mutates the view the application already received:
+						@app_headers = nil
+						
 						@pool = nil
 						
 						# Input buffer, reading request body, or response body (receive_data):
@@ -40,6 +43,10 @@ module Async
 					attr_accessor :pool
 					
 					attr :input
+					
+					# The stable, application-facing view of the initial header section.
+					# @returns [Protocol::HTTP::Headers | Nil] A snapshot of the initial headers, or `nil` before any headers have been received.
+					attr :app_headers
 					
 					# Add a header to the stream, validating against HTTP/2 constraints.
 					# @parameter key [String] The header name.
@@ -61,8 +68,36 @@ module Async
 					# @parameter end_stream [Boolean] Whether the stream ends after these headers.
 					def receive_trailing_headers(headers, end_stream)
 						headers.each do |key, value|
-							# SECURITY: Trailers join the headers unmarked. This is not a smuggling vector: `trailer: true` admits only fields whose policy permits trailers, and position does not change what those fields mean.
+							# Mark the start of the trailer section before the first trailer field is added, so received trailers stay distinct from the initial header section. An empty trailing HEADERS frame does not create a trailer section. `trailer!` is idempotent, so trailers delivered across multiple frames are handled as well.
+							@headers.trailer!
+							
+							# SECURITY: `trailer: true` admits only fields whose policy permits trailers, so a request-controlled trailer field cannot smuggle a field which is forbidden in that position.
 							add_header(key, value, trailer: true)
+						end
+					end
+					
+					# Publish the initial header section to the application.
+					#
+					# The application receives a private snapshot of the initial headers while the stream keeps its own working copy. Trailer fields which arrive afterwards are buffered into the working copy and are merged into the application view once the incoming stream has ended, so a long-lived request object always sees a stable initial view and can still read its trailers by field name.
+					#
+					# @parameter headers [Protocol::HTTP::Headers] The initial headers received on this stream.
+					# @returns [Protocol::HTTP::Headers] The stable application-facing headers.
+					def publish_headers(headers)
+						@app_headers = headers.dup
+						
+						return @app_headers
+					end
+					
+					# Merge trailer fields which arrived after the initial headers into the application-facing header view.
+					#
+					# This runs at the safe point where the incoming stream has ended, after the application already holds its stable initial view. Only the trailer section of the working copy is copied across, so the initial header section the application received is never reordered or replaced.
+					def merge_received_trailers
+						if @headers and @headers.trailer? and @app_headers
+							@app_headers.trailer!
+							
+							@headers.trailer.each do |key, value|
+								@app_headers.add(key, value, trailer: true)
+							end
 						end
 					end
 					
@@ -75,8 +110,13 @@ module Async
 							self.receive_initial_headers(super, frame.end_stream?)
 						end
 						
-						if @input and frame.end_stream?
-							@input.close_write
+						if frame.end_stream?
+							# Safe point: the peer will not send anything else on this stream. Move any buffered trailer fields into the application view, then release the input side once the final body chunk has been queued.
+							self.merge_received_trailers
+							
+							if @input
+								@input.close_write
+							end
 						end
 					rescue ::Protocol::HTTP::InvalidTrailerError => error
 						Console.warn(self, error)

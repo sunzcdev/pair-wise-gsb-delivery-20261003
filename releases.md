@@ -1,5 +1,9 @@
 # Releases
 
+## Unreleased
+
+  - On HTTP/2 connections, give the application a stable snapshot of the initial header section while the stream keeps buffering protocol-side data; received trailer fields stay distinct from the header section and are merged into the application view at the end of the stream, so trailers can no longer mutate a request or response object handed out earlier.
+
 ## v0.105.0
 
   - Respond with `400 Bad Request` for any `Protocol::HTTP::BadRequest` raised while parsing HTTP/1 or HTTP/2 requests, include the exception class name without reflecting request data, and avoid reporting them as unhandled server errors.

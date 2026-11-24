@@ -95,7 +95,9 @@ module Async
 							else
 								# Validate structured headers before exposing the request to the application:
 								@headers.to_h
-								@request.headers = @headers
+								
+								# Hand the application a stable snapshot of the initial header section. The stream keeps its own working copy, so trailer fields buffered by the protocol later do not mutate this view until they are merged at the end of the stream.
+								@request.headers = self.publish_headers(@headers)
 								
 								# We only construct the input/body if data is coming.
 								unless end_stream

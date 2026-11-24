@@ -78,7 +78,8 @@ module Async
 								end
 							end
 							
-							@response.headers = @headers
+							# Hand the application a stable snapshot of the initial header section. The stream keeps its own working copy, so trailer fields buffered by the protocol later do not mutate this view until they are merged at the end of the stream.
+							@response.headers = self.publish_headers(@headers)
 							
 							if @response.valid?
 								if !end_stream
