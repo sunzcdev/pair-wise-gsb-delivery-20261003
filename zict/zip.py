@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import zipfile
 from collections.abc import Iterator, MutableMapping
 from typing import TYPE_CHECKING, Any, Literal
@@ -91,6 +93,68 @@ class Zip(MutableMapping[str, bytes]):
                 self._file.fp.flush()
             self._file.close()
             self._file = None
+
+    def compact(self) -> None:
+        """Rewrite the zip archive on disk so that each key appears exactly
+        once, with its current value.
+
+        Archives produced by other tools may contain multiple entries for the
+        same key; reading always yields the last one. This method rewrites the
+        archive, dropping all superseded entries. It never changes which
+        values are visible through the mapping.
+
+        The rewrite is atomic: the compacted contents are first written to a
+        temporary file in the same directory, which then replaces the
+        original archive. If the rewrite fails partway through (e.g. the disk
+        fills up), the temporary file is deleted and the original archive is
+        left untouched, so readers that already hold it open - as well as
+        mappings opened afterwards - keep seeing the old contents.
+
+        On Windows, the final replacement fails with :class:`PermissionError`
+        if another process still holds the old archive open. In that case the
+        archive on disk is still the old version; the call can simply be
+        retried once the readers are done.
+
+        Raises
+        ------
+        ValueError
+            If the mapping was opened in read-only mode
+        OSError
+            If the mapping is closed, or if writing or replacing the archive
+            failed (the original archive is left untouched)
+        """
+        if self.mode == "closed":
+            raise OSError("File closed")
+        if self.mode == "r":
+            raise ValueError("Cannot compact a Zip file opened in read-only mode")
+        # Flush pending writes and release our own handle, so that it can't
+        # block the replacement below on Windows.
+        self.flush()
+        if not os.path.exists(self.filename):
+            return
+
+        dirname, basename = os.path.split(os.path.abspath(self.filename))
+        fd, tmpname = tempfile.mkstemp(prefix=basename + ".", suffix=".tmp", dir=dirname)
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(self.filename, mode="r") as src:
+                # Deduplicate keys; the last entry for each key is the
+                # one that reads resolve to.
+                infos = {}
+                for zi in src.infolist():
+                    infos[zi.filename] = zi
+                with zipfile.ZipFile(tmpname, mode="w") as dst:
+                    for zi in infos.values():
+                        dst.writestr(zi, src.read(zi.filename))
+            os.replace(tmpname, self.filename)
+        except BaseException:
+            # The partially written output must not be mistaken for the
+            # archive; the old version is still the current one.
+            try:
+                os.remove(tmpname)
+            except OSError:
+                pass
+            raise
 
     def close(self) -> None:
         self.flush()

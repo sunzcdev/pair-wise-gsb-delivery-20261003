@@ -6,6 +6,11 @@ Changelog
 ------------------
 - Dropped support for Python 3.8 (:pr:`106`) `Guido Imperiale`_
 - New object :class:`KeyMap` (:pr:`110`) `Guido Imperiale`_
+- New method :meth:`Zip.compact` to explicitly rewrite archives that contain
+  multiple entries for the same key, keeping only each key's current value.
+  The rewrite is atomic: a failure midway leaves the old archive in place, and
+  on Windows a ``PermissionError`` tells the caller that old readers still
+  hold the archive open and the call can be retried.
 
 
 3.0.0 - 2023-04-17
