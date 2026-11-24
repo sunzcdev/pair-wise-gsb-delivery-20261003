@@ -7,6 +7,13 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Added
 
+- `SemanticLogger.without_named_tag(*keys) { ... }` (and `Logger#without_named_tag`) hides one or
+  more named tags for a block without changing their values in enclosing blocks, and restores them
+  when the block exits, even when it raises. A shadow removes the key from the named tags, unlike
+  setting it to nil, which leaves the key present with a nil value; a later named tag that sets the
+  same key inside the block still wins over the shadow. It is per fiber, so fibers that share a
+  starting context stay independent. See
+  [Hide a named tag for a block](https://logger.reidmorrison.com/#hide-a-named-tag-for-a-block).
 - The formatters that write a metric with its log entry also write the metric's `dimensions`:
   `:json`, `:raw`, `:fluentd`, `:ecs`, `:syslog_cee`, and `:new_relic_logs` as a `dimensions` Hash,
   `:loki` as a `dimensions` value in JSON, and `:open_telemetry` as a

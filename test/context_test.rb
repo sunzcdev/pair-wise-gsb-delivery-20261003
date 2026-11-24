@@ -115,6 +115,158 @@ module SemanticLogger
         end
       end
 
+      describe ".without_named_tag" do
+        it "hides an inherited named tag without changing the other named tags" do
+          SemanticLogger.tagged(user: "jack", id: 1) do
+            SemanticLogger.without_named_tag(:id) do
+              assert_equal({user: "jack"}, SemanticLogger.named_tags)
+            end
+
+            assert_equal({user: "jack", id: 1}, SemanticLogger.named_tags)
+          end
+        end
+
+        it "hides several keys at once, and aliases String keys to Symbols" do
+          SemanticLogger.tagged(a: 1, b: 2, c: 3) do
+            SemanticLogger.without_named_tag("a", :c) do
+              assert_equal({b: 2}, SemanticLogger.named_tags)
+            end
+
+            assert_equal({a: 1, b: 2, c: 3}, SemanticLogger.named_tags)
+          end
+        end
+
+        it "lets a later named tag set the shadowed key again inside the block" do
+          SemanticLogger.tagged(user: "jack", id: 1) do
+            SemanticLogger.without_named_tag(:id) do
+              SemanticLogger.named_tagged(id: 2) do
+                assert_equal({user: "jack", id: 2}, SemanticLogger.named_tags)
+              end
+
+              assert_equal({user: "jack"}, SemanticLogger.named_tags)
+            end
+          end
+        end
+
+        it "restores the hidden value when the block raises" do
+          SemanticLogger.tagged(user: "jack", id: 1) do
+            assert_raises(ArgumentError) do
+              SemanticLogger.without_named_tag(:id) { raise ArgumentError }
+            end
+
+            assert_equal({user: "jack", id: 1}, SemanticLogger.named_tags)
+          end
+        end
+
+        it "is not the same as setting the tag to nil" do
+          SemanticLogger.tagged(id: 1) do
+            SemanticLogger.without_named_tag(:id) do
+              refute SemanticLogger.named_tags.key?(:id)
+
+              SemanticLogger.named_tagged(id: nil) do
+                assert_nil SemanticLogger.named_tags[:id]
+                assert SemanticLogger.named_tags.key?(:id)
+              end
+            end
+          end
+        end
+
+        it "can be nested, so an inner block hides another key" do
+          SemanticLogger.tagged(a: 1, b: 2, c: 3) do
+            SemanticLogger.without_named_tag(:a) do
+              assert_equal({b: 2, c: 3}, SemanticLogger.named_tags)
+
+              SemanticLogger.without_named_tag(:b) do
+                assert_equal({c: 3}, SemanticLogger.named_tags)
+              end
+
+              assert_equal({b: 2, c: 3}, SemanticLogger.named_tags)
+            end
+
+            assert_equal({a: 1, b: 2, c: 3}, SemanticLogger.named_tags)
+          end
+        end
+
+        it "restores the value that another block set inside it when it exits" do
+          SemanticLogger.tagged(id: 1) do
+            SemanticLogger.without_named_tag(:id) do
+              SemanticLogger.named_tagged(id: 2) { }
+              assert_equal({}, SemanticLogger.named_tags)
+            end
+
+            assert_equal({id: 1}, SemanticLogger.named_tags)
+          end
+        end
+
+        it "is a no-op for a key no block has set" do
+          SemanticLogger.tagged(id: 1) do
+            SemanticLogger.without_named_tag(:absent) do
+              assert_equal({id: 1}, SemanticLogger.named_tags)
+            end
+          end
+        end
+
+        it "with no keys runs the block unchanged" do
+          SemanticLogger.tagged(id: 1) do
+            SemanticLogger.without_named_tag { assert_equal({id: 1}, SemanticLogger.named_tags) }
+          end
+        end
+
+        it "applies to the log entries logged in the block" do
+          # Log#initialize snapshots the named tags of the current fiber, the way a logged entry does.
+          named_tags = nil
+          SemanticLogger.tagged(user: "jack", id: 1) do
+            SemanticLogger.without_named_tag(:id) do
+              named_tags = Log.new("ContextTest", :info).named_tags
+            end
+          end
+
+          assert_equal({user: "jack"}, named_tags)
+        end
+
+        it "keeps two fibers that share a starting context independent" do
+          SemanticLogger.tagged(trace_id: "root", request: "r1") do
+            snapshot = SemanticLogger.context
+            first    = Fiber.new do
+              seen = nil
+              SemanticLogger.with_context(snapshot) do
+                begin
+                  SemanticLogger.without_named_tag(:trace_id) do
+                    seen = SemanticLogger.named_tags
+                    raise "fiber failed"
+                  end
+                rescue RuntimeError
+                  # The block's ensure restores the hidden value before the rescue runs.
+                end
+              end
+              seen
+            end
+            second = Fiber.new do
+              SemanticLogger.with_context(snapshot) do
+                SemanticLogger.named_tagged(trace_id: "own") do
+                  SemanticLogger.named_tags
+                end
+              end
+            end
+
+            assert_equal({request: "r1"}, first.resume)
+            assert_equal({trace_id: "own", request: "r1"}, second.resume)
+            assert_equal({trace_id: "root", request: "r1"}, SemanticLogger.named_tags)
+          end
+        end
+
+        it "does not put the shadow in a context snapshot" do
+          context = nil
+          SemanticLogger.tagged(id: 1) do
+            SemanticLogger.without_named_tag(:id) do
+              context = SemanticLogger.context
+            end
+          end
+
+          assert_empty context.named_tags
+        end
+      end
+
       describe ".tags" do
         it "returns a copy that the caller can change" do
           SemanticLogger.tagged("a") do

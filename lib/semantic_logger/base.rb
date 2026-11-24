@@ -232,6 +232,12 @@ module SemanticLogger
       SemanticLogger.named_tags
     end
 
+    # Runs the block with the supplied named tags hidden on the current fiber (see
+    # SemanticLogger.without_named_tag).
+    def without_named_tag(*keys, &)
+      SemanticLogger.without_named_tag(*keys, &)
+    end
+
     # Tags permanently bound to this logger instance via `#tagged` (without a block).
     # Empty for a regular (non-child) logger.
     attr_reader :instance_tags, :instance_named_tags

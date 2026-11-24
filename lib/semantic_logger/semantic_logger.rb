@@ -677,6 +677,38 @@ module SemanticLogger
     Context.named_tagged(hash, &)
   end
 
+  # Runs the block with one or more named tags hidden from the logs of the current fiber, without
+  # changing their values in enclosing blocks.
+  #
+  # A shadow is not the same as setting a tag to nil: `named_tagged(key => nil)` leaves the key in
+  # the named tags with a nil value, whereas `without_named_tag` removes it entirely for the block,
+  # as though no enclosing block had set it. The tag can still be set again inside the block: a
+  # later `named_tagged` that names the same key wins over the shadow. When the block exits, even
+  # by raising, the hidden value is restored.
+  #
+  # Like the other tag block forms it applies to the current fiber only, so fibers that share a
+  # starting context, such as the fibers of one request, are independent: a shadow in one does not
+  # change the tags another fiber logs, or the value the enclosing block logs afterwards.
+  #
+  # Returns the result of the block.
+  #
+  # Example:
+  #   SemanticLogger.tagged(trace_id: "abc", user: "jack") do
+  #     SemanticLogger.without_named_tag(:trace_id) do
+  #       logger.info "logged without trace_id"
+  #       SemanticLogger.tagged(trace_id: "def") do
+  #         logger.info "logged with the new trace_id"
+  #       end
+  #     end
+  #     logger.info "trace_id is abc again"
+  #   end
+  def self.without_named_tag(*keys, &)
+    keys = keys.flatten.map(&:to_sym).uniq
+    return yield if keys.empty?
+
+    Context.without_named_tags(keys, &)
+  end
+
   # Returns [Hash] a copy of the named tags currently active for this fiber.
   def self.named_tags
     Context.named_tags

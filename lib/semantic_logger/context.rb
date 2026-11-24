@@ -18,6 +18,28 @@ module SemanticLogger
   Context = Data.define(:tags, :named_tags, :silence)
 
   class Context
+    # A layer of the current fiber's named tags that hides the keys it names from every earlier
+    # layer, without giving them a value. A Hash pushed with `named_tagged` that names one of the
+    # same keys still wins over a shadow below it, so the tag can be set again inside the block.
+    #
+    # It is distinct from `{key => nil}`: a shadowed key is absent from the merged named tags,
+    # whereas an explicit nil is a value the key is present with, as any other value would be.
+    class NamedTagShadow
+      # Returns [NamedTagShadow] one that hides the supplied keys, each converted to a Symbol, as
+      # named tag keys are Symbols. Takes ownership of the Array, which it freezes.
+      def self.new(keys)
+        super(keys.map(&:to_sym).freeze)
+      end
+
+      # Returns [Array<Symbol>] the keys this layer hides.
+      attr_reader :keys
+
+      def initialize(keys)
+        @keys = keys
+        freeze
+      end
+    end
+
     TAGS_KEY       = :semantic_logger_tags
     NAMED_TAGS_KEY = :semantic_logger_named_tags
     SILENCE_KEY    = :semantic_logger_silence
@@ -144,13 +166,29 @@ module SemanticLogger
         end
       end
 
+      # Runs the block with the named tag of each supplied key hidden on the current fiber, whatever
+      # value an enclosing block gave it. A later named tag Hash that sets one of the keys again
+      # wins over the shadow, so it can be set inside the block, and the block restores the hidden
+      # value when it exits, even when it raises.
+      def without_named_tags(keys)
+        previous = Thread.current[NAMED_TAGS_KEY]
+        begin
+          shadow   = NamedTagShadow.new(keys)
+          Thread.current[NAMED_TAGS_KEY] = (previous ? previous.dup << shadow : [shadow]).freeze
+          yield
+        ensure
+          Thread.current[NAMED_TAGS_KEY] = previous
+        end
+      end
+
       # Adds the Hash of named tags to the current fiber's named tags, until it is popped.
       def push_named_tags(hash)
         Thread.current[NAMED_TAGS_KEY] = (current_named_tags.dup << hash).freeze
       end
 
-      # Removes the last `quantity` Hashes of named tags pushed onto the current fiber.
-      # Returns [Array] the Hashes removed, or nil when the fiber has no named tags.
+      # Removes the last `quantity` layers of named tags pushed onto the current fiber, each a Hash
+      # or, from a `without_named_tags` block, a NamedTagShadow.
+      # Returns [Array] the layers removed, or nil when the fiber has no named tags.
       def pop_named_tags(quantity)
         pop(NAMED_TAGS_KEY, quantity)
       end
@@ -193,11 +231,22 @@ module SemanticLogger
 
       private
 
-      # Returns [Hash] a new Hash of the list of named tags Hashes merged, a later one winning.
+      # Returns [Hash] a new Hash of the list of named tags layers merged, a later one winning.
+      #
+      # A Hash sets its keys, and a NamedTagShadow removes the keys it names, as though no earlier
+      # layer had set them. A Hash later than the shadow can set a key again, which then stays.
       def merge(list)
         return {} if list.nil? || list.empty?
+        return list.first.dup if list.size == 1 && list.first.is_a?(Hash)
 
-        list.size == 1 ? list.first.dup : list.reduce({}) { |sum, hash| sum.merge(hash) }
+        list.each_with_object({}) do |layer, named_tags|
+          case layer
+          when NamedTagShadow
+            layer.keys.each { |key| named_tags.delete(key) }
+          else
+            named_tags.merge!(layer)
+          end
+        end
       end
 
       def current_tags

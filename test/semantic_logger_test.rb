@@ -489,6 +489,82 @@ class SemanticLoggerTest < Minitest::Test
       end
     end
 
+    describe ".without_named_tag" do
+      it "hides the named tag from the entries logged in the block and restores it afterwards" do
+        events = semantic_logger_events do
+          SemanticLogger.named_tagged(user: "jack", id: 1) do
+            SemanticLogger.without_named_tag(:id) do
+              logger.info("inside")
+            end
+            logger.info("after")
+          end
+        end
+
+        assert_equal 2, events.size
+        assert_semantic_logger_event(events.first, message: "inside", named_tags: {user: "jack"})
+        assert_semantic_logger_event(events.last, message: "after", named_tags: {user: "jack", id: 1})
+      end
+
+      it "lets the tag be set again inside the block" do
+        events = semantic_logger_events do
+          SemanticLogger.named_tagged(user: "jack", id: 1) do
+            SemanticLogger.without_named_tag(:id) do
+              SemanticLogger.named_tagged(id: 2) do
+                logger.info("reset")
+              end
+            end
+          end
+        end
+
+        assert_equal 1, events.size
+        assert_semantic_logger_event(events.first, message: "reset", named_tags: {user: "jack", id: 2})
+      end
+
+      it "restores the hidden value when the block raises" do
+        events = semantic_logger_events do
+          SemanticLogger.named_tagged(id: 1) do
+            assert_raises(ArgumentError) do
+              SemanticLogger.without_named_tag(:id) do
+                logger.info("inside")
+                raise ArgumentError
+              end
+            end
+            logger.info("after")
+          end
+        end
+
+        assert_equal 2, events.size
+        assert_semantic_logger_event(events.first, message: "inside", named_tags: {})
+        assert_semantic_logger_event(events.last, message: "after", named_tags: {id: 1})
+      end
+
+      it "hides more than one tag, and accepts String keys" do
+        events = semantic_logger_events do
+          SemanticLogger.named_tagged(a: 1, b: 2, c: 3) do
+            SemanticLogger.without_named_tag("a", :c) do
+              logger.info("inside")
+            end
+          end
+        end
+
+        assert_semantic_logger_event(events.first, message: "inside", named_tags: {b: 2})
+      end
+
+      it "leaves a tag set to nil present, unlike a shadow" do
+        events = semantic_logger_events do
+          SemanticLogger.named_tagged(id: 1) do
+            SemanticLogger.without_named_tag(:id) do
+              SemanticLogger.named_tagged(id: nil) do
+                logger.info("nil value")
+              end
+            end
+          end
+        end
+
+        assert_semantic_logger_event(events.first, message: "nil value", named_tags: {id: nil})
+      end
+    end
+
     describe ".fast_tag" do
       it "add string tag to log entries" do
         events = semantic_logger_events do

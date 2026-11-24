@@ -164,6 +164,44 @@ SemanticLogger.tagged(user: "jbloggs", request_id: "abc123") do
 end
 ~~~
 
+#### Hide a named tag for a block
+
+A named tag inherited from an enclosing block can be hidden for an inner block without changing
+its value outside it. `SemanticLogger.without_named_tag` removes the tag for the duration of the
+block, as though no enclosing block had set it, and restores the hidden value when the block exits,
+even when it raises.
+
+~~~ruby
+SemanticLogger.tagged(user: "jbloggs", request_id: "abc123") do
+  SemanticLogger.without_named_tag(:request_id) do
+    # Entries logged here carry `user` but no `request_id`.
+    logger.info("Logged without the request id")
+  end
+
+  # The request id is back.
+  logger.info("Logged with the request id again")
+end
+~~~
+
+A shadow is not the same as setting the tag to nil: `named_tagged(request_id: nil)` leaves the key
+present with a nil value, whereas `without_named_tag` removes the key entirely. The tag can still be
+set again inside the block, since a later named tag wins over the shadow:
+
+~~~ruby
+SemanticLogger.tagged(request_id: "abc123") do
+  SemanticLogger.without_named_tag(:request_id) do
+    SemanticLogger.tagged(request_id: "def456") do
+      # This entry carries the new request id.
+      logger.info("Logged with a replacement request id")
+    end
+  end
+end
+~~~
+
+Like the other tag block forms, it applies to the current fiber only. Fibers that share a starting
+context, such as the fibers of one request, stay independent: a shadow in one fiber changes neither
+the tags another fiber logs nor the value the enclosing block logs afterwards.
+
 #### Name your threads
 
 So concurrent log entries are easy to tell apart.
