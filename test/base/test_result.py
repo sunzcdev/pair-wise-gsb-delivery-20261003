@@ -2,7 +2,10 @@ import operator
 import sys
 
 from sqlalchemy import exc
+from sqlalchemy import Integer
+from sqlalchemy import String
 from sqlalchemy import testing
+from sqlalchemy import TypeDecorator
 from sqlalchemy.engine import result
 from sqlalchemy.testing import assert_raises
 from sqlalchemy.testing import assert_raises_message
@@ -11,6 +14,7 @@ from sqlalchemy.testing import eq_
 from sqlalchemy.testing import fixtures
 from sqlalchemy.testing import is_
 from sqlalchemy.testing import is_false
+from sqlalchemy.testing import is_none
 from sqlalchemy.testing import is_true
 from sqlalchemy.testing.assertions import expect_deprecated
 from sqlalchemy.testing.assertions import expect_raises
@@ -1148,6 +1152,298 @@ class MergeResultTest(fixtures.TestBase):
 
         # unique takes place
         eq_(result.scalars("y").all(), [2, 1, 3])
+
+    def _per_source_processor_fixture(self):
+        class PrefixedType(TypeDecorator):
+            impl = String
+            cache_ok = True
+
+            def __init__(self, prefix):
+                super().__init__()
+                self._prefix = prefix
+
+            def process_result_value(self, value, dialect):
+                return "%s:%s" % (self._prefix, value)
+
+        decorated = PrefixedType("decorated").result_processor(None, None)
+
+        md_plain = result.SimpleResultMetaData(
+            ["id", "data"], _processors=(None, None)
+        )
+        md_decorated = result.SimpleResultMetaData(
+            ["id", "data"], _processors=(None, decorated)
+        )
+
+        r1 = result.IteratorResult(
+            md_plain, iter([(1, "a"), (2, "b")])
+        )
+        r2 = result.IteratorResult(
+            md_decorated, iter([(3, "c"), (4, "d")])
+        )
+        return r1, r2
+
+    def test_merge_per_source_processors(self):
+        """Each source's values are interpreted via its own metadata,
+        even when column names match but type processors differ.
+
+        """
+        r1, r2 = self._per_source_processor_fixture()
+
+        merged = r1.merge(r2)
+
+        eq_(
+            merged.fetchall(),
+            [
+                (1, "a"),
+                (2, "b"),
+                (3, "decorated:c"),
+                (4, "decorated:d"),
+            ],
+        )
+
+    def test_merge_per_source_processors_many(self):
+        r1, r2 = self._per_source_processor_fixture()
+
+        merged = r1.merge(r2)
+
+        eq_(
+            merged.fetchmany(3),
+            [(1, "a"), (2, "b"), (3, "decorated:c")],
+        )
+        eq_(
+            merged.fetchmany(3),
+            [(4, "decorated:d")],
+        )
+
+    def test_merge_active_source_tracks_current_result(self, merge_fixture):
+        r1, r2, r3, r4 = merge_fixture
+
+        merged = r1.merge(r2, r3, r4)
+        is_none(merged.active_source)
+        eq_(merged.active_source_index, -1)
+
+        it = iter(merged)
+
+        # first source
+        row = next(it)
+        eq_(row, (7, "u1"))
+        is_(merged.active_source, r1)
+        eq_(merged.active_source_index, 0)
+        next(it)
+
+        # second source
+        row = next(it)
+        eq_(row, (9, "u3"))
+        is_(merged.active_source, r2)
+        eq_(merged.active_source_index, 1)
+
+        # third source (two rows)
+        next(it)
+        is_(merged.active_source, r3)
+        eq_(merged.active_source_index, 2)
+        next(it)
+        is_(merged.active_source, r3)
+
+        # fourth source
+        row = next(it)
+        eq_(row, (12, "u6"))
+        is_(merged.active_source, r4)
+        eq_(merged.active_source_index, 3)
+
+        # exhausted
+        assert_raises(StopIteration, next, it)
+        is_none(merged.active_source)
+        eq_(merged.active_source_index, -1)
+
+    def test_merge_active_source_with_per_source_processors(self):
+        r1, r2 = self._per_source_processor_fixture()
+        merged = r1.merge(r2)
+
+        eq_(merged.fetchone(), (1, "a"))
+        is_(merged.active_source, r1)
+
+        eq_(merged.fetchone(), (2, "b"))
+        is_(merged.active_source, r1)
+
+        eq_(merged.fetchone(), (3, "decorated:c"))
+        is_(merged.active_source, r2)
+
+    def test_merge_early_stop_closes_remaining_sources(self, merge_fixture):
+        r1, r2, r3, r4 = merge_fixture
+
+        merged = r1.merge(r2, r3, r4)
+        eq_(merged.first(), (7, "u1"))
+
+        # first() hard closes; every remaining cursor must be finished
+        for source in (r1, r2, r3, r4):
+            is_true(source.closed)
+            is_true(source._soft_closed)
+        is_true(merged.closed)
+        is_none(merged.active_source)
+        eq_(merged.active_source_index, -1)
+
+    def test_merge_close_closes_all_sources(self, merge_fixture):
+        r1, r2, r3, r4 = merge_fixture
+
+        merged = r1.merge(r2, r3, r4)
+        merged.fetchone()
+        merged.close()
+
+        for source in (r1, r2, r3, r4):
+            is_true(source.closed)
+        is_true(merged.closed)
+        is_none(merged.active_source)
+
+        assert_raises(exc.ResourceClosedError, merged.fetchone)
+
+    def test_merge_source_failure_closes_remaining_cursors(self):
+        class BatchFailure(Exception):
+            pass
+
+        class FailOnSecondBatch:
+            def __init__(self, rows):
+                self._rows = list(rows)
+                self._batches = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if not self._rows:
+                    raise StopIteration
+                self._batches += 1
+                if self._batches == 2:
+                    raise BatchFailure("third source failed")
+                return self._rows.pop(0)
+
+        r1, r2 = self._per_source_processor_fixture()
+
+        md3 = result.SimpleResultMetaData(
+            ["id", "data"], _processors=(None, None)
+        )
+        r3 = result.IteratorResult(
+            md3, iter(FailOnSecondBatch([(7, "g"), (8, "h")]))
+        )
+
+        merged = r1.merge(r2, r3)
+
+        # rows from the first two sources arrive with their own
+        # processing applied
+        eq_(
+            merged.fetchmany(4),
+            [(1, "a"), (2, "b"), (3, "decorated:c"), (4, "decorated:d")],
+        )
+        is_(merged.active_source, r2)
+
+        # pulling the next batch reaches the failing third source
+        with expect_raises(BatchFailure) as exc_info:
+            merged.fetchall()
+
+        # the error points back at the third source
+        eq_(exc_info.error.merge_source_index, 2)
+        is_(exc_info.error.merge_result, r3)
+
+        # every source cursor, including the one that failed and those
+        # not yet reached, has been released
+        for source in (r1, r2, r3):
+            is_true(source.closed)
+            is_true(source._soft_closed)
+        is_true(merged.closed)
+        is_none(merged.active_source)
+
+    def test_merge_source_failure_during_iteration(self):
+        class BatchFailure(Exception):
+            pass
+
+        class FailOnSecondBatch:
+            def __init__(self, rows):
+                self._rows = list(rows)
+                self._batches = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if not self._rows:
+                    raise StopIteration
+                self._batches += 1
+                if self._batches == 2:
+                    raise BatchFailure("boom")
+                return self._rows.pop(0)
+
+        r1, r2 = self._per_source_processor_fixture()
+        md3 = result.SimpleResultMetaData(["id", "data"])
+        r3 = result.IteratorResult(
+            md3, iter(FailOnSecondBatch([(7, "g"), (8, "h")]))
+        )
+
+        merged = r1.merge(r2, r3)
+
+        seen = []
+        with expect_raises(BatchFailure) as exc_info:
+            for row in merged:
+                seen.append(tuple(row))
+
+        eq_(
+            seen,
+            [
+                (1, "a"),
+                (2, "b"),
+                (3, "decorated:c"),
+                (4, "decorated:d"),
+                (7, "g"),
+            ],
+        )
+        eq_(exc_info.error.merge_source_index, 2)
+        is_(exc_info.error.merge_result, r3)
+
+        for source in (r1, r2, r3):
+            is_true(source.closed)
+
+    def test_merge_failure_values_use_source_rules(self):
+        """Values delivered before the failure were each converted by
+        their own source's rules."""
+
+        class FailingType(TypeDecorator):
+            impl = Integer
+            cache_ok = True
+
+            def process_result_value(self, value, dialect):
+                if value == "boom":
+                    raise ValueError("cannot process boom")
+                return "int:%s" % value
+
+        failing_proc = FailingType().result_processor(None, None)
+
+        md_plain = result.SimpleResultMetaData(
+            ["id", "data"], _processors=(None, None)
+        )
+        md_failing = result.SimpleResultMetaData(
+            ["id", "data"], _processors=(None, failing_proc)
+        )
+
+        r1 = result.IteratorResult(
+            md_plain, iter([(1, "a"), (2, "b")])
+        )
+        r2 = result.IteratorResult(
+            md_failing, iter([(3, 10), (4, "boom")])
+        )
+
+        merged = r1.merge(r2)
+
+        eq_(merged.fetchone(), (1, "a"))
+        eq_(merged.fetchone(), (2, "b"))
+        eq_(merged.fetchone(), (3, "int:10"))
+
+        with expect_raises(ValueError) as exc_info:
+            merged.fetchone()
+
+        # failure originates in the second source's processor
+        eq_(exc_info.error.merge_source_index, 1)
+        is_(exc_info.error.merge_result, r2)
+        is_true(r1.closed)
+        is_true(r2.closed)
+        is_true(merged.closed)
 
 
 class OnlyScalarsTest(fixtures.TestBase):

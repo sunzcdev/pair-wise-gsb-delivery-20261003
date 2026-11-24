@@ -1178,10 +1178,23 @@ class Result(_WithKeys, ResultInternal[Row[Unpack[_Ts]]]):
         which will be composed of iterators from the given result
         objects.
 
-        The new result will use the metadata from this result object.
-        The subsequent result objects must be against an identical
-        set of result / cursor metadata, otherwise the behavior is
-        undefined.
+        The new result presents the row/column metadata (such as the
+        :meth:`_engine.Result.keys` view) of this result object.  Each
+        contributing result is still read through its own cursor metadata
+        and result processors, however, so sources which expose identical
+        column names while using different type handlers remain legal;
+        values from every source are converted according to their own
+        rules.
+
+        The :class:`_engine.MergedResult` exposes the source currently
+        being read through :attr:`_engine.MergedResult.active_source` and
+        :attr:`_engine.MergedResult.active_source_index`.  If a source
+        raises while a row or batch is being fetched, every remaining
+        source cursor is closed; the propagated exception is annotated
+        with the index/result of the source that failed.  Explicitly
+        closing the merged result (or an early-stopping call such as
+        :meth:`_engine.Result.first` / :meth:`_engine.Result.one`) likewise
+        closes all of the source results.
 
         """
         return MergedResult(self._metadata, (self,) + others)
@@ -1980,6 +1993,12 @@ class MergedResult(IteratorResult[Unpack[_Ts]]):
 
     Returned by the :meth:`_engine.Result.merge` method.
 
+    The merged result presents the row/column metadata (i.e. the
+    :meth:`_engine.Result.keys` view) of the first result.  However, rows
+    delivered by each contributing result are interpreted using that
+    result's own cursor metadata and result processors, so sources which
+    share column names but use different type handlers remain legal.
+
     .. versionadded:: 1.4
 
     """
@@ -1993,11 +2012,13 @@ class MergedResult(IteratorResult[Unpack[_Ts]]):
         results: Sequence[Result[Unpack[_Ts]]],
     ):
         self._results = results
+        self._active_source_index = -1
+
+        self._merged_iterator = self._merge_results()
+
         super().__init__(
             cursor_metadata,
-            itertools.chain.from_iterable(
-                r._raw_row_iterator() for r in results
-            ),
+            self._merged_iterator,
         )
 
         self._unique_filter_state = results[0]._unique_filter_state
@@ -2010,8 +2031,206 @@ class MergedResult(IteratorResult[Unpack[_Ts]]):
             *[r._attributes for r in results]
         )
 
+    @property
+    def active_source(self) -> Optional[Result[Unpack[_Ts]]]:
+        """The :class:`_engine.Result` that is currently delivering rows.
+
+        This is the result whose underlying cursor / iterator is being read
+        at the point in time at which the attribute is accessed.  It is
+        ``None`` before iteration starts and after all sources have been
+        exhausted or the merged result has been closed.
+
+        .. versionadded:: 2.1.11
+        """
+        idx = self._active_source_index
+        if idx < 0:
+            return None
+        return self._results[idx]
+
+    @property
+    def active_source_index(self) -> int:
+        """The zero-based index of the result currently delivering rows.
+
+        The index corresponds to the position of the source result in the
+        sequence passed to :meth:`_engine.Result.merge` (the result the
+        method was called upon is index ``0``).  It is ``-1`` before
+        iteration starts and after the merged result has been closed or
+        exhausted.
+
+        .. versionadded:: 2.1.11
+        """
+        return self._active_source_index
+
+    @property
+    def _row_getter(  # type: ignore[override]
+        self,
+    ) -> Tuple[
+        Callable[..., Any],
+        Callable[..., Sequence[Any]],
+        Callable[..., Sequence[Any]],
+    ]:
+        # rows emitted by ``_merge_results`` have already been run through
+        # each source's own row factory / result processors; the merged
+        # result must only package them into ``Row`` objects using the
+        # shared metadata and must not apply the first source's
+        # processors a second time.
+        metadata = self._metadata
+        tuple_filters = metadata._tuplefilter
+        key_to_index = metadata._key_to_index
+        scalar_source = self._source_supports_scalars
+
+        if scalar_source:
+            # scalar sources (e.g. ORM single-entity results) deliver
+            # bare values rather than tuples; pass them through unchanged
+            def single_row(input_row: Any, /) -> Any:
+                return input_row
+
+            def many_rows(rows: Sequence[Any], /) -> Sequence[Any]:
+                return list(rows)
+
+            def interim_rows(rows: Sequence[Any], /) -> Sequence[Any]:
+                return list(rows)
+
+            return single_row, many_rows, interim_rows
+
+        def single_row(input_row: Sequence[Any], /) -> Row[Any]:
+            if type(input_row) is Row:
+                # already a fully built Row from a source result; reuse it
+                return input_row
+            if tuple_filters is not None:
+                input_row = tuple_filters(input_row)
+            return Row(metadata, None, key_to_index, input_row)
+
+        def many_rows(rows: Sequence[Any], /) -> List[Any]:
+            return [single_row(row) for row in rows]
+
+        def interim_rows(rows: Sequence[Any], /) -> Sequence[Any]:
+            # ORM loaders consume position-based tuples; strip the Row
+            # wrapper emitted by each source and apply any reduced-column
+            # tuple filter before handing the data back.
+            out: List[Any] = []
+            for row in rows:
+                if type(row) is Row:
+                    row = tuple(row)
+                if tuple_filters is not None:
+                    row = tuple_filters(row)
+                if type(row) is not tuple:
+                    row = tuple(row)
+                out.append(row)
+            return out
+
+        return single_row, many_rows, interim_rows
+
+    def _merge_results(self) -> Iterator[_InterimSupportsScalarsRowType]:
+        """Iterate over every source result, producing rows that have been
+        processed by the source's own metadata.
+
+        Each source contributes interim rows: plain tuples with that
+        source's result processors (and any tuple reduction) applied, but
+        no :class:`.Row` construction.  The merged result then packages
+        them into rows against the shared metadata.  Keeping the data in
+        tuple form here is what allows ORM entity loaders (which consume
+        position-based tuples via ``_raw_all_tuples()``) to keep working.
+
+        If fetching a row from a source raises, every remaining source
+        cursor is closed before the exception is propagated.  The raised
+        exception is annotated with the index of the source that failed so
+        that it can be traced back to the responsible result.
+
+        """
+        results = self._results
+        scalar_source = self._source_supports_scalars
+        try:
+            for idx, sub_result in enumerate(results):
+                self._active_source_index = idx
+
+                # use the source result's own interim row factory so that
+                # its result processors (e.g.
+                # TypeDecorator.process_result_value) are applied according
+                # to its own metadata rather than the merged result's
+                # metadata.
+                make_interim = sub_result._row_getter[2]
+
+                raw_iterator = sub_result._raw_row_iterator()
+                if make_interim is None:
+                    # scalar source whose rows are not tuple based;
+                    # values pass through unchanged
+                    for raw_row in raw_iterator:
+                        yield raw_row
+                else:
+                    for raw_row in raw_iterator:
+                        for interim_row in make_interim([raw_row]):
+                            if scalar_source:
+                                # scalar sources deliver single-element
+                                # tuples; unwrap back to the bare value
+                                yield interim_row[0]
+                            else:
+                                yield interim_row
+        except BaseException as err:
+            # a source failed while a batch / row was being fetched.
+            # close the source that failed as well as every source that
+            # had not yet been consumed.
+            failed_index = self._active_source_index
+            self._soft_close(hard=True)
+            # annotate the error so it points back at the source result
+            # that raised, then re-raise the original exception unchanged.
+            # some exception types disallow attribute assignment, in which
+            # case the cleanup above still applies and the original
+            # exception propagates.
+            try:
+                err.merge_source_index = failed_index  # type: ignore[attr-defined]
+                err.merge_result = results[failed_index]  # type: ignore[attr-defined]
+            except AttributeError:
+                pass
+            raise
+        finally:
+            self._active_source_index = -1
+
+    def _fetchiter_impl(self) -> Iterator[_InterimSupportsScalarsRowType]:
+        if self._hard_closed:
+            self._raise_hard_closed()
+        return self._merged_iterator
+
+    def _fetchone_impl(
+        self, hard_close: bool = False
+    ) -> Optional[_InterimRowType[Row[Unpack[TupleAny]]]]:
+        if self._hard_closed:
+            self._raise_hard_closed()
+
+        row = next(self._merged_iterator, _NO_ROW)
+        if row is _NO_ROW:
+            self._soft_close(hard=hard_close)
+            return None
+        else:
+            return row
+
+    def _fetchmany_impl(
+        self, size: Optional[int] = None
+    ) -> List[_InterimRowType[Row[Unpack[TupleAny]]]]:
+        if self._hard_closed:
+            self._raise_hard_closed()
+
+        if size is None:
+            return list(self._merged_iterator)
+        return list(itertools.islice(self._merged_iterator, 0, size))
+
+    def _fetchall_impl(
+        self,
+    ) -> List[_InterimRowType[Row[Unpack[TupleAny]]]]:
+        if self._hard_closed:
+            self._raise_hard_closed()
+        try:
+            return list(self._merged_iterator)
+        finally:
+            self._soft_close()
+
     def _soft_close(self, hard: bool = False, **kw: Any) -> None:
         for r in self._results:
             r._soft_close(hard=hard, **kw)
+        self._active_source_index = -1
         if hard:
+            self._hard_closed = True
             self.closed = True
+        self.iterator = iter([])
+        self._reset_memoizations()
+        self._soft_closed = True
