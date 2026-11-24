@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "../../servlets/hedge_status"
+
 module Requests
   module Plugins
     module Hedging
@@ -126,6 +128,117 @@ module Requests
           assert_includes(%i[idle closed], hedge_conn.state)
         ensure
           http.close
+        end
+      end
+
+      def test_hedging_accept_response_rejected_first_attempt_keeps_other_running
+        start_test_servlet(HedgeStatusServer, statuses: [500, 200]) do |server|
+          response = HTTPX.plugin(:hedging,
+                                   accept_response: ->(res) { !res.is_a?(HTTPX::ErrorResponse) && res.status < 500 })
+                           .get(server.origin.to_s)
+
+          verify_status(response, 200)
+
+          # both attempts must have been sent while racing each other.
+          assert server.request_count[0] == 2, "expected both hedge attempts to be sent (was #{server.request_count[0]})"
+        end
+      end
+
+      def test_hedging_accept_response_first_acceptable_wins
+        start_test_servlet(HedgeStatusServer, statuses: [200, 500]) do |server|
+          response = HTTPX.plugin(:hedging,
+                                   accept_response: ->(res) { !res.is_a?(HTTPX::ErrorResponse) && res.status < 500 })
+                           .get(server.origin.to_s)
+
+          verify_status(response, 200)
+        end
+      end
+
+      def test_hedging_accept_response_all_rejected_returns_traceable_hedging_error
+        start_test_servlet(HedgeStatusServer, statuses: [500, 503]) do |server|
+          response = HTTPX.plugin(:hedging,
+                                   accept_response: ->(res) { !res.is_a?(HTTPX::ErrorResponse) && res.status < 500 })
+                           .get(server.origin.to_s)
+
+          verify_error_response(response, HTTPX::HedgingError)
+
+          error = response.error
+
+          # the failure must be traceable back to every single attempt.
+          assert error.responses.size == 2, "expected 2 attempt responses (was #{error.responses.size})"
+          assert_equal [500, 503], error.responses.map(&:status)
+          assert error.message.include?("HTTP 500")
+          assert error.message.include?("HTTP 503")
+          assert server.request_count[0] == 2, "expected both hedge attempts to be sent (was #{server.request_count[0]})"
+        end
+      end
+
+      def test_hedging_accept_response_transport_errors_are_aggregated
+        # a server which accepts connections only to close them right away, so that
+        # both hedge attempts fail at the connection stage (after resolution, when
+        # the hedge pair is already established).
+        server = TCPServer.new("127.0.0.1", 0)
+        port = server.addr[1]
+        thread = Thread.new do
+          loop do
+            begin
+              client = server.accept
+              client.close
+            rescue IOError
+              break
+            end
+          end
+        end
+
+        begin
+          response = HTTPX.plugin(:hedging,
+                                   accept_response: ->(res) { !res.is_a?(HTTPX::ErrorResponse) })
+                           .with(timeout: { connect_timeout: 3, request_timeout: 5 })
+                           .get("http://127.0.0.1:#{port}/")
+
+          verify_error_response(response, HTTPX::HedgingError)
+
+          responses = response.error.responses
+
+          assert responses.size == 2, "expected 2 attempt errors (was #{responses.size})"
+          assert(responses.all? { |res| res.is_a?(HTTPX::ErrorResponse) })
+        ensure
+          server.close
+          thread.join
+        end
+      end
+
+      def test_hedging_without_accept_response_keeps_default_first_wins_behaviour
+        start_test_servlet(HedgeStatusServer, statuses: [500, 200]) do |server|
+          response = HTTPX.plugin(:hedging).get(server.origin.to_s)
+
+          # without an acceptance policy, the first completed response wins as before.
+          verify_status(response, 500)
+        end
+      end
+
+      def test_hedging_accept_response_must_be_callable
+        assert_raises(TypeError) { HTTPX.plugin(:hedging, accept_response: "not-callable") }
+      end
+
+      def test_hedging_all_rejected_connections_are_reusable
+        start_test_servlet(HedgeStatusServer, statuses: [500, 500]) do |server|
+          http = HTTPX.plugin(:persistent)
+                      .plugin(SessionWithPool)
+                      .plugin(:hedging, accept_response: ->(res) { res.status < 500 })
+
+          begin
+            failing = http.get(server.origin.to_s)
+            verify_error_response(failing, HTTPX::HedgingError)
+
+            # a subsequent successful request must still be served, i.e. healthy
+            # connections weren't permanently discarded by the all-failed hedge.
+            server.mount_proc("/ok") { |_req, res| res.status = 200; res.body = "ok" }
+            ok = http.get("#{server.origin}/ok")
+            verify_status(ok, 200)
+          ensure
+            http.close
+          end
         end
       end
     end

@@ -1,8 +1,18 @@
 module HTTPX
+  class HedgingError < Error
+    attr_reader responses: Array[Response | ErrorResponse]
+
+    def initialize: (Array[Response | ErrorResponse] responses) -> void
+
+    def close: () -> void
+  end
+
   module Plugins
     module Hedging
       interface _HedgingOptions
         def hedge_after: () -> (^(requestHedging request, Response response) -> interval | interval)?
+
+        def accept_response: () -> (^(Response | ErrorResponse response) -> boolish)?
       end
 
       module InstanceMethods
@@ -20,7 +30,41 @@ module HTTPX
 
         @is_hedge_request: bool
 
+        @hedge_main_request: requestHedging
+
+        @hedge_accepted_response: (Response | ErrorResponse)?
+
+        @hedge_connections: Array[connectionHedging]
+
+        @hedge_attempts: Array[Response | ErrorResponse]
+
+        def initialize_dup: (untyped orig) -> untyped
+
         def hedge_request=: (requestHedging? request) -> void
+
+        def remember_hedge_connections: (connectionHedging main_connection, connectionHedging hedge_connection) -> void
+
+        def hedge_accepted_response?: (Response | ErrorResponse response) -> bool
+
+        private
+
+        def hedge_accepted?: () -> boolish
+
+        def main_hedge_request: () -> requestHedging
+
+        def acceptable_hedge_response?: (Response | ErrorResponse response) -> bool
+
+        def hedge_requests_settled?: () -> boolish
+
+        def detach_hedge_requests: () -> void
+
+        def settle_all_hedge_attempts_failed: () -> void
+
+        def settle_accepted_hedge_response: (requestHedging main_request, Response response) -> void
+
+        def emit_base_response: (requestHedging request, Response | ErrorResponse response) -> void
+
+        def release_hedge_connections: (Array[connectionHedging] connections) -> void
       end
 
       module ConnectionMethods
