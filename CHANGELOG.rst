@@ -1,3 +1,11 @@
+Unreleased
+----------
+
+* Bugfix only switch to HTTP/2 on a cleartext connection once the full client
+  connection preface has been received, so partial prefaces are closed rather
+  than upgraded and HTTP/1 requests are identified without buffering a fixed
+  amount of data.
+
 0.18.0 2025-11-08
 -----------------
 

@@ -14,7 +14,12 @@ from hypercorn.asyncio.worker_context import EventWrapper
 from hypercorn.config import Config
 from hypercorn.events import Closed, RawData, Updated
 from hypercorn.protocol.events import Body, Data, EndBody, EndData, Request, Response, StreamClosed
-from hypercorn.protocol.h11 import H2CProtocolRequiredError, H2ProtocolAssumedError, H11Protocol
+from hypercorn.protocol.h11 import (
+    H2CProtocolRequiredError,
+    H2_PREFACE,
+    H2ProtocolAssumedError,
+    H11Protocol,
+)
 from hypercorn.protocol.http_stream import HTTPStream
 from hypercorn.typing import ConnectionState, Event as IOEvent
 
@@ -377,10 +382,108 @@ async def test_protocol_handle_h2c_upgrade(protocol: H11Protocol) -> None:
 
 @pytest.mark.asyncio
 async def test_protocol_handle_h2_prior(protocol: H11Protocol) -> None:
+    # A partial preface is buffered, nothing is sent and no protocol is chosen
+    await protocol.handle(RawData(data=H2_PREFACE[:10]))
+    assert protocol.sniffing
+    protocol.send.assert_not_called()  # type: ignore
+    # The remaining preface bytes plus trailing data trigger the switch, and
+    # everything received so far is handed to the H2 protocol in one piece.
     with pytest.raises(H2ProtocolAssumedError) as exc_info:
-        await protocol.handle(RawData(data=b"PRI * HTTP/2.0\r\n\r\nbbb"))
+        await protocol.handle(RawData(data=H2_PREFACE[10:] + b"bbb"))
+    assert not protocol.sniffing
+    assert exc_info.value.data == H2_PREFACE + b"bbb"
 
-    assert exc_info.value.data == b"PRI * HTTP/2.0\r\n\r\nbbb"
+
+@pytest.mark.asyncio
+async def test_protocol_handle_h2_prior_split_settings(protocol: H11Protocol) -> None:
+    # The last few preface bytes arrive together with the first SETTINGS frame
+    settings_frame = b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
+    await protocol.handle(RawData(data=H2_PREFACE[:20]))
+    assert protocol.sniffing
+    protocol.send.assert_not_called()  # type: ignore
+    with pytest.raises(H2ProtocolAssumedError) as exc_info:
+        await protocol.handle(RawData(data=H2_PREFACE[20:] + settings_frame))
+    assert exc_info.value.data == H2_PREFACE + settings_frame
+
+
+@pytest.mark.asyncio
+async def test_protocol_handle_h2_prior_truncated_closed(protocol: H11Protocol) -> None:
+    # Only part of the preface ever arrives, then the connection closes. The
+    # connection must simply close without initialising HTTP/2 or sending a
+    # SETTINGS frame.
+    await protocol.handle(RawData(data=H2_PREFACE[:15]))
+    assert protocol.sniffing
+    await protocol.handle(Closed())
+    assert protocol.send.call_args_list == [call(Closed())]  # type: ignore
+
+
+@pytest.mark.asyncio
+async def test_protocol_handle_h2_prior_idle_closed(protocol: H11Protocol) -> None:
+    # Closing before any data has arrived must not be treated as a truncated
+    # preface either.
+    await protocol.handle(Closed())
+    assert protocol.sniffing
+    protocol.send.assert_not_called()  # type: ignore
+
+
+@pytest.mark.asyncio
+async def test_protocol_handle_http1_short_prefix(protocol: H11Protocol) -> None:
+    # Bytes that cannot form the HTTP/2 preface are handed to h11 straight
+    # away without waiting for a fixed amount of data.
+    await protocol.handle(RawData(data=b"GE"))
+    assert not protocol.sniffing
+    await protocol.handle(
+        RawData(data=b"T / HTTP/1.1\r\nHost: hypercorn\r\nConnection: close\r\n\r\n")
+    )
+    protocol.stream.handle.assert_called()  # type: ignore
+    assert protocol.stream.handle.call_args_list[0] == call(  # type: ignore
+        Request(
+            stream_id=1,
+            headers=[(b"host", b"hypercorn"), (b"connection", b"close")],
+            http_version="1.1",
+            method="GET",
+            raw_path=b"/",
+            state=ConnectionState({}),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_protocol_handle_preface_prefix_then_http1(protocol: H11Protocol) -> None:
+    # Bytes that still match the start of the HTTP/2 preface are buffered until
+    # a byte rules it out, at which point everything is parsed as HTTP/1.
+    await protocol.handle(RawData(data=H2_PREFACE[:3]))  # b"PRI"
+    assert protocol.sniffing
+    protocol.send.assert_not_called()  # type: ignore
+    await protocol.handle(
+        RawData(data=b"X / HTTP/1.1\r\nHost: hypercorn\r\nConnection: close\r\n\r\n")
+    )
+    assert not protocol.sniffing
+    protocol.stream.handle.assert_called()  # type: ignore
+    assert protocol.stream.handle.call_args_list[0] == call(  # type: ignore
+        Request(
+            stream_id=1,
+            headers=[(b"host", b"hypercorn"), (b"connection", b"close")],
+            http_version="1.1",
+            method="PRIX",
+            raw_path=b"/",
+            state=ConnectionState({}),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_protocol_handle_http1_keep_alive_no_resniff(protocol: H11Protocol) -> None:
+    # Once identified as HTTP/1 subsequent keep-alive requests are parsed by
+    # h11 directly, i.e. the preface sniffing is not re-entered.
+    data = b"GET / HTTP/1.1\r\nHost: hypercorn\r\n\r\n"
+    await protocol.handle(RawData(data=data))
+    assert not protocol.sniffing
+    await protocol.stream_send(Response(stream_id=1, status_code=200, headers=[]))
+    await protocol.stream_send(EndBody(stream_id=1))
+    await protocol.stream_send(StreamClosed(stream_id=1))
+    await protocol.handle(RawData(data=data))
+    assert protocol.keep_alive_requests == 2
 
 
 @pytest.mark.asyncio

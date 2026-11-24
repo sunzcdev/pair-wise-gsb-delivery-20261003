@@ -24,6 +24,9 @@ from ..events import Closed, Event, RawData, Updated
 from ..typing import AppWrapper, ConnectionState, H11SendableEvent, TaskGroup, WorkerContext
 
 STREAM_ID = 1
+# RFC 7540 Section 3.5 - the connection preface a client must send when
+# using HTTP/2 with prior knowledge over a cleartext connection.
+H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 
 class H2CProtocolRequiredError(Exception):
@@ -106,17 +109,58 @@ class H11Protocol:
         self.stream: HTTPStream | WSStream | None = None
         self.task_group = task_group
         self.connection_state = connection_state
+        # Data buffered while sniffing for the HTTP/2 connection preface
+        # (prior knowledge). Once the protocol is known this is either handed
+        # wholesale to the H2 protocol or fed into the h11 connection.
+        self.preface_buffer = bytearray()
+        self.sniffing = True
 
     async def initiate(self) -> None:
         pass
 
     async def handle(self, event: Event) -> None:
         if isinstance(event, RawData):
-            self.connection.receive_data(event.data)
-            await self._handle_events()
+            if self.sniffing:
+                await self._sniff_preface(event.data)
+                if self.sniffing:
+                    # Still waiting for enough data to identify the protocol
+                    return
+            else:
+                self.connection.receive_data(event.data)
+                await self._handle_events()
         elif isinstance(event, Closed):
+            if self.sniffing and self.preface_buffer:
+                # The peer went away having sent only a partial HTTP/2
+                # preface. The connection was never upgraded, so simply
+                # close without initialising HTTP/2 or sending a SETTINGS.
+                await self.send(Closed())
+                return
             if self.stream is not None:
                 await self._close_stream()
+
+    async def _sniff_preface(self, data: bytes) -> None:
+        self.preface_buffer.extend(data)
+        buffered = bytes(self.preface_buffer)
+
+        # Only switch to HTTP/2 once the full connection preface has been
+        # observed. Anything buffered after the preface (e.g. the first
+        # SETTINGS frame) is handed over with it.
+        if buffered.startswith(H2_PREFACE):
+            self.sniffing = False
+            raise H2ProtocolAssumedError(buffered)
+
+        # A complete HTTP/2 preface can no longer be formed from the buffered
+        # data, so this must be an HTTP/1 request. Hand the buffered bytes to
+        # h11 without waiting for any fixed amount of data.
+        if not H2_PREFACE.startswith(buffered):
+            self.sniffing = False
+            self.connection.receive_data(buffered)
+            self.preface_buffer = bytearray()
+            await self._handle_events()
+            return
+
+        # The buffered data is still a prefix of the HTTP/2 preface, keep
+        # waiting for the remaining bytes (or for the connection to close).
 
     async def stream_send(self, event: StreamEvent) -> None:
         if isinstance(event, Response):
@@ -317,7 +361,3 @@ class H11Protocol:
                 )
             )
             raise H2CProtocolRequiredError(self.connection.trailing_data[0], event)
-        elif event.method == b"PRI" and event.target == b"*" and event.http_version == b"2.0":
-            raise H2ProtocolAssumedError(
-                b"PRI * HTTP/2.0\r\n\r\n" + self.connection.trailing_data[0]
-            )
