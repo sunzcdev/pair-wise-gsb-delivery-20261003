@@ -85,6 +85,10 @@ class WorkStealing(SchedulerPlugin):
     # { worker state: occupancy }
     in_flight_occupancy: defaultdict[WorkerState, float]
     in_flight_tasks: defaultdict[WorkerState, int]
+    # Resource permits reserved by in-flight steal requests, keyed by worker.
+    # Prospective thieves carry positive reservations, victims negative ones, so
+    # the net capacity of a worker accounts for every pending handshake.
+    in_flight_resources: defaultdict[WorkerState, defaultdict[str, float]]
     metrics: dict[str, dict[int, float]]
     _in_flight_event: asyncio.Event
     _request_counter: int
@@ -113,6 +117,7 @@ class WorkStealing(SchedulerPlugin):
         self.in_flight = {}
         self.in_flight_occupancy = defaultdict(int)
         self.in_flight_tasks = defaultdict(int)
+        self.in_flight_resources = defaultdict(lambda: defaultdict(float))
         self._in_flight_event = asyncio.Event()
         self.unknown_durations = {}
         self.metrics = {
@@ -212,6 +217,7 @@ class WorkStealing(SchedulerPlugin):
         self.in_flight_occupancy[thief] += info["thief_duration"]
         self.in_flight_tasks[victim] -= 1
         self.in_flight_tasks[thief] += 1
+        self._update_in_flight_resources(ts, victim, thief, +1)
 
     def _remove_from_in_flight(self, ts: TaskState) -> InFlightInfo | None:
         info = self.in_flight.pop(ts, None)
@@ -222,10 +228,73 @@ class WorkStealing(SchedulerPlugin):
             self.in_flight_occupancy[victim] += info["victim_duration"]
             self.in_flight_tasks[victim] += 1
             self.in_flight_tasks[thief] -= 1
+            self._update_in_flight_resources(ts, victim, thief, -1)
             if not self.in_flight:
                 self.in_flight_occupancy.clear()
+                self.in_flight_resources.clear()
                 self._in_flight_event.set()
         return info
+
+    def _update_in_flight_resources(
+        self,
+        ts: TaskState,
+        victim: WorkerState,
+        thief: WorkerState,
+        sign: int,
+    ) -> None:
+        """Record or release the resource reservation of an in-flight request.
+
+        A new request (``sign == 1``) reserves the task's resources on the
+        prospective *thief* and releases them on the *victim* for the duration
+        of the handshake. Reversing it (``sign == -1``) restores both sides,
+        regardless of whether the steal is ultimately confirmed, rejected or
+        aborted. Tasks without resource restrictions need no reservation.
+        """
+        restrictions = ts.resource_restrictions
+        if not restrictions:
+            return
+
+        for resource, required in restrictions.items():
+            self._shift_in_flight_resource(victim, resource, -sign * required)
+            self._shift_in_flight_resource(thief, resource, sign * required)
+
+    def _shift_in_flight_resource(
+        self, ws: WorkerState, resource: str, delta: float
+    ) -> None:
+        """Apply *delta* to one worker's in-flight reservation of *resource*."""
+        reservations = self.in_flight_resources[ws]
+        amount = reservations[resource] + delta
+        if abs(amount) < 1e-9:
+            reservations.pop(resource, None)
+        else:
+            reservations[resource] = amount
+
+        if not reservations:
+            self.in_flight_resources.pop(ws, None)
+
+    def _has_available_resources(self, ts: TaskState, ws: WorkerState) -> bool:
+        """Whether *ws* could run *ts* once pending reservations settle.
+
+        Accounts for resources already held by processing tasks and for permits
+        reserved by other in-flight steal requests. Workers that do not declare
+        a resource are treated as having none of it, mirroring
+        :meth:`Scheduler.valid_workers`.
+        """
+        restrictions = ts.resource_restrictions
+        if not restrictions:
+            return True
+
+        reservations = self.in_flight_resources.get(ws)
+        for resource, required in restrictions.items():
+            held = reservations.get(resource, 0.0) if reservations is not None else 0.0
+            available = (
+                ws.resources.get(resource, 0.0)
+                - ws.used_resources.get(resource, 0.0)
+                - held
+            )
+            if available + 1e-9 < required:
+                return False
+        return True
 
     def recalculate_cost(self, ts: TaskState) -> None:
         if ts not in self.in_flight:
@@ -360,6 +429,13 @@ class WorkStealing(SchedulerPlugin):
             ts = self.scheduler.tasks[key]
         except KeyError:
             logger.debug("Key released between request and confirm: %s", key)
+            # The task may have been interrupted without the transition hook
+            # finding it in ``scheduler.tasks``; reclaim any orphaned reservation
+            # so the target worker's quota never leaks.
+            for old_ts in list(self.in_flight):
+                if old_ts.key == key:
+                    self._remove_from_in_flight(old_ts)
+                    break
             return
         try:
             if self.in_flight[ts]["stimulus_id"] != stimulus_id:
@@ -403,6 +479,12 @@ class WorkStealing(SchedulerPlugin):
                 ts.processing_on = thief
                 victim.remove_from_processing(ts)
                 thief.add_to_processing(ts)
+                # `_remove_from_in_flight` above has already released the
+                # prospective reservation; now commit the resource permit by
+                # moving the authoritative scheduler accounting from victim to
+                # thief so that used_resources matches processing_on.
+                self.scheduler.release_resources(ts, victim)
+                self.scheduler.acquire_resources(ts, thief)
                 self.put_key_in_stealable(ts)
 
                 self.scheduler.send_task_to_worker(thief.address, ts)
@@ -546,6 +628,7 @@ class WorkStealing(SchedulerPlugin):
 
         self.key_stealable.clear()
         self.unknown_durations.clear()
+        self.in_flight_resources.clear()
 
     def story(self, *keys_or_ts: str | TaskState) -> list:
         keys = {key.key if not isinstance(key, str) else key for key in keys_or_ts}
@@ -600,6 +683,17 @@ class WorkStealing(SchedulerPlugin):
                 potential_thieves = valid_thieves
             elif not ts.loose_restrictions:
                 return None
+
+        # Do not pile another resource-hungry steal onto a thief whose permits
+        # are already spent or reserved by a concurrent in-flight request. If
+        # every valid thief is over-committed, preserve the historical choice and
+        # let the worker queue the task as constrained.
+        available_thieves = {
+            ws for ws in potential_thieves if self._has_available_resources(ts, ws)
+        }
+        if available_thieves:
+            potential_thieves = available_thieves
+
         return min(
             potential_thieves,
             key=partial(self.stealing_objective, ts, occupancies=occupancies),
