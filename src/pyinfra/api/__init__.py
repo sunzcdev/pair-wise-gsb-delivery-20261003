@@ -8,6 +8,7 @@ from .command import (
     MaskString,
 )
 from .hiddenvalue import HiddenValue
+from .arguments import UNSET, is_unset, unset
 from .config import Config
 from .deploy import deploy
 from .exceptions import (
@@ -58,6 +59,9 @@ __all__ = [
     "ShortFactBase",
     "State",
     "StringCommand",
+    "UNSET",
     "deploy",
+    "is_unset",
     "operation",
+    "unset",
 ]

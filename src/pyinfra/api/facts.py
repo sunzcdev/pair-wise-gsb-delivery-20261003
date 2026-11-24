@@ -22,7 +22,12 @@ from typing_extensions import override
 from pyinfra import logger
 from pyinfra.api.output import format_text
 from pyinfra.api import QuoteString, StringCommand
-from pyinfra.api.arguments import all_global_arguments, pop_global_arguments
+from pyinfra.api.arguments import (
+    all_global_arguments,
+    get_connector_arguments,
+    is_unset,
+    pop_global_arguments,
+)
 from pyinfra.api.exceptions import FactPreconditionError, FactProcessError, MissingCommandError
 from pyinfra.api.util import (
     get_kwargs_str,
@@ -33,8 +38,6 @@ from pyinfra.api.util import (
 from pyinfra.connectors.util import CommandOutput
 from pyinfra.context import ctx_host, ctx_state
 from pyinfra.progress import progress_spinner
-
-from .arguments import CONNECTOR_ARGUMENT_KEYS
 
 if TYPE_CHECKING:
     from pyinfra.api import Host, State
@@ -164,6 +167,14 @@ def _handle_fact_kwargs(state: State, host: Host, cls, args, kwargs):
     ).copy()
     # Update with the input kwargs (overrides)
     ctx_kwargs.update(kwargs)
+
+    # The copied resolved arguments remember connector args unset by the
+    # enclosing operation; a concrete fact-level override revokes that marker.
+    ctx_unset_keys = getattr(ctx_kwargs, "_unset_keys", None)
+    if ctx_unset_keys is not None:
+        for key, value in kwargs.items():
+            if not is_unset(value):
+                ctx_unset_keys.discard(key)
 
     # Pop executor kwargs, pass remaining
     global_kwargs, _ = pop_global_arguments(state, host, cast(dict[str, Any], ctx_kwargs))
@@ -330,9 +341,7 @@ def _get_fact(
     status = False
     output = CommandOutput([])
 
-    executor_kwargs = {
-        key: value for key, value in global_kwargs.items() if key in CONNECTOR_ARGUMENT_KEYS
-    }
+    executor_kwargs = get_connector_arguments(global_kwargs)
 
     if executor_kwargs.get("_su_user"):
         command = StringCommand("printf", QuoteString(_SU_OUTPUT_MARKER), "&&", command)

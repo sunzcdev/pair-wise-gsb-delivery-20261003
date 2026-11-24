@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 from pyinfra.api import Config, State
+from pyinfra.api.arguments import UNSET, get_connector_arguments, pop_global_arguments
 from pyinfra.api.host import HostData
 from pyinfra.context import ctx_config
 
@@ -75,6 +76,59 @@ class TestHostDeployContext(TestCase):
             assert host.current_deploy_name == "outer"
 
         assert host.current_deploy_name is None
+
+    def test_interleaved_host_argument_scopes_are_isolated(self):
+        inventory = make_inventory(hosts=("a", "b"))
+        state = State(inventory, Config())
+        host_a = inventory.get_host("a")
+        host_b = inventory.get_host("b")
+
+        outer_a = host_a.arguments(_sudo_user="a-outer")
+        outer_b = host_b.arguments(_sudo_user="b-outer")
+        outer_a.__enter__()
+        outer_b.__enter__()
+
+        inner_b = host_b.arguments(_sudo_user="b-inner")
+        inner_b.__enter__()
+
+        try:
+            with self.assertRaises(RuntimeError):
+                with host_a.arguments(_sudo_user=UNSET):
+                    raise RuntimeError("boom")
+
+            # The failed host returns to its own outer value, not the config default.
+            assert host_a.current_deploy_kwargs is not None
+            assert host_a.current_deploy_kwargs["_sudo_user"] == "a-outer"
+            args_a, _ = pop_global_arguments(state, host_a, {})
+            assert get_connector_arguments(args_a)["_sudo_user"] == "a-outer"
+
+            # The other host's independently interleaved inner scope is unaffected.
+            args_b, _ = pop_global_arguments(state, host_b, {})
+            assert get_connector_arguments(args_b)["_sudo_user"] == "b-inner"
+
+            inner_b.__exit__(None, None, None)
+
+            assert host_b.current_deploy_kwargs is not None
+            assert host_b.current_deploy_kwargs["_sudo_user"] == "b-outer"
+        finally:
+            outer_a.__exit__(None, None, None)
+            outer_b.__exit__(None, None, None)
+
+        assert host_a.current_deploy_kwargs is None
+        assert host_b.current_deploy_kwargs is None
+
+    def test_without_arguments_unsets_and_restores_named_argument(self):
+        host = self._make_host()
+
+        with host.arguments(_sudo_user="outer", _chdir="/outer"):
+            with host.without_arguments("_sudo_user"):
+                assert host.current_deploy_kwargs is not None
+                assert host.current_deploy_kwargs["_sudo_user"] is UNSET
+                assert host.current_deploy_kwargs["_chdir"] == "/outer"
+
+            assert host.current_deploy_kwargs is not None
+            assert host.current_deploy_kwargs["_sudo_user"] == "outer"
+            assert host.current_deploy_kwargs["_chdir"] == "/outer"
 
 
 class TestHostTempDirConfig(TestCase):

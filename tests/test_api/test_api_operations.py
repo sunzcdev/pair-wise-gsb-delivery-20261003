@@ -7,6 +7,7 @@ import time
 
 import pyinfra
 from pyinfra.api import (
+    UNSET,
     BaseStateCallback,
     Config,
     FileDownloadCommand,
@@ -16,6 +17,7 @@ from pyinfra.api import (
     State,
     StringCommand,
 )
+from pyinfra.api.host import Host
 from pyinfra.api.connect import connect_all, disconnect_all
 from pyinfra.api.exceptions import ArgumentTypeError, PyinfraError
 from pyinfra.api.operation import OperationMeta, add_op
@@ -39,6 +41,68 @@ class TestOperationMeta(TestCase):
     def test_operation_meta_repr_changes(self):
         op_meta = OperationMeta("hash", True)
         assert repr(op_meta) == "OperationMeta(executed=False, maybeChange=True, hash=hash)"
+
+
+class TestNestedArgumentConnectorScope(TestCase):
+    def test_interleaved_host_scopes_reach_connector(self):
+        inventory = make_inventory(hosts=("a", "b"))
+        state = State(inventory, Config())
+        host_a = inventory.get_host("a")
+        host_b = inventory.get_host("b")
+        state.activate_host(host_a)
+        state.activate_host(host_b)
+        host_a.connected = True
+        host_b.connected = True
+
+        calls = []
+
+        def run_shell_command(host, command, **kwargs):
+            calls.append((host.name, str(command), kwargs))
+            return True, CommandOutput([])
+
+        with patch.object(Host, "run_shell_command", run_shell_command):
+            outer_a = host_a.arguments(_sudo_user="a-outer", _env={"SCOPE": "a"})
+            outer_b = host_b.arguments(_sudo_user="b-outer", _env={"SCOPE": "b"})
+            outer_a.__enter__()
+            outer_b.__enter__()
+
+            inner_b = host_b.arguments(_sudo_user="b-inner")
+            inner_b.__enter__()
+
+            with self.assertRaises(RuntimeError):
+                with host_a.arguments(_sudo_user=UNSET):
+                    add_op(state, server.shell, "a-unset", host=host_a)
+                    raise RuntimeError("boom")
+
+            add_op(state, server.shell, "b-inner", host=host_b)
+            inner_b.__exit__(None, None, None)
+
+            add_op(state, server.shell, "a-after", host=host_a)
+            add_op(state, server.shell, "b-after", host=host_b)
+            run_ops(state)
+
+            outer_a.__exit__(None, None, None)
+            outer_b.__exit__(None, None, None)
+
+        by_command = {command: (name, kwargs) for name, command, kwargs in calls}
+
+        unset_name, unset_kwargs = by_command["a-unset"]
+        assert unset_name == "a"
+        assert "_sudo_user" not in unset_kwargs
+        assert unset_kwargs["_env"] == {"SCOPE": "a"}
+
+        after_name, after_kwargs = by_command["a-after"]
+        assert after_name == "a"
+        assert after_kwargs["_sudo_user"] == "a-outer"
+
+        inner_name, inner_kwargs = by_command["b-inner"]
+        assert inner_name == "b"
+        assert inner_kwargs["_sudo_user"] == "b-inner"
+        assert inner_kwargs["_env"] == {"SCOPE": "b"}
+
+        b_after_name, b_after_kwargs = by_command["b-after"]
+        assert b_after_name == "b"
+        assert b_after_kwargs["_sudo_user"] == "b-outer"
 
 
 class TestOperationsApi(PatchSSHTestCase):

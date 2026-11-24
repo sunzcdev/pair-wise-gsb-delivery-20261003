@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import traceback
 from itertools import product
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import gevent
 from paramiko import SSHException
@@ -14,7 +14,7 @@ from pyinfra.connectors.util import CommandOutput, OutputLine
 from pyinfra.context import ctx_host, ctx_state
 from pyinfra.progress import progress_spinner
 
-from .arguments import CONNECTOR_ARGUMENT_KEYS, ConnectorArguments
+from .arguments import ConnectorArguments, get_connector_arguments
 from .command import FunctionCommand, PyinfraCommand, StringCommand
 from .exceptions import NestedOperationError, PyinfraError
 from .util import (
@@ -71,12 +71,8 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
     retry_delay = global_arguments.get("_retry_delay", 5)
     retry_until = global_arguments.get("_retry_until", None)
 
-    executor_kwarg_keys = CONNECTOR_ARGUMENT_KEYS
     # See: https://github.com/python/mypy/issues/10371
-    base_connector_arguments: ConnectorArguments = cast(
-        ConnectorArguments,
-        {key: global_arguments[key] for key in executor_kwarg_keys if key in global_arguments},  # type: ignore[literal-required] # noqa
-    )
+    base_connector_arguments: ConnectorArguments = get_connector_arguments(global_arguments)
 
     retry_attempt = 0
     did_error = False

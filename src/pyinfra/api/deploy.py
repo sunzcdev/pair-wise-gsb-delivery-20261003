@@ -81,7 +81,9 @@ def deploy(
 def _wrap_deploy(func: Callable[P, Any]) -> PyinfraOperation[P]:
     @wraps(func)
     def decorated_func(*args: P.args, **kwargs: P.kwargs) -> Any:
-        deploy_kwargs, _ = pop_global_arguments(context.state, context.host, kwargs)
+        deploy_kwargs, explicit_argument_keys = pop_global_arguments(
+            context.state, context.host, kwargs
+        )
 
         deploy_data = getattr(func, "deploy_data", None)
 
@@ -89,6 +91,7 @@ def _wrap_deploy(func: Callable[P, Any]) -> PyinfraOperation[P]:
             name=func.deploy_name,  # type: ignore[attr-defined]
             kwargs=deploy_kwargs,
             data=deploy_data,
+            explicit_argument_keys=explicit_argument_keys,
         ):
             return func(*args, **kwargs)
 

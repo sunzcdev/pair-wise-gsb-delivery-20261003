@@ -11,7 +11,7 @@ from typing import (
 )
 from collections.abc import Callable, Iterable, Mapping
 
-from typing_extensions import TypedDict
+from typing_extensions import TypedDict, override
 
 from pyinfra.api.exceptions import ArgumentTypeError
 from pyinfra.api.util import raise_if_bad_type
@@ -23,6 +23,80 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 default_sentinel = object()
+
+
+class Unset:
+    """
+    Sentinel used to explicitly remove an inherited argument in a nested scope.
+
+    This is intentionally distinct from ``None``: ``None`` is a valid value for
+    many arguments, while :data:`UNSET` means the argument should not be passed
+    to the connector in the current scope.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+UNSET = Unset()
+# Common alternative type/sentinel names used by callers and integrations.
+UnsetType = Unset
+unset = UNSET
+
+
+def is_unset(value: Any) -> bool:
+    """Return whether ``value`` is an explicit unset sentinel."""
+
+    return (
+        value is UNSET
+        or value is unset
+        or value is default_sentinel
+        or value is Unset
+        or isinstance(value, Unset)
+    )
+
+
+class LayeredDict(dict[str, Any]):
+    """
+    A dict carrying keys that were explicitly unset while it was resolved.
+
+    The concrete dict values remain safe resolved values, while
+    :attr:`unset_keys` lets nested scopes and connector construction preserve
+    the distinction between an explicit ``None`` and an explicit unset.
+    """
+
+    _unset_keys: set[str]
+
+    def __init__(self, *args: Any, unset_keys: Iterable[str] = (), **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._unset_keys = set(unset_keys)
+
+    @property
+    def unset_keys(self) -> frozenset[str]:
+        return frozenset(self._unset_keys)
+
+    @unset_keys.setter
+    def unset_keys(self, keys: Iterable[str]) -> None:
+        self._unset_keys = set(keys)
+
+    @override
+    def __setitem__(self, key: str, value: Any) -> None:
+        # A later concrete assignment revokes an earlier unset marker. During
+        # ``dict.__init__`` the set may not exist yet.
+        unset_keys = getattr(self, "_unset_keys", None)
+        if unset_keys is not None:
+            unset_keys.discard(key)
+        super().__setitem__(key, value)
+
+    @override
+    def copy(self) -> LayeredDict:
+        return LayeredDict(super().copy(), unset_keys=self._unset_keys)
+
 
 EnvValue = str | HiddenValue
 
@@ -83,14 +157,127 @@ class ConnectorArguments(TypedDict, total=False):
     _temp_dir: str
 
 
-def generate_env(config: Config, value: Mapping[str, EnvValue] | None) -> dict[str, EnvValue]:
-    env: dict[str, EnvValue] = {
-        key: os.environ[key] for key in config.INHERIT_ENV if key in os.environ
-    }
+def merge_env_layers(
+    base: Mapping[str, EnvValue] | None,
+    override: Mapping[str, EnvValue] | None,
+) -> LayeredDict:
+    """
+    Merge nested ``_env`` mappings while preserving explicit removals.
+
+    ``None`` and :data:`UNSET` environment values both remove a key inherited
+    from an outer layer. The removal is retained in :attr:`LayeredDict.unset_keys`
+    so a later call to :func:`generate_env` does not add the key back from
+    ``config.ENV`` or the local process environment.
+    """
+
+    merged = LayeredDict()
+    unset_keys: set[str] = set()
+
+    if isinstance(base, Mapping):
+        merged.update(base)
+        unset_keys.update(getattr(base, "unset_keys", frozenset()))
+
+    if isinstance(override, Mapping):
+        unset_keys.update(getattr(override, "unset_keys", frozenset()))
+        for key, value in override.items():
+            if is_unset(value) or value is None:
+                merged.pop(key, None)
+                unset_keys.add(key)
+            else:
+                merged[key] = value
+                unset_keys.discard(key)
+
+    for key in unset_keys:
+        merged.pop(key, None)
+
+    merged.unset_keys = frozenset(unset_keys)
+    return merged
+
+
+def generate_env(config: Config, value: Mapping[str, EnvValue] | None) -> LayeredDict:
+    env: LayeredDict = LayeredDict(
+        {key: os.environ[key] for key in config.INHERIT_ENV if key in os.environ}
+    )
     env.update(config.ENV)
+
+    unset_keys: set[str] = set(getattr(value, "unset_keys", frozenset()))
+
     if value is not None:
-        env.update(value)
+        for key, env_value in value.items():
+            if is_unset(env_value) or env_value is None:
+                env.pop(key, None)
+                unset_keys.add(key)
+            else:
+                env[key] = env_value
+                unset_keys.discard(key)
+
+    for key in unset_keys:
+        env.pop(key, None)
+
+    env.unset_keys = frozenset(unset_keys)
     return env
+
+
+def merge_argument_layers(
+    base: Mapping[str, Any] | None,
+    override: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """
+    Copy and merge two host/deploy argument scopes without mutating either.
+
+    :data:`UNSET` values and :class:`LayeredDict` unset metadata become tombstone
+    values in the resulting scope. :func:`pop_global_arguments` turns those into
+    resolved defaults while recording them for connector filtering.
+    """
+
+    merged: dict[str, Any] = dict(base or {})
+
+    override_unset_keys = getattr(override, "unset_keys", frozenset())
+    if isinstance(override, Mapping):
+        for key, value in override.items():
+            if key in override_unset_keys or is_unset(value):
+                merged[key] = UNSET
+            elif key == "_env" and isinstance(value, Mapping):
+                base_env = merged.get("_env")
+                merged[key] = merge_env_layers(
+                    base_env if isinstance(base_env, Mapping) else None,
+                    value,
+                )
+            else:
+                merged[key] = value
+
+    for key in override_unset_keys:
+        merged[key] = UNSET
+
+    return merged
+
+
+def get_connector_arguments(
+    global_arguments: Mapping[str, Any],
+) -> ConnectorArguments:
+    """Return connector args, omitting values explicitly unset in this scope."""
+
+    unset_keys = getattr(global_arguments, "unset_keys", frozenset())
+    connector_arguments: dict[str, Any] = {}
+
+    for key in CONNECTOR_ARGUMENT_KEYS:
+        if key not in global_arguments or key in unset_keys:
+            continue
+
+        value = global_arguments[key]
+        if is_unset(value):
+            continue
+
+        if key == "_env" and isinstance(value, Mapping):
+            value = {
+                env_key: env_value
+                for env_key, env_value in value.items()
+                if not is_unset(env_value) and env_value is not None
+            }
+
+        connector_arguments[key] = value
+
+    return cast(ConnectorArguments, connector_arguments)
 
 
 auth_argument_meta: dict[str, ArgumentMeta] = {
@@ -418,24 +605,50 @@ def pop_global_arguments(
 
     cdkwargs = host.current_deploy_kwargs
     meta_kwargs: dict[str, Any] = cdkwargs or {}  # type: ignore[assignment]
+    meta_unset_keys = getattr(meta_kwargs, "unset_keys", frozenset())
+    caller_unset_keys = getattr(kwargs, "unset_keys", frozenset())
 
-    arguments: dict[str, Any] = {}
+    # Nested ``_env`` mappings are layered rather than replaced so an inner scope
+    # can remove one inherited variable without losing all the others.
+    explicit_env = kwargs.get("_env", default_sentinel)
+    if isinstance(explicit_env, Mapping):
+        meta_env = meta_kwargs.get("_env")
+        kwargs["_env"] = merge_env_layers(
+            meta_env if isinstance(meta_env, Mapping) else None,
+            explicit_env,
+        )
+
+    arguments = LayeredDict()
     found_keys: list[str] = []
+    unset_keys: set[str] = set()
 
     for key, type_ in all_global_arguments():
         argument_meta = all_argument_meta[key]
         handler = argument_meta.handler
-        default: Any = argument_meta.default(config)
+        config_default: Any = argument_meta.default(config)
+        default = config_default
 
         host_default = getattr(host.data, key, default_sentinel)
         if host_default is not default_sentinel:
             default = host_default
 
+        caller_marked_unset = key in caller_unset_keys
         if key in kwargs:
             found_keys.append(key)
             value = kwargs.pop(key)
+            if is_unset(value):
+                caller_marked_unset = True
+        elif key in meta_kwargs:
+            value = meta_kwargs[key]
         else:
-            value = meta_kwargs.get(key, default)
+            value = default
+
+        if caller_marked_unset or key in meta_unset_keys or is_unset(value):
+            # Resolve ordinary engine behaviour from the config default, while
+            # recording that the connector argument itself was explicitly
+            # unset and must therefore be omitted.
+            unset_keys.add(key)
+            value = config_default
 
         if handler:
             value = handler(config, value)
@@ -450,4 +663,6 @@ def pop_global_arguments(
 
         # TODO: why is type failing here?
         arguments[key] = value  # type: ignore
+
+    arguments.unset_keys = frozenset(unset_keys)
     return cast(AllArguments, arguments), found_keys

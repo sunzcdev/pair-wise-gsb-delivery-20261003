@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from copy import copy
 from typing import (
     TYPE_CHECKING,
@@ -9,7 +9,7 @@ from typing import (
     cast,
     overload,
 )
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from uuid import uuid4
 
 from typing_extensions import Unpack, override
@@ -20,6 +20,7 @@ from pyinfra.connectors.base import BaseConnector
 from pyinfra.connectors.util import CommandOutput, remove_any_sudo_askpass_file
 from pyinfra.context import ctx_config
 
+from .arguments import UNSET, is_unset, merge_argument_layers
 from .connectors import get_execution_connector
 from .exceptions import ConnectError
 from .facts import FactBase, ShortFactBase, get_fact
@@ -40,6 +41,14 @@ def extract_callable_datas(
         if callable(data):
             data = data()
         yield data
+
+
+def _as_condition_list(condition: Any) -> list[Callable[[], bool]]:
+    if condition is None:
+        return []
+    if isinstance(condition, list):
+        return condition
+    return [condition]
 
 
 class HostData:
@@ -236,8 +245,29 @@ class Host:
             in_deploy=False,
         )
 
-    def arguments(self, **arguments: Unpack[AllArguments]):
+    def arguments(self, **arguments: Unpack[AllArguments]) -> AbstractContextManager[None]:
+        """
+        Temporarily set global arguments for operations on this host.
+
+        Nested scopes inherit and shallow-merge the previous scope; ``_env``
+        mappings are merged key-by-key. Pass :data:`pyinfra.api.UNSET` to
+        explicitly remove an inherited argument for the current scope; an
+        explicit ``None`` remains a normal value for arguments which accept it.
+        """
+
         return self.deploy("", arguments, {}, in_deploy=False)
+
+    def without_arguments(self, *argument_names: str) -> AbstractContextManager[None]:
+        """
+        Context manager that explicitly unsets inherited global arguments.
+
+        On exit, the previous host argument scope is restored.
+        """
+
+        return self.arguments(**{name: UNSET for name in argument_names})
+
+    #: Descriptive alias for :meth:`without_arguments`.
+    unset_arguments = without_arguments
 
     @contextmanager
     def deploy(
@@ -246,7 +276,8 @@ class Host:
         kwargs: AllArguments | None,
         data: dict | None,
         in_deploy: bool = True,
-    ):
+        explicit_argument_keys: Iterable[str] | None = None,
+    ) -> Generator[None, None, None]:
         """
         Wraps a group of operations as a deploy, this should not be used
         directly, instead use ``pyinfra.api.deploy.deploy``.
@@ -263,16 +294,33 @@ class Host:
         old_deploy_data = self.current_deploy_data
         self.in_deploy = in_deploy
 
-        # Combine any old _ifs with the new ones
-        if old_deploy_kwargs and kwargs:
-            old_ifs = old_deploy_kwargs["_if"]
-            new_ifs = kwargs["_if"]
-            if old_ifs and new_ifs:
-                kwargs["_if"] = old_ifs + new_ifs
+        # Nested argument scopes inherit the previous per-host scope. Copy the
+        # dictionaries here: mutating the outer scope while entering an inner
+        # scope would otherwise leak an unset marker or override across hosts.
+        if kwargs is not None:
+            merged_kwargs = merge_argument_layers(old_deploy_kwargs, kwargs)
+
+            explicit_keys = (
+                set(explicit_argument_keys)
+                if explicit_argument_keys is not None
+                else set(kwargs.keys())
+            )
+
+            # Combine nested ``_if`` conditions, but only when the new scope
+            # explicitly supplied one. pop_global_arguments already inherits
+            # conditions for @deploy decorators when _if was not passed.
+            if old_deploy_kwargs and "_if" in explicit_keys and "_if" in old_deploy_kwargs:
+                old_ifs = old_deploy_kwargs["_if"]
+                new_ifs = kwargs.get("_if")
+                if not is_unset(old_ifs) and not is_unset(new_ifs) and old_ifs and new_ifs:
+                    merged_kwargs["_if"] = _as_condition_list(old_ifs) + _as_condition_list(new_ifs)
+
+            self.current_deploy_kwargs = cast("AllArguments", merged_kwargs)
+        else:
+            self.current_deploy_kwargs = None
 
         # Set the new values
         self.current_deploy_name = name
-        self.current_deploy_kwargs = kwargs
         self.current_deploy_data = data
         logger.debug(
             "Starting deploy %s (args=%r, data=%r)",
