@@ -300,6 +300,109 @@ def test_get_all_or_nothing():
     assert list(lru.order) == ["z", "y", "x"]
 
 
+def test_pin_skips_pinned_keys():
+    """Pin two heavy keys and leave a third, movable key evictable."""
+    lru = LRU(100, {}, weight=lambda k, v: v)
+    lru["heavy1"] = 40
+    lru["heavy2"] = 40
+    lru["movable"] = 10
+
+    pin1 = lru.pin("heavy1")
+    pin2 = lru.pin("heavy2")
+    assert lru.pinned_keys == {"heavy1", "heavy2"}
+    assert lru.pinned_weight == 80
+    assert lru.evictable_weight == 10
+
+    lru.n = 30
+    # The movable key is evicted; the pinned ones are spared even though they're the
+    # least recently used. Eviction does not loop waiting for the pins to be released.
+    assert lru.evict_until_below_target() == 50
+    assert list(lru) == ["heavy1", "heavy2"]
+    assert lru.excess == 50
+
+    cap = lru.capacity
+    assert cap.target == 30
+    assert cap.total_weight == 80
+    assert cap.pinned_weight == 80
+    assert cap.excess == 50
+    assert cap.unmet
+    assert cap.unmet_seconds > 0
+
+    # Release one borrow: heavy1 becomes evictable and gets evicted, but heavy2 alone
+    # still exceeds the target, so the excess is still reported.
+    pin1.release()
+    assert not lru.is_pinned("heavy1")
+    assert lru.evict_until_below_target() == 10
+    assert list(lru) == ["heavy2"]
+    assert lru.capacity.unmet
+
+    pin2.release()
+    assert lru.evict_until_below_target() == 0
+    assert not lru
+    cap = lru.capacity
+    assert not cap.unmet
+    assert cap.excess == 0
+    assert cap.last_unmet_seconds > 0
+
+    # Releasing twice is a no-op
+    pin2.release()
+
+
+def test_pin_all_keys_blocks_target():
+    lru = LRU(0, {}, weight=lambda k, v: v)
+    lru.set_noevict("x", 1)
+    lru.set_noevict("y", 1)
+    lru.pin("x")
+    lru.pin("y")
+
+    assert lru.evict_until_below_target() == 2
+    assert set(lru) == {"x", "y"}
+    with pytest.raises(KeyError, match="all keys are pinned"):
+        lru.evict()
+    with pytest.raises(KeyError, match="pinned"):
+        lru.evict("x")
+
+    lru.unpin("x")
+    assert lru.evict_until_below_target() == 1
+    assert set(lru) == {"y"}
+
+
+def test_pin_nested_and_errors():
+    lru = LRU(100, {}, weight=lambda k, v: v)
+    lru["x"] = 1
+
+    lru.pin("x")
+    lru.pin("x")
+    lru.unpin("x")
+    assert lru.is_pinned("x")  # Still pinned once
+    assert lru.unpin("x") == 0
+    assert not lru.is_pinned("x")
+
+    with pytest.raises(KeyError, match="not pinned"):
+        lru.unpin("x")
+    with pytest.raises(KeyError, match="missing"):
+        lru.pin("missing")
+
+
+def test_pin_survives_set_noevict_update():
+    lru = LRU(100, {}, weight=lambda k, v: v)
+    lru["x"] = 1
+    lru.pin("x")
+    lru.set_noevict("x", 2)  # Update in place; the pin must not be dropped
+    assert lru.is_pinned("x")
+    assert lru.weights["x"] == 2
+    assert lru.pinned_weight == 2
+
+
+def test_pin_dropped_on_delete():
+    lru = LRU(100, {}, weight=lambda k, v: v)
+    lru["x"] = 1
+    pin = lru.pin("x")
+    del lru["x"]
+    assert not lru.is_pinned("x")
+    assert pin.release() == 0  # No-op, key is gone
+
+
 def test_close_aborts_eviction():
     evicted = []
 

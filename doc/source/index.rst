@@ -68,7 +68,11 @@ API
 
 Additionally, **zict** makes available the following general-purpose objects:
 
+.. autoclass:: CapacityRecord
+   :members:
 .. autoclass:: InsertionSortedSet
+   :members:
+.. autoclass:: Pin
    :members:
 .. autoclass:: WeakValueMapping
    :members:

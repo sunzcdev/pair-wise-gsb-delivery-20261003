@@ -4,7 +4,7 @@ from collections.abc import Callable, ItemsView, Iterator, MutableMapping, Value
 from itertools import chain
 
 from zict.common import KT, VT, ZictBase, close, discard, flush, locked
-from zict.lru import LRU
+from zict.lru import CapacityRecord, LRU, Pin
 
 
 class Buffer(ZictBase[KT, VT]):
@@ -38,6 +38,14 @@ class Buffer(ZictBase[KT, VT]):
     fast. ``slow.__getitem__``, ``slow.__setitem__`` and callbacks are not protected
     by locks.
 
+    Values that are being borrowed by a processor can be protected from being moved to
+    ``slow`` (and thus from being evicted) with :meth:`pin`. Only the keys that are
+    currently in ``fast`` can be pinned. While some keys are pinned, eviction keeps
+    moving the other, evictable keys to ``slow``; if the target cannot be met because
+    the remaining weight is pinned, :meth:`evict_until_below_target` returns immediately
+    with the residual excess instead of waiting for the borrowers to release their pins.
+    :attr:`capacity` reports the resulting state.
+
     Examples
     --------
     >>> fast = {}
@@ -62,7 +70,7 @@ class Buffer(ZictBase[KT, VT]):
         self,
         fast: MutableMapping[KT, VT],
         slow: MutableMapping[KT, VT],
-        n: float,
+        n: float | None = None,
         weight: Callable[[KT, VT], float] = lambda k, v: 1,
         fast_to_slow_callbacks: Callable[[KT, VT], None]
         | list[Callable[[KT, VT], None]]
@@ -70,8 +78,13 @@ class Buffer(ZictBase[KT, VT]):
         slow_to_fast_callbacks: Callable[[KT, VT], None]
         | list[Callable[[KT, VT], None]]
         | None = None,
+        target: float | None = None,
     ):
         super().__init__()
+        if target is not None:
+            n = target
+        if n is None:
+            raise TypeError("Buffer requires a target size 'n' (or 'target')")
         self.fast = LRU(
             n,
             fast,
@@ -107,6 +120,15 @@ class Buffer(ZictBase[KT, VT]):
     @n.setter
     def n(self, value: float) -> None:
         self.fast.n = value
+
+    @property
+    def target(self) -> float:
+        """Alias for :attr:`n`, using capacity/target terminology."""
+        return self.n
+
+    @target.setter
+    def target(self, value: float) -> None:
+        self.n = value
 
     @property
     def offset(self) -> float:
@@ -198,11 +220,234 @@ class Buffer(ZictBase[KT, VT]):
             self._cancel_restore[key] = True
         self.fast.set_noevict(key, value)
 
-    def evict_until_below_target(self, n: float | None = None) -> None:
+    def evict_until_below_target(self, n: float | None = None) -> float:
         """Wrapper around :meth:`zict.LRU.evict_until_below_target`.
         Presented here to allow easier overriding.
+
+        Returns
+        -------
+        float
+            How much the fast mapping still exceeds the target once all the evictable
+            keys have been moved to slow. Non-zero only if the remaining weight is
+            pinned; see :meth:`pin` and :attr:`capacity`.
         """
-        self.fast.evict_until_below_target(n)
+        return self.fast.evict_until_below_target(n)
+
+    def shrink(self, target: float | None = None) -> float:
+        """Lower :attr:`n`/:attr:`target` (when given) and evict to the new target.
+
+        Returns the residual excess report from
+        :meth:`evict_until_below_target`.
+        """
+        if target is not None:
+            self.target = target
+        return self.evict_until_below_target()
+
+    resize = shrink
+    evict_to_target = evict_until_below_target
+
+    @property
+    def capacity(self) -> CapacityRecord:
+        """Snapshot of the capacity state of the fast mapping.
+
+        See Also
+        --------
+        capacity_record
+        pin
+        unpin
+        evict_until_below_target
+        zict.LRU.capacity
+        """
+        return self.fast.capacity
+
+    capacity_record = capacity
+    capacity_snapshot = capacity
+    capacity_report = capacity
+    capacity_info = capacity
+    stats = capacity
+    metrics = capacity
+
+    def get_capacity(self) -> CapacityRecord:
+        """Return a current :class:`~zict.CapacityRecord` snapshot."""
+        return self.fast.get_capacity()
+
+    def record_capacity(self) -> CapacityRecord:
+        """Alias for :attr:`capacity` / :meth:`get_capacity`."""
+        return self.fast.record_capacity()
+
+    @property
+    def unmet_seconds(self) -> float:
+        """Seconds for which the target has currently been continuously unmet."""
+        return self.fast.unmet_seconds
+
+    @property
+    def last_unmet_seconds(self) -> float:
+        """Duration of the most recently completed unmet interval."""
+        return self.fast.last_unmet_seconds
+
+    @property
+    def pinned_weight(self) -> float:
+        """Total weight of the keys that are currently pinned in fast.
+
+        See Also
+        --------
+        pin
+        pinned_keys
+        """
+        return self.fast.pinned_weight
+
+    @property
+    def evictable_weight(self) -> float:
+        """Total weight of the keys in fast that are not pinned and could be moved to
+        slow.
+
+        See Also
+        --------
+        pinned_weight
+        capacity
+        """
+        return self.fast.evictable_weight
+
+    @property
+    def excess(self) -> float:
+        """How much the weight in fast currently exceeds ``n``; zero or positive.
+
+        See Also
+        --------
+        capacity
+        pinned_weight
+        evict_until_below_target
+        """
+        return self.fast.excess
+
+    @property
+    def pinned(self) -> set[KT]:
+        """A copy of the set of keys currently pinned in fast."""
+        return self.fast.pinned
+
+    @property
+    def pinned_keys(self) -> set[KT]:
+        """A copy of the set of the keys that are currently pinned in fast.
+
+        See Also
+        --------
+        pinned
+        pin
+        """
+        return self.fast.pinned_keys
+
+    @property
+    def pin_counts(self) -> dict[KT, int]:
+        """Nested-pin counts for the currently pinned keys."""
+        return self.fast.pin_counts
+
+    @property
+    def pins(self) -> dict[KT, int]:
+        """Alias for :attr:`pin_counts`."""
+        return self.fast.pins
+
+    def is_pinned(self, key: object) -> bool:
+        """Whether *key* is currently pinned in fast.
+
+        See Also
+        --------
+        pin
+        """
+        return self.fast.is_pinned(key)
+
+    @locked
+    def pin(self, key: KT) -> Pin[KT]:
+        """Pin a value in the fast mapping, protecting it from being moved to slow (and
+        thus evicted) while it is being borrowed.
+
+        Pins can be nested and are counted. Use the returned context manager, or
+        :meth:`unpin` / :meth:`Pin.release`, to release them::
+
+            with buff.pin(key):
+                value = buff[key]
+                use(value)
+
+        While any key is pinned, :meth:`evict_until_below_target` still evicts every
+        other, non-pinned key. If the target cannot be reached because the pinned keys
+        are too heavy, it returns the residual excess instead of blocking.
+
+        Parameters
+        ----------
+        key: Key that must currently be present in the fast mapping.
+
+        Raises
+        ------
+        KeyError
+            If *key* is not in the fast mapping (e.g. it has already been moved to
+            slow).
+
+        See Also
+        --------
+        unpin
+        capacity
+        """
+        # Let the LRU do the counting (so pins can be nested); the Pin handle we hand
+        # back is bound to the Buffer instead, so that overridden unpin() - e.g. in
+        # AsyncBuffer - is honoured when it is released.
+        self.fast.pin(key)
+        return Pin(self, key)
+
+    # Terminology aliases for callers modeling borrowed/held objects.
+    borrow = pin
+    hold = pin
+    protect = pin
+    pin_key = pin
+    borrow_key = pin
+    hold_key = pin
+
+    def unpin(self, key: KT | Pin[KT], evict: bool = True) -> float:
+        """Release one pin previously acquired with :meth:`pin`.
+
+        *key* may be the key itself or the :class:`~zict.Pin` handle returned by
+        :meth:`pin`. By default this immediately calls
+        :meth:`evict_until_below_target`, so releasing the final borrow returns the
+        buffer to its configured range when possible. Pass ``evict=False`` to only
+        remove the pin; the caller can then evict explicitly.
+
+        Returns the residual excess after eviction (or immediately after unpinning when
+        ``evict=False``), as per :attr:`zict.LRU.excess`.
+
+        See Also
+        --------
+        release
+        pin
+        capacity
+        """
+        pin_handle: Pin[KT] | None = None
+        if isinstance(key, Pin):
+            pin_handle = key
+            key = key.key  # type: ignore[assignment]
+        with self.lock:
+            excess = self.fast.unpin(key)  # type: ignore[arg-type]
+        if pin_handle is not None:
+            pin_handle._released = True
+        if evict:
+            return self.evict_until_below_target()
+        return excess
+
+    def release(self, pin_or_key: Pin[KT] | KT, evict: bool = True) -> float:
+        """Release a pin handle or key. Alias-friendly wrapper around :meth:`unpin`."""
+        if isinstance(pin_or_key, Pin):
+            if pin_or_key._released:
+                return self.excess
+            return pin_or_key.release()
+        return self.unpin(pin_or_key, evict)
+
+    def release_pin(self, key: KT | Pin[KT], evict: bool = True) -> float:
+        """Alias for :meth:`unpin`."""
+        return self.unpin(key, evict)
+
+    def release_borrow(self, key: KT | Pin[KT], evict: bool = True) -> float:
+        """Alias for :meth:`unpin`."""
+        return self.unpin(key, evict)
+
+    unpin_key = unpin
+    release_key = unpin
 
     @locked
     def __delitem__(self, key: KT) -> None:

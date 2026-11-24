@@ -161,6 +161,9 @@ class AsyncBuffer(Buffer[KT, VT]):
     def async_evict_until_below_target(self, n: float | None = None) -> None:
         """If the total weight exceeds n, asynchronously start moving keys from fast to
         slow in a worker thread.
+
+        Weight that is pinned cannot be evicted; if the only reason the target is unmet
+        is that too much weight is pinned, no worker thread is spawned.
         """
         if n is None:
             n = self.n
@@ -168,9 +171,27 @@ class AsyncBuffer(Buffer[KT, VT]):
         weight = min(chain([self.fast.total_weight], self.evicting.values()))
         if weight <= n:
             return
+        if self.fast.evictable_weight <= 0:
+            # Everything above the target is pinned; there is nothing for a worker
+            # thread to do. Eviction resumes when a pin is released (see unpin()).
+            return
 
         # Note: this can get cancelled by LRU.close(), which in turn is
         # triggered by Buffer.close()
         future = self._offload(self.evict_until_below_target, n)
         self.evicting[future] = n
         future.add_done_callback(self.evicting.__delitem__)
+
+    @locked
+    def unpin(self, key: Any, evict: bool = True) -> float:
+        """Release a pin and, by default, asynchronously resume moving keys from fast
+        to slow when that makes weight evictable.
+
+        Unlike :meth:`Buffer.unpin`, this does not perform slow-layer writes on the
+        calling thread. The returned excess is the immediate pre-eviction value; await
+        :attr:`futures` and inspect :attr:`capacity` for completion.
+        """
+        excess = super().unpin(key, evict=False)
+        if evict:
+            self.async_evict_until_below_target()
+        return excess

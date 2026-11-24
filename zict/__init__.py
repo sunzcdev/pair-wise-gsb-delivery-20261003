@@ -6,7 +6,14 @@ from zict.file import File as File
 from zict.func import Func as Func
 from zict.keymap import KeyMap as KeyMap
 from zict.lmdb import LMDB as LMDB
+from zict.lru import Capacity as Capacity
+from zict.lru import CapacityInfo as CapacityInfo
+from zict.lru import CapacityRecord as CapacityRecord
+from zict.lru import CapacityReport as CapacityReport
+from zict.lru import CapacitySnapshot as CapacitySnapshot
+from zict.lru import ExcessReport as ExcessReport
 from zict.lru import LRU as LRU
+from zict.lru import Pin as Pin
 from zict.sieve import Sieve as Sieve
 from zict.utils import InsertionSortedSet as InsertionSortedSet
 from zict.zip import Zip as Zip

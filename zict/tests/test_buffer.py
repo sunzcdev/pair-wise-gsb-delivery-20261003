@@ -264,6 +264,134 @@ def test_set_noevict():
     assert s2f == []
 
 
+def test_pin_reports_excess_and_resumes():
+    """Borrow two heavy values and one evictable one; shrink the target below the
+    pinned weight, then release the pins one at a time.
+
+    Eviction must still move the evictable key to slow, must report the residual
+    excess instead of blocking on the borrowers, and must go back in range once the
+    last pin is released. See the ``capacity`` record for the whole story.
+    """
+    slow = {}
+    buff = Buffer({}, slow, n=12, weight=lambda _, x: len(x))
+    for key in ("borrow1", "borrow2", "other"):
+        buff[key] = b"data"
+
+    pin1 = buff.pin("borrow1")
+    pin2 = buff.pin("borrow2")
+    assert buff.pinned_keys == {"borrow1", "borrow2"}
+    assert buff.pinned_weight == 8
+
+    buff.n = 0
+    # Only the movable key goes to slow; the pinned ones stay in fast. No waiting.
+    assert buff.evict_until_below_target() == 8
+    assert list(buff.fast) == ["borrow1", "borrow2"]
+    assert list(slow) == ["other"]
+
+    cap = buff.capacity
+    assert cap.total_weight == 8
+    assert cap.pinned_weight == 8
+    assert cap.excess == 8
+    assert cap.unmet
+    assert cap.unmet_seconds > 0
+
+    # Release the first borrow; the pinned remainder is still over target.
+    pin1.release()
+    assert buff.evict_until_below_target() == 4
+    assert list(buff.fast) == ["borrow2"]
+    assert list(slow) == ["other", "borrow1"]
+    assert buff.capacity.unmet
+
+    # Release the last borrow; back within the configured range.
+    buff.unpin("borrow2")
+    assert buff.evict_until_below_target() == 0
+    assert not buff.fast
+    assert set(buff.slow) == {"other", "borrow1", "borrow2"}
+
+    cap = buff.capacity
+    assert not cap.unmet
+    assert cap.excess == 0
+    assert cap.pinned_weight == 0
+    assert cap.last_unmet_seconds > 0
+
+
+def test_pin_release_returns_to_target_without_second_evict_call():
+    slow = {}
+    buff = Buffer({}, slow, target=12, weight=lambda _, x: len(x))
+    for key in ("borrow1", "borrow2", "other"):
+        buff[key] = b"data"
+
+    borrow1 = buff.borrow("borrow1")
+    borrow2 = buff.borrow("borrow2")
+    buff.target = 0
+    assert buff.evict_until_below_target() == 8
+    assert list(buff.fast) == ["borrow1", "borrow2"]
+
+    # Releasing the first borrow automatically makes that key movable again.
+    assert borrow1.release() == 4
+    assert list(buff.fast) == ["borrow2"]
+    assert list(slow) == ["other", "borrow1"]
+    assert buff.capacity.unmet
+
+    # The last release restores the configured range without another shrink call.
+    assert borrow2.release() == 0
+    assert not buff.fast
+    assert set(slow) == {"other", "borrow1", "borrow2"}
+    record = buff.capacity_record
+    assert record.met
+    assert record["excess"] == 0
+    assert record["last_unmet_duration"] >= 0
+
+
+def test_capacity_record_aliases_are_callable_and_mapping_like():
+    buff = Buffer({}, {}, n=1, weight=lambda k, v: v)
+    buff.set_noevict("x", 2)
+    buff.pin("x")
+    buff.n = 0
+
+    record = buff.capacity_record
+    assert callable(record)
+    assert record() is record
+    assert record.actual_weight == 2
+    assert record.over_target == 2
+    assert record.duration >= 0
+    assert record["total_weight"] == 2
+    assert record["over"] == 2
+    assert record.get("pinned_weight") == 2
+    assert buff.pinned == {"x"}
+    assert buff.target == 0
+
+
+def test_pin_context_manager_and_nesting():
+    buff = Buffer({}, {}, n=10, weight=lambda k, v: v)
+    buff["x"] = 1
+    buff["y"] = 2
+
+    with buff.pin("x"):
+        assert buff.is_pinned("x")
+        with buff.pin("x"):  # nested
+            assert buff.is_pinned("x")
+        assert buff.is_pinned("x")  # still pinned once
+    assert not buff.is_pinned("x")
+
+    # Deleting a pinned key drops the pin; releasing the stale handle is a no-op.
+    pin = buff.pin("y")
+    del buff["y"]
+    assert not buff.is_pinned("y")
+    pin.release()
+    assert not buff.is_pinned("y")
+    assert buff.pinned_weight == 0
+
+
+def test_pin_requires_key_in_fast():
+    buff = Buffer({}, {}, n=10, weight=lambda k, v: v)
+    buff["x"] = 5
+    buff.evict_until_below_target(0)
+    assert not buff.fast
+    with pytest.raises(KeyError, match="x"):
+        buff.pin("x")
+
+
 def test_evict_restore_during_iter():
     """Test that __iter__ won't be disrupted if another thread evicts or restores a key"""
     buff = Buffer({"x": 1, "y": 2}, {"z": 3}, n=5)

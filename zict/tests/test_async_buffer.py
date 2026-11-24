@@ -70,6 +70,40 @@ async def test_simple(check_thread_leaks):
 
 
 @pytest.mark.asyncio
+async def test_pin_defers_eviction_until_release(check_thread_leaks):
+    """Weight that is pinned cannot be evicted, so no worker thread is spawned for it.
+    Releasing the last pin resumes asynchronous eviction.
+    """
+    with AsyncBuffer({}, utils_test.SlowDict(0.01), n=3, weight=lambda k, v: v) as buff:
+        buff.set_noevict("a", 2)
+        buff.set_noevict("b", 2)
+        assert not buff.futures
+
+        pin = buff.pin("a")
+        buff.n = 1
+        buff.async_evict_until_below_target()
+        # "b" is evictable, so a worker is spawned to move it out and report the
+        # residual pinned excess; "a" stays put.
+        await asyncio.wait(buff.futures)
+        assert set(buff.fast) == {"a"}
+        assert set(buff.slow) == {"b"}
+        assert not buff.evicting
+        assert buff.capacity.excess == 1
+
+        # Nothing to do while the only remaining key is pinned.
+        buff.async_evict_until_below_target()
+        assert not buff.futures
+
+        # Releasing the pin must resume asynchronous eviction on its own.
+        pin.release()
+        assert buff.futures
+        await asyncio.wait(buff.futures)
+        assert not buff.fast
+        assert set(buff.slow) == {"a", "b"}
+        assert not buff.capacity.unmet
+
+
+@pytest.mark.asyncio
 async def test_double_evict(check_thread_leaks):
     """User calls async_evict_until_below_target() while the same is already running"""
     with AsyncBuffer({}, utils_test.SlowDict(0.01), n=3) as buff:

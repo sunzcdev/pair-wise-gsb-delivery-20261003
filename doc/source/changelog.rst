@@ -6,6 +6,15 @@ Changelog
 ------------------
 - Dropped support for Python 3.8 (:pr:`106`) `Guido Imperiale`_
 - New object :class:`KeyMap` (:pr:`110`) `Guido Imperiale`_
+- Added :meth:`LRU.pin` and :meth:`Buffer.pin`, which temporarily protect keys from
+  eviction while their values are being borrowed. Pinned keys keep contributing to the
+  total weight; :meth:`LRU.evict_until_below_target` and
+  :meth:`Buffer.evict_until_below_target` keep evicting the remaining movable keys and
+  then return the residual excess instead of waiting for the borrowers to release their
+  pins. The new :attr:`LRU.capacity` and :attr:`Buffer.capacity` records report the
+  current excess, how much weight is pinned, and for how long the target has been unmet.
+- Added :meth:`LRU.unpin` and :meth:`Buffer.unpin`, and the :class:`Pin` context manager
+  returned by ``pin()``.
 
 
 3.0.0 - 2023-04-17
