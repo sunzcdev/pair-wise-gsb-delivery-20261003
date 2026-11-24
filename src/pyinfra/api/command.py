@@ -283,3 +283,42 @@ class RsyncCommand(PyinfraCommand):
             print_input=state.print_input,
             **connector_arguments,
         )
+
+
+class VerifyCommand(PyinfraCommand):
+    """
+    A read-only verification step that an operation can yield alongside its
+    write commands. Verification commands never run as part of the normal
+    command sequence: the execution engine only runs one after a write command
+    fails with an uncertain error (timeout/connection loss) to determine
+    whether the write actually landed on the target.
+
+    When the verification command succeeds (exit code 0) the write is treated
+    as applied and the operation is settled as a success; when it fails the
+    write is known not to have applied and the operation is retried (subject to
+    the usual ``_retries`` limit). An ordinary, definitive command failure
+    (non-zero exit code with a response) bypasses verification entirely.
+
+    Wrap a regular command, for example in an operation::
+
+        yield VerifyCommand(StringCommand("test -e", QuoteString(path)))
+    """
+
+    command: PyinfraCommand
+
+    def __init__(self, command: PyinfraCommand, **arguments: Unpack[ConnectorArguments]):
+        super().__init__(**arguments)
+        self.command = command
+
+    @override
+    def __repr__(self):
+        return f"VerifyCommand({self.command!r})"
+
+    @override
+    def __eq__(self, other) -> bool:
+        return isinstance(other, VerifyCommand) and self.command == other.command
+
+    @override
+    def execute(self, state: State, host: Host, connector_arguments: ConnectorArguments):
+        connector_arguments.update(self.connector_arguments)
+        return self.command.execute(state, host, connector_arguments)

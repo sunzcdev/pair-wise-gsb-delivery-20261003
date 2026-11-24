@@ -6,6 +6,7 @@ from .command import (
     RsyncCommand,
     StringCommand,
     MaskString,
+    VerifyCommand,
 )
 from .hiddenvalue import HiddenValue
 from .config import Config
@@ -58,6 +59,7 @@ __all__ = [
     "ShortFactBase",
     "State",
     "StringCommand",
+    "VerifyCommand",
     "deploy",
     "operation",
 ]

@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from pyinfra.api import Config, HiddenValue, State, StringCommand
 from pyinfra.api.connect import connect_all
-from pyinfra.connectors.fake import FakeConnector
+from pyinfra.connectors.fake import FakeConnector, FakeDisconnectError
 
 from ..util import make_inventory
 
@@ -188,3 +188,77 @@ class TestFakeConnector(TestCase):
             host.run_shell_command("echo hi")
 
         fake_sleep.assert_called_once_with(2.0)
+
+    def test_disconnect_raises_after_recording_write(self):
+        inventory = make_fake_inventory(
+            fake_responses={"apply-config": {"disconnect": True}},
+        )
+        State(inventory, Config())
+        host = inventory.get_host("@fake")
+
+        with self.assertRaises(FakeDisconnectError):
+            host.run_shell_command("apply-config")
+
+        # The write was recorded first, then the acknowledgement was "lost".
+        assert host.connector.executed_commands == ["apply-config"]
+        assert host.connector.disconnected_commands == ["apply-config"]
+
+    def test_disconnect_is_uncertain_error(self):
+        # ConnectionError is an OSError, the family the engine treats as
+        # uncertain (outcome cannot be inferred from the failure alone).
+        assert issubclass(FakeDisconnectError, OSError)
+
+    def test_disconnect_once_only_fires_first_time(self):
+        inventory = make_fake_inventory(
+            fake_responses={
+                "apply-config": {"disconnect": True, "disconnect_once": True},
+            },
+        )
+        State(inventory, Config())
+        host = inventory.get_host("@fake")
+
+        with self.assertRaises(FakeDisconnectError):
+            host.run_shell_command("apply-config")
+
+        # Second invocation returns the canned (default success) response.
+        status, output = host.run_shell_command("apply-config")
+        assert status is True
+        assert output.output_lines == []
+
+        # The write itself was recorded both times, but only the first lost
+        # its acknowledgement.
+        assert host.connector.executed_commands == ["apply-config", "apply-config"]
+        assert host.connector.disconnected_commands == ["apply-config"]
+
+    def test_disconnect_without_once_fires_every_time(self):
+        inventory = make_fake_inventory(
+            fake_responses={"apply-config": {"disconnect": True}},
+        )
+        State(inventory, Config())
+        host = inventory.get_host("@fake")
+
+        for _ in range(3):
+            with self.assertRaises(FakeDisconnectError):
+                host.run_shell_command("apply-config")
+
+        assert len(host.connector.disconnected_commands) == 3
+
+    def test_disconnect_once_tracks_matchers_independently(self):
+        inventory = make_fake_inventory(
+            fake_responses={
+                "first": {"disconnect": True, "disconnect_once": True},
+                "second": {"disconnect": True, "disconnect_once": True},
+            },
+        )
+        State(inventory, Config())
+        host = inventory.get_host("@fake")
+
+        with self.assertRaises(FakeDisconnectError):
+            host.run_shell_command("first write")
+        with self.assertRaises(FakeDisconnectError):
+            host.run_shell_command("second write")
+
+        # Each matcher gets its own one-shot budget.
+        status, _ = host.run_shell_command("first again")
+        assert status is True
+        assert host.connector.disconnected_commands == ["first write", "second write"]

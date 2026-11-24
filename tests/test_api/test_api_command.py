@@ -17,6 +17,7 @@ from pyinfra.api import (
     QuoteString,
     RsyncCommand,
     StringCommand,
+    VerifyCommand,
 )
 from pyinfra.api.command import PyinfraCommand, make_formatted_string_command
 
@@ -97,6 +98,39 @@ class TestFileCommands(TestCase):
     def test_rsync_command_repr(self):
         cmd = RsyncCommand("src", "dest", ["-a"])
         assert repr(cmd) == "RsyncCommand(src, dest, ['-a'])"
+
+
+class TestVerifyCommand(TestCase):
+    def test_wraps_command_and_repr(self):
+        inner = StringCommand("test -e", QuoteString("/etc/service.conf"))
+        cmd = VerifyCommand(inner)
+        assert cmd.command is inner
+        assert repr(cmd) == f"VerifyCommand({inner!r})"
+
+    def test_eq_compares_wrapped_commands(self):
+        left = VerifyCommand(StringCommand("check-config"))
+        right = VerifyCommand(StringCommand("check-config"))
+        different = VerifyCommand(StringCommand("check-other"))
+
+        assert left == right
+        assert left != different
+        assert left != StringCommand("check-config")
+
+    def test_execute_delegates_to_wrapped_command(self):
+        inner = StringCommand("check-config")
+        cmd = VerifyCommand(inner)
+
+        called = {}
+
+        def fake_execute(state, host, connector_arguments):
+            called["arguments"] = connector_arguments
+            return True, "output"
+
+        inner.execute = fake_execute  # type: ignore[method-assign]
+        result = cmd.execute(None, None, {"_timeout": 10})
+
+        assert result == (True, "output")
+        assert called["arguments"]["_timeout"] == 10
 
 
 class TestMakeFormattedStringCommand(TestCase):

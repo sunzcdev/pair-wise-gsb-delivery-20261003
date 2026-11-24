@@ -15,10 +15,11 @@ from pyinfra.api import (
     OperationValueError,
     State,
     StringCommand,
+    VerifyCommand,
 )
 from pyinfra.api.connect import connect_all, disconnect_all
 from pyinfra.api.exceptions import ArgumentTypeError, PyinfraError
-from pyinfra.api.operation import OperationMeta, add_op
+from pyinfra.api.operation import OperationMeta, add_op, operation
 from pyinfra.api.operations import run_ops
 from pyinfra.api.state import StateOperationMeta, StateStage
 from pyinfra.connectors.util import CommandOutput, OutputLine
@@ -1524,6 +1525,214 @@ class TestOperationRetry(PatchSSHTestCase):
         self.assertEqual(op_meta.max_retries, 3)
         self.assertTrue(op_meta.was_retried)
         self.assertTrue(op_meta.retry_succeeded)
+
+
+NO_DELAY = {"fake_delay": 0, "fake_delay_jitter": 0}
+
+
+@operation(is_idempotent=False)
+def write_with_verification():
+    """A write command with a read-only verification step attached."""
+    yield StringCommand("apply-config")
+    yield VerifyCommand(StringCommand("check-config"))
+
+
+@operation(is_idempotent=False)
+def write_without_verification():
+    yield StringCommand("apply-config")
+
+
+class TestOperationVerificationAfterDisconnect(TestCase):
+    """
+    When a write command fails with an uncertain error (timeout/lost connection)
+    the engine runs the operation's read-only verification step before deciding
+    whether to settle or resubmit the write. A definitive failure keeps the
+    ordinary retry path.
+    """
+
+    def _make_state(self, responses):
+        inventory = make_inventory(
+            hosts=(("@fake/box", {**NO_DELAY, "fake_responses": responses}),),
+        )
+        state = State(inventory, Config())
+        state.current_stage = StateStage.Prepare
+        connect_all(state)
+        return state, inventory.get_host("@fake/box")
+
+    def test_uncertain_failure_verified_applied_settles_without_retry(self):
+        state, host = self._make_state(
+            {
+                # The write is accepted (recorded), then the connection drops.
+                "apply-config": {"disconnect": True, "disconnect_once": True},
+                # Reconnecting, the read-only check proves it actually landed.
+                "check-config": {"stdout": "configured"},
+            },
+        )
+
+        with ctx_state.use(state), ctx_host.use(host):
+            op_meta = write_with_verification(_retries=3, _retry_delay=0)
+        run_ops(state)
+
+        # The write was submitted exactly once; the only other command is the
+        # read-only verification.
+        assert host.connector.executed_commands == ["apply-config", "check-config"]
+        assert host.connector.disconnected_commands == ["apply-config"]
+
+        assert op_meta.did_succeed()
+        assert op_meta.verified_after_disconnect is True
+        # A verified completion is not a retry: no resubmission happened.
+        assert op_meta.was_retried is False
+        assert op_meta.retry_attempts == 0
+        assert state.results[host].success_ops == 1
+        assert state.results[host].error_ops == 0
+
+    def test_uncertain_failure_verified_not_applied_resubmits_write(self):
+        state, host = self._make_state(
+            {
+                "apply-config": {"disconnect": True, "disconnect_once": True},
+                # The check says nothing was applied, so the write must rerun.
+                "check-config": {"success": False},
+            },
+        )
+
+        with ctx_state.use(state), ctx_host.use(host):
+            op_meta = write_with_verification(_retries=2, _retry_delay=0)
+        run_ops(state)
+
+        # First attempt: write + failed verification. Second attempt: the write
+        # is resubmitted and this time acknowledged normally.
+        assert host.connector.executed_commands == [
+            "apply-config",
+            "check-config",
+            "apply-config",
+        ]
+        assert host.connector.disconnected_commands == ["apply-config"]
+
+        assert op_meta.did_succeed()
+        assert op_meta.verified_after_disconnect is False
+        assert op_meta.was_retried is True
+        assert op_meta.retry_attempts == 1
+
+    def test_uncertain_failure_still_unapplied_after_retries_fails(self):
+        state, host = self._make_state(
+            {
+                # Every attempt loses the acknowledgement.
+                "apply-config": {"disconnect": True},
+                "check-config": {"success": False},
+            },
+        )
+
+        with ctx_state.use(state), ctx_host.use(host):
+            op_meta = write_with_verification(_retries=1, _retry_delay=0)
+        with self.assertRaises(PyinfraError):
+            run_ops(state)
+
+        # Two write submissions (initial + one retry), each followed by a check.
+        assert host.connector.executed_commands == [
+            "apply-config",
+            "check-config",
+            "apply-config",
+            "check-config",
+        ]
+        assert op_meta.did_error()
+        assert op_meta.verified_after_disconnect is False
+        assert op_meta.retry_attempts == 1
+        assert state.results[host].error_ops == 1
+
+    def test_definitive_failure_never_runs_verification(self):
+        state, host = self._make_state(
+            {
+                # A non-zero exit status is a definitive answer, not an
+                # uncertain one: the verification step must stay untouched.
+                "apply-config": {"success": False, "stderr": "nope"},
+                "check-config": {"stdout": "configured"},
+            },
+        )
+
+        with ctx_state.use(state), ctx_host.use(host):
+            op_meta = write_with_verification(_retries=1, _retry_delay=0)
+        with self.assertRaises(PyinfraError):
+            run_ops(state)
+
+        assert "check-config" not in host.connector.executed_commands
+        assert host.connector.executed_commands == ["apply-config", "apply-config"]
+        assert op_meta.verified_after_disconnect is False
+        assert op_meta.retry_attempts == 1
+
+    def test_uncertain_failure_without_verification_uses_normal_retry_path(self):
+        state, host = self._make_state(
+            {"apply-config": {"disconnect": True}},
+        )
+
+        with ctx_state.use(state), ctx_host.use(host):
+            op_meta = write_without_verification(_retries=1, _retry_delay=0)
+        with self.assertRaises(PyinfraError):
+            run_ops(state)
+
+        # No verification available, so each attempt just resubmits.
+        assert host.connector.executed_commands == ["apply-config", "apply-config"]
+        assert op_meta.verified_after_disconnect is False
+        assert op_meta.retry_attempts == 1
+
+    def test_inconclusive_verification_falls_back_to_retry(self):
+        state, host = self._make_state(
+            {
+                "apply-config": {"disconnect": True, "disconnect_once": True},
+                # The check itself cannot answer, so nothing is confirmed: the
+                # safe option is to resubmit rather than assume success.
+                "check-config": {"disconnect": True, "disconnect_once": True},
+            },
+        )
+
+        with ctx_state.use(state), ctx_host.use(host):
+            op_meta = write_with_verification(_retries=1, _retry_delay=0)
+        run_ops(state)
+
+        # First attempt: write + inconclusive check; second attempt resubmits
+        # the write and is acknowledged normally.
+        assert host.connector.executed_commands == [
+            "apply-config",
+            "check-config",
+            "apply-config",
+        ]
+        assert op_meta.did_succeed()
+        assert op_meta.verified_after_disconnect is False
+        assert op_meta.retry_attempts == 1
+
+    def test_verification_command_is_counted_as_no_change(self):
+        @operation(is_idempotent=False)
+        def verify_only():
+            yield VerifyCommand(StringCommand("check-config"))
+
+        inventory = make_inventory(hosts=(("@fake/box", NO_DELAY),))
+        state = State(inventory, Config())
+        state.current_stage = StateStage.Prepare
+        connect_all(state)
+        host = inventory.get_host("@fake/box")
+
+        with ctx_state.use(state), ctx_host.use(host):
+            op_meta = verify_only()
+
+        assert op_meta.will_change is False
+        assert state.meta[host].ops_change == 0
+        assert state.meta[host].ops_no_change == 1
+
+    def test_verification_info_exposed_in_retry_info_and_repr(self):
+        state, host = self._make_state(
+            {
+                "apply-config": {"disconnect": True, "disconnect_once": True},
+                "check-config": {"stdout": "configured"},
+            },
+        )
+
+        with ctx_state.use(state), ctx_host.use(host):
+            op_meta = write_with_verification(_retry_delay=0)
+        run_ops(state)
+
+        info = op_meta.get_retry_info()
+        assert info["verified_after_disconnect"] is True
+        assert info["was_retried"] is False
+        assert "verified after disconnect" in repr(op_meta)
 
 
 class TestRunNoWaitOps(PatchSSHTestCase):

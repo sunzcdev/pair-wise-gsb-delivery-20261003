@@ -37,6 +37,15 @@ DEFAULT_DELAY = float(os.environ.get("PYINFRA_FAKE_DELAY", "0.5"))
 DEFAULT_DELAY_JITTER = float(os.environ.get("PYINFRA_FAKE_DELAY_JITTER", "0.4"))
 
 
+class FakeDisconnectError(ConnectionError):
+    """
+    Raised by the fake connector to simulate losing the connection *after* a
+    command was accepted but before its exit status/output came back. The write
+    may therefore already have been applied, which is exactly the ambiguous
+    situation the operation verification flow is designed for.
+    """
+
+
 class FakeConnectorData(ConnectorData, total=False):
     fake_responses: dict[str | re.Pattern, Any]
     fake_delay: float
@@ -62,7 +71,15 @@ class FakeConnector(BaseConnector):
 
     + a ``str`` / ``list[str]`` of stdout lines, or
     + a ``dict`` with optional ``stdout`` (``str``/``list``), ``stderr``
-      (``str``/``list``) and ``success`` (``bool``) keys.
+      (``str``/``list``), ``success`` (``bool``) and ``disconnect`` (``bool``)
+      keys.
+
+    A response whose ``disconnect`` key is true simulates a connection dropping
+    after the command was accepted: it is recorded in ``executed_commands`` and
+    then raises :class:`FakeDisconnectError` *instead of* returning a status.
+    Set ``disconnect_once`` (also ``bool``) to only do this on the first
+    invocation — later invocations return the canned response normally, which
+    models a write that actually landed despite the lost acknowledgement.
 
     Matchers are tried in insertion order; the first match wins.
 
@@ -118,6 +135,14 @@ class FakeConnector(BaseConnector):
     ``dict`` with optional ``stdout``, ``stderr`` and ``success`` keys. Matchers
     are tried in insertion order; the first match wins, and unmatched commands
     succeed with no output.
+
+    A response dict may also set ``disconnect: True``: the command is recorded
+    first and then raises a connection error instead of returning a status,
+    modelling a write accepted before the link dropped. Add
+    ``disconnect_once: True`` to only do this on the first invocation; later
+    invocations return the canned response normally. This pairs with
+    :class:`pyinfra.api.VerifyCommand` to exercise the engine's
+    verify-before-retry flow for uncertain failures.
     """
 
     handles_execution = True
@@ -141,9 +166,18 @@ class FakeConnector(BaseConnector):
     #: Commands executed against this connector instance, recorded for tests/debug.
     executed_commands: list[str]
 
+    #: Commands whose acknowledgement was interrupted by a simulated
+    #: disconnect (one entry per disconnect raised). Pair this with
+    #: ``executed_commands`` to assert that a resubmitted write is recorded as a
+    #: new execution while only the first acknowledgement was lost.
+    disconnected_commands: list[str]
+
     def __init__(self, state, host) -> None:
         super().__init__(state, host)
         self.executed_commands = []
+        self.disconnected_commands = []
+        # Per-matcher counters so ``disconnect_once`` fires a single time.
+        self._disconnect_counts: dict[object, int] = {}
 
     @override
     @staticmethod
@@ -158,7 +192,7 @@ class FakeConnector(BaseConnector):
                 continue
             yield f"@fake/{sub_name}", {}, ["@fake"]
 
-    def _lookup_response(self, command_str: str) -> tuple[bool, CommandOutput]:
+    def _lookup_response(self, command_str: str) -> tuple[bool, CommandOutput, bool]:
         fake_responses = self.data.get("fake_responses") or {}
 
         for matcher, response in fake_responses.items():
@@ -171,20 +205,27 @@ class FakeConnector(BaseConnector):
             success = True
             stdout: list[str] = []
             stderr: list[str] = []
+            disconnect = False
 
             if isinstance(response, dict):
                 success = bool(response.get("success", True))
                 stdout = _as_lines(response.get("stdout"))
                 stderr = _as_lines(response.get("stderr"))
+
+                if response.get("disconnect"):
+                    fired = self._disconnect_counts.get(matcher, 0)
+                    if not response.get("disconnect_once") or fired == 0:
+                        disconnect = True
+                    self._disconnect_counts[matcher] = fired + 1
             else:
                 stdout = _as_lines(response)
 
             lines = [OutputLine("stdout", line) for line in stdout]
             lines += [OutputLine("stderr", line) for line in stderr]
-            return success, CommandOutput(lines)
+            return success, CommandOutput(lines), disconnect
 
         # Default: succeed with no output.
-        return True, CommandOutput([])
+        return True, CommandOutput([]), False
 
     def _sleep(self) -> None:
         """Simulate a realistic, non-instant task duration.
@@ -224,7 +265,18 @@ class FakeConnector(BaseConnector):
 
         self._sleep()
 
-        status, output = self._lookup_response(command_str)
+        status, output, disconnect = self._lookup_response(command_str)
+
+        if disconnect:
+            # The write has already been recorded above; simulate the
+            # acknowledgement getting lost on the way back. ConnectionError is
+            # an OSError, which the execution engine treats as an uncertain
+            # failure and routes through the verification flow.
+            self.disconnected_commands.append(command_str)
+            logger.debug("[fake] simulating disconnect after command on %s", self.host.name)
+            raise FakeDisconnectError(
+                f"Simulated connection lost after command was accepted: {command_str}",
+            )
 
         if print_output:
             for line in output.output_lines:

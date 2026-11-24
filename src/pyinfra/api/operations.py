@@ -15,7 +15,7 @@ from pyinfra.context import ctx_host, ctx_state
 from pyinfra.progress import progress_spinner
 
 from .arguments import CONNECTOR_ARGUMENT_KEYS, ConnectorArguments
-from .command import FunctionCommand, PyinfraCommand, StringCommand
+from .command import FunctionCommand, PyinfraCommand, StringCommand, VerifyCommand
 from .exceptions import NestedOperationError, PyinfraError
 from .util import (
     format_exception,
@@ -28,6 +28,13 @@ from .util import (
 if TYPE_CHECKING:
     from .inventory import Host
     from .state import State
+
+
+# Errors where the command may have been accepted and applied by the target
+# before the connection/timer gave out, so the outcome cannot be inferred from
+# the failure alone. A non-zero exit status is *not* uncertain: the target
+# answered, and its answer was "no".
+UNCERTAIN_COMMAND_EXCEPTIONS = (TimeoutError, OSError, SSHException)
 
 
 # Run a single host operation
@@ -58,6 +65,37 @@ def run_host_op(state: State, host: Host, op_hash: str) -> bool:
             host.executing_op_hash = None
 
 
+def _run_verification(
+    state: State,
+    host: Host,
+    verify_command: VerifyCommand,
+    base_connector_arguments: ConnectorArguments,
+) -> bool:
+    """
+    Run a read-only verification command after an uncertain (timeout/connection
+    loss) failure. Returns True when the verification confirms the write was
+    applied. A verification that itself fails to answer is inconclusive and
+    treated as "not applied" so the safe retry path is taken.
+    """
+    connector_arguments = base_connector_arguments.copy()
+    connector_arguments.update(verify_command.connector_arguments)
+
+    try:
+        status, output = verify_command.execute(state, host, connector_arguments)
+    except UNCERTAIN_COMMAND_EXCEPTIONS as e:
+        log_host_command_error(host, e)
+        host.log_styled(
+            "Verification could not determine whether the write was applied",
+            fg="yellow",
+            log_func=logger.warning,
+        )
+        return False
+
+    if status is False and not state.print_output:
+        print_host_combined_output(host, output)
+    return status is True
+
+
 def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
     op_data = state.get_op_data_for_host(host, op_hash)
     global_arguments = op_data.global_arguments
@@ -83,15 +121,41 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
     executed_commands = 0
     commands: list[PyinfraCommand] = []
     all_output_lines: list[OutputLine] = []
+    # Set when an uncertain failure was settled (not retried) because a
+    # read-only verification step proved the write had actually been applied.
+    verified_after_disconnect = False
 
     # Retry loop
     while retry_attempt <= retries:
         did_error = False
+        uncertain_error = False
         executed_commands = 0
         commands = []
         all_output_lines = []
 
-        for command in op_data.command_generator():
+        # Materialise the generator up front so verification steps (which are
+        # yielded alongside, usually after, the write commands) are already
+        # available the moment a write fails with an uncertain error. Each
+        # read-only VerifyCommand pairs with the write command preceding it.
+        # Commands are not hashable (PyinfraCommand defines __eq__), so the
+        # mapping is keyed by object identity.
+        generated_commands = list(op_data.command_generator())
+        verify_by_command: dict[int, VerifyCommand] = {}
+        last_write_command: PyinfraCommand | None = None
+        for generated_command in generated_commands:
+            if isinstance(generated_command, VerifyCommand):
+                if last_write_command is not None:
+                    verify_by_command[id(last_write_command)] = generated_command
+            else:
+                last_write_command = generated_command
+
+        for command in generated_commands:
+            # Verification steps do not run in the normal command sequence;
+            # they are held back and only used to settle an uncertain failure.
+            if isinstance(command, VerifyCommand):
+                continue
+
+            pending_verify_command = verify_by_command.get(id(command))
             commands.append(command)
             status = False
             connector_arguments = base_connector_arguments.copy()
@@ -107,7 +171,7 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
 
                 except TimeoutError as e:
                     log_host_command_error(host, e, timeout=timeout)
-
+                    uncertain_error = True
                 except NestedOperationError:
                     host.log_styled("Error in nested operation", fg="red", log_func=logger.error)
                 except Exception as e:
@@ -127,8 +191,9 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
                         host,
                         connector_arguments,
                     )
-                except (TimeoutError, OSError, SSHException) as e:
+                except UNCERTAIN_COMMAND_EXCEPTIONS as e:
                     log_host_command_error(host, e, timeout=timeout)
+                    uncertain_error = True
                 all_output_lines.extend(output_lines)
                 # If we failed and have not already printed the stderr, print it
                 if status is False and not state.print_output:
@@ -137,8 +202,57 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
             else:
                 try:
                     status = command.execute(state, host, connector_arguments)
-                except (TimeoutError, OSError, SSHException) as e:
+                except UNCERTAIN_COMMAND_EXCEPTIONS as e:
                     log_host_command_error(host, e, timeout=timeout)
+                    uncertain_error = True
+
+            # An uncertain failure means the target may already have applied
+            # the write: verify before deciding whether to resubmit it.
+            if uncertain_error:
+                did_error = True
+
+                if pending_verify_command is None:
+                    host.log_styled(
+                        "Write result is uncertain and no verification step is declared; "
+                        "treating as a failure",
+                        fg="yellow",
+                        log_func=logger.warning,
+                    )
+                else:
+                    host.log_styled(
+                        "Write result uncertain; running read-only verification step",
+                        fg="yellow",
+                        log_func=logger.info,
+                    )
+                    if _run_verification(
+                        state,
+                        host,
+                        pending_verify_command,
+                        base_connector_arguments,
+                    ):
+                        host.log_styled(
+                            "Verification confirms the write was applied; settling without retry",
+                            fg="green",
+                            log_func=logger.info,
+                        )
+                        verified_after_disconnect = True
+                        did_error = False
+                        executed_commands += 1
+                        break
+
+                    host.log_styled(
+                        "Verification shows the write was not applied; it will be resubmitted",
+                        fg="yellow",
+                        log_func=logger.info,
+                    )
+
+                if continue_on_error is True:
+                    # Carry on with the remaining commands rather than breaking,
+                    # matching the behaviour of an ordinary failed command.
+                    uncertain_error = False
+                    did_error = False
+                    continue
+                break
 
             # Break the loop to trigger a failure
             if status is False:
@@ -200,9 +314,12 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
         host_results.ops += 1
         host_results.success_ops += 1
 
-        _status_text = "Success" if executed_commands > 0 else "No changes"
-        if retry_attempt > 0:
-            _status_text = f"{_status_text} on retry {retry_attempt}"
+        if verified_after_disconnect:
+            _status_text = "Success (verified after disconnect)"
+        else:
+            _status_text = "Success" if executed_commands > 0 else "No changes"
+            if retry_attempt > 0:
+                _status_text = f"{_status_text} on retry {retry_attempt}"
 
         _log_status = format_text(_status_text, "green" if executed_commands > 0 else "cyan")
         logger.info(f"{host.print_prefix}{_log_status}")
@@ -239,6 +356,7 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
         CommandOutput(all_output_lines),
         retry_attempts=retry_attempt,
         max_retries=retries,
+        verified_after_disconnect=verified_after_disconnect,
     )
 
     return return_status

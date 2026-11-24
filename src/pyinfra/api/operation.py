@@ -22,7 +22,7 @@ from pyinfra.context import ctx_host, ctx_state
 
 from .arguments import EXECUTION_KWARG_KEYS, AllArguments, pop_global_arguments
 from .arguments_typed import PyinfraOperation
-from .command import PyinfraCommand, StringCommand
+from .command import PyinfraCommand, StringCommand, VerifyCommand
 from .exceptions import ArgumentTypeError, NestedOperationError, OperationValueError, PyinfraError
 from .facts import FactBase, ShortFactBase
 from .host import Host
@@ -52,6 +52,7 @@ class OperationMeta:
     _retry_attempts: int = 0
     _max_retries: int = 0
     _retry_succeeded: bool | None = None
+    _verified_after_disconnect: bool = False
 
     def __init__(self, hash, is_change: bool | None):
         self._hash = hash
@@ -71,10 +72,12 @@ class OperationMeta:
                     f", retries={self._retry_attempts}/{self._max_retries} ({retry_result})"
                 )
 
+            verified_info = ", verified after disconnect" if self._verified_after_disconnect else ""
+
             return (
                 "OperationMeta(executed=True, "
                 f"success={self.did_succeed()}, hash={self._hash}, "
-                f"commands={len(self._commands)}{retry_info})"
+                f"commands={len(self._commands)}{retry_info}{verified_info})"
             )
         return (
             f"OperationMeta(executed=False, maybeChange={self._maybe_is_change}, hash={self._hash})"
@@ -88,6 +91,7 @@ class OperationMeta:
         combined_output: CommandOutput,
         retry_attempts: int = 0,
         max_retries: int = 0,
+        verified_after_disconnect: bool = False,
     ) -> None:
         if self.is_complete():
             raise RuntimeError("Cannot complete an already complete operation")
@@ -96,6 +100,7 @@ class OperationMeta:
         self._combined_output = combined_output
         self._retry_attempts = retry_attempts
         self._max_retries = max_retries
+        self._verified_after_disconnect = verified_after_disconnect
 
         # Determine if operation succeeded after retries
         if retry_attempts > 0:
@@ -121,7 +126,9 @@ class OperationMeta:
 
         op_data = context.state.get_op_data_for_host(context.host, self._hash)
         cmd_gen = op_data.command_generator
-        for _ in cmd_gen():
+        for command in cmd_gen():
+            if isinstance(command, VerifyCommand):
+                continue
             self._maybe_is_change = True
             return True
         self._maybe_is_change = False
@@ -193,6 +200,17 @@ class OperationMeta:
         """
         return self._retry_succeeded
 
+    @property
+    def verified_after_disconnect(self) -> bool:
+        """
+        Returns whether a write whose result was uncertain (timeout or lost
+        connection) was confirmed applied by a read-only verification step,
+        rather than re-executed. Distinct from :attr:`was_retried`: a verified
+        operation is not counted as a retry because the write was only ever
+        submitted once.
+        """
+        return self._verified_after_disconnect
+
     def get_retry_info(self) -> dict[str, Any]:
         """
         Returns a dictionary with all retry-related information.
@@ -202,6 +220,7 @@ class OperationMeta:
             "max_retries": self._max_retries,
             "was_retried": self.was_retried,
             "retry_succeeded": self._retry_succeeded,
+            "verified_after_disconnect": self._verified_after_disconnect,
         }
 
 
@@ -367,7 +386,12 @@ def _wrap_operation(func: Callable[P, Generator], _set_in_op: bool = True) -> Py
         op_is_change = None
         if state.should_check_for_changes():
             op_is_change = False
-            for _ in command_generator():
+            # Verification steps are read-only and never change the target, so
+            # an operation that only yields them (e.g. an already-applied write
+            # with a VerifyCommand attached) is reported as making no changes.
+            for command in command_generator():
+                if isinstance(command, VerifyCommand):
+                    continue
                 op_is_change = True
                 break
         else:
