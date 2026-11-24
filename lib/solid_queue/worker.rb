@@ -3,9 +3,10 @@
 module SolidQueue
   class Worker < Processes::Poller
     include LifecycleHooks
+    include QueueControls
 
-    after_boot :run_start_hooks
-    before_shutdown :run_stop_hooks
+    after_boot :run_start_hooks, :subscribe_to_queue_control_events
+    before_shutdown :run_stop_hooks, :unsubscribe_from_queue_control_events
     after_shutdown :run_exit_hooks
 
     attr_reader :queues, :pool
@@ -34,19 +35,22 @@ module SolidQueue
 
     private
       def poll
-        claim_executions.then do |executions|
-          executions.each do |execution|
-            pool.post(execution)
-          end
+        delay = polling_interval
 
-          pool.idle? ? polling_interval : 10.minutes
+        queue_control_mutex.synchronize do
+          executions = claim_executions
+          executions.each { |execution| pool.post(execution) }
+
+          delay = pool.idle? ? polling_interval : 10.minutes
         end
+
+        delay
       end
 
       def claim_executions
         with_polling_volume do
           SolidQueue::ReadyExecution.claim(queues, pool.available_capacity, process_id)
-        end
+        end.then { |executions| release_paused_claims(executions) }
       end
 
       def request_termination

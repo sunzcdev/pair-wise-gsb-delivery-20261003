@@ -1,6 +1,10 @@
 require "test_helper"
 require "active_support/testing/method_call_assertions"
 
+class PauseProbeConcurrencyJob < StoreResultJob
+  limits_concurrency to: 3, key: ->(*) { "pause-probe" }, duration: 10.minutes
+end
+
 class WorkerTest < ActiveSupport::TestCase
   include ActiveSupport::Testing::MethodCallAssertions
   self.use_transactional_tests = false
@@ -65,6 +69,54 @@ class WorkerTest < ActiveSupport::TestCase
         worker&.stop
         wait_for_registered_processes(0, timeout: 1.second)
       end
+    end
+  end
+
+  test "pausing returns unstarted claims and resume runs each once in fiber mode" do
+    with_execution_isolation(:fiber) do
+      PauseProbeConcurrencyJob.perform_later("blocked", pause: 1.second)
+      2.times { |i| PauseProbeConcurrencyJob.perform_later("unstarted_#{i}") }
+
+      semaphore = SolidQueue::Semaphore.where("key LIKE ?", "%pause-probe").first!
+      assert_equal 0, semaphore.value
+
+      worker = SolidQueue::Worker.new(queues: "background", fibers: 1, polling_interval: 0.05)
+      worker.start
+      wait_for_registered_processes(1, timeout: 2.seconds)
+
+      wait_while_with_timeout!(2.seconds) { !JobResult.exists?(status: "started", value: "blocked") }
+      claimed = SolidQueue::ReadyExecution.claim([ "background" ], 2, worker.process_id)
+      assert_equal 2, claimed.size
+      assert_equal 3, SolidQueue::ClaimedExecution.count
+
+      queue = SolidQueue::Queue.find_by_name("background")
+      queue.pause
+
+      assert_equal 1, SolidQueue::ClaimedExecution.count
+      assert_equal 2, SolidQueue::ReadyExecution.count
+      assert_equal 0, worker.pool.available_capacity
+      assert_equal 0, semaphore.reload.value
+
+      queue.resume
+      wait_for_jobs_to_finish_for(5.seconds)
+      worker.wake_up
+
+      2.times do |i|
+        value = "unstarted_#{i}"
+        wait_while_with_timeout!(5.seconds) do
+          JobResult.where(value: value, status: "completed").count != 1
+        end
+        assert_equal 1, JobResult.where(value: value, status: "completed").count
+      end
+
+      assert_equal 0, SolidQueue::ClaimedExecution.count
+      wait_while_with_timeout!(2.seconds) do
+        SolidQueue::Semaphore.where("key LIKE ?", "%pause-probe").first&.value != 3
+      end
+      assert_equal 3, SolidQueue::Semaphore.where("key LIKE ?", "%pause-probe").first!.value
+    ensure
+      worker&.stop
+      wait_for_registered_processes(0, timeout: 2.seconds)
     end
   end
 

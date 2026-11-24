@@ -103,6 +103,9 @@ module SolidQueue
       end
 
       def perform_execution(execution)
+        started = begin_execution?(execution)
+        return unless started
+
         wrap_in_app_executor { execution.perform }
       rescue Async::Stop => error
         handle_thread_error(error)
@@ -111,7 +114,7 @@ module SolidQueue
         handle_unrecoverable_error(error)
         handle_thread_error(error)
       ensure
-        restore_capacity
+        finish_execution(execution) if started
       end
 
       def register_fatal_error(error)

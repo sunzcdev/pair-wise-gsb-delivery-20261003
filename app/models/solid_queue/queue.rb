@@ -12,6 +12,14 @@ module SolidQueue
       def find_by_name(name)
         new(name)
       end
+
+      def pause(name)
+        find_by_name(name).pause
+      end
+
+      def resume(name)
+        find_by_name(name).resume
+      end
     end
 
     def initialize(name)
@@ -19,15 +27,15 @@ module SolidQueue
     end
 
     def paused?
-      Pause.exists?(queue_name: name)
+      Pause.paused?(name)
     end
 
     def pause
-      Pause.create_or_find_by!(queue_name: name)
+      Pause.pause_queue(name)
     end
 
     def resume
-      Pause.where(queue_name: name).delete_all
+      Pause.resume_queue(name)
     end
 
     def clear

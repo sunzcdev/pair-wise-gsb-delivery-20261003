@@ -62,6 +62,39 @@ class QueueTest < ActiveSupport::TestCase
     end
   end
 
+  test "paused queue returns a claimed execution before user perform" do
+    AddToBufferJob.perform_later("not started")
+    claimed_execution = SolidQueue::ReadyExecution.claim([ "background" ], 1, nil).first
+
+    @background_queue.pause
+
+    assert_no_difference -> { JobBuffer.values.size } do
+      claimed_execution.perform
+    end
+
+    assert claimed_execution.job.reload.ready?
+    assert_equal 1, SolidQueue::ReadyExecution.where(job_id: claimed_execution.job_id).count
+  end
+
+  test "returning claimed executions preserves priority for resume" do
+    AddToBufferJob.set(queue: "pause-priority", priority: 100).perform_later("low")
+    AddToBufferJob.set(queue: "pause-priority", priority: -100).perform_later("high")
+
+    claimed = SolidQueue::ReadyExecution.claim([ "pause-priority" ], 2, nil)
+    assert_equal 2, claimed.size
+
+    SolidQueue::ClaimedExecution.release_unstarted(claimed)
+
+    ready = SolidQueue::ReadyExecution.queued_as("pause-priority").ordered.to_a
+    assert_equal [ -100, 100 ], ready.map(&:priority)
+
+    first = SolidQueue::ReadyExecution.claim([ "pause-priority" ], 1, nil).first
+    assert_equal(-100, first.priority)
+
+    second = SolidQueue::ReadyExecution.claim([ "pause-priority" ], 1, nil).first
+    assert_equal 100, second.priority
+  end
+
   test "return latency in seconds on each queue" do
     travel_to 5.minutes.from_now
 

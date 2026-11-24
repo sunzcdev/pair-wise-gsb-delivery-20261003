@@ -49,6 +49,7 @@ class ActiveSupport::TestCase
   def destroy_records
     SolidQueue::Job.destroy_all
     SolidQueue::Process.destroy_all
+    SolidQueue::Pause.delete_all
     SolidQueue::Semaphore.delete_all
     SolidQueue::RecurringTask.delete_all
     SolidQueue::ScheduledExecution.delete_all

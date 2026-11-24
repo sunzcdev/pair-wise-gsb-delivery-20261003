@@ -4,6 +4,8 @@ module SolidQueue
   class ClaimedExecution < Execution
     belongs_to :process
 
+    delegate :queue_name, :priority, to: :job, allow_nil: true
+
     scope :orphaned, -> { where.missing(:process) }
 
     class Result < Struct.new(:success, :error)
@@ -48,6 +50,14 @@ module SolidQueue
         end
       end
 
+      # Releases only the supplied claim instances. This is used for admissions
+      # that are known, by their owning worker, not to have entered +perform+.
+      def release_unstarted(executions)
+        Array(executions).each do |execution|
+          execution.release
+        end
+      end
+
       def fail_all_with(error)
         includes(:job).tap do |executions|
           return if executions.empty?
@@ -75,6 +85,15 @@ module SolidQueue
     end
 
     def perform
+      # This is the last database-backed gate before user code starts. A local
+      # pause event normally cancels the pool admission earlier; this check also
+      # covers a pause committed by another process after the admission was
+      # queued. Once #execute starts, the job follows its normal lifecycle.
+      if queue_paused?
+        release
+        return
+      end
+
       result = execute
 
       if result.success?
@@ -83,6 +102,14 @@ module SolidQueue
         finalizing { failed_with(result.error) }
         raise result.error
       end
+    end
+
+    def queue_paused?
+      job.present? && SolidQueue::Pause.paused?(job.queue_name)
+    end
+
+    def release_if_queue_paused
+      release if queue_paused?
     end
 
     def release

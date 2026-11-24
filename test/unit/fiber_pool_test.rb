@@ -16,6 +16,12 @@ class FiberPoolTest < Minitest::Test
     end
   end
 
+  SkippedExecution = Struct.new(:performed) do
+    def perform
+      self.performed = true
+    end
+  end
+
   def test_builds_a_fiber_pool
     pool = mock
 
@@ -37,6 +43,33 @@ class FiberPoolTest < Minitest::Test
       assert_equal 1, entries.map(&:first).uniq.count
       assert_equal 2, entries.map(&:last).uniq.count
       assert_equal 2, pool.available_capacity
+    ensure
+      pool&.shutdown
+      pool&.wait_for_termination(1.second)
+    end
+  end
+
+  def test_cancels_admissions_waiting_for_a_fiber_without_performing_them
+    with_execution_isolation(:fiber) do
+      pool = SolidQueue::FiberPool.new(1)
+      execution = SkippedExecution.new
+
+      # Simulate a claim admitted to the pool but still waiting in front of the
+      # fiber semaphore or reactor queue.
+      pool.send(:reserve_capacity!)
+      pool.send(:track_execution, execution)
+      pool.send(:pending_executions) << execution
+
+      assert_equal 0, pool.available_capacity
+      assert_equal [ execution ], pool.cancel_pending_executions
+      assert_equal 1, pool.available_capacity
+
+      pool.send(:start_reactor_if_needed)
+      pool.shutdown
+
+      assert pool.wait_for_termination(1.second)
+      assert_nil execution.performed
+      assert_equal 1, pool.available_capacity
     ensure
       pool&.shutdown
       pool&.wait_for_termination(1.second)
