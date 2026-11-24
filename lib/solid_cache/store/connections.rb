@@ -79,6 +79,21 @@ module SolidCache
           end
         end
 
+        # Like #reading_keys, but keeps each connection's keys and the error
+        # raised while reading them, so a single failed shard can be reported
+        # without discarding the results of the others.
+        def reading_keys_with_error(keys, failsafe:, failsafe_returning: nil)
+          group_by_connection(keys).map do |connection, grouped_keys|
+            result, error = failsafe_with_error(failsafe, returning: failsafe_returning) do
+              with_connection(connection) do
+                yield grouped_keys
+              end
+            end
+
+            [ connection, grouped_keys, result, error ]
+          end
+        end
+
         def writing_key(key, failsafe:, failsafe_returning: nil, &block)
           failsafe(failsafe, returning: failsafe_returning) do
             with_connection_for(key, &block)

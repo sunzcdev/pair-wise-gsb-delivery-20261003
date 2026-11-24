@@ -40,7 +40,78 @@ module SolidCache
         entry_clear
       end
 
+      # Like #read_multi, but returns a ReadMultiReport that says, for every
+      # key, whether it hit, is definitely absent, or could not be read because
+      # the shard holding it was unavailable.
+      #
+      # A key stored with a nil value counts as a hit, so it is distinguishable
+      # from a key that is not in the cache. Keys on a shard that failed are
+      # reported as unknown and never as misses, which means results for the
+      # healthy shards can be used directly.
+      #
+      # This always reads from the shards, bypassing the local cache, which
+      # cannot tell us whether a key was absent or unreadable.
+      def read_multi_report(*names)
+        options = merged_options(names.extract_options!)
+        return ReadMultiReport.new if names.empty?
+
+        keys_and_names = names.index_by { |name| normalize_key(name, options) }
+
+        instrument_multi :read_multi, keys_and_names.keys, options do |payload|
+          read_multi_entries_report(keys_and_names, options).tap do |report|
+            payload[:hits] = report.hits.map { |name| normalize_key(name, options) }
+          end
+        end
+      end
+
       private
+        def read_multi_entries_report(keys_and_names, options)
+          report = ReadMultiReport.new(names: keys_and_names.values)
+
+          entry_read_multi_report(keys_and_names.keys).each do |shard, shard_keys, serialized_entries, error|
+            shard_names = shard_keys.map { |key| keys_and_names[key] }
+
+            if error
+              report.record_unavailable_shard(shard, shard_names, error: error)
+            else
+              report.record_available_shard(shard, shard_names)
+              shard_keys.each do |key|
+                record_read_multi_entry(report, shard, keys_and_names[key], key, serialized_entries, options)
+              end
+            end
+          end
+
+          report
+        end
+
+        def record_read_multi_entry(report, shard, name, key, serialized_entries, options)
+          entry = deserialize_entry(serialized_entries[key], **options)
+
+          if entry.nil?
+            report.record_miss(shard, name)
+          elsif entry.expired?
+            delete_entry(key, **options)
+            report.record_miss(shard, name)
+          elsif entry.mismatched?(normalize_version(name, options))
+            report.record_miss(shard, name)
+          else
+            record_read_multi_entry_hit(report, shard, name, entry)
+          end
+        end
+
+        # A value that fails to deserialize is a miss, matching #read_multi_entries.
+        def record_read_multi_entry_hit(report, shard, name, entry)
+          if defined? ActiveSupport::Cache::DeserializationError
+            begin
+              report.record_hit(shard, name, entry.value)
+            rescue ActiveSupport::Cache::DeserializationError
+              report.record_miss(shard, name)
+            end
+          else
+            report.record_hit(shard, name, entry.value)
+          end
+        end
+
         def read_entry(key, **options)
           deserialize_entry(read_serialized_entry(key, **options), **options)
         end

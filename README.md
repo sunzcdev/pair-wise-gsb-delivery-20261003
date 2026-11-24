@@ -202,6 +202,35 @@ production:
   databases: [cache_shard1, cache_shard2, cache_shard3]
 ```
 
+### Reporting on a multi read
+
+`read_multi` returns a hash of the values it found. With a sharded cache that hash is ambiguous:
+a key may be missing from the returned hash because it is not in the cache, because it was stored
+with a `nil` value, or because the shard holding it could not be read.
+
+`read_multi_report` returns a `SolidCache::Store::ReadMultiReport` instead, which keeps those cases
+apart:
+
+```ruby
+report = Rails.cache.read_multi_report(key_one, key_two, key_three)
+
+report.hits           # keys that were found (the value may be nil)
+report.misses         # keys the cache answered "not present" for
+report.unknown        # keys whose shard could not be read
+report.results        # { key => value } for the hits, including nil values
+report.complete?      # false when any shard failed
+
+report.shard_for(key)            # the shard the key was assigned to
+report.shard(shard_name)         # #ok? / #unavailable?, plus #error and #names
+report.unavailable_shards        # every shard that could not be read
+```
+
+A key on a shard that failed is reported as unknown and never as a miss, so the hits and misses for
+the healthy shards can be consumed directly. Use `report.results` for the values, or `report.hits`
+and `report.misses` to drive your own fallback.
+
+`read_multi` itself is unchanged and still returns a plain hash.
+
 ## Enabling encryption
 
 To encrypt the cache values, you can add the encrypt property.

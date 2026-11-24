@@ -47,6 +47,15 @@ module SolidCache
           end
         end
 
+        # Reads the given keys, keeping each shard's keys, result and error
+        # separate so a failed shard can be reported instead of looking like a
+        # batch of misses.
+        def entry_read_multi_report(keys)
+          reading_keys_with_error(keys, failsafe: :read_multi_mget, failsafe_returning: {}) do |keys|
+            Entry.read_multi(keys)
+          end
+        end
+
         def entry_write(key, payload)
           writing_key(key, failsafe: :write_entry, failsafe_returning: nil) do
             Entry.write(key, payload)

@@ -30,9 +30,23 @@ module SolidCache
         def failsafe(method, returning: nil)
           yield
         rescue *TRANSIENT_ACTIVE_RECORD_ERRORS => error
-          ActiveSupport.error_reporter&.report(error, handled: true, severity: :warning)
-          error_handler&.call(method: method, exception: error, returning: returning)
+          handle_error(method: method, returning: returning, exception: error)
           returning
+        end
+
+        # Like #failsafe, but returns the error that was handled alongside the
+        # fallback value, so callers can report on a failure instead of
+        # silently treating it as an empty result.
+        def failsafe_with_error(method, returning: nil)
+          [ yield, nil ]
+        rescue *TRANSIENT_ACTIVE_RECORD_ERRORS => error
+          handle_error(method: method, returning: returning, exception: error)
+          [ returning, error ]
+        end
+
+        def handle_error(method:, returning:, exception:)
+          ActiveSupport.error_reporter&.report(exception, handled: true, severity: :warning)
+          error_handler&.call(method: method, exception: exception, returning: returning)
         end
     end
   end
