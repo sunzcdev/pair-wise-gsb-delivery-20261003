@@ -171,6 +171,35 @@ Only triggering expiry when we write means that if the cache is idle, the backgr
 
 If you want the cache expiry to be run in a background job instead of a thread, you can set `expiry_method` to `:job`. This will enqueue a `SolidCache::ExpiryJob`.
 
+## Cache statistics
+
+Call `#stats` on the cache store to get diagnostic information:
+
+```ruby
+Rails.cache.stats
+# {
+#   connections: 1,
+#   connection_stats: { default: { max_age: 3600, oldest_age: 12.3, max_entries: nil, entries: 42 } },
+#   namespace_stats: {
+#     "967196252176b1f197164978023819ec" => { entries: 42, byte_size: 12840, key_hash_collisions: 0 }
+#   }
+# }
+```
+
+`namespace_stats` reports the entry count and estimated `byte_size` for each
+namespace, aggregated across all the shards. The groups are keyed by a digest
+of the namespace rather than by the namespace itself, so the report is safe to
+share: original keys, namespaces and cached values never appear in it.
+
+`key_hash_collisions` counts the times a write targeted an index hash already
+used by a different key. The unique index means the new write replaces the
+existing entry, so the replaced key becomes unreadable. Re-writing the same key
+is not a collision. Collision counters are tracked per process and include only
+the digest group id and a count, never the conflicting keys or their values.
+
+Entries are always grouped per namespace; entries from different namespaces are
+never merged into a shared bucket.
+
 ## Sharding the cache
 
 Solid Cache uses the [Maglev](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/44824.pdf) consistent hashing scheme to shard the cache across multiple databases.

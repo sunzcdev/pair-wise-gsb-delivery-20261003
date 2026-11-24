@@ -16,6 +16,9 @@ module SolidCache
 
     MULTI_BATCH_SIZE = 1000
 
+    # Keys are normalized as "<namespace>:<name>" by Active Support::Cache::Store
+    NAMESPACE_SEPARATOR = ":"
+
     class << self
       def write(key, value)
         write_multi([ { key: key, value: value } ])
@@ -23,12 +26,60 @@ module SolidCache
 
       def write_multi(payloads)
         without_query_cache do
-          payloads.each_slice(MULTI_BATCH_SIZE).each do |payload_batch|
+          payloads.each_slice(MULTI_BATCH_SIZE).flat_map do |payload_batch|
+            collisions = key_hash_collisions(payload_batch)
             upsert_all \
               add_key_hash_and_byte_size(payload_batch),
               unique_by: upsert_unique_by, on_duplicate: :update, update_only: [ :key, :value, :byte_size ]
+            collisions
           end
         end
+      end
+
+      # Returns the entries whose stored key differs from the key being written,
+      # but share the same key hash index. A re-write of the exact same key is not
+      # a collision and is therefore excluded. Only key material (never values)
+      # is returned, so callers can report the identity clash without exposing
+      # cached values.
+      def key_hash_collisions(payloads)
+        hashes = key_hashes_for(payloads.map { |payload| payload[:key] })
+        existing = where(key_hash: hashes).pluck(:key_hash, :key).to_h
+
+        payloads.zip(hashes).filter_map do |payload, key_hash|
+          key = payload[:key]
+          stored_key = existing[key_hash]
+          { key_hash: key_hash, key: key, existing_key: stored_key } if stored_key && stored_key != key
+        end
+      end
+
+      # Aggregates entries by their namespace (the segment of the key before the
+      # first ":"). Entries without a namespace are grouped under "".
+      #
+      # The groups are returned keyed by a digest of the namespace rather than by
+      # the namespace itself: this keeps the stats safe to publish while remaining
+      # a stable identifier for diagnostics. Values are never read here.
+      def namespace_stats
+        without_query_cache do
+          grouped_rows = pluck(:key, :byte_size).group_by do |key, _byte_size|
+            namespace_for(key)
+          end
+
+          grouped_rows.transform_keys do |namespace|
+            namespace_group_id(namespace)
+          end.transform_values do |rows|
+            { entries: rows.count, byte_size: rows.sum { |_key, byte_size| byte_size } }
+          end
+        end
+      end
+
+      def namespace_group_id(namespace)
+        ActiveSupport::Digest.hexdigest(namespace.to_s)
+      end
+
+      def namespace_for(key)
+        string = key.to_s
+        separator = string.index(NAMESPACE_SEPARATOR)
+        separator ? string.byteslice(0, separator) : ""
       end
 
       def read(key)

@@ -31,6 +31,8 @@ module SolidCache
           writing_key(key, failsafe: :increment) do
             Entry.lock_and_write(key) do |value|
               block.call(value).tap { |result| track_writes(1) if result }
+            end.tap do
+              track_key_hash_collisions(Entry.key_hash_collisions([ { key: key } ]))
             end
           end
         end
@@ -49,7 +51,7 @@ module SolidCache
 
         def entry_write(key, payload)
           writing_key(key, failsafe: :write_entry, failsafe_returning: nil) do
-            Entry.write(key, payload)
+            track_key_hash_collisions(Entry.write(key, payload))
             track_writes(1)
             true
           end
@@ -57,8 +59,10 @@ module SolidCache
 
         def entry_write_multi(entries)
           writing_keys(entries, failsafe: :write_multi_entries, failsafe_returning: false) do |entries|
-            Entry.write_multi(entries)
-            track_writes(entries.count)
+            Entry.write_multi(entries).tap do |collisions|
+              track_key_hash_collisions(collisions)
+              track_writes(entries.count)
+            end
             true
           end
         end
