@@ -1,5 +1,9 @@
 # Releases
 
+## Unreleased
+
+  - Added `Async::HTTP::Protocol::HTTPS.for(names)` for constructing a protocol negotiator with a specific range of protocols (in order of preference), and fixed `Async::HTTP::Protocol::HTTPS#protocol_for` to respect the configured handlers rather than the global defaults, so connections are only matched to protocols within the configured range.
+
 ## v0.105.0
 
   - Respond with `400 Bad Request` for any `Protocol::HTTP::BadRequest` raised while parsing HTTP/1 or HTTP/2 requests, include the exception class name without reflecting request data, and avoid reporting them as unhandled server errors.

@@ -30,6 +30,25 @@ module Async
 					@handlers = handlers
 					@options = options
 				end
+
+				# Construct a protocol negotiator which supports a specific range of protocols, in order of preference. The last protocol is used as the fallback when the peer does not negotiate a protocol using ALPN.
+				#
+				# @parameter names [Array(String)] The ALPN protocol names to support, e.g. `["h2", "http/1.1"]`.
+				# @returns [HTTPS] The protocol negotiator.
+				def self.for(names)
+					handlers = {}
+
+					names.each do |name|
+						handlers[name] = HANDLERS.fetch(name) do
+							raise ArgumentError, "Unknown protocol name: #{name.inspect}!"
+						end
+					end
+
+					# If no protocol is negotiated, fall back to the last (most conservative) protocol:
+					handlers[nil] = handlers[names.last]
+
+					self.new(handlers)
+				end
 				
 				# Register a protocol handler for a given ALPN protocol name.
 				# @parameter name [String] The ALPN protocol name.
@@ -42,17 +61,17 @@ module Async
 				
 				# Determine the protocol of the peer and return the appropriate protocol class.
 				#
-				# Use TLS Application Layer Protocol Negotiation (ALPN) to determine the protocol.
+				# Use TLS Application Layer Protocol Negotiation (ALPN) to determine the protocol. Only connections with an interpretable negotiation result (i.e. within the configured range of protocols) are matched; anything else is rejected.
 				#
 				# @parameter peer [IO] The peer to communicate with.
 				# @returns [Class] The protocol class to use.
 				def protocol_for(peer)
 					# alpn_protocol is only available if openssl v1.0.2+
 					name = peer.alpn_protocol
-					
+
 					Console.debug(self){"Negotiating protocol #{name.inspect}..."}
-					
-					if protocol = HANDLERS[name]
+
+					if protocol = @handlers[name]
 						return protocol
 					else
 						raise ArgumentError, "Could not determine protocol for connection (#{name.inspect})."
