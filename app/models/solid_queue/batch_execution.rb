@@ -19,7 +19,7 @@ module SolidQueue
           if attempt_to_update_total_jobs(batch_id, jobs_in_batch)
             super jobs_in_batch
           else
-            raise Batch::AlreadyFinished, "Can't add jobs into an already finished batch"
+            raise Batch::AlreadyFinished, "Can't add jobs into a finished or sealed batch"
           end
         end
       end
@@ -27,7 +27,14 @@ module SolidQueue
       private
         def attempt_to_update_total_jobs(batch_id, jobs)
           new_jobs_count = count_new_jobs_among(jobs)
-          updated = SolidQueue::Batch.where(id: batch_id).unfinished.update_all([ "total_jobs = total_jobs + ?", new_jobs_count ])
+          # Static batches only reject appends once finished. Dynamic batches also
+          # reject them once sealed: the sealed_at guard makes the increment CAS lose
+          # after a concurrent seal commits, and that failure rolls the enclosing
+          # enqueue transaction back, so the job row can never be left orphaned.
+          # IS NOT TRUE is NULL-safe: legacy rows have a NULL dynamic flag.
+          appendable = SolidQueue::Batch.where(id: batch_id).unfinished.
+            where("dynamic IS NOT TRUE OR sealed_at IS NULL")
+          updated = appendable.update_all([ "total_jobs = total_jobs + ?", new_jobs_count ])
           updated > 0
         end
 
@@ -43,8 +50,10 @@ module SolidQueue
 
     private
       def finish_batch
-        # Skip the serialized callback and metadata columns on this hot path
-        if batch = Batch.select(:id, :finished_at, :enqueued_at).find_by(id: batch_id)
+        # Skip the serialized callback and metadata columns on this hot path,
+        # but keep every column the completion check reads, including the
+        # dynamic/seal flags that gate dynamic batch completion.
+        if batch = Batch.select(:id, :finished_at, :enqueued_at, :dynamic, :sealed_at).find_by(id: batch_id)
           batch.finish
         end
       rescue => error

@@ -11,7 +11,7 @@ module SolidQueue
     end
 
     include Callbacks, Status
-    include Clearable, Sweepable
+    include Clearable, Sweepable, Sealable
 
     has_many :jobs
     has_many :batch_executions, dependent: :destroy
@@ -63,6 +63,13 @@ module SolidQueue
         raise AlreadyFinished, "Can't enqueue an already finished batch"
       end
 
+      # A dynamic batch only accepts appends while open. The database CAS in
+      # BatchExecution.create_all_from_jobs is the authoritative guard against
+      # a seal that commits concurrently with this call.
+      if sealed?
+        raise AlreadyFinished, "Can't enqueue into a sealed batch"
+      end
+
       transaction do
         save! if new_record?
 
@@ -89,10 +96,14 @@ module SolidQueue
 
     def finish
       return if finished? || !enqueued?
+      # Check the seal before the tracking rows: an empty, unsealed dynamic
+      # batch must stay open even though a query currently sees no executions.
+      # A static batch is never sealed, so its empty-query completion is intact.
+      return if dynamic? && !sealed?
       return if batch_executions.exists?
 
       transaction do
-        updated = Batch.where(id: id).unfinished.enqueued.without_executions.update_all(finished_at: Time.current)
+        updated = Batch.where(id: id).unfinished.enqueued.without_executions.completion_sealed.update_all(finished_at: Time.current)
         finalize if updated > 0
       end
     end
@@ -117,6 +128,7 @@ module SolidQueue
         # inserting their executions. MySQL doesn't need this: it reads DML
         # subqueries from the latest committed data, so its CAS can't win wrongly.
         raise ActiveRecord::Rollback if batch_executions.exists?
+        raise ActiveRecord::Rollback if dynamic? && !sealed?
 
         SolidQueue.instrument(:finish_batch, batch_id: id) do |payload|
           failed_jobs = jobs.failed.count

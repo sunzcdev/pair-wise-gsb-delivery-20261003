@@ -144,6 +144,8 @@ ActiveRecord::Schema[7.1].define(version: 1) do
     t.integer "total_jobs", default: 0, null: false
     t.integer "completed_jobs", default: 0, null: false
     t.integer "failed_jobs", default: 0, null: false
+    t.boolean "dynamic"
+    t.datetime "sealed_at"
     t.datetime "enqueued_at"
     t.datetime "finished_at"
     t.datetime "failed_at"

@@ -11,6 +11,12 @@ module SolidQueue
         scope :unfinished, -> { where(finished_at: nil) }
         scope :failed, -> { where.not(failed_at: nil) }
         scope :enqueued, -> { where.not(enqueued_at: nil) }
+        scope :sealed, -> { where.not(sealed_at: nil) }
+        scope :unsealed, -> { where(sealed_at: nil) }
+        # Only dynamic batches can be sealed. A static batch never carries a
+        # sealed_at, so this keeps it eligible for completion exactly as before.
+        # IS NOT TRUE is NULL-safe: legacy rows have a NULL dynamic flag.
+        scope :completion_sealed, -> { where("dynamic IS NOT TRUE OR sealed_at IS NOT NULL") }
       end
 
       def status
@@ -37,6 +43,15 @@ module SolidQueue
 
       def enqueued?
         enqueued_at.present?
+      end
+
+      def dynamic?
+        # NULL and false both mean a legacy/static batch
+        self[:dynamic] == true
+      end
+
+      def sealed?
+        self[:sealed_at].present?
       end
 
       # Failed jobs no longer have tracking rows, so exclude them from the completed count.

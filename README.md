@@ -32,6 +32,7 @@ Solid Queue can be used with SQL databases such as MySQL, PostgreSQL, or SQLite,
   - [Error reporting on jobs](#error-reporting-on-jobs)
   - [Jobs interrupted by non-graceful process death](#jobs-interrupted-by-non-graceful-process-death)
 - [Batch jobs](#batch-jobs)
+  - [Dynamic batches: explicit appends and sealing](#dynamic-batches-explicit-appends-and-sealing)
   - [Batch progress and counters](#batch-progress-and-counters)
   - [Batch maintenance](#batch-maintenance)
   - [Clearing batches](#clearing-batches)
@@ -769,6 +770,29 @@ Callbacks can be given as a job class or as a configured job instance—for exam
 
 Callback jobs always enqueue through Solid Queue, even when the job classes involved (or the application default) use a different Active Job adapter. And a batch that ends up with no jobs finishes as soon as it starts, firing its callbacks right away.
 
+### Dynamic batches: explicit appends and sealing
+
+A regular (static) batch finishes as soon as a completion check sees no outstanding jobs. That's fine when every member is known up front, but not when running members enqueue more work as they go: an unlucky query that momentarily sees no unfinished jobs could fire the success callback before that later work even exists.
+
+For those cases, create a **dynamic** batch with `SolidQueue::Batch.enqueue_dynamic`. It stays open for appends from any connection—including `batch.enqueue` calls inside running jobs—until you explicitly **seal** it:
+
+```ruby
+batch = SolidQueue::Batch.enqueue_dynamic(on_finish: BatchFinishJob) do
+  ImportChunkJob.perform_later(chunk_ids.first)
+end
+
+# Later, from any process or connection — even from inside one of the jobs:
+batch.enqueue { ImportChunkJob.perform_later(next_chunk_id) }
+batch.seal
+```
+
+The rules are:
+
+- An unsealed dynamic batch never completes, even when it currently has no outstanding jobs. The maintenance sweeper won't finish it either. It can only finish after `seal`.
+- `seal` closes the batch against further appends. If all its work is already done when it's sealed, it finishes immediately; otherwise it finishes when the last outstanding member completes. Sealing is idempotent.
+- Appending after the seal (or after completion) raises `SolidQueue::Batch::AlreadyFinished`. The append runs in a single database transaction with the batch's bookkeeping, so a rejected append rolls back completely and never leaves an orphaned job.
+- Static batches created with `SolidQueue::Batch.enqueue` are unchanged: they have no seal and keep completing off the outstanding-jobs query, including batches created before this feature existed.
+
 ### Batch progress and counters
 
 Batches track `total_jobs`, `completed_jobs`, `failed_jobs` and `pending_jobs`, plus a `progress_percentage` helper. A couple of accounting details to be aware of:
@@ -811,6 +835,8 @@ bin/rails db:migrate
 Until you do, Solid Queue works exactly as before—jobs enqueue and run without any batch bookkeeping, trying to start a batch raises, and the dispatcher logs a deprecation warning to remind you the migration is pending. It becomes part of the base schema in Solid Queue 2.0.
 
 The copied migration is yours to adapt: if you're on PostgreSQL with a large jobs table, consider building the jobs index concurrently—`algorithm: :concurrently` on its `add_index`, with `disable_ddl_transaction!` on the migration—so the build doesn't block enqueues while it runs. Everything in the migration skips what already exists, so it's safe to rerun after a failure; just drop the invalid index a failed concurrent build leaves behind first.
+
+To use [dynamic batches](#dynamic-batches-explicit-appends-and-sealing), run `bin/rails solid_queue:update` again to copy the migration that adds their `dynamic` and `sealed_at` columns, then `bin/rails db:migrate`. Both columns are nullable and default to "not dynamic", so existing batches keep their static behavior without any backfill.
 
 ## Puma plugin
 

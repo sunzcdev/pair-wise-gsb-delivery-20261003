@@ -2,13 +2,14 @@
 
 require "test_helper"
 require_relative "../../../lib/generators/solid_queue/update/templates/db/add_batches_to_solid_queue"
+require_relative "../../../lib/generators/solid_queue/update/templates/db/add_dynamic_batches_to_solid_queue"
 
 class BatchPendingMigrationsTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
-  # Recreate an app that hasn't run the optional batches migration by
-  # reverting the actual migration that ships with the update generator,
-  # which also proves it's reversible and matches the base schema.
+  # Recreate an app that hasn't run the optional batches migrations by
+  # reverting the actual migrations that ship with the update generator,
+  # which also proves they're reversible and match the base schema.
   setup do
     migrate(:down)
   end
@@ -54,14 +55,20 @@ class BatchPendingMigrationsTest < ActiveSupport::TestCase
   end
 
   private
+    BATCH_MIGRATIONS = [ AddDynamicBatchesToSolidQueue, AddBatchesToSolidQueue ].freeze
+
     def migrate(direction)
       ActiveRecord::Migration.suppress_messages do
         SolidQueue::Record.connection_pool.with_connection do |connection|
-          AddBatchesToSolidQueue.new.exec_migration(connection, direction)
+          # Migrate down in reverse dependency order so the base batches tables
+          # are dropped last, and up in the opposite order.
+          migrations = direction == :down ? BATCH_MIGRATIONS : BATCH_MIGRATIONS.reverse
+          migrations.each { |migration| migration.new.exec_migration(connection, direction) }
         end
       end
 
       SolidQueue::Job.reset_column_information
+      SolidQueue::Batch.reset_column_information
       SolidQueue::Batch.instance_variable_set(:@migrated, nil)
 
       # Changing the jobs table's shape invalidates cached prepared statements
