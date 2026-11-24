@@ -28,6 +28,7 @@ from zeroconf.asyncio import AsyncZeroconf
 from .. import (
     QUICK_REQUEST_TIMEOUT_MS,
     _inject_response,
+    _wait_for,
     aaaa_response_packet,
     has_working_ipv6,
     make_service_info,
@@ -3041,3 +3042,278 @@ async def test_aaaa_known_answer_sent_once_per_address() -> None:
     for out in sent:
         assert [record.type for record, _ in out.answers].count(const._TYPE_AAAA) == 1
     await aiozc.async_close()
+
+
+def _stage_txt(name: str) -> r.DNSText:
+    return r.DNSText(
+        name,
+        const._TYPE_TXT,
+        const._CLASS_IN | const._CLASS_UNIQUE,
+        120,
+        b"\x05ttl=2",
+    )
+
+
+def _stage_a(host: str, ttl: int = 120) -> DNSAddress:
+    return DNSAddress(
+        host,
+        const._TYPE_A,
+        const._CLASS_IN | const._CLASS_UNIQUE,
+        ttl,
+        socket.inet_aton("127.0.0.1"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_request_observer_streams_txt_and_port_before_address() -> None:
+    """TXT/SRV reach the observer while the boolean stays pending until an address lands."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    await aiozc.zeroconf.async_wait_for_start()
+    zc = aiozc.zeroconf
+    type_ = "_http._tcp.local."
+    registration_name = f"stream.{type_}"
+    host = "streamhost.local."
+
+    info = ServiceInfo(type_, registration_name)
+    stages: list[tuple[ServiceInfo, list[r.DNSText], list[r.DNSService], list]] = []
+
+    def observer(snapshot, texts, services, addresses):
+        stages.append((snapshot, list(texts), list(services), list(addresses)))
+
+    task = asyncio.create_task(info.async_request(zc, timeout=5000, observer=observer))
+    await asyncio.sleep(0.05)
+
+    zc.record_manager.async_updates_from_response(
+        mock_incoming_msg([_stage_txt(registration_name), _srv(registration_name, host)])
+    )
+    await asyncio.sleep(0)
+    assert stages
+    assert not task.done()
+    assert info.addresses == []
+
+    first_snapshot, first_texts, first_services, first_addresses = stages[0]
+    assert len(first_texts) == 1
+    assert len(first_services) == 1
+    assert first_addresses == []
+    assert first_snapshot.port == 80
+    assert first_snapshot.text == b"\x05ttl=2"
+    assert first_snapshot.addresses == []
+
+    zc.record_manager.async_updates_from_response(mock_incoming_msg([_stage_a(host)]))
+    assert await asyncio.wait_for(task, timeout=2) is True
+    assert info.addresses == [socket.inet_aton("127.0.0.1")]
+
+    _, second_texts, second_services, second_addresses = stages[-1]
+    assert second_texts == []
+    assert second_services == []
+    assert [type(record) for record in second_addresses] == [DNSAddress]
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+async def test_async_request_observer_arguments_are_detached() -> None:
+    """Mutating the live ServiceInfo after the callback cannot change what the observer holds."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    await aiozc.zeroconf.async_wait_for_start()
+    zc = aiozc.zeroconf
+    type_ = "_http._tcp.local."
+    registration_name = f"detached.{type_}"
+    host = "detachedhost.local."
+
+    info = ServiceInfo(type_, registration_name)
+    snapshots: list[ServiceInfo] = []
+
+    def observer(snapshot, texts, services, addresses):
+        snapshots.append(snapshot)
+
+    task = asyncio.create_task(info.async_request(zc, timeout=5000, observer=observer))
+    await asyncio.sleep(0.05)
+    zc.record_manager.async_updates_from_response(
+        mock_incoming_msg([_stage_txt(registration_name), _srv(registration_name, host)])
+    )
+    await asyncio.sleep(0)
+    assert snapshots
+
+    snapshot = snapshots[0]
+    seen = (list(snapshot.addresses), snapshot.text, snapshot.port, dict(snapshot.properties))
+    info._ipv4_addresses.append(object())  # type: ignore[arg-type]
+    info.text = b"changed"
+    info.port = 9999
+    info._properties = {b"x": b"y"}
+    assert (list(snapshot.addresses), snapshot.text, snapshot.port, dict(snapshot.properties)) == seen
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+async def test_async_request_observer_reports_expired_address_as_none() -> None:
+    """An expired address reaches the observer as None and never completes the request."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    await aiozc.zeroconf.async_wait_for_start()
+    zc = aiozc.zeroconf
+    type_ = "_http._tcp.local."
+    registration_name = f"expired.{type_}"
+    host = "expiredhost.local."
+
+    info = ServiceInfo(type_, registration_name, server=host)
+    info._txt_seen = True
+    observed: list[list] = []
+
+    def observer(snapshot, texts, services, addresses):
+        observed.append(list(addresses))
+
+    task = asyncio.create_task(info.async_request(zc, timeout=5000, observer=observer))
+    await asyncio.sleep(0.05)
+    assert info in zc.record_manager.listeners
+
+    expired = _stage_a(host)
+    zc.cache._async_set_created_ttl(expired, 0, 1)
+    info.async_update_records(zc, r.current_time_millis(), [r.RecordUpdate(expired, None)])
+    assert observed == [[None]]
+    assert info.addresses == []
+    assert not task.done()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert info._observer is None
+    assert info not in zc.record_manager.listeners
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+async def test_async_request_observer_full_stage_sequence() -> None:
+    """TXT/SRV, then a goodbye, then a valid address: only the valid address completes."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    await aiozc.zeroconf.async_wait_for_start()
+    zc = aiozc.zeroconf
+    type_ = "_http._tcp.local."
+    registration_name = f"sequence.{type_}"
+    host = "sequencehost.local."
+
+    # A stale address already in the cache lets the record manager forward a
+    # goodbye for it, without itself being a usable endpoint.
+    stale = _stage_a(host)
+    zc.cache._async_set_created_ttl(stale, 0, 1)
+    zc.cache.async_add_records([stale])
+
+    info = ServiceInfo(type_, registration_name)
+    stages: list[tuple[int, int, list]] = []
+
+    def observer(snapshot, texts, services, addresses):
+        stages.append((len(texts), len(services), list(addresses)))
+
+    task = asyncio.create_task(info.async_request(zc, timeout=5000, observer=observer))
+    await asyncio.sleep(0.05)
+
+    zc.record_manager.async_updates_from_response(
+        mock_incoming_msg([_stage_txt(registration_name), _srv(registration_name, host)])
+    )
+    assert stages == [(1, 1, [])]
+    assert not task.done()
+
+    zc.record_manager.async_updates_from_response(mock_incoming_msg([_stage_a(host, ttl=0)]))
+    assert stages == [(1, 1, []), (0, 0, [None])]
+    assert not task.done()
+    assert info.addresses == []
+
+    zc.record_manager.async_updates_from_response(mock_incoming_msg([_stage_a(host)]))
+    assert await asyncio.wait_for(task, timeout=2) is True
+    assert info.addresses == [socket.inet_aton("127.0.0.1")]
+    assert stages[-1][:2] == (0, 0)
+    assert [type(record) for record in stages[-1][2]] == [DNSAddress]
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+async def test_async_request_without_observer_is_unchanged() -> None:
+    """Omitting the observer leaves the boolean contract and listener cleanup as before."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    await aiozc.zeroconf.async_wait_for_start()
+    zc = aiozc.zeroconf
+    type_ = "_http._tcp.local."
+    registration_name = f"noobserver.{type_}"
+    host = "noobserverhost.local."
+
+    info = ServiceInfo(type_, registration_name)
+    assert info._observer is None
+    task = asyncio.create_task(info.async_request(zc, timeout=5000))
+    await asyncio.sleep(0.05)
+    zc.record_manager.async_updates_from_response(
+        mock_incoming_msg(
+            [_stage_txt(registration_name), _srv(registration_name, host), _stage_a(host)]
+        )
+    )
+    assert await asyncio.wait_for(task, timeout=2) is True
+    assert info._observer is None
+    assert info not in zc.record_manager.listeners
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+async def test_async_request_observer_cancel_ends_listening() -> None:
+    """Cancelling async_request clears the observer and detaches the listener."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    await aiozc.zeroconf.async_wait_for_start()
+    zc = aiozc.zeroconf
+    type_ = "_http._tcp.local."
+    info = ServiceInfo(type_, f"cancel.{type_}")
+
+    task = asyncio.create_task(info.async_request(zc, timeout=5000, observer=lambda *args: None))
+    await asyncio.sleep(0.05)
+    assert info in zc.record_manager.listeners
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert info._observer is None
+    assert info not in zc.record_manager.listeners
+    await aiozc.async_close()
+
+
+def test_request_forwards_observer_from_worker_thread() -> None:
+    """The synchronous request() drives the observer and still returns a bool."""
+    type_ = "_http._tcp.local."
+    registration_name = f"syncreq.{type_}"
+    host = "syncreqhost.local."
+    zc = r.Zeroconf(interfaces=["127.0.0.1"])
+    _wait_for(lambda: zc.started)
+
+    info = ServiceInfo(type_, registration_name)
+    stages: list[tuple[list, list, list]] = []
+
+    def observer(snapshot, texts, services, addresses):
+        stages.append((list(texts), list(services), list(addresses)))
+
+    result: dict[str, bool] = {}
+    ready = Event()
+
+    def worker() -> None:
+        ready.set()
+        result["value"] = info.request(zc, 10000, observer=observer)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    ready.wait(2)
+    _inject_response(
+        zc,
+        mock_incoming_msg([_stage_txt(registration_name), _srv(registration_name, host)]),
+    )
+    _wait_for(lambda: len(stages) >= 1)
+    _inject_response(zc, mock_incoming_msg([_stage_a(host)]))
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert result["value"] is True
+    assert len(stages) == 2
+    assert (len(stages[0][0]), len(stages[0][1]), stages[0][2]) == (1, 1, [])
+    assert (stages[1][0], stages[1][1], [type(record) for record in stages[1][2]]) == (
+        [],
+        [],
+        [DNSAddress],
+    )
+    assert info._observer is None
+    zc.close()

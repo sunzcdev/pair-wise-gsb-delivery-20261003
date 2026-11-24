@@ -8,9 +8,10 @@ in the project's git history.
 from __future__ import annotations
 
 import asyncio
+import copy
 import random
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, cast
 
 from .._cache import DNSCache
@@ -89,6 +90,15 @@ RecordUpdate_ = RecordUpdate
 QU_QUESTION = DNSQuestionType.QU
 QM_QUESTION = DNSQuestionType.QM
 
+# A stage observer receives a detached snapshot of the ServiceInfo plus the
+# TXT, SRV, and address records that just arrived. Every call gets freshly
+# built values, and an expired address is delivered as None so it can never
+# be mistaken for a usable endpoint.
+ServiceInfoStageObserver = Callable[
+    ["ServiceInfo", "list[DNSText]", "list[DNSService]", "list[DNSAddress | None]"],
+    None,
+]
+
 randint = random.randint
 
 if TYPE_CHECKING:
@@ -159,6 +169,7 @@ class ServiceInfo(RecordUpdateListener):
         "_ipv6_denied",
         "_name",
         "_new_records_futures",
+        "_observer",
         "_properties",
         "_query_record_types",
         "_txt_seen",
@@ -227,6 +238,7 @@ class ServiceInfo(RecordUpdateListener):
         self.host_ttl = host_ttl
         self.other_ttl = other_ttl
         self._new_records_futures: set[asyncio.Future] | None = None
+        self._observer: ServiceInfoStageObserver | None = None
         self._dns_address_cache: list[DNSAddress] | None = None
         self._dns_address_nsec_cache: DNSNsec | None = None
         self._dns_pointer_cache: DNSPointer | None = None
@@ -329,12 +341,15 @@ class ServiceInfo(RecordUpdateListener):
         question_type: DNSQuestionType | None = None,
         addr: str | None = None,
         port: int = _MDNS_PORT,
+        observer: ServiceInfoStageObserver | None = None,
     ) -> bool:
         """Populate this object from the network, returning True on success.
 
         Event loop flavor of request; waits up to timeout milliseconds
         for the answers to arrive, and addr and port direct the queries
-        at a specific responder instead of the multicast group.
+        at a specific responder instead of the multicast group. observer,
+        when given, is called with a detached snapshot of the partial state
+        as records arrive; only a full result returns True.
         """
         if not zc.started:
             await zc.async_wait_for_start()
@@ -351,6 +366,7 @@ class ServiceInfo(RecordUpdateListener):
         delay = self._get_initial_delay()
         deadline = now + timeout
         send_at = now
+        self._observer = observer
         try:
             zc.async_add_listener(self, None)
             while not self._is_complete:
@@ -382,6 +398,7 @@ class ServiceInfo(RecordUpdateListener):
                     # history of the remote responder.
                     delay = _DUPLICATE_QUESTION_INTERVAL
         finally:
+            self._observer = None
             zc.async_remove_listener(self)
 
         return True
@@ -391,6 +408,8 @@ class ServiceInfo(RecordUpdateListener):
         new_records_futures = self._new_records_futures
         updated: bool = False
         nsec_records = None
+        observer = self._observer
+        stage = self._collect_stage_records(records) if observer is not None else None
         for record_update in records:
             record = record_update.new
             # NSEC records are processed last so a denial for an SRV target
@@ -407,6 +426,8 @@ class ServiceInfo(RecordUpdateListener):
                 updated |= self._process_record_threadsafe(zc, record, now)
         if updated and new_records_futures:
             _resolve_all_futures_to_none(new_records_futures)
+        if observer is not None and stage is not None:
+            self._report_stage(observer, stage, now)
 
     async def async_wait(self, timeout: float, loop: asyncio.AbstractEventLoop | None = None) -> None:
         """Suspend the calling task for timeout milliseconds, or less when new records arrive."""
@@ -540,12 +561,14 @@ class ServiceInfo(RecordUpdateListener):
         question_type: DNSQuestionType | None = None,
         addr: str | None = None,
         port: int = _MDNS_PORT,
+        observer: ServiceInfoStageObserver | None = None,
     ) -> bool:
         """Populate this object from the network, returning True on success.
 
         Waits up to timeout milliseconds for the answers to arrive; addr
         and port direct the queries at a specific responder instead of
-        the multicast group.
+        the multicast group. observer, when given, is called with a detached
+        snapshot of the partial state as records arrive.
         """
         assert zc.loop is not None, "Zeroconf instance must have a loop, was it not started?"
         assert zc.loop.is_running(), "Zeroconf instance loop must be running, was it already stopped?"
@@ -553,7 +576,7 @@ class ServiceInfo(RecordUpdateListener):
             raise RuntimeError("Use AsyncServiceInfo.async_request from the event loop")
         return bool(
             run_coro_with_timeout(
-                self.async_request(zc, timeout, question_type, addr, port),
+                self.async_request(zc, timeout, question_type, addr, port, observer),
                 zc.loop,
                 timeout,
             )
@@ -596,6 +619,42 @@ class ServiceInfo(RecordUpdateListener):
         out.add_question(question)
         for answer in known_answers:
             out.add_answer_at_time(answer, now)
+
+    def _collect_stage_records(
+        self, records: list[RecordUpdate_]
+    ) -> tuple[list[DNSText], list[DNSService], list[DNSAddress]]:
+        """Return the TXT, SRV and address records in this batch that belong to this request.
+
+        Address records for a target named by an SRV in the same batch are
+        included regardless of wire order. An expired address is returned too,
+        so the observer learns it is gone; the snapshot never carries it as a
+        usable address.
+        """
+        address_keys = {self.server_key} if self.server_key else set()
+        if _TYPE_SRV in self._query_record_types:
+            for record_update in records:
+                record = record_update.new
+                if type(record) is DNSService and record.key == self.key:
+                    address_keys.add(record.server_key)
+
+        texts: list[DNSText] = []
+        services: list[DNSService] = []
+        addresses: list[DNSAddress] = []
+        query_types = self._query_record_types
+        key = self.key
+        for record_update in records:
+            record = record_update.new
+            record_type = type(record)
+            if record_type is DNSText:
+                if record.key == key and _TYPE_TXT in query_types:
+                    texts.append(record)
+            elif record_type is DNSService:
+                if record.key == key and _TYPE_SRV in query_types:
+                    services.append(record)
+            elif record_type is DNSAddress and record.key in address_keys:
+                if record.type in query_types:
+                    addresses.append(record)
+        return texts, services, addresses
 
     def _dns_address_nsec(self, override_ttl: int_ | None) -> DNSNsec | None:
         cacheable = override_ttl is None
@@ -985,6 +1044,28 @@ class ServiceInfo(RecordUpdateListener):
 
         return False
 
+    def _report_stage(
+        self,
+        observer: ServiceInfoStageObserver,
+        stage: tuple[list[DNSText], list[DNSService], list[DNSAddress]],
+        now: float_,
+    ) -> None:
+        """Hand the observer a detached snapshot plus the records that just arrived.
+
+        Expired TXT/SRV records carry nothing current, so they are omitted; an
+        expired address is reported as None so the observer sees it disappear
+        without ever treating it as a usable endpoint.
+        """
+        texts, services, addresses = stage
+        current_texts = [copy.copy(record) for record in texts if not record.is_expired(now)]
+        current_services = [copy.copy(record) for record in services if not record.is_expired(now)]
+        current_addresses: list[DNSAddress | None] = [
+            None if record.is_expired(now) else copy.copy(record) for record in addresses
+        ]
+        if not current_texts and not current_services and not current_addresses:
+            return
+        observer(self._snapshot(), current_texts, current_services, current_addresses)
+
     def _set_ipv4_addresses_from_cache(self, zc: Zeroconf, now: float_) -> None:
         """Set IPv4 addresses from the cache."""
         if TYPE_CHECKING:
@@ -1040,6 +1121,32 @@ class ServiceInfo(RecordUpdateListener):
         # Clear the properties cache
         self._properties = None
         self._decoded_properties = None
+
+    def _snapshot(self) -> ServiceInfo:
+        """Return a detached copy whose mutable containers are not shared with this instance.
+
+        copy.copy drops the private ``_name`` cdef attribute under Cython, and
+        the cached record/copy containers would otherwise be aliased, so both
+        are reset here explicitly.
+        """
+        snapshot = copy.copy(self)
+        snapshot._name = self._name
+        snapshot._ipv4_addresses = list(self._ipv4_addresses)
+        snapshot._ipv6_addresses = list(self._ipv6_addresses)
+        snapshot._properties = None if self._properties is None else dict(self._properties)
+        snapshot._decoded_properties = (
+            None if self._decoded_properties is None else dict(self._decoded_properties)
+        )
+        snapshot._query_record_types = set(self._query_record_types)
+        snapshot._new_records_futures = None
+        snapshot._observer = None
+        snapshot._dns_address_cache = None
+        snapshot._dns_address_nsec_cache = None
+        snapshot._dns_pointer_cache = None
+        snapshot._dns_service_cache = None
+        snapshot._dns_text_cache = None
+        snapshot._get_address_and_nsec_records_cache = None
+        return snapshot
 
     def _unpack_text_into_properties(self) -> None:
         """Unpacks the text field into properties"""

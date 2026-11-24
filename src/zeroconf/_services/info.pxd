@@ -73,6 +73,7 @@ cdef class ServiceInfo(RecordUpdateListener):
     cdef public object other_ttl
     cdef public object interface_index
     cdef public cython.set _new_records_futures
+    cdef public object _observer
     cdef public DNSPointer _dns_pointer_cache
     cdef public DNSService _dns_service_cache
     cdef public DNSText _dns_text_cache
@@ -165,6 +166,14 @@ cdef class ServiceInfo(RecordUpdateListener):
     cdef cython.set _get_address_and_nsec_records(self, object override_ttl)
 
     cpdef void async_clear_cache(self)
+
+    @cython.locals(texts=list, services=list, addresses=list, address_keys=set, key=str)
+    cdef tuple _collect_stage_records(self, cython.list records)
+
+    @cython.locals(texts=list, services=list, addresses=list)
+    cdef void _report_stage(self, object observer, tuple stage, double now)
+
+    cpdef _snapshot(self)
 
     @cython.locals(cache=DNSCache, history=QuestionHistory, out=DNSOutgoing, qu_question=bint)
     cdef DNSOutgoing _generate_request_query(self, object zc, double now, object question_type)
