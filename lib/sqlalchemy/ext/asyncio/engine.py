@@ -6,6 +6,7 @@
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from typing import Any
 from typing import AsyncIterator
@@ -17,12 +18,14 @@ from typing import NoReturn
 from typing import Optional
 from typing import overload
 from typing import ParamSpec
+from typing import Tuple
 from typing import Type
 from typing import TYPE_CHECKING
 from typing import TypeVar
 from typing import Union
 
 from . import exc as async_exc
+from .base import _run_cleanup
 from .base import _run_to_completion
 from .base import asyncstartablecontext
 from .base import GeneratorStartableContext
@@ -605,8 +608,69 @@ class AsyncConnection(  # type: ignore[misc]
             yield ar
         except GeneratorExit:
             pass
+        except BaseException:
+            # the block raised, or the task was cancelled.  the result
+            # still has to be closed, and that close waited for, before the
+            # connection may be returned to the pool; a cancellation
+            # arriving meanwhile does not abandon it
+            _, cancelled = await self._close_stream_result(ar)
+            if cancelled is not None:
+                raise cancelled
+            raise
         else:
-            await _run_to_completion(ar.close())
+            failure, cancelled = await self._close_stream_result(ar)
+            if cancelled is not None:
+                raise cancelled
+            if failure is not None:
+                raise failure
+
+    async def _close_stream_result(
+        self, ar: AsyncResult[Any]
+    ) -> Tuple[Optional[BaseException], Optional[asyncio.CancelledError]]:
+        """Close a result delivered by :meth:`.AsyncConnection.stream`.
+
+        The close is waited for even if the calling task is cancelled
+        meanwhile, since the connection cannot go back to the pool until
+        the DBAPI cursor has been closed.  A close that fails, or that is
+        itself cancelled, leaves that cursor in an unknown state on a
+        connection which is about to be returned, so the connection is
+        invalidated rather than returned; a subsequent checkout then opens
+        a new one instead of receiving it.
+
+        Returns what the close and the wait cost, as :func:`._run_cleanup`
+        does.
+
+        """
+
+        async def close() -> None:
+            try:
+                await ar.close()
+            except BaseException:
+                await self._invalidate_after_failed_close()
+                raise
+
+        return await _run_cleanup(close())
+
+    async def _invalidate_after_failed_close(self) -> None:
+        """Discard a connection whose result close did not complete.
+
+        The cursor is in an unknown state, so the connection is not to be
+        used again; invalidating it closes it and returns its pool slot,
+        and the next checkout opens a replacement.  A failure of this step
+        does not displace the close failure already being reported, but a
+        cancellation of it propagates, so that it can be counted.
+
+        """
+        if self.closed or self.invalidated:
+            return
+        try:
+            await self.invalidate()
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            # the connection is unusable either way, and it was already
+            # discarded by invalidate()'s own bookkeeping
+            pass
 
     @overload
     async def execute(

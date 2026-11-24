@@ -68,6 +68,46 @@ async def _run_to_completion(coro: Coroutine[Any, Any, _T]) -> _T:
     return result
 
 
+async def _run_cleanup(
+    coro: Coroutine[Any, Any, Any],
+) -> Tuple[Optional[BaseException], Optional[asyncio.CancelledError]]:
+    """Run ``coro`` in a task of its own and wait for it to complete, even
+    if the calling task is cancelled meanwhile, reporting both outcomes.
+
+    This is :func:`._run_to_completion` for cleanup that is performed while
+    an exception is already propagating, so that a failure of the cleanup
+    can be acted upon without displacing that exception, and so that a
+    cancellation received while waiting is not lost along with it.
+
+    Returns a two-tuple of the exception ``coro`` raised, or ``None`` if it
+    completed, and the cancellation received by the calling task while
+    waiting, or ``None`` if it was not cancelled.  A ``coro`` that was
+    itself cancelled, as opposed to one that raised ``CancelledError``,
+    counts as both.
+
+    """
+    task = asyncio.create_task(coro)
+    cancelled = None
+    while True:
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as err:
+            if task.done():
+                # the cleanup itself raised or was cancelled; its outcome
+                # is examined below
+                break
+            cancelled = cancelled or err
+        except BaseException:
+            # the cleanup itself raised; its outcome is examined below
+            break
+        else:
+            break
+
+    if task.cancelled():
+        return asyncio.CancelledError(), cancelled
+    return task.exception(), cancelled
+
+
 class ReversibleProxy(Generic[_PT]):
     _proxy_objects: ClassVar[
         Dict[weakref.ref[Any], weakref.ref[ReversibleProxy[Any]]]
