@@ -1,6 +1,18 @@
 ## Changes between Bunny 3.6.0 and 3.7.0 (in development)
 
-No changes yet.
+### `Channel#basic_publish_batch` Writes Entries Individually and Returns a Result
+
+`basic_publish_batch` now reserves a publisher confirm slot and writes each
+message separately instead of encoding the whole batch into one buffer up
+front. A batch larger than the `outstanding_limit` is therefore processed
+slot by slot and no longer waits forever for room for the whole batch.
+
+It returns a `Bunny::BatchPublishResult` with a per-message entry that keeps
+the assigned confirm sequence number and reports one of `:written`,
+`:failed`, or `:not_started`. When a write raises, the messages already
+written remain tracked, the failed slot is rolled back, and the payloads
+that never started are returned via `not_started_payloads` for the caller
+to retry rather than being lost.
 
 
 ## Changes between Bunny 3.5.0 and 3.6.0 (Nov 9, 2026)

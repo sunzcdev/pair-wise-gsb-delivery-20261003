@@ -1126,13 +1126,30 @@ are unconfirmed. The default `outstanding_limit` is 1000. If the broker nacks a 
 `Bunny::MessageNacked` is raised.
 
 For best throughput when publishing groups of messages,
-use `basic_publish_batch`:
+use `basic_publish_batch`. It returns a `Bunny::BatchPublishResult` describing
+every message, so a batch larger than the outstanding limit is processed
+slot by slot instead of blocking until room for the whole batch exists:
 
 ``` ruby
 ch.confirm_select(tracking: true)
 
 messages.each_slice(1000) do |batch|
-  ch.basic_publish_batch(batch, "", queue.name)
+  result = ch.basic_publish_batch(batch, "", queue.name)
+  result.written_count # number of messages handed to the transport
+end
+```
+
+If writing a message fails, the messages already written keep their publisher
+confirm sequence numbers and the remaining payloads are returned to the caller
+instead of being lost:
+
+``` ruby
+result = ch.basic_publish_batch(messages, "", queue.name)
+
+unless result.success?
+  result.written_count       # how many messages were written before the failure
+  result.failure.error       # the exception raised by the failed write
+  result.not_started_payloads # payloads that never started, safe to retry
 end
 ```
 

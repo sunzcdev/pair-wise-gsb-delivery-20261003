@@ -828,27 +828,43 @@ module Bunny
       self
     end
 
-    # Publishes multiple messages in a batch with a single mutex acquisition.
-    # More efficient than calling basic_publish repeatedly when using publisher
-    # confirms with tracking. Recommended batch sizes: 500-3000.
+    # Publishes multiple messages, reserving publisher confirm slots one at a
+    # time and writing each message separately so a transport failure only
+    # affects the message being written.
+    #
+    # A batch larger than the outstanding limit is processed incrementally:
+    # the method waits for a free slot per message instead of blocking until
+    # room for the whole batch exists, so it never waits forever when the
+    # batch exceeds the limit.
+    #
+    # If writing a message raises, the remaining payloads are not written and
+    # are returned to the caller through the result rather than being lost.
     #
     # @param [Array<String>] payloads Array of message payloads to publish
     # @param [String, Bunny::Exchange] exchange Exchange name or object
     # @param [String] routing_key Routing key
     # @param [Hash] opts Publishing options (applied to all messages)
-    # @return [self]
+    # @return [Bunny::BatchPublishResult] per-message outcome, indexable by payload index
     #
     # @example Batch publishing with confirms
     #   ch.confirm_select(tracking: true)
     #   messages = 100.times.map { |i| "message #{i}" }
-    #   ch.basic_publish_batch(messages, "", queue.name)
+    #   result = ch.basic_publish_batch(messages, "", queue.name)
+    #   result.written_count # => 100
+    #
+    # @example Retrying the payloads that never started after a failure
+    #   result = ch.basic_publish_batch(messages, "", queue.name)
+    #   unless result.success?
+    #     ch.basic_publish_batch(result.not_started_payloads, "", queue.name)
+    #   end
     #
     # @api public
     def basic_publish_batch(payloads, exchange, routing_key, opts = {})
       raise_if_no_longer_open!
       raise ArgumentError, "payloads must be an Array" unless payloads.is_a?(Array)
       raise ArgumentError, "routing key cannot be longer than #{SHORTSTR_LIMIT} characters" if routing_key && routing_key.size > SHORTSTR_LIMIT
-      return self if payloads.empty?
+
+      return BatchPublishResult.new([]) if payloads.empty?
 
       exchange_name = exchange.is_a?(Bunny::Exchange) ? exchange.name : exchange
 
@@ -858,49 +874,51 @@ module Bunny
       opts[:content_type]  ||= DEFAULT_CONTENT_TYPE
       opts[:priority]      ||= 0
 
-      batch_size = payloads.size
+      entries = []
+      failure = nil
 
-      if @next_publish_seq_no > 0
-        @unconfirmed_set_mutex.synchronize do
-          # With throttling: wait until we have room for the batch
-          if @throttle_publishes
-            limit = @outstanding_limit
-            target = [limit - batch_size, 0].max
-            timeout_sec = (@confirm_timeout || @connection.continuation_timeout) / 1000.0
-            deadline = nil
-
-            while @unconfirmed_set.size > target
-              raise_if_no_longer_open!
-              deadline ||= Bunny::Timestamp.monotonic + timeout_sec
-              remaining = deadline - Bunny::Timestamp.monotonic
-              raise Timeout::Error, "Timed out waiting for publisher confirms (batch: #{batch_size}, limit: #{limit})" if remaining <= 0
-              @outstanding_limit_cond.wait(remaining)
-            end
-          end
-
-          # Register all sequence numbers at once
-          start_seq = @next_publish_seq_no
-          batch_size.times { |i| @unconfirmed_set.add(start_seq + i) }
-          @next_publish_seq_no = start_seq + batch_size
+      payloads.each_with_index do |payload, index|
+        if failure
+          entries << BatchPublishResult::Entry.new(index, payload, :not_started)
+          next
         end
+
+        entry, failure = batch_publish_one(payload, index, exchange_name, routing_key, opts)
+        entries << entry
       end
 
-      # Encode all messages into a single buffer and write once
-      data = +""
-      payloads.each do |payload|
-        frames = AMQ::Protocol::Basic::Publish.encode(@id,
-          payload,
-          opts,
-          exchange_name,
-          routing_key,
-          opts[:mandatory],
-          false,
-          @frame_max)
-        frames.each { |frame| data << frame.encode }
-      end
-      @connection.send_raw_without_timeout(data, self)
+      BatchPublishResult.new(entries)
+    end
 
-      self
+    # Writes a single batch entry and returns its result entry together with
+    # the exception (if any) so the caller can stop the remaining entries.
+    # Slot reservation happens before the write-only rescue block so a
+    # slot-wait timeout is not mistaken for a transport failure.
+    # @private
+    def batch_publish_one(payload, index, exchange_name, routing_key, opts)
+      seq_no = reserve_batch_publish_slot
+      write_batch_publish_entry(payload, index, seq_no, exchange_name, routing_key, opts)
+    end
+
+    # @private
+    def write_batch_publish_entry(payload, index, seq_no, exchange_name, routing_key, opts)
+      frames = AMQ::Protocol::Basic::Publish.encode(@id,
+        payload,
+        opts,
+        exchange_name,
+        routing_key,
+        opts[:mandatory],
+        false,
+        @frame_max)
+      @connection.send_frameset_without_timeout(frames, self)
+      [BatchPublishResult::Entry.new(index, payload, :written, seq_no: seq_no), nil]
+    rescue StandardError => e
+      begin
+        release_batch_publish_slot(seq_no)
+      rescue StandardError
+        # the write failure is the meaningful error; keep it
+      end
+      [BatchPublishResult::Entry.new(index, payload, :failed, seq_no: seq_no, error: e), e]
     end
 
     # Synchronously fetches a message from the queue, if there are any. This method is
@@ -2437,6 +2455,36 @@ module Bunny
         raise Timeout::Error, "Timed out waiting for publisher confirms (limit: #{limit})" if remaining <= 0
 
         @outstanding_limit_cond.wait(remaining)
+      end
+    end
+
+    # Reserves one publisher confirm sequence number for a batch entry,
+    # waiting for an outstanding-limit slot when throttling is enabled.
+    # Returns nil when publisher confirms are not enabled.
+    # @private
+    def reserve_batch_publish_slot
+      return nil if @next_publish_seq_no <= 0
+
+      @unconfirmed_set_mutex.synchronize do
+        wait_for_outstanding_slot_locked if @throttle_publishes
+
+        seq_no = @next_publish_seq_no
+        @unconfirmed_set.add(seq_no)
+        @next_publish_seq_no += 1
+        seq_no
+      end
+    end
+
+    # Rolls back a reserved slot whose frames never reached the transport.
+    # Assumes the slot is the most recently reserved one.
+    # @private
+    def release_batch_publish_slot(seq_no)
+      return if seq_no.nil? || @next_publish_seq_no <= 0
+
+      @unconfirmed_set_mutex.synchronize do
+        @unconfirmed_set.delete(seq_no)
+        @next_publish_seq_no = seq_no if seq_no == @next_publish_seq_no - 1
+        @outstanding_limit_cond&.broadcast
       end
     end
 

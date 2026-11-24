@@ -26,6 +26,7 @@ require "logger"
 
 # Core entities: connection, channel, exchange, queue, consumer
 require "bunny/session"
+require "bunny/batch_publish_result"
 require "bunny/channel"
 require "bunny/exchange"
 require "bunny/queue"

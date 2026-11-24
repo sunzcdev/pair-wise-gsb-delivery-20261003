@@ -430,14 +430,17 @@ describe Bunny::Channel do
         ch.close
       end
 
-      it "returns self for chaining" do
+      it "returns a per-message batch result" do
         ch = connection.create_channel
         ch.confirm_select(tracking: true, outstanding_limit: 100)
 
         q = ch.queue("", exclusive: true)
         result = ch.basic_publish_batch(["msg1", "msg2"], "", q.name)
 
-        expect(result).to eq ch
+        expect(result).to be_a(Bunny::BatchPublishResult)
+        expect(result.success?).to be true
+        expect(result.written_count).to eq 2
+        expect(result.seq_nos.size).to eq 2
         ch.close
       end
 
@@ -448,7 +451,8 @@ describe Bunny::Channel do
         q = ch.queue("", exclusive: true)
         result = ch.basic_publish_batch([], "", q.name)
 
-        expect(result).to eq ch
+        expect(result).to be_a(Bunny::BatchPublishResult)
+        expect(result.size).to eq 0
         expect(q.message_count).to eq 0
         ch.close
       end
@@ -541,6 +545,77 @@ describe Bunny::Channel do
         ch.wait_for_confirms
 
         expect(q.message_count).to eq 20
+        ch.close
+      end
+
+      it "processes a batch larger than the limit slot by slot and reports per-message outcomes" do
+        ch = connection.create_channel
+        # limit of two, send three
+        ch.confirm_select(tracking: true, outstanding_limit: 2)
+
+        q = ch.queue("", exclusive: true)
+        writes = 0
+        # fail the second transport write
+        allow(ch).to receive(:write_batch_publish_entry).and_wrap_original do |original, *args|
+          writes += 1
+          raise IOError, "simulated write failure" if writes == 2
+          original.call(*args)
+        end
+
+        result = ch.basic_publish_batch(%w[one two three], "", q.name)
+
+        # how many were handed over before the failed transfer is queryable
+        expect(result.written_count).to eq 1
+        expect(result[0]).to be_written
+        expect(result[0].seq_no).to eq 1
+
+        expect(result[1]).to be_failed
+        expect(result[1].error).to be_a(IOError)
+
+        # entries that never started are handed back to the caller
+        expect(result[2]).to be_not_started
+        expect(result.not_started_payloads).to eq ["three"]
+        expect(result.not_started_indexes).to eq [2]
+        ch.close
+      end
+
+      it "does not wait forever and lets an independent publish proceed once a slot frees" do
+        ch = connection.create_channel
+        # limit of two, batch of three
+        ch.confirm_select(tracking: true, outstanding_limit: 2)
+
+        q = ch.queue("", exclusive: true)
+        release_first_write = Queue.new
+
+        # park the batch after its first two writes, both slots occupied
+        writes = 0
+        allow(ch).to receive(:write_batch_publish_entry).and_wrap_original do |original, *args|
+          writes += 1
+          release_first_write.pop if writes == 2
+          original.call(*args)
+        end
+
+        batch_thread = Thread.new { ch.basic_publish_batch(%w[one two three], "", q.name) }
+        Bunny::TestKit.poll_until(5) { writes == 2 }
+
+        independent_thread = Thread.new { ch.basic_publish("independent", "", q.name) }
+        sleep 0.1
+        expect(writes).to eq 2
+
+        # one ack frees exactly one slot; one of the waiting publishers proceeds
+        ch.handle_ack_or_nack(1, false, false)
+        release_first_write.push(:go)
+        Bunny::TestKit.poll_until(5) { writes == 3 }
+
+        # the remaining ack frees the last slot for the other waiting publisher
+        ch.handle_ack_or_nack(2, false, false)
+        Bunny::TestKit.poll_until(5) { writes == 4 }
+        batch_thread.join(5)
+        independent_thread.join(5)
+
+        expect(writes).to eq 4
+        ch.wait_for_confirms
+        expect(q.message_count).to eq 4
         ch.close
       end
 
