@@ -350,10 +350,31 @@ if progress is not None:
     print(progress.state, progress.meta)
 ```
 
-`state` can be one of the `TaskState` enum values (`STARTED`, `SUCCESS`, `FAILURE`, `RETRY`) or any custom string.
+`state` can be one of the `TaskState` enum values (`STARTED`, `SUCCESS`, `FAILURE`, `RETRY`, `CANCELLED`) or any custom string.
 `meta` is generic (`ProgressTracker[MetaType]`) and can be any value your result backend can serialize, such as a plain
 string, a `dict`, or a pydantic model. If you call `set_progress` without `meta`, the previously stored `meta` value is
 preserved, which is handy when you only want to update `state`.
+
+### Attempts and stale writes
+
+Every progress record carries an `attempt` field with the 1-based number of the current execution attempt. It is derived
+from the internal `_retries` label, so the first run reports attempt `1`, the first retry reports attempt `2`, and so on.
+You can also read it directly from the tracker via `tracker.attempt`.
+
+When a task is retried, its progress naturally starts over near zero. To prevent a late write from a previous attempt
+(for example a coroutine that only finishes reporting `90%` after the retry has already reported `5%`) from clobbering
+the current state, the result backend only stores a progress record when its `attempt` is greater than or equal to the
+attempt of the record already stored. Writes made after the current attempt has been cancelled are skipped as well, so
+cleanup code cannot overwrite the real current state.
+
+Progress records produced by older versions without the `attempt` field are still readable and are treated as belonging
+to the first attempt.
+
+```python
+progress = await task.get_progress()
+if progress is not None:
+    print(progress.attempt, progress.state, progress.meta)
+```
 
 ::: warning important note
 

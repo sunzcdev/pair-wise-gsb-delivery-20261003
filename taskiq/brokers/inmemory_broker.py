@@ -83,13 +83,17 @@ class InmemoryResultBackend(AsyncResultBackend[_ReturnType]):
         """
         return self.results[task_id]
 
-    async def set_progress(
+    async def _write_progress(
         self,
         task_id: str,
         progress: TaskProgress[Any],
     ) -> None:
         """
-        Set progress of task execution.
+        Store progress of task execution.
+
+        Stale-write protection based on the attempt number is provided by
+        :meth:`AsyncResultBackend.set_progress`; this method only performs
+        the actual in-memory storage.
 
         :param task_id: task id
         :param progress: task execution progress
