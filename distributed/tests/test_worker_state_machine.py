@@ -10,6 +10,7 @@ from time import sleep
 import pytest
 from tlz import first
 
+import dask
 from dask.sizeof import sizeof
 
 import distributed.profile as profile
@@ -62,6 +63,7 @@ from distributed.worker_state_machine import (
     TransitionCounterMaxExceeded,
     UnpauseEvent,
     UpdateDataEvent,
+    WorkerState,
     merge_recs_instructions,
 )
 
@@ -1634,6 +1636,73 @@ def test_worker_nbytes(ws_with_running_task):
     # memory -> released by RemoveReplicasEvent
     ws.handle_stimulus(RemoveReplicasEvent(keys=["x", "y", "w"], stimulus_id="s7"))
     assert ws.nbytes == 0
+
+
+def test_actor_call_in_flight_bookkeeping(ws):
+    ws.begin_actor_call("x")
+    ws.begin_actor_call("x")
+    assert ws.actor_call_in_flight("x")
+    assert ws.actor_calls_in_flight == {"x": 2}
+
+    assert ws.end_actor_call("x") == 1
+    assert ws.actor_call_in_flight("x")
+    assert ws.end_actor_call("x") == 0
+    assert not ws.actor_call_in_flight("x")
+    assert ws.actor_calls_in_flight == {}
+
+
+def test_actor_with_in_flight_call_resists_free_keys(ws):
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy("w", actor=True, stimulus_id="s1"),
+        ExecuteSuccessEvent.dummy("w", nbytes=14, stimulus_id="s2"),
+    )
+    assert "w" in ws.actors
+    ws.begin_actor_call("w")
+
+    # While a method runs, a free-keys request must not release the actor
+    ws.handle_stimulus(FreeKeysEvent(keys=["w"], stimulus_id="s3"))
+    assert "w" in ws.actors
+    assert "w" in ws.tasks
+    assert ws.tasks["w"].state == "memory"
+
+    # Once the call settles, the same free-keys request drives the teardown
+    ws.end_actor_call("w")
+    ws.handle_stimulus(FreeKeysEvent(keys=["w"], stimulus_id="s4"))
+    assert "w" not in ws.actors
+    assert "w" not in ws.tasks
+
+
+def test_actor_with_in_flight_call_resists_forget():
+    with dask.config.set({"distributed.admin.low-level-log-length": None}):
+        ws = WorkerState(address="127.0.0.1:1")
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy("w", actor=True, stimulus_id="s1"),
+        ExecuteSuccessEvent.dummy("w", nbytes=14, stimulus_id="s2"),
+    )
+    ts = ws.tasks["w"]
+    assert ts.state == "memory"
+    ws.begin_actor_call("w")
+    assert "w" in ws.actors
+
+    # A free-keys request while a method runs must not release or forget the actor
+    ws.handle_stimulus(FreeKeysEvent(keys=["w"], stimulus_id="s3"))
+    assert "w" in ws.actors
+    assert "w" in ws.tasks
+    assert ws.tasks["w"].state == "memory"
+
+    # The explicit released->forgotten transition is also blocked while the call runs
+    ts.state = "released"
+    recs, _ = ws._transition_released_forgotten(ts, stimulus_id="s4")
+    assert recs == {}
+    assert "w" in ws.actors
+    assert "w" in ws.tasks
+    assert ws.tasks["w"].state == "released"
+
+    # After the call settles, the forget transition purges the actor object and task
+    ws.end_actor_call("w")
+    ws._transition_released_forgotten(ts, stimulus_id="s5")
+    assert "w" not in ws.actors
+    assert "w" not in ws.tasks
 
 
 def test_fetch_count(ws):

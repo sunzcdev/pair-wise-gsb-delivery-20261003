@@ -1373,6 +1373,12 @@ class TaskState:
     #: Whether this task is an Actor
     actor: bool
 
+    #: Number of actor method calls that have started on the hosting worker but have
+    #: not yet settled. While this is non-zero (or the actor is still held by some
+    #: client), the task must not be forgotten, so that a method that is already running
+    #: can return and other clients can keep reaching the same actor object.
+    actor_calls_in_flight: int
+
     #: The group of tasks to which this one belongs
     group: TaskGroup
 
@@ -1445,6 +1451,7 @@ class TaskState:
         self.resource_restrictions = None
         self.loose_restrictions = False
         self.actor = False
+        self.actor_calls_in_flight = 0
         self.type = None
         self.metadata = None
         self.annotations = None
@@ -2992,6 +2999,11 @@ class SchedulerState:
     def _transition_memory_forgotten(self, key: Key, stimulus_id: str) -> RecsMsgs:
         ts = self.tasks[key]
 
+        # An actor with a method still executing must not be forgotten; keep it pinned
+        # in memory until the last in-flight call settles.
+        if ts.actor and ts.actor_calls_in_flight and ts.state == "memory":
+            return {}, {}, {}
+
         if self.validate:
             assert ts.state == "memory"
             assert not ts.processing_on
@@ -3567,6 +3579,11 @@ class SchedulerState:
                 if ts.who_wants:
                     ts.who_wants.remove(cs)
                 if not ts.who_wants:
+                    # An actor with a method already running on the worker outlives its
+                    # last client holder. Defer the release/forget transition until the
+                    # in-flight call settles; handle_actor_call_end() resumes it then.
+                    if ts.actor and ts.actor_calls_in_flight:
+                        continue
                     if not ts.dependents:
                         # No live dependents, can forget
                         recommendations[ts.key] = "forgotten"
@@ -4124,6 +4141,7 @@ class Scheduler(SchedulerState, ServerNode):
             "log-event": self.log_worker_event,
             "worker-status-change": self.handle_worker_status_change,
             "request-refresh-who-has": self.handle_request_refresh_who_has,
+            "actor-call-end": self.handle_actor_call_end,
         }
 
         client_handlers = {
@@ -4165,6 +4183,7 @@ class Scheduler(SchedulerState, ServerNode):
             "log_event": self.log_event,
             "events": self.get_events,
             "nbytes": self.get_nbytes,
+            "actor_call_begin": self.handle_actor_call_begin,
             "versions": self.versions,
             "add_keys": self.add_keys,
             "rebalance": self.rebalance,
@@ -6039,6 +6058,41 @@ class Scheduler(SchedulerState, ServerNode):
         self.remove_replica(ts, ws)
         if not ts.who_has:
             self.transitions({key: "released"}, stimulus_id)
+
+    def handle_actor_call_begin(self, key: Key, stimulus_id: str) -> None:
+        """A worker reports that an actor method has started executing.
+
+        Pin the actor's task in memory for the lifetime of the call: it must not be
+        forgotten (and its hosting worker must not free the object) while a method is
+        already running, even if every client holding it disconnects in the meantime.
+        """
+        ts = self.tasks.get(key)
+        if ts is None:
+            return
+        ts.actor_calls_in_flight += 1
+
+    def handle_actor_call_end(self, key: Key, worker: str, stimulus_id: str) -> None:
+        """A worker reports that an actor method has settled (returned or raised).
+
+        Once no method is in flight anymore, forget any actor task whose client holders
+        have all gone away while a call was running. The actual destruction still
+        happens on the worker, only after the in-flight count reached zero there too.
+        """
+        ts = self.tasks.get(key)
+        if ts is None:
+            return
+        ts.actor_calls_in_flight = max(0, ts.actor_calls_in_flight - 1)
+        if ts.actor_calls_in_flight:
+            return
+        # Nobody wants the task anymore and nothing is running: resume the release that
+        # was deferred when the last client disconnected mid-call. With no live
+        # dependents the task can be forgotten; the resulting transition drives the
+        # worker-side teardown. who_wants/waiters may legitimately be None.
+        if not (ts.who_wants or ts.waiters) and ts.state == "memory":
+            if not ts.dependents:
+                self.transitions({key: "forgotten"}, stimulus_id=stimulus_id)
+            else:
+                self.transitions({key: "released"}, stimulus_id=stimulus_id)
 
     def handle_long_running(
         self,
@@ -9099,7 +9153,9 @@ def validate_task_state(ts: TaskState) -> None:
         assert not ts.waiting_on
 
     if ts.who_has:
-        assert ts.waiters or ts.who_wants, (
+        assert ts.waiters or ts.who_wants or (
+            ts.actor and ts.actor_calls_in_flight
+        ), (
             "unneeded task in memory",
             str(ts),
             str(ts.who_has),

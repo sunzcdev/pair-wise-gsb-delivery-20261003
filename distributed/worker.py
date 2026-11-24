@@ -62,6 +62,7 @@ from distributed import preloading, profile, utils
 from distributed.batched import BatchedSend
 from distributed.collections import LRU
 from distributed.comm import Comm, connect, get_address_host, parse_address
+from distributed.comm import CommClosedError
 from distributed.comm import resolve_address as comm_resolve_address
 from distributed.comm.addressing import address_from_user_args
 from distributed.core import (
@@ -2075,6 +2076,20 @@ class Worker(BaseWorker, ServerNode):
         func = getattr(actor, function)
         name = f"{key_split(key)}.{function}"
 
+        # Claim the actor for the lifetime of this call so that a client disconnect
+        # cannot destroy the object (and forget the task) while the method is running.
+        # The scheduler must learn about the in-flight call *before* the method body
+        # runs, hence an awaited RPC rather than a fire-and-forget stream message, so
+        # that it can never lose the race against a concurrent client disconnect.
+        self.state.begin_actor_call(key)
+        try:
+            await self.scheduler.actor_call_begin(
+                key=key, stimulus_id=f"actor-call-begin-{time()}"
+            )
+        except (OSError, CommClosedError):
+            # Scheduler unreachable: the worker (and its actor) are being torn down
+            # anyway. The local in-flight bookkeeping is all that remains relevant.
+            pass
         try:
             if iscoroutinefunction(func):
                 token = _worker_cvar.set(self)
@@ -2103,6 +2118,36 @@ class Worker(BaseWorker, ServerNode):
             return {"status": "OK", "result": to_serialize(result)}
         except Exception as ex:
             return {"status": "error", "exception": to_serialize(ex)}
+        finally:
+            self._actor_call_finished(key)
+
+    def _actor_call_finished(self, key: Key) -> None:
+        """Bookkeeping after an actor method call has settled (returned or raised)."""
+        remaining = self.state.end_actor_call(key)
+        # Notify the scheduler that a call settled. Once the in-flight count drops to
+        # zero and no client holds the actor anymore, the scheduler resumes the normal
+        # release path and asks the worker to free the (now idle) actor.
+        self.batched_send(
+            {"op": "actor-call-end", "key": key, "stimulus_id": f"actor-call-end-{time()}"}
+        )
+        if remaining:
+            return
+        ts = self.state.tasks.get(key)
+        # The scheduler already asked to drop the key; the call only kept it alive.
+        if ts is not None and ts.state == "released":
+            self.loop.add_callback(self._release_settled_actor, key)
+
+    async def _release_settled_actor(self, key: Key) -> None:
+        ts = self.state.tasks.get(key)
+        if ts is None or self.state.actor_call_in_flight(key):
+            return
+        if ts.state != "released" or key not in self.state.actors:
+            return
+        # The scheduler has forgotten the task: purge locally now that the method has
+        # settled, without expecting an acknowledgement from the scheduler.
+        self.state._purge_state(ts)
+        ts.state = "forgotten"
+        self.state.tasks.pop(key, None)
 
     def actor_attribute(self, actor=None, attribute=None) -> dict[str, Any]:
         try:

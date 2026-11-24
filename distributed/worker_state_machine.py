@@ -7,6 +7,7 @@ import logging
 import math
 import operator
 import random
+import threading
 import weakref
 from collections import Counter, defaultdict, deque
 from collections.abc import (
@@ -1214,6 +1215,18 @@ class WorkerState:
     #: Actor tasks. See :doc:`actors`.
     actors: dict[Key, object]
 
+    #: Number of actor method calls currently in flight for each actor key, i.e. methods
+    #: that have started executing on this worker but have not returned yet. An actor
+    #: with an in-flight call must not be destroyed even if every client has released it,
+    #: so that the running method can settle (return a result or raise) undisturbed.
+    #: Access from both the worker's event loop and the actor thread pool is guarded by
+    #: :attr:`actor_calls_lock`.
+    actor_calls_in_flight: dict[Key, int]
+
+    #: Lock guarding :attr:`actor_calls_in_flight`, which is mutated both from the
+    #: worker's event loop (release handling) and from the actor thread pool.
+    actor_calls_lock: threading.Lock
+
     #: Transition log: ``[(..., stimulus_id: str | None, timestamp: float), ...]``
     #: The number of stimuli logged is capped.
     #: See also :meth:`story` and :attr:`stimulus_log`.
@@ -1313,7 +1326,52 @@ class WorkerState:
         self.transition_counter_max = transition_counter_max
         self.transfer_incoming_bytes_limit = transfer_incoming_bytes_limit
         self.actors = {}
+        self.actor_calls_in_flight = {}
+        self.actor_calls_lock = threading.Lock()
         self.rng = random.Random(0)
+
+    def begin_actor_call(self, key: Key) -> None:
+        """Record that an actor method call has started executing on this worker.
+
+        As long as at least one call is in flight, the actor object identified by
+        *key* is protected against release/forget transitions so that the running
+        method can settle even if all of its client holders disappear meanwhile.
+        """
+        with self.actor_calls_lock:
+            self.actor_calls_in_flight[key] = self.actor_calls_in_flight.get(key, 0) + 1
+
+    def end_actor_call(self, key: Key) -> int:
+        """Record that an actor method call has finished.
+
+        Returns the number of calls still in flight for *key*.
+        """
+        with self.actor_calls_lock:
+            n = self.actor_calls_in_flight.get(key, 0) - 1
+            if n > 0:
+                self.actor_calls_in_flight[key] = n
+            else:
+                self.actor_calls_in_flight.pop(key, None)
+                n = 0
+            return n
+
+    def actor_call_in_flight(self, key: Key) -> bool:
+        """Return True if at least one actor method call for *key* is still running."""
+        with self.actor_calls_lock:
+            return key in self.actor_calls_in_flight
+
+    def __getstate__(self) -> dict[str, Any]:
+        # threading.Lock is not picklable; it is a runtime-only synchronization
+        # primitive and is recreated fresh in __setstate__.
+        return {
+            slot: getattr(self, slot)
+            for slot in self.__slots__
+            if slot != "actor_calls_lock" and hasattr(self, slot)
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        for slot, value in state.items():
+            setattr(self, slot, value)
+        self.actor_calls_lock = threading.Lock()
 
     def handle_stimulus(self, *stims: StateMachineEvent) -> Instructions:
         """Process one or more external events, transition relevant tasks to new states,
@@ -1460,10 +1518,16 @@ class WorkerState:
         """
         logger.debug("Purge task: %s", ts)
 
+        # An actor whose method is still running must outlive the scheduler's
+        # release/forget decision. Keep both the actor object and its TaskState alive;
+        # the worker will retry releasing them once the last in-flight call settles.
+        actor_in_flight = ts.key in self.actors and self.actor_call_in_flight(ts.key)
+
         # Do not use self.data.pop(key, None), as it could unspill the data from disk!
         if ts.key in self.data:
             del self.data[ts.key]
-        self.actors.pop(ts.key, None)
+        if not actor_in_flight:
+            self.actors.pop(ts.key, None)
         self.threads.pop(ts.key, None)
 
         for worker in ts.who_has:
@@ -2470,6 +2534,13 @@ class WorkerState:
         # Dependents _should_ be released by the scheduler before this
         if self.validate:
             assert not any(d.state != "forgotten" for d in ts.dependents)
+        # An actor with a method still executing cannot be forgotten: keep the
+        # TaskState parked in "released" and the actor object alive until the last
+        # in-flight call settles, at which point the worker re-issues the release.
+        if ts.key in self.actors and self.actor_call_in_flight(ts.key):
+            if self.validate:
+                assert ts.state == "released"
+            return recommendations, []
         for dep in ts.dependencies:
             dep.dependents.discard(ts)
             if dep.state == "released" and not dep.dependents:
@@ -2744,6 +2815,10 @@ class WorkerState:
         for key in ev.keys:
             ts = self.tasks.get(key)
             if ts:
+                # Keep an actor alive while one of its methods is still running. The
+                # worker releases the key itself once the last in-flight call settles.
+                if key in self.actors and self.actor_call_in_flight(key):
+                    continue
                 recommendations[ts] = "released"
         return recommendations, []
 

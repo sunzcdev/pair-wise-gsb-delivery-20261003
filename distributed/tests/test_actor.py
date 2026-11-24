@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import operator
 import sys
+import threading
 from time import sleep
 
 import pytest
@@ -23,7 +24,13 @@ from distributed import (
 )
 from distributed.metrics import time
 from distributed.utils import LateLoopEvent
-from distributed.utils_test import cluster, double, gen_cluster, inc
+from distributed.utils_test import (
+    async_poll_for,
+    cluster,
+    double,
+    gen_cluster,
+    inc,
+)
 from distributed.worker import Worker, get_worker
 
 
@@ -914,3 +921,147 @@ async def test_actor_worker_host_dies(c, s, a):
         await wait_ev.set()
         with pytest.raises(RuntimeError, match="Worker holding Actor was lost"):
             await fut.result()
+
+
+class BlockingActor:
+    """An actor whose method blocks until an external gate is released.
+
+    The blocking method is synchronous, so it runs in the worker's dedicated actor
+    thread and leaves the worker's event loop free to handle other connections.
+    """
+
+    def __init__(self):
+        self.calls = 0
+        self.entered = threading.Event()
+        self.gate = threading.Event()
+        self.settled = threading.Event()
+
+    def blocking(self):
+        self.calls += 1
+        self.entered.set()
+        self.gate.wait()
+        self.settled.set()
+        return "blocking-result"
+
+    def ping(self):
+        self.calls += 1
+        return "pong"
+
+
+@gen_cluster(nthreads=[("", 2)])
+async def test_actor_in_flight_call_survives_client_disconnect(s, a):
+    """A method that has already started must be allowed to settle if its submitting
+    client disconnects, and the actor must outlive that client while the call runs.
+    """
+    async with Client(s.address, asynchronous=True) as c1:
+        actor = await c1.submit(BlockingActor, actor=True, workers=[a.address])
+        key = actor.key
+
+        call = actor.blocking()
+        obj = a.state.actors[key]
+        await async_poll_for(obj.entered.is_set)
+
+        # The call is genuinely in flight on both the worker and the scheduler
+        assert a.state.actor_call_in_flight(key)
+        assert s.tasks[key].actor_calls_in_flight == 1
+
+        await c1.close()
+
+    # Give the scheduler time to process the client removal
+    await async_poll_for(lambda: key not in s.clients)
+    await asyncio.sleep(0.2)
+
+    # Neither the worker object nor the scheduler task may be torn down mid-call
+    assert key in a.state.actors
+    assert key in s.tasks
+    assert s.tasks[key].state == "memory"
+    assert s.tasks[key].actor_calls_in_flight == 1
+    assert not obj.settled.is_set()
+
+    # Settle the method directly on the worker; it must run to completion undisturbed
+    obj.gate.set()
+    await async_poll_for(obj.settled.is_set)
+
+    # The detached client's future can no longer deliver the result over its dead
+    # connection, but the method itself has settled and the bookkeeping is cleared.
+    await async_poll_for(lambda: not a.state.actor_call_in_flight(key))
+    assert call.done()
+
+
+@gen_cluster(nthreads=[("", 2)])
+async def test_actor_reachable_by_other_client_after_holder_disconnects(s, a):
+    """If another client still wants the actor, it keeps using the same remote object
+    after the original holder disconnects while a method is in flight.
+    """
+    async with Client(s.address, asynchronous=True) as c1:
+        actor = await c1.submit(BlockingActor, actor=True, workers=[a.address])
+        key = actor.key
+        address = actor._address
+        actor.blocking()
+        obj = a.state.actors[key]
+        await async_poll_for(obj.entered.is_set)
+
+        # A second client acquires its own handle to the very same actor object and
+        # registers scheduler-side interest, becoming a real holder.
+        async with Client(s.address, asynchronous=True) as c2:
+            other = Actor(BlockingActor, address, key)
+            other._client = c2
+            other._future = Future(key, c2)
+            c2._send_to_scheduler({"op": "client-desires-keys", "keys": [key]})
+            await async_poll_for(
+                lambda: bool(s.tasks[key].who_wants)
+                and len(s.tasks[key].who_wants) == 2
+            )
+
+            await c1.close()
+            await async_poll_for(
+                lambda: bool(s.tasks[key].who_wants)
+                and len(s.tasks[key].who_wants) == 1
+            )
+            await asyncio.sleep(0.2)
+
+            # c2 is now the sole holder; the actor is still alive and reachable even
+            # though a method is in flight and the original holder is gone.
+            assert key in a.state.actors
+            assert key in s.tasks
+            assert s.tasks[key].actor_calls_in_flight == 1
+
+            # Settle the in-flight method directly on the worker; it must run to
+            # completion undisturbed rather than be cancelled by the disconnect
+            obj.gate.set()
+            await async_poll_for(obj.settled.is_set)
+
+            # Now that the single actor thread is free, c2 drives the same object again
+            assert await other.ping() == "pong"
+            assert obj.calls == 2  # blocking + ping
+
+        # c2 disconnects with no call running: destruction is now allowed
+    await async_poll_for(lambda: key not in s.tasks and key not in a.state.actors)
+    assert not a.state.actor_calls_in_flight
+
+
+@gen_cluster(client=True, nthreads=[("", 2)])
+async def test_actor_destroyed_only_after_holders_and_calls_gone(c, s, a):
+    """Actual destruction must wait until there are neither holders nor in-flight
+    calls, but it must happen promptly once both conditions are met.
+    """
+    actor = await c.submit(BlockingActor, actor=True, workers=[a.address])
+    key = actor.key
+
+    actor.blocking()
+    obj = a.state.actors[key]
+    await async_poll_for(obj.entered.is_set)
+
+    # Drop every client reference while the method is still running
+    del actor
+    c._dec_ref(key)
+    await asyncio.sleep(0.3)
+    assert key in a.state.actors  # protected by the in-flight call
+    assert key in s.tasks
+
+    obj.gate.set()
+    await async_poll_for(lambda: key not in a.state.actors and key not in s.tasks)
+
+    assert key not in a.state.actors
+    assert not a.state.actor_calls_in_flight
+    assert obj.settled.is_set()
