@@ -20,3 +20,7 @@
 
 # misc
 .DS_Store
+
+# Cross-database outbox demo artifacts
+/demo/tmp/
+
