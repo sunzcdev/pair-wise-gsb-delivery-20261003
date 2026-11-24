@@ -107,6 +107,7 @@ def test_mapping():
     assert not buff.fast.weights
     assert not buff.fast.total_weight
     assert not buff.fast._cancel_evict
+    assert not buff.evict_exceptions
 
 
 def test_callbacks():
@@ -199,14 +200,93 @@ def test_callbacks_exception_catch():
     assert b == {"x": 1}
 
     # Add key > n, again total weight > n this will move everything to slow except w
-    # that stays in fast due to callback raising
-    with pytest.raises(MyError):
-        buff["w"] = 11
+    # that stays in fast due to callback raising. The failure is recorded in
+    # evict_exceptions instead of propagating out of __setitem__.
+    buff["w"] = 11
 
     assert f2s == ["x", "y", "z"]
     assert s2f == []
     assert a == {"w": 11}
     assert b == {"x": 1, "y": 2, "z": 8}
+    assert set(buff.evict_exceptions) == {"w"}
+    assert isinstance(buff.evict_exceptions["w"], MyError)
+    assert buff.fast.evict_exceptions is buff.evict_exceptions
+
+
+def test_evict_unserializable_stays_in_fast_others_spill():
+    """A value that the slow layer refuses (e.g. it can't be serialized) must stay in
+    fast and be recorded in evict_exceptions. Eviction must roll the failed item back,
+    keep reducing the fast weight by spilling the other candidates, and re-evaluate the
+    key once the same-named value is successfully replaced.
+    """
+
+    class NotSerializable:
+        """A value that the slow layer refuses to store"""
+
+    class Slow(UserDict):
+        def __setitem__(self, key, value):
+            if isinstance(value[0], NotSerializable):
+                raise TypeError(f"{key}: value is not serializable")
+            super().__setitem__(key, value)
+
+    a = {}
+    b = Slow()
+
+    def weight(k, v):
+        return v[1]
+
+    buff = Buffer(a, b, n=10, weight=weight)
+
+    bad = NotSerializable()
+    # The two large values sit on the oldest side of the LRU. x already carries an
+    # unserializable value in place, so insertion order is [x, y, z]
+    buff.set_noevict("x", (bad, 6))  # oldest; writing it to slow will fail
+    buff.set_noevict("y", (0, 6))
+    buff.set_noevict("z", (0, 1))  # newest
+    assert list(buff.fast.order) == ["x", "y", "z"]
+    assert buff.fast.total_weight == 13
+
+    # First eviction, all the way down: x fails to write to slow and stays in fast.
+    # Eviction rolls x back and keeps going, spilling the other two candidates instead,
+    # so that the only weight left in fast is the one that genuinely cannot be moved.
+    buff.evict_until_below_target(0)
+
+    # Fast still holds the unserializable item; slow received the other two
+    assert set(a) == {"x"}
+    assert a["x"] == (bad, 6)
+    assert set(b.data) == {"y", "z"}
+    assert b.data == {"y": (0, 6), "z": (0, 1)}
+    assert buff.fast.total_weight == 6
+
+    # The failure is explainable and points at the offending key and exception
+    assert set(buff.evict_exceptions) == {"x"}
+    assert isinstance(buff.evict_exceptions["x"], TypeError)
+    assert "not serializable" in str(buff.evict_exceptions["x"])
+
+    # Re-running eviction does not retry the still-bad key and does not raise
+    buff.evict_until_below_target(0)
+    assert set(a) == {"x"}
+    assert set(b.data) == {"y", "z"}
+    assert set(buff.evict_exceptions) == {"x"}
+
+    # Explicitly evicting the failing key retries it and re-raises
+    with pytest.raises(TypeError, match="not serializable"):
+        buff.fast.evict("x")
+    assert set(a) == {"x"}
+    assert set(buff.evict_exceptions) == {"x"}
+
+    # Replace the first item with a serializable value with the same key
+    buff["x"] = (1, 6)
+    assert not buff.evict_exceptions
+    assert set(a) == {"x"}
+    assert a["x"] == (1, 6)
+
+    # Second eviction: the replacement can now land on the slow layer
+    buff.evict_until_below_target(0)
+    assert not a
+    assert set(b.data) == {"x", "y", "z"}
+    assert b.data["x"] == (1, 6)
+    assert not buff.evict_exceptions
 
 
 def test_n_offset():

@@ -6,6 +6,13 @@ Changelog
 ------------------
 - Dropped support for Python 3.8 (:pr:`106`) `Guido Imperiale`_
 - New object :class:`KeyMap` (:pr:`110`) `Guido Imperiale`_
+- :class:`LRU` and :class:`Buffer` no longer abort eviction when an ``on_evict``
+  callback raises. The failing key/value pair is rolled back and kept in the LRU and
+  recorded, together with the exception, in the new ``evict_exceptions`` mapping;
+  automatic eviction skips it and keeps spilling the other candidates. A recorded key
+  becomes eligible for eviction again as soon as it is deleted or overwritten with a
+  new value. Explicitly calling :meth:`LRU.evict` with a failing key still retries the
+  eviction and re-raises.
 
 
 3.0.0 - 2023-04-17

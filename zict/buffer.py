@@ -27,7 +27,11 @@ class Buffer(ZictBase[KT, VT]):
         These functions run every time data moves from the fast to the slow
         mapping. They take two arguments, a key and a value.
         If an exception occurs during a fast_to_slow_callbacks (e.g a callback tried
-        storing to disk and raised a disk full error) the key will remain in the LRU.
+        storing to disk and raised a disk full error) the key will remain in the fast
+        mapping and be recorded, together with the exception, in
+        :attr:`evict_exceptions`. Eviction will skip it and try other candidates
+        instead; it becomes eligible again once the key is deleted or overwritten with
+        a new value.
     slow_to_fast_callbacks: list of callables
         These functions run every time data moves form the slow to the fast mapping.
 
@@ -130,6 +134,23 @@ class Buffer(ZictBase[KT, VT]):
     @offset.setter
     def offset(self, value: float) -> None:
         self.fast.offset = value
+
+    @property
+    def evict_exceptions(self) -> dict[KT, BaseException]:
+        """Keys that could not be moved from the fast to the slow mapping because the
+        slow mapping (or a ``fast_to_slow_callbacks`` callback) raised an exception,
+        mapped to the exception that was caught.
+
+        The key/value pairs stay in the fast mapping and are skipped by automatic
+        eviction, while other keys keep being evicted to free up weight. An entry is
+        removed when the key is successfully evicted, deleted, or overwritten with a new
+        value - at which point the key becomes eligible for eviction again.
+
+        See also
+        --------
+        LRU.evict_exceptions
+        """
+        return self.fast.evict_exceptions
 
     def fast_to_slow(self, key: KT, value: VT) -> None:
         self.slow[key] = value

@@ -66,6 +66,7 @@ def test_mapping():
     assert not lru.weights
     assert not lru.total_weight
     assert not lru._cancel_evict
+    assert not lru.evict_exceptions
 
 
 def test_overwrite():
@@ -124,12 +125,12 @@ def test_cb_exception_keep_on_lru():
     lru["x"] = 1
     lru["y"] = 2
 
-    with pytest.raises(MyError):
-        lru["z"] = 3
+    # No exception escapes: every failing key is rolled back into the LRU and recorded
+    lru["z"] = 3
 
-    # exception was raised in a later callback
-    assert a == [("x", 1)]
-    # tried to evict and raised exception
+    # exception was raised in a later callback, once per candidate
+    assert a == [("x", 1), ("y", 2), ("z", 3)]
+    # no callback after the failing one ever ran
     assert b == []
     assert lru.total_weight == 3
     assert lru.weights == {"x": 1, "y": 1, "z": 1}
@@ -138,6 +139,39 @@ def test_cb_exception_keep_on_lru():
 
     assert lru.d == {"x": 1, "y": 2, "z": 3}
     assert list(lru.order) == ["x", "y", "z"]
+
+    # The eviction result is explainable: every failing key maps to its exception
+    assert set(lru.evict_exceptions) == {"x", "y", "z"}
+    assert all(isinstance(exc, MyError) for exc in lru.evict_exceptions.values())
+
+    # Failing keys are skipped by automatic eviction
+    lru.evict_until_below_target()
+    assert set(lru) == {"x", "y", "z"}
+    assert a == [("x", 1), ("y", 2), ("z", 3)]
+
+    # Explicitly evicting a failing key retries it and re-raises
+    with pytest.raises(MyError):
+        lru.evict("x")
+    assert set(lru) == {"x", "y", "z"}
+    assert isinstance(lru.evict_exceptions["x"], MyError)
+
+    # Overwriting a failing key with a new value clears its record and makes it
+    # eligible for eviction again
+    lru.set_noevict("x", 1)
+    assert "x" not in lru.evict_exceptions
+    assert set(lru.evict_exceptions) == {"y", "z"}
+
+    def cb_ok(k, v):
+        pass
+
+    # With a working callback and every key replaced, nothing is blocked anymore
+    lru.on_evict = [cb_ok]
+    lru.set_noevict("y", 2)
+    lru.set_noevict("z", 3)
+    assert not lru.evict_exceptions
+    lru.evict_until_below_target(0)
+    assert not lru
+    assert lru.total_weight == 0
 
 
 def test_cb_exception_keep_on_lru_weights():
@@ -164,31 +198,26 @@ def test_cb_exception_keep_on_lru_weights():
 
     lru["x"] = 1
 
-    with pytest.raises(MyError):
-        # value is individually heavier than n
-        lru["y"] = 3
+    # value is individually heavier than n; the exception is recorded, not raised
+    lru["y"] = 3
 
-    # exception was raised in a later callback
+    # tried to evict y and failed, then evicted x and succeeded
     assert a == [("y", 3), ("x", 1)]
-    # tried to to evict x and succeeded
     assert b == [("x", 1)]
     assert lru.total_weight == 3
     assert set(lru) == {"y"}
 
     assert lru.d == {"y": 3}
     assert list(lru.order) == ["y"]
+    assert set(lru.evict_exceptions) == {"y"}
+    assert isinstance(lru.evict_exceptions["y"], MyError)
 
-    with pytest.raises(MyError):
-        # value is individually heavier than n
-        lru["z"] = 4
+    # value is individually heavier than n
+    lru["z"] = 4
 
-    # exception was raised in a later callback
-    assert a == [
-        ("y", 3),
-        ("x", 1),
-        ("z", 4),
-        ("y", 3),
-    ]  # try to evict z and then y again
+    # z fails and is recorded; y is not retried, as it already failed and hasn't been
+    # overwritten
+    assert a == [("y", 3), ("x", 1), ("z", 4)]
     # tried to evict and raised exception
     assert b == [("x", 1)]
     assert lru.total_weight == 7
@@ -196,6 +225,103 @@ def test_cb_exception_keep_on_lru_weights():
 
     assert lru.d == {"y": 3, "z": 4}
     assert list(lru.order) == ["y", "z"]
+    assert set(lru.evict_exceptions) == {"y", "z"}
+    assert all(isinstance(exc, MyError) for exc in lru.evict_exceptions.values())
+
+    # Deleting a failing key clears its record
+    del lru["y"]
+    assert set(lru.evict_exceptions) == {"z"}
+
+    # Overwriting a failing key clears its record and re-enables eviction
+    lru["z"] = 1
+    assert not lru.evict_exceptions
+    assert lru.d == {"z": 1}
+    assert lru.total_weight == 1
+
+
+def test_evict_failure_skips_and_retries_other_candidates():
+    """A failing candidate is rolled back and recorded; eviction keeps going on the
+    other keys, and a replaced value is re-evaluated afterwards.
+    """
+    class MyError(Exception):
+        pass
+
+    evicted = []
+
+    def cb(k, v):
+        if k == "x":
+            raise MyError(k)
+        evicted.append(k)
+
+    lru = LRU(
+        10,
+        {},
+        on_evict=cb,
+        weight=lambda k, v: v,
+    )
+    # Oldest on the left; two large weights, then a small one
+    lru.set_noevict("x", 6)  # oldest, will fail
+    lru.set_noevict("y", 6)
+    lru.set_noevict("z", 1)  # newest
+    assert list(lru.order) == ["x", "y", "z"]
+
+    lru.evict_until_below_target(0)
+
+    # x failed and stayed in the LRU; y and z were evicted instead
+    assert set(lru.d) == {"x"}
+    assert evicted == ["y", "z"]
+    assert set(lru.evict_exceptions) == {"x"}
+    assert isinstance(lru.evict_exceptions["x"], MyError)
+    assert lru.evict_exceptions["x"].args == ("x",)
+    assert lru.total_weight == 6
+
+    # Failing key is skipped: nothing more can be evicted automatically
+    lru.evict_until_below_target(0)
+    assert set(lru.d) == {"x"}
+
+    # Explicit eviction retries and re-raises
+    with pytest.raises(MyError):
+        lru.evict("x")
+    assert set(lru.d) == {"x"}
+
+    # Replace the bad value with a serializable one: the key is re-evaluated
+    lru.set_noevict("x", 6)
+    lru.on_evict = [lambda k, v: evicted.append(k)]
+    assert not lru.evict_exceptions
+    lru.evict_until_below_target(0)
+    assert not lru.d
+    assert evicted == ["y", "z", "x"]
+    assert not lru.evict_exceptions
+
+
+def test_evict_failure_heavy_key_does_not_block_lighter_keys():
+    class MyError(Exception):
+        pass
+
+    evicted = []
+
+    def cb(k, v):
+        if v >= 10:
+            raise MyError(k)
+        evicted.append(k)
+
+    lru = LRU(5, {}, on_evict=cb, weight=lambda k, v: v)
+    lru.set_noevict("x", 1)
+    lru.set_noevict("y", 2)
+    # z is a heavy key, so it would normally be evicted first
+    lru.set_noevict("z", 10)
+    assert list(lru.heavy) == ["z"]
+    assert list(lru.order) == ["x", "y", "z"]
+
+    lru.evict_until_below_target()
+
+    # Heavy z fails and gets out of the heavy set and behind x and y, which are then
+    # evicted successfully; the total still exceeds n, but no evictable key is left
+    assert set(lru.d) == {"z"}
+    assert evicted == ["x", "y"]
+    assert set(lru.evict_exceptions) == {"z"}
+    assert not lru.heavy
+    assert list(lru.order) == ["z"]
 
 
 def test_weight():

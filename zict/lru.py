@@ -31,7 +31,10 @@ class LRU(ZictBase[KT, VT]):
     on_evict: callable or list of callables
         Function:: k, v -> action to call on key/value pairs prior to eviction
         If an exception occurs during an on_evict callback (e.g a callback tried
-        storing to disk and raised a disk full error) the key will remain in the LRU.
+        storing to disk and raised a disk full error) the key will remain in the LRU
+        and be recorded, together with the exception, in :attr:`evict_exceptions`.
+        Automatic eviction will skip it and try the next candidates instead of
+        giving up; the key becomes eligible again once it's deleted or overwritten.
     on_cancel_evict: callable or list of callables
         Function:: k, v -> action to call on key/value pairs if they're deleted or
         updated from a thread while the on_evict callables are being executed in
@@ -77,6 +80,15 @@ class LRU(ZictBase[KT, VT]):
     weights: dict[KT, float]
     closed: bool
     total_weight: float
+    #: Keys whose eviction failed because one of the ``on_evict`` callbacks raised,
+    #: mapped to the exception that was caught. The key/value pairs are kept in the LRU
+    #: and are skipped by automatic eviction (e.g. by :meth:`evict_until_below_target`),
+    #: so that other keys can still be evicted to make space. An entry is removed as
+    #: soon as the key is successfully evicted, deleted, or overwritten with a new
+    #: value - at which point the key becomes eligible for eviction again.
+    #: Explicitly calling :meth:`evict` with one of these keys retries the eviction and
+    #: re-raises the exception if it fails again.
+    evict_exceptions: dict[KT, BaseException]
     _cancel_evict: dict[KT, bool]
 
     def __init__(
@@ -110,6 +122,7 @@ class LRU(ZictBase[KT, VT]):
         self.order = InsertionSortedSet(d)
         self.heavy = InsertionSortedSet(k for k, v in self.weights.items() if v >= n)
         self.closed = False
+        self.evict_exceptions = {}
         self._cancel_evict = {}
 
     @locked
@@ -134,18 +147,10 @@ class LRU(ZictBase[KT, VT]):
 
     def __setitem__(self, key: KT, value: VT) -> None:
         self.set_noevict(key, value)
-        try:
-            self.evict_until_below_target()
-        except Exception:
-            if self.weights.get(key, 0) > self.n and key not in self.heavy:
-                # weight(value) > n and evicting the key we just inserted failed.
-                # Evict the rest of the LRU instead.
-                try:
-                    while len(self.d) > 1:
-                        self.evict()
-                except Exception:
-                    pass
-            raise
+        # Keys whose eviction previously failed are re-evaluated now that they carry a
+        # new value; evict_until_below_target() records (but does not re-raise) any
+        # further failure in self.evict_exceptions.
+        self.evict_until_below_target()
 
     @locked
     def set_noevict(self, key: KT, value: VT) -> None:
@@ -158,6 +163,8 @@ class LRU(ZictBase[KT, VT]):
         weight = self.weight(key, value)
         if key in self._cancel_evict:
             self._cancel_evict[key] = True
+        # A new value may be evictable even if the previous one wasn't
+        self.evict_exceptions.pop(key, None)
         self.d[key] = value
         self.order.add(key)
         if weight > self.n:
@@ -165,8 +172,27 @@ class LRU(ZictBase[KT, VT]):
         self.weights[key] = weight
         self.total_weight += weight
 
+    def _next_evict_candidate(self) -> KT:
+        """Return the least recently inserted heavy key, or the least recently used key,
+        skipping keys whose eviction previously failed and were recorded in
+        :attr:`evict_exceptions`.
+
+        Raises KeyError if there is no key that can be evicted - either because the LRU
+        is empty or because every key still in it has already failed eviction.
+        """
+        for candidates in (self.heavy, self.order):
+            for key in candidates:
+                if key not in self.evict_exceptions:
+                    return key
+        raise KeyError("evict(): dictionary is empty")
+
     def evict_until_below_target(self, n: float | None = None) -> None:
         """Evict key/value pairs until the total weight falls below n
+
+        Keys whose eviction fails (see :attr:`evict_exceptions`) are rolled back into
+        the LRU and skipped, so that other keys keep being evicted until the target is
+        met or no evictable key is left. This method therefore doesn't re-raise
+        exceptions from the ``on_evict`` callbacks; the failures are recorded instead.
 
         Parameters
         ----------
@@ -179,7 +205,13 @@ class LRU(ZictBase[KT, VT]):
             try:
                 self.evict()
             except KeyError:
-                return  # Multithreaded race condition
+                # Multithreaded race condition, or every key still in the LRU already
+                # failed eviction and is recorded in self.evict_exceptions
+                return
+            except Exception:
+                # evict() rolled the failed key back into the LRU and recorded the
+                # exception in self.evict_exceptions; move on to the next candidate
+                continue
 
     @locked
     def evict(
@@ -187,6 +219,11 @@ class LRU(ZictBase[KT, VT]):
     ) -> tuple[KT, VT, float] | tuple[None, None, float]:
         """Evict least recently used key, or least recently inserted key with individual
         weight > n, if any. You may also evict a specific key.
+
+        Keys recorded in :attr:`evict_exceptions` are skipped when picking a key
+        automatically; passing *key* explicitly retries the eviction regardless of any
+        previous failure. If the eviction fails again, the exception is re-raised and
+        the record in :attr:`evict_exceptions` is updated with it.
 
         This is typically called from internal use, but can be externally
         triggered as well.
@@ -200,10 +237,7 @@ class LRU(ZictBase[KT, VT]):
         only possible in multithreaded access.
         """
         if key is nodefault:
-            try:
-                key = next(iter(self.heavy or self.order))
-            except StopIteration:
-                raise KeyError("evict(): dictionary is empty")
+            key = self._next_evict_candidate()
 
         if key in self._cancel_evict:
             return None, None, 0
@@ -230,9 +264,18 @@ class LRU(ZictBase[KT, VT]):
                     for cb in self.on_cancel_evict:
                         cb(key, value)
                     return None, None, 0
+        except Exception as e:
+            # Roll back the failed eviction: the key/value pair stays in the LRU.
+            # Remember the exception so that automatic eviction can skip this key and
+            # keep trying other candidates. The key becomes eligible again once it is
+            # deleted or overwritten with a new value, or if evict() is retried on it
+            # explicitly.
+            self.evict_exceptions[key] = e
+            raise
         finally:
             del self._cancel_evict[key]
 
+        self.evict_exceptions.pop(key, None)
         del self.d[key]
         self.order.remove(key)
         weight = self.weights.pop(key)
@@ -247,6 +290,8 @@ class LRU(ZictBase[KT, VT]):
         del self.d[key]
         self.order.remove(key)
         self.heavy.discard(key)
+        # Any previous eviction failure is moot now that the key is gone
+        self.evict_exceptions.pop(key, None)
         self.total_weight -= self.weights.pop(key)
 
     def keys(self) -> KeysView[KT]:
