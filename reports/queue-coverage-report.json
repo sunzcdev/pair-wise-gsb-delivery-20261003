@@ -1,0 +1,397 @@
+{
+  "generated_at": "2026-11-24T22:45:19.936Z",
+  "mode": "deterministic_fixture",
+  "database": "F:/GSB/workspaces/midnight-110-20261125-append-60/986/tmp/queue-coverage.sqlite3",
+  "reproduction_command": "bundle exec ruby bin/queue_coverage_report.rb --write reports/queue-coverage-report.md --json reports/queue-coverage-report.json",
+  "running_config": [
+    "billing",
+    "mail-*",
+    "mail-transaction*",
+    "legacy-*",
+    "ops-*"
+  ],
+  "candidate_config": [
+    "billing",
+    "mail-transaction*",
+    "mail-*",
+    "ops-*"
+  ],
+  "shared_snapshot": {
+    "ready_execution_counts": {
+      "billing": 1,
+      "legacy-etl": 1,
+      "mail-transactional": 1
+    },
+    "paused_queues": [
+      "billing"
+    ],
+    "running": {
+      "label": "running",
+      "config": [
+        "billing",
+        "mail-*",
+        "mail-transaction*",
+        "legacy-*",
+        "ops-*"
+      ],
+      "entries": [
+        {
+          "index": 1,
+          "pattern": "billing",
+          "match_type": "精确名(exact)",
+          "matched_queues": [
+            "billing"
+          ]
+        },
+        {
+          "index": 2,
+          "pattern": "mail-*",
+          "match_type": "前缀(prefix)",
+          "matched_queues": [
+            "mail-transactional"
+          ]
+        },
+        {
+          "index": 3,
+          "pattern": "mail-transaction*",
+          "match_type": "前缀(prefix)",
+          "matched_queues": [
+            "mail-transactional"
+          ]
+        },
+        {
+          "index": 4,
+          "pattern": "legacy-*",
+          "match_type": "前缀(prefix)",
+          "matched_queues": [
+            "legacy-etl"
+          ]
+        },
+        {
+          "index": 5,
+          "pattern": "ops-*",
+          "match_type": "前缀(prefix)",
+          "matched_queues": []
+        }
+      ],
+      "eligible_order": [
+        "billing",
+        "mail-transactional",
+        "legacy-etl"
+      ],
+      "claim_order": [
+        "mail-transactional",
+        "legacy-etl"
+      ],
+      "queues": [
+        {
+          "queue_name": "billing",
+          "status": "CONFIGURED_BUT_PAUSED",
+          "covered": true,
+          "paused": true,
+          "claimable": false,
+          "eligible_position": 1,
+          "claim_position": null,
+          "winning_match": "精确名(exact) billing (#1)",
+          "all_matches": [
+            "#1 精确名(exact) `billing`"
+          ],
+          "shadowed_matches": []
+        },
+        {
+          "queue_name": "legacy-etl",
+          "status": "CLAIMABLE",
+          "covered": true,
+          "paused": false,
+          "claimable": true,
+          "eligible_position": 3,
+          "claim_position": 2,
+          "winning_match": "前缀(prefix) legacy-* (#4)",
+          "all_matches": [
+            "#4 前缀(prefix) `legacy-*`"
+          ],
+          "shadowed_matches": []
+        },
+        {
+          "queue_name": "mail-transactional",
+          "status": "CLAIMABLE",
+          "covered": true,
+          "paused": false,
+          "claimable": true,
+          "eligible_position": 2,
+          "claim_position": 1,
+          "winning_match": "前缀(prefix) mail-* (#2)",
+          "all_matches": [
+            "#2 前缀(prefix) `mail-*`",
+            "#3 前缀(prefix) `mail-transaction*`"
+          ],
+          "shadowed_matches": [
+            "#3 前缀(prefix) `mail-transaction*`"
+          ]
+        }
+      ]
+    },
+    "candidate": {
+      "label": "candidate",
+      "config": [
+        "billing",
+        "mail-transaction*",
+        "mail-*",
+        "ops-*"
+      ],
+      "entries": [
+        {
+          "index": 1,
+          "pattern": "billing",
+          "match_type": "精确名(exact)",
+          "matched_queues": [
+            "billing"
+          ]
+        },
+        {
+          "index": 2,
+          "pattern": "mail-transaction*",
+          "match_type": "前缀(prefix)",
+          "matched_queues": [
+            "mail-transactional"
+          ]
+        },
+        {
+          "index": 3,
+          "pattern": "mail-*",
+          "match_type": "前缀(prefix)",
+          "matched_queues": [
+            "mail-transactional"
+          ]
+        },
+        {
+          "index": 4,
+          "pattern": "ops-*",
+          "match_type": "前缀(prefix)",
+          "matched_queues": []
+        }
+      ],
+      "eligible_order": [
+        "billing",
+        "mail-transactional"
+      ],
+      "claim_order": [
+        "mail-transactional"
+      ],
+      "queues": [
+        {
+          "queue_name": "billing",
+          "status": "CONFIGURED_BUT_PAUSED",
+          "covered": true,
+          "paused": true,
+          "claimable": false,
+          "eligible_position": 1,
+          "claim_position": null,
+          "winning_match": "精确名(exact) billing (#1)",
+          "all_matches": [
+            "#1 精确名(exact) `billing`"
+          ],
+          "shadowed_matches": []
+        },
+        {
+          "queue_name": "legacy-etl",
+          "status": "CONFIGURATION_ABSENT",
+          "covered": false,
+          "paused": false,
+          "claimable": false,
+          "eligible_position": null,
+          "claim_position": null,
+          "winning_match": null,
+          "all_matches": [],
+          "shadowed_matches": []
+        },
+        {
+          "queue_name": "mail-transactional",
+          "status": "CLAIMABLE",
+          "covered": true,
+          "paused": false,
+          "claimable": true,
+          "eligible_position": 2,
+          "claim_position": 1,
+          "winning_match": "前缀(prefix) mail-transaction* (#2)",
+          "all_matches": [
+            "#2 前缀(prefix) `mail-transaction*`",
+            "#3 前缀(prefix) `mail-*`"
+          ],
+          "shadowed_matches": [
+            "#3 前缀(prefix) `mail-*`"
+          ]
+        }
+      ]
+    }
+  },
+  "post_snapshot_read": {
+    "ready_execution_counts": {
+      "billing": 1,
+      "legacy-etl": 1,
+      "mail-transactional": 1,
+      "ops-late": 1
+    },
+    "paused_queues": [
+      "billing"
+    ],
+    "claimed_execution_rows": 0,
+    "late_queue": "ops-late",
+    "late_queue_ready_count": 1,
+    "late_queue_was_in_shared_snapshot": false,
+    "late_queue_live_matches": {
+      "candidate": [
+        "#4 前缀(prefix) `ops-*`"
+      ],
+      "running": [
+        "#5 前缀(prefix) `ops-*`"
+      ]
+    },
+    "interpretation": "This read is after the shared snapshot ended. It is audit evidence only; it is not mixed into the candidate-vs-running diff."
+  },
+  "self_checks": [
+    {
+      "name": "snapshot contains exactly three fixture queues",
+      "passed": true
+    },
+    {
+      "name": "billing is exact-matched in candidate",
+      "passed": true
+    },
+    {
+      "name": "billing is configured but paused",
+      "passed": true
+    },
+    {
+      "name": "mail-transactional matches two candidate prefixes",
+      "passed": true
+    },
+    {
+      "name": "mail-transactional is claimable in candidate",
+      "passed": true
+    },
+    {
+      "name": "legacy-etl is absent from candidate",
+      "passed": true
+    },
+    {
+      "name": "legacy-etl is claimable under running config",
+      "passed": true
+    },
+    {
+      "name": "late arrival is excluded from shared snapshot",
+      "passed": true
+    },
+    {
+      "name": "late ops-* match is invisible inside snapshot",
+      "passed": true
+    },
+    {
+      "name": "late arrival is visible after snapshot",
+      "passed": true
+    },
+    {
+      "name": "report did not claim executions",
+      "passed": true
+    }
+  ],
+  "events": [
+    {
+      "seq": 1,
+      "at": "2026-11-24T22:45:20.651Z",
+      "monotonic": 637247.3113177,
+      "event": "shared_snapshot_begin",
+      "mode": "DEFERRED",
+      "read_only": true
+    },
+    {
+      "seq": 2,
+      "at": "2026-11-24T22:45:20.652Z",
+      "monotonic": 637247.3120034,
+      "event": "shared_view_read",
+      "ready_queues": [
+        "billing",
+        "legacy-etl",
+        "mail-transactional"
+      ],
+      "paused_queues": [
+        "billing"
+      ]
+    },
+    {
+      "seq": 3,
+      "at": "2026-11-24T22:45:20.654Z",
+      "monotonic": 637247.3141152,
+      "event": "selector_core_read_complete",
+      "scan": "candidate",
+      "eligible_order": [
+        "billing",
+        "mail-transactional"
+      ],
+      "claim_order": [
+        "mail-transactional"
+      ]
+    },
+    {
+      "seq": 4,
+      "at": "2026-11-24T22:45:20.654Z",
+      "monotonic": 637247.3141196,
+      "event": "candidate_scan_midpoint",
+      "action": "insert ReadyExecution through a second SQLite connection",
+      "queue": "ops-late"
+    },
+    {
+      "seq": 5,
+      "at": "2026-11-24T22:45:20.685Z",
+      "monotonic": 637247.3456916,
+      "event": "late_arrival_committed_on_second_connection",
+      "job_id": 4,
+      "ready_execution_count": 1,
+      "queue": "ops-late"
+    },
+    {
+      "seq": 6,
+      "at": "2026-11-24T22:45:20.686Z",
+      "monotonic": 637247.3463528,
+      "event": "selector_match_attribution_complete",
+      "scan": "candidate",
+      "entry_count": 4
+    },
+    {
+      "seq": 7,
+      "at": "2026-11-24T22:45:20.686Z",
+      "monotonic": 637247.3467548,
+      "event": "selector_core_read_complete",
+      "scan": "running",
+      "eligible_order": [
+        "billing",
+        "mail-transactional",
+        "legacy-etl"
+      ],
+      "claim_order": [
+        "mail-transactional",
+        "legacy-etl"
+      ]
+    },
+    {
+      "seq": 8,
+      "at": "2026-11-24T22:45:20.687Z",
+      "monotonic": 637247.3472222,
+      "event": "selector_match_attribution_complete",
+      "scan": "running",
+      "entry_count": 5
+    },
+    {
+      "seq": 9,
+      "at": "2026-11-24T22:45:20.687Z",
+      "monotonic": 637247.3472391,
+      "event": "both_configs_scanned_in_shared_view"
+    },
+    {
+      "seq": 10,
+      "at": "2026-11-24T22:45:20.687Z",
+      "monotonic": 637247.3472858,
+      "event": "shared_snapshot_released"
+    }
+  ]
+}
