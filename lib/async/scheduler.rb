@@ -75,11 +75,18 @@ module Async
 		# @public Since *Async v1*.
 		# @parameter parent [Node | Nil] The parent node to use for task hierarchy.
 		# @parameter selector [IO::Event::Selector] The selector to use for event handling.
-		def initialize(parent = nil, selector: nil, profiler: Profiler&.default, worker_pool: WORKER_POOL)
+		# @parameter max_ready_count [Integer | Nil] The maximum number of ready fibers to resume per iteration of the event loop. When `nil`, the selector processes its entire ready list in a single iteration, which is the default behaviour. When set, any remaining ready fibers are deferred to the next iteration, ensuring the selector still gets a chance to service I/O events and timers even while tasks keep re-scheduling themselves. Selectors which don't support a per-iteration cap silently ignore this option.
+		def initialize(parent = nil, selector: nil, profiler: Profiler&.default, worker_pool: WORKER_POOL, max_ready_count: nil)
 			super(parent)
 			
 			@selector = selector || ::IO::Event::Selector.new(Fiber.current)
 			@profiler = profiler
+			
+			# The maximum number of ready fibers to resume per iteration of the event loop, or `nil` for no limit:
+			@max_ready_count = max_ready_count
+			
+			# Whether the selector supports capping the number of ready fibers resumed per iteration. Detected lazily so that selectors which only accept a duration continue to work unchanged:
+			@max_ready_count_supported = nil
 			
 			@interrupted = false
 			
@@ -447,6 +454,23 @@ module Async
 			end.value
 		end
 		
+		# Whether the attached selector supports capping the number of ready fibers resumed per iteration of the event loop.
+		#
+		# The native selectors bundled with `io-event` only accept a duration in `#select` and always drain their whole ready list. A custom selector may accept a `max_ready_count:` keyword instead. The capability is detected from the method signature so that older selectors, or test doubles that only implement `select(duration)`, keep working unchanged.
+		#
+		# @returns [Boolean] Whether the selector accepts the `max_ready_count:` keyword.
+		private def max_ready_count_supported?
+			if @max_ready_count_supported.nil?
+				parameters = @selector.method(:select).parameters
+				@max_ready_count_supported = parameters.any? do |type, name|
+					# A keyword rest (`**options`) accepts any keyword, while an explicit keyword must match by name:
+					type == :keyrest || (type == :key && name == :max_ready_count)
+				end
+			end
+			
+			return @max_ready_count_supported
+		end
+		
 		# Run one iteration of the event loop.
 		#
 		# When terminating the event loop, we already know we are finished. So we don't need to check the task tree. This is a logical requirement because `run_once` ignores transient tasks. For example, a single top level transient task is not enough to keep the reactor running, but during termination we must still process it in order to terminate child tasks.
@@ -469,10 +493,20 @@ module Async
 				interval = timeout
 			end
 			
-			begin
-				@selector.select(interval)
-			rescue Errno::EINTR
-				# Ignore.
+			# When the amount of ready work per iteration is capped, there may still be ready fibers queued after the cap is reached. We still enter the selector every iteration (below) with a zero duration so that I/O events and timers are serviced promptly instead of being starved by tasks which keep re-scheduling themselves:
+			if @max_ready_count && max_ready_count_supported?
+				# A non-blocking selector pass services up to the cap of ready fibers while preserving their relative order, then returns so the loop can service I/O and timers:
+				begin
+					@selector.select(0, max_ready_count: @max_ready_count)
+				rescue Errno::EINTR
+					# Ignore.
+				end
+			else
+				begin
+					@selector.select(interval)
+				rescue Errno::EINTR
+					# Ignore.
+				end
 			end
 			
 			@timers.fire

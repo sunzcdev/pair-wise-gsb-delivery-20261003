@@ -69,6 +69,19 @@ end
 
 You can use this approach to embed the reactor in another event loop. For some integrations, you may want to specify the maximum time to wait to {ruby Async::Scheduler#run_once}.
 
+### Bounding Ready Work Per Iteration
+
+Some tasks keep pushing their next chunk of work back onto the ready list instead of waiting on an event. Because the selector drains the entire ready list before polling for I/O, a group of such tasks can monopolise the event loop and starve sockets and timers of processing time.
+
+Pass `max_ready_count:` to {ruby Async::Scheduler#initialize} to cap how many ready fibers are resumed per iteration. Any ready fibers beyond the cap keep their relative order and are deferred to the next iteration; the selector is still entered on every iteration with a zero duration, so registered I/O and timers continue to be serviced promptly.
+
+```ruby
+# Resume at most 8 ready fibers per iteration of the event loop:
+scheduler = Async::Scheduler.new(max_ready_count: 8)
+```
+
+The cap is only applied when the attached selector's `#select` accepts a `max_ready_count:` keyword. Selectors which only accept a duration — including the selectors bundled with `io-event` — ignore the option and retain their default behaviour.
+
 ### Cancelling a Scheduler
 
 {ruby Async::Scheduler#cancel} will cancel the current scheduler and all children tasks.
