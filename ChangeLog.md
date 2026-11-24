@@ -1,7 +1,11 @@
 ## Changes between Bunny 3.6.0 and 3.7.0 (in development)
 
-No changes yet.
+### Queue Declaration Outcomes
 
+`Bunny::Channel#declare_queue` returns a `Bunny::QueueDeclaration` outcome with
+`definite_failure?`, `name_unknown?`, and `definite_success?` states. Declaration
+records are kept per channel generation, and unconfirmed declarations are not
+added to topology recovery
 
 ## Changes between Bunny 3.5.0 and 3.6.0 (Nov 9, 2026)
 

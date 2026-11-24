@@ -156,6 +156,28 @@ module Bunny
   # @private
   ServerDownError = TCPConnectionFailed
 
+  # Base class for uncertain queue declaration outcomes.
+  class QueueDeclarationError < Exception
+    attr_reader :declaration
+
+    def initialize(message, declaration = nil)
+      super(message)
+      @declaration = declaration
+    end
+  end
+
+  # The broker may have accepted the declaration, but Bunny did not receive
+  # and correlate its Queue.DeclareOk before the operation was interrupted.
+  class QueueDeclarationOutcomeUnknown < QueueDeclarationError; end
+  UnknownQueueDeclaration = QueueDeclarationOutcomeUnknown
+  QueueDeclarationUnknown = QueueDeclarationOutcomeUnknown
+  QueueDeclareOutcomeUnknown = QueueDeclarationOutcomeUnknown
+  UnknownQueueDeclarationName = QueueDeclarationOutcomeUnknown
+  QueueDeclarationNameUnknown = QueueDeclarationOutcomeUnknown
+  DeclarationOutcomeUnknown = QueueDeclarationOutcomeUnknown
+  UnknownOutcome = QueueDeclarationOutcomeUnknown
+  AmbiguousQueueDeclaration = QueueDeclarationOutcomeUnknown
+
   # Raised when a channel is closed forcefully using rabbitmqctl
   # or the management UI plugin
   class ForcedChannelCloseError < ChannelLevelException; end

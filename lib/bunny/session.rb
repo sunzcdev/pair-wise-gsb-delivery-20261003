@@ -228,6 +228,7 @@ module Bunny
       @recovery_mutex      = @mutex_impl.new
 
       @channels            = Hash.new
+      @channel_generations = Hash.new(0)
 
       trf = @opts.fetch(:topology_recovery_filter, DefaultTopologyRecoveryFilter.new)
       @topology_registry = TopologyRegistry.new(topology_recovery_filter: trf)
@@ -894,8 +895,23 @@ module Bunny
     # @param [Boolean] auto_delete
     # @param [Boolean] exclusive
     # @param [Hash] arguments
-    def record_queue_with(ch, name, server_named, durable, auto_delete, exclusive, arguments)
-      @topology_registry.record_queue_with(ch, name, server_named, durable, auto_delete, exclusive, arguments)
+    def record_queue_with(ch, name, server_named, durable, auto_delete, exclusive, arguments, metadata = {})
+      @topology_registry.record_queue_with(ch, name, server_named, durable, auto_delete, exclusive, arguments, metadata)
+    end
+
+    # @private
+    def record_queue_declaration(declaration)
+      @topology_registry.record_queue_declaration(declaration)
+    end
+
+    # @private
+    def queue_declaration_records
+      channel_records = @channel_mutex.synchronize do
+        @channels.values.flat_map do |channel|
+          channel.respond_to?(:queue_declaration_records) ? channel.queue_declaration_records : []
+        end
+      end
+      channel_records + @topology_registry.queue_declaration_records
     end
 
     # @param [Bunny::Queue, Bunny::RecordedQueue] queue
@@ -1434,8 +1450,27 @@ module Bunny
     # @private
     def register_channel(ch)
       @channel_mutex.synchronize do
-        @channels[ch.number] = ch
+        @channel_generations ||= Hash.new(0)
+        n = ch.number
+        unless @channels[n].equal?(ch)
+          @channel_generations[n] = (@channel_generations[n] || 0) + 1
+        end
+        @channels[n] = ch
+        if ch.respond_to?(:connection_generation=)
+          ch.connection_generation = @channel_generations[n]
+        end
       end
+    end
+
+    # @private
+    def channel_generation(number)
+      @channel_mutex.synchronize { (@channel_generations ||= Hash.new(0))[number] || 0 }
+    end
+    alias channel_epoch channel_generation
+
+    # @private
+    def current_channel_generation?(number, generation)
+      channel_generation(number) == generation
     end
 
     # @private

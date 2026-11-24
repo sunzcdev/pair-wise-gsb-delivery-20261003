@@ -45,6 +45,8 @@ module Bunny
     attr_reader :name
     # @return [Hash] Options this queue was created with
     attr_reader :options
+    # @return [Bunny::QueueDeclaration, nil] correlated declaration outcome
+    attr_reader :declaration
 
     # @param [Bunny::Channel] channel Channel this queue will use.
     # @param [String] name                          Queue name. Pass an empty string to make RabbitMQ generate a unique one.
@@ -120,6 +122,17 @@ module Bunny
     def server_named?
       @server_named
     end # server_named?
+
+    # @private
+    def declaration_state
+      @declaration&.state
+    end
+    alias declaration_status declaration_state
+
+    # @private
+    def declaration_unknown?
+      @declaration&.name_unknown? == true
+    end
 
     # @return [Hash] Additional optional arguments (typically used by RabbitMQ extensions and plugins)
     # @api public
@@ -387,6 +400,7 @@ module Bunny
     # @private
     def declare!
       queue_declare_ok = @channel.queue_declare(@name, @options)
+      @declaration = @channel.last_queue_declaration if @channel.is_a?(Bunny::Channel)
       @name = queue_declare_ok.queue
     end
 

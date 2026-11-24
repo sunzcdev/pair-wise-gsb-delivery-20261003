@@ -3,6 +3,7 @@
 
 require "set"
 require "bunny/topology_recovery_filter"
+require "bunny/queue_declaration"
 
 module Bunny
   # As queues, exchanges, bindings are created and deleted,
@@ -39,6 +40,7 @@ module Bunny
 
     def reset!
       @queues = {}
+      @queue_declarations = {}
       @exchanges = {}
       @queue_bindings = Set.new
       @exchange_bindings = Set.new
@@ -62,8 +64,19 @@ module Bunny
     # @return [Array<Bunny::RecordedQueue>]
     # @see Bunny::TopologyRecoveryFilter
     def filtered_queues
-      @filter.filter_queues(@queues.values)
+      confirmed_queues = @queues.values.select do |queue|
+        !queue.respond_to?(:confirmed?) || queue.confirmed?
+      end
+      @filter.filter_queues(confirmed_queues)
     end
+
+    # @return [Array<Bunny::RecordedQueue>] confirmed queues eligible for recovery
+    def recovery_candidate_queues
+      filtered_queues
+    end
+    alias recoverable_queues recovery_candidate_queues
+    alias queues_for_recovery recovery_candidate_queues
+    alias recovery_queues recovery_candidate_queues
 
     # @param [Bunny::Queue] queue
     def record_queue(queue)
@@ -76,8 +89,8 @@ module Bunny
     # @param [Boolean] durable
     # @param [Boolean] auto_delete
     # @param [Boolean] exclusive
-    # @param [Hash] arguments
-    def record_queue_with(ch, name, server_named, durable, auto_delete, exclusive, arguments)
+    # @param [Hash] metadata Optional confirmation generation/token metadata
+    def record_queue_with(ch, name, server_named, durable, auto_delete, exclusive, arguments, metadata = {})
       queue = RecordedQueue.new(ch, name)
         .with_server_named(server_named)
         .with_durable(durable)
@@ -85,7 +98,73 @@ module Bunny
         .with_exclusive(exclusive)
         .with_arguments(arguments)
 
+      if metadata.is_a?(Hash)
+        token = metadata[:declaration_token] || metadata["declaration_token"] || metadata[:token]
+        epoch = metadata[:confirmation_epoch] || metadata["confirmation_epoch"] || metadata[:epoch] || metadata[:generation]
+        confirmed = metadata.fetch(:confirmed) { metadata.fetch("confirmed", true) }
+        queue.with_declaration_token(token) if token
+        queue.with_confirmation_epoch(epoch) if epoch
+        queue.mark_unconfirmed! if confirmed == false
+      elsif metadata == false
+        queue.mark_unconfirmed!
+      end
+
         @queue_mutex.synchronize { @queues[queue.name] = queue }
+    end
+
+    # Tracks a declaration outcome without making it a recovery candidate.
+    # Only {#record_queue_with} after a correlated Queue.DeclareOk does that.
+    def record_queue_declaration(declaration)
+      @queue_mutex.synchronize { @queue_declarations[declaration_key(declaration)] = declaration }
+    end
+
+    # Records declaration intent that is not yet confirmed. It is intentionally
+    # not stored in {#queues}, so it cannot enter topology recovery.
+    def record_pending_queue_declaration_with(ch, name, server_named, durable, auto_delete, exclusive, arguments)
+      declaration = QueueDeclaration.new(
+        channel: ch,
+        channel_id: ch.respond_to?(:id) ? ch.id : ch.number,
+        requested_name: name,
+        server_named: server_named,
+        status: :pending,
+        options: {
+          durable: durable,
+          auto_delete: auto_delete,
+          exclusive: exclusive,
+          arguments: arguments
+        }
+      )
+      record_queue_declaration(declaration)
+      declaration
+    end
+    alias record_pending_queue_with record_pending_queue_declaration_with
+
+    def queue_declaration_records
+      @queue_mutex.synchronize { @queue_declarations.values.dup }
+    end
+    alias declaration_records queue_declaration_records
+    alias queue_declaration_outcomes queue_declaration_records
+    alias declaration_outcomes queue_declaration_records
+    alias queue_declaration_calls queue_declaration_records
+
+    def pending_queue_declarations
+      queue_declaration_records.select(&:pending?)
+    end
+
+    def unknown_queue_declarations
+      queue_declaration_records.select(&:name_unknown?)
+    end
+
+    def confirmed_queue_declarations
+      queue_declaration_records.select(&:definite_success?)
+    end
+
+    def definite_failed_queue_declarations
+      queue_declaration_records.select(&:definite_failure?)
+    end
+
+    def queue_declarations_for(channel)
+      queue_declaration_records.select { |d| d.belongs_to?(channel) }
     end
 
     # @param [Bunny::Queue, Bunny::RecordedQueue] queue
@@ -160,11 +239,15 @@ module Bunny
 
     # @param [String] old_name
     # @param [String] new_name
+    # @param [Bunny::Channel, nil] channel when provided, only this channel's consumers are updated
     # @private
-    def propagate_queue_name_change_to_consumers(old_name, new_name)
+    def propagate_queue_name_change_to_consumers(old_name, new_name, channel = nil)
       @consumer_mutex.synchronize do
         @consumers.each do |_, rc|
-          rc.update_queue_name_to(new_name) if rc.queue_name == old_name
+          next unless rc.queue_name == old_name
+          next if channel && rc.channel != channel
+
+          rc.update_queue_name_to(new_name)
         end
       end
     end
@@ -324,8 +407,10 @@ module Bunny
     # @private
     def record_queue_name_change(old_name, new_name)
       # update the recorded queue itself
+      channel = nil
       @queue_mutex.synchronize do
         if (orig = @queues[old_name])
+          channel = orig.channel
           @queues.delete(old_name)
 
           orig.update_name_to(new_name)
@@ -334,7 +419,7 @@ module Bunny
       end
 
       self.propagate_queue_name_change_to_bindings(old_name, new_name)
-      self.propagate_queue_name_change_to_consumers(old_name, new_name)
+      self.propagate_queue_name_change_to_consumers(old_name, new_name, channel)
       # Make sure the original name is removed and won't be recovered
       # but do not cascade
       self.delete_recorded_queue_named_without_cascading(old_name)
@@ -356,6 +441,13 @@ module Bunny
     #
     # Implementation
     #
+
+    def declaration_key(declaration)
+      token = declaration.respond_to?(:token) ? declaration.token : declaration[:token]
+      channel = declaration.respond_to?(:channel) ? declaration.channel : declaration[:channel]
+      epoch = declaration.respond_to?(:epoch) ? declaration.epoch : declaration[:epoch]
+      [channel&.object_id, epoch, token]
+    end
 
     # @param name [String] Auto-delete queue name
     def maybe_delete_recorded_auto_delete_queue(name)
@@ -558,6 +650,10 @@ module Bunny
     attr_reader :durable, :auto_delete, :exclusive
     # @return [Hash]
     attr_reader :arguments
+    # @return [Object] Correlated declaration token when known
+    attr_reader :declaration_token
+    # @return [Integer] Channel/connection generation that confirmed this queue
+    attr_reader :confirmation_epoch
 
     # @param ch [Bunny::Channel]
     # @param name [String]
@@ -569,6 +665,9 @@ module Bunny
       @exclusive = false
       @server_named = false
       @arguments = nil
+      @declaration_token = nil
+      @confirmation_epoch = nil
+      @confirmed = true
     end
 
     # @param value [String]
@@ -617,6 +716,35 @@ module Bunny
     # @param value [Hash]
     def with_arguments(value)
       @arguments = value
+      self
+    end
+
+    def with_declaration_token(value)
+      @declaration_token = value
+      self
+    end
+
+    def with_confirmation_epoch(value)
+      @confirmation_epoch = value
+      self
+    end
+    alias with_generation with_confirmation_epoch
+
+    def confirmed?
+      @confirmed
+    end
+
+    def pending?
+      !confirmed?
+    end
+
+    def mark_confirmed!
+      @confirmed = true
+      self
+    end
+
+    def mark_unconfirmed!
+      @confirmed = false
       self
     end
 

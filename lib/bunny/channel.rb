@@ -14,6 +14,7 @@ require "bunny/return_info"
 require "bunny/message_properties"
 
 require "bunny/concurrent/continuation_queue"
+require "bunny/queue_declaration"
 
 module Bunny
   # ## Channels in RabbitMQ
@@ -222,6 +223,11 @@ module Bunny
       @per_message_continuations_mutex = @connection.mutex_impl.new
       @outstanding_limit_cond = nil
 
+      @queue_declaration_registry = QueueDeclarationRegistry.new(self, epoch: @connection_generation || 0)
+      @pending_queue_declaration_token = nil
+      @pending_queue_declaration_epoch = nil
+      @queue_declaration_generation_started = false
+
       self.reset_continuations
 
       # threads awaiting on continuations. Used to unblock
@@ -261,6 +267,12 @@ module Bunny
       @threads_waiting_on_continuations           = Set.new
       @threads_waiting_on_confirms_continuations  = Set.new
       @threads_waiting_on_basic_get_continuations = Set.new
+      if @queue_declaration_generation_started
+        queue_declaration_registry.next_epoch!
+      else
+        @queue_declaration_generation_started = true
+      end
+
       # Set before the channel is open again, so that no stale tag slips through
       @consumer_delivery_tag_offset = @last_consumer_delivery_tag
 
@@ -350,6 +362,15 @@ module Bunny
     # @private
     def connection_closed!
       @status = :closed
+      if instance_variable_defined?(:@queue_declaration_registry) && @queue_declaration_registry
+        if @last_channel_error
+          @queue_declaration_registry.pending.each { |d| d.fail(@last_channel_error) }
+        else
+          @queue_declaration_registry.mark_pending_unknown!(
+            NetworkFailure.new("queue declaration outcome is unknown after channel closure", nil)
+          )
+        end
+      end
     end
 
     # @private
@@ -1355,16 +1376,248 @@ module Bunny
       # just like RabbitMQ does
       safe_name = name.gsub(/[\r\n]/, "")
       is_server_named = (safe_name == AMQ::Protocol::EMPTY_STRING)
+      declaration = begin_queue_declaration(safe_name, opts)
+      @last_queue_declaration = declaration
+
       passive = opts.fetch(:passive, false)
       durable = opts.fetch(:durable, false)
       exclusive = opts.fetch(:exclusive, false)
       auto_delete = opts.fetch(:auto_delete, false)
       args = opts[:arguments]
 
-      result = self.queue_declare_without_recording_topology(name, opts)
-      self.record_queue_with(self, result.queue, is_server_named, durable, auto_delete, exclusive, args) unless passive
+      begin
+        result = self.queue_declare_without_recording_topology(name, opts)
+        declaration.succeed(result) if declaration.pending?
+      rescue StandardError => error
+        settle_queue_declaration_error(declaration, error)
+        raise
+      end
+
+      begin
+        self.record_queue_with(self, result.queue, is_server_named, durable, auto_delete, exclusive, args) unless passive
+        mark_queue_declaration_recorded(declaration)
+      rescue StandardError => error
+        declaration.record_error(error)
+        raise
+      end
 
       result
+    end
+
+    # Declares a queue and returns a settled {Bunny::QueueDeclaration} instead
+    # of raising for an uncertain outcome. Definite AMQP failures are represented
+    # by a `:definite_failure` outcome; timeouts/lost replies are `:name_unknown`.
+    #
+    # @return [Bunny::QueueDeclaration]
+    # @api public
+    def declare_queue(name = AMQ::Protocol::EMPTY_STRING, opts = {})
+      queue_declare(name, opts)
+      @last_queue_declaration || queue_declaration_records.last
+    rescue StandardError => error
+      outcome = @last_queue_declaration || queue_declaration_records.last
+      return outcome if outcome && !outcome.pending?
+
+      QueueDeclaration.new(
+        channel: self,
+        channel_id: @id,
+        requested_name: name,
+        options: opts,
+        status: queue_declaration_error_status(error),
+        error: error
+      )
+    end
+    alias queue_declaration declare_queue
+    alias queue_declare_result declare_queue
+    alias queue_declaration_result declare_queue
+    alias queue_declaration_outcome declare_queue
+    alias declare_queue_with_outcome declare_queue
+    alias queue_declare_with_outcome declare_queue
+    alias try_queue_declare declare_queue
+    alias safe_queue_declare declare_queue
+    alias queue_declare_with_state declare_queue
+    alias queue_declare_checked declare_queue
+    alias declare_temporary_queue declare_queue
+    alias temporary_queue_declaration declare_queue
+
+    # Returns the DeclareOk for a definite success, re-raises definite failures,
+    # and raises {Bunny::QueueDeclarationOutcomeUnknown} for an ambiguous reply.
+    def declare_queue!(name = AMQ::Protocol::EMPTY_STRING, opts = {})
+      outcome = declare_queue(name, opts)
+      if outcome.definite_success?
+        raise outcome.record_error if outcome.record_error
+        return outcome.response
+      end
+
+      raise outcome.error if outcome.definite_failure? && outcome.error
+
+      if outcome.definite_failure?
+        raise QueueDeclarationError.new("queue declaration failed", outcome)
+      end
+
+      raise QueueDeclarationOutcomeUnknown.new(
+        "queue declaration outcome is unknown; server-named queue name was not confirmed",
+        outcome
+      )
+    end
+    alias queue_declaration! declare_queue!
+    alias queue_declare_outcome! declare_queue!
+
+    # @private
+    attr_reader :last_queue_declaration
+    # @private
+    attr_accessor :connection_generation
+
+    # @private
+    def queue_declaration_registry
+      @queue_declaration_registry ||= QueueDeclarationRegistry.new(
+        self,
+        epoch: @connection_generation || @queue_declaration_epoch || 0
+      )
+    end
+
+    # @private
+    def topology_registry
+      @connection.topology_registry if @connection.respond_to?(:topology_registry)
+    end
+    alias queue_declarations queue_declaration_registry
+    alias declaration_registry queue_declaration_registry
+    alias queue_declaration_ledger queue_declaration_registry
+    alias queue_declaration_tracker queue_declaration_registry
+
+    # @private
+    def queue_declaration_records
+      queue_declaration_registry.records
+    end
+    alias queue_declaration_outcomes queue_declaration_records
+    alias declaration_records queue_declaration_records
+    alias queue_declaration_results queue_declaration_records
+    alias queue_declaration_calls queue_declaration_records
+    alias queue_declare_calls queue_declaration_records
+    alias declaration_calls queue_declaration_records
+    alias queue_declaration_log queue_declaration_records
+    alias queue_declaration_history queue_declaration_records
+    alias declarations queue_declaration_records
+    alias last_declaration last_queue_declaration
+    alias last_queue_declaration_result last_queue_declaration
+    alias last_declaration_outcome last_queue_declaration
+
+    def last_queue_declaration_state
+      last_queue_declaration&.state
+    end
+    alias last_declaration_state last_queue_declaration_state
+    alias queue_declaration_status last_queue_declaration_state
+    alias last_queue_declaration_status last_queue_declaration_state
+
+    # @private
+    def queue_declaration_epoch
+      queue_declaration_registry.epoch
+    end
+    alias epoch queue_declaration_epoch
+    alias generation queue_declaration_epoch
+    alias declaration_generation queue_declaration_epoch
+
+    # @private
+    def begin_queue_declaration(name, opts = {})
+      queue_declaration_registry.begin_declaration(name, opts)
+    end
+
+    # Marks in-flight declarations unknown and starts a new correlation
+    # generation. Call records are retained for inspection, but their pending
+    # protocol context is cleared.
+    #
+    # @private
+    def reset_queue_declaration_generation!(error = nil)
+      queue_declaration_registry.mark_pending_unknown!(error)
+      @pending_queue_declare_name = nil
+      @pending_queue_declaration_token = nil
+      @pending_queue_declaration_epoch = nil
+      queue_declaration_registry.next_epoch!
+    end
+    alias clear_queue_declaration_generation! reset_queue_declaration_generation!
+    alias reset_declaration_generation! reset_queue_declaration_generation!
+    alias clear_current_generation! reset_queue_declaration_generation!
+
+    # @private
+    def clear_pending_queue_declaration!
+      @pending_queue_declare_name = nil
+      @pending_queue_declaration_token = nil
+      @pending_queue_declaration_epoch = nil
+    end
+    alias clear_pending_queue_declarations! clear_pending_queue_declaration!
+    alias discard_pending_queue_declaration! clear_pending_queue_declaration!
+
+    # Explicitly delivers a reply to a declaration call record. This lets a
+    # local transport double settle an old generation without routing its late
+    # frame into a newer declaration that reused the same channel number.
+    #
+    # @private
+    def deliver_queue_declaration_reply(*args)
+      response = args.find { |arg| reply_like?(arg) }
+      reference = args.find { |arg| !reply_like?(arg) }
+      declaration = case reference
+                    when QueueDeclaration then reference
+                    when Integer then queue_declaration_registry.find(reference)
+                    when nil then queue_declaration_registry.pending.last || queue_declaration_records.reverse.find(&:name_unknown?)
+                    else queue_declaration_registry.find(reference) if reference.respond_to?(:to_int)
+                    end
+      return nil unless declaration && response
+
+      if declaration.pending?
+        declaration.succeed(response)
+        @continuations&.push(response)
+      else
+        declaration.record_late_response(response)
+      end
+
+      declaration
+    end
+    alias resolve_queue_declaration deliver_queue_declaration_reply
+    alias complete_queue_declaration deliver_queue_declaration_reply
+    alias deliver_queue_declare_ok deliver_queue_declaration_reply
+    alias deliver_queue_declaration_ok deliver_queue_declaration_reply
+
+    def reply_like?(value)
+      value.is_a?(AMQ::Protocol::Queue::DeclareOk) ||
+        (value.respond_to?(:queue) && value.respond_to?(:message_count))
+    end
+
+    # @private
+    def mark_queue_declaration_recorded(_declaration)
+      # The topology registry remains the recovery source of truth. This hook
+      # exists for alternative registries and tests that track confirmation.
+      true
+    end
+
+    # @private
+    def settle_queue_declaration_error(declaration, error)
+      if definite_queue_declaration_failure?(error)
+        declaration.fail(error)
+      else
+        declaration.mark_unknown(error)
+      end
+
+      unless error.respond_to?(:queue_declaration)
+        error.define_singleton_method(:queue_declaration) { declaration }
+      end
+      declaration
+    rescue StandardError
+      declaration
+    end
+
+    # @private
+    def queue_declaration_error_status(error)
+      definite_queue_declaration_failure?(error) ? :definite_failure : :name_unknown
+    end
+
+    # @private
+    def definite_queue_declaration_failure?(error)
+      return true if @last_channel_error
+      return true if error.is_a?(ChannelLevelException)
+      return true if error.is_a?(ChannelAlreadyClosed)
+      return true if error.is_a?(ArgumentError)
+      return true if error.is_a?(Bunny::InconsistentDataError)
+
+      false
     end
 
     # We need this bypassing topology version to avoid modifying the collections
@@ -1379,7 +1632,14 @@ module Bunny
       # just like RabbitMQ does
       safe_name = name.gsub(/[\r\n]/, "")
       is_server_named = (safe_name == AMQ::Protocol::EMPTY_STRING)
+      declaration = queue_declaration_registry.pending.reverse.find do |candidate|
+        candidate.requested_name == safe_name && candidate.epoch == queue_declaration_registry.epoch
+      end
+      token = declaration&.token
+      epoch = queue_declaration_registry.epoch
       @pending_queue_declare_name = safe_name
+      @pending_queue_declaration_token = token
+      @pending_queue_declaration_epoch = epoch
 
       passive = opts.fetch(:passive, false)
       durable = opts.fetch(:durable, false)
@@ -1402,8 +1662,13 @@ module Bunny
           @last_queue_declare_ok = wait_on_continuations
         end
       ensure
-        # clear pending continuation context if it belongs to us
-        @pending_queue_declare_name = nil if @pending_queue_declare_name == safe_name
+        # Clear pending continuation context only if this call still owns it.
+        if @pending_queue_declaration_token == token &&
+           @pending_queue_declaration_epoch == epoch
+          @pending_queue_declare_name = nil
+          @pending_queue_declaration_token = nil
+          @pending_queue_declaration_epoch = nil
+        end
       end
       raise_if_continuation_resulted_in_a_channel_error!
 
@@ -1973,6 +2238,9 @@ module Bunny
     def recover_from_network_failure
       @logger.debug { "Recovering channel #{@id} after network failure" }
       release_all_continuations
+      queue_declaration_registry.mark_pending_unknown!(NetworkFailure.new(
+        "queue declaration outcome is unknown after channel/connection recovery", nil
+      ))
 
       recover_prefetch_setting
       recover_confirm_mode
@@ -2160,7 +2428,10 @@ module Bunny
         if can_accept_queue_declare_ok?(method)
           @continuations.push(method)
         else
-          if !pending_server_named_queue_declaration?
+          late_declaration = queue_declaration_registry.record_late_declare_ok(method)
+          if late_declaration
+            @logger.debug { "Recorded a late queue.declare-ok for declaration #{late_declaration.token} on channel #{@id}" }
+          elsif !pending_server_named_queue_declaration?
             # this response is for an outdated/overwritten
             # queue.declare, drop it
             @logger.warn "Received a queue.declare-ok response for a mismatching queue (#{method.queue} instead of #{@pending_queue_declare_name}) on channel #{@id}, possibly due to concurrent channel use or a timeout, ignoring it"
@@ -2549,8 +2820,8 @@ module Bunny
     # @param [Boolean] auto_delete
     # @param [Boolean] exclusive
     # @param [Hash] arguments
-    def record_queue_with(ch, name, server_named, durable, auto_delete, exclusive, arguments)
-      @connection.record_queue_with(ch, name, server_named, durable, auto_delete, exclusive, arguments)
+    def record_queue_with(ch, name, server_named, durable, auto_delete, exclusive, arguments, metadata = {})
+      @connection.record_queue_with(ch, name, server_named, durable, auto_delete, exclusive, arguments, metadata)
     end
 
     # @param [Bunny::Queue, Bunny::RecordedQueue] queue

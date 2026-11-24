@@ -9,6 +9,7 @@ require "amq/protocol/extensions"
 
 require "bunny/framing"
 require "bunny/exceptions"
+require "bunny/queue_declaration"
 
 require "bunny/socket"
 require "bunny/timestamp"
