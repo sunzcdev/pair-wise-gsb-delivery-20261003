@@ -78,6 +78,35 @@ module Dry
         _values[name] = setting.constructor.(value)
       end
 
+      # Applies a {Patch} of path-based change intents.
+      #
+      # The patch is validated in full before anything is written: an unknown
+      # path or a value rejected by a constructor raises and leaves the config
+      # untouched.
+      #
+      # A plain hash of path/action pairs is wrapped into a {Patch}, so the
+      # action sentinels {INHERIT} and {REMOVE_OVERRIDE} can be used there too.
+      # Note that explicit +nil+ is treated as a value and pins the setting to
+      # +nil+, never as an action.
+      #
+      # @param patch [Patch, Hash]
+      #
+      # @return [Config]
+      #
+      # @raise [FrozenConfigError] if the config is finalized
+      # @raise [InvalidPatchPathError] if a path does not map to a setting
+      # @raise [InvalidPatchValueError] if a value or action is invalid
+      #
+      # @api public
+      def apply_patch(patch)
+        raise FrozenConfigError, "Cannot modify frozen config" if frozen?
+
+        patch = Patch.new(**patch) if patch.is_a?(Hash)
+
+        patch.apply(self)
+        self
+      end
+
       # Update config with new values
       #
       # @param values [Hash, #to_hash] A hash with new values
@@ -255,6 +284,30 @@ module Dry
         _values.each_with_object({}) { |(key, val), dup_hsh|
           dup_hsh[key] = _settings[key].cloneable? ? val.dup : val
         }
+      end
+
+      # Returns a nested config, materializing and caching it without marking
+      # the parent setting as configured. Used by Patch while committing
+      # validated entries so nested traversal does not itself create overrides.
+      def nested_config(name)
+        return _values[name] if _values.key?(name)
+
+        _values[name] = _settings[name].to_value
+      end
+
+      # Pins a setting to an already-constructed value and marks it configured.
+      # Used by Patch, which validates every constructor up front for
+      # atomicity, so the constructor must not run a second time here.
+      def commit_value(name, value)
+        _configured.add(name)
+        _values[name] = value
+      end
+
+      # Returns a setting to its pristine, default-following state by dropping
+      # both the explicit-write marker and any cached value.
+      def release_override(name)
+        _configured.delete(name)
+        _values.delete(name)
       end
     end
   end
