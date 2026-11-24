@@ -527,29 +527,121 @@ describe Async::PriorityQueue do
 		
 		it "maintains correct priority order with stopped waiters" do
 			results = []
-			
+
 			# Start waiters: low, high, medium priority:
 			low_task = reactor.async{results << [:low, queue.dequeue(priority: 1)]}
 			high_task = reactor.async{results << [:high, queue.dequeue(priority: 10)]}
 			medium_task = reactor.async{results << [:medium, queue.dequeue(priority: 5)]}
-			
+
 			# Confirm all are waiting:
 			expect(queue.waiting_count).to be == 3
-			
+
 			# Stop the high priority waiter (should have been first):
 			high_task.stop
-			
+
 			# Add items:
 			queue.push(:item1)
 			queue.push(:item2)
-			
+
 			medium_task.wait
 			low_task.wait
-			
+
 			expect(results).to be == [
 				[:medium, :item1],
 				[:low, :item2]
 			]
+		end
+
+		with "cancellation window" do
+			it "redelivers an item when the selected waiter is cancelled before resuming" do
+				results = []
+
+				# Two older waiters at the same priority, in order `first` then `second`:
+				first = reactor.async do
+					results << [:first, queue.dequeue(priority: 5)]
+				end
+
+				second = reactor.async do
+					results << [:second, queue.dequeue(priority: 5)]
+				end
+
+				# A high priority waiter which jumps ahead of the two older waiters:
+				high = reactor.async do
+					results << [:high, queue.dequeue(priority: 10)]
+				end
+
+				# A later waiter at the same priority as the older two:
+				later = reactor.async do
+					results << [:later, queue.dequeue(priority: 5)]
+				end
+
+				expect(queue.waiting_count).to be == 4
+
+				# The producer selects the high priority waiter, but its fiber has not
+				# resumed yet. Cancel it within that window:
+				queue.push(:item)
+				high.stop
+
+				# The item is redelivered along the current waiting order, i.e. to the
+				# first of the older same-priority waiters. The high priority waiter never
+				# claims it and the other two waiters stay blocked:
+				first.wait
+				expect(results).to be == [[:first, :item]]
+				expect(queue.waiting_count).to be == 2
+				expect(queue).to be(:empty?)
+
+				# The remaining waiters keep their original same-priority (FIFO) order:
+				queue.push(:item2)
+				second.wait
+				expect(results).to be == [[:first, :item], [:second, :item2]]
+
+				queue.push(:item3)
+				later.wait
+				expect(results).to be == [
+					[:first, :item],
+					[:second, :item2],
+					[:later, :item3]
+				]
+
+				# Exactly one fiber actually received the item:
+				expect(results.map(&:last).count(:item)).to be == 1
+			end
+
+			it "returns the item to the queue if no other waiter can receive it" do
+				only = reactor.async do
+					queue.dequeue(priority: 5)
+				end
+
+				expect(queue.waiting_count).to be == 1
+
+				# Select the sole waiter, then cancel it before it resumes:
+				queue.push(:item)
+				only.stop
+
+				# Nothing was delivered, so the item stays available:
+				expect(queue).not.to be(:empty?)
+				expect(queue.size).to be == 1
+				expect(queue.waiting_count).to be == 0
+				expect(queue.dequeue).to be == :item
+			end
+
+			it "does not dispatch a redelivered item after the queue is closed" do
+				high = reactor.async do
+					queue.dequeue(priority: 10)
+				end
+
+				expect(queue.waiting_count).to be == 1
+
+				# Select the waiter, close the queue, then cancel it before it resumes:
+				queue.push(:item)
+				queue.close
+				high.stop
+
+				# The item is retained rather than handed to a dead waiter, and no waiters
+				# are left blocked:
+				expect(queue.waiting_count).to be == 0
+				expect(queue.items).to be == [:item]
+			end
 		end
 	end
 	
