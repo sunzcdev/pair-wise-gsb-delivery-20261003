@@ -751,6 +751,21 @@ class WorkerState:
         # tasks
         self.long_running.add(ts)
 
+    def remove_from_long_running(self, ts: TaskState) -> None:
+        """Move a task that rejoined the thread pool out of the long-running
+        set, so that it counts towards the worker's occupancy again.
+
+        This is the inverse of :meth:`add_to_long_running`.
+        """
+        if self.scheduler.validate:
+            assert ts in self.processing
+            assert ts in self.long_running
+
+        self.long_running.discard(ts)
+        tp = ts.prefix
+        self.task_prefix_count[tp.name] += 1
+        self.scheduler._task_prefix_count_global[tp.name] += 1
+
     def remove_from_processing(self, ts: TaskState) -> None:
         """Remove a task from a workers processing"""
         if self.scheduler.validate:
@@ -4119,6 +4134,7 @@ class Scheduler(SchedulerState, ServerNode):
             "release-worker-data": self.release_worker_data,
             "add-keys": self.add_keys,
             "long-running": self.handle_long_running,
+            "rejoin": self.handle_rejoin,
             "reschedule": self._reschedule,
             "keep-alive": lambda *args, **kwargs: None,
             "log-event": self.log_worker_event,
@@ -6093,6 +6109,59 @@ class Scheduler(SchedulerState, ServerNode):
         self.check_idle_saturated(ws)
 
         self.stimulus_queue_slots_maybe_opened(stimulus_id=stimulus_id)
+
+    def handle_rejoin(
+        self,
+        key: Key,
+        worker: str,
+        run_id: int,
+        stimulus_id: str,
+    ) -> None:
+        """A task that previously seceded from the thread pool has rejoined it
+
+        The task counts towards the worker's occupancy again, and it may be
+        stolen once more.
+        """
+        if worker not in self.workers:
+            logger.debug(
+                "Received rejoin signal from unknown worker %s. Ignoring.", worker
+            )
+            return
+
+        if key not in self.tasks:
+            logger.debug("Skipping rejoin since key %s was already released", key)
+            return
+
+        ts = self.tasks[key]
+
+        ws = ts.processing_on
+        if ws is None:
+            logger.debug("Received rejoin signal from duplicate task. Ignoring.")
+            return
+
+        if ws.address != worker or ts.run_id != run_id:
+            logger.debug(
+                "Received stale rejoin signal from worker %s for task %s. Ignoring.",
+                worker,
+                ts,
+            )
+            return
+
+        if ts not in ws.long_running:
+            logger.debug(
+                "Received rejoin signal for task %s which is not long-running. "
+                "Ignoring.",
+                ts,
+            )
+            return
+
+        ws.remove_from_long_running(ts)
+
+        steal = self.extensions.get("stealing")
+        if steal is not None:
+            steal.put_key_in_stealable(ts)
+
+        self.check_idle_saturated(ws)
 
     def handle_worker_status_change(
         self, status: str | Status, worker: str | WorkerState, stimulus_id: str

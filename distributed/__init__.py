@@ -62,7 +62,6 @@ from distributed.scheduler import KilledWorker, Scheduler
 from distributed.security import Security
 from distributed.semaphore import Semaphore
 from distributed.spans import span
-from distributed.threadpoolexecutor import rejoin
 from distributed.utils import CancelledError, TimeoutError, sync
 from distributed.variable import Variable
 from distributed.worker import (
@@ -71,6 +70,7 @@ from distributed.worker import (
     get_client,
     get_worker,
     print,
+    rejoin,
     secede,
     warn,
 )

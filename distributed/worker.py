@@ -91,8 +91,11 @@ from distributed.protocol.serialize import _is_dumpable
 from distributed.security import Security
 from distributed.sizeof import safe_sizeof as sizeof
 from distributed.spans import CONTEXTS_WITH_SPAN_ID, SpansWorkerExtension
-from distributed.threadpoolexecutor import ThreadPoolExecutor
-from distributed.threadpoolexecutor import secede as tpe_secede
+from distributed.threadpoolexecutor import (
+    ThreadPoolExecutor,
+    rejoin as tpe_rejoin,
+    secede as tpe_secede,
+)
 from distributed.utils import (
     TimeoutError,
     get_ip,
@@ -107,6 +110,7 @@ from distributed.utils import (
     run_in_executor_with_context,
     set_thread_state,
     silence_logging_cmgr,
+    sync,
     thread_state,
     wait_for,
 )
@@ -128,6 +132,7 @@ from distributed.worker_state_machine import (
     GatherDepSuccessEvent,
     PauseEvent,
     RefreshWhoHasEvent,
+    RejoinEvent,
     RemoveReplicasEvent,
     RemoveWorkerEvent,
     RescheduleEvent,
@@ -766,6 +771,10 @@ class Worker(BaseWorker, ServerNode):
             transfer_message_bytes_limit=transfer_message_bytes_limit,
         )
         BaseWorker.__init__(self, state)
+
+        # Set whenever a thread slot may have become available for seceded
+        # tasks waiting to rejoin the thread pool; see Worker.rejoin
+        self._rejoin_event = asyncio.Event()
 
         self.scheduler = self.rpc(scheduler_addr)
         self.execution_state = {
@@ -1848,6 +1857,47 @@ class Worker(BaseWorker, ServerNode):
                 topic, msg = e.to_event()
                 self.log_event(topic, msg)
             raise
+        finally:
+            # Wake up tasks waiting to rejoin the thread pool if a slot may
+            # have become available; see Worker.rejoin.
+            rejoin_event = getattr(self, "_rejoin_event", None)
+            if (
+                rejoin_event is not None
+                and self.state.executing_count < self.state.nthreads
+            ):
+                rejoin_event.set()
+
+    async def rejoin(self, key: Key) -> None:
+        """Wait for a thread slot to become available and move the task back
+        from long-running to executing, both on the worker and on the
+        scheduler.
+
+        This is the inverse of the stimulus emitted by :func:`~distributed.secede`.
+        It is idempotent: calling it for a task that is not currently seceded
+        (e.g. because a previous call already rejoined) returns immediately.
+
+        Cancelling the wait is safe: no capacity is reserved and no state is
+        modified until a slot has actually been claimed.
+
+        See also
+        --------
+        secede
+        """
+        while True:
+            ts = self.state.tasks.get(key)
+            if ts is None or ts.state != "long-running":
+                # Task is unknown, already done, or not seceded; nothing to do
+                return
+            if self.state.executing_count < self.state.nthreads:
+                # Claim the slot atomically (we're on the event loop, so no
+                # other stimulus can interleave between the check above and
+                # the transition below)
+                self.handle_stimulus(
+                    RejoinEvent(key=key, stimulus_id=f"rejoin-{time()}")
+                )
+                return
+            self._rejoin_event.clear()
+            await self._rejoin_event.wait()
 
     def stateof(self, key: str) -> dict[str, Any]:
         ts = self.state.tasks[key]
@@ -2687,6 +2737,50 @@ def secede():
             stimulus_id=f"secede-{time()}",
         ),
     )
+
+
+def rejoin():
+    """Have this task rejoin the worker's thread pool after having seceded
+
+    This blocks until a thread slot opens up (i.e. until the number of tasks
+    counting towards the worker's ``nthreads`` drops below it), then restores
+    this task's occupancy on both the worker and the scheduler, and finally
+    has this thread rejoin the thread pool. From this point on, the task is
+    subject to the worker's regular capacity constraints again.
+
+    This is the inverse of :func:`secede`; it is a no-op if the task did not
+    secede or already rejoined.
+
+    Examples
+    --------
+    >>> def mytask(x):
+    ...     # do some work
+    ...     client = get_client()
+    ...     futures = client.map(...)  # do some remote work
+    ...     secede()  # while that work happens, remove ourself from the pool
+    ...     result = client.gather(futures)
+    ...     rejoin()  # wait for a free slot, then count towards nthreads again
+    ...     return postprocess(result)  # do some more work
+
+    See Also
+    --------
+    secede
+    get_client
+    get_worker
+    """
+    try:
+        worker = get_worker()
+    except ValueError:
+        # Allow the low-level thread-pool helper to be used outside a Worker.
+        tpe_rejoin()
+        return
+
+    key = getattr(thread_state, "key", None)
+    if key is not None:
+        # Wait until the worker has capacity for this task again and restore its
+        # occupancy on both the worker and the scheduler.
+        sync(worker.loop, worker.rejoin, key)
+    tpe_rejoin()  # have this thread rejoin the thread pool
 
 
 async def get_data_from_worker(

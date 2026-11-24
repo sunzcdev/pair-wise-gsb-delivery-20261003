@@ -515,6 +515,24 @@ class LongRunningMsg(SendMessageToScheduler):
 
 
 @dataclass
+class RejoinMsg(SendMessageToScheduler):
+    """Worker -> Scheduler message to inform that a task that previously
+    seceded from the thread pool has rejoined it, so that it counts towards
+    the worker's occupancy again.
+
+    See also
+    --------
+    LongRunningMsg
+    """
+
+    op = "rejoin"
+
+    __slots__ = ("key", "run_id")
+    key: Key
+    run_id: int
+
+
+@dataclass
 class AddKeysMsg(SendMessageToScheduler):
     op = "add-keys"
 
@@ -1019,6 +1037,22 @@ class SecedeEvent(StateMachineEvent):
     __slots__ = ("key", "compute_duration")
     key: Key
     compute_duration: float
+
+
+@dataclass
+class RejoinEvent(StateMachineEvent):
+    """A task that previously seceded from the thread pool rejoins it.
+
+    The task counts towards the maximum number of concurrent tasks (nthreads)
+    again.
+
+    See also
+    --------
+    SecedeEvent
+    """
+
+    __slots__ = ("key",)
+    key: Key
 
 
 # {TaskState -> finish: TaskStateState | (finish: TaskStateState, transition *args)}
@@ -2311,6 +2345,30 @@ class WorkerState:
         self.long_running.add(ts)
         return self._ensure_computing()
 
+    def _transition_long_running_executing(
+        self, ts: TaskState, *, stimulus_id: str
+    ) -> RecsInstrs:
+        """The task rejoined the thread pool after having seceded from it, so
+        it counts towards the maximum number of concurrent tasks (nthreads)
+        again.
+
+        This is the inverse of :meth:`_transition_executing_long_running`.
+
+        See also
+        --------
+        RejoinEvent
+        """
+        ts.state = "executing"
+        self.long_running.discard(ts)
+        self.executing.add(ts)
+
+        smsg = RejoinMsg(
+            key=ts.key,
+            run_id=ts.run_id,
+            stimulus_id=stimulus_id,
+        )
+        return {}, [smsg]
+
     def _transition_executing_memory(
         self, ts: TaskState, value: object, run_id: int, *, stimulus_id: str
     ) -> RecsInstrs:
@@ -2520,6 +2578,7 @@ class WorkerState:
         ("flight", "missing"): _transition_flight_missing,
         ("flight", "released"): _transition_flight_released,
         ("long-running", "error"): _transition_generic_error,
+        ("long-running", "executing"): _transition_long_running_executing,
         ("long-running", "memory"): _transition_executing_memory,
         ("long-running", "rescheduled"): _transition_executing_rescheduled,
         ("long-running", "released"): _transition_executing_released,
@@ -3052,6 +3111,15 @@ class WorkerState:
         if not ts:
             return {}, []
         return {ts: ("long-running", ev.compute_duration)}, []
+
+    @_handle_event.register
+    def _handle_rejoin(self, ev: RejoinEvent) -> RecsInstrs:
+        # Repeated calls to rejoin() for the same task, as well as calls for
+        # tasks that never seceded, are a no-op
+        ts = self.tasks.get(ev.key)
+        if not ts or ts.state != "long-running":
+            return {}, []
+        return {ts: "executing"}, []
 
     @_handle_event.register
     def _handle_steal_request(self, ev: StealRequestEvent) -> RecsInstrs:

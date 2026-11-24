@@ -105,7 +105,6 @@ from distributed.publish import Datasets
 from distributed.security import Security
 from distributed.sizeof import sizeof
 from distributed.spans import SpanMetadata
-from distributed.threadpoolexecutor import rejoin
 from distributed.utils import (
     CancelledError,
     Deadline,
@@ -129,7 +128,7 @@ from distributed.utils_comm import (
     scatter_to_workers,
     unpack_remotedata,
 )
-from distributed.worker import get_client, get_worker, secede
+from distributed.worker import get_client, get_worker, rejoin, secede
 
 if TYPE_CHECKING:
     from typing import TypeAlias

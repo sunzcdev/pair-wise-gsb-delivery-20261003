@@ -6,8 +6,8 @@ import warnings
 import dask
 
 from distributed.metrics import time
-from distributed.threadpoolexecutor import rejoin, secede
-from distributed.worker import get_client, get_worker, thread_state
+from distributed.threadpoolexecutor import secede
+from distributed.worker import get_client, get_worker, rejoin, thread_state
 from distributed.worker_state_machine import SecedeEvent
 
 

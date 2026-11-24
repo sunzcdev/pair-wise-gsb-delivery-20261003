@@ -128,6 +128,9 @@ def rejoin():
     This will block until a new slot opens up in the executor.  The next thread
     to finish a task will leave the pool to allow this one to join.
 
+    This is a no-op if this thread is already part of the pool, so repeated
+    calls are safe.
+
     See Also
     --------
     secede : leave the thread pool
@@ -136,6 +139,9 @@ def rejoin():
     event = threading.Event()
     e = thread_state.executor
     with e._rejoin_lock:
+        if thread in e._threads:
+            # Already rejoined; nothing to do
+            return
         e._rejoin_list.append((thread, event))
     e.submit(lambda: None)
     event.wait()
