@@ -100,7 +100,21 @@ module Async
 			end
 			
 			@defer_cancel = nil
-			
+
+			# Tracks the delivery state of the first cancellation while the fiber is still alive:
+			# - `nil`: no cancellation has been initiated.
+			# - `:scheduled`: a `Cancel` has been raised into the fiber (or is otherwise in flight) but the fiber has not fully unwound yet.
+			# - `:caught`: the fiber caught the `Cancel` and has fully unwound the user block.
+			#
+			# Re-entrant cancels are only suppressed once the first `Cancel` has actually been delivered, never before.
+			@cancel_state = nil
+
+			# The primary reason this round of termination was triggered. It is assigned when the first cancel is initiated against this task and stays stable for the lifetime of the task, even if the fiber has not yet had a chance to process it.
+			@cancel_cause = nil
+
+			# The reason given by a re-entrant cancel that arrived after the first cancel had already been initiated (including while the fiber is unwinding and running its `ensure`/cleanup). It is kept for diagnostics without interrupting the recovery or replacing the primary {#cancel_cause}.
+			@parent_cause = nil
+
 			# Call this after all state is initialized, as it may call `add_child` which will set the parent and make it visible to the scheduler.
 			super(parent, **options)
 		end
@@ -187,6 +201,24 @@ module Async
 		# @returns [Boolean] Whether the task has been cancelled.
 		def cancelled?
 			@promise.cancelled?
+		end
+
+		# The primary reason this task's current (or final) round of termination was triggered.
+		#
+		# Once a task starts terminating due to a {Cancel}, the cause of that first cancel is preserved for the lifetime of the task and is not overwritten by any cancels that arrive while the task is finishing (e.g. when a parent task fails or is cancelled during cleanup).
+		#
+		# @returns [Exception | Nil] The primary cancellation cause, or nil if the task has not been cancelled.
+		def cancel_cause
+			@cancel_cause
+		end
+
+		# The reason given by a cancel that arrived while the task was already finishing.
+		#
+		# A task can be cancelled by the user and then have its parent task fail or be cancelled while its `ensure`/cleanup is still running. That later cancel must not interrupt the recovery that already started, but its reason is still useful for diagnostics, so it is recorded here without replacing the primary {#cancel_cause}.
+		#
+		# @returns [Exception | Nil] The cause of the re-entrant cancel, or nil if no such cancel occurred.
+		def parent_cause
+			@parent_cause
 		end
 		
 		# @returns [Boolean] Whether the task has completed execution and generated a result.
@@ -331,36 +363,65 @@ module Async
 			unless cause.is_a?(::Exception)
 				cause = nil
 			end
-			
+
 			# If no cause is given, we generate one from the current call stack:
 			unless cause
 				cause = Cancel::Cause.for("Cancelling task!")
 			end
-			
+
 			if self.cancelled?
 				# If the task is already cancelled, a `cancel` state transition re-enters the same state which is a no-op. However, we will also attempt to cancel any running children too. This can happen if the children did not cancel correctly the first time around. Doing this should probably be considered a bug, but it's better to be safe than sorry.
+				@parent_cause ||= cause if @cancel_cause
 				return cancelled!(cause)
 			end
-			
+
 			# If the fiber is alive, we need to cancel it:
 			if @fiber&.alive?
 				# As the task is now exiting, we want to ensure the event loop continues to execute until the task finishes.
 				self.transient = false
-				
+
 				# If we are deferring cancel...
 				if @defer_cancel == false
-					# Don't cancel now... but update the state so we know we need to cancel later.
+					# Don't cancel now... but update the state so we know we need to cancel later. This does not initiate a cancellation yet, so neither the primary cause nor the re-entrant parent cause is recorded here:
 					@defer_cancel = cause
 					return false
 				end
-				
+
+				# Record the primary reason on the very first cancellation that is actually delivered, and the reason of any later, re-entrant cancel separately. The primary reason is never replaced, so the cancel that actually triggered this round of termination stays identifiable while a parent failing during cleanup remains queryable via {#parent_cause}.
+				if @cancel_cause
+					@parent_cause ||= cause
+				else
+					@cancel_cause = cause
+				end
+
+				# A re-entrant cancel must not interrupt a recovery that has already started, while a forceful `terminate` of a fiber that has not begun unwinding must still work. We therefore only suppress delivery into a live fiber when:
+				#
+				# - the first `Cancel` has already been caught and the fiber is running its `rescue`/`ensure` cleanup (`:caught`), regardless of how the new cancel arrived; or
+				# - the first `Cancel` is in flight (`:scheduled`) and the new cancel is an indirect propagation (`later: true`, from `stop_children`, e.g. a parent failing while this task is being torn down). Such a propagated cancel would only queue on top of the first one and later interrupt the fiber's `ensure`, so we leave the in-flight cancel to finish the cleanup and release resources exactly once.
+				#
+				# A direct (`later: false`) cancel against a merely `:scheduled` fiber is never suppressed, which keeps forceful termination working.
+				suppress_redelivery =
+					@cancel_state == :caught || (@cancel_state == :scheduled && later)
+
+				if suppress_redelivery
+					begin
+						stop_children(true, cause: cause)
+					rescue Cancel
+						# A child being stopped may try to cancel this (current) task; do not let that interrupt this traversal:
+						retry
+					end
+
+					return false
+				end
+
 				if self.current?
 					# If the fiber is current, and later is `true`, we need to schedule the fiber to be cancelled later, as it's currently invoking `cancel`:
 					if later
 						# If the fiber is the current fiber and we want to cancel it later, schedule it:
 						Fiber.scheduler.push(Cancel::Later.new(self, cause))
 					else
-						# Otherwise, raise the exception directly:
+						# Otherwise, raise the exception directly, which delivers the `Cancel` immediately:
+						@cancel_state = :scheduled
 						raise Cancel, "Cancelling current task!", cause: cause
 					end
 				else
@@ -368,6 +429,8 @@ module Async
 					begin
 						# There is a chance that this will cancel the fiber that originally called cancel. If that happens, the exception handling in `#cancelled` will rescue the exception and re-raise it later.
 						Fiber.scheduler.raise(@fiber, Cancel, cause: cause)
+						# The `Cancel` was delivered to the fiber (it will catch it asynchronously):
+						@cancel_state = :scheduled
 					rescue FiberError
 						# In some cases, this can cause a FiberError (it might be resumed already), so we schedule it to be cancelled later:
 						Fiber.scheduler.push(Cancel::Later.new(self, cause))
@@ -375,6 +438,11 @@ module Async
 				end
 			else
 				# We are not running, but children might be, so transition directly into cancelled state:
+				if @cancel_cause
+					@parent_cause ||= cause
+				else
+					@cancel_cause = cause
+				end
 				cancel!(cause)
 			end
 		end
@@ -487,7 +555,10 @@ module Async
 		
 		def cancelled!(cause = $!)
 			# Console.info(self, status:) {"Task #{self} was cancelled with #{@children&.size.inspect} children!"}
-			
+
+			# Preserve the primary reason that triggered this round of termination. A re-entrant cancel during cleanup never replaces it:
+			@cancel_cause ||= cause
+
 			# Cancel the promise, specify nil here so that no exception is raised when waiting on the promise:
 			@promise.cancel(nil)
 			
@@ -527,12 +598,14 @@ module Async
 				begin
 					completed!(yield)
 				rescue Cancel => exception
+					# The fiber has fully unwound the user block after catching the cancellation:
+					@cancel_state = :caught
 					cancelled!(exception.cause || exception)
 				rescue StandardError => error
 					failed!(error)
 				rescue Exception => exception
 					failed!(exception)
-					
+
 					# This is a critical failure, we should stop the reactor:
 					raise
 				ensure
@@ -540,9 +613,9 @@ module Async
 					finish!
 				end
 			end
-			
+
 			@fiber.async_task = self
-			
+
 			(Fiber.scheduler || self.reactor).resume(@fiber)
 		end
 	end

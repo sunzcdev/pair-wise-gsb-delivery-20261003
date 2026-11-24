@@ -843,6 +843,128 @@ describe Async::Task do
 			expect(child_error.cause).to be == cause
 			expect(grandchild_error.cause).to be == cause
 		end
+
+		with "re-entrant cancellation during cleanup" do
+			it "preserves the primary cause and records the parent cause without interrupting cleanup" do
+				user_cause = RuntimeError.new("user cancel")
+				parent_cause = RuntimeError.new("parent failed elsewhere")
+
+				in_ensure = Async::Notification.new
+				proceed = Async::Notification.new
+
+				releases = []
+				parent = child = nil
+
+				reactor.run do |root|
+					parent = root.async do |task|
+						child = task.async do |child_task|
+							begin
+								sleep
+							ensure
+								# Signal that cleanup has started, then cooperatively yield and park once:
+								in_ensure.signal
+								child_task.yield
+								proceed.wait
+
+								releases << :resource
+							end
+						end
+
+						driver = task.async do
+							in_ensure.wait
+
+							# The child is now inside its `ensure`; cancelling the parent propagates a re-entrant cancel into it:
+							parent.cancel(cause: parent_cause)
+							proceed.signal
+						end
+
+						# 1) The user cancels the child first:
+						child.cancel(cause: user_cause)
+					end
+
+					parent.wait
+				end
+
+				# The cleanup ran to completion and the resource was released exactly once:
+				expect(releases).to be == [:resource]
+
+				# The primary reason (the cancel that actually triggered this round) is preserved:
+				expect(child).to be(:cancelled?)
+				expect(child.cancel_cause).to be == user_cause
+
+				# The later, re-entrant reason remains queryable without replacing the primary one:
+				expect(child.parent_cause).to be == parent_cause
+			end
+
+			it "releases a resource exactly once even when cleanup yields to the scheduler" do
+				user_cause = RuntimeError.new("user cancel")
+				parent_cause = RuntimeError.new("parent gone")
+
+				in_ensure = Async::Notification.new
+				proceed = Async::Notification.new
+				releases = []
+				parent = child = nil
+
+				reactor.run do |root|
+					parent = root.async do |task|
+						child = task.async do |child_task|
+							begin
+								sleep
+							ensure
+								in_ensure.signal
+
+								# The cleanup must be allowed to yield back to the scheduler once:
+								child_task.yield
+								proceed.wait
+
+								releases << :resource
+							end
+						end
+
+						task.async do
+							in_ensure.wait
+							parent.cancel(cause: parent_cause)
+							proceed.signal
+						end
+
+						child.cancel(cause: user_cause)
+					end
+
+					parent.wait
+				end
+
+				expect(releases.size).to be == 1
+				expect(child.cancel_cause).to be == user_cause
+				expect(child.parent_cause).to be == parent_cause
+			end
+
+			it "still forcefully terminates a task that has not begun unwinding" do
+				# A transient task whose `ensure` blocks again must still be reclaimed by a forceful termination:
+				task = reactor.async(transient: true) do
+					sleep
+				ensure
+					sleep
+				end
+
+				expect(reactor).to be(:finished?)
+				expect(reactor.run_once(0)).to be == true
+
+				reactor.close
+
+				expect(task).to be(:cancelled?)
+				expect(reactor).to be(:closed?)
+			end
+
+			it "exposes nil causes for a task that was never cancelled" do
+				task = reactor.async do
+					:done
+				end
+
+				expect(task.wait).to be == :done
+				expect(task.cancel_cause).to be_nil
+				expect(task.parent_cause).to be_nil
+			end
+		end
 	end
 	
 	with "#sleep" do
