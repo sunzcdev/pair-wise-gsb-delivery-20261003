@@ -555,11 +555,23 @@ class ProcessEnv(abc.ABC):
         if include_outer_env:
             computed_env = {**os.environ, **computed_env}
         if self.bin_paths:
+            path_key, prior_path = nox.command.extract_path(computed_env)
+            if _PLATFORM.startswith("win"):
+                # Windows treats PATH names case-insensitively; drop every
+                # casing so the override, empty string or removal becomes a
+                # single entry rather than two competing variables.
+                path_keys = [key for key in computed_env if key.upper() == "PATH"]
+            else:
+                path_keys = ["PATH"] if "PATH" in computed_env else []
+            for key in path_keys:
+                del computed_env[key]
+
             path_parts = [*self.bin_paths]
-            prior_path = computed_env.get("PATH")
             if prior_path:
                 path_parts.append(prior_path)
-            computed_env["PATH"] = os.pathsep.join(path_parts)
+            # Preserve the caller's chosen spelling when one was supplied;
+            # otherwise keep the conventional PATH name.
+            computed_env[path_key or "PATH"] = os.pathsep.join(path_parts)
         return computed_env
 
 

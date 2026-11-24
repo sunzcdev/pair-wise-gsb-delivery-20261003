@@ -447,6 +447,54 @@ class TestSession:
         assert "sad" not in result
         assert "unhappy" not in result
 
+    @pytest.mark.skipif(
+        not sys.platform.startswith("win"), reason="Windows-only PATH casing rules."
+    )
+    def test_run_path_override_different_casing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("PATH", os.pathsep.join(["/host/bin", os.environ["PATH"]]))
+        session, runner = self.make_session_and_runner()
+        assert runner.venv
+
+        with mock.patch("nox.command.run", autospec=True) as run:
+            session.run(
+                "sigtool",
+                env={"Path": "/override/bin", "SIGVAR": "normal-value"},
+                silent=True,
+            )
+
+        passed_env = run.call_args.kwargs["env"]
+        assert [key for key in passed_env if key.upper() == "PATH"] == ["Path"]
+        assert passed_env["Path"] == os.pathsep.join(
+            ["/no/bin/for/you", "/override/bin"]
+        )
+        assert passed_env["SIGVAR"] == "normal-value"
+        assert "/host/bin" not in passed_env["Path"]
+
+    @pytest.mark.skipif(
+        not sys.platform.startswith("win"), reason="Windows-only PATH casing rules."
+    )
+    def test_run_path_removed_without_outer_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HOST_ONLY", "host-value")
+        session, runner = self.make_session_and_runner()
+        assert runner.venv
+
+        with mock.patch("nox.command.run", autospec=True) as run:
+            session.run(
+                "sigtool",
+                env={"PATH": None, "SIGVAR": "normal-value"},
+                include_outer_env=False,
+                silent=True,
+            )
+
+        passed_env = run.call_args.kwargs["env"]
+        assert passed_env["PATH"] == "/no/bin/for/you"
+        assert "HOST_ONLY" not in passed_env
+        assert passed_env["SIGVAR"] == "normal-value"
+
     def test_run_external_not_a_virtualenv(self) -> None:
         # Non-virtualenv sessions should always allow external programs.
         session, runner = self.make_session_and_runner()

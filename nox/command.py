@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
     from typing import IO
 
-__all__ = ["CommandFailed", "ExternalType", "run", "which"]
+__all__ = ["CommandFailed", "ExternalType", "extract_path", "run", "which"]
 
 _PLATFORM = sys.platform
 
@@ -55,21 +55,61 @@ class CommandFailed(Exception):
 
 
 def which(
-    program: str | os.PathLike[str], paths: Sequence[str | os.PathLike[str]] | None
+    program: str | os.PathLike[str],
+    paths: Sequence[str | os.PathLike[str]] | None,
+    env: Mapping[str, str | None] | None = None,
 ) -> str:
-    """Finds the full path to an executable."""
+    """Finds the full path to an executable.
+
+    Lookup honours the environment the command will actually receive: a
+    ``PATH`` supplied in *env* (possibly an empty string, meaning an empty
+    search path) is used instead of the parent process's ``PATH``. On Windows
+    environment variables are case-insensitive, so any casing of ``PATH``
+    (``Path``, ``path``, ...) is recognised.
+    """
     if paths is not None:
         full_path = shutil.which(program, path=os.pathsep.join(str(p) for p in paths))
         if full_path:
             return os.fspath(full_path)
 
-    full_path = shutil.which(program)
-    if full_path:
-        return os.fspath(full_path)
+    path_key, path_value = extract_path(env)
+    if path_key is not None:
+        # An explicit value always wins, including an empty string: the caller
+        # asked for that exact search path, so don't fall back to the parent
+        # process's PATH when nothing is found in it.
+        full_path = shutil.which(program, path=path_value)
+        if full_path:
+            return os.fspath(full_path)
+    else:
+        full_path = shutil.which(program)
+        if full_path:
+            return os.fspath(full_path)
 
     logger.error(f"Program {program} not found.")
     msg = f"Program {program} not found"
     raise CommandFailed(msg)
+
+
+def extract_path(
+    env: Mapping[str, str | None] | None,
+) -> tuple[str | None, str | None]:
+    """Return the ``(key, value)`` of the PATH entry from *env*.
+
+    On Windows environment variable names are case-insensitive, so every
+    casing of ``PATH`` refers to the same variable; the last such entry wins,
+    matching how the operating system would resolve it. On other platforms
+    only the literal ``PATH`` key is considered. A missing entry returns
+    ``(None, None)``.
+    """
+    if not env:
+        return None, None
+    if _PLATFORM.startswith("win"):
+        matches = [(key, value) for key, value in env.items() if key.upper() == "PATH"]
+    else:
+        matches = [(key, value) for key, value in env.items() if key == "PATH"]
+    if not matches:
+        return None, None
+    return matches[-1]
 
 
 def _clean_env(env: Mapping[str, str | None] | None = None) -> dict[str, str] | None:
@@ -162,7 +202,12 @@ def run(
     cmd, args = args[0], args[1:]
     full_cmd = f"{cmd} {_shlex_join(args)}"
 
-    cmd_path = which(os.fspath(cmd), paths)
+    # Resolve the environment the command will actually run with before doing
+    # any lookup, so the same PATH (overrides, removals, limited inheritance)
+    # governs both command resolution and the child process.
+    env = _clean_env(env)
+
+    cmd_path = which(os.fspath(cmd), paths, env)
     str_args = [os.fspath(arg) for arg in args]
 
     if log:
@@ -187,8 +232,6 @@ def run(
                 f" located at {cmd_path}. This might cause issues! Pass"
                 " external=True into run() to silence this message."
             )
-
-    env = _clean_env(env)
 
     try:
         return_code, output = popen(

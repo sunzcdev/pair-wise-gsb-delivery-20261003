@@ -155,6 +155,68 @@ def test_process_env_get_env_exclude_outer() -> None:
     assert env["PATH"] == "/test/bin"
 
 
+def test_process_env_get_env_empty_path_keeps_bin_prefix() -> None:
+    # An empty-string PATH is an explicit value: the bin prefix is still
+    # prepended, producing a PATH containing only the virtualenv bin dir.
+    penv = nox.virtualenv.PassthroughEnv(bin_paths=["/test/bin"])
+    env = penv._get_env({"PATH": ""}, include_outer_env=True)
+    assert env["PATH"] == "/test/bin"
+
+
+def test_process_env_get_env_removed_path_exclude_outer() -> None:
+    # Removing PATH (None) and closing inheritance leaves only the bin prefix.
+    penv = nox.virtualenv.PassthroughEnv(bin_paths=["/test/bin"])
+    env = penv._get_env({"PATH": None}, include_outer_env=False)
+    assert [key for key in env if key.upper() == "PATH"] == ["PATH"]
+    assert env["PATH"] == "/test/bin"
+
+
+def test_process_env_get_env_override_path() -> None:
+    penv = nox.virtualenv.PassthroughEnv(bin_paths=["/test/bin"])
+    env = penv._get_env({"PATH": "/custom/bin"}, include_outer_env=False)
+    assert env["PATH"] == os.pathsep.join(["/test/bin", "/custom/bin"])
+
+
+@mock.patch("nox.virtualenv._PLATFORM", "win32")
+@mock.patch("nox.command._PLATFORM", "win32")
+def test_process_env_get_env_windows_case_insensitive_path() -> None:
+    penv = nox.virtualenv.PassthroughEnv(bin_paths=[r"C:\venv\Scripts"])
+    # The host exposes "PATH" while the caller overrides with a different
+    # casing. They must collapse into a single entry using the caller's value.
+    with mock.patch.dict(os.environ, {"PATH": r"C:\host\bin"}, clear=False):
+        env = penv._get_env({"Path": r"C:\override\bin"})
+
+    assert [key for key in env if key.upper() == "PATH"] == ["Path"]
+    assert env["Path"] == os.pathsep.join(
+        [r"C:\venv\Scripts", r"C:\override\bin"]
+    )
+    assert r"C:\host\bin" not in env["Path"]
+
+
+@mock.patch("nox.virtualenv._PLATFORM", "win32")
+@mock.patch("nox.command._PLATFORM", "win32")
+def test_process_env_get_env_windows_removed_path() -> None:
+    penv = nox.virtualenv.PassthroughEnv(bin_paths=[r"C:\venv\Scripts"])
+    with mock.patch.dict(os.environ, {"PATH": r"C:\host\bin"}, clear=False):
+        env = penv._get_env({"Path": None}, include_outer_env=False)
+
+    # The caller's spelling is retained even though the value was a removal,
+    # and only the bin prefix survives.
+    assert [key for key in env if key.upper() == "PATH"] == ["Path"]
+    assert env["Path"] == r"C:\venv\Scripts"
+
+
+@mock.patch("nox.virtualenv._PLATFORM", "win32")
+@mock.patch("nox.command._PLATFORM", "win32")
+def test_process_env_get_env_windows_empty_path() -> None:
+    penv = nox.virtualenv.PassthroughEnv(bin_paths=[r"C:\venv\Scripts"])
+    with mock.patch.dict(os.environ, {"PATH": r"C:\host\bin"}, clear=False):
+        env = penv._get_env({"Path": ""})
+
+    assert [key for key in env if key.upper() == "PATH"] == ["Path"]
+    assert env["Path"] == r"C:\venv\Scripts"
+
+
 def test_ensure_gitignore_creates_file(tmp_path: Path) -> None:
     envdir = tmp_path.joinpath(".nox")
     location = envdir.joinpath("session")

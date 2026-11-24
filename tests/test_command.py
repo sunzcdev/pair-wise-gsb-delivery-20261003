@@ -304,6 +304,199 @@ def test_run_env_systemroot() -> None:
     assert systemroot in result
 
 
+def test_extract_path_missing() -> None:
+    assert nox.command.extract_path(None) == (None, None)
+    assert nox.command.extract_path({}) == (None, None)
+    assert nox.command.extract_path({"OTHER": "x"}) == (None, None)
+
+
+def test_extract_path_exact() -> None:
+    assert nox.command.extract_path({"PATH": "a"}) == ("PATH", "a")
+    # An empty string is a real, meaningful value (an empty search path).
+    assert nox.command.extract_path({"PATH": ""}) == ("PATH", "")
+
+
+@only_on_windows
+def test_extract_path_case_insensitive_windows() -> None:
+    # Every casing names the same variable on Windows; the last entry wins,
+    # which is how the operating system would resolve the duplicate.
+    assert nox.command.extract_path({"Path": "a"}) == ("Path", "a")
+    assert nox.command.extract_path({"PATH": "a", "Path": "b"}) == ("Path", "b")
+    assert nox.command.extract_path({"path": "a", "PATH": ""}) == ("PATH", "")
+
+
+def test_which_uses_env_path(tmp_path: Path) -> None:
+    executable_name = (
+        "testexc.exe" if "windows" in platform.platform().lower() else "testexc"
+    )
+    outside = tmp_path / "outside"
+    inside = tmp_path / "inside"
+    outside.mkdir()
+    inside.mkdir()
+    executable = inside / executable_name
+    executable.touch()
+    executable.chmod(0o700)
+
+    # The host process PATH cannot see the tool, but the supplied env does.
+    resolved = nox.command.which(
+        executable_name, None, {"PATH": str(inside)}
+    )
+    assert Path(resolved) == executable
+
+
+def test_which_env_path_empty_string_blocks_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable_name = (
+        "testexc.exe" if "windows" in platform.platform().lower() else "testexc"
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    executable = outside / executable_name
+    executable.touch()
+    executable.chmod(0o700)
+    # The tool would be found through the parent process's PATH...
+    monkeypatch.setenv("PATH", str(outside))
+    # ...but an explicit empty search path must not fall back to it.
+    with pytest.raises(nox.command.CommandFailed):
+        nox.command.which(executable_name, None, {"PATH": ""})
+
+
+@only_on_windows
+def test_which_env_path_case_insensitive_windows(tmp_path: Path) -> None:
+    executable = tmp_path / "testexc.exe"
+    executable.touch()
+    executable.chmod(0o700)
+
+    resolved = nox.command.which("testexc", None, {"Path": str(tmp_path)})
+    assert Path(resolved) == executable
+
+
+def test_which_without_env_keeps_parent_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable_name = (
+        "testexc.exe" if "windows" in platform.platform().lower() else "testexc"
+    )
+    executable = tmp_path / executable_name
+    executable.touch()
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    # No env supplied: behave like the historical shutil.which() lookup.
+    assert Path(nox.command.which(executable_name, None)) == executable
+    assert Path(nox.command.which(executable_name, None, {})) == executable
+
+
+def test_run_resolves_command_with_computed_env(tmp_path: Path) -> None:
+    executable_name = (
+        "testexc.exe" if "windows" in platform.platform().lower() else "testexc"
+    )
+    executable = tmp_path / executable_name
+    executable.touch()
+    executable.chmod(0o700)
+
+    with mock.patch("nox.command.popen") as mock_command:
+        mock_command.return_value = (0, "")
+        nox.command.run(
+            [executable_name],
+            silent=True,
+            env={"PATH": str(tmp_path), "SIGIL": "123"},
+        )
+        mock_command.assert_called_once()
+        called_args, called_kwargs = mock_command.call_args
+        assert called_args[0][0] == str(executable)
+        assert called_kwargs["env"]["SIGIL"] == "123"
+        assert called_kwargs["env"]["PATH"] == str(tmp_path)
+
+
+@only_on_windows
+def test_run_path_override_removal_and_inheritance_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two tool dirs sharing a tool name exercise the full command pipeline.
+
+    Cell 1 overrides the tool PATH with a differently-cased key, cell 2
+    removes it and closes inheritance, and an ordinary cell 3 run in the same
+    process must still see the original host environment.
+    """
+    import nox.virtualenv
+
+    dir_one = tmp_path / "one"
+    dir_two = tmp_path / "two"
+    dir_one.mkdir()
+    dir_two.mkdir()
+    for directory, tag in ((dir_one, "ONE"), (dir_two, "TWO")):
+        (directory / "sigtool.cmd").write_text(
+            "@echo off\r\n"
+            f"echo TOOL={tag}\r\n"
+            "echo SIGVAR=%SIGVAR%\r\n"
+            "echo PATHVAL=%PATH%\r\n",
+            encoding="ascii",
+        )
+
+    # A real bin directory standing in for the virtualenv's own prefix.
+    venv_bin = Path(PYTHON).parent
+    assert (venv_bin / "python.exe").exists()
+    penv = nox.virtualenv.PassthroughEnv(bin_paths=[str(venv_bin)])
+
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join([str(dir_one), os.environ["PATH"]])
+    )
+    monkeypatch.setenv("HOST_MARKER", "host-value")
+
+    def parse(output: str) -> dict[str, str]:
+        return dict(line.split("=", 1) for line in output.splitlines())
+
+    # --- Cell 1: differently-cased override wins; venv bin prefix retained.
+    env1 = nox.command._clean_env(
+        penv._get_env(
+            {"Path": str(dir_two), "SIGVAR": "cell1-normal"},
+            include_outer_env=True,
+        )
+    )
+    assert [key for key in env1 if key.upper() == "PATH"] == ["Path"]
+    output1 = parse(
+        nox.command.run(["sigtool.cmd"], env=env1, silent=True, external=True)
+    )
+    assert output1["TOOL"] == "TWO"
+    assert output1["SIGVAR"] == "cell1-normal"
+    assert str(venv_bin) in output1["PATHVAL"]
+    assert str(dir_two) in output1["PATHVAL"]
+    assert str(dir_one) not in output1["PATHVAL"]
+    # The virtualenv's own tool remains reachable through the bin prefix.
+    assert Path(nox.command.which("python", penv.bin_paths, env1)).parent == venv_bin
+
+    # --- Cell 2: outer tool PATH removed, inheritance closed.
+    env2 = nox.command._clean_env(
+        penv._get_env(
+            {"PATH": None, "SIGVAR": "cell2-normal"},
+            include_outer_env=False,
+        )
+    )
+    assert env2["PATH"] == str(venv_bin)
+    assert "HOST_MARKER" not in env2
+    with pytest.raises(nox.command.CommandFailed):
+        nox.command.which("sigtool.cmd", penv.bin_paths, env2)
+    output2 = parse(
+        nox.command.run(
+            [str(dir_two / "sigtool.cmd")], env=env2, silent=True, external=True
+        )
+    )
+    assert output2["TOOL"] == "TWO"
+    assert output2["SIGVAR"] == "cell2-normal"
+    assert output2["PATHVAL"] == str(venv_bin)
+
+    # --- Cell 3: ordinary run in the same process keeps the host environment.
+    env3 = nox.command._clean_env(penv._get_env({}, include_outer_env=True))
+    output3 = parse(
+        nox.command.run(["sigtool.cmd"], env=env3, silent=True, external=True)
+    )
+    assert output3["TOOL"] == "ONE"
+    assert env3["HOST_MARKER"] == "host-value"
+    assert str(dir_one) in env3["PATH"]
+
+
 def test_run_not_found() -> None:
     with pytest.raises(nox.command.CommandFailed):
         nox.command.run(["nonexistentcmd"])
