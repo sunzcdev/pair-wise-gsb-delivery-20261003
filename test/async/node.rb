@@ -57,6 +57,70 @@ describe Async::Node do
 		end
 	end
 	
+	with "#transfer_to" do
+		let(:parent) {Async::Node.new(node)}
+		let(:new_parent) {Async::Node.new(node)}
+		let(:child) {Async::Node.new(parent)}
+		
+		before do
+			# A node can only participate in a transfer if it is retained by pending (non-transient) children:
+			Async::Node.new(child, annotation: "grandchild")
+			Async::Node.new(new_parent, annotation: "retainer")
+		end
+		
+		it "transfers a node and its subtree to a new parent" do
+			grandchild = child.children.first
+			
+			expect(child.transfer_to(new_parent)).to be == true
+			
+			expect(child.parent).to be_equal(new_parent)
+			expect(new_parent.children).to be(:include?, child)
+			expect(parent.children).to be(:empty?)
+			
+			# The subtree moves with the node:
+			expect(grandchild.parent).to be_equal(child)
+		end
+		
+		it "is a no-op if the parent is unchanged" do
+			expect(child.transfer_to(parent)).to be == true
+			expect(child.parent).to be_equal(parent)
+		end
+		
+		it "cannot transfer to itself" do
+			expect(child.transfer_to(child)).to be == false
+			expect(child.parent).to be_equal(parent)
+		end
+		
+		it "cannot transfer to a finished parent" do
+			finished_parent = Async::Node.new(node)
+			expect(finished_parent).to be(:finished?)
+			
+			expect(child.transfer_to(finished_parent)).to be == false
+			expect(child.parent).to be_equal(parent)
+		end
+		
+		it "cannot transfer a finished node" do
+			finished_child = Async::Node.new(parent)
+			expect(finished_child).to be(:finished?)
+			
+			expect(finished_child.transfer_to(new_parent)).to be == false
+			expect(finished_child.parent).to be_equal(parent)
+		end
+		
+		it "preserves transient state across the transfer" do
+			transient_child = Async::Node.new(parent, transient: true)
+			# Retain the transient child so that it can participate in a transfer:
+			Async::Node.new(transient_child)
+			
+			expect(parent.children).to be(:transients?)
+			
+			expect(transient_child.transfer_to(new_parent)).to be == true
+			
+			expect(parent.children).not.to be(:transients?)
+			expect(new_parent.children).to be(:transients?)
+		end
+	end
+	
 	with "#print_hierarchy" do
 		let(:buffer) {StringIO.new}
 		let(:output) {buffer.string}

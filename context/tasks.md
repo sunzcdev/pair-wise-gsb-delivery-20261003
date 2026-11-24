@@ -451,3 +451,35 @@ end
 ```
 
 Upon exiting the top level async block, the {ruby @refresh} task will be set to `nil`. Bear in mind, you should not share these resources across threads; doing so would need some form of mutual exclusion.
+
+### Transferring Tasks Between Parents
+
+Sometimes, a task is created by one parent but should outlive it. For example, a background job may be started as a child of the current request, but once it is ready, it should be handed off to a long-lived watcher. {ruby Async::Node#transfer_to} performs this handoff explicitly:
+
+```ruby
+Async do |task|
+	# A long-lived watcher which outlives individual requests:
+	watcher = task.async do
+		# ... monitor background jobs ...
+	end
+	
+	# A request-scoped task:
+	request = task.async do |subtask|
+		# A background job which should outlive the request:
+		job = subtask.async do
+			# ... background work ...
+		end
+		
+		# Once the job is ready, hand it off to the watcher:
+		job.transfer_to(watcher)
+	end
+end
+```
+
+The transfer is atomic with respect to the event loop: the parent change, and the cancellation and waiting boundaries that derive from it, are settled together. After a successful transfer:
+
+1. The original parent will no longer `cancel` the task or wait for it (e.g. via {ruby Async::Task#wait_all}).
+2. The new parent assumes those responsibilities: only that tree is responsible for finishing the task.
+3. The task's entire subtree, including any transient children, moves with it.
+
+A transfer can only occur if both the task and the new parent are definitely retained by the task tree. If the task is already finished, there is no pending work to hand off. If the new parent is already finished, it cannot take ownership of new children. In either case, `transfer_to` returns `false` and the task remains with its original parent, which stays responsible for finishing it.

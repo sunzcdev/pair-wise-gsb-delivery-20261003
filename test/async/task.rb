@@ -1460,4 +1460,242 @@ describe Async::Task do
 			expect(state).to be == :finished
 		end
 	end
+
+	with "#transfer_to" do
+		it "can hand off a background job to a long-lived watcher" do
+			reactor.run do |task|
+				# A long-lived watcher which outlives any individual request:
+				watcher = task.async do
+					sleep(10)
+				end
+				
+				ready = Async::Condition.new
+				job = transient = nil
+				transferred = nil
+				
+				# A request-scoped task, with a background job that should outlive it:
+				request = task.async do |subtask|
+					job = subtask.async do |job_task|
+						# The job carries its own transient child task:
+						transient = job_task.async(transient: true) do
+							sleep(10)
+						end
+						
+						sleep(10)
+					end
+					
+					# The job is now running; hand it off to the watcher:
+					transferred = job.transfer_to(watcher)
+					ready.signal
+				end
+				
+				# Wait until the handoff is complete:
+				ready.wait
+				expect(transferred).to be == true
+				
+				# The request finished without waiting for the job:
+				expect(request).to be(:finished?)
+				request.wait_all
+				
+				# The job, and its transient child, are now owned by the watcher:
+				expect(job.parent).to be == watcher
+				expect(transient.parent).to be == job
+				expect(job).to be(:running?)
+				expect(transient).to be(:running?)
+				
+				# Only the owning tree is responsible for finishing the job:
+				watcher.cancel
+				expect(job).to be(:cancelled?)
+
+				# The transient child is not cancelled directly, but handed up the tree:
+				expect(transient).to be(:running?)
+
+				# Let the watcher finish unwinding:
+				task.yield
+				expect(transient.parent).to be == task
+				transient.cancel
+				
+				# Both parents exit correctly:
+				expect(request).to be(:finished?)
+				expect(watcher).to be(:finished?)
+			end
+		end
+		
+		it "is not cancelled by the original parent after transfer" do
+			reactor.run do |task|
+				watcher = task.async do
+					sleep(10)
+				end
+				
+				ready = Async::Condition.new
+				job = nil
+				transferred = nil
+				
+				request = task.async do |subtask|
+					job = subtask.async do
+						sleep(10)
+					end
+					
+					transferred = job.transfer_to(watcher)
+					ready.signal
+					
+					sleep(10)
+				end
+				
+				ready.wait
+				expect(transferred).to be == true
+				
+				# Cancelling the original parent does not affect the transferred job:
+				request.cancel
+				expect(request).to be(:cancelled?)
+				
+				expect(job.parent).to be == watcher
+				expect(job).to be(:running?)
+				
+				job.cancel
+				watcher.cancel
+			end
+		end
+		
+		it "remains with the original parent if the new parent is finished" do
+			reactor.run do |task|
+				# A watcher which has already finished:
+				watcher = task.async {}
+				watcher.wait
+				expect(watcher).to be(:finished?)
+				
+				ready = Async::Condition.new
+				job = nil
+				transferred = nil
+				
+				request = task.async do |subtask|
+					job = subtask.async do
+						sleep(10)
+					end
+					
+					# The transfer cannot occur, so the job remains with the request:
+					transferred = job.transfer_to(watcher)
+					ready.signal
+					
+					sleep(10)
+				end
+				
+				ready.wait
+				expect(transferred).to be == false
+				expect(job.parent).to be == request
+				
+				# The original parent is still responsible for finishing the job:
+				request.cancel
+				expect(job).to be(:cancelled?)
+
+				# Let the request finish unwinding:
+				task.yield
+				expect(request).to be(:finished?)
+			end
+		end
+		
+		it "cannot transfer to itself" do
+			reactor.run do |task|
+				job = task.async do
+					sleep(10)
+				end
+				
+				expect(job.transfer_to(job)).to be == false
+				expect(job.parent).to be == task
+				
+				job.cancel
+			end
+		end
+		
+		it "settles cancellation and transfer scheduled together" do
+			reactor.run do |task|
+				watcher = task.async do
+					sleep(10)
+				end
+				
+				job = nil
+				request = task.async do |subtask|
+					job = subtask.async do
+						sleep(10)
+					end
+					
+					sleep(10)
+				end
+				
+				gate = Async::Condition.new
+				transferred = nil
+				
+				# The original parent's cancellation and the handoff enter the scheduler together:
+				canceller = task.async do
+					gate.wait
+					request.cancel
+				end
+				
+				handoff = task.async do
+					gate.wait
+					transferred = job.transfer_to(watcher)
+				end
+				
+				gate.signal
+				canceller.wait
+				handoff.wait
+				
+				# The cancellation won the race: the job was cancelled by its original parent, and the transfer could not occur:
+				expect(transferred).to be == false
+				expect(job).to be(:cancelled?)
+				expect(job.parent).to be_nil
+				
+				# Both parents exit correctly:
+				expect(request).to be(:finished?)
+				
+				watcher.cancel
+				expect(watcher).to be(:finished?)
+			end
+		end
+		
+		it "settles transfer and cancellation scheduled together" do
+			reactor.run do |task|
+				watcher = task.async do
+					sleep(10)
+				end
+				
+				job = nil
+				request = task.async do |subtask|
+					job = subtask.async do
+						sleep(10)
+					end
+					
+					sleep(10)
+				end
+				
+				gate = Async::Condition.new
+				transferred = nil
+				
+				# The handoff and the original parent's cancellation enter the scheduler together:
+				handoff = task.async do
+					gate.wait
+					transferred = job.transfer_to(watcher)
+				end
+				
+				canceller = task.async do
+					gate.wait
+					request.cancel
+				end
+				
+				gate.signal
+				handoff.wait
+				canceller.wait
+				
+				# The transfer won the race: the job is owned by the watcher and was not cancelled:
+				expect(transferred).to be == true
+				expect(job.parent).to be == watcher
+				expect(job).to be(:running?)
+				expect(request).to be(:cancelled?)
+				
+				job.cancel
+				watcher.cancel
+			end
+		end
+	end
 end
+		

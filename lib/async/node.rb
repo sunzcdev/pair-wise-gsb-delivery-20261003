@@ -204,6 +204,35 @@ module Async
 			return self
 		end
 		
+		# Transfer this node, and its entire subtree, to a new parent.
+		#
+		# This is an explicit handoff of ownership: the parent change, and the cancellation and waiting boundaries that derive from it, are settled together, atomically with respect to the event loop. After a successful transfer, the original parent will no longer cancel this node (e.g. via {Node#cancel}) or wait for it (e.g. via {Task#wait_all}); the new parent assumes those responsibilities, and only that tree is responsible for finishing this node.
+		#
+		# A transfer can only occur between two nodes that are both definitely retained by the task tree:
+		#
+		# - If this node is finished, there is no pending work to hand off, and nothing would remain to remove it from its new parent.
+		# - If the new parent is finished, it cannot take ownership of new children, as it may be consumed (removed from the tree) at any time.
+		#
+		# In either case, the node remains with its original parent.
+		#
+		# @parameter parent [Node] The new parent.
+		# @returns [Boolean] Whether the transfer occurred.
+		def transfer_to(parent)
+			# A node cannot be transferred to itself, and a finished node has no pending work to hand off:
+			if parent.nil? || parent.equal?(self) || self.finished?
+				return false
+			end
+		
+			# A finished parent cannot take ownership of new children:
+			if parent.finished?
+				return false
+			end
+		
+			self.parent = parent
+		
+			return true
+		end
+		
 		protected def set_parent(parent)
 			@parent = parent
 		end
