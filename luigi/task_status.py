@@ -26,3 +26,20 @@ BATCH_RUNNING = "BATCH_RUNNING"
 SUSPENDED = "SUSPENDED"  # Only kept for backward compatibility with old clients
 UNKNOWN = "UNKNOWN"
 DISABLED = "DISABLED"
+
+#
+# Blocking sub-states for external tasks (whose output is produced outside of
+# Luigi). The task itself stays PENDING so that tasks depending on it keep
+# waiting, while ``external_state`` records *why* it is blocked:
+#
+# EXTERNAL_MISSING:
+#     The completion probe ran successfully and reported that the output does
+#     not exist yet.
+# EXTERNAL_PROBE_FAILED:
+#     The completion probe itself raised (e.g. the metastore / storage was
+#     temporarily unreachable). This is a transient condition and the probe is
+#     retried with bounded backoff instead of being treated as a missing
+#     output.
+#
+EXTERNAL_MISSING = "EXTERNAL_MISSING"
+EXTERNAL_PROBE_FAILED = "EXTERNAL_PROBE_FAILED"

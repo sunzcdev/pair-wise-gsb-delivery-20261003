@@ -182,6 +182,8 @@ class TaskProcess(multiprocessing.Process):
         expl = ""
         missing = []
         new_deps = []
+        external_probe_failure = False
+        external_missing = False
         try:
             # Verify that all the tasks are fulfilled! For external tasks we
             # don't care about unfulfilled dependencies, because we are just
@@ -205,11 +207,24 @@ class TaskProcess(multiprocessing.Process):
 
             if _is_external(self.task):
                 # External task
-                if self.check_complete(self.task):
+                try:
+                    is_complete = self.check_complete(self.task)
+                except Exception:
+                    # The probe itself failed (e.g. storage temporarily
+                    # unreachable). Surface this distinctly from a genuine
+                    # "output does not exist yet" answer so the scheduler can
+                    # retry the probe with bounded backoff.
+                    raise ExternalProbeFailure(traceback.format_exc())
+                if is_complete:
                     status = DONE
                 else:
+                    # Distinct from a probe failure: the probe ran fine, the
+                    # output is genuinely not there yet. The task stays PENDING
+                    # with an explicit "missing" reason instead of being
+                    # recorded as a failed task.
                     status = FAILED
                     expl = "Task is an external data dependency and data does not exist (yet?)."
+                    external_missing = True
             else:
                 with self._forward_attributes():
                     new_deps = self._run_get_new_deps()
@@ -236,12 +251,19 @@ class TaskProcess(multiprocessing.Process):
 
         except KeyboardInterrupt:
             raise
+        except ExternalProbeFailure as ex:
+            # External completion probe could not run. Keep the task PENDING and
+            # let the scheduler apply bounded backoff rather than recording a
+            # regular task failure.
+            status = FAILED
+            expl = ex.trace
+            external_probe_failure = True
         except BaseException as ex:
             status = FAILED
             expl = self._handle_run_exception(ex)
 
         finally:
-            self.result_queue.put((self.task.task_id, status, expl, missing, new_deps))
+            self.result_queue.put((self.task.task_id, status, expl, missing, new_deps, external_probe_failure, external_missing))
 
     def _handle_run_exception(self, ex):
         logger.exception("[pid %s] Worker %s failed    %s", os.getpid(), self.worker_id, self.task)
@@ -412,6 +434,21 @@ class TracebackWrapper:
     """
 
     def __init__(self, trace):
+        self.trace = trace
+
+
+class ExternalProbeFailure(Exception):
+    """
+    Raised when the completion probe of an external task itself fails.
+
+    Unlike a missing output (``complete()`` returning ``False``), this signals
+    a transient condition (e.g. a storage system that is temporarily
+    unreachable). The scheduler records it separately and retries the probe
+    with bounded backoff instead of treating the external task as not ready.
+    """
+
+    def __init__(self, trace):
+        super(ExternalProbeFailure, self).__init__(trace)
         self.trace = trace
 
 
@@ -830,6 +867,13 @@ class Worker:
             self._batch_families_sent.add(family)
 
     def _add(self, task, is_complete):
+        # These flags defer the external-state RPCs until after the task
+        # itself has been registered with the scheduler, because the RPCs
+        # only make sense for a task the scheduler already knows about.
+        external_probe_failed = False
+        external_missing = False
+        formatted_traceback = None
+
         if self._config.task_limit is not None and len(self._scheduled_tasks) >= self._config.task_limit:
             logger.warning("Will not run %s or any dependencies due to exceeded task-limit of %d", task, self._config.task_limit)
             deps = None
@@ -837,7 +881,6 @@ class Worker:
             runnable = False
 
         else:
-            formatted_traceback = None
             try:
                 self._check_complete_value(is_complete)
             except KeyboardInterrupt:
@@ -849,12 +892,24 @@ class Worker:
 
             if formatted_traceback is not None:
                 self.add_succeeded = False
-                self._log_complete_error(task, formatted_traceback)
-                task.trigger_event(Event.DEPENDENCY_MISSING, task)
-                self._email_complete_error(task, formatted_traceback)
-                deps = None
-                status = UNKNOWN
-                runnable = False
+                if _is_external(task):
+                    # The completion probe for an external dependency could not
+                    # even run. Keep the task PENDING and ask the scheduler to
+                    # track a bounded, transient probe failure rather than
+                    # dropping it into UNKNOWN like a regular scheduling error.
+                    deps = None
+                    status = PENDING
+                    runnable = self._config.retry_external_tasks
+                    external_probe_failed = True
+                    task.trigger_event(Event.DEPENDENCY_MISSING, task)
+                    self._log_complete_error(task, formatted_traceback)
+                else:
+                    self._log_complete_error(task, formatted_traceback)
+                    task.trigger_event(Event.DEPENDENCY_MISSING, task)
+                    self._email_complete_error(task, formatted_traceback)
+                    deps = None
+                    status = UNKNOWN
+                    runnable = False
 
             elif is_complete:
                 deps = None
@@ -866,6 +921,7 @@ class Worker:
                 deps = None
                 status = PENDING
                 runnable = self._config.retry_external_tasks
+                external_missing = True
                 task.trigger_event(Event.DEPENDENCY_MISSING, task)
                 logger.warning("Data for %s does not exist (yet?). The task is an external data dependency, so it cannot be run from this luigi process.", task)
 
@@ -912,7 +968,52 @@ class Worker:
             batchable=task.batchable,
             retry_policy_dict=_get_retry_policy_dict(task),
             accepts_messages=task.accepts_messages,
+            is_external=_is_external(task),
         )
+
+        # Now that the scheduler knows the task, record the precise external
+        # blocking reason (a failing probe vs. a definite "not ready" answer).
+        if external_probe_failed:
+            self._report_external_probe_failure(task, formatted_traceback)
+        elif external_missing:
+            self._report_external_task_missing(task)
+
+    def _report_external_task_missing(self, task, retry=False):
+        """Tell the scheduler that a probed external task is genuinely not ready yet.
+
+        Returns the scheduler's resulting task status, or ``None`` if the
+        report could not be delivered.
+        """
+        try:
+            response = self._scheduler.report_external_task_missing(
+                worker=self._id,
+                task_id=task.task_id,
+                message="Data for {} does not exist (yet?).".format(task),
+                retry=retry,
+            )
+            return response.get("status")
+        except Exception:
+            # The scheduler is best-effort here: never let bookkeeping break
+            # the scheduling loop itself.
+            logger.debug("Failed to report external task %s as missing", task.task_id, exc_info=True)
+            return None
+
+    def _report_external_probe_failure(self, task, formatted_traceback):
+        """Tell the scheduler that the external task probe raised a transient error.
+
+        Returns the scheduler's resulting task status (PENDING while retries
+        remain, FAILED once the bounded retry budget is exhausted), or None.
+        """
+        try:
+            response = self._scheduler.report_external_probe_failure(
+                worker=self._id,
+                task_id=task.task_id,
+                message=formatted_traceback,
+            )
+            return response.get("status")
+        except Exception:
+            logger.debug("Failed to report external probe failure for %s", task.task_id, exc_info=True)
+            return None
 
     def _validate_dependency(self, dependency):
         if isinstance(dependency, Target):
@@ -1077,7 +1178,7 @@ class Worker:
                 continue
 
             logger.info(error_msg)
-            self._task_result_queue.put((task_id, FAILED, error_msg, [], []))
+            self._task_result_queue.put((task_id, FAILED, error_msg, [], [], False, False))
 
     def _handle_next_task(self):
         """
@@ -1093,7 +1194,9 @@ class Worker:
             self._purge_children()  # Deal with subprocess failures
 
             try:
-                task_id, status, expl, missing, new_requirements = self._task_result_queue.get(timeout=self._config.wait_interval)
+                result = self._task_result_queue.get(timeout=self._config.wait_interval)
+                task_id, status, expl, missing, new_requirements = result[:5]
+                external_probe_failure, external_missing = result[5], result[6]
             except Queue.Empty:
                 return
 
@@ -1102,6 +1205,55 @@ class Worker:
                 continue
                 # Not a running task. Probably already removed.
                 # Maybe it yielded something?
+
+            # External tasks never fail as such: both a failing probe and a
+            # definite "not ready" answer keep the task PENDING while retries
+            # remain. The task is first moved out of RUNNING, then the
+            # scheduler records the real blocking reason and applies bounded
+            # backoff; once the retry budget is exhausted it answers FAILED.
+            if external_probe_failure or external_missing:
+                self._add_task(
+                    worker=self._id,
+                    task_id=task_id,
+                    status=PENDING,
+                    expl=json.dumps(expl),
+                    resources=task.process_resources(),
+                    runnable=self._config.retry_external_tasks,
+                    params=task.to_str_params(),
+                    family=task.task_family,
+                    module=task.task_module,
+                    new_deps=[],
+                    assistant=self._assistant,
+                    retry_policy_dict=_get_retry_policy_dict(task),
+                    is_external=True,
+                )
+
+                if external_probe_failure:
+                    resulting_status = self._report_external_probe_failure(task, expl)
+                else:
+                    resulting_status = self._report_external_task_missing(task, retry=True)
+
+                if resulting_status == FAILED:
+                    # honor the scheduler's decision to give up on the probe
+                    self._add_task(
+                        worker=self._id,
+                        task_id=task_id,
+                        status=FAILED,
+                        expl=json.dumps(expl),
+                        resources=task.process_resources(),
+                        runnable=None,
+                        params=task.to_str_params(),
+                        family=task.task_family,
+                        module=task.task_module,
+                        new_deps=[],
+                        assistant=self._assistant,
+                        retry_policy_dict=_get_retry_policy_dict(task),
+                        is_external=True,
+                    )
+                    self.run_succeeded = False
+
+                self._running_tasks.pop(task_id)
+                return
 
             # external task if run not implemented, retry-able if config option is enabled.
             external_task_retryable = _is_external(task) and self._config.retry_external_tasks
@@ -1128,6 +1280,7 @@ class Worker:
                 new_deps=new_deps,
                 assistant=self._assistant,
                 retry_policy_dict=_get_retry_policy_dict(task),
+                is_external=_is_external(task),
             )
 
             self._running_tasks.pop(task_id)

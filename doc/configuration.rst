@@ -796,6 +796,23 @@ disable_window
   scheduler forgets about disables that have occurred longer ago than
   this amount of time. Defaults to 3600 (1 hour).
 
+external_probe_retry_delay
+  Number of seconds the scheduler waits before re-dispatching an
+  external task whose completion probe raised a transient error (for
+  example because an external storage system was temporarily
+  unreachable). Such a probe failure is tracked separately from a
+  definite "output not ready yet" answer: the task stays PENDING with
+  an ``EXTERNAL_PROBE_FAILED`` blocking reason and only the branch
+  depending on it waits, while unrelated tasks keep being scheduled.
+  Defaults to 30 seconds.
+
+external_probe_retry_count
+  Maximum number of times a failing external-task completion probe is
+  retried. Once this many consecutive probe failures are recorded, the
+  external task is marked as FAILED instead of being retried forever.
+  A successful probe (whether it reports the output missing or present)
+  resets the counter. Defaults to 10.
+
 max_shown_tasks
   .. versionadded:: 1.0.20
 

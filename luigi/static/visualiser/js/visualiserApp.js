@@ -15,6 +15,8 @@ function visualiserApp(luigi) {
         DONE: 'check',
         FAILED: 'times',
         UPSTREAM_FAILED: 'warning',
+        UPSTREAM_EXTERNAL_PROBE_FAILED: 'warning',
+        UPSTREAM_MISSING_INPUT: 'pause',
         DISABLED: 'minus-circle',
         UPSTREAM_DISABLED: 'warning'
     };
@@ -79,6 +81,9 @@ function visualiserApp(luigi) {
             progressPercentage: task.progress_percentage,
             acceptsMessages: task.accepts_messages,
             workerIdRunning: task.worker_running,
+            externalState: task.external_state,
+            externalStateMessage: task.external_state_message,
+            externalProbeAttempts: task.external_probe_attempts,
         };
     }
 
@@ -113,6 +118,10 @@ function visualiserApp(luigi) {
             case 'UPSTREAM_FAILED':
                 iconClass = 'fa-warning';
                 iconColor = 'maroon';
+                break;
+            case 'UPSTREAM_EXTERNAL_PROBE_FAILED':
+                iconClass = 'fa-warning';
+                iconColor = 'orange';
                 break;
             case 'UPSTREAM_DISABLED':
                 iconClass = 'fa-warning';
@@ -816,6 +825,8 @@ function visualiserApp(luigi) {
                 'DONE',
                 'PENDING',
                 'UPSTREAM_DISABLED',
+                'UPSTREAM_EXTERNAL_PROBE_FAILED',
+                'UPSTREAM_MISSING_INPUT',
                 'UPSTREAM_FAILED',
                 'DISABLED',
                 'FAILED'
@@ -1283,10 +1294,22 @@ function visualiserApp(luigi) {
                     data: 'taskParams',
                     render: function(data, type, row) {
                         var params = JSON.parse(data);
+                        var details = '<div>' + renderParams(params) + '</div>';
+                        if (row.externalState) {
+                            var label = row.externalState === 'EXTERNAL_PROBE_FAILED'
+                                ? 'external probe unreachable'
+                                : 'external output missing';
+                            var title = row.externalStateMessage ? ' title="' +
+                                row.externalStateMessage.replace(/"/g, '&quot;') + '"' : '';
+                            var attempts = row.externalState === 'EXTERNAL_PROBE_FAILED' && row.externalProbeAttempts
+                                ? ' (attempt ' + row.externalProbeAttempts + ')' : '';
+                            details += '<div class="text-orange"' + title + '><i class="fa fa-warning"></i> ' +
+                                label + attempts + '</div>';
+                        }
                         if (row.resources !== '{}') {
-                            return '<div>' + renderParams(params) + '</div><div>' + row.resources + '</div>';
+                            return '<div>' + details + '</div><div>' + row.resources + '</div>';
                         } else {
-                            return '<div>' + renderParams(params) + '</div>';
+                            return details;
                         }
                     }
                 },

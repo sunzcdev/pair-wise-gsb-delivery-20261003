@@ -42,6 +42,7 @@ from luigi.metrics import MetricsCollectors
 from luigi.parameter import ParameterVisibility
 from luigi.task import Config
 from luigi.task_status import BATCH_RUNNING, DISABLED, DONE, FAILED, PENDING, RUNNING, SUSPENDED, UNKNOWN
+from luigi.task_status import EXTERNAL_MISSING, EXTERNAL_PROBE_FAILED
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +50,16 @@ UPSTREAM_RUNNING = "UPSTREAM_RUNNING"
 UPSTREAM_MISSING_INPUT = "UPSTREAM_MISSING_INPUT"
 UPSTREAM_FAILED = "UPSTREAM_FAILED"
 UPSTREAM_DISABLED = "UPSTREAM_DISABLED"
+# The upstream external dependency could not be probed because the probe
+# (e.g. a call to an external storage system) raised. This is transient:
+# the probe is retried with bounded backoff.
+UPSTREAM_EXTERNAL_PROBE_FAILED = "UPSTREAM_EXTERNAL_PROBE_FAILED"
 
 UPSTREAM_SEVERITY_ORDER = (
     "",
     UPSTREAM_RUNNING,
     UPSTREAM_MISSING_INPUT,
+    UPSTREAM_EXTERNAL_PROBE_FAILED,
     UPSTREAM_FAILED,
     UPSTREAM_DISABLED,
 )
@@ -144,6 +150,15 @@ class scheduler(Config):
     """
     Sets a cooldown period in seconds after a task was completed, during this period the same task will not accepted by the scheduler.
     """
+
+    external_probe_retry_delay = parameter.FloatParameter(
+        default=30.0,
+        description="Seconds to wait before re-running the completion probe of an external task whose probe raised a transient error.",
+    )
+    external_probe_retry_count = parameter.IntParameter(
+        default=10,
+        description="Maximum number of times a failing external-task completion probe is retried before the task is marked as FAILED.",
+    )
 
     def _get_retry_policy(self):
         return RetryPolicy(self.retry_count, self.disable_hard_timeout, self.disable_window)
@@ -280,6 +295,14 @@ class Task:
         self.runnable = False
         self.batchable = False
         self.batch_id = None
+        # External task completion-probe bookkeeping. ``external_state`` is one
+        # of None, EXTERNAL_MISSING or EXTERNAL_PROBE_FAILED. It is only set for
+        # external tasks while they are still PENDING and explains *why* the
+        # task (and everything depending on it) is blocked.
+        self.external_state = None
+        self.external_state_message = None
+        self.external_probe_attempts = 0
+        self.external_probe_retry = None  # earliest timestamp at which the probe may be retried
 
     def __repr__(self):
         return "Task(%r)" % vars(self)
@@ -474,6 +497,13 @@ class SimpleTaskState:
             self.set_state(state)
             self._status_tasks = collections.defaultdict(dict)
             for task in self._tasks.values():
+                # Backward compatibility: tasks pickled before external-task
+                # probe tracking was introduced lack these attributes.
+                if not hasattr(task, "external_state"):
+                    task.external_state = None
+                    task.external_state_message = None
+                    task.external_probe_attempts = 0
+                    task.external_probe_retry = None
                 self._status_tasks[task.status][task.id] = task
         else:
             logger.info("No prior state file exists at %s. Starting with empty state", self._state_path)
@@ -585,6 +615,33 @@ class SimpleTaskState:
             if remove_on_failure:
                 task.remove = time.time()
 
+        if new_status != PENDING:
+            # The external blocking reason only makes sense while the task is
+            # still waiting for its externally produced output.
+            task.external_state = None
+            task.external_state_message = None
+            task.external_probe_retry = None
+
+    def set_external_state(self, task, external_state, message=None, retry_at=None):
+        """
+        Record why an external task is currently blocked.
+
+        The task stays PENDING either way, so only tasks that (transitively)
+        depend on it are affected; every other task can still be scheduled.
+        """
+        task.external_state = external_state
+        task.external_state_message = message
+        task.external_probe_retry = retry_at
+        task.updated = time.time()
+
+    def external_probe_due(self, task, now=None):
+        """True iff a blocked external task may be (re-)probed now."""
+        if task.external_state not in (EXTERNAL_PROBE_FAILED, EXTERNAL_MISSING):
+            return False
+        if task.external_probe_retry is None:
+            return True
+        return (now or time.time()) >= task.external_probe_retry
+
     def fail_dead_worker_task(self, task, config, assistants):
         # If a running worker disconnects, tag all its jobs as FAILED and subject it to the same retry logic
         if task.status in (BATCH_RUNNING, RUNNING) and task.worker_running and task.worker_running not in task.stakeholders | assistants:
@@ -611,9 +668,19 @@ class SimpleTaskState:
             if time.time() - task.scheduler_disable_time > config.disable_persist:
                 self.re_enable(task, config)
 
-        # Reset FAILED tasks to PENDING if max timeout is reached, and retry delay is >= 0
-        if task.status == FAILED and config.retry_delay >= 0 and task.retry < time.time():
+        # Reset FAILED tasks to PENDING if max timeout is reached, and retry delay is >= 0.
+        # A task whose retry has been cleared (e.g. an external task that used up
+        # its bounded probe budget) is left FAILED until explicitly re-enabled.
+        if task.status == FAILED and config.retry_delay >= 0 and task.retry is not None and task.retry < time.time():
             self.set_status(task, PENDING, config)
+
+        # Once the bounded backoff for a failing external probe has elapsed,
+        # clear the gate so the task becomes eligible for a worker to re-run
+        # the probe. Do not touch ``task.updated`` here: this runs inside
+        # prune() (which is also triggered by read-only task_list calls) and
+        # changing the timestamp would make repeated serializations differ.
+        if task.status == PENDING and self.external_probe_due(task):
+            task.external_probe_retry = None
 
     def may_prune(self, task):
         return task.remove and time.time() >= task.remove
@@ -824,6 +891,7 @@ class Scheduler:
         batch_id=None,
         retry_policy_dict=None,
         owners=None,
+        is_external=False,
         **kwargs,
     ):
         """
@@ -912,7 +980,20 @@ class Scheduler:
         task_is_not_running = task.status not in (RUNNING, BATCH_RUNNING)
         task_started_a_run = status in (DONE, FAILED, RUNNING)
         running_on_this_worker = task.worker_running == worker_id
-        if task_is_not_running or (task_started_a_run and running_on_this_worker) or new_deps:
+        # An external task that was dispatched for a probe and then reported
+        # back as still blocked must be moved out of RUNNING back to PENDING.
+        external_probe_reported_back = is_external and status == PENDING and task.status in (RUNNING, BATCH_RUNNING) and running_on_this_worker
+
+        # External tasks never run inside Luigi: while they are PENDING the
+        # scheduler keeps an explicit reason for the block (output missing vs.
+        # probe temporarily failing) so it can be displayed and retried with
+        # bounded backoff. This must be captured before set_status(), which
+        # clears external state on status transitions such as UNKNOWN->PENDING.
+        # A worker may have reported a probe failure through the dedicated RPC
+        # just before re-registering, so an existing reason is left untouched.
+        remember_external_state = task.external_state if is_external else None
+
+        if task_is_not_running or (task_started_a_run and running_on_this_worker) or new_deps or external_probe_reported_back:
             # don't allow re-scheduling of task while it is running, it must either fail or succeed on the worker actually running it
             if status != task.status or status == PENDING:
                 # Update the DB only if there was a acctual change, to prevent noise.
@@ -920,6 +1001,17 @@ class Scheduler:
                 # (so checking for status != task.status woule lie)
                 self._update_task_history(task, status)
             self._state.set_status(task, PENDING if status == SUSPENDED else status, self._config)
+            if external_probe_reported_back:
+                # The probe finished; nobody is running this task anymore.
+                task.worker_running = None
+                task.time_running = None
+
+        if is_external and task.status == PENDING:
+            if remember_external_state is not None:
+                # restore the blocking reason that set_status() may have cleared
+                task.external_state = remember_external_state
+            elif task.external_state is None:
+                self._state.set_external_state(task, EXTERNAL_MISSING, message=expl)
 
         if status == FAILED and self._config.batch_emails:
             batched_params, _ = self._state.get_batcher(worker_id, family)
@@ -1014,6 +1106,75 @@ class Scheduler:
         return {"response": response}
 
     @rpc_method()
+    def report_external_task_missing(self, worker, task_id, message=None, retry=False, **kwargs):
+        """
+        A worker probed an external task and the probe succeeded, reporting
+        that the output still does not exist.
+
+        The task remains PENDING with ``external_state`` set to
+        EXTERNAL_MISSING, so dependent tasks keep waiting while every other
+        task can still be scheduled. When ``retry`` is true (i.e. the probe
+        ran as a dispatched task), the normal scheduler retry delay is used to
+        pace re-probing so the task does not get redispatched in a tight loop.
+        """
+        task = self._state.get_task(task_id)
+        if task is None or task.status != PENDING:
+            return {"task_id": task_id, "status": None, "external_state": None}
+
+        # A definite "not ready" answer supersedes any earlier transient probe
+        # failure: the real waiting reason changes immediately.
+        task.external_probe_attempts = 0
+        retry_at = time.time() + self._config.retry_delay if retry else None
+        self._state.set_external_state(task, EXTERNAL_MISSING, message=message, retry_at=retry_at)
+        logger.info("External task %r is not ready yet", task_id)
+        return {"task_id": task_id, "status": task.status, "external_state": task.external_state}
+
+    @rpc_method()
+    def report_external_probe_failure(self, worker, task_id, message=None, **kwargs):
+        """
+        A worker's completion probe for an external task raised (e.g. the
+        storage system was temporarily unreachable).
+
+        The task remains PENDING with ``external_state`` set to
+        EXTERNAL_PROBE_FAILED and is retried with bounded backoff. Once the
+        configured number of attempts is exhausted the task is marked FAILED,
+        matching the behavior for regular task failures.
+        """
+        task = self._state.get_task(task_id)
+        if task is None or task.status != PENDING:
+            return {"task_id": task_id, "status": None, "external_state": None}
+
+        task.external_probe_attempts += 1
+        if task.external_probe_attempts > self._config.external_probe_retry_count:
+            logger.warning(
+                "External task %r probe failed %d times, giving up and marking it FAILED",
+                task_id,
+                task.external_probe_attempts - 1,
+            )
+            self._state.set_status(
+                task,
+                FAILED,
+                self._config,
+            )
+            # The bounded probe budget is exhausted: don't let the generic
+            # FAILED->PENDING pruning resurrect this task on retry_delay.
+            task.retry = None
+            task.expl = message or "External task completion probe kept failing"
+            return {"task_id": task_id, "status": task.status, "external_state": None}
+
+        retry_at = time.time() + self._config.external_probe_retry_delay
+        self._state.set_external_state(task, EXTERNAL_PROBE_FAILED, message=message, retry_at=retry_at)
+        logger.warning(
+            "Probe for external task %r failed (attempt %d/%d), retrying in %.1fs: %s",
+            task_id,
+            task.external_probe_attempts,
+            self._config.external_probe_retry_count,
+            self._config.external_probe_retry_delay,
+            message,
+        )
+        return {"task_id": task_id, "status": task.status, "external_state": task.external_state, "retry_at": retry_at}
+
+    @rpc_method()
     def has_task_history(self):
         return self._config.record_task_history
 
@@ -1084,6 +1245,11 @@ class Scheduler:
 
     def _schedulable(self, task):
         if task.status != PENDING:
+            return False
+        # While an external task is blocked (probe temporarily failing, or
+        # waiting for the next re-probe of a missing output), don't redispatch
+        # it until its retry window has elapsed.
+        if task.external_state in (EXTERNAL_PROBE_FAILED, EXTERNAL_MISSING) and not self._state.external_probe_due(task):
             return False
         for dep in task.deps:
             dep_task = self._state.get_task(dep, default=None)
@@ -1306,6 +1472,11 @@ class Scheduler:
                             upstream_status_table[dep_id] = ""  # will be updated postorder
                         else:
                             dep_status = STATUS_TO_UPSTREAM_MAP.get(dep.status, "")
+                            # A pending external task blocks its dependents either
+                            # because its output is genuinely missing or because
+                            # the completion probe could not be reached.
+                            if dep.status == PENDING and dep.external_state == EXTERNAL_PROBE_FAILED:
+                                dep_status = UPSTREAM_EXTERNAL_PROBE_FAILED
                             upstream_status_table[dep_id] = dep_status
                     elif upstream_status_table[dep_id] == "" and dep.deps:
                         # This is the postorder update step when we set the
@@ -1333,6 +1504,12 @@ class Scheduler:
             "tracking_url": getattr(task, "tracking_url", None),
             "status_message": getattr(task, "status_message", None),
             "progress_percentage": getattr(task, "progress_percentage", None),
+            # Why a PENDING external task is blocked (None for non-external /
+            # non-blocked tasks). See luigi.task_status for the possible values.
+            "external_state": getattr(task, "external_state", None),
+            "external_state_message": getattr(task, "external_state_message", None),
+            "external_probe_attempts": getattr(task, "external_probe_attempts", 0),
+            "external_probe_retry": getattr(task, "external_probe_retry", None),
         }
         if task.status == DISABLED:
             ret["re_enable_able"] = task.scheduler_disable_time is not None
