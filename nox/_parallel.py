@@ -509,6 +509,12 @@ def run_manifest_parallel(
     """
     queue = list(manifest)
     in_queue = set(queue)
+    results: dict[SessionRunner, Result] = {
+        session: session.result
+        for session in queue
+        if getattr(session, "resume_cached", False)
+        and getattr(session, "result", None) is not None
+    }
     nodes = [
         _Node(
             session=session,
@@ -519,9 +525,9 @@ def run_manifest_parallel(
             allow_parallel=resolve_allow_parallel(global_config, session.func),
         )
         for session in queue
+        if session not in results
     ]
 
-    results: dict[SessionRunner, Result] = {}
     not_started = list(nodes)
     futures: dict[Future[Result], _Node] = {}
     children = _Children()

@@ -14,11 +14,12 @@
 
 from __future__ import annotations
 
-__lazy_modules__ = {"copy", "functools", "inspect", "types"}
+__lazy_modules__ = {"copy", "functools", "inspect", "os", "types"}
 
 import copy
 import functools
 import inspect
+import os
 import types
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
@@ -54,6 +55,26 @@ def _copy_func(src: T, name: str | None = None) -> T:
     return cast("T", dst)
 
 
+def _coerce_paths(
+    value: str | os.PathLike[str] | Iterable[str | os.PathLike[str]] | None,
+) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, os.PathLike)):
+        return [os.fspath(value)]
+    paths: list[str] = []
+    try:
+        items = iter(value)
+    except TypeError:
+        return []
+    for item in items:
+        try:
+            paths.append(os.fspath(item))
+        except TypeError:
+            continue
+    return paths
+
+
 class Func:
     """This is a function decorator that adds additional Nox-specific metadata."""
 
@@ -79,6 +100,11 @@ class Func:
         requires: Sequence[str] | None = None,
         download_python: Literal["auto", "never", "always"] | None = None,
         allow_parallel: bool | None = None,
+        outputs: str | os.PathLike[str] | Sequence[str | os.PathLike[str]] | None = None,
+        artifacts: str
+        | os.PathLike[str]
+        | Sequence[str | os.PathLike[str]]
+        | None = None,
     ) -> None:
         self.func = func
         self.python = python
@@ -92,6 +118,7 @@ class Func:
         self.requires = list(requires or [])
         self.download_python = download_python
         self.allow_parallel = allow_parallel
+        self.outputs = _coerce_paths(outputs) + _coerce_paths(artifacts)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name={self.name!r})"
@@ -115,6 +142,7 @@ class Func:
             requires=self._requires,
             download_python=self.download_python,
             allow_parallel=self.allow_parallel,
+            outputs=self.outputs,
         )
 
     @property
@@ -172,6 +200,7 @@ class Call(Func):
             requires=func.requires,
             download_python=func.download_python,
             allow_parallel=func.allow_parallel,
+            outputs=getattr(func, "outputs", None),
         )
         self.call_spec = call_spec
         self.session_signature = session_signature

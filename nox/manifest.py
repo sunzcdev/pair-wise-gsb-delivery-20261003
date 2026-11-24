@@ -20,6 +20,7 @@ import ast
 import functools
 import itertools
 import operator
+import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
@@ -296,6 +297,27 @@ class Manifest:
         self._queue = [
             session for session in resolved_graph if session not in parent_sessions
         ]
+
+    def resume_plan(
+        self,
+        report: str | os.PathLike[str] | None = None,
+        *,
+        records: Sequence[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Build the content-aware resume plan for this manifest.
+
+        When ``report`` is omitted, the configured ``--report`` location is
+        used. Missing or old-schema evidence is non-fatal and yields a plan
+        that reruns every selected session.
+        """
+        from nox._resume import plan_for_manifest  # noqa: PLC0415
+
+        return plan_for_manifest(
+            self, self._config, records=records, report_path=report
+        )
+
+    # Verb-first alias used by the task layer/tests.
+    plan_resume = resume_plan
 
     def make_session(
         self, name: str, func: Func, *, multi: bool = False

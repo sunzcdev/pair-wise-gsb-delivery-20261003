@@ -39,6 +39,7 @@ from colorlog.escape_codes import parse_colors
 import nox
 from nox import _merge, registry
 from nox._resolver import CycleError
+from nox._resume import plan_for_manifest as resume_manifest
 from nox._version import InvalidVersionSpecifier, VersionCheckFailed, check_nox_version
 from nox.logger import logger
 from nox.manifest import WARN_PYTHONS_IGNORED, Manifest
@@ -58,7 +59,9 @@ __all__ = [
     "honor_usage_request",
     "load_nox_module",
     "merge_noxfile_options",
+    "plan_resume_manifest",
     "print_summary",
+    "resume_manifest",
     "run_manifest",
 ]
 
@@ -396,6 +399,18 @@ def honor_usage_request(manifest: Manifest, global_config: NoxConfig) -> Manifes
     return 0
 
 
+def plan_resume_manifest(
+    manifest: Manifest, global_config: NoxConfig
+) -> Manifest:
+    """Attach the optional report-backed resume plan to ``manifest``.
+
+    Missing or irrelevant report evidence is non-fatal: the resulting plan
+    simply selects every session for execution.
+    """
+    resume_manifest(manifest, global_config)
+    return manifest
+
+
 def run_manifest(manifest: Manifest, global_config: NoxConfig) -> list[Result]:
     """Run the full manifest of sessions.
 
@@ -407,6 +422,16 @@ def run_manifest(manifest: Manifest, global_config: NoxConfig) -> list[Result]:
         tuple[~nox.sessions.Session,~.SessionStatus]: A two-tuple of the
             sessions and the result of each session that was run.
     """
+    # Build an optional content-aware resume plan from the JSON report. A
+    # missing, old-schema, or irrelevant report leaves every session selected.
+    try:
+        resume_manifest(manifest, global_config)
+    except Exception as exc:  # noqa: BLE001 - resume is an optimization
+        logger.debug("Ignoring unusable resume evidence: %s", exc)
+        for planned_session in getattr(manifest, "_queue", []):
+            planned_session.resume_cached = False
+            planned_session.result = None
+
     # When --parallel/-j requests more than one job, hand off to the parallel
     # scheduler, which runs independent sessions in their own subprocesses.
     jobs = global_config.parallel or 1
@@ -429,11 +454,34 @@ def run_manifest(manifest: Manifest, global_config: NoxConfig) -> list[Result]:
 
     results = []
 
+    def checkpoint() -> None:
+        """Best-effort incremental report, useful after a hard interruption."""
+        if global_config.report is None:
+            return
+        try:
+            create_report(results, global_config)
+        except Exception as exc:  # noqa: BLE001 - checkpointing is advisory
+            logger.debug("Could not write resume checkpoint: %s", exc)
+
     # Iterate over each session in the manifest, and execute it.
     #
     # Note that it is possible for the manifest to be altered in any given
     # iteration.
     for session in manifest:
+        if getattr(session, "resume_cached", False) and session.result is not None:
+            result = session.result
+            name = session.friendly_name
+            reason = getattr(session, "resume_reason", None)
+            if reason:
+                logger.info("Reusing session %s (%s).", name, reason)
+            else:
+                logger.info("Reusing successful session %s from report.", name)
+            results.append(result)
+            checkpoint()
+            if not result and global_config.stop_on_first_error:
+                return results
+            continue
+
         # possibly raise warnings associated with this session
         if WARN_PYTHONS_IGNORED in session.func.should_warn:
             logger.warning(
@@ -447,6 +495,7 @@ def run_manifest(manifest: Manifest, global_config: NoxConfig) -> list[Result]:
         status = result.imperfect
         result.log(f"Session {name} {status}.")
         results.append(result)
+        checkpoint()
 
         # Sanity check: If we are supposed to stop on the first error case,
         # then abort now.

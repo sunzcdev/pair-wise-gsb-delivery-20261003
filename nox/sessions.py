@@ -47,6 +47,13 @@ import humanize
 
 import nox.command
 import nox.virtualenv
+from nox._resume import (
+    _safe_list as _resume_safe_list,
+    collect_outputs,
+    session_identity,
+    session_identity_id,
+    snapshot_tree,
+)
 from nox.logger import logger
 from nox.popen import DEFAULT_INTERRUPT_TIMEOUT, DEFAULT_TERMINATE_TIMEOUT
 from nox.virtualenv import (
@@ -990,6 +997,44 @@ class Session:
         """Outputs a debug-level message during the session."""
         logger.debug(*args, **kwargs)
 
+    @property
+    def outputs(self) -> list[str]:
+        """Output paths declared by this session for resume validation."""
+        return self._runner.declared_outputs
+
+    @outputs.setter
+    def outputs(
+        self, values: str | os.PathLike[str] | Iterable[str | os.PathLike[str]]
+    ) -> None:
+        if isinstance(values, (str, os.PathLike)):
+            values = [values]
+        self._runner.declared_outputs = [os.fspath(value) for value in values]
+
+    @property
+    def artifacts(self) -> list[str]:
+        """Alias for :attr:`outputs` using CI artifact terminology."""
+        return self.outputs
+
+    @artifacts.setter
+    def artifacts(
+        self, values: str | os.PathLike[str] | Iterable[str | os.PathLike[str]]
+    ) -> None:
+        self.outputs = values
+
+    def declare_output(self, *paths: str | os.PathLike[str]) -> None:
+        """Declare one or more output files or directories for resume checks.
+
+        Declarations are optional: Nox also observes files created or changed
+        by a session. Explicit declarations make ownership unambiguous when a
+        session updates a pre-existing file.
+        """
+        self._runner.declared_outputs.extend(os.fspath(path) for path in paths)
+
+    # Common verb-first aliases.
+    declare_outputs = declare_output
+    declare_artifact = declare_output
+    declare_artifacts = declare_output
+
     def error(self, *args: Any) -> NoReturn:
         """Immediately aborts the session and optionally logs an error."""
         raise _SessionQuit(*args)
@@ -1086,6 +1131,12 @@ class SessionRunner:
         self.posargs: list[str] = list(global_config.posargs)
         self.result: Result | None = None
         self.multi = multi
+        self.declared_outputs: list[str] = list(
+            _resume_safe_list(getattr(func, "outputs", []))
+        )
+        self.resume_cached = False
+        self.resume_entry: dict[str, Any] | None = None
+        self.resume_reason: str | None = None
 
         if getattr(func, "parametrize", None):
             self.multi = True
@@ -1201,15 +1252,56 @@ class SessionRunner:
         try:
             cwd = os.path.realpath(os.path.dirname(self.global_config.noxfile))
 
+            outputs: list[dict[str, Any]] = []
+            identity: dict[str, Any] | None = None
+            identity_id: str | None = None
             with _chdir(cwd):
                 self._create_venv()
+                # Snapshot after environment creation so virtualenv contents are
+                # not mistaken for session artifacts.
+                report_path = self.global_config.report
+                excluded_files = [report_path] if report_path else []
+                try:
+                    before_outputs = snapshot_tree(
+                        cwd,
+                        extra_directories=[self.global_config.envdir],
+                    )
+                except Exception as exc:  # noqa: BLE001 - observation is optional
+                    logger.debug("Could not snapshot session outputs: %s", exc)
+                    before_outputs = {}
                 session = Session(self)
                 session.env["NOX_CURRENT_SESSION"] = session.name
                 self.func(session)
 
+                # Resume metadata is observational and must never turn an
+                # otherwise successful user session into a failure.
+                try:
+                    identity = session_identity(self)
+                    identity_id = session_identity_id(identity)
+                    declared = [
+                        *_resume_safe_list(getattr(self.func, "outputs", [])),
+                        *_resume_safe_list(self.declared_outputs),
+                    ]
+                    outputs = collect_outputs(
+                        before_outputs,
+                        cwd,
+                        declared=declared,
+                        exclude_files=excluded_files,
+                        extra_directories=[self.global_config.envdir],
+                        owner_id=identity_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Could not collect session outputs: %s", exc)
+                    outputs = []
+
             # Nothing went wrong; return a success.
             self.result = Result(
-                self, Status.SUCCESS, duration=time.perf_counter() - start
+                self,
+                Status.SUCCESS,
+                duration=time.perf_counter() - start,
+                outputs=outputs,
+                identity=identity,
+                identity_id=identity_id,
             )
 
         except nox.virtualenv.InterpreterNotFound as exc:
@@ -1285,6 +1377,9 @@ class Result:
         reason: str | None = None,
         *,
         duration: float = 0.0,
+        outputs: Sequence[dict[str, Any]] | None = None,
+        identity: dict[str, Any] | None = None,
+        identity_id: str | None = None,
     ) -> None:
         """Initialize the Result object.
 
@@ -1294,11 +1389,17 @@ class Result:
             status (~nox.sessions.Status): The final result status.
             reason (str): Additional info.
             duration (float): Time taken in seconds.
+            outputs (Sequence[dict]): Content-addressed output artifacts.
+            identity (dict): Stable variant/configuration identity.
+            identity_id (str): Hash of ``identity``.
         """
         self.session = session
         self.status = status
         self.reason = reason
         self.duration = duration
+        self.outputs = list(outputs or [])
+        self.identity = identity
+        self.identity_id = identity_id
 
     def __bool__(self) -> bool:
         return self.status.value > 0
@@ -1355,7 +1456,7 @@ class Result:
         Returns:
             dict: The serialized result.
         """
-        return {
+        data = {
             "args": getattr(self.session.func, "call_spec", {}),
             "name": self.session.name,
             "result": self.status.name.lower(),
@@ -1364,13 +1465,29 @@ class Result:
             "signatures": self.session.signatures,
             "duration": self.duration,
         }
+        # Keep the long-standing report schema unchanged for sessions without
+        # artifact evidence. Output-producing successes add resume metadata.
+        if self.outputs:
+            identity = self.identity or session_identity(self.session)
+            identity_id = self.identity_id or session_identity_id(identity)
+            data["identity"] = identity
+            data["identity_id"] = identity_id
+            data["outputs"] = self.outputs
+            # CI vocabulary alias; the resume planner reads either key.
+            data["artifacts"] = self.outputs
+        return data
 
     @classmethod
     def from_dict(cls, session: SessionRunner, entry: dict[str, Any]) -> Result:
         """Rebuild a result from a :meth:`serialize` entry."""
-        return cls(
+        result = cls(
             session,
             Status[entry["result"].upper()],
             entry.get("reason"),
             duration=entry.get("duration", 0.0),
+            outputs=entry.get("outputs", entry.get("artifacts", [])),
+            identity=entry.get("identity"),
+            identity_id=entry.get("identity_id"),
         )
+        result.resume_entry = entry  # type: ignore[attr-defined]
+        return result

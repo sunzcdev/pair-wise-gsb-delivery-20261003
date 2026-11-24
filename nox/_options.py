@@ -322,6 +322,24 @@ class NoxfileOptions(_option_set.OptionsBase):
             help="Output a report of all sessions to the given filename.",
         ),
     )
+    resume: str | None = attrs.field(
+        default=None,
+        validator=av_opt_str,
+        metadata=opt(
+            "--resume",
+            "--resume-from",
+            "--resume-file",
+            "--resume-report",
+            group="execution",
+            completer=_completers.json_file_completer,
+            argparse_kwargs={"nargs": "?", "const": ""},
+            help=(
+                "Reuse successful matrix cells when their variant identity and "
+                "recorded output hashes still match. With no path, use --report; "
+                "an old report without resume evidence runs normally."
+            ),
+        ),
+    )
     reuse_existing_virtualenvs: bool | None = attrs.field(
         default=None,
         validator=av_opt_bool,

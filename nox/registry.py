@@ -65,6 +65,8 @@ def session_decorator(
     requires: Sequence[str] | None = ...,
     download_python: Literal["auto", "never", "always"] | None = None,
     allow_parallel: bool | None = ...,
+    outputs: str | Sequence[str] | None = ...,
+    artifacts: str | Sequence[str] | None = ...,
 ) -> Callable[[RawFunc | Func], Func]: ...
 
 
@@ -83,6 +85,8 @@ def session_decorator(
     requires: Sequence[str] | None = None,
     download_python: Literal["auto", "never", "always"] | None = None,
     allow_parallel: bool | None = None,
+    outputs: str | Sequence[str] | None = None,
+    artifacts: str | Sequence[str] | None = None,
 ) -> Func | Callable[[RawFunc | Func], Func]:
     """Designate the decorated function as a session."""
     # If `func` is provided, then this is the decorator call with the function
@@ -106,6 +110,8 @@ def session_decorator(
             requires=requires,
             download_python=download_python,
             allow_parallel=allow_parallel,
+            outputs=outputs,
+            artifacts=artifacts,
         )
 
     if isinstance(func, Func):
@@ -135,6 +141,8 @@ def session_decorator(
         requires=requires,
         download_python=download_python,
         allow_parallel=allow_parallel,
+        outputs=outputs,
+        artifacts=artifacts,
     )
     if reg_name in _REGISTRY:
         msg = (
