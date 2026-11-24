@@ -29,6 +29,7 @@ class ActiveSupport::TestCase
     @all_stores = []
     SolidCache::Record.each_shard do
       SolidCache::Entry.delete_all
+      SolidCache::Counter.delete_all
     end
   end
 

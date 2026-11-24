@@ -36,6 +36,36 @@ CREATE TABLE public.schema_migrations (
 
 
 --
+-- Name: solid_cache_counters; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.solid_cache_counters (
+    id bigint NOT NULL,
+    name character varying NOT NULL,
+    value bigint DEFAULT 0 NOT NULL
+);
+
+
+--
+-- Name: solid_cache_counters_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.solid_cache_counters_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: solid_cache_counters_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.solid_cache_counters_id_seq OWNED BY public.solid_cache_counters.id;
+
+
+--
 -- Name: solid_cache_entries; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -69,6 +99,13 @@ ALTER SEQUENCE public.solid_cache_entries_id_seq OWNED BY public.solid_cache_ent
 
 
 --
+-- Name: solid_cache_counters id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.solid_cache_counters ALTER COLUMN id SET DEFAULT nextval('public.solid_cache_counters_id_seq'::regclass);
+
+
+--
 -- Name: solid_cache_entries id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -92,11 +129,26 @@ ALTER TABLE ONLY public.schema_migrations
 
 
 --
+-- Name: solid_cache_counters solid_cache_counters_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.solid_cache_counters
+    ADD CONSTRAINT solid_cache_counters_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: solid_cache_entries solid_cache_entries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.solid_cache_entries
     ADD CONSTRAINT solid_cache_entries_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: index_solid_cache_counters_on_name; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX index_solid_cache_counters_on_name ON public.solid_cache_counters USING btree (name);
 
 
 --

@@ -243,9 +243,87 @@ class SolidCache::ExpiryTest < ActiveSupport::TestCase
     assert_enqueued_jobs(2, only: SolidCache::ExpiryJob) do
       @cache.write_multi(10.times.index_by { |i| "key#{i}" })
     end
-
-    assert_enqueued_jobs(2, only: SolidCache::ExpiryJob) do
-      @cache.write_multi(10.times.index_by { |i| "key#{i}" })
-    end
   end
+
+  test "size estimate tracks write deltas per shard and drives max_size expiry" do
+    skip if single_database?
+
+    SolidCache::Store.any_instance.stubs(:rand).returns(0)
+
+    max_size = 10_000
+    @cache = lookup_store(expiry_batch_size: 1, max_age: nil, max_size: max_size, expiry_method: :job, shards: [ first_shard_key, second_shard_key ])
+    shard_one_keys = shard_keys(@cache, first_shard_key)
+    shard_two_keys = shard_keys(@cache, second_shard_key)
+
+    # Place the same number of small values on both shards, two expiry triggers per write
+    assert_enqueued_jobs(20, only: SolidCache::ExpiryJob) do
+      shard_one_keys.first(5).each { |key| @cache.write(key, "a" * 10) }
+      shard_two_keys.first(5).each { |key| @cache.write(key, "a" * 10) }
+    end
+    perform_enqueued_jobs
+
+    # Both shards start with an exact, independent estimate below the threshold
+    shard_two_estimate = estimate_on(second_shard_key)
+    assert_equal actual_byte_size_on(first_shard_key), estimate_on(first_shard_key)
+    assert_equal actual_byte_size_on(second_shard_key), shard_two_estimate
+    assert_operator estimate_on(first_shard_key), :<, max_size
+
+    # Overwrite an old key on shard one with a large (incompressible) value: the
+    # estimate crosses the max_size threshold right away and expiry kicks in.
+    # Use the most recently written key so the large entry is not an expiry candidate.
+    large_value = SecureRandom.random_bytes(20_000)
+    assert_enqueued_jobs(2, only: SolidCache::ExpiryJob) do
+      @cache.write(shard_one_keys[4], large_value)
+    end
+    assert_operator estimate_on(first_shard_key), :>, max_size
+    perform_enqueued_jobs
+
+    # Five entries were written and two expiry batches deleted the two oldest
+    assert_equal 3, entry_count_on(first_shard_key)
+    assert_equal 5, entry_count_on(second_shard_key)
+
+    # A write on shard two that fails as part of a transaction leaves its estimate untouched
+    assert_enqueued_jobs(2, only: SolidCache::ExpiryJob) do
+      SolidCache::Record.with_shard(second_shard_key) do
+        SolidCache::Entry.transaction do
+          @cache.write(shard_two_keys[0], "b" * 5_000)
+          raise ActiveRecord::Rollback
+        end
+      end
+    end
+    perform_enqueued_jobs
+
+    assert_equal shard_two_estimate, estimate_on(second_shard_key)
+    assert_equal "a" * 10, @cache.read(shard_two_keys[0])
+
+    # Next round: delete the large value, the estimate drops by exactly its byte size
+    large_key = @cache.send(:normalize_key, shard_one_keys[4], {})
+    large_byte_size = SolidCache::Record.with_shard(first_shard_key) do
+      SolidCache::Entry.uncached do
+        SolidCache::Entry.where(key_hash: SolidCache::Entry.send(:key_hash_for, large_key)).pick(:byte_size)
+      end
+    end
+
+    before_delete = estimate_on(first_shard_key)
+    @cache.delete(shard_one_keys[4])
+    assert_equal before_delete - large_byte_size, estimate_on(first_shard_key)
+
+    # Reconcile actual usage, estimates and expiry triggers on both shards
+    assert_equal actual_byte_size_on(first_shard_key), estimate_on(first_shard_key)
+    assert_equal actual_byte_size_on(second_shard_key), estimate_on(second_shard_key)
+    assert_equal 24, performed_jobs.count { |job| job[:job] == SolidCache::ExpiryJob }
+  end
+
+  private
+    def estimate_on(shard)
+      SolidCache::Record.with_shard(shard) { SolidCache::Entry.estimated_size }
+    end
+
+    def actual_byte_size_on(shard)
+      SolidCache::Record.with_shard(shard) { SolidCache::Entry.uncached { SolidCache::Entry.sum(:byte_size) } }
+    end
+
+    def entry_count_on(shard)
+      SolidCache::Record.with_shard(shard) { SolidCache::Entry.uncached { SolidCache::Entry.count } }
+    end
 end

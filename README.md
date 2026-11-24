@@ -123,7 +123,7 @@ There are five options that can be set on the engine:
 
 - `executor` - the [Rails executor](https://guides.rubyonrails.org/threading_and_code_execution.html#executor) used to wrap asynchronous operations, defaults to the app executor
 - `connects_to` - a custom connects to value for the abstract `SolidCache::Record` active record model. Required for sharding and/or using a separate cache database to the main app. This will overwrite any value set in `config/solid_cache.yml`
-- `size_estimate_samples` - if `max_size` is set on the cache, the number of the samples used to estimate the size.
+- `size_estimate_samples` - the number of samples used when correcting the tracked size estimate with a bounded sampling estimate (see [Cache expiry](#cache-expiry)).
 - `encrypted` - whether cache values should be encrypted (see [Enabling encryption](#enabling-encryption))
 - `encryption_context_properties` - custom encryption context properties
 
@@ -161,7 +161,7 @@ Solid Cache tracks writes to the cache. For every write it increments a counter 
 
 1. Check if we have exceeded the `max_entries` or `max_size` values (if set).
    The current entries are estimated by subtracting the max and min IDs from the `SolidCache::Entry` table.
-   The current size is estimated by sampling the entry `byte_size` columns.
+   The current size is tracked in a per-shard counter that is updated with the byte size delta of every successful write, overwrite and delete. It can be corrected with a bounded sampling estimate of the entry `byte_size` columns by calling `SolidCache::Entry.reconcile_estimated_size`.
 2. If we have, it will delete `expiry_batch_size` entries.
 3. If not, it will delete up to `expiry_batch_size` entries, provided they are all older than `max_age`.
 

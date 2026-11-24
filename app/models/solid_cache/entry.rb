@@ -23,11 +23,15 @@ module SolidCache
 
       def write_multi(payloads)
         without_query_cache do
+          byte_size_delta = 0
           payloads.each_slice(MULTI_BATCH_SIZE).each do |payload_batch|
+            payload_batch = add_key_hash_and_byte_size(payload_batch)
+            byte_size_delta += byte_size_delta_for(payload_batch)
             upsert_all \
-              add_key_hash_and_byte_size(payload_batch),
+              payload_batch,
               unique_by: upsert_unique_by, on_duplicate: :update, update_only: [ :key, :value, :byte_size ]
           end
+          track_byte_size(byte_size_delta)
         end
       end
 
@@ -51,7 +55,11 @@ module SolidCache
 
       def delete_by_key(*keys)
         without_query_cache do
-          where(key_hash: key_hashes_for(keys)).delete_all
+          relation = where(key_hash: key_hashes_for(keys))
+          byte_size = relation.sum(:byte_size)
+          deleted = relation.delete_all
+          track_byte_size(-byte_size) if deleted > 0
+          deleted
         end
       end
 
@@ -59,12 +67,14 @@ module SolidCache
         with_connection do |connection|
           connection.truncate(table_name)
         end
+        clear_estimated_size
       end
 
       def clear_delete
         without_query_cache do
           in_batches.delete_all
         end
+        clear_estimated_size
       end
 
       def lock_and_write(key, &block)
@@ -92,6 +102,16 @@ module SolidCache
               payload[:byte_size] = byte_size_for(payload)
             end
           end
+        end
+
+        # The change in stored bytes if this batch is written: the full byte
+        # size of new keys, plus the size difference for overwritten keys.
+        # Looks up the existing rows by their indexed key_hash, so it doesn't
+        # need to scan the whole table.
+        def byte_size_delta_for(payloads)
+          existing_byte_sizes = where(key_hash: payloads.map { |payload| payload[:key_hash] })
+            .pluck(:key_hash, :byte_size).to_h
+          payloads.sum { |payload| payload[:byte_size] - existing_byte_sizes.fetch(payload[:key_hash], 0) }
         end
 
         def upsert_unique_by

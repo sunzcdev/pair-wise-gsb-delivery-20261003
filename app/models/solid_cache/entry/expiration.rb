@@ -8,7 +8,9 @@ module SolidCache
       class_methods do
         def expire(count, max_age:, max_entries:, max_size:)
           if (ids = expiry_candidate_ids(count, max_age: max_age, max_entries: max_entries, max_size: max_size)).any?
+            byte_size = where(id: ids).sum(:byte_size)
             delete(ids)
+            track_byte_size(-byte_size)
           end
         end
 

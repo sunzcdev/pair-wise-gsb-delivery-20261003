@@ -72,7 +72,9 @@ module SolidCache
 
     test "batching multi queries" do
       stub_const(Entry, :MULTI_BATCH_SIZE, 2) do
-        assert_queries_count(2) do
+        # Two batched upserts, plus one indexed byte size delta lookup per
+        # batch and a single size counter update for the whole write
+        assert_queries_count(6) do
           Entry.write_multi([ { key: "hello".b, value: "there" }, { key: "foo".b, value: "bar" }, { key: "baz".b, value: "zab" } ])
         end
 

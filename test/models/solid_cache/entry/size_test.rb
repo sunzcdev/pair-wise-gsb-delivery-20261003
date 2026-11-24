@@ -12,6 +12,79 @@ module SolidCache
       assert_equal 0, Entry.estimated_size
     end
 
+    test "estimates size from successful write deltas" do
+      write_entries(value_lengths: [ 10, 20, 30 ])
+
+      assert_equal actual_byte_size, Entry.estimated_size
+    end
+
+    test "overwriting a key adjusts the estimate by the size difference" do
+      write_entries(value_lengths: [ 10, 20, 30 ])
+      previous_estimate = Entry.estimated_size
+
+      Entry.write("key00000", "a" * 100)
+
+      assert_equal previous_estimate + 90, Entry.estimated_size
+      assert_equal actual_byte_size, Entry.estimated_size
+    end
+
+    test "deleting entries decreases the estimate" do
+      write_entries(value_lengths: [ 10, 20, 30 ])
+      previous_estimate = Entry.estimated_size
+      deleted_byte_size = Entry.where(key_hash: Entry.send(:key_hash_for, "key00001")).pick(:byte_size)
+
+      Entry.delete_by_key("key00001")
+
+      assert_equal previous_estimate - deleted_byte_size, Entry.estimated_size
+      assert_equal actual_byte_size, Entry.estimated_size
+    end
+
+    test "a failed transaction does not change the estimate" do
+      write_entries(value_lengths: [ 10 ])
+      previous_estimate = Entry.estimated_size
+
+      Entry.transaction do
+        Entry.write("key00001", "a" * 100)
+        raise ActiveRecord::Rollback
+      end
+
+      assert_equal previous_estimate, Entry.estimated_size
+      assert_nil Entry.read("key00001")
+    end
+
+    test "reconciles the tracked estimate with a bounded sampling estimate" do
+      write_entries(value_lengths: [ 10, 20, 30 ])
+
+      # An untracked delete makes the tracked estimate drift
+      Entry.delete(Entry.first.id)
+      assert_not_equal actual_byte_size, Entry.estimated_size
+
+      Entry.reconcile_estimated_size(samples: 10)
+
+      # The moving average bookkeeping entry is only written after the sample is taken
+      bookkeeping_size = Entry.where(key_hash: Entry.send(:key_hash_for, Entry::Size::MovingAverageEstimate::ESTIMATES_KEY)).sum(:byte_size)
+      assert_equal actual_byte_size - bookkeeping_size, Entry.estimated_size
+    end
+
+    test "updating the estimate does not scan the entries table" do
+      write_entries(value_lengths: [ 10 ] * 100)
+
+      queries = []
+      subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
+        queries << payload[:sql] if payload[:sql].is_a?(String)
+      end
+
+      Entry.write("key00100", "a" * 10)
+      Entry.delete_by_key("key00100")
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+
+      full_table_aggregates = queries.select do |sql|
+        sql.match?(/solid_cache_entries/) && sql.match?(/\bSUM\(|\bCOUNT\(/i) && !sql.match?(/WHERE/i)
+      end
+      assert_empty full_table_aggregates
+    end
+
     test "gets exact estimate when samples sizes are big enough" do
       write_entries(value_lengths: [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ])
 
@@ -73,6 +146,10 @@ module SolidCache
     end
 
     private
+      def actual_byte_size
+        Entry.uncached { Entry.sum(:byte_size) }
+      end
+
       def write_entries(value_lengths:)
         Entry.write_multi(value_lengths.map.with_index { |value_length, index| { key: "key#{index.to_s.rjust(5, "0")}", value: "a" * value_length } })
       end
