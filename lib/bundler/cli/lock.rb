@@ -82,6 +82,13 @@ module Bundler
         definition.with_cache! if options[:local] && options["add-ruby-abi"].any?
         definition.remotely! unless options[:local]
 
+        # Re-selecting a platform's variants resolves just that platform, so it
+        # runs once the sources are set up. Any conflict raises before the
+        # lockfile below is written, leaving the file untouched.
+        options["update-platform-variants"].flatten.each do |platform_string|
+          definition.update_platform_variants(Gem::Platform.new(platform_string))
+        end
+
         if options["normalize-platforms"]
           definition.normalize_platforms
         end
@@ -122,6 +129,24 @@ module Bundler
 
       if options["normalize-platforms"] && options["remove-platform"].any?
         raise InvalidOption, "--normalize-platforms can't be used with --remove-platform"
+      end
+
+      if options["update-platform-variants"].any?
+        if options["add-platform"].any?
+          raise InvalidOption, "--update-platform-variants can't be used with --add-platform"
+        end
+
+        if options["remove-platform"].any?
+          raise InvalidOption, "--update-platform-variants can't be used with --remove-platform"
+        end
+
+        if options["normalize-platforms"]
+          raise InvalidOption, "--update-platform-variants can't be used with --normalize-platforms"
+        end
+
+        if options[:update]
+          raise InvalidOption, "--update-platform-variants can't be used with --update"
+        end
       end
     end
   end

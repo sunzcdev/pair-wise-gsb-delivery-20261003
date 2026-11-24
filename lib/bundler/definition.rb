@@ -596,6 +596,62 @@ module Bundler
       @platforms.delete(platform)
     end
 
+    # Re-selects the platform-specific variants for +platform+ only.
+    #
+    # Unlike #add_platform this does not resolve the whole bundle again. Only
+    # the rows that are specific to +platform+ may move, preferring the newest
+    # build available for that platform. Rows that the other locked platforms
+    # still use (the generic `ruby` branch included) stay exactly as locked, so
+    # a new gem that only the re-selected variant needs is allowed in, while a
+    # candidate that would force a shared gem to move is reported as a conflict
+    # and leaves the lockfile untouched.
+    def update_platform_variants(platform)
+      if platform.to_s == "unknown"
+        raise InvalidOption, "The platform `#{platform}` is unknown to RubyGems and can't be re-selected."
+      end
+
+      if platform == Gem::Platform::RUBY
+        raise InvalidOption, "The `ruby` platform has no platform-specific variants to re-select."
+      end
+
+      unless lockfile_exists?
+        raise GemfileLockNotFound, "This Bundle hasn't been installed yet. " \
+          "Run `bundle install` to update and install the bundled gems."
+      end
+
+      unless @platforms.include?(platform)
+        raise InvalidOption, "Unable to re-select the variants of the platform `#{platform}` " \
+          "since it's not locked. Add it first with `bundle lock --add-platform #{platform}`."
+      end
+
+      names = platform_variant_rows(platform).map(&:name).uniq
+
+      if names.empty?
+        Bundler.ui.info "No #{platform} specific variants to re-select."
+        return
+      end
+
+      Bundler.ui.info "Re-selecting #{platform} specific variants of #{names.sort.join(", ")}..."
+
+      begin
+        chosen = resolve_platform_variants(platform, names)
+      rescue SolveFailure, GemNotFound
+        raise PlatformVariantConflict, platform_variant_conflict_message(platform, names)
+      end
+
+      merged = merge_platform_variants(platform, names, chosen)
+
+      # The resolver may relax a pinned shared gem to satisfy the new variant
+      # when it hits a conflict. Re-check the merged result so a locked branch
+      # another platform still uses can never be moved, and so no requirement is
+      # left unsatisfied.
+      unless platform_variants_valid?(platform, names, merged)
+        raise PlatformVariantConflict, platform_variant_conflict_message(platform, names)
+      end
+
+      @resolve = SpecSet.new(merged)
+    end
+
     def nothing_changed?
       !something_changed?
     end
@@ -630,6 +686,305 @@ module Bundler
     end
 
     private
+
+    # The locked rows specific to the given platform. These are the variants the
+    # re-selection is allowed to move; every other locked row (the generic
+    # `ruby` branch and the rows another locked platform also uses) is left
+    # untouched.
+    def platform_variant_rows(platform, base = @locked_specs)
+      others = @platforms - [platform]
+
+      base.to_a.select do |spec|
+        platform_specific_for?(spec.platform, platform) &&
+          others.none? {|other| platform_specific_for?(spec.platform, other) }
+      end
+    end
+
+    def platform_specific_for?(spec_platform, platform)
+      return false if spec_platform == Gem::Platform::RUBY || spec_platform.to_s == Gem::Platform::RUBY
+
+      Gem::Platform.new(spec_platform) === platform
+    end
+
+    # Resolve what the platform needs with every still-shared locked gem pinned
+    # to its exact locked version. New gems dragged in by a re-selected variant
+    # are found and added; an attempt to move a shared gem makes PubGrub fail
+    # instead of silently changing another platform's branch.
+    def resolve_platform_variants(platform, names)
+      # Dropping the re-selected names from the pinned base leaves them without a
+      # locked version, and the floor requirement below steers the resolver to
+      # each one's newest build instead of keeping the stale variant. Everything
+      # else stays pinned to its locked version, which protects the shared
+      # branch.
+      pinned = SpecSet.new(@locked_specs.reject {|spec| names.include?(spec.name) })
+
+      resolver_base = Resolver::Base.new(
+        platform_variant_source_requirements(names),
+        platform_variant_resolution_dependencies(platform, names),
+        pinned,
+        [platform],
+        locked_specs: pinned,
+        unlock: names,
+        prerelease: gem_version_promoter.pre?,
+        prefer_local: @prefer_local,
+        new_platforms: [],
+        overrides: @overrides,
+        explicit_unlocks: names
+      )
+
+      SpecSet.new(Resolver.new(resolver_base, gem_version_promoter, @most_specific_locked_platform).start)
+    end
+
+    # The newest build of each re-selected gem for the platform, never older
+    # than what is already locked.
+    def target_floors(platform, names)
+      rows = platform_variant_rows(platform).to_h {|spec| [spec.name, spec] }
+
+      names.filter_map do |name|
+        row = rows[name]
+        next unless row
+
+        newest = newest_platform_candidate(row.source, name, platform, row.version)
+        [name, newest.version] if newest
+      end.to_h
+    end
+
+    # The normal source mapping (so new transitive gems are found the same way a
+    # regular resolution finds them) with the re-selected names registered so
+    # their variants are fetched too.
+    def platform_variant_source_requirements(names)
+      requirements = source_requirements.dup
+
+      names.each do |name|
+        source = requirements[name] || default_source
+        source.add_dependency_names([name])
+        requirements[name] = source
+      end
+
+      requirements
+    end
+
+    # Resolution roots for the platform: the Gemfile dependencies applicable to
+    # it, plus the usual metadata requirements, matching what a normal
+    # resolution feeds the resolver. Each re-selected gem is raised to its newest
+    # build with an extra root requirement (indirect gems get a fresh root), so a
+    # stale locked variant is never kept by accident and a shared gem that cannot
+    # meet it makes the solver fail rather than move.
+    def platform_variant_resolution_dependencies(platform, names)
+      deps = expanded_dependencies.select do |dep|
+        dep.gem_platforms([platform]).any?
+      end
+
+      floors = target_floors(platform, names)
+
+      elevated = deps.map do |dep|
+        version = floors[dep.name]
+        next dep unless version
+
+        raise_requirement(dep, version)
+      end
+
+      elevated_names = elevated.map(&:name)
+      floors.each do |name, version|
+        next if elevated_names.include?(name)
+
+        elevated << Gem::Dependency.new(name, ">= #{version}")
+      end
+
+      elevated
+    end
+
+    def raise_requirement(dep, version)
+      raised = dep.dup
+      raised.instance_variable_set(:@requirement, Gem::Requirement.new(">= #{version}"))
+      raised
+    end
+
+    # Keep every locked row except the old platform-specific rows that got a
+    # replacement, then add what the re-selection resolved: the new platform
+    # variants plus the gems only they need.
+    def merge_platform_variants(platform, names, resolved)
+      replacements = {}
+      resolved.each do |spec|
+        next unless names.include?(spec.name)
+        next unless platform_specific_for?(spec.platform, platform)
+
+        replacements[spec.name] = spec
+      end
+
+      kept = @locked_specs.to_a.reject do |spec|
+        replacements.key?(spec.name) && platform_specific_for?(spec.platform, platform)
+      end
+
+      present = kept.to_h {|spec| [spec.full_name, true] }
+      additions = replacements.values.dup
+
+      # The resolver pins every shared gem to its locked version, so the only
+      # other rows worth adding are brand new gems (which only the re-selected
+      # variants need) and further rows for the platform being re-selected.
+      resolved.each do |spec|
+        next if present.key?(spec.full_name) || additions.any? {|s| s.full_name == spec.full_name }
+        next unless platform_specific_for?(spec.platform, platform) || !@locked_specs.names.include?(spec.name)
+
+        additions << spec
+      end
+
+      dedupe = {}
+      (kept + additions).select do |spec|
+        dedupe[spec.full_name] ? false : (dedupe[spec.full_name] = true)
+      end
+    end
+
+    # Names both sides of the conflict that stopped the re-selection: the newest
+    # platform build that wants a change, and the locked path keeping the shared
+    # gem where it is.
+    def platform_variant_conflict_message(platform, names)
+      conflict = platform_variant_shared_conflict(platform, names)
+
+      lines = []
+      lines << "Unable to re-select the #{platform} variants because that would require " \
+               "changing gems still shared with the other locked platforms, so the lockfile was not updated."
+      lines << ""
+
+      if conflict
+        requirer, dep, locked_version, locked_requirer = conflict
+        lines << "The newest #{platform} variant conflicts with a locked path:"
+        lines << ""
+        lines << "  * #{requirer.full_name} requires #{pretty_dep(dep)}"
+
+        if locked_requirer
+          locked_dep = locked_requirer.runtime_dependencies.find {|d| d.name == dep.name }
+          lines << "  * #{dep.name} (#{locked_version}) is locked for #{locked_platform_label(locked_requirer, platform)}, " \
+                   "where #{locked_requirer.full_name} requires #{pretty_dep(locked_dep)}"
+        else
+          lines << "  * #{dep.name} (#{locked_version}) is locked for the other platforms"
+        end
+      else
+        lines << "The newest #{platform} variants cannot be satisfied without moving a gem that " \
+                 "another locked platform still uses."
+      end
+
+      lines.join("\n")
+    end
+
+    # The re-selection may only move the given platform's variants and add gems
+    # those variants alone need. Every other locked row must survive at its
+    # locked version, and every requirement in the merged result must be met by
+    # some row, so a resolver that relaxed a shared pin (and thereby moved or
+    # orphaned it) is rejected rather than written out.
+    def platform_variants_valid?(platform, names, merged)
+      merged_versions = merged.to_h {|spec| [spec.full_name, spec.version] }
+
+      shared_ok = @locked_specs.all? do |spec|
+        next true if names.include?(spec.name) && platform_specific_for?(spec.platform, platform)
+
+        merged_versions.key?(spec.full_name)
+      end
+      return false unless shared_ok
+
+      by_name = merged.group_by(&:name)
+
+      merged.all? do |spec|
+        spec.runtime_dependencies.all? do |dep|
+          candidates = by_name[dep.name]
+          next true unless candidates
+
+          candidates.any? {|candidate| dep.requirement.satisfied_by?(candidate.version) }
+        end
+      end
+    end
+
+    # Walks the newest builds of the re-selected names (and whatever gems only
+    # they need) looking for a requirement a still-shared locked gem cannot
+    # satisfy. Returns the requirer, the requirement, the locked version, and the
+    # locked row that keeps that gem in place.
+    def platform_variant_shared_conflict(platform, names)
+      locked_versions = {}
+      @locked_specs.each {|spec| locked_versions[spec.name] = spec.version }
+
+      seen = {}
+      queue = names.filter_map do |name|
+        row = platform_variant_rows(platform).find {|spec| spec.name == name }
+        next unless row
+
+        newest_platform_candidate(row.source, name, platform, row.version)
+      end
+
+      until queue.empty?
+        spec = queue.shift
+        next if spec.nil? || seen[spec.name]
+
+        seen[spec.name] = true
+
+        spec.runtime_dependencies.each do |dep|
+          next if dep.name == spec.name || names.include?(dep.name)
+
+          if (locked_version = locked_versions[dep.name])
+            next if dep.requirement.satisfied_by?(locked_version)
+
+            return [spec, dep, locked_version, locked_requirer_for(dep.name, platform)]
+          end
+
+          nexted = newest_dependency_candidate(spec.source, dep, platform)
+          queue << nexted if nexted && !seen[nexted.name]
+        end
+      end
+
+      nil
+    end
+
+    def newest_platform_candidate(source, name, platform, minimum_version)
+      candidates = source.specs.search(name).select do |spec|
+        platform_specific_for?(spec.platform, platform) &&
+          spec.version >= minimum_version &&
+          spec.matches_current_metadata?
+      end
+
+      candidates.max_by(&:version)
+    end
+
+    def newest_dependency_candidate(source, dep, platform)
+      candidates = source.specs.search(dep.name).select do |spec|
+        dep.requirement.satisfied_by?(spec.version) &&
+          spec.installable_on_platform?(platform) &&
+          spec.matches_current_metadata?
+      end
+      return if candidates.empty?
+
+      newest_version = candidates.map(&:version).max
+      same_version = candidates.select {|spec| spec.version == newest_version }
+      MatchPlatform.select_best_platform_match(same_version, platform).last
+    end
+
+    # The locked row that most explains why the shared gem stays put: prefer a
+    # row for another platform whose requirement the newer build would break,
+    # otherwise any locked row depending on it.
+    def locked_requirer_for(name, platform)
+      requirers = @locked_specs.to_a.select do |spec|
+        spec.name != name && spec.runtime_dependencies.any? {|dep| dep.name == name }
+      end
+
+      requirers.min_by do |spec|
+        priority = if platform_specific_for?(spec.platform, platform)
+          2
+        elsif spec.platform == Gem::Platform::RUBY
+          0
+        else
+          1
+        end
+        [priority, spec.full_name]
+      end
+    end
+
+    def locked_platform_label(spec, platform)
+      if spec.platform == Gem::Platform::RUBY
+        "the ruby platform"
+      elsif platform_specific_for?(spec.platform, platform)
+        "the #{platform} platform"
+      else
+        "the #{spec.platform} platform"
+      end
+    end
 
     def lockfile_changes_summary(update_refused_reason)
       added =   []

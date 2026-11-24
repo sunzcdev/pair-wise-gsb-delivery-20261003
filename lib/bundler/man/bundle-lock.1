@@ -4,7 +4,7 @@
 .SH "NAME"
 \fBbundle\-lock\fR \- Creates / Updates a lockfile without installing
 .SH "SYNOPSIS"
-\fBbundle lock\fR [\-\-update] [\-\-bundler[=BUNDLER]] [\-\-local] [\-\-print] [\-\-lockfile=PATH] [\-\-full\-index] [\-\-gemfile=GEMFILE] [\-\-add\-checksums] [\-\-add\-platform] [\-\-remove\-platform] [\-\-normalize\-platforms] [\-\-add\-ruby\-abi] [\-\-remove\-ruby\-abi] [\-\-patch] [\-\-minor] [\-\-major] [\-\-pre] [\-\-strict] [\-\-conservative] [\-\-cooldown=NUMBER]
+\fBbundle lock\fR [\-\-update] [\-\-bundler[=BUNDLER]] [\-\-local] [\-\-print] [\-\-lockfile=PATH] [\-\-full\-index] [\-\-gemfile=GEMFILE] [\-\-add\-checksums] [\-\-add\-platform] [\-\-remove\-platform] [\-\-update\-platform\-variants] [\-\-normalize\-platforms] [\-\-add\-ruby\-abi] [\-\-remove\-ruby\-abi] [\-\-patch] [\-\-minor] [\-\-major] [\-\-pre] [\-\-strict] [\-\-conservative] [\-\-cooldown=NUMBER]
 .SH "DESCRIPTION"
 Lock the gems specified in Gemfile\.
 .SH "OPTIONS"
@@ -38,6 +38,9 @@ Add a new platform to the lockfile, re\-resolving for the addition of that platf
 .TP
 \fB\-\-remove\-platform=<list>\fR
 Remove a platform from the lockfile\.
+.TP
+\fB\-\-update\-platform\-variants=<list>\fR
+Re\-select the platform\-specific variants of an already locked platform\. Only the gems that are specific to that platform are re\-resolved, preferring their newest build, so a gem that only that platform needs is added to the lockfile\. Gems still shared with the other locked platforms, including the generic \fBruby\fR branch, keep their locked version\. If a new platform build would force a shared gem to change, the conflict is reported and the lockfile is left untouched\.
 .TP
 \fB\-\-normalize\-platforms\fR
 Normalize lockfile platforms\.

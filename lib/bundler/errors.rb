@@ -311,4 +311,10 @@ module Bundler
 
     status_code(44)
   end
+
+  # Raised when re-selecting the variants of a single platform would require
+  # changing gems still shared with the other locked platforms.
+  class PlatformVariantConflict < BundlerError
+    status_code(45)
+  end
 end

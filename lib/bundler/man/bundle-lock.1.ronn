@@ -13,6 +13,7 @@ bundle-lock(1) -- Creates / Updates a lockfile without installing
               [--add-checksums]
               [--add-platform]
               [--remove-platform]
+              [--update-platform-variants]
               [--normalize-platforms]
               [--add-ruby-abi]
               [--remove-ruby-abi]
@@ -66,6 +67,15 @@ Lock the gems specified in Gemfile.
 
 * `--remove-platform=<list>`:
   Remove a platform from the lockfile.
+
+* `--update-platform-variants=<list>`:
+  Re-select the platform-specific variants of an already locked platform. Only
+  the gems that are specific to that platform are re-resolved, preferring their
+  newest build, so a gem that only that platform needs is added to the
+  lockfile. Gems still shared with the other locked platforms, including the
+  generic `ruby` branch, keep their locked version. If a new platform build
+  would force a shared gem to change, the conflict is reported and the lockfile
+  is left untouched.
 
 * `--normalize-platforms`:
   Normalize lockfile platforms.
