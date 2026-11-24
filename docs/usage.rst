@@ -547,6 +547,35 @@ You can output a report in ``json`` format by specifying ``--report``:
 
     nox --report status.json
 
+Each session entry includes a ``commands`` list describing every command the
+session ran, and a ``failed_command`` entry naming the command that failed the
+session (``null`` when the session did not fail on a command). Every command
+entry records:
+
+- ``command``: the command line that was run;
+- ``return_code``: the process's real exit code;
+- ``stdout_tail`` / ``stderr_tail``: the bounded end of each stream, kept
+  separately so the final, failure-relevant output can't be pushed out by a
+  long run on the other stream;
+- ``truncated``: per-stream ``dropped`` and ``retained`` byte counts, stating
+  exactly how much output was cut;
+- ``output_limit``: the per-stream cap that was in effect.
+
+The terminal always receives the complete output live while a command runs;
+only the copy recorded in the report is bounded. Tails are retained as raw
+bytes and decoded as one piece, so a multibyte character written across
+several writes is never split mid-character.
+
+Use ``--report-output-limit`` (or the ``NOX_REPORT_OUTPUT_LIMIT`` environment
+variable, or ``nox.options.report_output_limit`` in the Noxfile) to change the
+number of tail bytes retained per stream. The default is ``10000``; ``0``
+records no output at all while still reporting the truncation counts and the
+real exit code:
+
+.. code-block:: console
+
+    nox --report status.json --report-output-limit 2000
+
 
 Converting from tox
 -------------------

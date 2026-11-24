@@ -1346,3 +1346,136 @@ def test_noxfile_script_mode_url_req(tmp_path: Path) -> None:
     assert job.returncode == 0
     # Newer hatchling keeps the tag as written, older versions normalize it
     assert job.stdout.rstrip() in {"2024.10.9", "2024.10.09"}
+
+
+# A child program that interleaves stdout and stderr, splits one multibyte
+# character across several writes on each stream, then exits non-zero. The
+# multibyte split is the regression case for byte-level tail retention.
+_CHATTY_PROGRAM = """
+import sys
+
+text = "中"
+raw = text.encode("utf-8")
+for index in range(300):
+    sys.stdout.write(f"stdout line {index}\\n")
+    sys.stderr.write(f"stderr line {index}\\n")
+for stream, label in ((sys.stdout, "OUT"), (sys.stderr, "ERR")):
+    stream.write(label + "-")
+    stream.flush()
+    for byte in raw:
+        stream.buffer.write(bytes([byte]))
+        stream.flush()
+    stream.write("-TAIL\\n")
+    stream.flush()
+sys.exit(3)
+"""
+
+
+def test_main_report_contains_bounded_tails_and_exit_code(
+    run_nox: Callable[..., tuple[int, str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(nox, "options", nox._options.NoxfileOptions())
+    helper = tmp_path / "chatty.py"
+    helper.write_text(_CHATTY_PROGRAM, encoding="utf-8")
+    report = tmp_path / "report.json"
+    noxfile = tmp_path / "noxfile.py"
+    noxfile.write_text(
+        f"""
+import nox
+
+@nox.session(venv_backend="none")
+def chatty(session):
+    session.run({sys.executable!r}, {str(helper)!r})
+""",
+        encoding="utf-8",
+    )
+
+    returncode, stdout, stderr = run_nox(
+        "-f",
+        str(noxfile),
+        "-s",
+        "chatty",
+        "--report",
+        str(report),
+        "--report-output-limit",
+        "200",
+    )
+
+    # The session fails because the child exits 3; nox's own exit code is 1.
+    assert returncode == 1
+    # Live terminal output still contains the full progress.
+    assert "stdout line 0" in stdout
+    assert "stdout line 299" in stdout
+    assert "stderr line 0" in stderr
+    assert "stderr line 299" in stderr
+
+    import json
+
+    data = json.loads(report.read_text(encoding="utf-8"))
+    assert data["result"] == 0
+    session_entry = data["sessions"][0]
+    assert session_entry["result"] == "failed"
+
+    failed = session_entry["failed_command"]
+    assert failed is not None
+    assert failed["return_code"] == 3
+    assert failed["output_limit"] == 200
+    # Both tails retain the final, failure-relevant multibyte segment whole.
+    assert "OUT-中-TAIL" in failed["stdout_tail"]
+    assert "ERR-中-TAIL" in failed["stderr_tail"]
+    assert "stdout line 0" not in failed["stdout_tail"]
+    assert "stderr line 0" not in failed["stderr_tail"]
+    assert failed["truncated"]["stdout"]["dropped"] > 0
+    assert failed["truncated"]["stderr"]["dropped"] > 0
+    assert failed["truncated"]["stdout"]["retained"] <= 200
+    assert failed["truncated"]["stderr"]["retained"] <= 200
+
+    # The same record is listed among the session's commands.
+    assert session_entry["commands"][0]["return_code"] == 3
+
+
+def test_main_report_output_limit_zero_records_no_tails(
+    run_nox: Callable[..., tuple[int, str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(nox, "options", nox._options.NoxfileOptions())
+    helper = tmp_path / "fail.py"
+    helper.write_text("import sys; sys.stderr.write('boom'); sys.exit(1)", encoding="utf-8")
+    report = tmp_path / "report.json"
+    noxfile = tmp_path / "noxfile.py"
+    noxfile.write_text(
+        f"""
+import nox
+
+@nox.session(venv_backend="none")
+def failing(session):
+    session.run({sys.executable!r}, {str(helper)!r})
+""",
+        encoding="utf-8",
+    )
+
+    returncode, _stdout, _stderr = run_nox(
+        "-f",
+        str(noxfile),
+        "-s",
+        "failing",
+        "--report",
+        str(report),
+        "--report-output-limit",
+        "0",
+    )
+
+    assert returncode == 1
+    import json
+
+    data = json.loads(report.read_text(encoding="utf-8"))
+    failed = data["sessions"][0]["failed_command"]
+    assert failed["return_code"] == 1
+    assert failed["stdout_tail"] == ""
+    assert failed["stderr_tail"] == ""
+    assert failed["truncated"]["stderr"]["retained"] == 0
+    assert failed["truncated"]["stderr"]["dropped"] > 0
+

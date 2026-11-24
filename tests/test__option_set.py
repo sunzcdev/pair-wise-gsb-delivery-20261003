@@ -285,6 +285,51 @@ class TestEnvVars:
         assert "'download_python' must be in" in capsys.readouterr().err
 
 
+class TestReportOutputLimit:
+    def test_default(self) -> None:
+        assert _options.options.parse_args([]).report_output_limit == 10000
+
+    def test_cli_value(self) -> None:
+        config = _options.options.parse_args(["--report-output-limit", "0"])
+        assert config.report_output_limit == 0
+
+    def test_env_var_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("NOX_REPORT_OUTPUT_LIMIT", "512")
+
+        config = _options.options.parse_args([])
+
+        assert config.report_output_limit == 512
+        assert config.provenance("report_output_limit") is Source.ENVIRONMENT
+
+    def test_noxfile_value(self) -> None:
+        noxfile_config = _options.NoxfileOptions()
+        noxfile_config.report_output_limit = 42
+
+        config = _options.options.parse_args([])
+        _merge.merge_noxfile_options(config, noxfile_config)
+
+        assert config.report_output_limit == 42
+
+    def test_invalid_env_var_is_a_clean_error(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("NOX_REPORT_OUTPUT_LIMIT", "lots")
+
+        with pytest.raises(SystemExit):
+            _options.options.parse_args([])
+
+        assert "report output limit" in capsys.readouterr().err
+
+    def test_negative_value_rejected(self) -> None:
+        with pytest.raises(ValueError, match=">= 0"):
+            _options.NoxfileOptions(report_output_limit=-1)  # type: ignore[call-arg]
+
+    def test_zero_is_allowed(self) -> None:
+        assert (
+            _options.NoxfileOptions(report_output_limit=0).report_output_limit == 0  # type: ignore[call-arg]
+        )
+
+
 class TestReuseAliasPrecedence:
     """An explicit --reuse-venv on the command line now wins over the -r/-N
     aliases given alongside it (the aliases used to win). -R still wins."""
@@ -357,6 +402,7 @@ class TestToArgv:
             ["--nocolor", "--install-only", "--non-interactive", "-ts"],
             ["--default-venv-backend", "uv", "--download-python", "never"],
             ["--force-python", "3.13", "--stop-on-first-error"],
+            ["--report-output-limit", "256"],
             ["-j", "2", "--allow-parallel"],
             ["--python"],
             ["--extra-python"],

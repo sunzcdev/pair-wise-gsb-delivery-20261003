@@ -584,6 +584,7 @@ The following options can be specified in the Noxfile:
 * ``nox.options.parallel`` is equivalent to specifying :ref:`-j or --parallel <opt-parallel>`.
 * ``nox.options.allow_parallel`` is equivalent to specifying :ref:`--allow-parallel <opt-allow-parallel>`. You can force this off by specifying ``--no-allow-parallel`` during invocation.
 * ``nox.options.report`` is equivalent to specifying :ref:`--report <opt-report>`.
+* ``nox.options.report_output_limit`` is equivalent to specifying ``--report-output-limit``.
 * ``nox.options.verbose`` is equivalent to specifying :ref:`-v or --verbose <opt-verbose>`. You can force this off by specifying ``--no-verbose`` during invocation.
 
 

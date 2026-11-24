@@ -14,14 +14,17 @@
 
 from __future__ import annotations
 
-__lazy_modules__ = {"contextlib", "itertools", "locale"}
+__lazy_modules__ = {"codecs", "contextlib", "dataclasses", "itertools", "locale", "threading"}
 
+import codecs
 import contextlib
+import dataclasses
 import itertools
 import locale
 import os
 import subprocess
 import sys
+import threading
 from typing import IO, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -29,9 +32,13 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_INTERRUPT_TIMEOUT",
+    "DEFAULT_OUTPUT_LIMIT",
     "DEFAULT_TERMINATE_TIMEOUT",
+    "PopenResult",
     "decode_output",
     "popen",
+    "shutdown_process",
+    "shutdown_streaming_process",
 ]
 
 
@@ -41,6 +48,11 @@ def __dir__() -> list[str]:
 
 DEFAULT_INTERRUPT_TIMEOUT = 0.3
 DEFAULT_TERMINATE_TIMEOUT = 0.2
+
+# Per-stream (stdout and stderr, independently) number of tail bytes retained
+# for the JSON report when a command produces a lot of output. The terminal
+# still receives everything live; only the recorded copy is bounded.
+DEFAULT_OUTPUT_LIMIT = 10_000
 
 _CMD_META = frozenset("&<>^|()")
 
@@ -148,6 +160,31 @@ def shutdown_process(
     return proc.communicate()
 
 
+def shutdown_streaming_process(
+    proc: subprocess.Popen[bytes],
+    interrupt_timeout: float | None,
+    terminate_timeout: float | None,
+) -> None:
+    """Stop a child whose pipes are drained by Nox's own reader threads.
+
+    Unlike :func:`shutdown_process` this never calls ``communicate()`` (the
+    pipes already have readers), it only escalates wait/terminate/kill; the
+    readers see EOF and finish on their own.
+    """
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=interrupt_timeout)
+        return
+
+    proc.terminate()
+
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=terminate_timeout)
+        return
+
+    proc.kill()
+    proc.wait()
+
+
 def decode_output(output: bytes) -> str:
     """Try to decode the given bytes with encodings from the system.
 
@@ -165,6 +202,182 @@ def decode_output(output: bytes) -> str:
         return output.decode(second_encoding)
 
 
+@dataclasses.dataclass(frozen=True)
+class PopenResult:
+    """Everything :func:`popen` learned while running a command.
+
+    ``output`` keeps the historical contract: merged stdout/stderr text for a
+    ``silent`` command (used as :meth:`session.run`'s return value), an empty
+    string otherwise.
+
+    The ``stdout_tail``/``stderr_tail`` pair is the bounded end of each stream
+    as raw bytes, so a multibyte character split across two reads is never
+    truncated mid-character: the retained bytes are decoded as one piece.
+    ``truncated`` reports, per stream, how many bytes were discarded and how
+    many are retained, so a report can state exactly how much was cut.
+    """
+
+    return_code: int
+    output: str
+    stdout_tail: bytes = b""
+    stderr_tail: bytes = b""
+    truncated: dict[str, int] = dataclasses.field(default_factory=dict)
+
+
+class _BoundedTail:
+    """Keep only the last ``limit`` bytes while remembering the full length."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._buf = bytearray()
+        self.total = 0
+
+    def append(self, chunk: bytes) -> None:
+        self.total += len(chunk)
+        if self.limit <= 0:
+            return
+        self._buf.extend(chunk)
+        overflow = len(self._buf) - self.limit
+        if overflow > 0:
+            del self._buf[:overflow]
+
+    @property
+    def bytes(self) -> bytes:
+        return bytes(self._buf)
+
+    def truncated_info(self) -> dict[str, int]:
+        dropped = self.total - len(self._buf)
+        return {"dropped": dropped, "retained": len(self._buf)}
+
+
+def _stream_reader(
+    pipe: IO[bytes],
+    *,
+    tail: _BoundedTail,
+    live_stream: IO[str] | None,
+    full_output: bytearray | None,
+    output_lock: threading.Lock,
+) -> None:
+    """Drain one child pipe until EOF.
+
+    Every chunk is appended to the bounded tail and, when the caller wants it,
+    to the merged full-output buffer. When a live terminal stream is given, the
+    chunk is also decoded incrementally and forwarded immediately, so output
+    appears while the command runs and a multibyte character split across reads
+    is still emitted whole (the decoder holds the partial sequence until the
+    rest of it arrives).
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while True:
+        chunk = pipe.read(1024)
+        if not chunk:
+            break
+        tail.append(chunk)
+        if full_output is not None:
+            with output_lock:
+                full_output.extend(chunk)
+        if live_stream is not None:
+            _write_live(live_stream, decoder.decode(chunk))
+    if live_stream is not None:
+        final = decoder.decode(b"", final=True)
+        if final:
+            _write_live(live_stream, final)
+
+
+def _write_live(stream: IO[str], text: str) -> None:
+    """Forward live output, escaping anything the console encoding cannot hold."""
+    if not text:
+        return
+    try:
+        stream.write(text)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        stream.write(text.encode(encoding, "backslashreplace").decode(encoding))
+    stream.flush()
+
+
+def _stream_popen(
+    proc: subprocess.Popen[bytes],
+    *,
+    silent: bool,
+    output_limit: int,
+    interrupt_timeout: float | None,
+    terminate_timeout: float | None,
+) -> PopenResult:
+    """Read both pipes concurrently with bounded per-stream tails."""
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+
+    # A silent command's full merged output is its documented return value, so
+    # it must be accumulated completely. A non-silent command goes to the
+    # terminal live and only the bounded tails are kept for the report.
+    full_output = bytearray() if silent else None
+    output_lock = threading.Lock()
+    stdout_tail = _BoundedTail(output_limit)
+    stderr_tail = _BoundedTail(output_limit)
+
+    live_out = None if silent else sys.stdout
+    live_err = None if silent else sys.stderr
+    threads = [
+        threading.Thread(
+            target=_stream_reader,
+            name="nox-stdout-reader",
+            args=(proc.stdout,),
+            kwargs={
+                "tail": stdout_tail,
+                "live_stream": live_out,
+                "full_output": full_output,
+                "output_lock": output_lock,
+            },
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_stream_reader,
+            name="nox-stderr-reader",
+            args=(proc.stderr,),
+            kwargs={
+                "tail": stderr_tail,
+                "live_stream": live_err,
+                "full_output": full_output,
+                "output_lock": output_lock,
+            },
+            daemon=True,
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        shutdown_streaming_process(proc, interrupt_timeout, terminate_timeout)
+        if proc.returncode != 0:
+            raise
+    finally:
+        for thread in threads:
+            thread.join()
+        # Closing the Popen also closes both pipes, avoiding ResourceWarnings
+        # about inherited file descriptors.
+        proc.wait()
+        proc.stdout.close()
+        proc.stderr.close()
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    output = decode_output(bytes(full_output)) if full_output else ""
+    return PopenResult(
+        return_code=proc.returncode,
+        output=output,
+        stdout_tail=stdout_tail.bytes,
+        stderr_tail=stderr_tail.bytes,
+        truncated={
+            "stdout": stdout_tail.truncated_info(),
+            "stderr": stderr_tail.truncated_info(),
+        },
+    )
+
+
 def popen(
     args: Sequence[str],
     *,
@@ -174,7 +387,8 @@ def popen(
     stderr: int | IO[str] | None = subprocess.STDOUT,
     interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
     terminate_timeout: float | None = DEFAULT_TERMINATE_TIMEOUT,
-) -> tuple[int, str]:
+    output_limit: int = DEFAULT_OUTPUT_LIMIT,
+) -> PopenResult:
     if silent and stdout is not None:
         msg = (
             "Can not specify silent and stdout; passing a custom stdout always silences"
@@ -182,24 +396,42 @@ def popen(
         )
         raise ValueError(msg)
 
-    if silent:
-        stdout = subprocess.PIPE
-
     popen_args: Sequence[str] | str = args
     if sys.platform.startswith("win") and args[0].casefold().endswith((".bat", ".cmd")):
         popen_args = _windows_batch_command(args, env)
 
-    proc = subprocess.Popen(popen_args, env=env, stdout=stdout, stderr=stderr)
+    if silent or (stdout is None and stderr in (None, subprocess.STDOUT)):
+        # Nox owns the pipes: drain them itself so output streams live and the
+        # end of each stream is retained within the bounded report limit.
+        proc = subprocess.Popen(
+            popen_args,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return _stream_popen(
+            proc,
+            silent=silent,
+            output_limit=output_limit,
+            interrupt_timeout=interrupt_timeout,
+            terminate_timeout=terminate_timeout,
+        )
 
-    try:
-        out, _err = proc.communicate()
-        sys.stdout.flush()
+    # Custom stdout/stderr destinations (files or descriptors) are handed to
+    # the child directly; there is nothing for Nox to retain or stream.
+    with subprocess.Popen(popen_args, env=env, stdout=stdout, stderr=stderr) as proc:
+        try:
+            out, _err = proc.communicate()
+            sys.stdout.flush()
 
-    except KeyboardInterrupt:
-        out, _err = shutdown_process(proc, interrupt_timeout, terminate_timeout)
-        if proc.returncode != 0:
-            raise
+        except KeyboardInterrupt:
+            out, _err = shutdown_process(proc, interrupt_timeout, terminate_timeout)
+            if proc.returncode != 0:
+                raise
 
-    return_code = proc.wait()
+        return_code = proc.wait()
 
-    return return_code, decode_output(out) if out else ""
+    return PopenResult(
+        return_code=return_code,
+        output=decode_output(out) if out else "",
+    )

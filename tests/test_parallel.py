@@ -405,6 +405,64 @@ def exclusive(session):
     assert output.count(f"parallel={expected}") == 3
 
 
+def test_parallel_report_carries_command_tails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # End-to-end: a failing parallel session's child report (with bounded
+    # tails) must survive the parent's merge into the final --report file.
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+    helper = tmp_path / "chatty.py"
+    helper.write_text(
+        'import sys\n'
+        'sys.stdout.write("out" * 400 + "OUT-中-END\\n")\n'
+        'sys.stderr.write("err" * 400 + "ERR-中-END\\n")\n'
+        "sys.exit(3)\n",
+        encoding="utf-8",
+    )
+    report = tmp_path / "report.json"
+    noxfile = tmp_path / "noxfile.py"
+    noxfile.write_text(
+        f"""import nox
+
+@nox.session(venv_backend="none", allow_parallel=True)
+def failing(session):
+    session.run({sys.executable!r}, {str(helper)!r})
+""",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "nox",
+            "--noxfile",
+            str(noxfile),
+            "-j",
+            "2",
+            "--allow-parallel",
+            "--report",
+            str(report),
+            "--report-output-limit",
+            "128",
+            "--nocolor",
+        ],
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+        timeout=60,
+    )
+
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    data = json.loads(report.read_text(encoding="utf-8"))
+    failed = data["sessions"][0]["failed_command"]
+    assert failed["return_code"] == 3
+    assert failed["output_limit"] == 128
+    assert "OUT-中-END" in failed["stdout_tail"]
+    assert "ERR-中-END" in failed["stderr_tail"]
+    assert failed["truncated"]["stdout"]["dropped"] > 0
+
+
 def test_child_argv_full() -> None:
     config = _options.options.namespace(
         noxfile="nf.py",
@@ -651,6 +709,50 @@ def test_read_report_missing_falls_back_to_returncode(
         path, _fake_runner(FakeSession("x")), returncode=returncode
     )
     assert result.status is expected
+
+
+def test_read_report_preserves_command_records(tmp_path: object) -> None:
+    # The child's JSON report carries bounded command tails; the parent must
+    # reconstruct them so the final merged report keeps the failure context.
+    path = str(tmp_path / "r.json")  # type: ignore[operator]
+    report = _report_data(result="failed", reason=None)
+    report["sessions"][0]["commands"] = [
+        {
+            "command": "python chatty.py",
+            "return_code": 3,
+            "stdout_tail": "OUT-中-TAIL",
+            "stderr_tail": "ERR-中-TAIL",
+            "truncated": {
+                "stdout": {"dropped": 4800, "retained": 200},
+                "stderr": {"dropped": 4800, "retained": 200},
+            },
+            "output_limit": 200,
+        }
+    ]
+    report["sessions"][0]["failed_command"] = report["sessions"][0]["commands"][0]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f)
+
+    result = _parallel._read_report(path, _fake_runner(FakeSession("x")), returncode=1)
+
+    assert result.status is Status.FAILED
+    assert len(result.commands) == 1
+    command = result.commands[0]
+    assert command.return_code == 3
+    assert command.stdout_tail == "OUT-中-TAIL"
+    assert command.limit == 200
+    assert command.truncated["stderr"]["dropped"] == 4800
+    assert result.failed_command == command
+
+
+def test_child_argv_forwards_report_output_limit() -> None:
+    config = _options.options.parse_args(["--report-output-limit", "256"])
+    argv = _parallel._child_argv(
+        typing.cast("typing.Any", config),
+        _fake_runner(FakeSession("tests")),
+        "r.json",
+    )
+    assert argv[argv.index("--report-output-limit") + 1] == "256"
 
 
 def test_reporter_render() -> None:

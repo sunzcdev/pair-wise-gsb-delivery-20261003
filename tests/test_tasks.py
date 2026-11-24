@@ -884,6 +884,8 @@ def test_create_report() -> None:
                             "reason": None,
                             "args": {},
                             "duration": 0.0,
+                            "commands": [],
+                            "failed_command": None,
                         }
                     ],
                 },

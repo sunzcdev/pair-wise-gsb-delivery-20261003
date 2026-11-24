@@ -144,6 +144,25 @@ def _parallel_converter(value: str | int | None) -> int | None:
     return None if value is None else parse_parallel(value)
 
 
+def _report_output_limit_converter(value: str | int) -> int:
+    """Normalize the report limit from a CLI int, an env-var string, or a Noxfile."""
+    if isinstance(value, int):
+        limit = value
+    else:
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            msg = (
+                f"invalid report output limit {value!r} (expected a non-negative"
+                " integer)"
+            )
+            raise ValueError(msg) from None
+    if limit < 0:
+        msg = f"report output limit must be >= 0, got {limit}"
+        raise ValueError(msg)
+    return limit
+
+
 def _parallel_arg(value: str) -> int:
     """``argparse`` type for ``--parallel`` that reports errors nicely."""
     try:
@@ -320,6 +339,25 @@ class NoxfileOptions(_option_set.OptionsBase):
             group="reporting",
             completer=_completers.json_file_completer,
             help="Output a report of all sessions to the given filename.",
+        ),
+    )
+    report_output_limit: int = attrs.field(
+        default=10000,
+        converter=_report_output_limit_converter,
+        validator=av.instance_of(int),
+        metadata=opt(
+            "--report-output-limit",
+            group="reporting",
+            env_var="NOX_REPORT_OUTPUT_LIMIT",
+            argparse_kwargs={"type": int},
+            help=(
+                "Maximum number of bytes retained from the end of each stream"
+                " (stdout and stderr independently) of every command in the JSON"
+                " report. The terminal still receives the complete output live;"
+                " this only bounds what the report records, and the final"
+                " (failure-relevant) output is never pushed out. Use 0 to record"
+                " no output. Environment variable: NOX_REPORT_OUTPUT_LIMIT"
+            ),
         ),
     )
     reuse_existing_virtualenvs: bool | None = attrs.field(

@@ -55,6 +55,7 @@ def run_with_defaults(**kwargs: Any) -> dict[str, Any]:
         "stderr": subprocess.STDOUT,
         "interrupt_timeout": nox.popen.DEFAULT_INTERRUPT_TIMEOUT,
         "terminate_timeout": nox.popen.DEFAULT_TERMINATE_TIMEOUT,
+        "output_limit": nox.popen.DEFAULT_OUTPUT_LIMIT,
         **kwargs,
     }
 
@@ -71,6 +72,7 @@ def _run_with_defaults(**kwargs: Any) -> dict[str, Any]:
         "stderr": subprocess.STDOUT,
         "interrupt_timeout": nox.popen.DEFAULT_INTERRUPT_TIMEOUT,
         "terminate_timeout": nox.popen.DEFAULT_TERMINATE_TIMEOUT,
+        "output_limit": nox.popen.DEFAULT_OUTPUT_LIMIT,
         **kwargs,
     }
 
@@ -560,16 +562,20 @@ class TestSession:
         runner.venv = nox.virtualenv.PassthroughEnv()
 
         subp_popen_instance = mock.Mock()
-        subp_popen_instance.communicate.side_effect = KeyboardInterrupt()
+        # The streaming wait() is interrupted; the reader pipes reach EOF at
+        # once instead of looping on an endless mock.
+        subp_popen_instance.wait.side_effect = KeyboardInterrupt()
+        subp_popen_instance.stdout.read.return_value = b""
+        subp_popen_instance.stderr.read.return_value = b""
         with (
-            mock.patch("nox.popen.shutdown_process", autospec=True) as shutdown_process,
+            mock.patch(
+                "nox.popen.shutdown_streaming_process", autospec=True
+            ) as shutdown_process,
             mock.patch(
                 "nox.popen.subprocess.Popen",
                 new=mock.Mock(return_value=subp_popen_instance),
             ),
         ):
-            shutdown_process.return_value = ("", "")
-
             timeout_kwargs: dict[str, float | None] = {}
             if interrupt_timeout_setting != "default":
                 timeout_kwargs["interrupt_timeout"] = interrupt_timeout_setting
@@ -1665,3 +1671,95 @@ class TestResult:
         assert answer["result"] == "success"
         assert answer["result_code"] == 1
         assert answer["signatures"] == ["siggy"]
+        assert answer["commands"] == []
+        assert answer["failed_command"] is None
+
+    def test__serialize_commands(self) -> None:
+        command = nox.command.CommandResult(
+            command="python -c 'exit(1)'",
+            return_code=1,
+            stdout_tail="out-tail",
+            stderr_tail="err-tail",
+            truncated={
+                "stdout": {"dropped": 90, "retained": 10},
+                "stderr": {"dropped": 0, "retained": 8},
+            },
+            limit=10,
+        )
+        runner = typing.cast(
+            "nox.sessions.SessionRunner",
+            argparse.Namespace(
+                signatures=["siggy"], name="namey", func=mock.Mock()
+            ),
+        )
+        result = nox.sessions.Result(
+            runner,
+            nox.sessions.Status.FAILED,
+            commands=[command],
+            failed_command=command,
+        )
+
+        answer = result.serialize()
+
+        assert answer["commands"][0] == {
+            "command": "python -c 'exit(1)'",
+            "return_code": 1,
+            "stdout_tail": "out-tail",
+            "stderr_tail": "err-tail",
+            "truncated": {
+                "stdout": {"dropped": 90, "retained": 10},
+                "stderr": {"dropped": 0, "retained": 8},
+            },
+            "output_limit": 10,
+        }
+        assert answer["failed_command"] == answer["commands"][0]
+
+    def test__from_dict_roundtrip_with_commands(self) -> None:
+        command = nox.command.CommandResult(
+            command="tool --flag",
+            return_code=2,
+            stdout_tail="尾",
+            stderr_tail="boom",
+            truncated={"stdout": {"dropped": 5, "retained": 3}, "stderr": {"dropped": 0, "retained": 4}},
+            limit=3,
+        )
+        runner = typing.cast(
+            "nox.sessions.SessionRunner",
+            argparse.Namespace(
+                signatures=["siggy"], name="namey", func=mock.Mock()
+            ),
+        )
+        original = nox.sessions.Result(
+            runner,
+            nox.sessions.Status.FAILED,
+            commands=[command],
+            failed_command=command,
+        )
+
+        rebuilt = nox.sessions.Result.from_dict(runner, original.serialize())
+
+        assert rebuilt.status is nox.sessions.Status.FAILED
+        assert len(rebuilt.commands) == 1
+        assert rebuilt.commands[0] == command
+        assert rebuilt.failed_command == command
+
+    def test__from_dict_without_command_fields(self) -> None:
+        # Reports written by older Nox versions have no command entries.
+        runner = typing.cast(
+            "nox.sessions.SessionRunner",
+            argparse.Namespace(signatures=["s"], name="n", func=mock.Mock()),
+        )
+        legacy_entry = {
+            "name": "n",
+            "result": "success",
+            "result_code": 1,
+            "reason": None,
+            "signatures": ["s"],
+            "duration": 0.0,
+        }
+
+        result = nox.sessions.Result.from_dict(runner, legacy_entry)
+
+        assert result.status is nox.sessions.Status.SUCCESS
+        assert result.commands == []
+        assert result.failed_command is None

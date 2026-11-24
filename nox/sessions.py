@@ -48,7 +48,11 @@ import humanize
 import nox.command
 import nox.virtualenv
 from nox.logger import logger
-from nox.popen import DEFAULT_INTERRUPT_TIMEOUT, DEFAULT_TERMINATE_TIMEOUT
+from nox.popen import (
+    DEFAULT_INTERRUPT_TIMEOUT,
+    DEFAULT_OUTPUT_LIMIT,
+    DEFAULT_TERMINATE_TIMEOUT,
+)
 from nox.virtualenv import (
     CondaEnv,
     PassthroughEnv,
@@ -284,6 +288,7 @@ class Session:
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
         terminate_timeout: float | None = DEFAULT_TERMINATE_TIMEOUT,
+        output_limit: int | None = None,
     ) -> str | bool | None:
         """
         Install dependencies and run a Python script.
@@ -306,6 +311,7 @@ class Session:
             stderr=stderr,
             interrupt_timeout=interrupt_timeout,
             terminate_timeout=terminate_timeout,
+            output_limit=output_limit,
         )
 
     @property
@@ -348,6 +354,12 @@ class Session:
             logger.exception(f"Function {func!r} raised {e!r}.")
             raise nox.command.CommandFailed() from e
 
+    def _resolve_output_limit(self, output_limit: int | None) -> int:
+        """Resolve a per-call override against the global report setting."""
+        if output_limit is not None:
+            return output_limit
+        return self._runner.global_config.report_output_limit
+
     @typing.overload
     def run(
         self,
@@ -362,6 +374,7 @@ class Session:
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
         terminate_timeout: float | None = DEFAULT_TERMINATE_TIMEOUT,
+        output_limit: int | None = None,
     ) -> bool | None: ...
 
     @typing.overload
@@ -378,6 +391,7 @@ class Session:
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
         terminate_timeout: float | None = DEFAULT_TERMINATE_TIMEOUT,
+        output_limit: int | None = None,
     ) -> str | None: ...
 
     @typing.overload
@@ -394,6 +408,7 @@ class Session:
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
         terminate_timeout: float | None = DEFAULT_TERMINATE_TIMEOUT,
+        output_limit: int | None = None,
     ) -> str | bool | None: ...
 
     def run(
@@ -409,6 +424,7 @@ class Session:
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
         terminate_timeout: float | None = DEFAULT_TERMINATE_TIMEOUT,
+        output_limit: int | None = None,
     ) -> str | bool | None:
         """Run a command.
 
@@ -509,6 +525,11 @@ class Session:
         :param stderr: Redirect standard output of the command into a file. Can't be
             combined with *silent*.
         :type stderr: file or file descriptor
+        :param output_limit: Maximum number of bytes retained from the end of each
+            stream (stdout and stderr independently) for the JSON report. The full
+            output still reaches the terminal live. Defaults to the
+            ``--report-output-limit`` global setting.
+        :type output_limit: int or None
         """
         if not args:
             msg = "At least one argument required to run()."
@@ -534,6 +555,7 @@ class Session:
             stderr=stderr,
             interrupt_timeout=interrupt_timeout,
             terminate_timeout=terminate_timeout,
+            output_limit=self._resolve_output_limit(output_limit),
         )
 
     def run_install(
@@ -549,6 +571,7 @@ class Session:
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
         terminate_timeout: float | None = DEFAULT_TERMINATE_TIMEOUT,
+        output_limit: int | None = None,
     ) -> str | bool | None:
         """Run a command in the install step.
 
@@ -617,6 +640,7 @@ class Session:
             stderr=stderr,
             interrupt_timeout=interrupt_timeout,
             terminate_timeout=terminate_timeout,
+            output_limit=self._resolve_output_limit(output_limit),
         )
 
     def run_always(
@@ -632,6 +656,7 @@ class Session:
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
         terminate_timeout: float | None = DEFAULT_TERMINATE_TIMEOUT,
+        output_limit: int | None = None,
     ) -> str | bool | None:
         """This is an alias to ``run_install``, which better describes the use case.
 
@@ -650,6 +675,7 @@ class Session:
             stderr=stderr,
             interrupt_timeout=interrupt_timeout,
             terminate_timeout=terminate_timeout,
+            output_limit=output_limit,
         )
 
     def _run(
@@ -665,6 +691,7 @@ class Session:
         stderr: int | IO[str] | None,
         interrupt_timeout: float | None,
         terminate_timeout: float | None,
+        output_limit: int | None = None,
     ) -> str | bool:
         """Like run(), except that it runs even if --install-only is provided."""
         # Legacy support - run a function given.
@@ -713,6 +740,7 @@ class Session:
             stderr=stderr,
             interrupt_timeout=interrupt_timeout,
             terminate_timeout=terminate_timeout,
+            output_limit=output_limit,
         )
 
     def conda_install(
@@ -729,6 +757,7 @@ class Session:
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
         terminate_timeout: float | None = DEFAULT_TERMINATE_TIMEOUT,
+        output_limit: int | None = None,
     ) -> None:
         """Install invokes `conda install`_ to install packages inside of the
         session's environment.
@@ -830,6 +859,7 @@ class Session:
             stderr=stderr,
             interrupt_timeout=interrupt_timeout,
             terminate_timeout=terminate_timeout,
+            output_limit=self._resolve_output_limit(output_limit),
         )
 
     def install(
@@ -845,6 +875,7 @@ class Session:
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
         terminate_timeout: float | None = DEFAULT_TERMINATE_TIMEOUT,
+        output_limit: int | None = None,
     ) -> None:
         """Install invokes `pip`_ to install packages inside of the session's
         virtualenv.
@@ -926,6 +957,7 @@ class Session:
             stderr=stderr,
             interrupt_timeout=interrupt_timeout,
             terminate_timeout=terminate_timeout,
+            output_limit=self._resolve_output_limit(output_limit),
         )
 
     def notify(
@@ -1086,6 +1118,9 @@ class SessionRunner:
         self.posargs: list[str] = list(global_config.posargs)
         self.result: Result | None = None
         self.multi = multi
+        # One entry per command actually run during the session; serialized
+        # into the JSON report (bounded stream tails, truncation, exit codes).
+        self.commands: list[nox.command.CommandResult] = []
 
         if getattr(func, "parametrize", None):
             self.multi = True
@@ -1198,6 +1233,7 @@ class SessionRunner:
                     return self.result
 
         start = time.perf_counter()
+        record_token = nox.command.command_records.set(self.commands)
         try:
             cwd = os.path.realpath(os.path.dirname(self.global_config.noxfile))
 
@@ -1209,7 +1245,10 @@ class SessionRunner:
 
             # Nothing went wrong; return a success.
             self.result = Result(
-                self, Status.SUCCESS, duration=time.perf_counter() - start
+                self,
+                Status.SUCCESS,
+                duration=time.perf_counter() - start,
+                commands=list(self.commands),
             )
 
         except nox.virtualenv.InterpreterNotFound as exc:
@@ -1219,6 +1258,7 @@ class SessionRunner:
                     Status.FAILED,
                     reason=str(exc),
                     duration=time.perf_counter() - start,
+                    commands=list(self.commands),
                 )
             else:
                 logger.warning(
@@ -1229,6 +1269,7 @@ class SessionRunner:
                     Status.SKIPPED,
                     reason=str(exc),
                     duration=time.perf_counter() - start,
+                    commands=list(self.commands),
                 )
 
         except _SessionQuit as exc:
@@ -1237,6 +1278,7 @@ class SessionRunner:
                 Status.ABORTED,
                 reason=str(exc),
                 duration=time.perf_counter() - start,
+                commands=list(self.commands),
             )
 
         except _SessionSkip as exc:
@@ -1245,11 +1287,16 @@ class SessionRunner:
                 Status.SKIPPED,
                 reason=str(exc),
                 duration=time.perf_counter() - start,
+                commands=list(self.commands),
             )
 
-        except nox.command.CommandFailed:
+        except nox.command.CommandFailed as exc:
             self.result = Result(
-                self, Status.FAILED, duration=time.perf_counter() - start
+                self,
+                Status.FAILED,
+                duration=time.perf_counter() - start,
+                commands=list(self.commands),
+                failed_command=exc.result,
             )
 
         except KeyboardInterrupt:
@@ -1259,8 +1306,14 @@ class SessionRunner:
         except Exception as exc:  # noqa: BLE001
             logger.exception(f"Session {self.friendly_name} raised exception {exc!r}")
             self.result = Result(
-                self, Status.FAILED, duration=time.perf_counter() - start
+                self,
+                Status.FAILED,
+                duration=time.perf_counter() - start,
+                commands=list(self.commands),
             )
+
+        finally:
+            nox.command.command_records.reset(record_token)
 
         return self.result
 
@@ -1285,6 +1338,8 @@ class Result:
         reason: str | None = None,
         *,
         duration: float = 0.0,
+        commands: Sequence[nox.command.CommandResult] | None = None,
+        failed_command: nox.command.CommandResult | None = None,
     ) -> None:
         """Initialize the Result object.
 
@@ -1294,11 +1349,16 @@ class Result:
             status (~nox.sessions.Status): The final result status.
             reason (str): Additional info.
             duration (float): Time taken in seconds.
+            commands: Records of the commands run during the session, each with
+                bounded stream tails for the JSON report.
+            failed_command: The specific command whose failure failed the session.
         """
         self.session = session
         self.status = status
         self.reason = reason
         self.duration = duration
+        self.commands = list(commands) if commands is not None else []
+        self.failed_command = failed_command
 
     def __bool__(self) -> bool:
         return self.status.value > 0
@@ -1349,6 +1409,18 @@ class Result:
                 log_function = logger.error if status.value <= 0 else logger.info
         log_function(message)
 
+    @staticmethod
+    def _serialize_command(command: nox.command.CommandResult) -> dict[str, Any]:
+        """Return the JSON-safe form of one :class:`CommandResult`."""
+        return {
+            "command": command.command,
+            "return_code": command.return_code,
+            "stdout_tail": command.stdout_tail,
+            "stderr_tail": command.stderr_tail,
+            "truncated": command.truncated,
+            "output_limit": command.limit,
+        }
+
     def serialize(self) -> dict[str, Any]:
         """Return a serialized representation of this result.
 
@@ -1363,14 +1435,42 @@ class Result:
             "reason": self.reason,
             "signatures": self.session.signatures,
             "duration": self.duration,
+            "commands": [self._serialize_command(command) for command in self.commands],
+            "failed_command": (
+                self._serialize_command(self.failed_command)
+                if self.failed_command is not None
+                else None
+            ),
         }
 
     @classmethod
     def from_dict(cls, session: SessionRunner, entry: dict[str, Any]) -> Result:
         """Rebuild a result from a :meth:`serialize` entry."""
-        return cls(
+        result = cls(
             session,
             Status[entry["result"].upper()],
             entry.get("reason"),
             duration=entry.get("duration", 0.0),
+            commands=[
+                nox.command.CommandResult(
+                    command=command["command"],
+                    return_code=command["return_code"],
+                    stdout_tail=command["stdout_tail"],
+                    stderr_tail=command["stderr_tail"],
+                    truncated=command["truncated"],
+                    limit=command["output_limit"],
+                )
+                for command in entry.get("commands", [])
+            ],
         )
+        failed = entry.get("failed_command")
+        if failed is not None:
+            result.failed_command = nox.command.CommandResult(
+                command=failed["command"],
+                return_code=failed["return_code"],
+                stdout_tail=failed["stdout_tail"],
+                stderr_tail=failed["stderr_tail"],
+                truncated=failed["truncated"],
+                limit=failed["output_limit"],
+            )
+        return result

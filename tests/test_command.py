@@ -329,7 +329,7 @@ def test_run_path_existent(tmp_path: Path) -> None:
     executable.chmod(0o700)
 
     with mock.patch("nox.command.popen") as mock_command:
-        mock_command.return_value = (0, "")
+        mock_command.return_value = nox.popen.PopenResult(0, "")
         nox.command.run([executable_name], silent=True, paths=[str(tmp_path)])
         mock_command.assert_called_with(
             [str(executable)],
@@ -339,6 +339,7 @@ def test_run_path_existent(tmp_path: Path) -> None:
             stderr=subprocess.STDOUT,
             interrupt_timeout=0.3,
             terminate_timeout=0.2,
+            output_limit=nox.popen.DEFAULT_OUTPUT_LIMIT,
         )
 
 
@@ -464,37 +465,50 @@ def interrupt_process(proc: subprocess.Popen[Any]) -> None:
 def command_with_keyboard_interrupt(
     monkeypatch: pytest.MonkeyPatch, marker: Any
 ) -> None:
-    """Monkeypatch Popen.communicate to raise KeyboardInterrupt."""
+    """Monkeypatch Popen to raise KeyboardInterrupt while the child runs."""
     if sys.platform.startswith("win"):
         # Enable Ctrl-C because the child inherits the setting from us.
         enable_ctrl_c(enabled=True)
 
     communicate = subprocess.Popen.communicate
+    wait = subprocess.Popen.wait
 
-    def wrapper(
+    def trigger_interrupt(proc: subprocess.Popen[Any]) -> None:
+        # Give the child time to install its signal handlers.
+        while not marker.exists():
+            time.sleep(0.05)
+
+        # Send a real keyboard interrupt to the child.
+        interrupt_process(proc)
+
+        # Fake a keyboard interrupt in the parent.
+        raise KeyboardInterrupt
+
+    def communicate_wrapper(
         proc: subprocess.Popen[Any], *args: Any, **kwargs: Any
     ) -> tuple[Any, Any]:
         # Raise the interrupt only on the first call, so Nox has a chance to
         # shut down the child process subsequently.
-
-        if wrapper.firstcall:  # type: ignore[attr-defined]
-            wrapper.firstcall = False  # type: ignore[attr-defined]
-
-            # Give the child time to install its signal handlers.
-            while not marker.exists():
-                time.sleep(0.05)
-
-            # Send a real keyboard interrupt to the child.
-            interrupt_process(proc)
-
-            # Fake a keyboard interrupt in the parent.
-            raise KeyboardInterrupt
+        if communicate_wrapper.firstcall:  # type: ignore[attr-defined]
+            communicate_wrapper.firstcall = False  # type: ignore[attr-defined]
+            trigger_interrupt(proc)
 
         return communicate(proc, *args, **kwargs)
 
-    wrapper.firstcall = True  # type: ignore[attr-defined]
+    def wait_wrapper(proc: subprocess.Popen[Any], *args: Any, **kwargs: Any) -> int:
+        # The streaming popen path waits instead of calling communicate();
+        # interrupt it the same way, then defer to the real wait.
+        if wait_wrapper.firstcall:  # type: ignore[attr-defined]
+            wait_wrapper.firstcall = False  # type: ignore[attr-defined]
+            trigger_interrupt(proc)
 
-    monkeypatch.setattr("subprocess.Popen.communicate", wrapper)
+        return wait(proc, *args, **kwargs)
+
+    communicate_wrapper.firstcall = True  # type: ignore[attr-defined]
+    wait_wrapper.firstcall = True  # type: ignore[attr-defined]
+
+    monkeypatch.setattr("subprocess.Popen.communicate", communicate_wrapper)
+    monkeypatch.setattr("subprocess.Popen.wait", wait_wrapper)
 
 
 def format_program(program: str, marker: Any) -> str:
@@ -768,3 +782,80 @@ def test_run_internal_directory(normalized: bool) -> None:
     )
 
     assert "Python" in result
+
+
+def test_run_records_command_result() -> None:
+    records: list[nox.command.CommandResult] = []
+    token = nox.command.command_records.set(records)
+    try:
+        nox.command.run(
+            [
+                PYTHON,
+                "-c",
+                (
+                    "import sys;"
+                    'sys.stdout.write("out-tail");'
+                    'sys.stderr.write("err-tail");'
+                    "sys.exit(2)"
+                ),
+            ],
+            success_codes=[2],
+            output_limit=128,
+        )
+    finally:
+        nox.command.command_records.reset(token)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.return_code == 2
+    assert "out-tail" in record.stdout_tail
+    assert "err-tail" in record.stderr_tail
+    assert record.limit == 128
+    assert set(record.truncated) == {"stdout", "stderr"}
+
+
+def test_run_without_recorder_still_works() -> None:
+    # The context variable is unset outside a session; nothing to append to.
+    assert nox.command.command_records.get() is None
+    assert nox.command.run([PYTHON, "-c", "print(1)"]) is True
+
+
+def test_run_failure_carries_command_result() -> None:
+    with pytest.raises(nox.command.CommandFailed) as exc:
+        nox.command.run(
+            [
+                PYTHON,
+                "-c",
+                'import sys; sys.stderr.write("boom"); sys.exit(5)',
+            ]
+        )
+
+    assert exc.value.return_code == 5
+    assert exc.value.result is not None
+    assert exc.value.result.return_code == 5
+    assert "boom" in exc.value.result.stderr_tail
+
+
+def test_run_rejects_negative_output_limit() -> None:
+    with pytest.raises(ValueError, match="output_limit"):
+        nox.command.run([PYTHON, "-c", "print(1)"], output_limit=-1)
+
+
+def test_run_long_output_keeps_failure_tail() -> None:
+    # The exception-relevant final line must survive even though the command
+    # produced far more output than the limit.
+    program = (
+        "import sys;"
+        'sys.stdout.write("x" * 5000);'
+        'sys.stderr.write("y" * 5000);'
+        'sys.stderr.write("THE-FAILURE-REASON");'
+        "sys.exit(1)"
+    )
+    with pytest.raises(nox.command.CommandFailed) as exc:
+        nox.command.run([PYTHON, "-c", program], output_limit=200)
+
+    result = exc.value.result
+    assert result is not None
+    assert len(result.stderr_tail.encode()) <= 200
+    assert result.stderr_tail.endswith("THE-FAILURE-REASON")
+    assert result.truncated["stderr"]["dropped"] > 0

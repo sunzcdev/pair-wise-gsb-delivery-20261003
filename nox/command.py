@@ -14,8 +14,11 @@
 
 from __future__ import annotations
 
-__lazy_modules__ = {"nox.logger", "pathlib", "shlex", "shutil"}
+__lazy_modules__ = {"contextvars", "dataclasses", "locale", "nox.logger", "pathlib", "shlex", "shutil"}
 
+import contextvars
+import dataclasses
+import locale
 import os
 import shlex
 import shutil
@@ -25,13 +28,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, overload
 
 from nox.logger import logger
-from nox.popen import DEFAULT_INTERRUPT_TIMEOUT, DEFAULT_TERMINATE_TIMEOUT, popen
+from nox.popen import (
+    DEFAULT_INTERRUPT_TIMEOUT,
+    DEFAULT_OUTPUT_LIMIT,
+    DEFAULT_TERMINATE_TIMEOUT,
+    PopenResult,
+    popen,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
     from typing import IO
 
-__all__ = ["CommandFailed", "ExternalType", "run", "which"]
+__all__ = ["CommandFailed", "CommandResult", "ExternalType", "command_records", "run", "which"]
 
 _PLATFORM = sys.platform
 
@@ -43,15 +52,48 @@ def __dir__() -> list[str]:
 ExternalType = Literal["error", True, False]
 
 
+@dataclasses.dataclass(frozen=True)
+class CommandResult:
+    """What happened when one command line was run.
+
+    The two tails are the bounded end of each stream, decoded as one piece so
+    a multibyte character split across writes survives intact. ``truncated``
+    states, per stream, how many bytes were discarded and retained; ``limit``
+    is the configured per-stream cap. The real process exit code is always
+    recorded, even on failure.
+    """
+
+    command: str
+    return_code: int
+    stdout_tail: str
+    stderr_tail: str
+    truncated: dict[str, dict[str, int]]
+    limit: int
+
+
+# Set by a SessionRunner for the duration of a session; command.run appends a
+# CommandResult per invocation so the JSON report can describe each command
+# without session.run having to grow a new public parameter. A context variable
+# keeps parallel sessions and test runs isolated automatically.
+command_records: contextvars.ContextVar[list[CommandResult] | None] = contextvars.ContextVar(
+    "nox_command_records", default=None
+)
+
+
 class CommandFailed(Exception):
     """Raised when an executed command returns a non-success status code."""
 
     def __init__(
-        self, reason: str | None = None, *, return_code: int | None = None
+        self,
+        reason: str | None = None,
+        *,
+        return_code: int | None = None,
+        result: CommandResult | None = None,
     ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.return_code = return_code
+        self.result = result
 
 
 def which(
@@ -103,6 +145,7 @@ def run(
     stderr: int | IO[str] | None = ...,
     interrupt_timeout: float | None = ...,
     terminate_timeout: float | None = ...,
+    output_limit: int = ...,
 ) -> str: ...
 
 
@@ -120,6 +163,7 @@ def run(
     stderr: int | IO[str] | None = ...,
     interrupt_timeout: float | None = ...,
     terminate_timeout: float | None = ...,
+    output_limit: int = ...,
 ) -> bool: ...
 
 
@@ -137,6 +181,7 @@ def run(
     stderr: int | IO[str] | None = ...,
     interrupt_timeout: float | None = ...,
     terminate_timeout: float | None = ...,
+    output_limit: int = ...,
 ) -> str | bool: ...
 
 
@@ -153,8 +198,17 @@ def run(
     stderr: int | IO[str] | None = subprocess.STDOUT,
     interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
     terminate_timeout: float | None = DEFAULT_TERMINATE_TIMEOUT,
+    output_limit: int = DEFAULT_OUTPUT_LIMIT,
 ) -> str | bool:
-    """Run a command-line program."""
+    """Run a command-line program.
+
+    ``output_limit`` bounds, per stream, how many tail bytes are recorded for
+    the JSON report. The terminal always receives the complete output live;
+    the cap only affects what Nox retains.
+    """
+    if output_limit < 0:
+        msg = "output_limit must be a non-negative integer"
+        raise ValueError(msg)
 
     if success_codes is None:
         success_codes = [0]
@@ -191,7 +245,7 @@ def run(
     env = _clean_env(env)
 
     try:
-        return_code, output = popen(
+        popen_result: PopenResult = popen(
             [cmd_path, *str_args],
             silent=silent,
             env=env,
@@ -199,7 +253,22 @@ def run(
             stderr=stderr,
             interrupt_timeout=interrupt_timeout,
             terminate_timeout=terminate_timeout,
+            output_limit=output_limit,
         )
+        return_code = popen_result.return_code
+        output = popen_result.output
+
+        command_result = CommandResult(
+            command=full_cmd,
+            return_code=return_code,
+            stdout_tail=_decode_tail(popen_result.stdout_tail),
+            stderr_tail=_decode_tail(popen_result.stderr_tail),
+            truncated=popen_result.truncated,
+            limit=output_limit,
+        )
+        records = command_records.get()
+        if records is not None:
+            records.append(command_result)
 
         if return_code not in success_codes:
             suffix = ":" if (silent and output) else ""
@@ -211,7 +280,7 @@ def run(
                 logger.error(output)
 
             msg = f"Returned code {return_code}"
-            raise CommandFailed(msg, return_code=return_code)
+            raise CommandFailed(msg, return_code=return_code, result=command_result)
 
         if output:
             logger.output(output)
@@ -221,3 +290,18 @@ def run(
         raise
 
     return output if silent else True
+
+
+def _decode_tail(tail: bytes) -> str:
+    """Decode a retained stream tail, tolerating a legacy non-UTF-8 encoding."""
+    if not tail:
+        return ""
+    try:
+        return tail.decode("utf-8")
+    except UnicodeDecodeError:
+        second_encoding = locale.getpreferredencoding()
+        if second_encoding.casefold() in {"utf8", "utf-8"}:
+            # Never raise while building a report: keep the undecodable bytes
+            # visible instead of losing the failure context.
+            return tail.decode("utf-8", errors="replace")
+        return tail.decode(second_encoding, errors="replace")
