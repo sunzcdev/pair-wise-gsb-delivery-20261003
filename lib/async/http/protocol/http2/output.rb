@@ -51,26 +51,29 @@ module Async
 					end
 					
 					# Write a chunk of data to the HTTP/2 stream, respecting flow control.
+					#
+					# A DATA frame consumes credit from *two* windows: the stream window and the connection window shared by every stream. The output must therefore wait until both windows can cover the next frame. Waiting on the connection window is what keeps a blocked stream from claiming connection credit it has not yet been able to use: no credit is consumed for a fragment that never leaves this task, so a peer stream remains free to use the whole connection window once it is replenished.
+					#
 					# @parameter chunk [String] The data to write.
 					def write(chunk)
 						until chunk.empty?
 							stream = @stream or raise IOError, "HTTP/2 stream is closed!"
-							maximum_size = stream.available_frame_size
-							
+							maximum_size = available_frame_size(stream)
+
 							# We try to avoid synchronization if possible:
 							if maximum_size <= 0
 								@guard.synchronize do
-									maximum_size = stream.available_frame_size
-									
+									maximum_size = available_frame_size(stream)
+
 									while maximum_size <= 0
 										@window_updated.wait(@guard)
-										
+
 										stream = @stream or raise IOError, "HTTP/2 stream is closed!"
-										maximum_size = stream.available_frame_size
+										maximum_size = available_frame_size(stream)
 									end
 								end
 							end
-							
+
 							break unless chunk = send_data(stream, chunk, maximum_size)
 						end
 					end
@@ -112,7 +115,15 @@ module Async
 					end
 					
 					private
-					
+
+					# The largest payload that can be sent right now, limited by both the per-stream window and the connection-wide window (and the negotiated maximum frame size). A non-positive result means the next frame cannot be accepted yet and the task should wait for a window update.
+					#
+					# @parameter stream [Stream] The HTTP/2 stream to send on.
+					# @returns [Integer] The number of bytes the next DATA frame may carry.
+					def available_frame_size(stream)
+						[stream.available_frame_size, stream.connection.available_frame_size].min
+					end
+
 					def stream(task)
 						task.annotate("Streaming #{@body} to #{@stream}.")
 						
