@@ -75,6 +75,7 @@ from .visitors import ExternallyTraversible
 from .visitors import InternalTraversal
 from .visitors import traverse
 from .visitors import Visitable
+from ._compiler_registry import custom_compiler_dispatchers_from_key
 from .. import exc
 from .. import inspection
 from .. import util
@@ -692,6 +693,18 @@ class ClauseElement(
 
         return self
 
+    @HasMemoized.memoized_attribute
+    def _custom_compiler_dispatchers(self):
+        # memoized per statement: walking the structural cache key to find
+        # the custom compiler dispatchers involved is only needed once.  The
+        # current registration *generation* of each dispatcher is read at
+        # cache lookup time so that a hot-swapped compiler is still detected
+        # when the same statement object is executed again.
+        cache_key = self._generate_cache_key()
+        if cache_key is None:
+            return ()
+        return custom_compiler_dispatchers_from_key(cache_key.key)
+
     def _compile_w_cache(
         self,
         dialect: Dialect,
@@ -720,12 +733,27 @@ class ClauseElement(
                 assert compiled_cache is not None
 
             cache_key, extracted_params, param_dict = elem_cache_key
+            custom_dispatchers = self._custom_compiler_dispatchers
             key = (
                 dialect,
                 cache_key,
                 tuple(column_keys),
                 bool(schema_translate_map),
                 for_executemany,
+                # custom compilers registered through ext.compiler may be
+                # swapped at runtime; their current registration generations
+                # are part of the key so that a hot-swapped compiler is not
+                # masked by a previously compiled statement while statements
+                # not involving custom elements remain cacheable.  The
+                # empty tuple is shared and costs nothing for ordinary
+                # statements; the generation itself is read live so that a
+                # swap is detected even when this statement object is reused.
+                ()
+                if not custom_dispatchers
+                else tuple(
+                    (dispatcher, dispatcher.registry_generation)
+                    for dispatcher in custom_dispatchers
+                ),
             )
             compiled_sql = compiled_cache.get(key)
 

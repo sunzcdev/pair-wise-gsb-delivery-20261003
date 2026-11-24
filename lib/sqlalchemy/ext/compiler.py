@@ -486,13 +486,13 @@ from __future__ import annotations
 
 from typing import Any
 from typing import Callable
-from typing import Dict
 from typing import Type
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
 from .. import exc
-from ..sql import sqltypes
+from ..sql._compiler_registry import CustomCompilerDispatcher
+from ..sql._compiler_registry import next_registry_generation
 
 if TYPE_CHECKING:
     from ..sql.compiler import SQLCompiler
@@ -513,7 +513,7 @@ def compiles(class_: Type[Any], *specs: str) -> Callable[[_F], _F]:
         existing_dispatch = getattr(class_, "_compiler_dispatch", None)
 
         if not existing:
-            existing = _dispatcher()
+            existing = CustomCompilerDispatcher()
 
             if existing_dispatch:
 
@@ -546,6 +546,11 @@ def compiles(class_: Type[Any], *specs: str) -> Callable[[_F], _F]:
 
         else:
             existing.specs["default"] = fn
+
+        # mark this dispatcher as modified so that compiled statement caches
+        # holding a statement compiled with the previous handler(s) cannot be
+        # reused for subsequent executions.
+        existing.registry_generation = next_registry_generation()
         return fn
 
     return decorate
@@ -558,44 +563,13 @@ def deregister(class_: Type[Any]) -> None:
     """
 
     if hasattr(class_, "_compiler_dispatcher"):
+        # bump the generation on the dispatcher itself before it is removed
+        # from the class.  Statements that were compiled with one of its
+        # handlers may still reference it through their per-statement cache,
+        # so the new generation ensures they miss the compiled statement
+        # cache and are recompiled with the original dispatch afterwards.
+        class_._compiler_dispatcher.registry_generation = (
+            next_registry_generation()
+        )
         class_._compiler_dispatch = class_._original_compiler_dispatch
         del class_._compiler_dispatcher
-
-
-class _dispatcher:
-    def __init__(self) -> None:
-        self.specs: Dict[str, Callable[..., Any]] = {}
-
-    def __call__(self, element: Any, compiler: SQLCompiler, **kw: Any) -> Any:
-        # TODO: yes, this could also switch off of DBAPI in use.
-        fn = self.specs.get(compiler.dialect.name, None)
-        if not fn:
-            try:
-                fn = self.specs["default"]
-            except KeyError as ke:
-                raise exc.UnsupportedCompilationError(
-                    compiler,
-                    type(element),
-                    message="%s construct has no default "
-                    "compilation handler." % type(element),
-                ) from ke
-
-        # if compilation includes add_to_result_map, collect add_to_result_map
-        # arguments from the user-defined callable, which are probably none
-        # because this is not public API.  if it wasn't called, then call it
-        # ourselves.
-        arm = kw.get("add_to_result_map", None)
-        if arm:
-            arm_collection = []
-            kw["add_to_result_map"] = lambda *args: arm_collection.append(args)
-
-        expr = fn(element, compiler, **kw)
-
-        if arm:
-            if not arm_collection:
-                arm_collection.append(
-                    (None, None, (element,), sqltypes.NULLTYPE)
-                )
-            for tup in arm_collection:
-                arm(*tup)
-        return expr

@@ -1,3 +1,5 @@
+import threading
+
 from sqlalchemy import Column
 from sqlalchemy import column
 from sqlalchemy import desc
@@ -27,6 +29,7 @@ from sqlalchemy.sql.expression import Select
 from sqlalchemy.sql.sqltypes import NULLTYPE
 from sqlalchemy.testing import assert_raises_message
 from sqlalchemy.testing import AssertsCompiledSQL
+from sqlalchemy.testing import engines
 from sqlalchemy.testing import eq_
 from sqlalchemy.testing import fixtures
 from sqlalchemy.types import TypeEngine
@@ -611,3 +614,327 @@ class ExecuteTest(fixtures.TablesTest):
             result = session.execute(select_fixture())
 
             eq_(result.first(), (1, "some data"))
+
+
+class CompilerHotSwapCacheTest(fixtures.RemovesEvents, fixtures.TestBase):
+    """The compiled statement cache must not mask a hot-swapped custom
+    compiler, while continuing to serve unrelated statements and compilers
+    that were not touched.
+
+    """
+
+    @testing.fixture
+    def custom_element(self):
+        class my_function(FunctionElement):
+            type = Integer()
+            inherit_cache = True
+
+        return my_function
+
+    @testing.fixture
+    def other_custom_element(self):
+        class other_function(FunctionElement):
+            type = Integer()
+            inherit_cache = True
+
+        return other_function
+
+    def _wrappers(self):
+        # two execution_options wrappers of the same engine; these share the
+        # dialect and the same compiled_cache object.
+        engine = engines.testing_engine()
+        cache = {}
+        wrapper_one = engine.execution_options(compiled_cache=cache)
+        wrapper_two = engine.execution_options(compiled_cache=cache)
+        return engine, cache, wrapper_one, wrapper_two
+
+    def _record_sql(self, engine):
+        statements = []
+
+        def _record(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        # RemovesEvents removes these again after each test
+        self.event_listen(engine, "before_cursor_execute", _record)
+
+        return statements
+
+    def test_reregister_forces_recompile(self, custom_element):
+        engine, cache, wrapper_one, wrapper_two = self._wrappers()
+        statements = self._record_sql(engine)
+
+        @compiles(custom_element)
+        def first(element, compiler, **kw):
+            return "1"
+
+        stmt = select(custom_element())
+
+        with wrapper_one.connect() as conn:
+            conn.execute(stmt)
+            eq_(len(cache), 1)
+
+            # an equal-structure execution is a cache hit
+            conn.execute(select(custom_element()))
+            eq_(len(cache), 1)
+            eq_(len([s for s in statements if "SELECT 1" in s]), 2)
+
+        @compiles(custom_element)
+        def second(element, compiler, **kw):
+            return "2"
+
+        with wrapper_two.connect() as conn:
+            conn.execute(select(custom_element()))
+
+        # the new registration is used for new executions ...
+        eq_(len([s for s in statements if "SELECT 2" in s]), 1)
+        # ... and it could not reuse the old cache entry
+        eq_(len(cache), 2)
+
+        with wrapper_one.connect() as conn:
+            # the next query through the first wrapper does not reuse the
+            # stale compilation either
+            conn.execute(select(custom_element()))
+            eq_(len([s for s in statements if "SELECT 2" in s]), 2)
+            eq_(len(cache), 2)
+
+        deregister(custom_element)
+        engine.dispose()
+
+    def test_unrelated_statement_keeps_caching(
+        self, custom_element, other_custom_element
+    ):
+        engine, cache, wrapper_one, wrapper_two = self._wrappers()
+
+        @compiles(custom_element)
+        def first(element, compiler, **kw):
+            return "1"
+
+        @compiles(other_custom_element)
+        def other_first(element, compiler, **kw):
+            return "10"
+
+        unrelated = select(literal_column("1"))
+
+        with wrapper_one.connect() as conn:
+            conn.execute(select(custom_element()))
+            conn.execute(select(other_custom_element()))
+            conn.execute(unrelated)
+            eq_(len(cache), 3)
+
+            # all three are cache hits before any change
+            conn.execute(select(custom_element()))
+            conn.execute(select(other_custom_element()))
+            conn.execute(unrelated)
+            eq_(len(cache), 3)
+
+        @compiles(custom_element)
+        def second(element, compiler, **kw):
+            return "2"
+
+        with wrapper_two.connect() as conn:
+            # only the re-registered element misses; the other custom element
+            # and the plain expression still hit the shared cache
+            conn.execute(select(custom_element()))
+            eq_(len(cache), 4)
+
+            conn.execute(select(other_custom_element()))
+            conn.execute(unrelated)
+            eq_(len(cache), 4)
+
+        deregister(custom_element)
+        deregister(other_custom_element)
+        engine.dispose()
+
+    def test_deregister_invalidates_cached_statement(self, custom_element):
+        engine, cache, wrapper_one, wrapper_two = self._wrappers()
+
+        @compiles(custom_element)
+        def first(element, compiler, **kw):
+            return "1"
+
+        with wrapper_one.connect() as conn:
+            conn.execute(select(custom_element()))
+            eq_(len(cache), 1)
+
+        deregister(custom_element)
+
+        # without a custom dispatcher the class falls back to its original
+        # compilation; the previously cached statement must not be served
+        with wrapper_two.connect() as conn:
+            assert_raises_message(
+                exc.UnsupportedCompilationError,
+                "Compiler .* can't render element of type .*",
+                conn.execute,
+                select(custom_element()),
+            )
+        engine.dispose()
+
+    def test_deregister_invalidates_reused_statement(self, custom_element):
+        # the same statement object, executed again after deregister, must
+        # not reuse its memoized pre-deregister compilation
+        engine, cache, wrapper_one, _ = self._wrappers()
+
+        @compiles(custom_element)
+        def first(element, compiler, **kw):
+            return "1"
+
+        stmt = select(custom_element())
+        with wrapper_one.connect() as conn:
+            conn.execute(stmt)
+            eq_(len(cache), 1)
+
+        deregister(custom_element)
+
+        with wrapper_one.connect() as conn:
+            assert_raises_message(
+                exc.UnsupportedCompilationError,
+                "Compiler .* can't render element of type .*",
+                conn.execute,
+                stmt,
+            )
+        engine.dispose()
+
+    def test_in_flight_statement_keeps_old_compilation(self, custom_element):
+        # a statement already handed off to the driver completes with the SQL
+        # it was compiled with even if a new compiler is registered while the
+        # driver call is in flight.
+        engine, cache, wrapper_one, wrapper_two = self._wrappers()
+        statements = self._record_sql(engine)
+
+        @compiles(custom_element)
+        def first(element, compiler, **kw):
+            return "1"
+
+        release = threading.Event()
+        first_in_flight = threading.Event()
+
+        def _pause(conn, cursor, statement, parameters, context, executemany):
+            if "SELECT 1" in statement and not first_in_flight.is_set():
+                first_in_flight.set()
+                release.wait(10)
+
+        # RemovesEvents removes this again after the test
+        self.event_listen(engine, "before_cursor_execute", _pause)
+
+        worker_error = {}
+
+        def worker():
+            try:
+                with wrapper_one.connect() as conn:
+                    conn.execute(select(custom_element()))
+            except Exception as err:  # pragma: no cover - failure reporting
+                worker_error["error"] = err
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        assert first_in_flight.wait(10)
+
+        # the first execution already reached the driver with the old SQL
+        eq_(len([s for s in statements if "SELECT 1" in s]), 1)
+
+        @compiles(custom_element)
+        def second(element, compiler, **kw):
+            return "2"
+
+        with wrapper_two.connect() as conn:
+            conn.execute(select(custom_element()))
+        eq_(len([s for s in statements if "SELECT 2" in s]), 1)
+
+        # let the paused, already-compiled execution finish
+        release.set()
+        thread.join(10)
+        assert not thread.is_alive()
+        assert "error" not in worker_error, worker_error
+
+        # the old compilation was used exactly once and never reused
+        eq_(len([s for s in statements if "SELECT 1" in s]), 1)
+        eq_(len([s for s in statements if "SELECT 2" in s]), 1)
+
+        deregister(custom_element)
+        engine.dispose()
+
+    def test_inherited_handler_invalidates_subclass_statement(
+        self, custom_element
+    ):
+        # a subclass that does not register its own handler inherits the
+        # dispatcher of its custom-compiled superclass; swapping the handler
+        # on the superclass must invalidate statements built from the
+        # subclass as well.
+        class sub_element(custom_element):
+            inherit_cache = True
+
+        engine, cache, wrapper_one, wrapper_two = self._wrappers()
+
+        @compiles(custom_element)
+        def first(element, compiler, **kw):
+            return "1"
+
+        with wrapper_one.connect() as conn:
+            conn.execute(select(sub_element()))
+            eq_(len(cache), 1)
+
+        @compiles(custom_element)
+        def second(element, compiler, **kw):
+            return "2"
+
+        with wrapper_two.connect() as conn:
+            conn.execute(select(sub_element()))
+            eq_(len(cache), 2)
+
+        deregister(custom_element)
+        engine.dispose()
+
+    def test_built_in_engine_cache_invalidated(self, custom_element):
+        # same scenario through the engine's own LRU compiled cache, which is
+        # shared by every execution_options wrapper by default
+        engine = engines.testing_engine()
+        wrapper_one = engine.execution_options(logging_token="one")
+        wrapper_two = engine.execution_options(logging_token="two")
+        statements = self._record_sql(engine)
+
+        @compiles(custom_element)
+        def first(element, compiler, **kw):
+            return "1"
+
+        with wrapper_one.connect() as conn:
+            conn.execute(select(custom_element()))
+        eq_(len([s for s in statements if "SELECT 1" in s]), 1)
+
+        @compiles(custom_element)
+        def second(element, compiler, **kw):
+            return "2"
+
+        with wrapper_two.connect() as conn:
+            conn.execute(select(custom_element()))
+        with wrapper_one.connect() as conn:
+            conn.execute(select(custom_element()))
+
+        eq_(len([s for s in statements if "SELECT 1" in s]), 1)
+        eq_(len([s for s in statements if "SELECT 2" in s]), 2)
+
+        deregister(custom_element)
+        engine.dispose()
+
+    def test_override_of_built_in_construct_invalidated(self):
+        # overriding the compilation of a built-in construct that already had
+        # its own dispatch must invalidate its cached statements too
+        engine, cache, wrapper_one, wrapper_two = self._wrappers()
+
+        with wrapper_one.connect() as conn:
+            conn.execute(select(literal_column("1")))
+            eq_(len(cache), 1)
+
+        @compiles(Select)
+        def override(element, compiler, **kw):
+            return "SELECT 2"
+
+        try:
+            with wrapper_two.connect() as conn:
+                # a structurally equal, freshly created statement now compiles
+                # through the overriding dispatcher and gets its own cache
+                # entry instead of reusing the original compilation
+                conn.execute(select(literal_column("1")))
+                eq_(len(cache), 2)
+        finally:
+            deregister(Select)
+        engine.dispose()
