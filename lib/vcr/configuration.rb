@@ -581,6 +581,10 @@ module VCR
         end
       end
 
+      before_record(:preserve_body_end) do |interaction|
+        interaction.response.record_body_end(interaction.request)
+      end
+
       before_record(:decode_compressed_response) do |interaction|
         interaction.response.decompress if interaction.response.compressed?
       end

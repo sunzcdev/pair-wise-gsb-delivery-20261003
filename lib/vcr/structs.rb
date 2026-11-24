@@ -358,6 +358,82 @@ module VCR
       edit_header('Content-Length') { body ? body.bytesize.to_s : '0' }
     end
 
+    # @private
+    # Status codes whose responses never carry a message body (RFC 9110
+    # §8.6). Their Content-Length, when present, describes the selected
+    # representation rather than a body of their own.
+    BODILESS_STATUS_CODES = ((100..199).to_a | [204, 304]).freeze
+
+    # @private
+    # Whether or not a response to a request with the given method and
+    # the given status code can carry a message body.
+    def self.bodiless?(request_method, status_code)
+      request_method == :head || BODILESS_STATUS_CODES.include?(status_code)
+    end
+
+    # Records how the response body is delimited, so that the semantics
+    # can be preserved when the response is played back. The semantics
+    # are derived from the request and the response headers as recorded:
+    #
+    # * `no_body` -- the response cannot carry a body (e.g. a HEAD
+    #   response or a 204/304 response); its Content-Length, if any,
+    #   describes the selected representation.
+    # * `content_length` -- the body is delimited by an explicit
+    #   Content-Length header.
+    # * `connection_close` -- the response carries no Content-Length;
+    #   the body ended when the connection closed.
+    #
+    # @param [Request] request the request that yielded this response
+    # @see #recorded_body_end
+    def record_body_end(request)
+      adapter_metadata['vcr_body_end'] =
+        if self.class.bodiless?(request.method, status.code)
+          'no_body'
+        elsif get_header('Content-Length')
+          'content_length'
+        else
+          'connection_close'
+        end
+    end
+
+    # @return [String, nil] the body end semantics recorded for this
+    #  response (`no_body`, `content_length` or `connection_close`), or
+    #  nil when they were not recorded.
+    # @see #record_body_end
+    def recorded_body_end
+      adapter_metadata['vcr_body_end']
+    end
+
+    # Restores the body end semantics that were in effect when the
+    # response was recorded:
+    #
+    # * A response whose body ended when the connection closed must not
+    #   carry a Content-Length, so any Content-Length a `before_playback`
+    #   hook or the HTTP adapter added is removed.
+    # * A response with a declared Content-Length gets it updated so
+    #   that it matches the played back body.
+    # * A response that cannot carry a body keeps its recorded
+    #   Content-Length untouched.
+    #
+    # Does nothing when no body end semantics were recorded.
+    #
+    # @return [Response] self
+    # @see #record_body_end
+    def preserve_body_end
+      case recorded_body_end
+      when 'connection_close'
+        # The header may have been added to the headers hash directly
+        # (e.g. by a playback hook or the HTTP adapter), bypassing the
+        # normalized header index, so delete it case-insensitively.
+        headers.keys.each do |key|
+          headers.delete(key) if key.to_s.downcase == 'content-length'
+        end
+      when 'content_length'
+        update_content_length_header
+      end
+      self
+    end
+
     # The type of encoding.
     #
     # @return [String] encoding type

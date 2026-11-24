@@ -14,6 +14,7 @@
     - [Freezing time](/cassettes/freezing_time.md)
     - [Naming](/cassettes/naming.md)
     - [No cassette](/cassettes/no_cassette.md)
+    - [Preserve body end](/cassettes/preserve_body_end.md)
     - [Recompress](/cassettes/recompress.md)
     - [Update content length header](/cassettes/update_content_length_header.md)
   - Configuration

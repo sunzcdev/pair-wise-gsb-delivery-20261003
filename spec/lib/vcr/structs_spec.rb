@@ -3,6 +3,7 @@
 require 'support/ruby_interpreter'
 
 require 'base64'
+require 'uri'
 require 'yaml'
 require 'vcr/structs'
 require 'vcr/errors'
@@ -686,6 +687,106 @@ module VCR
             }.to change { inst.headers[header] }.from(['2']).to(['3'])
           end
         end
+      end
+    end
+
+    describe '#record_body_end' do
+      include_context "configuration stubbing"
+
+      before(:each) do
+        allow(config).to receive(:preserve_exact_body_bytes_for?).and_return(false)
+      end
+
+      def response_for(method, code, headers)
+        request = VCR::Request.new(method)
+        response = described_class.new(VCR::ResponseStatus.new(code, ''), headers, '')
+        response.record_body_end(request)
+        response
+      end
+
+      it 'records connection_close for a response without a Content-Length header' do
+        response = response_for(:get, 200, {})
+        expect(response.recorded_body_end).to eq('connection_close')
+      end
+
+      it 'records content_length for a response with a Content-Length header' do
+        response = response_for(:get, 200, { 'Content-Length' => ['8'] })
+        expect(response.recorded_body_end).to eq('content_length')
+      end
+
+      it 'records content_length for a zero length response' do
+        response = response_for(:get, 200, { 'Content-Length' => ['0'] })
+        expect(response.recorded_body_end).to eq('content_length')
+      end
+
+      it 'records no_body for a HEAD response, even though it declares a Content-Length' do
+        response = response_for(:head, 200, { 'Content-Length' => ['42'] })
+        expect(response.recorded_body_end).to eq('no_body')
+      end
+
+      it 'records no_body for a 304 response' do
+        response = response_for(:get, 304, { 'Content-Length' => ['42'] })
+        expect(response.recorded_body_end).to eq('no_body')
+      end
+
+      it 'records no_body for a 204 response' do
+        response = response_for(:get, 204, {})
+        expect(response.recorded_body_end).to eq('no_body')
+      end
+
+      it 'records no_body for a 1xx response' do
+        response = response_for(:get, 100, {})
+        expect(response.recorded_body_end).to eq('no_body')
+      end
+
+      it 'stores the semantics in the adapter metadata so they survive serialization' do
+        response = response_for(:get, 200, {})
+        reloaded = described_class.from_hash(response.to_hash)
+        expect(reloaded.recorded_body_end).to eq('connection_close')
+      end
+    end
+
+    describe '#recorded_body_end' do
+      it 'returns nil when no body end semantics were recorded' do
+        response = described_class.new(VCR::ResponseStatus.new(200, ''), {}, 'body')
+        expect(response.recorded_body_end).to be_nil
+      end
+    end
+
+    describe '#preserve_body_end' do
+      def response_with_body_end(body_end, headers, body)
+        described_class.new(
+          VCR::ResponseStatus.new(200, ''), headers, body, nil,
+          { 'vcr_body_end' => body_end }
+        )
+      end
+
+      it 'removes a Content-Length header from a connection_close response' do
+        response = response_with_body_end('connection_close', { 'Content-Length' => ['8'] }, 'the body')
+        response.preserve_body_end
+        expect(response.headers).not_to have_key('Content-Length')
+      end
+
+      it 'leaves a connection_close response without a Content-Length header alone' do
+        response = response_with_body_end('connection_close', {}, 'the body')
+        expect { response.preserve_body_end }.not_to change { response.headers }
+      end
+
+      it 'updates the Content-Length header of a content_length response to match the body' do
+        response = response_with_body_end('content_length', { 'Content-Length' => ['3'] }, 'the body')
+        response.preserve_body_end
+        expect(response.headers['Content-Length']).to eq(['8'])
+      end
+
+      it 'leaves the Content-Length header of a no_body response untouched' do
+        response = response_with_body_end('no_body', { 'Content-Length' => ['42'] }, '')
+        response.preserve_body_end
+        expect(response.headers['Content-Length']).to eq(['42'])
+      end
+
+      it 'does nothing when no body end semantics were recorded' do
+        response = described_class.new(VCR::ResponseStatus.new(200, ''), { 'Content-Length' => ['3'] }, 'the body')
+        expect { response.preserve_body_end }.not_to change { response.headers }
       end
     end
 

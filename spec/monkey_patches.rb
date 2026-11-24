@@ -54,8 +54,8 @@ end
 require 'httpclient'
 
 if RUBY_INTERPRETER == :mri
-  require 'typhoeus'
   begin
+    require 'typhoeus'
     require 'patron'
     require 'em-http-request'
     require 'curb'
@@ -75,8 +75,13 @@ end
 require 'vcr/library_hooks/webmock'
 $original_webmock_callbacks = ::WebMock::CallbackRegistry.callbacks
 
-require 'vcr/library_hooks/excon'
-$excon_after_loaded_hook = VCR.configuration.hooks[:after_library_hooks_loaded].last
+begin
+  require 'vcr/library_hooks/excon'
+  $excon_after_loaded_hook = VCR.configuration.hooks[:after_library_hooks_loaded].last
+rescue LoadError
+  # excon is not always available, depending on the Gemfile used
+  warn $!.message
+end
 
 # disable all by default; we'll enable specific ones when we need them
 MonkeyPatches.disable_all!

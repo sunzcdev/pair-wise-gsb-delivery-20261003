@@ -3,6 +3,7 @@ Changelog
 
 ## Unreleased
 
+- [new] Add `preserve_body_end` cassette option that records how each response body was delimited (connection close, explicit Content-Length, or no body) and restores those semantics on playback, so a connection-close response does not keep a temporary Content-Length added by a playback hook or the HTTP adapter
 - [fix] `uri_without_params` ignores percent-encoded query params given by their decoded name, e.g. `uri_without_params('date[gte]')` now ignores `date%5Bgte%5D` (#633)
 - [fix] Leave the Content-Length header of HEAD and 304 responses untouched when `update_content_length_header` is enabled (#779)
 

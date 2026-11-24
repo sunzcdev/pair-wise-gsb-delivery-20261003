@@ -86,6 +86,15 @@ module VCR
   #  not to overwrite the Content-Length header of the responses to
   #  match the length of the response body, except for HEAD and
   #  304 Not Modified responses. Defaults to false.
+  # @option options :preserve_body_end [Boolean] Whether or not to
+  #  preserve the way each recorded response body was delimited.
+  #  Responses whose body ended when the connection closed are played
+  #  back without a Content-Length header (even if a `before_playback`
+  #  hook or the HTTP adapter added a temporary one), responses with a
+  #  declared Content-Length get it updated to match the played back
+  #  body, and responses that cannot carry a body (e.g. HEAD or
+  #  304 Not Modified responses) keep their recorded Content-Length.
+  #  Defaults to false.
   # @option options :decode_compressed_response [Boolean] Whether or
   #  not to decode compressed responses before recording the cassette.
   #  This makes the cassette more human readable. Defaults to false.

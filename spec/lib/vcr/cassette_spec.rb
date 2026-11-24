@@ -288,6 +288,68 @@ RSpec.describe VCR::Cassette do
             expect(get_interaction.response.headers['Content-Length']).to eq(['4'])
           end
 
+          it 'includes :preserve_body_end in the tags when given preserve_body_end: true' do
+            cassette = VCR::Cassette.new('example', record: record_mode, preserve_body_end: true)
+            expect(cassette.tags).to include(:preserve_body_end)
+          end
+
+          context 'when given preserve_body_end: true' do
+            def interaction_with_body_end(body_end, headers, body, method = :get)
+              VCR::HTTPInteraction.new(
+                VCR::Request.new(method),
+                VCR::Response.new(
+                  VCR::ResponseStatus.new(200), headers, body, nil,
+                  { 'vcr_body_end' => body_end }
+                )
+              )
+            end
+
+            it 'restores the recorded body end semantics after the before_playback hooks have run' do
+              connection_close_interaction = interaction_with_body_end('connection_close', {}, 'short')
+              zero_length_interaction      = interaction_with_body_end('content_length', { 'Content-Length' => ['0'] }, '')
+              head_interaction             = interaction_with_body_end('no_body', { 'Content-Length' => ['42'] }, '', :head)
+              normal_interaction           = interaction_with_body_end('content_length', { 'Content-Length' => ['4'] }, 'body')
+
+              stub_old_interactions([
+                connection_close_interaction, zero_length_interaction,
+                head_interaction, normal_interaction
+              ])
+
+              VCR.configuration.before_playback do |interaction|
+                response = interaction.response
+
+                case response.recorded_body_end
+                when 'connection_close'
+                  response.body = 'a longer close-delimited body'
+                  # simulate the HTTP adapter adding a temporary Content-Length
+                  response.headers['Content-Length'] = ['999']
+                when 'content_length'
+                  response.body = 'a longer body' if response.body == 'body'
+                end
+              end
+
+              VCR::Cassette.new('example', record: record_mode, preserve_body_end: true).http_interactions
+
+              expect(connection_close_interaction.response.headers).not_to have_key('Content-Length')
+              expect(connection_close_interaction.response.body).to eq('a longer close-delimited body')
+              expect(zero_length_interaction.response.headers['Content-Length']).to eq(['0'])
+              expect(head_interaction.response.headers['Content-Length']).to eq(['42'])
+              expect(normal_interaction.response.headers['Content-Length']).to eq(['13'])
+            end
+
+            it 'leaves responses without recorded body end semantics alone' do
+              interaction = http_interaction do |i|
+                i.response.headers = { 'Content-Length' => ['3'] }
+                i.response.body = 'a much longer body'
+              end
+              stub_old_interactions([interaction])
+
+              VCR::Cassette.new('example', record: record_mode, preserve_body_end: true).http_interactions
+
+              expect(interaction.response.headers['Content-Length']).to eq(['3'])
+            end
+          end
+
           [nil, false].each do |val|
             it "does not update the content_lenth headers when given update_content_length_header: #{val.inspect}" do
               stub_old_interactions(interactions)

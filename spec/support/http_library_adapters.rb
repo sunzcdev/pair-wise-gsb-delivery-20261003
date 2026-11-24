@@ -209,8 +209,14 @@ HTTP_LIBRARY_ADAPTERS['excon'] = Module.new do
   end
 end
 
-require 'faraday'
+begin
+  require 'faraday'
+rescue LoadError
+  # faraday is not always available, depending on the Gemfile used
+  warn $!.message
+end
 
+if defined?(Faraday)
 %w[ net_http typhoeus patron ].each do |_faraday_adapter|
   if Faraday::VERSION > '2.0'
     require "faraday/#{_faraday_adapter}"
@@ -267,4 +273,5 @@ require 'faraday'
       headers.merge("User-Agent" => ["Faraday v#{Faraday::VERSION}"])
     end
   end
+end
 end

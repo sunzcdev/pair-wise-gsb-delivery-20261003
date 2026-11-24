@@ -187,7 +187,7 @@ module VCR
         :update_content_length_header, :allow_playback_repeats, :allow_unused_http_interactions,
         :exclusive, :serialize_with, :preserve_exact_body_bytes, :decode_compressed_response,
         :recompress_response, :persist_with, :persister_options, :clean_outdated_http_interactions,
-        :drop_unused_requests
+        :drop_unused_requests, :preserve_body_end
       ]
 
       if invalid_options.size > 0
@@ -212,7 +212,7 @@ module VCR
     def assign_tags
       @tags = Array(@options.fetch(:tags) { @options[:tag] })
 
-      [:update_content_length_header, :preserve_exact_body_bytes, :decode_compressed_response, :recompress_response].each do |tag|
+      [:update_content_length_header, :preserve_exact_body_bytes, :decode_compressed_response, :recompress_response, :preserve_body_end].each do |tag|
         @tags << tag if @options[tag]
       end
     end
@@ -222,6 +222,7 @@ module VCR
         deserialized_hash['http_interactions'].map { |h| HTTPInteraction.from_hash(h) }.tap do |interactions|
           invoke_hook(:before_playback, interactions)
           invoke_hook(:recompress_response, interactions)
+          preserve_body_end_semantics(interactions)
 
           interactions.reject! do |i|
             i.request.uri.is_a?(String) && VCR.request_ignorer.ignore?(i.request)
@@ -234,6 +235,17 @@ module VCR
 
     def storage_key
       @storage_key ||= [name, @serializer.file_extension].join('.')
+    end
+
+    # Restores the body end semantics recorded for each response, so that
+    # a response whose body ended when the connection closed does not keep
+    # a Content-Length that a `before_playback` hook or the HTTP adapter
+    # added, and a response with a declared Content-Length has it updated
+    # to match the played back body. This runs after the `before_playback`
+    # hooks so that it has the final word on the played back headers.
+    def preserve_body_end_semantics(interactions)
+      return unless tags.include?(:preserve_body_end)
+      interactions.each { |i| i.response.preserve_body_end }
     end
 
     def raise_error_unless_valid_record_mode

@@ -12,6 +12,7 @@
   - automatic_re_recording.feature
   - exclusive.feature
   - update_content_length_header.feature
+  - preserve_body_end.feature
   - decompress.feature
   - persistence.feature
   - allow_unused_http_interactions.feature
