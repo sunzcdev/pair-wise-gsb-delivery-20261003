@@ -7547,6 +7547,172 @@ class SchemaTest(fixtures.TestBase, AssertsCompiledSQL):
             render_schema_translate=True,
         )
 
+    def test_schema_translate_per_table(self):
+        m = MetaData()
+        table1 = Table(
+            "mytable",
+            m,
+            Column("myid", Integer),
+            Column("name", String),
+        )
+        table2 = Table(
+            "myothertable",
+            m,
+            Column("otherid", Integer),
+            Column("othername", String),
+        )
+
+        table1.execution_options(schema_translate_map={None: "local_schema"})
+
+        # per-table map applies without any statement/connection level map
+        self.assert_compile(
+            table1.select().where(table1.c.name == "hi"),
+            "SELECT local_schema.mytable.myid, local_schema.mytable.name "
+            "FROM local_schema.mytable "
+            "WHERE local_schema.mytable.name = :name_1",
+        )
+
+        # per-table map takes precedence over the global map for that
+        # table; the global map still applies to other tables
+        self.assert_compile(
+            select(table1, table2).select_from(
+                join(table1, table2, table1.c.myid == table2.c.otherid)
+            ),
+            "SELECT local_schema.mytable.myid, local_schema.mytable.name, "
+            "global_schema.myothertable.otherid, "
+            "global_schema.myothertable.othername "
+            "FROM local_schema.mytable "
+            "JOIN global_schema.myothertable "
+            "ON local_schema.mytable.myid = "
+            "global_schema.myothertable.otherid",
+            schema_translate_map={None: "global_schema"},
+            render_schema_translate=True,
+        )
+
+    def test_schema_translate_per_table_key_fallback(self):
+        m = MetaData()
+        table1 = Table(
+            "mytable",
+            m,
+            Column("myid", Integer),
+            schema="remote_owner",
+        )
+
+        # keys not present in the per-table map fall back to the
+        # global translate map
+        table1.execution_options(schema_translate_map={None: "unused"})
+
+        self.assert_compile(
+            table1.select(),
+            "SELECT global_remote.mytable.myid " "FROM global_remote.mytable",
+            schema_translate_map={"remote_owner": "global_remote"},
+            render_schema_translate=True,
+        )
+
+        # a per-table target of None renders no schema at all
+        table1.execution_options(schema_translate_map={"remote_owner": None})
+        self.assert_compile(
+            table1.select(),
+            "SELECT mytable.myid FROM mytable",
+            schema_translate_map={"remote_owner": "global_remote"},
+            render_schema_translate=True,
+        )
+
+    def test_schema_translate_per_table_crud(self):
+        m = MetaData()
+        table1 = Table(
+            "mytable",
+            m,
+            Column("myid", Integer),
+            Column("name", String),
+        )
+        table1.execution_options(schema_translate_map={None: "local_schema"})
+
+        self.assert_compile(
+            table1.insert().values(name="foo"),
+            "INSERT INTO local_schema.mytable (name) VALUES (:name)",
+        )
+        self.assert_compile(
+            table1.update().where(table1.c.name == "hi").values(name="foo"),
+            "UPDATE local_schema.mytable SET name=:name "
+            "WHERE local_schema.mytable.name = :name_1",
+        )
+        self.assert_compile(
+            table1.delete().where(table1.c.name == "hi"),
+            "DELETE FROM local_schema.mytable "
+            "WHERE local_schema.mytable.name = :name_1",
+        )
+
+    def test_schema_translate_per_alias(self):
+        m = MetaData()
+        table1 = Table(
+            "mytable",
+            m,
+            Column("myid", Integer),
+            Column("name", String),
+        )
+
+        alias1 = table1.alias().execution_options(
+            schema_translate_map={None: "alias_schema"}
+        )
+
+        stmt = select(table1.c.myid, alias1.c.myid).select_from(
+            table1.join(alias1, table1.c.myid == alias1.c.myid)
+        )
+
+        # per-alias map applies to the aliased reference only
+        self.assert_compile(
+            stmt,
+            "SELECT table_schema.mytable.myid, "
+            "mytable_1.myid AS myid_1 "
+            "FROM table_schema.mytable "
+            "JOIN alias_schema.mytable AS mytable_1 "
+            "ON table_schema.mytable.myid = mytable_1.myid",
+            schema_translate_map={None: "table_schema"},
+            render_schema_translate=True,
+        )
+
+        # the alias the option was not set on is not affected
+        alias2 = table1.alias()
+        stmt = select(alias1.c.myid, alias2.c.myid).select_from(
+            alias1.join(alias2, alias1.c.myid == alias2.c.myid)
+        )
+        self.assert_compile(
+            stmt,
+            "SELECT mytable_1.myid, mytable_2.myid AS myid_1 "
+            "FROM alias_schema.mytable AS mytable_1 "
+            "JOIN table_schema.mytable AS mytable_2 "
+            "ON mytable_1.myid = mytable_2.myid",
+            schema_translate_map={None: "table_schema"},
+            render_schema_translate=True,
+        )
+
+    def test_schema_translate_per_table_and_alias_distinct(self):
+        # combine a per-table map with a per-alias map to render the
+        # same table from two different schemas at once
+        m = MetaData()
+        table1 = Table(
+            "mytable",
+            m,
+            Column("myid", Integer),
+            Column("name", String),
+        )
+        table1.execution_options(schema_translate_map={None: "schema_one"})
+        alias1 = table1.alias().execution_options(
+            schema_translate_map={None: "schema_two"}
+        )
+
+        stmt = select(table1.c.myid, alias1.c.myid).select_from(
+            table1.join(alias1, table1.c.myid == alias1.c.myid)
+        )
+        self.assert_compile(
+            stmt,
+            "SELECT schema_one.mytable.myid, mytable_1.myid AS myid_1 "
+            "FROM schema_one.mytable "
+            "JOIN schema_two.mytable AS mytable_1 "
+            "ON schema_one.mytable.myid = mytable_1.myid",
+        )
+
     @testing.combinations(
         (
             lambda t1, t2: select(t1, t2),

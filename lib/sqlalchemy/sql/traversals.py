@@ -792,6 +792,11 @@ class TraversalComparatorStrategy(HasTraversalDispatch, util.MemoizedSlots):
     ):
         return left == right
 
+    def visit_execution_options(
+        self, attrname, left_parent, left, right_parent, right, **kw
+    ):
+        return left == right
+
     def visit_dialect_options(
         self, attrname, left_parent, left, right_parent, right, **kw
     ):

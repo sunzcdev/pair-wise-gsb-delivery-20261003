@@ -271,6 +271,26 @@ def _select_iterables(
     )
 
 
+def _schema_translate_map_for_object(
+    obj: Any,
+) -> Optional[Mapping[Optional[str], Optional[str]]]:
+    """Return the ``schema_translate_map`` execution option declared
+    directly on a schema-laden object such as a
+    :class:`_expression.TableClause` or an :class:`_sql.Alias`, if any.
+
+    Such a mapping is applied only to the object on which it is
+    declared, and takes precedence over a ``schema_translate_map``
+    applied at the statement, connection, or engine level for that
+    particular object.
+
+    """
+    execution_options = getattr(obj, "_execution_options", None)
+    if execution_options:
+        return execution_options.get("schema_translate_map", None)
+    else:
+        return None
+
+
 _SelfGenerativeType = TypeVar("_SelfGenerativeType", bound="_GenerativeType")
 
 

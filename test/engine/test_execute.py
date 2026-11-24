@@ -27,6 +27,7 @@ from sqlalchemy import Sequence
 from sqlalchemy import String
 from sqlalchemy import testing
 from sqlalchemy import text
+from sqlalchemy import true
 from sqlalchemy import TypeDecorator
 from sqlalchemy import util
 from sqlalchemy import VARCHAR
@@ -1540,6 +1541,77 @@ class SchemaTranslateTest(fixtures.TestBase, testing.AssertsExecutionResults):
         asserter.assert_(
             CompiledSQL("SELECT __[SCHEMA_foo].t2.x FROM __[SCHEMA_foo].t2")
         )
+
+    def test_per_table_schema_translate_ddl(self, connection):
+        metadata = MetaData()
+        t1 = Table("t1", metadata, Column("x", Integer))
+        t1.execution_options(schema_translate_map={None: config.test_schema})
+
+        t1.create(connection)
+        try:
+            insp = inspect(connection)
+            is_true(insp.has_table("t1", schema=config.test_schema))
+            is_false(insp.has_table("t1", schema=None))
+        finally:
+            t1.drop(connection)
+
+        insp = inspect(connection)
+        is_false(insp.has_table("t1", schema=config.test_schema))
+
+    def test_per_table_schema_translate(self, same_named_tables, connection):
+        # a per-table schema_translate_map takes precedence over the
+        # connection level map for that table only
+        m = MetaData()
+        scoped_table = Table("t1", m, Column("x", String(10)))
+        scoped_table.execution_options(
+            schema_translate_map={None: config.test_schema}
+        )
+
+        unscoped_table = Table("t1", MetaData(), Column("x", String(10)))
+
+        conn = connection.execution_options(schema_translate_map={None: None})
+
+        # per-table map renders test_schema regardless of the
+        # connection level map
+        eq_(conn.scalar(select(scoped_table.c.x)), "ts1")
+        # connection level map still applies to other tables
+        eq_(conn.scalar(select(unscoped_table.c.x)), "tsnone")
+
+    def test_per_table_and_alias_schema_translate_swapped(
+        self, same_named_tables, connection
+    ):
+        # compare two same-named tables in different schemas within a
+        # single query, by applying distinct schema_translate_maps to a
+        # table and to an alias of that table.  swapping the maps and
+        # reusing the same compiled cache must not render the targets
+        # of a previous execution.
+        t = Table("t1", MetaData(), Column("x", String(10)))
+
+        cache = {}
+        conn = connection.execution_options(compiled_cache=cache)
+
+        t.execution_options(schema_translate_map={None: config.test_schema})
+        a = t.alias().execution_options(schema_translate_map={None: None})
+        stmt = select(t.c.x, a.c.x).select_from(t.join(a, true()))
+        eq_(conn.execute(stmt).all(), [("ts1", "tsnone")])
+        eq_(len(cache), 1)
+
+        # swap the translation targets
+        t.execution_options(schema_translate_map={None: None})
+        a = t.alias().execution_options(
+            schema_translate_map={None: config.test_schema}
+        )
+        stmt = select(t.c.x, a.c.x).select_from(t.join(a, true()))
+        eq_(conn.execute(stmt).all(), [("tsnone", "ts1")])
+        eq_(len(cache), 2)
+
+        # swap back; the first compiled statement is reused from the
+        # cache and still renders the original targets
+        t.execution_options(schema_translate_map={None: config.test_schema})
+        a = t.alias().execution_options(schema_translate_map={None: None})
+        stmt = select(t.c.x, a.c.x).select_from(t.join(a, true()))
+        eq_(conn.execute(stmt).all(), [("ts1", "tsnone")])
+        eq_(len(cache), 2)
 
 
 class ExecutionOptionsTest(fixtures.TestBase):

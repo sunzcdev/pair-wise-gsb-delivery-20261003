@@ -927,6 +927,62 @@ as the schema name is passed to these methods explicitly.
     configurations, the :ref:`horizontal_sharding_toplevel` extension may
     be used.  See the example at :ref:`examples_sharding`.
 
+.. _schema_translating_per_table:
+
+Per-Table and Per-Alias Schema Translation
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: 2.1
+
+A schema translate map may also be applied to an individual
+:class:`_schema.Table` object, or to an individual :class:`_sql.Alias`
+of that table, using the :meth:`_expression.TableClause.execution_options`
+and :meth:`_sql.Alias.execution_options` methods.   Such a map takes
+precedence over a statement, connection, or engine level
+``schema_translate_map`` for that particular table reference, while the
+more global map continues to apply to all other tables::
+
+    # render this table as "user_schema_one.user"
+    user_table = user_table.execution_options(
+        schema_translate_map={None: "user_schema_one"}
+    )
+
+    # render an alias of the same table as "user_schema_two.user"
+    user_alias = user_table.alias().execution_options(
+        schema_translate_map={None: "user_schema_two"}
+    )
+
+    stmt = select(user_table.c.id, user_alias.c.id).select_from(
+        user_table.join(user_alias, user_table.c.id == user_alias.c.id)
+    )
+
+The above statement renders SQL of the form:
+
+.. sourcecode:: sql
+
+    SELECT user_schema_one.user.id, user_schema_two.user.id AS id_1
+    FROM user_schema_one.user
+    JOIN user_schema_two.user AS user_1
+        ON user_schema_one.user.id = user_schema_two.user.id
+
+This allows a single query to refer to the same table within multiple
+schemas at once, such as when comparing tables that are distributed
+across multiple databases.  Note that
+:meth:`_expression.TableClause.execution_options` stores the option on
+the :class:`_schema.Table` object itself, so it remains in effect for
+all statements that use that object until it is changed;
+:meth:`_sql.Alias.execution_options` is instead generative, returning
+a new :class:`_sql.Alias` that carries the option.
+
+Per-table and per-alias translate maps participate in the SQL
+compilation cache key of statements that use them, so statements that
+make use of differing translate maps are cached and rendered
+independently of each other.
+
+.. seealso::
+
+    :ref:`schema_translating`
+
 .. _sql_caching:
 
 

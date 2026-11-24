@@ -215,6 +215,16 @@ class InternalTraversal(Enum):
 
     dp_executable_options = "EO"
 
+    dp_execution_options = "EX"
+    """Visit the ``_execution_options`` dictionary of an object that
+    carries its own execution options, such as a
+    :class:`_expression.TableClause` or an :class:`_sql.Alias`.
+
+    The dictionary is considered to be significant for cache key
+    generation.
+
+    """
+
     dp_compile_state_funcs = "WC"
 
     dp_fromclause_ordered_set = "CO"

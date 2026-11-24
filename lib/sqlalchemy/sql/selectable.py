@@ -162,6 +162,7 @@ if TYPE_CHECKING:
     from .sqltypes import TableValueType
     from .type_api import TypeEngine
     from .visitors import _CloneCallableType
+    from ..engine.interfaces import _ImmutableExecuteOptions
 
 
 _ColumnsClauseElement = Union["FromClause", ColumnElement[Any], "TextClause"]
@@ -1763,7 +1764,10 @@ class AliasedReturnsRows(NoInit, NamedFromClause[_KeyColCC_co]):
     _traverse_internals: _TraverseInternalsType = [
         ("element", InternalTraversal.dp_clauseelement),
         ("name", InternalTraversal.dp_anon_name),
+        ("_execution_options", InternalTraversal.dp_execution_options),
     ]
+
+    _execution_options: _ImmutableExecuteOptions = util.EMPTY_DICT
 
     @classmethod
     def _construct(
@@ -1826,6 +1830,50 @@ class AliasedReturnsRows(NoInit, NamedFromClause[_KeyColCC_co]):
     def original(self) -> ReturnsRows:
         """Legacy for dialects that are referring to Alias.original."""
         return self.element
+
+    def execution_options(self, **kw: Any) -> Self:
+        """Apply execution options to this :class:`_sql.Alias`.
+
+        This method is generative; the options are applied to a copy of
+        this :class:`_sql.Alias` which is returned.
+
+        Currently, the only execution option that is consumed at the
+        level of an individual alias is the ``schema_translate_map``
+        option, which allows a :ref:`schema translate map
+        <schema_translating>` to be applied to the table or selectable
+        referenced by this alias only, taking precedence over any
+        translate map applied at the statement, connection, or engine
+        level for this particular table reference::
+
+            user_alias = user_table.alias().execution_options(
+                schema_translate_map={None: "user_schema_two"}
+            )
+
+        The value of the option also participates in SQL compilation
+        cache keys, so statements that make use of differing translate
+        maps will be cached and rendered independently of each other.
+
+        .. versionadded:: 2.1
+
+        .. seealso::
+
+            :ref:`schema_translating`
+
+            :meth:`_expression.TableClause.execution_options`
+
+        """
+        c = self._clone()
+        c._execution_options = c._execution_options.union(kw)
+        return c
+
+    def get_execution_options(self) -> _ImmutableExecuteOptions:
+        """Get the execution options that have been applied to this
+        :class:`_sql.Alias` using :meth:`_sql.Alias.execution_options`.
+
+        .. versionadded:: 2.1
+
+        """
+        return self._execution_options
 
     def is_derived_from(self, fromclause: Optional[FromClause]) -> bool:
         if fromclause in self._cloned_set:
@@ -1940,6 +1988,7 @@ class TableValuedAlias(LateralFromClause, Alias):
         ("_tableval_type", InternalTraversal.dp_type),
         ("_render_derived", InternalTraversal.dp_boolean),
         ("_render_derived_w_types", InternalTraversal.dp_boolean),
+        ("_execution_options", InternalTraversal.dp_execution_options),
     ]
 
     def _init(
@@ -3206,9 +3255,12 @@ class TableClause(
         ),
         ("name", InternalTraversal.dp_string),
         ("schema", InternalTraversal.dp_string),
+        ("_execution_options", InternalTraversal.dp_execution_options),
     ]
 
     _is_table = True
+
+    _execution_options: _ImmutableExecuteOptions = util.EMPTY_DICT
 
     fullname: str
 
@@ -3255,6 +3307,61 @@ class TableClause(
 
     def _refresh_for_new_column(self, column: ColumnElement[Any]) -> None:
         pass
+
+    def execution_options(self, **kw: Any) -> Self:
+        """Apply execution options to this :class:`_expression.TableClause`
+        or :class:`_schema.Table`.
+
+        Currently, the only execution option that is consumed at the
+        level of an individual table is the ``schema_translate_map``
+        option, which allows a :ref:`schema translate map
+        <schema_translating>` to be applied to this table only, taking
+        precedence over any translate map applied at the statement,
+        connection, or engine level for this particular table::
+
+            user_table = user_table.execution_options(
+                schema_translate_map={None: "user_schema_one"}
+            )
+
+        The option is stored on the table object itself, so it will be
+        applied to all statements that make use of this table object
+        until it is changed.  The value of the option also participates
+        in SQL compilation cache keys, so statements that make use of
+        differing translate maps will be cached and rendered
+        independently of each other.
+
+        .. note::
+
+            As with other mutations of an existing
+            :class:`_expression.TableClause` or :class:`_schema.Table`
+            object, such as :meth:`_schema.Table.append_column`,
+            changing the execution options of a table should be done
+            before statements that make use of that table are
+            constructed; statements that were already constructed should
+            be re-constructed in order to take into account the new
+            options.
+
+        .. versionadded:: 2.1
+
+        .. seealso::
+
+            :ref:`schema_translating`
+
+            :meth:`_sql.Alias.execution_options`
+
+        """
+        self._execution_options = self._execution_options.union(kw)
+        return self
+
+    def get_execution_options(self) -> _ImmutableExecuteOptions:
+        """Get the execution options that have been applied to this
+        :class:`_expression.TableClause` or :class:`_schema.Table`
+        using :meth:`_expression.TableClause.execution_options`.
+
+        .. versionadded:: 2.1
+
+        """
+        return self._execution_options
 
     @util.ro_memoized_property
     def description(self) -> str:

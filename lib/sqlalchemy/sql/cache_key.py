@@ -17,6 +17,7 @@ from typing import Iterable
 from typing import Iterator
 from typing import List
 from typing import Literal
+from typing import Mapping
 from typing import MutableMapping
 from typing import NamedTuple
 from typing import Optional
@@ -69,6 +70,31 @@ CALL_GEN_CACHE_KEY: Final = CacheTraverseTarget.CALL_GEN_CACHE_KEY
 STATIC_CACHE_KEY: Final = CacheTraverseTarget.STATIC_CACHE_KEY
 PROPAGATE_ATTRS: Final = CacheTraverseTarget.PROPAGATE_ATTRS
 ANON_NAME: Final = CacheTraverseTarget.ANON_NAME
+
+
+def _hashable_option_value(value: Any) -> Any:
+    """convert an execution option value into a hashable structure
+    suitable for cache key generation."""
+    if isinstance(value, dict):
+        return tuple(
+            (key, _hashable_option_value(sub_value))
+            for key, sub_value in value.items()
+        )
+    elif isinstance(value, (list, tuple)):
+        return tuple(_hashable_option_value(elem) for elem in value)
+    else:
+        return value
+
+
+def _execution_options_cache_key(
+    execution_options: Mapping[str, Any],
+) -> Tuple[Any, ...]:
+    """Produce a hashable cache key structure from an execution options
+    dictionary."""
+    return tuple(
+        (key, _hashable_option_value(value))
+        for key, value in execution_options.items()
+    )
 
 
 class HasCacheKey(_cache_key_cy.BaseHasCacheKey):
@@ -610,6 +636,16 @@ class _CacheKeyTraversal(
                 ]
             ),
         )
+
+    def visit_execution_options(
+        self,
+        attrname: str,
+        obj: Any,
+        parent: Any,
+        anon_map: anon_map,
+        bindparams: List[BindParameter[Any]],
+    ) -> Tuple[Any, ...]:
+        return (attrname, _execution_options_cache_key(obj))
 
     visit_clauseelement_tuples = visit_has_cache_key_tuples
 

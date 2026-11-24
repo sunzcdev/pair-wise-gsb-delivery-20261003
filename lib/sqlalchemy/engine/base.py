@@ -42,6 +42,7 @@ from .. import log
 from .. import util
 from ..sql import compiler
 from ..sql import util as sql_util
+from ..sql.base import _schema_translate_map_for_object
 from ..util.typing import Never
 from ..util.typing import TupleAny
 from ..util.typing import TypeVarTuple
@@ -249,6 +250,14 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         """
 
         name = obj.schema
+
+        obj_schema_translate_map = _schema_translate_map_for_object(obj)
+        if (
+            obj_schema_translate_map is not None
+            and name in obj_schema_translate_map
+        ):
+            return obj_schema_translate_map[name] or None
+
         schema_translate_map: Optional[SchemaTranslateMapType] = (
             self._execution_options.get("schema_translate_map", None)
         )

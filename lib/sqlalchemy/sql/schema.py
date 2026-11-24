@@ -85,6 +85,7 @@ from .base import Executable
 from .base import SchemaEventTarget as SchemaEventTarget
 from .base import SchemaVisitable as SchemaVisitable
 from .base import WriteableColumnCollection
+from .cache_key import _execution_options_cache_key
 from .coercions import _document_text_coercion
 from .ddl import CheckFirst
 from .elements import ClauseElement
@@ -471,10 +472,12 @@ class Table(
     def _gen_cache_key(
         self, anon_map: anon_map, bindparams: List[BindParameter[Any]]
     ) -> Tuple[Any, ...]:
+        key: Tuple[Any, ...] = (self,)
         if self._annotations:
-            return (self,) + self._annotations_cache_key
-        else:
-            return (self,)
+            key += self._annotations_cache_key
+        if self._execution_options:
+            key += (_execution_options_cache_key(self._execution_options),)
+        return key
 
     if not typing.TYPE_CHECKING:
         # typing tools seem to be inconsistent in how they handle

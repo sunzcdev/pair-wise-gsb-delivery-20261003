@@ -79,6 +79,7 @@ from ._typing import is_dml
 from .base import _de_clone
 from .base import _from_objects
 from .base import _NONE_NAME
+from .base import _schema_translate_map_for_object
 from .base import _SentinelDefaultCharacterization
 from .base import NO_ARG
 from .elements import quoted_name
@@ -2821,7 +2822,17 @@ class SQLCompiler(Compiled):
                 and ambiguous_table_name_map
                 and tablename in ambiguous_table_name_map
             ):
-                tablename = ambiguous_table_name_map[tablename]
+                # if the schema was removed by a per-object
+                # schema_translate_map, the table renders without any
+                # schema or alias, so the anonymized name does not apply
+                per_object_schema_translate_map = (
+                    _schema_translate_map_for_object(table)
+                )
+                if (
+                    per_object_schema_translate_map is None
+                    or table.schema not in per_object_schema_translate_map
+                ):
+                    tablename = ambiguous_table_name_map[tablename]
 
             if isinstance(tablename, elements._truncated_label):
                 tablename = self._truncated_identifier("alias", tablename)
@@ -4672,6 +4683,17 @@ class SQLCompiler(Compiled):
                 kwargs["lateral_from_linter"] = from_linter
 
         if enclosing_alias is not None and enclosing_alias.element is alias:
+            if (
+                _schema_translate_map_for_object(alias) is None
+                and _schema_translate_map_for_object(enclosing_alias)
+                is not None
+            ):
+                # for an alias of an alias, if the inner alias does not
+                # carry its own schema_translate_map but an enclosing
+                # alias does, the enclosing alias's map applies
+                map_enclosing_alias = enclosing_alias
+            else:
+                map_enclosing_alias = alias
             inner = alias.element._compiler_dispatch(
                 self,
                 asfrom=asfrom,
@@ -4679,7 +4701,7 @@ class SQLCompiler(Compiled):
                 iscrud=iscrud,
                 fromhints=fromhints,
                 lateral=lateral,
-                enclosing_alias=alias,
+                enclosing_alias=map_enclosing_alias,
                 **kwargs,
             )
             if subquery and (asfrom or lateral):
@@ -5769,7 +5791,42 @@ class SQLCompiler(Compiled):
             from_linter.froms[table] = table.fullname
 
         if asfrom or ashint or within_tstring:
-            effective_schema = self.preparer.schema_for_object(table)
+            per_object_schema_translate = False
+
+            # an alias that encloses this table, possibly across
+            # multiple levels of aliasing, may carry its own
+            # schema_translate_map, which takes precedence
+            # over that of the table itself
+            schema_translate_map = None
+            enclosing_maps = []
+            map_enclosing_alias = enclosing_alias
+            while map_enclosing_alias is not None:
+                elem = getattr(map_enclosing_alias, "element", None)
+                if elem is None:
+                    break
+                ea_map = _schema_translate_map_for_object(map_enclosing_alias)
+                if ea_map is not None:
+                    enclosing_maps.append(ea_map)
+                if elem is table:
+                    # the innermost alias that carries a map wins
+                    if enclosing_maps:
+                        schema_translate_map = enclosing_maps[-1]
+                    break
+                elif getattr(elem, "_is_from_container", False):
+                    map_enclosing_alias = elem
+                else:
+                    break
+
+            if (
+                schema_translate_map is not None
+                and table.schema in schema_translate_map
+            ):
+                effective_schema = schema_translate_map[table.schema] or None
+                per_object_schema_translate = True
+            else:
+                effective_schema = self.preparer.schema_for_object(table)
+                if effective_schema != table.schema:
+                    per_object_schema_translate = True
 
             if use_schema and effective_schema:
                 ret = (
@@ -5786,6 +5843,7 @@ class SQLCompiler(Compiled):
                         or enclosing_alias.element is not table
                     )
                     and not effective_schema
+                    and not per_object_schema_translate
                     and ambiguous_table_name_map
                     and table.name in ambiguous_table_name_map
                 ):
@@ -8097,10 +8155,6 @@ class StrSQLTypeCompiler(GenericTypeCompiler):
             return get_col_spec(**kw)
 
 
-class _SchemaForObjectCallable(Protocol):
-    def __call__(self, obj: Any, /) -> str: ...
-
-
 class _BindNameForColProtocol(Protocol):
     def __call__(self, col: ColumnClause[Any]) -> str: ...
 
@@ -8120,16 +8174,30 @@ class IdentifierPreparer:
 
     _strings: MutableMapping[str, str]
 
-    schema_for_object: _SchemaForObjectCallable = operator.attrgetter("schema")
-    """Return the .schema attribute for an object.
+    def schema_for_object(self, obj: Any) -> Optional[str]:
+        """Return the .schema attribute for an object.
 
-    For the default IdentifierPreparer, the schema for an object is always
-    the value of the ".schema" attribute.   if the preparer is replaced
-    with one that has a non-empty schema_translate_map, the value of the
-    ".schema" attribute is rendered a symbol that will be converted to a
-    real schema name from the mapping post-compile.
+        If the object is a table that carries its own
+        ``schema_translate_map`` execution option, as may be applied using
+        the :meth:`_expression.TableClause.execution_options` method, the
+        schema name is translated using that mapping.  Aliased table
+        references are translated using a mapping applied using the
+        :meth:`_sql.Alias.execution_options` method at the point at which
+        the aliased reference itself is rendered.
 
-    """
+        Otherwise, if the preparer is replaced with one that has a
+        non-empty schema_translate_map, the value of the ".schema"
+        attribute is rendered a symbol that will be converted to a
+        real schema name from the mapping post-compile.
+
+        """
+        if getattr(obj, "_is_table", False):
+            schema_translate_map = _schema_translate_map_for_object(obj)
+            if schema_translate_map is not None:
+                schema = obj.schema
+                if schema in schema_translate_map:
+                    return schema_translate_map[schema] or None
+        return obj.schema
 
     _includes_none_schema_translate: bool = False
 
@@ -8177,6 +8245,17 @@ class IdentifierPreparer:
 
         def symbol_getter(obj):
             name = obj.schema
+            if getattr(obj, "_is_table", False):
+                per_object_schema_translate_map = (
+                    _schema_translate_map_for_object(obj)
+                )
+                if (
+                    per_object_schema_translate_map is not None
+                    and name in per_object_schema_translate_map
+                ):
+                    # per-object schema translate maps are rendered
+                    # unconditionally at compile time
+                    return per_object_schema_translate_map[name] or None
             if obj._use_schema_map and (name is not None or includes_none):
                 if name is not None and ("[" in name or "]" in name):
                     raise exc.CompileError(
