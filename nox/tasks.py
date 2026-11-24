@@ -17,6 +17,7 @@ from __future__ import annotations
 __lazy_modules__ = {
     "ast",
     "colorlog.escape_codes",
+    "contextlib",
     "importlib.util",
     "json",
     "nox",
@@ -24,13 +25,16 @@ __lazy_modules__ = {
     "nox._version",
     "nox.logger",
     "nox.manifest",
+    "threading",
 }
 
 import ast
+import contextlib
 import importlib.util
 import json
 import os
 import sys
+import threading
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, TypeVar
 
@@ -46,6 +50,7 @@ from nox.sessions import Result, Status, _duration_str, resolve_allow_parallel
 
 if TYPE_CHECKING:
     import types
+    from collections.abc import Callable, Iterator
 
     from nox._options import NoxConfig
 
@@ -396,6 +401,35 @@ def honor_usage_request(manifest: Manifest, global_config: NoxConfig) -> Manifes
     return 0
 
 
+@contextlib.contextmanager
+def _stream_results(
+    global_config: NoxConfig,
+) -> Iterator[Callable[[Result], None] | None]:
+    """Yield a sink that appends each finished result to the JSONL report.
+
+    When ``--report-jsonl`` was given, every result is written as one JSON
+    line (the same shape as a ``--report`` session entry) and flushed
+    immediately, so a readable record of the run exists while it is still in
+    progress -- and survives the run ending early. Yields ``None`` when no
+    streaming report was requested.
+    """
+    path = getattr(global_config, "report_jsonl", None)
+    if path is None:
+        yield None
+        return
+
+    lock = threading.Lock()
+    with open(path, "w", encoding="utf-8") as stream_file:
+
+        def record(result: Result) -> None:
+            line = json.dumps(result.serialize(), default=str)
+            with lock:
+                stream_file.write(f"{line}\n")
+                stream_file.flush()
+
+        yield record
+
+
 def run_manifest(manifest: Manifest, global_config: NoxConfig) -> list[Result]:
     """Run the full manifest of sessions.
 
@@ -421,40 +455,44 @@ def run_manifest(manifest: Manifest, global_config: NoxConfig) -> list[Result]:
             " --allow-parallel."
         )
         jobs = 1
-    if jobs > 1:
-        # Imported lazily so sequential runs don't pay for the parallel machinery.
-        from nox._parallel import run_manifest_parallel  # noqa: PLC0415
 
-        return run_manifest_parallel(manifest, global_config, jobs)
+    with _stream_results(global_config) as record:
+        if jobs > 1:
+            # Imported lazily so sequential runs don't pay for the parallel machinery.
+            from nox._parallel import run_manifest_parallel  # noqa: PLC0415
 
-    results = []
+            return run_manifest_parallel(manifest, global_config, jobs, record=record)
 
-    # Iterate over each session in the manifest, and execute it.
-    #
-    # Note that it is possible for the manifest to be altered in any given
-    # iteration.
-    for session in manifest:
-        # possibly raise warnings associated with this session
-        if WARN_PYTHONS_IGNORED in session.func.should_warn:
-            logger.warning(
-                f"Session {session.name} is set to run with venv_backend='none', "
-                "IGNORING its"
-                f" python={session.func.should_warn[WARN_PYTHONS_IGNORED]} parametrization. "
-            )
+        results = []
 
-        result = session.execute()
-        name = session.friendly_name
-        status = result.imperfect
-        result.log(f"Session {name} {status}.")
-        results.append(result)
+        # Iterate over each session in the manifest, and execute it.
+        #
+        # Note that it is possible for the manifest to be altered in any given
+        # iteration.
+        for session in manifest:
+            # possibly raise warnings associated with this session
+            if WARN_PYTHONS_IGNORED in session.func.should_warn:
+                logger.warning(
+                    f"Session {session.name} is set to run with venv_backend='none', "
+                    "IGNORING its"
+                    f" python={session.func.should_warn[WARN_PYTHONS_IGNORED]} parametrization. "
+                )
 
-        # Sanity check: If we are supposed to stop on the first error case,
-        # then abort now.
-        if not result and global_config.stop_on_first_error:
-            return results
+            result = session.execute()
+            name = session.friendly_name
+            status = result.imperfect
+            result.log(f"Session {name} {status}.")
+            results.append(result)
+            if record is not None:
+                record(result)
 
-    # The entire manifest has been processed; return the results.
-    return results
+            # Sanity check: If we are supposed to stop on the first error case,
+            # then abort now.
+            if not result and global_config.stop_on_first_error:
+                return results
+
+        # The entire manifest has been processed; return the results.
+        return results
 
 
 Sequence_Results_T = TypeVar("Sequence_Results_T", bound=Sequence[Result])

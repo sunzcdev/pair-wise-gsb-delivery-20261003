@@ -154,7 +154,144 @@ def test_parallel_stop_on_first_error(monkeypatch: pytest.MonkeyPatch) -> None:
     results = _run([x, y], _config(stop_on_first_error=True), jobs=1)
 
     assert calls == ["x"]
-    assert [r.session.friendly_name for r in results] == ["x"]
+    # ``y`` never ran, but it still appears in the results (as not_started)
+    # so a partially-run matrix can't be mistaken for a complete one.
+    assert [r.session.friendly_name for r in results] == ["x", "y"]
+    assert results[0].status is Status.FAILED
+    assert results[1].status is Status.NOT_STARTED
+    assert not results[1]
+
+
+def test_parallel_distinguishes_unstarted_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The artifact must distinguish "dependency not satisfied" (aborted) from
+    # "never started" (not_started): with -x, x's failure stops the scheduler
+    # before either dependent or independent sessions are queued.
+    calls: list[str] = []
+    _patch_run_session(monkeypatch, failures=["x"], calls=calls)
+    x = FakeSession("x")
+    dependent = FakeSession("dependent", deps=[x])
+    independent = FakeSession("independent")
+
+    results = _run(
+        [x, dependent, independent], _config(stop_on_first_error=True), jobs=1
+    )
+
+    by_name = {r.session.friendly_name: r for r in results}
+    assert by_name["x"].status is Status.FAILED
+    # Dependency unmet: the prerequisite already failed.
+    assert by_name["dependent"].status is Status.ABORTED
+    assert "x was not successful" in (by_name["dependent"].reason or "")
+    # Never started: nothing about its dependencies was wrong.
+    assert by_name["independent"].status is Status.NOT_STARTED
+    # Neither unstarted session spawned a worker.
+    assert calls == ["x"]
+
+
+def test_parallel_worker_exception_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If the worker machinery itself blows up, the session's terminal state
+    # was never received: report it as incomplete, don't crash the scheduler.
+    def boom(
+        _session: object, _config: object, _children: object, **_kwargs: object
+    ) -> tuple[Result, str]:
+        raise OSError("cannot spawn child")
+
+    monkeypatch.setattr(_parallel, "_run_session", boom)
+
+    results = _run([FakeSession("a"), FakeSession("b")], _config(), jobs=2)
+
+    assert [r.status for r in results] == [Status.INCOMPLETE] * 2
+    assert all(not r for r in results)
+    assert all("cannot spawn child" in (r.reason or "") for r in results)
+
+
+def test_parallel_records_results_as_they_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_run_session(monkeypatch, failures=["d"])
+    d = FakeSession("d")
+    e = FakeSession("e", deps=[d])
+    recorded: list[Result] = []
+    runners = [_fake_runner(s) for s in (d, e)]
+
+    results = _parallel.run_manifest_parallel(
+        typing.cast("Manifest", runners),
+        typing.cast("typing.Any", _config()),
+        4,
+        record=recorded.append,
+    )
+
+    # Every terminal state (the failure and the cascading abort) was streamed.
+    assert [r.status for r in recorded] == [Status.FAILED, Status.ABORTED]
+    assert recorded == results
+
+
+def test_parallel_records_unstarted_padding(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    _patch_run_session(monkeypatch, failures=["x"], calls=calls)
+    recorded: list[Result] = []
+
+    results = _parallel.run_manifest_parallel(
+        typing.cast("Manifest", [_fake_runner(FakeSession(n)) for n in ("x", "y")]),
+        typing.cast("typing.Any", _config(stop_on_first_error=True)),
+        1,
+        record=recorded.append,
+    )
+
+    assert [r.status for r in results] == [Status.FAILED, Status.NOT_STARTED]
+    # The padded not_started result is streamed too, so the artifact always
+    # accounts for the whole matrix.
+    assert [r.status for r in recorded] == [Status.FAILED, Status.NOT_STARTED]
+
+
+def test_parallel_interrupt_records_terminal_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An interrupted scheduler must not leave the artifact implying the
+    # matrix passed: the still-running session is streamed as incomplete and
+    # the queued one as not_started before the interrupt propagates.
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_run_session(
+        session: SessionRunner,
+        _global_config: object,
+        _children: object,
+        **_kwargs: object,
+    ) -> tuple[Result, str]:
+        started.set()
+        release.wait(30)
+        return Result(session, Status.SUCCESS, duration=0.0), ""
+
+    def interrupting_wait(*_args: object, **_kwargs: object) -> None:
+        assert started.wait(30)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_parallel, "_run_session", fake_run_session)
+    monkeypatch.setattr(_parallel, "wait", interrupting_wait)
+    recorded: list[Result] = []
+
+    def record(result: Result) -> None:
+        recorded.append(result)
+        release.set()  # let the worker finish so the executor can shut down
+
+    with pytest.raises(KeyboardInterrupt):
+        _parallel.run_manifest_parallel(
+            typing.cast(
+                "Manifest",
+                [_fake_runner(FakeSession(n)) for n in ("running", "queued")],
+            ),
+            typing.cast("typing.Any", _config()),
+            1,
+            record=record,
+        )
+
+    by_name = {r.session.friendly_name: r for r in recorded}
+    assert by_name["running"].status is Status.INCOMPLETE
+    assert by_name["queued"].status is Status.NOT_STARTED
 
 
 def _patch_run_session_tracking_concurrency(
@@ -639,21 +776,217 @@ def test_read_report_nonzero_returncode_overrides_passing_report(
     assert result.duration == 3.0
 
 
-@pytest.mark.parametrize(
-    ("returncode", "expected"),
-    [(0, Status.SUCCESS), (1, Status.FAILED)],
-)
-def test_read_report_missing_falls_back_to_returncode(
-    tmp_path: object, returncode: int, expected: Status
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_read_report_missing_is_incomplete(
+    tmp_path: object, returncode: int
 ) -> None:
+    # A child that wrote no report delivered no terminal state; whatever its
+    # exit code, the session must not count as a pass (or a plain failure).
     path = str(tmp_path / "missing.json")  # type: ignore[operator]
     result = _parallel._read_report(
         path, _fake_runner(FakeSession("x")), returncode=returncode
     )
-    assert result.status is expected
+    assert result.status is Status.INCOMPLETE
+    assert not result
+    assert result.reason is not None
+    assert str(returncode) in result.reason
 
 
-def test_reporter_render() -> None:
+def test_child_argv_omits_report_jsonl() -> None:
+    # The streaming report is written by the parent scheduler only; children
+    # must not append to the shared file.
+    config = _options.options.namespace(
+        noxfile="noxfile.py",
+        report_jsonl="stream.jsonl",
+        error_on_missing_interpreters=False,
+        error_on_external_run=False,
+        color=False,
+        posargs=[],
+    )
+    argv = _parallel._child_argv(
+        typing.cast("typing.Any", config),
+        _fake_runner(FakeSession("tests")),
+        "r.json",
+    )
+    assert "--report-jsonl" not in argv
+
+
+def test_report_jsonl_cli_option() -> None:
+    assert _options.options.parse_args([]).report_jsonl is None
+    parsed = _options.options.parse_args(["--report-jsonl", "s.jsonl"])
+    assert parsed.report_jsonl == "s.jsonl"
+
+
+def test_report_jsonl_noxfile_settable() -> None:
+    assert hasattr(_options.NoxfileOptions(), "report_jsonl")
+
+
+def test_parallel_end_to_end_reports_every_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Three-plus-cell matrix, ended early by -x: one cell succeeds, one fails
+    # fast (ending the scheduler), its dependent is aborted (dependencies not
+    # satisfied), and the remaining queued cell never starts. Both artifacts
+    # must account for every cell, and the exit code must not pass.
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+    noxfile = tmp_path / "noxfile.py"
+    noxfile.write_text(
+        """import time
+
+import nox
+
+@nox.session(venv_backend="none", allow_parallel=True)
+def bad(session):
+    raise ValueError("boom")
+
+@nox.session(venv_backend="none", allow_parallel=True)
+def ok(session):
+    time.sleep(1)
+
+@nox.session(venv_backend="none", allow_parallel=True, requires=["bad"])
+def dependent(session):
+    pass
+
+@nox.session(venv_backend="none", allow_parallel=True)
+def late(session):
+    pass
+""",
+        encoding="utf-8",
+    )
+    report = tmp_path / "report.json"
+    stream = tmp_path / "stream.jsonl"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "nox",
+            "--noxfile",
+            str(noxfile),
+            "-j",
+            "2",
+            "-x",
+            "--report",
+            str(report),
+            "--report-jsonl",
+            str(stream),
+            "--nocolor",
+        ],
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+        timeout=60,
+    )
+    output = completed.stdout + completed.stderr
+
+    # The matrix did not pass, even though every finished cell but one did.
+    assert completed.returncode == 1, output
+
+    # The full report still works, and covers all four cells.
+    data = json.loads(report.read_text(encoding="utf-8"))
+    assert data["result"] == 0
+    by_name = {entry["name"]: entry["result"] for entry in data["sessions"]}
+    assert by_name == {
+        "bad": "failed",
+        "ok": "success",
+        "dependent": "aborted",
+        "late": "not_started",
+    }
+
+    # The streaming report recorded every terminal state as it happened.
+    entries = [
+        json.loads(line)
+        for line in stream.read_text(encoding="utf-8").splitlines()
+    ]
+    assert {entry["name"]: entry["result"] for entry in entries} == by_name
+
+
+def test_report_jsonl_sequential_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+    noxfile = tmp_path / "noxfile.py"
+    noxfile.write_text(
+        """import nox
+
+@nox.session(venv_backend="none")
+def first(session):
+    session.log("one")
+
+@nox.session(venv_backend="none")
+def second(session):
+    session.log("two")
+""",
+        encoding="utf-8",
+    )
+    stream = tmp_path / "stream.jsonl"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "nox",
+            "--noxfile",
+            str(noxfile),
+            "--report-jsonl",
+            str(stream),
+            "--nocolor",
+        ],
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+        timeout=60,
+    )
+    output = completed.stdout + completed.stderr
+
+    assert completed.returncode == 0, output
+    entries = [
+        json.loads(line)
+        for line in stream.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [entry["name"] for entry in entries] == ["first", "second"]
+    assert [entry["result"] for entry in entries] == ["success", "success"]
+
+
+@pytest.mark.parametrize("status", [Status.NOT_STARTED, Status.INCOMPLETE])
+def test_new_statuses_are_falsy_and_serialize(status: Status) -> None:
+    session = typing.cast(
+        "SessionRunner",
+        types.SimpleNamespace(func=types.SimpleNamespace(), name="x", signatures=["x"]),
+    )
+    result = Result(session, status, reason="why")
+    assert not result
+    entry = result.serialize()
+    assert entry["result"] == status.name.lower()
+    assert entry["reason"] == "why"
+    # Round-trips through the child-report reader.
+    assert Result.from_dict(session, entry).status is status
+
+
+def test_unstarted_result_distinguishes_dependency_state() -> None:
+    failed_dep = FakeSession("dep")
+    node_aborted = _parallel._Node(
+        session=_fake_runner(FakeSession("child")),
+        deps=[typing.cast("SessionRunner", failed_dep)],
+        envdir="e1",
+        allow_parallel=True,
+    )
+    node_plain = _parallel._Node(
+        session=_fake_runner(FakeSession("other")),
+        deps=[],
+        envdir="e2",
+        allow_parallel=True,
+    )
+    results = {
+        typing.cast("SessionRunner", failed_dep): Result(
+            typing.cast("SessionRunner", failed_dep), Status.FAILED
+        )
+    }
+
+    aborted = _parallel._unstarted_result(node_aborted, results)
+    assert aborted.status is Status.ABORTED
+    assert "dep was not successful" in (aborted.reason or "")
+    assert _parallel._unstarted_result(node_plain, results).status is (
+        Status.NOT_STARTED
+    )
     reporter = _parallel._Reporter(color=False, tty=False, total=2)
     reporter._active = {"a": 100.0, "b": 100.0}
     reporter._preview = {"a": "compiling module x"}
@@ -1088,7 +1421,10 @@ def test_run_manifest_dispatches_to_parallel(
     captured: dict[str, object] = {}
 
     def fake_parallel(
-        _manifest: object, _global_config: object, jobs: int
+        _manifest: object,
+        _global_config: object,
+        jobs: int,
+        record: object = None,
     ) -> list[Result]:
         captured["jobs"] = jobs
         return []
@@ -1110,7 +1446,10 @@ def test_run_manifest_dispatches_with_global_allow_parallel(
     captured: dict[str, object] = {}
 
     def fake_parallel(
-        _manifest: object, _global_config: object, jobs: int
+        _manifest: object,
+        _global_config: object,
+        jobs: int,
+        record: object = None,
     ) -> list[Result]:
         captured["jobs"] = jobs
         return []

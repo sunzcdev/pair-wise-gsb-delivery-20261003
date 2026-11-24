@@ -372,6 +372,13 @@ prerequisite fails. ``--stop-on-first-error`` stops launching new sessions after
 the first failure; sessions already running are allowed to finish, and their
 results still appear in the summary and in any ``--report`` file.
 
+Every queued session always appears in the results, so a matrix that ended
+early can never be mistaken for a fully-passing one. Sessions the scheduler
+never got to are reported as ``not_started`` (or ``aborted`` when a
+prerequisite had already failed), and a session whose worker exited without
+reporting an outcome is reported as ``incomplete``; all of these count as
+failures in the summary, the ``--report`` result, and the exit code.
+
 Each session's output is buffered and printed as a single block when that
 session finishes, so output from concurrent sessions never interleaves. On an
 interactive terminal a live status board shows which sessions are currently
@@ -546,6 +553,29 @@ You can output a report in ``json`` format by specifying ``--report``:
 .. code-block:: console
 
     nox --report status.json
+
+.. _opt-report-jsonl:
+
+Streaming results as they finish
+--------------------------------
+
+``--report`` is written once, at the end of the run. To follow along while a
+run is still in progress -- or to keep a record when a run ends early -- use
+``--report-jsonl``:
+
+.. code-block:: console
+
+    nox --report-jsonl status.jsonl
+
+Each session's result is appended as one JSON line (the same shape as a
+``--report`` session entry) as soon as the session reaches a terminal state,
+and the file is flushed after every line. Sessions that never produced a
+result are recorded too: as ``aborted`` when a prerequisite did not succeed,
+as ``not_started`` when the scheduler ended before they began, and as
+``incomplete`` when they started but no terminal state was received. A CI
+system can therefore tell a partially-completed matrix apart from a passing
+one instead of reading "every recorded session passed" as "the matrix
+passed".
 
 
 Converting from tox

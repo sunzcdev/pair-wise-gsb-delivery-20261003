@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+* Add `--report-jsonl` (also `nox.options.report_jsonl`): each session's
+  result is appended to the given file as one JSON line as soon as the
+  session reaches a terminal state, so a readable record exists while the
+  run is still in progress and survives an interrupted run.
+* Reports now distinguish sessions whose dependencies were not satisfied
+  (`aborted`) from sessions the scheduler never started (`not_started`) and
+  sessions that started but reported no terminal state (`incomplete`). Every
+  queued session now appears in the results, so a partially-completed matrix
+  can no longer look fully green in the `--report` result or the exit code.
+
 ## 2026.10.20
 
 Parallel mode no longer prints an "experimental" banner, and sessions can check

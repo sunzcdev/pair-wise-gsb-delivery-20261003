@@ -73,12 +73,16 @@ _SYMBOLS = {
     Status.SKIPPED: "⊘",
     Status.FAILED: "✗",
     Status.ABORTED: "↯",
+    Status.NOT_STARTED: "◌",
+    Status.INCOMPLETE: "…",
 }
 _ASCII_SYMBOLS = {
     Status.SUCCESS: "+",
     Status.SKIPPED: "-",
     Status.FAILED: "x",
     Status.ABORTED: "!",
+    Status.NOT_STARTED: ".",
+    Status.INCOMPLETE: "?",
 }
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
@@ -381,9 +385,16 @@ def _read_report(path: str, session: SessionRunner, returncode: int) -> Result:
             entry = json.load(report_file)["sessions"][0]
         result = Result.from_dict(session, entry)
     except (OSError, ValueError, KeyError, IndexError):
-        # The child died before writing a usable report; trust its exit code.
-        status = Status.SUCCESS if returncode == 0 else Status.FAILED
-        return Result(session, status)
+        # The child died before writing a usable report, so its terminal
+        # state was never received. Don't guess one from the exit code: a
+        # child that was stopped before reporting must not count as a pass.
+        return Result.incomplete(
+            session,
+            reason=(
+                "The session's worker exited (code"
+                f" {returncode}) without reporting a result"
+            ),
+        )
     # A child may run more than the scheduled session (e.g. via notify()); its
     # exit code reflects every one of them. Don't report success over a non-zero
     # child whose first session happened to pass.
@@ -494,8 +505,24 @@ def _stop_procs(procs: Collection[subprocess.Popen[bytes]]) -> None:
             _signal_group(proc, kill=True)
 
 
+def _unstarted_result(node: _Node, results: dict[SessionRunner, Result]) -> Result:
+    """Return the result for a session the scheduler never started.
+
+    A session whose prerequisite already has an unsuccessful result is
+    reported as ``aborted`` -- its dependencies were not satisfied. Anything
+    else simply never started (the scheduler ended first).
+    """
+    failed = [dep for dep in node.deps if dep in results and not results[dep]]
+    if failed:
+        return Result.aborted_prerequisite(node.session, failed[0])
+    return Result.not_started(node.session)
+
+
 def run_manifest_parallel(
-    manifest: Manifest, global_config: NoxConfig, jobs: int
+    manifest: Manifest,
+    global_config: NoxConfig,
+    jobs: int,
+    record: Callable[[Result], None] | None = None,
 ) -> list[Result]:
     """Run the manifest's sessions concurrently, honoring ``requires=``.
 
@@ -503,9 +530,14 @@ def run_manifest_parallel(
         manifest: The (already filtered and dependency-resolved) manifest.
         global_config: The global configuration.
         jobs: The maximum number of sessions to run at once.
+        record: If given, called with each result as soon as the session
+            reaches a terminal state (used for the streaming JSONL report).
 
     Returns:
-        The results, in manifest order, for every session that ran.
+        The results, in manifest order, for every queued session. Sessions
+        the scheduler never got to are reported as ``not_started`` (or
+        ``aborted`` when a prerequisite had already failed), so a partially
+        completed matrix can never look fully green.
     """
     queue = list(manifest)
     in_queue = set(queue)
@@ -526,6 +558,10 @@ def run_manifest_parallel(
     futures: dict[Future[Result], _Node] = {}
     children = _Children()
     stop = False
+
+    def record_result(result: Result) -> None:
+        if record is not None:
+            record(result)
 
     reporter = _Reporter(
         color=bool(global_config.color),
@@ -581,6 +617,7 @@ def run_manifest_parallel(
                     progressed = True
                     result = Result.aborted_prerequisite(node.session, failed[0])
                     results[node.session] = result
+                    record_result(result)
                     reporter.finished(node.session.friendly_name, result, "")
                 elif (
                     len(futures) < jobs
@@ -605,15 +642,59 @@ def run_manifest_parallel(
                 done, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for future in done:
                     node = futures.pop(future)
-                    result = future.result()
+                    try:
+                        result = future.result()
+                    except Exception as exc:  # noqa: BLE001 - report, don't crash
+                        # The worker machinery itself failed; the session's
+                        # terminal state was never received.
+                        result = Result.incomplete(
+                            node.session,
+                            reason=f"The session's worker raised {exc!r}",
+                        )
                     results[node.session] = result
+                    record_result(result)
                     if not result and global_config.stop_on_first_error:
                         stop = True
-        except KeyboardInterrupt:  # pragma: no cover - hard to trigger in tests
+        except KeyboardInterrupt:
             children.stop_all()
             executor.shutdown(wait=False, cancel_futures=True)
+            # The scheduler is ending with sessions still in flight or
+            # queued. Record a terminal state for each of them in the
+            # streaming report, so the artifact never shows a partial matrix
+            # as complete.
+            for future, node in futures.items():
+                result = None
+                if future.done():
+                    with contextlib.suppress(Exception):
+                        result = future.result()
+                if result is None:
+                    result = Result.incomplete(
+                        node.session,
+                        reason="The run was interrupted while the session was"
+                        " still running",
+                    )
+                results[node.session] = result
+                record_result(result)
+            for node in not_started:
+                result = _unstarted_result(node, results)
+                results[node.session] = result
+                record_result(result)
             raise
 
     # Report wall-clock time in the summary, not the sum of session durations.
     global_config.parallel_wall_time = time.monotonic() - start
-    return [results[session] for session in queue if session in results]
+
+    # Every queued session must appear in the results: one without a result
+    # never started (the scheduler stopped first), and silently dropping it
+    # would let a partially-run matrix look fully green. Padding happens in
+    # queue order, so an unstarted prerequisite cascades to its dependents
+    # as "aborted" (dependency not satisfied).
+    final = []
+    for node in nodes:
+        result = results.get(node.session)
+        if result is None:
+            result = _unstarted_result(node, results)
+            results[node.session] = result
+            record_result(result)
+        final.append(result)
+    return final

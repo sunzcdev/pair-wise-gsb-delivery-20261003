@@ -915,6 +915,89 @@ def test_create_report_path_args(tmp_path: Path) -> None:
     assert data["sessions"][0]["args"] == {"src": "docs"}
 
 
+def _report_result(name: str, status: sessions.Status) -> sessions.Result:
+    return sessions.Result(
+        session=typing.cast(
+            "sessions.SessionRunner",
+            argparse.Namespace(signatures=[name], name=name, func=object()),
+        ),
+        status=status,
+    )
+
+
+def test_create_report_unstarted_sessions_fail_the_matrix(tmp_path: Path) -> None:
+    # A run that ended before every session produced a result must not report
+    # the matrix as passing, even if every finished session succeeded.
+    report = tmp_path / "report.json"
+    config = _options.options.namespace(report=str(report))
+    results = [
+        _report_result("done", sessions.Status.SUCCESS),
+        _report_result("queued", sessions.Status.NOT_STARTED),
+        _report_result("lost", sessions.Status.INCOMPLETE),
+    ]
+
+    answer = tasks.create_report(results, config)
+
+    assert answer is results
+    data = json.loads(report.read_text(encoding="utf-8"))
+    assert data["result"] == 0
+    by_name = {entry["name"]: entry["result"] for entry in data["sessions"]}
+    assert by_name == {
+        "done": "success",
+        "queued": "not_started",
+        "lost": "incomplete",
+    }
+
+
+def test_final_reduce_unstarted_sessions_fail() -> None:
+    config = _options.options.namespace()
+    results = [
+        _report_result("done", sessions.Status.SUCCESS),
+        _report_result("queued", sessions.Status.NOT_STARTED),
+    ]
+    assert tasks.final_reduce(results, config) == 1
+    # The old conclusion for a fully-passing matrix is unchanged.
+    assert tasks.final_reduce(results[:1], config) == 0
+
+
+def test_run_manifest_streams_jsonl_report(tmp_path: Path) -> None:
+    stream = tmp_path / "stream.jsonl"
+    config = _options.options.namespace(
+        stop_on_first_error=False, report_jsonl=str(stream)
+    )
+    sessions_ = [
+        typing.cast("sessions.SessionRunner", mock.Mock(spec=sessions.SessionRunner)),
+        typing.cast("sessions.SessionRunner", mock.Mock(spec=sessions.SessionRunner)),
+    ]
+    manifest = Manifest({}, config)
+    manifest._queue = copy.copy(sessions_)
+    for i, mock_session in enumerate(sessions_):
+        mock_session.execute.return_value = sessions.Result(  # type: ignore[attr-defined]
+            session=mock_session, status=sessions.Status.SUCCESS
+        )
+        mock_session.name = f"s{i}"
+        mock_session.signatures = [f"s{i}"]
+        mock_session.func = session_func
+
+    results = tasks.run_manifest(manifest, global_config=config)
+
+    assert len(results) == 2
+    # Each result was appended as one readable JSON line as it completed.
+    entries = [
+        json.loads(line)
+        for line in stream.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [entry["name"] for entry in entries] == ["s0", "s1"]
+    assert [entry["result"] for entry in entries] == ["success", "success"]
+
+
+def test_run_manifest_no_jsonl_report_by_default(tmp_path: Path) -> None:
+    config = _options.options.namespace(stop_on_first_error=False)
+    assert config.report_jsonl is None
+    with tasks._stream_results(config) as record:
+        assert record is None
+
+
 def test_honor_usage_request_noop() -> None:
     config = _options.options.namespace(usage=None)
     manifest = typing.cast("Manifest", {"thing": mock.sentinel.THING})

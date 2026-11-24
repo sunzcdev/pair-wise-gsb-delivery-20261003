@@ -322,6 +322,24 @@ class NoxfileOptions(_option_set.OptionsBase):
             help="Output a report of all sessions to the given filename.",
         ),
     )
+    report_jsonl: str | None = attrs.field(
+        default=None,
+        validator=av_opt_str,
+        metadata=opt(
+            "--report-jsonl",
+            group="reporting",
+            # Parent-only: parallel children would interleave writes to the
+            # shared file; the scheduler records their results for them.
+            forward=Forward.NEVER,
+            completer=_completers.json_file_completer,
+            help=(
+                "Append each session's result to the given file as JSON Lines"
+                " as soon as the session reaches a terminal state, so partial"
+                " results are available while the run is still in progress"
+                " (and survive an interrupted run)."
+            ),
+        ),
+    )
     reuse_existing_virtualenvs: bool | None = attrs.field(
         default=None,
         validator=av_opt_bool,

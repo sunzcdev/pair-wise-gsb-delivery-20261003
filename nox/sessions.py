@@ -145,6 +145,12 @@ class Status(enum.Enum):
     FAILED = 0
     SUCCESS = 1
     SKIPPED = 2
+    # The scheduler queued the session but ended before it ever started.
+    NOT_STARTED = -2
+    # The session started, but no terminal state was ever received for it
+    # (e.g. its worker died before writing a report, or the run was
+    # interrupted while it was still going).
+    INCOMPLETE = -3
 
 
 class _WorkingDirContext:
@@ -1314,6 +1320,26 @@ class Result:
             reason=(
                 f"Prerequisite session {dependency.friendly_name} was not successful"
             ),
+            duration=0,
+        )
+
+    @classmethod
+    def not_started(cls, session: SessionRunner, reason: str | None = None) -> Result:
+        """Return the result for a session the scheduler never started."""
+        return cls(
+            session,
+            Status.NOT_STARTED,
+            reason=reason or "The scheduler ended before this session started",
+            duration=0,
+        )
+
+    @classmethod
+    def incomplete(cls, session: SessionRunner, reason: str | None = None) -> Result:
+        """Return the result for a session that started but reported no end state."""
+        return cls(
+            session,
+            Status.INCOMPLETE,
+            reason=reason or "The session started but no terminal state was received",
             duration=0,
         )
 
