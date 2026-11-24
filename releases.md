@@ -1,5 +1,9 @@
 # Releases
 
+## Unreleased
+
+  - Fixed `Scheduler#io_wait` letting a readiness notification that already entered the selector's ready queue for a cancelled wait settle a subsequent wait on the same fiber (for example a write wait registered immediately after a read wait was cancelled). Each wait registration now carries an explicit round, so stale notifications are treated as spurious wake-ups and retried; normal readiness and timeout behaviour is unchanged.
+
 ## v2.46.0
 
   - Fixed `Thread#kill` raising a `TypeError` while shutting down a thread with an active `Async::Reactor`.

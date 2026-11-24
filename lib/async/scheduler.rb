@@ -17,6 +17,19 @@ require "io/event"
 require "console"
 require "resolv"
 
+# Tracks the current {Scheduler#io_wait} round per fiber. A new wait (including
+# retries after a stale wake-up) advances the round, so readiness notifications
+# delivered through {Scheduler::WaitRegistration} can be attributed to the exact
+# wait that registered for them.
+Fiber.attr_writer :async_io_wait_round
+
+class Fiber
+	# @returns [Integer] The current IO wait round of the fiber, starting at zero.
+	def async_io_wait_round
+		instance_variable_get(:@async_io_wait_round) || 0
+	end
+end
+
 module Async
 	begin
 		require "fiber/profiler"
@@ -46,6 +59,48 @@ module Async
 		# @public Since *Async v1*.
 		def self.supported?
 			true
+		end
+		
+		# Binds a single {Scheduler#io_wait} registration to an explicit round.
+		#
+		# The selector only knows how to resume the object it registered, so the
+		# waiting fiber is wrapped rather than passed directly. When a readiness
+		# notification is delivered, the wrapper compares the round it was
+		# registered for with the fiber's current wait round. A notification that
+		# entered the selector's ready queue before a previous wait was cancelled
+		# therefore cannot settle a subsequent wait on the same fiber, even though
+		# it is delivered afterwards.
+		class WaitRegistration
+			# Create a new wait registration for the given fiber and round.
+			#
+			# @parameter fiber [Fiber] The fiber performing the wait.
+			# @parameter round [Integer] The round of the wait.
+			def initialize(fiber, round)
+				@fiber = fiber
+				@round = round
+			end
+		
+			# @returns [Boolean] Whether the waiting fiber is still alive.
+			def alive?
+				@fiber.alive?
+			end
+		
+			# Deliver a readiness result to the waiting fiber.
+			#
+			# A result belonging to an older round (e.g. a notification queued for a
+			# wait that has since been cancelled and replaced) is dropped and
+			# reported as `false`, which the scheduler treats as a spurious wake-up
+			# and retries without resetting the original timer.
+			#
+			# @parameter result [Object] The readiness result from the selector.
+			# @returns [Integer | false] The result if it belongs to the current round, otherwise `false`.
+			def transfer(result = nil)
+				if @round == @fiber.async_io_wait_round
+					return @fiber.transfer(result)
+				end
+		
+				return false
+			end
 		end
 		
 		# Used to augment the scheduler to add support for blocking operations.
@@ -301,6 +356,13 @@ module Async
 		
 		# Wait for the specified IO to become ready for the specified events.
 		#
+		# Each registration gets its own monotonically increasing round on the
+		# waiting fiber, via {WaitRegistration}. This ensures that a readiness
+		# notification which already entered the selector's ready queue for an
+		# earlier, now-cancelled wait cannot settle a later wait registered by the
+		# same fiber (e.g. a write wait following a cancelled read wait on the
+		# same socket).
+		#
 		# @public Since *Async v2*.
 		# @asynchronous May be non-blocking.
 		#
@@ -325,8 +387,8 @@ module Async
 				end
 			end
 			
-			# A selector wait may return a falsy result when the fiber is resumed without the requested IO becoming ready. For example, a deferred unblock from a previous blocking operation may arrive after the fiber has moved on to this wait. Retry these stale or spurious wake-ups without resetting the original timer.
-			until result = @selector.io_wait(fiber, io, events)
+			# A selector wait may return a falsy result when the fiber is resumed without the requested IO becoming ready. For example, a deferred unblock from a previous blocking operation may arrive after the fiber has moved on to this wait, or a readiness notification may belong to an earlier round that was cancelled and replaced. Retry these stale or spurious wake-ups without resetting the original timer.
+			until result = @selector.io_wait(WaitRegistration.new(fiber, fiber.async_io_wait_round += 1), io, events)
 				# If the original timer resumed the fiber, the false result represents the timeout rather than a spurious wake-up:
 				return false if expired
 			end
