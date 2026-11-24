@@ -358,6 +358,7 @@ class Session:
         success_codes: Iterable[int] | None = None,
         log: bool = True,
         external: ExternalType | None = None,
+        fallback: str | os.PathLike[str] | None = None,
         stdout: int | IO[str] | None = None,
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
@@ -374,6 +375,7 @@ class Session:
         success_codes: Iterable[int] | None = None,
         log: bool = True,
         external: ExternalType | None = None,
+        fallback: str | os.PathLike[str] | None = None,
         stdout: int | IO[str] | None = None,
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
@@ -390,6 +392,7 @@ class Session:
         success_codes: Iterable[int] | None = None,
         log: bool = True,
         external: ExternalType | None = None,
+        fallback: str | os.PathLike[str] | None = None,
         stdout: int | IO[str] | None = None,
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
@@ -405,6 +408,7 @@ class Session:
         success_codes: Iterable[int] | None = None,
         log: bool = True,
         external: ExternalType | None = None,
+        fallback: str | os.PathLike[str] | None = None,
         stdout: int | IO[str] | None = None,
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
@@ -493,6 +497,12 @@ class Session:
             ``--error-on-external-run``. This has no effect for sessions that
             do not have a virtualenv.
         :type external: bool
+        :param fallback: An explicit path to an executable used only when the
+            preferred program cannot be found in the session's paths, or
+            disappears before it starts. The fallback is invoked with the same
+            arguments, working directory and environment as the preferred
+            program. ``None`` (the default) means no fallback is allowed.
+        :type fallback: str, path-like, or None
         :param interrupt_timeout: The timeout (in seconds) that Nox should wait after it
             and its children receive an interrupt signal before sending a terminate
             signal to its children. Set to ``None`` to never send a terminate signal.
@@ -530,6 +540,7 @@ class Session:
             success_codes=success_codes,
             log=log,
             external=external,
+            fallback=fallback,
             stdout=stdout,
             stderr=stderr,
             interrupt_timeout=interrupt_timeout,
@@ -545,6 +556,7 @@ class Session:
         success_codes: Iterable[int] | None = None,
         log: bool = True,
         external: ExternalType | None = None,
+        fallback: str | os.PathLike[str] | None = None,
         stdout: int | IO[str] | None = None,
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
@@ -583,6 +595,12 @@ class Session:
             ``--error-on-external-run``. This has no effect for sessions that
             do not have a virtualenv.
         :type external: bool
+        :param fallback: An explicit path to an executable used only when the
+            preferred program cannot be found in the session's paths, or
+            disappears before it starts. The fallback is invoked with the same
+            arguments, working directory and environment as the preferred
+            program. ``None`` (the default) means no fallback is allowed.
+        :type fallback: str, path-like, or None
         :param interrupt_timeout: The timeout (in seconds) that Nox should wait after it
             and its children receive an interrupt signal before sending a terminate
             signal to its children. Set to ``None`` to never send a terminate signal.
@@ -613,6 +631,7 @@ class Session:
             success_codes=success_codes,
             log=log,
             external=external,
+            fallback=fallback,
             stdout=stdout,
             stderr=stderr,
             interrupt_timeout=interrupt_timeout,
@@ -628,6 +647,7 @@ class Session:
         success_codes: Iterable[int] | None = None,
         log: bool = True,
         external: ExternalType | None = None,
+        fallback: str | os.PathLike[str] | None = None,
         stdout: int | IO[str] | None = None,
         stderr: int | IO[str] | None = subprocess.STDOUT,
         interrupt_timeout: float | None = DEFAULT_INTERRUPT_TIMEOUT,
@@ -646,6 +666,7 @@ class Session:
             success_codes=success_codes,
             log=log,
             external=external,
+            fallback=fallback,
             stdout=stdout,
             stderr=stderr,
             interrupt_timeout=interrupt_timeout,
@@ -661,6 +682,7 @@ class Session:
         success_codes: Iterable[int] | None,
         log: bool,
         external: ExternalType | None,
+        fallback: str | os.PathLike[str] | None = None,
         stdout: int | IO[str] | None,
         stderr: int | IO[str] | None,
         interrupt_timeout: float | None,
@@ -706,6 +728,7 @@ class Session:
             env=env,
             paths=self.bin_paths,
             silent=silent,
+            fallback=fallback,
             success_codes=success_codes,
             log=log,
             external=external,

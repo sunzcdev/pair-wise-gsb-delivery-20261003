@@ -416,6 +416,29 @@ Programs in sibling directories are still external, even when the directory name
 
 If the Noxfile sets ``nox.options.error_on_external_run``, you can override the Noxfile setting from the command line by using ``--no-error-on-external-run``.
 
+Falling back to another executable
+-----------------------------------
+
+Nox always resolves the program from the session's virtualenv first. When a
+tool may be missing from the virtualenv, or might disappear after it was
+resolved but before it starts, you can pass an explicit ``fallback`` path to
+:func:`session.run <nox.sessions.Session.run>`:
+
+.. code-block:: python
+
+    session.run(
+        "some-tool",
+        "--check",
+        fallback="/usr/local/bin/some-tool",
+    )
+
+The fallback is only used when the preferred entry point cannot be found, or
+when it cannot be started anymore. It runs exactly once with the same
+arguments, working directory and environment as the preferred program, and
+Nox logs which executable was actually used. A call without ``fallback``
+never reuses a fallback from an earlier call. The ordinary ``external``
+rules still apply to whichever executable ends up running.
+
 Specifying a different configuration file
 -----------------------------------------
 

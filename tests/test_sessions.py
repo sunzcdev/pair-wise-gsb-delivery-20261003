@@ -48,6 +48,7 @@ def run_with_defaults(**kwargs: Any) -> dict[str, Any]:
         "env": None,
         "silent": False,
         "paths": None,
+        "fallback": None,
         "success_codes": None,
         "log": True,
         "external": False,
@@ -479,6 +480,30 @@ class TestSession:
             **run_with_defaults(
                 external=True, env=mock.ANY, paths=["/path/to/env/bin"]
             ),
+        )
+
+    def test_run_passes_fallback_to_command(self, tmp_path: Path) -> None:
+        session, _runner = self.make_session_and_runner()
+        fallback = tmp_path / "fallback-tool"
+
+        with mock.patch("nox.command.run", autospec=True) as run:
+            session.run("frobnicate", "--flag", fallback=fallback)
+
+        run.assert_called_once_with(
+            ("frobnicate", "--flag"),
+            **run_with_defaults(fallback=fallback, env=mock.ANY, paths=mock.ANY),
+        )
+
+    def test_run_install_passes_fallback_to_command(self, tmp_path: Path) -> None:
+        session, _runner = self.make_session_and_runner()
+        fallback = tmp_path / "fallback-tool"
+
+        with mock.patch("nox.command.run", autospec=True) as run:
+            session.run_install("frobnicate", fallback=fallback)
+
+        run.assert_called_once_with(
+            ("frobnicate",),
+            **run_with_defaults(fallback=fallback, env=mock.ANY, paths=mock.ANY),
         )
 
     def test_run_external_with_error_on_external_run(self) -> None:

@@ -35,6 +35,8 @@ import nox.popen
 
 PYTHON = sys.executable
 
+IS_WINDOWS = sys.platform.startswith("win")
+
 skip_on_windows_primary_console_session = pytest.mark.skipif(
     sys.platform.startswith("win") and "SECONDARY_CONSOLE_SESSION" not in os.environ,
     reason="On Windows, this test must run in a separate console session.",
@@ -340,6 +342,352 @@ def test_run_path_existent(tmp_path: Path) -> None:
             interrupt_timeout=0.3,
             terminate_timeout=0.2,
         )
+
+
+def _write_tool(
+    directory: Path, name: str, body: str, *, executable: bool = True
+) -> Path:
+    """Write an executable named *name* into *directory* and return its path.
+
+    On Windows a ``.cmd`` launcher is written alongside a ``.py`` worker (the
+    shape Nox's own virtualenvs use); elsewhere the script is made executable
+    directly.
+    """
+    if IS_WINDOWS:
+        worker = directory / f"{name}.py"
+        worker.write_text(body, encoding="utf-8")
+        launcher = directory / f"{name}.cmd"
+        launcher.write_text(f'@"{PYTHON}" "%~dp0{name}.py" %*\n', encoding="utf-8")
+        return launcher
+
+    tool = directory / name
+    tool.write_text(f"#!{PYTHON}\n{body}", encoding="utf-8")
+    if executable:
+        tool.chmod(0o755)
+    return tool
+
+
+def _tool_paths(tool: Path) -> list[Path]:
+    """All files that make up *tool* (launcher plus its worker on Windows)."""
+    if IS_WINDOWS:
+        return [tool, tool.with_suffix(".py")]
+    return [tool]
+
+
+def _remove_tool(tool: Path) -> None:
+    for path in _tool_paths(tool):
+        path.unlink(missing_ok=True)
+
+
+def _starts_with_executable(args: Any, executable: str) -> bool:
+    """Whether a Popen *args* value invokes *executable*.
+
+    On Windows nox.popen rewrites ``.cmd``/``.bat`` invocations into a string
+    command line, so both list and string forms must be recognized.
+    """
+    if isinstance(args, (list, tuple)):
+        candidate = os.fspath(args[0])
+    else:
+        candidate = os.fspath(args).split(" ", 1)[0].strip('"')
+    return os.path.normcase(candidate) == os.path.normcase(executable)
+
+
+def test_run_fallback_when_preferred_vanishes_before_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The preferred entry exists in the virtualenv bin dir; the explicit
+    # fallback lives elsewhere.
+    venv_bin = tmp_path / "venv-bin"
+    venv_bin.mkdir()
+    other_bin = tmp_path / "other-bin"
+    other_bin.mkdir()
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+
+    marker = tmp_path / "marker.txt"
+    primary = _write_tool(
+        venv_bin,
+        "frobnicate",
+        (
+            "from pathlib import Path\n"
+            f"Path(r'{marker}').write_text('primary', encoding='utf-8')\n"
+        ),
+    )
+    fallback = _write_tool(
+        other_bin,
+        "frobnicate-fallback",
+        (
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            f"Path(r'{marker}').write_text(\n"
+            "    'fallback:' + os.getcwd() + ':' + ' '.join(sys.argv[1:]),\n"
+            "    encoding='utf-8')\n"
+        ),
+    )
+
+    resolved = nox.command.which("frobnicate", [str(venv_bin)])
+
+    # Local launch stand-in: hold the preferred tool at the "resolved but not
+    # yet started" stage, then remove it before Popen actually spawns it.
+    real_popen = subprocess.Popen
+    launches: list[Any] = []
+
+    class VanishingPopen(real_popen):  # type: ignore[misc, valid-type]
+        def __init__(self, args: Any, *popen_args: Any, **popen_kwargs: Any) -> None:
+            launches.append(args)
+            if _starts_with_executable(args, resolved):
+                _remove_tool(primary)
+            super().__init__(args, *popen_args, **popen_kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", VanishingPopen)
+    monkeypatch.chdir(cwd)
+
+    caplog.set_level(logging.WARNING)
+    result = nox.command.run(
+        ["frobnicate", "--flag", "value"],
+        paths=[str(venv_bin)],
+        fallback=fallback,
+        silent=True,
+        env={"FROBNICATE_VAR": "session-env"},
+    )
+
+    # The fallback ran exactly once and recorded its actual source.
+    assert len(launches) == 2
+    assert _starts_with_executable(launches[0], resolved)
+    assert _starts_with_executable(launches[1], os.fspath(fallback))
+    recorded = marker.read_text(encoding="utf-8")
+    assert recorded.startswith("fallback:")
+    assert str(cwd) in recorded
+    assert "--flag value" in recorded
+    assert "fallback executable" in caplog.text
+    assert result == ""
+
+
+def test_run_fallback_not_used_when_preferred_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    venv_bin = tmp_path / "venv-bin"
+    venv_bin.mkdir()
+    other_bin = tmp_path / "other-bin"
+    other_bin.mkdir()
+
+    marker = tmp_path / "marker.txt"
+    primary = _write_tool(
+        venv_bin,
+        "frobnicate",
+        (
+            "import sys\n"
+            "from pathlib import Path\n"
+            f"Path(r'{marker}').write_text('primary', encoding='utf-8')\n"
+            "sys.exit(7)\n"
+        ),
+    )
+    fallback = _write_tool(
+        other_bin,
+        "frobnicate-fallback",
+        (
+            "from pathlib import Path\n"
+            f"Path(r'{marker}').write_text('fallback', encoding='utf-8')\n"
+        ),
+    )
+
+    real_popen = subprocess.Popen
+    launches: list[Any] = []
+
+    class RecordingPopen(real_popen):  # type: ignore[misc, valid-type]
+        def __init__(self, args: Any, *popen_args: Any, **popen_kwargs: Any) -> None:
+            launches.append(args)
+            super().__init__(args, *popen_args, **popen_kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", RecordingPopen)
+    caplog.set_level(logging.WARNING)
+
+    # Exit code 7 is explicitly acceptable to the caller, so the preferred
+    # tool's result is used and the fallback must never be touched.
+    result = nox.command.run(
+        ["frobnicate"],
+        paths=[str(venv_bin)],
+        fallback=fallback,
+        success_codes=[0, 7],
+    )
+
+    assert result is True
+    assert len(launches) == 1
+    assert _starts_with_executable(launches[0], os.fspath(primary))
+    assert marker.read_text(encoding="utf-8") == "primary"
+    assert "fallback" not in caplog.text
+
+
+def test_run_without_fallback_does_not_reuse_previous_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    venv_bin = tmp_path / "venv-bin"
+    venv_bin.mkdir()
+    other_bin = tmp_path / "other-bin"
+    other_bin.mkdir()
+
+    marker = tmp_path / "marker.txt"
+    primary = _write_tool(
+        venv_bin,
+        "frobnicate",
+        (
+            "from pathlib import Path\n"
+            f"Path(r'{marker}').write_text('primary', encoding='utf-8')\n"
+        ),
+    )
+    fallback = _write_tool(
+        other_bin,
+        "frobnicate-fallback",
+        (
+            "from pathlib import Path\n"
+            f"Path(r'{marker}').write_text('fallback', encoding='utf-8')\n"
+        ),
+    )
+
+    resolved = nox.command.which("frobnicate", [str(venv_bin)])
+    real_popen = subprocess.Popen
+
+    class VanishingPopen(real_popen):  # type: ignore[misc, valid-type]
+        def __init__(self, args: Any, *popen_args: Any, **popen_kwargs: Any) -> None:
+            if _starts_with_executable(args, resolved):
+                _remove_tool(primary)
+            super().__init__(args, *popen_args, **popen_kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", VanishingPopen)
+
+    # First call explicitly names a fallback and succeeds via that fallback.
+    first = nox.command.run(["frobnicate"], paths=[str(venv_bin)], fallback=fallback)
+    assert first is True
+    assert marker.read_text(encoding="utf-8") == "fallback"
+
+    # A separate call without a fallback cannot reuse the earlier fallback.
+    marker.unlink()
+    with pytest.raises(nox.command.CommandFailed, match="not found"):
+        nox.command.run(["frobnicate"], paths=[str(venv_bin)])
+    assert not marker.exists()
+
+
+def test_run_fallback_when_preferred_unresolved(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    venv_bin = tmp_path / "venv-bin"
+    venv_bin.mkdir()
+    fallback = _write_tool(
+        tmp_path,
+        "frobnicate-fallback",
+        "import sys\nprint('from fallback')\n",
+    )
+
+    caplog.set_level(logging.WARNING)
+    result = nox.command.run(
+        ["frobnicate", "--version"],
+        paths=[str(venv_bin)],
+        fallback=fallback,
+        silent=True,
+    )
+
+    assert "from fallback" in result
+    assert "fallback executable" in caplog.text
+
+
+def test_run_fallback_that_is_also_missing(tmp_path: Path) -> None:
+    venv_bin = tmp_path / "venv-bin"
+    venv_bin.mkdir()
+    missing_fallback = tmp_path / "does-not-exist"
+
+    with pytest.raises(nox.command.CommandFailed, match="fallback"):
+        nox.command.run(
+            ["frobnicate"],
+            paths=[str(venv_bin)],
+            fallback=missing_fallback,
+        )
+
+
+def test_run_fallback_after_start_failure_runs_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Deterministic, platform-independent stand-in: the resolved preferred
+    # entry fails to start, the explicit fallback then runs exactly once.
+    venv_bin = tmp_path / "venv-bin"
+    venv_bin.mkdir()
+    _write_tool(
+        venv_bin,
+        "frobnicate",
+        "raise SystemExit('the real primary never runs')\n",
+    )
+    fallback = _write_tool(
+        tmp_path,
+        "frobnicate-fallback",
+        "import sys\nprint('from fallback')\n",
+    )
+    resolved = nox.command.which("frobnicate", [str(venv_bin)])
+
+    real_popen = nox.popen.popen
+
+    def fake_popen(args: Any, **kwargs: Any) -> tuple[int, str]:
+        if _starts_with_executable(args, resolved):
+            raise FileNotFoundError(2, "The system cannot find the file specified")
+        return real_popen(args, **kwargs)
+
+    caplog.set_level(logging.WARNING)
+    with mock.patch("nox.command.popen", side_effect=fake_popen) as mocked:
+        result = nox.command.run(
+            ["frobnicate", "--flag"],
+            paths=[str(venv_bin)],
+            fallback=fallback,
+            silent=True,
+        )
+
+    assert mocked.call_count == 2
+    assert _starts_with_executable(mocked.call_args_list[0][0][0], resolved)
+    assert _starts_with_executable(mocked.call_args_list[1][0][0], str(fallback))
+    assert result.strip() == "from fallback"
+    assert "disappeared" in caplog.text
+    assert "Ran fallback executable" in caplog.text
+
+
+def test_run_missing_fallback_start_failure_raises(tmp_path: Path) -> None:
+    venv_bin = tmp_path / "venv-bin"
+    venv_bin.mkdir()
+    _write_tool(
+        venv_bin,
+        "frobnicate",
+        "raise SystemExit('the real primary never runs')\n",
+    )
+    fallback = tmp_path / "missing-fallback"
+
+    with (
+        mock.patch("nox.command.popen", side_effect=FileNotFoundError) as mocked,
+        pytest.raises(nox.command.CommandFailed, match="Fallback program"),
+    ):
+        nox.command.run(["frobnicate"], paths=[str(venv_bin)], fallback=fallback)
+
+    assert mocked.call_count == 2
+
+
+def test_run_fallback_shares_env(tmp_path: Path) -> None:
+    venv_bin = tmp_path / "venv-bin"
+    venv_bin.mkdir()
+    fallback = _write_tool(
+        tmp_path,
+        "frobnicate-fallback",
+        "import os, sys\nsys.stdout.write(os.environ['NOX_FALLBACK_TEST'])\n",
+    )
+
+    result = nox.command.run(
+        ["frobnicate"],
+        paths=[str(venv_bin)],
+        fallback=fallback,
+        env={"NOX_FALLBACK_TEST": "shared-env"},
+        silent=True,
+    )
+
+    assert result.strip() == "shared-env"
 
 
 def test_run_external_warns(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
