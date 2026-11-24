@@ -57,7 +57,7 @@ from distributed.event import Event
 from distributed.lock import Lock
 from distributed.multi_lock import MultiLock
 from distributed.nanny import Nanny
-from distributed.queues import Queue
+from distributed.queues import AckableMessage, Queue
 from distributed.scheduler import KilledWorker, Scheduler
 from distributed.security import Security
 from distributed.semaphore import Semaphore
@@ -86,6 +86,7 @@ except ImportError:
 
 
 __all__ = [
+    "AckableMessage",
     "Actor",
     "ActorFuture",
     "Adaptive",
