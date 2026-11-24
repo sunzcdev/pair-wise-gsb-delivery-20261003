@@ -603,7 +603,20 @@ class SSHConnector(BaseConnector):
         if _sudo or _doas or _dzdo or _su_user:
             # Get temp file location
             temp_file = remote_temp_filename or self.host.get_temp_filename(remote_filename)
-            self._put_file(filename_or_io, temp_file)
+
+            # Only pre-registered paths have shared ownership. Ordinary sudo
+            # uploads retain the historical upload + immediate rm lifecycle,
+            # even when they run inside an operation.
+            shared_temp = self.host.temp_file_is_managed(temp_file)
+            owner = self.host.executing_op_hash if shared_temp else None
+            needs_upload = (
+                self.host.acquire_temp_file(temp_file, owner) if shared_temp else True
+            )
+
+            if needs_upload:
+                self._put_file(filename_or_io, temp_file)
+                if shared_temp:
+                    self.host.mark_temp_file_uploaded(temp_file)
 
             # Make sure our sudo/su user can access the file
             other_user = _su_user or _sudo_user or _doas_user or _dzdo_user
@@ -645,17 +658,20 @@ class SSHConnector(BaseConnector):
                 logger.error(f"File upload error: {output.stderr}")
                 return False
 
-            # Delete the temporary file now that we've successfully copied it
-            status, output = self.run_shell_command(
-                StringCommand("rm", "-f", temp_file),
-                print_output=print_output,
-                print_input=print_input,
-                **noauth_arguments,
-            )
+            # Delete an ordinary temporary file now that it has been copied.
+            # Shared files are removed only when their last registered owner
+            # releases them (normally operation teardown or host disconnect).
+            if not shared_temp:
+                status, output = self.run_shell_command(
+                    StringCommand("rm", "-f", temp_file),
+                    print_output=print_output,
+                    print_input=print_input,
+                    **noauth_arguments,
+                )
 
-            if status is False:
-                logger.error(f"Unable to remove temporary file: {output.stderr}")
-                return False
+                if status is False:
+                    logger.error(f"Unable to remove temporary file: {output.stderr}")
+                    return False
 
         # No sudo and no su_user, so just upload it!
         else:

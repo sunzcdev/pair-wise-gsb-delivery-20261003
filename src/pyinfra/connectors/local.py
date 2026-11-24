@@ -108,7 +108,7 @@ class LocalConnector(BaseConnector):
         self,
         filename_or_io,
         remote_filename,
-        remote_temp_filename=None,  # ignored
+        remote_temp_filename=None,  # used only when pre-registered as shared
         print_output: bool = False,
         print_input: bool = False,
         **arguments,
@@ -121,18 +121,34 @@ class LocalConnector(BaseConnector):
             bool: Indicating success or failure
         """
 
-        _, temp_filename = mkstemp()
+        # Only a path explicitly registered with shared owners changes lifecycle.
+        # Ordinary uploads - including operation-owned files - keep the private
+        # mkstemp file that is removed in this call's finally block.
+        shared_temp = remote_temp_filename is not None and self.host.temp_file_is_managed(
+            remote_temp_filename,
+        )
+        owner = self.host.executing_op_hash if shared_temp else None
+        if shared_temp:
+            needs_upload = self.host.acquire_temp_file(remote_temp_filename, owner)
+            temp_filename = remote_temp_filename
+        else:
+            _, temp_filename = mkstemp()
+            needs_upload = True
 
         try:
-            # Load our file or IO object and write it to the temporary file
-            with get_file_io(filename_or_io) as file_io:
-                with open(temp_filename, "wb") as temp_f:
-                    data = file_io.read()
+            if needs_upload:
+                # Load our file or IO object and write it to the temporary file
+                with get_file_io(filename_or_io) as file_io:
+                    with open(temp_filename, "wb") as temp_f:
+                        data = file_io.read()
 
-                    if isinstance(data, str):
-                        data = data.encode()
+                        if isinstance(data, str):
+                            data = data.encode()
 
-                    temp_f.write(data)
+                        temp_f.write(data)
+
+                if shared_temp:
+                    self.host.mark_temp_file_uploaded(temp_filename)
 
             # Copy the file using `cp` such that we support sudo/su
             status, output = self.run_shell_command(
@@ -145,7 +161,8 @@ class LocalConnector(BaseConnector):
             if not status:
                 raise OSError(output.stderr)
         finally:
-            os.remove(temp_filename)
+            if not shared_temp:
+                os.remove(temp_filename)
 
         if print_output:
             echo(

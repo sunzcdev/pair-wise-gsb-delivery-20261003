@@ -9,7 +9,7 @@ from typing import (
     cast,
     overload,
 )
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Hashable
 from uuid import uuid4
 
 from typing_extensions import Unpack, override
@@ -23,6 +23,7 @@ from pyinfra.context import ctx_config
 from .connectors import get_execution_connector
 from .exceptions import ConnectError
 from .facts import FactBase, ShortFactBase, get_fact
+from .tempfiles import TempFileLease, TempFileRegistry
 from .util import memoize, sha1_hash
 
 if TYPE_CHECKING:
@@ -158,6 +159,12 @@ class Host:
         self.loop_position = []
 
         self.connector_data = {}
+
+        # Per-host registry of temporary files shared between operation plans.
+        # Regular single-upload temp files keep their own connector-managed
+        # lifecycle and are simply recorded here; files with explicit owners are
+        # only removed once every owner has released them.
+        self.temp_file_registry = TempFileRegistry()
 
         # Append only list of operation hashes as called on this host, used to
         # generate a DAG to create the final operation order.
@@ -421,6 +428,11 @@ class Host:
         # TODO: consider whether this should be here!
         remove_any_sudo_askpass_file(self)
 
+        # Safety net: remove any shared temporary files whose owners did not run
+        # their normal release (e.g. a host that failed mid-deploy). Best-effort,
+        # a broken connection must not prevent the disconnect completing.
+        self.temp_file_registry.release_all(self)
+
         self.state.trigger_callbacks("host_disconnect", self)
         self.connected = False
 
@@ -444,6 +456,58 @@ class Host:
         """
         self._check_state()
         return self.connector.get_file(*args, **kwargs)
+
+    # Temporary file ownership
+    #
+
+    def temp_file_is_managed(self, temp_filename: str) -> bool:
+        """Whether shared ownership was explicitly registered for this path."""
+
+        return self.temp_file_registry.is_managed(temp_filename)
+
+    def acquire_temp_file(self, temp_filename: str, owner: Hashable | None = None) -> bool:
+        """
+        Record that ``owner`` (an operation hash) relies on ``temp_filename``.
+
+        Returns ``True`` when the file's content still has to be uploaded and
+        ``False`` when a previous caller already staged it. A path first acquired
+        without an owner is unmanaged and keeps the connector's normal lifecycle.
+        """
+        return self.temp_file_registry.acquire(temp_filename, owner)
+
+    @contextmanager
+    def hold_temp_file(
+        self,
+        temp_filename: str,
+        owner: Hashable | None = None,
+    ) -> Generator[TempFileLease, None, None]:
+        """Hold ownership of a shared temporary file for one block."""
+
+        with self.temp_file_registry.hold(self, temp_filename, owner) as lease:
+            yield lease
+
+    def mark_temp_file_uploaded(self, temp_filename: str) -> None:
+        """
+        Record that ``temp_filename``'s content is now staged on the target, so
+        later owners reuse it rather than uploading it again.
+        """
+        self.temp_file_registry.mark_uploaded(temp_filename)
+
+    def release_temp_file(
+        self, temp_filename: str, owner: Hashable | None = None
+    ) -> None:
+        """
+        Release an owner's hold on a temporary file, removing it once it has no
+        owners left. Unmanaged files are left to their connector's own cleanup.
+        """
+        self.temp_file_registry.release(self, temp_filename, owner)
+
+    def release_owner_temp_files(self, owner: Hashable) -> None:
+        """
+        Release every temporary file held by a single owner, typically called when
+        an operation finishes (including after a failure).
+        """
+        self.temp_file_registry.release_owner(self, owner)
 
     # Rsync - optional connector specific ability
 

@@ -29,6 +29,7 @@ from .host import Host
 from .inventory import Inventory
 from .operation import operation
 from .state import BaseStateCallback, State
+from .tempfiles import TempFileLease, TempFileRegistry
 
 __all__ = [
     "BaseStateCallback",
@@ -58,6 +59,8 @@ __all__ = [
     "ShortFactBase",
     "State",
     "StringCommand",
+    "TempFileLease",
+    "TempFileRegistry",
     "deploy",
     "operation",
 ]

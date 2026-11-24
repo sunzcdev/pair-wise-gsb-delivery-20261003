@@ -57,6 +57,14 @@ def run_host_op(state: State, host: Host, op_hash: str) -> bool:
         else:
             host.executing_op_hash = None
 
+            # Release every shared temporary file this (outer) operation acquired.
+            # Runs even when the operation failed before reading the file, so the
+            # last owner of a shared upload triggers its single cleanup while earlier
+            # failures leave the file in place for remaining owners. Nested ops are
+            # skipped here: their files belong to the enclosing operation, which
+            # releases them when it itself finishes.
+            host.release_owner_temp_files(op_hash)
+
 
 def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
     op_data = state.get_op_data_for_host(host, op_hash)

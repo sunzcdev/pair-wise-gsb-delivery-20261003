@@ -13,6 +13,8 @@ from pyinfra import logger
 from .hiddenvalue import HiddenValue
 
 from .arguments import ConnectorArguments
+from .tempfiles import TempFileLease as TempFileLease
+from .tempfiles import TempFileRegistry as TempFileRegistry
 
 if TYPE_CHECKING:
     from pyinfra.api.host import Host
