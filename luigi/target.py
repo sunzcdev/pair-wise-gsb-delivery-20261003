@@ -52,6 +52,26 @@ class Target(metaclass=abc.ABCMeta):
         """
         pass
 
+    def artifact_version(self) -> Any:
+        """
+        Return a comparable (hashable) version of the resource behind this target.
+
+        The worker's completion cache (see the ``cache_task_completion`` option in the
+        :ref:`worker-config`) stores the version it observed together with a successful
+        completeness check. When the version observed later differs, only that task's
+        completion check is redone. This makes artifacts that were replaced or removed
+        between two steps visible without losing the caching altogether: unrelated tasks
+        keep their cached answer and the graph is not re-scanned.
+
+        Returning ``None`` means "no comparable version is known" and keeps the original
+        rule of caching the answer permanently.
+
+        The default implementation returns ``None``. Targets that can cheaply describe
+        their current state (e.g. a file's modification time and size) should override
+        this method. The value must be hashable and comparable with ``==``.
+        """
+        return None
+
 
 class FileSystemException(Exception):
     """

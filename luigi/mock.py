@@ -20,6 +20,7 @@ This module provides a class :class:`MockTarget`, an implementation of :py:class
 The main purpose is unit testing workflows without writing to disk.
 """
 
+import hashlib
 import multiprocessing
 import sys
 from io import BytesIO
@@ -110,6 +111,19 @@ class MockTarget(target.FileSystemTarget):
         self,
     ):
         return self.path in self.fs.get_all_data()
+
+    def artifact_version(self):
+        """
+        Content based version, so that overwriting a mock file is visible to the worker's
+        completion cache.
+        """
+        data = self.fs.get_all_data()
+        if self.path not in data:
+            return ("missing", self.path)
+        contents = data[self.path]
+        if not isinstance(contents, bytes):
+            contents = str(contents).encode("utf-8")
+        return ("mock", hashlib.sha1(contents).hexdigest())
 
     def move(self, path, raise_if_exists=False):
         """

@@ -24,6 +24,10 @@ class Event:
     DEPENDENCY_MISSING = "event.core.dependency.missing"
     DEPENDENCY_PRESENT = "event.core.dependency.present"
     BROKEN_TASK = "event.core.task.broken"
+    #: Triggered when a cached completion is discarded because the artifact version of a
+    #: task changed. Callbacks receive the task, the cached version and the current version.
+    #: This makes it observable which ``complete()`` call was re-validated.
+    COMPLETE_REVALIDATED = "event.core.complete.revalidated"
     START = "event.core.start"
     #: This event can be fired by the task itself while running. The purpose is
     #: for the task to report progress, metadata or any generic info so that

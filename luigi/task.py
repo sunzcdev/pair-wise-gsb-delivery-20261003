@@ -611,6 +611,32 @@ class Task(metaclass=Register):
 
         return all(map(lambda output: output.exists(), outputs))
 
+    def artifact_version(self):
+        """
+        Return a comparable (hashable) version of this task's artifacts, or ``None``.
+
+        The worker uses this together with its completion cache (see the
+        ``cache_task_completion`` option in the :ref:`worker-config`). The default
+        implementation combines the :py:meth:`luigi.target.Target.artifact_version` of all
+        outputs, so file based outputs get a version for free. Override this if the
+        artifacts are identified differently, e.g. by a checksum or a database revision.
+
+        Returning ``None`` means that no comparable version is known, in which case the
+        completion check is cached permanently like before (the original rule). Only tasks
+        whose artifact version changed get their ``complete()`` re-checked; unrelated tasks
+        keep their cached answer and the rest of the graph is not re-scanned.
+        """
+        versions = []
+        for output in flatten(self.output()):
+            getter = getattr(output, "artifact_version", None)
+            if getter is None:
+                return None
+            version = getter()
+            if version is None:
+                return None
+            versions.append(version)
+        return tuple(versions) if versions else None
+
     @classmethod
     def bulk_complete(cls, parameter_tuples):
         """

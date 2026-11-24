@@ -155,6 +155,22 @@ class LocalTarget(FileSystemTarget):
             except OSError:
                 pass
 
+    def artifact_version(self):
+        """
+        Describe the current state of the file so the worker's completion cache can tell
+        when it was replaced or removed.
+
+        The file identity (inode/file index) is part of the version because luigi writes
+        atomically to a temporary file and moves it into place, which produces a new file
+        even when size and modification time happen to coincide. ``st_ctime_ns`` covers
+        in-place rewrites that keep the file identity.
+        """
+        try:
+            stat = os.stat(self.path)
+        except OSError:
+            return ("missing", self.path)
+        return ("file", stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+
     def open(self, mode="r"):
         rwmode = mode.replace("b", "").replace("t", "")
         if rwmode == "w":

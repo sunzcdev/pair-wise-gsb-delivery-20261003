@@ -215,9 +215,9 @@ class TaskProcess(multiprocessing.Process):
                     new_deps = self._run_get_new_deps()
                 if not new_deps:
                     if not self.check_complete_on_run:
-                        # update the cache
+                        # update the cache, remembering which artifact version was observed
                         if self.task_completion_cache is not None:
-                            self.task_completion_cache[self.task.task_id] = True
+                            self.task_completion_cache[self.task.task_id] = (True, task_artifact_version(self.task))
                         status = DONE
                     elif self.check_complete(self.task):
                         status = DONE
@@ -415,18 +415,91 @@ class TracebackWrapper:
         self.trace = trace
 
 
+def task_artifact_version(task):
+    """
+    Return the comparable artifact version of *task*, or ``None`` when the task does not
+    expose one.
+
+    Tasks with file based outputs get a version for free (see
+    :py:meth:`luigi.target.Target.artifact_version`). Tasks can override
+    :py:meth:`luigi.task.Task.artifact_version` to define their own comparable version.
+    If the version cannot be determined, ``None`` is returned so that the original caching
+    rule applies instead of breaking the completion check.
+    """
+    getter = getattr(task, "artifact_version", None)
+    if getter is None:
+        return None
+    try:
+        return getter()
+    except Exception:
+        logger.debug("Could not determine the artifact version of %s", task, exc_info=True)
+        return None
+
+
+def _cached_complete_and_version(completion_cache, cache_key):
+    """
+    Return the cache entry for *cache_key* as a ``(complete, artifact_version)`` tuple.
+
+    Only entries that record a successful check are cached, so a falsy *complete* means
+    "not cached". Legacy entries are plain booleans, they carry no artifact version and
+    therefore keep behaving like the original, permanent cache. ``None`` means "not cached".
+    """
+    entry = completion_cache.get(cache_key)
+    if not entry:
+        return None
+    if isinstance(entry, tuple):
+        complete, version = entry
+        return (complete, version) if complete else None
+    return (bool(entry), None)
+
+
 def check_complete_cached(task, completion_cache=None):
-    # check if cached and complete
+    """
+    Check if *task* is complete, using and maintaining the optional completion cache.
+
+    Cache entries store the artifact version observed next to the completion flag. As long
+    as the version stays the same, the cached answer is used and ``complete()`` is not
+    called again. If the artifact of the task was replaced or removed in the meantime, only
+    the completion check of that task is redone, and
+    :py:attr:`luigi.event.Event.COMPLETE_REVALIDATED` is triggered so that the re-check is
+    visible. Tasks without a comparable artifact version keep the original caching rule.
+    """
     cache_key = task.task_id
-    if completion_cache is not None and completion_cache.get(cache_key):
-        return True
+
+    cached = _cached_complete_and_version(completion_cache, cache_key) if completion_cache is not None else None
+    cached_version = None
+    version_changed = False
+    if cached is not None:
+        _, cached_version = cached
+        if cached_version is None:
+            # no comparable version, keep the original behavior of trusting the cache
+            return True
+        if task_artifact_version(task) == cached_version:
+            return True
+        version_changed = True
+        logger.debug("Artifact version of %s changed from %r, re-checking complete()", task, cached_version)
 
     # (re-)check the status
     is_complete = task.complete()
+    # read the version again, the artifact may have changed while complete() ran
+    current_version = task_artifact_version(task) if (completion_cache is not None or version_changed) else None
 
-    # tell the cache when complete
-    if completion_cache is not None and is_complete:
-        completion_cache[cache_key] = is_complete
+    if completion_cache is not None:
+        if is_complete:
+            completion_cache[cache_key] = (True, current_version)
+        elif cached is not None:
+            # the cached answer is stale, drop it so later checks look at the artifact again
+            completion_cache.pop(cache_key, None)
+
+    if version_changed:
+        logger.info(
+            "Artifact of %s changed from %r to %r, re-checked complete(): %s",
+            task,
+            cached_version,
+            current_version,
+            is_complete,
+        )
+        task.trigger_event(Event.COMPLETE_REVALIDATED, task, cached_version, current_version)
 
     return is_complete
 

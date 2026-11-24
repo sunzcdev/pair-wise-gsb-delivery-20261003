@@ -216,6 +216,39 @@ there is also the option to wrap dependent tasks by :class:`~luigi.task.DynamicR
 For an example of a workflow using dynamic dependencies, see
 `examples/dynamic_requirements.py <https://github.com/spotify/luigi/blob/master/examples/dynamic_requirements.py>`_.
 
+Cached completion and artifact versions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A cached completion answer is only as good as the artifact it was observed on. A file that
+was replaced or removed between two steps of the same worker would otherwise keep its stale
+answer. To handle that, a target can describe itself with
+:py:meth:`luigi.target.Target.artifact_version`. :class:`~luigi.local_target.LocalTarget`
+does this out of the box using the file's modification time, file identity and size.
+
+.. code:: python
+
+    class SharedReport(luigi.Task):
+        def output(self):
+            return luigi.LocalTarget('/reports/shared.csv')
+
+        # inherits Task.artifact_version, which combines the versions of all outputs
+
+The worker stores the observed version next to the cached answer. On the next check the
+version of the task is compared:
+
+* if it is unchanged, the cached answer is used and ``complete()`` is not called;
+* if it changed, only that task's ``complete()`` is re-checked and
+  :py:attr:`luigi.event.Event.COMPLETE_REVALIDATED` is triggered with the task, the
+  previously observed version and the current one;
+* if a task returns ``None`` (the default for tasks that do not expose a comparable
+  version), the original rule applies and the cached answer is trusted permanently.
+
+Only the dependencies whose versions changed are re-checked, so the rest of the graph is not
+re-scanned. A parent whose necessary output disappeared during that re-check is held back
+instead of starting with incomplete inputs. Override
+:py:meth:`luigi.task.Task.artifact_version` when the artifact is identified differently,
+e.g. by a checksum or a database revision.
+
 
 Task status tracking
 ~~~~~~~~~~~~~~~~~~~~

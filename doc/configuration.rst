@@ -367,6 +367,15 @@ cache_task_completion
   become expensive, e.g. in case the per-task completion check entails remote
   resources. When set to true, completion checks are cached so that tasks
   declared as complete once are not checked again.
+
+  The cache remembers a comparable artifact version together with the cached
+  answer (see :py:meth:`luigi.target.Target.artifact_version` and
+  :py:meth:`luigi.task.Task.artifact_version`). If the artifact of such a task
+  is replaced or removed between two steps, only that task's completion check is
+  redone; other tasks keep their cached answer and the graph is not re-scanned.
+  Tasks without a comparable artifact version keep the original rule and stay
+  cached. Every such re-check triggers
+  :py:attr:`luigi.event.Event.COMPLETE_REVALIDATED`.
   Defaults to false.
 
 
