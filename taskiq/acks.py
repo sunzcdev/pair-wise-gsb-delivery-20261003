@@ -55,6 +55,16 @@ class AckableMessage(BaseModel):
 
     data: bytes
     ack: Callable[[], Awaitable[None] | None]
+    # Optional broker-level requeue hook. When a delivery cannot be
+    # processed (for example its task is not registered in time),
+    # the Receiver calls this hook to hand the message back to the
+    # broker instead of simply acknowledging and dropping it.
+    requeue: Callable[[], Awaitable[None] | None] | None = None
+
+    @property
+    def is_requeueable(self) -> bool:
+        """Whether the broker offered a requeue hook for this message."""
+        return self.requeue is not None
 
 
 class AckController:

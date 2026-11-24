@@ -81,6 +81,44 @@ async def manually_acked_task(context: Context = TaskiqDepends()) -> None:
 If a task has no `ack_type` label, the worker-level `--ack-type` value is used.
 Manual acknowledgement requires a broker that yields `AckableMessage`.
 
+### Waiting for late-registered tasks
+
+Sometimes a worker starts processing messages before all task modules finished
+loading, so deliveries for momentarily unknown task names arrive first. By
+default such deliveries are reported and acknowledged immediately. The
+`Receiver` can instead keep them in a bounded waiting area for a short,
+optional grace period:
+
+```python
+from taskiq.receiver import Receiver
+
+receiver = Receiver(
+    broker,
+    # Park deliveries whose task name is not registered yet...
+    unregistered_task_timeout=2.0,
+    # ...up to this many concurrent parked deliveries.
+    max_unregistered_tasks=100,
+)
+```
+
+When using the CLI, pass these through `--receiver_arg`, for example
+`--receiver_arg unregistered_task_timeout=2.0`.
+
+Each parked delivery is decided exactly once:
+
+- if its task name gets registered before the deadline, the original
+  delivery is handed back to the normal execution pipeline and runs once;
+- if the deadline expires, the receiver calls the broker-level `requeue`
+  hook of the `AckableMessage` when the broker offers one and then
+  acknowledges the delivery;
+- if the broker cannot requeue the message, the expiry is logged as a
+  warning and the delivery is acknowledged (or simply dropped for messages
+  without acknowledgement support).
+
+Already known tasks are never blocked by parked deliveries, and a task that
+becomes registered only after its delivery was settled is not executed
+retroactively.
+
 ### Type casts
 
 One of the features taskiq has is automatic type casts. For example you have a type-hinted task like this:

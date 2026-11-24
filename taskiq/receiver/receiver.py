@@ -10,8 +10,9 @@ from concurrent.futures import Executor, ProcessPoolExecutor
 from dataclasses import dataclass
 from enum import Enum, auto
 from logging import getLogger
-from time import time
+from time import monotonic, time
 from typing import Any, get_type_hints
+from uuid import uuid4
 
 import anyio
 from taskiq_dependencies import DependencyGraph
@@ -62,6 +63,23 @@ class _StartedCallback:
     owns_delivery_slot: bool
 
 
+@dataclass(slots=True)
+class _PendingTask:
+    """A delivery parked until its task name becomes registered."""
+
+    delivery: _PrefetchedMessage
+    task_name: str
+    task_id: str
+    ack_controller: AckController
+    enqueued_at: float
+    deadline: float
+    settled: bool = False
+
+
+# How often the pending-task supervisor re-checks parked deliveries.
+_PENDING_TASK_POLL_INTERVAL = 0.05
+
+
 def _execute_sync_task_in_executor(
     target: Callable[..., Any],
     args: tuple[Any, ...],
@@ -97,6 +115,8 @@ class Receiver:
         on_exit: Callable[["Receiver"], None] | None = None,
         max_tasks_to_execute: int | None = None,
         wait_tasks_timeout: float | None = None,
+        unregistered_task_timeout: float | None = None,
+        max_unregistered_tasks: int = 100,
     ) -> None:
         self.broker = broker
         self.executor = executor
@@ -112,6 +132,18 @@ class Receiver:
         self.max_tasks_to_execute = max_tasks_to_execute
         self.wait_tasks_timeout = wait_tasks_timeout
         self._listen_error: BaseException | None = None
+        if unregistered_task_timeout is not None and unregistered_task_timeout <= 0:
+            raise ValueError("unregistered_task_timeout must be positive.")
+        if max_unregistered_tasks <= 0:
+            raise ValueError("max_unregistered_tasks must be positive.")
+        self.unregistered_task_timeout = unregistered_task_timeout
+        self.max_unregistered_tasks = max_unregistered_tasks
+        # Deliveries parked while their task name is not registered yet.
+        self.pending_tasks: dict[str, _PendingTask] = {}
+        # Set whenever the pending registry becomes empty, so the runner
+        # can wait for the last parked delivery to be settled on shutdown.
+        self._pending_empty = asyncio.Event()
+        self._pending_empty.set()
         if max_prefetch < 0:
             raise ValueError("max_prefetch cannot be negative.")
         for task in self.broker.get_all_tasks().values():
@@ -424,15 +456,24 @@ class Receiver:
         self._listen_error = None
         logger.info("Listening started.")
         queue: asyncio.Queue[_PrefetchedMessage | _QueueSignal] = asyncio.Queue()
+        prefetch_done = asyncio.Event()
 
         try:
             try:
                 async with anyio.create_task_group() as gr:
-                    gr.start_soon(self.prefetcher, queue, finish_event)
-                    gr.start_soon(self.runner, queue)
+                    gr.start_soon(self.prefetcher, queue, finish_event, prefetch_done)
+                    gr.start_soon(self.runner, queue, prefetch_done)
+                    if self.unregistered_task_timeout is not None:
+                        gr.start_soon(
+                            self.pending_task_supervisor,
+                            queue,
+                            finish_event,
+                            prefetch_done,
+                        )
             finally:
                 with anyio.CancelScope(shield=True):
                     await self._discard_queued_messages(queue)
+                    await self._abandon_pending_tasks()
         except BaseException:
             if self._listen_error is not None:
                 error = self._listen_error
@@ -453,12 +494,14 @@ class Receiver:
         self,
         queue: "asyncio.Queue[_PrefetchedMessage | _QueueSignal]",
         finish_event: asyncio.Event,
+        prefetch_done: asyncio.Event,
     ) -> None:
         """
         Prefetch tasks data.
 
         :param queue: queue for prefetched data.
         :param finish_event: event to indicate that we need to stop prefetching.
+        :param prefetch_done: event set once prefetching has fully stopped.
         """
         state = _PrefetchState(iterator=self.broker.listen())
 
@@ -493,6 +536,7 @@ class Receiver:
                     await self._enqueue_late_prefetched_message(queue, state)
                 finally:
                     queue.put_nowait(_QueueSignal.DONE)
+                    prefetch_done.set()
                     finish_waiter.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await finish_waiter
@@ -649,11 +693,13 @@ class Receiver:
     async def runner(
         self,
         queue: "asyncio.Queue[_PrefetchedMessage | _QueueSignal]",
+        prefetch_done: asyncio.Event,
     ) -> None:
         """
         Run tasks.
 
         :param queue: queue with prefetched data.
+        :param prefetch_done: event set once the prefetcher has stopped.
         """
         tasks: set[asyncio.Task[Any]] = set()
 
@@ -669,7 +715,10 @@ class Receiver:
                         )
                         await asyncio.wait(tasks, timeout=self.wait_tasks_timeout)
                         logger.info("No more tasks to wait for. Shutting down.")
+                    await self._wait_for_pending_tasks(prefetch_done)
                     break
+                if await self._park_if_unregistered(queued_message):
+                    continue
                 execution_semaphore = self.sem
                 owns_execution_slot = execution_semaphore is not None
                 if execution_semaphore is not None:
@@ -743,6 +792,222 @@ class Receiver:
             self.sem.release()
         if owns_delivery_slot:
             self.sem_prefetch.release()
+
+    async def _park_if_unregistered(
+        self,
+        queued_message: _PrefetchedMessage,
+    ) -> bool:
+        """
+        Park a delivery whose task name is not registered yet.
+
+        The delivery is only parked when the optional unregistered-task
+        waiting is enabled and the bounded pending registry still has
+        capacity. Every other delivery (including unparsable messages and
+        an overflowing registry) falls through to the normal callback path.
+
+        :param queued_message: prefetched delivery taken from the queue.
+        :return: True when the delivery was parked and must not be started.
+        """
+        if self.unregistered_task_timeout is None:
+            return False
+        message_data = (
+            queued_message.data.data
+            if isinstance(queued_message.data, AckableMessage)
+            else queued_message.data
+        )
+        try:
+            taskiq_msg = self.broker.formatter.loads(message=message_data)
+        except Exception:
+            return False
+        if self.broker.find_task(taskiq_msg.task_name) is not None:
+            return False
+        if len(self.pending_tasks) >= self.max_unregistered_tasks:
+            logger.warning(
+                'Pending registry is full, processing task "%s" immediately.',
+                taskiq_msg.task_name,
+            )
+            return False
+        ack_controller = AckController(
+            queued_message.data.ack
+            if isinstance(queued_message.data, AckableMessage)
+            else None,
+        )
+        now = monotonic()
+        pending = _PendingTask(
+            delivery=queued_message,
+            task_name=taskiq_msg.task_name,
+            task_id=taskiq_msg.task_id or uuid4().hex,
+            ack_controller=ack_controller,
+            enqueued_at=now,
+            deadline=now + self.unregistered_task_timeout,
+        )
+        self.pending_tasks[pending.task_id] = pending
+        self._pending_empty.clear()
+        logger.info(
+            'Task "%s" is not registered yet, waiting up to %.2f seconds.',
+            pending.task_name,
+            self.unregistered_task_timeout,
+        )
+        return True
+
+    async def _wait_for_pending_tasks(
+        self,
+        prefetch_done: asyncio.Event,
+    ) -> None:
+        """Wait for parked deliveries once no more deliveries can arrive."""
+        if self.unregistered_task_timeout is None:
+            return
+        if not prefetch_done.is_set() or not self.pending_tasks:
+            return
+        logger.info(
+            "Waiting for %d parked deliveries to be settled...",
+            len(self.pending_tasks),
+        )
+        while not self._pending_empty.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._pending_empty.wait(),
+                    timeout=self.wait_tasks_timeout,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.warning(
+                    "Timed out waiting for %d parked deliveries during shutdown.",
+                    len(self.pending_tasks),
+                )
+                break
+
+    async def pending_task_supervisor(
+        self,
+        queue: "asyncio.Queue[_PrefetchedMessage | _QueueSignal]",
+        finish_event: asyncio.Event,
+        prefetch_done: asyncio.Event,
+    ) -> None:
+        """
+        Decide the fate of every parked delivery once.
+
+        A parked delivery is either redelivered once its task name becomes
+        registered, or settled when its waiting deadline expires. On shutdown
+        the remaining parked deliveries are abandoned without acknowledgement,
+        so a capable broker can redeliver them to another worker.
+
+        :param queue: runner queue used to redeliver registered tasks.
+        :param finish_event: event signalling that listening must stop.
+        :param prefetch_done: event set once the prefetcher has stopped.
+        """
+        while True:
+            if finish_event.is_set():
+                self._abandon_pending_tasks_sync()
+                return
+            if prefetch_done.is_set() and not self.pending_tasks:
+                return
+            for pending in list(self.pending_tasks.values()):
+                if pending.settled:
+                    continue
+                if self.broker.find_task(pending.task_name) is not None:
+                    self._redeliver_pending_task(pending, queue)
+                elif monotonic() >= pending.deadline:
+                    await self._settle_expired_pending_task(pending)
+            await asyncio.sleep(_PENDING_TASK_POLL_INTERVAL)
+
+    def _redeliver_pending_task(
+        self,
+        pending: _PendingTask,
+        queue: "asyncio.Queue[_PrefetchedMessage | _QueueSignal]",
+    ) -> None:
+        """Hand a parked delivery back to the runner after registration."""
+        if pending.settled:
+            return
+        pending.settled = True
+        self.pending_tasks.pop(pending.task_id, None)
+        logger.info(
+            'Task "%s" got registered, redelivering its parked message.',
+            pending.task_name,
+        )
+        self._refresh_pending_empty()
+        # The delivery keeps its original admission ownership, so the normal
+        # runner/callback path releases the prefetched capacity exactly once.
+        queue.put_nowait(pending.delivery)
+
+    async def _settle_expired_pending_task(self, pending: _PendingTask) -> None:
+        """Requeue an expired delivery when possible, otherwise report it."""
+        if pending.settled:
+            return
+        pending.settled = True
+        self.pending_tasks.pop(pending.task_id, None)
+        self._refresh_pending_empty()
+        message = pending.delivery.data
+        if isinstance(message, AckableMessage) and message.is_requeueable:
+            logger.warning(
+                'Task "%s" was not registered in time, requeuing message %s.',
+                pending.task_name,
+                pending.task_id,
+            )
+            try:
+                await self._invoke_delivery_hook(message.requeue)
+            except Exception:
+                logger.exception(
+                    'Failed to requeue message %s for task "%s".',
+                    pending.task_id,
+                    pending.task_name,
+                )
+            else:
+                await self._ack_pending_task(pending)
+                return
+        else:
+            logger.warning(
+                'Task "%s" was not registered in time; broker cannot requeue '
+                "message %s, dropping it after acknowledgement.",
+                pending.task_name,
+                pending.task_id,
+            )
+        await self._ack_pending_task(pending)
+
+    async def _invoke_delivery_hook(
+        self,
+        hook: Callable[[], Any] | None,
+    ) -> None:
+        """Call a sync or async broker delivery hook (ack or requeue)."""
+        if hook is None:
+            return
+        result = hook()
+        if inspect.isawaitable(result):
+            await result
+
+    async def _ack_pending_task(self, pending: _PendingTask) -> None:
+        """Acknowledge a settled parked delivery exactly once."""
+        if not pending.ack_controller.is_ackable:
+            return
+        try:
+            await pending.ack_controller.ack()
+        except Exception:
+            logger.exception(
+                'Failed to acknowledge parked message %s for task "%s".',
+                pending.task_id,
+                pending.task_name,
+            )
+
+    def _refresh_pending_empty(self) -> None:
+        """Signal that no parked deliveries remain once the registry drains."""
+        if not self.pending_tasks:
+            self._pending_empty.set()
+
+    def _abandon_pending_tasks_sync(self) -> None:
+        """Drop parked deliveries on shutdown, returning their capacity."""
+        if not self.pending_tasks:
+            return
+        logger.warning(
+            "Abandoning %d parked deliveries during Receiver shutdown.",
+            len(self.pending_tasks),
+        )
+        for pending in self.pending_tasks.values():
+            if pending.delivery.owns_delivery_slot:
+                self.sem_prefetch.release()
+        self.pending_tasks.clear()
+        self._refresh_pending_empty()
+
+    async def _abandon_pending_tasks(self) -> None:
+        """Async wrapper used by the shielded listener cleanup path."""
+        self._abandon_pending_tasks_sync()
 
     def _record_listen_error(self, error: BaseException) -> None:
         """Preserve the first listener error and report cleanup failures."""

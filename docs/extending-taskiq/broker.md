@@ -43,6 +43,27 @@ async def listen(self) -> AsyncGenerator[AckableMessage, None]:
       )
 ```
 
+### Optional requeue hook
+
+`AckableMessage` also accepts an optional `requeue` callable. When the
+`Receiver` is configured to wait for late-registered tasks and a delivery
+expires before its task name becomes available, it calls `requeue` to hand
+the message back to the broker instead of acknowledging and dropping it.
+The hook, like `ack`, takes no parameters and may be a regular function or
+a coroutine function:
+
+```python
+
+yield AckableMessage(
+   data=message.bytes,
+   ack=message.ack,
+   requeue=message.requeue,
+)
+```
+
+When `requeue` is omitted, the receiver reports the expired delivery and
+acknowledges it using the regular `ack` hook.
+
 ## Conventions
 
 For brokers, we have several conventions. It's good if your broker implements them.
