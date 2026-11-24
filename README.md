@@ -769,6 +769,32 @@ Callbacks can be given as a job class or as a configured job instance—for exam
 
 Callback jobs always enqueue through Solid Queue, even when the job classes involved (or the application default) use a different Active Job adapter. And a batch that ends up with no jobs finishes as soon as it starts, firing its callbacks right away.
 
+### Fiber and child-work handoff
+
+Batch scope is tracked for the current Fiber, so nested scopes that yield while other Fibers run restore the correct batch when they resume. A Fiber you start yourself does not inherit the active batch. Pass batch attribution explicitly when that child work should join the batch:
+
+```ruby
+ownership = SolidQueue::Batch.current_ownership
+
+Fiber.new do
+  ownership.wrap do
+    # Jobs constructed here capture ownership.batch_id, including jobs
+    # bulk-enqueued after the original batch block has returned.
+    LaterJob.perform_later
+    ActiveJob.perform_all_later([ AnotherJob.new ])
+  end
+end
+```
+
+For jobs already constructed without a batch, keep the ownership object and stamp or submit them later:
+
+```ruby
+ownership.enqueue_all(prebuilt_jobs)
+# or ownership.assign_to(job) before calling job.enqueue
+```
+
+An active batch at actual enqueue time still takes precedence over the delivered attribution; without an active batch, the delivered attribution—and a batch ID already captured by a job—is preserved.
+
 ### Batch progress and counters
 
 Batches track `total_jobs`, `completed_jobs`, `failed_jobs` and `pending_jobs`, plus a `progress_percentage` helper. A couple of accounting details to be aware of:

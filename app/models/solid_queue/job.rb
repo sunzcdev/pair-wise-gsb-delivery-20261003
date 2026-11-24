@@ -18,13 +18,17 @@ module SolidQueue
     serialize :arguments, coder: JSON
 
     class << self
-      def enqueue_all(active_jobs)
-        # Bulk enqueues bypass ActiveJob#enqueue, so batch membership is captured here
+      def enqueue_all(active_jobs, explicit_context = nil, batch: nil, batch_id: nil, ownership: nil, handoff: nil)
+        # Bulk enqueues bypass ActiveJob#enqueue, so batch membership is captured here.
+        # An active batch still wins over both an explicitly delivered attribution and
+        # membership captured when each job was constructed.
+        explicit_context ||= batch || ownership || handoff || batch_id
+        explicit_batch_id = Batch.resolve_batch_id(explicit_context) if explicit_context
         current_batch_id = Batch.current_batch_id
 
         active_jobs.each do |job|
           job.scheduled_at ||= Time.current
-          job.batch_id = current_batch_id || job.batch_id
+          job.batch_id = current_batch_id || explicit_batch_id || job.batch_id
         end
         active_jobs_by_job_id = active_jobs.index_by(&:job_id)
 

@@ -16,14 +16,32 @@ module ActiveJob
     # rebinds membership; enqueueing without a batch preserves it.
     # SolidQueue::Job.enqueue_all repeats this capture because bulk enqueue
     # bypasses #enqueue.
+    module ClassMethods
+      def with_batch_ownership(ownership, &block)
+        SolidQueue::Batch.with_ownership(ownership, &block)
+      end
+      alias with_batch with_batch_ownership
+      alias with_batch_context with_batch_ownership
+    end
+
     def initialize(*arguments, **kwargs)
       super
       self.batch_id = SolidQueue::Batch.current_batch_id if solid_queue_job?
     end
 
-    def enqueue(options = {})
-      self.batch_id = SolidQueue::Batch.current_batch_id || batch_id if solid_queue_job?
-      super
+    def enqueue(options = {}, &block)
+      if solid_queue_job?
+        options = options.dup
+        explicit_batch = options.delete(:batch) ||
+          options.delete(:batch_id) ||
+          options.delete(:ownership) ||
+          options.delete(:handoff)
+        explicit_batch_id = SolidQueue::Batch.resolve_batch_id(explicit_batch) if explicit_batch
+
+        self.batch_id = SolidQueue::Batch.current_batch_id || explicit_batch_id || batch_id
+      end
+
+      super(options, &block)
     end
 
     def serialize
