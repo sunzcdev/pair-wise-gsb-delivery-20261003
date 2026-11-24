@@ -3,7 +3,7 @@ from collections.abc import AsyncGenerator
 
 import pytest
 
-from taskiq import MultiBroker
+from taskiq import MultiBroker, SourcedMessage
 from taskiq.acks import AckableMessage
 from taskiq.brokers.inmemory_broker import InmemoryResultBackend
 from taskiq.events import TaskiqEvents
@@ -41,6 +41,16 @@ def test_multi_broker_validates_default_routing_label() -> None:
             routing={"fast": AsyncQueueBroker()},
             default_routing_label="slow",
         )
+
+
+def test_multi_broker_validates_max_buffer_size() -> None:
+    with pytest.raises(ValueError, match="max_buffer_size"):
+        MultiBroker(routing={"fast": AsyncQueueBroker()}, max_buffer_size=0)
+
+
+def test_multi_broker_validates_reconnect_delay() -> None:
+    with pytest.raises(ValueError, match="reconnect_delay"):
+        MultiBroker(routing={"fast": AsyncQueueBroker()}, reconnect_delay=-1)
 
 
 def test_task_registration_on_inner_broker_raises() -> None:
@@ -325,8 +335,10 @@ class DyingBroker(AsyncQueueBroker):
     def __init__(self, messages_before_death: int) -> None:
         super().__init__()
         self.messages_before_death = messages_before_death
+        self.listen_calls = 0
 
     async def listen(self) -> AsyncGenerator[AckableMessage, None]:
+        self.listen_calls += 1
         while self.messages_before_death > 0:
             self.messages_before_death -= 1
             data = await self.queue.get()
@@ -334,36 +346,236 @@ class DyingBroker(AsyncQueueBroker):
         raise RuntimeError("cluster is down")
 
 
-async def test_failed_broker_does_not_stop_healthy_brokers(
+class RoundBroker(AsyncQueueBroker):
+    """
+    Controllable broker that disconnects once and then reconnects.
+
+    Its first listen round yields one message and breaks, simulating
+    a dropped connection. Every later round stays open and keeps
+    delivering. Each delivery records the round that produced it
+    and the round that eventually acknowledges it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rounds = 0
+        self.deliveries: list[tuple[bytes, int]] = []
+        self.acks: list[tuple[bytes, int]] = []
+
+    def make_ack(self, data: bytes, round_number: int):
+        """Build an ack callable bound to a concrete listen round."""
+
+        def _ack() -> None:
+            self.acks.append((data, round_number))
+
+        return _ack
+
+    async def listen(self) -> AsyncGenerator[AckableMessage, None]:
+        self.rounds += 1
+        round_number = self.rounds
+        if round_number == 1:
+            data = await self.queue.get()
+            self.deliveries.append((data, round_number))
+            yield AckableMessage(data=data, ack=self.make_ack(data, round_number))
+            raise RuntimeError("connection dropped")
+        while True:
+            data = await self.queue.get()
+            self.deliveries.append((data, round_number))
+            yield AckableMessage(data=data, ack=self.make_ack(data, round_number))
+
+
+class GateBroker(AsyncQueueBroker):
+    """Broker that blocks before producing, used to fill the merged buffer."""
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        super().__init__()
+        self.gate = gate
+        self.produced = 0
+
+    async def listen(self) -> AsyncGenerator[AckableMessage, None]:
+        while True:
+            data = await self.queue.get()
+            # The third item is never produced until the gate opens,
+            # simulating a source blocked while the merged buffer is full.
+            if self.produced >= 2:
+                await self.gate.wait()
+
+            async def _ack() -> None:
+                return None
+
+            yield AckableMessage(data=data, ack=_ack)
+            self.produced += 1
+
+
+async def _collect(
+    broker: MultiBroker,
+    count: int,
+) -> list[bytes | SourcedMessage]:
+    """Drain `count` messages from a MultiBroker listener."""
+    iterator = broker.listen()
+    messages = [
+        await asyncio.wait_for(iterator.__anext__(), timeout=1)
+        for _ in range(count)
+    ]
+    await iterator.aclose()
+    return messages
+
+
+async def test_failed_broker_is_reconnected_while_others_keep_listening(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     dying = DyingBroker(messages_before_death=2)
     healthy = AsyncQueueBroker()
-    broker = MultiBroker(routing={"dying": dying, "healthy": healthy})
+    broker = MultiBroker(
+        routing={"dying": dying, "healthy": healthy},
+        reconnect_delay=0.01,
+    )
 
     for _ in range(2):
         await dying.kick(build_message())
     for _ in range(3):
         await healthy.kick(build_message())
 
-    received = 0
-    iterator = broker.listen()
-    for _ in range(5):
-        await asyncio.wait_for(iterator.__anext__(), timeout=1)
-        received += 1
-    await iterator.aclose()
+    received = await _collect(broker, 5)
 
-    assert received == 5
+    assert len(received) == 5
     assert "cluster is down" in caplog.text
+    # The failed listener is reopened instead of being excluded forever.
+    await asyncio.sleep(0.05)
+    assert dying.listen_calls >= 2
 
 
-async def test_listen_ends_when_all_inner_brokers_fail() -> None:
+async def test_listen_keeps_running_when_all_brokers_fail_then_recovers() -> None:
     broker = MultiBroker(
         routing={
             "first": DyingBroker(messages_before_death=0),
             "second": DyingBroker(messages_before_death=0),
         },
+        reconnect_delay=0.01,
+    )
+    first = broker.brokers[0]
+
+    iterator = broker.listen()
+    try:
+        # No message can arrive, but the generator must not end either:
+        # both brokers keep reopening their listeners.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(iterator.__anext__(), timeout=0.1)
+        await asyncio.sleep(0.05)
+        assert first.listen_calls >= 2
+    finally:
+        await iterator.aclose()
+
+
+async def test_delivery_keeps_source_and_listen_round_after_reconnect() -> None:
+    flaky = RoundBroker()
+    steady = AsyncQueueBroker()
+    broker = MultiBroker(
+        routing={"a": flaky, "b": steady},
+        reconnect_delay=0.01,
     )
 
-    with pytest.raises(StopAsyncIteration):
-        await asyncio.wait_for(broker.listen().__anext__(), timeout=1)
+    # A yields one message on round one, then drops.
+    await flaky.queue.put(b"a-1")
+    # B keeps delivering two messages while A is disconnected.
+    await steady.queue.put(b"b-1")
+    await steady.queue.put(b"b-2")
+    # A reconnects (round two) and delivers one more message.
+    await flaky.queue.put(b"a-2")
+
+    messages = await _collect(broker, 4)
+    by_data = {message.data: message for message in messages}
+
+    assert isinstance(by_data[b"a-1"], SourcedMessage)
+    assert by_data[b"a-1"].source == "a"
+    assert by_data[b"a-1"].listen_round == 1
+
+    assert isinstance(by_data[b"a-2"], SourcedMessage)
+    assert by_data[b"a-2"].source == "a"
+    assert by_data[b"a-2"].listen_round == 2
+
+    for data in (b"b-1", b"b-2"):
+        assert isinstance(by_data[data], SourcedMessage)
+        assert by_data[data].source == "b"
+        assert by_data[data].listen_round == 1
+
+    assert flaky.rounds == 2
+    # The broker itself saw both rounds on the delivery side.
+    assert flaky.deliveries == [(b"a-1", 1), (b"a-2", 2)]
+
+
+async def test_ack_goes_to_the_round_that_produced_the_message() -> None:
+    flaky = RoundBroker()
+    steady = AsyncQueueBroker()
+    broker = MultiBroker(
+        routing={"a": flaky, "b": steady},
+        reconnect_delay=0.01,
+    )
+
+    await flaky.queue.put(b"a-1")
+    await steady.queue.put(b"b-1")
+    await steady.queue.put(b"b-2")
+    await flaky.queue.put(b"a-2")
+
+    messages = await _collect(broker, 4)
+    # Acknowledge after A has already reopened its second listener.
+    for message in messages:
+        assert isinstance(message, SourcedMessage)
+        result = message.ack()
+        assert result is None
+
+    # Both acks of A are recorded against their real rounds,
+    # the reconnect never rerouted the first ack to round two.
+    assert flaky.acks == [(b"a-1", 1), (b"a-2", 2)]
+
+
+async def test_bounded_merged_queue_applies_backpressure_to_sources() -> None:
+    gate = asyncio.Event()
+    gated = GateBroker(gate)
+    broker = MultiBroker(
+        routing={"gated": gated},
+        max_buffer_size=1,
+    )
+    for index in range(3):
+        await gated.queue.put(f"msg-{index}".encode())
+
+    iterator = broker.listen()
+    # Two deliveries fill the single-slot buffer (one handed out,
+    # one buffered); producing the third must block instead of
+    # growing the queue.
+    first = await asyncio.wait_for(iterator.__anext__(), timeout=1)
+    second = await asyncio.wait_for(iterator.__anext__(), timeout=1)
+    await asyncio.sleep(0.05)
+    assert gated.produced == 2
+
+    # The source stays blocked on the gate, proving the merged queue
+    # did not accept an unbounded number of pending deliveries.
+    gate.set()
+    third = await asyncio.wait_for(iterator.__anext__(), timeout=1)
+    await iterator.aclose()
+
+    assert [first.data, second.data, third.data] == [
+        b"msg-0",
+        b"msg-1",
+        b"msg-2",
+    ]
+    assert gated.produced == 3
+    for message in (first, second, third):
+        assert isinstance(message, SourcedMessage)
+        assert message.source == "gated"
+
+
+async def test_plain_bytes_messages_pass_through_without_wrapper() -> None:
+    class BytesBroker(AsyncQueueBroker):
+        async def listen(self) -> AsyncGenerator[bytes, None]:
+            while True:
+                yield await self.queue.get()
+
+    bytes_broker = BytesBroker()
+    broker = MultiBroker(routing={"raw": bytes_broker})
+    await bytes_broker.queue.put(b"raw-payload")
+
+    messages = await _collect(broker, 1)
+
+    assert messages == [b"raw-payload"]
+    assert not isinstance(messages[0], AckableMessage)

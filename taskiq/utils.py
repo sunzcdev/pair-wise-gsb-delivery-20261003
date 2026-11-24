@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import inspect
+import math
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Coroutine
 from types import CoroutineType
@@ -82,12 +83,19 @@ async def _run_producers(
 
 async def merge_async_iterables(
     *iterables: AsyncGenerator[_T, None],
+    max_buffer_size: float = math.inf,
 ) -> AsyncGenerator[_T, None]:
     """
     Merge multiple async generators into a single one.
 
     All values from every generator are yielded
     as soon as they arrive, in no particular order.
+
+    The merged stream keeps at most `max_buffer_size`
+    pending values. Producers block on a full buffer,
+    so a slow consumer applies backpressure to every
+    source instead of letting the merged queue grow
+    without limits. The default is an unbounded buffer.
 
     If any of the inner generators raises an exception,
     all other generators are cancelled and the error is
@@ -97,9 +105,15 @@ async def merge_async_iterables(
     all inner generators are closed as well.
 
     :param iterables: async generators to merge.
+    :param max_buffer_size: maximum number of values buffered
+        between the producers and the consumer, must be positive.
     :return: single generator with values from all generators.
     """
-    send_stream, receive_stream = anyio.create_memory_object_stream[_T]()
+    if max_buffer_size <= 0:
+        raise ValueError("max_buffer_size must be positive.")
+    send_stream, receive_stream = anyio.create_memory_object_stream[_T](
+        max_buffer_size=max_buffer_size,
+    )
     producers = asyncio.create_task(_run_producers(iterables, send_stream))
     try:
         async for message in receive_stream:
