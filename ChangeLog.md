@@ -1,6 +1,12 @@
 ## Changes between Bunny 3.6.0 and 3.7.0 (in development)
 
-No changes yet.
+### Waiting, Deadline and Cancellation for Publishes on a `connection.blocked` Connection
+
+RabbitMQ can ask publishers to stop via `connection.blocked` while consumer acknowledgements, heartbeats and frame reading keep working. Publishes can now opt into waiting for recovery with `basic_publish(..., wait_when_blocked: true)`; the wait happens before a sequence number is allocated or frames are handed to the transport, and does not hold the channel publishing mutex or a session-wide lock
+
+The wait accepts a `:blocked_timeout` deadline (in seconds; `:timeout`, `:unblock_timeout`, `:wait_timeout` and `:blocked_timeout_ms` are also understood) and/or a `Bunny::CancellationToken` passed as `:cancellation`. A publish that times out or is cancelled is removed from the admission set and can never be sent after `connection.unblocked`, while publishes already handed to the transport keep their existing publisher-confirm settlement
+
+New `Bunny::PublishGate` (also `Bunny::BlockedPublishGate`, available via `Bunny::Session#publish_gate` / `Bunny::Channel#publish_gate`) and `Bunny::Session#wait_while_blocked` / `Bunny::Channel#wait_while_blocked` expose the mechanism. The gate releases parked publishers on unblock and fails them on connection shutdown or network failure
 
 
 ## Changes between Bunny 3.5.0 and 3.6.0 (Nov 9, 2026)

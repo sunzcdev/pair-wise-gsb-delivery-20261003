@@ -779,6 +779,11 @@ module Bunny
       raise_if_no_longer_open!
       raise ArgumentError, "routing key cannot be longer than #{SHORTSTR_LIMIT} characters" if routing_key && routing_key.size > SHORTSTR_LIMIT
 
+      # Opt-in wait while a connection.blocked alarm is active. This parks the
+      # caller before a sequence number is allocated or frames are handed to the
+      # transport, so a cancelled/timed out publish can never be sent later.
+      await_publish_admission!(opts)
+
       exchange_name = exchange.is_a?(Bunny::Exchange) ? exchange.name : exchange
 
       mode = if opts.fetch(:persistent, true)
@@ -826,6 +831,104 @@ module Bunny
       wait_for_publish_confirm(seq_no, continuation) if continuation
 
       self
+    end
+
+    # Admission gate consulted by publishes that opt into waiting while the
+    # connection is blocked. Real sessions expose their connection-wide gate;
+    # standalone channels get a channel-local gate they can drive in tests.
+    # @return [Bunny::PublishGate]
+    # @api public
+    def publish_gate
+      return @publish_gate if instance_variable_defined?(:@publish_gate) && @publish_gate
+
+      @publish_gate = connection_publish_gate || Bunny::PublishGate.new(respond_to?(:logger) ? logger : nil)
+    end
+
+    # Blocks while the broker reports the connection as blocked, without
+    # holding the channel publishing mutex or any session lock.
+    #
+    # @param timeout [Numeric, nil] maximum seconds to wait for unblock
+    # @param cancellation [Bunny::CancellationToken, #cancelled?, nil]
+    # @return [true] once admission is allowed
+    # @raise [Bunny::PublishWaitTimeout] if the deadline expired
+    # @raise [Bunny::PublishCancelled] if cancelled before admission
+    # @api public
+    def wait_while_blocked(timeout: nil, cancellation: nil)
+      if (gate = connection_publish_gate)
+        gate.wait_for_admission(timeout: timeout, cancellation: cancellation)
+      elsif connection_reports_blocked?
+        wait_on_blocked_flag(timeout, cancellation)
+      else
+        publish_gate.wait_for_admission(timeout: timeout, cancellation: cancellation)
+      end
+    end
+
+    # Blocks according to the publish options when waiting on a blocked
+    # connection was requested. No-op for the default (non-waiting) publish.
+    # @api private
+    def await_publish_admission!(opts)
+      return unless publish_admission_requested?(opts)
+
+      timeout      = publish_blocked_timeout(opts)
+      cancellation = opts[:cancellation] || opts[:cancellation_token] || opts[:cancel]
+
+      if (gate = opts[:publish_gate])
+        gate.wait_for_admission(timeout: timeout, cancellation: cancellation)
+      else
+        wait_while_blocked(timeout: timeout, cancellation: cancellation)
+      end
+    end
+
+    # @api private
+    def publish_admission_requested?(opts)
+      return true if opts[:wait_when_blocked] || opts[:wait_if_blocked] ||
+                     opts[:blocked_wait] || opts[:wait]
+      return true unless publish_blocked_timeout(opts).nil?
+
+      opts.key?(:cancellation) || opts.key?(:cancellation_token) || opts.key?(:cancel)
+    end
+
+    # @api private
+    def publish_blocked_timeout(opts)
+      timeout = opts[:blocked_timeout] || opts[:unblock_timeout] ||
+                opts[:wait_timeout] || opts[:block_timeout] || opts[:timeout]
+      return timeout.to_f if timeout
+      return opts[:blocked_timeout_ms] / 1000.0 if opts[:blocked_timeout_ms]
+
+      nil
+    end
+
+    # @api private
+    def connection_publish_gate
+      return nil unless @connection
+
+      if @connection.respond_to?(:publish_gate)
+        @connection.publish_gate
+      elsif @connection.respond_to?(:blocked_publish_gate)
+        @connection.blocked_publish_gate
+      end
+    end
+
+    # @api private
+    def connection_reports_blocked?
+      @connection.respond_to?(:blocked?) && @connection.blocked?
+    end
+
+    # Polling fallback for minimal connection doubles that only expose
+    # #blocked?; real sessions use the event-driven {Bunny::PublishGate}.
+    # @api private
+    def wait_on_blocked_flag(timeout, cancellation)
+      deadline = timeout ? Bunny::Timestamp.monotonic + timeout.to_f : nil
+      while @connection.blocked?
+        if cancellation&.cancelled?
+          raise Bunny::PublishCancelled, "publish was cancelled before it was sent"
+        end
+        if deadline && Bunny::Timestamp.monotonic >= deadline
+          raise Bunny::PublishWaitTimeout, "timed out waiting for connection to unblock"
+        end
+        sleep 0.01
+      end
+      true
     end
 
     # Publishes multiple messages in a batch with a single mutex acquisition.

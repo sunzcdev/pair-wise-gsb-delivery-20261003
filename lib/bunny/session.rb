@@ -88,6 +88,11 @@ module Bunny
     attr_reader :mechanism
     # @return [Logger]
     attr_reader :logger
+    # Admission gate used by publishes that opt into waiting while the
+    # connection is blocked by the broker (connection.blocked)
+    # @return [Bunny::PublishGate]
+    attr_reader :publish_gate
+    alias blocked_publish_gate publish_gate
     # @return [Integer] Timeout for blocking protocol operations (queue.declare, queue.bind, etc), in milliseconds. Default is 15000.
     attr_reader :continuation_timeout
     attr_reader :network_recovery_interval
@@ -199,6 +204,7 @@ module Bunny
       @status             = :not_connected
       @manually_closed    = false
       @blocked            = false
+      @publish_gate        = PublishGate.new(@logger)
 
       # these are negotiated with the broker during the connection tuning phase
       @client_frame_max   = opts.fetch(:frame_max, DEFAULT_FRAME_MAX)
@@ -334,6 +340,8 @@ module Bunny
       # reset here for cases when automatic network recovery kicks in
       # when we were blocked. MK.
       @blocked       = false
+      # wake publishers parked on the previous connection and reopen the gate
+      @publish_gate&.reset!(Bunny::ConnectionAlreadyClosed.new)
       self.reset_continuations
 
       begin
@@ -516,6 +524,22 @@ module Bunny
     def blocked?
       @blocked
     end
+
+    # Blocks the calling thread while the broker has the connection blocked,
+    # without holding any session or transport lock. Consumer acknowledgements,
+    # heartbeats and frame reading continue on their own threads.
+    #
+    # @param timeout [Numeric, nil] maximum seconds to wait for unblock
+    # @param cancellation [Bunny::CancellationToken, #cancelled?, nil]
+    # @return [true] when the connection was unblocked (or was not blocked)
+    # @raise [Bunny::PublishWaitTimeout] if the deadline expired
+    # @raise [Bunny::PublishCancelled] if the wait was cancelled
+    # @api public
+    def wait_while_blocked(timeout: nil, cancellation: nil)
+      @publish_gate.wait_for_admission(timeout: timeout, cancellation: cancellation)
+    end
+    alias wait_for_unblock wait_while_blocked
+    alias await_unblock wait_while_blocked
 
     # Returns the session error handler.
     # By default, this is a Bunny::ExceptionAccumulator instance.
@@ -754,9 +778,11 @@ module Bunny
         end
       when AMQ::Protocol::Connection::Blocked then
         @blocked = true
+        @publish_gate.block!(method.reason) if @publish_gate
         @block_callback.call(method) if @block_callback
       when AMQ::Protocol::Connection::Unblocked then
         @blocked = false
+        @publish_gate.unblock! if @publish_gate
         @unblock_callback.call(method) if @unblock_callback
       when AMQ::Protocol::Connection::UpdateSecretOk then
         @continuations.push(method)
@@ -817,6 +843,7 @@ module Bunny
 
     # @private
     def handle_network_failure(exception)
+      @publish_gate&.fail_all!(exception)
       raise NetworkErrorWrapper.new(exception) unless @threaded
 
       @status_mutex.synchronize { @status = :disconnected }
@@ -1314,6 +1341,7 @@ module Bunny
       rescue Exception => e
         @logger.warn "Caught an exception when cleaning up after receiving connection.close: #{e.message}"
       ensure
+        @publish_gate&.fail_all!(Bunny::ConnectionAlreadyClosed.new)
         close_transport
       end
     end

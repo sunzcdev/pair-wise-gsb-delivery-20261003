@@ -175,6 +175,16 @@ module Bunny
   # Raised on initial TCP connection timeout
   class ConnectionTimeout < Timeout::Error; end
 
+  # Raised when a publish gave up waiting for a connection.blocked
+  # state to clear because its deadline was reached
+  class PublishWaitTimeout < ClientTimeout; end
+  BlockedPublishTimeout = PublishWaitTimeout
+
+  # Raised when a waiting publish is cancelled by its caller before
+  # it was admitted for transmission
+  class PublishCancelled < Exception; end
+  PublishCanceled = PublishCancelled
+
 
   # Base exception class for data consistency and framing errors.
   class InconsistentDataError < Exception
