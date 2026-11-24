@@ -1,6 +1,18 @@
 ## Changes between Bunny 3.6.0 and 3.7.0 (in development)
 
-No changes yet.
+### A Pending `basic.get` Is Now Unblocked When the Channel or Connection Closes
+
+A `Channel#basic_get` (and `Queue#pop`) waiting for a response no longer sleeps until the
+continuation timeout when the channel is closed locally, closed by the server, torn down by a
+network failure, or reconnected during automatic recovery. The waiting thread now wakes up
+immediately and raises the matching `ChannelAlreadyClosed` or channel-level exception instead.
+All concurrent waiters on the same channel are released.
+
+### `basic.get` and Consumer Deliveries on the Same Channel Keep Their Frame Attribution
+
+Interleaved `basic.get-ok`, `basic.get-empty` and `basic.deliver` framesets are demultiplexed to
+their own continuations, including messages whose content spans several body frames, for which the
+assembled content object identity is preserved end to end.
 
 
 ## Changes between Bunny 3.5.0 and 3.6.0 (Nov 9, 2026)

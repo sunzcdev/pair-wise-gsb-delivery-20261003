@@ -169,6 +169,10 @@ module Bunny
 
     DEFAULT_CONTENT_TYPE = "application/octet-stream".freeze
 
+    # Pushed onto the basic.get continuation queue when the channel is closed
+    # while a basic.get is in flight, so that the waiting thread wakes up immediately
+    CHANNEL_CLOSED_SENTINEL = :channel_closed
+
     # Default outstanding limit for publisher confirms with tracking.
     # Batch size of 1000 provides optimal throughput per benchmarks.
     DEFAULT_OUTSTANDING_CONFIRMS_LIMIT = 1000
@@ -233,6 +237,10 @@ module Bunny
 
       @next_publish_seq_no = 0
       @delivery_tag_offset = 0
+
+      # used to delay continuation reset until no basic.get thread is blocked in the old queue
+      @basic_get_waiters_lock = ::Mutex.new
+      @basic_get_waiters_cond = ::ConditionVariable.new
 
       # Delivery tags restart at 1 on a reopened or recovered channel. Shifting them
       # by the highest tag seen so far keeps them unique, see #guarding_against_stale_delivery_tags.
@@ -302,6 +310,7 @@ module Bunny
       @status_mutex.synchronize { @status = :closing }
       @connection.close_channel(self)
       @status = :closed
+      unblock_basic_get_waiters!
       @work_pool.shutdown
       maybe_kill_consumer_work_pool!
     end
@@ -350,6 +359,7 @@ module Bunny
     # @private
     def connection_closed!
       @status = :closed
+      unblock_basic_get_waiters!
     end
 
     # @private
@@ -943,7 +953,14 @@ module Bunny
       # able to handle anyway as "got no message, no need to act". MK.
       last_basic_get_response = if @connection.open?
                                   begin
-                                    wait_on_basic_get_continuations
+                                    response = wait_on_basic_get_continuations
+                                    if response.equal?(CHANNEL_CLOSED_SENTINEL)
+                                      raise_if_continuation_resulted_in_a_channel_error!
+                                      raise_if_no_longer_open!
+                                      # the channel was torn down by connection recovery, this get cannot be answered
+                                      raise ChannelAlreadyClosed.new("channel #{@id} was closed while a basic.get was in flight", self)
+                                    end
+                                    response
                                   rescue Timeout::Error => e
                                     raise_if_continuation_resulted_in_a_channel_error!
                                     raise e
@@ -2268,6 +2285,15 @@ module Bunny
       @basic_get_continuations.push([nil, nil, nil])
     end
 
+    # Unblocks every thread currently waiting on basic.get so that they can observe
+    # the closed channel instead of sleeping until the continuation timeout.
+    # @private
+    def unblock_basic_get_waiters!
+      @threads_waiting_on_basic_get_continuations.size.times do
+        @basic_get_continuations.push(CHANNEL_CLOSED_SENTINEL)
+      end
+    end
+
     # @private
     def handle_frameset(basic_deliver, properties, content)
       tag = basic_deliver.consumer_tag
@@ -2380,6 +2406,7 @@ module Bunny
           @basic_get_continuations.poll(@connection.continuation_timeout)
         ensure
           @threads_waiting_on_basic_get_continuations.delete(t)
+          @basic_get_waiters_lock.synchronize { @basic_get_waiters_cond.broadcast }
         end
       else
         connection.reader_loop.run_once until @basic_get_continuations.length > 0
@@ -2471,6 +2498,13 @@ module Bunny
       @threads_waiting_on_confirms_continuations.each(&:run)
       @threads_waiting_on_continuations.each(&:run)
       @threads_waiting_on_basic_get_continuations.each(&:run)
+
+      # wake up basic.get waiters and let them observe the failure before
+      # the continuation queue is replaced below
+      unblock_basic_get_waiters!
+      @basic_get_waiters_lock.synchronize do
+        @basic_get_waiters_cond.wait(@basic_get_waiters_lock) until @threads_waiting_on_basic_get_continuations.empty?
+      end
 
       if @outstanding_limit_cond
         @unconfirmed_set_mutex.synchronize { @outstanding_limit_cond.broadcast }
@@ -2674,6 +2708,7 @@ module Bunny
     # @private
     def closed!
       @status = :closed
+      unblock_basic_get_waiters!
       @work_pool.shutdown
       @connection.release_channel_id(@id)
     end
