@@ -12,7 +12,7 @@ import pytest
 
 import dask.config
 
-from distributed import Event, Lock, Scheduler, wait
+from distributed import Event, Lock, Scheduler, Worker, wait
 from distributed.active_memory_manager import (
     ActiveMemoryManagerExtension,
     ActiveMemoryManagerPolicy,
@@ -33,7 +33,10 @@ from distributed.utils_test import (
     slowinc,
     wait_for_state,
 )
-from distributed.worker_state_machine import AcquireReplicasEvent
+from distributed.worker_state_machine import (
+    AcquireReplicasEvent,
+    GatherDepNetworkFailureEvent,
+)
 
 
 @contextmanager
@@ -922,6 +925,127 @@ async def test_RetireWorker_all_replicas_are_being_retired(c, s, w1, w2, w3):
     assert s.tasks["x"].who_has == {ws1, ws2}
     await c.retire_workers([w1.address, w2.address])
     assert s.tasks["x"].who_has == {ws3}
+
+
+class FailOnceRecipient(Worker):
+    """A worker where the first gather_dep fails with a network failure and the
+    second one is held back until the test releases it; subsequent ones succeed.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.gather_calls = 0
+        self.first_gather_failed = asyncio.Event()
+        self.block_second_gather = asyncio.Event()
+        super().__init__(*args, **kwargs)
+
+    async def gather_dep(self, worker, to_gather, total_nbytes, *, stimulus_id):
+        self.gather_calls += 1
+        if self.gather_calls == 1:
+            self.first_gather_failed.set()
+            return GatherDepNetworkFailureEvent(
+                worker=worker,
+                total_nbytes=total_nbytes,
+                stimulus_id="fail-once-recipient",
+            )
+        if self.gather_calls == 2:
+            await self.block_second_gather.wait()
+        return await super().gather_dep(
+            worker, to_gather, total_nbytes, stimulus_id=stimulus_id
+        )
+
+
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)] * 2,
+    config={
+        "distributed.scheduler.active-memory-manager.start": True,
+        "distributed.scheduler.active-memory-manager.interval": 0.05,
+        "distributed.scheduler.active-memory-manager.measure": "managed",
+        "distributed.scheduler.active-memory-manager.policies": [],
+    },
+)
+async def test_RetireWorker_all_replicas_retired_recipient_fails_once(c, s, w1, w2):
+    """Two workers hold the only replicas of a key and are both retired at the same
+    time. The recipient's first attempt to receive the key fails; the second one
+    succeeds.
+
+    Until a worker that is not being retired has confirmed its replica, the last
+    copy on the source workers must not be released - neither by RetireWorker nor
+    by ReduceReplicas - so that at least one readable copy survives the failed
+    transfer. Once the recipient confirms, both sources may retire.
+    """
+    async with FailOnceRecipient(s.address, nthreads=1) as w3:
+        x = await c.scatter(
+            {"x": 123}, workers=[w1.address, w2.address], broadcast=True
+        )
+        assert len(s.tasks["x"].who_has) == 2
+
+        retire_fut = asyncio.create_task(c.retire_workers([w1.address, w2.address]))
+
+        # The first attempt to replicate x onto w3 fails
+        await w3.first_gather_failed.wait()
+        # Let the AMM run a few more iterations. It must not drop the source
+        # replicas while w3 has not confirmed its copy.
+        await asyncio.sleep(0.3)
+
+        # At least one readable copy remains on the source workers
+        assert s.tasks["x"].who_has
+        assert "x" in w1.data or "x" in w2.data
+        # Neither source has been retired yet
+        assert not retire_fut.done()
+        assert w1.address in s.workers
+        assert w2.address in s.workers
+
+        # The second attempt succeeds; now both sources may retire
+        w3.block_second_gather.set()
+        await retire_fut
+
+        assert w1.address not in s.workers
+        assert w2.address not in s.workers
+        assert dict(w3.data) == {"x": 123}
+
+
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)] * 2,
+    config={
+        "distributed.scheduler.active-memory-manager.start": True,
+        "distributed.scheduler.active-memory-manager.interval": 0.05,
+        "distributed.scheduler.active-memory-manager.measure": "managed",
+        "distributed.scheduler.active-memory-manager.policies": [
+            {"class": "distributed.active_memory_manager.ReduceReplicas"},
+        ],
+    },
+)
+async def test_RetireWorker_ReduceReplicas_respects_unconfirmed_replicas(c, s, w1, w2):
+    """ReduceReplicas must not drop the last copy of a key from the workers being
+    retired while the replication to a worker that is not being retired has not
+    been confirmed yet.
+    """
+    async with FailOnceRecipient(s.address, nthreads=1) as w3:
+        x = await c.scatter(
+            {"x": 123}, workers=[w1.address, w2.address], broadcast=True
+        )
+        assert len(s.tasks["x"].who_has) == 2
+
+        retire_fut = asyncio.create_task(c.retire_workers([w1.address, w2.address]))
+
+        await w3.first_gather_failed.wait()
+        # Let the AMM run a few more iterations. ReduceReplicas wants to reduce x
+        # to a single replica, but it must not drop any copy while the only
+        # confirmed replicas are on workers that are being retired.
+        await asyncio.sleep(0.3)
+
+        assert len(s.tasks["x"].who_has) >= 2
+        assert "x" in w1.data and "x" in w2.data
+        assert not retire_fut.done()
+
+        w3.block_second_gather.set()
+        await retire_fut
+
+        assert w1.address not in s.workers
+        assert w2.address not in s.workers
+        assert dict(w3.data) == {"x": 123}
 
 
 @gen_cluster(

@@ -354,6 +354,33 @@ class ActiveMemoryManagerExtension:
             key=lambda ws: (ws.status != Status.running, self.workers_memory[ws]),
         )
 
+        # IF all remaining replicas would be on workers that are being retired
+        #    (i.e. none would be left on a worker in running status)
+        # AND there is at least one running worker that could hold a replica instead,
+        # THEN don't drop anything yet.
+        #
+        # The last copy of a key may only be released once a worker that is not being
+        # retired has confirmed that it holds a replica. This prevents data loss when
+        # multiple workers are being retired at the same time: each RetireWorker
+        # instance (or ReduceReplicas) could otherwise assume that the other workers
+        # will retain a copy and together drop every replica before the replication
+        # to a safe worker has been confirmed. Note that replications are
+        # fire-and-forget, so a replica that has been requested but not yet confirmed
+        # by the receiving worker must not be counted here.
+        #
+        # If there are no running workers at all (e.g. the whole cluster is being
+        # retired), allow the drop to proceed; RetireWorker will deal with the
+        # situation through its no_recipients logic instead.
+        if (
+            self.scheduler.running
+            and not (ts.who_has - pending_drop - {choice}) & self.scheduler.running
+        ):
+            log_reject(
+                "dropping this replica would leave no copies on workers that "
+                "are not being retired"
+            )
+            return None
+
         # IF there is only one candidate that could drop the key
         # AND the candidate has status=running
         # AND there were candidates with status=paused or closing_gracefully, but we
@@ -737,4 +764,13 @@ class RetireWorker(ActiveMemoryManagerPolicy):
         ws = self.manager.scheduler.workers.get(self.address)
         if ws is None:
             return True
-        return all(len(ts.who_has or ()) > 1 for ts in ws.has_what)
+        running = self.manager.scheduler.running
+        return all(
+            # It is only safe to release the last copy of a key on this worker once
+            # a worker that is not being retired has confirmed that it holds a
+            # replica. Other replicas on workers that are themselves being retired
+            # don't count, as those workers may disappear before the key has been
+            # replicated to safety.
+            not ts.who_has or not ts.who_has.isdisjoint(running)
+            for ts in ws.has_what
+        )
