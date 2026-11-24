@@ -86,6 +86,11 @@ module Fluent
       @without_source = system_config.without_source || false
       @source_only_mode = SourceOnlyMode.new(system_config.with_source_only, start_in_parallel)
       @source_only_buffer_agent = nil
+      # Retry checkpoints of the with-source-only cancellation sequence.
+      # They make #cancel_source_only! resumable: a retry skips the phases
+      # whose effects are already in place.
+      @source_only_real_plugins_started = false
+      @source_only_inputs_switched = false
       @enable_input_metrics = system_config.enable_input_metrics
 
       suppress_interval(system_config.emit_error_log_interval) unless system_config.emit_error_log_interval.nil?
@@ -291,6 +296,26 @@ module Fluent
       flushing_threads.each{|t| t.join }
     end
 
+    # Cancel with-source-only mode in a retry-safe way.
+    #
+    # The cancellation is split into phases whose effects are durable on their
+    # own, so that calling this method again after a failure resumes from the
+    # point where the previous attempt stopped instead of starting over (which
+    # would double-deliver events) or giving up (which would strand the
+    # backlog):
+    #
+    #   1. start the real plugins (filters/outputs). If this fails, nothing has
+    #      been torn down yet: inputs keep buffering into the temporary buffer
+    #      and the call can simply be retried.
+    #   2. switch the inputs over to the normal EventRouter. Events emitted
+    #      afterwards never go back to the temporary buffer, while the buffer
+    #      still owns every event emitted before the switch.
+    #   3. replace the buffering agent with a flushing one that resumes the
+    #      very same buffer directory. File chunks already purged by an earlier
+    #      attempt stay purged, so successfully delivered events are not sent
+    #      again; chunks that remain on disk are flushed in their original
+    #      order. If building/starting the flushing agent fails, the previous
+    #      agent (and thus the backlog) is left untouched for another retry.
     def cancel_source_only!
       unless @source_only_mode.enabled?
         log.info "do nothing for canceling with-source-only because the current mode is not with-source-only."
@@ -298,10 +323,27 @@ module Fluent
       end
 
       log.info "cancel with-source-only mode and start the other plugins"
+
+      start_real_plugins_for_source_only!
+      switch_inputs_to_normal_router!
+      replace_source_only_buffer_agent_with_flushing_one!
+
+      @source_only_mode.disable!
+    end
+
+    def start_real_plugins_for_source_only!
+      return if @source_only_real_plugins_started
+
       all_plugins = [:input, :output_with_router, @labels.values, :filter, :output].flatten.reverse
       start(kind_or_agent_list: all_plugins)
+      @source_only_real_plugins_started = true
+    end
+
+    def switch_inputs_to_normal_router!
+      return if @source_only_inputs_switched
 
       lifecycle_control_list[:input].each(&:event_emitter_cancel_source_only)
+      @source_only_inputs_switched = true
 
       # Want to make sure that the source_only_router finishes all process before
       # shutting down the agent.
@@ -311,16 +353,40 @@ module Fluent
       # the entire shutting down process does not care about it either.
       # So, sleep here just in case.
       sleep 1
+    end
 
-      shutdown(kind_or_agent_list: [@source_only_buffer_agent])
-      @source_only_buffer_agent = nil
+    def replace_source_only_buffer_agent_with_flushing_one!
+      flushing_agent = build_flushing_source_only_buffer_agent
 
+      begin
+        start(kind_or_agent_list: [flushing_agent])
+      rescue => e
+        # The flushing agent never took over: get rid of it (it has not
+        # touched the buffer path yet) and keep the previous agent so the
+        # backlog in the buffer directory is preserved for a retry.
+        log.warn "failed to start the loading agent for with-source-only; keep buffering until the next retry", error: e
+        flushing_agent.shutdown rescue nil
+        raise
+      end
+
+      # The flushing agent resumed the same buffer directory successfully: the
+      # previous agent can now be shut down. Its flush threads are disabled, so
+      # shutting it down does not deliver anything; the files it owns are read
+      # by the flushing agent instead.
+      previous_agent = @source_only_buffer_agent
+      shutdown(kind_or_agent_list: [previous_agent])
+      @source_only_buffer_agent = flushing_agent
+    end
+
+    def build_flushing_source_only_buffer_agent
       # This agent can stop after flushing its all buffer, but it is not implemented for now.
       log.info "starts the loading agent for with-source-only"
-      setup_source_only_buffer_agent(flush: true)
-      start(kind_or_agent_list: [@source_only_buffer_agent])
-
-      @source_only_mode.disable!
+      agent = SourceOnlyBufferAgent.new(log: log, system_config: Fluent::Engine.system_config)
+      # A configuration failure happens before the buffer path is opened, so
+      # the previous agent keeps owning the whole backlog and the caller can
+      # retry after fixing the configuration without losing anything.
+      agent.configure(flush: true)
+      agent
     end
 
     def shutdown(kind_or_agent_list: nil)
