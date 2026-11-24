@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from pyinfra.api.host import Host
     from pyinfra.api.inventory import Inventory
     from pyinfra.api.operation import OperationMeta
+    from pyinfra.api.rollout import Rollout
 
 
 # Work out the max parallel we can achieve with the open files limit of the user/process,
@@ -197,6 +198,10 @@ class State:
     current_op_file_number: int = 0
     should_raise_failed_hosts: Callable[[State], bool] | None = None
 
+    # Grouped rolling rollout state, created lazily when an operation runs with a
+    # ``_batch_size`` set so per-group error budgets accumulate across operations.
+    rollout: Rollout | None = None
+
     def __init__(
         self,
         inventory: Inventory | None = None,
@@ -272,6 +277,9 @@ class State:
 
         # Limit hosts changes dynamically to limit operations to a subset of hosts
         self.limit_hosts: list[Host] = initial_limit
+
+        # Grouped rolling rollout (see api/rollout.py), initialised on first use
+        self.rollout = None
 
         # Op basics
         self.op_meta: dict[str, StateOperationMeta] = {}  # maps operation hash -> names/etc
@@ -462,3 +470,35 @@ class State:
         if not isinstance(limit_hosts, list):
             return True
         return host in limit_hosts
+
+    def get_rollout(self, batch_size: int, error_budget: dict[str, int] | None = None) -> "Rollout":
+        """
+        Return the deploy's :class:`~pyinfra.api.rollout.Rollout`, creating it on
+        first use.
+
+        The rollout is shared by every rolling operation so per-group error
+        budgets persist across operations. Rolling settings must therefore match
+        between operations: an operation that asks for different values raises
+        rather than silently changing the admission rules mid-deploy.
+        """
+
+        from .rollout import Rollout
+
+        if self.rollout is None:
+            self.rollout = Rollout(self.inventory, batch_size, error_budget)
+            return self.rollout
+
+        if batch_size != self.rollout.batch_size:
+            raise PyinfraError(
+                (
+                    f"Cannot change rollout `_batch_size` within a deploy "
+                    f"(got {batch_size}, existing {self.rollout.batch_size})."
+                ),
+            )
+
+        if (error_budget or {}) != self.rollout.error_budget:
+            raise PyinfraError(
+                "Cannot change rollout `_error_budget` within a deploy.",
+            )
+
+        return self.rollout

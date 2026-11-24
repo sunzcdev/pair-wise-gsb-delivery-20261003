@@ -7,6 +7,11 @@ from unittest.mock import patch
 from rich.console import Console
 
 from pyinfra.api import Config, State
+from pyinfra.api.connect import connect_all
+from pyinfra.api.operation import add_op
+from pyinfra.api.operations import run_ops
+from pyinfra.api.state import StateStage
+from pyinfra.operations import server
 
 import pyinfra_cli.prints as prints_module
 from pyinfra_cli.console import console
@@ -14,10 +19,13 @@ from pyinfra_cli.prints import (
     _display_width,
     _format_host_data,
     _scalar_style,
+    build_results_json,
     print_inventory,
+    print_results,
     print_rows,
 )
 
+from ..paramiko_util import FakeBuffer, FakeChannel, PatchSSHTestCase
 from ..util import make_inventory
 
 
@@ -145,3 +153,104 @@ class TestPrintInventory(TestCase):
         # Non-JSON scalars render unstyled (shown via str()).
         assert _scalar_style(datetime(2021, 8, 14)) == ""
         assert _scalar_style(PurePosixPath("/opt/app")) == ""
+
+
+def _failing_host_side_effect(failing_host):
+    def effect(host, *args, **kwargs):
+        if host.name == failing_host:
+            return (False, FakeBuffer("", FakeChannel(1)))
+        return (True, FakeBuffer("ok", FakeChannel(0)))
+
+    return effect
+
+
+class TestPrintRolloutResults(PatchSSHTestCase):
+    def tearDown(self):
+        # Keep gevent-local host/state context from leaking into later tests.
+        from pyinfra.context import ctx_host, ctx_state
+
+        ctx_host.reset()
+        ctx_state.reset()
+        super().tearDown()
+
+    def _paused_rollout_state(self):
+        inventory = make_inventory(
+            hosts=("a1", "a2", "a3", "a4", "b1", "b2"),
+            service_a=(["a1", "a2", "a3", "a4"], {}),
+            service_b=(["b1", "b2"], {}),
+        )
+        state = State(inventory, Config())
+        state.current_stage = StateStage.Prepare
+        connect_all(state)
+
+        add_op(
+            state,
+            server.shell,
+            "echo roll",
+            _batch_size=2,
+            _error_budget={"service_a": 1},
+        )
+
+        with patch(
+            "pyinfra.api.host.Host.run_shell_command",
+            autospec=True,
+            side_effect=_failing_host_side_effect("a1"),
+        ):
+            run_ops(state)
+
+        return state
+
+    def test_json_locates_unstarted_batches_and_not_started_hosts(self):
+        state = self._paused_rollout_state()
+        payload = build_results_json(state)
+
+        assert payload["unstarted_batches"] == {"service_a": [["a3", "a4"]]}
+
+        [operation] = payload["operations"]
+        assert sorted(operation["not_started"]) == ["a3", "a4"]
+        assert "a1" in operation["error"]
+        assert "a2" in operation["success"]
+        # The other group finished and has nobody waiting.
+        assert "b1" in operation["success"] and "b2" in operation["success"]
+        assert payload["totals"]["not_started"] == 2
+        assert payload["failed_hosts"] == ["a1"]
+
+    def test_human_results_table_has_not_started_column_and_batch_listing(self):
+        state = self._paused_rollout_state()
+        wide_console = Console(width=200, force_terminal=False, highlight=False)
+
+        # The table rows are emitted via the pyinfra logger, while the unstarted
+        # batch listing goes through the rich console; capture both separately.
+        with self.assertLogs("pyinfra", level="INFO") as logs:
+            with patch.object(prints_module, "console", wide_console):
+                with wide_console.capture() as capture:
+                    print_results(state)
+
+        logged = "\n".join(logs.output)
+        assert "Not Started" in logged
+        assert "2 (a3, a4)" in logged
+
+        output = capture.get()
+        assert "Rollout batches not started" in output
+        assert "service_a" in output and "a3" in output and "a4" in output
+        # The healthy group has no unstarted batch listed.
+        assert "service_b" not in output.split("Rollout batches not started")[1]
+
+    def test_non_rolling_results_have_no_not_started_payload(self):
+        inventory = make_inventory(hosts=("a1", "a2"))
+        state = State(inventory, Config())
+        state.current_stage = StateStage.Prepare
+        connect_all(state)
+        add_op(state, server.shell, "echo plain")
+
+        with patch(
+            "pyinfra.api.host.Host.run_shell_command",
+            autospec=True,
+            side_effect=_failing_host_side_effect(None),
+        ):
+            run_ops(state)
+
+        payload = build_results_json(state)
+        assert "not_started" not in payload["totals"]
+        assert "unstarted_batches" not in payload
+        assert "not_started" not in payload["operations"][0]

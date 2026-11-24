@@ -332,6 +332,89 @@ def _run_no_wait_ops(state: State):
         state.fail_hosts(failed_hosts)
 
 
+def _run_rollout_op(state: State, op_hash: str):
+    """
+    Run one operation as a grouped rolling rollout.
+
+    Each inventory group admits one fixed-size batch at a time, waiting for the
+    batch to finish before admitting the group's next one. Groups run concurrently
+    via their own greenlets, so a group that pauses on its error budget merely
+    stops admitting new batches: batches already admitted still report their real
+    results, and other groups keep rolling.
+    """
+
+    op_meta = state.get_op_meta(op_hash)
+    batch_size = op_meta.global_arguments["_batch_size"]
+    error_budget = op_meta.global_arguments["_error_budget"]
+    rollout = state.get_rollout(batch_size, error_budget)
+
+    if state.pool is None:
+        raise PyinfraError("No pool found on state.")
+
+    def run_batch(batch, progress):
+        active_hosts = set(state.inventory.get_active_hosts())
+        # Hosts that failed during connect (or in a previous operation) are no
+        # longer active, and an op may not apply to every host (eg _run_once).
+        runnable = [
+            host for host in batch if host in active_hosts and op_hash in state.ops[host]
+        ]
+        if not runnable:
+            return set()
+
+        greenlet_to_host = {
+            state.pool.spawn(_run_host_op_with_context, state, host, op_hash): host
+            for host in runnable
+        }
+
+        # Trigger CLI progress as hosts complete
+        for greenlet in gevent.iwait(greenlet_to_host.keys()):
+            progress(greenlet_to_host[greenlet])
+
+        return {host for greenlet, host in greenlet_to_host.items() if not greenlet.get()}
+
+    def run_group(group_rollout, progress):
+        # Hosts in batches admitted by an earlier operation still execute this one,
+        # reporting their real results even if the group is now paused.
+        for batch in group_rollout.admitted_batches():
+            failed_hosts = run_batch(batch, progress)
+            state.fail_hosts(failed_hosts)
+            group_rollout.record_errors(failed_hosts)
+
+        # Then admit further batches in order, one at a time.
+        while group_rollout.next_batch < len(group_rollout.batches):
+            # Budget exhausted: stop admitting new batches for this group. Hosts in
+            # already-admitted batches were handled above and are unaffected.
+            if group_rollout.paused:
+                return
+
+            batch = group_rollout.batches[group_rollout.next_batch]
+            # Admission advances before execution so unstarted-batch reporting
+            # reflects admission, not host health.
+            group_rollout.next_batch += 1
+
+            failed_hosts = run_batch(batch, progress)
+            # FAIL_PERCENT may raise here, aborting the whole run exactly as the
+            # non-rolling strategies do.
+            state.fail_hosts(failed_hosts)
+            group_rollout.record_errors(failed_hosts)
+
+    active_hosts = state.inventory.get_active_hosts()
+    with progress_spinner(active_hosts) as progress:
+        # One driver greenlet per service group; groups advance their batches
+        # concurrently, so a paused group never blocks another group's rollout.
+        group_greenlets = [
+            state.pool.spawn(run_group, group_rollout, progress)
+            for group_rollout in rollout.groups.values()
+            if group_rollout.has_any_host(active_hosts)
+        ]
+        gevent.joinall(group_greenlets)
+
+        # Surface FAIL_PERCENT and any other failure the same way _run_no_wait_ops
+        # does: a greenlet that ended with an exception must not be swallowed.
+        for greenlet in group_greenlets:
+            greenlet.get()
+
+
 def _run_single_op(state: State, op_hash: str):
     """
     Run a single operation for all servers. Can be configured to run in serial.
@@ -343,6 +426,11 @@ def _run_single_op(state: State, op_hash: str):
     log_operation_start(op_meta)
 
     if op_meta.global_arguments["_serial"]:
+        if op_meta.global_arguments["_batch_size"]:
+            raise PyinfraError(
+                "Cannot combine `_serial` with `_batch_size` on the same operation.",
+            )
+
         with progress_spinner(state.inventory.get_active_hosts()) as progress:
             # For each host, run the op
             for host in state.inventory.get_active_hosts():
@@ -353,6 +441,9 @@ def _run_single_op(state: State, op_hash: str):
                 # operation before it runs on the remaining hosts.
                 if not result:
                     state.fail_hosts({host})
+
+    elif op_meta.global_arguments["_batch_size"]:
+        _run_rollout_op(state, op_hash)
 
     else:
         # Start with the whole inventory in one batch

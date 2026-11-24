@@ -191,19 +191,26 @@ def build_plan_json(state: State) -> list[dict]:
 
 def build_results_json(state: State) -> dict:
     operations: list[dict] = []
-    totals = {"hosts": 0, "success": 0, "error": 0, "no_change": 0}
+    totals = {"hosts": 0, "success": 0, "error": 0, "no_change": 0, "not_started": 0}
+    rollout = state.rollout
 
     for op_hash in state.get_op_order():
         hosts_in_op = 0
         success: list[str] = []
         error: list[str] = []
         no_change: list[str] = []
+        not_started: list[str] = []
 
         for host in state.inventory.iter_activated_hosts():
             if op_hash not in state.ops[host]:
                 continue
 
             hosts_in_op += 1
+
+            if rollout is not None and rollout.is_host_unstarted(host):
+                not_started.append(host.name)
+                continue
+
             op_meta = state.ops[host][op_hash].operation_meta
             if op_meta.did_succeed(_raise_if_not_complete=False):
                 if op_meta.did_change():
@@ -213,30 +220,45 @@ def build_results_json(state: State) -> dict:
             else:
                 error.append(host.name)
 
-        meta = state.op_meta[op_hash]
-        operations.append(
-            {
-                "op_hash": op_hash,
-                "name": pretty_op_name(meta),
-                "names": sorted(meta.names),
-                "args": list(meta.args),
-                "hosts": hosts_in_op,
-                "success": sorted(success),
-                "error": sorted(error),
-                "no_change": sorted(no_change),
-            }
-        )
+        result = {
+            "op_hash": op_hash,
+            "name": pretty_op_name(state.op_meta[op_hash]),
+            "names": sorted(state.op_meta[op_hash].names),
+            "args": list(state.op_meta[op_hash].args),
+            "hosts": hosts_in_op,
+            "success": sorted(success),
+            "error": sorted(error),
+            "no_change": sorted(no_change),
+        }
+        if rollout is not None:
+            result["not_started"] = sorted(not_started)
+        operations.append(result)
 
         totals["hosts"] += hosts_in_op
         totals["success"] += len(success)
         totals["error"] += len(error)
         totals["no_change"] += len(no_change)
+        totals["not_started"] += len(not_started)
 
-    return {
+    payload: dict = {
         "operations": operations,
-        "totals": totals,
+        "totals": (
+            totals
+            if rollout is not None
+            else {k: v for k, v in totals.items() if k != "not_started"}
+        ),
         "failed_hosts": sorted(host.name for host in state.failed_hosts),
     }
+
+    if rollout is not None:
+        payload["unstarted_batches"] = {
+            (group_name if group_name is not None else "(ungrouped)"): [
+                [host.name for host in batch] for batch in batches
+            ]
+            for group_name, batches in rollout.get_unstarted_batches().items()
+        }
+
+    return payload
 
 
 def print_run_json(state: State, dry: bool) -> None:
@@ -516,22 +538,40 @@ def print_meta(state: State):
 
 
 def print_results(state: State):
+    # A grouped rollout can leave whole batches unstarted when a group pauses on
+    # its error budget. Those hosts are still active, so distinguish them from
+    # hosts that actually ran the operation and errored.
+    rollout = state.rollout
+    include_not_started = rollout is not None
+
     rows: list[tuple[Callable, list[str] | str]] = [
-        (logger.info, ["Operation", "Hosts", "Success", "Error", "No Change"]),
+        (
+            logger.info,
+            (
+                ["Operation", "Hosts", "Success", "Error", "No Change", "Not Started"]
+                if include_not_started
+                else ["Operation", "Hosts", "Success", "Error", "No Change"]
+            ),
+        ),
     ]
 
-    totals = {"hosts": 0, "success": 0, "error": 0, "no_change": 0}
+    totals = {"hosts": 0, "success": 0, "error": 0, "no_change": 0, "not_started": 0}
 
     for op_hash in state.get_op_order():
         hosts_in_op = 0
         hosts_in_op_success: list[str] = []
         hosts_in_op_error: list[str] = []
         hosts_in_op_no_change: list[str] = []
+        hosts_in_op_not_started: list[str] = []
         for host in state.inventory.iter_activated_hosts():
             if op_hash not in state.ops[host]:
                 continue
 
             hosts_in_op += 1
+
+            if include_not_started and rollout.is_host_unstarted(host):  # type: ignore[union-attr]
+                hosts_in_op_not_started.append(host.name)
+                continue
 
             op_meta = state.ops[host][op_hash].operation_meta
             if op_meta.did_succeed(_raise_if_not_complete=False):
@@ -570,9 +610,50 @@ def print_results(state: State):
         else:
             row.append("-")
 
+        if include_not_started:
+            if hosts_in_op_not_started:
+                num_not_started = len(hosts_in_op_not_started)
+                row.append(
+                    f"{num_not_started} "
+                    f"({truncate(', '.join(sorted(hosts_in_op_not_started)), 48)})",
+                )
+                totals["not_started"] += num_not_started
+            else:
+                row.append("-")
+
         rows.append((logger.info, row))
 
-    totals_row = ["Grand total"] + [str(i) if i else "-" for i in totals.values()]
+    totals_row = ["Grand total"] + [
+        str(i) if i else "-"
+        for i in (
+            totals.values()
+            if include_not_started
+            else (totals[key] for key in ("hosts", "success", "error", "no_change"))
+        )
+    ]
     rows.append((logger.info, totals_row))
 
     print_rows(rows)
+
+    if include_not_started:
+        _print_unstarted_batches(state)
+
+
+def _print_unstarted_batches(state: State) -> None:
+    """Name the service-group batches that were never admitted, group by group."""
+
+    rollout = state.rollout
+    if rollout is None:
+        return
+
+    unstarted = rollout.get_unstarted_batches()
+    if not unstarted:
+        return
+
+    console.print()
+    console.print("--> Rollout batches not started (group error budget reached):")
+    for group_name, batches in unstarted.items():
+        label = group_name if group_name is not None else "(ungrouped)"
+        for batch in batches:
+            host_names = ", ".join(host.name for host in batch)
+            console.print(f"    {format_text(str(label), bold=True)}: {host_names}")

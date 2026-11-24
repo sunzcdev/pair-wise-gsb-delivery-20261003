@@ -72,6 +72,8 @@ class PyinfraOperation(Generic[P], Protocol):
         _parallel: None | int = None,
         _run_once: bool = False,
         _serial: bool = False,
+        _batch_size: None | int = None,
+        _error_budget: None | dict[str, int] = None,
         #
         # op args
         #

@@ -2,6 +2,7 @@
 
 Core:
 
+- api: add `_batch_size` grouped rolling rollout with per-group `_error_budget`, pausing a group's new batches while admitted batches and other service groups keep reporting real results
 - api: name operations and hosts in dependency cycle errors (#2049) (@ynaamane)
 
 Operations/facts:

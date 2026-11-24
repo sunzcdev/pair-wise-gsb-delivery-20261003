@@ -243,6 +243,8 @@ class ExecutionArguments(TypedDict):
     _parallel: int
     _run_once: bool
     _serial: bool
+    _batch_size: int
+    _error_budget: dict[str, int] | None
 
 
 execution_argument_meta: dict[str, ArgumentMeta] = {
@@ -261,6 +263,25 @@ execution_argument_meta: dict[str, ArgumentMeta] = {
     "_serial": ArgumentMeta(
         "Run this operation host by host, rather than in parallel.",
         default=lambda _: False,
+    ),
+    "_batch_size": ArgumentMeta(
+        (
+            "Roll this operation out in fixed-size batches, independently per inventory group. "
+            "A batch must finish on every host in the group before the group's next batch is "
+            "admitted, while different groups continue independently. ``0`` (the default) "
+            "disables grouped rolling and uses the normal parallel/serial dispatch."
+        ),
+        default=lambda _: 0,
+    ),
+    "_error_budget": ArgumentMeta(
+        (
+            "Mapping of inventory group name to the number of failed hosts that group may "
+            "tolerate during a grouped rollout (requires ``_batch_size``). Once the budget is "
+            "reached the group stops admitting new batches; batches already admitted still run "
+            "and report their real results, and other groups are unaffected. Groups absent from "
+            "the mapping have an unlimited budget."
+        ),
+        default=lambda _: None,
     ),
 }
 
@@ -350,8 +371,9 @@ __argument_docs__ = {
         By default, every operation runs against **all hosts in parallel** (capped by the open-file
         limit). ``_parallel`` lowers that cap for a single operation, ``_serial`` forces host-by-host
         execution, and ``_run_once`` executes only against the first host that reaches the operation.
-        These three are mutually exclusive on a per-operation basis and must take the same value on
-        every host.
+        ``_batch_size`` instead rolls the operation out in fixed-size batches per inventory group,
+        with ``_error_budget`` pausing a group's new batches once its budget is exhausted. The
+        execution strategy must take the same value on every host.
         """,
         "",
     ),
