@@ -1,6 +1,6 @@
 {
     "arg": "/tmp/foo",
-    "command": "awk '/# END PYINFRA BLOCK/{ f=0} f; /# BEGIN PYINFRA BLOCK/{ f=1} ' /tmp/foo || (find /tmp/foo -type f > /dev/null && echo __pyinfra_exists_/tmp/foo || echo __pyinfra_missing_/tmp/foo )",
+    "command": "awk '/# END PYINFRA BLOCK/{ if (f != 1) bad = 1; f = 0; nend++; next} f; /# BEGIN PYINFRA BLOCK/{ if (f != 0) bad = 1; f = 1; nbegin++} END {if (bad || f != 0 || nbegin > 1 || nend > 1) print \"__pyinfra_invalid_block_markers\"}' /tmp/foo || (find /tmp/foo -type f > /dev/null && echo __pyinfra_exists_/tmp/foo || echo __pyinfra_missing_/tmp/foo )",
     "output": [
         "__pyinfra_exists_/tmp/foo"
     ],

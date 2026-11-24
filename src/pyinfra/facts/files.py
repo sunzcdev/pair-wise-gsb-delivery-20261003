@@ -645,6 +645,10 @@ MARKER_BEGIN_DEFAULT = "BEGIN"
 MARKER_END_DEFAULT = "END"
 EXISTS = "__pyinfra_exists_"
 MISSING = "__pyinfra_missing_"
+# Returned (as the last line of output) by the ``Block`` fact command when the
+# begin/end markers do not exactly surround a single block, ie they are
+# duplicated, interleaved or one of them is missing.
+INVALID_MARKERS = "__pyinfra_invalid_block_markers"
 
 
 class Block(FactBase):
@@ -663,6 +667,9 @@ class Block(FactBase):
 
     If the ``path`` exists but the markers are not found
         returns ``[]``
+
+    If the markers are duplicated, interleaved or unpaired (so they do not
+        exactly surround a single block) returns ``INVALID_MARKERS``
     """
 
     # if markers aren't found, awk will return 0 and produce no output but we need to
@@ -687,7 +694,10 @@ class Block(FactBase):
         )
 
         cmd = StringCommand(
-            f"awk '/{end}/{{ f=0}} f; /{start}/{{ f=1}} ' ",
+            f"awk '/{end}/{{ if (f != 1) bad = 1; f = 0; nend++; next}} f; "
+            f"/{start}/{{ if (f != 0) bad = 1; f = 1; nbegin++}} "
+            f'END {{if (bad || f != 0 || nbegin > 1 || nend > 1) print "{INVALID_MARKERS}"}}'
+            "' ",
             QuoteString(path),
             " || ",
             backstop,
@@ -701,6 +711,8 @@ class Block(FactBase):
             return []
         if output and (output[0] == f"{MISSING}{self.path}"):
             return None
+        if output and (output[-1] == INVALID_MARKERS):
+            return INVALID_MARKERS
         return output
 
 

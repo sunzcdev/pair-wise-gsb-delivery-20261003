@@ -17,6 +17,6 @@
         }
     },
     "commands": [
-        "OUT=\"$(TMPDIR=_tempdir_ mktemp -t pyinfra.XXXXXX)\" &&  ( awk '{{print}}' /dev/null  -  > \"$OUT\" <<'PYINFRAHERE'\n# BEGIN PYINFRA BLOCK\nplease add this\n# END PYINFRA BLOCK\nPYINFRAHERE\n )  && mv \"$OUT\" /home/someone/something"
+        "if grep -qF -e '# BEGIN PYINFRA BLOCK' -e '# END PYINFRA BLOCK' /home/someone/something 2>/dev/null; then echo 'pyinfra: unexpected block markers in /home/someone/something, not modifying the file' >&2; exit 1; fi && OUT=\"$(TMPDIR=_tempdir_ mktemp -t pyinfra.XXXXXX)\" &&  ( awk '{{print}}' /dev/null  -  > \"$OUT\" <<'PYINFRAHERE'\n# BEGIN PYINFRA BLOCK\nplease add this\n# END PYINFRA BLOCK\nPYINFRAHERE\n )  && mv \"$OUT\" /home/someone/something"
     ]
 }

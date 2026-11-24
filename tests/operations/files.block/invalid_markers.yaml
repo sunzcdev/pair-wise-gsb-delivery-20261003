@@ -1,0 +1,14 @@
+require_platform:
+- Darwin
+- Linux
+args:
+- /home/someone/something
+kwargs:
+  content: should be this
+facts:
+  files.Block:
+    begin=None, end=None, marker=None, path=/home/someone/something: __pyinfra_invalid_block_markers
+exception:
+  names:
+  - OperationValueError
+  message: "the block markers in '/home/someone/something' do not exactly surround a single block (they are duplicated, interleaved or unpaired); not modifying the file"

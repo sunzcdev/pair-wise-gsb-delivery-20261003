@@ -14,4 +14,5 @@ facts:
     - previously was something else
 commands:
 - |-
-  OUT="$(TMPDIR=_tempdir_ mktemp -t pyinfra.XXXXXX)" &&  awk 'BEGIN {{f=1; x=ARGV[2]; ARGV[2]=""}}/# BEGIN PYINFRA BLOCK/ {print; print x; f=0} /# END PYINFRA BLOCK/ {print; f=1; next} f' /home/someone/something 'should be this' > "$OUT"  && mv "$OUT" /home/someone/something
+  OUT="$(TMPDIR=_tempdir_ mktemp -t pyinfra.XXXXXX)" &&  awk 'BEGIN {f=0; x=ARGV[2]; ARGV[2]=""; e=ARGV[3]; ARGV[3]=""} /# BEGIN PYINFRA BLOCK/ {n1++; if (f != 0 || n1 > 1) bad=1; f=1; print; next} /# END PYINFRA BLOCK/ {n2++; if (f != 1 || n2 > 1) bad=1; f=0; if (crlf) {gsub(/\n/, "\r\n", x); x=x "\r"} print x; print; next} f == 1 {if (!checked) {checked=1; crlf=(substr($0, length($0)) == "\r")} cur=cur $0 "\n"; next} {print} END {if (bad || f != 0 || n1 != 1 || n2 != 1) {print "pyinfra: invalid block markers in " FILENAME ", not modifying the file" > "/dev/stderr"; exit 1} if (cur != e) {print "pyinfra: block in " FILENAME " changed since this plan was made, not modifying the file" > "/dev/stderr"; exit 1}}' /home/someone/something 'should be this' 'previously was something else
+  ' > "$OUT"  && mv "$OUT" /home/someone/something

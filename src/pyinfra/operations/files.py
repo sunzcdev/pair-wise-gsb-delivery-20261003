@@ -42,6 +42,7 @@ from pyinfra.api.util import (
     memoize,
 )
 from pyinfra.facts.files import (
+    INVALID_MARKERS,
     MARKER_BEGIN_DEFAULT,
     MARKER_DEFAULT,
     MARKER_END_DEFAULT,
@@ -2037,6 +2038,23 @@ def block(
 
     Removal ignores ``content`` and ``line``
 
+    Invalid markers are rejected
+        The markers in the file must exactly surround a single block. If they
+        are duplicated, interleaved or one of them is missing, the operation
+        fails and the file is left untouched.
+
+    Concurrent modification is detected
+        The generated command re-validates the markers and the block contents
+        at execution time. If the managed block changed since the plan was made
+        the command fails, reporting that the plan is stale, and the file is
+        left byte-for-byte unchanged. Changes made *outside* the managed block
+        are preserved.
+
+    Newlines and metadata are preserved
+        When replacing an existing block, the line ending style (LF or CRLF)
+        used by that block is preserved, as are the file's owner, group and
+        mode (unless ``preserve_meta=False``).
+
     ``content`` is written to the file verbatim. It is shell-quoted before being passed to
     ``awk``, so shell metacharacters (``$(...)``, quotes, backticks) are kept literal and never
     expanded on the remote host.
@@ -2094,7 +2112,12 @@ def block(
     mark_2 = (marker or MARKER_DEFAULT).format(mark=end or MARKER_END_DEFAULT)
 
     current = host.get_fact(Block, path=path, marker=marker, begin=begin, end=end)
-    cmd = None
+
+    if current == INVALID_MARKERS:
+        raise OperationValueError(
+            f"the block markers in {path!r} do not exactly surround a single block "
+            "(they are duplicated, interleaved or unpaired); not modifying the file"
+        )
 
     # Use _temp_dir global argument if provided, otherwise fall back to config
     tmp_dir = None
@@ -2152,8 +2175,28 @@ def block(
             out_prep,
         )
 
-    current = host.get_fact(Block, path=path, marker=marker, begin=begin, end=end)
-    # None means file didn't exist, empty list means marker was not found
+    # Fails the command (leaving the file untouched) when the file contains any block
+    # markers. Used by the insert paths: the plan was made assuming no block exists, so
+    # finding markers at execution time means they are invalid (eg unpaired) or the file
+    # changed since the plan was made.
+    no_markers_guard = StringCommand(
+        "if grep -qF -e",
+        QuoteString(mark_1),
+        "-e",
+        QuoteString(mark_2),
+        q_path,
+        "2>/dev/null; then echo 'pyinfra: unexpected block markers in "
+        f"{path}, not modifying the file' >&2; exit 1; fi &&",
+    )
+
+    # awk statements (shared by the update and remove commands) that validate the markers
+    # exactly surround a single block, exiting non-zero - before ``mv`` replaces the
+    # file - when they do not.
+    invalid_markers_exit = (
+        'print "pyinfra: invalid block markers in " FILENAME ", not modifying the file"'
+        ' > "/dev/stderr"; exit 1'
+    )
+
     cmd = None
     if present:
         if not content:
@@ -2180,6 +2223,7 @@ def block(
             here = "PYINFRAHERE"
             original = q_path if current is not None else QuoteString("/dev/null")
             cmd = StringCommand(
+                no_markers_guard,
                 out_prep,
                 "(",
                 "awk '{{print}}'",
@@ -2202,6 +2246,7 @@ def block(
                 f"END {{if (f==0) print x }} {print_before}'"
             )
             cmd = StringCommand(
+                no_markers_guard,
                 out_prep,
                 prog,
                 q_path,
@@ -2210,18 +2255,37 @@ def block(
                 real_out,
             )
         else:
-            if (len(current) != len(content)) or (
-                not all(lines[0] == lines[1] for lines in zip(content, current, strict=True))
+            # The existing block may use CRLF line endings; detect that (the fact keeps
+            # the trailing carriage returns) so the replacement reuses the same style
+            # and idempotency comparisons ignore it.
+            crlf = all(line_.endswith("\r") for line_ in current)
+            current_content = [line_[:-1] for line_ in current] if crlf else current
+            if (len(current_content) != len(content)) or (
+                not all(
+                    lines[0] == lines[1] for lines in zip(content, current_content, strict=True)
+                )
             ):  # marked_block found but text is different
+                # The expected current block content, exactly as awk re-assembles it
+                # below (one trailing newline per line, carriage returns included).
+                expected = "".join(f"{line_}\n" for line_ in current)
                 prog = (
-                    'awk \'BEGIN {{f=1; x=ARGV[2]; ARGV[2]=""}}'
-                    f"/{mark_1}/ {{print; print x; f=0}} /{mark_2}/ {{print; f=1; next}} f'"
+                    "awk 'BEGIN {f=0; x=ARGV[2]; ARGV[2]=\"\"; e=ARGV[3]; ARGV[3]=\"\"} "
+                    f"/{mark_1}/ {{n1++; if (f != 0 || n1 > 1) bad=1; f=1; print; next}} "
+                    f"/{mark_2}/ {{n2++; if (f != 1 || n2 > 1) bad=1; f=0; "
+                    'if (crlf) {gsub(/\\n/, "\\r\\n", x); x=x "\\r"} print x; print; next} '
+                    'f == 1 {if (!checked) {checked=1; crlf=(substr($0, length($0)) == "\\r")} '
+                    'cur=cur $0 "\\n"; next} '
+                    "{print} "
+                    f"END {{if (bad || f != 0 || n1 != 1 || n2 != 1) {{{invalid_markers_exit}}} "
+                    'if (cur != e) {print "pyinfra: block in " FILENAME " changed since this '
+                    'plan was made, not modifying the file" > "/dev/stderr"; exit 1}}\''
                 )
                 cmd = StringCommand(
                     out_prep,
                     prog,
                     q_path,
                     QuoteString(block_content),
+                    QuoteString(expected),
                     '> "$OUT"',
                     real_out,
                 )
@@ -2238,8 +2302,14 @@ def block(
         elif current == []:
             host.noop("no remove required: markers not found")
         else:
-            cmd = StringCommand(f"awk '/{mark_1}/,/{mark_2}/ {{next}} 1'")
-            yield StringCommand(out_prep, cmd, q_path, "> $OUT", real_out)
+            prog = (
+                "awk '"
+                f"/{mark_1}/ {{n1++; if (f != 0 || n1 > 1) bad=1; f=1; next}} "
+                f"/{mark_2}/ {{n2++; if (f != 1 || n2 > 1) bad=1; f=0; next}} "
+                "f == 0 {print} "
+                f"END {{if (bad || f != 0 || n1 != 1 || n2 != 1) {{{invalid_markers_exit}}}}}'"
+            )
+            yield StringCommand(out_prep, prog, q_path, "> $OUT", real_out)
 
 
 _TAR_FORMATS = {
