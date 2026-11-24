@@ -54,7 +54,7 @@ from luigi.event import Event
 from luigi.parameter import BoolParameter, FloatParameter, IntParameter, OptionalParameter, Parameter, TimeDeltaParameter
 from luigi.scheduler import DISABLED, DONE, FAILED, PENDING, UNKNOWN, WORKER_STATE_ACTIVE, WORKER_STATE_DISABLED, RetryPolicy, Scheduler
 from luigi.target import Target
-from luigi.task import Config, DynamicRequirements, Task, flatten
+from luigi.task import Config, DynamicRequirements, ResumableDynamicRequirements, Task, flatten
 from luigi.task_register import TaskClassException, load_task
 from luigi.task_status import RUNNING
 
@@ -142,12 +142,13 @@ class TaskProcess(multiprocessing.Process):
         self.check_complete = functools.partial(check_complete_cached, completion_cache=task_completion_cache)
 
     def _run_get_new_deps(self):
-        task_gen = self.task.run()
+        task_gen, resumable = self._get_task_generator()
 
-        if not isinstance(task_gen, collections.abc.Generator):
+        if task_gen is None:
             return None
 
         next_send = None
+        seen_stage_keys = set()
         while True:
             try:
                 if next_send is None:
@@ -157,17 +158,58 @@ class TaskProcess(multiprocessing.Process):
             except StopIteration:
                 return None
 
-            # if requires is not a DynamicRequirements, create one to use its default behavior
-            if not isinstance(requires, DynamicRequirements):
+            if resumable:
+                # staged tasks must identify every group explicitly, so that a
+                # resuming worker can match groups by identity instead of by
+                # the number of yields that happened so far
+                if not isinstance(requires, ResumableDynamicRequirements):
+                    raise TaskException(
+                        "run_stages() of %s must yield ResumableDynamicRequirements "
+                        "instances with an explicit key, got %r" % (self.task, requires)
+                    )
+                if requires.key in seen_stage_keys:
+                    raise TaskException(
+                        "run_stages() of %s yielded two requirement groups with the same key %r" % (self.task, requires.key)
+                    )
+                seen_stage_keys.add(requires.key)
+            elif not isinstance(requires, DynamicRequirements):
+                # if requires is not a DynamicRequirements, create one to use its default behavior
                 requires = DynamicRequirements(requires)
 
             if not requires.complete(self.check_complete):
                 # not all requirements are complete, return them which adds them to the tree
-                new_deps = [(t.task_module, t.task_family, t.to_str_params()) for t in requires.flat_requirements]
+                if resumable:
+                    # only re-schedule the members whose outputs are not
+                    # confirmed yet, never the whole group
+                    incomplete = requires.incomplete(self.check_complete)
+                else:
+                    incomplete = requires.flat_requirements
+                new_deps = [(t.task_module, t.task_family, t.to_str_params()) for t in incomplete]
                 return new_deps
 
             # get the next generator result
             next_send = requires.paths
+
+    def _get_task_generator(self):
+        """
+        Returns a tuple of (generator, resumable).
+
+        Tasks overriding :py:meth:`Task.run_stages` get the explicit resumable
+        entry point; all other tasks keep the legacy generator ``run()``
+        behavior. Returns (None, ...) when there is no generator to drive.
+        """
+        if type(self.task).run_stages is not Task.run_stages:
+            task_gen = self.task.run_stages()
+            if task_gen is None:
+                return None, True
+            if not isinstance(task_gen, collections.abc.Generator):
+                raise TaskException("run_stages() of %s must be a generator yielding ResumableDynamicRequirements" % self.task)
+            return task_gen, True
+
+        task_gen = self.task.run()
+        if not isinstance(task_gen, collections.abc.Generator):
+            return None, False
+        return task_gen, False
 
     def run(self):
         logger.info("[pid %s] Worker %s running   %s", os.getpid(), self.worker_id, self.task)

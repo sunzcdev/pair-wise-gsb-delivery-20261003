@@ -701,6 +701,38 @@ class Task(metaclass=Register):
         """
         pass  # default impl
 
+    def run_stages(self):
+        """
+        Explicit resumable entry point for tasks that yield their dependencies
+        in multiple groups (e.g. a first batch whose outputs determine a second
+        batch) and that must be safely resumable by another worker.
+
+        Override this method instead of :py:meth:`run` when you need resume
+        semantics that are verified against the identity and the output state
+        of each group, rather than against how many yields have happened so
+        far. The method must be a generator yielding
+        :py:class:`ResumableDynamicRequirements` instances, each carrying a
+        stable, unique ``key`` identifying the group. Any final output of the
+        task should be written after the last yield, just like in a generator
+        ``run()`` method.
+
+        On (re-)scheduling, the worker re-drives this generator from the
+        beginning. For every yielded group it checks the group's key (which
+        must not repeat within a run) and the output state of every member.
+        Groups whose outputs are all confirmed are skipped; for the first
+        group with missing outputs, only the not-yet-confirmed members are
+        handed back to the scheduler as new dependencies, so a resuming worker
+        never re-runs confirmed work and never skips ahead to the final write
+        while a member's output is still missing.
+
+        If this method is overridden, it takes precedence over :py:meth:`run`.
+        Tasks that do not override it keep the legacy generator ``run()``
+        behavior unchanged.
+
+        The default implementation returns ``None`` (no staged requirements).
+        """
+        return None
+
     def on_failure(self, exception):
         """
         Override for custom error handling.
@@ -856,6 +888,45 @@ class DynamicRequirements(object):
 
         # default implementation
         return all(complete_fn(t) for t in self.flat_requirements)
+
+
+class ResumableDynamicRequirements(DynamicRequirements):
+    """
+    A group of dynamic requirements with an explicit, stable identity, to be
+    yielded from a task's :py:meth:`Task.run_stages` method.
+
+    In contrast to plain :py:class:`DynamicRequirements`, each instance carries
+    a mandatory ``key`` identifying the group. A worker that resumes the task
+    (possibly a different worker than the one that started it) matches groups
+    by this key and verifies the output state of every member, instead of
+    assuming that a certain number of yields may be skipped. For a partially
+    confirmed group, :py:meth:`incomplete` reports exactly the members whose
+    outputs are still missing, so that only those are re-scheduled.
+
+    .. py:attribute:: key
+
+        A hashable, stable identifier of the group. Must be unique among the
+        groups yielded by one ``run_stages()`` run and stable across worker
+        restarts.
+    """
+
+    def __init__(self, requirements, key, custom_complete=None):
+        if key is None:
+            raise ValueError("ResumableDynamicRequirements requires an explicit, non-None key")
+        super().__init__(requirements, custom_complete=custom_complete)
+        self.key = key
+
+    def incomplete(self, complete_fn=None):
+        """
+        Returns the list of member tasks whose outputs are not (yet) confirmed,
+        checking each member individually with *complete_fn*.
+        """
+        if complete_fn is None:
+
+            def complete_fn(task):
+                return task.complete()
+
+        return [t for t in self.flat_requirements if not complete_fn(t)]
 
 
 class ExternalTask(Task):

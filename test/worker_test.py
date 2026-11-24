@@ -136,6 +136,57 @@ class DynamicRequiresOtherModule(Task):
             f.write("Done!")
 
 
+class StagedItemTask(Task):
+    p = luigi.Parameter()
+
+    # test hooks (class attributes so dynamically re-loaded instances see them)
+    run_log_path = None
+    fail_for = frozenset()
+
+    def output(self):
+        return luigi.LocalTarget(self.p)
+
+    def run(self):
+        name = os.path.basename(self.p)
+        with open(type(self).run_log_path, "a") as f:
+            f.write(name + "\n")
+        if name in type(self).fail_for:
+            raise RuntimeError("simulating a worker dying on %s" % name)
+        with self.output().open("w") as f:
+            f.write("Done!")
+
+
+class StagedParentTask(Task):
+    p = luigi.Parameter()
+
+    def output(self):
+        return luigi.LocalTarget(os.path.join(self.p, "parent"))
+
+    def _batch(self, name, indexes):
+        return [StagedItemTask(p=os.path.join(self.p, "%s_%d" % (name, i))) for i in indexes]
+
+    def run_stages(self):
+        first = yield luigi.ResumableDynamicRequirements(self._batch("a", range(2)), key="batch-a")
+        # the second batch is only known once the first batch's outputs exist
+        second = yield luigi.ResumableDynamicRequirements(self._batch("b", range(2)), key="batch-b")
+        with self.output().open("w") as f:
+            for target in first + second:
+                for line in target.open("r"):
+                    print(line.strip(), file=f)
+
+
+class StagedParentMissingKeyTask(StagedParentTask):
+    def run_stages(self):
+        # not wrapped in ResumableDynamicRequirements: no explicit identity
+        yield [StagedItemTask(p=os.path.join(self.p, "a_0"))]
+
+
+class StagedParentDuplicateKeyTask(StagedParentTask):
+    def run_stages(self):
+        yield luigi.ResumableDynamicRequirements([StagedItemTask(p=os.path.join(self.p, "a_0"))], key="same-key")
+        yield luigi.ResumableDynamicRequirements([StagedItemTask(p=os.path.join(self.p, "a_1"))], key="same-key")
+
+
 class DummyErrorTask(Task):
     retry_index = 0
 
@@ -1171,6 +1222,91 @@ class DynamicDependenciesTest(LuigiTestCase):
 class DynamicDependenciesWithMultipleWorkersTest(DynamicDependenciesTest):
     n_workers = 100
     timeout = 10.0  # We run 7 tasks that take 0.5s each so it should take less than 3.5s
+
+
+class ResumableStagedDependenciesTest(LuigiTestCase):
+    def setUp(self):
+        self.p = tempfile.mkdtemp()
+        self.run_log = os.path.join(self.p, "run.log")
+        StagedItemTask.run_log_path = self.run_log
+        StagedItemTask.fail_for = frozenset()
+
+    def tearDown(self):
+        StagedItemTask.run_log_path = None
+        StagedItemTask.fail_for = frozenset()
+        shutil.rmtree(self.p)
+
+    def _item(self, name):
+        return StagedItemTask(p=os.path.join(self.p, name))
+
+    def _write_output(self, task):
+        with task.output().open("w") as f:
+            f.write("Done!")
+
+    def _read_run_log(self):
+        if not os.path.exists(self.run_log):
+            return []
+        with open(self.run_log) as f:
+            return [line.strip() for line in f if line.strip()]
+
+    def test_resume_with_second_batch_half_done(self):
+        # a first worker confirms batch a and half of batch b, then dies on b_1
+        StagedItemTask.fail_for = frozenset(["b_1"])
+        t = StagedParentTask(p=self.p)
+        self.assertFalse(luigi.build([t], local_scheduler=True, workers=1))
+        self.assertCountEqual(self._read_run_log(), ["a_0", "a_1", "b_0", "b_1"])
+        # the parent must not have skipped ahead to its final write while
+        # b_1's output is still missing
+        self.assertFalse(t.complete())
+
+        # a second worker continues from the confirmed state; b_1's output is
+        # still missing, so only that unconfirmed item is re-run
+        StagedItemTask.fail_for = frozenset()
+        os.remove(self.run_log)
+        t2 = StagedParentTask(p=self.p)
+        self.assertTrue(luigi.build([t2], local_scheduler=True, workers=1))
+        self.assertEqual(self._read_run_log(), ["b_1"])
+        self.assertTrue(t2.complete())
+        with t2.output().open("r") as f:
+            self.assertEqual(len(f.read().strip().splitlines()), 4)
+
+    def test_resume_returns_only_unconfirmed_group_members(self):
+        from luigi.worker import TaskProcess
+
+        t = StagedParentTask(p=self.p)
+        # batch a fully confirmed, batch b half confirmed (b_1 still missing)
+        for name in ("a_0", "a_1", "b_0"):
+            self._write_output(self._item(name))
+
+        process = TaskProcess(task=t, worker_id="w1", result_queue=mock.Mock(), status_reporter=mock.Mock())
+        new_deps = process._run_get_new_deps()
+
+        # only the unconfirmed member of the second group is handed back
+        self.assertEqual(len(new_deps), 1)
+        _, family, params = new_deps[0]
+        self.assertEqual(family, "StagedItemTask")
+        self.assertEqual(params["p"], os.path.join(self.p, "b_1"))
+        # the generator stopped at the incomplete group: no final write
+        self.assertFalse(t.complete())
+
+        # once the missing output shows up, the parent runs through to the end
+        self._write_output(self._item("b_1"))
+        process = TaskProcess(task=t, worker_id="w2", result_queue=mock.Mock(), status_reporter=mock.Mock())
+        self.assertIsNone(process._run_get_new_deps())
+        self.assertTrue(t.complete())
+
+    def test_stages_require_explicit_keys(self):
+        t = StagedParentMissingKeyTask(p=self.p)
+        self.assertFalse(luigi.build([t], local_scheduler=True, workers=1))
+        self.assertFalse(t.complete())
+
+    def test_stages_require_unique_keys(self):
+        # first group is already confirmed, so the duplicate key is only
+        # detected when the resumed run reaches the second group
+        self._write_output(StagedItemTask(p=os.path.join(self.p, "a_0")))
+        t = StagedParentDuplicateKeyTask(p=self.p)
+        self.assertFalse(luigi.build([t], local_scheduler=True, workers=1))
+        self.assertFalse(t.complete())
 
 
 class WorkerPingThreadTests(unittest.TestCase):
