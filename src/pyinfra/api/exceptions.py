@@ -132,3 +132,27 @@ class ArgumentTypeError(PyinfraError, TypeError):
     """
     Raised when global arguments are passed with invalid types.
     """
+
+
+class CrossHostDependencyError(PyinfraError):
+    """
+    Base class for an explicit cross-host operation dependency that cannot be satisfied.
+    """
+
+
+class CrossHostDependencyFailed(CrossHostDependencyError):
+    """
+    Raised when a host operation required by a cross-host dependency settles as failed.
+    """
+
+
+class CrossHostDependencyTimeout(CrossHostDependencyError, TimeoutError):
+    """
+    Raised when a cross-host dependency source does not settle before its bounded timeout.
+    """
+
+
+class UnresolvableCrossHostDependency(CrossHostDependencyError, ValueError):
+    """
+    Raised when a cross-host dependency refers to a host or operation that cannot exist.
+    """

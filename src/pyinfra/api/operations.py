@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import time
 import traceback
+from collections.abc import Callable
 from itertools import product
 from typing import TYPE_CHECKING, cast
 
 import gevent
+from gevent.lock import BoundedSemaphore
 from paramiko import SSHException
 
 from pyinfra import logger
@@ -16,7 +18,16 @@ from pyinfra.progress import progress_spinner
 
 from .arguments import CONNECTOR_ARGUMENT_KEYS, ConnectorArguments
 from .command import FunctionCommand, PyinfraCommand, StringCommand
-from .exceptions import NestedOperationError, PyinfraError
+from .dependencies import (
+    CrossHostDependencyGraph,
+    DependencyStatus,
+    OperationHandle,
+)
+from .exceptions import (
+    CrossHostDependencyError,
+    NestedOperationError,
+    PyinfraError,
+)
 from .util import (
     format_exception,
     log_error_or_warning,
@@ -391,6 +402,196 @@ def _run_single_op(state: State, op_hash: str):
     state.trigger_callbacks("operation_end", op_hash)
 
 
+def _run_cross_host_dependency_host_ops(
+    state: State,
+    host: Host,
+    graph: CrossHostDependencyGraph,
+    execution_slots: BoundedSemaphore,
+    progress: Callable[[tuple[Host, str]], None] | None = None,
+) -> None:
+    """
+    Run one host's local operation stream while honouring only explicit cross-host edges.
+
+    Waiting for an incoming edge blocks this host stream, not streams belonging to unrelated
+    hosts. This is the unit that prevents a cluster reload from overtaking its backend checks.
+    """
+
+    for op_hash in list(host.op_hash_order):
+        handle = OperationHandle(host.name, op_hash)
+
+        try:
+            graph.wait_for_target(handle)
+        except CrossHostDependencyError as error:
+            graph.block_target(handle, str(error))
+            logger.error(
+                "Skipping dependent operation on %s because its cross-host edge did not settle",
+                host,
+            )
+            if progress:
+                progress((host, op_hash))
+            raise
+
+        op_data = state.ops[host].get(op_hash)
+        if op_data is None:
+            graph.settle_node(handle, True, "operation is not present on host")
+            if progress:
+                progress((host, op_hash))
+            continue
+
+        operation_meta = op_data.operation_meta
+
+        # Recovery against the same State must not call set_complete() twice. A genuinely
+        # successful node is reused; incomplete timed-out nodes fall through and run again.
+        if operation_meta.is_complete():
+            success = operation_meta.did_succeed(_raise_if_not_complete=False) is True
+
+            if success:
+                graph.settle_node(
+                    handle,
+                    True,
+                    "already completed in the current State",
+                )
+                if progress:
+                    progress((host, op_hash))
+                continue
+
+            existing_settlement = graph.settlements.get(handle.node)
+            if (
+                existing_settlement is not None
+                and existing_settlement.status is not DependencyStatus.PENDING
+            ):
+                graph.settle_node(handle, False, "already failed")
+                if progress:
+                    progress((host, op_hash))
+                op_meta = state.get_op_meta(op_hash)
+                raise PyinfraError(
+                    f"Error in operation {', '.join(op_meta.names)} on {host}",
+                )
+
+            # graph.recover(reset_failed=True) explicitly discarded the terminal settlement.
+            operation_meta.reset_for_recovery()
+
+        op_meta = state.get_op_meta(op_hash)
+        log_operation_start(op_meta)
+
+        # Dependency waiting happens before acquiring an execution slot. Otherwise a target
+        # could occupy a limited parallel slot while waiting for a source that cannot be
+        # scheduled, creating an implementation-induced deadlock.
+        with execution_slots:
+            result = _run_host_op_with_context(state, host, op_hash)
+
+        if progress:
+            progress((host, op_hash))
+
+        graph.settle_node(handle, result)
+
+        if result is False:
+            raise PyinfraError(
+                f"Error in operation {', '.join(op_meta.names)} on {host}",
+            )
+
+
+def _run_cross_host_dependency_ops(state: State) -> None:
+    """
+    Run host-local streams concurrently and coordinate only registered cross-host edges.
+
+    A timed-out source's host greenlet is cancelled so an unresponsive call cannot keep the
+    run alive forever. Unrelated host streams are joined normally and therefore still finish.
+    """
+
+    graph = state.cross_host_dependencies
+    graph.arm(state)
+
+    active_hosts = list(state.inventory.get_active_hosts())
+    planned_operations = product(active_hosts, state.get_op_order())
+
+    dependency_errors: list[CrossHostDependencyError] = []
+    failed_hosts: set[Host] = set()
+    cancelled_hosts: set[Host] = set()
+
+    with progress_spinner(planned_operations) as progress:
+        parallel_limit = state.config.PARALLEL or len(active_hosts) or 1
+        execution_slots = BoundedSemaphore(parallel_limit)
+
+        # Spawn all host coordinators directly. They wait on edges outside the parallel
+        # semaphore; using state.pool here could block spawning the very source host a queued
+        # target is waiting for.
+        greenlet_to_host = {
+            gevent.spawn(
+                _run_cross_host_dependency_host_ops,
+                state,
+                host,
+                graph,
+                execution_slots,
+                progress,
+            ): host
+            for host in active_hosts
+        }
+        host_to_greenlet = {host: greenlet for greenlet, host in greenlet_to_host.items()}
+        pending = dict(greenlet_to_host)
+
+        while pending:
+            # Short bounded wait lets the coordinator enforce edge deadlines even when the
+            # target is not currently inside wait_for_target().
+            gevent.wait(list(pending), timeout=0.02)
+
+            for greenlet in list(pending):
+                if not greenlet.ready():
+                    continue
+
+                host = pending.pop(greenlet)
+                host_to_greenlet.pop(host, None)
+                exception = greenlet.exception
+
+                if exception is None:
+                    continue
+                if isinstance(exception, CrossHostDependencyError):
+                    dependency_errors.append(exception)
+                elif isinstance(exception, PyinfraError):
+                    failed_hosts.add(host)
+                elif isinstance(exception, gevent.GreenletExit) and host in cancelled_hosts:
+                    logger.debug("Cancelled unreachable dependency source on %s", host)
+                else:
+                    raise exception
+
+            graph.expire_edges()
+
+            # A deadline settles the *edge* as timed out. The source call may still be blocked,
+            # so cancel only that source host stream; unrelated greenlets remain untouched.
+            for edge in graph.edges:
+                if edge.status is not DependencyStatus.TIMED_OUT:
+                    continue
+                source_host = state.inventory.hosts.get(edge.source.host_name)
+                source_greenlet = host_to_greenlet.get(source_host) if source_host else None
+                if source_greenlet is not None and not source_greenlet.ready():
+                    cancelled_hosts.add(source_host)  # type: ignore[arg-type]
+                    source_greenlet.kill(block=False)
+
+    # Preserve pyinfra's normal fail-percent/no-host settlement, but never let that generic
+    # message hide which explicit edge failed or became unreachable.
+    fail_settlement_error: PyinfraError | None = None
+    try:
+        state.fail_hosts(failed_hosts)
+    except PyinfraError as error:
+        fail_settlement_error = error
+
+    if dependency_errors:
+        if len(dependency_errors) == 1:
+            raise dependency_errors[0] from fail_settlement_error
+        message = "Multiple cross-host dependencies were not satisfied:\n" + "\n".join(
+            str(error) for error in dependency_errors
+        )
+        raise CrossHostDependencyError(message) from fail_settlement_error
+
+    try:
+        graph.raise_if_unsatisfied()
+    except CrossHostDependencyError as error:
+        raise error from fail_settlement_error
+
+    if fail_settlement_error is not None:
+        raise fail_settlement_error
+
+
 def run_ops(state: State, serial: bool = False, no_wait: bool = False):
     """
     Runs all operations across all servers in a configurable manner.
@@ -408,6 +609,10 @@ def run_ops(state: State, serial: bool = False, no_wait: bool = False):
         # Run all ops, but server by server
         if serial:
             _run_serial_ops(state)
+        # Explicit cross-host edges use concurrent host streams so an edge blocks only its
+        # dependent stream, rather than inserting a global operation barrier.
+        elif state.cross_host_dependencies.edges:
+            _run_cross_host_dependency_ops(state)
         # Run all the ops on each server in parallel (not waiting at each operation)
         elif no_wait:
             _run_no_wait_ops(state)

@@ -52,10 +52,18 @@ class OperationMeta:
     _retry_attempts: int = 0
     _max_retries: int = 0
     _retry_succeeded: bool | None = None
+    _host: Host | None = None
 
-    def __init__(self, hash, is_change: bool | None):
+    def __init__(self, hash, is_change: bool | None, host: Host | None = None):
         self._hash = hash
         self._maybe_is_change = is_change
+        self._host = host
+
+    @property
+    def host(self) -> Host | None:
+        """Host on which this operation meta was created in API mode."""
+
+        return self._host
 
     @override
     def __repr__(self) -> str:
@@ -103,6 +111,21 @@ class OperationMeta:
 
     def is_complete(self) -> bool:
         return self._success is not None
+
+    def reset_for_recovery(self) -> None:
+        """
+        Clear completion state so an explicitly recovered failed node can run again.
+
+        This is not used by an ordinary run. The dependency graph calls it only after an
+        operator has explicitly reset a failed edge, ensuring stale failure state cannot be
+        mistaken for either success or a still-terminal failure.
+        """
+
+        self._success = None
+        self._commands = None
+        self._combined_output = None
+        self._retry_attempts = 0
+        self._retry_succeeded = None
 
     def _raise_if_not_complete(self) -> None:
         if not self.is_complete():
@@ -328,7 +351,7 @@ def _wrap_operation(func: Callable[P, Generator], _set_in_op: bool = True) -> Py
                     break
 
             if has_run:
-                return OperationMeta(op_hash, is_change=False)
+                return OperationMeta(op_hash, is_change=False, host=host)
 
         # Grab a reference to any *current* deploy data as this may change when
         # we later evaluate the operation at runtime.This means we put back the
@@ -383,7 +406,7 @@ def _wrap_operation(func: Callable[P, Generator], _set_in_op: bool = True) -> Py
         else:
             host_meta.ops_no_change += 1
 
-        operation_meta = OperationMeta(op_hash, op_is_change)
+        operation_meta = OperationMeta(op_hash, op_is_change, host=host)
 
         # Add the server-relevant commands
         op_data = StateOperationHostData(command_generator, global_arguments, operation_meta)

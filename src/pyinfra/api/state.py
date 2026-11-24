@@ -6,7 +6,7 @@ from enum import IntEnum
 from graphlib import CycleError, TopologicalSorter
 from itertools import pairwise
 from multiprocessing import cpu_count
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from collections.abc import Callable, Iterator
 
 from gevent.pool import Pool
@@ -15,6 +15,7 @@ from paramiko import PKey
 from pyinfra import logger
 
 from .config import Config
+from .dependencies import CrossHostDependency, CrossHostDependencyGraph, NodeRef
 from .exceptions import PyinfraError
 
 if TYPE_CHECKING:
@@ -168,6 +169,9 @@ class State:
     # A pyinfra.api.Config
     config: Config
 
+    # Explicit edges between operation nodes on different hosts
+    cross_host_dependencies: CrossHostDependencyGraph
+
     # Main gevent pool
     pool: Pool
 
@@ -276,6 +280,9 @@ class State:
         # Op basics
         self.op_meta: dict[str, StateOperationMeta] = {}  # maps operation hash -> names/etc
 
+        # Explicit cross-host operation edges. Empty graphs preserve the legacy schedulers.
+        self.cross_host_dependencies = CrossHostDependencyGraph()
+
         # Op dict for each host
         self.ops: dict[Host, dict[str, StateOperationHostData]] = {host: {} for host in inventory}
 
@@ -375,6 +382,67 @@ class State:
             final_op_order.extend(node_group)
 
         return final_op_order
+
+    def get_host_operation_order(self) -> list[NodeRef]:
+        """
+        Topological order of ``(host, operation hash)`` nodes with explicit cross-host edges.
+
+        Unlike :meth:`get_op_order`, this preserves which host owns each node. Execution does
+        not have to run this list as a global barrier; it is useful for validation and tooling.
+        """
+
+        return self.cross_host_dependencies.validate_dag(self)
+
+    def require_cross_host(
+        self,
+        target: Any,
+        sources: list[Any] | tuple[Any, ...] | None = None,
+        *,
+        checks: list[Any] | tuple[Any, ...] | None = None,
+        timeout: float | None = None,
+        name: str | None = None,
+    ) -> list[CrossHostDependency]:
+        """
+        Add explicit edges requiring every source operation to succeed before ``target`` runs.
+
+        Unlike placing all operations in one global operation order, these edges only block the
+        target's host stream. Hosts with unrelated operations remain runnable in parallel.
+        """
+
+        required_sources = sources if sources is not None else checks
+        if required_sources is None:
+            raise TypeError("require_cross_host() requires 'sources' (or alias 'checks').")
+        return self.cross_host_dependencies.require(
+            target,
+            required_sources,
+            timeout=timeout,
+            name=name,
+        )
+
+    def recover_cross_host_dependencies(
+        self,
+        *,
+        reset_failed: bool = False,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """
+        Recover explicit dependency state and reactivate hosts reset from known failures.
+
+        Timed-out/unreachable edges can be retried without ``reset_failed``. A known failed
+        edge remains terminal unless the operator explicitly passes ``reset_failed=True``
+        after correcting the cause.
+        """
+
+        plan = self.cross_host_dependencies.recover(reset_failed=reset_failed)
+
+        if reset_failed:
+            for edge in plan["failed"]:
+                host_name = edge["source"]["host"]
+                host = self.inventory.hosts.get(host_name)
+                if host is not None and host in self.failed_hosts:
+                    self.failed_hosts.remove(host)
+                    self.active_hosts.add(host)
+
+        return plan
 
     def get_op_meta(self, op_hash: str) -> StateOperationMeta:
         return self.op_meta[op_hash]

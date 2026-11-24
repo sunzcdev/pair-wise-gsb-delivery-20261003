@@ -9,8 +9,17 @@ from .command import (
 )
 from .hiddenvalue import HiddenValue
 from .config import Config
+from .dependencies import (
+    CrossHostDependency,
+    CrossHostDependencyGraph,
+    DependencyStatus,
+    OperationHandle,
+)
 from .deploy import deploy
 from .exceptions import (
+    CrossHostDependencyError,
+    CrossHostDependencyFailed,
+    CrossHostDependencyTimeout,
     DeployError,
     FactPreconditionError,
     FactError,
@@ -23,6 +32,7 @@ from .exceptions import (
     OperationError,
     OperationTypeError,
     OperationValueError,
+    UnresolvableCrossHostDependency,
 )
 from .facts import FactBase, ShortFactBase
 from .host import Host
@@ -33,6 +43,12 @@ from .state import BaseStateCallback, State
 __all__ = [
     "BaseStateCallback",
     "Config",
+    "CrossHostDependency",
+    "CrossHostDependencyError",
+    "CrossHostDependencyFailed",
+    "CrossHostDependencyGraph",
+    "CrossHostDependencyTimeout",
+    "DependencyStatus",
     "DeployError",
     "FactBase",
     "FactError",
@@ -51,6 +67,7 @@ __all__ = [
     "MaskString",
     "MissingCommandError",
     "OperationError",
+    "OperationHandle",
     "OperationTypeError",
     "OperationValueError",
     "QuoteString",
@@ -58,6 +75,7 @@ __all__ = [
     "ShortFactBase",
     "State",
     "StringCommand",
+    "UnresolvableCrossHostDependency",
     "deploy",
     "operation",
 ]
