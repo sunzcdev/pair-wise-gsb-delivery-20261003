@@ -1,3 +1,13 @@
+# Upgrading to version 1.8.x
+Batches can now be nested, which needs a new `parent_batch_id` column on the batches table. Fresh installs get it with the base schema; existing installations need to copy the migration that adds it and run it:
+
+```bash
+bin/rails solid_queue:update
+bin/rails db:migrate
+```
+
+Until you run it, everything works as before, batches aside: like the rest of the batches schema, the new column counts as pending migrations, so enqueuing batches raises `SolidQueue::Batch::PendingMigrations` and jobs enqueue without batch bookkeeping.
+
 # Upgrading to version 1.7.2
 Jobs with [concurrency controls](README.md#concurrency-controls) now remember which semaphore they got their slot from, in their serialized job data, and give the slot back only to that semaphore. Before, a job that ran past its `duration` gave its slot back to the semaphore a later job had created after the job's own one expired, so one more job than the limit allowed could run at the same time, and keep doing so until the jobs waiting for that key ran out.
 

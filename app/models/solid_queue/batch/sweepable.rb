@@ -35,11 +35,12 @@ module SolidQueue
             swept
           end
 
-          # A started batch with no tracking rows left can finish
+          # A started batch with no tracking rows left and no pending child
+          # batches can finish
           def finish_stalled_batches(batch_size:)
             finished = 0
 
-            unfinished.enqueued.without_executions.find_each(batch_size: batch_size) do |batch|
+            unfinished.enqueued.without_executions.without_pending_child_batches.find_each(batch_size: batch_size) do |batch|
               finished += 1
               batch.finish
             end

@@ -253,6 +253,115 @@ class SolidQueue::BatchTest < ActiveSupport::TestCase
     assert batch.active_job_batch_id.present?
   end
 
+  test "batches enqueued inside another batch's block become its children" do
+    child = nil
+    parent = SolidQueue::Batch.enqueue do
+      NiceJob.perform_later("parent job")
+      child = SolidQueue::Batch.enqueue { NiceJob.perform_later("child job") }
+    end
+
+    assert_equal parent.id, child.parent_batch_id
+    assert_equal [ child ], parent.child_batches
+  end
+
+  test "batches enqueued while performing one of the batch's jobs become its children" do
+    parent = SolidQueue::Batch.enqueue { NiceJob.perform_later("parent job") }
+    child = nil
+
+    SolidQueue::Batch.wrap_in_performing_batch_context(parent.id) do
+      child = SolidQueue::Batch.enqueue { NiceJob.perform_later("child job") }
+    end
+
+    assert_equal parent.id, child.parent_batch_id
+    # Plain jobs enqueued while performing don't join the batch on their own
+    assert_equal 1, parent.jobs.count
+  end
+
+  test "parent batch finishes only after its child batches finish" do
+    child = nil
+    parent = SolidQueue::Batch.enqueue(on_finish: BatchCompletionJob) do
+      NiceJob.perform_later("parent job")
+      child = SolidQueue::Batch.enqueue { NiceJob.perform_later("child job") }
+    end
+
+    parent.jobs.sole.finished!
+    assert_not parent.reload.finished?
+    assert_equal 0, SolidQueue::Job.where(class_name: "BatchCompletionJob").count
+
+    child.jobs.sole.finished!
+    assert child.reload.finished?
+    assert parent.reload.finished?
+    assert parent.succeeded?
+    assert_equal 1, SolidQueue::Job.where(class_name: "BatchCompletionJob").count
+  end
+
+  test "a failed child batch fails the parent without shifting its job counters" do
+    child = nil
+    parent = SolidQueue::Batch.enqueue do
+      NiceJob.perform_later("parent job")
+      child = SolidQueue::Batch.enqueue { NiceJob.perform_later("child job") }
+    end
+
+    parent.jobs.sole.finished!
+    child.jobs.sole.failed_with(RuntimeError.new("boom"))
+
+    assert child.reload.failed?
+    assert parent.reload.finished?
+    assert parent.failed?
+    assert_equal 1, parent.total_jobs
+    assert_equal 1, parent.completed_jobs
+    assert_equal 0, parent.failed_jobs
+  end
+
+  test "failure propagates up through multiple levels of nesting" do
+    child = grandchild = nil
+    parent = SolidQueue::Batch.enqueue do
+      NiceJob.perform_later("parent job")
+      child = SolidQueue::Batch.enqueue do
+        grandchild = SolidQueue::Batch.enqueue { NiceJob.perform_later("grandchild job") }
+      end
+    end
+
+    parent.jobs.sole.finished!
+    grandchild.jobs.sole.failed_with(RuntimeError.new("boom"))
+
+    assert grandchild.reload.failed?
+    assert child.reload.failed?
+    assert_equal 0, child.failed_jobs
+    assert parent.reload.failed?
+    assert_equal 0, parent.failed_jobs
+  end
+
+  test "reopening a batch as a child does not reparent it" do
+    parent = SolidQueue::Batch.enqueue { NiceJob.perform_later("parent job") }
+    child = SolidQueue::Batch.enqueue { NiceJob.perform_later("child job") }
+
+    SolidQueue::Batch.wrap_in_batch_context(parent.id) do
+      child.enqueue { NiceJob.perform_later("another child job") }
+    end
+
+    assert_nil child.parent_batch_id
+  end
+
+  test "sweep_stalled does not finish parents with pending child batches" do
+    child = nil
+    parent = SolidQueue::Batch.enqueue do
+      NiceJob.perform_later("parent job")
+      child = SolidQueue::Batch.enqueue { NiceJob.perform_later("child job") }
+    end
+
+    # Resolve the parent's job without callbacks, as a bulk discard would
+    parent.jobs.sole.update_columns(finished_at: Time.current)
+    SolidQueue::BatchExecution.where(batch_id: parent.id).delete_all
+
+    SolidQueue::Batch.sweep_stalled
+
+    assert_not parent.reload.finished?
+
+    child.jobs.sole.finished!
+    assert parent.reload.finished?
+  end
+
   test "cannot enqueue when the batch was finished concurrently" do
     batch = SolidQueue::Batch.enqueue(on_finish: BatchCompletionJob) do
       NiceJob.perform_later("world")

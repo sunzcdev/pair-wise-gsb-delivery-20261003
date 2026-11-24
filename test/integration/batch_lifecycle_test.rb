@@ -85,6 +85,22 @@ class BatchLifecycleTest < ActiveSupport::TestCase
     end
   end
 
+  class SpawnsChildBatchesJob < ApplicationJob
+    queue_as :background
+
+    def perform
+      SolidQueue::Batch.enqueue(on_success: BatchOnSuccessJob.new("child 1")) do
+        AddToBufferJob.perform_later "child 1 job"
+      end
+
+      SolidQueue::Batch.enqueue(on_failure: BatchOnFailureJob.new("child 2")) do
+        AddToBufferJob.perform_later "child 2 first"
+        FailingJob.perform_later
+        AddToBufferJob.perform_later "child 2 last"
+      end
+    end
+  end
+
   test "empty batches fire callbacks" do
     SolidQueue::Batch.enqueue(on_success: BatchOnSuccessJob.new("3")) do
       SolidQueue::Batch.enqueue(on_success: BatchOnSuccessJob.new("2")) do
@@ -125,6 +141,52 @@ class BatchLifecycleTest < ActiveSupport::TestCase
     assert_finished_in_order(job!(job3), batch2.reload)
     assert_finished_in_order(job!(job2), batch2)
     assert_finished_in_order(job!(job1), batch1.reload)
+  end
+
+  test "parent batch waits for child batches enqueued by its job, without holding a worker thread" do
+    # A single execution thread: the parent job enqueues two child batches and
+    # finishes. If waiting for the children held the thread, they could never
+    # run and this test would time out.
+    @worker = SolidQueue::Worker.new(queues: "background", threads: 1)
+
+    parent_batch = SolidQueue::Batch.enqueue(on_success: BatchOnSuccessJob.new("parent"), on_failure: BatchOnFailureJob.new("parent")) do
+      SpawnsChildBatchesJob.perform_later
+    end
+
+    @dispatcher.start
+    @worker.start
+
+    wait_for_batches_to_finish_for(10.seconds)
+    wait_for_jobs_to_finish_for(10.seconds)
+
+    parent_batch.reload
+    child_batch1, child_batch2 = parent_batch.child_batches.order(:id).to_a
+
+    # The child batches got the thread and ran to completion
+    assert_equal 3, SolidQueue::Batch.finished.count
+    assert child_batch1.succeeded?
+    assert child_batch2.failed?
+    assert_includes JobBuffer.values, "child 1 job"
+    assert_includes JobBuffer.values, "child 2 last"
+
+    # The parent's own job succeeded, but the failed child batch fails the parent
+    assert_equal 1, parent_batch.total_jobs
+    assert_equal 1, parent_batch.completed_jobs
+    assert_equal 0, parent_batch.failed_jobs
+    assert parent_batch.failed?
+
+    # The parent item ended long before its child batches, and the parent
+    # batch settled only after both of them did
+    parent_job = parent_batch.jobs.sole
+    assert_operator parent_job.finished_at, :<, child_batch2.reload.finished_at
+    assert_operator child_batch1.reload.finished_at, :<, parent_batch.finished_at
+    assert_operator child_batch2.finished_at, :<, parent_batch.finished_at
+
+    # Each batch fired the callback matching its actual result
+    assert_includes JobBuffer.values, "child 1: 1 jobs succeeded!"
+    assert_includes JobBuffer.values, "child 2: 1 jobs failed!"
+    assert_includes JobBuffer.values, "parent: 0 jobs failed!"
+    assert_not_includes JobBuffer.values, "parent: 1 jobs succeeded!"
   end
 
   test "prebuilt jobs capture their batch before enqueue is deferred" do

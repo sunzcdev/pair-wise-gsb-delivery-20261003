@@ -32,6 +32,7 @@ Solid Queue can be used with SQL databases such as MySQL, PostgreSQL, or SQLite,
   - [Error reporting on jobs](#error-reporting-on-jobs)
   - [Jobs interrupted by non-graceful process death](#jobs-interrupted-by-non-graceful-process-death)
 - [Batch jobs](#batch-jobs)
+  - [Nested batches](#nested-batches)
   - [Batch progress and counters](#batch-progress-and-counters)
   - [Batch maintenance](#batch-maintenance)
   - [Clearing batches](#clearing-batches)
@@ -717,6 +718,7 @@ Solid Queue supports grouping jobs into batches, so you can track the progress o
   - `on_success`: fired when all jobs have succeeded, including retries. It won't fire if any jobs have failed, but it will fire if jobs have been discarded using `discard_on`.
   - `on_failure`: fired when all jobs have finished, including retries, and one or more of them have failed.
 - Enqueuing more jobs for a batch from inside one of its jobs, with `batch.enqueue`
+- Nesting batches: a batch enqueued inside another batch—within its `enqueue` block or from inside one of its jobs—becomes its child
 - Attaching a description and arbitrary metadata to a batch
 
 Callback jobs are regular jobs: the batch doesn't pass them any arguments (although you can configure your own), and they can access the batch they belong to through the `batch` accessor:
@@ -768,6 +770,23 @@ Besides the callbacks, `SolidQueue::Batch.enqueue` accepts a `description:`, to 
 Callbacks can be given as a job class or as a configured job instance—for example, `on_finish: BatchFinishJob.new.set(queue: :batches)` or `on_success: BatchSuccessJob.new("some argument")`. Note that the job is serialized when the batch is created, so options resolved at that point (like `wait_until:` timestamps) are relative to batch creation, not to when the callback is eventually enqueued.
 
 Callback jobs always enqueue through Solid Queue, even when the job classes involved (or the application default) use a different Active Job adapter. And a batch that ends up with no jobs finishes as soon as it starts, firing its callbacks right away.
+
+### Nested batches
+
+A batch enqueued while another batch is active becomes a child of that batch. A batch is active inside its own `enqueue` block, and inside the `perform` of any of its jobs:
+
+```ruby
+class ImportJob < ApplicationJob
+  def perform
+    # This batch is a child of ImportJob's batch
+    SolidQueue::Batch.enqueue(on_success: NotifyJob) do
+      RowJob.perform_all_later(rows)
+    end
+  end
+end
+```
+
+A parent batch finishes only after all its child batches have finished, and a child batch that fails marks the parent as failed, so the parent's `on_failure` callback fires even when all its own jobs succeeded. The parent's job counters (`total_jobs`, `completed_jobs`, `failed_jobs`) only ever track its own jobs; child batches keep their own. Waiting for children doesn't hold a worker thread: the parent's completion is checked as jobs and child batches finish, so a single-threaded worker can run the children after the job that enqueued them has finished.
 
 ### Batch progress and counters
 

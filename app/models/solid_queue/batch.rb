@@ -16,10 +16,25 @@ module SolidQueue
     has_many :jobs
     has_many :batch_executions, dependent: :destroy
 
+    # A batch enqueued inside another batch's context (its enqueue block or one
+    # of its jobs' perform) becomes a child: the parent won't finish until all
+    # its children have, and a failed child fails the parent.
+    belongs_to :parent_batch, class_name: "SolidQueue::Batch", optional: true
+    has_many :child_batches, class_name: "SolidQueue::Batch", foreign_key: :parent_batch_id, inverse_of: :parent_batch
+
     store :metadata, coder: JSON
 
     # Join-free so update_all keeps this condition in the completion update's own WHERE
     scope :without_executions, -> { where.not(id: BatchExecution.select(:batch_id)) }
+
+    # The derived table lets MySQL update the same table the subquery reads.
+    # NULL parent ids must be filtered out: NOT IN doesn't match anything when
+    # the subquery yields NULLs.
+    scope :without_pending_child_batches, -> {
+      where.not(id: Batch.unscoped.select(:parent_batch_id).from(
+        Batch.unfinished.where.not(parent_batch_id: nil).select(:parent_batch_id), :pending_child_batches
+      ))
+    }
 
     # Provider-agnostic batch identifier, analogous to jobs.active_job_id.
     before_create :set_active_job_batch_id
@@ -31,7 +46,7 @@ module SolidQueue
       # migration, jobs enqueue without any batch bookkeeping and batches
       # themselves can't be used.
       def migrated?
-        @migrated ||= table_exists? && BatchExecution.table_exists? && Job.column_names.include?("batch_id")
+        @migrated ||= table_exists? && BatchExecution.table_exists? && Job.column_names.include?("batch_id") && column_names.include?("parent_batch_id")
       end
 
       def enqueue(description: nil, on_success: nil, on_failure: nil, on_finish: nil, metadata: nil, **extra_metadata, &block)
@@ -54,6 +69,21 @@ module SolidQueue
       ensure
         ActiveSupport::IsolatedExecutionState[:current_batch_id] = previous_batch_id
       end
+
+      # The batch whose job is currently performing, if any. Batches enqueued
+      # from inside a job become children of that job's batch. Unlike the
+      # enqueue block context, this doesn't make plain jobs join the batch.
+      def performing_batch_id
+        ActiveSupport::IsolatedExecutionState[:performing_batch_id]
+      end
+
+      def wrap_in_performing_batch_context(batch_id)
+        previous_batch_id = performing_batch_id.presence
+        ActiveSupport::IsolatedExecutionState[:performing_batch_id] = batch_id
+        yield
+      ensure
+        ActiveSupport::IsolatedExecutionState[:performing_batch_id] = previous_batch_id
+      end
     end
 
     def enqueue(&block)
@@ -64,7 +94,12 @@ module SolidQueue
       end
 
       transaction do
-        save! if new_record?
+        if new_record?
+          # The innermost active batch becomes the parent: an enclosing
+          # batch's enqueue block first, then the batch being performed.
+          self.parent_batch_id ||= self.class.current_batch_id.presence || self.class.performing_batch_id.presence
+          save!
+        end
 
         self.class.wrap_in_batch_context(id) { block&.call(self) }
 
@@ -90,11 +125,18 @@ module SolidQueue
     def finish
       return if finished? || !enqueued?
       return if batch_executions.exists?
+      return if child_batches.unfinished.exists?
 
+      finalized = false
       transaction do
-        updated = Batch.where(id: id).unfinished.enqueued.without_executions.update_all(finished_at: Time.current)
-        finalize if updated > 0
+        updated = Batch.where(id: id).unfinished.enqueued.without_executions.without_pending_child_batches.update_all(finished_at: Time.current)
+        finalized = finalize if updated > 0
       end
+
+      # Unblock the parent's own completion check outside this transaction, so
+      # it reads this batch's finished state as committed. Completion walks up
+      # the tree one level per finished batch, never holding a worker thread.
+      parent_batch&.finish if finalized
     end
 
     private
@@ -116,11 +158,13 @@ module SolidQueue
         # transaction's row lock keeps adders out, since they increment before
         # inserting their executions. MySQL doesn't need this: it reads DML
         # subqueries from the latest committed data, so its CAS can't win wrongly.
-        raise ActiveRecord::Rollback if batch_executions.exists?
+        raise ActiveRecord::Rollback if batch_executions.exists? || child_batches.unfinished.exists?
 
         SolidQueue.instrument(:finish_batch, batch_id: id) do |payload|
           failed_jobs = jobs.failed.count
-          failed_at = Time.current if failed_jobs > 0
+          # A failed child batch fails its parent, without shifting the
+          # parent's own job counters
+          failed_at = Time.current if failed_jobs > 0 || child_batches.failed.exists?
           completed_jobs = total_jobs - failed_jobs
 
           update_columns(failed_jobs:, failed_at:, completed_jobs:)
@@ -128,6 +172,8 @@ module SolidQueue
 
           payload.merge!(total_jobs:, failed_jobs:, completed_jobs:)
         end
+
+        true
       end
   end
 end

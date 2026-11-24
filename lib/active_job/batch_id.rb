@@ -9,6 +9,8 @@ module ActiveJob
     included do
       attr_accessor :batch_id
       attr_accessor :callback_batch_id
+
+      around_perform :wrap_perform_in_batch_context
     end
 
     # Seed membership at construction for enqueue paths deferred until after the
@@ -49,6 +51,17 @@ module ActiveJob
     end
 
     private
+
+      # Exposes the job's batch while it performs, so batches enqueued from
+      # inside #perform become its children. Plain jobs enqueued there don't
+      # join the batch: that still takes an explicit batch.enqueue block.
+      def wrap_perform_in_batch_context(&block)
+        if solid_queue_job? && batch_id.present?
+          SolidQueue::Batch.wrap_in_performing_batch_context(batch_id, &block)
+        else
+          block.call
+        end
+      end
 
       def solid_queue_job?
         self.class.queue_adapter_name == "solid_queue"
