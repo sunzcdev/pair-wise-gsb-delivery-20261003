@@ -6,6 +6,10 @@ Changelog
 ------------------
 - Dropped support for Python 3.8 (:pr:`106`) `Guido Imperiale`_
 - New object :class:`KeyMap` (:pr:`110`) `Guido Imperiale`_
+- ``File.__setitem__`` is now atomic: the value is written to a staging ``*.tmp`` file
+  and renamed into place, so a failed or interrupted write no longer destroys the
+  previously committed value nor leaves a truncated file that looks like a key to a
+  freshly opened ``File`` on the same directory.
 
 
 3.0.0 - 2023-04-17
