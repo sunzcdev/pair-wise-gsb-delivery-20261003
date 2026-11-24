@@ -14,6 +14,7 @@ require "bunny/authentication/external_mechanism_encoder"
 
 require "bunny/concurrent/continuation_queue"
 require "bunny/concurrent/exception_accumulator"
+require "bunny/concurrent/pending_channel_operation_registry"
 
 require "amq/protocol/client"
 require "amq/settings"
@@ -228,6 +229,14 @@ module Bunny
       @recovery_mutex      = @mutex_impl.new
 
       @channels            = Hash.new
+      # channel.open/channel.close continuations keyed by channel id, so that
+      # a response for a closed channel generation cannot be consumed by the
+      # channel that reused its id
+      @pending_channel_operations = Concurrent::PendingChannelOperationRegistry.new
+      # monotonically increasing generation per channel number; a close from
+      # an older generation must not release the id held by a newer one
+      @channel_generation_mutex = @mutex_impl.new
+      @channel_generations      = Hash.new(0)
 
       trf = @opts.fetch(:topology_recovery_filter, DefaultTopologyRecoveryFilter.new)
       @topology_registry = TopologyRegistry.new(topology_recovery_filter: trf)
@@ -653,33 +662,59 @@ module Bunny
 
     # @private
     def open_channel(ch)
-      @channel_mutex.synchronize do
-        n = ch.number
-        self.register_channel(ch)
+      n = ch.number
+      reserve_channel_number(n)
+      register_channel(ch)
 
-        @transport_mutex.synchronize do
-          @transport.send_frame(AMQ::Protocol::Channel::Open.encode(n, AMQ::Protocol::EMPTY_STRING))
+      begin
+        method = @pending_channel_operations.await(n, AMQ::Protocol::Channel::OpenOk, @continuation_timeout) do
+          @transport_mutex.synchronize do
+            @transport.send_frame(AMQ::Protocol::Channel::Open.encode(n, AMQ::Protocol::EMPTY_STRING))
+          end
         end
-        @last_channel_open_ok = wait_on_continuations
-        raise_if_continuation_resulted_in_a_connection_error!
-
-        @last_channel_open_ok
+      rescue ::Exception
+        remove_channel_from_registry(ch)
+        raise
       end
+      raise_if_continuation_resulted_in_a_connection_error!
+
+      # a frame from a previous generation reusing this id must not open this channel
+      raise UnexpectedProtocolMethodError.new(method, AMQ::Protocol::Channel::OpenOk) unless method.is_a?(AMQ::Protocol::Channel::OpenOk)
+
+      method
     end
 
     # @private
     def close_channel(ch)
-      @channel_mutex.synchronize do
-        n = ch.number
+      n = ch.number
+      generation = channel_generation(n)
 
-        @transport.send_frame(AMQ::Protocol::Channel::Close.encode(n, 200, "Goodbye", 0, 0))
-        @last_channel_close_ok = wait_on_continuations
-        raise_if_continuation_resulted_in_a_connection_error!
-
-        self.unregister_channel(ch)
-        self.release_channel_id(ch.id)
-        @last_channel_close_ok
+      begin
+        method = @pending_channel_operations.await(n, AMQ::Protocol::Channel::CloseOk, @continuation_timeout) do
+          @transport_mutex.synchronize do
+            @transport.send_frame(AMQ::Protocol::Channel::Close.encode(n, 200, "Goodbye", 0, 0))
+          end
+        end
+      rescue ::Exception
+        # the wait failed (e.g. timeout or connection loss): stop routing
+        # frames to a channel that is no longer usable, but keep its id
+        # reserved since the broker never acknowledged the close
+        remove_channel_from_registry(ch)
+        raise
       end
+      raise_if_continuation_resulted_in_a_connection_error!
+
+      # a frame from the channel generation that reused this id must not settle this close
+      raise UnexpectedProtocolMethodError.new(method, AMQ::Protocol::Channel::CloseOk) unless method.is_a?(AMQ::Protocol::Channel::CloseOk)
+
+      # The broker has acknowledged the close: only now is the channel removed
+      # from frame routing, so a late frame from the previous generation cannot
+      # reach the channel reusing the id. The id is released only when no newer
+      # generation has reserved it in the meantime.
+      remove_channel_from_registry(ch)
+      release_channel_id(n) if current_channel_generation?(n, generation)
+
+      method
     end
 
     # @private
@@ -730,9 +765,16 @@ module Bunny
       @logger.debug { "Session#handle_frame on #{ch_number}: #{method.inspect}" }
       case method
       when AMQ::Protocol::Channel::OpenOk then
-        @continuations.push(method)
+        # routed to the exact channel.open that requested it by id; if no
+        # operation is pending, the frame belongs to a stale generation and
+        # is ignored instead of waking up an unrelated waiter
+        unless @pending_channel_operations.deliver(ch_number, method)
+          @logger.warn "Received a channel.open-ok for channel #{ch_number} without a pending channel.open. Ignoring the frame."
+        end
       when AMQ::Protocol::Channel::CloseOk then
-        @continuations.push(method)
+        unless @pending_channel_operations.deliver(ch_number, method)
+          @logger.warn "Received a channel.close-ok for channel #{ch_number} without a pending channel.close. Ignoring the frame."
+        end
       when AMQ::Protocol::Connection::Close then
         if recover_from_connection_close?
           @logger.warn "Recovering from connection.close (#{method.reply_text})"
@@ -1306,6 +1348,9 @@ module Bunny
 
     def clean_up_on_shutdown
       begin
+        # give in-flight channel.open/channel.close operations a definite
+        # terminal state instead of leaving their threads to hit the timeout
+        @pending_channel_operations.fail_all(ConnectionClosedError.new(nil))
         shut_down_all_consumer_work_pools!
         maybe_shutdown_reader_loop
         maybe_shutdown_heartbeat_sender
@@ -1431,6 +1476,28 @@ module Bunny
       @channel_id_allocator.release_channel_id(i)
     end
 
+    # Marks the channel number as reserved by a new channel generation. This
+    # protects an id that gets reused while a channel.close for the previous
+    # generation is still awaiting its channel.close-ok.
+    #
+    # @private
+    def reserve_channel_number(n)
+      @channel_generation_mutex.synchronize do
+        @channel_generations[n] += 1
+        @channel_generations[n]
+      end
+    end
+
+    # @private
+    def channel_generation(n)
+      @channel_generation_mutex.synchronize { @channel_generations[n] }
+    end
+
+    # @private
+    def current_channel_generation?(n, generation)
+      @channel_generation_mutex.synchronize { @channel_generations[n] == generation }
+    end
+
     # @private
     def register_channel(ch)
       @channel_mutex.synchronize do
@@ -1438,12 +1505,28 @@ module Bunny
       end
     end
 
+    # Removes the channel from the connection registry. Also returns its id
+    # to the allocator. Callers that only want to drop the frame routing entry
+    # (for example when the id must stay reserved until a pending close has
+    # been acknowledged) use #remove_channel_from_registry instead.
+    #
     # @private
     def unregister_channel(ch)
       @channel_mutex.synchronize do
         n = ch.number
 
         self.release_channel_id(n)
+        @channels.delete(ch.number)
+      end
+    end
+
+    # Removes the channel from the connection registry without releasing the
+    # channel id, so the id cannot be handed out again before the protocol
+    # exchange that retired this channel has reached a terminal state.
+    #
+    # @private
+    def remove_channel_from_registry(ch)
+      @channel_mutex.synchronize do
         @channels.delete(ch.number)
       end
     end

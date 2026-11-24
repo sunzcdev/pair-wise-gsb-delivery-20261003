@@ -180,6 +180,16 @@ module Bunny
   class InconsistentDataError < Exception
   end
 
+  # Raised when a synchronous request receives a response of an unexpected
+  # type, e.g. a stale channel.close-ok that raced with a channel.open on a
+  # reused channel id.
+  class UnexpectedProtocolMethodError < InconsistentDataError
+    def initialize(actual_method, expected_class)
+      actual_name = actual_method.nil? ? "nil" : actual_method.class.name
+      super("expected #{expected_class.name} but received #{actual_name}")
+    end
+  end
+
   # Raised by adapters when frame does not end with final octet [AMQ::Protocol::Frame::FINAL_OCTET].
   # This suggest that there is a bug in adapter or AMQ broker implementation.
   #

@@ -1,6 +1,23 @@
 ## Changes between Bunny 3.6.0 and 3.7.0 (in development)
 
-No changes yet.
+### Channel Ids Are Only Reused After `channel.close-ok`
+
+A channel id is now kept allocated until the broker acknowledges the
+`channel.close`, so short-lived connections that repeatedly open and close
+channels can no longer hand an id back out while its previous generation is
+still settling on the wire.
+
+`channel.open-ok` and `channel.close-ok` frames are routed to the exact
+operation that requested them, keyed by channel id and expected response
+type. A late `close-ok` for a previous channel generation can therefore never
+unblock the `channel.open` of a channel that reused the same id, and frames
+without a matching pending operation are ignored with a warning instead of
+waking an unrelated waiter.
+
+In-flight channel open and close operations now also receive a terminal error
+when the connection shuts down, instead of blocking until the continuation
+timeout. User-initiated waiting closes and explicit channel number allocation
+keep working as before.
 
 
 ## Changes between Bunny 3.5.0 and 3.6.0 (Nov 9, 2026)
