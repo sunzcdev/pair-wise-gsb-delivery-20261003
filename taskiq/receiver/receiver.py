@@ -17,7 +17,13 @@ import anyio
 from taskiq_dependencies import DependencyGraph
 
 from taskiq.abc.broker import AckableMessage, AsyncBroker
-from taskiq.abc.middleware import TaskiqMiddleware
+from taskiq.abc.middleware import (
+    EXECUTION_COUNT_LABELS,
+    RETRY_PHASE_LABELS,
+    EXECUTIONS_LABEL,
+    RetryPhase,
+    TaskiqMiddleware,
+)
 from taskiq.acks import AckController, AcknowledgeType, parse_acknowledge_type
 from taskiq.context import Context
 from taskiq.exceptions import NoResultError
@@ -219,11 +225,7 @@ class Receiver:
 
         try:
             if not isinstance(result.error, NoResultError):
-                await self.broker.result_backend.set_result(taskiq_msg.task_id, result)
-
-                for middleware in reversed(self.broker.middlewares):
-                    if middleware.__class__.post_save != TaskiqMiddleware.post_save:
-                        await maybe_awaitable(middleware.post_save(taskiq_msg, result))
+                await self._save_result_with_retries(taskiq_msg, result)
 
         except Exception as exc:
             logger.exception("Can't set result in result backend.")
@@ -232,6 +234,55 @@ class Receiver:
 
         if ack_time == AcknowledgeType.WHEN_SAVED and ack_controller.is_ackable:
             await ack_controller.ack()
+
+    async def _save_result_with_retries(
+        self,
+        taskiq_msg: TaskiqMessage,
+        result: TaskiqResult[Any],
+    ) -> None:
+        """
+        Save the execution result, retrying only the save phase on failure.
+
+        Middlewares may request another save attempt via
+        :meth:`TaskiqMiddleware.on_save_error`. The task function is never
+        re-invoked here, since its result has already been computed.
+
+        :param taskiq_msg: Processed message.
+        :param result: Result to persist.
+        """
+        while True:
+            try:
+                await self.broker.result_backend.set_result(
+                    taskiq_msg.task_id,
+                    result,
+                )
+            except Exception as exc:
+                logger.exception("Can't set result in result backend.")
+                # Record the phase so middlewares and custom handlers know
+                # that only the result persistence has to be redone.
+                for phase_label in RETRY_PHASE_LABELS:
+                    taskiq_msg.labels[phase_label] = RetryPhase.SAVE
+                should_retry = False
+                for middleware in reversed(self.broker.middlewares):
+                    if (
+                        middleware.__class__.on_save_error
+                        != TaskiqMiddleware.on_save_error
+                    ):
+                        should_retry = bool(
+                            await maybe_awaitable(
+                                middleware.on_save_error(taskiq_msg, result, exc),
+                            ),
+                        )
+                        if should_retry:
+                            break
+                if not should_retry:
+                    raise
+                continue
+
+            for middleware in reversed(self.broker.middlewares):
+                if middleware.__class__.post_save != TaskiqMiddleware.post_save:
+                    await maybe_awaitable(middleware.post_save(taskiq_msg, result))
+            return
 
     def _get_ack_time(self, message: TaskiqMessage) -> AcknowledgeType:
         """
@@ -276,13 +327,32 @@ class Receiver:
         loop = asyncio.get_running_loop()
         returned = None
         found_exception: BaseException | None = None
+        # The phase currently being prepared. It starts at execution for
+        # backwards compatibility and is narrowed to dependencies while
+        # parameters and dependencies are being resolved.
+        failure_phase = RetryPhase.EXECUTION
         signature = None
+        # A phase recorded on a previous, retried delivery must not leak
+        # into this fresh processing or onto a successful result.
+        for phase_label in RETRY_PHASE_LABELS:
+            message.labels.pop(phase_label, None)
+        # Expose how many times the task body actually ran. A value carried
+        # by a retried message under any alias key is preserved.
+        carried_executions = 0
+        for counter_label in EXECUTION_COUNT_LABELS:
+            if counter_label in message.labels:
+                with contextlib.suppress(TypeError, ValueError):
+                    carried_executions = max(
+                        carried_executions,
+                        int(message.labels[counter_label]),
+                    )
+        for counter_label in EXECUTION_COUNT_LABELS:
+            message.labels.setdefault(counter_label, carried_executions)
         if message.task_name not in self.known_tasks:
             self._prepare_task(message.task_name, target)
         if self.validate_params:
             signature = self.task_signatures.get(message.task_name)
         dependency_graph = self.dependency_graphs.get(message.task_name)
-        parse_params(signature, self.task_hints.get(message.task_name) or {}, message)
 
         dep_ctx = None
         # Kwargs are defined in another variable,
@@ -313,11 +383,25 @@ class Receiver:
             else inspect.iscoroutinefunction
         )
         try:
+            # Parameter parsing and dependency resolution belong to the
+            # recoverable "dependencies" phase.
+            failure_phase = RetryPhase.DEPENDENCIES
+            parse_params(
+                signature,
+                self.task_hints.get(message.task_name) or {},
+                message,
+            )
             # We put kwargs resolving here,
             # to be able to catch any exception (for example ),
             # that happen while resolving dependencies.
             if dep_ctx:
                 kwargs = await dep_ctx.resolve_kwargs()
+            # Dependencies are ready; from now on a failure is an
+            # execution-phase failure. Count exactly one task invocation.
+            failure_phase = RetryPhase.EXECUTION
+            executions = int(message.labels.get(EXECUTIONS_LABEL, 0)) + 1
+            for counter_label in EXECUTION_COUNT_LABELS:
+                message.labels[counter_label] = executions
             # We update kwargs with kwargs from network.
             kwargs.update(message.kwargs)
             is_coroutine = True
@@ -385,6 +469,13 @@ class Receiver:
                     found_exception.__traceback__,
                 )
             await dep_ctx.close(*args)
+
+        # Record which phase failed so retry middlewares and custom
+        # handlers can decide whether the dependencies, the task body or
+        # only the result persistence has to be redone.
+        if found_exception is not None:
+            for phase_label in RETRY_PHASE_LABELS:
+                message.labels[phase_label] = failure_phase
 
         # Assemble result.
         result: TaskiqResult[Any] = TaskiqResult(

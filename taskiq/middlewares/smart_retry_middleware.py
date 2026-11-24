@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import random
 from collections.abc import Iterable
@@ -5,26 +6,31 @@ from collections.abc import Set as AbstractSet
 from logging import getLogger
 from typing import Any
 
-from taskiq import ScheduleSource
-from taskiq.abc.middleware import TaskiqMiddleware
-from taskiq.exceptions import NoResultError
+from taskiq.abc.middleware import RetryPhase
+from taskiq.abc.schedule_source import ScheduleSource
 from taskiq.kicker import AsyncKicker
 from taskiq.message import TaskiqMessage
-from taskiq.result import TaskiqResult
+from taskiq.middlewares.retry_middleware import BaseRetryMiddleware
 
 __all__ = ("SmartRetryMiddleware",)
 
 _logger = getLogger("taskiq.smart_retry_middleware")
 
 
-class SmartRetryMiddleware(TaskiqMiddleware):
-    """Middleware to retry tasks delays.
+class SmartRetryMiddleware(BaseRetryMiddleware):
+    """
+    Middleware to retry failed tasks with delays.
 
     This middleware retries failed tasks with support for:
     - max retries
     - delay
     - jitter
     - exponential backoff
+    - phase selection via ``retry_on``
+
+    Failures while saving the result are retried in place after the
+    calculated delay: only the result backend is called again, the task
+    function itself is not executed a second time.
     """
 
     def __init__(
@@ -38,6 +44,8 @@ class SmartRetryMiddleware(TaskiqMiddleware):
         max_delay_exponent: float = 60,
         schedule_source: ScheduleSource | None = None,
         types_of_exceptions: Iterable[type[BaseException]] | None = None,
+        retry_on: Iterable[RetryPhase | str] | None = None,
+        **phase_aliases: Any,
     ) -> None:
         """
         Initialize retry middleware.
@@ -52,44 +60,28 @@ class SmartRetryMiddleware(TaskiqMiddleware):
         :param schedule_source: Schedule source to use for scheduling.
             If None, the default broker will be used.
         :param types_of_exceptions: Types of exceptions to retry from.
+        :param retry_on: Phases that are allowed to be retried. Defaults
+            to dependency preparation and task execution.
+        :param phase_aliases: Alternative names for ``retry_on``.
         """
-        super().__init__()
-        self.default_retry_count = default_retry_count
-        self.default_retry_label = default_retry_label
-        self.no_result_on_retry = no_result_on_retry
-        self.default_delay = default_delay
+        super().__init__(
+            default_retry_count=default_retry_count,
+            default_retry_label=default_retry_label,
+            no_result_on_retry=no_result_on_retry,
+            types_of_exceptions=types_of_exceptions,
+            retry_on=retry_on,
+            default_delay=default_delay,
+            **phase_aliases,
+        )
         self.use_jitter = use_jitter
         self.use_delay_exponent = use_delay_exponent
         self.max_delay_exponent = max_delay_exponent
         self.schedule_source = schedule_source
-        self.types_of_exceptions = types_of_exceptions
 
         if not isinstance(schedule_source, (ScheduleSource, type(None))):
             raise TypeError(
                 "schedule_source must be an instance of ScheduleSource or None",
             )
-
-    def _get_types_of_exceptions(
-        self,
-        message: TaskiqMessage,
-    ) -> Iterable[type[BaseException]] | None:
-        """
-        Resolve retryable exception types for a task.
-
-        Per-task ``types_of_exceptions`` set via the task decorator take
-        precedence over the broker-wide value. Types are read from the
-        registered task object, since label values are stringified when a
-        message is serialized and cannot carry real exception types.
-
-        :param message: Original task message.
-        :return: Effective exception types or None.
-        """
-        task = self.broker.find_task(message.task_name)
-        if task is not None:
-            task_types = task.labels.get("types_of_exceptions")
-            if task_types is not None:
-                return task_types
-        return self.types_of_exceptions
 
     def is_retry_on_error(self, message: TaskiqMessage) -> bool:
         """
@@ -100,12 +92,7 @@ class SmartRetryMiddleware(TaskiqMiddleware):
         :param message: Original task message.
         :return: True if should retry on error.
         """
-        retry_on_error = message.labels.get("retry_on_error")
-        if isinstance(retry_on_error, str):
-            retry_on_error = retry_on_error.lower() == "true"
-        if retry_on_error is None:
-            retry_on_error = self.default_retry_label
-        return retry_on_error
+        return self._is_retry_enabled(message)
 
     def make_delay(self, message: TaskiqMessage, retries: int) -> float:
         """
@@ -148,72 +135,41 @@ class SmartRetryMiddleware(TaskiqMiddleware):
                 **message.kwargs,
             )
 
-    async def on_error(
+    async def send_retry(
+        self,
+        kicker: AsyncKicker[Any, Any],
+        message: TaskiqMessage,
+        retries: int,
+    ) -> None:
+        """Re-send the failed message using the calculated delay."""
+        delay = self.make_delay(message, retries)
+
+        _logger.info(
+            "Task %s failed. Retrying %d/%d in %.2f seconds.",
+            message.task_name,
+            retries,
+            int(message.labels.get("max_retries", self.default_retry_count)),
+            delay,
+        )
+
+        await self.on_send(kicker, message, delay)
+
+    async def delay_before_save_retry(
         self,
         message: TaskiqMessage,
-        result: TaskiqResult[Any],
-        exception: BaseException,
+        retries: int,
     ) -> None:
-        """
-        Retry on error.
-
-        If an error is raised during task execution,
-        this middleware schedules the task to be retried
-        after a calculated delay.
-
-        :param message: Message that caused the error.
-        :param result: Execution result.
-        :param exception: Caught exception.
-        """
-        types_of_exceptions = self._get_types_of_exceptions(message)
-        if types_of_exceptions is not None and not isinstance(
-            exception,
-            tuple(types_of_exceptions),
-        ):
-            return
-
-        if isinstance(exception, NoResultError):
-            return
-
-        retry_on_error = self.is_retry_on_error(message)
-
-        if not retry_on_error:
-            return
-
-        retries = int(message.labels.get("_retries", 0)) + 1
-        max_retries = int(message.labels.get("max_retries", self.default_retry_count))
-
-        if retries < max_retries:
-            delay = self.make_delay(message, retries)
-
-            _logger.info(
-                "Task %s failed. Retrying %d/%d in %.2f seconds.",
-                message.task_name,
-                retries,
-                max_retries,
-                delay,
-            )
-
-            kicker: AsyncKicker[Any, Any] = (
-                AsyncKicker(
-                    task_name=message.task_name,
-                    broker=self.broker,
-                    labels=message.labels,
-                )
-                .with_task_id(message.task_id)
-                .with_labels(_retries=retries)
-            )
-
-            await self.on_send(kicker, message, delay)
-
-            if self.no_result_on_retry:
-                result.error = NoResultError()
-
-        else:
-            _logger.warning(
-                "Task '%s' invocation failed. Maximum retries count is reached.",
-                message.task_name,
-            )
+        """Wait for the calculated delay before retrying a result save."""
+        delay = self.make_delay(message, retries)
+        _logger.info(
+            "Task %s result saving failed. Retrying save %d/%d in %.2f seconds.",
+            message.task_name,
+            retries,
+            int(message.labels.get("max_retries", self.default_retry_count)),
+            delay,
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     @classmethod
     def task_only_labels(cls) -> AbstractSet[str]:
@@ -223,4 +179,4 @@ class SmartRetryMiddleware(TaskiqMiddleware):
         Per-task ``types_of_exceptions`` set via the task decorator is read
         from the registered task object and cannot be properly serialized.
         """
-        return super().task_only_labels() | {"types_of_exceptions"}
+        return super().task_only_labels()

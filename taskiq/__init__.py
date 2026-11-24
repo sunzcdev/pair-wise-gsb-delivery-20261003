@@ -6,7 +6,18 @@ from taskiq_dependencies import Depends as TaskiqDepends
 
 from taskiq.abc.broker import AsyncBroker, AsyncTaskiqDecoratedTask
 from taskiq.abc.formatter import TaskiqFormatter
-from taskiq.abc.middleware import TaskiqMiddleware
+from taskiq.abc.middleware import (
+    EXECUTIONS_LABEL,
+    EXECUTION_COUNT_LABEL,
+    RETRY_PHASE_LABEL,
+    RETRY_STAGE_LABEL,
+    Phase,
+    RetryPhase,
+    RetryStage,
+    RetryStep,
+    TaskPhase,
+    TaskiqMiddleware,
+)
 from taskiq.abc.result_backend import AsyncResultBackend
 from taskiq.abc.schedule_source import ScheduleSource
 from taskiq.acks import AckableMessage, AcknowledgeType
@@ -28,10 +39,12 @@ from taskiq.exceptions import (
 from taskiq.funcs import gather
 from taskiq.message import BrokerMessage, TaskiqMessage
 from taskiq.middlewares import (
+    BaseRetryMiddleware,
     PrometheusMiddleware,
     SimpleRetryMiddleware,
     SmartRetryMiddleware,
 )
+from taskiq.middlewares.retry_middleware import get_retry_phase
 from taskiq.result import TaskiqResult
 from taskiq.scheduler.scheduled_task import ScheduledTask
 from taskiq.scheduler.scheduler import TaskiqScheduler
@@ -47,14 +60,21 @@ __all__ = [
     "AsyncResultBackend",
     "AsyncTaskiqDecoratedTask",
     "AsyncTaskiqTask",
+    "BaseRetryMiddleware",
     "BrokerMessage",
     "Context",
+    "EXECUTIONS_LABEL",
+    "EXECUTION_COUNT_LABEL",
     "InMemoryBroker",
     "MultiBroker",
     "NoResultError",
     "PrometheusMiddleware",
+    "RETRY_PHASE_LABEL",
+    "RETRY_STAGE_LABEL",
     "ResultGetError",
     "ResultIsReadyError",
+    "RetryPhase",
+    "RetryStage",
     "ScheduleSource",
     "ScheduledTask",
     "SecurityError",
@@ -75,4 +95,5 @@ __all__ = [
     "__version__",
     "async_shared_broker",
     "gather",
+    "get_retry_phase",
 ]
