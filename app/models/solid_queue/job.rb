@@ -13,32 +13,23 @@ module SolidQueue
       end
     end
 
-    include Executable, Clearable, Recurrable, Batchable
+    include Executable, Clearable, Recurrable, Batchable, BulkEnqueue
 
     serialize :arguments, coder: JSON
 
     class << self
-      def enqueue_all(active_jobs)
-        # Bulk enqueues bypass ActiveJob#enqueue, so batch membership is captured here
-        current_batch_id = Batch.current_batch_id
+      # The dedup_key column ships in the base schema but reaches existing apps
+      # through an optional update migration. Until they run it, bulk enqueues
+      # behave exactly as before and every job is inserted as new.
+      def dedup_migrated?
+        @dedup_migrated ||= column_names.include?("dedup_key")
+      end
 
-        active_jobs.each do |job|
-          job.scheduled_at ||= Time.current
-          job.batch_id = current_batch_id || job.batch_id
-        end
-        active_jobs_by_job_id = active_jobs.index_by(&:job_id)
-
-        transaction do
-          jobs = create_all_from_active_jobs(active_jobs)
-          prepare_all_for_execution(jobs).tap do |enqueued_jobs|
-            enqueued_jobs.each do |enqueued_job|
-              active_jobs_by_job_id[enqueued_job.active_job_id].provider_job_id = enqueued_job.id
-              active_jobs_by_job_id[enqueued_job.active_job_id].successfully_enqueued = true
-            end
-          end
-        end
-
-        active_jobs.count(&:successfully_enqueued?)
+      # Dedup relies on the database skipping rows that violate the dedup_key
+      # unique index during a bulk insert, which only adapters with insert
+      # conflict targets support.
+      def dedup_enabled?
+        dedup_migrated? && supports_insert_conflict_target?
       end
 
       def enqueue(active_job, scheduled_at: Time.current)
@@ -63,12 +54,6 @@ module SolidQueue
           raise enqueue_error
         end
 
-        def create_all_from_active_jobs(active_jobs)
-          job_rows = active_jobs.map { |job| attributes_from_active_job(job) }
-          insert_all(job_rows)
-          where(active_job_id: active_jobs.map(&:job_id)).order(id: :asc)
-        end
-
         def attributes_from_active_job(active_job)
           {
             queue_name: active_job.queue_name || DEFAULT_QUEUE_NAME,
@@ -80,6 +65,7 @@ module SolidQueue
             concurrency_key: active_job.concurrency_key
           }.tap do |attributes|
             attributes[:batch_id] = active_job.batch_id if Batch.migrated?
+            attributes[:dedup_key] = active_job.solid_queue_dedup_key if dedup_migrated?
           end
         end
     end

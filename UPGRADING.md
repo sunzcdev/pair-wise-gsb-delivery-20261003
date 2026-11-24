@@ -1,3 +1,13 @@
+# Upgrading to the next release
+Bulk enqueues can now skip jobs that are already present, using a business key declared with `dedup_by` on the job class (see the [deduplication section](README.md#bulk-enqueuing-and-deduplication) in the README). This needs a new nullable `dedup_key` column on `solid_queue_jobs` with a unique index. Fresh installs get it with the base schema; existing installations need to copy the migration and run it:
+
+```bash
+bin/rails solid_queue:update
+bin/rails db:migrate
+```
+
+The migration is optional: until you run it, everything works as before and bulk enqueues simply insert every job. On a large jobs table you can build the index concurrently, the same way the batches migration notes describe.
+
 # Upgrading to version 1.7.2
 Jobs with [concurrency controls](README.md#concurrency-controls) now remember which semaphore they got their slot from, in their serialized job data, and give the slot back only to that semaphore. Before, a job that ran past its `duration` gave its slot back to the semaphore a later job had created after the job's own one expired, so one more job than the limit allowed could run at the same time, and keep doing so until the jobs waiting for that key ran out.
 

@@ -50,9 +50,11 @@ ActiveRecord::Schema[7.1].define(version: 1) do
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
     t.bigint "batch_id"
+    t.string "dedup_key"
     t.index ["active_job_id"], name: "index_solid_queue_jobs_on_active_job_id"
     t.index ["batch_id"], name: "index_solid_queue_jobs_on_batch_id"
     t.index ["class_name"], name: "index_solid_queue_jobs_on_class_name"
+    t.index ["dedup_key"], name: "index_solid_queue_jobs_on_dedup_key", unique: true
     t.index ["finished_at"], name: "index_solid_queue_jobs_on_finished_at"
     t.index ["queue_name", "finished_at"], name: "index_solid_queue_jobs_for_filtering"
     t.index ["scheduled_at", "finished_at"], name: "index_solid_queue_jobs_for_alerting"

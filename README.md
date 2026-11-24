@@ -647,6 +647,36 @@ In addition, mixing concurrency controls with **bulk enqueuing** (Active Job's `
 
 When jobs that have concurrency controls and `on_conflict: :discard` are enqueued in bulk, the ones that fail to be enqueued and are discarded would have `successfully_enqueued` set to `false`. The total count of jobs enqueued returned by `perform_all_later` will exclude these jobs as expected.
 
+## Bulk enqueuing and deduplication
+
+When clients retry a request, a bulk enqueue (`ActiveJob.perform_all_later`) can contain items that were already persisted by the original attempt. Solid Queue can recognize these instead of inserting duplicate jobs, using a business key declared on the job class:
+
+```ruby
+class PublishInvoiceJob < ApplicationJob
+  # The callable receives the job's arguments, like the concurrency key
+  dedup_by ->(invoice) { invoice.id }
+
+  def perform(invoice)
+    # ...
+  end
+end
+```
+
+The resulting key is namespaced by job class, so identical arguments in different job classes never collide. Jobs without a `dedup_by` declaration have no key and are always enqueued as new, preserving the previous behavior. A key that computes to blank (`nil` or an empty string) is treated the same way.
+
+Deduplication applies to bulk enqueues. When a job with an already-stored key is encountered, no new row is written and the incoming Active Job instance is mapped to the existing job, with `successfully_enqueued` set to `true` and `provider_job_id` pointing at that job. `SolidQueue::Job.enqueue_all` returns a result object describing the two groups:
+
+```ruby
+result = SolidQueue::Job.enqueue_all(jobs)
+result.enqueued    # Solid Queue jobs newly written by this request
+result.duplicated  # pre-existing jobs matched by their dedup key
+result.size        # total accepted count, enqueued + duplicated
+```
+
+The whole bulk enqueue still runs in a single transaction. If writing any execution (for example a `ReadyExecution`) fails, every row inserted by the request rolls back and the error is raised, so a partial write is never reported as success. Repeating the same request after such a failure then creates only the entries that are still missing, leaving exactly one job per business key.
+
+This needs a unique index on a new `dedup_key` column, which the base schema includes. Existing apps get it through the optional update migration copied by `bin/rails solid_queue:update`; until that migration runs, bulk enqueues keep working without deduplication.
+
 ## Failed jobs and retries
 
 Solid Queue doesn't include any automatic retry mechanism, it [relies on Active Job for this](https://edgeguides.rubyonrails.org/active_job_basics.html#retrying-or-discarding-failed-jobs). Jobs that fail will be kept in the system, and a _failed execution_ (a record in the `solid_queue_failed_executions` table) will be created for these. The job will stay there until manually discarded or re-enqueued. You can do this in a console as:

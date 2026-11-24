@@ -56,6 +56,16 @@ class UpdateGeneratorTest < Rails::Generators::TestCase
     end
   end
 
+  test "copies the dedup key migration" do
+    run_generator
+
+    assert_migration "db/queue_migrate/add_dedup_key_to_solid_queue.rb" do |migration|
+      assert_match(/class AddDedupKeyToSolidQueue/, migration)
+      assert_match(/add_column :solid_queue_jobs, :dedup_key, :string/, migration)
+      assert_match(/unique: true/, migration)
+    end
+  end
+
   private
     def with_migration_template(name)
       Dir.mktmpdir do |source_root|
