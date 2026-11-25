@@ -9,7 +9,7 @@ from typing import Self, TypeVar
 
 from ..lowlevel import checkpoint_if_cancelled
 from ._eventloop import get_async_backend
-from ._exceptions import BusyResourceError, NoEventLoopError
+from ._exceptions import BusyResourceError, ClosedResourceError, NoEventLoopError
 from ._tasks import CancelScope
 from ._testing import TaskInfo, get_current_task
 
@@ -150,6 +150,187 @@ class EventAdapter(Event):
             return EventStatistics(tasks_waiting=0)
 
         return self._internal_event.statistics()
+
+
+class ReusableEvent:
+    """
+    An event that can be reused across multiple rounds of notifications.
+
+    Unlike :class:`Event`, which is a one-shot flag that can only be set once, this
+    event supports an arbitrary number of notification rounds. Each round is opened
+    with :meth:`start_round`, which returns a round token. The token is then passed to
+    both :meth:`wait` (by the party waiting for the round) and :meth:`set` (by the
+    party notifying that the round has completed). When the round is over,
+    :meth:`finish_round` releases the bookkeeping associated with its token.
+
+    A notifier always hands in the result for its own round. A notification for a
+    round that nobody is waiting on (for example because the waiters already moved on
+    to a later round) is discarded; it can never release a task that is waiting for a
+    different, newer round. This makes the object safe to keep reusing in a loop where
+    notifications may be delivered late or out of order.
+
+    Like the other synchronization primitives, this object is bound to the event loop
+    of the tasks calling :meth:`wait`. :meth:`set` and :meth:`close_round` may be
+    scheduled to run in that loop from other threads (for example via
+    :func:`~from_thread.run_sync`), which is how
+    :meth:`~from_thread.BlockingPortal.call_async` coordinates across event loops.
+
+    :raises ~anyio.ClosedResourceError: if :meth:`wait` is called after the event has
+        been closed, or if it is closed while a task is waiting
+
+    .. versionadded:: 4.17.0
+    """
+
+    __slots__ = "__weakref__", "_closed", "_completed", "_next_round", "_waiters"
+
+    def __init__(self) -> None:
+        self._next_round = 0
+        # One-shot events for the tasks currently blocked on each round
+        self._waiters: dict[int, Event] = {}
+        # Rounds whose notification arrived while nobody was parked in wait()
+        self._completed: set[int] = set()
+        self._closed = False
+
+    def start_round(self) -> int:
+        """
+        Open a new round and return its token.
+
+        Each returned token is unique and strictly greater than all previously
+        returned tokens. Pass it to :meth:`wait`, :meth:`set` and, once the round is
+        over, :meth:`finish_round`.
+
+        """
+        round_ = self._next_round
+        self._next_round += 1
+        return round_
+
+    def set(self, round_: int) -> None:
+        """
+        Hand in the notification for the given round.
+
+        Every task currently waiting on the round is released. If no task is waiting
+        on the round yet (the notification arrived before the waiters parked, or
+        after they left), the completion is recorded against that round only, so a
+        subsequent :meth:`wait` for the same round returns immediately. Other rounds,
+        including any newer round the waiters moved on to, are never affected.
+
+        Notifications delivered after the event has been closed are ignored.
+
+        """
+        if self._closed:
+            return
+
+        event = self._waiters.pop(round_, None)
+        if event is not None:
+            event.set()
+        else:
+            self._completed.add(round_)
+
+    async def wait(self, round_: int) -> None:
+        """
+        Wait until the given round has been completed.
+
+        Only a notification carrying this exact round token can release this call; a
+        notification for any other round is ignored. This method may be called again
+        with the same round token after a cancelled wait (for example from a shielded
+        cancel scope); if the round completed in the meantime, it returns immediately.
+
+        :raises ~anyio.ClosedResourceError: if the event has been closed
+
+        """
+        await checkpoint_if_cancelled()
+        if self._closed:
+            raise ClosedResourceError("This reusable event has been closed")
+
+        if round_ in self._completed:
+            return
+
+        event = self._waiters.get(round_)
+        if event is None:
+            event = Event()
+            self._waiters[round_] = event
+
+        try:
+            await event.wait()
+        except BaseException:
+            # The notification may have completed our round while the wait was being
+            # cancelled, so only remove a still-pending entry
+            if not event.is_set():
+                self._waiters.pop(round_, None)
+
+            raise
+
+        if self._closed:
+            raise ClosedResourceError("This reusable event has been closed")
+
+    def finish_round(self, round_: int) -> None:
+        """
+        Discard all bookkeeping for the given round.
+
+        Call this once the round's result has been consumed so that pending waiters
+        and completion markers do not accumulate for rounds nobody cares about
+        anymore.
+
+        """
+        self._waiters.pop(round_, None)
+        self._completed.discard(round_)
+
+    def mark_closed(self) -> None:
+        """
+        Mark the event as closed without waking any waiters.
+
+        This is used together with :meth:`close_round` when the closing has to be
+        scheduled into several event loops: the loop owning the coordination marks
+        the event closed first, after which each affected loop is asked to wake its
+        own waiters. Subsequent calls to :meth:`wait` raise
+        :class:`~anyio.ClosedResourceError`, and further calls to :meth:`set` are
+        ignored.
+
+        """
+        self._closed = True
+
+    def close(self) -> None:
+        """
+        Close the event, releasing every task currently blocked in :meth:`wait`.
+
+        Subsequent calls to :meth:`wait` raise :class:`~anyio.ClosedResourceError`,
+        while further calls to :meth:`set` are ignored. This method must run in the
+        event loop that owns the waiting tasks; use :meth:`close_round` when closing
+        has to be scheduled into another event loop.
+
+        """
+        if self._closed:
+            return
+
+        self._closed = True
+        for event in self._waiters.values():
+            event.set()
+
+        self._waiters.clear()
+
+    def close_round(self, round_: int) -> None:
+        """
+        Ensure the event is closed and release the tasks waiting on one round.
+
+        This is a loop-safe variant of :meth:`close` for cross-thread coordination:
+        schedule it to run in the event loop that owns the given round's waiters.
+        Unlike :meth:`close`, calling it after the event has already been marked
+        closed (via :meth:`mark_closed`) still wakes the round's waiters, so the
+        closing party can fan one such call out to every affected event loop.
+
+        """
+        self._closed = True
+        event = self._waiters.pop(round_, None)
+        if event is not None:
+            event.set()
+
+    def is_closed(self) -> bool:
+        """Return ``True`` if the event has been closed."""
+        return self._closed
+
+    def statistics(self) -> EventStatistics:
+        """Return statistics about the current state of this event."""
+        return EventStatistics(tasks_waiting=len(self._waiters))
 
 
 class Lock:

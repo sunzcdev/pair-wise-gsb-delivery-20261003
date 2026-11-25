@@ -555,6 +555,107 @@ class TestBlockingPortal:
         assert released_by_caller
 
     @pytest.mark.parametrize("target_backend", get_available_backends())
+    async def test_call_async_reuses_event_across_rounds(
+        self, target_backend: str
+    ) -> None:
+        portal_cm = start_blocking_portal(backend=target_backend)
+        portal = await to_thread.run_sync(portal_cm.__enter__)
+        try:
+            # Many sequential calls reuse the same round-aware event. Each call must
+            # see its own result rather than a notification from a previous round.
+            for i in range(20):
+                assert await portal.call_async(lambda i=i: i) == i
+        finally:
+            await to_thread.run_sync(portal_cm.__exit__, None, None, None)
+
+    @pytest.mark.parametrize("target_backend", get_available_backends())
+    async def test_call_async_stale_notification_does_not_release_later_round(
+        self, target_backend: str
+    ) -> None:
+        portal_cm = start_blocking_portal(backend=target_backend)
+        portal = await to_thread.run_sync(portal_cm.__enter__)
+        try:
+            # A round whose notification has no waiter (simulating a late completion)
+            # must be recorded for that round only.
+            stale_round = portal._call_event.start_round()
+            portal._call_event.set(stale_round)
+            portal._call_event.finish_round(stale_round)
+
+            # A fresh call_async() opens a later round and must block until its own
+            # result is ready, instead of being released by the stale notification.
+            async def slow_value() -> int:
+                await sleep(0.05)
+                return 42
+
+            with fail_after(2):
+                assert await portal.call_async(slow_value) == 42
+        finally:
+            await to_thread.run_sync(portal_cm.__exit__, None, None, None)
+
+    @pytest.mark.parametrize("target_backend", get_available_backends())
+    async def test_call_async_released_when_portal_stops(
+        self, target_backend: str
+    ) -> None:
+        started = threading.Event()
+        portal_cm = start_blocking_portal(backend=target_backend)
+        portal = await to_thread.run_sync(portal_cm.__enter__)
+
+        async def wait_forever() -> None:
+            started.set()
+            await sleep(math.inf)
+
+        async def caller() -> None:
+            with pytest.raises(RuntimeError, match="This portal is not running"):
+                await portal.call_async(wait_forever)
+
+        try:
+            async with create_task_group() as tg:
+                tg.start_soon(caller)
+                await to_thread.run_sync(started.wait, 5)
+                # Stop the portal while call_async() is still waiting. The waiting
+                # caller must be woken through its own event loop and exit.
+                await to_thread.run_sync(portal.call, portal.stop, True)
+        finally:
+            await to_thread.run_sync(portal_cm.__exit__, None, None, None)
+
+    @pytest.mark.parametrize("target_backend", get_available_backends())
+    @pytest.mark.usefixtures("deactivate_blockbuster")
+    async def test_call_async_late_completion_after_stop(
+        self, target_backend: str
+    ) -> None:
+        portal_cm = start_blocking_portal(backend=target_backend)
+        portal = await to_thread.run_sync(portal_cm.__enter__)
+        release = threading.Event()
+        started = threading.Event()
+        result: Future[str] = Future()
+
+        async def target() -> str:
+            started.set()
+            await to_thread.run_sync(release.wait, 5)
+            return "done"
+
+        def blocking_thread() -> None:
+            try:
+                result.set_result(portal.call(target))
+            except BaseException as exc:  # noqa: BLE001
+                result.set_exception(exc)
+
+        try:
+            thread = threading.Thread(target=blocking_thread)
+            thread.start()
+            await to_thread.run_sync(started.wait, 5)
+
+            # Stop the portal while the target task is still running. The blocking
+            # thread waiting in portal.call() must still be able to exit.
+            await to_thread.run_sync(portal.call, portal.stop, True)
+            release.set()
+            thread.join(5)
+            assert not thread.is_alive()
+        finally:
+            release.set()
+            await to_thread.run_sync(portal_cm.__exit__, None, None, None)
+
+    @pytest.mark.parametrize("target_backend", get_available_backends())
     @pytest.mark.usefixtures("deactivate_blockbuster")
     async def test_future_cancellation_does_not_block(
         self, target_backend: str

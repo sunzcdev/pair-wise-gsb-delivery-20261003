@@ -1,0 +1,4 @@
+Fixed ``BlockingPortal.call_async()`` potentially returning the result of a previous
+call when a completion notification was delivered late or after the portal had been
+shut down. Calls now wait on their own round of a shared reusable event, and callers
+still waiting when the portal is stopped are woken up instead of hanging.

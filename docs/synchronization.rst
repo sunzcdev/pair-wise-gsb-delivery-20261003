@@ -25,6 +25,27 @@ Example:
    replaced instead. This practice prevents a class of race conditions, and matches the
    semantics of the Trio library.
 
+Reusable events
+~~~~~~~~~~~~~~~
+
+For coordination that runs in repeated rounds, :class:`ReusableEvent` lets a single
+event object be reused instead of constructing a fresh :class:`Event` for every round.
+Each round is opened with :meth:`~ReusableEvent.start_round`, which returns a round
+token. The token is handed both to the waiting party
+(:meth:`~ReusableEvent.wait`) and to the notifying party
+(:meth:`~ReusableEvent.set`).
+
+A notifier always completes its own round: a notification carrying the token of a round
+that nobody is waiting on (for example because the waiters already moved on to a later
+round) is discarded and can never release a task waiting on a different, newer round.
+This prevents late or out-of-order notifications from being mistaken for the result of
+the current round. When a round is no longer needed, call
+:meth:`~ReusableEvent.finish_round` to release its bookkeeping.
+
+Closing the event with :meth:`~ReusableEvent.close` releases every task currently
+waiting and makes subsequent waits raise :class:`~anyio.ClosedResourceError`, so that
+tasks blocked on a component that is shutting down can still exit.
+
 Semaphores
 ----------
 

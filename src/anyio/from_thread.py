@@ -39,8 +39,8 @@ from ._core._eventloop import (
     threadlocals,
 )
 from ._core._eventloop import run as run_eventloop
-from ._core._exceptions import NoEventLoopError, RunFinishedError
-from ._core._synchronization import Event
+from ._core._exceptions import ClosedResourceError, NoEventLoopError, RunFinishedError
+from ._core._synchronization import Event, ReusableEvent
 from ._core._tasks import CancelScope, create_task_group
 from .abc._tasks import TaskStatus
 from .lowlevel import EventLoopToken, current_token
@@ -194,6 +194,14 @@ class BlockingPortal:
         self._token = current_token()
         self._event_loop_thread_id: int | None = get_ident()
         self._stop_event = Event()
+        # Round-aware event shared by all call_async() invocations. Each call waits
+        # on its own round, so a notification for an earlier round can never release
+        # a caller waiting on a later round, even if it is delivered late.
+        self._call_event = ReusableEvent()
+        # Source event loop tokens of the calls currently in flight, keyed by the
+        # round token they are waiting on. Used to wake the callers up when the
+        # portal is shut down.
+        self._call_tokens: dict[int, EventLoopToken] = {}
         self._task_group = create_task_group()
 
     async def __aenter__(self) -> Self:
@@ -234,6 +242,22 @@ class BlockingPortal:
         """
         self._event_loop_thread_id = None
         self._stop_event.set()
+        # Mark the round-aware event closed and release any call_async() callers
+        # still waiting. The per-round events belong to the callers' own event
+        # loops, so each close is scheduled into the corresponding source loop.
+        self._call_event.mark_closed()
+        for round_, source_token in self._call_tokens.items():
+            try:
+                source_token.backend_class.run_sync_soon(
+                    self._call_event.close_round,
+                    (round_,),
+                    source_token.native_token,
+                )
+            except RunFinishedError:
+                # The caller's event loop is already gone, so there is nobody left
+                # to wake up there
+                pass
+
         if cancel_remaining:
             self._task_group.cancel_scope.cancel("the blocking portal is shutting down")
 
@@ -384,9 +408,10 @@ class BlockingPortal:
         """
         self._check_running()
         source_token = current_token()
-        event = Event()
         future: Future[T_Retval] = Future()
         cancellation: Future[None] = Future()
+        round_ = self._call_event.start_round()
+        self._call_tokens[round_] = source_token
 
         async def run_call() -> None:
             with CancelScope() as scope:
@@ -405,9 +430,14 @@ class BlockingPortal:
                 await self._call_func(func, args, {}, future)
 
         def notify_source(_: Future[T_Retval]) -> None:
+            # Hand the notification in for this call's own round only. If the caller
+            # has already moved on or the event was closed, this is a no-op and can
+            # never wake up a later round.
             try:
                 source_token.backend_class.run_sync_soon(
-                    event.set, (), source_token.native_token
+                    self._call_event.set,
+                    (round_,),
+                    source_token.native_token,
                 )
             except RunFinishedError:
                 pass
@@ -420,23 +450,38 @@ class BlockingPortal:
                     future.set_exception(exc)
 
         future.add_done_callback(notify_source)
-        self._token.backend_class.run_sync_soon(
-            spawn_task, (), self._token.native_token
-        )
         try:
-            await event.wait()
-        except get_cancelled_exc_class():
-            cancellation.cancel()
-            if not abandon_on_cancel:
-                with CancelScope(shield=True):
-                    await event.wait()
+            self._token.backend_class.run_sync_soon(
+                spawn_task, (), self._token.native_token
+            )
+            try:
+                await self._call_event.wait(round_)
+            except ClosedResourceError:
+                # The portal was shut down while this call was still in flight
+                raise RuntimeError("This portal is not running") from None
+            except get_cancelled_exc_class():
+                cancellation.cancel()
+                if not abandon_on_cancel:
+                    with CancelScope(shield=True):
+                        try:
+                            # Re-wait on the same round; a completion that arrived
+                            # while the wait was being cancelled is not lost
+                            await self._call_event.wait(round_)
+                        except ClosedResourceError:
+                            # The portal was shut down before the target task finished
+                            raise RuntimeError(
+                                "This portal is not running"
+                            ) from None
 
-                if not future.cancelled():
-                    future.result()
+                    if not future.cancelled():
+                        future.result()
 
-            raise
+                raise
 
-        return future.result()
+            return future.result()
+        finally:
+            self._call_tokens.pop(round_, None)
+            self._call_event.finish_round(round_)
 
     @overload
     def start_task_soon(

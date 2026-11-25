@@ -1,0 +1,4 @@
+Added the ``ReusableEvent`` synchronization primitive, which supports an arbitrary
+number of notification rounds identified by round tokens. Notifications always target
+their own round, so a late or stale notification can never release a task that has moved
+on to a later round, and closing the event releases every task still waiting.

@@ -10,9 +10,11 @@ import pytest
 from anyio import (
     CancelScope,
     CapacityLimiter,
+    ClosedResourceError,
     Condition,
     Event,
     Lock,
+    ReusableEvent,
     Semaphore,
     WouldBlock,
     create_task_group,
@@ -344,6 +346,176 @@ class TestEvent:
 
         run(
             event.wait,
+            backend=anyio_backend_name,
+            backend_options=anyio_backend_options,
+        )
+
+
+class TestReusableEvent:
+    async def test_rounds_are_independent(self) -> None:
+        event = ReusableEvent()
+        round1 = event.start_round()
+        round2 = event.start_round()
+        assert round1 != round2
+
+        async def notify(round_: int) -> None:
+            event.set(round_)
+
+        # Completing the first round must not release a waiter of the second round
+        async with create_task_group() as tg:
+            tg.start_soon(notify, round1)
+            with move_on_after(0.1) as scope:
+                await event.wait(round2)
+
+        assert scope.cancelled_caught
+
+        # The second round still completes when its own notification arrives
+        async with create_task_group() as tg:
+            tg.start_soon(notify, round2)
+            with fail_after(1):
+                await event.wait(round2)
+
+    async def test_stale_notification_does_not_release_later_round(self) -> None:
+        event = ReusableEvent()
+        first = event.start_round()
+        second = event.start_round()
+
+        # A notification for the first round handed in while nobody is waiting on it
+        event.set(first)
+
+        # It must not release a waiter on the second round
+        with move_on_after(0.1) as scope:
+            await event.wait(second)
+
+        assert scope.cancelled_caught
+
+        # But a re-entrant wait on the same first round returns immediately, so a
+        # shielded re-wait after cancellation is not lost
+        with fail_after(1):
+            await event.wait(first)
+
+    async def test_notification_after_wait_parks(self) -> None:
+        event = ReusableEvent()
+        round_ = event.start_round()
+        woken = False
+
+        async def waiter() -> None:
+            nonlocal woken
+            await event.wait(round_)
+            woken = True
+
+        async def notifier() -> None:
+            await wait_all_tasks_blocked()
+            assert event.statistics().tasks_waiting == 1
+            event.set(round_)
+
+        async with create_task_group() as tg:
+            tg.start_soon(waiter)
+            tg.start_soon(notifier)
+
+        assert woken
+        assert event.statistics().tasks_waiting == 0
+
+    async def test_finish_round_discards_completion(self) -> None:
+        event = ReusableEvent()
+        round_ = event.start_round()
+        event.set(round_)
+        event.finish_round(round_)
+
+        # The recorded completion is gone, so a new round blocks again
+        next_round = event.start_round()
+        with move_on_after(0.1) as scope:
+            await event.wait(next_round)
+
+        assert scope.cancelled_caught
+
+    async def test_cancelled_wait_keeps_late_notification(self) -> None:
+        event = ReusableEvent()
+        round_ = event.start_round()
+
+        async def waiter(*, task_status: TaskStatus[CancelScope]) -> None:
+            with CancelScope() as scope:
+                task_status.started(scope)
+                await event.wait(round_)
+
+        async with create_task_group() as tg:
+            scope = await tg.start(waiter)
+            await wait_all_tasks_blocked()
+            assert event.statistics().tasks_waiting == 1
+            scope.cancel()
+
+        # The round was never completed, so waiting on it still blocks
+        with move_on_after(0.1) as timed_scope:
+            await event.wait(round_)
+
+        assert timed_scope.cancelled_caught
+
+        # Delivering the notification now records the completion
+        event.set(round_)
+        with fail_after(1):
+            await event.wait(round_)
+
+    async def test_close_releases_waiters(self) -> None:
+        event = ReusableEvent()
+        round_ = event.start_round()
+        errors: list[BaseException] = []
+
+        async def closer() -> None:
+            await wait_all_tasks_blocked()
+            event.close()
+
+        async def waiter() -> None:
+            try:
+                await event.wait(round_)
+            except ClosedResourceError as exc:
+                errors.append(exc)
+
+        async with create_task_group() as tg:
+            tg.start_soon(waiter)
+            tg.start_soon(closer)
+
+        assert errors and isinstance(errors[0], ClosedResourceError)
+        assert event.is_closed()
+        with pytest.raises(ClosedResourceError):
+            await event.wait(event.start_round())
+
+        # Notifications after closing are ignored
+        event.set(round_)
+        assert event.is_closed()
+
+    async def test_close_round_wakes_one_round_after_mark_closed(self) -> None:
+        event = ReusableEvent()
+        round_ = event.start_round()
+        event.mark_closed()
+        errors: list[BaseException] = []
+
+        async def waiter() -> None:
+            try:
+                await event.wait(round_)
+            except ClosedResourceError as exc:
+                errors.append(exc)
+
+        async with create_task_group() as tg:
+            tg.start_soon(waiter)
+            await wait_all_tasks_blocked()
+            event.close_round(round_)
+
+        assert errors and isinstance(errors[0], ClosedResourceError)
+
+    def test_instantiate_outside_event_loop(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        event = ReusableEvent()
+        assert not event.is_closed()
+        assert event.statistics().tasks_waiting == 0
+        round_ = event.start_round()
+        event.set(round_)
+
+        async def consume() -> None:
+            await event.wait(round_)
+
+        run(
+            consume,
             backend=anyio_backend_name,
             backend_options=anyio_backend_options,
         )
