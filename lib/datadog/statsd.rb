@@ -1,6 +1,15 @@
 # frozen_string_literal: true
 require 'socket'
 
+# The base error class has to exist before the serialization code is loaded,
+# because the tag serialization errors inherit from it.
+module Datadog
+  class Statsd
+    class Error < StandardError
+    end
+  end
+end
+
 require_relative 'statsd/version'
 require_relative 'statsd/telemetry'
 require_relative 'statsd/udp_connection'
@@ -32,9 +41,6 @@ require_relative 'statsd/timer'
 #   statsd = Datadog::Statsd.new 'localhost', 8125, tags: 'tag1:true'
 module Datadog
   class Statsd
-    class Error < StandardError
-    end
-
     OK       = 0
     WARNING  = 1
     CRITICAL = 2
@@ -183,6 +189,11 @@ module Datadog
     # @option opts [Numeric] :sample_rate sample rate, 1 for always
     # @option opts [Boolean] :pre_sampled If true, the client assumes the caller has already sampled metrics at :sample_rate, and doesn't perform sampling.
     # @option opts [Array<String>] :tags An array of tags
+    # @option opts [Hash] :tag_merge Opt into the identity-aware tag merge rules
+    #   for this metric. Accepts `:remove` (original keys to drop) and `:set`
+    #   (keys to replace, single-valued only). Other global keys keep all of
+    #   their values. Distinct remaining original keys that escape to the same
+    #   wire key raise {Serialization::TagConflictError}.
     # @option opts [Numeric] :by increment value, default 1
     # @option opts [String] :cardinality The tag cardinality to use
     # @see #count
@@ -200,6 +211,8 @@ module Datadog
     # @option opts [Boolean] :pre_sampled If true, the client assumes the caller has already sampled metrics at :sample_rate, and doesn't perform sampling.
     # @option opts [Array<String>] :tags An array of tags
     # @option opts [Numeric] :by decrement value, default 1
+    # @option opts [Hash] :tag_merge Opt into the identity-aware tag merge rules
+    #   for this metric. See {#increment}.
     # @option opts [String] :cardinality The tag cardinality to use
     # @see #count
     def decrement(stat, opts = EMPTY_OPTIONS)
@@ -464,13 +477,27 @@ module Datadog
 
       sample_rate = opts[:sample_rate] || @sample_rate || 1
       cardinality = opts[:cardinality] || @cardinality
+      tag_merge = opts[:tag_merge]
+
+      # Merge-enabled metrics validate the full tag identity set up front so a
+      # conflicting metric is rejected in the caller, even when serialization
+      # is delayed to the sender thread.
+      if tag_merge && @delay_serialization
+        serializer.validate_stat_tags(stat, tags: opts[:tags], tag_merge: tag_merge)
+      end
 
       if sample_rate == 1 || opts[:pre_sampled] || rand <= sample_rate
         full_stat =
           if @delay_serialization
-            [stat, delta, type, opts[:tags], sample_rate, cardinality]
+            # Ordinary calls keep the 6-element shape of delayed messages.
+            if tag_merge
+              [stat, delta, type, opts[:tags], sample_rate, cardinality, tag_merge]
+            else
+              [stat, delta, type, opts[:tags], sample_rate, cardinality]
+            end
           else
-            serializer.to_stat(stat, delta, type, tags: opts[:tags], sample_rate: sample_rate, cardinality: cardinality)
+            serializer.to_stat(stat, delta, type, tags: opts[:tags], sample_rate: sample_rate,
+                                             cardinality: cardinality, tag_merge: tag_merge)
           end
 
         forwarder.send_message(full_stat)

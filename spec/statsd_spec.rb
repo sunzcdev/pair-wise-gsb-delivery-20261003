@@ -1301,6 +1301,73 @@ describe Datadog::Statsd do
     end
   end
 
+  describe 'Identity-aware tag merging' do
+    let(:namespace) { nil }
+    let(:sample_rate) { nil }
+    let(:tags) { %w[site:first site:second s|egment:x segment:y] }
+
+    # Telemetry lines also carry the global tags, so look only at the metric lines.
+    def metric_lines(packet)
+      packet.split("\n").reject { |line| line.start_with?('datadog.dogstatsd.client.') }
+    end
+
+    around do |example|
+      ClimateControl.modify('DD_TAGS' => 'zone:outer') { example.run }
+    end
+
+    it 'drops a key by original identity, replaces the env zone, and leaves global tags untouched' do
+      subject.increment('merged_ok', tag_merge: { remove: 's|egment', set: { zone: 'inner' } })
+      subject.flush(sync: true)
+
+      expect(metric_lines(socket.recv[0]))
+        .to eq ['merged_ok:1|c|#zone:inner,site:first,site:second,segment:y']
+    end
+
+    it 'rejects a metric that keeps two original keys collapsing to one wire key' do
+      expect do
+        subject.increment('merged_conflict', tag_merge: { set: { zone: 'inner' } })
+      end.to raise_error(Datadog::Statsd::Serialization::TagConflictError) do |error|
+        expect(error.metric_name).to eq 'merged_conflict'
+        expect(error.conflicts.length).to eq 1
+        expect(error.conflicts.first.wire_key).to eq 'segment'
+        expect(error.conflicts.first.original_keys).to eq ['s|egment', 'segment']
+      end
+
+      subject.flush(sync: true)
+      # The rejected metric never reached the wire.
+      expect(socket.recv).to be_nil
+    end
+
+    it 'keeps the ordinary append contract and the original global tags after merge requests' do
+      begin
+        subject.increment('merged_conflict', tag_merge: { set: { zone: 'inner' } })
+      rescue Datadog::Statsd::Serialization::TagConflictError
+        # rejected on purpose; it must not change the shared global tags
+      end
+
+      subject.increment('plain', tags: ['zone:inner'])
+      subject.flush(sync: true)
+
+      expect(metric_lines(socket.recv[0]))
+        .to eq ['plain:1|c|#zone:outer,site:second,segment:x,segment:y,zone:inner']
+      expect(subject.tags).to eq %w[zone:outer site:second segment:x segment:y]
+    end
+
+    it 'keeps every value of a repeated global key in order when nothing is removed' do
+      subject.increment('merged_all', tag_merge: { remove: 's|egment' })
+      subject.flush(sync: true)
+
+      expect(metric_lines(socket.recv[0]))
+        .to eq ['merged_all:1|c|#zone:outer,site:first,site:second,segment:y']
+    end
+
+    it 'rejects replacing a multi-valued key with a single value' do
+      expect do
+        subject.increment('merged_set', tag_merge: { set: { site: 'third' } })
+      end.to raise_error(Datadog::Statsd::Serialization::TagMergeError)
+    end
+  end
+
   describe 'External env' do
     let(:tags) { nil }
 

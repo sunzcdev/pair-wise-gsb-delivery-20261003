@@ -13,8 +13,18 @@ module Datadog
         end
 
         # using *args would make new allocations
-        def to_stat(name, delta, type, tags: [], sample_rate: 1, cardinality: nil)
-          stat_serializer.format(name, delta, type, tags: tags, sample_rate: sample_rate, cardinality: cardinality)
+        def to_stat(name, delta, type, tags: [], sample_rate: 1, cardinality: nil, tag_merge: nil)
+          stat_serializer.format(name, delta, type, tags: tags, sample_rate: sample_rate, cardinality: cardinality,
+                                                  tag_merge: tag_merge)
+        end
+
+        # Resolves the tag identity set for a merge-enabled metric without
+        # emitting it, so conflicts surface at the caller even when the actual
+        # serialization is delayed.
+        def validate_stat_tags(name, tags: [], tag_merge: nil)
+          return unless tag_merge
+
+          stat_serializer.validate_tags(name, tags, tag_merge)
         end
 
         # using *args would make new allocations

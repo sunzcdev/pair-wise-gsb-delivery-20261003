@@ -62,4 +62,21 @@ describe "Delayed serialization mode" do
       "pow:1|c|@2|#tag1:val1|c:banana"
     ].join("\n"))
   end
+
+  it "rejects conflicting tags at the caller before delayed serialization" do
+    socket = FakeUDPSocket.new(copy_message: true)
+    allow(UDPSocket).to receive(:new).and_return(socket)
+    dogstats = Datadog::Statsd.new("localhost", 1234,
+                                   delay_serialization: true,
+                                   origin_detection: false,
+                                   tags: ["s|egment:x", "segment:y"],
+                                   )
+
+    expect do
+      dogstats.increment("conflicted", tag_merge: { set: { "zone" => "inner" } })
+    end.to raise_error(Datadog::Statsd::Serialization::TagConflictError)
+
+    dogstats.flush(sync: true)
+    expect(socket.recv).to be_nil
+  end
 end

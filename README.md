@@ -158,6 +158,39 @@ After the client is created, you can start sending custom metrics to Datadog. Se
 
 Some options are supported when submitting metrics, like [applying a Sample Rate to your metrics](https://docs.datadoghq.com/metrics/dogstatsd_metrics_submission/?tab=ruby#metric-submission-options) or [tagging your metrics with your custom tags](https://docs.datadoghq.com/metrics/dogstatsd_metrics_submission/?tab=ruby#metric-tagging). Find all the available functions to report metrics in the [DogStatsD-ruby rubydoc](https://www.rubydoc.info/github/DataDog/dogstatsd-ruby/master/Datadog/Statsd).
 
+#### Overriding global tags for a single metric
+
+By default, tags passed to a metric are appended to the client's global tags (which themselves come from the `tags` option, `DD_TAGS`, `DD_ENV`, `DD_SERVICE`, `DD_VERSION` and `DD_ENTITY_ID`). A client created with `tags` as an **array** may repeat a key to carry several ordered values:
+
+```ruby
+statsd = Datadog::Statsd.new('localhost', 8125, tags: ['site:first', 'site:second'])
+```
+
+For metrics that opt in with the `:tag_merge` option, the client merges tags by the *original* key, before any wire escaping:
+
+* `remove:` drops whole keys by their original identity,
+* `set:` replaces a key that is declared single-valued,
+* every other global key keeps all of its values, in order,
+* `tags:` passed to that call are still appended as extra values.
+
+```ruby
+# Drop the `site` key and replace the `env` tag (from DD_ENV/DD_TAGS) for this metric only.
+statsd.increment('page.views', tag_merge: { remove: 'site', set: { env: 'staging' } })
+```
+
+Keys are compared before escaping, but the output is still escaped exactly like the ordinary tag path. If two distinct remaining original keys escape to the same wire key (for example `s|egment:x` and `segment:y`), the metric is rejected with `Datadog::Statsd::Serialization::TagConflictError` instead of silently overwriting one source:
+
+```ruby
+begin
+  statsd.increment('page.views', tag_merge: { set: { env: 'staging' } })
+rescue Datadog::Statsd::Serialization::TagConflictError => e
+  e.metric_name  # => "page.views"
+  e.conflicts    # => [#<struct wire_key="segment", original_keys=["s|egment", "segment"]>]
+end
+```
+
+Merge requests never mutate the client's global tags, and calls without `:tag_merge` keep the original append-only contract.
+
 ### Events
 
 After the client is created, you can start sending events to your Datadog Event Stream. See the dedicated [Event Submission: DogStatsD documentation](https://docs.datadoghq.com/events/guides/dogstatsd/?code-lang=ruby) to see how to submit an event to Datadog your Event Stream.

@@ -3,6 +3,15 @@
 [//]: # (comment: Don't forget to update lib/datadog/statsd/version.rb:DogStatsd::Statsd::VERSION when releasing a new version)
 
 
+## Unreleased
+
+  * [FEATURE] Add the opt-in `:tag_merge` metric option to merge tags by their
+    original key identity: remove global keys, replace single-valued keys, and
+    keep every value of repeated keys. Distinct original keys that escape to the
+    same wire key raise `Datadog::Statsd::Serialization::TagConflictError` rather
+    than silently overwriting one another. Calls without `:tag_merge` keep the
+    existing append-only tag contract.
+
 ## 5.7.1 / 2025.08.20
 
   * [IMPROVEMENT] Suppress external env if origin detection is configured off. [#316][] by [@StephenWakely][]

@@ -11,18 +11,29 @@ module Datadog
           @field_serializer = FieldSerializer.new(container_id, external_data)
         end
 
-        def format(metric_name, delta, type, tags: [], sample_rate: 1, cardinality: nil)
+        def format(metric_name, delta, type, tags: [], sample_rate: 1, cardinality: nil, tag_merge: nil)
           metric_name = formatted_metric_name(metric_name)
           fields = field_serializer.format(cardinality)
 
+          tags_list = if tag_merge
+                        tag_serializer.format_merged(
+                          tags,
+                          remove: tag_merge[:remove],
+                          set: tag_merge[:set],
+                          metric_name: metric_name,
+                        )
+                      else
+                        tag_serializer.format(tags)
+                      end
+
           if sample_rate != 1
-            if tags_list = tag_serializer.format(tags)
+            if tags_list
               "#{@prefix_str}#{metric_name}:#{delta}|#{type}|@#{sample_rate}|##{tags_list}#{fields}"
             else
               "#{@prefix_str}#{metric_name}:#{delta}|#{type}|@#{sample_rate}#{fields}"
             end
           else
-            if tags_list = tag_serializer.format(tags)
+            if tags_list
               "#{@prefix_str}#{metric_name}:#{delta}|#{type}|##{tags_list}#{fields}"
             else
               "#{@prefix_str}#{metric_name}:#{delta}|#{type}#{fields}"
@@ -32,6 +43,18 @@ module Datadog
 
         def global_tags
           tag_serializer.global_tags
+        end
+
+        # Raises a TagConflictError when the merge-enabled tag set for this
+        # metric would collapse distinct original keys once escaped.
+        def validate_tags(metric_name, tags, tag_merge)
+          tag_serializer.format_merged(
+            tags,
+            remove: tag_merge[:remove],
+            set: tag_merge[:set],
+            metric_name: formatted_metric_name(metric_name),
+          )
+          nil
         end
 
         private

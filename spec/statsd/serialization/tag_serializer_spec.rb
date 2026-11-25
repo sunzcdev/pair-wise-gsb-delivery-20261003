@@ -237,6 +237,69 @@ describe Datadog::Statsd::Serialization::TagSerializer do
       end
     end
 
+    context '[testing identity-aware merging]' do
+      around do |example|
+        ClimateControl.modify('DD_TAGS' => 'zone:outer') { example.run }
+      end
+
+      let(:global_tags) do
+        %w[site:first site:second s|egment:x segment:y]
+      end
+
+      describe '#format_merged' do
+        it 'removes a key by its original identity and replaces a declared single value' do
+          expect(subject.format_merged(remove: 's|egment', set: { 'zone' => 'inner' }))
+            .to eq 'zone:inner,site:first,site:second,segment:y'
+        end
+
+        it 'keeps every value of a repeated global key in order' do
+          expect(subject.format_merged(remove: 's|egment')).to eq 'zone:outer,site:first,site:second,segment:y'
+        end
+
+        it 'reports distinct original keys that escape to the same wire key' do
+          expect { subject.format_merged(set: { 'zone' => 'inner' }) }
+            .to raise_error(Datadog::Statsd::Serialization::TagConflictError) do |error|
+              expect(error.conflicts.map { |conflict| [conflict.wire_key, conflict.original_keys] })
+                .to eq [['segment', ['s|egment', 'segment']]]
+            end
+        end
+
+        it 'tags the conflict with the metric name when provided' do
+          expect { subject.format_merged(metric_name: 'some.metric') }
+            .to raise_error(Datadog::Statsd::Serialization::TagConflictError, /some\.metric/)
+        end
+
+        it 'appends message tags as extra values of an existing key' do
+          expect(subject.format_merged(['site:third', 'extra:one'], remove: 's|egment'))
+            .to eq 'zone:outer,site:first,site:second,site:third,segment:y,extra:one'
+        end
+
+        it 'rejects replacing a multi-valued key with a single value' do
+          expect { subject.format_merged(set: { 'site' => 'third' }) }
+            .to raise_error(Datadog::Statsd::Serialization::TagMergeError)
+        end
+
+        it 'allows replacing a multi-valued key with an explicit list' do
+          expect(subject.format_merged(set: { 'site' => %w[third fourth] }, remove: 's|egment'))
+            .to eq 'zone:outer,site:third,site:fourth,segment:y'
+        end
+
+        it 'does not mutate the global tags used by plain calls' do
+          before = subject.format(nil)
+
+          expect { subject.format_merged(remove: 's|egment') }.not_to raise_error
+          expect(subject.format(nil)).to eq before
+        end
+
+        it 'keeps the multi-valued identity source for later merges' do
+          subject.format_merged(remove: 's|egment', set: { 'zone' => 'inner' })
+
+          expect(subject.global_tag_set.values_for('site')).to eq %w[first second]
+          expect(subject.global_tag_set.values_for('zone')).to eq %w[outer]
+        end
+      end
+    end
+
     context 'benchmark' do
       before { skip("Benchmarks results are currently not used by CI") if ENV.key?('CI') }
 

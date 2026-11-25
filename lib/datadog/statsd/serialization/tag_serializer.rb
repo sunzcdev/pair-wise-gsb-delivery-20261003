@@ -5,11 +5,18 @@ module Datadog
     module Serialization
       class TagSerializer
         def initialize(global_tags = [], env = ENV)
+          defaults = default_tags(env)
+
+          # Keep the original key identity straight from the caller-provided
+          # tags (arrays may carry several ordered values for one key) for
+          # merge-enabled metrics.
+          @global_tag_set = TagSet.build(defaults, global_tags)
+
           # Convert to hash
           global_tags = to_tags_hash(global_tags)
 
           # Merge with default tags
-          global_tags = default_tags(env).merge(global_tags)
+          global_tags = defaults.merge(global_tags)
 
           # Convert to tag list and set
           @global_tags = to_tags_list(global_tags)
@@ -34,9 +41,64 @@ module Datadog
           tags.join(',')
         end
 
+        # Formats a metric whose tags follow the identity-aware merge rules.
+        #
+        # The global tag identity set is copied, never mutated, so merge
+        # requests cannot rewrite the tags used by ordinary calls. `remove`
+        # drops keys by their original identity, `set` replaces single-valued
+        # keys, and message tags are appended as extra values. Distinct
+        # remaining original keys that escape to the same wire key raise a
+        # `TagConflictError` instead of silently overwriting one another.
+        def format_merged(message_tags = nil, remove: nil, set: nil, metric_name: nil)
+          merged = global_tag_set
+
+          merged.remove(remove) if remove
+          apply_merged_values(merged, set) if set
+          append_tags(merged, message_tags) if message_tags && !message_tags.empty?
+
+          conflicts = merged.conflicts
+          raise TagConflictError.new(conflicts, metric_name) unless conflicts.empty?
+
+          list = merged.to_list
+          list.empty? ? nil : list.join(',')
+        end
+
         attr_reader :global_tags
 
+        # Independent copy of the identity-preserving global tags.
+        def global_tag_set
+          @global_tag_set.dup
+        end
+
         private
+
+        def apply_merged_values(tag_set, values)
+          case values
+          when Hash
+            values.each { |key, value| tag_set.set(key, value) }
+          when Array
+            values.each do |tag|
+              parsed = TagSet.parse(tag)
+              tag_set.set(parsed[0], parsed[1]) if parsed
+            end
+          else
+            raise ArgumentError, 'merged tag values must be a Hash or an Array'
+          end
+        end
+
+        def append_tags(tag_set, message_tags)
+          case message_tags
+          when Hash
+            message_tags.each { |key, value| tag_set.add_value(key, value) }
+          when Array
+            message_tags.each do |tag|
+              parsed = TagSet.parse(tag)
+              tag_set.add_value(parsed[0], parsed[1]) if parsed
+            end
+          else
+            raise ArgumentError, 'tags must be an array of string tags or a Hash'
+          end
+        end
 
         def to_tags_hash(tags)
           case tags
