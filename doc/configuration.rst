@@ -817,6 +817,16 @@ max_graph_nodes
 record_task_history
   If true, stores task history in a database. Defaults to false.
 
+recovery_claim_delay
+  Number of seconds after a scheduler restart during which the worker
+  recorded as running a restored RUNNING task may reclaim it through an
+  explicit recovery handoff (the ``claim_task_run`` RPC). A successful
+  claim rotates the task's run token, so late status updates from a
+  previous execution attempt can be told apart and are ignored. If the
+  original worker has not reported back by the deadline, the task is
+  released as PENDING so that another worker can take it over; its
+  dependencies are left untouched. Defaults to 600 (10 minutes).
+
 remove_delay
   Number of seconds to wait before removing a task that has no
   stakeholders. Defaults to 600 (10 minutes).

@@ -118,6 +118,13 @@ class scheduler(Config):
     worker_disconnect_delay = parameter.FloatParameter(default=60.0)
     state_path = parameter.Parameter(default="/var/lib/luigi-server/state.pickle")
 
+    recovery_claim_delay = parameter.FloatParameter(
+        default=600.0,
+        description="Seconds after a scheduler restart during which the worker recorded as running "
+        "a restored RUNNING task may reclaim it (explicit recovery handoff) before the task is "
+        "released for other workers to take over",
+    )
+
     batch_emails = parameter.BoolParameter(default=False, description="Send e-mails in batches rather than immediately")
 
     # Jobs are disabled if we see more than retry_count failures in disable_window seconds.
@@ -258,6 +265,8 @@ class Task:
         self.remove = None
         self.worker_running = None  # the worker id that is currently running the task or None
         self.time_running = None  # Timestamp when picked up by worker
+        self.run_id = None  # token of the current execution attempt, used to tell apart late updates from previous executors
+        self.recovery_deadline = None  # deadline for the original worker to reclaim this task after a scheduler restart
         self.expl = None
         self.priority = priority
         self.resources = _get_default(resources, {})
@@ -474,6 +483,11 @@ class SimpleTaskState:
             self.set_state(state)
             self._status_tasks = collections.defaultdict(dict)
             for task in self._tasks.values():
+                # Backfill attributes that did not exist when the state was pickled
+                if not hasattr(task, "run_id"):
+                    task.run_id = None
+                if not hasattr(task, "recovery_deadline"):
+                    task.recovery_deadline = None
                 self._status_tasks[task.status][task.id] = task
         else:
             logger.info("No prior state file exists at %s. Starting with empty state", self._state_path)
@@ -644,6 +658,38 @@ class SimpleTaskState:
     def get_worker(self, worker_id):
         return self._active_workers.setdefault(worker_id, Worker(worker_id))
 
+    def get_existing_worker(self, worker_id):
+        # Like get_worker, but does not create a worker entry for unknown ids
+        return self._active_workers.get(worker_id)
+
+    def get_recovery_expired_tasks(self, now=None):
+        """
+        Restored RUNNING tasks whose recovery claim window has elapsed.
+        """
+        now = time.time() if now is None else now
+        return [
+            task
+            for task in self.get_active_tasks_by_status(RUNNING, BATCH_RUNNING)
+            if getattr(task, "recovery_deadline", None) is not None and task.recovery_deadline <= now
+        ]
+
+    def release_task_for_recovery(self, task):
+        """
+        Release a restored RUNNING task whose original worker did not reclaim it
+        in time, so that another worker can take it over.
+
+        The previous run token is invalidated, so late status updates from the
+        previous executor can be told apart and will be ignored. Dependencies
+        of (and on) the task are left untouched.
+        """
+        logger.info("Releasing unclaimed recovered task %r (was running on %r)", task.id, task.worker_running)
+        task.recovery_deadline = None
+        task.worker_running = None
+        task.time_running = None
+        task.batch_id = None
+        task.run_id = uuid.uuid4().hex  # invalidate the previous run token
+        self.set_status(task, PENDING)
+
     def inactivate_workers(self, delete_workers):
         # Mark workers as inactive
         for worker in delete_workers:
@@ -709,6 +755,23 @@ class Scheduler:
 
     def load(self):
         self._state.load()
+        self._begin_recovery()
+
+    def _begin_recovery(self):
+        """
+        Open a recovery claim window for RUNNING tasks restored from a previous
+        scheduler instance. Until the deadline, only the worker recorded as
+        running each task may reclaim it (see claim_task_run); afterwards the
+        task is either kept by a worker that reported back alive, or released
+        for other workers to take over.
+        """
+        deadline = time.time() + self._config.recovery_claim_delay
+        for task in self._state.get_active_tasks_by_status(RUNNING, BATCH_RUNNING):
+            task.recovery_deadline = deadline
+            if getattr(task, "run_id", None) is None:
+                # tokenize the restored run so late updates carrying a foreign
+                # run token can be told apart from it
+                task.run_id = uuid.uuid4().hex
 
     def dump(self):
         self._state.dump()
@@ -719,9 +782,28 @@ class Scheduler:
     def prune(self):
         logger.debug("Starting pruning of task graph")
         self._prune_workers()
+        self._prune_recovery()
         self._prune_tasks()
         self._prune_emails()
         logger.debug("Done pruning task graph")
+
+    def _prune_recovery(self):
+        now = time.time()
+        for task in self._state.get_recovery_expired_tasks(now):
+            owner = self._state.get_existing_worker(task.worker_running) if task.worker_running else None
+            if owner is not None and owner.last_active + self._config.worker_disconnect_delay > now:
+                # The original executor reported back after the restart and is
+                # still alive: treat it as an implicit claim, the run continues
+                # with its original run token.
+                logger.info("Task %r recovered implicitly: worker %r is alive", task.id, task.worker_running)
+                task.recovery_deadline = None
+            else:
+                logger.info(
+                    "Recovery claim for task %r expired, worker %r did not report back",
+                    task.id,
+                    task.worker_running,
+                )
+                self._state.release_task_for_recovery(task)
 
     def _prune_workers(self):
         remove_workers = []
@@ -789,6 +871,35 @@ class Scheduler:
         return {"task_id": task_id, "status": task.status}
 
     @rpc_method()
+    def claim_task_run(self, worker=None, task_id=None, **kwargs):
+        """
+        Explicit recovery handoff after a scheduler restart.
+
+        The worker recorded as running a restored RUNNING task may reclaim it
+        until ``recovery_claim_delay`` seconds after the state was loaded. A
+        successful claim rotates the task's run token: the returned run_id must
+        be used for subsequent status updates, and updates carrying the
+        previous token are rejected as stale.
+        """
+        self._update_worker(worker)
+        task = self._state.get_task(task_id)
+        if task is None:
+            return {"task_id": task_id, "claimed": False, "run_id": None, "status": None}
+
+        now = time.time()
+        deadline = getattr(task, "recovery_deadline", None)
+        claimable = task.status in (RUNNING, BATCH_RUNNING) and deadline is not None and now <= deadline and task.worker_running == worker
+        if not claimable:
+            return {"task_id": task_id, "claimed": False, "run_id": None, "status": task.status}
+
+        task.run_id = uuid.uuid4().hex
+        task.time_running = now
+        task.recovery_deadline = None
+        task.updated = now
+        logger.info("Worker %s reclaimed task %s after scheduler restart", worker, task_id)
+        return {"task_id": task_id, "claimed": True, "run_id": task.run_id, "status": task.status}
+
+    @rpc_method()
     def mark_as_done(self, task_id=None):
         status = DONE
         task = self._state.get_task(task_id)
@@ -824,6 +935,7 @@ class Scheduler:
         batch_id=None,
         retry_policy_dict=None,
         owners=None,
+        run_id=None,
         **kwargs,
     ):
         """
@@ -832,6 +944,11 @@ class Scheduler:
         * update status of task
         * add additional workers/stakeholders
         * update priority when needed
+
+        The optional ``run_id`` identifies the execution attempt this update
+        belongs to (as handed out by get_work or claim_task_run). Updates for
+        a stale run, e.g. a late terminal state replayed by a previous
+        executor, are ignored.
         """
         assert worker is not None
         worker_id = worker
@@ -862,6 +979,20 @@ class Scheduler:
         task = self._state.get_task(task_id, setdefault=_default_task)
 
         if task is None or (task.status != RUNNING and not worker.enabled):
+            return
+
+        # Distinguish late updates from a previous execution attempt: a status
+        # report is only valid for the run token currently on record.
+        current_run_id = getattr(task, "run_id", None)
+        if status in (DONE, FAILED, RUNNING) and run_id is not None and current_run_id is not None and run_id != current_run_id:
+            logger.info(
+                "Ignoring stale %s update for task %r from worker %r: run_id %r does not match current run %r",
+                status,
+                task_id,
+                worker_id,
+                run_id,
+                current_run_id,
+            )
             return
 
         # Ignore claims that the task is PENDING if it very recently was marked as DONE.
@@ -1253,6 +1384,7 @@ class Scheduler:
             batch_id = hashlib.new("md5", batch_string.encode("utf-8"), usedforsecurity=False).hexdigest()
             for task in batched_tasks:
                 self._state.set_batch_running(task, batch_id, worker_id)
+                task.run_id = uuid.uuid4().hex
 
             combined_params = best_task.params.copy()
             combined_params.update(batched_params)
@@ -1263,6 +1395,7 @@ class Scheduler:
             reply["task_params"] = combined_params
             reply["batch_id"] = batch_id
             reply["batch_task_ids"] = [task.id for task in batched_tasks]
+            reply["run_id"] = best_task.run_id
 
         elif best_task:
             self.update_metrics_task_started(best_task)
@@ -1270,12 +1403,14 @@ class Scheduler:
             best_task.worker_running = worker_id
             best_task.resources_running = best_task.resources.copy()
             best_task.time_running = time.time()
+            best_task.run_id = uuid.uuid4().hex
             self._update_task_history(best_task, RUNNING, host=host)
 
             reply["task_id"] = best_task.id
             reply["task_family"] = best_task.family
             reply["task_module"] = getattr(best_task, "module", None)
             reply["task_params"] = best_task.params
+            reply["run_id"] = best_task.run_id
 
         else:
             reply["task_id"] = None
