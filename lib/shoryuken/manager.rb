@@ -34,6 +34,7 @@ module Shoryuken
       @stop_new_dispatching       = Shoryuken::Helpers::AtomicBoolean.new(false)
       @dispatch_started           = Shoryuken::Helpers::AtomicBoolean.new(false)
       @dispatching_release_signal = ::Queue.new
+      @fifo_groups                = FifoGroups.new
     end
 
     # Starts the dispatch loop
@@ -188,6 +189,8 @@ module Shoryuken
 
       logger.debug { "Assigning #{sqs_msg.message_id}" }
 
+      fifo_lease = register_fifo_lease(queue_name, sqs_msg)
+
       @busy_processors.increment
       fire_utilization_update_event
 
@@ -198,11 +201,32 @@ module Shoryuken
       # and silently breaking the concurrency limit
       @executor.post do
         original_priority = Thread.current.priority
+        outcome = :acknowledged
+        processing_entered = false
+
         begin
           Thread.current.priority = Shoryuken.thread_priority
+          fifo_lease&.wait_for_turn
+          processing_entered = true
           Processor.process(queue_name, sqs_msg)
+          outcome = :retry_pending if fifo_retry_scheduled?(sqs_msg)
+        rescue Exception
+          outcome = :retry_pending
+          raise
         ensure
           Thread.current.priority = original_priority
+
+          if fifo_lease
+            if processing_entered
+              outcome = :acknowledged if fifo_acknowledged?(sqs_msg)
+              fifo_lease.settle(outcome)
+            else
+              # The worker never entered (shutdown/interrupt while queued on the group barrier). Remove its waiter slot
+              # so a dead lease cannot become the active owner later.
+              fifo_lease.cancel
+            end
+          end
+
           processor_done(queue_name)
         end
       rescue Exception
@@ -218,6 +242,7 @@ module Shoryuken
       # (@max_processors - busy) until dispatch stalls and the group stops
       # processing. The message was never processed, so we must not run the
       # FIFO message_processed callback - decrement directly instead.
+      fifo_lease&.cancel
       @busy_processors.decrement
       fire_utilization_update_event
       release(sqs_msg)
@@ -279,6 +304,72 @@ module Shoryuken
       sqs_msgs
     end
 
+    # Registers the ordered FIFO group slot for a single message.
+    #
+    # Registration happens on the dispatch thread while messages from one receive are assigned in SQS order. The returned
+    # lease blocks processor threads until all earlier messages for the same queue/message group have been acknowledged.
+    # Messages from other groups get independent leases and continue in parallel.
+    #
+    # @param queue_name [String] the queue name
+    # @param sqs_msg [Object] the received message
+    # @return [FifoGroups::Lease, nil] the lease, or nil when the message is not ordered by a FIFO group
+    def register_fifo_lease(queue_name, sqs_msg)
+      group_id = fifo_message_group_id(sqs_msg)
+      return nil unless group_id
+
+      @fifo_groups.register([queue_name, group_id], fifo_message_id(sqs_msg))
+    end
+
+    # Reads the SQS MessageGroupId without assuming whether the message is an AWS type, a Shoryuken::Message, or a test
+    # double.
+    #
+    # @param sqs_msg [Object] the received message
+    # @return [String, nil]
+    def fifo_message_group_id(sqs_msg)
+      Processor.message_group_id(sqs_msg)
+    end
+
+    # Reads the stable SQS message id used to recognize a redelivery of the predecessor that is waiting for retry.
+    #
+    # @param sqs_msg [Object] the received message
+    # @return [String, Object, nil]
+    def fifo_message_id(sqs_msg)
+      return sqs_msg['message_id'] || sqs_msg[:message_id] if sqs_msg.is_a?(Hash)
+
+      sqs_msg.message_id if sqs_msg.respond_to?(:message_id)
+    rescue StandardError
+      nil
+    end
+
+    # Whether the delivery has a successful delete receipt. This takes precedence over a later middleware/error so a
+    # true acknowledgement releases same-group successors even if post-delete bookkeeping raises.
+    #
+    # @param sqs_msg [Object] the processed message
+    # @return [Boolean]
+    def fifo_acknowledged?(sqs_msg)
+      if sqs_msg.respond_to?(:instance_variable_defined?) &&
+         sqs_msg.instance_variable_defined?(:@shoryuken_acknowledged)
+        return sqs_msg.instance_variable_get(:@shoryuken_acknowledged) == true
+      end
+
+      sqs_msg.acknowledged? if sqs_msg.respond_to?(:acknowledged?)
+    rescue StandardError
+      false
+    end
+
+    # ExponentialBackoffRetry swallows the worker exception after scheduling a visibility timeout retry and marks the
+    # message. Such a settlement is not an acknowledgement, so its same-group successors must remain held.
+    #
+    # @param sqs_msg [Object] the processed message
+    # @return [Boolean]
+    def fifo_retry_scheduled?(sqs_msg)
+      sqs_msg.respond_to?(:instance_variable_defined?) &&
+        sqs_msg.instance_variable_defined?(:@shoryuken_retry_scheduled) &&
+        sqs_msg.instance_variable_get(:@shoryuken_retry_scheduled) == true
+    rescue StandardError
+      false
+    end
+
     # Handles errors during dispatch
     #
     # @param error [Exception] the exception that occurred
@@ -312,6 +403,198 @@ module Shoryuken
           busy_processors: busy
         }
       )
+    end
+  end
+
+  # Thread-safe ordered barriers for FIFO message groups.
+  #
+  # A key is a [queue_name, message_group_id] pair. The first registered lease for an idle group is runnable; later
+  # registrations wait in receive order. A failed or delayed-retry predecessor keeps ownership of the barrier, and a
+  # redelivery with the same SQS message id is allowed to take that ownership without joining the back of the queue.
+  class FifoGroups
+    # One scheduled execution slot.
+    class Lease
+      # @return [Object] stable SQS message identifier
+      attr_reader :message_id
+
+      # @param groups [Shoryuken::FifoGroups] the owning registry
+      # @param key [Array<String>] queue/group key
+      # @param message_id [Object] stable SQS message identifier
+      def initialize(groups, key, message_id)
+        @groups = groups
+        @key = key
+        @message_id = message_id
+        @state = :waiting
+      end
+
+      # Blocks until this slot is the active group execution.
+      #
+      # @return [void]
+      def wait_for_turn
+        @groups.wait_for_turn(self)
+      end
+
+      # Records the final processing settlement and advances the next slot.
+      #
+      # @param outcome [Symbol] :acknowledged or :retry_pending
+      # @return [void]
+      def settle(outcome)
+        @groups.settle(self, outcome)
+      end
+
+      # Removes a slot whose work was never posted or never started.
+      #
+      # @return [void]
+      def cancel
+        @groups.cancel(self)
+      end
+
+      # @api private
+      def running?
+        @state == :running
+      end
+
+      # @api private
+      def activate!
+        @state = :running
+      end
+
+      # @api private
+      def retry_pending?
+        @state == :retry_pending
+      end
+
+      # @api private
+      def mark_retry_pending!
+        @state = :retry_pending
+      end
+
+      # @api private
+      def cancelled?
+        @state == :cancelled
+      end
+
+      # @api private
+      def cancel!
+        @state = :cancelled
+      end
+
+      # @api private
+      attr_reader :key
+    end
+
+    def initialize
+      @mutex = Mutex.new
+      @condition = ConditionVariable.new
+      @groups = {}
+    end
+
+    # Registers a message in its group's receive order.
+    #
+    # @param key [Array<String>] queue/group key
+    # @param message_id [Object] stable SQS message identifier
+    # @return [Lease]
+    def register(key, message_id)
+      @mutex.synchronize do
+        group = (@groups[key] ||= new_group)
+        lease = Lease.new(self, key, message_id)
+
+        if group[:owner].nil? && !group[:retry_pending]
+          group[:owner] = lease
+          group[:owner_message_id] = message_id
+          lease.activate!
+        elsif group[:retry_pending] && message_id && message_id == group[:owner_message_id]
+          # SQS redelivered the unresolved predecessor. Let this attempt pass the successors that are already waiting.
+          group[:owner] = lease
+          group[:retry_pending] = false
+          lease.activate!
+        else
+          group[:waiters] << lease
+        end
+
+        lease
+      end
+    end
+
+    # Waits until a lease becomes the active execution or is cancelled.
+    #
+    # @param lease [Lease]
+    # @return [void]
+    def wait_for_turn(lease)
+      @mutex.synchronize do
+        @condition.wait(@mutex) until lease.running? || lease.cancelled?
+      end
+    end
+
+    # Settles an active lease.
+    #
+    # @param lease [Lease]
+    # @param outcome [Symbol] :acknowledged or :retry_pending
+    # @return [void]
+    def settle(lease, outcome)
+      @mutex.synchronize do
+        group = @groups[lease.key]
+        next unless group && group[:owner].equal?(lease)
+
+        if outcome == :retry_pending
+          lease.mark_retry_pending!
+          group[:retry_pending] = true
+        else
+          promote_next(group)
+        end
+
+        delete_if_idle(lease.key, group)
+        @condition.broadcast
+      end
+    end
+
+    # Cancels a lease that will never run.
+    #
+    # @param lease [Lease]
+    # @return [void]
+    def cancel(lease)
+      @mutex.synchronize do
+        group = @groups[lease.key]
+        next unless group
+
+        lease.cancel!
+
+        if group[:owner].equal?(lease)
+          promote_next(group)
+        else
+          group[:waiters].delete(lease)
+        end
+
+        delete_if_idle(lease.key, group)
+        @condition.broadcast
+      end
+    end
+
+    private
+
+    def new_group
+      { owner: nil, owner_message_id: nil, retry_pending: false, waiters: [] }
+    end
+
+    def promote_next(group)
+      next_lease = group[:waiters].shift
+
+      if next_lease
+        next_lease.activate!
+        group[:owner] = next_lease
+        group[:owner_message_id] = next_lease.message_id
+        group[:retry_pending] = false
+      else
+        group[:owner] = nil
+        group[:owner_message_id] = nil
+        group[:retry_pending] = false
+      end
+    end
+
+    def delete_if_idle(key, group)
+      return if group[:owner] || group[:retry_pending] || group[:waiters].any?
+
+      @groups.delete(key)
     end
   end
 end

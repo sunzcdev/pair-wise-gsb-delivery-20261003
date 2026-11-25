@@ -21,7 +21,23 @@ module Shoryuken
 
           entries = [sqs_msg].flatten.map.with_index { |message, i| { id: i.to_s, receipt_handle: message.receipt_handle } }
 
-          Shoryuken::Client.queues(queue).delete_messages(entries: entries)
+          delete_failed = Shoryuken::Client.queues(queue).delete_messages(entries: entries)
+          mark_acknowledged(sqs_msg) unless delete_failed
+        end
+
+        private
+
+        # Marks every single/batch delivery represented by this AutoDelete call as acknowledged.
+        #
+        # The instance variable is used directly so RSpec verifying doubles and ordinary message objects need no extra
+        # stubbed method.
+        #
+        # @param sqs_msg [Shoryuken::Message, Array<Shoryuken::Message>]
+        # @return [void]
+        def mark_acknowledged(sqs_msg)
+          Array(sqs_msg).each do |message|
+            message.instance_variable_set(:@shoryuken_acknowledged, true)
+          end
         end
       end
     end

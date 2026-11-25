@@ -131,10 +131,27 @@ module Shoryuken
     # @return [Aws::SQS::Types::DeleteMessageResult] The deletion result
     # @raise [Aws::SQS::Errors::ServiceError] If the deletion fails
     def delete
-      client.delete_message(
+      result = client.delete_message(
         queue_url: queue_url,
         receipt_handle: data.receipt_handle
       )
+      acknowledge!
+      result
+    end
+
+    # Marks this delivery as acknowledged by a successful delete receipt.
+    #
+    # @return [void]
+    # @api private
+    def acknowledge!
+      @shoryuken_acknowledged = true
+    end
+
+    # Whether Shoryuken has observed a successful acknowledgement for this delivery.
+    #
+    # @return [Boolean]
+    def acknowledged?
+      @shoryuken_acknowledged == true
     end
 
     # Changes the visibility timeout of this message with additional options.

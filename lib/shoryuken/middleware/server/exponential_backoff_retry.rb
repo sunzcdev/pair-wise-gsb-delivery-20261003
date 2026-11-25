@@ -52,6 +52,8 @@ module Shoryuken
               raise
             end
 
+            mark_retry_scheduled(sqs_msg)
+
             logger.warn { "Message #{sqs_msg.message_id} will attempt retry due to error: #{e.message}" }
             # since we didn't raise, lets log the backtrace for debugging purposes.
             logger.debug { e.backtrace.join("\n") } unless e.backtrace.nil?
@@ -59,6 +61,15 @@ module Shoryuken
         end
 
         private
+
+        # Marks a message as waiting for a delayed redelivery rather than being acknowledged. The Manager's FIFO group
+        # barrier uses this to keep already-received successors behind this predecessor.
+        #
+        # @param sqs_msg [Shoryuken::Message, Object] the retried message
+        # @return [void]
+        def mark_retry_scheduled(sqs_msg)
+          sqs_msg.instance_variable_set(:@shoryuken_retry_scheduled, true)
+        end
 
         # Logs once per worker class that its batches are not backoff retried
         #

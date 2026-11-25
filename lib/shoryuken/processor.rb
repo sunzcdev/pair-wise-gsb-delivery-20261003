@@ -21,6 +21,36 @@ module Shoryuken
       new(queue, sqs_msg).process
     end
 
+    # Extracts the SQS FIFO MessageGroupId from an AWS message, Shoryuken::Message, Hash, or test double.
+    #
+    # @param sqs_msg [Object] the received message
+    # @return [String, nil]
+    def self.message_group_id(sqs_msg)
+      return nil if sqs_msg.is_a?(Array)
+
+      if sqs_msg.is_a?(Hash)
+        return sqs_msg['MessageGroupId'] || sqs_msg[:MessageGroupId] ||
+               sqs_msg['message_group_id'] || sqs_msg[:message_group_id]
+      end
+
+      if sqs_msg.respond_to?(:attributes)
+        attributes = sqs_msg.attributes
+        if attributes.respond_to?(:[])
+          group_id = begin
+            attributes['MessageGroupId'] || attributes[:MessageGroupId] ||
+              attributes['message_group_id'] || attributes[:message_group_id]
+          rescue StandardError
+            nil
+          end
+          return group_id if group_id
+        end
+      end
+
+      sqs_msg.message_group_id if sqs_msg.respond_to?(:message_group_id)
+    rescue StandardError
+      nil
+    end
+
     # Initializes a new Processor
     #
     # @param queue [String] the queue name
