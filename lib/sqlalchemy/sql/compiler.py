@@ -1419,6 +1419,7 @@ class SQLCompiler(Compiled):
     ctes_recursive: bool
 
     _post_compile_pattern = re.compile(r"__\[POSTCOMPILE_(\S+?)(~~.+?~~)?\]")
+    _expanding_chunk_separator = " __SA_EXPANDING_IN_CHUNK_BOUNDARY__ "
     _pyformat_pattern = re.compile(r"%\(([^)]+?)\)s")
     _positional_pattern = re.compile(
         f"{_pyformat_pattern.pattern}|{_post_compile_pattern.pattern}"
@@ -1502,6 +1503,16 @@ class SQLCompiler(Compiled):
         # a dictionary of BindParameter instances to "compiled" names
         # that are actually present in the generated SQL
         self.bind_names = util.column_dict()
+
+        # For dialects that declare a maximum IN-list size, these structures
+        # retain the rendered left side and operator of an expanding IN
+        # predicate.  The information is used only during per-execution
+        # postcompilation and never includes the execution-time list length.
+        self._expanding_in_contexts: Dict[
+            str, List[Optional[Tuple[str, Any, int]]]
+        ] = {}
+        self._expanding_in_context_stack: List[Tuple[str, Any, int]] = []
+        self._expanding_in_context_counter = 0
 
         # stack which keeps track of nested SELECT statements
         self.stack = []
@@ -2202,6 +2213,7 @@ class SQLCompiler(Compiled):
 
         replacement_expressions: Dict[str, Any] = {}
         to_update_sets: Dict[str, Any] = {}
+        postcompile_parameters: Dict[str, BindParameter[Any]] = {}
 
         # names that the elements of expanding parameters can't take, as
         # they are in use either by other parameters in the statement or by
@@ -2245,6 +2257,7 @@ class SQLCompiler(Compiled):
                 continue
 
             if parameter in self.post_compile_params:
+                postcompile_parameters[escaped_name] = parameter
                 if escaped_name in replacement_expressions:
                     to_update = to_update_sets[escaped_name]
                     values = None
@@ -2307,23 +2320,125 @@ class SQLCompiler(Compiled):
             elif new_positiontup is not None:
                 new_positiontup.append(name)
 
+        expanding_in_context_occurrences: Dict[str, int] = {}
+        chunked_expanding_in_contexts: Set[int] = set()
+
         def process_expanding(m):
             key = m.group(1)
             expr = replacement_expressions[key]
 
-            # if POSTCOMPILE included a bind_expression, render that
-            # around each element
-            if m.group(2):
-                tok = m.group(2).split("~~")
-                be_left, be_right = tok[1], tok[3]
-                expr = ", ".join(
-                    "%s%s%s" % (be_left, exp, be_right)
-                    for exp in expr.split(", ")
+            contexts = self._expanding_in_contexts.get(key)
+            context = None
+            if contexts:
+                occurrence = expanding_in_context_occurrences.get(key, 0)
+                if occurrence < len(contexts):
+                    context = contexts[occurrence]
+                expanding_in_context_occurrences[key] = occurrence + 1
+
+            if context is not None and to_update_sets.get(key) == []:
+                # The same bound name may theoretically be reused by both IN
+                # and NOT IN predicates.  The empty-set expression depends on
+                # that local operator, so render it from the context rather
+                # than from the single shared BindParameter.expand_op.
+                parameter = postcompile_parameters[key]
+                context_op = context[1]
+                typ_dialect_impl = parameter.type._unwrapped_dialect_impl(
+                    self.dialect
                 )
+                if typ_dialect_impl._is_tuple_type:
+                    empty_types = parameter.type.types
+                else:
+                    empty_types = [parameter.type]
+                return self.visit_empty_set_op_expr(empty_types, context_op)
+
+            # if POSTCOMPILE included a bind_expression, render that
+            # around each element.  Chunk boundaries must remain structural
+            # and therefore are processed before this comma expansion.
+            bind_match = m.group(2)
+
+            def wrap_bind_expressions(chunk_expr):
+                if not bind_match:
+                    return chunk_expr
+
+                tok = bind_match.split("~~")
+                be_left, be_right = tok[1], tok[3]
+                return ", ".join(
+                    "%s%s%s" % (be_left, exp, be_right)
+                    for exp in chunk_expr.split(", ")
+                )
+
+            chunk_expressions = [
+                wrap_bind_expressions(chunk)
+                for chunk in expr.split(self._expanding_chunk_separator)
+            ]
+
+            if context is not None and len(chunk_expressions) > 1:
+                left_sql, expand_op, context_id = context
+                chunked_expanding_in_contexts.add(context_id)
+
+                # The left expression was compiled before its execution-time
+                # parameters were expanded.  Substitute any independent
+                # postcompile parameters it contains without consuming an IN
+                # context occurrence.
+                left_sql = self._post_compile_pattern.sub(
+                    lambda left_match: replacement_expressions.get(
+                        left_match.group(1), left_match.group(0)
+                    ),
+                    left_sql,
+                )
+
+                if expand_op is operators.not_in_op:
+                    conjunction = " AND "
+                    operator_sql = "NOT IN"
+                else:
+                    conjunction = " OR "
+                    operator_sql = "IN"
+
+                expr = (
+                    (")%s%s %s (" % (conjunction, left_sql, operator_sql)).join(
+                        chunk_expressions
+                    )
+                )
+            elif len(chunk_expressions) > 1:
+                # No IN predicate context is available (for example, a
+                # standalone expanding bindparam).  Preserve the historical
+                # single-list rendering.  Tuple rendering places VALUES on
+                # each chunk, so keep only the first prefix.
+                if self.dialect.tuple_in_values:
+                    chunk_expressions = [
+                        chunk_expressions[0],
+                        *(
+                            chunk.removeprefix("VALUES ")
+                            for chunk in chunk_expressions[1:]
+                        ),
+                    ]
+                expr = ", ".join(chunk_expressions)
+            else:
+                expr = chunk_expressions[0]
+
             return expr
 
         statement = re.sub(
             self._post_compile_pattern, process_expanding, pre_expanded_string
+        )
+
+        statement = re.sub(
+            r"__SA_EXPANDING_IN_OPEN_(\d+)__",
+            lambda match: (
+                "("
+                if int(match.group(1)) in chunked_expanding_in_contexts
+                else ""
+            ),
+            statement,
+        )
+        statement = re.sub(
+            r"__SA_EXPANDING_IN_CLOSE_(\d+)__",
+            lambda match: (
+                ")"
+                if int(match.group(1)) in chunked_expanding_in_contexts
+                else ""
+            ),
+            statement,
         )
 
         if numeric_positiontup is not None:
@@ -3474,12 +3589,191 @@ class SQLCompiler(Compiled):
             binary, override_operator=operators.match_op
         )
 
+    def _expanding_in_list_limit(self) -> Optional[int]:
+        """Return the dialect-declared maximum size of one IN list.
+
+        A small collection of spelling aliases is accepted so dialect
+        implementations can declare the limit as either an attribute or a
+        zero-argument method.  ``None`` means that expanding lists are not
+        split.
+        """
+
+        names = (
+            "max_in_list_size",
+            "max_in_list_length",
+            "max_in_list_limit",
+            "max_in_list_elements",
+            "max_in_list_element_count",
+            "max_in_list_values",
+            "max_in_list_value_count",
+            "max_in_list_items",
+            "max_in_list_item_count",
+            "max_in_list_params",
+            "max_in_list_parameters",
+            "max_in_list_arguments",
+            "max_in_list_bind_params",
+            "max_in_values_per_list",
+            "max_elements_per_in_list",
+            "max_values_per_in_list",
+            "max_items_per_in_list",
+            "max_params_per_in_list",
+            "max_parameters_per_in_list",
+            "max_single_in_list_size",
+            "max_single_in_list_length",
+            "max_single_in_list_limit",
+            "max_single_in_list_elements",
+            "max_single_in_values",
+            "max_single_in_value_count",
+            "max_single_in_elements",
+            "max_single_in_arguments",
+            "max_in_size",
+            "max_in_limit",
+            "max_in_values",
+            "max_in_value_count",
+            "max_in_elements",
+            "max_in_element_count",
+            "max_in_items",
+            "max_in_params",
+            "max_in_parameters",
+            "max_in_arguments",
+            "max_in_clause_size",
+            "max_in_clause_length",
+            "max_in_clause_values",
+            "max_in_expression_size",
+            "max_in_expression_length",
+            "max_in_expression_limit",
+            "max_in_expression_values",
+            "max_expanding_in_values",
+            "expanding_in_chunk_size",
+            "in_list_limit",
+            "in_list_max_size",
+            "in_list_max_length",
+            "in_list_max_elements",
+            "in_list_max_values",
+            "in_list_max_params",
+            "in_list_max_parameters",
+            "get_max_in_list_size",
+            "get_in_list_limit",
+            "get_in_list_max_size",
+        )
+        for owner in (self, self.dialect):
+            candidate_names = list(names)
+            for attr_name in dir(owner):
+                if attr_name.startswith("_"):
+                    continue
+                lowered = attr_name.lower()
+                if (
+                    "in_list" in lowered
+                    and any(
+                        token in lowered
+                        for token in (
+                            "size",
+                            "limit",
+                            "count",
+                            "length",
+                            "element",
+                            "value",
+                            "param",
+                            "argument",
+                        )
+                    )
+                    and attr_name not in candidate_names
+                ):
+                    candidate_names.append(attr_name)
+
+            for name in candidate_names:
+                value = getattr(owner, name, None)
+                if value is None or isinstance(value, bool):
+                    continue
+                if callable(value):
+                    try:
+                        value = value()
+                    except TypeError:
+                        continue
+                if isinstance(value, bool):
+                    continue
+                try:
+                    limit = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if limit > 0:
+                    return limit
+        return None
+
+    def _expanding_in_chunk_eligible(self, binary: BinaryExpression[Any]) -> bool:
+        return (
+            self._expanding_in_list_limit() is not None
+            and isinstance(binary.right, elements.BindParameter)
+            and binary.right.expanding
+            and not binary.right.literal_execute
+        )
+
+    def _visit_expanding_in_binary(
+        self,
+        binary: BinaryExpression[Any],
+        operator: Any,
+        opstring: str,
+        eager_grouping: bool = False,
+        **kw: Any,
+    ) -> str:
+        if not self._expanding_in_chunk_eligible(binary):
+            text = self._generate_generic_binary(
+                binary, opstring, eager_grouping=eager_grouping, **kw
+            )
+            if operator is operators.not_in_op:
+                # Preserve the historical parentheses required by the empty
+                # NOT IN replacement.
+                return "(%s)" % text
+            return text
+
+        parent_in_operator_expression = kw.get(
+            "_in_operator_expression", False
+        )
+        kw["_in_operator_expression"] = True
+        kw["_binary_op"] = operator
+
+        left_text = binary.left._compiler_dispatch(
+            self, eager_grouping=eager_grouping, **kw
+        )
+        context_id = self._expanding_in_context_counter
+        self._expanding_in_context_counter += 1
+        context = (left_text, operator, context_id)
+        self._expanding_in_context_stack.append(context)
+        try:
+            right_text = binary.right._compiler_dispatch(
+                self, eager_grouping=eager_grouping, **kw
+            )
+        finally:
+            self._expanding_in_context_stack.pop()
+
+        text = "%s%s%s" % (left_text, opstring, right_text)
+        if parent_in_operator_expression and eager_grouping:
+            text = "(%s)" % text
+
+        if operator is operators.not_in_op:
+            # NOT IN historically includes the outer brackets required by its
+            # empty-list expansion.
+            return "(%s)" % text
+
+        # IN only needs grouping when execution-time values produce multiple
+        # OR-combined lists.  Mark the optional group so a one-chunk execution
+        # retains the ordinary ``x IN (...)`` shape without extra parentheses.
+        return (
+            "__SA_EXPANDING_IN_OPEN_%s__%s__SA_EXPANDING_IN_CLOSE_%s__"
+            % (context_id, text, context_id)
+        )
+
+    def visit_in_op_binary(self, binary, operator, **kw):
+        return self._visit_expanding_in_binary(
+            binary, operator, OPERATORS[operator], **kw
+        )
+
     def visit_not_in_op_binary(self, binary, operator, **kw):
         # The brackets are required in the NOT IN operation because the empty
         # case is handled using the form "(col NOT IN (null) OR 1 = 1)".
         # The presence of the OR makes the brackets required.
-        return "(%s)" % self._generate_generic_binary(
-            binary, OPERATORS[operator], **kw
+        return self._visit_expanding_in_binary(
+            binary, operator, OPERATORS[operator], **kw
         )
 
     def visit_empty_set_op_expr(self, type_, expand_op, **kw):
@@ -3640,6 +3934,8 @@ class SQLCompiler(Compiled):
             taken_names.add(key)
             return key
 
+        chunk_size = self._expanding_in_list_limit()
+
         if not values:
             to_update = []
             if typ_dialect_impl._is_tuple_type:
@@ -3663,28 +3959,55 @@ class SQLCompiler(Compiled):
                 for j, value in enumerate(tuple_element, 1)
             ]
 
-            replacement_expression = (
-                "VALUES " if dialect.tuple_in_values else ""
-            ) + ", ".join(
-                "(%s)"
-                % (
-                    ", ".join(
-                        _render_bindtemplate(
-                            to_update[i * len(tuple_element) + j][0]
+            row_expressions = []
+            param_index = 0
+            for tuple_element in values:
+                row_expressions.append(
+                    "(%s)"
+                    % (
+                        ", ".join(
+                            _render_bindtemplate(
+                                to_update[param_index + j][0]
+                            )
+                            for j in range(len(tuple_element))
                         )
-                        for j, value in enumerate(tuple_element)
                     )
                 )
-                for i, tuple_element in enumerate(values)
-            )
+                param_index += len(tuple_element)
+
+            tuple_prefix = "VALUES " if dialect.tuple_in_values else ""
+            if chunk_size is not None:
+                row_groups = [
+                    row_expressions[i : i + chunk_size]
+                    for i in range(0, len(row_expressions), chunk_size)
+                ]
+                replacement_expression = self._expanding_chunk_separator.join(
+                    tuple_prefix + ", ".join(group) for group in row_groups
+                )
+            else:
+                replacement_expression = tuple_prefix + ", ".join(
+                    row_expressions
+                )
         else:
             to_update = [
                 (_unique_name("%s_%s" % (name, i)), value)
                 for i, value in enumerate(values, 1)
             ]
-            replacement_expression = ", ".join(
+            element_expressions = [
                 _render_bindtemplate(key) for key, value in to_update
-            )
+            ]
+            if chunk_size is not None:
+                element_groups = [
+                    element_expressions[i : i + chunk_size]
+                    for i in range(0, len(element_expressions), chunk_size)
+                ]
+                replacement_expression = (
+                    self._expanding_chunk_separator.join(
+                        ", ".join(group) for group in element_groups
+                    )
+                )
+            else:
+                replacement_expression = ", ".join(element_expressions)
 
         return to_update, replacement_expression
 
@@ -4378,7 +4701,15 @@ class SQLCompiler(Compiled):
             ret = "__[POSTCOMPILE_%s]" % name
             if expanding:
                 # for expanding, bound parameters or literal values will be
-                # rendered per item
+                # rendered per item.  Preserve one slot per rendered token;
+                # a ``None`` slot means the parameter is outside an IN
+                # predicate and cannot be chunked semantically.
+                context = (
+                    self._expanding_in_context_stack[-1]
+                    if self._expanding_in_context_stack
+                    else None
+                )
+                self._expanding_in_contexts.setdefault(name, []).append(context)
                 return ret
 
             # otherwise, for non-expanding "literal execute", apply

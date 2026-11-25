@@ -362,6 +362,9 @@ class DefaultDialect(Dialect):
     max_index_name_length: Optional[int] = None
     max_constraint_name_length: Optional[int] = None
 
+    #: Maximum number of elements in a single IN list, or ``None``.
+    max_in_list_size: Optional[int] = None
+
     supports_sane_rowcount = True
     supports_sane_multi_rowcount = True
     colspecs: MutableMapping[Type[TypeEngine[Any]], Type[TypeEngine[Any]]] = {}
@@ -459,6 +462,7 @@ class DefaultDialect(Dialect):
         compiler_linting: Linting = int(compiler.NO_LINTING),  # type: ignore[assignment]  # noqa: E501
         server_side_cursors: bool = False,
         skip_autocommit_rollback: bool = False,
+        max_in_list_size: Optional[int] = None,
         **kwargs: Any,
     ):
         if server_side_cursors:
@@ -519,6 +523,8 @@ class DefaultDialect(Dialect):
             self.max_identifier_length = (
                 self._user_defined_max_identifier_length
             )
+        if max_in_list_size is not None:
+            self.max_in_list_size = max_in_list_size
         self.label_length = label_length
         self.compiler_linting = compiler_linting
 

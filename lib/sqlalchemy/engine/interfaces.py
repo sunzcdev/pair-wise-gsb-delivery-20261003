@@ -927,6 +927,18 @@ class Dialect(EventTarget):
     """The maximum length of constraint names if different from
     ``max_identifier_length``."""
 
+    max_in_list_size: Optional[int]
+    """The maximum number of elements supported in one IN (...) list.
+
+    When set, expanding bound parameters used by IN and NOT IN expressions
+    are rendered at execution time as several smaller lists combined using
+    OR for IN and AND for NOT IN.  ``None`` (the default) disables splitting.
+
+    This limit applies only to a single IN list.  It does not change checks
+    for the total number of bound parameters accepted by a statement.
+
+    """
+
     supports_server_side_cursors: Union[generic_fn_descriptor[bool], bool]
     """indicates if the dialect supports server side cursors"""
 
