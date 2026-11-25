@@ -111,6 +111,22 @@ module ROM
 
       option :primary_key, default: -> { schema.primary_key_name }
 
+      # @!attribute [r] nullable_join_aliases
+      #   @return [Array<Symbol>] Table aliases introduced by outer joins.
+      #     Attributes qualified with these aliases may be nil when the joined
+      #     side is missing, so derived read schemas mark them as optional.
+      #
+      # @api private
+      option :nullable_join_aliases, default: -> { EMPTY_ARRAY }
+
+      # @!attribute [r] nullable_join_sources
+      #   @return [Array<Symbol>] Datasets of relations that can be missing due
+      #     to outer joins (the right side of a LEFT JOIN or the left side of
+      #     a RIGHT JOIN), used for unaliased joins.
+      #
+      # @api private
+      option :nullable_join_sources, default: -> { EMPTY_ARRAY }
+
       # Return relation that will load associated tuples of this relation
       #
       # This method is useful for defining custom relation views for relation

@@ -133,6 +133,19 @@ module ROM
         new(map(&:joined))
       end
 
+      # Return a new schema with attributes transformed by the block
+      #
+      # Unlike {#project}, this preserves every attribute and all schema
+      # options. It's used to adjust attribute types (eg mark them optional)
+      # for derived read relations such as outer joins.
+      #
+      # @return [Schema]
+      #
+      # @api private
+      def with_attributes
+        new(map { |attr| yield(attr) })
+      end
+
       # Create a new relation based on the schema definition
       #
       # @param [Relation] relation The source relation

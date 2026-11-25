@@ -238,7 +238,8 @@ module ROM
         #
         # @api public
         def select(...)
-          schema.project(...).(self)
+          projected_schema = __nullable_schema_projection__(schema.project(...))
+          projected_schema.(self)
         end
         alias_method :project, :select
 
@@ -250,7 +251,10 @@ module ROM
         #
         # @api public
         def select_append(...)
-          schema.merge(schema.canonical.project(...)).(self)
+          projected_schema = __nullable_schema_projection__(
+            schema.merge(schema.canonical.project(...))
+          )
+          projected_schema.(self)
         end
 
         # Returns a copy of the relation with a SQL DISTINCT clause.
@@ -1102,10 +1106,20 @@ module ROM
             elsif block_given?
               __join__(type, other, JoinDSL.new(schema).(&), opts)
             else
-              new(dataset.__send__(type, other.to_sym, join_cond, opts, &))
+              __joined_relation__(
+                type,
+                new(dataset.__send__(type, other.to_sym, join_cond, opts, &)),
+                other.to_sym,
+                opts
+              )
             end
           elsif other.is_a?(::Sequel::SQL::AliasedExpression)
-            new(dataset.__send__(type, other, join_cond, opts, &))
+            __joined_relation__(
+              type,
+              new(dataset.__send__(type, other, join_cond, opts, &)),
+              other.alias,
+              opts
+            )
           elsif other.respond_to?(:name) && other.name.is_a?(Relation::Name)
             if block_given?
               join_cond = JoinDSL.new(schema).(&)
@@ -1116,7 +1130,12 @@ module ROM
                 join_opts = EMPTY_HASH
               end
 
-              new(dataset.__send__(type, other.name.dataset.to_sym, join_cond, join_opts))
+              __joined_relation__(
+                type,
+                new(dataset.__send__(type, other.name.dataset.to_sym, join_cond, join_opts)),
+                other.name.aliaz || other.name.dataset,
+                join_opts
+              )
             else
               associations[other.name.key].join(type, self, other)
             end
@@ -1124,6 +1143,97 @@ module ROM
             raise ArgumentError,
                   "+other+ must be either a symbol or a relation, #{other.class} given"
           end
+        end
+        # rubocop:enable Metrics/AbcSize, Metrics/PerceivedComplexity, Metrics/MethodLength, Metrics/CyclomaticComplexity
+
+        # Carry information about sides that can be missing due to outer joins
+        #
+        # The nullable sides are recorded on the derived relation and applied
+        # when read schemas are projected, while canonical schemas and write
+        # relations keep their original non-null constraints.
+        #
+        # @api private
+        def __joined_relation__(type, relation, table_alias, opts = EMPTY_HASH)
+          return relation unless __outer_join__(type)
+
+          alias_name = opts[:table_alias] || table_alias
+          nullable_side = __nullable_join_side__(type, alias_name)
+
+          relation.with(
+            nullable_join_aliases: nullable_join_aliases + [alias_name],
+            nullable_join_sources: nullable_join_sources + [nullable_side]
+          )
+        end
+
+        # @api private
+        def __outer_join__(type)
+          type.equal?(:left_join) || type.equal?(:right_join)
+        end
+
+        # Return the identifier of the relation that can be missing.
+        #
+        # In a LEFT JOIN the joined (right) side can be missing, in a RIGHT
+        # JOIN the base (left) side can be missing.
+        #
+        # @api private
+        def __nullable_join_side__(type, alias_name)
+          if type.equal?(:left_join)
+            alias_name
+          else
+            schema.name.dataset
+          end
+        end
+
+        # @api private
+        def __nullable_join_attr?(attr)
+          qualified = attr.meta[:qualified]
+
+          nullable_join_aliases.include?(qualified) ||
+            nullable_join_sources.any? { |source| __attr_from_side?(attr, source) }
+        end
+
+        # Mark an attribute optional without breaking zero-arity memoization
+        #
+        # ROM memoizes zero-arity attribute methods with a plain hash lookup,
+        # which cannot distinguish an absent key from a cached `nil`. Building
+        # a fresh SQL::Attribute from the optional type sidesteps stale memo
+        # state while preserving every attribute option and type metadata.
+        #
+        # @api private
+        def __optional_attr__(attr)
+          return attr if attr.optional?
+
+          attr.class.new(attr.type.optional, **attr.options)
+        end
+
+        # @api private
+        def __attr_from_side?(attr, side)
+          __attr_source__(attr).equal?(side)
+        end
+
+        # @api private
+        def __attr_source__(attr)
+          source = attr.source
+          source.respond_to?(:dataset) ? source.dataset : source
+        end
+
+        # Apply outer-join nullability when a read schema is projected
+        #
+        # Projection pulls canonical (non-null) attribute types in; attributes
+        # belonging to a nullable outer-join side are marked optional here,
+        # every other attribute keeps its canonical constraint.
+        #
+        # @api private
+        def __nullable_schema_projection__(schema)
+          return schema if nullable_join_aliases.empty?
+
+          schema.with_attributes { |attr|
+            if __nullable_join_attr?(attr)
+              __optional_attr__(attr)
+            else
+              attr
+            end
+          }
         end
       end
       # rubocop:enable Metrics/AbcSize, Metrics/PerceivedComplexity, Metrics/MethodLength, Metrics/CyclomaticComplexity, Metrics/ModuleLength
