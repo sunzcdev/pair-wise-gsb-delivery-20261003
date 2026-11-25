@@ -53,7 +53,7 @@ module Flipper
 
       # Public
       def get(feature)
-        if memoizing?
+        if memoizing? && !nested_reference?
           cache.fetch(key_for(feature.key)) do
             cache[key_for(feature.key)] = preloaded_missing?(feature) ? default_config : @adapter.get(feature)
           end
@@ -65,22 +65,13 @@ module Flipper
       # Public
       def get_multi(features)
         if memoizing?
-          uncached_features = features.reject do |feature|
-            cache[key_for(feature.key)] ||= default_config if preloaded_missing?(feature)
-            cache[key_for(feature.key)]
-          end
-
-          if uncached_features.any?
-            response = @adapter.get_multi(uncached_features)
-            response.each do |key, hash|
-              cache[key_for(key)] = hash
-            end
-          end
-
-          result = {}
-          features.each do |feature|
-            result[feature.key] = cache[key_for(feature.key)]
-          end
+          # Reads made while resolving a FeatureEnabled reference must reach the
+          # wrapped adapter every time so federated adapters can route them (or
+          # report an undeclared dependency); caching them would pin the nested
+          # flag to whatever backend answered first.
+          nested, top_level = features.partition { |feature| nested_reference? }
+          result = memoized_get_multi(top_level)
+          nested.each { |feature| result[feature.key] = @adapter.get(feature) }
           result
         else
           @adapter.get_multi(features)
@@ -160,6 +151,33 @@ module Flipper
       end
 
       private
+
+      # Internal: True when the current read was triggered by a FeatureEnabled
+      # expression resolving another feature, rather than a top-level check.
+      def nested_reference?
+        stack = Thread.current[Flipper::Expressions::FeatureEnabled::ORIGIN_STACK_KEY]
+        stack && !stack.empty?
+      end
+
+      # Internal: The original memoized batch read, used only for top-level
+      # features that are safe to cache.
+      def memoized_get_multi(features)
+        uncached_features = features.reject do |feature|
+          cache[key_for(feature.key)] ||= default_config if preloaded_missing?(feature)
+          cache[key_for(feature.key)]
+        end
+
+        if uncached_features.any?
+          response = @adapter.get_multi(uncached_features)
+          response.each do |key, hash|
+            cache[key_for(key)] = hash
+          end
+        end
+
+        features.each_with_object({}) do |feature, result|
+          result[feature.key] = cache[key_for(feature.key)]
+        end
+      end
 
       def preloaded_missing?(feature)
         cache[@get_all_key] && cache[@features_key] && !cache[@features_key].include?(feature.key)

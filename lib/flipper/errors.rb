@@ -21,6 +21,18 @@ module Flipper
     end
   end
 
+  # Raised when an adapter is asked to resolve a reference to an external
+  # feature that no declaration allows it to follow.
+  class MissingDependency < Error
+    attr_reader :feature_name, :dependency_name
+
+    def initialize(feature_name, dependency_name)
+      @feature_name = feature_name.to_s
+      @dependency_name = dependency_name.to_s
+      super "Feature #{@feature_name.inspect} references external feature #{@dependency_name.inspect}, but no external source is declared for it. Declare the source on the migrating adapter or remove the reference."
+    end
+  end
+
   # Raised when attempting to declare a group name that has already been used.
   class DuplicateGroup < Error; end
 
