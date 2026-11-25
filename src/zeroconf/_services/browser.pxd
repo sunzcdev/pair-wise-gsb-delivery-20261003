@@ -2,6 +2,7 @@
 import cython
 
 from .._cache cimport DNSCache
+from .._dns cimport DNSService
 from .._history cimport QuestionHistory
 from .._protocol.outgoing cimport DNSOutgoing, DNSPointer, DNSQuestion, DNSRecord
 from .._record_update cimport RecordUpdate
@@ -15,6 +16,7 @@ cdef object cached_possible_types
 cdef cython.uint _EXPIRE_REFRESH_TIME_PERCENT, _MAX_MSG_TYPICAL, _DNS_PACKET_HEADER_LEN
 cdef cython.uint _TYPE_PTR
 cdef cython.uint _TYPE_NSEC
+cdef cython.uint _TYPE_SRV
 cdef object _CLASS_IN
 cdef object SERVICE_STATE_CHANGE_ADDED, SERVICE_STATE_CHANGE_REMOVED, SERVICE_STATE_CHANGE_UPDATED
 cdef cython.set _ADDRESS_RECORD_TYPES
@@ -109,13 +111,22 @@ cdef class _ServiceBrowserBase(RecordUpdateListener):
     cdef public QueryScheduler query_scheduler
     cdef public bint done
     cdef public object _query_sender_task
+    cdef public bint _require_usable_view
+    cdef cython.set _pending_view_names
+    cdef cython.set _delivered_views
 
     cpdef void _enqueue_callback(self, object state_change, object type_, object name)
 
     @cython.locals(record_update=RecordUpdate, record=DNSRecord, cache=DNSCache, service=DNSRecord, pointer=DNSPointer)
     cpdef void async_update_records(self, object zc, double now, cython.list records)
 
+    @cython.locals(srv_record=DNSService, record=DNSRecord)
+    cpdef bint _has_usable_view(self, str name, double now)
+
     cpdef cython.list _names_matching_types(self, object types)
+
+    @cython.locals(name=str, type_=str)
+    cpdef void _resolve_pending_view_names(self)
 
     cpdef _fire_service_state_changed_event(self, cython.tuple event)
 

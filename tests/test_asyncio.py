@@ -48,6 +48,7 @@ from . import (
     _clear_cache,
     has_working_ipv6,
     make_service_info,
+    mock_incoming_msg,
     time_changed_millis,
 )
 
@@ -641,6 +642,33 @@ async def test_async_service_browser(quick_timing: None) -> None:
         ("update", type_, registration_name),
         ("remove", type_, registration_name),
     ]
+
+
+@pytest.mark.asyncio
+async def test_async_service_browser_require_usable_view(aiozc: AsyncZeroconf) -> None:
+    """AsyncServiceBrowser holds callbacks until the view is usable with require_usable_view."""
+    zc = aiozc.zeroconf
+    type_ = "_hap._tcp.local."
+    registration_name = f"xxxyyy.{type_}"
+
+    callbacks = []
+
+    def on_service_state_change(zeroconf, service_type, state_change, name):
+        """Dummy callback."""
+        if name == registration_name:
+            callbacks.append((service_type, state_change, name))
+
+    browser = AsyncServiceBrowser(zc, type_, [on_service_state_change], require_usable_view=True)
+
+    info = make_service_info(type_, registration_name)
+    zc.record_manager.async_updates_from_response(
+        mock_incoming_msg([info.dns_pointer(), info.dns_service(), info.dns_text()])
+    )
+    assert callbacks == []
+
+    zc.record_manager.async_updates_from_response(mock_incoming_msg([*info.dns_addresses()]))
+    assert callbacks == [(type_, ServiceStateChange.Added, registration_name)]
+    await browser.async_cancel()
 
 
 @pytest.mark.asyncio

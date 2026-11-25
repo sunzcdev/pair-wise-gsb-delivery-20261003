@@ -921,6 +921,199 @@ def test_service_browser_is_aware_of_port_changes(zc: Zeroconf) -> None:
     browser.cancel()
 
 
+def _backdate_address_records(zc: Zeroconf, name: str, ms: float) -> None:
+    """Age the cached address records for `name` by `ms` milliseconds."""
+    for record in zc.cache.entries_with_name(name):
+        if record.type in (const._TYPE_A, const._TYPE_AAAA):
+            record.created -= ms
+
+
+def test_service_browser_require_usable_view_holds_initial_add(zc: Zeroconf) -> None:
+    """With require_usable_view the add callback waits for a usable view."""
+    type_ = "_hap._tcp.local."
+    registration_name = f"xxxyyy.{type_}"
+
+    callbacks = []
+    views = []
+
+    def on_service_state_change(zeroconf, service_type, state_change, name):
+        """Record the callback and the view readable from the cache at that moment."""
+        if name != registration_name:
+            return
+        callbacks.append((service_type, state_change, name))
+        info = r.ServiceInfo(service_type, name)
+        info.load_from_cache(zeroconf)
+        views.append((state_change, info.server, info.parsed_addresses()))
+
+    browser = ServiceBrowser(zc, type_, [on_service_state_change], require_usable_view=True)
+
+    info = make_service_info(type_, registration_name)
+    # The PTR, TXT, SRV and A records arrive in separate responses
+    _inject_response(zc, mock_incoming_msg([info.dns_pointer()]))
+    _inject_response(zc, mock_incoming_msg([info.dns_text()]))
+    _inject_response(zc, mock_incoming_msg([info.dns_service()]))
+    time.sleep(0.1)
+    assert callbacks == []
+
+    _inject_response(zc, mock_incoming_msg([*info.dns_addresses()]))
+    time.sleep(0.1)
+    assert callbacks == [(type_, ServiceStateChange.Added, registration_name)]
+    assert views == [(ServiceStateChange.Added, "spare-rig.local.", ["10.7.4.2"])]
+    browser.cancel()
+
+
+def test_service_browser_require_usable_view_srv_target_migration(zc: Zeroconf) -> None:
+    """A migrated SRV target is only delivered once its new address arrives."""
+    type_ = "_hap._tcp.local."
+    registration_name = f"xxxyyy.{type_}"
+    old_server = "old-rig.local."
+    new_server = "new-rig.local."
+
+    callbacks = []
+    views = []
+
+    def on_service_state_change(zeroconf, service_type, state_change, name):
+        """Record the callback and the view readable from the cache at that moment."""
+        if name != registration_name:
+            return
+        callbacks.append((service_type, state_change, name))
+        info = r.ServiceInfo(service_type, name)
+        info.load_from_cache(zeroconf)
+        views.append((state_change, info.server, info.parsed_addresses()))
+
+    browser = ServiceBrowser(zc, type_, [on_service_state_change], require_usable_view=True)
+
+    old_info = make_service_info(
+        type_, registration_name, server=old_server, addresses=[socket.inet_aton("10.7.4.2")]
+    )
+    _inject_response(
+        zc,
+        mock_incoming_msg(
+            [
+                old_info.dns_pointer(),
+                old_info.dns_service(),
+                old_info.dns_text(),
+                *old_info.dns_addresses(),
+            ]
+        ),
+    )
+    time.sleep(0.1)
+    assert callbacks == [(type_, ServiceStateChange.Added, registration_name)]
+    assert views == [(ServiceStateChange.Added, old_server, ["10.7.4.2"])]
+
+    # The service migrates to a new SRV target; the new address only
+    # arrives in a later response, so the old view is still the usable
+    # one and no callback may observe the new target yet.
+    new_info = make_service_info(
+        type_, registration_name, server=new_server, addresses=[socket.inet_aton("10.7.4.3")]
+    )
+    _inject_response(zc, mock_incoming_msg([new_info.dns_service()]))
+    time.sleep(0.1)
+    assert callbacks == [(type_, ServiceStateChange.Added, registration_name)]
+
+    # Age the old address past its TTL before the new address arrives;
+    # once expired it must not be relied on, so a TXT change still
+    # must not produce a callback.
+    _backdate_address_records(zc, old_server, const._DNS_HOST_TTL * 1000 + 1)
+    changed_txt_info = make_service_info(
+        type_, registration_name, server=new_server, properties={"path": "/v2/"}
+    )
+    _inject_response(zc, mock_incoming_msg([changed_txt_info.dns_text()]))
+    time.sleep(0.1)
+    assert callbacks == [(type_, ServiceStateChange.Added, registration_name)]
+
+    # The new address arrives; the complete new endpoint becomes readable.
+    _inject_response(zc, mock_incoming_msg([*new_info.dns_addresses()]))
+    time.sleep(0.1)
+    assert callbacks == [
+        (type_, ServiceStateChange.Added, registration_name),
+        (type_, ServiceStateChange.Updated, registration_name),
+    ]
+    assert views == [
+        (ServiceStateChange.Added, old_server, ["10.7.4.2"]),
+        (ServiceStateChange.Updated, new_server, ["10.7.4.3"]),
+    ]
+
+    _inject_response(
+        zc,
+        mock_incoming_msg([DNSPointer(type_, const._TYPE_PTR, const._CLASS_IN, 0, registration_name)]),
+    )
+    time.sleep(0.1)
+    assert callbacks == [
+        (type_, ServiceStateChange.Added, registration_name),
+        (type_, ServiceStateChange.Updated, registration_name),
+        (type_, ServiceStateChange.Removed, registration_name),
+    ]
+    browser.cancel()
+
+
+def test_service_browser_require_usable_view_no_remove_without_add(zc: Zeroconf) -> None:
+    """A service whose view never became usable produces no callbacks at all."""
+    type_ = "_hap._tcp.local."
+    registration_name = f"xxxyyy.{type_}"
+
+    callbacks = []
+
+    def on_service_state_change(zeroconf, service_type, state_change, name):
+        """Dummy callback."""
+        if name == registration_name:
+            callbacks.append((service_type, state_change, name))
+
+    browser = ServiceBrowser(zc, type_, [on_service_state_change], require_usable_view=True)
+
+    info = make_service_info(type_, registration_name)
+    _inject_response(zc, mock_incoming_msg([info.dns_pointer(), info.dns_service()]))
+    time.sleep(0.1)
+    assert callbacks == []
+
+    _inject_response(
+        zc,
+        mock_incoming_msg([DNSPointer(type_, const._TYPE_PTR, const._CLASS_IN, 0, registration_name)]),
+    )
+    time.sleep(0.1)
+    assert callbacks == []
+    browser.cancel()
+
+
+def test_service_browser_default_delivers_srv_target_change_immediately(zc: Zeroconf) -> None:
+    """Without require_usable_view an SRV target change fires an update right away."""
+    type_ = "_hap._tcp.local."
+    registration_name = f"xxxyyy.{type_}"
+
+    callbacks = []
+
+    def on_service_state_change(zeroconf, service_type, state_change, name):
+        """Dummy callback."""
+        if name == registration_name:
+            callbacks.append((service_type, state_change, name))
+
+    browser = ServiceBrowser(zc, type_, [on_service_state_change])
+
+    old_info = make_service_info(type_, registration_name, server="old-rig.local.")
+    _inject_response(
+        zc,
+        mock_incoming_msg(
+            [
+                old_info.dns_pointer(),
+                old_info.dns_service(),
+                old_info.dns_text(),
+                *old_info.dns_addresses(),
+            ]
+        ),
+    )
+    time.sleep(0.1)
+    assert callbacks == [(type_, ServiceStateChange.Added, registration_name)]
+
+    new_info = make_service_info(type_, registration_name, server="new-rig.local.")
+    _inject_response(zc, mock_incoming_msg([new_info.dns_service()]))
+    time.sleep(0.1)
+    assert callbacks == [
+        (type_, ServiceStateChange.Added, registration_name),
+        (type_, ServiceStateChange.Updated, registration_name),
+    ]
+    browser.cancel()
+
+
 def test_service_browser_listeners_update_service(zc: Zeroconf) -> None:
     """Test that the ServiceBrowser ServiceListener that implements update_service."""
 

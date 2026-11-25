@@ -45,8 +45,11 @@ class AsyncServiceBrowser(_ServiceBrowserBase):
         port: int = _MDNS_PORT,
         delay: int = _BROWSER_TIME,
         question_type: DNSQuestionType | None = None,
+        require_usable_view: bool = False,
     ) -> None:
-        super().__init__(zeroconf, type_, handlers, listener, addr, port, delay, question_type)
+        super().__init__(
+            zeroconf, type_, handlers, listener, addr, port, delay, question_type, require_usable_view
+        )
         self._async_start()
 
     async def __aenter__(self) -> Self:

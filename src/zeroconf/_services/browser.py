@@ -25,7 +25,7 @@ from typing import (
     cast,
 )
 
-from .._dns import DNSPointer, DNSQuestion, DNSQuestionType
+from .._dns import DNSPointer, DNSQuestion, DNSQuestionType, DNSService
 from .._logger import log
 from .._protocol.outgoing import DNSOutgoing
 from .._record_update import RecordUpdate
@@ -51,6 +51,7 @@ from ..const import (
     _MDNS_PORT,
     _TYPE_NSEC,
     _TYPE_PTR,
+    _TYPE_SRV,
 )
 
 # https://datatracker.ietf.org/doc/html/rfc6762#section-5.2
@@ -541,9 +542,12 @@ class _ServiceBrowserBase(RecordUpdateListener):
 
     __slots__ = (
         "_cache",
+        "_delivered_views",
         "_loop",
         "_pending_handlers",
+        "_pending_view_names",
         "_query_sender_task",
+        "_require_usable_view",
         "_service_state_changed",
         "done",
         "query_scheduler",
@@ -561,12 +565,18 @@ class _ServiceBrowserBase(RecordUpdateListener):
         port: int = _MDNS_PORT,
         delay: int = _BROWSER_TIME,
         question_type: DNSQuestionType | None = None,
+        require_usable_view: bool = False,
     ) -> None:
         """Start watching one or more fully qualified service types.
 
         Events are delivered to the given ServiceListener or handler
         callables; delay sets the interval between the periodic queries
-        and question_type forces QM or QU questions.
+        and question_type forces QM or QU questions. When
+        require_usable_view is True, add/update events are held back
+        until the cache holds a usable view of the service — an
+        unexpired SRV record and at least one unexpired address record
+        for its current target — so a callback never observes a new
+        SRV target still waiting on its address records.
         """
         assert handlers or listener, "You need to specify at least one handler"
         self.types: set[str] = set(type_ if isinstance(type_, list) else [type_])
@@ -578,6 +588,9 @@ class _ServiceBrowserBase(RecordUpdateListener):
         assert zc.loop is not None
         self._loop = zc.loop
         self._pending_handlers: dict[tuple[str, str], ServiceStateChange] = {}
+        self._require_usable_view = require_usable_view
+        self._pending_view_names: set[tuple[str, str]] = set()
+        self._delivered_views: set[tuple[str, str]] = set()
         self._service_state_changed = Signal()
         self.query_scheduler = QueryScheduler(
             zc,
@@ -622,10 +635,22 @@ class _ServiceBrowserBase(RecordUpdateListener):
                 pointer = record
                 for type_ in self.types.intersection(cached_possible_types(pointer.name)):
                     if old_record is None:
-                        self._enqueue_callback(SERVICE_STATE_CHANGE_ADDED, type_, pointer.alias)
+                        if self._require_usable_view:
+                            self._pending_view_names.add((pointer.alias, type_))
+                        else:
+                            self._enqueue_callback(SERVICE_STATE_CHANGE_ADDED, type_, pointer.alias)
                         self.query_scheduler.reschedule_ptr_first_refresh(pointer)
                     elif pointer.is_expired(now):
-                        self._enqueue_callback(SERVICE_STATE_CHANGE_REMOVED, type_, pointer.alias)
+                        if self._require_usable_view:
+                            key = (pointer.alias, type_)
+                            self._pending_view_names.discard(key)
+                            # A service whose view was never usable was never
+                            # announced, so there is nothing to remove.
+                            if key in self._delivered_views:
+                                self._delivered_views.discard(key)
+                                self._enqueue_callback(SERVICE_STATE_CHANGE_REMOVED, type_, pointer.alias)
+                        else:
+                            self._enqueue_callback(SERVICE_STATE_CHANGE_REMOVED, type_, pointer.alias)
                         self.query_scheduler.cancel_ptr_refresh(pointer)
                     else:
                         self.query_scheduler.reschedule_ptr_first_refresh(pointer)
@@ -640,11 +665,17 @@ class _ServiceBrowserBase(RecordUpdateListener):
                 names = {service.name for service in cache.async_entries_with_server(record.name)}
                 # Iterate through the DNSCache and callback any services that use this address
                 for type_, name in self._names_matching_types(names):
-                    self._enqueue_callback(SERVICE_STATE_CHANGE_UPDATED, type_, name)
+                    if self._require_usable_view:
+                        self._pending_view_names.add((name, type_))
+                    else:
+                        self._enqueue_callback(SERVICE_STATE_CHANGE_UPDATED, type_, name)
                 continue
 
             for type_, name in self._names_matching_types((record.name,)):
-                self._enqueue_callback(SERVICE_STATE_CHANGE_UPDATED, type_, name)
+                if self._require_usable_view:
+                    self._pending_view_names.add((name, type_))
+                else:
+                    self._enqueue_callback(SERVICE_STATE_CHANGE_UPDATED, type_, name)
 
     def async_update_records_complete(self) -> None:
         """Called when a record update has completed for all handlers.
@@ -655,6 +686,7 @@ class _ServiceBrowserBase(RecordUpdateListener):
 
         This method is expected to be overridden by subclasses.
         """
+        self._resolve_pending_view_names()
         for pending in self._pending_handlers.items():
             self._fire_service_state_changed_event(pending)
         self._pending_handlers.clear()
@@ -724,11 +756,49 @@ class _ServiceBrowserBase(RecordUpdateListener):
             state_change=state_change,
         )
 
+    def _has_usable_view(self, name: str_, now: float_) -> bool_:
+        """Return True if the cache holds an unexpired SRV and an unexpired address for its target."""
+        cache = self._cache
+        # get_by_details returns the most recently added SRV, which is the
+        # target a ServiceInfo load would use; a superseded SRV can linger
+        # in the cache briefly after a target change (RFC 6762 §10.2), so
+        # the view must be checked against the newest target only.
+        srv_record = cache.get_by_details(name, _TYPE_SRV, _CLASS_IN)
+        if srv_record is None or srv_record.is_expired(now):
+            return False
+        if TYPE_CHECKING:
+            srv_record = cast(DNSService, srv_record)
+        for record in cache.async_entries_with_name(srv_record.server):
+            if record.type in _ADDRESS_RECORD_TYPES and not record.is_expired(now):
+                return True
+        return False
+
     def _names_matching_types(self, names: Iterable[str]) -> list[tuple[str, str]]:
         """Return the type and name for records matching the types we are browsing."""
         return [
             (type_, name) for name in names for type_ in self.types.intersection(cached_possible_types(name))
         ]
+
+    def _resolve_pending_view_names(self) -> None:
+        """Enqueue callbacks for pending names whose view is now usable.
+
+        Must be called from the event loop after the cache has committed
+        the records that triggered the pending checks.
+        """
+        if not self._pending_view_names:
+            return
+        now = current_time_millis()
+        pending_view_names = sorted(self._pending_view_names)
+        self._pending_view_names.clear()
+        for name, type_ in pending_view_names:
+            if not self._has_usable_view(name, now):
+                continue
+            key = (name, type_)
+            if key in self._delivered_views:
+                self._enqueue_callback(SERVICE_STATE_CHANGE_UPDATED, type_, name)
+            else:
+                self._delivered_views.add(key)
+                self._enqueue_callback(SERVICE_STATE_CHANGE_ADDED, type_, name)
 
 
 class ServiceBrowser(_ServiceBrowserBase, threading.Thread):
@@ -745,12 +815,13 @@ class ServiceBrowser(_ServiceBrowserBase, threading.Thread):
         port: int = _MDNS_PORT,
         delay: int = _BROWSER_TIME,
         question_type: DNSQuestionType | None = None,
+        require_usable_view: bool = False,
     ) -> None:
         assert zc.loop is not None
         if not zc.loop.is_running():
             raise RuntimeError("The event loop is not running")
         threading.Thread.__init__(self)
-        super().__init__(zc, type_, handlers, listener, addr, port, delay, question_type)
+        super().__init__(zc, type_, handlers, listener, addr, port, delay, question_type, require_usable_view)
         # Add the queue before the listener is installed in _setup
         # to ensure that events run in the dedicated thread and do
         # not block the event loop
@@ -782,6 +853,7 @@ class ServiceBrowser(_ServiceBrowserBase, threading.Thread):
 
         This method will be run in the event loop.
         """
+        self._resolve_pending_view_names()
         for pending in self._pending_handlers.items():
             self.queue.put(pending)
         self._pending_handlers.clear()
