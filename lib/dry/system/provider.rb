@@ -137,6 +137,20 @@ module Dry
         @statuses = []
         @step_running = nil
 
+        # Coordinates concurrent `start`/`resolve` calls for this provider. A single
+        # attempt runs the lifecycle while every other caller waits for its outcome, so
+        # concurrent resolves never re-run the steps or observe a half-finished start.
+        @start_mutex = Mutex.new
+        @start_condition = ConditionVariable.new
+        @start_in_progress = false
+        @start_owner = nil
+        @start_error = nil
+
+        # Keys staged by a step that failed. They stay available for a subsequent
+        # `stop`/cleanup, and are discarded immediately before that step is retried, so a
+        # fresh attempt never collides with or re-publishes the previous attempt's objects.
+        @pending_rollback_keys = []
+
         @source = source_class.new(
           **source_options,
           provider_container: provider_container,
@@ -163,23 +177,46 @@ module Dry
       # Also runs any callbacks for the step, and then merges any registered components
       # from the provider container into the target container.
       #
+      # Concurrent calls while a start is already running do not run the lifecycle again.
+      # They wait for the in-flight attempt to settle, then return the same result or
+      # raise the same failure. After a failed attempt, the next call runs a fresh,
+      # cleanly rolled-back attempt, so a corrected provider can start successfully.
+      #
       # @return [self]
       #
       # @api public
       def start
-        run_step(:prepare)
-        run_step(:start)
+        claim = claim_start
+
+        # Another thread owns the in-flight attempt: wait for its outcome and either
+        # re-raise its failure or return once the provider has started.
+        return join_start if claim == :join
+
+        # A re-entrant call from the thread running the attempt (e.g. a resolve of the
+        # provider's own root key from inside its start block) must not re-run the steps.
+        return self if claim == :reentrant
+
+        # The provider has already started successfully.
+        return self if claim == :done
+
+        run_start_attempt
+
+        self
       end
 
       # Runs the `stop` lifecycle step.
       #
       # Also runs any callbacks for the step.
       #
+      # A provider whose start attempt failed may also be stopped, so its cleanup can
+      # release the objects that were actually created before the failure. A provider
+      # that was never started remains a no-op.
+      #
       # @return [self]
       #
       # @api public
       def stop
-        return self unless started?
+        return self unless started? || start_failed?
 
         run_step(:stop)
       end
@@ -205,6 +242,14 @@ module Dry
         statuses.include?(:stop)
       end
 
+      # Returns true if the most recent start attempt failed and has not since been
+      # retried successfully.
+      #
+      # @api private
+      def start_failed?
+        !started? && !@start_error.nil?
+      end
+
       private
 
       # @api private
@@ -228,18 +273,145 @@ module Dry
       def run_step(step_name)
         return self if step_running? || statuses.include?(step_name)
 
+        # Discard the partial staging left by a previous failed attempt before running a
+        # fresh `prepare`/`start`. This is deliberately not done for `stop`, whose
+        # cleanup needs to resolve the objects that failed attempt registered.
+        remove_pending_rollback_keys! if step_name == :prepare || step_name == :start
+
         @step_running = step_name
+        staged_keys = staged_provider_keys
 
-        source.run_callback(:before, step_name)
-        source.public_send(step_name)
-        source.run_callback(:after, step_name)
+        begin
+          source.run_callback(:before, step_name)
+          source.public_send(step_name)
+          source.run_callback(:after, step_name)
 
-        statuses << step_name
+          # Registrations are published after prepare/start only. Running `apply` after
+          # `stop` would re-publish partial staging left by a failed start while its
+          # cleanup runs, leaking an old attempt's objects into the target container.
+          apply unless step_name == :stop
 
-        apply
+          # Record the step only once its registrations have been published, so a failure
+          # while applying does not leave the provider believing the step completed.
+          statuses << step_name
+        ensure
+          # On failure, remember exactly the registrations this step added. They remain
+          # resolvable via the provider container so a `stop` cleanup can release the
+          # created objects, and are discarded before the next `prepare`/`start` attempt.
+          # `stop` failures do not replace rollback state held for a failed start.
+          if $! && step_name != :stop
+            @pending_rollback_keys = added_staged_keys_since(staged_keys)
+          end
 
-        @step_running = nil
+          @step_running = nil
+        end
 
+        self
+      end
+
+      # Claims the right to run a start attempt for the current thread.
+      #
+      # @return [Symbol] one of `:run`, `:join`, `:reentrant`, or `:done`
+      #
+      # @api private
+      def claim_start
+        @start_mutex.synchronize do
+          if @start_in_progress && @start_owner == Thread.current
+            :reentrant
+          elsif @start_in_progress
+            :join
+          elsif started?
+            :done
+          else
+            @start_in_progress = true
+            @start_owner = Thread.current
+            @start_error = nil
+            :run
+          end
+        end
+      end
+
+      # Waits for an in-flight start attempt to settle and shares its outcome.
+      #
+      # A failed attempt's exception is re-raised in every joining thread, giving all
+      # concurrent resolves one deterministic result instead of a mix of key errors and
+      # half-published values.
+      #
+      # @api private
+      def join_start
+        error = @start_mutex.synchronize do
+          @start_condition.wait(@start_mutex) while @start_in_progress
+          @start_error
+        end
+
+        raise error if error
+
+        self
+      end
+
+      # Runs the prepare and start steps for the thread that claimed the attempt,
+      # recording the outcome and releasing all waiting threads when it settles.
+      #
+      # @api private
+      def run_start_attempt
+        run_step(:prepare)
+        run_step(:start)
+      ensure
+        # Capture any in-flight failure (including non-StandardError exits) so joining
+        # threads settle with the same deterministic result instead of waiting forever.
+        error = $!
+
+        @start_mutex.synchronize do
+          @start_error = error if error
+          @start_in_progress = false
+          @start_owner = nil
+          @start_condition.broadcast
+        end
+      end
+
+      # Snapshot of the keys currently staged in the provider's own container.
+      #
+      # @return [Array<String>]
+      #
+      # @api private
+      def staged_provider_keys
+        [].tap { |keys| provider_container.each_key { |key| keys << key } }
+      end
+
+      # Keys present now that were not present in the given snapshot, i.e. exactly the
+      # registrations added by the step that just ran. This is what lets cleanup know
+      # which objects were actually created rather than touching unrelated registrations.
+      #
+      # @return [Array<String>]
+      #
+      # @api private
+      def added_staged_keys_since(before_keys)
+        staged_provider_keys.reject { |key| before_keys.include?(key) }
+      rescue StandardError
+        # Never let rollback bookkeeping raise from inside the step's `ensure` and mask
+        # the original lifecycle failure.
+        []
+      end
+
+      # Removes the partial registrations recorded from a previous failed attempt. Scoped
+      # strictly to the keys that attempt added; earlier successful steps are preserved.
+      #
+      # @return [self]
+      #
+      # @api private
+      def remove_pending_rollback_keys!
+        return self if @pending_rollback_keys.empty?
+
+        @pending_rollback_keys.each do |key|
+          provider_container._container.delete(key)
+        end
+
+        @pending_rollback_keys.clear
+
+        self
+      rescue StandardError
+        # Rollback bookkeeping must never mask the lifecycle failure or block a retry.
+        @pending_rollback_keys.clear
         self
       end
 
