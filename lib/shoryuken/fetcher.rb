@@ -18,10 +18,17 @@ module Shoryuken
 
     # Fetches messages from a queue with automatic retry
     #
+    # The slots are reserved by the manager before this is called, so `limit` never exceeds the capacity currently
+    # available to the group. When `cancellation` is cancelled while the (long-polling) SQS request is in flight, the
+    # request itself cannot be aborted - SQS has no way to interrupt an HTTP call once sent. The response is therefore
+    # still received, but {Shoryuken::Helpers::FetchCancellation#cancelled?} lets the caller discard it and give the
+    # reservation back instead of letting a late answer take slots that were already released.
+    #
     # @param queue [Shoryuken::Polling::QueueConfiguration] the queue configuration
     # @param limit [Integer] the maximum number of messages to fetch
+    # @param cancellation [Shoryuken::Helpers::FetchCancellation, nil] flag cancelled when the in-flight fetch is aborted
     # @return [Array<Aws::SQS::Types::Message>] the fetched messages
-    def fetch(queue, limit)
+    def fetch(queue, limit, cancellation = nil)
       fetch_with_auto_retry(3) do
         started_at = Time.now
 
@@ -29,7 +36,14 @@ module Shoryuken
 
         sqs_msgs = Array(receive_messages(queue, limit))
 
-        logger.debug { "Found #{sqs_msgs.size} messages for #{queue.name}" } unless sqs_msgs.empty?
+        if cancellation&.cancelled?
+          # The cancel landed while the request was in flight; leave the discard and the visibility release to the
+          # manager, which owns the reservation and knows whether the messages may still be processed.
+          logger.debug { "Fetch for #{queue} completed after cancellation with #{sqs_msgs.size} message(s)" }
+        else
+          logger.debug { "Found #{sqs_msgs.size} messages for #{queue.name}" } unless sqs_msgs.empty?
+        end
+
         logger.debug { "Fetcher for #{queue} completed in #{elapsed(started_at)} ms" }
 
         sqs_msgs

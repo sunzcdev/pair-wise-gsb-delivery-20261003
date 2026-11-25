@@ -190,5 +190,39 @@ RSpec.describe Shoryuken::Fetcher do
         expect { subject.fetch(queue_config, 1) }.to raise_error('persistent')
       end
     end
+
+    context 'with a cancellation' do
+      let(:cancellation) { Shoryuken::Helpers::FetchCancellation.new }
+      let(:sqs_response) { [double('SQS Msg', message_id: 'late')] }
+
+      before do
+        allow(Shoryuken::Client).to receive(:queues).with(queue_name).and_return(queue)
+        allow(queue).to receive(:receive_messages).and_return(sqs_response)
+      end
+
+      it 'still performs the SQS request when not cancelled' do
+        expect(subject.fetch(queue_config, 1, cancellation)).to eq(sqs_response)
+        expect(queue).to have_received(:receive_messages)
+      end
+
+      it 'receives the late response but lets the caller see it was cancelled' do
+        # The SQS HTTP call cannot be aborted once sent: it still returns, but the flag tells the manager the response
+        # arrived after the cancel and must not take any slot.
+        cancellation.cancel
+
+        expect(subject.fetch(queue_config, 1, cancellation)).to eq(sqs_response)
+        expect(cancellation).to be_cancelled
+      end
+
+      it 'cancelling during the request is observed on the response that comes back' do
+        allow(queue).to receive(:receive_messages) do
+          cancellation.cancel
+          sqs_response
+        end
+
+        expect(subject.fetch(queue_config, 1, cancellation)).to eq(sqs_response)
+        expect(cancellation).to be_cancelled
+      end
+    end
   end
 end
