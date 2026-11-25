@@ -183,6 +183,51 @@ module Dry
           self
         end
 
+        # Rebinds one or more previously imported keys, rebuilding them from their
+        # source container and replacing the existing imported registrations.
+        #
+        # This is useful when the source container has published new instances for
+        # a subset of its keys while other components should keep the instances they
+        # were already resolved with. Only the given keys are rebuilt; components
+        # resolved earlier keep their original objects until their own lifecycle ends.
+        #
+        # Only keys declared for import from the given namespace can be rebound
+        # (a declared key not yet lazily loaded is imported for the first time),
+        # and only keys still available in the source container. If any key cannot
+        # be rebuilt, none of the registrations are changed.
+        #
+        # @example
+        #   MyApp.import(keys: %w[db redis], from: Core, as: :core)
+        #
+        #   MyApp["core.db"] # => #<DB:0x0001>
+        #
+        #   # Core has since registered a new connection for "db"
+        #   MyApp.rebind_import(from: Core, as: :core, keys: ["db"])
+        #
+        #   MyApp["core.db"] # => #<DB:0x0002>
+        #   MyApp["core.redis"] # => the original instance, untouched
+        #
+        # @param keys [Array<String, Symbol>] the imported keys to rebuild, without
+        #   the import namespace
+        # @param from [Class] the container the keys were imported from
+        # @param as [Symbol, nil] the namespace the keys were imported under
+        #
+        # @raise [Dry::System::ContainerAlreadyFinalizedError] if the container has
+        #   already been finalized
+        # @raise [Dry::System::ImportedKeyNotFoundError] if a key was not previously
+        #   imported or can no longer be resolved from the source container
+        #
+        # @return [self]
+        #
+        # @api public
+        def rebind_import(from:, as:, keys:)
+          raise Dry::System::ContainerAlreadyFinalizedError if finalized?
+
+          importer.rebind(as, keys: keys, source: from)
+
+          self
+        end
+
         # @overload register_provider(name, namespace: nil, from: nil, source: nil, if: true, &block)
         #   Registers a provider and its lifecycle hooks
         #

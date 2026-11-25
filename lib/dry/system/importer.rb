@@ -28,10 +28,13 @@ module Dry
 
       attr_reader :registry
 
+      attr_reader :imported_keys
+
       # @api private
       def initialize(container)
         @container = container
         @registry = {}
+        @imported_keys = Hash.new { |h, k| h[k] = [] }
       end
 
       # @api private
@@ -74,6 +77,51 @@ module Dry
         self
       end
 
+      # Explicitly rebuilds the given imported keys from their source container,
+      # replacing any previously imported registrations.
+      #
+      # Only keys declared for import from the given namespace can be rebound; the
+      # source of any other keys is left untouched. A key declared but not yet
+      # lazily loaded is imported for the first time. If one of the keys can no
+      # longer be resolved from the source container, no keys are replaced and an
+      # {ImportedKeyNotFoundError} is raised.
+      #
+      # @api private
+      def rebind(namespace, keys:, source: Undefined)
+        item = self[namespace]
+        ns_key = namespace_key(namespace)
+
+        unless Undefined.equal?(source) || item.container.equal?(source)
+          raise ArgumentError, "Import namespace #{namespace.inspect} is not registered for the given source container"
+        end
+
+        keys = Array(keys).map(&:to_s)
+
+        unknown_keys = keys - rebindable_keys(item, ns_key)
+        unless unknown_keys.empty?
+          raise ImportedKeyNotFoundError.new(unknown_keys.first, namespace)
+        end
+
+        missing_keys = keys.reject { |key| item.container.key?(key) }
+        unless missing_keys.empty?
+          raise ImportedKeyNotFoundError.new(missing_keys.first, namespace)
+        end
+
+        # Build every replacement before replacing anything, so a failure to
+        # rebuild one key leaves all existing registrations untouched. Keys not
+        # loaded yet are imported for the first time; already-imported keys have
+        # their old registrations removed before being rebuilt.
+        merge_container = build_merge_container(item.container, keys)
+
+        stale_keys = keys.select { |key| imported_keys[ns_key].include?(key) }
+        stale_keys.each { |key| unregister_imported(namespace, key) }
+
+        merge(container, merge_container, namespace: namespace)
+        track_imported_keys(namespace, merge_container._container.keys)
+
+        self
+      end
+
       private
 
       # Returns nil if given a nil (i.e. root) namespace. Otherwise, converts the namespace to a
@@ -93,8 +141,19 @@ module Dry
           .then { (arr = item.container.exports) ? _1 & arr : _1 }
       end
 
+      # The keys eligible for rebinding: those already imported, plus any keys
+      # declared for import that have not been lazily loaded yet.
+      def rebindable_keys(item, ns_key)
+        declared = item.import_keys || item.container.keys
+        declared = declared & item.container.exports if item.container.exports
+
+        imported_keys[ns_key] | declared
+      end
+
       def import_keys(other, namespace, keys)
-        merge(container, build_merge_container(other, keys), namespace: namespace)
+        merge_container = build_merge_container(other, keys)
+        track_imported_keys(namespace, merge_container._container.keys)
+        merge(container, merge_container, namespace: namespace)
       end
 
       def import_all(other, namespace)
@@ -105,7 +164,18 @@ module Dry
             build_merge_container(other.finalize!, other.keys)
           end
 
+        track_imported_keys(namespace, merge_container._container.keys)
         merge(container, merge_container, namespace: namespace)
+      end
+
+      def track_imported_keys(namespace, keys)
+        imported_keys[namespace_key(namespace)].concat(keys).uniq!
+      end
+
+      def unregister_imported(namespace, key)
+        namespaced = [namespace, key].compact.join(KEY_SEPARATOR)
+        container._container.delete(namespaced)
+        imported_keys[namespace_key(namespace)].delete(key)
       end
 
       # Merges `other` into `container`, favoring the container's existing registrations

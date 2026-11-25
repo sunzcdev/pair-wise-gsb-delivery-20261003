@@ -9,6 +9,7 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Add `Container.rebind_import(from:, as:, keys:)` for explicitly rebuilding selected imported keys from their source container, replacing only the given imported registrations. Components already resolved with earlier instances keep those objects until their own lifecycle ends; keys whose source is unchanged are not built again. A rebuild that fails because a key is missing from the source container leaves every existing registration untouched, and keys that were never declared for import can neither be rebound nor resolved.
 - The Zeitwerk plugin accepts an `enable_reloading:` option, which enables reloading on the loader ahead of `setup`, so Zeitwerk tracks the constants it defines and they can be unloaded later. Applied from the plugin's `after(:configure)` hook, so it is in time whether the loader is set up by the plugin or by the integrating library. (@afomera in #297)
 
 ### Changed

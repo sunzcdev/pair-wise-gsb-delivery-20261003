@@ -7,6 +7,17 @@ module Dry
     # @api public
     ContainerAlreadyFinalizedError = Class.new(StandardError)
 
+    # Error raised when a rebind is attempted for a key that was not declared for
+    # import, or that can no longer be resolved from the source container
+    #
+    # @api public
+    ImportedKeyNotFoundError = Class.new(StandardError) do
+      def initialize(key, namespace)
+        namespaced_key = namespace ? "#{namespace}.#{key}" : key
+        super("Cannot rebind #{namespaced_key.inspect}: it was not imported")
+      end
+    end
+
     # Error raised when a component dir is added to configuration more than once
     #
     # @api public
