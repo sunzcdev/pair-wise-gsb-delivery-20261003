@@ -22,6 +22,14 @@ module ROM
     SQLParseError             = Class.new(MigrationError)
     SQLEnvError               = Class.new(MigrationError)
 
+    # Raised when a relation expression cannot be pushed down to the
+    # gateway's connection and no local fallback was declared
+    UnsupportedSQLError       = Class.new(StandardError)
+
+    # Raised when a declared local fallback would have to pull more
+    # tuples than the relation is allowed to buffer
+    FallbackExceededError     = Class.new(StandardError)
+
     ERROR_MAP = {
       Sequel::DatabaseError => DatabaseError,
       Sequel::ConstraintViolation => ConstraintError,

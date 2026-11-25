@@ -81,6 +81,7 @@ module ROM
       # @api public
       def initialize(uri, options = EMPTY_HASH)
         @connection = connect(uri, options)
+        bind_connection(@connection)
         load_extensions(Array(options[:extensions]))
         Notifications.trigger('configuration.gateway.connected', connection: @connection)
 
@@ -182,6 +183,37 @@ module ROM
         @database_type ||= connection.database_type.to_sym
       end
 
+      # Check whether this gateway's real connection can execute an SQL
+      # feature natively
+      #
+      # The check always goes through the currently configured connection
+      # object, so that two gateways connected to databases with different
+      # SQL capabilities answer independently of the order in which they
+      # were created. Sequel connections expose feature probes as
+      # +supports_<feature>?+ methods (for example +supports_window_functions?+);
+      # plain connection doubles only need to implement the same predicate
+      # to be used as local stand-ins.
+      #
+      # @example
+      #   gateway.supports_sql_feature?(:window_functions)
+      #
+      # @param [Symbol] feature feature name, without the +supports_+ prefix
+      #
+      # @return [Boolean]
+      #
+      # @api public
+      def supports_sql_feature?(feature)
+        predicate = :"supports_#{feature}?"
+
+        if connection.respond_to?(predicate)
+          connection.public_send(predicate)
+        elsif connection.respond_to?(:dataset) && connection.dataset.respond_to?(predicate)
+          connection.dataset.public_send(predicate)
+        else
+          false
+        end
+      end
+
       # Call a SQL function
       #
       # @example
@@ -207,6 +239,19 @@ module ROM
       end
 
       private
+
+      # Bind this gateway to its connection so that a relation can always
+      # resolve the gateway owning its dataset, even when several gateways
+      # live in the same process. The marker lives on the connection object
+      # itself instead of in global state, so it is immune to the order in
+      # which gateways are created.
+      #
+      # @api private
+      def bind_connection(connection)
+        connection.singleton_class.attr_accessor :rom_sql_gateway unless
+          connection.respond_to?(:rom_sql_gateway=)
+        connection.rom_sql_gateway = self
+      end
 
       # Connect to database or reuse established connection instance
       #

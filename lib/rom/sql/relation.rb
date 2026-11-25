@@ -8,6 +8,7 @@ require 'rom/sql/transaction'
 
 require 'rom/sql/relation/reading'
 require 'rom/sql/relation/writing'
+require 'rom/sql/relation/pushdown'
 
 module ROM
   module SQL
@@ -20,6 +21,7 @@ module ROM
       include SQL
       include Writing
       include Reading
+      include Pushdown
 
       extend Notifications::Listener
 
@@ -110,6 +112,13 @@ module ROM
       end
 
       option :primary_key, default: -> { schema.primary_key_name }
+
+      # @!attribute [r] pushdown_plan
+      #   @return [ROM::SQL::Relation::Pushdown::Plan, nil] optional
+      #     preferred-SQL-pushdown declaration evaluated on materialization
+      #
+      # @api public
+      option :pushdown_plan, default: -> {}
 
       # Return relation that will load associated tuples of this relation
       #
