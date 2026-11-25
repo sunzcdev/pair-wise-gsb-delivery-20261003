@@ -719,3 +719,55 @@ def test_cache_total_records_invariant_under_mixed_ops() -> None:
         cache.async_add_records([rec])
         assert cache._total_records == actual()
     assert cache._total_records == const._MAX_CACHE_RECORDS
+
+
+def test_stale_readd_does_not_overwrite_fresher_record() -> None:
+    """An older observation of an equal record cannot replace a fresher cached one."""
+    cache = r.DNSCache()
+    name = "stale.local."
+    fresh = r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, 100, b"\x01\x02\x03\x04", created=10_000.0)
+    stale = r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, 100, b"\x01\x02\x03\x04", created=5_000.0)
+
+    cache.async_add_records([fresh])
+    assert cache.async_add_records([stale]) is False
+
+    cached = cache.async_get_unique(fresh)
+    assert cached is fresh
+    assert cache._total_records == 1
+    # The expiration heap keeps the fresh record's deadline only.
+    assert cache._expirations == {fresh: fresh.created + fresh.ttl * 1000}
+
+
+def test_stale_readd_keeps_fresher_expiration_deadline() -> None:
+    """Only the fresher record's expiration survives an out-of-order re-add."""
+    cache = r.DNSCache()
+    name = "deadline.local."
+    ttl = 10
+    # The later observation is cached first; the earlier one is replayed after.
+    later = r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, ttl, b"\x0a\x00\x00\x01", created=2_000.0)
+    earlier = r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, ttl, b"\x0a\x00\x00\x01", created=1_000.0)
+
+    cache.async_add_records([later])
+    cache.async_add_records([earlier])
+
+    assert cache.async_get_unique(later) is later
+    # Expiring at the earlier deadline must not remove the live later record.
+    assert cache.async_expire(earlier.created + ttl * 1000) == []
+    assert cache.async_entries_with_name(name) == [later]
+    # The later deadline still reaps it.
+    expired = cache.async_expire(later.created + ttl * 1000)
+    assert expired == [later]
+    assert not cache.async_entries_with_name(name)
+
+
+def test_same_timestamp_readd_still_refreshes_ttl() -> None:
+    """Equal timestamps are not older, so a TTL extension still lands."""
+    cache = r.DNSCache()
+    name = "equal.local."
+    short = r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, 10, b"\x01\x01\x01\x01", created=1_000.0)
+    long_ = r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, 100, b"\x01\x01\x01\x01", created=1_000.0)
+
+    cache.async_add_records([short])
+    assert cache.async_add_records([long_]) is False
+    assert cache.async_get_unique(short) is long_
+    assert cache._expirations[long_] == 1_000.0 + 100 * 1000

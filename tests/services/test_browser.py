@@ -709,10 +709,21 @@ async def test_ttl_refresh_cancelled_rescue_query(quick_timing: None) -> None:
             # fresh (AKA 75% of the TTL)
             now_millis += (expected_ttl * 1000) * 0.80
             # Inject a response that will reschedule
-            # the rescue query so it does not happen
+            # the rescue query so it does not happen. The refreshed
+            # record carries the simulated reception timestamp, so it
+            # is accepted as a newer observation of the cached pointer
+            # while preserving the test's simulated expiration window.
+            refreshed_pointer = r.DNSPointer(
+                info.dns_pointer().name,
+                const._TYPE_PTR,
+                const._CLASS_IN,
+                expected_ttl,
+                registration_name,
+                created=now_millis,
+            )
             with patch("time.monotonic", return_value=now_millis / 1000):
                 zeroconf_browser.record_manager.async_updates_from_response(
-                    mock_incoming_msg([info.dns_pointer()]),
+                    mock_incoming_msg([refreshed_pointer]),
                 )
 
             time_changed_millis(now_millis)
@@ -730,6 +741,21 @@ async def test_ttl_refresh_cancelled_rescue_query(quick_timing: None) -> None:
             # Don't remove service, allow close() to cleanup
         finally:
             await aio_zeroconf_registrar.async_close()
+            # The simulated clock was pushed hours past the real one, leaving
+            # every cached record with a future ``created`` stamp relative to
+            # real time, so a real-time goodbye reads as an older update.
+            # Restamp the cache to real time and replay a current goodbye so
+            # the browser observes the registrar's removal.
+            restamp_now = r.current_time_millis()
+            for store in list(zeroconf_browser.cache.cache.values()):
+                for record in list(store.values()):
+                    zeroconf_browser.cache._async_set_created_ttl(record, restamp_now, expected_ttl)
+            with patch("time.monotonic", return_value=restamp_now / 1000):
+                zeroconf_browser.record_manager.async_updates_from_response(
+                    mock_incoming_msg(
+                        [r.DNSPointer(type_, const._TYPE_PTR, const._CLASS_IN, 0, registration_name)]
+                    )
+                )
             await asyncio.wait_for(service_removed.wait(), 1)
             assert service_removed.is_set()
             await browser.async_cancel()
@@ -1724,3 +1750,99 @@ def test_service_browser_aaaa_scope_variant_does_not_trigger_update(zc: Zeroconf
         assert updates == [registration_name]
     finally:
         browser.cancel()
+
+
+def _ptr_response(name: str, alias: str, ttl: int, received_at: float) -> r.DNSIncoming:
+    """A one-record PTR response stamped as received at ``received_at``."""
+    outgoing = r.DNSOutgoing(const._FLAGS_QR_RESPONSE)
+    outgoing.add_answer_at_time(DNSPointer(name, const._TYPE_PTR, const._CLASS_IN, ttl, alias), 0)
+    return r.DNSIncoming(outgoing.packets()[0], now=received_at)
+
+
+def test_browser_ignores_late_older_ptr_and_keeps_single_refresh(zc: Zeroconf) -> None:
+    """A late older PTR neither re-fires an event nor reschedules the refresh query."""
+    type_ = "_replay._tcp.local."
+    alias = "inst._replay._tcp.local."
+    events: list[tuple[str, ServiceStateChange]] = []
+
+    class Listener(r.ServiceListener):
+        def add_service(self, zc, type_, name) -> None:  # type: ignore[no-untyped-def]
+            events.append((name, ServiceStateChange.Added))
+
+        def remove_service(self, zc, type_, name) -> None:  # type: ignore[no-untyped-def]
+            events.append((name, ServiceStateChange.Removed))
+
+        def update_service(self, zc, type_, name) -> None:  # type: ignore[no-untyped-def]
+            events.append((name, ServiceStateChange.Updated))
+
+    browser = ServiceBrowser(zc, type_, None, Listener())
+    try:
+        ttl = 100
+        base = current_time_millis()
+        later_received = base
+        earlier_received = base - 5_000
+        scheduler = browser.query_scheduler
+
+        later_msg = _ptr_response(type_, alias, ttl, later_received)
+        later = later_msg.answers()[0]
+        with patch("zeroconf._handlers.record_manager.current_time_millis", return_value=later_received):
+            zc.record_manager.async_updates_from_response(later_msg)
+        assert _wait_for(lambda: len(events) == 1)
+        assert events == [(alias, ServiceStateChange.Added)]
+
+        scheduled = scheduler._next_scheduled_for_alias[alias]
+        later_refresh = later.get_expiration_time(const._EXPIRE_REFRESH_TIME_PERCENT)
+        assert scheduled.when_millis == later_refresh
+
+        # The older observation is only processed once its own TTL has elapsed.
+        earlier_msg = _ptr_response(type_, alias, ttl, earlier_received)
+        process_at = earlier_received + ttl * 1000 + 1
+        with patch("zeroconf._handlers.record_manager.current_time_millis", return_value=process_at):
+            zc.record_manager.async_updates_from_response(earlier_msg)
+        time.sleep(0.05)
+
+        # No extra event and the cached record is still the later observation.
+        assert events == [(alias, ServiceStateChange.Added)]
+        cached = zc.cache.async_get_unique(later)
+        assert cached is later
+        # The single refresh schedule keeps the later record's deadline.
+        assert scheduler._next_scheduled_for_alias[alias] is scheduled
+        assert scheduled.when_millis == later_refresh
+        assert len(scheduler._query_heap) == 1
+    finally:
+        browser.cancel()
+
+
+def test_browser_accepts_delayed_valid_ptr_with_remaining_ttl(zc: Zeroconf) -> None:
+    """A delayed PTR still inside its window schedules against its real remaining TTL."""
+    type_ = "_delayed._tcp.local."
+    alias = "inst._delayed._tcp.local."
+    added = Event()
+
+    class Listener(r.ServiceListener):
+        def add_service(self, zc, type_, name) -> None:  # type: ignore[no-untyped-def]
+            added.set()
+
+    browser = ServiceBrowser(zc, type_, None, Listener())
+    try:
+        # Above _DNS_PTR_MIN_TTL so the minimum-TTL protection does not rewrite it.
+        ttl = const._DNS_OTHER_TTL
+        received_at = current_time_millis()
+        # A quarter of the TTL passes in the queue before processing.
+        process_at = received_at + ttl * 250
+
+        msg = _ptr_response(type_, alias, ttl, received_at)
+        record = msg.answers()[0]
+        with patch("zeroconf._handlers.record_manager.current_time_millis", return_value=process_at):
+            zc.record_manager.async_updates_from_response(msg)
+
+        assert added.wait(timeout=5)
+        cached = zc.cache.async_get_unique(record)
+        assert cached is record
+        # Expiration stays anchored at reception, so only 75% remains.
+        assert cached.get_remaining_ttl(process_at) == pytest.approx(ttl * 0.75)
+        scheduled = browser.query_scheduler._next_scheduled_for_alias[alias]
+        assert scheduled.when_millis == record.get_expiration_time(const._EXPIRE_REFRESH_TIME_PERCENT)
+    finally:
+        browser.cancel()
+

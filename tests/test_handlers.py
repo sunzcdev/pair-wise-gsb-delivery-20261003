@@ -1409,6 +1409,177 @@ async def test_duplicate_goodbye_answers_in_packet():
     await aiozc.async_close()
 
 
+def _address_response(record: r.DNSAddress, received_at: float) -> r.DNSIncoming:
+    """Build a response carrying ``record`` as if received at ``received_at``."""
+    outgoing = r.DNSOutgoing(const._FLAGS_QR_RESPONSE)
+    outgoing.add_answer_at_time(record, 0)
+    incoming = r.DNSIncoming(outgoing.packets()[0], now=received_at)
+    # DNSIncoming re-parses the wire packet into fresh record objects stamped
+    # with ``now``; return the parsed copy so tests hold the cached identity.
+    assert len(incoming.answers()) == 1
+    return incoming
+
+
+@pytest.mark.asyncio
+async def test_late_expired_response_does_not_evict_fresher_record():
+    """An earlier response processed after its TTL elapsed cannot touch a cached fresher one."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    zc = aiozc.zeroconf
+    name = "replay.local."
+    address = socket.inet_aton("10.9.9.9")
+    ttl = 10
+    ttl_millis = ttl * 1000
+    # Anchor the simulated clock to a real reading so the "current" processing
+    # time used by the record manager stays inside every record's window.
+    base = current_time_millis()
+    received_early = base
+    received_late = base + 1_000
+
+    later_msg = _address_response(
+        r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, ttl, address), received_late
+    )
+    earlier_msg = _address_response(
+        r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, ttl, address), received_early
+    )
+    later = later_msg.answers()[0]
+
+    # The later observation enters the cache first.
+    with patch("zeroconf._handlers.record_manager.current_time_millis", return_value=received_late):
+        zc.record_manager.async_updates_from_response(later_msg)
+    assert zc.cache.async_get_unique(later) is later
+
+    # The earlier observation is only processed once its own TTL has elapsed.
+    process_at = received_early + ttl_millis + 1
+    with patch("zeroconf._handlers.record_manager.current_time_millis", return_value=process_at):
+        zc.record_manager.async_updates_from_response(earlier_msg)
+
+    assert zc.cache.async_get_unique(later) is later
+    # The heap carries only the later record's expiration deadline.
+    assert zc.cache._expirations == {later: received_late + ttl_millis}
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+async def test_late_expired_response_fires_no_listener_update():
+    """A stale late record produces neither a cache change nor a listener notification."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    zc = aiozc.zeroconf
+    seen: list[r.DNSRecord] = []
+
+    class Recorder(r.RecordUpdateListener):
+        def update_record(self, zc, now, record) -> None:  # type: ignore[no-untyped-def]
+            seen.append(record)
+
+    listener = Recorder()
+    zc.add_listener(listener, None)
+
+    name = "late.local."
+    address = socket.inet_aton("10.8.8.8")
+    ttl = 10
+    base = current_time_millis()
+    received_early = base
+    received_late = base + 1_000
+    later_msg = _address_response(
+        r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, ttl, address), received_late
+    )
+    earlier_msg = _address_response(
+        r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, ttl, address), received_early
+    )
+    later = later_msg.answers()[0]
+
+    with patch("zeroconf._handlers.record_manager.current_time_millis", return_value=received_late):
+        zc.record_manager.async_updates_from_response(later_msg)
+    seen.clear()
+
+    with patch(
+        "zeroconf._handlers.record_manager.current_time_millis",
+        return_value=received_early + ttl * 1000 + 1,
+    ):
+        zc.record_manager.async_updates_from_response(earlier_msg)
+
+    assert seen == []
+    assert zc.cache.async_get_unique(later) is later
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+async def test_delayed_record_within_window_keeps_true_remaining_ttl():
+    """A delayed but still-valid record is accepted with the TTL anchored at reception, not processing."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    zc = aiozc.zeroconf
+    name = "window.local."
+    address = socket.inet_aton("10.7.7.7")
+    ttl = 10
+    # Half the TTL passes between reception and processing; the record is
+    # still inside its validity window.
+    received_at = current_time_millis()
+    process_at = received_at + ttl * 500
+
+    msg = _address_response(r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, ttl, address), received_at)
+    record = msg.answers()[0]
+    with patch("zeroconf._handlers.record_manager.current_time_millis", return_value=process_at):
+        zc.record_manager.async_updates_from_response(msg)
+
+    cached = zc.cache.async_get_unique(record)
+    assert cached is record
+    # The expiration stays reception + full TTL, leaving only the real remainder.
+    assert cached.get_remaining_ttl(process_at) == pytest.approx(5.0)
+    assert cached.get_expiration_time(100) == received_at + ttl * 1000
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+async def test_prompt_goodbye_still_removes_record():
+    """A TTL 0 received and processed immediately keeps its existing goodbye behavior."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    zc = aiozc.zeroconf
+    name = "goodbye.local."
+    address = socket.inet_aton("10.6.6.6")
+    received_at = current_time_millis()
+    live_msg = _address_response(
+        r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, 120, address), received_at
+    )
+    goodbye_msg = _address_response(
+        r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, 0, address), received_at + 1
+    )
+    live = live_msg.answers()[0]
+
+    zc.record_manager.async_updates_from_response(live_msg)
+    assert zc.cache.async_get_unique(live) is live
+
+    with patch("zeroconf._handlers.record_manager.current_time_millis", return_value=received_at + 1):
+        zc.record_manager.async_updates_from_response(goodbye_msg)
+
+    assert zc.cache.async_get_unique(live) is None
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+async def test_late_goodbye_does_not_evict_fresher_record():
+    """A TTL 0 that arrives later than a cached fresh observation is treated as a stale update."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    zc = aiozc.zeroconf
+    name = "lategoodbye.local."
+    address = socket.inet_aton("10.5.5.5")
+    base = current_time_millis()
+    goodbye_msg = _address_response(
+        r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, 0, address), base
+    )
+    fresh_msg = _address_response(
+        r.DNSAddress(name, const._TYPE_A, const._CLASS_IN, 120, address), base + 1_000
+    )
+    fresh = fresh_msg.answers()[0]
+
+    # The fresh observation is cached first; the older goodbye is replayed.
+    with patch("zeroconf._handlers.record_manager.current_time_millis", return_value=base + 1_000):
+        zc.record_manager.async_updates_from_response(fresh_msg)
+    with patch("zeroconf._handlers.record_manager.current_time_millis", return_value=base + 2_000):
+        zc.record_manager.async_updates_from_response(goodbye_msg)
+
+    assert zc.cache.async_get_unique(fresh) is fresh
+    await aiozc.async_close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("quick_aggregation_timing")
 async def test_response_aggregation_timings(run_isolated: None) -> None:

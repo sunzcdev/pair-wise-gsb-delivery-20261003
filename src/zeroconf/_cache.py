@@ -257,7 +257,12 @@ class DNSCache:
         # removes the risk that accessing the cache from the wrong
         # direction would return the old incorrect entry.
         store = self.cache.get(record.key)
-        is_new = store is None or record not in store
+        existing = None if store is None else store.get(record)
+        # Responses processed out of receive order must not let an older
+        # observation rewrite the TTL or expiration of a fresher one.
+        if existing is not None and existing is not record and record.created < existing.created:
+            return False
+        is_new = existing is None
         # Bound total cache size; evict closest-to-expiration entry to
         # make room before inserting a new record. Prevents a LAN-local
         # flood of unique-name records from growing the cache without

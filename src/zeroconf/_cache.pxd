@@ -62,6 +62,7 @@ cdef class DNSCache:
 
     @cython.locals(
         store=cython.dict,
+        existing=DNSRecord,
         service_store=cython.dict,
         service_record=DNSService,
         when=object,

@@ -88,7 +88,10 @@ class RecordManager:
         address_adds: list[DNSRecord] = []
         other_adds: list[DNSRecord] = []
         removes: set[DNSRecord] = set()
-        now = msg.now
+        # A packet can sit queued past the TTL of its own answers, so judge
+        # acceptability at processing time while each record keeps the TTL it
+        # had at reception (its ``created`` stamp, set when the packet arrived).
+        now = current_time_millis()
         unique_types: set[tuple[str, int, int]] = set()
         cache = self.cache
         answers = msg.answers()
@@ -111,17 +114,24 @@ class RecordManager:
                 # Safe because the record is never in the cache yet
                 record._set_created_ttl(record.created, _DNS_PTR_MIN_TTL)
 
-            if record.unique:  # https://tools.ietf.org/html/rfc6762#section-10.2
-                unique_types.add((record.name, record_type, record.class_))
-
-            if TYPE_CHECKING:
-                record = cast(_UniqueRecordsType, record)
-
             maybe_entry = cache.async_get_unique(record)
             if maybe_entry is None and record_type == _TYPE_AAAA:
                 if TYPE_CHECKING:
                     assert isinstance(record, DNSAddress)
                 maybe_entry = self._async_merge_address(record)
+
+            # Responses can be processed out of receive order. An update that
+            # is older than what is already cached cannot shorten its TTL or
+            # move a refresh schedule, and a TTL 0 that arrived late must not
+            # evict a fresher record the way a prompt goodbye does.
+            if maybe_entry is not None and record.created < maybe_entry.created:
+                continue
+
+            if record.unique:  # https://tools.ietf.org/html/rfc6762#section-10.2
+                unique_types.add((record.name, record_type, record.class_))
+
+            if TYPE_CHECKING:
+                record = cast(_UniqueRecordsType, record)
 
             if not record.is_expired(now):
                 if record_type in _ADDRESS_RECORD_TYPES:
