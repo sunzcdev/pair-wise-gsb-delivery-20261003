@@ -113,6 +113,8 @@ h2_max_concurrent_streams  N/A                           Maximum number of HTTP/
                                                          streams.
 h2_max_header_list_size    N/A                           Maximum number of HTTP/2 headers.               65536
 h2_max_inbound_frame_size  N/A                           Maximum size of a HTTP/2 frame.                 16KiB
+h2_push_deduplicate        N/A                           Share one PUSH_PROMISE for equivalent parent    ``False``
+                                                         context and representation requests.
 include_date_header        N/A                           Include the                                     ``True``
                                                          ``Date: Tue, 15 Nov 1994 08:12:31 GMT``
                                                          header.

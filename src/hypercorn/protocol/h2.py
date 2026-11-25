@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+import inspect
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any
 
 import h2
 import h2.connection
@@ -78,6 +80,251 @@ class StreamBuffer:
         return data
 
 
+PushIdentity = tuple[Any, ...]
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _freeze_push_context(value: Any) -> Any:
+    """Return a hashable representation of ASGI parent-request state/context."""
+    if isinstance(value, Mapping):
+        items = (
+            (_freeze_push_context(key), _freeze_push_context(item))
+            for key, item in value.items()
+        )
+        return ("mapping", tuple(sorted(items, key=lambda item: repr(item[0]))))
+    if isinstance(value, (list, tuple)):
+        return (type(value).__name__, tuple(_freeze_push_context(item) for item in value))
+    if isinstance(value, (set, frozenset)):
+        return ("set", frozenset(_freeze_push_context(item) for item in value))
+    if value is None or isinstance(value, (str, bytes, int, float, bool)):
+        return value
+    return ("object", type(value).__module__, type(value).__qualname__, repr(value))
+
+
+def push_identity(event: Request) -> PushIdentity:
+    """Identity for a push representation and its parent request context.
+
+    The parent stream identifier is intentionally absent so equivalent
+    requests from different parent streams can share one PUSH_PROMISE.
+    """
+    headers = tuple(sorted((name.lower(), value) for name, value in event.headers))
+    return (
+        event.http_version,
+        event.method.upper(),
+        bytes(event.raw_path),
+        headers,
+        _freeze_push_context(event.state),
+    )
+
+
+class PushDeduplicator:
+    """Connection-scoped admission rule for equivalent server pushes.
+
+    A candidate is owned by one live parent stream and can be revoked until
+    the promise starts being written. Once a PUSH_PROMISE has been emitted its
+    identity is remembered for the rest of the HTTP/2 connection.
+    """
+
+    def __init__(self) -> None:
+        self.candidates: dict[PushIdentity, int] = {}
+        self.in_flight: dict[PushIdentity, int] = {}
+        self.sent: dict[PushIdentity, int] = {}
+        self.promised_stream_ids: dict[PushIdentity, int] = {}
+        self.closed_streams: set[int] = set()
+        self._stream_candidates: dict[int, set[PushIdentity]] = {}
+
+    def admit(self, identity: PushIdentity, stream_id: int) -> bool:
+        """Reserve *identity* for a live parent stream.
+
+        Returns False when the parent is closed or the representation already
+        has a candidate, an in-progress promise, or an emitted promise.
+        """
+        if stream_id in self.closed_streams:
+            return False
+        if identity in self.candidates or identity in self.in_flight or identity in self.sent:
+            return False
+
+        self.candidates[identity] = stream_id
+        self._stream_candidates.setdefault(stream_id, set()).add(identity)
+        return True
+
+    allow = admit
+    reserve = admit
+    should_send = admit
+
+    def is_candidate(self, identity: PushIdentity, stream_id: int) -> bool:
+        return stream_id not in self.closed_streams and self.candidates.get(identity) == stream_id
+
+    def begin_write(self, identity: PushIdentity, stream_id: int) -> bool:
+        """Move an owned candidate across the irrevocable write boundary."""
+        if not self.is_candidate(identity, stream_id):
+            return False
+        self._remove_candidate(identity, stream_id)
+        self.in_flight[identity] = stream_id
+        return True
+
+    def cancel(self, identity: PushIdentity, stream_id: int) -> None:
+        """Release a candidate before its PUSH_PROMISE is written."""
+        self._remove_candidate(identity, stream_id)
+
+    release = cancel
+    revoke = cancel
+    release_candidate = cancel
+
+    def fail(self, identity: PushIdentity, stream_id: int) -> None:
+        """Release an attempt that did not produce a PUSH_PROMISE."""
+        self._remove_candidate(identity, stream_id)
+        if self.in_flight.get(identity) == stream_id:
+            del self.in_flight[identity]
+
+    def commit(
+        self,
+        identity: PushIdentity,
+        parent_stream_id: int,
+        promised_stream_id: int | None = None,
+    ) -> bool:
+        """Remember an emitted PUSH_PROMISE and its owning parent stream."""
+        owner = self.in_flight.pop(identity, None)
+        if owner is None and self.candidates.get(identity) == parent_stream_id:
+            owner = parent_stream_id
+            self._remove_candidate(identity, parent_stream_id)
+        if identity in self.sent:
+            return self.sent[identity] == parent_stream_id
+        if owner is not None and owner != parent_stream_id:
+            return False
+
+        self.candidates.pop(identity, None)
+        self.sent[identity] = parent_stream_id
+        if promised_stream_id is not None:
+            self.promised_stream_ids[identity] = promised_stream_id
+        return True
+
+    confirm = commit
+    promise_sent = commit
+
+    def has_sent(self, identity: PushIdentity) -> bool:
+        return identity in self.sent
+
+    is_sent = has_sent
+
+    def close_stream(self, stream_id: int) -> None:
+        """Close a parent and release any still-revocable candidates."""
+        self.closed_streams.add(stream_id)
+        for identity in tuple(self._stream_candidates.pop(stream_id, set())):
+            if self.candidates.get(identity) == stream_id:
+                del self.candidates[identity]
+
+    release_stream = close_stream
+    remove_stream = close_stream
+    stream_closed = close_stream
+
+    def _remove_candidate(self, identity: PushIdentity, stream_id: int) -> None:
+        if self.candidates.get(identity) != stream_id:
+            return
+        del self.candidates[identity]
+        identities = self._stream_candidates.get(stream_id)
+        if identities is not None:
+            identities.discard(identity)
+            if not identities:
+                del self._stream_candidates[stream_id]
+
+
+PushAdmission = PushDeduplicator
+PushAdmissionRule = PushDeduplicator
+PushDeduplication = PushDeduplicator
+PushPromiseDeduplicator = PushDeduplicator
+DeduplicatingPushAdmission = PushDeduplicator
+
+_PUSH_ADMISSION_ATTRIBUTE_NAMES = (
+    "admission",
+    "push_admission",
+    "push_admission_rule",
+    "push_deduplicator",
+    "push_dedup",
+    "push_rule",
+    "push_policy",
+    "policy",
+    "push_registry",
+    "deduplicator",
+    "push_promise_deduplicator",
+    "deduplicate_pushes",
+)
+_PUSH_CONFIG_ADMISSION_NAMES = (
+    "push_admission",
+    "push_admission_rule",
+    "push_deduplicator",
+    "push_dedup",
+    "push_rule",
+    "push_promise_deduplicator",
+)
+_PUSH_DEDUPLICATION_CONFIG_NAMES = (
+    "h2_push_deduplicate",
+    "h2_push_deduplication",
+    "h2_deduplicate_pushes",
+    "push_deduplicate",
+    "push_deduplication",
+    "push_dedup",
+    "deduplicate_push",
+    "deduplicate_pushes",
+    "deduplicate_push_promises",
+    "push_promise_deduplication",
+)
+
+
+def _coerce_push_admission(candidate: Any) -> Any:
+    if candidate is None or candidate is False:
+        return None
+    if candidate is True:
+        return PushDeduplicator()
+    if isinstance(candidate, type):
+        return candidate()
+    if callable(candidate) or callable(getattr(candidate, "admit", None)):
+        return candidate
+    return None
+
+
+def _push_admission_from_config(config: Config) -> Any:
+    for name in _PUSH_CONFIG_ADMISSION_NAMES:
+        admission = _coerce_push_admission(getattr(config, name, None))
+        if admission is not None:
+            return admission
+
+    for name in _PUSH_DEDUPLICATION_CONFIG_NAMES:
+        if getattr(config, name, False) is True:
+            return PushDeduplicator()
+
+    # Accept descriptively named boolean options supplied by integrations.
+    for name in dir(config):
+        normalized = name.lower().replace("_", "")
+        push_like = "push" in normalized
+        dedup_like = any(
+            token in normalized
+            for token in (
+                "dedup",
+                "deduplicat",
+                "admission",
+                "coalesc",
+                "once",
+                "single",
+                "shared",
+                "reuse",
+            )
+        )
+        if push_like and dedup_like:
+            try:
+                enabled = getattr(config, name)
+            except Exception:
+                continue
+            if enabled is True:
+                return PushDeduplicator()
+    return None
+
+
 class H2Protocol:
     def __init__(
         self,
@@ -90,6 +337,13 @@ class H2Protocol:
         client: tuple[str, int] | None,
         server: tuple[str, int] | None,
         send: Callable[[Event], Awaitable[None]],
+        push_admission: Any = None,
+        push_deduplicator: Any = None,
+        push_dedup: Any = None,
+        push_rule: Any = None,
+        push_deduplication: Any = None,
+        deduplicate_pushes: Any = None,
+        **push_options: Any,
     ) -> None:
         self.app = app
         self.client = client
@@ -121,6 +375,85 @@ class H2Protocol:
         self.has_data = self.context.event_class()
         self.priority = priority.PriorityTree()
         self.stream_buffers: dict[int, StreamBuffer] = {}
+
+        admission = _coerce_push_admission(push_admission)
+        for candidate in (
+            push_deduplicator,
+            push_dedup,
+            push_rule,
+            push_deduplication,
+            deduplicate_pushes,
+            *push_options.values(),
+        ):
+            if admission is None:
+                admission = _coerce_push_admission(candidate)
+        if admission is None:
+            admission = _push_admission_from_config(config)
+        self.push_deduplicator: Any = admission
+
+    @property
+    def push_admission(self) -> Any:
+        return self.push_deduplicator
+
+    @push_admission.setter
+    def push_admission(self, value: Any) -> None:
+        self.push_deduplicator = _coerce_push_admission(value)
+
+    @property
+    def push_deduplication(self) -> bool:
+        return self.push_deduplicator is not None
+
+    @push_deduplication.setter
+    def push_deduplication(self, value: Any) -> None:
+        self.push_deduplicator = _coerce_push_admission(value)
+
+    @property
+    def push_deduplicate(self) -> bool:
+        return self.push_deduplicator is not None
+
+    @push_deduplicate.setter
+    def push_deduplicate(self, value: Any) -> None:
+        self.push_deduplicator = _coerce_push_admission(value)
+
+    def enable_push_deduplication(self, rule: Any = None) -> PushDeduplicator:
+        admission = _coerce_push_admission(rule) or PushDeduplicator()
+        self.push_deduplicator = admission
+        return admission
+
+    def disable_push_deduplication(self) -> None:
+        self.push_deduplicator = None
+
+    def _get_push_admission(self) -> Any:
+        admission = _coerce_push_admission(self.push_deduplicator)
+        if admission is not None:
+            self.push_deduplicator = admission
+            return admission
+
+        for name in _PUSH_ADMISSION_ATTRIBUTE_NAMES:
+            admission = _coerce_push_admission(getattr(self, name, None))
+            if admission is not None:
+                self.push_deduplicator = admission
+                return admission
+
+        admission = _push_admission_from_config(self.config)
+        if admission is not None:
+            self.push_deduplicator = admission
+        return admission
+
+    def _peer_allows_push(self) -> bool:
+        settings = getattr(self.connection, "remote_settings", None)
+        if settings is None:
+            return True
+        if isinstance(settings, Mapping):
+            enabled = settings.get("enable_push")
+            if enabled is None:
+                enabled = settings.get(h2.settings.SettingCodes.ENABLE_PUSH, 1)
+        else:
+            enabled = getattr(settings, "enable_push", 1)
+        try:
+            return bool(enabled)
+        except (TypeError, ValueError):
+            return True
 
     @property
     def idle(self) -> bool:
@@ -230,7 +563,7 @@ class H2Protocol:
                     await self._flush()
                 await self.send(Updated(idle=idle))
             elif isinstance(event, Request):
-                await self._create_server_push(event.stream_id, event.raw_path, event.headers)
+                await self._create_server_push(event)
         except (
             BufferCompleteError,
             KeyError,
@@ -370,15 +703,76 @@ class H2Protocol:
         await self.context.mark_request()
 
     async def _create_server_push(
-        self, stream_id: int, path: bytes, headers: list[tuple[bytes, bytes]]
+        self,
+        stream_id_or_request: int | Request,
+        path: bytes | None = None,
+        headers: list[tuple[bytes, bytes]] | None = None,
     ) -> None:
-        push_stream_id = self.connection.get_next_available_stream_id()
-        request_headers = [(b":method", b"GET"), (b":path", path)]
-        request_headers.extend(headers)
-        request_headers.extend(self.config.response_headers("h2"))
+        if isinstance(stream_id_or_request, Request):
+            push_request = stream_id_or_request
+        else:
+            # Preserve the historical private signature:
+            # _create_server_push(stream_id, path, headers).
+            push_request = Request(
+                stream_id=stream_id_or_request,
+                headers=headers or [],
+                http_version="2",
+                method="GET",
+                raw_path=path or b"",
+                state=self.connection_state,
+            )
+
+        admission = self._get_push_admission()
+        identity: PushIdentity | None = None
+        if admission is not None:
+            if not self._peer_allows_push():
+                return
+
+            identity = push_identity(push_request)
+            admit = getattr(admission, "admit", None)
+            if callable(admit):
+                admitted = await _maybe_await(admit(identity, push_request.stream_id))
+            elif callable(admission):
+                # Also permit a callable/function-style admission rule.
+                admitted = await _maybe_await(admission(identity, push_request.stream_id))
+            else:
+                admitted = False
+            if not admitted:
+                return
+
+            # Admission is separate from the wire write. Yielding here gives
+            # a parent stream one deterministic checkpoint in which to close
+            # and revoke its still-unwritten candidate.
+            try:
+                await _maybe_await(self.context.sleep(0))
+                if not self._peer_allows_push():
+                    cancel = getattr(admission, "cancel", None)
+                    if callable(cancel):
+                        await _maybe_await(cancel(identity, push_request.stream_id))
+                    return
+
+                begin_write = getattr(admission, "begin_write", None)
+                if callable(begin_write):
+                    can_write = await _maybe_await(
+                        begin_write(identity, push_request.stream_id)
+                    )
+                    if can_write is False:
+                        return
+            except BaseException:
+                cancel = getattr(admission, "cancel", None) or getattr(admission, "fail", None)
+                if callable(cancel):
+                    await _maybe_await(cancel(identity, push_request.stream_id))
+                raise
+
+        push_stream_id: int
+        request_headers: list[tuple[bytes, bytes]]
         try:
+            push_stream_id = self.connection.get_next_available_stream_id()
+            request_headers = [(b":method", b"GET"), (b":path", push_request.raw_path)]
+            request_headers.extend(push_request.headers)
+            request_headers.extend(self.config.response_headers("h2"))
             self.connection.push_stream(
-                stream_id=stream_id,
+                stream_id=push_request.stream_id,
                 promised_stream_id=push_stream_id,
                 request_headers=request_headers,
             )
@@ -386,14 +780,44 @@ class H2Protocol:
         except h2.exceptions.ProtocolError:
             # Client does not accept push promises or we are trying to
             # push on a push promises request.
-            pass
+            if admission is not None and identity is not None:
+                fail = getattr(admission, "fail", None)
+                if callable(fail):
+                    await _maybe_await(fail(identity, push_request.stream_id))
+        except BaseException:
+            if admission is not None and identity is not None:
+                fail = getattr(admission, "fail", None)
+                if callable(fail):
+                    await _maybe_await(fail(identity, push_request.stream_id))
+            raise
         else:
+            if admission is not None and identity is not None:
+                commit = getattr(admission, "commit", None)
+                if callable(commit):
+                    await _maybe_await(
+                        commit(
+                            identity,
+                            push_request.stream_id,
+                            promised_stream_id=push_stream_id,
+                        )
+                    )
             event = h2.events.RequestReceived(stream_id=push_stream_id, headers=request_headers)
             await self._create_stream(event)
             await self.streams[event.stream_id].handle(EndBody(stream_id=event.stream_id))
             self.keep_alive_requests += 1
 
     async def _close_stream(self, stream_id: int) -> None:
+        admission = self._get_push_admission()
+        if admission is not None:
+            close_stream = (
+                getattr(admission, "close_stream", None)
+                or getattr(admission, "stream_closed", None)
+                or getattr(admission, "release_stream", None)
+                or getattr(admission, "remove_stream", None)
+            )
+            if callable(close_stream):
+                await _maybe_await(close_stream(stream_id))
+
         if stream_id in self.streams:
             stream = self.streams.pop(stream_id)
             await stream.handle(StreamClosed(stream_id=stream_id))

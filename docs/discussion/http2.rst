@@ -45,3 +45,22 @@ HTTP/2 features
 
 Hypercorn supports pipeling, flow control, server push, and
 prioritisation.
+
+Push deduplication
+~~~~~~~~~~~~~~~~~~
+
+Multiple parent streams can ask Hypercorn to push the same cached
+representation. Opt into a connection-scoped admission rule with
+``push_deduplication = True`` (or the equivalent
+``h2_push_deduplicate = True`` configuration). A custom
+``PushDeduplicator`` or compatible admission object can also be passed as
+``push_admission`` when constructing the H2 protocol.
+
+Admission shares a promise only when the peer enables push and the parent
+request context and push representation are equal. The parent stream
+identifier is not part of that identity. An unwritten promise remains a
+revocable candidate until its write boundary; closing its parent releases
+the candidate. After the ``PUSH_PROMISE`` has been emitted, the identity
+is remembered for the lifetime of the connection and closing its parent
+does not allow a duplicate. Push deduplication is disabled by default, so
+existing push usage is unchanged.

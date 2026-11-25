@@ -83,6 +83,7 @@ class Config:
     h2_max_concurrent_streams = 100
     h2_max_header_list_size = 2**16
     h2_max_inbound_frame_size = 2**14 * OCTETS
+    h2_push_deduplicate = False
     include_date_header = True
     include_server_header = True
     keep_alive_timeout = 5 * SECONDS
@@ -97,6 +98,10 @@ class Config:
     max_requests: int | None = None
     max_requests_jitter: int = 0
     pid_path: str | None = None
+    push_admission: Any = None
+    push_deduplicate: bool = False
+    push_deduplication: bool = False
+    push_deduplicator: Any = None
     server_names: list[str] = []
     shutdown_timeout = 60 * SECONDS
     ssl_handshake_timeout = 60 * SECONDS
