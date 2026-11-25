@@ -439,9 +439,10 @@ class _ProxyAdapter(httputil.HTTPMessageDelegate):
         self.delegate.finish()
         self._cleanup()
 
-    def on_connection_close(self) -> None:
-        self.delegate.on_connection_close()
+    def on_connection_close(self) -> Awaitable[None] | None:
+        ret = self.delegate.on_connection_close()
         self._cleanup()
+        return ret
 
     def _cleanup(self) -> None:
         self.connection.context._unapply_xheaders()  # type: ignore

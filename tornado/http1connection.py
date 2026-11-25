@@ -204,6 +204,11 @@ class HTTP1Connection(httputil.HTTPConnection):
         self._expected_content_remaining: int | None = None
         # A Future for our outgoing writes, returned by IOStream.write.
         self._pending_write: Future[None] | None = None
+        # True while we are waiting for the delegate to process a chunk
+        # of the body (i.e. inside a data_received call that returned an
+        # unfinished awaitable). Used to decide whether a blocked body
+        # read needs to be cancelled when the connection closes.
+        self._delegate_busy = False
 
     def read_response(self, delegate: httputil.HTTPMessageDelegate) -> Awaitable[bool]:
         """Read a single HTTP response.
@@ -343,19 +348,58 @@ class HTTP1Connection(httputil.HTTPConnection):
                     resp_start_line.code if self.is_client else 0, headers, delegate
                 )
                 if body_future is not None:
-                    if self._body_timeout is None:
-                        await body_future
-                    else:
-                        try:
-                            await gen.with_timeout(
-                                self.stream.io_loop.time() + self._body_timeout,
-                                body_future,
-                                quiet_exceptions=iostream.StreamClosedError,
+                    # Read the body in a separate task so that it can be
+                    # cancelled if the connection closes while we are
+                    # waiting for the delegate (see below).
+                    body_task = asyncio.ensure_future(body_future)
+
+                    # A pending read on the stream fails if the connection
+                    # is closed, but if the delegate's data_received is
+                    # still running (flow control) there is no pending
+                    # read and the close would go unnoticed, leaving the
+                    # delegate (and any resources it holds) stuck
+                    # indefinitely. Watch for the close ourselves and, if
+                    # the delegate is still busy, cancel the body read;
+                    # the cancellation is delivered to the in-progress
+                    # data_received, which may catch it and release its
+                    # resources before on_connection_close is called. If
+                    # the delegate is not busy, the body read will notice
+                    # the close on its own (and may still be able to
+                    # finish from buffered data), so leave it alone.
+                    def cancel_body_if_delegate_busy() -> None:
+                        if self._delegate_busy:
+                            body_task.cancel()
+
+                    self.stream.set_close_callback(cancel_body_if_delegate_busy)
+                    try:
+                        if self._body_timeout is None:
+                            await body_task
+                        else:
+                            try:
+                                await gen.with_timeout(
+                                    self.stream.io_loop.time() + self._body_timeout,
+                                    body_task,
+                                    quiet_exceptions=iostream.StreamClosedError,
+                                )
+                            except TimeoutError:
+                                gen_log.info(
+                                    "Timeout reading body from %s", self.context
+                                )
+                                self.stream.close()
+                                return False
+                    except asyncio.CancelledError:
+                        if self.stream.closed():
+                            # The connection was closed while we were
+                            # waiting for the delegate. This is equivalent
+                            # to the StreamClosedError we would have
+                            # gotten from a pending read; the finally
+                            # clause will notify the delegate.
+                            raise iostream.StreamClosedError(
+                                "connection closed while reading body"
                             )
-                        except TimeoutError:
-                            gen_log.info("Timeout reading body from %s", self.context)
-                            self.stream.close()
-                            return False
+                        raise
+                    finally:
+                        self.stream.set_close_callback(None)
             self._read_finished = True
             if not self._write_finished or self.is_client:
                 with _ExceptionLoggingContext(app_log):
@@ -391,7 +435,12 @@ class HTTP1Connection(httputil.HTTPConnection):
         finally:
             if need_delegate_close:
                 with _ExceptionLoggingContext(app_log):
-                    delegate.on_connection_close()
+                    maybe_awaitable = delegate.on_connection_close()
+                    if maybe_awaitable is not None:
+                        # on_connection_close may return an awaitable to
+                        # do asynchronous cleanup before the connection
+                        # is torn down.
+                        await maybe_awaitable
             header_future = None  # type: ignore
             self._clear_callbacks()
         return True
@@ -739,7 +788,27 @@ class HTTP1Connection(httputil.HTTPConnection):
             with _ExceptionLoggingContext(app_log):
                 ret = delegate.data_received(data)
                 if ret is not None:
-                    await ret
+                    self._delegate_busy = True
+                    try:
+                        await ret
+                    except asyncio.CancelledError:
+                        task = asyncio.current_task()
+                        if task is not None and task.cancelling() > 0:
+                            # This task was cancelled because the
+                            # connection was closed while the delegate
+                            # was busy (see _read_message_inner). The
+                            # cancellation has been delivered to the
+                            # delegate's data_received; stop the body
+                            # read quietly. The next read will hit the
+                            # closed stream and produce StreamClosedError.
+                            return
+                        # A CancelledError raised by the delegate's own
+                        # awaitable (as opposed to our cancellation) is
+                        # an error like any other; let the context
+                        # manager above log it.
+                        raise
+                    finally:
+                        self._delegate_busy = False
 
     async def _read_fixed_body(
         self, content_length: int, delegate: httputil.HTTPMessageDelegate
@@ -929,7 +998,7 @@ class _GzipMessageDelegate(httputil.HTTPMessageDelegate):
                 raise httputil.HTTPInputError("invalid gzip data: %s" % e)
         return self._delegate.finish()
 
-    def on_connection_close(self) -> None:
+    def on_connection_close(self) -> Awaitable[None] | None:
         return self._delegate.on_connection_close()
 
 

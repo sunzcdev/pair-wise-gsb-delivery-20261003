@@ -750,11 +750,20 @@ class HTTPMessageDelegate:
         """Called after the last chunk of data has been received."""
         pass
 
-    def on_connection_close(self) -> None:
+    def on_connection_close(self) -> Awaitable[None] | None:
         """Called if the connection is closed without finishing the request.
 
         If ``headers_received`` is called, either ``finish`` or
         ``on_connection_close`` will be called, but not both.
+
+        May return an `.Awaitable`; if it does, it is awaited before the
+        connection is torn down.
+
+        .. versionchanged:: 6.7
+           May now return an `.Awaitable`. In addition, if a
+           ``data_received`` call is still in progress when the
+           connection is closed, it is cancelled and
+           ``on_connection_close`` is called only after it has completed.
         """
         pass
 

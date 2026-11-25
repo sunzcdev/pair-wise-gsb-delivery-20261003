@@ -229,7 +229,7 @@ class RequestHandler:
         assert self.request.connection is not None
         # TODO: need to add set_close_callback to HTTPConnection interface
         self.request.connection.set_close_callback(  # type: ignore
-            self.on_connection_close
+            self._on_connection_close
         )
         self.initialize(**kwargs)
 
@@ -303,7 +303,7 @@ class RequestHandler:
         """
         pass
 
-    def on_connection_close(self) -> None:
+    def on_connection_close(self) -> Awaitable[None] | None:
         """Called in async handlers if the client closed the connection.
 
         Override this to clean up resources associated with
@@ -316,11 +316,48 @@ class RequestHandler:
         indefinitely) after the client has gone away, so this method
         may not be called promptly after the end user closes their
         connection.
+
+        This method may be a coroutine. For handlers using
+        `.stream_request_body`, if the connection is closed while a
+        `~.RequestHandler.data_received` call is still in progress, the
+        in-progress call is cancelled (it sees `asyncio.CancelledError`
+        at its current await point, which it may catch to release any
+        resources it is holding) and ``on_connection_close`` is called
+        only after it has completed. ``on_connection_close`` is called at
+        most once per request, at a point where the handler can tell
+        which chunks of the body were delivered to the application and
+        which were not.
+
+        .. versionchanged:: 6.7
+           This method may now be a coroutine, and for
+           `.stream_request_body` handlers it is called after any
+           in-progress `~.RequestHandler.data_received` call has
+           completed (cancelling it first if it is still running).
         """
         if _has_stream_request_body(self.__class__):
             if not self.request._body_future.done():
                 self.request._body_future.set_exception(iostream.StreamClosedError())
                 self.request._body_future.exception()
+
+    def _on_connection_close(self) -> None:
+        # Registered as the connection's close callback, which is used
+        # when the connection is closed while the handler is still
+        # working on its response (as opposed to while the request body
+        # is being read, which is reported through the delegate instead
+        # and may be awaited there). on_connection_close may be a
+        # coroutine; make sure it gets awaited in that case.
+        result = self.on_connection_close()
+        if result is not None:
+
+            async def await_result() -> None:
+                try:
+                    await result
+                except Exception:
+                    app_log.error(
+                        "Uncaught exception in on_connection_close", exc_info=True
+                    )
+
+            asyncio.ensure_future(await_result())
 
     def clear(self) -> None:
         """Resets all headers and content for this response."""
@@ -2193,6 +2230,12 @@ def stream_request_body(cls: type[_RequestHandlerType]) -> type[_RequestHandlerT
       until those futures have completed.
     * The regular HTTP method (``post``, ``put``, etc) will be called after
       the entire body has been read.
+    * If the connection is closed while a ``data_received`` call is still
+      in progress, that call is cancelled (it sees
+      `asyncio.CancelledError` at its current await point, which it may
+      catch to release any resources it is holding) and
+      `.RequestHandler.on_connection_close` is called only after it has
+      completed.
 
     See the `file receiver demo <https://github.com/tornadoweb/tornado/tree/stable/demos/file_upload/>`_
     for example usage.
@@ -2676,11 +2719,12 @@ class _HandlerDelegate(httputil.HTTPMessageDelegate):
             self.request.body = bytes(self.chunks)
             self.execute()
 
-    def on_connection_close(self) -> None:
+    def on_connection_close(self) -> Awaitable[None] | None:
         if self.stream_request_body:
-            self.handler.on_connection_close()
+            return self.handler.on_connection_close()
         else:
             self.chunks = None  # type: ignore
+            return None
 
     def execute(self) -> Awaitable[None] | None:
         # If template cache is disabled (usually in the debug mode),

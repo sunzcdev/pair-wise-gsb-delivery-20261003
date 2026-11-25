@@ -272,9 +272,10 @@ class _RoutingDelegate(httputil.HTTPMessageDelegate):
         assert self.delegate is not None
         self.delegate.finish()
 
-    def on_connection_close(self) -> None:
+    def on_connection_close(self) -> Awaitable[None] | None:
         if self.delegate is not None:
-            self.delegate.on_connection_close()
+            return self.delegate.on_connection_close()
+        return None
 
 
 class _DefaultMessageDelegate(httputil.HTTPMessageDelegate):

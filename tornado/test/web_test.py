@@ -3589,10 +3589,44 @@ class StreamingRequestBodyTest(WebTestCase):
                 super().on_connection_close()
                 self.test.close_future.set_result(None)
 
+        @stream_request_body
+        class CancelDuringUploadHandler(RequestHandler):
+            def initialize(self, test):
+                self.test = test
+                self.test.handler = self
+                self.chunks = []
+                self.cleanup_count = 0
+
+            async def data_received(self, data):
+                self.chunks.append(data)
+                if len(self.chunks) == 1:
+                    self.test.first_chunk_delivered.set_result(None)
+                elif len(self.chunks) == 2:
+                    # The second chunk is still being processed (and its
+                    # "resources" are still held) when the client
+                    # disconnects. Block until we are cancelled.
+                    self.test.second_chunk_started.set_result(None)
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        self.test.data_received_cancelled.set_result(None)
+                        raise
+
+            async def on_connection_close(self):
+                # Awaitable cleanup point: runs (at most once) after the
+                # in-progress data_received has exited, so it can see
+                # exactly which chunks were delivered to the application.
+                super().on_connection_close()
+                await gen.sleep(0)
+                self.cleanup_count += 1
+                if not self.test.cleanup_done.done():
+                    self.test.cleanup_done.set_result(list(self.chunks))
+
         return [
             ("/stream_body", StreamingBodyHandler, dict(test=self)),
             ("/early_return", EarlyReturnHandler),
             ("/close_detection", CloseDetectionHandler, dict(test=self)),
+            ("/cancel_during_upload", CancelDuringUploadHandler, dict(test=self)),
         ]
 
     def connect(self, url, connection_close):
@@ -3648,6 +3682,38 @@ class StreamingRequestBodyTest(WebTestCase):
         stream = self.connect(b"/close_detection", connection_close=False)
         stream.close()
         yield self.close_future
+
+    @gen_test
+    def test_close_during_data_received(self):
+        # If the client disconnects while a data_received call is still
+        # running, the in-progress call is cancelled (so it can release
+        # any resources it holds) and on_connection_close runs exactly
+        # once, afterwards, observing exactly the chunks that were
+        # delivered to the application.
+        self.first_chunk_delivered: Future[None] = Future()
+        self.second_chunk_started: Future[None] = Future()
+        self.data_received_cancelled: Future[None] = Future()
+        self.cleanup_done: Future[list] = Future()
+
+        stream = self.connect(b"/cancel_during_upload", connection_close=False)
+        stream.write(b"4\r\nasdf\r\n")
+        yield self.first_chunk_delivered
+        stream.write(b"4\r\nqwer\r\n")
+        # Wait until the second chunk's data_received is blocked.
+        yield self.second_chunk_started
+        # This chunk is never delivered to the application.
+        stream.write(b"4\r\nzxcv\r\n")
+        stream.close()
+        # The in-progress data_received sees CancelledError first so it
+        # can release its resources, then the cleanup point runs.
+        yield self.data_received_cancelled
+        chunks = yield self.cleanup_done
+        # The two delivered chunks are distinguishable from the one that
+        # was never read.
+        self.assertEqual(chunks, [b"asdf", b"qwer"])
+        # The cleanup ran exactly once.
+        yield gen.sleep(0.05)
+        self.assertEqual(self.handler.cleanup_count, 1)
 
 
 # Each method in this handler returns a yieldable object and yields to the

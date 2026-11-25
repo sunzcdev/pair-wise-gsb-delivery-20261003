@@ -745,11 +745,14 @@ class BaseIOStream:
                 state |= self.io_loop.READ
             if self.writing():
                 state |= self.io_loop.WRITE
-            if state == self.io_loop.ERROR and self._read_buffer_size == 0:
+            if state == self.io_loop.ERROR and (
+                self._read_buffer_size == 0 or self._close_callback is not None
+            ):
                 # If the connection is idle, listen for reads too so
                 # we can tell if the connection is closed.  If there is
-                # data in the read buffer we won't run the close callback
-                # yet anyway, so we don't need to listen in this case.
+                # data in the read buffer and no one is waiting for the
+                # close callback, we don't need to listen: the next read
+                # will notice the close.
                 state |= self.io_loop.READ
             if state != self._state:
                 assert (
@@ -1069,11 +1072,7 @@ class BaseIOStream:
         # immediately anyway.  Instead, we insert checks at various times to
         # see if the connection is idle and add the read listener then.
         if self._state is None or self._state == ioloop.IOLoop.ERROR:
-            if (
-                not self.closed()
-                and self._read_buffer_size == 0
-                and self._close_callback is not None
-            ):
+            if not self.closed() and self._close_callback is not None:
                 self._add_io_state(ioloop.IOLoop.READ)
 
     def _add_io_state(self, state: int) -> None:
