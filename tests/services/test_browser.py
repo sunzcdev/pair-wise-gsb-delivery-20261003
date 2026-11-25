@@ -1196,6 +1196,74 @@ async def test_generate_service_query_suppress_duplicate_questions():
 
 
 @pytest.mark.asyncio
+async def test_refresh_query_suppressed_only_when_known_answers_substitutable():
+    """A refresh query is suppressed only by a multicast round whose known answers it fully covers."""
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    zc = aiozc.zeroconf
+    now = current_time_millis()
+    type_ = "_coexist._tcp.local."
+    types_ = {type_}
+    ptr_alpha = r.DNSPointer(type_, const._TYPE_PTR, const._CLASS_IN, 4500, f"alpha.{type_}")
+    ptr_beta = r.DNSPointer(type_, const._TYPE_PTR, const._CLASS_IN, 4500, f"beta.{type_}")
+
+    sent: list[r.DNSOutgoing] = []
+
+    def send(out, *args):  # type: ignore[no-untyped-def]
+        sent.append(out)
+
+    delay = const._BROWSER_TIME
+    # Two browsers on the same service type: one multicasts, the other
+    # is bound to a specific interface so it sends QU questions.
+    mcast_browser = _services_browser.QueryScheduler(
+        zc, types_, None, const._MDNS_PORT, True, delay, (0, 0), None
+    )
+    ucast_browser = _services_browser.QueryScheduler(
+        zc, types_, "10.0.0.1", const._MDNS_PORT, False, delay, (0, 0), None
+    )
+
+    with patch.object(zc, "async_send", send):
+        # Browser one knows only instance alpha; its refresh round goes
+        # out and is remembered with {alpha} as the known answers.
+        zc.cache.async_add_records([ptr_alpha])
+        mcast_browser.async_send_ready_queries(False, now, types_)
+        assert len(sent) == 1
+        out = sent.pop()
+        assert out.questions == [DNSQuestion(type_, const._TYPE_PTR, const._CLASS_IN)]
+        assert not out.questions[0].unicast
+        assert [record for record, _ in out.answers] == [ptr_alpha]
+
+        # Browser two knows only instance beta: the remembered known
+        # answers are not comparable, so the refresh question is sent.
+        zc.cache.async_remove_records([ptr_alpha])
+        zc.cache.async_add_records([ptr_beta])
+        mcast_browser.async_send_ready_queries(False, now, types_)
+        assert len(sent) == 1
+        out = sent.pop()
+        assert out.questions == [DNSQuestion(type_, const._TYPE_PTR, const._CLASS_IN)]
+        assert [record for record, _ in out.answers] == [ptr_beta]
+
+        # The identical round is fully substitutable and is suppressed.
+        mcast_browser.async_send_ready_queries(False, now, types_)
+        assert not sent
+
+        # The same call on the unicast interface asks QU questions and
+        # is never suppressed.
+        zc.question_history.clear()
+        ucast_browser.async_send_ready_queries(False, now, types_)
+        assert len(sent) == 1
+        out = sent.pop()
+        assert out.questions == [DNSQuestion(type_, const._TYPE_PTR, const._CLASS_IN)]
+        assert out.questions[0].unicast
+
+        # A local QU query must not suppress the multicast refresh round.
+        mcast_browser.async_send_ready_queries(False, now, types_)
+        assert len(sent) == 1
+        assert not sent[0].questions[0].unicast
+
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
 async def test_query_scheduler():
     delay = const._BROWSER_TIME
     types_ = {"_hap._tcp.local.", "_http._tcp.local."}
