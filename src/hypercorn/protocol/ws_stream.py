@@ -178,6 +178,11 @@ class WSStream:
         self.app = app
         self.app_put: Callable | None = None
         self.buffer = WebsocketBuffer(config.websocket_max_message_size)
+        # Data received whilst the app decides to accept or reject
+        # the connection. It is bounded by the max message size, and
+        # is either delivered after acceptance or discarded on
+        # rejection.
+        self._pre_accept_buffer = b""
         self.client = client
         self.closed = False
         self.config = config
@@ -236,8 +241,13 @@ class WSStream:
                 )
                 await self.app_put({"type": "websocket.connect"})
         elif isinstance(event, (Body, Data)) and not self.handshake.accepted:
-            await self._send_error_response(400)
-            self.closed = True
+            # The client has sent data before the app has decided to
+            # accept or reject the connection. Buffer it (bounded)
+            # pending the handshake decision, rather than erroring.
+            self._pre_accept_buffer += event.data
+            if len(self._pre_accept_buffer) > self.config.websocket_max_message_size:
+                await self._send_error_response(400)
+                self.closed = True
         elif isinstance(event, (Body, Data)):
             self.connection.receive_data(event.data)
             await self._handle_events()
@@ -359,6 +369,12 @@ class WSStream:
         )
         if self.config.websocket_ping_interval is not None:
             self.task_group.spawn(self._send_pings)
+        if self._pre_accept_buffer != b"":
+            # Deliver any data received whilst waiting for the app to
+            # accept, ensuring it arrives after websocket.connect.
+            data, self._pre_accept_buffer = self._pre_accept_buffer, b""
+            self.connection.receive_data(data)
+            await self._handle_events()
 
     async def _send_rejection(self, message: WebsocketResponseBodyEvent) -> None:
         body_suppressed = suppress_body("GET", self.response["status"])

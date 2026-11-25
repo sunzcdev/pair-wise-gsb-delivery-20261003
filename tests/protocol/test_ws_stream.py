@@ -201,7 +201,10 @@ async def test_handle_request(stream: WSStream) -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_data_before_acceptance(stream: WSStream) -> None:
+async def test_handle_data_before_acceptance_rejected(stream: WSStream) -> None:
+    # Data received whilst the app is deciding (the connect message
+    # is still being handled) must be buffered, and discarded if the
+    # app rejects the connection.
     await stream.handle(
         Request(
             stream_id=1,
@@ -212,12 +215,82 @@ async def test_handle_data_before_acceptance(stream: WSStream) -> None:
             state=ConnectionState({}),
         )
     )
+    await stream.handle(Data(stream_id=1, data=b"\x81\x85&`\x13\x0eN\x05\x7fbI"))
+    stream.app_put = AsyncMock()
+    await stream.app_send(cast(WebsocketCloseEvent, {"type": "websocket.close"}))
+    assert stream.send.call_args_list == [  # type: ignore
+        call(
+            Response(
+                stream_id=1,
+                headers=[(b"content-length", b"0"), (b"connection", b"close")],
+                status_code=403,
+            )
+        ),
+        call(EndBody(stream_id=1)),
+    ]
+    # The buffered data must not be delivered to the app
+    stream.app_put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_data_before_acceptance_disconnect(stream: WSStream) -> None:
+    # Data received whilst the app is deciding must be discarded if
+    # the connection closes before the handshake completes.
     await stream.handle(
-        Data(
+        Request(
             stream_id=1,
-            data=b"X",
+            http_version="2",
+            headers=[(b"sec-websocket-version", b"13")],
+            raw_path=b"/?a=b",
+            method="GET",
+            state=ConnectionState({}),
         )
     )
+    await stream.handle(Data(stream_id=1, data=b"\x81\x85&`\x13\x0eN\x05\x7fbI"))
+    stream.app_put = AsyncMock()
+    await stream.handle(StreamClosed(stream_id=1))
+    assert stream.app_put.call_args_list == [
+        call({"type": "websocket.disconnect", "code": 1006})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_data_before_acceptance_accepted(stream: WSStream) -> None:
+    # Data received whilst the app is deciding must be delivered
+    # (after websocket.connect) once the app accepts.
+    await stream.handle(
+        Request(
+            stream_id=1,
+            http_version="2",
+            headers=[(b"sec-websocket-version", b"13")],
+            raw_path=b"/?a=b",
+            method="GET",
+            state=ConnectionState({}),
+        )
+    )
+    await stream.handle(Data(stream_id=1, data=b"\x81\x85&`\x13\x0eN\x05\x7fbI"))
+    stream.app_put = AsyncMock()
+    await stream.app_send(cast(WebsocketAcceptEvent, {"type": "websocket.accept"}))
+    assert stream.app_put.call_args_list == [
+        call({"type": "websocket.receive", "bytes": None, "text": "hello"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_data_before_acceptance_exceeds_buffer(stream: WSStream) -> None:
+    # The pre-acceptance buffer is bounded by the max message size
+    stream.config.websocket_max_message_size = 2
+    await stream.handle(
+        Request(
+            stream_id=1,
+            http_version="2",
+            headers=[(b"sec-websocket-version", b"13")],
+            raw_path=b"/?a=b",
+            method="GET",
+            state=ConnectionState({}),
+        )
+    )
+    await stream.handle(Data(stream_id=1, data=b"\x81\x85&`\x13\x0eN\x05\x7fbI"))
     assert stream.send.call_args_list == [  # type: ignore
         call(
             Response(
