@@ -145,6 +145,153 @@ class TCPClientTest(AsyncTestCase):
         context.verify_mode = ssl.CERT_NONE
         return context
 
+    def verifying_tls_context(self):
+        # Trusts test.crt (self-signed, valid for foo.example.com) and
+        # verifies the server's certificate and hostname.
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        context.load_verify_locations(
+            os.path.join(os.path.dirname(__file__), "test.crt")
+        )
+        return context
+
+    def tls_server_options(self, basename="test"):
+        test_dir = os.path.dirname(__file__)
+        return dict(
+            certfile=os.path.join(test_dir, basename + ".crt"),
+            keyfile=os.path.join(test_dir, basename + ".key"),
+        )
+
+    @gen_test
+    async def test_connect_tls_handshake_failure_falls_back(self):
+        # The first address completes its TCP connection quickly, but its
+        # TLS certificate cannot be validated. The connection must fail
+        # over to the second address within the same deadline, and the
+        # caller still sees the original server identity.
+        bad_server = TestTCPServer(
+            socket.AF_INET, ssl_options=self.tls_server_options("test2")
+        )
+        good_server = TestTCPServer(
+            socket.AF_INET, ssl_options=self.tls_server_options()
+        )
+
+        class FakeResolver(Resolver):
+            async def resolve(self, host, port, family=socket.AF_UNSPEC):
+                return [
+                    (socket.AF_INET, ("127.0.0.1", bad_server.port)),
+                    (socket.AF_INET, ("127.0.0.1", good_server.port)),
+                ]
+
+        client = TCPClient(resolver=FakeResolver())
+        try:
+            stream = await client.connect(
+                "foo.example.com",
+                443,
+                ssl_options=self.verifying_tls_context(),
+                timeout=5,
+            )
+            with closing(stream):
+                # The second address won the race.
+                self.assertEqual(stream.socket.getpeername()[1], good_server.port)
+                # The TLS handshake was performed with the original
+                # hostname, not an address returned by the resolver.
+                self.assertEqual(
+                    stream.socket.getpeercert()["subjectAltName"],
+                    (("DNS", "foo.example.com"),),
+                )
+                stream.write(b"hello")
+                server_stream = await good_server.queue.get()
+                self.assertEqual(await server_stream.read_bytes(5), b"hello")
+            # The failed candidate's stream was closed.
+            bad_stream = await bad_server.queue.get()
+            await bad_stream.read_until_close()
+        finally:
+            client.close()
+            bad_server.stop()
+            good_server.stop()
+
+    @skipIfNoIPv6
+    @gen_test
+    async def test_connect_tls_fallback_closes_other_candidates(self):
+        # The first address group (IPv6) completes its TCP connections
+        # first, but one candidate's certificate is invalid and the
+        # other never completes the TLS handshake. The second group
+        # (IPv4) succeeds within the shared deadline, and all losing
+        # candidates are closed.
+        bad_server = TestTCPServer(
+            socket.AF_INET6, ssl_options=self.tls_server_options("test2")
+        )
+        # A plain TCP server that accepts connections but never speaks,
+        # so the TLS handshake never completes.
+        hanging_server = TestTCPServer(socket.AF_INET6)
+        good_server = TestTCPServer(
+            socket.AF_INET, ssl_options=self.tls_server_options()
+        )
+
+        class FakeResolver(Resolver):
+            async def resolve(self, host, port, family=socket.AF_UNSPEC):
+                return [
+                    (socket.AF_INET6, ("::1", bad_server.port, 0, 0)),
+                    (socket.AF_INET6, ("::1", hanging_server.port, 0, 0)),
+                    (socket.AF_INET, ("127.0.0.1", good_server.port)),
+                ]
+
+        client = TCPClient(resolver=FakeResolver())
+        try:
+            stream = await client.connect(
+                "foo.example.com",
+                443,
+                ssl_options=self.verifying_tls_context(),
+                timeout=5,
+            )
+            with closing(stream):
+                self.assertEqual(stream.socket.getpeername()[1], good_server.port)
+                self.assertEqual(
+                    stream.socket.getpeercert()["subjectAltName"],
+                    (("DNS", "foo.example.com"),),
+                )
+                stream.write(b"hello")
+                server_stream = await good_server.queue.get()
+                self.assertEqual(await server_stream.read_bytes(5), b"hello")
+            # Both candidates from the first group were closed: the one
+            # whose handshake failed and the one that was still in
+            # progress when the winner was chosen.
+            bad_stream = await bad_server.queue.get()
+            await bad_stream.read_until_close()
+            hanging_stream = await hanging_server.queue.get()
+            await hanging_stream.read_until_close()
+        finally:
+            client.close()
+            bad_server.stop()
+            hanging_server.stop()
+            good_server.stop()
+
+    @gen_test
+    async def test_connect_tls_all_candidates_fail_handshake(self):
+        # If every candidate's TLS handshake fails, the TLS error is
+        # reported to the caller.
+        bad_server = TestTCPServer(
+            socket.AF_INET, ssl_options=self.tls_server_options("test2")
+        )
+
+        class FakeResolver(Resolver):
+            async def resolve(self, host, port, family=socket.AF_UNSPEC):
+                return [(socket.AF_INET, ("127.0.0.1", bad_server.port))]
+
+        client = TCPClient(resolver=FakeResolver())
+        try:
+            with self.assertRaises(ssl.SSLError):
+                await client.connect(
+                    "foo.example.com",
+                    443,
+                    ssl_options=self.verifying_tls_context(),
+                    timeout=5,
+                )
+            bad_stream = await bad_server.queue.get()
+            await bad_stream.read_until_close()
+        finally:
+            client.close()
+            bad_server.stop()
+
     # In the following tests the server accepts the connection but never
     # responds to the TLS handshake. The client's socket must be closed when
     # the connection attempt is abandoned (#3614). The server's
@@ -669,6 +816,35 @@ class ConnectorTest(AsyncTestCase):
         with self.assertRaises(TimeoutError) as cm:
             future.result()
         self.assertEqual(str(cm.exception), "Timeout while connecting to a, c")
+
+    def test_connect_timeout_message_handshaking(self):
+        # An attempt that reports itself as being in the TLS handshake
+        # phase gets a distinct timeout message.
+        conn, future = self.start_connect([(AF1, "a")])
+        self.streams["a"].handshaking = True
+        conn.on_connect_timeout()
+        self.connect_futures.pop((AF1, "a"))
+        self.assertTrue(self.streams.pop("a").closed)
+        with self.assertRaises(TimeoutError) as cm:
+            future.result()
+        self.assertEqual(str(cm.exception), "Timeout during TLS handshake with a")
+
+    def test_connect_timeout_message_mixed_phases(self):
+        conn, future = self.start_connect(self.addrinfo)
+        conn.on_timeout()
+        self.assert_pending((AF1, "a"), (AF2, "c"))
+        self.streams["a"].handshaking = True
+        conn.on_connect_timeout()
+        self.connect_futures.pop((AF1, "a"))
+        self.assertTrue(self.streams.pop("a").closed)
+        self.connect_futures.pop((AF2, "c"))
+        self.assertTrue(self.streams.pop("c").closed)
+        with self.assertRaises(TimeoutError) as cm:
+            future.result()
+        self.assertEqual(
+            str(cm.exception),
+            "Timeout while connecting to c; Timeout during TLS handshake with a",
+        )
 
     def test_two_family_success_after_timeout(self):
         conn, future = self.start_connect(self.addrinfo)

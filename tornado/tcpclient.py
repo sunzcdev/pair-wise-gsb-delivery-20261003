@@ -63,13 +63,22 @@ class _Connector:
 
     http://tools.ietf.org/html/rfc6555
 
+    The ``connect`` callable returns a ``(closable, future)`` pair for
+    each attempt.  The future completes with the connected stream once
+    it is ready for use (including any TLS handshake), so the race is
+    won by the first fully usable connection rather than simply the
+    first TCP connection to be established.  Closing the closable
+    abandons the attempt at any stage.  If the closable has a boolean
+    ``handshaking`` attribute, it is used to distinguish the TCP and
+    TLS phases of the attempt in timeout error messages.
+
     """
 
     def __init__(
         self,
         addrinfo: list[tuple[Any, ...]],
         connect: Callable[
-            [socket.AddressFamily, tuple[Any, ...]], tuple[IOStream, "Future[IOStream]"]
+            [socket.AddressFamily, tuple[Any, ...]], tuple[Any, "Future[IOStream]"]
         ],
     ) -> None:
         self.io_loop = IOLoop.current()
@@ -81,10 +90,12 @@ class _Connector:
         self.last_error: Exception | None = None
         self.remaining = len(addrinfo)
         self.primary_addrs, self.secondary_addrs = self.split(addrinfo)
-        self.streams: set[IOStream] = set()
-        # Addresses with connection attempts in progress. Used for
-        # error messages.
-        self.pending_addrs: set[tuple[Any, ...]] = set()
+        self.streams: set[Any] = set()
+        # Addresses with connection attempts in progress, mapped to the
+        # closable returned by ``connect`` for that attempt.  Used for
+        # error messages and to remove the winning attempt from
+        # ``self.streams``.
+        self.pending: dict[tuple[Any, ...], Any] = {}
 
     @staticmethod
     def split(
@@ -152,7 +163,7 @@ class _Connector:
             future.set_exception(e)
         else:
             self.streams.add(stream)
-            self.pending_addrs.add(addr)
+            self.pending[addr] = stream
         future_add_done_callback(
             future, functools.partial(self.on_connect_done, addrs, af, addr)
         )
@@ -165,7 +176,7 @@ class _Connector:
         future: "Future[IOStream]",
     ) -> None:
         self.remaining -= 1
-        self.pending_addrs.discard(addr)
+        attempt = self.pending.pop(addr, None)
         try:
             stream = future.result()
         except (Exception, asyncio.CancelledError) as e:
@@ -189,7 +200,10 @@ class _Connector:
             # This is a late arrival; just drop it.
             stream.close()
         else:
-            self.streams.discard(stream)
+            # The object tracked while the attempt was in progress may
+            # differ from the stream it produced (see _TLSAttempt); only
+            # the latter is handed to our caller.
+            self.streams.discard(attempt if attempt is not None else stream)
             self.future.set_result((af, addr, stream))
             self.close_streams()
 
@@ -224,13 +238,27 @@ class _Connector:
 
     def on_connect_timeout(self) -> None:
         if not self.future.done():
-            if self.pending_addrs:
-                message = "Timeout while connecting to %s" % ", ".join(
-                    sorted(_format_addr(addr) for addr in self.pending_addrs)
+            connecting = []
+            handshaking = []
+            for addr, attempt in self.pending.items():
+                if getattr(attempt, "handshaking", False):
+                    handshaking.append(addr)
+                else:
+                    connecting.append(addr)
+            messages = []
+            if connecting:
+                messages.append(
+                    "Timeout while connecting to %s"
+                    % ", ".join(sorted(_format_addr(addr) for addr in connecting))
                 )
-            else:
-                message = "Timeout while connecting"
-            self.future.set_exception(TimeoutError(message))
+            if handshaking:
+                messages.append(
+                    "Timeout during TLS handshake with %s"
+                    % ", ".join(sorted(_format_addr(addr) for addr in handshaking))
+                )
+            self.future.set_exception(
+                TimeoutError("; ".join(messages) or "Timeout while connecting")
+            )
         self.close_streams()
 
     def clear_timeouts(self) -> None:
@@ -242,6 +270,36 @@ class _Connector:
     def close_streams(self) -> None:
         for stream in self.streams:
             stream.close()
+
+
+class _TLSAttempt:
+    """Tracks a single connection attempt that includes a TLS handshake.
+
+    This is the closable used by `_Connector` for connections made with
+    ``ssl_options``.  Closing it abandons the attempt at any stage:
+    while the TCP connection is in progress, during the TLS handshake,
+    or after it has completed.
+    """
+
+    def __init__(self, stream: IOStream) -> None:
+        self.stream = stream
+        # Set once the TCP connection has been established and the TLS
+        # handshake has begun.  Used by `_Connector` to describe this
+        # attempt in timeout error messages.
+        self.handshaking = False
+        self.tls_future: Future[IOStream] | None = None
+
+    def close(self) -> None:
+        if self.tls_future is not None:
+            # The socket now belongs to the SSLIOStream created by
+            # start_tls (the original stream must not be closed once
+            # its socket has been detached).  Cancelling the future
+            # returned by `IOStream.start_tls` closes the new
+            # `SSLIOStream` and its socket.  This is a no-op if the
+            # handshake has already completed.
+            self.tls_future.cancel()
+        else:
+            self.stream.close()
 
 
 class TCPClient:
@@ -307,6 +365,15 @@ class TCPClient:
         .. versionchanged:: 6.6
            Timeout errors now have messages describing which phase of
            the connection process timed out.
+
+        .. versionchanged:: 6.7
+           When ``ssl_options`` is used, the TLS handshake is part of
+           the "happy eyeballs" race between candidate addresses: a
+           candidate only wins the race once its handshake has completed,
+           and a failed handshake immediately allows another candidate
+           to be tried.  All candidates share the same ``timeout``
+           deadline.  Previously the first TCP connection to complete
+           won the race, even if its TLS handshake subsequently failed.
         """
         if timeout is not None:
             if isinstance(timeout, numbers.Real):
@@ -323,15 +390,29 @@ class TCPClient:
             )
         else:
             addrinfo = await self.resolver.resolve(host, port, af)
-        connector = _Connector(
-            addrinfo,
-            functools.partial(
+        if ssl_options is not None:
+            # Each candidate performs its TLS handshake as part of the
+            # race, so the winner is the first connection that is
+            # actually usable rather than merely the first to complete
+            # a TCP connection.  A failed handshake immediately frees
+            # up a slot for the next candidate, and all candidates
+            # share the original deadline.
+            connect_factory = functools.partial(
+                self._create_ssl_stream,
+                max_buffer_size,
+                ssl_options=ssl_options,
+                server_hostname=host,
+                source_ip=source_ip,
+                source_port=source_port,
+            )
+        else:
+            connect_factory = functools.partial(
                 self._create_stream,
                 max_buffer_size,
                 source_ip=source_ip,
                 source_port=source_port,
-            ),
-        )
+            )
+        connector = _Connector(addrinfo, connect_factory)
         connect_future = connector.start(connect_timeout=timeout)
         try:
             af, addr, stream = await connect_future
@@ -344,35 +425,6 @@ class TCPClient:
         # TODO: For better performance we could cache the (af, addr)
         # information here and reuse it on subsequent connections to
         # the same host. (http://tools.ietf.org/html/rfc6555#section-4.2)
-        if ssl_options is not None:
-            tls_future = stream.start_tls(
-                False, ssl_options=ssl_options, server_hostname=host
-            )
-            try:
-                if timeout is not None:
-                    stream = await gen.with_timeout(
-                        timeout,
-                        tls_future,
-                        message=lambda: "Timeout during TLS handshake with "
-                        + _format_addr(addr),
-                    )
-                else:
-                    stream = await tls_future
-            except asyncio.CancelledError:
-                if (
-                    tls_future.done()
-                    and not tls_future.cancelled()
-                    and tls_future.exception() is None
-                ):
-                    # Cancelling a completed future does not close its stream.
-                    tls_future.result().close()
-                raise
-            finally:
-                # If we're exiting early (timeout or cancellation), cancel
-                # the handshake so the new SSLIOStream (which now owns the
-                # socket) is closed. with_timeout does not do this for us.
-                # This is a no-op if the handshake has already completed.
-                tls_future.cancel()
         return stream
 
     def _create_stream(
@@ -383,8 +435,9 @@ class TCPClient:
         source_ip: str | None = None,
         source_port: int | None = None,
     ) -> tuple[IOStream, "Future[IOStream]"]:
-        # Always connect in plaintext; we'll convert to ssl if necessary
-        # after one connection has completed.
+        # Always connect in plaintext; if ssl_options were given,
+        # _create_ssl_stream converts each candidate stream to TLS as
+        # soon as its TCP connection is established.
         source_port_bind = source_port if isinstance(source_port, int) else 0
         source_ip_bind = source_ip
         if source_port_bind and not source_ip:
@@ -404,3 +457,57 @@ class TCPClient:
             socket_obj.close()
             raise
         return stream, stream.connect(addr)
+
+    def _create_ssl_stream(
+        self,
+        max_buffer_size: int | None,
+        af: socket.AddressFamily,
+        addr: tuple[Any, ...],
+        ssl_options: dict[str, Any] | ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
+        source_ip: str | None = None,
+        source_port: int | None = None,
+    ) -> tuple[_TLSAttempt, "Future[IOStream]"]:
+        # Connect in plaintext and begin the TLS handshake as soon as the
+        # TCP connection is established.  The returned future does not
+        # complete until the handshake is done, so the `_Connector` race
+        # is won by the first connection that is actually usable.
+        stream, tcp_future = self._create_stream(
+            max_buffer_size, af, addr, source_ip=source_ip, source_port=source_port
+        )
+        attempt = _TLSAttempt(stream)
+        ssl_future: Future[IOStream] = Future()
+
+        def on_tcp_connected(future: "Future[IOStream]") -> None:
+            try:
+                connected_stream = future.result()
+            except (Exception, asyncio.CancelledError) as e:
+                if isinstance(e, asyncio.CancelledError):
+                    ssl_future.cancel()
+                else:
+                    ssl_future.set_exception(e)
+                return
+            try:
+                tls_future = connected_stream.start_tls(
+                    False, ssl_options=ssl_options, server_hostname=server_hostname
+                )
+            except Exception as e:
+                ssl_future.set_exception(e)
+                return
+            attempt.handshaking = True
+            attempt.tls_future = tls_future
+            future_add_done_callback(tls_future, on_tls_handshake_done)
+
+        def on_tls_handshake_done(future: "Future[IOStream]") -> None:
+            try:
+                ssl_stream = future.result()
+            except (Exception, asyncio.CancelledError) as e:
+                if isinstance(e, asyncio.CancelledError):
+                    ssl_future.cancel()
+                else:
+                    ssl_future.set_exception(e)
+                return
+            ssl_future.set_result(ssl_stream)
+
+        future_add_done_callback(tcp_future, on_tcp_connected)
+        return attempt, ssl_future
