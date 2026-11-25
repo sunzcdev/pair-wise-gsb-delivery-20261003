@@ -129,7 +129,9 @@ def trio_worker(
             sock.listen(config.backlog)
         for sock in sockets.insecure_sockets:
             sock.listen(config.backlog)
-    app = load_application(config.application_path, config.wsgi_max_body_size)
+    app = load_application(
+        config.application_path, config.wsgi_max_body_size, config.wsgi_stream_request_body
+    )
 
     shutdown_trigger = None
     if shutdown_event is not None:

@@ -43,5 +43,7 @@ async def serve(
         warnings.warn("The config `workers` has no affect when using serve", Warning)
 
     await worker_serve(
-        wrap_app(app, config.wsgi_max_body_size, mode), config, shutdown_trigger=shutdown_trigger
+        wrap_app(app, config.wsgi_max_body_size, mode, config.wsgi_stream_request_body),
+        config,
+        shutdown_trigger=shutdown_trigger,
     )

@@ -113,6 +113,7 @@ class Config:
     worker_class = "asyncio"
     workers = 1
     wsgi_max_body_size = 16 * 1024 * 1024 * BYTES
+    wsgi_stream_request_body = False
 
     def set_cert_reqs(self, value: int) -> None:
         warnings.warn("Please use verify_mode instead", Warning)

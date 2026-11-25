@@ -18,8 +18,13 @@ class InvalidPathError(Exception):
 
 
 class _WSGIMiddleware:
-    def __init__(self, wsgi_app: WSGIFramework, max_body_size: int = MAX_BODY_SIZE) -> None:
-        self.wsgi_app = WSGIWrapper(wsgi_app, max_body_size)
+    def __init__(
+        self,
+        wsgi_app: WSGIFramework,
+        max_body_size: int = MAX_BODY_SIZE,
+        stream_request_body: bool = False,
+    ) -> None:
+        self.wsgi_app = WSGIWrapper(wsgi_app, max_body_size, stream_request_body)
         self.max_body_size = max_body_size
 
     async def __call__(

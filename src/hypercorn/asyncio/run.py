@@ -183,7 +183,9 @@ async def worker_serve(
 def asyncio_worker(
     config: Config, sockets: Sockets | None = None, shutdown_event: EventType | None = None
 ) -> None:
-    app = load_application(config.application_path, config.wsgi_max_body_size)
+    app = load_application(
+        config.application_path, config.wsgi_max_body_size, config.wsgi_stream_request_body
+    )
 
     shutdown_trigger = None
     if shutdown_event is not None:
@@ -207,7 +209,9 @@ def uvloop_worker(
     except ImportError as error:
         raise Exception("uvloop is not installed") from error
 
-    app = load_application(config.application_path, config.wsgi_max_body_size)
+    app = load_application(
+        config.application_path, config.wsgi_max_body_size, config.wsgi_stream_request_body
+    )
 
     shutdown_trigger = None
     if shutdown_event is not None:

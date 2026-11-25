@@ -178,4 +178,7 @@ worker_class               ``-k``, ``--worker-class``    The type of worker to u
 workers                    ``-w``, ``--workers``         The number of workers to spawn and use.         1
 wsgi_max_body_size         N/A                           The maximum size of a body that will be         16MiB
                                                          accepted in WSGI mode.
+wsgi_stream_request_body   N/A                           Stream the request body to the WSGI app         False
+                                                         as it is read, rather than buffering it all
+                                                         first.
 ========================== ============================= =============================================== ========================

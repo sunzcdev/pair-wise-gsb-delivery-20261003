@@ -1,3 +1,14 @@
+Unreleased
+----------
+
+* Add optional streaming of the WSGI request body via the
+  ``wsgi_stream_request_body`` config and the ``stream_request_body``
+  argument to the WSGI middleware and ``WSGIWrapper``. When enabled
+  ``wsgi.input`` receives the body as it is read, the max body size is
+  enforced on the cumulative amount received, unread remainders are
+  drained after the app returns, and reads fail promptly if the client
+  disconnects mid-body.
+
 0.18.0 2025-11-08
 -----------------
 
