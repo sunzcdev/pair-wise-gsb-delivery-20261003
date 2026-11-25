@@ -8,6 +8,8 @@
 
 ### New features
 
+- `Interpreter::ArgumentValue#source` reports whether an argument's value came from the schema default (`:default_value`), an explicit `null` (`:null`), or an explicitly-provided value (`:provided`), with matching `null?` and `provided?` predicates, so the three cases stay distinguishable even when they resolve to the same Ruby value
+
 ### Bug fixes
 
 # 2.6.16 (17 Nov 2026)

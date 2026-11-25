@@ -512,6 +512,18 @@ module GraphQL
           default_used = true
         end
 
+        # Track where the resolved value actually came from. This stays distinct
+        # from the value itself so that an omitted argument, an explicit `null`,
+        # and an explicitly-provided default remain distinguishable even when
+        # they coerce to the same Ruby value.
+        value_source = if default_used
+          GraphQL::Execution::Interpreter::ArgumentValue::DEFAULT_VALUE_SOURCE
+        elsif value.nil?
+          GraphQL::Execution::Interpreter::ArgumentValue::NULL_VALUE_SOURCE
+        else
+          GraphQL::Execution::Interpreter::ArgumentValue::PROVIDED_VALUE_SOURCE
+        end
+
         loaded_value = nil #: untyped
         coerced_value = begin
           type.coerce_input(value, context)
@@ -545,6 +557,7 @@ module GraphQL
               original_value: resolved_coerced_value,
               definition: self,
               default_used: default_used,
+              source: value_source,
             )
           end
         end
