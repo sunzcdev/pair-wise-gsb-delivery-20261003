@@ -75,6 +75,8 @@ Here is the break-down of exceptions that can be raised by Bunny:
         Bunny::ShutdownSignal
         Bunny::TCPConnectionFailed
 
+        Bunny::TransactionOutcomeUnknown
+
     Timeout::Error
       Bunny::ClientTimeout
       Bunny::ConnectionTimeout
@@ -184,6 +186,31 @@ exceptions on the thread `Bunny::Session` was instantiated on.
 
 Bunny will recover from server-sent `connection.close`, if you don't want it to do
 so then pass `recover_from_connection_close: false` to `Bunny.new`. 
+
+
+### Transactions with an Unknown Outcome
+
+An AMQP 0-9-1 transaction is committed with `Bunny::Channel#tx_commit`. If the
+connection is lost after `tx.commit` was sent but before the `tx.commit-ok`
+response arrives, the broker may or may not have committed the transaction.
+
+Bunny reports this as `Bunny::TransactionOutcomeUnknown` instead of retrying or
+reporting success. The messages published as part of that transaction are not
+republished on a recovered channel: the caller has to decide what to do next.
+
+``` ruby
+begin
+  ch.tx_commit
+rescue Bunny::TransactionOutcomeUnknown => e
+  # the transaction may or may not have been committed
+end
+```
+
+A recovered channel can be used to open a new transaction and commit a new batch
+of messages. A channel-level error that names the very `tx.*` method being awaited
+(for example, `PRECONDITION_FAILED - channel is not transactional`) still raises
+the corresponding `Bunny::ChannelLevelException`, because the operation definitely
+did not take effect in that case.
 
 
 ## Channel-level Exceptions

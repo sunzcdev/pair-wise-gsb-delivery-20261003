@@ -169,6 +169,30 @@ module Bunny
 
     DEFAULT_CONTENT_TYPE = "application/octet-stream".freeze
 
+    # Tracks the transaction operation the caller is waiting for a response to
+    # @private
+    TxOperation = Struct.new(:operation, :response_class, :queue) do
+      # @return [Boolean] true if this method is the response this operation waits for
+      def expects?(method)
+        method.is_a?(response_class)
+      end
+    end
+
+    # AMQP method ids of tx.* methods
+    # @private
+    TX_METHOD_IDS = {
+      select:   AMQ::Protocol::Tx::Select.method_id,
+      commit:   AMQ::Protocol::Tx::Commit.method_id,
+      rollback: AMQ::Protocol::Tx::Rollback.method_id
+    }.freeze
+
+    # @private
+    TX_RESPONSE_CLASSES = {
+      select:   AMQ::Protocol::Tx::SelectOk,
+      commit:   AMQ::Protocol::Tx::CommitOk,
+      rollback: AMQ::Protocol::Tx::RollbackOk
+    }.freeze
+
     # Default outstanding limit for publisher confirms with tracking.
     # Batch size of 1000 provides optimal throughput per benchmarks.
     DEFAULT_OUTSTANDING_CONFIRMS_LIMIT = 1000
@@ -212,6 +236,14 @@ module Bunny
       @exchange_mutex = @connection.mutex_impl.new
 
       @unconfirmed_set_mutex = @connection.mutex_impl.new
+
+      # Serializes tx.* operations and lets the network failure handler
+      # settle a pending one as "outcome unknown"
+      @tx_continuation_mutex = @connection.mutex_impl.new
+      @tx_continuation       = nil
+      # operations whose caller gave up while the channel stayed open: their responses
+      # may still arrive, in order, and must not be mistaken for those of later ones
+      @abandoned_tx_operations = []
 
       # Publisher confirm tracking (initialized before reset_continuations)
       @confirms_tracking_enabled = false
@@ -263,6 +295,10 @@ module Bunny
       @threads_waiting_on_basic_get_continuations = Set.new
       # Set before the channel is open again, so that no stale tag slips through
       @consumer_delivery_tag_offset = @last_consumer_delivery_tag
+      # A response for an operation sent on the previous channel stream can never
+      # arrive on the new one, so nothing may keep waiting for it
+      settle_pending_tx_operation(:interrupted)
+      @tx_continuation_mutex.synchronize { @abandoned_tx_operations.clear }
 
       @connection.open_channel(self)
       # clear last channel error
@@ -300,6 +336,8 @@ module Bunny
 
       # once channel.close is on the wire, the server rejects any other frame on this channel
       @status_mutex.synchronize { @status = :closing }
+      # a caller blocked on a transaction operation will never get a response now
+      settle_pending_tx_operation(:channel_closed)
       @connection.close_channel(self)
       @status = :closed
       @work_pool.shutdown
@@ -350,6 +388,9 @@ module Bunny
     # @private
     def connection_closed!
       @status = :closed
+      # a caller blocked on a transaction operation has to learn that no response
+      # will ever arrive for it
+      settle_pending_tx_operation(:interrupted)
     end
 
     # @private
@@ -1789,47 +1830,55 @@ module Bunny
     # @group Transactions (tx.*)
 
     # Puts the channel into transaction mode (starts a transaction)
+    #
     # @return [AMQ::Protocol::Tx::SelectOk] RabbitMQ response
+    # @raise [Bunny::TransactionOutcomeUnknown] if the response to `tx.select` was not received
     # @api public
     def tx_select
       raise_if_no_longer_open!
 
-      @connection.send_frame(AMQ::Protocol::Tx::Select.encode(@id))
-      with_continuation_timeout do
-        @last_tx_select_ok = wait_on_continuations
+      @last_tx_select_ok = perform_tx_operation(:select) do
+        @connection.send_frame(AMQ::Protocol::Tx::Select.encode(@id))
       end
-      raise_if_continuation_resulted_in_a_channel_error!
       @tx_mode = true
 
       @last_tx_select_ok
     end
 
-    # Commits current transaction
+    # Commits the current transaction.
+    #
+    # A returned value means that the broker has confirmed the commit. If the outcome
+    # of the commit cannot be established, {Bunny::TransactionOutcomeUnknown} is raised
+    # because the transaction may or may not have been committed by then.
+    #
+    # Bunny never retries a commit and never reports one as committed without a
+    # `tx.commit-ok`. Messages published as part of such a transaction are not
+    # republished on a new channel or after a connection recovery.
+    #
     # @return [AMQ::Protocol::Tx::CommitOk] RabbitMQ response
+    # @raise [Bunny::TransactionOutcomeUnknown] if no `tx.commit-ok` was received
     # @api public
     def tx_commit
       raise_if_no_longer_open!
 
-      @connection.send_frame(AMQ::Protocol::Tx::Commit.encode(@id))
-      with_continuation_timeout do
-        @last_tx_commit_ok = wait_on_continuations
+      @last_tx_commit_ok = perform_tx_operation(:commit) do
+        @connection.send_frame(AMQ::Protocol::Tx::Commit.encode(@id))
       end
-      raise_if_continuation_resulted_in_a_channel_error!
 
       @last_tx_commit_ok
     end
 
     # Rolls back current transaction
+    #
     # @return [AMQ::Protocol::Tx::RollbackOk] RabbitMQ response
+    # @raise [Bunny::TransactionOutcomeUnknown] if the response to `tx.rollback` was not received
     # @api public
     def tx_rollback
       raise_if_no_longer_open!
 
-      @connection.send_frame(AMQ::Protocol::Tx::Rollback.encode(@id))
-      with_continuation_timeout do
-        @last_tx_rollback_ok = wait_on_continuations
+      @last_tx_rollback_ok = perform_tx_operation(:rollback) do
+        @connection.send_frame(AMQ::Protocol::Tx::Rollback.encode(@id))
       end
-      raise_if_continuation_resulted_in_a_channel_error!
 
       @last_tx_rollback_ok
     end
@@ -1837,6 +1886,21 @@ module Bunny
     # @return [Boolean] true if this channel has transactions enabled
     def using_tx?
       !!@tx_mode
+    end
+
+    # Settles a transaction operation that is waiting for a response, e.g. because
+    # the connection went down or the channel was closed. This way the caller learns
+    # that the outcome of its operation is not known instead of waiting for a response
+    # that will never arrive.
+    #
+    # @param [Symbol] outcome :interrupted or :channel_closed
+    # @return [Bunny::Channel::TxOperation, nil] the settled operation, if there was one
+    # @private
+    def settle_pending_tx_operation(outcome = :interrupted)
+      op = detach_tx_operation
+      op.queue.push(outcome) if op
+
+      op
     end
 
     # @endgroup
@@ -2222,9 +2286,14 @@ module Bunny
         unregister_consumer(method.consumer_tag)
         delete_recorded_consumer(method.consumer_tag)
       when AMQ::Protocol::Tx::SelectOk, AMQ::Protocol::Tx::CommitOk, AMQ::Protocol::Tx::RollbackOk then
-        @continuations.push(method)
-      when AMQ::Protocol::Tx::SelectOk then
-        @continuations.push(method)
+        op = take_matching_tx_operation(method)
+        if op
+          op.queue.push(method)
+        else
+          # the caller already gave up on this response (e.g. it timed out),
+          # it must not be mistaken for the response to another operation
+          @logger.warn "Received #{method.class.name} with no matching transaction operation on channel #{@id}, ignoring it"
+        end
       when AMQ::Protocol::Confirm::SelectOk then
         @continuations.push(method)
       when AMQ::Protocol::Basic::Ack then
@@ -2242,6 +2311,8 @@ module Bunny
           Thread.new { @on_error.call(self, method) } if @on_error
         else
           @last_channel_error = instantiate_channel_level_exception(method)
+          # settled after the error is recorded so that the waiting caller sees it
+          settle_pending_tx_operation(:channel_closed)
           @continuations.push(method)
         end
 
@@ -2420,6 +2491,137 @@ module Bunny
       end
     end
 
+    # Runs a tx.* operation and waits for its response.
+    #
+    # Unlike other channel operations, one whose response never arrives is not retried
+    # and never considered successful: the caller is told that its outcome is unknown
+    # so that it can decide what to do next.
+    #
+    # @private
+    def perform_tx_operation(operation)
+      op = @tx_continuation_mutex.synchronize do
+        raise_if_no_longer_open!
+        raise "Another transaction operation is already in progress on channel #{@id}" if @tx_continuation
+
+        TxOperation.new(operation, TX_RESPONSE_CLASSES.fetch(operation), new_continuation).tap { |o| @tx_continuation = o }
+      end
+
+      begin
+        yield
+
+        outcome = begin
+                    with_continuation_timeout { poll_tx_continuation(op) }
+                  rescue ::Timeout::Error
+                    :timeout
+                  end
+
+        case outcome
+        when :interrupted
+          raise transaction_outcome_unknown_error(operation, "the connection was lost")
+        when :timeout
+          # the channel is still open, so the response may still arrive and would
+          # otherwise be taken for the response to a later operation
+          @tx_continuation_mutex.synchronize { @abandoned_tx_operations << op }
+          raise transaction_outcome_unknown_error(operation, "no response arrived within the continuation timeout")
+        when :channel_closed
+          error = @last_channel_error
+          # a direct rejection of this very method means it definitely did not take effect
+          raise error if error && tx_method_rejected_by_channel_error?(error, operation)
+
+          raise transaction_outcome_unknown_error(operation, "the channel was closed", error)
+        end
+
+        outcome
+      ensure
+        detach_tx_operation(op)
+      end
+    end
+
+    # Waits for the response to a transaction operation.
+    #
+    # The wait is bounded by the continuation timeout. When the connection goes away
+    # in the meantime, the operation is settled by {#settle_pending_tx_operation}
+    # instead of a response ever arriving.
+    #
+    # @return [AMQ::Protocol::Method, Symbol] the response, or :interrupted
+    # @private
+    def poll_tx_continuation(op)
+      queue = op.queue
+
+      if @connection.threaded
+        queue.poll(@connection.continuation_timeout)
+      else
+        begin
+          connection.reader_loop.run_once until queue.length > 0
+        rescue AMQ::Protocol::EmptyResponseError, IOError, SystemCallError
+          # the connection is gone, no response will ever arrive
+          return :interrupted
+        end
+
+        queue.pop
+      end
+    end
+
+    # Detaches the transaction operation awaiting a response, if there is one.
+    #
+    # @param [Bunny::Channel::TxOperation, nil] expected only detach if this operation is still the pending one
+    # @return [Bunny::Channel::TxOperation, nil] the detached operation
+    # @private
+    def detach_tx_operation(expected = nil)
+      @tx_continuation_mutex.synchronize do
+        op = @tx_continuation
+        return nil if op && expected && !op.equal?(expected)
+
+        @tx_continuation = nil
+        op
+      end
+    end
+
+    # Detaches the transaction operation that a given response belongs to.
+    #
+    # Responses arrive in the order the operations were sent, so a response to an
+    # operation the caller already gave up on is discarded first: otherwise it would
+    # be mistaken for the response to the next operation.
+    #
+    # @param [AMQ::Protocol::Method] method a tx.*-ok method
+    # @return [Bunny::Channel::TxOperation, nil] the detached operation, if the response matches it
+    # @private
+    def take_matching_tx_operation(method)
+      @tx_continuation_mutex.synchronize do
+        if (abandoned = @abandoned_tx_operations.shift)
+          @logger.warn "Discarding the late #{method.class.name} for an abandoned tx.#{abandoned.operation} on channel #{@id}"
+          return nil
+        end
+
+        op = @tx_continuation
+        return nil unless op && op.expects?(method)
+
+        @tx_continuation = nil
+        op
+      end
+    end
+
+    # @private
+    def transaction_outcome_unknown_error(operation, reason, channel_level_exception = nil)
+      TransactionOutcomeUnknown.new(
+        "The outcome of tx.#{operation} on channel #{@id} is unknown: #{reason}, so it may or may not have taken effect",
+        operation,
+        channel_level_exception)
+    end
+
+    # A channel-level error that names the tx.* method the caller is waiting on is a
+    # direct rejection of that very method: it did not take effect.
+    #
+    # @private
+    def tx_method_rejected_by_channel_error?(error, operation)
+      return false unless error.is_a?(ChannelLevelException)
+
+      close = error.channel_close
+      return false unless close
+
+      close.class_id == AMQ::Protocol::Tx.method_id && close.method_id == TX_METHOD_IDS[operation]
+    end
+
     # Waits for a slot when outstanding limit is reached.
     # Assumes @unconfirmed_set_mutex is already held.
     # @private
@@ -2476,6 +2678,7 @@ module Bunny
         @unconfirmed_set_mutex.synchronize { @outstanding_limit_cond.broadcast }
       end
 
+      settle_pending_tx_operation(:interrupted)
       reset_continuations
     end
 

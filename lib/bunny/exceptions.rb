@@ -224,6 +224,28 @@ module Bunny
     end
   end
 
+  # Raised when the outcome of a transaction cannot be established, for instance
+  # when the connection is lost before the broker's `tx.commit-ok` is received.
+  #
+  # The transaction may or may not have been committed by the broker: Bunny never
+  # retries it and never reports it as committed in that case.
+  #
+  # @see Bunny::Channel#tx_commit
+  # @api public
+  class TransactionOutcomeUnknown < Exception
+    # @return [Symbol] operation whose outcome is unknown, e.g. `:commit`
+    attr_reader :operation
+    # @return [Bunny::ChannelLevelException, nil] channel-level error reported by the
+    #   server, if it arrived without a direct rejection of the operation itself
+    attr_reader :channel_level_exception
+
+    def initialize(message, operation = :commit, channel_level_exception = nil)
+      super(message)
+      @operation = operation
+      @channel_level_exception = channel_level_exception
+    end
+  end
+
   # Raised when RabbitMQ responds with 406 PRECONDITION_FAILED
   class PreconditionFailed < ChannelLevelException
   end

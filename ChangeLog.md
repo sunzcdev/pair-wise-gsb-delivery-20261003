@@ -1,6 +1,17 @@
 ## Changes between Bunny 3.6.0 and 3.7.0 (in development)
 
-No changes yet.
+### Transaction Commit Outcomes Are Reported to the Caller
+
+`Bunny::Channel#tx_commit` now raises `Bunny::TransactionOutcomeUnknown` when the
+`tx.commit-ok` response never arrives, for instance because the connection went
+down after `tx.commit` was sent. Such a commit is never retried, never reported
+as successful, and the messages published as part of that transaction are not
+republished on a recovered channel.
+
+`Bunny::Channel#tx_select` and `Bunny::Channel#tx_rollback` report an unknown
+outcome the same way. A channel-level error that names the very `tx.*` method
+being awaited is still raised as the corresponding `Bunny::ChannelLevelException`,
+since the operation definitely did not take effect in that case.
 
 
 ## Changes between Bunny 3.5.0 and 3.6.0 (Nov 9, 2026)
