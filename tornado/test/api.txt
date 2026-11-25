@@ -152,6 +152,7 @@ tornado.http1connection.HTTP1ServerConnection.__init__: method(self, stream, par
 tornado.http1connection.HTTP1ServerConnection.close: method(self)
 tornado.http1connection.HTTP1ServerConnection.context: attribute
 tornado.http1connection.HTTP1ServerConnection.params: attribute
+tornado.http1connection.HTTP1ServerConnection.shutdown: method(self, grace=None)
 tornado.http1connection.HTTP1ServerConnection.start_serving: method(self, delegate)
 tornado.http1connection.HTTP1ServerConnection.stream: attribute
 tornado.http1connection.is_transfer_encoding_chunked: function(headers)
@@ -243,6 +244,7 @@ tornado.httpserver.HTTPServer.close_all_connections: method(self)
 tornado.httpserver.HTTPServer.configurable_base: classmethod(cls)
 tornado.httpserver.HTTPServer.configurable_default: classmethod(cls)
 tornado.httpserver.HTTPServer.conn_params: attribute
+tornado.httpserver.HTTPServer.graceful_shutdown: method(self, grace=None)
 tornado.httpserver.HTTPServer.handle_stream: method(self, stream, address)
 tornado.httpserver.HTTPServer.initialize: method(self, request_callback, no_keep_alive=False, xheaders=False, ssl_options=None, protocol=None, decompress_request=False, chunk_size=None, max_header_size=None, idle_connection_timeout=None, body_timeout=None, max_body_size=None, max_buffer_size=None, trusted_downstream=None, header_timeout=None)
 tornado.httpserver.HTTPServer.on_close: method(self, server_conn)

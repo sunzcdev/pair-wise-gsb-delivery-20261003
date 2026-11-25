@@ -29,11 +29,13 @@ import socket
 import ssl
 import typing
 from collections.abc import Awaitable, Callable
+from datetime import timedelta
 from typing import Any
 
 from tornado import httputil, iostream, netutil
 from tornado.escape import native_str
 from tornado.http1connection import HTTP1ConnectionParameters, HTTP1ServerConnection
+from tornado.locks import Event
 from tornado.tcpserver import TCPServer
 from tornado.util import Configurable
 
@@ -218,6 +220,11 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
         )
         self._connections: set[HTTP1ServerConnection] = set()
         self.trusted_downstream = trusted_downstream
+        # Set by on_close once all HTTP/1 connections have gone away. A
+        # graceful_shutdown() coroutine waits on this to know when the server
+        # has drained. It is lazily created so ordinary servers do not pay
+        # for the object.
+        self._drained_event: Event | None = None
 
     @classmethod
     def configurable_base(cls) -> type[Configurable]:
@@ -246,6 +253,84 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
             conn = next(iter(self._connections))
             await conn.close()
 
+    async def graceful_shutdown(self, grace: float | None = None) -> None:
+        """Stop accepting new connections and phase out existing ones.
+
+        This implements a staged shutdown for the end of a maintenance
+        window:
+
+        1. The listening sockets are closed immediately, so no new TCP
+           connections are accepted. Connections that were already accepted
+           but have not yet sent a request are closed without ever entering
+           the application.
+        2. Each open connection is put into a shutting-down state. Requests
+           already in flight on an HTTP/1 connection are allowed to complete
+           (a streaming response may run to the end), but once the response
+           is done the keep-alive connection is closed instead of being
+           reused, so later requests arriving on it never reach the
+           application.
+        3. The ``grace`` argument bounds how long in-flight requests may take.
+           When the grace period expires any connections that are still open
+           are forcibly closed.
+
+        If ``grace`` is ``None`` (the default) the shutdown is immediate and
+        every open connection, including an in-flight one, is closed at once.
+        This is equivalent to the older pattern of calling
+        `~.TCPServer.stop` followed by `close_all_connections`, which remains
+        available and unchanged. Pass a number of seconds to opt into the
+        staged behavior that lets current responses finish first.
+
+        The coroutine returns once there are no listening sockets and no
+        open connections left, so no listeners or in-flight connections
+        remain afterwards.
+
+        Note that this method does not currently close open websocket
+        connections (see `close_all_connections`).
+
+        :arg grace: grace period in seconds for in-flight requests, or
+            ``None`` to close all connections immediately.
+
+        .. versionadded:: 6.7
+        """
+        # Phase 1: stop accepting new connections (closes the listeners).
+        self.stop()
+
+        if not self._connections:
+            # Nothing to drain; the server is fully shut down.
+            return
+
+        if grace is None:
+            # Immediate shutdown: close every connection, including requests
+            # that are still in flight.
+            await self.close_all_connections()
+            return
+
+        # Prepare the drain signal before shutting the connections down: an
+        # idle connection may close itself (and reach on_close) inside the
+        # loop below, so the event must already exist to record that it
+        # drained.
+        if self._drained_event is None:
+            self._drained_event = Event()
+
+        # Phase 2: put every existing connection into the shutting-down
+        # state. Idle connections close themselves at once; in-flight
+        # requests are allowed to finish, subject to the grace period.
+        for conn in self._connections:
+            conn.shutdown(grace)
+
+        # Phase 3: wait for the connections to drain, or for the grace
+        # period to elapse. on_close sets the event once the last connection
+        # has left self._connections.
+        try:
+            await self._drained_event.wait(timeout=timedelta(seconds=grace))
+        except TimeoutError:
+            # The grace period elapsed with connections still open.
+            # Forcibly close whatever remains.
+            await self.close_all_connections()
+        # Either everything drained on its own within the grace period, or
+        # the stragglers have just been force-closed, so no listeners or
+        # in-flight connections remain.
+
     def handle_stream(
         self, stream: iostream.IOStream, address: tuple[Any, ...]
     ) -> None:
@@ -271,6 +356,8 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
 
     def on_close(self, server_conn: object) -> None:
         self._connections.remove(typing.cast(HTTP1ServerConnection, server_conn))
+        if not self._connections and self._drained_event is not None:
+            self._drained_event.set()
 
 
 class _CallableAdapter(httputil.HTTPMessageDelegate):

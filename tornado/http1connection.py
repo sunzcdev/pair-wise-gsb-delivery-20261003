@@ -954,6 +954,16 @@ class HTTP1ServerConnection:
         self.params = params
         self.context = context
         self._serving_future: Future[None] | None = None
+        # Set by shutdown(). Once set, no further request is started: the
+        # serving loop closes the underlying stream instead of calling the
+        # application, unless a request is already in flight.
+        self._shutting_down = False
+        # The HTTP1Connection currently being served, or None while the loop
+        # is between requests. Its ``_request_headers`` attribute stays None
+        # until a request's headers have actually been read, which is what
+        # distinguishes an in-flight request from a connection merely idle
+        # while waiting for the next request's bytes.
+        self._current_connection: HTTP1Connection | None = None
 
     async def close(self) -> None:
         """Closes the connection.
@@ -968,6 +978,53 @@ class HTTP1ServerConnection:
             await self._serving_future
         except Exception:
             pass
+
+    def _is_in_flight(self) -> bool:
+        """Whether a request has started and its response is not yet done.
+
+        A connection parked idle between requests (waiting for the next
+        request's first byte) is *not* in flight, even though its serving
+        loop is inside a read call.
+        """
+        return (
+            self._current_connection is not None
+            and self._current_connection._request_headers is not None
+        )
+
+    def shutdown(self, grace: float | None = None) -> None:
+        """Begins a graceful shutdown of this connection.
+
+        After this method returns, no new requests will be passed to the
+        application. A request that is already in flight is allowed to
+        finish; the stream is closed as soon as that response has been
+        completed (or immediately, if the connection was idle).
+
+        If ``grace`` is a number of seconds, a request still running after
+        the grace period expires is aborted by closing the stream. If
+        ``grace`` is ``None`` (the default), an in-flight request may take
+        as long as it needs, though idle connections are still closed at
+        once.
+
+        .. versionadded:: 6.7
+        """
+        self._shutting_down = True
+        if not self._is_in_flight():
+            # The serving loop is blocked waiting for the next request's
+            # bytes (or has not started a request at all). Close the stream
+            # now to wake it up; the resulting read error makes the loop
+            # unwind instead of starting a new request.
+            self.stream.close()
+        if grace is not None:
+            io_loop = self.stream.io_loop
+            io_loop.add_timeout(io_loop.time() + grace, self._grace_expired)
+
+    def _grace_expired(self) -> None:
+        if self._serving_future is None or self._serving_future.done():
+            return
+        # Close the stream even if a request is still in flight. Pending
+        # reads/writes then fail and the serving loop unwinds without
+        # starting another request.
+        self.stream.close()
 
     def start_serving(self, delegate: httputil.HTTPServerConnectionDelegate) -> None:
         """Starts serving requests on this connection.
@@ -985,7 +1042,17 @@ class HTTP1ServerConnection:
     ) -> None:
         try:
             while True:
+                if self._shutting_down:
+                    # A shutdown is in progress and no request is currently
+                    # being processed (an in-flight request keeps us inside
+                    # read_response below). Do not start another request;
+                    # close the stream instead. It may already have been
+                    # closed by the grace-period timeout, in which case this
+                    # is a no-op.
+                    self.stream.close()
+                    return
                 conn = HTTP1Connection(self.stream, False, self.params, self.context)
+                self._current_connection = conn
                 request_delegate = delegate.start_request(self, conn)
                 try:
                     ret = await conn.read_response(request_delegate)
@@ -1001,7 +1068,15 @@ class HTTP1ServerConnection:
                     gen_log.error("Uncaught exception", exc_info=True)
                     conn.close()
                     return
+                finally:
+                    self._current_connection = None
                 if not ret:
+                    return
+                if self._shutting_down:
+                    # The response that was in flight has now been fully
+                    # written. Do not reuse the connection for another
+                    # request; close it so no new business processing starts.
+                    self.stream.close()
                     return
                 await asyncio.sleep(0)
         finally:

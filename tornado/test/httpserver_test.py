@@ -1825,3 +1825,283 @@ class LegacyInterfaceTest(AsyncHTTPTestCase):
         if not self.http1:
             self.skipTest("requires HTTP/1.x")
         self.assertEqual(response.body, b"Hello world")
+
+
+class GracefulShutdownTest(AsyncHTTPTestCase):
+    """Tests for the staged, graceful shutdown of `.HTTPServer`.
+
+    These tests exercise the scenario at the end of a maintenance window:
+    the server stops accepting new connections, an in-flight streaming
+    response is allowed to finish within the grace period, while requests
+    arriving later on an idle keep-alive connection never reach the
+    application.
+    """
+
+    def get_app(self):
+        class StreamHandler(RequestHandler):
+            def initialize(self, stream_event):
+                self.stream_event = stream_event
+                self._closed = False
+
+            async def get(self):
+                self.set_header("Content-Type", "text/plain")
+                # Flush the headers (and the first chunk) immediately so the
+                # client can observe the response starting before shutdown.
+                self.write(b"chunk-0\n")
+                await self.flush()
+                await self.stream_event.wait()
+                if self._closed:
+                    # The connection was force-closed at the deadline; do not
+                    # attempt to write the remaining chunks.
+                    return
+                for i in range(1, 4):
+                    self.write(("chunk-%d\n" % i).encode())
+                    await self.flush()
+                self.finish()
+
+            def on_connection_close(self):
+                # Signal the waiting get() coroutine so it unwinds cleanly
+                # instead of trying to write onto the closed connection.
+                self._closed = True
+                self.stream_event.set()
+
+        class CountHandler(RequestHandler):
+            def initialize(self, counter):
+                self.counter = counter
+
+            def get(self):
+                self.counter["value"] += 1
+                self.finish(str(self.counter["value"]))
+
+        stream_event = Event()
+        counter = {"value": 0}
+        self.stream_event = stream_event
+        self.counter = counter
+        return Application(
+            [
+                ("/stream", StreamHandler, dict(stream_event=stream_event)),
+                ("/count", CountHandler, dict(counter=counter)),
+            ]
+        )
+
+    async def connect(self):
+        stream = IOStream(socket.socket())
+        self.addCleanup(stream.close)
+        await stream.connect(("127.0.0.1", self.get_http_port()))
+        return stream
+
+    @staticmethod
+    async def read_headers(stream):
+        first_line = await stream.read_until(b"\r\n")
+        assert first_line.startswith(b"HTTP/1.1 200"), first_line
+        header_bytes = await stream.read_until(b"\r\n\r\n")
+        return HTTPHeaders.parse(header_bytes.decode("latin1"))
+
+    async def read_chunk(self, stream):
+        """Reads one HTTP/1 chunked-encoding chunk and returns its body."""
+        size_line = await stream.read_until(b"\r\n")
+        size = int(size_line[:-2].decode("latin1"), 16)
+        body = await stream.read_bytes(size)
+        await stream.read_bytes(2)  # trailing CRLF
+        return body
+
+    @gen_test
+    async def test_inflight_stream_completes_idle_and_new_conn_rejected(self):
+        # Client A: start a streaming request and wait for the first chunk.
+        stream_a = await self.connect()
+        stream_a.write(b"GET /stream HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        headers_a = await self.read_headers(stream_a)
+        self.assertEqual(headers_a.get("Transfer-Encoding"), "chunked")
+        # The first chunk has already been flushed.
+        first = await asyncio.wait_for(self.read_chunk(stream_a), 5)
+        self.assertEqual(first, b"chunk-0\n")
+
+        # Client B: a second, entirely idle keep-alive connection. Arm its
+        # EOF read up front so the server's close cannot be missed.
+        stream_b = await self.connect()
+        b_eof = asyncio.ensure_future(stream_b.read_until_close())
+
+        # Begin the staged shutdown with a generous grace period.
+        shutdown_task = asyncio.ensure_future(
+            self.http_server.graceful_shutdown(grace=5)
+        )
+        # Let the server run its shutdown bookkeeping.
+        await asyncio.sleep(0.1)
+
+        # The listening socket is gone: a brand-new connection is refused.
+        refused = IOStream(socket.socket())
+        with self.assertRaises((StreamClosedError, OSError, ConnectionRefusedError)):
+            await asyncio.wait_for(
+                refused.connect(("127.0.0.1", self.get_http_port())), 5
+            )
+
+        # The idle connection B is closed by the server without serving
+        # another request.
+        b_data = await asyncio.wait_for(b_eof, 5)
+        self.assertEqual(b_data, b"")
+
+        # No business processing happened on B; the count handler never ran.
+        self.assertEqual(self.counter["value"], 0)
+
+        # Client A's stream is still alive and completes within the deadline.
+        self.assertFalse(stream_a.closed())
+        # Arm A's EOF read before releasing the handler, then let it finish.
+        a_eof = asyncio.ensure_future(stream_a.read_until_close())
+        self.stream_event.set()
+        body = await asyncio.wait_for(a_eof, 5)
+        self.assertIn(b"chunk-3\n", body)
+
+        # Once A drains, graceful_shutdown returns with nothing left over:
+        # no listeners and no in-flight connections.
+        await asyncio.wait_for(shutdown_task, 5)
+        self.assertEqual(self.http_server._connections, set())
+
+    @gen_test
+    async def test_request_after_shutdown_on_keepalive_never_reaches_app(self):
+        stream = await self.connect()
+        # Complete one normal request so the connection is kept alive.
+        stream.write(b"GET /count HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        headers = await self.read_headers(stream)
+        body = await stream.read_bytes(int(headers["Content-Length"]))
+        self.assertEqual(body, b"1")
+
+        # Arm the EOF read before shutting down, so the server's close of the
+        # idle keep-alive connection is observed reliably.
+        eof = asyncio.ensure_future(stream.read_until_close())
+
+        # Shut down while the connection sits idle between requests.
+        shutdown_task = asyncio.ensure_future(
+            self.http_server.graceful_shutdown(grace=5)
+        )
+
+        # The keep-alive connection is closed by the server rather than
+        # reused, so the client simply reaches EOF with no further data.
+        data = await asyncio.wait_for(eof, 5)
+        self.assertEqual(data, b"")
+
+        await asyncio.wait_for(shutdown_task, 5)
+        # Only the single pre-shutdown request ever reached the application.
+        self.assertEqual(self.counter["value"], 1)
+        self.assertEqual(self.http_server._connections, set())
+
+    @gen_test
+    async def test_late_request_on_idle_keepalive_never_reaches_app(self):
+        # A request that is *sent* after shutdown begins, on a connection that
+        # was previously idle, must not start a second round of business
+        # processing.
+        stream = await self.connect()
+        stream.write(b"GET /count HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        headers = await self.read_headers(stream)
+        first_body = await stream.read_bytes(int(headers["Content-Length"]))
+        self.assertEqual(first_body, b"1")
+        self.assertEqual(self.counter["value"], 1)
+
+        # Begin shutdown and let it run to completion. The connection is idle
+        # between requests, so the server marks it shutting down and closes it
+        # without ever reading a further request.
+        await self.http_server.graceful_shutdown(grace=5)
+
+        # Any bytes the client now sends cannot reach the application: the
+        # server side has already gone away.
+        try:
+            stream.write(b"GET /count HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        except iostream.StreamClosedError:
+            pass
+
+        # The late request never reached the application and no connection
+        # remains on the server.
+        self.assertEqual(self.counter["value"], 1)
+        self.assertEqual(self.http_server._connections, set())
+
+    @gen_test
+    async def test_grace_period_force_closes_stragglers(self):
+        stream = await self.connect()
+        stream.write(b"GET /stream HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        await self.read_headers(stream)
+        first = await asyncio.wait_for(self.read_chunk(stream), 5)
+        self.assertEqual(first, b"chunk-0\n")
+
+        # Arm the client's EOF read before the deadline so the forced close is
+        # observed reliably.
+        eof = asyncio.ensure_future(stream.read_until_close())
+
+        # The streaming handler never releases stream_event on its own, so it
+        # cannot finish; the short grace period must abort it.
+        start = self.io_loop.time()
+        await self.http_server.graceful_shutdown(grace=0.3)
+        elapsed = self.io_loop.time() - start
+
+        # The coroutine waited for the grace period, then force-closed the
+        # straggler; nothing remains on the server side.
+        self.assertGreaterEqual(elapsed, 0.25)
+        self.assertEqual(self.http_server._connections, set())
+        # The client observes the server-initiated close as EOF.
+        data = await asyncio.wait_for(eof, 5)
+        self.assertTrue(stream.closed())
+        # Only the pre-shutdown first chunk was delivered.
+        self.assertNotIn(b"chunk-3", data)
+
+    @gen_test
+    async def test_no_grace_closes_connections_immediately(self):
+        # One idle, one in-flight connection. Arm their EOF reads up front.
+        idle = await self.connect()
+        idle_eof = asyncio.ensure_future(idle.read_until_close())
+
+        busy = await self.connect()
+        busy.write(b"GET /stream HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        await self.read_headers(busy)
+        first = await asyncio.wait_for(self.read_chunk(busy), 5)
+        self.assertEqual(first, b"chunk-0\n")
+        busy_eof = asyncio.ensure_future(busy.read_until_close())
+
+        # Without a grace period, all connections are closed at once even
+        # though the streaming request has not finished. This matches the
+        # legacy stop() + close_all_connections() pattern.
+        await self.http_server.graceful_shutdown()
+
+        # Both clients reach EOF promptly.
+        idle_data = await asyncio.wait_for(idle_eof, 5)
+        busy_data = await asyncio.wait_for(busy_eof, 5)
+        self.assertEqual(idle_data, b"")
+        self.assertNotIn(b"chunk-3", busy_data)
+        self.assertTrue(idle.closed())
+        self.assertTrue(busy.closed())
+        self.assertEqual(self.http_server._connections, set())
+
+    @gen_test
+    async def test_shutdown_without_connections(self):
+        # Nothing connected: shutting down must simply close the listeners
+        # and return without hanging.
+        await asyncio.wait_for(self.http_server.graceful_shutdown(grace=1), 5)
+        self.assertEqual(self.http_server._connections, set())
+
+    @gen_test
+    async def test_graceful_shutdown_is_idempotent(self):
+        # Calling graceful_shutdown more than once must not raise; after the
+        # first call there is nothing left to do.
+        stream = await self.connect()
+        stream.write(b"GET /count HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        headers = await self.read_headers(stream)
+        await stream.read_bytes(int(headers["Content-Length"]))
+        eof = asyncio.ensure_future(stream.read_until_close())
+
+        await self.http_server.graceful_shutdown(grace=5)
+        await asyncio.wait_for(eof, 5)
+        # The listeners were already removed and the set is empty; a second
+        # call returns immediately without error.
+        await asyncio.wait_for(self.http_server.graceful_shutdown(grace=5), 5)
+        self.assertEqual(self.http_server._connections, set())
+
+    @gen_test
+    async def test_stop_still_works_as_before(self):
+        # The original immediate-shutdown API is unchanged.
+        stream = await self.connect()
+        stream.write(b"GET /count HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        headers = await self.read_headers(stream)
+        await stream.read_bytes(int(headers["Content-Length"]))
+
+        self.http_server.stop()
+        # stop() only removes the listeners; the existing connection lingers.
+        self.assertFalse(stream.closed())
+        await self.http_server.close_all_connections()
+        self.assertEqual(self.http_server._connections, set())
