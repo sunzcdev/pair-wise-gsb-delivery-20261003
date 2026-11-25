@@ -16,17 +16,30 @@ module SolidCache
 
     MULTI_BATCH_SIZE = 1000
 
+    # Guards #next_write_timestamp so successive writes are stamped in order.
+    WRITE_TIMESTAMP_LOCK = Mutex.new
+
     class << self
       def write(key, value)
         write_multi([ { key: key, value: value } ])
       end
 
+      # Entries are upserted, so rewriting a key keeps its id. Every write also
+      # stamps +created_at+ afresh, which makes the column the version of the row
+      # that was last written: expiry selects candidates by id but re-checks
+      # +created_at+ before deleting, so a key rewritten while a cleanup is running
+      # is kept and the value just written survives.
+      #
+      # The stamp is produced here instead of by the database so it can be made
+      # strictly increasing (see #next_write_timestamp), which keeps two writes in
+      # quick succession distinguishable even on platforms with a coarse clock.
       def write_multi(payloads)
+        written_at = next_write_timestamp
         without_query_cache do
           payloads.each_slice(MULTI_BATCH_SIZE).each do |payload_batch|
             upsert_all \
-              add_key_hash_and_byte_size(payload_batch),
-              unique_by: upsert_unique_by, on_duplicate: :update, update_only: [ :key, :value, :byte_size ]
+              add_key_hash_and_byte_size(payload_batch, written_at: written_at),
+              unique_by: upsert_unique_by, on_duplicate: :update, update_only: [ :key, :value, :byte_size, :created_at ]
           end
         end
       end
@@ -85,12 +98,29 @@ module SolidCache
       end
 
       private
-        def add_key_hash_and_byte_size(payloads)
+        def add_key_hash_and_byte_size(payloads, written_at: nil)
           payloads.map do |payload|
             payload.dup.tap do |payload|
               payload[:key_hash] = key_hash_for(payload[:key])
               payload[:byte_size] = byte_size_for(payload)
+              payload[:created_at] = written_at if written_at
             end
+          end
+        end
+
+        # Timestamp stamped on a write, strictly increasing within the process.
+        # Clock resolution is coarse on some platforms (milliseconds on Windows),
+        # so two writes in quick succession could otherwise share a timestamp and
+        # a rewrite would look identical to the value it replaced. Bumping past
+        # the last stamp keeps consecutive writes ordered, so the expiry version
+        # check can tell them apart.
+        def next_write_timestamp
+          WRITE_TIMESTAMP_LOCK.synchronize do
+            now = Time.current
+            if @last_write_timestamp && now <= @last_write_timestamp
+              now = @last_write_timestamp + 0.000001
+            end
+            @last_write_timestamp = now
           end
         end
 

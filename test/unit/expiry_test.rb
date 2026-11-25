@@ -41,6 +41,134 @@ class SolidCache::ExpiryTest < ActiveSupport::TestCase
       assert_equal 4, @cache.read(default_shard_keys[3])
     end
 
+    test "keeps an entry refreshed after the candidates are selected (#{expiry_method})" do
+      # Make sure the writes below don't schedule an expiry of their own, so the
+      # only cleanup is the one we drive step by step.
+      SolidCache::Store.any_instance.stubs(:rand).returns(1)
+
+      @cache = lookup_store(expiry_batch_size: 10, max_age: 2.weeks, expiry_method: expiry_method)
+      default_shard_keys = shard_keys(@cache, first_shard_key)
+      refreshed_key, stale_key, other_key = default_shard_keys[0], default_shard_keys[1], default_shard_keys[2]
+      @cache.write(refreshed_key, "old")
+      @cache.write(stale_key, "old")
+      @cache.write(other_key, "old")
+      wait_for_background_tasks(@cache)
+
+      send_entries_back_in_time(3.weeks)
+
+      # Pause after selecting the IDs: all three entries are expired.
+      candidates = with_first_shard do
+        SolidCache::Entry.send(:expiry_candidates, 10, max_age: 2.weeks, max_entries: nil, max_size: nil)
+      end
+      assert_equal 3, candidates.ids.sort.size
+
+      # The hot key is rewritten while the cleanup is paused. `stale_key` is left alone.
+      @cache.write(refreshed_key, "new")
+      wait_for_background_tasks(@cache)
+
+      deleted = nil
+      with_first_shard do
+        assert_queries_count(1) { deleted = SolidCache::Entry.send(:delete_expiry_candidates, candidates) }
+      end
+
+      # Only the versions that were still the ones we selected are removed.
+      assert_equal 2, deleted
+      assert_equal "new", @cache.read(refreshed_key)
+      assert_nil @cache.read(stale_key)
+      assert_nil @cache.read(other_key)
+    end
+
+    test "keeps an entry refreshed after the candidates are selected when the cache is full (#{expiry_method})" do
+      SolidCache::Store.any_instance.stubs(:rand).returns(1)
+
+      @cache = lookup_store(expiry_batch_size: 10, max_age: nil, max_entries: 1, expiry_method: expiry_method)
+      default_shard_keys = shard_keys(@cache, first_shard_key)
+      refreshed_key, stale_key, other_key = default_shard_keys[0], default_shard_keys[1], default_shard_keys[2]
+      @cache.write(refreshed_key, "old")
+      @cache.write(stale_key, "old")
+      @cache.write(other_key, "old")
+      wait_for_background_tasks(@cache)
+
+      candidates = with_first_shard do
+        SolidCache::Entry.send(:expiry_candidates, 10, max_age: nil, max_entries: 1, max_size: nil)
+      end
+      assert_equal 3, candidates.ids.sort.size
+
+      @cache.write(refreshed_key, "new")
+      wait_for_background_tasks(@cache)
+
+      deleted = with_first_shard { SolidCache::Entry.send(:delete_expiry_candidates, candidates) }
+
+      assert_equal 2, deleted
+      assert_equal "new", @cache.read(refreshed_key)
+      assert_nil @cache.read(stale_key)
+      assert_nil @cache.read(other_key)
+      assert_equal 1, with_first_shard { SolidCache::Entry.uncached { SolidCache::Entry.count } }
+    end
+
+    test "expire rechecks the selected versions and keeps a refreshed entry (#{expiry_method})" do
+      SolidCache::Store.any_instance.stubs(:rand).returns(1)
+
+      @cache = lookup_store(expiry_batch_size: 10, max_age: 2.weeks, expiry_method: expiry_method)
+      default_shard_keys = shard_keys(@cache, first_shard_key)
+      refreshed_key, stale_key = default_shard_keys[0], default_shard_keys[1]
+      @cache.write(refreshed_key, "old")
+      @cache.write(stale_key, "old")
+      wait_for_background_tasks(@cache)
+
+      send_entries_back_in_time(3.weeks)
+
+      # Run a real `expire`, but pause after the candidates have been selected by
+      # wrapping the delete step: the hot key is rewritten before the delete runs.
+      original = SolidCache::Entry.method(:delete_expiry_candidates)
+      interleaved = lambda do |candidates|
+        @cache.write(refreshed_key, "new")
+        wait_for_background_tasks(@cache)
+        original.call(candidates)
+      end
+
+      deleted = with_first_shard do
+        SolidCache::Entry.stub(:delete_expiry_candidates, interleaved) do
+          SolidCache::Entry.expire(10, max_age: 2.weeks, max_entries: nil, max_size: nil)
+        end
+      end
+
+      # The batch delete only removed the entry that was still the selected version.
+      assert_equal 1, deleted
+
+      # Reading back finds the refreshed value: straight from the database (the
+      # stored payload is the serialized entry) and through the store.
+      stored_key = @cache.send(:normalize_key, refreshed_key, {})
+      stored_payload = with_first_shard { SolidCache::Entry.uncached { SolidCache::Entry.read(stored_key) } }
+      assert_equal "new", @cache.send(:deserialize_entry, stored_payload).value
+      assert_equal "new", @cache.read(refreshed_key)
+      assert_nil with_first_shard { SolidCache::Entry.uncached { SolidCache::Entry.read(@cache.send(:normalize_key, stale_key, {})) } }
+      assert_equal 1, with_first_shard { SolidCache::Entry.uncached { SolidCache::Entry.count } }
+    end
+
+    test "expires entries whose stored created_at is coarser than the selected value (#{expiry_method})" do
+      @cache = lookup_store(expiry_batch_size: 10, max_age: 2.weeks, expiry_method: expiry_method)
+      default_shard_keys = shard_keys(@cache, first_shard_key)
+      @cache.write(default_shard_keys[0], 1)
+      wait_for_background_tasks(@cache)
+
+      # Older rows store millisecond precision (e.g. STRFTIME('%f') on SQLite),
+      # while the values read back carry microseconds. The version check has to
+      # still recognise that row as the one it selected.
+      with_first_shard do
+        SolidCache::Entry.uncached do
+          SolidCache::Entry.update_all(created_at: "2020-01-01 00:00:00.123")
+        end
+      end
+
+      expired = with_first_shard do
+        SolidCache::Entry.expire(10, max_age: 2.weeks, max_entries: nil, max_size: nil)
+      end
+
+      assert_equal 1, expired
+      assert_nil @cache.read(default_shard_keys[0])
+    end
+
     test "expires records when the cache is full (#{expiry_method})" do
       SolidCache::Store.any_instance.stubs(:rand).returns(0)
 
@@ -248,4 +376,9 @@ class SolidCache::ExpiryTest < ActiveSupport::TestCase
       @cache.write_multi(10.times.index_by { |i| "key#{i}" })
     end
   end
+
+  private
+    def with_first_shard(&block)
+      SolidCache::Record.with_shard(first_shard_key, &block)
+    end
 end
