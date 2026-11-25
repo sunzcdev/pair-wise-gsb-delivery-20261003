@@ -121,6 +121,12 @@ module SemanticLogger
         hash[:dimensions]    = log.dimensions if log.dimensions?
       end
 
+      # The category of a native Ruby warning (see SemanticLogger::CoreExt::RubyWarnings), so that
+      # a structured entry at :warn can tell one apart from an application's own logger.warn.
+      def warning_category
+        hash[:warning_category] = log.warning_category if log.warning_category
+      end
+
       # Returns log messages in Hash format
       def call(log, logger)
         self.hash   = {}
@@ -143,6 +149,7 @@ module SemanticLogger
         payload
         exception
         metric
+        warning_category
 
         hash
       end

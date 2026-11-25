@@ -677,6 +677,32 @@ module SemanticLogger
     Context.named_tagged(hash, &)
   end
 
+  # Whether Ruby's own categorized warnings are routed into Semantic Logger as `:warn` entries
+  # (see SemanticLogger::CoreExt::RubyWarnings).
+  def self.capture_ruby_warnings?
+    CoreExt::RubyWarnings.enabled?
+  end
+
+  # Route Ruby's own categorized warnings, `:deprecated` and `:experimental`, into Semantic Logger
+  # as ordinary `:warn` entries.
+  #
+  # Each entry keeps the severity of an application warning, but carries the Ruby category in
+  # `Log#warning_category`, and its call site is the location Ruby named in the warning, so the JSON
+  # (and every structured formatter) can tell a native Ruby warning apart from an application
+  # `logger.warn` at the same level. An appender's level and filter still apply, so a filter Proc can
+  # drop one category on one appender by reading `log.warning_category`.
+  #
+  # This does not change `Warning[:deprecated]` or `Warning[:experimental]`: which warnings Ruby
+  # raises stays exactly as the process set it. Warnings without a category, and any other output of
+  # `Warning.warn`, are passed on unchanged. Pass false to stop capturing; the warnings then go to
+  # `Warning.warn` as before.
+  #
+  # Example:
+  #   SemanticLogger.capture_ruby_warnings = true
+  def self.capture_ruby_warnings=(enabled)
+    CoreExt::RubyWarnings.enabled = enabled
+  end
+
   # Returns [Hash] a copy of the named tags currently active for this fiber.
   def self.named_tags
     Context.named_tags

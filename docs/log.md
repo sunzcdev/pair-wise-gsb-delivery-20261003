@@ -82,6 +82,7 @@ situational field.
 |`metric`|`String`|The metric name, present for metric and `measure_*` calls. See [Metrics](metrics.html).|
 |`metric_amount`|`Numeric`|Amount to add to a counter metric, for example the quantity purchased. A counter adds 1 when it is `nil`. A negative amount with a `metric` is deprecated, see [Negative metric amounts](upgrading.html#negative-metric-amounts).|
 |`dimensions`|`Hash`|Dimensions (key/value labels) supplied for a metric.|
+|`warning_category`|`Symbol`|The category of a native Ruby warning that [capturing Ruby's own warnings](config.html#capturing-ruby-s-own-warnings) turned into this entry, `:deprecated` or `:experimental`. `nil` for an application's own log call, which is how a `:warn` entry tells a native warning apart from an application `logger.warn`. Its location is the entry's `call_site`.|
 
 ### The call site
 

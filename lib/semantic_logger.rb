@@ -46,6 +46,11 @@ end
 # json 3.1 (see SemanticLogger::CoreExt::Warning).
 Warning.singleton_class.prepend(SemanticLogger::CoreExt::Warning) if SemanticLogger::CoreExt::Warning::NEEDED
 
+# Routes Ruby's own categorized warnings into Semantic Logger when an application enables it
+# (see SemanticLogger.capture_ruby_warnings= and SemanticLogger::CoreExt::RubyWarnings). Loaded now,
+# but prepended to Warning only while enabled, so loading Semantic Logger changes nothing by default.
+require "semantic_logger/core_ext/ruby_warnings"
+
 # Flush all appenders at exit, waiting for outstanding messages on the queue to be written first.
 #
 # During an outage of the destination of an appender added with async: true or in batches, that would

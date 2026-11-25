@@ -59,6 +59,13 @@ module SemanticLogger
   #   was created, such as the OpenTelemetry context. Only a formatter built for that appender writes
   #   them, as the NewRelicLogs formatter writes the linking metadata its appender captures.
   #
+  # warning_category [Symbol]
+  #   Set when this entry is a native Ruby warning that SemanticLogger::CoreExt::RubyWarnings
+  #   captured, the category Ruby passed to `Warning.warn`, such as `:deprecated` or
+  #   `:experimental`. nil for an application's own log call, which is how a JSON entry at the
+  #   same `:warn` level tells a native warning apart from an application `logger.warn`. The
+  #   warning's location is the entry's call site (see #call_site).
+  #
   # The payload, named tags, context, and dimensions have the values of sensitive keys replaced
   # before the entry is written to any appender, when SemanticLogger.sensitive_keys is set (see
   # #redact).
@@ -102,7 +109,7 @@ module SemanticLogger
     attr_accessor :level, :level_index, :name, :message, :time, :duration,
                   :payload, :exception, :thread_name, :backtrace, :call_site,
                   :tags, :named_tags, :context, :captures,
-                  :metric, :metric_amount, :dimensions
+                  :metric, :metric_amount, :dimensions, :warning_category
 
     # Parameters
     #   thread: [Thread]

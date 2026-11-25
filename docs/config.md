@@ -356,6 +356,47 @@ Notes:
 - Setting `SemanticLogger.cache_loggers = false` clears the cache. It can also be cleared explicitly
   with `SemanticLogger.clear_logger_cache`, for example after redefining a class.
 
+### Capturing Ruby's own warnings
+
+Ruby raises two kinds of native warning with a category, `:deprecated` and `:experimental`, and
+writes them through `Warning.warn`. Turn on capture to route them into Semantic Logger as ordinary
+`:warn` entries, alongside an application's own `logger.warn`:
+
+~~~ruby
+SemanticLogger.capture_ruby_warnings = true
+~~~
+
+A captured warning keeps the `:warn` severity, so the level filtering already in place still
+applies, but carries the Ruby category in `warning_category`, and its call site is the location
+Ruby named in the warning. That is how a JSON entry at the same `:warn` level tells a native Ruby
+warning apart from an application warning:
+
+~~~json
+{"level":"warn","name":"Ruby Warning","file":"app/order.rb","line":42,
+ "message":"BufferedIO is deprecated, use IO#read","warning_category":"deprecated"}
+~~~
+
+An application `logger.warn` has no `warning_category` (the key is omitted). The two categories are
+the only ones Ruby itself warns with; a warning without a category, and any other output of
+`Warning.warn`, is passed on unchanged.
+
+Capturing does not change `Warning[:deprecated]` or `Warning[:experimental]`, so which warnings
+Ruby raises stays exactly as the process set it. A warning the process switched off never reaches
+`Warning.warn`, so it is never logged. Set the flag back to `false` to stop capturing; the warnings
+then go to `Warning.warn` as before.
+
+Because the category travels on the log entry, an appender filter can treat one category
+differently without touching the other appenders. For example, keep every entry except native
+experimental warnings on one destination:
+
+~~~ruby
+SemanticLogger.add_appender(
+  file_name: "stable.log",
+  formatter: :json,
+  filter:    ->(log) { log.warning_category != :experimental }
+)
+~~~
+
 ---
 
 ## Per-appender settings

@@ -7,6 +7,17 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Added
 
+- `SemanticLogger.capture_ruby_warnings = true` routes Ruby's own categorized warnings,
+  `:deprecated` and `:experimental`, into Semantic Logger as ordinary `:warn` entries. Each carries
+  the Ruby category in `Log#warning_category` (written as `warning_category` by the structured
+  formatters) and the location Ruby named in the warning as its call site, so a JSON entry at the
+  same `:warn` level tells a native warning apart from an application `logger.warn`, which has no
+  category. The entry goes through the logger's and each appender's level and filter, so an appender
+  filter can drop one category on one destination, and a warning below the configured level is not
+  logged. It does not change `Warning[:deprecated]` or `Warning[:experimental]`, so which warnings
+  Ruby raises stays as the process set it; warnings without a category, and every other output of
+  `Warning.warn`, pass through unchanged. Off by default. See
+  [Capturing Ruby's own warnings](https://logger.reidmorrison.com/config.html#capturing-ruby-s-own-warnings).
 - The formatters that write a metric with its log entry also write the metric's `dimensions`:
   `:json`, `:raw`, `:fluentd`, `:ecs`, `:syslog_cee`, and `:new_relic_logs` as a `dimensions` Hash,
   `:loki` as a `dimensions` value in JSON, and `:open_telemetry` as a
