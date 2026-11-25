@@ -4,6 +4,7 @@ import sys
 from abc import ABCMeta, abstractmethod
 from collections.abc import Callable, Coroutine
 from contextvars import Context
+from dataclasses import dataclass
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, final, overload
 
@@ -83,6 +84,35 @@ class TaskStatus(Protocol[T_contra]):
         """
 
 
+@final
+@dataclass(frozen=True)
+class TaskFailure:
+    """
+    A diagnostic record of a single task failure in a :class:`TaskGroup`.
+
+    Instances of this class are collected on demand (see
+    :attr:`TaskGroup.collect_failures`) and exposed via :attr:`TaskGroup.failures`.
+    They are purely informational – the exceptions are still raised from the task
+    group in an exception group, as usual.
+
+    .. versionadded:: 4.17.0
+    """
+
+    exception: BaseException
+    """The exception raised by the task."""
+
+    task_name: str
+    """The name of the task that raised the exception."""
+
+    cleanup: bool
+    """
+    ``True`` if the exception was raised while the task was already being cancelled
+    (typically from a ``finally:`` block or an exception handler doing cleanup),
+    ``False`` if the exception was a root failure that caused the task group to
+    initiate cancellation.
+    """
+
+
 class TaskGroup(metaclass=ABCMeta):
     """
     Groups several asynchronous tasks together.
@@ -98,6 +128,34 @@ class TaskGroup(metaclass=ABCMeta):
     """
 
     cancel_scope: CancelScope
+
+    collect_failures: bool = False
+    """
+    Whether to record per-task failure diagnostics (see :attr:`failures`).
+
+    This must be enabled before spawning any tasks in the group, either by passing
+    ``collect_failures=True`` to :func:`~anyio.create_task_group` or by setting this
+    attribute before entering the task group. Failure collection is disabled by
+    default, in which case :attr:`failures` will always be empty.
+
+    .. versionadded:: 4.17.0
+    """
+
+    @property
+    def failures(self) -> tuple[TaskFailure, ...]:
+        """
+        Diagnostics of the failures recorded from tasks in this task group.
+
+        Each entry identifies the exception raised by a task, the name of that task,
+        and whether the exception was a root failure or one raised during cleanup
+        after cancellation. Tasks that finished normally and tasks that were simply
+        cancelled are never recorded here.
+
+        This will always be empty unless :attr:`collect_failures` was enabled.
+
+        .. versionadded:: 4.17.0
+        """
+        return ()
 
     def cancel(self, reason: str | None = None) -> None:
         """

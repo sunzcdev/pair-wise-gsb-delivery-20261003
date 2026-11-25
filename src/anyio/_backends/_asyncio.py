@@ -99,7 +99,12 @@ from ..abc import (
     UDPPacketType,
     UNIXDatagramPacketType,
 )
-from ..abc._tasks import call_for_coroutine, get_callable_name, get_coro_name
+from ..abc._tasks import (
+    TaskFailure,
+    call_for_coroutine,
+    get_callable_name,
+    get_coro_name,
+)
 from ..lowlevel import RunVar, _run_vars
 
 if TYPE_CHECKING:
@@ -620,8 +625,13 @@ class TaskGroup(abc.TaskGroup):
         self.cancel_scope: CancelScope = CancelScope()
         self._entered = False
         self._exceptions: list[BaseException] = []
+        self._failures: list[TaskFailure] = []
         self._tasks: set[asyncio.Task] = set()
         self._on_completed_fut: asyncio.Future[None] | None = None
+
+    @property
+    def failures(self) -> tuple[TaskFailure, ...]:
+        return tuple(self._failures)
 
     async def __aenter__(self) -> Self:
         if self._entered:
@@ -739,6 +749,15 @@ class TaskGroup(abc.TaskGroup):
                 if task_status_future is None or task_status_future.done():
                     if not isinstance(exc, CancelledError):
                         self._exceptions.append(exc)
+                        if self.collect_failures:
+                            self._failures.append(
+                                TaskFailure(
+                                    exception=exc,
+                                    task_name=handle.name,
+                                    cleanup=self.cancel_scope.cancel_called
+                                    or handle._cancel_scope.cancel_called,
+                                )
+                            )
 
                     if not self.cancel_scope._effectively_cancelled:
                         self.cancel_scope.cancel()

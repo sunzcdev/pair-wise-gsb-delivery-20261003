@@ -47,6 +47,7 @@ Task groups
 
 .. autoclass:: anyio.abc.TaskGroup
 .. autoclass:: anyio.abc.TaskStatus
+.. autoclass:: anyio.abc.TaskFailure
 
 Running code in worker threads
 ------------------------------

@@ -78,6 +78,90 @@ async def test_success() -> None:
     assert results == {"a", "b"}
 
 
+async def test_collect_failures() -> None:
+    """
+    Test that failure diagnostics distinguish root failures from cleanup failures.
+
+    Tasks that finish normally or are simply cancelled must not be recorded, and
+    the native exception group must still be raised as usual.
+    """
+    compute_error = ValueError("computation failed")
+    cleanup_error = KeyError("cleanup failed")
+    arrived = [Event() for _ in range(4)]
+    normal_done = Event()
+    entered_try = Event()
+    completed: list[str] = []
+
+    async def barrier(index: int) -> None:
+        # Rendezvous: only proceed once every task has arrived
+        arrived[index].set()
+        for event in arrived:
+            await event.wait()
+
+    async def normal() -> None:
+        await barrier(0)
+        completed.append("normal")
+        normal_done.set()
+
+    async def failing() -> None:
+        await barrier(1)
+        # Make sure the normal task has exited and the cleanup-failing task is
+        # inside its try block before raising the root failure
+        await normal_done.wait()
+        await entered_try.wait()
+        raise compute_error
+
+    async def cleanup_failing() -> None:
+        await barrier(2)
+        try:
+            entered_try.set()
+            await sleep_forever()
+        finally:
+            raise cleanup_error
+
+    async def cancelled() -> None:
+        await barrier(3)
+        await sleep_forever()
+
+    task_group = create_task_group(collect_failures=True)
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        async with task_group:
+            task_group.start_soon(normal, name="normal")
+            task_group.start_soon(failing, name="failing")
+            task_group.start_soon(cleanup_failing, name="cleanup_failing")
+            task_group.start_soon(cancelled, name="cancelled")
+
+    # The native exception group is still raised, containing both real errors
+    assert set(exc_info.value.exceptions) == {compute_error, cleanup_error}
+
+    # The normal task ran to completion before the group was cancelled
+    assert completed == ["normal"]
+
+    # Only the two real errors were recorded; the normal and purely cancelled
+    # tasks were not
+    assert len(task_group.failures) == 2
+    root_failures = [failure for failure in task_group.failures if not failure.cleanup]
+    cleanup_failures = [failure for failure in task_group.failures if failure.cleanup]
+    assert len(root_failures) == 1
+    assert root_failures[0].exception is compute_error
+    assert root_failures[0].task_name == "failing"
+    assert len(cleanup_failures) == 1
+    assert cleanup_failures[0].exception is cleanup_error
+    assert cleanup_failures[0].task_name == "cleanup_failing"
+
+
+async def test_failures_not_collected_by_default() -> None:
+    async def failing() -> None:
+        raise Exception("foo")
+
+    task_group = create_task_group()
+    with pytest.raises(BaseExceptionGroup):
+        async with task_group:
+            task_group.start_soon(failing)
+
+    assert task_group.failures == ()
+
+
 @pytest.mark.parametrize(
     "modulename",
     [

@@ -232,16 +232,24 @@ def current_effective_deadline() -> float:
     return get_async_backend().current_effective_deadline()
 
 
-def create_task_group() -> TaskGroup:
+def create_task_group(*, collect_failures: bool = False) -> TaskGroup:
     """
     Create a task group.
 
+    :param collect_failures: if ``True``, record per-task failure diagnostics which
+        can be inspected via :attr:`TaskGroup.failures <.abc.TaskGroup.failures>`
+        (this does not change how exceptions are raised from the task group)
     :return: a task group
     :raises NoEventLoopError: if no supported asynchronous event loop is running in the
         current thread
 
+    .. versionchanged:: 4.17.0
+        Added the ``collect_failures`` parameter.
+
     """
-    return get_async_backend().create_task_group()
+    task_group = get_async_backend().create_task_group()
+    task_group.collect_failures = collect_failures
+    return task_group
 
 
 @final

@@ -1,0 +1,1 @@
+Added opt-in task failure diagnostics for task groups (`create_task_group(collect_failures=True)` and `TaskGroup.failures`) which record each task's exception along with its origin, distinguishing root failures from errors raised during cleanup after cancellation

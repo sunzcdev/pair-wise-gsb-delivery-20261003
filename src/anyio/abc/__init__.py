@@ -45,6 +45,7 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._streams import UnreliableObjectSendStream as UnreliableObjectSendStream
     from ._streams import UnreliableObjectStream as UnreliableObjectStream
     from ._subprocesses import Process as Process
+    from ._tasks import TaskFailure as TaskFailure
     from ._tasks import TaskGroup as TaskGroup
     from ._tasks import TaskStatus as TaskStatus
     from ._testing import TestRunner as TestRunner

@@ -84,7 +84,13 @@ from .._core._tasks import CancelScope as BaseCancelScope
 from .._core._tasks import TaskHandle
 from ..abc import IPSockAddrType, UDPPacketType, UNIXDatagramPacketType
 from ..abc._eventloop import AsyncBackend, StrOrBytesPath
-from ..abc._tasks import T_contra, call_for_coroutine, get_callable_name, get_coro_name
+from ..abc._tasks import (
+    T_contra,
+    TaskFailure,
+    call_for_coroutine,
+    get_callable_name,
+    get_coro_name,
+)
 
 if TYPE_CHECKING:
     from _typeshed import FileDescriptorLike
@@ -217,7 +223,28 @@ class TaskGroup(abc.TaskGroup):
         self._entered = False
         self._active = False
         self._nursery_manager = trio.open_nursery(strict_exception_groups=True)
+        self._failures: list[TaskFailure] = []
         self.cancel_scope = None  # type: ignore[assignment]
+
+    @property
+    def failures(self) -> tuple[TaskFailure, ...]:
+        return tuple(self._failures)
+
+    async def _run_and_record(self, handle: TaskHandle[Any]) -> None:
+        try:
+            await handle._run_coro()
+        except BaseException as exc:
+            if not isinstance(exc, trio.Cancelled):
+                self._failures.append(
+                    TaskFailure(
+                        exception=exc,
+                        task_name=handle.name,
+                        cleanup=self.cancel_scope.cancel_called
+                        or handle._cancel_scope.cancel_called,
+                    )
+                )
+
+            raise
 
     async def __aenter__(self) -> Self:
         if self._entered:
@@ -269,12 +296,14 @@ class TaskGroup(abc.TaskGroup):
         self._check_active(coro)
         final_name = get_coro_name(coro, name)
         handle = TaskHandle(coro, final_name)
+        run_coro: Callable[[], Coroutine[Any, Any, None]] = handle._run_coro
+        if self.collect_failures:
+            run_coro = partial(self._run_and_record, handle)
+
         if context is not None:
-            context.run(
-                partial(self._nursery.start_soon, handle._run_coro, name=handle.name)
-            )
+            context.run(partial(self._nursery.start_soon, run_coro, name=handle.name))
         else:
-            self._nursery.start_soon(handle._run_coro, name=handle.name)
+            self._nursery.start_soon(run_coro, name=handle.name)
 
         return handle
 
@@ -299,7 +328,10 @@ class TaskGroup(abc.TaskGroup):
                 wrapper_task_status.real_task_status = task_status
 
             handle = TaskHandle(coro, final_name)
-            await handle._run_coro()
+            if self.collect_failures:
+                await self._run_and_record(handle)
+            else:
+                await handle._run_coro()
 
         self._check_active()
         final_name = get_callable_name(func, name)
