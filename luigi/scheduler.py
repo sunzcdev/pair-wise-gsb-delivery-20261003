@@ -280,6 +280,9 @@ class Task:
         self.runnable = False
         self.batchable = False
         self.batch_id = None
+        # Canonical (environment + set-disambiguated target) identity of the
+        # batch this task currently belongs to.
+        self.batch_key = None
 
     def __repr__(self):
         return "Task(%r)" % vars(self)
@@ -426,6 +429,47 @@ class Worker:
         return self.id
 
 
+class BatchRegistration:
+    """
+    Description of how a worker wants tasks of a given family to be batched.
+
+    :param batch_param_names: names of the parameters that are combined into a batch
+    :param max_batch_size: maximum number of member tasks in one batch
+    :param set_batch_param_names: names of the batch parameters whose values describe
+        the same collection regardless of ordering (or duplicates). Two tasks only
+        share a batch when the set-canonicalized values of these parameters are equal.
+    """
+
+    def __init__(self, batch_param_names, max_batch_size=float("inf"), set_batch_param_names=None):
+        self.batch_param_names = tuple(batch_param_names or ())
+        self.max_batch_size = max_batch_size
+        self.set_batch_param_names = frozenset(set_batch_param_names or ())
+
+    def __iter__(self):
+        # Kept so legacy tuple unpacking (batched_params, max_batch_size) keeps working
+        yield self.batch_param_names
+        yield self.max_batch_size
+
+    def canonical_param_value(self, name, value):
+        """
+        Return an order-insensitive identity for a batch parameter value.
+
+        Parameters declared as set-like are compared on the underlying collection
+        instead of their serialized representation, so that e.g. ``"a,b"`` and
+        ``"b,a"`` resolve to the same batch identity. Everything else is compared
+        by its plain serialized value.
+        """
+        if name not in self.set_batch_param_names:
+            return value
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return ("set", frozenset(value))
+        if isinstance(value, str):
+            # Values may be serialized collections joined by a separator; normalize
+            # on the individual members so order and duplicates don't matter.
+            return ("set", frozenset(piece for piece in re.split(r"[,|;]", value) if piece != ""))
+        return ("set", frozenset([value]))
+
+
 class SimpleTaskState:
     """
     Keep track of the current state and handle persistence.
@@ -441,15 +485,53 @@ class SimpleTaskState:
         self._status_tasks = collections.defaultdict(dict)
         self._active_workers = {}  # map from id to a Worker object
         self._task_batchers = {}
+        # Canonical batch identity -> batch_id of a batch that is currently being
+        # executed. Guarantees equivalent requests keep landing in the same batch
+        # and that a different environment can never claim an in-flight batch.
+        self._active_batch_registry = {}
         self._metrics_collector = None
 
     def get_state(self):
-        return self._tasks, self._active_workers, self._task_batchers
+        return self._tasks, self._active_workers, self._task_batchers, self._active_batch_registry
 
     def set_state(self, state):
         self._tasks, self._active_workers = state[:2]
         if len(state) >= 3:
-            self._task_batchers = state[2]
+            self._task_batchers = self._upgrade_batchers(state[2])
+        # Older pickles don't carry the registry; it is rebuilt from the running
+        # batches below so a restarted worker can still settle its own batch.
+        self._active_batch_registry = state[3] if len(state) >= 4 else {}
+        self._rebuild_active_batch_registry()
+
+    @staticmethod
+    def _upgrade_batchers(task_batchers):
+        # Pickles written by older versions stored plain tuples
+        # (batched_args, max_batch_size). Keep loading them as batch registrations.
+        upgraded = {}
+        for worker_id, families in (task_batchers or {}).items():
+            upgraded[worker_id] = {}
+            for family, registration in families.items():
+                if isinstance(registration, BatchRegistration):
+                    upgraded[worker_id][family] = registration
+                else:
+                    batched_args, max_batch_size = registration
+                    upgraded[worker_id][family] = BatchRegistration(batched_args, max_batch_size)
+        return upgraded
+
+    def _rebuild_active_batch_registry(self):
+        for task in self._tasks.values():
+            batch_id = getattr(task, "batch_id", None)
+            if batch_id is None:
+                continue
+            batch_key = getattr(task, "batch_key", None)
+            if batch_key is None:
+                # Backward compatibility: batches from old archives have no canonical
+                # key. The batch id itself is the only identity they can be settled
+                # under, so register it under its own id and never hand it out to a
+                # newly created batch.
+                batch_key = ("legacy", batch_id)
+                task.batch_key = batch_key
+            self._active_batch_registry.setdefault(batch_key, batch_id)
 
     def dump(self):
         try:
@@ -494,12 +576,30 @@ class SimpleTaskState:
         assert batch_id is not None
         return [task for task in self.get_active_tasks_by_status(BATCH_RUNNING) if task.batch_id == batch_id]
 
-    def set_batcher(self, worker_id, family, batcher_args, max_batch_size):
+    def set_batcher(self, worker_id, family, batcher_args, max_batch_size, set_batcher_args=None):
         self._task_batchers.setdefault(worker_id, {})
-        self._task_batchers[worker_id][family] = (batcher_args, max_batch_size)
+        self._task_batchers[worker_id][family] = BatchRegistration(
+            batcher_args,
+            max_batch_size,
+            set_batcher_args,
+        )
 
     def get_batcher(self, worker_id, family):
-        return self._task_batchers.get(worker_id, {}).get(family, (None, 1))
+        return self._task_batchers.get(worker_id, {}).get(family, BatchRegistration(None, 1))
+
+    def register_active_batch(self, batch_key, batch_id):
+        """Remember a batch that is currently being executed."""
+        self._active_batch_registry[batch_key] = batch_id
+
+    def get_active_batch(self, batch_key):
+        """Return the id of an in-flight batch with this canonical identity, if any."""
+        return self._active_batch_registry.get(batch_key)
+
+    def unregister_active_batch(self, batch_id):
+        """Forget a batch once none of its members are BATCH_RUNNING anymore."""
+        for batch_key, registered_id in list(self._active_batch_registry.items()):
+            if registered_id == batch_id:
+                del self._active_batch_registry[batch_key]
 
     def num_pending_tasks(self):
         """
@@ -525,9 +625,10 @@ class SimpleTaskState:
             self.set_status(task, FAILED, config)
             task.clear_failures()
 
-    def set_batch_running(self, task, batch_id, worker_id):
+    def set_batch_running(self, task, batch_id, worker_id, batch_key=None):
         self.set_status(task, BATCH_RUNNING)
         task.batch_id = batch_id
+        task.batch_key = batch_key
         task.worker_running = worker_id
         task.resources_running = task.resources
         task.time_running = time.time()
@@ -549,11 +650,18 @@ class SimpleTaskState:
             elif task.scheduler_disable_time is not None and new_status != DISABLED:
                 return
 
-        if task.status == RUNNING and task.batch_id is not None and new_status != RUNNING:
-            for batch_task in self.get_batch_running_tasks(task.batch_id):
-                self.set_status(batch_task, new_status, config)
+        if task.status in (RUNNING, BATCH_RUNNING) and task.batch_id is not None and new_status != RUNNING:
+            finished_batch_id = task.batch_id
+            for batch_task in list(self.get_batch_running_tasks(finished_batch_id)):
+                # Clear the membership before recursing so each member is settled
+                # individually under its own original task id.
                 batch_task.batch_id = None
+                batch_task.batch_key = None
+                self.set_status(batch_task, new_status, config)
             task.batch_id = None
+            task.batch_key = None
+            if not self.get_batch_running_tasks(finished_batch_id):
+                self.unregister_active_batch(finished_batch_id)
 
         if new_status == FAILED and task.status != DISABLED:
             task.add_failure()
@@ -771,8 +879,8 @@ class Scheduler:
                 self._update_priority(t, prio, worker)
 
     @rpc_method()
-    def add_task_batcher(self, worker, task_family, batched_args, max_batch_size=float("inf")):
-        self._state.set_batcher(worker, task_family, batched_args, max_batch_size)
+    def add_task_batcher(self, worker, task_family, batched_args, max_batch_size=float("inf"), set_batched_args=None):
+        self._state.set_batcher(worker, task_family, batched_args, max_batch_size, set_batched_args)
 
     @rpc_method()
     def forgive_failures(self, task_id=None):
@@ -922,7 +1030,8 @@ class Scheduler:
             self._state.set_status(task, PENDING if status == SUSPENDED else status, self._config)
 
         if status == FAILED and self._config.batch_emails:
-            batched_params, _ = self._state.get_batcher(worker_id, family)
+            registration = self._state.get_batcher(worker_id, family)
+            batched_params = registration.batch_param_names
             if batched_params:
                 unbatched_params = {param: value for param, value in task.params.items() if param not in batched_params}
             else:
@@ -970,7 +1079,7 @@ class Scheduler:
         if not self._config.batch_emails:
             return
         worker_id = kwargs["worker"]
-        batched_params, _ = self._state.get_batcher(worker_id, family)
+        batched_params = self._state.get_batcher(worker_id, family).batch_param_names
         if batched_params:
             unbatched_params = {param: value for param, value in params.items() if param not in batched_params}
         else:
@@ -1098,8 +1207,14 @@ class Scheduler:
             for task in self._state.get_active_tasks_by_status(BATCH_RUNNING)
             if task.worker_running == worker_id and task.batch_id not in running_batch_ids
         ]
+        orphaned_batch_ids = {task.batch_id for task in orphaned_tasks}
         for task in orphaned_tasks:
+            task.batch_id = None
+            task.batch_key = None
             self._state.set_status(task, PENDING)
+        for batch_id in orphaned_batch_ids:
+            if not self._state.get_batch_running_tasks(batch_id):
+                self._state.unregister_active_batch(batch_id)
 
     @rpc_method()
     def count_pending(self, worker):
@@ -1135,6 +1250,109 @@ class Scheduler:
             "running_tasks": running_tasks,
         }
 
+    def _batch_environment(self, task, registration):
+        """
+        The parameters that must be identical for two tasks to share a worker.
+
+        Every parameter outside the declared batch parameters is part of the
+        environment, so a different environment can never join the same batch.
+        """
+        return tuple(
+            sorted(
+                (name, value)
+                for name, value in task.params.items()
+                if name not in registration.batch_param_names
+            )
+        )
+
+    def _set_targets(self, tasks, registration):
+        """Union of the set-like batch parameter values across batch members."""
+        union = collections.defaultdict(set)
+        for member in tasks:
+            for name in registration.set_batch_param_names:
+                canonical = registration.canonical_param_value(name, member.params.get(name))
+                if isinstance(canonical, tuple) and canonical and canonical[0] == "set":
+                    union[name].update(canonical[1])
+                else:
+                    union[name].add(canonical)
+        return frozenset((name, frozenset(values)) for name, values in union.items())
+
+    def _batch_key(self, task, batched_tasks, registration):
+        # Include the family so identical parameter shapes of different task
+        # families can never collide.
+        #
+        # Set-like parameters are aggregated over every member: the batch identity
+        # is the union of the declared target sets, so submissions describing the
+        # same collection in any order resolve to the same key. Ordinary batch
+        # parameters contribute the anchor's serialized value instead.
+        ordered_targets = tuple(
+            (name, task.params.get(name))
+            for name in registration.batch_param_names
+            if name not in registration.set_batch_param_names
+        )
+        return (
+            task.family,
+            self._batch_environment(task, registration),
+            self._set_targets(batched_tasks, registration),
+            ordered_targets,
+        )
+
+    @staticmethod
+    def _key_parts(batch_key):
+        # Mirrors the tuple layout produced by ``_batch_key``.
+        return {
+            "family": batch_key[0],
+            "environment": batch_key[1],
+            "set_targets": batch_key[2],
+            "ordered_targets": batch_key[3],
+        }
+
+    def _same_batch_identity(self, candidate, anchor, registration):
+        """
+        Whether ``candidate`` can be batched together with ``anchor``.
+
+        Only the environment (parameters outside the batch declaration) has to
+        match; batch parameters are merged into one run regardless of their value.
+        Set-like batch parameters additionally define the canonical identity of
+        the batch, so re-submissions with the same members in another order land
+        in the same batch.
+        """
+        return self._batch_environment(candidate, registration) == self._batch_environment(anchor, registration)
+
+    def _find_extendable_batch(self, candidate, registration):
+        """
+        Return (batch_key, batch_id) of an in-flight batch that ``candidate`` can
+        join, or ``(None, None)``.
+
+        A batch qualifies when it runs the same family and environment, has the
+        same ordinary batch parameter values, and the targets declared by
+        ``candidate`` are all already covered by that batch's canonical target
+        set. This is what lets a re-submitted equivalent request (same set,
+        different serialized order) attach to the active batch instead of
+        starting a new one.
+        """
+        candidate_environment = self._batch_environment(candidate, registration)
+        candidate_ordered = tuple(
+            (name, candidate.params.get(name))
+            for name in registration.batch_param_names
+            if name not in registration.set_batch_param_names
+        )
+        candidate_targets = dict(self._set_targets([candidate], registration))
+        for active_key, active_batch_id in self._state._active_batch_registry.items():
+            active = self._key_parts(active_key)
+            if active["family"] != candidate.family:
+                continue
+            if active["environment"] != candidate_environment:
+                continue
+            if active["ordered_targets"] != candidate_ordered:
+                continue
+            active_targets = dict(active["set_targets"])
+            if set(active_targets) != set(candidate_targets):
+                continue
+            if all(candidate_targets[name] <= active_targets[name] for name in candidate_targets):
+                return active_key, active_batch_id
+        return None, None
+
     @rpc_method(allow_null=False)
     def get_work(self, host=None, assistant=False, current_tasks=None, worker=None, **kwargs):
         # TODO: remove any expired nodes
@@ -1169,7 +1387,8 @@ class Scheduler:
         if assistant:
             self.add_worker(worker_id, [("assistant", assistant)])
 
-        batched_params, unbatched_params, batched_tasks, max_batch_size = None, None, [], 1
+        batched_params, batched_tasks = None, []
+        batcher_registration = None
         best_task = None
         if current_tasks is not None:
             ct_set = set(current_tasks)
@@ -1204,13 +1423,16 @@ class Scheduler:
                 best_task
                 and batched_params
                 and task.family == best_task.family
-                and len(batched_tasks) < max_batch_size
+                and len(batched_tasks) < batcher_registration.max_batch_size
                 and task.is_batchable()
-                and all(task.params.get(name) == value for name, value in unbatched_params.items())
+                and task.status == PENDING
+                and self._same_batch_identity(task, best_task, batcher_registration)
                 and task.resources == best_task.resources
                 and self._schedulable(task)
             ):
                 for name, params in batched_params.items():
+                    # Keep each member's original serialized value; the list order
+                    # in the reply is only the order in which members were picked.
                     params.append(task.params.get(name))
                 batched_tasks.append(task)
             if best_task:
@@ -1225,14 +1447,15 @@ class Scheduler:
                 in_workers = (assistant and task.runnable) or worker_id in task.workers
                 if in_workers and self._has_resources(task.resources, used_resources):
                     best_task = task
-                    batch_param_names, max_batch_size = self._state.get_batcher(worker_id, task.family)
+                    batcher_registration = self._state.get_batcher(worker_id, task.family)
+                    batch_param_names = batcher_registration.batch_param_names
                     if batch_param_names and task.is_batchable():
                         try:
                             batched_params = {name: [task.params[name]] for name in batch_param_names}
-                            unbatched_params = {name: value for name, value in task.params.items() if name not in batched_params}
                             batched_tasks.append(task)
                         except KeyError:
-                            batched_params, unbatched_params = None, None
+                            batched_params = None
+                            batcher_registration = None
                 else:
                     workers = itertools.chain(task.workers, [worker_id]) if assistant else task.workers
                     for task_worker in workers:
@@ -1248,12 +1471,49 @@ class Scheduler:
 
         reply = self.count_pending(worker_id)
 
-        if len(batched_tasks) > 1:
-            batch_string = "|".join(task.id for task in batched_tasks)
-            batch_id = hashlib.new("md5", batch_string.encode("utf-8"), usedforsecurity=False).hexdigest()
-            for task in batched_tasks:
-                self._state.set_batch_running(task, batch_id, worker_id)
+        if batched_tasks and batcher_registration is not None:
+            # The canonical identity covers the environment (non-batched params)
+            # and the union of the set-disambiguated targets. Equivalent requests
+            # therefore map to the same identity even when their serialized order
+            # differs, while a different environment always gets its own identity.
+            batch_key = self._batch_key(best_task, batched_tasks, batcher_registration)
+            existing_batch_id = self._state.get_active_batch(batch_key)
+            if existing_batch_id is None and len(batched_tasks) == 1:
+                # The only pending member might extend an in-flight batch whose
+                # other members are already BATCH_RUNNING.
+                batch_key, existing_batch_id = self._find_extendable_batch(batched_tasks[0], batcher_registration)
+            if existing_batch_id is not None:
+                # An equivalent batch is already being executed. Only hand over the
+                # members that are still waiting; members which failed or completed
+                # stay with the worker that owns the existing batch.
+                existing_members = {t.id for t in self._state.get_batch_running_tasks(existing_batch_id)}
+                new_tasks = [t for t in batched_tasks if t.id not in existing_members and t.status == PENDING]
+                for member_task in new_tasks:
+                    self._state.set_batch_running(member_task, existing_batch_id, worker_id, batch_key=batch_key)
+                # The reply reports every member of the active batch, using each
+                # member's own originally serialized parameters.
+                member_tasks = self._state.get_batch_running_tasks(existing_batch_id)
+                member_tasks.sort(key=lambda member: member.id)
+                batched_tasks = member_tasks
+                batched_params = {
+                    name: [member.params.get(name) for member in member_tasks]
+                    for name in batcher_registration.batch_param_names
+                }
+                batch_id = existing_batch_id
+            elif len(batched_tasks) > 1:
+                batch_string = "|".join(task.id for task in batched_tasks)
+                batch_id = hashlib.new("md5", batch_string.encode("utf-8"), usedforsecurity=False).hexdigest()
+                self._state.register_active_batch(batch_key, batch_id)
+                for member_task in batched_tasks:
+                    self._state.set_batch_running(member_task, batch_id, worker_id, batch_key=batch_key)
+            else:
+                # A single pending member with no active equivalent batch runs on
+                # its own as a regular task instead of forming a one-member batch.
+                batched_tasks = []
 
+        if batched_tasks:
+            # Report the combined parameters built from each member's own
+            # serialized values, never the canonicalized set representation.
             combined_params = best_task.params.copy()
             combined_params.update(batched_params)
 
@@ -1263,6 +1523,7 @@ class Scheduler:
             reply["task_params"] = combined_params
             reply["batch_id"] = batch_id
             reply["batch_task_ids"] = [task.id for task in batched_tasks]
+            reply["batch_key"] = repr(batch_key)
 
         elif best_task:
             self.update_metrics_task_started(best_task)

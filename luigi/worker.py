@@ -825,6 +825,7 @@ class Worker:
                     worker=self._id,
                     task_family=family,
                     batched_args=batch_param_names,
+                    set_batched_args=task_class.set_batch_param_names(),
                     max_batch_size=task.max_batch_size,
                 )
             self._batch_families_sent.add(family)

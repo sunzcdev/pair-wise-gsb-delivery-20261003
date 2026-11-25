@@ -28,6 +28,7 @@ import luigi.configuration
 import luigi.scheduler
 import luigi.server
 from luigi.target import FileAlreadyExists
+from luigi.task_status import BATCH_RUNNING
 
 
 class SchedulerIoTest(unittest.TestCase):
@@ -393,3 +394,314 @@ class StableDoneCooldownSecsTest(unittest.TestCase):
     def test_sending_same_task_twice_without_cooldown_leads_to_double_run(self):
         second_run_result = self.get_second_run_result_on_double_run()
         self.assertEqual(second_run_result.scheduling_succeeded, False)
+
+
+class SetBatchIdentityTest(unittest.TestCase):
+    """
+    Behavior of batch parameters declared as set-like.
+
+    Equivalent targets submitted in a different order must resolve to the same
+    active batch (for a given environment), while another environment gets its
+    own batch. Members keep reporting under their original serialized task ids,
+    and batches persisted by an old scheduler version must remain settleable.
+    """
+
+    FAMILY = "SetBatchJob"
+    BATCH_PARAM = "targets"
+    ENV_PARAM = "env"
+
+    def _scheduler(self, state_path=None, retry_delay=-1):
+        scheduler = luigi.scheduler.Scheduler(retry_delay=retry_delay)
+        if state_path is not None:
+            scheduler._state._state_path = state_path
+        return scheduler
+
+    def _register_batcher(self, scheduler, worker="worker-1"):
+        scheduler.add_task_batcher(
+            worker=worker,
+            task_family=self.FAMILY,
+            batched_args=[self.BATCH_PARAM],
+            set_batched_args=[self.BATCH_PARAM],
+            max_batch_size=float("inf"),
+        )
+
+    def _add_task(self, scheduler, task_id, targets, environment, worker="worker-1", batchable=True):
+        scheduler.add_task(
+            worker=worker,
+            task_id=task_id,
+            family=self.FAMILY,
+            params={self.BATCH_PARAM: targets, self.ENV_PARAM: environment},
+            status="PENDING",
+            batchable=batchable,
+        )
+
+    def _task_ids(self, reply):
+        return set(reply["batch_task_ids"])
+
+    def test_set_disambiguated_targets_share_one_active_batch(self):
+        scheduler = self._scheduler()
+        self._register_batcher(scheduler)
+
+        # A batch family carries a set of targets. Two submissions describe the
+        # same set in different orders, in the same environment.
+        self._add_task(scheduler, "job-ab", "a,b", "prod")
+        self._add_task(scheduler, "job-ba", "b,a", "prod")
+        # Duplicate submission of the equivalent request.
+        self._add_task(scheduler, "job-ab-2", "a,b", "prod")
+        # An unrelated member that is still part of the same environment batch.
+        self._add_task(scheduler, "job-c", "c", "prod")
+
+        reply = scheduler.get_work(worker="worker-1")
+        first_batch_id = reply["batch_id"]
+        self.assertEqual({"job-ab", "job-ba", "job-ab-2", "job-c"}, self._task_ids(reply))
+        # Results are still reported with each member's original serialized params.
+        self.assertEqual(["a,b", "b,a", "a,b", "c"], reply["task_params"][self.BATCH_PARAM])
+
+        # The equivalent request resolves to a single canonical identity, even
+        # though the members were serialized in different orders.
+        registry = scheduler._state._active_batch_registry
+        self.assertEqual([first_batch_id], list(registry.values()))
+        [canonical_key] = registry.keys()
+
+        # Re-submitting the equivalent request must not create another batch.
+        self._add_task(scheduler, "job-ab-3", "b,a", "prod")
+        follow_up = scheduler.get_work(worker="worker-1")
+        # The newly submitted member joins the already active batch under its id;
+        # the reply lists every member using its own originally serialized params.
+        self.assertEqual(first_batch_id, follow_up["batch_id"])
+        self.assertEqual(
+            {"job-ab", "job-ba", "job-ab-2", "job-c", "job-ab-3"},
+            self._task_ids(follow_up),
+        )
+        self.assertIn("b,a", follow_up["task_params"][self.BATCH_PARAM])
+        self.assertEqual([first_batch_id], list(scheduler._state._active_batch_registry.values()))
+        self.assertEqual(canonical_key, next(iter(scheduler._state._active_batch_registry)))
+
+    def test_different_environments_never_share_a_batch(self):
+        scheduler = self._scheduler()
+        self._register_batcher(scheduler)
+
+        self._add_task(scheduler, "prod-ab", "a,b", "prod")
+        self._add_task(scheduler, "prod-ba", "b,a", "prod")
+        self._add_task(scheduler, "stage-ab", "a,b", "staging")
+        self._add_task(scheduler, "stage-ba", "b,a", "staging")
+
+        prod_reply = scheduler.get_work(worker="worker-1")
+        self.assertEqual({"prod-ab", "prod-ba"}, self._task_ids(prod_reply))
+        prod_batch_id = prod_reply["batch_id"]
+
+        stage_reply = scheduler.get_work(worker="worker-1")
+        self.assertEqual({"stage-ab", "stage-ba"}, self._task_ids(stage_reply))
+        self.assertNotEqual(prod_batch_id, stage_reply["batch_id"])
+
+        # The two batches have distinct canonical identities.
+        self.assertNotEqual(prod_reply["batch_key"], stage_reply["batch_key"])
+        self.assertEqual(
+            2,
+            len(set(scheduler._state._active_batch_registry.values())),
+        )
+
+    def test_ordered_batch_parameter_is_not_treated_as_a_set(self):
+        scheduler = self._scheduler()
+        # Register the targets parameter as an ordinary (ordered) batch parameter.
+        scheduler.add_task_batcher(
+            worker="worker-1",
+            task_family=self.FAMILY,
+            batched_args=[self.BATCH_PARAM],
+            max_batch_size=float("inf"),
+        )
+        # Same environment, two members that differ only in the ordering. They can
+        # still be combined into a single batch run by the worker.
+        self._add_task(scheduler, "job-ab", "a,b", "prod")
+        self._add_task(scheduler, "job-ba", "b,a", "prod")
+
+        reply = scheduler.get_work(worker="worker-1")
+        self.assertEqual({"job-ab", "job-ba"}, self._task_ids(reply))
+        # The serialized values are preserved verbatim (order is significant).
+        self.assertEqual(["a,b", "b,a"], reply["task_params"][self.BATCH_PARAM])
+
+    def test_failure_retry_keeps_finished_members_with_their_worker(self):
+        scheduler = self._scheduler()
+        self._register_batcher(scheduler)
+
+        self._add_task(scheduler, "job-a", "a", "prod")
+        self._add_task(scheduler, "job-b", "b", "prod")
+
+        reply = scheduler.get_work(worker="worker-1")
+        batch_id = reply["batch_id"]
+        self.assertEqual({"job-a", "job-b"}, self._task_ids(reply))
+
+        # One member fails; the whole batch settles and goes back to PENDING for retry.
+        scheduler.add_task(worker="worker-1", task_id="job-a", family=self.FAMILY, status="FAILED", batch_id=batch_id)
+        self.assertEqual("FAILED", scheduler._state.get_task("job-a").status)
+        self.assertEqual("FAILED", scheduler._state.get_task("job-b").status)
+        self.assertIsNone(scheduler._state.get_task("job-a").batch_id)
+        # Once the batch has settled, its identity is free again.
+        self.assertEqual({}, scheduler._state._active_batch_registry)
+
+        # Simulate the retry delay expiring and re-submit the same request.
+        for task_id, target in (("job-a", "a"), ("job-b", "b")):
+            scheduler.add_task(
+                worker="worker-1",
+                task_id=task_id,
+                family=self.FAMILY,
+                params={self.BATCH_PARAM: target, self.ENV_PARAM: "prod"},
+                status="PENDING",
+                batchable=True,
+            )
+
+        retry_reply = scheduler.get_work(worker="worker-1")
+        # A brand new batch is created for the retry.
+        self.assertIn("batch_id", retry_reply)
+        self.assertEqual({"job-a", "job-b"}, self._task_ids(retry_reply))
+
+        # job-b now completes successfully and must not be re-dispatched to another worker.
+        scheduler.add_task(worker="worker-1", task_id="job-b", family=self.FAMILY, status="DONE", batch_id=retry_reply["batch_id"])
+        self.assertEqual("DONE", scheduler._state.get_task("job-b").status)
+
+        # Another worker asking for the still-pending target only gets that member;
+        # the completed member is never handed over.
+        self._register_batcher(scheduler, worker="worker-2")
+        self._add_task(scheduler, "job-a-c", "a", "prod", worker="worker-2")
+        other_reply = scheduler.get_work(worker="worker-2")
+        # Only a single pending member exists, so no batch is formed and the
+        # completed member is never handed over.
+        self.assertNotIn("batch_id", other_reply)
+        self.assertEqual("job-a-c", other_reply["task_id"])
+        self.assertEqual("DONE", scheduler._state.get_task("job-b").status)
+
+    def _build_legacy_archive(self, state_path):
+        """
+        Write a state file in the pre-feature format:
+
+        * batchers stored as plain (batched_args, max_batch_size) tuples
+        * Task objects without a ``batch_key`` attribute
+        * no active-batch registry (3-tuple state)
+        """
+        tasks = {}
+        retry_policy = luigi.scheduler.RetryPolicy(999999999, 999999999, 3600)
+        for task_id, targets in (("legacy-a", "a"), ("legacy-b", "b")):
+            task = luigi.scheduler.Task(
+                task_id=task_id,
+                status=BATCH_RUNNING,
+                deps=None,
+                family=self.FAMILY,
+                params={self.BATCH_PARAM: targets, self.ENV_PARAM: "legacy-env"},
+                retry_policy=retry_policy,
+            )
+            task.batchable = True
+            task.batch_id = "legacy-batch-id"
+            task.worker_running = "legacy-worker"
+            # Emulate the old class: no batch_key attribute at all.
+            del task.batch_key
+            tasks[task_id] = task
+
+        active_workers = {"legacy-worker": luigi.scheduler.Worker("legacy-worker")}
+        task_batchers = {
+            "legacy-worker": {
+                self.FAMILY: ((self.BATCH_PARAM,), float("inf")),
+            }
+        }
+        with open(state_path, "wb") as fobj:
+            pickle.dump((tasks, active_workers, task_batchers), fobj)
+
+    def test_legacy_running_batch_can_still_be_settled(self):
+        state_dir = tempfile.mkdtemp()
+        try:
+            state_path = os.path.join(state_dir, "state.pickle")
+            self._build_legacy_archive(state_path)
+
+            scheduler = self._scheduler(state_path=state_path)
+            scheduler.load()
+
+            # The old batcher tuple is upgraded transparently.
+            registration = scheduler._state.get_batcher("legacy-worker", self.FAMILY)
+            self.assertEqual((self.BATCH_PARAM,), registration.batch_param_names)
+
+            # The old batch is registered under its own legacy identity and cannot
+            # be claimed by a newly created batch of another environment.
+            self.assertEqual("legacy-batch-id", scheduler._state.get_active_batch(("legacy", "legacy-batch-id")))
+            legacy_tasks = scheduler._state.get_batch_running_tasks("legacy-batch-id")
+            self.assertEqual({"legacy-a", "legacy-b"}, {task.id for task in legacy_tasks})
+
+            # A new environment submitting the same targets must get its own batch.
+            self._register_batcher(scheduler)
+            self._add_task(scheduler, "new-a", "a", "new-env")
+            self._add_task(scheduler, "new-b", "b", "new-env")
+            new_reply = scheduler.get_work(worker="worker-1")
+            self.assertIn("batch_id", new_reply)
+            self.assertNotEqual("legacy-batch-id", new_reply["batch_id"])
+            self.assertEqual({"new-a", "new-b"}, self._task_ids(new_reply))
+
+            # The legacy worker settles its own batch using the original batch id.
+            scheduler.add_task(
+                worker="legacy-worker",
+                task_id="legacy-a",
+                family=self.FAMILY,
+                status="DONE",
+                batch_id="legacy-batch-id",
+            )
+            self.assertEqual("DONE", scheduler._state.get_task("legacy-a").status)
+            self.assertEqual("DONE", scheduler._state.get_task("legacy-b").status)
+            self.assertIsNone(scheduler._state.get_task("legacy-a").batch_id)
+            self.assertNotIn(("legacy", "legacy-batch-id"), scheduler._state._active_batch_registry)
+
+            # And it survives a dump/load round trip with the new on-disk format.
+            scheduler.dump()
+            reloaded = self._scheduler(state_path=state_path)
+            reloaded.load()
+            self.assertEqual("DONE", reloaded._state.get_task("legacy-a").status)
+            self.assertEqual("DONE", reloaded._state.get_task("legacy-b").status)
+            # The new environment's batch is untouched and still in flight.
+            self.assertEqual("BATCH_RUNNING", reloaded._state.get_task("new-a").status)
+            self.assertEqual(
+                new_reply["batch_id"],
+                reloaded._state.get_task("new-a").batch_id,
+            )
+        finally:
+            shutil.rmtree(state_dir)
+
+    def test_restart_preserves_active_batch_identity_across_failure(self):
+        state_dir = tempfile.mkdtemp()
+        try:
+            state_path = os.path.join(state_dir, "state.pickle")
+            scheduler = self._scheduler(state_path=state_path)
+            self._register_batcher(scheduler)
+
+            self._add_task(scheduler, "job-a", "a", "prod")
+            self._add_task(scheduler, "job-b", "b", "prod")
+            reply = scheduler.get_work(worker="worker-1")
+            batch_id = reply["batch_id"]
+
+            # One member fails, state is persisted, then the scheduler restarts.
+            scheduler.add_task(worker="worker-1", task_id="job-a", family=self.FAMILY, status="FAILED", batch_id=batch_id)
+            scheduler.dump()
+
+            restarted = self._scheduler(state_path=state_path)
+            restarted.load()
+            self.assertEqual("FAILED", restarted._state.get_task("job-a").status)
+            self.assertEqual("FAILED", restarted._state.get_task("job-b").status)
+
+            # Re-issue the identical request after the failure.
+            self._register_batcher(restarted)
+            for task_id, target in (("job-a", "a"), ("job-b", "b")):
+                restarted.add_task(
+                    worker="worker-1",
+                    task_id=task_id,
+                    family=self.FAMILY,
+                    params={self.BATCH_PARAM: target, self.ENV_PARAM: "prod"},
+                    status="PENDING",
+                    batchable=True,
+                )
+            retry_reply = restarted.get_work(worker="worker-1")
+            self.assertEqual({"job-a", "job-b"}, self._task_ids(retry_reply))
+            # The failed batch had been unregistered when it settled, so the retry
+            # is registered as a fresh active batch rather than reviving the old one.
+            registry = restarted._state._active_batch_registry
+            self.assertEqual(1, len(registry))
+            self.assertEqual(retry_reply["batch_id"], next(iter(registry.values())))
+            # Both members were FAILED and are now BATCH_RUNNING again as a retry.
+            for task_id in ("job-a", "job-b"):
+                self.assertEqual("BATCH_RUNNING", restarted._state.get_task(task_id).status)
+        finally:
+            shutil.rmtree(state_dir)

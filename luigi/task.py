@@ -394,6 +394,17 @@ class Task(metaclass=Register):
         return [name for name, p in cls.get_params() if p._is_batchable()]
 
     @classmethod
+    def set_batch_param_names(cls):
+        """
+        Names of batch parameters that identify a collection of targets.
+
+        Values of these parameters are compared as sets when deciding whether
+        two tasks can share the same worker batch, so the order in which the
+        targets were serialized does not matter.
+        """
+        return [name for name, p in cls.get_params() if p._is_batchable() and p._is_set_like()]
+
+    @classmethod
     def get_param_names(cls, include_significant=False):
         return [name for name, p in cls.get_params() if include_significant or p.significant]
 

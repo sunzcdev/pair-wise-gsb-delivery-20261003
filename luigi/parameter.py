@@ -212,6 +212,7 @@ class Parameter(Generic[T]):
         positional: bool = True,
         always_in_help: bool = False,
         batch_method: Optional[Callable[[Iterable[Any]], Any]] = None,
+        set_like: bool = False,
         visibility: ParameterVisibility = ParameterVisibility.PUBLIC,
     ):
         """
@@ -240,6 +241,11 @@ class Parameter(Generic[T]):
                                                         parameter values into a single value. Used
                                                         when receiving batched parameter lists from
                                                         the scheduler. See :ref:`batch_method`
+        :param bool set_like: Only meaningful together with ``batch_method``. When true, the
+                              parameter describes a collection of targets whose identity does not
+                              depend on the serialized order (or on duplicates). Tasks carrying the
+                              same set of values in different orders are then recognized as
+                              equivalent and scheduled into the same worker batch.
 
         :param visibility: A Parameter whose value is a :py:class:`~luigi.parameter.ParameterVisibility`.
                             Default value is ParameterVisibility.PUBLIC
@@ -247,6 +253,7 @@ class Parameter(Generic[T]):
         """
         self._default = default
         self._batch_method = batch_method
+        self._set_like = set_like and batch_method is not None
         if is_global:
             warnings.warn("is_global support is removed. Assuming positional=False", DeprecationWarning, stacklevel=2)
             positional = False
@@ -336,6 +343,9 @@ class Parameter(Generic[T]):
 
     def _is_batchable(self):
         return self._batch_method is not None
+
+    def _is_set_like(self):
+        return getattr(self, "_set_like", False)
 
     def parse(self, x):
         """

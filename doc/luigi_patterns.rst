@@ -181,6 +181,32 @@ task that ends up running will use resources. The scheduler only checks
 that there are sufficient resources for each task individually before
 batching them all together.
 
+Order-insensitive (set-like) batch parameters
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Some batch parameters describe a collection of targets rather than a
+single value. If the same collection can be serialized in more than one
+order, two submissions are really the same request and should be handled
+by a single worker batch even though their serialized parameters differ.
+Mark such a parameter with ``set_like=True`` (in addition to a
+``batch_method``):
+
+.. code-block:: python
+
+    class A(luigi.Task):
+        targets = luigi.Parameter(batch_method=",".join, set_like=True)
+        environment = luigi.Parameter()
+
+With this declaration, ``A(targets="a,b", environment="prod")`` and
+``A(targets="b,a", environment="prod")`` are recognized as equivalent and
+join the same active batch. Parameters without ``set_like`` keep their
+ordinary, order-sensitive identity, and every parameter outside the
+batch declaration (such as ``environment`` above) still has to match
+exactly, so a different environment always gets its own independent
+batch. Each member keeps reporting results under its own original task id
+and serialized parameter values; the set comparison is only used to
+decide batch membership.
+
 Tasks that regularly overwrite the same data source
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
