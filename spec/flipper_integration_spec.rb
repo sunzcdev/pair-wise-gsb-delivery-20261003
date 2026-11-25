@@ -645,17 +645,47 @@ RSpec.describe Flipper do
       expect(feature.enabled?(clooney)).to be(false)
     end
 
-    it "returns false on circular dependency" do
+    it "raises a reference-chain error on circular dependency" do
       feature.enable Flipper.feature_enabled(:other)
       flipper[:other].enable Flipper.feature_enabled(:search)
 
-      expect(feature.enabled?).to be(false)
+      expect { feature.enabled? }.to raise_error(
+        Flipper::CircularDependencyError,
+        /search -> other -> search/
+      )
     end
 
-    it "returns false on self-reference" do
+    it "raises a reference-chain error on self-reference" do
       feature.enable Flipper.feature_enabled(:search)
 
-      expect(feature.enabled?).to be(false)
+      expect { feature.enabled? }.to raise_error(
+        Flipper::CircularDependencyError,
+        /search -> search/
+      )
+    end
+
+    it "does not visit a circular branch after Any is already true" do
+      actor = Flipper::Actor.new("short-circuit", { "plan" => "basic" })
+      feature.enable Flipper.any(
+        Flipper.property(:plan).eq("basic"),
+        Flipper.feature_enabled(:other)
+      )
+      flipper[:other].enable Flipper.feature_enabled(:search)
+
+      expect(feature.enabled?(actor)).to be(true)
+      expect(Thread.current[:flipper_evaluating_features]).to be_nil
+    end
+
+    it "does not visit a circular branch after All is already false" do
+      actor = Flipper::Actor.new("short-circuit", { "plan" => "premium" })
+      feature.enable Flipper.all(
+        Flipper.property(:plan).eq("basic"),
+        Flipper.feature_enabled(:other)
+      )
+      flipper[:other].enable Flipper.feature_enabled(:search)
+
+      expect(feature.enabled?(actor)).to be(false)
+      expect(Thread.current[:flipper_evaluating_features]).to be_nil
     end
 
     it "cleans up thread-local state after evaluation" do
@@ -670,7 +700,7 @@ RSpec.describe Flipper do
     it "cleans up thread-local state after self-reference" do
       feature.enable Flipper.feature_enabled(:search)
 
-      feature.enabled?
+      expect { feature.enabled? }.to raise_error(Flipper::CircularDependencyError)
       evaluating = Thread.current[:flipper_evaluating_features]
       expect(evaluating.nil? || evaluating.empty?).to be(true)
     end
@@ -679,9 +709,22 @@ RSpec.describe Flipper do
       feature.enable Flipper.feature_enabled(:other)
       flipper[:other].enable Flipper.feature_enabled(:search)
 
-      feature.enabled?
+      expect { feature.enabled? }.to raise_error(Flipper::CircularDependencyError)
       evaluating = Thread.current[:flipper_evaluating_features]
       expect(evaluating.nil? || evaluating.empty?).to be(true)
+    end
+
+    it "keeps a diamond reference to a shared leaf valid" do
+      flipper.enable(:leaf)
+      flipper[:left].enable Flipper.feature_enabled(:leaf)
+      flipper[:right].enable Flipper.feature_enabled(:leaf)
+      feature.enable Flipper.all(
+        Flipper.feature_enabled(:left),
+        Flipper.feature_enabled(:right)
+      )
+
+      expect(feature.enabled?).to be(true)
+      expect(Thread.current[:flipper_evaluating_features]).to be_nil
     end
   end
 

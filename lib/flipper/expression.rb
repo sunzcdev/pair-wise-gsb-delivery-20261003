@@ -55,7 +55,14 @@ module Flipper
     end
 
     def evaluate(context = {})
-      if call_with_context?
+      # Any/All must evaluate their operands lazily. Building the argument
+      # array first would visit (and potentially raise from) a branch whose
+      # result the group no longer needs.
+      if any?
+        args.any? { |arg| arg.evaluate(context) }
+      elsif all?
+        args.all? { |arg| arg.evaluate(context) }
+      elsif call_with_context?
         function.call(*args.map {|arg| arg.evaluate(context) }, context: context)
       else
         function.call(*args.map {|arg| arg.evaluate(context) })

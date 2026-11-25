@@ -6,6 +6,9 @@ require 'flipper/gate_values'
 
 module Flipper
   class Feature
+    # Raised when FeatureEnabled traversal returns to an active feature.
+    CircularDependencyError = Flipper::CircularDependencyError
+
     # Private: The name of feature instrumentation events.
     InstrumentationName = "feature_operation.#{InstrumentationNamespace}".freeze
 
