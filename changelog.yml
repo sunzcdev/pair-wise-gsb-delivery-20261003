@@ -5,6 +5,8 @@
   - "Use dataset to fetch record after insert so that read types are properly applied in Create command (@katafrakt)"
   changed:
   - "Minimum Ruby version is now 3.2 (@flash-gordon)"
+  added:
+  - "`Relation#import` streams relations from another gateway in bounded limit/offset batches when `:slice` is given, commits every batch in its own transaction, reports committed batches via `ROM::SQL::Relation::Writing::ImportBatch` and an optional block, and supports `:offset` to resume without rewriting already committed rows"
 - version: 3.7.0
   summary:
   date: 2025-01-08

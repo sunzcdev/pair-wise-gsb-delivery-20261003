@@ -4,6 +4,22 @@ module ROM
   module SQL
     class Relation < ROM::Relation
       module Writing
+        # Status of a single batch imported from a different gateway
+        #
+        # @!attribute [r] index
+        #   @return [Integer] Zero-based position of the batch within the import
+        #
+        # @!attribute [r] offset
+        #   @return [Integer] Offset of the batch inside the source relation.
+        #     Use it as the cursor to resume a failed import without rewriting
+        #     the tuples that were already committed
+        #
+        # @!attribute [r] rows
+        #   @return [Integer] Number of tuples written with the batch
+        #
+        # @api public
+        ImportBatch = ::Struct.new(:index, :offset, :rows, keyword_init: true)
+
         # Add upsert option (only PostgreSQL >= 9.5)
         # Uses internal Sequel implementation
         # Default - ON CONFLICT DO NOTHING
@@ -82,7 +98,7 @@ module ROM
           dataset.delete(...)
         end
 
-        # Insert tuples from other relation
+        # Insert tuples from another relation
         #
         # NOTE: The method implicitly uses a transaction
         #
@@ -102,30 +118,123 @@ module ROM
         #     transaction block
         #
         # @overload import(other, options)
-        #   Import data from another relation. The source
-        #   relation will be materialized before loading
+        #   Import data from another relation. When +:slice+ is provided the
+        #   source relation is never fully materialized: it is read through a
+        #   count/limit/offset cursor and only one batch is kept in memory at
+        #   a time. Every batch is written in its own transaction, so batches
+        #   committed before a failure stay committed. Without +:slice+ the
+        #   source relation is materialized before loading, as before
         #
         #   @param [Relation] other
         #
         #   @option [Integer] :slice
+        #     Max number of tuples fetched and written per batch
         #
-        # @return [Integer] Number of imported tuples
+        #   @option [Integer] :offset
+        #     Cursor inside the source relation. Rows before it are skipped,
+        #     which allows resuming an import from the last committed batch
+        #
+        # @yieldparam [ROM::SQL::Relation::Writing::ImportBatch] batch
+        #   Called after every successfully committed batch
+        #
+        # @return [Integer, Array] Number of imported tuples for the legacy
+        #   paths; an array of {ImportBatch} when batching is used with a
+        #   relation from a different gateway
         #
         # @api public
-        def import(other, options = EMPTY_HASH)
-          columns = other.schema.map { |a| a.alias || a.name }
-
+        def import(other, options = EMPTY_HASH, &block)
           if other.gateway.eql?(gateway)
-            dataset.import(columns, other.dataset, options)
+            dataset.import(import_columns(other), other.dataset, options)
+          elsif options[:slice]
+            import_in_batches(other, options, &block)
           else
-            keys = columns.map(&:to_sym)
-            dataset.import(
-              columns,
-              other.to_a.map { |record|
-                record.to_h.values_at(*keys)
-              },
-              options
-            )
+            dataset.import(import_columns(other), import_rows(other), options)
+          end
+        end
+
+        private
+
+        # Columns used to load tuples from another relation
+        #
+        # @api private
+        def import_columns(other)
+          other.schema.map { |attribute| attribute.alias || attribute.name }
+        end
+
+        # Materialize tuples from another relation as plain value arrays
+        #
+        # @api private
+        def import_rows(other)
+          keys = import_columns(other).map(&:to_sym)
+
+          other.to_a.map { |record| record.to_h.values_at(*keys) }
+        end
+
+        # Stream tuples from a relation on a different gateway in bounded
+        # batches using a count/limit/offset cursor. Each batch is committed
+        # in its own transaction and reported through the returned array and
+        # the optional block
+        #
+        # @api private
+        def import_in_batches(other, options, &block)
+          slice = options.fetch(:slice)
+
+          unless slice.is_a?(::Integer) && slice.positive?
+            raise ArgumentError, "+:slice+ must be a positive integer, #{slice.inspect} given"
+          end
+
+          offset = options.fetch(:offset, 0)
+
+          unless offset.is_a?(::Integer) && offset >= 0
+            raise ArgumentError, "+:offset+ must be a non-negative integer, #{offset.inspect} given"
+          end
+
+          insert_options = options.except(:slice, :offset)
+          columns = import_columns(other)
+          keys = columns.map(&:to_sym)
+          batches = []
+          index = 0
+
+          loop do
+            rows = import_batch_rows(other, slice, offset)
+
+            break if rows.empty?
+
+            values = rows.map { |record| record.to_h.values_at(*keys) }
+            write_import_batch(columns, values, insert_options)
+
+            batch = ImportBatch.new(index: index, offset: offset, rows: values.size)
+            block&.call(batch)
+            batches << batch
+
+            offset += values.size
+            index += 1
+          end
+
+          batches
+        end
+
+        # Fetch at most +slice+ tuples starting at +offset+. SQL relations are
+        # paged in the database with a limit/offset cursor, so only one batch
+        # is ever held in memory; other adapters fall back to array slicing,
+        # which is still bounded by the batch size
+        #
+        # @api private
+        def import_batch_rows(other, slice, offset)
+          if other.respond_to?(:limit) && other.respond_to?(:offset)
+            other.limit(slice).offset(offset).to_a
+          else
+            other.to_a[offset, slice].to_a
+          end
+        end
+
+        # Write a single batch inside an independent transaction so a failure
+        # rolls the batch back without touching the already committed ones
+        #
+        # @api private
+        def write_import_batch(columns, values, insert_options)
+          dataset.db.transaction do
+            dataset.import(columns, values, insert_options)
           end
         end
       end
