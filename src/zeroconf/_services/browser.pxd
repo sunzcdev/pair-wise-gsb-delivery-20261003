@@ -84,7 +84,7 @@ cdef class QueryScheduler:
     @cython.locals(scheduled=_ScheduledPTRQuery)
     cpdef void cancel_ptr_refresh(self, DNSPointer pointer)
 
-    @cython.locals(current=_ScheduledPTRQuery, expire_time=double)
+    @cython.locals(current=_ScheduledPTRQuery, refresh_time_millis=double, expire_time_millis=double)
     cpdef void reschedule_ptr_first_refresh(self, DNSPointer pointer)
 
     @cython.locals(ttl_millis="unsigned int", additional_wait=double, next_query_time=double)

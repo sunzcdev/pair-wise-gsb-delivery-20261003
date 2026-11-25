@@ -1361,6 +1361,225 @@ async def test_query_scheduler_rescue_records():
     await aiozc.async_close()
 
 
+@pytest.mark.asyncio
+async def test_query_scheduler_reduced_ttl_still_refreshes_before_expiry():
+    """Verify a PTR refreshed with a reduced TTL is rescheduled before it expires.
+
+    When a PTR record suddenly gets a much shorter TTL, the previously
+    scheduled refresh may fall after the new expiration time. Even if the
+    new refresh time is within the coalescing window of the previously
+    scheduled one, the query must be moved earlier so the record gets a
+    real chance to be refreshed before it expires, without disturbing the
+    schedule of other instances that share the same round.
+    """
+    delay = const._BROWSER_TIME
+    types_ = {"_hap._tcp.local.", "_http._tcp.local."}
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    await aiozc.zeroconf.async_wait_for_start()
+    zc = aiozc.zeroconf
+    sends: list[r.DNSIncoming] = []
+
+    def send(out, addr=const._MDNS_ADDR, port=const._MDNS_PORT, v6_flow_scope=()):
+        pout = r.DNSIncoming(out.packets()[0])
+        sends.append(pout)
+
+    query_scheduler = _services_browser.QueryScheduler(zc, types_, None, 0, True, delay, (0, 0), None)
+    loop = asyncio.get_running_loop()
+
+    # patch the zeroconf send so we can capture what is being sent
+    with patch.object(zc, "async_send", send):
+        query_scheduler.start(loop)
+
+        original_now = loop.time()
+        now_millis = original_now * 1000
+        for query_count in range(_services_browser.STARTUP_QUERIES):
+            now_millis += (2**query_count) * 1000
+            time_changed_millis(now_millis)
+
+        scheduled_base = now_millis
+        ptr_record = r.DNSPointer(
+            "_hap._tcp.local.",
+            const._TYPE_PTR,
+            const._CLASS_IN,
+            const._DNS_OTHER_TTL,
+            "zoomer._hap._tcp.local.",
+            created=scheduled_base,
+        )
+        ptr2_record = r.DNSPointer(
+            "_hap._tcp.local.",
+            const._TYPE_PTR,
+            const._CLASS_IN,
+            const._DNS_OTHER_TTL,
+            "disappear._hap._tcp.local.",
+            created=scheduled_base,
+        )
+        query_scheduler.reschedule_ptr_first_refresh(ptr_record)
+        query_scheduler.reschedule_ptr_first_refresh(ptr2_record)
+
+        # Both instances are scheduled for the same round
+        round_time_millis = scheduled_base + (const._DNS_OTHER_TTL * 1000) * 0.75
+        assert query_scheduler._next_scheduled_for_alias[ptr_record.alias].when_millis == round_time_millis
+        assert query_scheduler._next_scheduled_for_alias[ptr2_record.alias].when_millis == round_time_millis
+
+        # Move time forward to just before the round so the scheduler
+        # sets its next wake up at the round time
+        sends.clear()
+        now_millis = round_time_millis - 15000
+        time_changed_millis(now_millis)
+        assert not sends
+
+        # The first instance is seen again with a much shorter TTL that
+        # makes it expire before the round, but the new refresh time is
+        # still within the coalescing window of the round
+        short_ttl = 10
+        ptr_record_short = r.DNSPointer(
+            "_hap._tcp.local.",
+            const._TYPE_PTR,
+            const._CLASS_IN,
+            short_ttl,
+            "zoomer._hap._tcp.local.",
+            created=now_millis,
+        )
+        new_expire_time = now_millis + short_ttl * 1000
+        new_refresh_time = now_millis + (short_ttl * 1000) * 0.75
+        assert new_expire_time < round_time_millis
+        assert 0 < round_time_millis - new_refresh_time <= delay
+
+        query_scheduler.reschedule_ptr_first_refresh(ptr_record_short)
+
+        # The query must be moved earlier so the record can be
+        # refreshed before it expires
+        rescheduled = query_scheduler._next_scheduled_for_alias[ptr_record.alias]
+        assert rescheduled.when_millis == new_refresh_time
+        assert rescheduled.when_millis < new_expire_time
+        # The scheduler wake up is moved up as well so the query
+        # actually goes out while the record is still valid
+        assert query_scheduler._next_run.when() == pytest.approx(millis_to_seconds(new_refresh_time))
+        # The other instance sharing the round keeps its own schedule
+        other = query_scheduler._next_scheduled_for_alias[ptr2_record.alias]
+        assert other.when_millis == round_time_millis
+        assert other.cancelled is False
+
+        # Move time to the new refresh time; the early query goes out
+        now_millis = new_refresh_time
+        time_changed_millis(now_millis)
+        assert len(sends) == 1
+        # The other instance was not treated as refreshed by the early
+        # query; its original schedule is still in place
+        other = query_scheduler._next_scheduled_for_alias[ptr2_record.alias]
+        assert other.when_millis == round_time_millis
+        assert other.cancelled is False
+
+        # The other instance does not answer either, so once its own
+        # scheduled query goes out it still gets its own rescue query
+        now_millis = round_time_millis + delay
+        time_changed_millis(now_millis)
+        assert len(sends) == 2
+        # The first instance expired without being refreshed so it
+        # is no longer scheduled
+        assert ptr_record.alias not in query_scheduler._next_scheduled_for_alias
+        rescue = query_scheduler._next_scheduled_for_alias[ptr2_record.alias]
+        assert rescue.cancelled is False
+        assert rescue.when_millis == pytest.approx(
+            now_millis + (const._DNS_OTHER_TTL * 1000) * _services_browser.RESCUE_RECORD_RETRY_TTL_PERCENTAGE
+        )
+        assert rescue.when_millis < ptr2_record.get_expiration_time(100)
+
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+async def test_query_scheduler_refresh_within_window_after_round_stays_merged():
+    """Verify a refresh within the coalescing window after the round stays merged.
+
+    When the new expiration time falls after the previously scheduled
+    round, a new refresh time within the coalescing window must not cause
+    churn: the existing schedule, the order of the pending queries, and
+    the next wake up are all preserved.
+    """
+    delay = const._BROWSER_TIME
+    types_ = {"_hap._tcp.local.", "_http._tcp.local."}
+    aiozc = AsyncZeroconf(interfaces=["127.0.0.1"])
+    await aiozc.zeroconf.async_wait_for_start()
+    zc = aiozc.zeroconf
+    sends: list[r.DNSIncoming] = []
+
+    def send(out, addr=const._MDNS_ADDR, port=const._MDNS_PORT, v6_flow_scope=()):
+        pout = r.DNSIncoming(out.packets()[0])
+        sends.append(pout)
+
+    query_scheduler = _services_browser.QueryScheduler(zc, types_, None, 0, True, delay, (0, 0), None)
+    loop = asyncio.get_running_loop()
+
+    # patch the zeroconf send so we can capture what is being sent
+    with patch.object(zc, "async_send", send):
+        query_scheduler.start(loop)
+
+        original_now = loop.time()
+        now_millis = original_now * 1000
+        for query_count in range(_services_browser.STARTUP_QUERIES):
+            now_millis += (2**query_count) * 1000
+            time_changed_millis(now_millis)
+
+        scheduled_base = now_millis
+        ptr_record = r.DNSPointer(
+            "_hap._tcp.local.",
+            const._TYPE_PTR,
+            const._CLASS_IN,
+            const._DNS_OTHER_TTL,
+            "zoomer._hap._tcp.local.",
+            created=scheduled_base,
+        )
+        ptr2_record = r.DNSPointer(
+            "_hap._tcp.local.",
+            const._TYPE_PTR,
+            const._CLASS_IN,
+            const._DNS_OTHER_TTL,
+            "stayer._hap._tcp.local.",
+            created=scheduled_base,
+        )
+        query_scheduler.reschedule_ptr_first_refresh(ptr_record)
+        query_scheduler.reschedule_ptr_first_refresh(ptr2_record)
+
+        # Both instances are scheduled for the same round
+        round_time_millis = scheduled_base + (const._DNS_OTHER_TTL * 1000) * 0.75
+        scheduled_before = list(query_scheduler._query_heap)
+        next_run_before = query_scheduler._next_run
+
+        # The record is seen again with a slightly longer TTL; the new
+        # refresh time falls within the coalescing window after the
+        # round and the record now expires after the round
+        ptr_record_longer = r.DNSPointer(
+            "_hap._tcp.local.",
+            const._TYPE_PTR,
+            const._CLASS_IN,
+            const._DNS_OTHER_TTL + 10,
+            "zoomer._hap._tcp.local.",
+            created=scheduled_base,
+        )
+        new_refresh_time = ptr_record_longer.get_expiration_time(const._EXPIRE_REFRESH_TIME_PERCENT)
+        assert 0 < new_refresh_time - round_time_millis <= delay
+        assert ptr_record_longer.get_expiration_time(100) > round_time_millis
+
+        query_scheduler.reschedule_ptr_first_refresh(ptr_record_longer)
+
+        # The existing schedule is preserved to avoid churn
+        current = query_scheduler._next_scheduled_for_alias[ptr_record.alias]
+        assert current.when_millis == round_time_millis
+        assert current.cancelled is False
+        # The pending queries keep their order and the wake up is unchanged
+        assert query_scheduler._query_heap == scheduled_before
+        assert query_scheduler._next_run is next_run_before
+
+        # Both queries still fire at the round time
+        sends.clear()
+        now_millis = round_time_millis
+        time_changed_millis(now_millis)
+        assert len(sends) == 1
+
+    await aiozc.async_close()
+
+
 def test_service_browser_matching(zc: Zeroconf) -> None:
     """Test that the ServiceBrowser matching does not match partial names."""
 

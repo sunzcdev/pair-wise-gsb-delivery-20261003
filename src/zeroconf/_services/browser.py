@@ -379,19 +379,40 @@ class QueryScheduler:
         """Reschedule a query for a pointer."""
         current = self._next_scheduled_for_alias.get(pointer.alias)
         refresh_time_millis = pointer.get_expiration_time(_EXPIRE_REFRESH_TIME_PERCENT)
+        expire_time_millis = pointer.get_expiration_time(100)
         if current is not None:
-            # If the expire time is within self._min_time_between_queries_millis
+            # If the refresh time is within self._min_time_between_queries_millis
             # of the current scheduled time avoid churn by not rescheduling
+            # unless the record would expire before the currently scheduled
+            # query is sent, in which case the query must be moved earlier
+            # so the record still gets a chance to be refreshed before it
+            # expires.
             if (
                 -self._min_time_between_queries_millis
                 <= refresh_time_millis - current.when_millis
                 <= self._min_time_between_queries_millis
+                and current.when_millis < expire_time_millis
             ):
                 return
             current.cancelled = True
             del self._next_scheduled_for_alias[pointer.alias]
-        expire_time_millis = pointer.get_expiration_time(100)
         self._schedule_ptr_refresh(pointer, expire_time_millis, refresh_time_millis)
+        next_run = self._next_run
+        if (
+            self._startup_queries_sent >= STARTUP_QUERIES
+            and next_run is not None
+            and not next_run.cancelled()
+            and next_run.when() > millis_to_seconds(refresh_time_millis)
+        ):
+            # If the scheduler would not wake up before the new refresh
+            # time, move the next run up so the query is sent while the
+            # record is still valid.
+            if TYPE_CHECKING:
+                assert self._loop is not None
+            next_run.cancel()
+            self._next_run = self._loop.call_at(
+                millis_to_seconds(refresh_time_millis), self._process_ready_types
+            )
 
     def schedule_rescue_query(
         self,
