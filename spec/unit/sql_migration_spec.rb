@@ -59,6 +59,168 @@ RSpec.describe ROM::SQL::Migration::SQLParser do
     end
   end
 
+  describe "string- and trigger-aware split=semicolon" do
+    it "keeps semicolons inside single-quoted strings from splitting" do
+      with_sql(<<~SQL) do |path|
+        -- @migrate up
+        -- @migrate begin split=semicolon
+        CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+        INSERT INTO notes (body) VALUES ('one;two;three');
+        -- @migrate end
+      SQL
+        migration = parser.call(path)
+
+        expect(migration.up.map(&:line)).to eq([3, 4])
+        migration.apply(db, :up)
+        expect(db[:notes].get(:body)).to eq("one;two;three")
+      end
+    end
+
+    it "treats a complete SQLite trigger (two internal inserts) as one statement" do
+      with_sql(<<~SQL) do |path|
+        -- @migrate up
+        -- @migrate begin split=semicolon
+        CREATE TRIGGER test_ledger AFTER INSERT ON jobs BEGIN
+          INSERT INTO audit(note) VALUES ('part;one');
+          INSERT INTO audit(note) VALUES ('part;two');
+        END;
+        -- @migrate end
+      SQL
+        migration = parser.call(path)
+        statements = migration.up
+
+        expect(statements.size).to eq(1)
+        expect(statements.first).to have_attributes(line: 3, column: 1)
+        expect(statements.first.sql).to eq(<<~SQL_CHOMP.chomp)
+          CREATE TRIGGER test_ledger AFTER INSERT ON jobs BEGIN
+            INSERT INTO audit(note) VALUES ('part;one');
+            INSERT INTO audit(note) VALUES ('part;two');
+          END
+        SQL_CHOMP
+      end
+    end
+
+    it "creates two audit rows per insert when the trigger is applied" do
+      db.create_table(:jobs) { primary_key :id; String :name }
+      db.create_table(:audit) { primary_key :id; String :note }
+
+      with_sql(<<~SQL) do |path|
+        -- @migrate up
+        -- @migrate begin split=semicolon
+        CREATE TRIGGER test_ledger AFTER INSERT ON jobs BEGIN
+          INSERT INTO audit(note) VALUES ('part;one');
+          INSERT INTO audit(note) VALUES ('part;two');
+        END;
+        -- @migrate end
+      SQL
+        parser.call(path).apply(db, :up)
+
+        db[:jobs].insert(name: "first")
+        db[:jobs].insert(name: "second")
+
+        expect(db[:audit].order(:id).select_map(:note)).to eq(
+          ["part;one", "part;two", "part;one", "part;two"]
+        )
+      end
+    end
+
+    it "rebuilds a table with its trigger and locates the bad trailing down fragment" do
+      db.create_table(:jobs) { primary_key :id; String :name }
+
+      source = <<~SQL
+        -- @migrate up
+        -- @migrate begin split=semicolon
+        DROP TRIGGER IF EXISTS test_ledger;
+        DROP TABLE IF EXISTS audit;
+        CREATE TABLE audit (id INTEGER PRIMARY KEY, note TEXT);
+        CREATE TRIGGER test_ledger AFTER INSERT ON jobs BEGIN
+          INSERT INTO audit(note) VALUES ('part;one');
+          INSERT INTO audit(note) VALUES ('part;two');
+        END;
+        -- @migrate end
+        -- @migrate down
+        -- @migrate begin split=semicolon
+        DROP TRIGGER IF EXISTS test_ledger;
+        DROP TABLE audit;
+            THIS IS A BAD FRAGMENT;
+        -- @migrate end
+      SQL
+
+      with_sql(source) do |path|
+        migration = parser.call(path)
+
+        # The trigger is one complete statement, not three fragments.
+        trigger = migration.up.find { |s| s.sql.start_with?("CREATE TRIGGER") }
+        expect(trigger.line).to eq(6)
+
+        migration.apply(db, :up)
+        db[:jobs].insert(name: "x")
+        expect(db[:audit].count).to eq(2)
+
+        bad_line = source.lines.index { |l| l.include?("THIS IS A BAD FRAGMENT") } + 1
+        bad_col = source.lines[bad_line - 1].index("THIS IS A BAD FRAGMENT") + 1
+
+        expect { migration.apply(db, :down) }.to raise_error(Sequel::DatabaseError) do |error|
+          expect(error.backtrace.first).to eq("#{path}:#{bad_line}:#{bad_col}:in 'down'")
+          expect(error.source_line).to eq(bad_line)
+          expect(error.source_column).to eq(bad_col)
+
+          # The reported coordinates point at the start of the bad fragment
+          # in the original file.
+          original = File.readlines(path)
+          expect(original[bad_line - 1][error.source_pos..]).to start_with("THIS IS A BAD FRAGMENT")
+        end
+      end
+    end
+
+    it "raises SQLParseError before applying when a string is left unterminated" do
+      with_sql(<<~SQL) do |path|
+        -- @migrate up
+        -- @migrate begin split=semicolon
+        INSERT INTO notes (body) VALUES ('oops;
+        -- @migrate end
+      SQL
+        expect { parser.call(path) }.to raise_error(ROM::SQL::SQLParseError) do |error|
+          expect(error.message).to match(/Unterminated quoted string/)
+          expect(error.message).to include("#{path}:3:1")
+          expect(error.source_location).to eq([path, 3, 1])
+        end
+      end
+    end
+
+    it "raises SQLParseError at the trigger start when END is missing" do
+      with_sql(<<~SQL) do |path|
+        -- @migrate up
+        -- @migrate begin split=semicolon
+        CREATE TRIGGER broken_trg AFTER INSERT ON jobs BEGIN
+          INSERT INTO audit(note) VALUES ('one');
+        -- @migrate end
+      SQL
+        expect { parser.call(path) }.to raise_error(ROM::SQL::SQLParseError) do |error|
+          expect(error.message).to match(/missing matching END/)
+          expect(error.message).to include("#{path}:3:1")
+          expect(error.line).to eq(3)
+          expect(error.column).to eq(1)
+        end
+      end
+    end
+
+    it "exposes a 1-based column and a 0-based pos on every statement" do
+      with_sql(<<~SQL) do |path|
+        -- @migrate up
+        -- @migrate begin split=semicolon
+        CREATE TABLE alpha (id INTEGER PRIMARY KEY);
+            CREATE TABLE beta (id INTEGER PRIMARY KEY);
+        -- @migrate end
+      SQL
+        first, second = parser.call(path).up
+
+        expect(first).to have_attributes(line: 3, column: 1, pos: 0)
+        expect(second).to have_attributes(line: 4, column: 5, pos: 4)
+      end
+    end
+  end
+
   describe "split=line" do
     it "emits each non-empty line as a separate statement" do
       with_sql(<<~SQL) do |path|
@@ -530,7 +692,8 @@ RSpec.describe ROM::SQL::Migration::SQLParser do
         -- @migrate end
       SQL
         expect { parser.call(path).apply(db, :up) }.to raise_error(Sequel::DatabaseError) do |error|
-          expect(error.backtrace.first).to eq("#{path}:4:in 'up'")
+          expect(error.backtrace.first).to eq("#{path}:4:1:in 'up'")
+          expect(error.source_location).to eq([path, 4, 1])
         end
       end
     end
@@ -544,7 +707,29 @@ RSpec.describe ROM::SQL::Migration::SQLParser do
         -- @migrate end
       SQL
         expect { parser.call(path).apply(db, :up) }.to raise_error(Sequel::DatabaseError) do |error|
-          expect(error.backtrace.first).to eq("#{path}:4:in 'up'")
+          expect(error.backtrace.first).to eq("#{path}:4:1:in 'up'")
+          expect(error.source_location).to eq([path, 4, 1])
+        end
+      end
+    end
+
+    it "points the column at the first non-whitespace character of an indented statement" do
+      source = "-- @migrate up\n" \
+               "-- @migrate begin split=semicolon\n" \
+               "CREATE TABLE good (id INTEGER PRIMARY KEY);\n" \
+               "    BROKEN STATEMENT HERE;\n" \
+               "-- @migrate end\n"
+
+      with_sql(source) do |path|
+        expect { parser.call(path).apply(db, :up) }.to raise_error(Sequel::DatabaseError) do |error|
+          # Four leading spaces => the statement starts at column 5.
+          expect(error.backtrace.first).to eq("#{path}:4:5:in 'up'")
+          expect(error.source_line).to eq(4)
+          expect(error.source_column).to eq(5)
+          expect(error.source_pos).to eq(4)
+
+          line = File.readlines(path)[3]
+          expect(line[error.source_pos..]).to start_with("BROKEN STATEMENT HERE")
         end
       end
     end
@@ -558,7 +743,7 @@ RSpec.describe ROM::SQL::Migration::SQLParser do
         -- @migrate end
       SQL
         expect { parser.call(path).apply(db, :up) }.to raise_error(Sequel::DatabaseError) do |error|
-          expect(error.backtrace.first).to eq("#{path}:3:in 'up'")
+          expect(error.backtrace.first).to eq("#{path}:3:1:in 'up'")
         end
       end
     end
@@ -579,7 +764,8 @@ RSpec.describe ROM::SQL::Migration::SQLParser do
         migration.apply(db, :up)
 
         expect { migration.apply(db, :down) }.to raise_error(Sequel::DatabaseError) do |error|
-          expect(error.backtrace.first).to eq("#{path}:8:in 'down'")
+          expect(error.backtrace.first).to eq("#{path}:8:1:in 'down'")
+          expect(error.source_location).to eq([path, 8, 1])
         end
       end
     end

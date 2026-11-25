@@ -58,10 +58,23 @@ module ROM
       #
       # Splitting caveats:
       #
-      # * `split=semicolon` splits on `;` followed by end of line. It does **not**
-      #   track string literals or `$$`-quoted bodies; semicolons inside those will
-      #   be mistaken for statement terminators. Use the default single-statement
-      #   mode for migrations containing such content.
+      # * `split=semicolon` splits on a top-level `;` followed by end of line.
+      #   The scanner tracks single-quoted strings (`'it''s'`), double-quoted
+      #   and backtick/bracket identifiers, `--` and `/* ... */` comments,
+      #   `$tag$ ... $tag$` bodies, and the `BEGIN ... END` body of a
+      #   `CREATE [TEMP] TRIGGER` (also PROCEDURE/FUNCTION) so semicolons
+      #   inside those constructs do not terminate the statement. A complete
+      #   trigger is therefore returned as one `Statement`. An unterminated
+      #   string/dollar quote or a routine body missing its matching `END`
+      #   raises `SQLParseError` at the start of that statement during
+      #   parsing, i.e. before the migration is applied.
+      # * Every `Statement` carries a 1-based `column` (the first
+      #   non-whitespace character of its first line; `pos` exposes the
+      #   matching 0-based offset). Execution errors are annotated with a
+      #   `file:line:column:in 'direction'` backtrace frame and expose the
+      #   same coordinates via `source_location`/`source_line`/
+      #   `source_column` so the location can be checked against the original
+      #   file.
       # * `split=line` emits each non-empty line as a separate statement. Plain
       #   SQL comment lines (`-- ...` without the `@migrate` sigil) are passed
       #   through verbatim and will each be sent to the database as their own
@@ -124,11 +137,6 @@ module ROM
       class SQLParser
         NEWLINE = "\n"
 
-        # Matches a trailing `;` (with optional trailing horizontal whitespace)
-        # at the end of a statement buffer. `split=semicolon` treats an
-        # end-of-line `;` as a statement terminator.
-        SEMICOLON = /;[ \t]*\z/
-
         # Each TOKENS row is `[type, regex]`. Every regex must include a
         # `(?<value>...)` named capture identifying the substring that becomes
         # the token's value and position. The tokenizer reads
@@ -172,6 +180,175 @@ module ROM
           def end = pos + length
           def type?(name) = type == name
           def line_pos = "#{line}:#{pos}"
+        end
+
+        # Character-level scanner for `split=semicolon` bodies. It keeps
+        # lexical state across physical lines so semicolons inside single
+        # quoted strings, quoted identifiers, comments, dollar-quoted bodies
+        # and `CREATE TRIGGER ... BEGIN ... END` blocks are not mistaken for
+        # top-level statement terminators.
+        #
+        # A semicolon terminates a statement only when it is lexically
+        # top-level, no routine block is open, and it is followed on its line
+        # by horizontal whitespace only (matching the historical
+        # "`;` at end of line" rule).
+        #
+        # @api private
+        class SemicolonScanner
+          WORD = /\A[A-Za-z_][A-Za-z0-9_]*/
+          DOLLAR_OPEN = /\A\$(?<tag>[A-Za-z_]\w*)?\$/
+
+          QUOTE_OPEN = {
+            "'" => :single,
+            '"' => :double,
+            "`" => :backtick,
+            "[" => :bracket
+          }.freeze
+
+          QUOTE_CLOSE = {
+            single: "'",
+            double: '"',
+            backtick: "`",
+            bracket: "]"
+          }.freeze
+
+          QUOTE_LABEL = {
+            single: "quoted string",
+            double: "quoted identifier",
+            backtick: "quoted identifier",
+            bracket: "bracketed identifier"
+          }.freeze
+
+          private_constant :WORD, :DOLLAR_OPEN, :QUOTE_OPEN, :QUOTE_CLOSE, :QUOTE_LABEL
+
+          def initialize
+            @quote = nil            # open quote kind (see QUOTE_CLOSE)
+            @comment_depth = 0      # open nested /* ... */ depth
+            @dollar_tag = nil       # open $tag$ ... $tag$ tag ("" for $$)
+            @create_seen = false    # current statement starts with CREATE
+            @routine = false        # current statement is CREATE ... TRIGGER/PROCEDURE/FUNCTION
+            @blocks = []            # open :begin / :case frames inside the routine
+          end
+
+          # Scan one physical `line` (without its newline). Returns the 0-based
+          # index of the terminating semicolon, or `nil` when the line does not
+          # end a statement.
+          #
+          # @api private
+          def scan(line)
+            i = 0
+
+            while i < line.length
+              if @quote
+                i = scan_quoted(line, i)
+              elsif @comment_depth.positive?
+                i = scan_block_comment(line, i)
+              elsif @dollar_tag
+                closer = "$#{@dollar_tag}$"
+
+                if line[i, closer.length] == closer
+                  @dollar_tag = nil
+                  i += closer.length
+                else
+                  i += 1
+                end
+              elsif line[i, 2] == "--"
+                # Rest of the line is a SQL line comment.
+                break
+              elsif line[i, 2] == "/*"
+                @comment_depth = 1
+                i += 2
+              elsif (quote = QUOTE_OPEN[line[i]])
+                @quote = quote
+                i += 1
+              elsif line[i] == "$" && (match = line[i..].match(DOLLAR_OPEN))
+                @dollar_tag = match[:tag] || ""
+                i += match.end(0)
+              elsif (word = line[i..].match(WORD))
+                process_word(word[0].upcase)
+                i += word[0].length
+              elsif line[i] == ";"
+                if @blocks.empty? && line[(i + 1)..] =~ /\A[ \t]*\z/
+                  return i
+                end
+
+                i += 1
+              else
+                i += 1
+              end
+            end
+
+            nil
+          end
+
+          # Clear per-statement state after a terminator. Lexical state is
+          # always closed at a top-level terminating semicolon.
+          #
+          # @api private
+          def reset_statement!
+            @create_seen = false
+            @routine = false
+            @blocks.clear
+          end
+
+          # Description of a construct left open at section end, or `nil`
+          # when the body is lexically complete.
+          #
+          # @api private
+          def unterminated
+            if @quote
+              QUOTE_LABEL[@quote]
+            elsif @dollar_tag
+              "dollar-quoted body"
+            elsif @routine && !@blocks.empty?
+              "trigger/procedure body (missing matching END)"
+            end
+          end
+
+          private
+
+          def scan_quoted(line, index)
+            close = QUOTE_CLOSE[@quote]
+
+            if line[index] == close
+              if line[index + 1] == close
+                # Doubled closing char is an escaped literal ('' / "" / `` / ]]).
+                index + 2
+              else
+                @quote = nil
+                index + 1
+              end
+            else
+              index + 1
+            end
+          end
+
+          def scan_block_comment(line, index)
+            if line[index, 2] == "/*"
+              @comment_depth += 1
+              index + 2
+            elsif line[index, 2] == "*/"
+              @comment_depth -= 1
+              index + 2
+            else
+              index + 1
+            end
+          end
+
+          def process_word(word)
+            case word
+            when "CREATE"
+              @create_seen = true
+            when "TRIGGER", "PROCEDURE", "FUNCTION"
+              @routine = true if @create_seen
+            when "BEGIN"
+              @blocks << :begin if @routine
+            when "CASE"
+              @blocks << :case if @routine
+            when "END"
+              @blocks.pop if @routine && !@blocks.empty?
+            end
+          end
         end
 
         # Translate a `.sql` migration file into an `SQLMigration`.
@@ -341,21 +518,108 @@ module ROM
 
           case settings.fetch(:split, :absent)
           when :absent
-            [Statement.new(sql: join(line_tokens), line: line_tokens.first.line)]
+            first = line_tokens.first
+            [Statement.new(
+              sql: join(line_tokens),
+              line: first.line,
+              column: start_column(first)
+            )]
           when "line"
             line_tokens
               .reject { |token| token.value.strip.empty? }
-              .map { |token| Statement.new(sql: token.value, line: token.line) }
-          when "semicolon"
-            line_tokens
-              .slice_after { |token| token.value.match?(SEMICOLON) }
-              .filter_map { |group|
-                sql = join(group).sub(SEMICOLON, "")
-                Statement.new(sql: sql, line: group.first.line) unless sql.strip.empty?
+              .map { |token|
+                Statement.new(
+                  sql: token.value,
+                  line: token.line,
+                  column: start_column(token)
+                )
               }
+          when "semicolon"
+            split_semicolon(line_tokens)
           else
             raise SQLParseError, %(Unknown split strategy #{settings[:split].inspect}: expected "semicolon" or "line" in #{@path})
           end
+        end
+
+        # Split a `split=semicolon` body into top-level statements.
+        #
+        # Unlike a plain `;`/EOL regex, the {SemicolonScanner} ignores
+        # semicolons that live inside quoted strings/identifiers, comments,
+        # dollar-quoted bodies, or the `BEGIN..END` body of a trigger (or
+        # other stored program), so a complete `CREATE TRIGGER` is returned
+        # as one statement. A construct left open when the section ends
+        # (unterminated string/dollar quote or a trigger body missing its
+        # `END`) raises `SQLParseError` at the start of that statement,
+        # before any migration is applied.
+        #
+        # @api private
+        def split_semicolon(line_tokens)
+          scanner = SemicolonScanner.new
+          statements = []
+          group = []
+
+          line_tokens.each do |token|
+            group << token
+
+            next unless (index = scanner.scan(token.value))
+
+            statements << build_statement(group, terminator_index: index)
+            group = []
+            scanner.reset_statement!
+          end
+
+          if group.any?
+            if (kind = scanner.unterminated)
+              first = group.first
+              column = start_column(first)
+
+              raise SQLParseError.new(
+                "Unterminated #{kind} starts at " \
+                "#{location(@path, first.line, column)} " \
+                "(end of section reached)",
+                file: @path, line: first.line, column: column
+              )
+            end
+
+            statements << build_statement(group, terminator_index: nil)
+          end
+
+          statements.reject { |statement| statement.sql.strip.empty? }
+        end
+
+        # Build a `Statement` from a group of line tokens, removing the
+        # terminating `;` (located at `terminator_index` on the group's last
+        # line) when present.
+        #
+        # @api private
+        def build_statement(group, terminator_index:)
+          first = group.first
+          column = start_column(first)
+
+          values = group.map(&:value)
+
+          if terminator_index
+            last = +values.last
+            last = (last[0...terminator_index] || "") +
+                   (last[(terminator_index + 1)..] || "")
+            last.sub!(/[ \t]+\z/, "")
+            values[-1] = last
+          end
+
+          Statement.new(
+            sql: values.join(NEWLINE),
+            line: first.line,
+            column: column
+          )
+        end
+
+        # 1-based column of the first non-whitespace character of a line
+        # token, falling back to the token's own position.
+        #
+        # @api private
+        def start_column(token)
+          offset = token.value.index(/\S/)
+          offset ? offset + 1 : token.pos + 1
         end
 
         # Join line tokens back into a single SQL string.

@@ -2,17 +2,38 @@
 
 require "dry/struct"
 
+require "rom/sql/errors"
 require "rom/sql/types"
 
 module ROM
   module SQL
     module Migration
       # A single executable statement extracted from a `.sql` migration
-      # section, paired with the source line where it begins. The line is
-      # used to annotate backtraces when execution fails.
+      # section, paired with the source position where it begins. `line` is
+      # a 1-based file line; `column` is the 1-based column of the first
+      # non-whitespace character of the statement; `pos` is the matching
+      # 0-based intra-line offset. The location is used to annotate
+      # backtraces when execution fails.
       #
       # @api private
-      Statement = Data.define(:sql, :line)
+      Statement = Data.define(:sql, :line, :column) do
+        # Accepts the historical `Statement.new(sql, line)` / keyword form as
+        # well as an explicit `column`. Column defaults to 1 (first column).
+        def initialize(*args, **kwargs)
+          if args.any?
+            sql, line, column = args
+            super(sql: sql, line: line, column: column || 1)
+          else
+            kwargs[:column] = 1 unless kwargs.key?(:column)
+            super(**kwargs)
+          end
+        end
+
+        # 0-based offset of the statement start on its source line.
+        #
+        # @api private
+        def pos = column - 1
+      end
 
       # A migration translated from a `.sql` file by `SQLParser`.
       #
@@ -88,7 +109,8 @@ module ROM
             name = Regexp.last_match[:name]
             ENV.fetch(name) do
               raise SQLEnvError,
-                    "Undefined environment variable ${#{name}} in #{filename}:#{statement.line}"
+                    "Undefined environment variable ${#{name}} in " \
+                    "#{filename}:#{statement.line}:#{statement.column}"
             end
           end
 
@@ -96,13 +118,24 @@ module ROM
         end
 
         # Prepend a synthetic frame pointing at the failing statement's source
-        # location, so the migration file appears at the top of the backtrace.
+        # location (`file:line:column:in 'direction'`), so the migration file
+        # appears at the top of the backtrace. The same coordinates are also
+        # exposed structurally on the error via `source_location`,
+        # `source_file`, `source_line`, `source_column` and `source_pos`.
         #
         # @api private
         def annotate(error, statement, direction)
-          frame = "#{filename}:#{statement.line}:in '#{direction}'"
+          frame = "#{filename}:#{statement.line}:#{statement.column}:in '#{direction}'"
           trace = error.backtrace || []
           error.set_backtrace([frame, *trace])
+
+          location = [filename, statement.line, statement.column].freeze
+          error.define_singleton_method(:source_location) { location }
+          error.define_singleton_method(:source_file) { filename }
+          error.define_singleton_method(:source_line) { statement.line }
+          error.define_singleton_method(:source_column) { statement.column }
+          error.define_singleton_method(:source_pos) { statement.pos }
+
           error
         end
       end
