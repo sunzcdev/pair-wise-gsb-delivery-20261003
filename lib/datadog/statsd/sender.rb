@@ -95,6 +95,12 @@ module Datadog
         end
       end
 
+      # Compatibility with {SingleThreadSender}; the background queue remains
+      # the ordering boundary for asynchronous sending.
+      def add_messages(messages)
+        Array(messages).each { |message| add(message) }
+      end
+
       def start
         raise ArgumentError, 'Sender already started' if message_queue
 

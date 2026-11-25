@@ -52,6 +52,19 @@ module Datadog
     # minimum flush interval for the telemetry in seconds
     DEFAULT_TELEMETRY_FLUSH_INTERVAL = 10
 
+    BATCH_DEPTH_KEY = :datadog_statsd_batch_depth
+    ISOLATED_BATCH_OPTIONS = %i[
+      isolated
+      isolation
+      transaction
+      transactional
+      savepoint
+      rollback
+      rollback_on_error
+      discard_on_error
+      atomic
+    ].freeze
+
     COUNTER_TYPE = 'c'
     GAUGE_TYPE = 'g'
     HISTOGRAM_TYPE = 'h'
@@ -400,17 +413,57 @@ module Datadog
     # It also means that an automatic flush could occur if the buffer is filled
     # during the execution of the batch block.
     #
+    # Nested batches act as isolated, thread-local scopes. If a nested batch
+    # raises, metrics created in that nested scope are discarded. Metrics from
+    # an outer batch are retained and can still be flushed after the caller
+    # rescues the error. Successful nested scopes are published to their
+    # parent before the normal synchronous flush.
+    #
     # This method is DEPRECATED and will be removed in future v6.x API.
+    #
+    # @option options [Boolean] :isolated force an isolated scope even for a
+    #   top-level batch (also available as +transactional+, +rollback_on_error+,
+    #   or +discard_on_error+)
     #
     # @example Send several metrics in one packet:
     #   $statsd.batch do |s|
     #      s.gauge('users.online',156)
     #      s.increment('page.views')
     #    end
-    def batch
-      yield self
-      flush(sync: true)
+    def batch(*args, **options, &block)
+      options = args.shift if args.first.is_a?(Hash) && options.empty?
+      forced_mode = args.first unless args.first.is_a?(Hash)
+
+      parent_batch_depth = Thread.current[BATCH_DEPTH_KEY].to_i
+      isolated = isolated_batch?(options, forced_mode, parent_batch_depth)
+
+      Thread.current[BATCH_DEPTH_KEY] = parent_batch_depth + 1
+
+      begin
+        if isolated
+          forwarder.isolated_scope { yield(self) }
+        else
+          yield(self)
+        end
+
+        flush(sync: true)
+      ensure
+        Thread.current[BATCH_DEPTH_KEY] = parent_batch_depth.zero? ? nil : parent_batch_depth
+      end
     end
+
+    # An explicitly isolated/transactional batch. Metrics are only published if
+    # the block completes successfully. The block's value is returned.
+    def transaction(**options, &block)
+      options[:isolated] = true
+      result = nil
+      batch(**options) do |statsd|
+        result = block.call(statsd)
+      end
+      result
+    end
+    alias isolate transaction
+    alias isolated_batch transaction
 
     # Close the underlying socket
     #
@@ -454,6 +507,29 @@ module Datadog
     attr_reader :forwarder
 
     EMPTY_OPTIONS = {}.freeze
+
+    def isolated_batch?(options, forced_mode, parent_batch_depth)
+      if ISOLATED_BATCH_OPTIONS.any? { |key| options.key?(key) }
+        return ISOLATED_BATCH_OPTIONS.any? do |key|
+          scope_mode_enabled?(options[key])
+        end
+      end
+
+      return scope_mode_enabled?(forced_mode) unless forced_mode.nil?
+
+      parent_batch_depth > 0
+    end
+
+    def scope_mode_enabled?(value)
+      case value
+      when nil, false, :shared, :none, :off
+        false
+      when String
+        !%w[shared none off false].include?(value)
+      else
+        true
+      end
+    end
 
     def now
       Process.clock_gettime(Process::CLOCK_MONOTONIC)

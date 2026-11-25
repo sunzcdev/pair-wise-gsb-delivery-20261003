@@ -24,19 +24,27 @@ module Datadog
 
       def add(message)
         @mx.synchronize {
-          # we have just forked, meaning we have messages in the buffer that we should
-          # not send, they belong to the parent process, let's clear the buffer.
-          if forked?
-            @message_buffer.reset
-            @message_queue.clear
-            @flush_timer.start if @flush_timer && @flush_timer.stop?
-            update_fork_pid
-          end
+          reset_after_fork_if_needed
 
           @message_queue << message
           if @message_queue.size >= @message_queue_size
             drain_message_queue
           end
+        }
+      end
+
+      # Adds several already-packed payloads while holding the same lock. This
+      # keeps a successfully committed isolated scope together relative to
+      # other threads using this sender.
+      def add_messages(messages)
+        messages = Array(messages)
+        return if messages.empty?
+
+        @mx.synchronize {
+          reset_after_fork_if_needed
+
+          @message_queue.concat(messages)
+          drain_message_queue if @message_queue.size >= @message_queue_size
         }
       end
 
@@ -65,6 +73,17 @@ module Datadog
         while msg = @message_queue.shift
           @message_buffer.add(msg)
         end
+      end
+
+      def reset_after_fork_if_needed
+        return unless forked?
+
+        # we have just forked, meaning we have messages in the buffer that we should
+        # not send, they belong to the parent process, let's clear the buffer.
+        @message_buffer.reset
+        @message_queue.clear
+        @flush_timer.start if @flush_timer && @flush_timer.stop?
+        update_fork_pid
       end
 
       # below are "fork management" methods to be able to clean the MessageBuffer

@@ -5,6 +5,27 @@ module Datadog
     class MessageBuffer
       PAYLOAD_SIZE_TOLERANCE = 0.05
 
+      # Collects packed payloads in memory instead of writing them to a real
+      # StatsD connection. This is used by isolated/nested batches so that
+      # messages can be discarded if their scope fails.
+      class CaptureConnection
+        attr_reader :packets
+
+        def initialize
+          @packets = []
+        end
+
+        def write(packet)
+          # The owning MessageBuffer mutates and clears the string it passes to
+          # write, so capture an independent copy.
+          @packets << packet.dup
+        end
+
+        def reset_telemetry
+          # no telemetry is owned by the capture connection
+        end
+      end
+
       def initialize(connection,
         max_payload_size: nil,
         max_pool_size: DEFAULT_BUFFER_POOL_SIZE,
@@ -61,6 +82,14 @@ module Datadog
 
         connection.write(buffer)
         clear_buffer
+      end
+
+      # Flushes the current packet into the capture connection and returns all
+      # captured packets. Only meaningful for buffers initialized with
+      # {CaptureConnection}.
+      def captured_packets
+        flush
+        connection.packets.dup
       end
 
       private
