@@ -54,6 +54,10 @@ from .sql.schema import (
 from .sql.schema import ColumnCollectionMixin as ColumnCollectionMixin
 from .sql.schema import ColumnDefault as ColumnDefault
 from .sql.schema import Computed as Computed
+from .sql.schema import ComputedReconstruction as ComputedReconstruction
+from .sql.schema import (
+    ComputedReconstructionState as ComputedReconstructionState,
+)
 from .sql.schema import Constraint as Constraint
 from .sql.schema import DefaultClause as DefaultClause
 from .sql.schema import DefaultGenerator as DefaultGenerator
@@ -72,4 +76,9 @@ from .sql.schema import SchemaItem as SchemaItem
 from .sql.schema import SchemaVisitable as SchemaVisitable
 from .sql.schema import Sequence as Sequence
 from .sql.schema import Table as Table
+from .sql.schema import TableReconstruction as TableReconstruction
+from .sql.schema import (
+    parse_computed_column_references as parse_computed_column_references,
+)
+from .sql.schema import ReconstructionState as ReconstructionState
 from .sql.schema import UniqueConstraint as UniqueConstraint

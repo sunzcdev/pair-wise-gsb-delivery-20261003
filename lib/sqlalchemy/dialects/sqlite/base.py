@@ -1822,7 +1822,10 @@ class SQLiteDDLCompiler(compiler.DDLCompiler):
                 colspec += " AUTOINCREMENT"
 
         if column.computed is not None:
-            colspec += " " + self.process(column.computed)
+            computed_kw = {}
+            if kwargs.get("render_incomplete_computed", False):
+                computed_kw["render_incomplete_computed"] = True
+            colspec += " " + self.process(column.computed, **computed_kw)
 
         return colspec
 
@@ -2187,6 +2190,161 @@ TABLE_OPTIONS_PATTERN = re.compile(
 )
 
 
+def _split_create_table_body(tablesql):
+    """Split a CREATE TABLE body into top-level comma separated parts.
+
+    Parenthesized expressions (including commas inside function calls)
+    and quoted identifiers / string literals are respected.
+
+    """
+
+    parts = []
+    buf = []
+    depth = 0
+    i = 0
+    n = len(tablesql)
+
+    while i < n:
+        ch = tablesql[i]
+
+        if ch in ("'", '"', "`"):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            while i < n:
+                c = tablesql[i]
+                buf.append(c)
+                i += 1
+                if c == quote:
+                    if i < n and tablesql[i] == quote:
+                        buf.append(tablesql[i])
+                        i += 1
+                        continue
+                    break
+            continue
+
+        if ch == "[":
+            buf.append(ch)
+            i += 1
+            while i < n:
+                c = tablesql[i]
+                buf.append(c)
+                i += 1
+                if c == "]":
+                    break
+            continue
+
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+
+        if ch == "," and depth == 0:
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _create_table_part_column_name(part):
+    """Return the column name defined by a column-definition part."""
+
+    for kind, value in schema._tokenize_computed_expression(part):
+        if kind == "name":
+            return value
+    return None
+
+
+def _match_column_definition_part(tablesql, name):
+    """Find the top-level CREATE TABLE part defining ``name``."""
+
+    target = name.lower()
+    for part in _split_create_table_body(tablesql):
+        part_name = _create_table_part_column_name(part)
+        if part_name is not None and (
+            part_name == name or part_name.lower() == target
+        ):
+            return part
+    return None
+
+
+def _extract_balanced_parenthesized(text, open_index):
+    """Return the interior of the balanced parentheses at ``open_index``."""
+
+    depth = 0
+    i = open_index
+    n = len(text)
+    while i < n:
+        ch = text[i]
+
+        if ch in ("'", '"', "`"):
+            quote = ch
+            i += 1
+            while i < n:
+                if text[i] == quote:
+                    if i + 1 < n and text[i + 1] == quote:
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+
+        if ch == "[":
+            j = text.find("]", i + 1)
+            i = n if j == -1 else j + 1
+            continue
+
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1 : i]
+        i += 1
+    return None
+
+
+def _extract_generated_sqltext(tablesql, name):
+    """Extract the verbatim AS (...) expression for a generated column.
+
+    Supports both the canonical ``GENERATED ALWAYS AS`` form and SQLite's
+    shorthand ``AS`` form.  Returns an empty string when the expression
+    cannot be located.
+
+    """
+
+    part = _match_column_definition_part(tablesql, name)
+    if part is not None:
+        match = re.search(r"\bAS\b\s*\(", part, re.IGNORECASE)
+        if match:
+            open_index = match.end() - 1
+            interior = _extract_balanced_parenthesized(part, open_index)
+            if interior is not None:
+                return interior
+
+    # fallback to the historical name-anchored greedy regular expression
+    pattern = (
+        r"[^,]*\s+GENERATED\s+ALWAYS\s+AS"
+        r"\s+\((.*)\)\s*(?:virtual|stored)?"
+    )
+    match = re.search(re.escape(name) + pattern, tablesql, re.IGNORECASE)
+    if match:
+        return match.group(1)
+
+    return ""
+
+
 class SQLiteDialect(default.DefaultDialect):
     name = "sqlite"
     supports_alter = False
@@ -2516,6 +2674,8 @@ class SQLiteDialect(default.DefaultDialect):
         )
         columns = []
         tablesql = None
+        info = list(info)
+        table_column_names = [row[1] for row in info]
         for row in info:
             name = row[1]
             type_ = row[2].upper()
@@ -2559,6 +2719,7 @@ class SQLiteDialect(default.DefaultDialect):
                     generated,
                     persisted,
                     tablesql,
+                    table_column_names,
                 )
             )
         if columns:
@@ -2580,6 +2741,7 @@ class SQLiteDialect(default.DefaultDialect):
         generated,
         persisted,
         tablesql,
+        table_column_names=None,
     ):
         if generated:
             # the type of a column "cc INTEGER GENERATED ALWAYS AS (1 + 42)"
@@ -2602,16 +2764,22 @@ class SQLiteDialect(default.DefaultDialect):
         if generated:
             sqltext = ""
             if tablesql:
-                pattern = (
-                    r"[^,]*\s+GENERATED\s+ALWAYS\s+AS"
-                    r"\s+\((.*)\)\s*(?:virtual|stored)?"
+                sqltext = _extract_generated_sqltext(tablesql, name)
+
+            column_references = (
+                schema.parse_computed_column_references(
+                    sqltext,
+                    table_column_names
+                    if table_column_names is not None
+                    else [name],
                 )
-                match = re.search(
-                    re.escape(name) + pattern, tablesql, re.IGNORECASE
-                )
-                if match:
-                    sqltext = match.group(1)
-            colspec["computed"] = {"sqltext": sqltext, "persisted": persisted}
+            )
+
+            colspec["computed"] = {
+                "sqltext": sqltext,
+                "persisted": persisted,
+                "column_references": column_references,
+            }
         return colspec
 
     def _resolve_type_affinity(self, type_):

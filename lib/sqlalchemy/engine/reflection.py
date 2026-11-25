@@ -1659,6 +1659,114 @@ class Inspector(inspection.Inspectable["Inspector"]):
             reflection_options,
         )
 
+        self._apply_computed_reconstruction(
+            _reflect_info,
+            table_key,
+            table,
+        )
+
+    def _apply_computed_reconstruction(
+        self,
+        _reflect_info: _ReflectionInfo,
+        table_key: TableKey,
+        table: sa_schema.Table,
+    ) -> None:
+        """Attach inspectable reconstruction state to reflected computed
+        columns and to the current column projection.
+
+        The full set of reflected columns (including columns excluded from
+        the current projection) is used to derive transitive dependencies
+        through other generated columns; excluded columns are never added
+        back to ``table.columns``.
+
+        """
+
+        all_col_ds = _reflect_info.columns.get(table_key)
+        if not all_col_ds:
+            return
+
+        all_column_names = [col_d["name"] for col_d in all_col_ds]
+
+        expressions: Dict[str, str] = {}
+        references: Dict[str, List[str]] = {}
+        for col_d in all_col_ds:
+            computed_d = col_d.get("computed")
+            if not computed_d:
+                continue
+            name = col_d["name"]
+            sqltext = computed_d.get("sqltext") or ""
+            expressions[name] = sqltext
+
+            col_refs = computed_d.get("column_references")
+            if col_refs is None:
+                col_refs = (
+                    sa_schema.parse_computed_column_references(
+                        sqltext, all_column_names
+                    )
+                )
+            references[name] = list(col_refs)
+
+        projected_columns = {col.name for col in table.columns}
+
+        column_states: Dict[str, sa_schema.ComputedReconstruction] = {}
+        for column in table.columns:
+            computed = column.computed
+            if computed is None:
+                continue
+
+            # prefer the (possibly event-adjusted) expression actually
+            # attached to the reflected Column
+            expression: Optional[str]
+            sqltext_obj = computed.sqltext
+            if isinstance(sqltext_obj, TextClause):
+                expression = sqltext_obj.text
+            elif sqltext_obj is not None:
+                expression = str(sqltext_obj)
+            else:
+                expression = expressions.get(column.name)
+
+            if expression and column.name not in references:
+                references[column.name] = (
+                    sa_schema.parse_computed_column_references(
+                        expression, all_column_names
+                    )
+                )
+
+            state = sa_schema._build_computed_reconstruction(
+                column.name,
+                expression=expression,
+                projected_columns=projected_columns,
+                references_by_column=references,
+            )
+            computed.reconstruction = state
+            column.reconstruction = state
+            column_states[column.name] = state
+
+        if not column_states:
+            table.reconstruction = None
+            return
+
+        def _union(attr: str) -> List[str]:
+            result: List[str] = []
+            for state in column_states.values():
+                for name in getattr(state, attr):
+                    if name not in result:
+                        result.append(name)
+            return result
+
+        table.reconstruction = sa_schema.TableReconstruction(
+            table,
+            column_states,
+            direct_missing_columns=_union("direct_missing_columns"),
+            transitive_missing_columns=_union(
+                "transitive_missing_columns"
+            ),
+            underlying_missing_columns=_union(
+                "underlying_missing_columns"
+            ),
+            missing_columns=_union("missing_columns"),
+        )
+
     def _reflect_column(
         self,
         table: sa_schema.Table,
@@ -1716,7 +1824,11 @@ class Inspector(inspection.Inspectable["Inspector"]):
             colargs.append(default)
 
         if "computed" in col_d:
-            computed = sa_schema.Computed(**col_d["computed"])
+            computed_d = col_d["computed"]
+            computed = sa_schema.Computed(
+                computed_d["sqltext"],
+                persisted=computed_d.get("persisted"),
+            )
             colargs.append(computed)
 
         if "identity" in col_d:

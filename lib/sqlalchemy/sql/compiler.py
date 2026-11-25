@@ -7290,8 +7290,13 @@ class DDLCompiler(Compiled):
         for create_column in create.columns:
             column = create_column.element
             try:
+                column_kw = dict(kw)
+                column_kw["first_pk"] = (
+                    column.primary_key and not first_pk
+                )
                 processed = self.process(
-                    create_column, first_pk=column.primary_key and not first_pk
+                    create_column,
+                    **column_kw,
                 )
                 if processed is not None:
                     text += separator
@@ -7373,7 +7378,9 @@ class DDLCompiler(Compiled):
         if column.system:
             return None
 
-        text = self.get_column_specification(column, first_pk=first_pk)
+        text = self.get_column_specification(
+            column, first_pk=first_pk, **kw
+        )
         const = " ".join(
             self.process(constraint) for constraint in column.constraints
         )
@@ -7617,7 +7624,10 @@ class DDLCompiler(Compiled):
             colspec += " DEFAULT " + default
 
         if column.computed is not None:
-            colspec += " " + self.process(column.computed)
+            computed_kw = {}
+            if kwargs.get("render_incomplete_computed", False):
+                computed_kw["render_incomplete_computed"] = True
+            colspec += " " + self.process(column.computed, **computed_kw)
 
         if (
             column.identity is not None
@@ -7814,6 +7824,20 @@ class DDLCompiler(Compiled):
         return text
 
     def visit_computed_column(self, generated, **kw):
+        reconstruction = getattr(generated, "reconstruction", None)
+        if (
+            reconstruction is not None
+            and reconstruction.state
+            == schema.ReconstructionState.MISSING_COLUMNS
+            and not kw.get("render_incomplete_computed", False)
+        ):
+            raise exc.CompileError(
+                reconstruction.diagnostic_message()
+                + ". Re-reflect with all required columns or pass "
+                "compile_kwargs={'render_incomplete_computed': True} "
+                "to render the preserved expression anyway."
+            )
+
         text = "GENERATED ALWAYS AS (%s)" % self.sql_compiler.process(
             generated.sqltext, include_table=False, literal_binds=True
         )

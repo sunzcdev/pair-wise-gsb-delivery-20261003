@@ -2,6 +2,7 @@
 
 from sqlalchemy import CheckConstraint
 from sqlalchemy import Column
+from sqlalchemy import create_engine
 from sqlalchemy import DDL
 from sqlalchemy import event
 from sqlalchemy import exc
@@ -11,15 +12,19 @@ from sqlalchemy import MetaData
 from sqlalchemy import PrimaryKeyConstraint
 from sqlalchemy import Table
 from sqlalchemy import testing
+from sqlalchemy import text
 from sqlalchemy import types as sqltypes
 from sqlalchemy import UniqueConstraint
 from sqlalchemy.dialects.sqlite import base as sqlite
+from sqlalchemy.schema import CreateTable
+from sqlalchemy.schema import parse_computed_column_references
 from sqlalchemy.sql.elements import quoted_name
 from sqlalchemy.testing import assert_raises_message
 from sqlalchemy.testing import eq_
 from sqlalchemy.testing import expect_raises
 from sqlalchemy.testing import fixtures
 from sqlalchemy.testing import is_
+from sqlalchemy.testing import is_false
 from sqlalchemy.testing import is_true
 from sqlalchemy.testing import mock
 from sqlalchemy.types import Integer
@@ -1709,6 +1714,199 @@ class ComputedReflectionTest(fixtures.TestBase):
                 is_true(bool(col.computed))
                 eq_(col.computed.sqltext.text, info["text"], msg)
                 eq_(col.computed.persisted, info["stored"], msg)
+
+
+class ComputedProjectionReconstructionTest(fixtures.TestBase):
+    """Reflection reconstruction state for partial column projections."""
+
+    __only_on__ = "sqlite"
+    __backend__ = True
+
+    scenario_ddl = """
+        CREATE TABLE computed (
+            "input value" INTEGER,
+            a TEXT AS ("input value" || 'input value'),
+            b TEXT AS (a || 'B')
+        )
+    """
+
+    def _make_table(self, connection):
+        connection.exec_driver_sql("DROP TABLE IF EXISTS computed")
+        connection.exec_driver_sql(self.scenario_ddl)
+
+    def test_inspector_column_references(self, connection):
+        self._make_table(connection)
+        insp = inspect(connection)
+        cols = {c["name"]: c for c in insp.get_columns("computed")}
+
+        eq_(
+            cols["a"]["computed"]["sqltext"],
+            '"input value" || \'input value\'',
+        )
+        eq_(cols["a"]["computed"]["column_references"], ["input value"])
+        eq_(cols["b"]["computed"]["sqltext"], "a || 'B'")
+        eq_(cols["b"]["computed"]["column_references"], ["a"])
+
+    def test_full_reflection_is_reconstructable(self, connection):
+        self._make_table(connection)
+        table = Table("computed", MetaData(), autoload_with=connection)
+
+        eq_(list(table.c.keys()), ["input value", "a", "b"])
+        is_true(table.reconstruction is not None)
+        is_true(table.reconstruction.reconstructable)
+        eq_(table.reconstruction.missing_columns, [])
+
+        # the reflected DDL compiles and can be sent to a fresh SQLite DB
+        ddl = str(CreateTable(table))
+        is_true('"input value" ||' in ddl)
+        is_true("a || 'B'" in ddl)
+
+        engine = create_engine("sqlite://")
+        try:
+            table.metadata.create_all(engine)
+            with engine.begin() as conn:
+                conn.execute(
+                    text('INSERT INTO computed ("input value") VALUES (41)')
+                )
+                row = conn.execute(
+                    text('SELECT a, b FROM computed')
+                ).first()
+            eq_(row[0], "41input value")
+            eq_(row[1], "41input valueB")
+        finally:
+            engine.dispose()
+
+    def test_two_generated_columns_projection(self, connection):
+        self._make_table(connection)
+        table = Table(
+            "computed",
+            MetaData(),
+            autoload_with=connection,
+            include_columns=["a", "b"],
+        )
+
+        # requested projection is not augmented with dependencies
+        eq_(list(table.c.keys()), ["a", "b"])
+
+        recon = table.reconstruction
+        is_true(recon is not None)
+        is_false(recon.reconstructable)
+        eq_(recon.missing_columns, ["input value"])
+        eq_(recon.direct_missing_columns, ["input value"])
+
+        a_state = table.c.a.computed.reconstruction
+        eq_(a_state.expression, '"input value" || \'input value\'')
+        eq_(a_state.direct_missing_columns, ["input value"])
+        eq_(a_state.underlying_missing_columns, [])
+
+        b_state = table.c.b.computed.reconstruction
+        eq_(b_state.expression, "a || 'B'")
+        eq_(b_state.direct_missing_columns, [])
+        eq_(b_state.underlying_missing_columns, ["input value"])
+
+        # DDL generation refuses the unusable statement
+        with expect_raises(exc.CompileError, "input value"):
+            str(CreateTable(table))
+
+        # explicit escape hatch renders the preserved expressions
+        ddl = str(
+            CreateTable(table).compile(
+                dialect=connection.dialect,
+                compile_kwargs={"render_incomplete_computed": True},
+            )
+        )
+        is_true('"input value" ||' in ddl)
+        is_true("a || 'B'" in ddl)
+
+    def test_single_second_generated_column_projection(self, connection):
+        self._make_table(connection)
+        table = Table(
+            "computed",
+            MetaData(),
+            autoload_with=connection,
+            include_columns=["b"],
+        )
+
+        eq_(list(table.c.keys()), ["b"])
+
+        state = table.c.b.computed.reconstruction
+        is_false(state.reconstructable)
+
+        # 'a' is directly missing ...
+        eq_(state.direct_missing_columns, ["a"])
+        eq_(table.reconstruction.direct_missing_columns, ["a"])
+
+        # ... while 'input value' is derived through 'a'
+        eq_(state.transitive_missing_columns, ["input value"])
+        eq_(state.underlying_missing_columns, ["input value"])
+        eq_(table.reconstruction.underlying_missing_columns, ["input value"])
+        eq_(state.dependency_paths["input value"],
+            ["b", "a", "input value"])
+
+        # the full missing closure contains both levels
+        eq_(state.missing_columns, ["a", "input value"])
+
+        with expect_raises(exc.CompileError):
+            CreateTable(table).compile(dialect=connection.dialect)
+
+    def test_create_does_not_send_unusable_statement(self, connection):
+        self._make_table(connection)
+        table = Table(
+            "computed",
+            MetaData(),
+            autoload_with=connection,
+            include_columns=["b"],
+        )
+
+        sent = []
+
+        def record(conn, cursor, statement, *args):
+            sent.append(statement)
+
+        event.listen(connection, "before_cursor_execute", record)
+        try:
+            with expect_raises(exc.InvalidRequestError, "'a'"):
+                table.create(connection)
+        finally:
+            event.remove(connection, "before_cursor_execute", record)
+
+        is_false(
+            any(s.lstrip().upper().startswith("CREATE") for s in sent)
+        )
+
+        # direct execution of the DDL construct is blocked as well
+        with expect_raises(exc.InvalidRequestError):
+            connection.execute(CreateTable(table))
+
+    def test_raise_if_incomplete(self, connection):
+        self._make_table(connection)
+        table = Table(
+            "computed",
+            MetaData(),
+            autoload_with=connection,
+            include_columns=["b"],
+        )
+        with expect_raises(exc.InvalidRequestError, "'a'"):
+            table.reconstruction.raise_if_incomplete()
+        with expect_raises(exc.InvalidRequestError, "input value"):
+            table.c.b.computed.reconstruction.raise_if_incomplete()
+
+    @testing.combinations(
+        ('"input value" || \'input value\'', ["input value"]),
+        ("length(length) + x", ["length", "x"]),
+        ("count(*) + count(x)", ["x"]),
+        ('"input value" + [input value] + `input value`', ["input value"]),
+        ("x /* input value */ + -- input value\n 1", ["x"]),
+        ("main.t.col + t.x", ["col", "x"]),
+        ("1 + 2.5 || 'input value'", []),
+        argnames="expression,expected",
+    )
+    def test_reference_analyzer(self, expression, expected):
+        names = ["input value", "length", "count", "x", "t", "col"]
+        eq_(
+            parse_computed_column_references(expression, names),
+            expected,
+        )
 
 
 class TableOptionsReflectionTest(fixtures.TestBase):

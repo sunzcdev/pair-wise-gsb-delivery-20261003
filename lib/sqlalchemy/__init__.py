@@ -61,6 +61,7 @@ from .schema import CheckFirst as CheckFirst
 from .schema import Column as Column
 from .schema import ColumnDefault as ColumnDefault
 from .schema import Computed as Computed
+from .schema import ComputedReconstruction as ComputedReconstruction
 from .schema import Constraint as Constraint
 from .schema import CreateTable as CreateTable
 from .schema import CreateTableAs as CreateTableAs
@@ -80,9 +81,12 @@ from .schema import Index as Index
 from .schema import insert_sentinel as insert_sentinel
 from .schema import MetaData as MetaData
 from .schema import Named as Named
+from .schema import parse_computed_column_references
 from .schema import PrimaryKeyConstraint as PrimaryKeyConstraint
+from .schema import ReconstructionState as ReconstructionState
 from .schema import Sequence as Sequence
 from .schema import Table as Table
+from .schema import TableReconstruction as TableReconstruction
 from .schema import TypedColumns as TypedColumns
 from .schema import UniqueConstraint as UniqueConstraint
 from .sql import ColumnExpressionArgument as ColumnExpressionArgument

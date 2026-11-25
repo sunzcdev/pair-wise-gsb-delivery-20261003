@@ -1574,6 +1574,14 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
     ) -> CursorResult[Unpack[TupleAny]]:
         """Execute a schema.DDL object."""
 
+        # refuse to send DDL for a reflected projection whose computed
+        # columns cannot be reconstructed from the columns present
+        _reconstruction = getattr(
+            getattr(ddl, "element", None), "reconstruction", None
+        )
+        if _reconstruction is not None:
+            _reconstruction.raise_if_incomplete()
+
         exec_opts = ddl._execution_options.merge_with(
             self._execution_options, execution_options
         )

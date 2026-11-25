@@ -1,0 +1,20 @@
+.. change::
+    :tags: usecase, reflection, sqlite
+    :tickets: 1058
+
+    When reflecting a SQLite table using a partial column projection such as
+    :paramref:`_schema.Table.include_columns`, reflected computed columns now
+    carry a :class:`.ComputedReconstruction` state available as
+    ``column.computed.reconstruction`` / ``column.reconstruction`` and
+    aggregated for the current projection at
+    ``table.reconstruction``.  The state preserves the original expression
+    text and distinguishes columns directly missing from the projection from
+    underlying base columns derived transitively through another missing
+    generated column, without adding excluded columns back to the reflected
+    :class:`_schema.Table`.  DDL generation/emission for a projection that
+    cannot be reconstructed raises a clear error before an unusable CREATE
+    statement is sent; the preserved expression may still be rendered using
+    ``compile_kwargs={"render_incomplete_computed": True}``.  Expression
+    extraction now also supports the SQLite shorthand ``AS (...)`` form and
+    identifies references with a tokenizer that ignores string literals,
+    comments and function names.

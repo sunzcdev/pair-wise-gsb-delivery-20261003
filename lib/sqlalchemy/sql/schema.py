@@ -430,6 +430,16 @@ class Table(
 
     _sentinel_column: Optional[Column[Any]]
 
+    reconstruction: Optional[TableReconstruction] = None
+    """Reconstruction state for reflected computed columns in the current
+    column projection.
+
+    Populated by table reflection; ``None`` for tables that were not
+    reflected or have no computed columns.  See
+    :class:`.TableReconstruction`.
+
+    """
+
     constraints: Set[Constraint]
     """A collection of all :class:`_schema.Constraint` objects associated with
       this :class:`_schema.Table`.
@@ -1554,6 +1564,11 @@ class Table(
 
         """
 
+        if self.reconstruction is not None:
+            # fail before any checkfirst / CREATE statement is sent when
+            # a reflected projection cannot reconstruct its computed cols
+            self.reconstruction.raise_if_incomplete()
+
         # the default is to only check for schema objects
         bind._run_ddl_visitor(ddl.SchemaGenerator, self, checkfirst=checkfirst)
 
@@ -2500,6 +2515,13 @@ class Column(DialectKWArgs, SchemaItem, ColumnClause[_T], Named[_T]):
     """
 
     computed: Optional[Computed]
+
+    reconstruction: Optional[ComputedReconstruction] = None
+    """Reconstruction state for a reflected computed column, if any.
+
+    This is the same object as :attr:`Computed.reconstruction`.
+
+    """
 
     identity: Optional[Identity]
 
@@ -6860,6 +6882,589 @@ class MetaData(HasSchemaAttr):
         self._objects.add(obj)
 
 
+# ---------------------------------------------------------------------------
+# Reflection reconstruction state for computed / generated columns
+# ---------------------------------------------------------------------------
+
+
+class ReconstructionState:
+    """Status values describing how a reflected computed column fits the
+    current column projection.
+
+    .. versionadded:: 2.1.11
+
+    """
+
+    RECONSTRUCTABLE = "reconstructable"
+    """The expression text is available and every column it needs is
+    present in the current projection."""
+
+    MISSING_COLUMNS = "missing_columns"
+    """The expression references columns that are absent from the current
+    projection; DDL for the projection cannot be reconstructed."""
+
+    UNKNOWN = "unknown"
+    """The expression text or its dependencies could not be analyzed.
+
+    The original expression may still be rendered verbatim, but
+    reconstructability cannot be confirmed.
+    """
+
+    # legacy / descriptive aliases
+    COMPLETE = RECONSTRUCTABLE
+    INCOMPLETE = MISSING_COLUMNS
+
+
+# descriptive alias
+ComputedReconstructionState = ReconstructionState
+
+
+def _tokenize_computed_expression(expression: str) -> List[Tuple[str, str]]:
+    """Tokenize a SQL computed expression enough to locate identifiers.
+
+    The scanner understands single quoted string literals (whose contents
+    must never be treated as references), quoted identifiers using
+    ``"``, ````` or ``[]``, comments, numbers and bare identifiers.
+
+    Returns a list of ``(kind, value)`` tuples where kind is ``"name"``
+    or ``"op"``.  String literals and comments are consumed without
+    emitting their contents.
+
+    """
+
+    tokens: List[Tuple[str, str]] = []
+    if not expression:
+        return tokens
+
+    i = 0
+    n = len(expression)
+
+    while i < n:
+        ch = expression[i]
+
+        if ch.isspace():
+            i += 1
+            continue
+
+        # -- line comment ------------------------------------------------
+        if ch == "-" and i + 1 < n and expression[i + 1] == "-":
+            j = expression.find("\n", i + 2)
+            i = n if j == -1 else j + 1
+            continue
+
+        # -- block comment -----------------------------------------------
+        if ch == "/" and i + 1 < n and expression[i + 1] == "*":
+            j = expression.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+            continue
+
+        # -- single quoted string literal ('' is an escaped quote) ------
+        if ch == "'":
+            i += 1
+            while i < n:
+                if expression[i] == "'":
+                    if i + 1 < n and expression[i + 1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+
+        # -- double quoted identifier ("" is an escaped quote) -----------
+        if ch == '"':
+            buf: List[str] = []
+            i += 1
+            while i < n:
+                if expression[i] == '"':
+                    if i + 1 < n and expression[i + 1] == '"':
+                        buf.append('"')
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                buf.append(expression[i])
+                i += 1
+            tokens.append(("name", "".join(buf)))
+            continue
+
+        # -- backtick quoted identifier (`` is an escaped backtick) -----
+        if ch == "`":
+            buf = []
+            i += 1
+            while i < n:
+                if expression[i] == "`":
+                    if i + 1 < n and expression[i + 1] == "`":
+                        buf.append("`")
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                buf.append(expression[i])
+                i += 1
+            tokens.append(("name", "".join(buf)))
+            continue
+
+        # -- [bracket] quoted identifier --------------------------------
+        if ch == "[":
+            j = expression.find("]", i + 1)
+            if j == -1:
+                tokens.append(("name", expression[i + 1 :]))
+                i = n
+            else:
+                tokens.append(("name", expression[i + 1 : j]))
+                i = j + 1
+            continue
+
+        # -- numeric literal --------------------------------------------
+        if ch.isdigit() or (
+            ch == "." and i + 1 < n and expression[i + 1].isdigit()
+        ):
+            j = i + 1
+            while j < n and (expression[j].isalnum() or expression[j] in "."):
+                # keep scanning exponent markers / x-style literals simple
+                if expression[j] == "." and j + 1 < n and expression[j + 1] == ".":
+                    break
+                j += 1
+            tokens.append(("literal", expression[i:j]))
+            i = j
+            continue
+
+        # -- bare identifier --------------------------------------------
+        if ch == "_" or ch == "$" or ch.isalpha() or ord(ch) > 127:
+            j = i + 1
+            while j < n:
+                c = expression[j]
+                if c == "_" or c == "$" or c.isalnum() or ord(c) > 127:
+                    j += 1
+                else:
+                    break
+            tokens.append(("name", expression[i:j]))
+            i = j
+            continue
+
+        tokens.append(("op", ch))
+        i += 1
+
+    return tokens
+
+
+def parse_computed_column_references(
+    expression: Optional[str], column_names: Collection[str]
+) -> List[str]:
+    """Return the table columns referenced by a computed expression.
+
+    Only identifiers that correspond to one of the names in
+    ``column_names`` are returned, in first-reference order.  Contents of
+    string literals and names used as functions (an identifier directly
+    followed by ``(``) are not considered references.  Dotted qualifiers
+    (e.g. the table name in ``t.col``) are ignored.
+
+    """
+
+    if not expression or not column_names:
+        return []
+
+    names = list(column_names)
+    exact = {name: name for name in names}
+    folded = {name.lower(): name for name in names}
+
+    tokens = _tokenize_computed_expression(expression)
+    references: List[str] = []
+
+    for idx, (kind, value) in enumerate(tokens):
+        if kind != "name":
+            continue
+
+        nxt = tokens[idx + 1] if idx + 1 < len(tokens) else None
+
+        # a name immediately followed by "(" is a function name
+        if nxt is not None and nxt[0] == "op" and nxt[1] == "(":
+            continue
+
+        # a name immediately followed by "." is a qualifier
+        if nxt is not None and nxt[0] == "op" and nxt[1] == ".":
+            continue
+
+        canonical = exact.get(value)
+        if canonical is None:
+            canonical = folded.get(value.lower())
+
+        if canonical is not None and canonical not in references:
+            references.append(canonical)
+
+    return references
+
+
+class ComputedReconstruction:
+    """Inspectable reconstruction state for one reflected computed column.
+
+    The state describes how the column's preserved generation expression
+    fits into the currently reflected column projection.  In particular:
+
+    * :attr:`expression` keeps the original expression text exactly as
+      reflected from the database.
+    * :attr:`direct_missing_columns` lists columns named directly by the
+      expression that are absent from the projection.
+    * :attr:`transitive_missing_columns` lists further absent columns
+      reached by expanding missing generated columns referenced by the
+      expression.
+    * :attr:`underlying_missing_columns` is the subset of transitive
+      missing columns that are underlying base (non-generated) columns.
+
+    """
+
+    def __init__(
+        self,
+        *,
+        column_name: str,
+        expression: Optional[str],
+        state: str,
+        referenced_columns: Sequence[str] = (),
+        direct_missing_columns: Sequence[str] = (),
+        transitive_missing_columns: Sequence[str] = (),
+        underlying_missing_columns: Sequence[str] = (),
+        intermediate_missing_columns: Sequence[str] = (),
+        missing_columns: Sequence[str] = (),
+        dependency_paths: Optional[Dict[str, List[str]]] = None,
+    ) -> None:
+        self.column_name = column_name
+        self.expression = expression
+        self.state = state
+        self.referenced_columns = list(referenced_columns)
+        self.direct_missing_columns = list(direct_missing_columns)
+        self.transitive_missing_columns = list(transitive_missing_columns)
+        self.indirect_missing_columns = list(transitive_missing_columns)
+        self.underlying_missing_columns = list(underlying_missing_columns)
+        self.intermediate_missing_columns = list(
+            intermediate_missing_columns
+        )
+        self.missing_columns = list(missing_columns)
+        self.dependency_paths = dict(dependency_paths or {})
+
+    # -- status ---------------------------------------------------------
+
+    @property
+    def status(self) -> str:
+        """Alias of :attr:`state`."""
+
+        return self.state
+
+    @property
+    def root_missing_columns(self) -> List[str]:
+        """Underlying base columns reached through another generated col."""
+
+        return list(self.underlying_missing_columns)
+
+    @property
+    def reconstructable(self) -> bool:
+        """True if every dependency is present in the projection."""
+
+        return self.state == ReconstructionState.RECONSTRUCTABLE
+
+    @property
+    def is_complete(self) -> bool:
+        return self.reconstructable
+
+    @property
+    def sqltext(self) -> Optional[str]:
+        """The original expression text (alias of :attr:`expression`)."""
+
+        return self.expression
+
+    def diagnostic_message(self) -> Optional[str]:
+        """Return a clear description of the reconstruction problem."""
+
+        if self.state == ReconstructionState.RECONSTRUCTABLE:
+            return None
+
+        if self.state == ReconstructionState.UNKNOWN:
+            return (
+                f"reflected computed column '{self.column_name}' has an "
+                "unknown reconstruction state; its generation expression "
+                "or dependencies could not be analyzed"
+            )
+
+        parts = [
+            f"reflected computed column '{self.column_name}' cannot be "
+            "reconstructed from the current column projection"
+        ]
+        if self.expression:
+            parts.append(f"original expression: {self.expression!r}")
+        if self.direct_missing_columns:
+            parts.append(
+                "directly references missing column(s): "
+                + ", ".join(repr(c) for c in self.direct_missing_columns)
+            )
+        if self.underlying_missing_columns:
+            via = []
+            for col in self.underlying_missing_columns:
+                path = self.dependency_paths.get(col)
+                if path and len(path) > 2:
+                    via.append(
+                        repr(col)
+                        + " (through "
+                        + " -> ".join(repr(p) for p in path[1:-1])
+                        + ")"
+                    )
+                else:
+                    via.append(repr(col))
+            parts.append(
+                "underlying missing column(s) reached through another "
+                "generated column: " + ", ".join(via)
+            )
+        elif self.transitive_missing_columns:
+            parts.append(
+                "transitively missing column(s): "
+                + ", ".join(repr(c) for c in self.transitive_missing_columns)
+            )
+        return "; ".join(parts)
+
+    def raise_if_incomplete(self) -> None:
+        """Raise :class:`.InvalidRequestError` if reconstruction is impossible.
+
+        Unknown states are not treated as hard failures because the
+        original expression may still be renderable verbatim.
+
+        """
+
+        if self.state == ReconstructionState.MISSING_COLUMNS:
+            raise exc.InvalidRequestError(self.diagnostic_message())
+
+    def __bool__(self) -> bool:
+        return self.reconstructable
+
+    def __repr__(self) -> str:
+        return (
+            f"ComputedReconstruction(column_name={self.column_name!r}, "
+            f"state={self.state!r}, "
+            f"direct_missing_columns={self.direct_missing_columns!r}, "
+            f"underlying_missing_columns="
+            f"{self.underlying_missing_columns!r})"
+        )
+
+
+class TableReconstruction:
+    """Reconstruction state for the computed columns of a reflected Table.
+
+    This is the inspectable state of the current column projection: it
+    aggregates one :class:`.ComputedReconstruction` per projected computed
+    column together with the union of directly and transitively missing
+    columns.
+
+    """
+
+    def __init__(
+        self,
+        table: "Table",
+        columns: Dict[str, ComputedReconstruction],
+        direct_missing_columns: Sequence[str] = (),
+        transitive_missing_columns: Sequence[str] = (),
+        underlying_missing_columns: Sequence[str] = (),
+        missing_columns: Sequence[str] = (),
+    ) -> None:
+        self.table = table
+        self.columns = dict(columns)
+        self.direct_missing_columns = list(direct_missing_columns)
+        self.transitive_missing_columns = list(transitive_missing_columns)
+        self.indirect_missing_columns = list(transitive_missing_columns)
+        self.underlying_missing_columns = list(underlying_missing_columns)
+        self.missing_columns = list(missing_columns)
+
+        if any(
+            c.state == ReconstructionState.MISSING_COLUMNS
+            for c in self.columns.values()
+        ):
+            self.state = ReconstructionState.MISSING_COLUMNS
+        elif any(
+            c.state == ReconstructionState.UNKNOWN
+            for c in self.columns.values()
+        ):
+            self.state = ReconstructionState.UNKNOWN
+        else:
+            self.state = ReconstructionState.RECONSTRUCTABLE
+
+    @property
+    def reconstructable(self) -> bool:
+        """True if every projected computed column is reconstructable."""
+
+        return self.state == ReconstructionState.RECONSTRUCTABLE
+
+    @property
+    def generated_columns(self) -> List[str]:
+        return list(self.columns)
+
+    def __getitem__(self, name: str) -> ComputedReconstruction:
+        return self.columns[name]
+
+    def get(self, name: str) -> Optional[ComputedReconstruction]:
+        return self.columns.get(name)
+
+    def diagnostic_message(self) -> Optional[str]:
+        if self.state == ReconstructionState.RECONSTRUCTABLE:
+            return None
+
+        table_name = getattr(self.table, "description", None) or getattr(
+            self.table, "name", "<table>"
+        )
+
+        if self.state == ReconstructionState.UNKNOWN:
+            return (
+                f"reflected table '{table_name}' has computed columns with "
+                "unknown reconstruction state"
+            )
+
+        clauses = []
+        if self.direct_missing_columns:
+            clauses.append(
+                "directly missing column(s): "
+                + ", ".join(repr(c) for c in self.direct_missing_columns)
+            )
+        if self.underlying_missing_columns:
+            clauses.append(
+                "underlying missing column(s) via another generated "
+                "column: "
+                + ", ".join(repr(c) for c in self.underlying_missing_columns)
+            )
+        elif self.transitive_missing_columns:
+            clauses.append(
+                "transitively missing column(s): "
+                + ", ".join(repr(c) for c in self.transitive_missing_columns)
+            )
+
+        message = (
+            f"reflected table '{table_name}' cannot generate valid DDL "
+            "from the current column projection"
+        )
+        if clauses:
+            message += " (" + "; ".join(clauses) + ")"
+
+        details = [
+            msg
+            for col in self.columns.values()
+            if (msg := col.diagnostic_message())
+        ]
+        if details:
+            message += ". " + "; ".join(details)
+        return message
+
+    def raise_if_incomplete(self) -> None:
+        """Raise :class:`.InvalidRequestError` if the projection cannot
+        be reconstructed."""
+
+        if self.state == ReconstructionState.MISSING_COLUMNS:
+            raise exc.InvalidRequestError(self.diagnostic_message())
+
+    def __bool__(self) -> bool:
+        return self.reconstructable
+
+    def __repr__(self) -> str:
+        return (
+            f"TableReconstruction(table={getattr(self.table, 'name', None)!r}, "
+            f"state={self.state!r}, "
+            f"columns={list(self.columns)!r}, "
+            f"direct_missing_columns={self.direct_missing_columns!r}, "
+            f"underlying_missing_columns="
+            f"{self.underlying_missing_columns!r})"
+        )
+
+
+def _build_computed_reconstruction(
+    column_name: str,
+    *,
+    expression: Optional[str],
+    projected_columns: Collection[str],
+    references_by_column: Dict[str, List[str]],
+) -> ComputedReconstruction:
+    """Build the reconstruction state for one computed column.
+
+    ``references_by_column`` describes the direct references of every
+    generated column in the full reflected table (including columns that
+    are not part of the current projection), which allows transitive
+    underlying dependencies to be derived.
+
+    """
+
+    projected = set(projected_columns)
+
+    if not expression:
+        return ComputedReconstruction(
+            column_name=column_name,
+            expression=expression,
+            state=ReconstructionState.UNKNOWN,
+        )
+
+    references = list(references_by_column.get(column_name, ()))
+
+    # Full dependency closure over generated columns of the whole table.
+    closure: List[str] = []
+    seen = {column_name}
+    parent: Dict[str, str] = {}
+    queue = list(references)
+    while queue:
+        dep = queue.pop(0)
+        if dep in seen:
+            continue
+        seen.add(dep)
+        closure.append(dep)
+        if dep in references_by_column:
+            for sub in references_by_column[dep]:
+                if sub not in seen:
+                    parent.setdefault(sub, dep)
+                    queue.append(sub)
+
+    direct_missing = [c for c in references if c not in projected]
+
+    transitive_missing: List[str] = []
+    for dep in closure:
+        if dep in references:
+            continue
+        if dep not in projected and dep not in transitive_missing:
+            transitive_missing.append(dep)
+
+    underlying_missing = [
+        c for c in transitive_missing if c not in references_by_column
+    ]
+    intermediate_missing = [
+        c for c in transitive_missing if c in references_by_column
+    ]
+
+    missing_columns: List[str] = []
+    for c in direct_missing + transitive_missing:
+        if c not in missing_columns:
+            missing_columns.append(c)
+
+    dependency_paths: Dict[str, List[str]] = {}
+    for missing in missing_columns:
+        path = [missing]
+        cur = missing
+        while cur in parent:
+            cur = parent[cur]
+            path.append(cur)
+        path.append(column_name)
+        path.reverse()
+        dependency_paths[missing] = path
+
+    state = (
+        ReconstructionState.MISSING_COLUMNS
+        if missing_columns
+        else ReconstructionState.RECONSTRUCTABLE
+    )
+
+    return ComputedReconstruction(
+        column_name=column_name,
+        expression=expression,
+        state=state,
+        referenced_columns=references,
+        direct_missing_columns=direct_missing,
+        transitive_missing_columns=transitive_missing,
+        underlying_missing_columns=underlying_missing,
+        intermediate_missing_columns=intermediate_missing,
+        missing_columns=missing_columns,
+        dependency_paths=dependency_paths,
+    )
+
+
 class Computed(FetchedValue, SchemaItem):
     """Defines a generated column, i.e. "GENERATED ALWAYS AS" syntax.
 
@@ -6924,6 +7529,7 @@ class Computed(FetchedValue, SchemaItem):
         self.sqltext = coercions.expect(roles.DDLExpressionRole, sqltext)
         self.persisted = persisted
         self.column = None
+        self.reconstruction: Optional[ComputedReconstruction] = None
 
     def _set_parent(self, parent: SchemaEventTarget, **kw: Any) -> None:
         assert isinstance(parent, Column)

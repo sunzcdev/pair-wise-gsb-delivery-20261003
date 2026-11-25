@@ -364,6 +364,15 @@ class ReflectedComputed(TypedDict):
     persisted: NotRequired[bool]
     """indicates if the value is stored in the table or computed on demand"""
 
+    column_references: NotRequired[Sequence[str]]
+    """names of the table's own columns referenced by :attr:`sqltext`.
+
+    String literals and function names are excluded.  This is used to
+    reconstruct dependency state when reflection requests only a subset
+    of the table's columns.
+
+    """
+
 
 class ReflectedColumn(TypedDict):
     """Dictionary representing the reflected elements corresponding to
