@@ -202,14 +202,17 @@ class QueueProcessorTest < Minitest::Test
   end
 
   # Cannot reach its destination while `down`, and says that each such write wrote nothing. Counts
-  # every write, alone or in a batch, whether it fails or not, in `attempts`.
+  # every write, alone or in a batch, whether it fails or not, in `attempts`. Records each failure it
+  # is told the worker thread is backing off from, so that a test can report a recovery from it.
   class OutageAppender < BatchAppender
     attr_accessor :down
+    attr_reader :backing_offs
 
     def initialize(**)
       super
-      @down     = true
-      @attempts = Queue.new
+      @down         = true
+      @attempts     = Queue.new
+      @backing_offs = []
     end
 
     def attempts = @attempts.size
@@ -228,11 +231,83 @@ class QueueProcessorTest < Minitest::Test
       exception.is_a?(IOError)
     end
 
+    # Records the failure, but reports no recovery, so that the worker thread waits out the back-off
+    # unless the test reports one itself.
+    def backing_off(failure)
+      @backing_offs << failure
+    end
+
     private
 
     def attempt
       @attempts << true
       raise IOError, "destination unavailable" if down
+    end
+  end
+
+  # A clock for the back-offs that never waits out real seconds: it waits until the queue it is given
+  # holds an entry, until the test advances it (see #advance), or until it is stopped (see #stop), and
+  # records each length it was asked to wait for, as the real clock would have. So a test can hold
+  # the worker thread in a back-off for as long as it needs, then end it as a real timeout would,
+  # without waiting.
+  class FakeClock
+    def initialize
+      @waits    = []
+      @expiries = 0
+      @closed   = false
+      @mutex    = Mutex.new
+      @gate     = ConditionVariable.new
+    end
+
+    # Returns [Array<Integer>] how long each back-off was asked to wait, in order.
+    def waits = @mutex.synchronize { @waits.dup }
+
+    # Waits for the given seconds, as Queue#pop(timeout:) does, and records the seconds. Returns true
+    # once the queue holds an entry first, such as when a recovery ends the back-off, and nil once the
+    # wait ran out (see #advance) or the clock was stopped (see #stop), as a real timeout would.
+    def wait(queue, seconds)
+      @mutex.synchronize { @waits << seconds }
+      loop do
+        return true if queue.pop(timeout: 0)
+
+        expired = @mutex.synchronize do
+          if @expiries.positive?
+            @expiries -= 1
+          elsif @closed
+            true
+          end
+        end
+        return nil if expired
+
+        @mutex.synchronize { @gate.wait(@mutex, 0.01) }
+      end
+    end
+
+    # Ends the back-off under way, and the next `count` ones, as the real clock running out would.
+    # Returns the clock itself.
+    def advance(count = 1)
+      @mutex.synchronize do
+        @expiries += count
+        @gate.broadcast
+      end
+      self
+    end
+
+    # Ends every wait, present and future, so that the worker thread carries on, as when the test
+    # closes the processor. Returns the clock itself.
+    def stop
+      @mutex.synchronize do
+        @closed = true
+        @gate.broadcast
+      end
+      self
+    end
+
+    # Waits, for 5 seconds at most, until the given number of back-offs have been recorded.
+    def wait_for(count)
+      deadline = Time.now + 5
+      sleep(0.01) until waits.size >= count || Time.now > deadline
+      self
     end
   end
 
@@ -1451,6 +1526,260 @@ class QueueProcessorTest < Minitest::Test
         assert processor.flush
         assert_equal 3, appender.events.size
         assert_equal 0, processor.failed_count
+      end
+    end
+
+    # The appender, or its client, reports that the destination has recovered from the failure under
+    # way, ending that back-off rather than waiting it out (see Subscriber#backing_off). A report is
+    # honoured only for its own failure, and only once, so a late one starts no write.
+    describe "a report that the destination recovered" do
+      let(:appender) do
+        a        = OutageAppender.new
+        a.logger = internal_logger
+        a
+      end
+
+      let(:clock) { FakeClock.new }
+
+      after do
+        clock.stop
+        @processor&.close
+      end
+
+      # Starts a processor whose back-offs are waited out on the fake clock, and logs one message.
+      # Returns the failure the worker thread first backs off from.
+      def start_backing_off(**)
+        @processor = start(max_queue_size: 3, async_max_retries: 10, clock: clock, **)
+        @processor.log(new_log(message: "first"))
+        clock.wait_for(1)
+        @processor.backoff.summary.failure
+      end
+
+      # Waits, for 5 seconds at most, until the block returns true.
+      def wait_until
+        deadline = Time.now + 5
+        sleep(0.01) until yield || Time.now > deadline
+      end
+
+      it "ends the back-off under way, so the queued messages are written without waiting it out" do
+        failure = start_backing_off
+
+        assert_equal 1, failure.id
+        assert_predicate failure, :pending?
+
+        appender.down = false
+
+        assert failure.recovered
+
+        @processor.log(new_log(message: "second"))
+
+        wait_until { appender.events.size == 2 }
+
+        assert_equal %w[first second], appender.events.map(&:message)
+        assert_equal [1], clock.waits, "the worker thread should have waited only for the first back-off"
+        assert_equal 1, @processor.backoff.summary.recoveries
+        assert_equal 0, @processor.backoff.summary.late_recoveries
+      end
+
+      it "ends the back-off without waiting the whole of it out, on the clock" do
+        failure = start_backing_off
+
+        appender.down = false
+        failure.recovered
+        wait_until { appender.events.any? }
+
+        assert_equal [1], clock.waits
+        assert_equal 1, @processor.failed_count + @processor.processed_count
+      ensure
+        clock.stop
+      end
+
+      it "tells the appender about each failure it backs off from, once, with the failure's generation" do
+        first = start_backing_off
+
+        assert_equal [first], appender.backing_offs
+        assert_equal 1, first.retry_count
+      end
+
+      it "writes the message that failed again once its back-off is ended, ahead of the queued ones" do
+        failure = start_backing_off
+
+        appender.down = false
+        failure.recovered
+        wait_until { appender.events.size == 1 }
+
+        assert_equal %w[first], appender.events.map(&:message)
+        assert_equal 0, @processor.failed_count
+      end
+
+      it "writes the batch that failed again, as it was, once its back-off is ended" do
+        @processor = start(batch: true, batch_seconds: 60, max_queue_size: 3, async_max_retries: 10, clock: clock)
+        @processor.log(new_log(message: "first"))
+        @processor.log(new_log(message: "second"))
+        @processor.signal.set
+        clock.wait_for(1)
+        failure = @processor.backoff.summary.failure
+
+        assert_equal 1, failure.id
+        appender.down = false
+
+        assert failure.recovered
+
+        wait_until { appender.batches&.any? }
+
+        assert_equal([%w[first second]], appender.batches.map { |logs| logs.map(&:message) })
+        assert_equal 1, @processor.backoff.summary.recoveries
+        assert_equal 0, @processor.failed_count
+      end
+
+      it "leaves a flush during an outage as it was, without a report to end the back-off" do
+        failure = start_backing_off
+        @processor.log(new_log(message: "second"))
+
+        # A flush submitted during the outage ends the back-off under way itself, and the queued
+        # messages are discarded rather than written, as before.
+        assert @processor.flush
+        refute failure.recovered, "a report after the flush should end nothing"
+        assert_equal 0, @processor.backoff.summary.recoveries
+        assert_equal 2, @processor.failed_count
+        assert_empty appender.events
+      end
+
+      it "still closes, and stops the worker thread, whatever a report does" do
+        start_backing_off
+        appender.down = false
+
+        assert @processor.close
+        refute_predicate @processor, :active?
+        assert_predicate appender, :closed
+      end
+    end
+
+    # Two independent failures of the same destination: the first is reported recovered during its
+    # back-off, the second is not. A late report of the first arrives during the second's back-off,
+    # before the second's own report. Each report, and each write tried again, is told apart by the
+    # generation of its failure, and a late report starts no write.
+    describe "two independent failures, with a late report of the first" do
+      let(:appender) do
+        a        = OutageAppender.new
+        a.logger = internal_logger
+        a
+      end
+
+      let(:clock) { FakeClock.new }
+
+      after do
+        clock.stop
+        @processor&.close
+      end
+
+      def wait_until
+        deadline = Time.now + 5
+        sleep(0.01) until yield || Time.now > deadline
+      end
+
+      it "honours only each failure's own report, and starts no write for a late one" do
+        @processor = start(max_queue_size: 3, async_max_retries: 10, clock: clock)
+
+        # First failure: "one" cannot be written. Keep logging into the bounded queue meanwhile.
+        @processor.log(new_log(message: "one"))
+        clock.wait_for(1)
+        first = @processor.backoff.summary.failure
+
+        assert_equal 1, first.id
+        assert_equal 1, first.retry_count
+
+        @processor.log(new_log(message: "two"))
+
+        # The destination is back: report the first failure recovered during its back-off.
+        appender.down = false
+
+        assert first.recovered
+
+        wait_until { appender.events.size == 2 }
+
+        # The next failure is an independent one, with a generation of its own.
+        appender.down = true
+        @processor.log(new_log(message: "four"))
+        clock.wait_for(2)
+        second = @processor.backoff.summary.failure
+
+        assert_equal [2, 1], [second.id, second.retry_count]
+
+        # The first failure's report arrives again, late, during the second's back-off: it ends nothing.
+        written_before = appender.events.size
+
+        refute first.recovered
+
+        assert_equal written_before, appender.events.size, "a late report should start no write"
+        assert_same second, @processor.backoff.summary.failure, "the late report should not end the second back-off"
+
+        # The second failure's own report ends its back-off, and "four" is written again.
+        appender.down = false
+
+        assert second.recovered
+
+        wait_until { appender.events.size == 3 }
+
+        assert_equal %w[one two four], appender.events.map(&:message)
+        assert_equal 2, @processor.backoff.summary.recoveries
+        assert_equal 1, @processor.backoff.summary.late_recoveries
+      end
+
+      it "tells the two recoveries, the late report, and the writes tried again apart, by generation" do
+        @processor = start(max_queue_size: 3, async_max_retries: 10, clock: clock)
+
+        @processor.log(new_log(message: "one"))
+        clock.wait_for(1)
+        first = @processor.backoff.summary.failure
+
+        appender.down = false
+        first.recovered
+        wait_until { appender.events.size == 1 }
+
+        appender.down = true
+        @processor.log(new_log(message: "two"))
+        clock.wait_for(2)
+        second = @processor.backoff.summary.failure
+
+        first.recovered
+        appender.down = false
+
+        assert second.recovered
+        wait_until { appender.events.size == 2 }
+
+        # The events tell the two recoveries, the late report, and the writes tried again apart, by
+        # the generation of their failure.
+        events = @processor.backoff.summary.backoff_events
+
+        assert_equal %i[failure recovery write failure late_recovery recovery write], events.map(&:kind)
+        assert_equal [1, 1, 1, 2, 1, 2, 2], events.map(&:failure_id)
+        assert_equal 2, @processor.backoff.summary.failures
+        assert_equal 1, @processor.backoff.summary.late_recoveries
+        assert_equal 0, @processor.failed_count
+      end
+
+      it "keeps the queue bounded, dropping nothing that it took off, in order, during both failures" do
+        @processor = start(max_queue_size: 2, async_max_retries: 10, clock: clock)
+
+        @processor.log(new_log(message: "one"))
+        clock.wait_for(1)
+        first = @processor.backoff.summary.failure
+
+        # The queue holds two, and is full: a third waits for room, as the thread logging to it would.
+        @processor.log(new_log(message: "two"))
+        @processor.log(new_log(message: "three"))
+
+        assert_equal 2, @processor.max_queue_size
+        assert_equal 2, @processor.queue.size
+
+        appender.down = false
+        first.recovered
+        wait_until { appender.events.size == 3 }
+
+        assert_equal %w[one two three], appender.events.map(&:message), "the messages should keep their order"
+        assert_equal 0, @processor.failed_count
+        assert_equal 0, @processor.dropped_count
       end
     end
 

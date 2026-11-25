@@ -1009,6 +1009,55 @@ end
 any of it is sent can still be stored by a destination whose answer then times out. Answer that from
 `#wrote_nothing?`, for `#log` and `#batch` alike.
 
+#### Report that the destination has recovered
+
+An appender whose client knows when the destination is back, such as one that watches a connection,
+can end the back-off under way rather than wait it out. When the worker thread is about to back off,
+it calls `#backing_off(failure)` on the appender, on its own thread, with the failure it is backing
+off from. The appender, or its client, then reports the recovery from that failure, once, by calling
+`#recovered` on it:
+
+~~~ruby
+def backing_off(failure)
+  @client = nil                                      # reconnect on the next write
+  @watchdog = MyClient.when_up { failure.recovered } # once the destination answers again
+end
+~~~
+
+Calling `#recovered` ends that back-off, so the worker thread writes the message that failed again,
+ahead of the messages on the queue, without waiting out the rest of the back-off. `#recovered`
+returns `true` when it ended the back-off, and `false` when it did not.
+
+A report is honoured only for the failure it is for, and only once. One that arrives after that
+back-off has ended, such as a late one delivered during the back-off from a later failure, ends
+nothing and starts no write, so a late report can never write a message twice. Each failure has a
+generation of its own, from `#id`, which tells them apart, and the appender can read its
+`#retry_count`, its `#exception`, whether its back-off is still `#pending?`, and whether it was
+`#honoured?`. So an appender whose client reports every recovery, without telling which failure it
+belongs to, does no harm: a report for a back-off that has ended is ignored.
+
+The worker thread calls `#backing_off` before it waits, so a destination that is already back ends
+the back-off at once, and it must not block, since the worker thread waits for it. An appender that
+does not implement `#backing_off` waits out every back-off, as before. A report from it changes
+nothing of the queue, its maximum size, a flush, or a close: those act as they did.
+
+~~~ruby
+def backing_off(failure)
+  return unless @client&.reconnect
+  failure.recovered if @client.healthy?
+rescue StandardError
+  nil                                              # wait out the back-off instead
+end
+~~~
+
+`#recovered` takes no lock, so it can be called from any thread, including a signal trap, as can the
+counters that report it. `SemanticLogger.stats[:appenders]` reports, for each asynchronous appender,
+`failures` (how many back-offs it has entered), `recoveries` (how many were ended by a report), and
+`late_recoveries` (how many reports arrived too late to end one). An asynchronous appender also answers
+`#backoff_events`, the most recent of them in order, each by its failure's generation, ending with the
+write the worker thread tried again, so that a test or an operator can tell a real retry from a late
+report. The list is bounded, so that a long outage cannot grow it without limit.
+
 Such a `#batch` works with any formatter, including a formatter block. An appender that cannot be
 batched in some configuration says why from `#batch_refusal`, and what to do instead, so that
 `add_appender` raises an `ArgumentError` with it when asked to batch the appender, with

@@ -75,7 +75,24 @@ module SemanticLogger
                    "queued up. Consider reducing the log level or changing the appenders")
       end
 
-      # Report the number of log messages queued ahead of a command, such as a flush, that is being
+      # Report that the appender reported that its destination had recovered from the failure, and
+      # that the back-off it was in ended, so that the worker thread writes again at once rather than
+      # wait it out.
+      def recovered(failure)
+        log(:info, "Async: The destination is back, so ending the back-off from failure #{failure.id} " \
+                   "after #{failure.retry_count} attempt(s)", failure.exception)
+      end
+
+      # Report that the appender reported that its destination had recovered, but too late to end the
+      # back-off it reported it for: that back-off had already ended, whether it ran out, was ended by
+      # an earlier report, or was cancelled by a flush or close, or the process exiting. The report
+      # ends nothing and starts no write, so that a late report never writes a message twice.
+      def late_recovery(failure)
+        log(:debug, "Async: Ignoring a report that the destination recovered from failure #{failure.id}: " \
+                    "its back-off had already ended")
+      end
+
+      # Report the log messages queued ahead of a command, such as a flush, that is being
       # submitted: at :warn for more than 1,000, at :info for more than 100, otherwise at :trace, and
       # not at all for none.
       def queued(count, command)

@@ -25,7 +25,10 @@ module SemanticLogger
 
     attr_accessor :lag_check_interval, :lag_threshold_s, :dropped_message_report_seconds,
                   :batch_size, :batch_seconds, :non_blocking
-    attr_reader :appender, :signal, :processed_count
+    # The back-off holds the failures, the failures in a row, and the reports that the destination
+    # recovered, which end one (see Backoff). Its #summary tells a real recovery, a late report, and a
+    # write tried again apart by their failure's generation.
+    attr_reader :appender, :signal, :processed_count, :backoff
 
     # Create a new processor and start its worker thread.
     def self.start(**args) = new(**args).tap(&:thread)
@@ -79,12 +82,13 @@ module SemanticLogger
     #     Maximum number of consecutive times to restart the worker thread after it raises an
     #     exception while processing messages. Each restart first sleeps for `retry_count` seconds
     #     (1s, then 2s, ...) as a back-off, unless a flush or close is waiting (see #flush), or the
-    #     process is exiting (see #process_exiting=). Once this many consecutive retries are
-    #     exhausted the thread stops instead of restarting. The counter resets to zero whenever a
-    #     message is processed successfully. A message or batch that the destination failed is
-    #     written again after the back-off when the appender says that the write wrote none of it
-    #     (see Subscriber#wrote_nothing?), up to HeldWrite::MAX_RESENDS times after the destination
-    #     answered with a failure, and is otherwise discarded.
+    #     process is exiting (see #process_exiting=), or the appender reports that the destination has
+    #     recovered from the failure it is backing off from (see Subscriber#backing_off). Once this
+    #     many consecutive retries are exhausted the thread stops instead of restarting. The counter
+    #     resets to zero whenever a message is processed successfully. A message or batch that the
+    #     destination failed is written again after the back-off when the appender says that the
+    #     write wrote none of it (see Subscriber#wrote_nothing?), up to HeldWrite::MAX_RESENDS times
+    #     after the destination answered with a failure, and is otherwise discarded.
     #     -1: Retry indefinitely and never stop the thread (the pre-v5 behaviour). The back-off
     #         still applies, and still resets after any successful message.
     #     A worker thread started again by #reopen in the same process carries on with the count, so
@@ -93,6 +97,10 @@ module SemanticLogger
     #     unavailable; one that stopped before, such as after a fatal exception, has the retries it
     #     had left. Only the worker thread of a child process, after a fork, starts counting afresh.
     #     Default: 100
+    #
+    #   clock: [#wait]
+    #     Internal: waits for the given seconds, or on the given Queue, for the back-offs, as
+    #     Queue#pop(timeout:) does. Supplied only by the tests, as a fake clock; nil: the real one.
     def initialize(appender:,
                    max_queue_size: 10_000,
                    lag_check_interval: 1_000,
@@ -102,7 +110,8 @@ module SemanticLogger
                    batch_seconds: 5,
                    non_blocking: false,
                    dropped_message_report_seconds: 30,
-                   async_max_retries: 100)
+                   async_max_retries: 100,
+                   clock: nil)
       @appender                       = appender
       @lag_check_interval             = lag_check_interval
       @lag_threshold_s                = lag_threshold_s
@@ -111,11 +120,12 @@ module SemanticLogger
       @batch_seconds                  = batch_seconds
       @non_blocking                   = non_blocking
       @dropped_message_report_seconds = dropped_message_report_seconds
-      @backoff                        = Backoff.new(async_max_retries)
+      @reporter                       = Reporter.new(appender)
+      @backoff                        = Backoff.new(async_max_retries, clock: clock, reporter: @reporter,
+                                                      appender: appender)
       @thread                         = nil
       # Only batch mode parks the worker on the signal; streaming mode never touches it.
       @signal                         = Concurrent::Event.new if batch
-      @reporter                       = Reporter.new(appender)
       @reopener                       = Reopener.new(appender, @reporter)
       @processed_count                = 0
       @inbox                          = Inbox.new(max_queue_size)
@@ -367,7 +377,9 @@ module SemanticLogger
     # A flush or close that is waiting (see #flush), or the process exiting (see #process_exiting=),
     # does not wait out a back-off, so processing then restarts straight away, without counting a
     # retry, and discards the messages queued ahead of the next request without writing them (see
-    # Backoff#give_up?).
+    # Backoff#give_up?). Nor does the worker thread wait out a back-off when the appender reports that
+    # the destination has recovered from the failure it is backing off from (see
+    # Subscriber#backing_off), so processing then restarts at once, too.
     def process
       safe_log(:trace, "Async: Appender thread active")
       begin
@@ -375,7 +387,7 @@ module SemanticLogger
         carry_on = @stack_overflow || (batch? ? process_messages_in_batches : process_messages)
       rescue StandardError => e
         retry if @backoff.give_up?(e)
-        if @backoff.retry?
+        if @backoff.retry?(e)
           safe_log(:warn, "Async: Restarting due to exception, retry #{retry_count} of #{@backoff.limit}, " \
                           "sleeping #{retry_count}s", e)
           @backoff.wait

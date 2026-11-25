@@ -30,7 +30,32 @@ module SemanticLogger
                      :queue, :max_queue_size, :capped?, :non_blocking?, :non_blocking=, :batch?,
                      :lag_check_interval, :lag_check_interval=,
                      :lag_threshold_s, :lag_threshold_s=,
-                     :processed_count, :dropped_count, :failed_count
+                     :processed_count, :dropped_count, :failed_count,
+                     :retry_count
+
+      # Returns [QueueProcessor::Backoff::Summary] what the back-off of the wrapped appender did, so
+      # that a real recovery, a late report, and a write tried again are told apart by the generation
+      # of their failure (see QueueProcessor::Backoff#summary).
+      def backoff_summary = processor.backoff.summary
+
+      # Returns [Integer] how many failures the worker thread has backed off from since the process
+      # started, or since the last fork. Each one has a generation of its own (see Backoff::Failure#id).
+      def failure_count = backoff_summary.failures
+      # Returns [Integer] how many reports that the destination had recovered ended the back-off
+      # under way, and how many arrived for a failure whose back-off had already ended, starting no
+      # write, since the process started, or since the last fork.
+      def recovery_count = backoff_summary.recoveries
+      def late_recovery_count = backoff_summary.late_recoveries
+
+      # Returns [Backoff::Failure|nil] the failure the worker thread is backing off from, and whose
+      # recovery the appender may report once (see Subscriber#backing_off), or nil once that back-off
+      # has ended. Its #id tells it apart from any other failure.
+      def backing_off = backoff_summary.failure
+
+      # Returns [Array<Backoff::EventLog::Event>] the most recent back-off events, oldest first, each
+      # by the generation of its failure: the failures, the reports of a recovery that ended one, those
+      # that arrived too late, and the writes tried again (see Backoff::EventLog). Bounded.
+      def backoff_events = backoff_summary.backoff_events
 
       # Appender proxy to allow an existing appender to run asynchronously in a separate thread.
       #
@@ -134,17 +159,27 @@ module SemanticLogger
       #   failed:         [Integer] Cumulative number of log messages discarded because they
       #                             could not be written, whether their content or the
       #                             destination was at fault (see Subscriber#message_error?).
+      #   failures:       [Integer] Cumulative number of failures the worker thread has backed off
+      #                             from, each with a generation of its own (see #backing_off).
+      #   recoveries:     [Integer] Cumulative number of reports that the destination had recovered
+      #                             that ended the back-off under way.
+      #   late_recoveries: [Integer] Cumulative number of reports that the destination had recovered
+      #                             that arrived after their back-off had ended, and so started no
+      #                             write.
       def stats
         {
-          name:           name,
-          async:          true,
-          thread_active:  active? || false,
-          queue_size:     queue.size,
-          capped:         capped?,
-          max_queue_size: capped? ? max_queue_size : nil,
-          processed:      processed_count,
-          dropped:        dropped_count,
-          failed:         failed_count
+          name:            name,
+          async:           true,
+          thread_active:   active? || false,
+          queue_size:      queue.size,
+          capped:          capped?,
+          max_queue_size:  capped? ? max_queue_size : nil,
+          processed:       processed_count,
+          dropped:         dropped_count,
+          failed:          failed_count,
+          failures:        failure_count,
+          recoveries:      recovery_count,
+          late_recoveries: late_recovery_count
         }
       end
     end

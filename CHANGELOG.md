@@ -7,6 +7,18 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Added
 
+- An appender whose client knows when the destination is back can now end the worker thread's
+  back-off rather than wait it out. When the worker thread is about to back off, it calls the
+  appender's new `#backing_off(failure)`, and the appender reports the recovery from that failure,
+  once, by calling `#recovered` on it, which ends that back-off and writes the message that failed
+  again at once. A report is honoured only for the failure it is for, and only once, so a late one,
+  delivered during the back-off from a later failure, ends nothing and starts no write; each failure
+  has a generation of its own, from `#id`. `SemanticLogger.stats[:appenders]` reports `failures`,
+  `recoveries`, and `late_recoveries` for each asynchronous appender, and it answers `#backoff_events`
+  with the most recent of them, each by its failure's generation. `#backing_off` returns `nil` by
+  default, so an appender that does not implement it waits out every back-off, as before, and a
+  queue's maximum size, a flush, and a close behave as they did. See
+  [Report that the destination has recovered](https://logger.reidmorrison.com/config.html#report-that-the-destination-has-recovered).
 - The formatters that write a metric with its log entry also write the metric's `dimensions`:
   `:json`, `:raw`, `:fluentd`, `:ecs`, `:syslog_cee`, and `:new_relic_logs` as a `dimensions` Hash,
   `:loki` as a `dimensions` value in JSON, and `:open_telemetry` as a

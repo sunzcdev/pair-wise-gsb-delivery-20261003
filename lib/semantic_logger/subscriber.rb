@@ -231,6 +231,30 @@ module SemanticLogger
       false
     end
 
+    # Called on the worker thread of an asynchronous appender with the failure it is about to back
+    # off from, once for each failure, before it waits. The appender, or the client it writes with,
+    # can then report once that the destination has recovered, by calling #recovered on that
+    # failure, which ends that back-off at once rather than waiting it out:
+    #
+    #   def backing_off(failure)
+    #     @client = nil                        # reconnect on the next write
+    #     supervise { |up| failure.recovered if up }
+    #   end
+    #
+    # The report is honoured only for the failure it is given, and only once: one that arrives after
+    # that back-off has ended, such as a late one delivered during the back-off from a later failure,
+    # ends nothing and so starts no write. The failure's #id tells it apart from any other. So an
+    # appender that recovers by itself, such as Bunny, can report each recovery without having to
+    # tell which failure it belongs to, and a report that arrives too late does no harm.
+    #
+    # The call runs before the worker thread waits, so a destination that is already back ends the
+    # back-off at once. It must not block: the worker thread waits for it. A block that raises is
+    # reported to the internal logger, and the worker thread waits out the back-off as usual. So do
+    # appenders that do not implement it: they wait out every back-off.
+    def backing_off(_failure)
+      nil
+    end
+
     private
 
     # Returns the log message formatted by this appender's formatter.

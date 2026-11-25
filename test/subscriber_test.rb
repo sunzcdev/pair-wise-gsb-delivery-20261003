@@ -205,6 +205,27 @@ class SubscriberTest < Minitest::Test
       end
     end
 
+    describe "#backing_off" do
+      it "takes the failure it is about to back off from, and defaults to doing nothing with it" do
+        failure = SemanticLogger::QueueProcessor::Backoff.new(1).retry?
+
+        assert_nil appender.backing_off(failure)
+      end
+
+      it "reports a recovered destination from the failure once, ending that back-off" do
+        recover = lambda(&:recovered)
+        appender.define_singleton_method(:backing_off, &recover)
+        backoff = SemanticLogger::QueueProcessor::Backoff.new(1)
+        failure = backoff.retry?
+
+        appender.backing_off(failure)
+
+        assert_nil backoff.failure
+        assert_predicate failure, :honoured?
+        assert_equal 1, backoff.recovery_count
+      end
+    end
+
     describe "#batch_refusal" do
       it "is nil whatever the formatter, since #batch may format each log message with #format_log" do
         appender.formatter = ->(log, _logger) { log.message }

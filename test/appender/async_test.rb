@@ -307,6 +307,36 @@ module Appender
         ensure
           proxy&.close
         end
+
+        it "reports the back-off counts, and the failure it is backing off from" do
+          proxy = SemanticLogger::Appender::Async.new(appender: appender, max_queue_size: 100)
+          stats = proxy.stats
+
+          assert_equal 0, stats[:failures]
+          assert_equal 0, stats[:recoveries]
+          assert_equal 0, stats[:late_recoveries]
+          assert_nil proxy.backing_off
+          assert_empty proxy.backoff_events
+        ensure
+          proxy&.close
+        end
+
+        it "counts a failure, the report that ended it, and a late report, told apart by generation" do
+          proxy = SemanticLogger::Appender::Async.new(appender: appender)
+          backoff = proxy.processor.instance_variable_get(:@backoff)
+          failure = backoff.retry?(IOError.new("down"))
+          failure.recovered
+          failure.recovered
+          stats = proxy.stats
+
+          assert_equal 1, stats[:failures]
+          assert_equal 1, stats[:recoveries]
+          assert_equal 1, stats[:late_recoveries]
+          assert_equal %i[failure recovery late_recovery], proxy.backoff_events.map(&:kind)
+          assert_equal [1, 1, 1], proxy.backoff_events.map(&:failure_id)
+        ensure
+          proxy&.close
+        end
       end
 
       describe "with a payload nested too deeply for JSON" do

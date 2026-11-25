@@ -350,6 +350,17 @@ before using them all, such as after a fatal exception, has only the retries it 
 message is written, the count starts again. After a fork, the worker thread of the child process
 starts counting afresh.
 
+An appender, or its client, that knows when the destination is back can end a back-off rather than
+wait it out, so that the entries it holds, and those queued behind it, are written at once. When the
+worker thread is about to back off, it calls the appender's `#backing_off(failure)`, and the
+appender reports the recovery from that failure once, from any thread, which ends that back-off.
+Only that failure's report can end that back-off, and only once: a late one, delivered during a
+later back-off, ends nothing and writes nothing. See
+[Report that the destination has recovered](config.html#report-that-the-destination-has-recovered).
+`SemanticLogger.stats[:appenders]` counts, for each asynchronous appender, its `failures`,
+`recoveries`, and `late_recoveries`, so that an outage is not backed off from any longer than the
+destination is actually unavailable.
+
 A flush or close does not wait out the back-offs of the worker thread, nor for each message ahead of
 it to fail in turn. Submitting one ends the back-off under way, and until it has run, a message or
 batch that the destination fails is discarded, and counted as `failed`, rather than written again
@@ -500,7 +511,10 @@ SemanticLogger.stats
 #          max_queue_size: 10_000,
 #          processed:      1_529,
 #          dropped:        0,
-#          failed:         0 }  # discarded because they could not be written
+#          failed:         0,    # discarded because they could not be written
+#          failures:       0,    # back-offs entered after a failure
+#          recoveries:     0,    # back-offs ended by a report that the destination was back
+#          late_recoveries: 0 }  # reports that arrived after their back-off had ended
 #      ]
 #    }
 ~~~

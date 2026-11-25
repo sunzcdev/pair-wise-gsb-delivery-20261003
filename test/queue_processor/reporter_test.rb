@@ -29,6 +29,40 @@ class ReporterTest < Minitest::Test
       assert_equal "Async: Queued log messages: 1001, running command: flush", internal.events.last.message
     end
 
+    describe "a report that the destination recovered" do
+      let(:internal) do
+        log = SemanticLogger::Test::CaptureLogEvents.new
+        appender.logger = log
+        log
+      end
+
+      it "reports the failure whose back-off a report ended, with its generation and exception" do
+        backoff = SemanticLogger::QueueProcessor::Backoff.new(3, reporter: reporter)
+        failure = backoff.retry?(IOError.new("down"))
+        internal # The appender's logger is the one the reporter reports to.
+        failure.recovered
+
+        report = internal.events.last
+
+        assert_equal :info, report.level
+        assert_match(/destination is back.*failure 1 after 1 attempt/, report.message)
+        assert_same failure.exception, report.exception
+      end
+
+      it "reports a report that arrived too late to end a back-off, so that no write started" do
+        backoff = SemanticLogger::QueueProcessor::Backoff.new(3, reporter: reporter)
+        failure = backoff.retry?
+        internal # The appender's logger is the one the reporter reports to.
+        failure.recovered
+        failure.recovered
+
+        report = internal.events.last
+
+        assert_equal :debug, report.level
+        assert_match(/Ignoring a report that the destination recovered from failure 1/, report.message)
+      end
+    end
+
     it "neither counts nor reports an empty list of discarded log messages" do
       internal        = SemanticLogger::Test::CaptureLogEvents.new
       appender.logger = internal
