@@ -171,6 +171,67 @@ Only triggering expiry when we write means that if the cache is idle, the backgr
 
 If you want the cache expiry to be run in a background job instead of a thread, you can set `expiry_method` to `:job`. This will enqueue a `SolidCache::ExpiryJob`.
 
+## Clearing the cache
+
+### Full clear
+
+Calling `clear` without arguments keeps the original behaviour and wipes every
+entry on every shard (using `truncate` or `delete` depending on `clear_with`):
+
+```ruby
+Rails.cache.clear
+```
+
+### Namespace-scoped, point-in-time clear
+
+When an administrator needs to invalidate a single namespace while the
+application keeps writing to that namespace, pass `:namespace` to `clear`.
+Instead of truncating a table, Solid Cache bumps a per-shard, per-namespace
+**generation marker** and then sweeps only the entries that carry the previous
+generation:
+
+```ruby
+report = Rails.cache.clear(namespace: "tenant-123")
+# {
+#   namespace: "tenant-123",
+#   cutoff_at: 2026-11-25 10:00:00 UTC,
+#   shards: {
+#     primary_shard_one: { generation: 1, cleared_generation: 0, deleted: 12 },
+#     primary_shard_two: { generation: 1, cleared_generation: 0, deleted: 7 }
+#   }
+# }
+```
+
+The report records the cutoff time and, for every shard, the generation that
+was cleared and how many rows were actually deleted.
+
+Because writes completed after the bump are stamped with the new generation,
+they survive the sweep and stay readable — including a key that already existed
+but is rewritten while the sweep is running. A sibling namespace is never
+touched: keys are matched using the full `"namespace:..."` prefix, so
+`"tenant-1"` cannot reach `"tenant-10"`.
+
+Passing `namespace: true` clears the store's own configured namespace.
+
+### Pausing and resuming individual shards
+
+A `:gate` callable receives each shard name. The generation is bumped first on
+every shard, but a shard is only swept when the gate returns a truthy value.
+This lets an operator pause the sweep on individual shards while writes
+continue:
+
+```ruby
+gate = ->(shard) { shard != :primary_shard_two }
+Rails.cache.clear(namespace: "tenant-123", gate: gate)
+```
+
+Paused shards report `paused: true` and keep their bumped generation. Resume
+them later without bumping the generation again:
+
+```ruby
+Rails.cache.clear(namespace: "tenant-123", sweep_pending: true)
+```
+
 ## Sharding the cache
 
 Solid Cache uses the [Maglev](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/44824.pdf) consistent hashing scheme to shard the cache across multiple databases.

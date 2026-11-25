@@ -16,9 +16,12 @@ module SolidCache
 
     MULTI_BATCH_SIZE = 1000
 
+    # Escape character used by #delete_scoped for LIKE wildcard escaping.
+    LIKE_ESCAPE_CHARACTER = "\\"
+
     class << self
-      def write(key, value)
-        write_multi([ { key: key, value: value } ])
+      def write(key, value, generation: nil)
+        write_multi([ { key: key, value: value, generation: generation } ])
       end
 
       def write_multi(payloads)
@@ -26,7 +29,8 @@ module SolidCache
           payloads.each_slice(MULTI_BATCH_SIZE).each do |payload_batch|
             upsert_all \
               add_key_hash_and_byte_size(payload_batch),
-              unique_by: upsert_unique_by, on_duplicate: :update, update_only: [ :key, :value, :byte_size ]
+              unique_by: upsert_unique_by, on_duplicate: :update,
+              update_only: [ :key, :value, :byte_size, :generation ]
           end
         end
       end
@@ -55,6 +59,28 @@ module SolidCache
         end
       end
 
+      # Delete entries belonging to +key_prefix+ that were written before or at
+      # +generation+. Entries written after a generation bump carry a higher
+      # generation and are left untouched, even when their key already existed.
+      #
+      # The key prefix is always matched on the full stored key so that a
+      # namespace can never reach into a sibling namespace with a shared prefix.
+      def delete_scoped(key_prefix, generation)
+        without_query_cache do
+          where(generation: ..generation)
+            .where(arel_table[:key].matches(key_prefix, LIKE_ESCAPE_CHARACTER, true))
+            .in_batches.delete_all
+        end
+      end
+
+      # Delete every entry written before or at +generation+, regardless of key.
+      # Used for stores that write keys without a namespace prefix.
+      def delete_generation(generation)
+        without_query_cache do
+          where(generation: ..generation).in_batches.delete_all
+        end
+      end
+
       def clear_truncate
         with_connection do |connection|
           connection.truncate(table_name)
@@ -67,12 +93,14 @@ module SolidCache
         end
       end
 
-      def lock_and_write(key, &block)
+      def lock_and_write(key, namespace: Generation::DEFAULT_NAMESPACE, &block)
         transaction do
           without_query_cache do
             result = lock.where(key_hash: key_hash_for(key)).pick(:key, :value)
             new_value = block.call(result&.first == key ? result[1] : nil)
-            write(key, new_value) if new_value
+            # Always stamp the current generation so a key rewritten while a
+            # scoped clear is running belongs to the surviving generation.
+            write(key, new_value, generation: Generation.current(namespace)) if new_value
             new_value
           end
         end
@@ -90,6 +118,7 @@ module SolidCache
             payload.dup.tap do |payload|
               payload[:key_hash] = key_hash_for(payload[:key])
               payload[:byte_size] = byte_size_for(payload)
+              payload[:generation] ||= 0
             end
           end
         end

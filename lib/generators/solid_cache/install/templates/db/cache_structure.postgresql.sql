@@ -45,7 +45,8 @@ CREATE TABLE public.solid_cache_entries (
     value bytea NOT NULL,
     created_at timestamp(6) without time zone NOT NULL,
     key_hash bigint NOT NULL,
-    byte_size integer NOT NULL
+    byte_size integer NOT NULL,
+    generation bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -118,6 +119,60 @@ CREATE UNIQUE INDEX index_solid_cache_entries_on_key_hash ON public.solid_cache_
 --
 
 CREATE INDEX index_solid_cache_entries_on_key_hash_and_byte_size ON public.solid_cache_entries USING btree (key_hash, byte_size);
+
+
+--
+-- Name: solid_cache_generations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.solid_cache_generations (
+    id bigint NOT NULL,
+    namespace character varying(1024) NOT NULL,
+    generation bigint DEFAULT 0 NOT NULL,
+    created_at timestamp(6) without time zone NOT NULL,
+    updated_at timestamp(6) without time zone NOT NULL
+);
+
+
+--
+-- Name: solid_cache_generations_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.solid_cache_generations_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: solid_cache_generations_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.solid_cache_generations_id_seq OWNED BY public.solid_cache_generations.id;
+
+
+--
+-- Name: solid_cache_generations id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.solid_cache_generations ALTER COLUMN id SET DEFAULT nextval('public.solid_cache_generations_id_seq'::regclass);
+
+
+--
+-- Name: solid_cache_generations solid_cache_generations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.solid_cache_generations
+    ADD CONSTRAINT solid_cache_generations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: index_solid_cache_generations_on_namespace; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX index_solid_cache_generations_on_namespace ON public.solid_cache_generations USING btree (namespace);
 
 
 --

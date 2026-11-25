@@ -38,10 +38,24 @@ CREATE TABLE `solid_cache_entries` (
   `created_at` datetime(6) NOT NULL,
   `key_hash` bigint NOT NULL,
   `byte_size` int NOT NULL,
+  `generation` bigint NOT NULL DEFAULT 0,
   PRIMARY KEY (`id`),
   UNIQUE KEY `index_solid_cache_entries_on_key_hash` (`key_hash`),
   KEY `index_solid_cache_entries_on_byte_size` (`byte_size`),
   KEY `index_solid_cache_entries_on_key_hash_and_byte_size` (`key_hash`,`byte_size`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+DROP TABLE IF EXISTS `solid_cache_generations`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `solid_cache_generations` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `namespace` varchar(1024) NOT NULL,
+  `generation` bigint NOT NULL DEFAULT 0,
+  `created_at` datetime(6) NOT NULL,
+  `updated_at` datetime(6) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `index_solid_cache_generations_on_namespace` (`namespace`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 /*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;

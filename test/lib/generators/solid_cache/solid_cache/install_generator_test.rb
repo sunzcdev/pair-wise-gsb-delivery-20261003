@@ -24,7 +24,12 @@ module SolidCache
     test "generator updates environment config" do
       run_generator
       assert_file "#{destination_root}/config/cache.yml", expected_cache_config
-      assert_file "#{destination_root}/db/cache_schema.rb"
+      assert_file "#{destination_root}/db/cache_schema.rb" do |content|
+        assert_match(/create_table "solid_cache_entries"/, content)
+        assert_match(/t.integer "generation"/, content)
+        assert_match(/create_table "solid_cache_generations"/, content)
+        assert_match(/t.string "namespace"/, content)
+      end
       assert_file "#{destination_root}/config/environments/development.rb", /config.cache_store = :memory_store\n/
       assert_file "#{destination_root}/config/environments/development.rb", /config.cache_store = :null_store\n/
       assert_file "#{destination_root}/config/environments/test.rb", /config.cache_store = :null_store\n/
@@ -63,6 +68,8 @@ module SolidCache
         end
 
         assert_match(/index.*key_hash/, content)
+        assert_match(/solid_cache_generations/, content)
+        assert_match(/generation/, content)
       end
 
       assert_file "#{destination_root}/config/environments/production.rb", /config.cache_store = :solid_cache_store\n/
