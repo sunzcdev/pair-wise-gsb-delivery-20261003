@@ -15,6 +15,7 @@ from sqlalchemy import table
 from sqlalchemy import testing
 from sqlalchemy import type_coerce
 from sqlalchemy import update
+from sqlalchemy.engine.interfaces import CacheStats
 from sqlalchemy.sql import crud
 from sqlalchemy.sql.sqltypes import NullType
 from sqlalchemy.testing import assert_raises_message
@@ -680,6 +681,188 @@ class UpdateReturningTest(fixtures.TablesTest, AssertsExecutionResults):
             .returning(table.c.id, table.c.full)
         )
         eq_(result.fetchall(), [(1, True), (2, True)])
+
+
+class UpdateReturningCacheTest(fixtures.TablesTest):
+    """RETURNING that projects a plain column together with an expression
+    that renders the same name.  The string name stays ambiguous, while each
+    expression object continues to identify its own value, including across
+    compiled cache hits and with reordered projections.
+
+    """
+
+    __requires__ = ("update_returning",)
+    __sparse_driver_backend__ = True
+
+    run_create_tables = "each"
+
+    @classmethod
+    def define_tables(cls, metadata):
+        Table(
+            "update_returning_cache_tbl",
+            metadata,
+            Column(
+                "id", Integer, primary_key=True, test_needs_autoincrement=True
+            ),
+            Column("x", Integer),
+        )
+
+    @classmethod
+    def insert_data(cls, connection):
+        connection.execute(
+            cls.tables.update_returning_cache_tbl.insert(),
+            [{"id": 1, "x": 10}, {"id": 2, "x": 20}],
+        )
+
+    def _stmt(self, table, expr_first=False):
+        expr = (table.c.x + 1).label("x")
+        if expr_first:
+            columns = (expr, table.c.x)
+        else:
+            columns = (table.c.x, expr)
+        stmt = (
+            update(table)
+            .where(table.c.id == 1)
+            .values(x=table.c.x + 5)
+            .returning(*columns)
+        )
+        return stmt, expr
+
+    def _assert_ambiguous(self, row):
+        # both projections render the same string name, so string based
+        # lookup continues to report the ambiguity
+        assert_raises_message(
+            sa_exc.InvalidRequestError,
+            "Ambiguous column name 'x'",
+            lambda: row._mapping["x"],
+        )
+
+    def test_dupe_name_object_keys_and_cache_hit(self, connection):
+        table = self.tables.update_returning_cache_tbl
+        eo = {"compiled_cache": {}}
+
+        # two statement trees with distinct expression object identity but
+        # identical projection shape; they share one compiled cache entry
+        stmt1, expr1 = self._stmt(table)
+        stmt2, expr2 = self._stmt(table)
+        is_(expr1 is expr2, False)
+        eq_(stmt1._generate_cache_key(), stmt2._generate_cache_key())
+
+        result1 = connection.execute(stmt1, execution_options=eo)
+        eq_(result1.context.cache_hit, CacheStats.CACHE_MISS)
+        row1 = result1.first()
+
+        result2 = connection.execute(stmt2, execution_options=eo)
+        eq_(result2.context.cache_hit, CacheStats.CACHE_HIT)
+        row2 = result2.first()
+
+        # the cache hit must not carry the previous round's expression
+        # objects / positional bindings into the new row
+        eq_((row1[0], row1[1]), (15, 16))
+        eq_(row1._mapping[table.c.x], 15)
+        eq_(row1._mapping[expr1], 16)
+
+        eq_((row2[0], row2[1]), (20, 21))
+        eq_(row2._mapping[table.c.x], 20)
+        eq_(row2._mapping[expr2], 21)
+
+        self._assert_ambiguous(row1)
+        self._assert_ambiguous(row2)
+
+        # the already returned row keeps working with its own two keys
+        eq_(row1._mapping[table.c.x], 15)
+        eq_(row1._mapping[expr1], 16)
+
+    def test_reordered_projection_separate_cache_entry(self, connection):
+        table = self.tables.update_returning_cache_tbl
+        cache = {}
+        eo = {"compiled_cache": cache}
+
+        # prime the cache with the (column, expression) projection order,
+        # where both projections render the same string name
+        stmt1, expr1 = self._stmt(table)
+        result1 = connection.execute(stmt1, execution_options=eo)
+        eq_(result1.context.cache_hit, CacheStats.CACHE_MISS)
+        row1 = result1.first()
+        eq_(len(cache), 1)
+
+        # swapping the projection order changes the cache key, producing an
+        # independent cache entry; values still come back through the current
+        # statement's own expression objects
+        stmt2, expr2 = self._stmt(table, expr_first=True)
+        is_false(stmt1._generate_cache_key() == stmt2._generate_cache_key())
+        result2 = connection.execute(stmt2, execution_options=eo)
+        eq_(result2.context.cache_hit, CacheStats.CACHE_MISS)
+        eq_(len(cache), 2)
+        row2 = result2.first()
+
+        # another tree of the swapped shape hits its own cache entry and its
+        # row is keyed by that statement's own expression objects
+        stmt3, expr3 = self._stmt(table, expr_first=True)
+        eq_(stmt2._generate_cache_key(), stmt3._generate_cache_key())
+        result3 = connection.execute(stmt3, execution_options=eo)
+        eq_(result3.context.cache_hit, CacheStats.CACHE_HIT)
+        eq_(len(cache), 2)
+        row3 = result3.first()
+
+        # the compiler disambiguates the repeated name for the plain column
+        # when the label is rendered first: "x" stays bound to the labeled
+        # expression while the column gets a separate generated name, so
+        # string lookup of "x" is unique and object lookup still resolves
+        # each projection by the current statement
+        plain_name = row2._fields[1]
+        is_(plain_name == "x", False)
+        eq_((row2[0], row2[1]), (21, 20))
+        eq_(row2._mapping[expr2], 21)
+        eq_(row2._mapping[table.c.x], 20)
+        eq_(row2._mapping["x"], 21)
+        eq_(row2._mapping[plain_name], 20)
+
+        plain_name3 = row3._fields[1]
+        eq_((row3[0], row3[1]), (26, 25))
+        eq_(row3._mapping[expr3], 26)
+        eq_(row3._mapping[table.c.x], 25)
+        eq_(row3._mapping["x"], 26)
+        eq_(row3._mapping[plain_name3], 25)
+
+        # the earlier ambiguous row remains usable through its own two keys
+        eq_((row1[0], row1[1]), (15, 16))
+        eq_(row1._mapping[table.c.x], 15)
+        eq_(row1._mapping[expr1], 16)
+        self._assert_ambiguous(row1)
+
+    def test_unique_string_names_unchanged(self, connection):
+        table = self.tables.update_returning_cache_tbl
+        eo = {"compiled_cache": {}}
+
+        def stmt():
+            expr = (table.c.x + 1).label("y")
+            return (
+                update(table)
+                .where(table.c.id == 1)
+                .values(x=table.c.x + 5)
+                .returning(table.c.x, expr)
+            ), expr
+
+        stmt1, expr1 = stmt()
+        stmt2, expr2 = stmt()
+        is_(expr1 is expr2, False)
+
+        result1 = connection.execute(stmt1, execution_options=eo)
+        eq_(result1.context.cache_hit, CacheStats.CACHE_MISS)
+        row1 = result1.first()
+
+        result2 = connection.execute(stmt2, execution_options=eo)
+        eq_(result2.context.cache_hit, CacheStats.CACHE_HIT)
+        row2 = result2.first()
+
+        # existing string based usage with unique names stays unchanged
+        eq_((row1._mapping["x"], row1._mapping["y"]), (15, 16))
+        eq_((row2._mapping["x"], row2._mapping["y"]), (20, 21))
+        eq_(row1._mapping[table.c.x], 15)
+        eq_(row1._mapping[expr1], 16)
+        eq_(row2._mapping[table.c.x], 20)
+        eq_(row2._mapping[expr2], 21)
 
 
 class DeleteReturningTest(fixtures.TablesTest, AssertsExecutionResults):
