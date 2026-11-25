@@ -1,0 +1,16 @@
+What's new in Tornado 6.7.0
+===========================
+
+General changes
+~~~~~~~~~~~~~~~
+
+- `.bind_sockets` (and the corresponding `.TCPServer.listen` and `.TCPServer.bind`
+  methods) now accept a ``max_attempts`` argument. When binding a group of sockets
+  for more than one address family (such as IPv4 and IPv6) on an ephemeral port,
+  the operating system may choose a port for the first family that is unavailable
+  for another family, causing a transient ``EADDRINUSE`` error. With
+  ``max_attempts`` greater than one, all sockets opened during the failed attempt
+  are closed and the whole group is bound again with a freshly selected port, for
+  up to the given number of attempts. Address families that are genuinely
+  unavailable (for example, a host without IPv6 support) continue to be skipped
+  as before rather than retried.

@@ -88,6 +88,16 @@ def _server_ssl_defaults() -> ssl.SSLContext:
 _DEFAULT_BACKLOG = 128
 
 
+class _BindSocketRetry(Exception):
+    """Internal signal used to restart a group of socket binds.
+
+    Raised when a bind fails with a transient error (such as
+    ``EADDRINUSE`` while trying to use the same ephemeral port for more
+    than one address family) and the caller opted in to bounded retries
+    via ``max_attempts``. The original error is attached as the cause.
+    """
+
+
 def bind_sockets(
     port: int,
     address: str | None = None,
@@ -95,6 +105,7 @@ def bind_sockets(
     backlog: int = _DEFAULT_BACKLOG,
     flags: int | None = None,
     reuse_port: bool = False,
+    max_attempts: int = 1,
 ) -> list[socket.socket]:
     """Creates listening sockets bound to the given port and address.
 
@@ -118,11 +129,31 @@ def bind_sockets(
     ``reuse_port`` option sets ``SO_REUSEPORT`` option for every socket
     in the list. If your platform doesn't support this option ValueError will
     be raised.
+
+    ``max_attempts`` is a commitment to bind the whole group of sockets
+    (e.g. one IPv4 and one IPv6 socket) together. When ``port`` is zero
+    (ask the operating system for an ephemeral port), the first socket
+    picks a port and the remaining address families are bound to that
+    same port. That later bind can fail transiently, most commonly with
+    ``EADDRINUSE`` when the chosen port happens to be taken for the other
+    address family. When this happens and ``max_attempts`` is greater
+    than one, all sockets opened during the failed attempt are closed and
+    the whole group is bound again, letting the operating system pick a
+    new port, for up to ``max_attempts`` attempts in total. Address
+    families that are genuinely unavailable (e.g. an environment without
+    IPv6 support) are skipped as declared rather than retried, so the
+    returned list may contain fewer sockets than address families.
+
+    .. versionchanged:: 6.7
+
+       Added the ``max_attempts`` argument.
     """
     if reuse_port and not hasattr(socket, "SO_REUSEPORT"):
         raise ValueError("the platform doesn't support SO_REUSEPORT")
+    if not isinstance(max_attempts, int) or max_attempts < 1:
+        raise ValueError("max_attempts must be a positive integer")
 
-    sockets = []
+    sockets: list[socket.socket] = []
     if address == "":
         address = None
     if not socket.has_ipv6 and family == socket.AF_UNSPEC:
@@ -134,92 +165,125 @@ def bind_sockets(
         family = socket.AF_INET
     if flags is None:
         flags = socket.AI_PASSIVE
-    bound_port = None
-    unique_addresses: set[Any] = set()
-    for res in sorted(
+
+    # Resolve the full set of addresses once; every attempt binds the
+    # same group of addresses so that a failed round can be discarded
+    # and restarted with a freshly allocated port.
+    addrinfo = sorted(
         socket.getaddrinfo(address, port, family, socket.SOCK_STREAM, 0, flags),
         key=lambda x: x[0],
-    ):
-        if res in unique_addresses:
-            continue
+    )
 
-        unique_addresses.add(res)
-
-        af, socktype, proto, canonname, sockaddr = res
-        if (
-            sys.platform == "darwin"
-            and address == "localhost"
-            and af == socket.AF_INET6
-            and sockaddr[3] != 0
-        ):
-            # Mac OS X includes a link-local address fe80::1%lo0 in the
-            # getaddrinfo results for 'localhost'.  However, the firewall
-            # doesn't understand that this is a local address and will
-            # prompt for access (often repeatedly, due to an apparent
-            # bug in its ability to remember granting access to an
-            # application). Skip these addresses.
-            continue
+    last_error: OSError | None = None
+    for attempt in range(max_attempts):
+        bound_port = None
+        unique_addresses: set[Any] = set()
         try:
-            sock = socket.socket(af, socktype, proto)
-        except OSError as e:
-            if errno_from_exception(e) == errno.EAFNOSUPPORT:
-                continue
-            raise
-        if os.name != "nt":
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            except OSError as e:
-                if errno_from_exception(e) != errno.ENOPROTOOPT:
-                    # Hurd doesn't support SO_REUSEADDR.
+            for res in addrinfo:
+                if res in unique_addresses:
+                    continue
+
+                unique_addresses.add(res)
+
+                af, socktype, proto, canonname, sockaddr = res
+                if (
+                    sys.platform == "darwin"
+                    and address == "localhost"
+                    and af == socket.AF_INET6
+                    and sockaddr[3] != 0
+                ):
+                    # Mac OS X includes a link-local address fe80::1%lo0 in the
+                    # getaddrinfo results for 'localhost'.  However, the firewall
+                    # doesn't understand that this is a local address and will
+                    # prompt for access (often repeatedly, due to an apparent
+                    # bug in its ability to remember granting access to an
+                    # application). Skip these addresses.
+                    continue
+                try:
+                    sock = socket.socket(af, socktype, proto)
+                except OSError as e:
+                    if errno_from_exception(e) == errno.EAFNOSUPPORT:
+                        continue
                     raise
-        if reuse_port:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        if af == socket.AF_INET6:
-            # On linux, ipv6 sockets accept ipv4 too by default,
-            # but this makes it impossible to bind to both
-            # 0.0.0.0 in ipv4 and :: in ipv6.  On other systems,
-            # separate sockets *must* be used to listen for both ipv4
-            # and ipv6.  For consistency, always disable ipv4 on our
-            # ipv6 sockets and use a separate ipv4 socket when needed.
-            #
-            # Python 2.x on windows doesn't have IPPROTO_IPV6.
-            if hasattr(socket, "IPPROTO_IPV6"):
-                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                if os.name != "nt":
+                    try:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    except OSError as e:
+                        if errno_from_exception(e) != errno.ENOPROTOOPT:
+                            # Hurd doesn't support SO_REUSEADDR.
+                            raise
+                if reuse_port:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                if af == socket.AF_INET6:
+                    # On linux, ipv6 sockets accept ipv4 too by default,
+                    # but this makes it impossible to bind to both
+                    # 0.0.0.0 in ipv4 and :: in ipv6.  On other systems,
+                    # separate sockets *must* be used to listen for both ipv4
+                    # and ipv6.  For consistency, always disable ipv4 on our
+                    # ipv6 sockets and use a separate ipv4 socket when needed.
+                    #
+                    # Python 2.x on windows doesn't have IPPROTO_IPV6.
+                    if hasattr(socket, "IPPROTO_IPV6"):
+                        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
 
-        # automatic port allocation with port=None
-        # should bind on the same port on IPv4 and IPv6
-        host, requested_port = sockaddr[:2]
-        if requested_port == 0 and bound_port is not None:
-            sockaddr = tuple([host, bound_port] + list(sockaddr[2:]))
+                # automatic port allocation with port=None
+                # should bind on the same port on IPv4 and IPv6
+                host, requested_port = sockaddr[:2]
+                if requested_port == 0 and bound_port is not None:
+                    sockaddr = tuple([host, bound_port] + list(sockaddr[2:]))
 
-        sock.setblocking(False)
-        try:
-            sock.bind(sockaddr)
-        except OSError as e:
-            if (
-                errno_from_exception(e) == errno.EADDRNOTAVAIL
-                and address == "localhost"
-                and sockaddr[0] == "::1"
-            ):
-                # On some systems (most notably docker with default
-                # configurations), ipv6 is partially disabled:
-                # socket.has_ipv6 is true, we can create AF_INET6
-                # sockets, and getaddrinfo("localhost", ...,
-                # AF_PASSIVE) resolves to ::1, but we get an error
-                # when binding.
-                #
-                # Swallow the error, but only for this specific case.
-                # If EADDRNOTAVAIL occurs in other situations, it
-                # might be a real problem like a typo in a
-                # configuration.
-                sock.close()
+                sock.setblocking(False)
+                try:
+                    sock.bind(sockaddr)
+                except OSError as e:
+                    if (
+                        errno_from_exception(e) == errno.EADDRNOTAVAIL
+                        and address == "localhost"
+                        and sockaddr[0] == "::1"
+                    ):
+                        # On some systems (most notably docker with default
+                        # configurations), ipv6 is partially disabled:
+                        # socket.has_ipv6 is true, we can create AF_INET6
+                        # sockets, and getaddrinfo("localhost", ...,
+                        # AF_PASSIVE) resolves to ::1, but we get an error
+                        # when binding.
+                        #
+                        # Swallow the error, but only for this specific case.
+                        # If EADDRNOTAVAIL occurs in other situations, it
+                        # might be a real problem like a typo in a
+                        # configuration.
+                        sock.close()
+                        continue
+                    elif errno_from_exception(e) == errno.EADDRINUSE:
+                        # The operating system handed out a port for one
+                        # address family that cannot be used by another
+                        # family in the same group. Release every handle
+                        # opened in this round (including the one whose
+                        # bind just failed) and either restart with a
+                        # freshly allocated port or surface the error.
+                        sock.close()
+                        for opened in sockets:
+                            opened.close()
+                        sockets.clear()
+                        last_error = e
+                        raise _BindSocketRetry() from e
+                    else:
+                        raise
+                bound_port = sock.getsockname()[1]
+                sock.listen(backlog)
+                sockets.append(sock)
+        except _BindSocketRetry:
+            if attempt + 1 < max_attempts:
+                # Start another round; the operating system may pick a
+                # different ephemeral port that both families can share.
                 continue
-            else:
-                raise
-        bound_port = sock.getsockname()[1]
-        sock.listen(backlog)
-        sockets.append(sock)
-    return sockets
+            assert last_error is not None
+            raise last_error
+        else:
+            return sockets
+    # Every attempt was exhausted; surface the last transient error.
+    assert last_error is not None
+    raise last_error
 
 
 if hasattr(socket, "AF_UNIX"):

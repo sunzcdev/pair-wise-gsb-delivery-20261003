@@ -159,6 +159,7 @@ class TCPServer:
         backlog: int = _DEFAULT_BACKLOG,
         flags: int | None = None,
         reuse_port: bool = False,
+        max_attempts: int = 1,
     ) -> None:
         """Starts accepting connections on the given port.
 
@@ -174,6 +175,11 @@ class TCPServer:
 
            Added ``family``, ``backlog``, ``flags``, and ``reuse_port``
            arguments to match `tornado.netutil.bind_sockets`.
+
+        .. versionchanged:: 6.7
+
+           Added the ``max_attempts`` argument to match
+           `tornado.netutil.bind_sockets`.
         """
         sockets = bind_sockets(
             port,
@@ -182,6 +188,7 @@ class TCPServer:
             backlog=backlog,
             flags=flags,
             reuse_port=reuse_port,
+            max_attempts=max_attempts,
         )
         self.add_sockets(sockets)
 
@@ -212,6 +219,7 @@ class TCPServer:
         backlog: int = _DEFAULT_BACKLOG,
         flags: int | None = None,
         reuse_port: bool = False,
+        max_attempts: int = 1,
     ) -> None:
         """Binds this server to the given port on the given address.
 
@@ -239,6 +247,9 @@ class TCPServer:
         .. versionchanged:: 6.2
            Added the ``flags`` argument to match `.bind_sockets`.
 
+        .. versionchanged:: 6.7
+           Added the ``max_attempts`` argument to match `.bind_sockets`.
+
         .. deprecated:: 6.2
            Use either ``listen()`` or ``add_sockets()`` instead of ``bind()``
            and ``start()``.
@@ -250,6 +261,7 @@ class TCPServer:
             backlog=backlog,
             flags=flags,
             reuse_port=reuse_port,
+            max_attempts=max_attempts,
         )
         if self._started:
             self.add_sockets(sockets)
