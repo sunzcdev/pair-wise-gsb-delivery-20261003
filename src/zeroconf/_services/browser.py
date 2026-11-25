@@ -542,6 +542,7 @@ class _ServiceBrowserBase(RecordUpdateListener):
     __slots__ = (
         "_cache",
         "_loop",
+        "_pending_handler_indexes",
         "_pending_handlers",
         "_query_sender_task",
         "_service_state_changed",
@@ -577,7 +578,8 @@ class _ServiceBrowserBase(RecordUpdateListener):
         self._cache = zc.cache
         assert zc.loop is not None
         self._loop = zc.loop
-        self._pending_handlers: dict[tuple[str, str], ServiceStateChange] = {}
+        self._pending_handlers: list[tuple[tuple[str, str], ServiceStateChange]] = []
+        self._pending_handler_indexes: dict[tuple[str, str], int] = {}
         self._service_state_changed = Signal()
         self.query_scheduler = QueryScheduler(
             zc,
@@ -628,6 +630,13 @@ class _ServiceBrowserBase(RecordUpdateListener):
                         self._enqueue_callback(SERVICE_STATE_CHANGE_REMOVED, type_, pointer.alias)
                         self.query_scheduler.cancel_ptr_refresh(pointer)
                     else:
+                        key = (pointer.alias, type_)
+                        index = self._pending_handler_indexes.get(key)
+                        if (
+                            index is not None
+                            and self._pending_handlers[index][1] is SERVICE_STATE_CHANGE_REMOVED
+                        ):
+                            self._enqueue_callback(SERVICE_STATE_CHANGE_ADDED, type_, pointer.alias)
                         self.query_scheduler.reschedule_ptr_first_refresh(pointer)
                 continue
 
@@ -655,9 +664,10 @@ class _ServiceBrowserBase(RecordUpdateListener):
 
         This method is expected to be overridden by subclasses.
         """
-        for pending in self._pending_handlers.items():
+        for pending in self._pending_handlers:
             self._fire_service_state_changed_event(pending)
         self._pending_handlers.clear()
+        self._pending_handler_indexes.clear()
 
     @property
     def service_state_changed(self) -> SignalRegistrationInterface:
@@ -694,18 +704,35 @@ class _ServiceBrowserBase(RecordUpdateListener):
         type_: str_,
         name: str_,
     ) -> None:
-        # Code to ensure we only do a single update message
-        # Precedence is; Added, Remove, Update
+        """Coalesce redundant changes while keeping remove/add boundaries."""
         key = (name, type_)
-        if (
-            state_change is SERVICE_STATE_CHANGE_ADDED
-            or (
-                state_change is SERVICE_STATE_CHANGE_REMOVED
-                and self._pending_handlers.get(key) is not SERVICE_STATE_CHANGE_ADDED
-            )
-            or (state_change is SERVICE_STATE_CHANGE_UPDATED and key not in self._pending_handlers)
-        ):
-            self._pending_handlers[key] = state_change
+        index = self._pending_handler_indexes.get(key)
+        current = self._pending_handlers[index][1] if index is not None else None
+
+        if state_change is SERVICE_STATE_CHANGE_ADDED:
+            if current is SERVICE_STATE_CHANGE_REMOVED:
+                pass
+            elif current is SERVICE_STATE_CHANGE_UPDATED:
+                assert index is not None
+                self._pending_handlers[index] = (key, SERVICE_STATE_CHANGE_ADDED)
+                return
+            elif current is not None:
+                return
+        elif state_change is SERVICE_STATE_CHANGE_REMOVED:
+            if current is SERVICE_STATE_CHANGE_UPDATED:
+                assert index is not None
+                self._pending_handlers[index] = (key, SERVICE_STATE_CHANGE_REMOVED)
+                return
+            if current is not None:
+                return
+        elif state_change is SERVICE_STATE_CHANGE_UPDATED:
+            if current is SERVICE_STATE_CHANGE_REMOVED:
+                state_change = SERVICE_STATE_CHANGE_ADDED
+            elif current is not None:
+                return
+
+        self._pending_handler_indexes[key] = len(self._pending_handlers)
+        self._pending_handlers.append((key, state_change))
 
     def _fire_service_state_changed_event(self, event: tuple[tuple[str, str], ServiceStateChange]) -> None:
         """Fire a service state changed event.
@@ -782,9 +809,10 @@ class ServiceBrowser(_ServiceBrowserBase, threading.Thread):
 
         This method will be run in the event loop.
         """
-        for pending in self._pending_handlers.items():
+        for pending in self._pending_handlers:
             self.queue.put(pending)
         self._pending_handlers.clear()
+        self._pending_handler_indexes.clear()
 
     def cancel(self) -> None:
         """Cancel the browser."""

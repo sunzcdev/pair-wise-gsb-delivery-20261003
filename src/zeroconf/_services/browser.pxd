@@ -104,7 +104,8 @@ cdef class _ServiceBrowserBase(RecordUpdateListener):
     cdef public object zc
     cdef DNSCache _cache
     cdef object _loop
-    cdef public cython.dict _pending_handlers
+    cdef public cython.dict _pending_handler_indexes
+    cdef public cython.list _pending_handlers
     cdef public object _service_state_changed
     cdef public QueryScheduler query_scheduler
     cdef public bint done
