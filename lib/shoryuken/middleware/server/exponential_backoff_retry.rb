@@ -8,6 +8,10 @@ module Shoryuken
       class ExponentialBackoffRetry
         include Util
 
+        # SQS's maximum visibility timeout: a message can stay in flight for at most 12 hours
+        # from when its current receipt was received
+        MAX_VISIBILITY_TIMEOUT = 43_200
+
         # Batch worker classes already warned that exponential backoff is skipped for them
         BATCH_WARNED = Helpers::AtomicHash.new
         private_constant :BATCH_WARNED
@@ -30,7 +34,12 @@ module Shoryuken
             return yield
           end
 
-          started_at = Time.now
+          # SQS's 12-hour in-flight ceiling runs from when the message was received, not from
+          # when processing started - the message may have waited in the local dispatch queue
+          # first. Anchor the cap to the receipt so a long local wait doesn't produce a
+          # visibility timeout the server will reject.
+          received_at = sqs_msg.received_at if sqs_msg.respond_to?(:received_at)
+          received_at ||= Time.now
 
           # Scope the rescue to the single-message yield only. A method-level
           # rescue would also catch the batch `return yield` above, then route the
@@ -46,7 +55,7 @@ module Shoryuken
             # NonRetryableException middleware can delete the message immediately.
             raise if NonRetryableException.non_retryable?(e, worker_options['non_retryable_exceptions'])
 
-            if retry_intervals.nil? || !handle_failure(sqs_msg, started_at, retry_intervals)
+            if retry_intervals.nil? || !handle_failure(sqs_msg, received_at, retry_intervals)
               # Re-raise the exception if the job is not going to be exponential backoff retried.
               # This allows custom middleware (like exception notifiers) to be aware of the unhandled failure.
               raise
@@ -91,12 +100,12 @@ module Shoryuken
         # Calculates the next visibility timeout capped at SQS maximum
         #
         # @param interval [Integer] the desired interval
-        # @param started_at [Time] when processing started
+        # @param received_at [Time] when the message was received (the 12h ceiling runs from here)
         # @return [Integer] the capped visibility timeout (never negative)
-        def next_visibility_timeout(interval, started_at)
-          max_timeout = 43_200 - (Time.now - started_at).ceil - 1
+        def next_visibility_timeout(interval, received_at)
+          max_timeout = MAX_VISIBILITY_TIMEOUT - (Time.now - received_at).ceil - 1
           interval = max_timeout if interval > max_timeout
-          # Never go negative: a job that ran longer than the 12h SQS ceiling
+          # Never go negative: a message whose receipt is older than the 12h SQS ceiling
           # drives max_timeout below zero, and change_message_visibility rejects
           # a negative timeout. Clamp to 0 (retry as soon as possible) instead.
           [interval.to_i, 0].max
@@ -105,10 +114,10 @@ module Shoryuken
         # Handles a message failure by adjusting visibility timeout
         #
         # @param sqs_msg [Shoryuken::Message] the failed message
-        # @param started_at [Time] when processing started
+        # @param received_at [Time] when the message was received
         # @param retry_intervals [Array<Integer>, #call] the configured intervals
         # @return [Boolean] true if retry was scheduled, false otherwise
-        def handle_failure(sqs_msg, started_at, retry_intervals)
+        def handle_failure(sqs_msg, received_at, retry_intervals)
           receive_count = sqs_msg.attributes['ApproximateReceiveCount'].to_i
 
           begin
@@ -120,7 +129,7 @@ module Shoryuken
 
           return false unless interval
 
-          sqs_msg.change_visibility(visibility_timeout: next_visibility_timeout(interval.to_i, started_at))
+          sqs_msg.change_visibility(visibility_timeout: next_visibility_timeout(interval.to_i, received_at))
 
           logger.info { "Message #{sqs_msg.message_id} failed, will be retried in #{interval} seconds" }
 

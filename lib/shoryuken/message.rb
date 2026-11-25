@@ -87,6 +87,11 @@ module Shoryuken
     # @return [Aws::SQS::Types::Message] The raw SQS message data
     attr_accessor :data
 
+    # @return [Time] When this receipt of the message was received from SQS. The visibility
+    #   timeout (and SQS's 12-hour in-flight ceiling) starts counting from this moment, not
+    #   from when a worker picks the message up - it may sit in the local dispatch queue first.
+    attr_accessor :received_at
+
     # Creates a new Message instance wrapping SQS message data.
     #
     # @param client [Aws::SQS::Client] The SQS client for message operations
@@ -94,10 +99,11 @@ module Shoryuken
     # @param data [Aws::SQS::Types::Message] The raw SQS message data
     # @api private
     def initialize(client, queue, data)
-      self.client     = client
-      self.data       = data
-      self.queue_url  = queue.url
-      self.queue_name = queue.name
+      self.client      = client
+      self.data        = data
+      self.queue_url   = queue.url
+      self.queue_name  = queue.name
+      self.received_at = Time.now
     end
 
     # Tells whether this is the last receive before SQS moves the message to the dead-letter queue.

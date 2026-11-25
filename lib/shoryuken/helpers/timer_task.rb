@@ -8,15 +8,21 @@ module Shoryuken
       # Initializes a new TimerTask
       #
       # @param execution_interval [Float] interval in seconds between task executions
+      # @param initial_interval [Float, nil] interval in seconds before the first execution;
+      #   defaults to execution_interval. Useful when the schedule is anchored to an earlier
+      #   point in time (e.g. a message receipt) so the first run comes sooner than the rest.
       # @param task [Proc] the task to execute on each interval (provided as a block)
       # @return [TimerTask] a new TimerTask instance
-      # @raise [ArgumentError] if no block is provided or interval is not positive
+      # @raise [ArgumentError] if no block is provided or an interval is not positive
       # @yield the task to execute on each interval
-      def initialize(execution_interval:, &task)
+      def initialize(execution_interval:, initial_interval: nil, &task)
         raise ArgumentError, 'A block must be provided' unless block_given?
 
         @execution_interval = Float(execution_interval)
         raise ArgumentError, 'execution_interval must be positive' if @execution_interval <= 0
+
+        @initial_interval = Float(initial_interval || execution_interval)
+        raise ArgumentError, 'initial_interval must be positive' if @initial_interval <= 0
 
         @task = task
         @mutex = Mutex.new
@@ -76,8 +82,10 @@ module Shoryuken
         # processed). Reset to normal priority.
         Thread.current.priority = 0
 
+        interval = @initial_interval
         until @killed
-          sleep(@execution_interval)
+          sleep(interval)
+          interval = @execution_interval
           break if @killed
 
           begin

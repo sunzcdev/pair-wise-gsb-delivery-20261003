@@ -27,6 +27,10 @@ RSpec.describe Shoryuken::Message do
       expect(subject.queue_name).to eq('test-queue')
       expect(subject.data).to eq(data)
     end
+
+    it 'stamps received_at with the receive time' do
+      expect(subject.received_at).to be_within(1).of(Time.now)
+    end
   end
 
   describe 'delegated methods' do

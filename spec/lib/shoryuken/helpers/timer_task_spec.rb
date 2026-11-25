@@ -172,6 +172,28 @@ RSpec.describe Shoryuken::Helpers::TimerTask do
       expect(execution_count).to be <= 4 # Allow some timing variance
     end
 
+    it 'requires a positive initial_interval when given' do
+      message = 'initial_interval must be positive'
+      expect { described_class.new(execution_interval: 1, initial_interval: 0) {} }.to raise_error(ArgumentError, message)
+      expect { described_class.new(execution_interval: 1, initial_interval: -1) {} }.to raise_error(ArgumentError, message)
+    end
+
+    it 'runs the first execution after initial_interval, then every execution_interval' do
+      fires = []
+      started_at = Time.now
+      timer = described_class.new(execution_interval: 0.2, initial_interval: 0.05) do
+        fires << Time.now
+      end
+
+      timer.execute
+      sleep(0.35) # initial 0.05 + one steady 0.2 interval
+      timer.kill
+
+      expect(fires.size).to be >= 2
+      expect(fires[0] - started_at).to be_within(0.15).of(0.05)
+      expect(fires[1] - fires[0]).to be_within(0.15).of(0.2)
+    end
+
     it 'calls the task block correctly' do
       task_called = false
       timer = described_class.new(execution_interval: 0.05) do

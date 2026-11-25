@@ -277,6 +277,21 @@ RSpec.describe Shoryuken::Middleware::Server::ExponentialBackoffRetry do
       expect { subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'failed' } }.not_to raise_error
     end
 
+    it 'caps the visibility timeout from the receipt time, not from processing start' do
+      TestWorker.get_shoryuken_options['retry_intervals'] = [86_400]
+
+      # The message was received 120s ago and spent most of that waiting in the
+      # local dispatch queue; SQS counts the 12h in-flight ceiling from the receipt
+      t0 = Time.at(1_700_000_000)
+      allow(Time).to receive(:now).and_return(t0 + 120)
+      allow(sqs_msg).to receive(:received_at).and_return(t0)
+
+      allow(sqs_msg).to receive(:queue) { sqs_queue }
+      expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: 43_200 - 120 - 1)
+
+      expect { subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { raise 'failed' } }.not_to raise_error
+    end
+
     it 'never sets a negative visibility timeout for jobs longer than the SQS ceiling' do
       TestWorker.get_shoryuken_options['retry_intervals'] = [300]
       started_at = Time.now
