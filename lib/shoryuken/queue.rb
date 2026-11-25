@@ -18,6 +18,10 @@ module Shoryuken
     # SQS attribute name for the dead-letter queue redrive policy
     REDRIVE_POLICY_ATTR     = 'RedrivePolicy'
 
+    # Total batch delete attempts made by {#delete_messages_settlement}: the initial batch plus
+    # one targeted redo containing only clearly retryable receipts.
+    DELETE_MAX_ATTEMPTS     = 2
+
     # @return [String] the queue name
     attr_accessor :name
 
@@ -26,7 +30,6 @@ module Shoryuken
 
     # @return [String] the queue URL
     attr_accessor :url
-
     # Initializes a new Queue instance
     #
     # @param client [Aws::SQS::Client] the SQS client
@@ -56,19 +59,57 @@ module Shoryuken
         options.merge(queue_url: url)
       ).failed || []
 
-      # Log every failure (not just the first) and return a plain boolean.
-      # The previous `any? { logger.error ... }` short-circuited after the first
-      # failure - so the rest went unlogged - and only returned truthy because
-      # Logger#error happens to return true.
-      failed_messages.each do |failure|
-        logger.error do
-          "Could not delete #{failure.id}, code: '#{failure.code}', message: '#{failure.message}', " \
-            "sender_fault: #{failure.sender_fault}"
-        end
-      end
+      log_delete_failures(failed_messages)
 
       failed_messages.any?
     end
+
+    # Deletes messages in batch and returns a grouped {DeletionResult} settlement.
+    #
+    # Unlike {#delete_messages}, this consumes the per-receipt +successful+/+failed+
+    # entries of the batch response. Receipts whose failure code clearly names a
+    # temporary broker condition are re-sent - on their own, without the already
+    # confirmed or terminally rejected receipts - up to {DELETE_MAX_ATTEMPTS} total
+    # attempts. Expired/invalid receipts such as +ReceiptHandleIsInvalid+ are never
+    # retried. The worker handler is not involved here, so it never runs twice.
+    #
+    # Accepts either a positional options hash or keyword arguments:
+    #
+    #   queue.delete_messages_settlement(entries: entries)
+    #   queue.delete_messages_settlement({ entries: entries }, max_attempts: 3)
+    #
+    # @param options [Hash, nil] options containing +:entries+
+    # @param max_attempts [Integer] total attempts including the initial batch
+    # @param extra [Hash] keyword-style options (e.g. +entries:+) when +options+ is omitted
+    # @return [Shoryuken::DeletionResult] the final grouped settlement
+    def delete_messages_settlement(options = nil, max_attempts: DELETE_MAX_ATTEMPTS, **extra)
+      options = extra.merge(options || {})
+      entries = Array(options[:entries] || options['entries'])
+      # Only entries are re-sent per attempt; never leak the control key to the AWS request.
+      request_options = options.reject do |key, _|
+        %i[entries max_attempts].include?(key.to_sym)
+      end
+      max_attempts = [max_attempts.to_i, 1].max
+
+      settlement = DeletionResult.new(entries)
+      pending_entries = entries
+      attempts = 0
+
+      loop do
+        response = client.delete_message_batch(request_options.merge(entries: pending_entries, queue_url: url))
+        settlement.record(response)
+        log_delete_failures(response_failures(response))
+
+        attempts += 1
+        pending_entries = settlement.retry_entries
+
+        break if pending_entries.empty? || attempts >= max_attempts
+      end
+
+      settlement
+    end
+    alias delete_messages_result delete_messages_settlement
+    alias delete_settlement delete_messages_settlement
 
     # Sends a single message to the queue
     #
@@ -140,6 +181,74 @@ module Shoryuken
     end
 
     private
+
+    # Logs every per-entry failure from a delete_message_batch response. Extracted so both
+    # the boolean {#delete_messages} contract and the settlement/retry path log identically.
+    #
+    # @param failed_messages [Array<Object>] AWS BatchResultErrorEntry objects or compatible hashes
+    # @return [void]
+    def log_delete_failures(failed_messages)
+      # Log every failure (not just the first). The previous `any? { logger.error ... }`
+      # short-circuited after the first failure - so the rest went unlogged - and only
+      # returned truthy because Logger#error happens to return true.
+      Array(failed_messages).each do |failure|
+        logger.error do
+          "Could not delete #{failure_id(failure)}, code: '#{failure_code(failure)}', " \
+            "message: '#{failure_message(failure)}', sender_fault: #{failure_sender_fault(failure)}"
+        end
+      end
+    end
+
+    # Reads the +failed+ entries from an AWS result type or a Hash response.
+    #
+    # @param response [Object, Hash] the batch response
+    # @return [Array<Object>] the failed entries
+    def response_failures(response)
+      failed = if response.is_a?(Hash)
+                 response[:failed] || response['failed']
+               elsif response.respond_to?(:failed)
+                 response.failed
+               end
+
+      Array(failed)
+    end
+
+    # @param failure [Object, Hash] the failure entry
+    # @return [String, nil]
+    def failure_id(failure)
+      failure_field(failure, :id)
+    end
+
+    # @param failure [Object, Hash] the failure entry
+    # @return [String, nil]
+    def failure_code(failure)
+      failure_field(failure, :code)
+    end
+
+    # @param failure [Object, Hash] the failure entry
+    # @return [String, nil]
+    def failure_message(failure)
+      failure_field(failure, :message)
+    end
+
+    # @param failure [Object, Hash] the failure entry
+    # @return [Boolean, nil]
+    def failure_sender_fault(failure)
+      failure_field(failure, :sender_fault)
+    end
+
+    # Reads a field from an AWS struct or a Hash failure entry.
+    #
+    # @param failure [Object, Hash] the failure entry
+    # @param field [Symbol] the field name
+    # @return [Object, nil]
+    def failure_field(failure, field)
+      if failure.is_a?(Hash)
+        failure[field] || failure[field.to_s]
+      elsif failure.respond_to?(field)
+        failure.public_send(field)
+      end
+    end
 
     # Logs any per-entry failures from a batch send. SQS reports these in response.failed (throttling, oversize/malformed
     # entries, or a same-batch duplicate message_deduplication_id) rather than raising, so without this they are silently

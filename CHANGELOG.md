@@ -1,5 +1,14 @@
 ## [Unreleased]
 
+- Enhancement: AutoDelete settles `delete_message_batch` per receipt and redoes only clearly retryable deletes
+  - A batch call can come back successful while SQS lists some receipts in `failed`. The new
+    `Shoryuken::DeletionResult` groups receipts as `successful`, `retryable_failures` and
+    `terminal_failures` (for example `ReceiptHandleIsInvalid`), exposes the targeted `retry_entries`
+    and a JSON-friendly `to_h`, and `Queue#delete_messages_settlement` retries only the transient
+    subset once; `AutoDelete` returns the final settlement without re-running the finished handler
+  - `Queue#delete_messages` keeps its boolean contract (`true` when any failure is reported), so
+    `NonRetryableException` and existing callers are unchanged
+
 - Fix: `perform_async`, `perform_in` and `perform_at` of a raw worker with several queues (an Array, or a lambda that
   returns several) raise an `ArgumentError` that names the worker and its queues and asks for `queue:` when called
   without `queue:`
