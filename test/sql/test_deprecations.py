@@ -16,6 +16,7 @@ from sqlalchemy import table
 from sqlalchemy import testing
 from sqlalchemy.engine import default
 from sqlalchemy.sql import operators
+from sqlalchemy.sql import visitors
 from sqlalchemy.testing import assertions
 from sqlalchemy.testing import AssertsCompiledSQL
 from sqlalchemy.testing import config
@@ -218,6 +219,107 @@ class SelectableTest(fixtures.TestBase, AssertsCompiledSQL):
             "JOIN (SELECT 1 AS a, 2 AS b) AS joinfrom "
             "ON basefrom.a = joinfrom.a",
         )
+
+    def test_replace_selectable_distinguishes_same_named_aliases(self):
+        items = table("items", column("n", Integer), column("stamp", Integer))
+        selected = items.alias("same")
+        independent = items.alias("same")
+
+        scalar = (
+            select(independent.c.stamp)
+            .where(independent.c.n == 2)
+            .scalar_subquery()
+        )
+        stmt = select(selected.c.n, scalar.label("stamp")).where(
+            selected.c.n == 1
+        )
+        replacement = (
+            select(items.c.n, (items.c.stamp + 1).label("stamp"))
+            .subquery("target")
+        )
+
+        with testing.expect_deprecated(
+            r"The Selectable.replace_selectable\(\) method is deprecated"
+        ):
+            replaced = stmt.replace_selectable(selected, replacement)
+
+        self.assert_compile(
+            replaced,
+            "SELECT target.n, (SELECT same.stamp "
+            "FROM items AS same "
+            "WHERE same.n = :n_1) AS stamp "
+            "FROM (SELECT items.n AS n, items.stamp + :stamp_1 AS stamp "
+            "FROM items) AS target "
+            "WHERE target.n = :n_2",
+        )
+
+        traversed = list(visitors.iterate(replaced))
+        assert any(elem is replacement for elem in traversed)
+        assert any(elem is independent for elem in traversed)
+        assert not any(elem is selected for elem in traversed)
+
+
+class ReplaceSelectableExecutionTest(fixtures.TablesTest):
+    __sparse_driver_backend__ = True
+
+    @classmethod
+    def define_tables(cls, metadata):
+        Table(
+            "items",
+            metadata,
+            Column("n", Integer, primary_key=True),
+            Column("stamp", Integer),
+        )
+
+    @classmethod
+    def insert_data(cls, connection):
+        connection.execute(
+            cls.tables.items.insert(),
+            [
+                {"n": 1, "stamp": 11},
+                {"n": 2, "stamp": 22},
+                {"n": 3, "stamp": 33},
+            ],
+        )
+
+    def test_only_selected_alias_chain_is_redirected(self):
+        items = self.tables.items
+        selected = items.alias("same")
+        independent = items.alias("same")
+        lookup = items.alias("lookup")
+
+        independent_scalar = (
+            select(independent.c.stamp)
+            .where(independent.c.n == 2)
+            .scalar_subquery()
+        )
+        correlated_scalar = (
+            select(lookup.c.stamp)
+            .where(lookup.c.n == selected.c.n)
+            .scalar_subquery()
+        )
+        original = select(
+            selected.c.n,
+            selected.c.stamp,
+            independent_scalar.label("independent_stamp"),
+            correlated_scalar.label("correlated_stamp"),
+        ).where(selected.c.n == 1)
+
+        replacement = select(
+            items.c.n, (items.c.stamp + 1).label("stamp")
+        ).subquery("target")
+
+        with testing.expect_deprecated(
+            r"The Selectable.replace_selectable\(\) method is deprecated"
+        ):
+            replaced = original.replace_selectable(selected, replacement)
+
+        with config.db.connect() as conn:
+            original_rows = [tuple(row) for row in conn.execute(original)]
+            replaced_rows = [tuple(row) for row in conn.execute(replaced)]
+
+        eq_(original_rows, [(1, 11, 22, 11)])
+        eq_(replaced_rows, [(1, 12, 22, 11)])
 
 
 class KeyTargetingTest(fixtures.TablesTest):

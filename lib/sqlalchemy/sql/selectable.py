@@ -162,6 +162,7 @@ if TYPE_CHECKING:
     from .sqltypes import TableValueType
     from .type_api import TypeEngine
     from .visitors import _CloneCallableType
+    from .visitors import ExternallyTraversible
 
 
 _ColumnsClauseElement = Union["FromClause", ColumnElement[Any], "TextClause"]
@@ -341,14 +342,47 @@ class Selectable(ReturnsRows):
         "deprecated, and will be removed in a future release.  Similar "
         "functionality is available via the sqlalchemy.sql.visitors module.",
     )
-    @util.preload_module("sqlalchemy.sql.util")
-    def replace_selectable(self, old: FromClause, alias: Alias) -> Self:
-        """Replace all occurrences of :class:`_expression.FromClause`
-        'old' with the given :class:`_expression.Alias`
-        object, returning a copy of this :class:`_expression.FromClause`.
+    def replace_selectable(
+        self, old: FromClause, alias: FromClause
+    ) -> Self:
+        """Replace references to the exact :class:`_expression.FromClause`
+        *old* with *alias*.
+
+        Selection is based on object identity rather than the FROM name, so
+        another alias that happens to have the same name is left unchanged.
+        Columns exported by *old*, or carrying its table identity, are
+        redirected to the corresponding exported columns of *alias*.  When
+        lineage correspondence is not available, the exported column key or
+        name is used, but only for columns on the selected reference chain.
 
         """
-        return util.preloaded.sql_util.ClauseAdapter(alias).traverse(self)
+
+        exported_columns = alias.exported_columns
+        selected_column_keys = {
+            id(column): key for key, column in old.exported_columns.items()
+        }
+
+        def replace(
+            elem: ExternallyTraversible,
+        ) -> Optional[ExternallyTraversible]:
+            if elem is old:
+                return alias
+
+            if isinstance(elem, ColumnClause) and (
+                id(elem) in selected_column_keys or elem.table is old
+            ):
+                new_column = alias.corresponding_column(elem)
+                if new_column is None:
+                    new_column = exported_columns.get(
+                        selected_column_keys.get(id(elem), elem.key)
+                    )
+                if new_column is None:
+                    new_column = exported_columns.get(elem.name)
+                return new_column
+
+            return None
+
+        return cast(Self, visitors.replacement_traverse(self, {}, replace))
 
     def corresponding_column(
         self, column: KeyedColumnElement[Any], require_embedded: bool = False
