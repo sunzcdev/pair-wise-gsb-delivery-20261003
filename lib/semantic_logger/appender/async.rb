@@ -30,7 +30,7 @@ module SemanticLogger
                      :queue, :max_queue_size, :capped?, :non_blocking?, :non_blocking=, :batch?,
                      :lag_check_interval, :lag_check_interval=,
                      :lag_threshold_s, :lag_threshold_s=,
-                     :processed_count, :dropped_count, :failed_count
+                     :processed_count, :dropped_count, :failed_count, :reopen_count
 
       # Appender proxy to allow an existing appender to run asynchronously in a separate thread.
       #
@@ -134,6 +134,9 @@ module SemanticLogger
       #   failed:         [Integer] Cumulative number of log messages discarded because they
       #                             could not be written, whether their content or the
       #                             destination was at fault (see Subscriber#message_error?).
+      #   reopened:       [Integer] Cumulative number of times the worker thread has reopened
+      #                             the appender (see #reopen), marking where its destination
+      #                             was swapped out.
       def stats
         {
           name:           name,
@@ -144,7 +147,8 @@ module SemanticLogger
           max_queue_size: capped? ? max_queue_size : nil,
           processed:      processed_count,
           dropped:        dropped_count,
-          failed:         failed_count
+          failed:         failed_count,
+          reopened:       reopen_count
         }
       end
     end

@@ -253,8 +253,31 @@ module Appender
           assert_equal 100, stats[:max_queue_size]
           assert_equal 0, stats[:dropped]
           assert_equal 0, stats[:failed]
+          assert_equal 0, stats[:reopened]
           assert_kind_of Integer, stats[:queue_size]
           assert_kind_of Integer, stats[:processed]
+        ensure
+          proxy&.close
+        end
+
+        it "counts how many times the worker thread has reopened the appender" do
+          reopenable = Class.new(SemanticLogger::Test::CaptureLogEvents) do
+            attr_reader :reopens
+
+            def reopen
+              @reopens = (@reopens || 0) + 1
+            end
+          end.new
+          reopenable.logger = appender.logger
+          proxy             = SemanticLogger::Appender::Async.new(appender: reopenable, max_queue_size: 100)
+
+          proxy.reopen
+
+          assert proxy.flush, "the worker thread should answer the flush and run the reopen"
+
+          assert_equal 1, reopenable.reopens
+          assert_equal 1, proxy.reopen_count
+          assert_equal 1, proxy.stats[:reopened]
         ensure
           proxy&.close
         end

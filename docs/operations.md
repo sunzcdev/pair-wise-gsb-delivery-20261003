@@ -121,6 +121,15 @@ did not fork (see [Log rotation](#log-rotation)).
    and waits for, at most one second; an appender added with `async: true` or in batches is still
    reopened by its own thread.
 
+   A batch the worker thread has already taken off the queue is still written to the destination it
+   started with: the reopen waits until that write returns, so the destination is never changed in
+   the middle of a write. When that write's result is unknown, the appender says neither that it
+   wrote none of the batch nor that it never reached the destination, the batch is not treated as a
+   success and is never sent again to the new destination; it is discarded and counted as `failed`
+   on its own (see [Retry a failing appender](#retry-a-failing-appender)). Entries accepted later are
+   written to the new destination. The `reopened` counter in `SemanticLogger.stats` marks the point
+   of the swap, so the two can be reconciled (see [Monitoring the background thread](#monitoring-the-background-thread)).
+
 You might opt out if another library forks in ways you do not want to trigger a reopen, or you need
 to control exactly when the appender thread restarts.
 
@@ -500,13 +509,21 @@ SemanticLogger.stats
 #          max_queue_size: 10_000,
 #          processed:      1_529,
 #          dropped:        0,
-#          failed:         0 }  # discarded because they could not be written
+#          failed:         0,      # discarded because they could not be written
+#          reopened:       1 }     # times its worker thread reopened the destination
 #      ]
 #    }
 ~~~
 
-The `processed`, `dropped`, and `failed` counters are cumulative since process startup. Reading `stats` is
+The `processed`, `dropped`, `failed`, and `reopened` counters are cumulative since process startup. Reading `stats` is
 thread-safe and adds no locking to the logging hot path.
+
+`reopened` counts how many times the appender's worker thread has reopened it (see [Reopen manually](#reopen-manually)),
+including a reopen that raised, which still tried to change the destination. It marks where the destination was
+swapped out: the entries written or discarded up to that count went to the previous destination, and later entries go
+to the new one. An entry, or batch, whose write returns an indeterminate result is never sent there again: unless the
+appender says the write wrote none of it (see [Retry a failing appender](#retry-a-failing-appender)), it is discarded
+and counted as `failed`, so a reopen cannot send it twice to the new destination.
 
 Semantic Logger also warns when an entry has waited on the queue too long. Tune the threshold and how
 often it is checked:

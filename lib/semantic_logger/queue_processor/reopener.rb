@@ -7,14 +7,21 @@ module SemanticLogger
     # Nor is it reopened on the thread that asks, often a signal trap after a log rotation, where
     # Ruby does not allow a Mutex to be locked, as connecting with a timeout does.
     #
-    # It knows whether a reopen has been asked for, and reports a reopen that fails to the internal
-    # logger. Asked from any thread, and from a signal trap, so it records that on a Queue.
+    # It knows whether a reopen has been asked for, how many times it has reopened the appender,
+    # and reports a reopen that fails to the internal logger. Asked from any thread, and from a
+    # signal trap, so it records those on a Queue. Only the worker thread ever reopens the appender,
+    # so it alone changes the count; the threads that ask only read it.
     class Reopener
+      # Returns [Integer] how many times the worker thread has reopened the appender, including one
+      # that raised, which still changed, or tried to change, the destination (see #reopen_if_asked).
+      attr_reader :reopen_count
+
       def initialize(appender, reporter)
-        @appender  = appender
-        @reporter  = reporter
-        @asked     = Queue.new
-        @reopening = false
+        @appender     = appender
+        @reporter     = reporter
+        @asked        = Queue.new
+        @reopening    = false
+        @reopen_count = 0
       end
 
       # Ask for the appender to be reopened before the worker thread writes again.
@@ -42,6 +49,7 @@ module SemanticLogger
         return if @asked.empty?
 
         @reopening = true
+        @reopen_count += 1
         @asked.clear
         @appender.reopen if @appender.respond_to?(:reopen)
         nil

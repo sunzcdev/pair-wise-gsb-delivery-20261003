@@ -169,6 +169,49 @@ class QueueProcessorTest < Minitest::Test
     end
   end
 
+  # A batching appender whose #reopen swaps its destination, from "old" to "new", as reopening a
+  # file or a connection to another server does. It records, in `routes`, which destination each
+  # batch went to and what became of the write, so that the boundary at which the destination was
+  # swapped out can be checked. A batch containing "hold" blocks once it has been taken off the
+  # queue, until the test opens `gate`, while a batch containing "unknown" answers the first write
+  # with an indeterminate result: it raises an error the appender gives no write-answer hooks for
+  # (it implements neither #wrote_nothing? nor #not_sent?), so the worker can neither call the write
+  # a success nor send it again, and must settle the batch on its own (see #failed_count).
+  class SwitchingBatchAppender < SimpleAppender
+    attr_reader :gate, :waiting, :routes
+
+    def initialize(**)
+      super
+      @destination   = "old"
+      @gate          = Queue.new
+      @waiting       = Queue.new
+      @routes        = []
+      @first_attempt = true
+    end
+
+    def batch(logs)
+      if @first_attempt && logs.any? { |log| log.message.include?("hold") }
+        waiting << true
+        gate.pop
+      end
+      if @first_attempt
+        @first_attempt = false
+        routes << [@destination, logs.map(&:message), "raised"]
+        raise IOError, "the write result is unknown"
+      end
+      routes << [@destination, logs.map(&:message), "written"]
+    end
+
+    def reopen
+      @destination = "new"
+    end
+
+    # The messages in each batch written to the named destination, in the order they were written.
+    def batches_to(destination)
+      routes.select { |route| route.first == destination }.map { |route| route[1] }
+    end
+  end
+
   # Cannot reach its destination for a message containing "unavailable" the first `failures` times
   # it is written, alone or in a batch, and says that such a write wrote nothing.
   class ResendingAppender < BatchAppender
@@ -2650,6 +2693,94 @@ class QueueProcessorTest < Minitest::Test
 
         assert processor.flush, "the new worker thread should answer the flush"
         assert_equal 1, appender.events.count
+      end
+
+      describe "around a batch whose write result is unknown when its destination is swapped out" do
+        let(:appender) do
+          a        = SwitchingBatchAppender.new
+          a.logger = internal_logger
+          a
+        end
+
+        # Holds the worker thread once it has taken the batch containing "hold" off the queue, and
+        # is writing it, until the test opens the gate.
+        def hold_batch(processor)
+          processor.log(new_log(message: "hold"))
+          processor.log(new_log(message: "old batch"))
+          processor.signal.set
+
+          assert appender.waiting.pop(timeout: 5), "the worker thread should take the batch off the queue"
+        end
+
+        # The old outlet answers the held write with an unknown result, then waits for the worker to
+        # settle it, so that a later flush only covers the records that follow it.
+        def answer_unknown_and_settle(processor)
+          appender.gate << true
+          deadline = Time.now + 5
+          Thread.pass until processor.failed_count == 2 || Time.now > deadline
+
+          assert_equal 2, processor.failed_count, "the old batch should be settled on its own, as failed"
+        end
+
+        it "reopens between the held batch and the next record, so later records use the new destination" do
+          processor = start(batch: true, batch_seconds: 60, async_max_retries: 10)
+          stub_back_off(processor) do
+            hold_batch(processor)
+
+            # Asked for while the worker thread is still writing the batch, and a record accepted
+            # meanwhile, before the old outlet has answered.
+            processor.reopen
+            processor.log(new_log(message: "later"))
+
+            assert_equal 0, processor.reopen_count, "a reopen must not happen while the appender is writing"
+
+            answer_unknown_and_settle(processor)
+
+            assert processor.flush, "the worker thread should answer the flush"
+          end
+
+          # The point at which the destination was swapped out: one reopen, after the held batch.
+          assert_equal 1, processor.reopen_count
+          assert_equal [["old", ["hold", "old batch"], "raised"], ["new", ["later"], "written"]], appender.routes
+          # The old batch was neither written nor sent again: it alone is counted as failed, while
+          # the later record was written to the new destination.
+          assert_equal 1, processor.processed_count
+          assert_equal 2, processor.failed_count
+        end
+
+        it "keeps the count of reopens the worker thread has run, even after the held batch is settled" do
+          processor = start(batch: true, batch_seconds: 60, async_max_retries: 10)
+          stub_back_off(processor) do
+            hold_batch(processor)
+            processor.reopen
+            processor.log(new_log(message: "later"))
+            answer_unknown_and_settle(processor)
+
+            assert processor.flush, "the worker thread should answer the flush"
+          end
+
+          assert_equal 1, processor.reopen_count
+        end
+
+        it "never sends the held batch to the new destination, however often it was asked to reopen" do
+          processor = start(batch: true, batch_seconds: 60, async_max_retries: 10)
+          stub_back_off(processor) do
+            hold_batch(processor)
+            3.times { processor.reopen }
+            processor.log(new_log(message: "later"))
+            answer_unknown_and_settle(processor)
+
+            assert processor.flush, "the worker thread should answer the flush"
+          end
+
+          # The asks coalesce into one reopen, and the only batch the new destination ever receives
+          # is the record accepted after the reopen, not the held batch.
+          assert_equal 1, processor.reopen_count
+          assert_equal [["later"]], appender.batches_to("new")
+          assert_equal [["hold", "old batch"]], appender.batches_to("old")
+          assert_equal 2, processor.failed_count
+          assert_equal 1, processor.processed_count
+        end
       end
 
       describe "#await_reopen" do

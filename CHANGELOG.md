@@ -103,6 +103,15 @@ This project adheres to [Semantic Versioning](http://semver.org/).
   it is discarded, and only those after it are written again, rather than the batch split up and
   written again in parts. See
   [Custom appenders](https://logger.reidmorrison.com/config.html#custom-appenders).
+- An asynchronous or batched appender now counts how many times its worker thread has reopened the
+  destination, as `reopen_count`, and as `reopened` in its `stats` (and in
+  `SemanticLogger.stats[:appenders]`), including a reopen that raised, which still tried to change
+  the destination. The counter marks where the destination was swapped out, so the entries written
+  (`processed`) and discarded (`failed`) around a reopen can be reconciled against it. A batch taken
+  off the queue before the reopen is still written to the destination it started with, and when that
+  write has an unknown result, one the appender gives no write-answer hook for, it is discarded and
+  counted as `failed` rather than sent again to the new destination, which later entries use. See
+  [Reopen manually](https://logger.reidmorrison.com/operations.html#reopen-manually).
 
 ### Changed
 

@@ -37,6 +37,30 @@ class ReopenerTest < Minitest::Test
       assert_equal 2, appender.reopens
     end
 
+    it "counts each time it reopens the appender, so a switch of destination is checkable" do
+      assert_equal 0, reopener.reopen_count
+
+      reopener.ask
+      reopener.reopen_if_asked
+
+      assert_equal 1, reopener.reopen_count
+
+      # Reopens asked for before it runs again are one reopen, and one count.
+      3.times { reopener.ask }
+      reopener.reopen_if_asked
+
+      assert_equal 2, reopener.reopen_count
+      assert_equal 2, appender.reopens
+    end
+
+    it "counts a reopen that fails, which still tried to change the destination" do
+      appender.reopen_error = SocketError.new("getaddrinfo: nodename nor servname provided, or not known")
+      reopener.ask
+      reopener.reopen_if_asked
+
+      assert_equal 1, reopener.reopen_count
+    end
+
     it "reports a reopen that fails, rather than raising it" do
       appender.reopen_error = SocketError.new("getaddrinfo: nodename nor servname provided, or not known")
       reopener.ask

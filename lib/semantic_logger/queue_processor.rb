@@ -174,6 +174,12 @@ module SemanticLogger
     # whether their content or the destination was at fault (see Subscriber#message_error?).
     def failed_count = @reporter.failed_count
 
+    # Returns [Integer] how many times the worker thread has reopened the appender (see #reopen),
+    # so that the point at which the destination was swapped out can be checked against the counts
+    # of messages written (see #processed_count) and discarded (see #failed_count). A reopen the
+    # appender raised is counted too: it still changed, or tried to change, the destination.
+    def reopen_count = @reopener.reopen_count
+
     # Returns [true|false] whether messages are processed in batches.
     def batch? = @batch
 
