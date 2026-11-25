@@ -264,12 +264,14 @@ class AppenderTest < Minitest::Test
           it "applies the batch options of add_appender to the instance, without a warning" do
             batcher = InMemoryBatchAppender.new
             added   = refute_deprecated do
-              SemanticLogger::Appender.factory(option => batcher, batch: true, batch_size: 2, batch_seconds: 1)
+              SemanticLogger::Appender.factory(option => batcher, batch: true, batch_size: 2, batch_seconds: 1,
+                                               isolation_write_budget: 6)
             end
 
             assert_predicate added, :batch?
             assert_same batcher, added.appender
             assert_equal 2, added.processor.batch_size
+            assert_equal 6, added.isolation_write_budget
           ensure
             added&.close
           end

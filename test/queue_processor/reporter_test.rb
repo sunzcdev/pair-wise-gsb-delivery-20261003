@@ -38,6 +38,32 @@ class ReporterTest < Minitest::Test
       assert_empty internal.events
     end
 
+    it "neither counts nor reports an empty list of log messages with an unknown outcome" do
+      internal        = SemanticLogger::Test::CaptureLogEvents.new
+      appender.logger = internal
+      reporter.undecided([], error, interval: 30)
+
+      assert_equal 0, reporter.undecided_count
+      assert_empty internal.events
+    end
+
+    it "reports log messages with an unknown outcome separately from discarded ones" do
+      internal        = SemanticLogger::Test::CaptureLogEvents.new
+      appender.logger = internal
+      entry           = SemanticLogger::Log.new("Test", :info)
+      entries         = [entry, SemanticLogger::Log.new("Test", :info)]
+      reporter.undecided(entries, error, interval: 30)
+
+      assert_equal 2, reporter.undecided_count
+      assert_equal 0, reporter.failed_count, "undecided entries are not definite failures"
+      assert_equal 1, internal.events.size
+      event = internal.events.first
+
+      assert_equal :warn, event.level
+      assert_match(/Left 2 log message\(s\) with an unknown outcome/, event.message)
+      assert_same error, event.exception
+    end
+
     it "reports to the internal logger of the appender, with the exception" do
       internal        = SemanticLogger::Test::CaptureLogEvents.new
       appender.logger = internal

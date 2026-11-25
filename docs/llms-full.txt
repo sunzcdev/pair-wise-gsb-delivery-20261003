@@ -2569,6 +2569,15 @@ SemanticLogger.add_appender(
 )
 ~~~
 
+When a batch is rejected for the content of one of its entries, it is split into parts and each part
+sent again to isolate the entry at fault (see
+[When the server does not accept a request](#when-the-server-does-not-accept-a-request)). On an
+appender whose batch is all or nothing, `isolation_write_budget` caps how many of those writes one
+original batch may use after the first, whole-batch write; entries still unwritten once it is spent
+are reported with an unknown outcome (`undecided` in `SemanticLogger.stats`) rather than as failed,
+and are not sent again blindly. See
+[Cap the writes used to isolate a bad batch entry](operations.html#cap-the-writes-used-to-isolate-a-bad-batch-entry).
+
 #### When the server does not accept a request
 
 An entry is written once the server answers its request with a 2xx status. The HTTP appender, and
@@ -5728,6 +5737,36 @@ internal logger straight away, with its error. After that, the number discarded 
 latest error, at most once every `dropped_message_report_seconds` (default `30`). The total appears
 as `failed` for that appender in `SemanticLogger.stats[:appenders]`.
 
+#### Cap the writes used to isolate a bad batch entry
+
+When an appender sends a whole batch in one request and that request is rejected for the content of
+one entry (an "all or nothing" batch), the worker splits the batch in halves and writes each half
+again, then splits again, until the entry at fault stands alone and can be discarded while the rest
+are still written. A destination that rejects one entry after another can otherwise take about two
+writes for every entry in the batch, each one a request to it.
+
+`isolation_write_budget` caps how many of those writes one original batch may use. The first write of
+the whole batch does not count; every write of a split-off part after it does, whether that part is
+stored, rejected, or split again. When the appender names the entry it rejected itself (for example
+the Splunk HTTP appender does, from the collector's response), no isolating split is needed, so
+re-sending the entries after it spends none of the budget. The budget starts afresh for each original
+batch.
+
+```ruby
+SemanticLogger.add_appender(appender: :http, url: "http://localhost:8088", batch: true,
+                            isolation_write_budget: 10)
+```
+
+Once the budget is spent, no more parts are written. The entries already confirmed written stay
+written, the entries already confirmed rejected are counted as `failed`, and every entry still in a
+part that was never written is reported separately with an unknown outcome, at `warn`, and counted as
+`undecided` in `SemanticLogger.stats[:appenders]`. Such an entry is never reported as a definite
+failure, since the destination never rejected it, and is not sent again blindly, since the
+destination may already have stored it; the application must log it again if it needs it written.
+With no budget (the default) a batch is split however many writes that takes, as before. The budget
+applies only to a batched, all or nothing appender; it never changes how a write whose outcome is
+unclear (see above) is held and written again.
+
 A `JSON::ParserError`, such as from a destination that answered with an HTML error page, is a
 problem with the destination, so the thread backs off as for any other error. The appender decides
 which errors are caused by message content; see [Custom appenders](config.html#custom-appenders).
@@ -5911,13 +5950,14 @@ SemanticLogger.stats
 #          max_queue_size: 10_000,
 #          processed:      1_529,
 #          dropped:        0,
-#          failed:         0 }  # discarded because they could not be written
+#          failed:         0,       # discarded because they could not be written
+#          undecided:      0 }      # unknown outcome after the isolation write budget ran out
 #      ]
 #    }
 ~~~
 
-The `processed`, `dropped`, and `failed` counters are cumulative since process startup. Reading `stats` is
-thread-safe and adds no locking to the logging hot path.
+The `processed`, `dropped`, `failed`, and `undecided` counters are cumulative since process startup.
+Reading `stats` is thread-safe and adds no locking to the logging hot path.
 
 Semantic Logger also warns when an entry has waited on the queue too long. Tune the threshold and how
 often it is checked:

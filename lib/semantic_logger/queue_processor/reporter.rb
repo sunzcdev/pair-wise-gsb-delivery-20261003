@@ -13,9 +13,10 @@ module SemanticLogger
       private_constant :POSITIONAL
 
       def initialize(appender)
-        @appender = appender
-        @dropped  = ThrottledCounter.new
-        @failed   = ThrottledCounter.new(reported_at: nil)
+        @appender  = appender
+        @dropped   = ThrottledCounter.new
+        @failed    = ThrottledCounter.new(reported_at: nil)
+        @undecided = ThrottledCounter.new(reported_at: nil)
       end
 
       # Returns the internal logger of the appender, which it can replace at any time.
@@ -27,6 +28,13 @@ module SemanticLogger
       # Returns [Integer] the number of log messages discarded because they could not be written,
       # whether their content or the destination was at fault (see Subscriber#message_error?).
       def failed_count = @failed.total
+
+      # Returns [Integer] the number of log messages whose fate is not known: a write that split an
+      # all or nothing batch to isolate the entries at fault ran out of its isolation write budget
+      # (see QueueProcessor#initialize) before writing them, so they were neither confirmed written
+      # nor confirmed rejected. They are not counted as failed, and are not sent again blindly,
+      # since the destination may already have stored them (see #undecided).
+      def undecided_count = @undecided.total
 
       # Log to the internal logger, ignoring any StandardError. These calls may run after Ruby has
       # released file handles during shutdown, and the internal logger may not take them, such as a
@@ -93,6 +101,25 @@ module SemanticLogger
           period = seconds ? " in the last #{seconds.round} seconds" : ""
           log(:error, "Async: Discarded #{count} log message(s)#{period} that could not be written, " \
                       "most recently from #{logs.first.name}", exception)
+        end
+      end
+
+      # Record log messages whose fate is not known, if any: an all or nothing batch was being split
+      # into parts to isolate the entries at fault, but the isolation write budget (see
+      # QueueProcessor#initialize) ran out before these were written. The destination neither stored
+      # nor rejected them, so they are reported separately from discarded ones (see #failed), at
+      # :warn rather than :error, and never as a definite failure. They are not sent again blindly,
+      # since the destination may already have stored them; an application that needs them written
+      # must log them again. The first is reported straight away, with the error that stopped the
+      # splitting when there is one, and after that the count at most once every `interval` seconds.
+      def undecided(logs, exception, interval:)
+        return if logs.empty?
+
+        @undecided.record(logs.size, interval: interval) do |count, seconds|
+          period = seconds ? " in the last #{seconds.round} seconds" : ""
+          log(:warn, "Async: Left #{count} log message(s)#{period} with an unknown outcome after the " \
+                     "isolation write budget ran out, most recently from #{logs.first.name}; they are " \
+                     "not reported as failed and are not sent again blindly", exception)
         end
       end
 

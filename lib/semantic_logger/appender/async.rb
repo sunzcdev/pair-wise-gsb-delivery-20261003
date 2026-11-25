@@ -30,7 +30,8 @@ module SemanticLogger
                      :queue, :max_queue_size, :capped?, :non_blocking?, :non_blocking=, :batch?,
                      :lag_check_interval, :lag_check_interval=,
                      :lag_threshold_s, :lag_threshold_s=,
-                     :processed_count, :dropped_count, :failed_count
+                     :processed_count, :dropped_count, :failed_count, :undecided_count,
+                     :isolation_write_budget
 
       # Appender proxy to allow an existing appender to run asynchronously in a separate thread.
       #
@@ -89,6 +90,17 @@ module SemanticLogger
       #     -1: Retry indefinitely and never stop the thread (the pre-v5 behaviour).
       #     Default: 100
       #
+      #   isolation_write_budget: [Integer|nil]
+      #     When batching an appender whose #batch is all or nothing
+      #     (see SemanticLogger::Subscriber#batch_all_or_nothing?), the most writes spent splitting
+      #     one original batch into parts to isolate the entries the destination rejects, after the
+      #     whole batch was rejected. The first, whole-batch write does not count; every write of a
+      #     part after it does. Once it is spent, the entries still in parts not written are reported
+      #     with an unknown outcome (#undecided_count) rather than as failed, and are not sent again
+      #     blindly. nil splits each batch however many writes that takes, the behaviour without this
+      #     option. Applies only with batch: true.
+      #     Default: nil
+      #
       # The proxy also answers #wrapped_logger, the logger that the appender writes to, when the
       # appender has one, such as one added with `logger:`, so that it is found the same way with or
       # without async: true. The proxy of any other appender does not respond to it.
@@ -134,6 +146,11 @@ module SemanticLogger
       #   failed:         [Integer] Cumulative number of log messages discarded because they
       #                             could not be written, whether their content or the
       #                             destination was at fault (see Subscriber#message_error?).
+      #   undecided:      [Integer] Cumulative number of log messages whose fate is not known,
+      #                             because isolating the entries at fault in an all or nothing
+      #                             batch ran out of isolation_write_budget before they were
+      #                             written; neither confirmed written nor rejected, and not
+      #                             counted as failed.
       def stats
         {
           name:           name,
@@ -144,7 +161,8 @@ module SemanticLogger
           max_queue_size: capped? ? max_queue_size : nil,
           processed:      processed_count,
           dropped:        dropped_count,
-          failed:         failed_count
+          failed:         failed_count,
+          undecided:      undecided_count
         }
       end
     end

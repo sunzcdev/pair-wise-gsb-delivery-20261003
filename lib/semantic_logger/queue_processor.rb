@@ -93,6 +93,32 @@ module SemanticLogger
     #     unavailable; one that stopped before, such as after a fatal exception, has the retries it
     #     had left. Only the worker thread of a child process, after a fork, starts counting afresh.
     #     Default: 100
+    #
+    #   isolation_write_budget: [Integer|nil]
+    #     The most writes spent isolating the entries at fault within one original batch, when the
+    #     appender's #batch is all or nothing (see Subscriber#batch_all_or_nothing?) and a message
+    #     error (see Subscriber#message_error?) rejects the whole batch. The rejected batch is split
+    #     in halves and each half written again, then split again, until the entries the destination
+    #     rejects stand alone and can be discarded. The first, whole-batch write does not count;
+    #     every write of a part after it counts one against the budget of the original batch it came
+    #     from, whether that part succeeds, is rejected, or is split again. A destination that
+    #     rejects one entry after another can otherwise take about two writes for every entry in the
+    #     batch, each one a request to it. When the appender names the entry it rejected itself (see
+    #     Subscriber#rejected_entry), no isolating split is needed, so re-sending the entries after
+    #     it spends none of the budget.
+    #     Once the budget is spent, no more parts are written: the entries already confirmed written
+    #     stay counted as written, those already confirmed rejected are discarded and counted as
+    #     failed, and every entry still in a part not yet written is reported with an unknown
+    #     outcome (see #undecided_count), never as a definite failure and never sent again blindly,
+    #     since the destination may already have stored them. The budget starts afresh for each
+    #     original batch.
+    #     nil: No limit; an all or nothing batch is split down to single entries however many writes
+    #         that takes (the behaviour without this option).
+    #     Only applies when batch: true and the appender's #batch is all or nothing. A batch that is
+    #     not all or nothing is never split, and a write whose outcome is unclear (see
+    #     Subscriber#wrote_nothing?) is held and written again as before, without spending the
+    #     budget, so this never replays such a write blindly.
+    #     Default: nil
     def initialize(appender:,
                    max_queue_size: 10_000,
                    lag_check_interval: 1_000,
@@ -102,7 +128,13 @@ module SemanticLogger
                    batch_seconds: 5,
                    non_blocking: false,
                    dropped_message_report_seconds: 30,
-                   async_max_retries: 100)
+                   async_max_retries: 100,
+                   isolation_write_budget: nil)
+      if isolation_write_budget && (!isolation_write_budget.is_a?(Integer) || isolation_write_budget.negative?)
+        raise(ArgumentError, "isolation_write_budget must be nil or a non-negative Integer, " \
+                             "not: #{isolation_write_budget.inspect}")
+      end
+
       @appender                       = appender
       @lag_check_interval             = lag_check_interval
       @lag_threshold_s                = lag_threshold_s
@@ -111,6 +143,7 @@ module SemanticLogger
       @batch_seconds                  = batch_seconds
       @non_blocking                   = non_blocking
       @dropped_message_report_seconds = dropped_message_report_seconds
+      @isolation_write_budget         = isolation_write_budget
       @backoff                        = Backoff.new(async_max_retries)
       @thread                         = nil
       # Only batch mode parks the worker on the signal; streaming mode never touches it.
@@ -173,6 +206,16 @@ module SemanticLogger
     # Returns [Integer] the number of log messages discarded because they could not be written,
     # whether their content or the destination was at fault (see Subscriber#message_error?).
     def failed_count = @reporter.failed_count
+
+    # Returns [Integer] the number of log messages whose fate is not known, because splitting an all
+    # or nothing batch to isolate the entries at fault ran out of its isolation write budget (see
+    # #initialize) before writing them. They are neither confirmed written nor confirmed rejected,
+    # so are not counted as failed (see #failed_count), and are not sent again blindly.
+    def undecided_count = @reporter.undecided_count
+
+    # Returns [Integer|nil] the most writes spent isolating the entries at fault within one original
+    # batch (see #initialize), or nil when there is no limit.
+    def isolation_write_budget = @isolation_write_budget
 
     # Returns [true|false] whether messages are processed in batches.
     def batch? = @batch
@@ -602,23 +645,66 @@ module SemanticLogger
     # has been rescued, rather than from within its rescue clause. So a destination that rejects one
     # message after another, each time the first of the rest, neither deepens the stack nor chains
     # each error to the one before it (Exception#cause).
+    #
+    # Every write made to isolate the messages at fault, after the original whole batch was
+    # rejected, spends the isolation write budget of that batch (see #initialize): the first write of
+    # the whole batch does not, and neither does re-sending the entries after one the appender names
+    # as rejected (see Subscriber#rejected_entry), since the appender has already pinpointed that
+    # entry rather than leaving it to be found by splitting. Once the budget is spent, the parts still
+    # to be written are not written at all: their messages are reported with an unknown outcome (see
+    # #isolation_budget_exhausted), rather than discarded, so none is reported as a definite failure
+    # without the destination having rejected it.
     def write_batch(logs)
-      parts = [logs]
-      while (part = parts.shift)
+      # Each queued part is [logs, isolation], isolation saying writing it is an isolation write that
+      # spends the budget: any part produced after the original batch, other than the rest of a named
+      # rejection, which is not.
+      parts        = [[logs, false]]
+      budget       = @isolation_write_budget
+      budget_error = nil
+      while (part, isolation = parts.shift)
+        if isolation && budget&.zero?
+          parts.unshift([part, isolation])
+          return isolation_budget_exhausted(parts.map(&:first), budget_error)
+        end
+
+        error = nil
         begin
           appender.batch(part)
           @processed_count += part.size
         rescue SystemStackError => e
-          return stack_overflowed(part + parts.flatten(1), e)
+          return stack_overflowed(part + parts.map(&:first).flatten(1), e)
         rescue StandardError => e
           raise unless message_error?(e)
 
+          error   = e
           failure = BatchFailure.new(appender, part, e)
           @processed_count += failure.written
           messages_failed(failure.discarded, e)
-          parts.unshift(*failure.parts)
+          # A named rejection stored the entries before the one it names (written > 0), and re-sends
+          # only those after it as one batch. That re-send is not an isolation write, so it spends no
+          # budget; every other part produced after the original batch is.
+          named_rejection = failure.written.positive?
+          parts.unshift(*failure.parts.map { |piece| [piece, !named_rejection] })
+        end
+
+        # Every isolation write spends one, whether it stored the part, the destination rejected it,
+        # or it was split again. The original batch and the rest of a named rejection spend none.
+        if isolation && budget
+          budget       -= 1
+          budget_error   = error if error && budget.zero?
         end
       end
+    end
+
+    # Stop splitting an all or nothing batch whose isolation write budget is spent (see #write_batch).
+    # The entries in the parts still to be written were neither confirmed written nor confirmed
+    # rejected, so they are reported with an unknown outcome, in their original order, rather than
+    # counted as failed or sent again blindly: the destination may already have stored them. The
+    # entries confirmed before this were already counted as written or failed, and the worker carries
+    # on with the next batch.
+    def isolation_budget_exhausted(parts, exception)
+      logs = parts.flatten(1)
+      @reporter.undecided(logs, exception, interval: dropped_message_report_seconds)
     end
 
     # Discard log messages whose writing overflowed the stack, for example a value nested too

@@ -54,6 +54,27 @@ class QueueProcessorTest < Minitest::Test
     end
   end
 
+  # As PoisonedBatchAppender, but records every #batch attempt, including the ones the destination
+  # rejects, in `attempts`, so a test can count the writes the isolation procedure made, not only
+  # the batches it stored. `batches` still holds only the ones stored.
+  class TrackingPoisonedBatchAppender < PoisonedBatchAppender
+    attr_reader :attempts
+
+    def batch(logs)
+      (@attempts ||= []) << logs
+      super
+    end
+  end
+
+  # As TrackingPoisonedBatchAppender, but names the entry the destination rejected
+  # (#rejected_entry), having stored every entry before it, so the worker needs no half-splitting to
+  # find it (see Subscriber#rejected_entry).
+  class NamedRejectionBatchAppender < TrackingPoisonedBatchAppender
+    def rejected_entry(_exception)
+      attempts.last.index { |log| log.message.include?("poison") }
+    end
+  end
+
   # Batch support on top of PoisonedAppender that writes one message at a time, so that a
   # poisoned message fails the batch after the messages before it were written.
   class PoisonedItemBatchAppender < PoisonedAppender
@@ -963,6 +984,187 @@ class QueueProcessorTest < Minitest::Test
             assert_equal 0, processor.processed_count
             assert_equal 8, processor.failed_count
             assert_predicate processor, :active?
+          end
+        end
+
+        # An all or nothing appender whose whole batch is rejected first, and whose parts are then
+        # split to isolate the entries at fault, with a cap on how many writes that may take per
+        # original batch (see QueueProcessor#initialize).
+        describe "with an isolation write budget" do
+          # The tracking appender records every #batch attempt, including rejected ones, so the
+          # number of writes the isolation procedure made can be checked, not only what it stored.
+          let(:appender) do
+            a        = TrackingPoisonedBatchAppender.new
+            a.logger = internal_logger
+            a
+          end
+
+          # Five entries, the bad one in the middle, as the task sets out.
+          let(:messages) { %w[a b poison d e] }
+
+          def write_with_budget(budget)
+            processor = start(batch: true, batch_size: 100, batch_seconds: 60,
+                                     isolation_write_budget: budget)
+            messages.each { |message| processor.log(new_log(message: message)) }
+            assert processor.flush, "the worker thread should answer the flush"
+            processor
+          end
+
+          def attempt_sizes = appender.attempts.map(&:size)
+
+          def stored_messages = Array(appender.batches).flatten.map(&:message)
+
+          it "exposes the budget it was given" do
+            processor = build(batch: true, isolation_write_budget: 7)
+
+            assert_equal 7, processor.isolation_write_budget
+            assert_nil build(batch: true).isolation_write_budget
+          end
+
+          [-1, 1.5, "3"].each do |bad_budget|
+            it "rejects a budget that is not nil or a non-negative Integer, #{bad_budget.inspect}" do
+              error = assert_raises(ArgumentError) do
+                build(batch: true, isolation_write_budget: bad_budget)
+              end
+
+              assert_match(/isolation_write_budget/, error.message)
+            end
+          end
+
+          it "splits a batch without limit as before when no budget is given" do
+            processor = write_with_budget(nil)
+
+            # Original batch, then halves down to the single bad entry; [d,e] is written once the
+            # entry at fault has been found and discarded.
+            assert_equal [5, 3, 2, 1, 2], attempt_sizes
+            # Only the batches the destination stored: the two good halves and nothing of poison.
+            assert_equal %w[a b d e], stored_messages
+            assert_equal 4, processor.processed_count
+            assert_equal 1, processor.failed_count
+            assert_equal 0, processor.undecided_count
+          end
+
+          it "reports confirmed, rejected, and undecided entries separately when the budget runs out" do
+            processor = write_with_budget(3)
+
+            # 1: the original batch is rejected atomically (free). Then three isolation writes:
+            # [a,b,poison] rejected and split, [a,b] delivered, [poison] rejected on its own.
+            # [d,e] is never sent: the budget that would write it has run out.
+            assert_equal [5, 3, 2, 1], attempt_sizes
+            delivered = stored_messages
+
+            # Original order, and each confirmed entry delivered exactly once.
+            assert_equal %w[a b], delivered
+            assert_equal delivered, delivered.uniq
+            assert_equal 2, processor.processed_count
+            # Only the entry the destination rejected on its own is a definite failure.
+            assert_equal 1, processor.failed_count
+            # The entries never judged are reported separately, never as failed.
+            assert_equal 2, processor.undecided_count
+            assert_predicate processor, :active?
+
+            report = internal_logger.events.find { |event| event.message.include?("unknown outcome") }
+
+            assert report, "the undecided entries must be reported"
+            assert_equal :warn, report.level
+            assert_match(/2 log message\(s\)/, report.message)
+            refute(internal_logger.events.any? { |event| event.message.include?("Discarded 2") })
+          end
+
+          it "counts every write after the original batch against the budget, including successful ones" do
+            # Budget 2: [a,b,poison] then [a,b] spend it; [poison] and [d,e] are never written.
+            processor = write_with_budget(2)
+
+            assert_equal [5, 3, 2], attempt_sizes
+            assert_equal %w[a b], stored_messages
+            assert_equal 2, processor.processed_count
+            assert_equal 0, processor.failed_count, "nothing was confirmed rejected"
+            assert_equal 3, processor.undecided_count
+          end
+
+          it "does not write any part when the budget is zero, once the original batch is rejected" do
+            processor = write_with_budget(0)
+
+            assert_equal [5], attempt_sizes
+            assert_empty stored_messages
+            assert_equal 0, processor.processed_count
+            assert_equal 0, processor.failed_count
+            assert_equal 5, processor.undecided_count
+          end
+
+          it "starts the budget afresh for the next original batch" do
+            processor = start(batch: true, batch_size: 100, batch_seconds: 60,
+                                     isolation_write_budget: 3)
+            # Two original batches, each with a bad entry in the middle. A flush between them makes
+            # the worker write each five entries as its own batch, each with its own budget of 3.
+            %w[a b poison d e].each { |message| processor.log(new_log(message: message)) }
+            processor.flush
+            %w[f g poison i j].each { |message| processor.log(new_log(message: message)) }
+            processor.flush
+
+            # Each original batch follows the same four writes (5, 3, 2, 1), twice.
+            assert_equal [5, 3, 2, 1, 5, 3, 2, 1], appender.attempts.map(&:size)
+            assert_equal 4, processor.processed_count
+            assert_equal 2, processor.failed_count
+            assert_equal 4, processor.undecided_count
+          end
+
+          it "does not spend the budget on a batch that is not all or nothing" do
+            # This appender's #batch is not all or nothing, so a message error discards the batch
+            # without splitting it, and the budget neither limits nor changes that.
+            appender.define_singleton_method(:batch_all_or_nothing?) { false }
+            processor = write_with_budget(0)
+
+            assert_equal [5], attempt_sizes
+            assert_empty stored_messages
+            assert_equal 0, processor.processed_count
+            assert_equal 5, processor.failed_count
+            assert_equal 0, processor.undecided_count
+          end
+
+          it "leaves an unclear write outcome to the held-write retry, without replaying it blindly" do
+            # A destination error (not a message error) whose outcome the appender cannot vouch for
+            # (#wrote_nothing? is false, the Subscriber default) must follow the existing behaviour:
+            # the batch is discarded and counted as failed, never split, and the budget plays no part.
+            attempts = []
+            appender.define_singleton_method(:batch) do |logs|
+              attempts << logs
+              raise IOError, "answer lost, may have been stored"
+            end
+            processor = build(batch: true, batch_seconds: 60, async_max_retries: 0,
+                                     isolation_write_budget: 0)
+            messages.each { |message| processor.queue << new_log(message: message) }
+            processor.signal.set
+            stub_back_off(processor) { processor.send(:process) }
+
+            # One write only: no split, no replay, despite a budget that would forbid isolation writes.
+            assert_equal [5], attempts.map(&:size)
+            assert_equal 5, processor.failed_count
+            assert_equal 0, processor.undecided_count
+          end
+
+          it "does not spend the budget when the appender names the entry it rejected" do
+            # Swap in an appender that pinpoints the bad entry itself, so no half-splitting is needed.
+            named        = NamedRejectionBatchAppender.new
+            named.logger = internal_logger
+            processor    = SemanticLogger::QueueProcessor.start(
+              appender: named, batch: true, batch_size: 100, batch_seconds: 60,
+              isolation_write_budget: 0
+            )
+            messages.each { |message| processor.log(new_log(message: message)) }
+            assert processor.flush, "the worker thread should answer the flush"
+
+            # The original batch, then one re-send of the entries after the named bad entry. Neither
+            # is an isolating half-split, so a zero budget does not stop them.
+            assert_equal [5, 2], named.attempts.map(&:size)
+            # The entries before the named bad entry were stored by the rejected request itself, and
+            # the two after it by the one re-send; nothing is sent a second time.
+            assert_equal %w[d e], Array(named.batches).flatten.map(&:message)
+            assert_equal 4, processor.processed_count
+            assert_equal 1, processor.failed_count
+            assert_equal 0, processor.undecided_count
+          ensure
+            processor&.close
           end
         end
       end

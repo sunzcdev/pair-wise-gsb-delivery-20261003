@@ -493,6 +493,15 @@ SemanticLogger.add_appender(
 )
 ~~~
 
+When a batch is rejected for the content of one of its entries, it is split into parts and each part
+sent again to isolate the entry at fault (see
+[When the server does not accept a request](#when-the-server-does-not-accept-a-request)). On an
+appender whose batch is all or nothing, `isolation_write_budget` caps how many of those writes one
+original batch may use after the first, whole-batch write; entries still unwritten once it is spent
+are reported with an unknown outcome (`undecided` in `SemanticLogger.stats`) rather than as failed,
+and are not sent again blindly. See
+[Cap the writes used to isolate a bad batch entry](operations.html#cap-the-writes-used-to-isolate-a-bad-batch-entry).
+
 #### When the server does not accept a request
 
 An entry is written once the server answers its request with a 2xx status. The HTTP appender, and

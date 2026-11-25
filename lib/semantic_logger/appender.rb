@@ -41,7 +41,7 @@ module SemanticLogger
                      max_queue_size: 10_000, lag_check_interval: 1_000, lag_threshold_s: 30,
                      batch_size: 300, batch_seconds: 5,
                      non_blocking: false, dropped_message_report_seconds: 30,
-                     async_max_retries: 100,
+                     async_max_retries: 100, isolation_write_budget: nil,
                      **args,
                      &)
       appender, created = build(**args, &)
@@ -63,7 +63,8 @@ module SemanticLogger
           batch_seconds:                  batch_seconds,
           non_blocking:                   non_blocking,
           dropped_message_report_seconds: dropped_message_report_seconds,
-          async_max_retries:              async_max_retries
+          async_max_retries:              async_max_retries,
+          isolation_write_budget:         isolation_write_budget
         )
       elsif async == true
         Appender::Async.new(

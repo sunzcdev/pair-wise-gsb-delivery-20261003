@@ -307,6 +307,29 @@ module Appender
         ensure
           proxy&.close
         end
+
+        it "reports the count of messages whose outcome is unknown" do
+          proxy = SemanticLogger::Appender::Async.new(appender: appender)
+
+          assert_equal 0, proxy.undecided_count
+          assert_equal 0, proxy.stats[:undecided]
+        ensure
+          proxy&.close
+        end
+
+        it "passes the isolation write budget through to the queue processor" do
+          batched   = InMemoryBatchAppender.new
+          proxy     = SemanticLogger::Appender::Async.new(appender: batched, batch: true,
+                                                                  isolation_write_budget: 4)
+          unlimited = SemanticLogger::Appender::Async.new(appender: InMemoryBatchAppender.new,
+                                                                  batch: true)
+
+          assert_equal 4, proxy.isolation_write_budget
+          assert_nil unlimited.isolation_write_budget
+        ensure
+          proxy&.close
+          unlimited&.close
+        end
       end
 
       describe "with a payload nested too deeply for JSON" do
