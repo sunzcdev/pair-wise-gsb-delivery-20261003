@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
+require "thread"
+
 require "dry/system/constants"
+require "dry/system/errors"
 
 module Dry
   module System
@@ -52,6 +55,13 @@ module Dry
     #
     # @api public
     class Provider
+      # Fiber-local key holding the names of the providers whose lifecycle steps are
+      # currently running on the current thread, in resolution order. Used to tell a
+      # genuine circular dependency apart from a provider resolving its own root key.
+      #
+      # @api private
+      RESOLUTION_CHAIN_KEY = :__dry_system_provider_resolution_chain__
+
       # Returns the provider's unique name.
       #
       # @return [Symbol]
@@ -135,7 +145,16 @@ module Dry
 
         @provider_container = build_provider_container
         @statuses = []
+
+        # Synchronizes lifecycle step access across threads. A provider step runs once:
+        # other threads resolving the same provider wait on the condition variable and
+        # either observe its success or receive the failure that ended this attempt,
+        # leaving the provider free to be retried afterwards.
+        @mutex = Mutex.new
+        @condition = ConditionVariable.new
         @step_running = nil
+        @step_thread = nil
+        @step_error = nil
 
         @source = source_class.new(
           **source_options,
@@ -226,37 +245,133 @@ module Dry
 
       # @api private
       def run_step(step_name)
-        return self if step_running? || statuses.include?(step_name)
+        @mutex.synchronize do
+          return self if statuses.include?(step_name)
 
-        @step_running = step_name
+          # A step for this provider is already running.
+          if step_running
+            if @step_thread == Thread.current
+              # On this thread, the provider is being resolved again while its own step
+              # is in progress. A single re-entry (a chain of length one) supports
+              # resolving a component sharing the provider's own root key; any deeper
+              # re-entry closes a loop and is a genuine circular dependency.
+              if resolution_chain.one?
+                return self
+              end
 
-        source.run_callback(:before, step_name)
-        source.public_send(step_name)
-        source.run_callback(:after, step_name)
+              raise_circular_dependency_error
+            else
+              # Another thread is running the step. Wait for it to finish, then share
+              # its outcome: success returns normally, failure re-raises the error.
+              wait_for_step(step_name)
+              return self
+            end
+          end
 
-        statuses << step_name
+          # A previous attempt failed before completing this step. Drop the recorded
+          # error so the step can be retried with the corrected dependencies.
+          @step_error = nil
+          @step_running = step_name
+          @step_thread = Thread.current
+        end
 
-        apply
-
-        @step_running = nil
+        begin
+          begin_step(step_name)
+        rescue StandardError => error
+          fail_step(error)
+          raise
+        else
+          complete_step(step_name)
+        end
 
         self
       end
 
-      # Returns true if a step is currenly running.
+      # Runs the step's source behavior with this provider tracked on the current
+      # thread's resolution chain, allowing genuine cycles to be detected.
       #
-      # This is important for short-circuiting the invocation of {#run_step} and avoiding
-      # infinite loops if a provider step happens to result in resolution of a component
-      # with the same root key as the provider's own name (which ordinarily results in
-      # that provider being started).
-      #
-      # @return [Boolean]
-      #
-      # @see {#run_step}
+      # @return [void]
       #
       # @api private
-      def step_running?
-        !!step_running
+      def begin_step(step_name)
+        resolution_chain.push(name)
+
+        begin
+          source.run_callback(:before, step_name)
+          source.public_send(step_name)
+          source.run_callback(:after, step_name)
+        ensure
+          resolution_chain.pop
+        end
+      end
+
+      # Marks the step complete, records its status, and applies the registered
+      # components before waking any threads waiting for this provider.
+      #
+      # @return [void]
+      #
+      # @api private
+      def complete_step(step_name)
+        @mutex.synchronize do
+          statuses << step_name
+          apply
+          @step_running = nil
+          @step_thread = nil
+          @condition.broadcast
+        end
+      end
+
+      # Records the failure, clears the running step, and wakes every waiting thread so
+      # they observe the same error. The error is retained only until the next attempt.
+      #
+      # @return [void]
+      #
+      # @api private
+      def fail_step(error)
+        @mutex.synchronize do
+          @step_error = error
+          @step_running = nil
+          @step_thread = nil
+          @condition.broadcast
+        end
+      end
+
+      # Waits for another thread's running step to settle, then re-raises its error.
+      #
+      # @return [void]
+      #
+      # @api private
+      def wait_for_step(step_name)
+        while step_running && !statuses.include?(step_name)
+          @condition.wait(@mutex)
+        end
+
+        raise @step_error if @step_error
+        raise ProviderCircularDependencyError.new([name]) unless statuses.include?(step_name)
+      end
+
+      # Raises an error describing the cycle formed by the providers currently on the
+      # resolution chain, from the first occurrence of this provider back to itself.
+      #
+      # @return [void]
+      #
+      # @api private
+      def raise_circular_dependency_error
+        start_index = resolution_chain.index(name)
+        cycle = resolution_chain[start_index..] + [name]
+
+        raise ProviderCircularDependencyError.new(cycle)
+      end
+
+      # The names of the providers whose steps are running on the current thread, in the
+      # order in which they were resolved. Fiber-local so distinct threads (and fibers)
+      # keep independent chains and never mistake shared initialization for a cycle.
+      #
+      # @return [Array<Symbol>]
+      #
+      # @api private
+      def resolution_chain
+        Thread.current[RESOLUTION_CHAIN_KEY] ||= []
       end
 
       # Registers any components from the provider's container in the main container.

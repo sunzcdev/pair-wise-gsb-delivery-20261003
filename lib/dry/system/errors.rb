@@ -56,6 +56,23 @@ module Dry
       end
     end
 
+    # Error raised when resolving a provider leads back to a provider whose lifecycle
+    # step is already running on the same thread, forming a circular dependency.
+    #
+    # The message lists every provider key involved in the cycle, in the order in which
+    # they were being resolved, with the first key repeated at the end to make the
+    # "back edge" explicit.
+    #
+    # @api public
+    ProviderCircularDependencyError = Class.new(StandardError) do
+      # @api private
+      def initialize(cycle)
+        cycle = cycle.map { |key| ":#{key}" }
+
+        super("Circular dependency detected when starting providers: #{cycle.join(" -> ")}")
+      end
+    end
+
     # Error raised when a named provider source could not be found
     #
     # @api public

@@ -21,6 +21,7 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Fixed
 
+- Provider lifecycle steps are now synchronized across threads. A provider resolving another provider whose step is already running on a different thread waits for that step to finish and shares its outcome instead of failing with a missing key, while a genuine circular dependency raises `ProviderCircularDependencyError` naming every provider key in the cycle. A failed attempt wakes all waiting threads with the same error and leaves the providers unstarted, so they can be retried once the dependency is corrected; already successful providers are not run again.
 - Avoid errors from attempted duplicate registrations when finalizing a container with manifest-registered dependencies that have already been loaded as part of finalizing providers. (@alassek, @timriley in #295)
 - Require `"dry/configurable"` in the files that need it, fixing issues when loading specific source files _before_ the main `Dry::System::Container` source file is required. (@timriley in #298)
 

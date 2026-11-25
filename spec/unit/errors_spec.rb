@@ -5,6 +5,17 @@ require "dry/system/errors"
 module Dry
   module System
     RSpec.describe "Errors" do
+      describe ProviderCircularDependencyError do
+        subject(:error) { described_class.new(%i[a b a]) }
+
+        it "lists every provider key in the cycle, with the first key repeated at the end" do
+          expect(error).to be_a(StandardError)
+          expect(error.message).to eq(
+            "Circular dependency detected when starting providers: :a -> :b -> :a"
+          )
+        end
+      end
+
       describe ComponentNotLoadableError do
         let(:component) { instance_double(Dry::System::Component, key: key) }
         let(:error) { instance_double(NameError, name: "Foo", receiver: "Test") }
