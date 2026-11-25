@@ -1,0 +1,1 @@
+Fixed stapled byte and object streams leaving one half unclosed when closing the other half failed; coordinated closes now preserve the first error, remain cancellation-safe, and close shared underlying resources only once.

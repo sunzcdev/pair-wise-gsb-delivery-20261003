@@ -1,0 +1,1 @@
+Added :class:nyio.streams.stapled.StreamCloseGroup (also available as `StreamOwner`) for explicit close ownership when several stapled streams reference the same underlying resources.

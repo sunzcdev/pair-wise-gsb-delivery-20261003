@@ -145,6 +145,8 @@ Streams and stream wrappers
 .. autoclass:: anyio.streams.stapled.MultiListener
 .. autoclass:: anyio.streams.stapled.StapledByteStream
 .. autoclass:: anyio.streams.stapled.StapledObjectStream
+.. autoclass:: anyio.streams.stapled.StreamCloseGroup
+.. autodata:: anyio.streams.stapled.StreamOwner
 .. autoclass:: anyio.streams.text.TextReceiveStream
 .. autoclass:: anyio.streams.text.TextSendStream
 .. autoclass:: anyio.streams.text.TextStream

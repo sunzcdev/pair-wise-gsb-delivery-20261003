@@ -88,6 +88,18 @@ It comes in two variants:
 * :class:`~.streams.stapled.StapledObjectStream` (combines an
   :class:`~.abc.ObjectReceiveStream` with a compatible :class:`~.abc.ObjectSendStream`)
 
+Closing a stapled stream marks the stream as closed and then closes both halves.
+If closing one half raises, the other half is still closed and the first
+exception is re-raised without being wrapped. Cancellation is shielded while
+these cleanup calls run; a pending cancellation is delivered once cleanup is
+complete.
+
+When several stapled streams wrap the same underlying resource, pass a shared
+:class:`~.streams.stapled.StreamCloseGroup` as their ``owner``. The group makes
+the ownership explicit, closes each registered resource at most once, remembers
+the first close error, and makes all participating stapled streams reject
+further operations after coordinated closure starts.
+
 Buffered byte streams
 ---------------------
 
