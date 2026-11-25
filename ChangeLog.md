@@ -1,6 +1,18 @@
 ## Changes between Bunny 3.6.0 and 3.7.0 (in development)
 
-No changes yet.
+### New `Bunny::Channel#wait_for_confirms_until`
+
+Waits until the broker confirms every message with a publisher confirm sequence number
+up to a given one. Unlike `Bunny::Channel#wait_for_confirms`, messages published after
+the call do not extend the wait, so it can be used on a channel that is published to
+continuously.
+
+Nacks, timeouts and a lost channel or connection are reported with distinct exceptions
+(`Bunny::MessageNacked`, `Timeout::Error`, `Bunny::ChannelAlreadyClosed` and
+`Bunny::NetworkFailure` respectively). `Bunny::Channel#wait_for_confirms` is unchanged.
+
+New `Bunny::Channel#last_publish_seq_no` returns the sequence number of the most recently
+published message and is meant to be passed to `wait_for_confirms_until`.
 
 
 ## Changes between Bunny 3.5.0 and 3.6.0 (Nov 9, 2026)

@@ -1165,6 +1165,37 @@ end
 `wait_for_confirms` blocks until all outstanding messages are acked or nacked.
 Returns `false` if any were nacked. The nacked message IDs are in `channel.nacked_set`.
 
+Note that `wait_for_confirms` waits for *every* message published so far, including
+messages other threads publish while it is blocked. On a channel that is published to
+continuously, use `Bunny::Channel#wait_for_confirms_until` instead: it waits for a
+specific sequence number only, which can be captured with `Bunny::Channel#last_publish_seq_no`.
+
+``` ruby
+ch.confirm_select
+
+2.times { x.publish("msg", routing_key: q.name) }
+# the sequence number of the last message published so far
+batch = ch.last_publish_seq_no
+
+# only waits for the messages above, messages published later do not extend it
+ch.wait_for_confirms_until(batch, timeout: 5_000)
+```
+
+The three ways such a wait can fail are reported with distinct exceptions:
+
+ * a nacked sequence number raises `Bunny::MessageNacked`
+ * running out of time raises `Timeout::Error`
+ * the channel being closed raises `Bunny::ChannelAlreadyClosed`, and a lost
+   connection raises `Bunny::NetworkFailure`, since the confirmation can never arrive
+
+A nack stays recorded on the channel, so a later wait covering it raises `Bunny::MessageNacked`
+again. The `delivery_tag` of the exception is the nacked sequence number.
+
+Because confirms are cumulative on a channel, waiting for the last sequence number of a
+batch covers the whole batch. This makes it possible to wait for an earlier batch first,
+then read the outcome of messages published afterwards: an earlier round completing does
+not consume or block the outcome of the messages published after it.
+
 ### Learn More
 
 See RabbitMQ documentation on [Publisher Confirms](https://www.rabbitmq.com/docs/confirms) and [Publisher-side Data Safety](https://www.rabbitmq.com/docs/publishers#data-safety)

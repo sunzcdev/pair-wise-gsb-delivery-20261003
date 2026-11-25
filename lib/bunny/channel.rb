@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "set"
+require "monitor"
 
 require "bunny/concurrent/atomic_fixnum"
 require "bunny/consumer_work_pool"
@@ -222,6 +223,42 @@ module Bunny
       @per_message_continuations_mutex = @connection.mutex_impl.new
       @outstanding_limit_cond = nil
 
+      # State for waits on a specific sequence number, see #wait_for_confirms_until.
+      #
+      # A wait is about the sequence number it was given: it succeeds when that
+      # message is acked, raises when it was nacked, and reports a loss when its
+      # confirmation cannot arrive. Because confirms are cumulative on a channel,
+      # waiting for the last sequence number of a batch covers the whole batch.
+      #
+      # @confirms_lost_ranges records, as ranges, the tags that were still
+      # unconfirmed when the channel or its connection went away. The broker
+      # forgets those messages, so their fate is unknown for good and waiting for
+      # one of them must not report success. Only the tags pending at that moment
+      # are recorded, so messages published later stay waitable: a loss does not
+      # poison a continuously publishing channel.
+      #
+      # Guarded by @unconfirmed_set_mutex.
+      @confirms_lost_ranges = []
+
+      # Waiters sleep on a condition variable of their own rather than on
+      # @unconfirmed_set_mutex, which is configurable (see Bunny::Session#mutex_impl)
+      # and need not provide one.
+      #
+      # A waiter holds @confirms_wait_mutex from before it inspects the state
+      # until it is actually asleep, while a notifier releases
+      # @unconfirmed_set_mutex before acquiring @confirms_wait_mutex to
+      # broadcast. The waiter's order (wait mutex, then unconfirmed set mutex)
+      # therefore never deadlocks against the notifier's, and because the notifier
+      # needs the wait mutex it cannot broadcast in the window between a waiter's
+      # state check and its sleep.
+      #
+      # @confirms_waiters_count is guarded by @confirms_wait_mutex too, so the
+      # decision to skip a broadcast is made under the same lock a waiter uses to
+      # go to sleep.
+      @confirms_wait_mutex    = ::Monitor.new
+      @confirms_wait_cond     = @confirms_wait_mutex.new_cond
+      @confirms_waiters_count = 0
+
       self.reset_continuations
 
       # threads awaiting on continuations. Used to unblock
@@ -302,6 +339,7 @@ module Bunny
       @status_mutex.synchronize { @status = :closing }
       @connection.close_channel(self)
       @status = :closed
+      confirmations_unavailable!(:channel_closed)
       @work_pool.shutdown
       maybe_kill_consumer_work_pool!
     end
@@ -350,6 +388,7 @@ module Bunny
     # @private
     def connection_closed!
       @status = :closed
+      confirmations_unavailable!
     end
 
     # @private
@@ -1906,7 +1945,12 @@ module Bunny
     # currently unacknowledged published messages. Returns immediately
     # if there are no outstanding confirms.
     #
+    # Note that this waits for *all* messages published so far, including
+    # those published by other threads while this method is blocked. Use
+    # {#wait_for_confirms_until} to wait for a specific sequence number.
+    #
     # @return [Boolean] true if all messages were acknowledged positively since the last time this method was called, false otherwise
+    # @see #wait_for_confirms_until
     # @see #confirm_select
     # @see #unconfirmed_set
     # @see #nacked_set
@@ -1915,6 +1959,84 @@ module Bunny
     def wait_for_confirms
       wait_on_confirms_continuations
       read_and_reset_only_acks_received
+    end
+
+    # Blocks the calling thread until the broker confirms (or nacks) every
+    # message with a publisher confirm sequence number up to and including the
+    # given one.
+    #
+    # Unlike {#wait_for_confirms}, messages published *after* this method was
+    # called do not extend the wait, so this is safe to use on a channel that
+    # is published to continuously, e.g. by other threads.
+    #
+    # The three ways a wait can fail are reported with distinct exceptions:
+    #
+    #  * a nacked sequence number raises {Bunny::MessageNacked}, `delivery_tag`
+    #    being the nacked sequence number. Nacks stay recorded on the channel,
+    #    so a later wait covering one raises again
+    #  * running out of time raises `Timeout::Error`
+    #  * the channel or its connection going away raises {Bunny::ChannelAlreadyClosed}
+    #    when the channel was closed and {Bunny::NetworkFailure} when the
+    #    connection was lost: in either case the confirmation can never arrive
+    #
+    # @param [Integer, nil] seq_no Sequence number to wait for. When nil, the
+    #   highest one handed out at the time of this call is used, so messages
+    #   published later never extend the wait.
+    # @param [Integer, nil] timeout Timeout in milliseconds. Defaults to the
+    #   channel's confirm timeout, or the connection's continuation timeout
+    #
+    # @return [Boolean] true when every sequence number up to and including the
+    #   given one was acked
+    #
+    # @example Waiting for a batch while other threads keep publishing
+    #   ch.confirm_select
+    #
+    #   messages.each { |m| x.publish(m, routing_key: q.name) }
+    #   # waits only for the messages published above
+    #   ch.wait_for_confirms_until(nil, timeout: 5_000)
+    #
+    # @see #wait_for_confirms
+    # @see #last_publish_seq_no
+    # @api public
+    def wait_for_confirms_until(seq_no = nil, timeout: nil)
+      raise_if_no_longer_open!
+      unless using_publisher_confirmations?
+        raise ArgumentError, "publisher confirms are not enabled on this channel, use Bunny::Channel#confirm_select first"
+      end
+
+      timeout ||= @confirm_timeout || @connection.continuation_timeout
+      raise ArgumentError, "timeout must be a positive integer, given: #{timeout}" if timeout && timeout <= 0
+
+      target = @unconfirmed_set_mutex.synchronize do
+        last = @next_publish_seq_no - 1
+        t = seq_no.nil? ? last : Integer(seq_no)
+        raise ArgumentError, "sequence number must not be negative, given: #{t}" if t < 0
+        if t > last
+          raise ArgumentError, "cannot wait for sequence number #{t}, only #{last} message(s) have been published so far"
+        end
+        t
+      end
+      return true if target.zero?
+
+      deadline = timeout && (Bunny::Timestamp.monotonic + (timeout / 1000.0))
+      if @connection.threaded
+        wait_for_confirms_until_with_cond_var(target, deadline)
+      else
+        wait_for_confirms_until_with_reader_loop(target, deadline)
+      end
+    end
+
+    # @return [Integer] Sequence number of the most recently published message,
+    #   0 when no message has been published with publisher confirms enabled.
+    #   Can be passed to {#wait_for_confirms_until}.
+    # @see #wait_for_confirms_until
+    # @see #next_publish_seq_no
+    # @api public
+    def last_publish_seq_no
+      @unconfirmed_set_mutex.synchronize do
+        n = @next_publish_seq_no - 1
+        n < 0 ? 0 : n
+      end
     end
 
     # @endgroup
@@ -1996,6 +2118,10 @@ module Bunny
     # @api plugin
     def recover_confirm_mode
       return unless using_publisher_confirmations?
+
+      # the broker forgets unconfirmed messages across a connection loss, so
+      # their fate is unknown from now on: record it before clearing the set
+      confirmations_unavailable!
 
       @unconfirmed_set_mutex.synchronize do
         @unconfirmed_set.clear
@@ -2350,6 +2476,17 @@ module Bunny
           confirmed_range.each { |tag| @confirms_callback.call(tag, false, nack) }
         end
       end
+
+      # waiters inspect the state under @unconfirmed_set_mutex, so they are
+      # woken up only after it has been released
+      wake_confirms_waiters
+    end
+
+    # @private
+    def wake_confirms_waiters
+      @confirms_wait_mutex.synchronize do
+        @confirms_wait_cond.broadcast if @confirms_waiters_count > 0
+      end
     end
 
     # @private
@@ -2463,6 +2600,133 @@ module Bunny
           @per_message_continuations.delete(seq_no)
         end
       end
+    end
+
+    # The state of a #wait_for_confirms_until wait, evaluated under
+    # @unconfirmed_set_mutex. Returns one of
+    #
+    #  * [:done, nil]          the target tag is not outstanding any more, so it
+    #                          was acked (nacks are checked first)
+    #  * [:nacked, tag]        a nacked tag at or below the target
+    #  * [:lost, reason]       the target's confirmation can never arrive, `reason`
+    #                          says whether the channel or the connection went away
+    #  * [:pending, nil]       nothing conclusive yet
+    #
+    # A nack at or below the target means the target cannot have been acked:
+    # the broker confirms in order, so once an earlier message is nacked the
+    # target of a batch is not confirmed either.
+    # @private
+    def evaluate_confirms_until_locked(target)
+      lost = @confirms_lost_ranges.find { |range, _| range.cover?(target) }
+      return [:lost, lost.last] if lost
+
+      nacked = (@nacked_set || Set.new).select { |t| t <= target }.min
+      return [:nacked, nacked] if nacked
+
+      # anything still unconfirmed above the target is none of this wait's business
+      return [:done, nil] if @unconfirmed_set.nil? || @unconfirmed_set.empty? ||
+                             @unconfirmed_set.min > target
+
+      [:pending, nil]
+    end
+
+    # Interprets the outcome of #evaluate_confirms_until_locked, raising the
+    # exception that corresponds to it or returning true. @private
+    def confirms_until_outcome!(outcome)
+      case outcome[0]
+      when :done
+        true
+      when :nacked
+        seq_no = outcome[1]
+        raise MessageNacked.new("Message #{seq_no} was nacked", seq_no)
+      when :lost
+        if outcome[1] == :channel_closed
+          raise ChannelAlreadyClosed.new(
+            "channel #{@id} was closed before the publisher confirm arrived", self)
+        else
+          raise NetworkFailure.new(
+            "the connection was lost before the publisher confirm arrived", nil)
+        end
+      end
+    end
+
+    # Multi-threaded mode: the reader loop dispatches confirmations, so the
+    # calling thread only sleeps until woken up or the deadline passes. @private
+    def wait_for_confirms_until_with_cond_var(target, deadline)
+      @confirms_wait_mutex.synchronize do
+        @confirms_waiters_count += 1
+        begin
+          loop do
+            outcome = @unconfirmed_set_mutex.synchronize { evaluate_confirms_until_locked(target) }
+            return confirms_until_outcome!(outcome) unless outcome[0] == :pending
+
+            remaining = deadline && (deadline - Bunny::Timestamp.monotonic)
+            if remaining && remaining <= 0
+              raise Timeout::Error, "Timed out waiting for publisher confirms up to sequence number #{target}"
+            end
+
+            # the state is re-evaluated on every wake-up, including spurious ones
+            @confirms_wait_cond.wait(remaining)
+          end
+        ensure
+          @confirms_waiters_count -= 1
+        end
+      end
+    end
+
+    # Single-threaded mode: nobody else pumps the connection, so confirmations
+    # are read here. @private
+    def wait_for_confirms_until_with_reader_loop(target, deadline)
+      loop do
+        outcome = @unconfirmed_set_mutex.synchronize { evaluate_confirms_until_locked(target) }
+        return confirms_until_outcome!(outcome) unless outcome[0] == :pending
+
+        remaining = deadline && (deadline - Bunny::Timestamp.monotonic)
+        if remaining && remaining <= 0
+          raise Timeout::Error, "Timed out waiting for publisher confirms up to sequence number #{target}"
+        end
+
+        begin
+          @connection.reader_loop.run_once
+        rescue AMQ::Protocol::EmptyResponseError, IOError, SystemCallError => e
+          # nothing can be confirmed any more, report it like a threaded channel would
+          confirmations_unavailable!
+          raise NetworkFailure.new("the connection was lost while waiting for a publisher confirm: #{e.message}", e)
+        end
+      end
+    end
+
+    # Records that every message still unconfirmed can no longer be confirmed
+    # and wakes up waiters. Called when the channel or connection is closed or
+    # recovery invalidates the unconfirmed set.
+    #
+    # Only the tags pending right now are recorded, so messages published later
+    # stay waitable. Tags already recorded by an earlier call are skipped, and
+    # pending tags are stored as contiguous ranges, so the footprint is
+    # proportional to the number of loss events rather than to the number of
+    # messages. @private
+    def confirmations_unavailable!(reason = :network_failure)
+      @unconfirmed_set_mutex.synchronize do
+        unless @unconfirmed_set.nil? || @unconfirmed_set.empty?
+          already_lost = lambda do |tag|
+            @confirms_lost_ranges.any? { |range, _| range.cover?(tag) }
+          end
+
+          ranges = []
+          @unconfirmed_set.to_a.sort.each do |tag|
+            next if already_lost.call(tag)
+
+            if !ranges.empty? && ranges.last.max + 1 == tag
+              ranges[-1] = (ranges.last.min..tag)
+            else
+              ranges << (tag..tag)
+            end
+          end
+          ranges.each { |r| @confirms_lost_ranges << [r, reason] }
+        end
+      end
+
+      wake_confirms_waiters
     end
 
 
@@ -2674,6 +2938,7 @@ module Bunny
     # @private
     def closed!
       @status = :closed
+      confirmations_unavailable!(:channel_closed)
       @work_pool.shutdown
       @connection.release_channel_id(@id)
     end
