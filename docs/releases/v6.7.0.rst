@@ -1,0 +1,15 @@
+What's new in Tornado 6.7.0
+===========================
+
+In development
+--------------
+
+`tornado.queues`
+~~~~~~~~~~~~~~~~
+
+- New `.Queue.get_batch` method removes and returns a batch of items. It takes
+  ``max_items`` and ``min_items`` limits, an optional ``timeout`` deadline, and a
+  ``return_partial_on_timeout`` flag controlling whether a timed-out batch raises
+  `TimeoutError` or yields the items gathered so far. Items collected by a batch
+  that is cancelled (or times out without delivering) are returned to the queue in
+  their original order and still require a matching `.task_done`.

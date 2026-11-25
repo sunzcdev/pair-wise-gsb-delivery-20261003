@@ -183,6 +183,448 @@ class QueueGetTest(AsyncTestCase):
         self.assertEqual(results, list(range(5)))
 
 
+class QueueBatchTest(AsyncTestCase):
+    def test_invalid_arguments(self):
+        q: queues.Queue[int] = queues.Queue()
+        self.assertRaises(ValueError, q.get_batch, 0)
+        self.assertRaises(ValueError, q.get_batch, -1)
+        self.assertRaises(ValueError, q.get_batch, 2, 0)
+        self.assertRaises(ValueError, q.get_batch, 2, 3)
+        self.assertRaises(ValueError, q.get_batch, 1.5)  # type: ignore
+
+    def test_immediate_batch_collects_up_to_max(self):
+        q: queues.Queue[int] = queues.Queue()
+        for i in range(5):
+            q.put_nowait(i)
+        # min_items defaults to 1, so the batch resolves immediately; it
+        # collects up to max_items even though the minimum was met sooner.
+        batch = q.get_batch(3)
+        self.assertEqual([0, 1, 2], batch.result())
+        self.assertEqual([3, 4], [q.get_nowait(), q.get_nowait()])
+
+    def test_immediate_batch_respects_min(self):
+        q: queues.Queue[int] = queues.Queue()
+        for i in range(2):
+            q.put_nowait(i)
+        # min_items == max_items and enough items are available.
+        batch = q.get_batch(2, min_items=2)
+        self.assertEqual([0, 1], batch.result())
+        self.assertTrue(q.empty())
+
+    @gen_test
+    def test_batch_waits_for_min_items(self):
+        q: queues.Queue[int] = queues.Queue()
+        batch = asyncio.ensure_future(q.get_batch(5, min_items=3))
+        yield gen.moment
+        self.assertFalse(batch.done())
+
+        q.put_nowait(0)
+        q.put_nowait(1)
+        yield gen.moment
+        # Only two items; still waiting for the third.
+        self.assertFalse(batch.done())
+
+        q.put_nowait(2)
+        yield gen.moment
+        # The minimum is met; it returns immediately without waiting for the
+        # remaining capacity to fill up.
+        self.assertEqual([0, 1, 2], (yield batch))
+        self.assertTrue(q.empty())
+
+    @gen_test
+    def test_batch_returns_as_soon_as_min_met_with_more_available(self):
+        # While waiting, the batch fills toward max_items, but once a new item
+        # pushes it to min_items it is delivered even though max is larger.
+        q: queues.Queue[int] = queues.Queue()
+        q.put_nowait(0)
+        q.put_nowait(1)
+        # Holds 0 and 1 (max 5), needs one more to reach min 3.
+        batch = asyncio.ensure_future(q.get_batch(5, min_items=3))
+        yield gen.moment
+        self.assertFalse(batch.done())
+        q.put_nowait(2)
+        q.put_nowait(3)
+        yield gen.moment
+        # The third item (2) satisfied the minimum and delivery happened; 3
+        # stays in the queue for others.
+        self.assertEqual([0, 1, 2], (yield batch))
+        self.assertEqual(3, q.get_nowait())
+
+    @gen_test
+    def test_max_items_caps_items_held_while_waiting(self):
+        # A delivered batch never takes more than max_items, leaving the rest
+        # for other consumers.
+        q: queues.Queue[int] = queues.Queue()
+        for i in range(4):
+            q.put_nowait(i)
+        batch = asyncio.ensure_future(q.get_batch(2, min_items=2))
+        self.assertEqual([0, 1], (yield batch))
+        self.assertEqual([2, 3], [q.get_nowait(), q.get_nowait()])
+
+    @gen_test
+    def test_waiting_batch_reaches_min_when_more_items_arrive(self):
+        # The batch holds items below its minimum and waits; once enough items
+        # arrive it is delivered and any surplus stays in the queue.
+        q: queues.Queue[int] = queues.Queue()
+        q.put_nowait(0)
+        q.put_nowait(1)
+        # Holds 0 and 1, needs one more to reach a minimum of three.
+        batch = asyncio.ensure_future(q.get_batch(3, min_items=3))
+        yield gen.moment
+        self.assertFalse(batch.done())
+        self.assertEqual(0, q.qsize())
+
+        # Item 2 arrives and completes the batch; item 3 (arriving at the same
+        # time) is surplus and stays queued.
+        q.put_nowait(2)
+        q.put_nowait(3)
+        yield gen.moment
+        self.assertEqual([0, 1, 2], (yield batch))
+        self.assertEqual(3, q.get_nowait())
+
+    @gen_test
+    def test_batch_timeout_raises_and_returns_items_in_order(self):
+        q: queues.Queue[int] = queues.Queue()
+        q.put_nowait(0)
+        q.put_nowait(1)
+        batch = asyncio.ensure_future(
+            q.get_batch(3, min_items=3, timeout=timedelta(seconds=0.01))
+        )
+        with self.assertRaises(TimeoutError):
+            yield batch
+
+        # The two items already collected are back in the queue, in order.
+        self.assertEqual(2, q.qsize())
+        self.assertEqual(0, q.get_nowait())
+        self.assertEqual(1, q.get_nowait())
+
+    @gen_test
+    def test_batch_timeout_requeues_to_waiting_plain_getter(self):
+        q: queues.Queue[int] = queues.Queue()
+        q.put_nowait(0)
+        q.put_nowait(1)
+        batch = asyncio.ensure_future(
+            q.get_batch(3, min_items=3, timeout=timedelta(seconds=0.02))
+        )
+        yield gen.moment
+        # A plain getter waits behind the batch.
+        single = asyncio.ensure_future(q.get())
+        yield gen.moment
+        self.assertFalse(single.done())
+
+        with self.assertRaises(TimeoutError):
+            yield batch
+        # The requeued items immediately satisfy the plain getter in order.
+        self.assertEqual(0, (yield single))
+        self.assertEqual(1, q.get_nowait())
+
+    @gen_test
+    def test_batch_timeout_without_any_items(self):
+        q: queues.Queue[int] = queues.Queue()
+        with self.assertRaises(TimeoutError):
+            yield q.get_batch(2, min_items=2, timeout=timedelta(seconds=0.01))
+        self.assertTrue(q.empty())
+
+    @gen_test
+    def test_batch_timeout_returns_partial(self):
+        q: queues.Queue[int] = queues.Queue()
+        q.put_nowait(0)
+        q.put_nowait(1)
+        batch = q.get_batch(
+            4,
+            min_items=3,
+            timeout=timedelta(seconds=0.01),
+            return_partial_on_timeout=True,
+        )
+        # The partial collection is handed over rather than raising.
+        self.assertEqual([0, 1], (yield batch))
+        self.assertTrue(q.empty())
+
+    @gen_test
+    def test_batch_timeout_returns_empty_partial(self):
+        q: queues.Queue[int] = queues.Queue()
+        batch = q.get_batch(
+            2,
+            min_items=2,
+            timeout=timedelta(seconds=0.01),
+            return_partial_on_timeout=True,
+        )
+        self.assertEqual([], (yield batch))
+
+    @gen_test
+    def test_batch_zero_timeout(self):
+        q: queues.Queue[int] = queues.Queue()
+        q.put_nowait(0)
+        with self.assertRaises(TimeoutError):
+            yield q.get_batch(2, min_items=2, timeout=timedelta(seconds=0))
+        # The item was never delivered, so it stays in the queue.
+        self.assertEqual(0, q.get_nowait())
+
+    @gen_test
+    def test_cancel_returns_items_in_order_with_other_getter(self):
+        # The scenario from the design: a batch getter has collected two items
+        # and is waiting for a third, while a plain consumer and a cancellation
+        # both become runnable. Items not handed to the cancelled consumer must
+        # be returned in their original order.
+        q: queues.Queue[int] = queues.Queue()
+        q.put_nowait(0)
+        q.put_nowait(1)
+
+        # The batch getter (cap 5, minimum 4) eagerly holds 0 and 1, then
+        # waits for more items.
+        batch = asyncio.ensure_future(q.get_batch(5, min_items=4))
+        yield gen.moment
+        self.assertFalse(batch.done())
+        self.assertEqual(0, q.qsize())
+
+        # A plain consumer lines up behind the still-waiting batch getter.
+        single = asyncio.ensure_future(q.get())
+        yield gen.moment
+        self.assertFalse(single.done())
+
+        # A third item arrives and is collected, but the minimum (4) is still
+        # not met, so the batch getter keeps waiting.
+        q.put_nowait(2)
+        yield gen.moment
+        self.assertFalse(batch.done())
+
+        # Cancel the batch; its three items (0, 1, 2) go back in their
+        # original order, and the plain getter receives the first one.
+        batch.cancel()
+        yield gen.moment
+        self.assertEqual(0, (yield single))
+        self.assertEqual([1, 2], [q.get_nowait(), q.get_nowait()])
+        self.assertTrue(q.empty())
+        with self.assertRaises(asyncio.CancelledError):
+            yield batch
+
+    @gen_test
+    def test_cancel_with_later_put_preserves_order(self):
+        # A cancelled batch getter returns its items ahead of items that are
+        # put into the queue afterwards.
+        q: queues.Queue[int] = queues.Queue()
+        q.put_nowait(0)
+        q.put_nowait(1)
+        batch = asyncio.ensure_future(q.get_batch(5, min_items=4))
+        yield gen.moment
+        self.assertFalse(batch.done())
+
+        batch.cancel()
+        yield gen.moment
+        with self.assertRaises(asyncio.CancelledError):
+            yield batch
+
+        # New items go in after the returned ones.
+        q.put_nowait(2)
+        self.assertEqual([0, 1, 2], [q.get_nowait() for _ in range(3)])
+
+    @gen_test
+    def test_items_beyond_cap_stay_queued(self):
+        # A batch fills to its cap and leaves any extra items queued; the
+        # delivered batch's items plus the leftover preserve the global order.
+        q: queues.Queue[int] = queues.Queue()
+        getter = asyncio.ensure_future(q.get_batch(2, min_items=2))
+        yield gen.moment
+        q.put_nowait(0)
+        q.put_nowait(1)
+        q.put_nowait(2)
+        yield gen.moment
+        # 0 and 1 fill and complete the batch; item 2 was beyond the cap.
+        self.assertEqual([0, 1], (yield getter))
+        self.assertEqual(2, q.get_nowait())
+
+    @gen_test
+    def test_cancel_before_any_items(self):
+        q: queues.Queue[int] = queues.Queue()
+        batch = asyncio.ensure_future(q.get_batch(2, min_items=2))
+        yield gen.moment
+        batch.cancel()
+        yield gen.moment
+        with self.assertRaises(asyncio.CancelledError):
+            yield batch
+        self.assertTrue(q.empty())
+
+        # The queue still works normally afterwards.
+        q.put_nowait(7)
+        self.assertEqual(7, (yield q.get()))
+
+    @gen_test
+    def test_batch_interleaved_with_plain_getters(self):
+        q: queues.Queue[int] = queues.Queue()
+        # A batch getter (min 2) waits on an empty queue.
+        batch = asyncio.ensure_future(q.get_batch(3, min_items=2))
+        yield gen.moment
+
+        # First item goes to the batch getter (still one short).
+        q.put_nowait(0)
+        yield gen.moment
+        self.assertFalse(batch.done())
+
+        # A plain getter queues behind the batch getter.
+        single = asyncio.ensure_future(q.get())
+        yield gen.moment
+
+        # The next item completes the batch (0, 1); the plain getter is still
+        # waiting.
+        q.put_nowait(1)
+        yield gen.moment
+        self.assertEqual([0, 1], (yield batch))
+        self.assertFalse(single.done())
+
+        # The following item reaches the plain getter in order.
+        q.put_nowait(2)
+        yield gen.moment
+        self.assertEqual(2, (yield single))
+
+    @gen_test
+    def test_batch_task_done_and_join(self):
+        q: queues.Queue[int] = queues.Queue()
+        for i in range(6):
+            q.put_nowait(i)
+
+        consumed = []
+
+        async def batch_consumer():
+            batch = await q.get_batch(4, min_items=2)
+            consumed.extend(batch)
+            for _ in batch:
+                q.task_done()
+
+        async def plain_consumer():
+            for _ in range(2):
+                item = await q.get()
+                consumed.append(item)
+                q.task_done()
+
+        async def run():
+            await asyncio.gather(batch_consumer(), plain_consumer())
+            # All items were delivered in order across both consumers.
+            self.assertEqual(list(range(6)), consumed)
+            # join() completes because every item was settled with task_done.
+            await q.join()
+
+        yield run()
+
+    @gen_test
+    def test_batch_cancel_then_join_completes(self):
+        q: queues.Queue[int] = queues.Queue()
+        q.put_nowait(0)
+        q.put_nowait(1)
+        waiting = asyncio.ensure_future(q.get_batch(3, min_items=3))
+        yield gen.moment
+        # It holds the two items while waiting for a third.
+        self.assertEqual(0, q.qsize())
+        waiting.cancel()
+        yield gen.moment
+        with self.assertRaises(asyncio.CancelledError):
+            yield waiting
+
+        # The returned items are still outstanding tasks: consume and settle
+        # them, after which join() must finish.
+        items = []
+        while not q.empty():
+            items.append(q.get_nowait())
+        self.assertEqual([0, 1], items)
+        for _ in items:
+            q.task_done()
+        yield q.join()
+
+    @gen_test
+    def test_batch_with_bounded_queue_unblocks_putters(self):
+        q: queues.Queue[int] = queues.Queue(maxsize=2)
+        q.put_nowait(0)
+        q.put_nowait(1)
+        # This putter blocks until the batch getter frees room.
+        blocked_put = q.put(2)
+        yield gen.moment
+        self.assertFalse(blocked_put.done())
+
+        # The batch getter drains the queue, making room for the blocked put.
+        batch = asyncio.ensure_future(q.get_batch(2, min_items=2))
+        self.assertEqual([0, 1], (yield batch))
+        # The blocked putter completes as soon as a slot opens.
+        yield blocked_put
+        self.assertEqual([2], [q.get_nowait()])
+
+    @gen_test
+    def test_bounded_queue_put_with_waiting_batch_then_cancel(self):
+        # Standard queue semantics: a put succeeds while a consumer is waiting.
+        # The waiting batch takes the new item too; cancelling it returns every
+        # item it held, so nothing is lost and all tasks remain settleable.
+        q: queues.Queue[int] = queues.Queue(maxsize=2)
+        q.put_nowait(0)
+        q.put_nowait(1)
+        # The batch holds both items while waiting for four in total.
+        waiting = asyncio.ensure_future(q.get_batch(4, min_items=4))
+        yield gen.moment
+        self.assertFalse(waiting.done())
+
+        # A producer can put because a consumer (the batch) is waiting; the
+        # batch collects the new item but is still one short of its minimum.
+        put = q.put(2)
+        yield gen.moment
+        self.assertTrue(put.done())
+        self.assertFalse(waiting.done())
+
+        # Cancelling returns every held item in the original order.
+        waiting.cancel()
+        yield gen.moment
+        with self.assertRaises(asyncio.CancelledError):
+            yield waiting
+        items = []
+        while not q.empty():
+            items.append(q.get_nowait())
+        self.assertEqual([0, 1, 2], items)
+        for _ in items:
+            q.task_done()
+        yield q.join()
+
+
+class PriorityQueueBatchTest(AsyncTestCase):
+    @gen_test
+    def test_batch_preserves_priority_order(self):
+        q: queues.PriorityQueue[tuple[int, str]] = queues.PriorityQueue()
+        q.put_nowait((2, "b"))
+        q.put_nowait((1, "a"))
+        q.put_nowait((3, "c"))
+        batch = asyncio.ensure_future(q.get_batch(2, min_items=2))
+        self.assertEqual([(1, "a"), (2, "b")], (yield batch))
+        self.assertEqual((3, "c"), q.get_nowait())
+
+    @gen_test
+    def test_cancel_restores_priority_order(self):
+        q: queues.PriorityQueue[tuple[int, str]] = queues.PriorityQueue()
+        q.put_nowait((2, "b"))
+        q.put_nowait((1, "a"))
+        waiting = asyncio.ensure_future(q.get_batch(3, min_items=3))
+        yield gen.moment
+        self.assertFalse(waiting.done())
+        waiting.cancel()
+        yield gen.moment
+        with self.assertRaises(asyncio.CancelledError):
+            yield waiting
+        # Both items are back and still come out in priority order.
+        self.assertEqual((1, "a"), q.get_nowait())
+        self.assertEqual((2, "b"), q.get_nowait())
+
+
+class LifoQueueBatchTest(AsyncTestCase):
+    @gen_test
+    def test_cancel_restores_lifo_order(self):
+        q: queues.LifoQueue[int] = queues.LifoQueue()
+        q.put_nowait(0)
+        q.put_nowait(1)
+        waiting = asyncio.ensure_future(q.get_batch(3, min_items=3))
+        yield gen.moment
+        waiting.cancel()
+        yield gen.moment
+        with self.assertRaises(asyncio.CancelledError):
+            yield waiting
+        # LIFO order is preserved after the items are returned.
+        self.assertEqual(1, q.get_nowait())
+        self.assertEqual(0, q.get_nowait())
+
+
 class QueuePutTest(AsyncTestCase):
     @gen_test
     def test_blocking_put(self):

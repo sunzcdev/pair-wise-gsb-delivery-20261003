@@ -31,13 +31,17 @@ import collections
 import datetime
 import heapq
 from collections.abc import Awaitable
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, Union
 
 from tornado import ioloop
 from tornado.concurrent import Future, future_set_result_unless_cancelled
 from tornado.locks import Event
 
 _T = TypeVar("_T")
+
+# Entries on ``Queue._getters`` are either a plain `.Future` (for ``get``) or
+# a `_BatchGetter` (for ``get_batch``).
+_Getter = Union["Future[_T]", "_BatchGetter[_T]"]
 
 __all__ = ["Queue", "PriorityQueue", "LifoQueue", "QueueFull", "QueueEmpty"]
 
@@ -66,6 +70,41 @@ def _set_timeout(
         io_loop = ioloop.IOLoop.current()
         timeout_handle = io_loop.add_timeout(timeout, on_timeout)
         future.add_done_callback(lambda _: io_loop.remove_timeout(timeout_handle))
+
+
+class _BatchGetter(Generic[_T]):
+    """A waiting ``get_batch`` consumer.
+
+    A batch getter eagerly pulls items out of the queue as they arrive,
+    collecting them in ``items`` until it has at least ``min_items``. If the
+    awaitable is cancelled (or times out without delivering) before that, the
+    collected items are handed back to the queue in their original order.
+    """
+
+    def __init__(
+        self,
+        min_items: int,
+        max_items: int,
+        future: "Future[list[_T]]",
+        return_partial_on_timeout: bool,
+    ) -> None:
+        self.min_items = min_items
+        self.max_items = max_items
+        self.future = future
+        self.return_partial_on_timeout = return_partial_on_timeout
+        self.items: list[_T] = []
+        # True once ``items`` has been handed over to the consumer; from then
+        # on the queue must not put them back.
+        self.delivered = False
+
+    def add_item(self, item: _T) -> None:
+        self.items.append(item)
+
+    def satisfied(self) -> bool:
+        return len(self.items) >= self.min_items
+
+    def full(self) -> bool:
+        return len(self.items) >= self.max_items
 
 
 class _QueueIterator(Generic[_T]):
@@ -157,7 +196,7 @@ class Queue(Generic[_T]):
 
         self._maxsize = maxsize
         self._init()
-        self._getters: collections.deque[Future[_T]] = collections.deque([])
+        self._getters: collections.deque[_Getter[_T]] = collections.deque([])
         self._putters: collections.deque[tuple[_T, Future[None]]] = collections.deque(
             []
         )
@@ -217,14 +256,61 @@ class Queue(Generic[_T]):
         """
         self._consume_expired()
         if self._getters:
-            assert self.empty(), "queue non-empty, why are getters waiting?"
-            getter = self._getters.popleft()
+            # A cancelled getter may still be queued until its completion
+            # callback runs; its items (if a batch getter) are returned then.
+            # Only a live getter implies the queue is empty.
+            if self._first_getter_alive() and not self.empty():
+                raise AssertionError(
+                    "queue non-empty, why are getters waiting?"
+                )
             self.__put_internal(item)
-            future_set_result_unless_cancelled(getter, self._get())
+            self._feed_getters()
         elif self.full():
             raise QueueFull
         else:
             self.__put_internal(item)
+
+    def _first_getter_alive(self) -> bool:
+        if not self._getters:
+            return False
+        getter = self._getters[0]
+        if isinstance(getter, _BatchGetter):
+            return not getter.future.done()
+        return not getter.done()
+
+    def _feed_getters(self) -> None:
+        # Hand queued items to waiting getters in FIFO order. A plain getter
+        # takes a single item; a batch getter keeps taking items up to its
+        # ``max_items`` capacity, but it is only delivered once it has
+        # gathered at least ``min_items``. Items past its capacity stay in the
+        # queue, but cannot reach any later getter until this one is settled.
+        while self._getters and self.qsize():
+            getter = self._getters[0]
+            if isinstance(getter, _BatchGetter):
+                if getter.future.done():
+                    # A cancelled/timed-out batch getter; drop it. Its items,
+                    # if any, are returned by its completion callback.
+                    self._getters.popleft()
+                    continue
+                while self.qsize() and not getter.full():
+                    getter.add_item(self._get())
+                if getter.satisfied():
+                    self._getters.popleft()
+                    self._deliver_batch(getter)
+                else:
+                    # It is full but still short of its minimum, waiting for
+                    # more items; nothing left can reach a later getter.
+                    break
+            else:
+                self._getters.popleft()
+                future_set_result_unless_cancelled(getter, self._get())
+
+    def _deliver_batch(self, getter: "_BatchGetter[_T]") -> None:
+        if not getter.delivered:
+            getter.delivered = True
+            future_set_result_unless_cancelled(
+                getter.future, list(getter.items)
+            )
 
     def get(self, timeout: float | datetime.timedelta | None = None) -> Awaitable[_T]:
         """Remove and return an item from the queue.
@@ -257,6 +343,107 @@ class Queue(Generic[_T]):
             self._getters.append(future)
             _set_timeout(future, timeout)
         return future
+
+    def get_batch(
+        self,
+        max_items: int,
+        min_items: int = 1,
+        timeout: None | float | datetime.timedelta = None,
+        *,
+        return_partial_on_timeout: bool = False,
+    ) -> Awaitable[list[_T]]:
+        """Remove and return a batch of items from the queue.
+
+        The awaitable resolves with a list of at least ``min_items`` and at
+        most ``max_items`` items, in the order in which they were put into the
+        queue. Available items are collected eagerly, up to ``max_items``; the
+        batch is delivered as soon as it holds at least ``min_items`` items.
+        If fewer than ``min_items`` items are available, the caller waits for
+        more items to arrive. A waiting batch holds up to ``max_items`` items
+        at a time, so items beyond that cap remain in the queue (though behind
+        the waiting batch) until it is settled.
+
+        After ``timeout`` elapses before ``min_items`` have been gathered, the
+        behavior depends on ``return_partial_on_timeout``:
+
+        * When ``False`` (the default), `TimeoutError` is raised and every
+          item collected so far is put back into the queue in its original
+          position, so it remains available to other consumers and must still
+          be settled with `.task_done`.
+        * When ``True``, the items collected so far (possibly an empty list)
+          are returned instead of raising.
+
+        If the awaitable is cancelled before the batch is delivered, the
+        collected items are likewise returned to the queue in their original
+        order and remain subject to `.task_done`.
+
+        ``timeout`` may be a number denoting a time (on the same scale as
+        `tornado.ioloop.IOLoop.time`, normally `time.time`), or a
+        `datetime.timedelta` object for a deadline relative to the current
+        time. A timeout of zero resolves or raises immediately.
+
+        .. versionadded:: 6.7
+        """
+        if not isinstance(max_items, int) or max_items < 1:
+            raise ValueError("max_items must be a positive integer")
+        if not isinstance(min_items, int) or min_items < 1:
+            raise ValueError("min_items must be a positive integer")
+        if min_items > max_items:
+            raise ValueError("min_items must not be greater than max_items")
+
+        future: Future[list[_T]] = Future()
+        getter = _BatchGetter(
+            min_items, max_items, future, return_partial_on_timeout
+        )
+
+        # Collect up to ``max_items`` items immediately (this also unblocks
+        # putters when the queue is bounded). The batch is only delivered once
+        # at least ``min_items`` have been gathered.
+        while len(getter.items) < max_items:
+            try:
+                getter.add_item(self.get_nowait())
+            except QueueEmpty:
+                break
+
+        if len(getter.items) >= min_items:
+            self._deliver_batch(getter)
+            return future
+
+        # Wait for enough items to arrive.
+        self._getters.append(getter)
+        if timeout is not None:
+            io_loop = ioloop.IOLoop.current()
+            timeout_handle = io_loop.add_timeout(
+                timeout, lambda: self._on_batch_timeout(getter)
+            )
+            future.add_done_callback(
+                lambda _: io_loop.remove_timeout(timeout_handle)
+            )
+        future.add_done_callback(lambda _: self._on_batch_done(getter))
+        return future
+
+    def _on_batch_timeout(self, getter: "_BatchGetter[_T]") -> None:
+        if getter.future.done():
+            return
+        if getter.return_partial_on_timeout:
+            self._deliver_batch(getter)
+        else:
+            getter.future.set_exception(TimeoutError())
+
+    def _on_batch_done(self, getter: "_BatchGetter[_T]") -> None:
+        if getter.delivered:
+            # The items were handed to the consumer; nothing to return.
+            return
+        getter.delivered = True
+        self._return_items(getter.items)
+
+    def _return_items(self, items: list[_T]) -> None:
+        # Put items back in their original relative order, ahead of any other
+        # items still in the queue. No task accounting changes: these items
+        # were never delivered and still require a matching ``task_done``.
+        for item in reversed(items):
+            self._put_back(item)
+        self._feed_getters()
 
     def get_nowait(self) -> _T:
         """Remove and return an item from the queue without blocking.
@@ -322,6 +509,11 @@ class Queue(Generic[_T]):
     def _put(self, item: _T) -> None:
         self._queue.append(item)
 
+    def _put_back(self, item: _T) -> None:
+        # Restore an item that had been removed, keeping it ahead of the items
+        # still queued so the original ordering is preserved.
+        self._queue.appendleft(item)
+
     # End of the overridable methods.
 
     def __put_internal(self, item: _T) -> None:
@@ -334,8 +526,20 @@ class Queue(Generic[_T]):
         while self._putters and self._putters[0][1].done():
             self._putters.popleft()
 
-        while self._getters and self._getters[0].done():
+        while self._getters:
+            getter = self._getters[0]
+            if isinstance(getter, _BatchGetter):
+                done = getter.future.done()
+            else:
+                done = getter.done()
+            if not done:
+                break
             self._getters.popleft()
+            if isinstance(getter, _BatchGetter):
+                # Return any items the expired batch getter was holding.
+                if not getter.delivered:
+                    getter.delivered = True
+                    self._return_items(getter.items)
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} at {hex(id(self))} {self._format()}>"
@@ -395,6 +599,9 @@ class PriorityQueue(Queue[_T]):
         item: _T = heapq.heappop(self._queue)
         return item
 
+    def _put_back(self, item: _T) -> None:
+        heapq.heappush(self._queue, item)
+
 
 class LifoQueue(Queue[_T]):
     """A `.Queue` that retrieves the most recently put items first.
@@ -432,3 +639,6 @@ class LifoQueue(Queue[_T]):
     def _get(self) -> _T:
         item: _T = self._queue.pop()
         return item
+
+    def _put_back(self, item: _T) -> None:
+        self._queue.append(item)
