@@ -91,6 +91,26 @@ statsd = Datadog::Statsd.new('localhost', 8125, single_thread: true)
 statsd.close()
 ```
 
+### Reloading global tags
+
+Call `reload_tags` (or `reload`) to switch the global tags used by later
+submissions:
+
+```ruby
+old_telemetry = statsd.telemetry
+statsd.reload_tags(deployment: 'canary')
+statsd.increment('deploy.heartbeat')
+```
+
+A reload creates a new immutable configuration generation. Messages already
+accepted by the background sender keep using their original serializer,
+connection and telemetry. Consequently, if the first packet is blocked in the
+writer while tags are reloaded and a second packet is sent, the second packet
+uses the new tags; if the first write then fails,
+`statsd.previous_telemetry` (or the `Telemetry` object captured before reload)
+records that writer failure with the old generation's tags. Code that never
+calls a reload method keeps the original single-generation behavior.
+
 ### Origin detection in Kubernetes
 
 Origin detection is a method to detect the pod that DogStatsD packets are coming from and add the pod's tags to the tag list.

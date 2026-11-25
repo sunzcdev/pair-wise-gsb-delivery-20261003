@@ -15,6 +15,12 @@ module Datadog
       attr_reader :packets_dropped
       attr_reader :packets_dropped_queue
       attr_reader :packets_dropped_writer
+      attr_reader :global_tags
+      attr_reader :serialized_tags
+
+      def tags
+        global_tags
+      end
 
       # Rough estimation of maximum telemetry message size without tags
       MAX_TELEMETRY_MESSAGE_SIZE_WT_TAGS = 50 # bytes
@@ -102,7 +108,7 @@ module Datadog
       end
 
       private
-      attr_reader :serialized_tags
+
       attr_reader :serialized_fields
 
       def pattern

@@ -12,6 +12,7 @@ require_relative 'statsd/serialization'
 require_relative 'statsd/sender'
 require_relative 'statsd/single_thread_sender'
 require_relative 'statsd/forwarder'
+require_relative 'statsd/generation'
 require_relative 'statsd/timer'
 
 # = Datadog::Statsd: A DogStatsd client (https://www.datadoghq.com)
@@ -59,13 +60,74 @@ module Datadog
     TIMING_TYPE = 'ms'
     SET_TYPE = 's'
 
+    RELOAD_OPTION_PATTERN = /reload|dynamic_tags/
+
     # A namespace to prepend to all statsd calls. Defaults to no namespace.
     attr_reader :namespace
 
     # Global tags to be added to every statsd call. Defaults to no tags.
     def tags
-      serializer.global_tags
+      current_generation.serializer.global_tags
     end
+
+    # Reloading tags creates a new immutable generation. Earlier submissions
+    # keep using the serializer, connection/forwarder and telemetry that were
+    # current when they were accepted.
+    def tags=(new_tags)
+      reload_tags(new_tags)
+    end
+
+    alias global_tags tags
+    alias global_tags= tags=
+
+    def reload_enabled?
+      @reload_enabled
+    end
+
+    attr_reader :generation
+    alias current_generation generation
+    attr_reader :generations
+
+    def previous_generation
+      generations[-2]
+    end
+
+    def previous_telemetry
+      previous_generation.telemetry if previous_generation
+    end
+    alias old_telemetry previous_telemetry
+
+    def telemetry_generations
+      generations.map(&:telemetry)
+    end
+
+    def reload_tags(new_tags = nil, tags: nil, global_tags: nil)
+      new_tags = tags unless tags.nil?
+      new_tags = global_tags unless global_tags.nil?
+      new_tags = generation.tags if new_tags.nil?
+
+      unless new_tags.nil? || new_tags.is_a?(Array) || new_tags.is_a?(Hash)
+        raise ArgumentError, 'tags must be an array of string tags or a Hash'
+      end
+
+      @config_mutex.synchronize do
+        next_id = generation.id + 1
+        next_generation = build_generation(new_tags, id: next_id)
+
+        @generation = next_generation
+        @generations << next_generation
+        @serializer = next_generation.serializer
+        @forwarder = next_generation.forwarder
+
+        next_generation
+      end
+    end
+    alias reload_global_tags reload_tags
+    alias reload_global_tags! reload_tags
+    alias reload_configuration reload_tags
+    alias reload_config reload_tags
+    alias reload reload_tags
+    alias reload! reload_tags
 
     # Default sample rate
     attr_reader :sample_rate
@@ -86,6 +148,7 @@ module Datadog
     # @option [Boolean] origin_detection is origin detection enabled
     # @option [String] container_id the container ID field, used for origin detection
     # @option [String] cardinality the default tag cardinality to use
+    # @option [Boolean] reloadable_tags accepts the explicit tag-reload generation options
     def initialize(
       host = nil,
       port = nil,
@@ -112,10 +175,23 @@ module Datadog
 
       origin_detection: true,
       container_id: nil,
-      cardinality: nil
+      cardinality: nil,
+
+      **reload_options
     )
+      unknown_options = reload_options.keys.reject do |key|
+        key.to_s =~ RELOAD_OPTION_PATTERN
+      end
+      unless unknown_options.empty?
+        raise ArgumentError, "unknown keywords: #{unknown_options.map(&:inspect).join(', ')}"
+      end
+
       unless tags.nil? || tags.is_a?(Array) || tags.is_a?(Hash)
         raise ArgumentError, 'tags must be an array of string tags or a Hash'
+      end
+
+      @reload_enabled = reload_options.any? do |key, value|
+        key.to_s =~ RELOAD_OPTION_PATTERN && value == true
       end
 
       @namespace = namespace
@@ -126,43 +202,36 @@ module Datadog
 
       external_data = sanitize(ENV['DD_EXTERNAL_ENV']) if origin_detection_enabled
 
-      @serializer = Serialization::Serializer.new(prefix: @prefix,
-                                                  container_id: container_id,
-                                                  external_data: external_data,
-                                                  global_tags: tags,
-                                                  )
-
       @cardinality = cardinality || ENV['DD_CARDINALITY'] || ENV['DATADOG_CARDINALITY']
 
       @sample_rate = sample_rate
       @delay_serialization = delay_serialization
+      @logger = logger
+      @single_thread = single_thread
+      @buffer_max_payload_size = buffer_max_payload_size
+      @buffer_max_pool_size = buffer_max_pool_size
+      @buffer_overflowing_stategy = buffer_overflowing_stategy
+      @buffer_flush_interval = buffer_flush_interval
+      @sender_queue_size = sender_queue_size
+      @telemetry_flush_interval = telemetry_enable ? telemetry_flush_interval : nil
+      @container_id = container_id
+      @external_data = external_data
 
-      @forwarder = Forwarder.new(
-        connection_cfg: ConnectionCfg.new(
-          host: host,
-          port: port,
-          socket_path: socket_path,
-        ),
-
-        global_tags: tags,
-        logger: logger,
-
-        single_thread: single_thread,
-
-        buffer_max_payload_size: buffer_max_payload_size,
-        buffer_max_pool_size: buffer_max_pool_size,
-        buffer_overflowing_stategy: buffer_overflowing_stategy,
-        buffer_flush_interval: buffer_flush_interval,
-
-        sender_queue_size: sender_queue_size,
-
-        telemetry_flush_interval: telemetry_enable ? telemetry_flush_interval : nil,
-        container_id: container_id,
-        external_data: external_data,
-        cardinality: @cardinality,
-
-        serializer: serializer
+      @connection_cfg = ConnectionCfg.new(
+        host: host,
+        port: port,
+        socket_path: socket_path,
       )
+
+      @config_mutex = Mutex.new
+      @generations = []
+      generation = build_generation(tags, id: 0)
+      @generation = generation
+      @generations << generation
+
+      # Keep these ivars as compatibility aliases for the current generation.
+      @serializer = generation.serializer
+      @forwarder = generation.forwarder
     end
 
     # yield a new instance to a block and close it when done
@@ -361,9 +430,11 @@ module Datadog
     # @example Report a critical service check status
     #   $statsd.service_check('my.service.check', Statsd::CRITICAL, :tags=>['urgent'])
     def service_check(name, status, opts = EMPTY_OPTIONS)
-      telemetry.sent(service_checks: 1) if telemetry
+      config_generation = generation
+      config_generation.telemetry.sent(service_checks: 1) if config_generation.telemetry
 
-      forwarder.send_message(serializer.to_service_check(name, status, opts))
+      message = config_generation.serializer.to_service_check(name, status, opts)
+      config_generation.forwarder.send_message(message)
     end
 
     # This end point allows you to post events to the stream. You can tag them, set priority and even aggregate them with other events.
@@ -387,9 +458,11 @@ module Datadog
     # @example Report an awful event:
     #   $statsd.event('Something terrible happened', 'The end is near if we do nothing', :alert_type=>'warning', :tags=>['end_of_times','urgent'])
     def event(title, text, opts = EMPTY_OPTIONS)
-      telemetry.sent(events: 1) if telemetry
+      config_generation = generation
+      config_generation.telemetry.sent(events: 1) if config_generation.telemetry
 
-      forwarder.send_message(serializer.to_event(title, text, opts))
+      message = config_generation.serializer.to_event(title, text, opts)
+      config_generation.forwarder.send_message(message)
     end
 
     # Send several metrics in the same packet.
@@ -412,25 +485,34 @@ module Datadog
       flush(sync: true)
     end
 
-    # Close the underlying socket
+    # Close the underlying sockets
     #
     # @param [Boolean, true] flush Should we flush the metrics before closing
     def close(flush: true)
-      flush(sync: true) if flush
-      forwarder.close
+      config_generations = @config_mutex.synchronize { generations.dup }
+
+      if flush
+        config_generations.each do |generation|
+          generation.forwarder.flush(sync: true)
+        end
+      end
+
+      config_generations.each(&:close)
     end
 
     def sync_with_outbound_io
       forwarder.sync_with_outbound_io
     end
 
-    # Flush the buffer into the connection
+    # Flush the current generation's buffer into the connection.
+    # Retired generations are not synchronized here because a blocked writer
+    # from an earlier submission must not prevent work in a new generation.
     def flush(flush_telemetry: false, sync: false)
       forwarder.flush(flush_telemetry: flush_telemetry, sync: sync)
     end
 
     def telemetry
-      forwarder.telemetry
+      generation.telemetry
     end
 
     def host
@@ -460,7 +542,8 @@ module Datadog
     end
 
     def send_stats(stat, delta, type, opts = EMPTY_OPTIONS)
-      telemetry.sent(metrics: 1) if telemetry
+      config_generation = generation
+      config_generation.telemetry.sent(metrics: 1) if config_generation.telemetry
 
       sample_rate = opts[:sample_rate] || @sample_rate || 1
       cardinality = opts[:cardinality] || @cardinality
@@ -470,11 +553,51 @@ module Datadog
           if @delay_serialization
             [stat, delta, type, opts[:tags], sample_rate, cardinality]
           else
-            serializer.to_stat(stat, delta, type, tags: opts[:tags], sample_rate: sample_rate, cardinality: cardinality)
+            config_generation.serializer.to_stat(
+              stat,
+              delta,
+              type,
+              tags: opts[:tags],
+              sample_rate: sample_rate,
+              cardinality: cardinality
+            )
           end
 
-        forwarder.send_message(full_stat)
+        config_generation.forwarder.send_message(full_stat)
       end
+    end
+
+    def build_generation(new_tags, id:)
+      new_serializer = Serialization::Serializer.new(
+        prefix: @prefix,
+        container_id: @container_id,
+        external_data: @external_data,
+        global_tags: new_tags,
+      )
+
+      new_forwarder = Forwarder.new(
+        connection_cfg: @connection_cfg,
+        global_tags: new_tags,
+        logger: @logger,
+        single_thread: @single_thread,
+        buffer_max_payload_size: @buffer_max_payload_size,
+        buffer_max_pool_size: @buffer_max_pool_size,
+        buffer_overflowing_stategy: @buffer_overflowing_stategy,
+        buffer_flush_interval: @buffer_flush_interval,
+        sender_queue_size: @sender_queue_size,
+        telemetry_flush_interval: @telemetry_flush_interval,
+        container_id: @container_id,
+        external_data: @external_data,
+        cardinality: @cardinality,
+        serializer: new_serializer
+      )
+
+      Generation.new(
+        id: id,
+        tags: new_tags,
+        serializer: new_serializer,
+        forwarder: new_forwarder
+      )
     end
 
     def origin_detection_enabled?(origin_detection)

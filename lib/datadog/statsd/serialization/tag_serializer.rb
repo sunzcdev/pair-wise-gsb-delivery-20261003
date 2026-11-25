@@ -5,19 +5,8 @@ module Datadog
     module Serialization
       class TagSerializer
         def initialize(global_tags = [], env = ENV)
-          # Convert to hash
-          global_tags = to_tags_hash(global_tags)
-
-          # Merge with default tags
-          global_tags = default_tags(env).merge(global_tags)
-
-          # Convert to tag list and set
-          @global_tags = to_tags_list(global_tags)
-          if @global_tags.any?
-            @global_tags_formatted = @global_tags.join(',')
-          else
-            @global_tags_formatted = nil
-          end
+          @env = env
+          self.global_tags = global_tags
         end
 
         def format(message_tags)
@@ -36,7 +25,20 @@ module Datadog
 
         attr_reader :global_tags
 
+        def global_tags=(global_tags)
+          # Convert to hash, then merge with the default tags from the environment
+          global_tags = to_tags_hash(global_tags)
+          global_tags = default_tags(@env).merge(global_tags)
+
+          @global_tags = to_tags_list(global_tags)
+          @global_tags_formatted = if @global_tags.any?
+                                     @global_tags.join(',')
+                                   end
+        end
+
         private
+
+        attr_reader :env
 
         def to_tags_hash(tags)
           case tags

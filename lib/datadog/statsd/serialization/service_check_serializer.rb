@@ -14,6 +14,10 @@ module Datadog
           @field_serializer = FieldSerializer.new(container_id, external_data)
         end
 
+        def global_tags=(global_tags)
+          tag_serializer.global_tags = global_tags
+        end
+
         def format(name, status, options = EMPTY_OPTIONS)
           String.new.tap do |service_check|
             # line basics

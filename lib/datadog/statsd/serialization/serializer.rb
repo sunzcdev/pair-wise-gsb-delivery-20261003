@@ -31,6 +31,12 @@ module Datadog
           stat_serializer.global_tags
         end
 
+        def global_tags=(global_tags)
+          stat_serializer.global_tags = global_tags
+          service_check_serializer.global_tags = global_tags
+          event_serializer.global_tags = global_tags
+        end
+
         protected
         attr_reader :stat_serializer
         attr_reader :service_check_serializer

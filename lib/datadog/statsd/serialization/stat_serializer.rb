@@ -34,6 +34,10 @@ module Datadog
           tag_serializer.global_tags
         end
 
+        def global_tags=(global_tags)
+          tag_serializer.global_tags = global_tags
+        end
+
         private
 
         attr_reader :prefix

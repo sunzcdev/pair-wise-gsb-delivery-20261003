@@ -18,6 +18,10 @@ module Datadog
           @field_serializer = FieldSerializer.new(container_id, external_data)
         end
 
+        def global_tags=(global_tags)
+          tag_serializer.global_tags = global_tags
+        end
+
         def format(title, text, options = EMPTY_OPTIONS)
           title = escape(title)
           text = escape(text)
