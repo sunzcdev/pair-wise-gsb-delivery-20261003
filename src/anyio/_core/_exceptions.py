@@ -140,6 +140,19 @@ class NoEventLoopError(RuntimeError):
     """
 
 
+class PortalShutdownError(RuntimeError):
+    """
+    Raised by :meth:`.BlockingPortal.start_task` (when called with
+    ``settle_on_stop=True``) if the portal is shut down via
+    :meth:`~.BlockingPortal.stop` before the target task has called
+    ``task_status.started()``.
+
+    The target task itself is not cancelled and keeps running in the portal's task
+    group; only the thread waiting for the startup confirmation is released with this
+    exception. Any later ``task_status.started()`` call from the task is ignored.
+    """
+
+
 class RunFinishedError(RuntimeError):
     """
     Raised by :func:`.from_thread.run` and :func:`.from_thread.run_sync` if the event

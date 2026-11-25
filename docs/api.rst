@@ -285,6 +285,7 @@ Exceptions
 .. autoexception:: anyio.FutureNotFinished
 .. autoexception:: anyio.IncompleteRead
 .. autoexception:: anyio.NoEventLoopError
+.. autoexception:: anyio.PortalShutdownError
 .. autoexception:: anyio.RunFinishedError
 .. autoexception:: anyio.TaskFailed
 .. autoexception:: anyio.TaskCancelled

@@ -1,0 +1,6 @@
+Added the ``settle_on_stop`` option to ``BlockingPortal.start_task()``. When enabled, a
+``start_task()`` call whose target task has not yet called ``task_status.started()`` is
+settled promptly with the new ``PortalShutdownError`` when the portal is stopped, even
+when running tasks are not cancelled. Already-started tasks continue to deliver their
+result or exception through their own futures, and a late ``task_status.started()`` is
+ignored. The default behavior is unchanged.

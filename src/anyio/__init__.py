@@ -38,6 +38,7 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._exceptions import FutureNotFinished as FutureNotFinished
     from ._core._exceptions import IncompleteRead as IncompleteRead
     from ._core._exceptions import NoEventLoopError as NoEventLoopError
+    from ._core._exceptions import PortalShutdownError as PortalShutdownError
     from ._core._exceptions import RunFinishedError as RunFinishedError
     from ._core._exceptions import TaskCancelled as TaskCancelled
     from ._core._exceptions import TaskFailed as TaskFailed

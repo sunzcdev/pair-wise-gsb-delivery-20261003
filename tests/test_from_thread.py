@@ -18,6 +18,7 @@ from anyio import (
     CancelScope,
     Event,
     NoEventLoopError,
+    PortalShutdownError,
     RunFinishedError,
     create_task_group,
     fail_after,
@@ -964,6 +965,156 @@ class TestBlockingPortal:
         with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
             _future, start_value = portal.start_task(taskfunc, name="testname")
             assert start_value == "testname"
+
+    def test_start_task_settle_on_stop(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        gate = Event()
+        task1_entered = threading.Event()
+        task2_entered = threading.Event()
+        task2_started = threading.Event()
+        release_gate = threading.Event()
+        started_calls: list[str] = []
+        outcomes: dict[str, object] = {}
+
+        async def task1(*, task_status: TaskStatus[str]) -> str:
+            task_status.started("started-value")
+            task1_entered.set()
+            await gate.wait()
+            return "gate-released"
+
+        async def task2(*, task_status: TaskStatus[None]) -> None:
+            task2_entered.set()
+            await gate.wait()
+            # The portal is stopped before this point; the late confirmation must be
+            # ignored rather than overwrite the shutdown result.
+            task_status.started()
+            started_calls.append("task2")
+            task2_started.set()
+
+        async def open_gate_when_signaled() -> None:
+            # Runs inside the portal so the gate can still be opened after the portal
+            # has been stopped (``portal.call()`` would raise ``RuntimeError`` then).
+            await to_thread.run_sync(release_gate.wait)
+            gate.set()
+
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            portal.start_task_soon(open_gate_when_signaled)
+
+            def thread1() -> None:
+                future, value = portal.start_task(task1)
+                outcomes["start1"] = value
+                outcomes["result1"] = future.result()
+
+            def thread2() -> None:
+                try:
+                    portal.start_task(task2, settle_on_stop=True)
+                    outcomes["start2"] = "returned"
+                except BaseException as exc:
+                    outcomes["start2"] = exc
+
+            th1 = threading.Thread(target=thread1)
+            th2 = threading.Thread(target=thread2)
+            th1.start()
+            th2.start()
+            assert task1_entered.wait(5)
+            assert task2_entered.wait(5)
+
+            # Both requests are now in flight; the second one has not confirmed
+            # startup yet and is therefore tracked as pending.
+            assert len(portal._pending_starts) == 1
+            pending_status = next(iter(portal._pending_starts))
+
+            # Stop without cancelling the still running tasks.
+            portal.call(portal.stop, False)
+
+            # The unconfirmed caller is released promptly with a distinguishable
+            # result, before the gate is opened.
+            th2.join(5)
+            assert not th2.is_alive()
+            assert isinstance(outcomes["start2"], PortalShutdownError)
+
+            # The pending request was settled exactly once and cannot be confirmed
+            # by a late ``started()``.
+            assert portal._pending_starts == set()
+            assert pending_status._started_called is False
+            assert isinstance(pending_status._future.exception(), PortalShutdownError)
+
+            # The confirmed task is unaffected and its caller is still waiting on the
+            # original future.
+            assert th1.is_alive()
+            assert outcomes.get("start1") == "started-value"
+            assert "result1" not in outcomes
+
+            # Open the gate and let the running tasks finish on their own.
+            release_gate.set()
+            th1.join(5)
+            assert not th1.is_alive()
+            assert outcomes["result1"] == "gate-released"
+
+            # The late confirmation ran exactly once and did not overwrite the
+            # already settled startup future.
+            assert task2_started.wait(5)
+            assert started_calls == ["task2"]
+            assert pending_status._started_called is True
+            assert isinstance(pending_status._future.exception(), PortalShutdownError)
+
+    def test_start_task_settle_on_stop_default(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        """Without ``settle_on_stop``, stopping does not settle a pending start."""
+        gate = Event()
+        entered = threading.Event()
+        release_gate = threading.Event()
+        outcome: dict[str, object] = {}
+
+        async def taskfunc(*, task_status: TaskStatus) -> None:
+            entered.set()
+            await gate.wait()
+
+        async def open_gate_when_signaled() -> None:
+            await to_thread.run_sync(release_gate.wait)
+            gate.set()
+
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            portal.start_task_soon(open_gate_when_signaled)
+
+            def thread1() -> None:
+                try:
+                    portal.start_task(taskfunc)
+                    outcome["result"] = "returned"
+                except BaseException as exc:
+                    outcome["result"] = exc
+
+            th = threading.Thread(target=thread1)
+            th.start()
+            assert entered.wait(5)
+            portal.call(portal.stop, False)
+
+            # The default behavior keeps waiting for the task to finish.
+            th.join(1)
+            assert th.is_alive()
+            assert "result" not in outcome
+
+            release_gate.set()
+            th.join(5)
+            assert not th.is_alive()
+            assert isinstance(outcome["result"], RuntimeError)
+            assert "Task exited without calling task_status.started()" in str(
+                outcome["result"]
+            )
+
+    def test_start_task_double_started(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        async def taskfunc(*, task_status: TaskStatus) -> None:
+            task_status.started()
+            task_status.started()
+
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            future, _value = portal.start_task(taskfunc)
+            with pytest.raises(RuntimeError, match="called 'started' twice"):
+                future.result()
 
     def test_contextvar_propagation_sync(
         self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]

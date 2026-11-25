@@ -19,7 +19,6 @@ from contextlib import (
 )
 from contextvars import Context
 from dataclasses import dataclass, field
-from functools import partial
 from inspect import isawaitable
 from threading import Lock, Thread, current_thread, get_ident
 from types import TracebackType
@@ -39,7 +38,7 @@ from ._core._eventloop import (
     threadlocals,
 )
 from ._core._eventloop import run as run_eventloop
-from ._core._exceptions import NoEventLoopError, RunFinishedError
+from ._core._exceptions import NoEventLoopError, PortalShutdownError, RunFinishedError
 from ._core._synchronization import Event
 from ._core._tasks import CancelScope, create_task_group
 from .abc._tasks import TaskStatus
@@ -175,11 +174,24 @@ class _BlockingAsyncContextManager(AbstractContextManager, Generic[T_co]):
 
 
 class _BlockingPortalTaskStatus(TaskStatus):
-    def __init__(self, future: Future):
+    def __init__(self, portal: BlockingPortal, future: Future) -> None:
+        self._portal = portal
         self._future = future
+        self._started_called = False
 
     def started(self, value: object = None) -> None:
-        self._future.set_result(value)
+        if self._started_called:
+            raise RuntimeError("called 'started' twice on the same task status")
+
+        self._started_called = True
+        # The startup has now been confirmed, so this request is no longer pending
+        # (and must not be settled by a later ``stop()``).
+        self._portal._pending_starts.discard(self)
+        if not self._future.done():
+            # The future may already have been settled (e.g. with
+            # PortalShutdownError) if the portal was stopped before this call. In
+            # that case the late startup confirmation is simply ignored.
+            self._future.set_result(value)
 
 
 class BlockingPortal:
@@ -195,6 +207,9 @@ class BlockingPortal:
         self._event_loop_thread_id: int | None = get_ident()
         self._stop_event = Event()
         self._task_group = create_task_group()
+        # Task statuses of ``start_task()`` calls (with ``settle_on_stop=True``)
+        # whose target tasks have not yet called ``task_status.started()``.
+        self._pending_starts: set[_BlockingPortalTaskStatus] = set()
 
     async def __aenter__(self) -> Self:
         await self._task_group.__aenter__()
@@ -228,14 +243,36 @@ class BlockingPortal:
         This marks the portal as no longer accepting new calls and exits from
         :meth:`sleep_until_stopped`.
 
+        Any :meth:`start_task` call made with ``settle_on_stop=True`` whose target
+        task has not yet called ``task_status.started()`` is settled immediately with
+        a :class:`PortalShutdownError`, regardless of ``cancel_remaining``. The
+        target tasks themselves keep running unless ``cancel_remaining`` is ``True``.
+
         :param cancel_remaining: ``True`` to cancel all the remaining tasks, ``False``
             to let them finish before returning
 
         """
         self._event_loop_thread_id = None
         self._stop_event.set()
+        self._settle_pending_starts()
         if cancel_remaining:
             self._task_group.cancel_scope.cancel("the blocking portal is shutting down")
+
+    def _settle_pending_starts(self) -> None:
+        """
+        Release every caller still waiting for a startup confirmation that has not
+        yet been delivered, with a distinguishable shutdown result.
+
+        Each request is settled at most once: the entries are removed from the
+        registry first, and a late ``task_status.started()`` afterwards becomes a
+        no-op rather than overwriting the result.
+
+        """
+        pending_starts = self._pending_starts
+        self._pending_starts = set()
+        for task_status in pending_starts:
+            if not task_status._future.done():
+                task_status._future.set_exception(PortalShutdownError())
 
     async def _call_func(
         self,
@@ -293,6 +330,7 @@ class BlockingPortal:
         kwargs: dict[str, Any],
         name: object,
         future: Future[T_Retval],
+        on_schedule: Callable[[], None] | None = None,
     ) -> None:
         """
         Spawn a new task using the given callable.
@@ -303,17 +341,21 @@ class BlockingPortal:
         :param name: name of the task (will be coerced to a string if not ``None``)
         :param future: a future that will resolve to the return value of the callable,
             or the exception raised during its execution
+        :param on_schedule: optional callback invoked in the event loop thread
+            immediately before the task is scheduled, so any bookkeeping can be done
+            atomically with the scheduling
 
         """
-        run_sync(
-            partial(self._task_group.start_soon, name=name),
-            self._call_func,
-            func,
-            args,
-            kwargs,
-            future,
-            token=self._token,
-        )
+
+        def schedule() -> None:
+            if on_schedule is not None:
+                on_schedule()
+
+            self._task_group.start_soon(
+                self._call_func, func, args, kwargs, future, name=name
+            )
+
+        run_sync(schedule, token=self._token)
 
     @overload
     def call(
@@ -488,6 +530,7 @@ class BlockingPortal:
         func: Callable[..., Awaitable[T_Retval]],
         *args: object,
         name: object = None,
+        settle_on_stop: bool = False,
     ) -> tuple[Future[T_Retval], Any]:
         """
         Start a task in the portal's task group and wait until it signals for readiness.
@@ -497,16 +540,30 @@ class BlockingPortal:
         :param func: the target function
         :param args: positional arguments passed to ``func``
         :param name: name of the task (will be coerced to a string if not ``None``)
+        :param settle_on_stop: if ``True`` and :meth:`stop` is called before the
+            target task calls ``task_status.started()``, this call is settled
+            promptly with :class:`PortalShutdownError` instead of waiting for the
+            task to finish. The target task is not cancelled and keeps running; a
+            ``task_status.started()`` call arriving afterwards is ignored. Tasks
+            that have already reported startup are unaffected and continue to
+            deliver their return value or exception through the returned future.
         :return: a tuple of (future, task_status_value) where the ``task_status_value``
             is the value passed to ``task_status.started()`` from within the target
             function
         :rtype: tuple[concurrent.futures.Future[T_Retval], Any]
+        :raises PortalShutdownError: if ``settle_on_stop`` is ``True`` and the portal
+            is stopped before the target task reports startup
 
         .. versionadded:: 3.0
+
+        .. versionchanged:: 4.17.0
+            Added the ``settle_on_stop`` parameter and the
+            :class:`PortalShutdownError` exception.
 
         """
 
         def task_done(future: Future[T_Retval]) -> None:
+            self._pending_starts.discard(task_status)
             if not task_status_future.done():
                 if future.cancelled():
                     task_status_future.cancel()
@@ -520,10 +577,27 @@ class BlockingPortal:
 
         self._check_running()
         task_status_future: Future = Future()
-        task_status = _BlockingPortalTaskStatus(task_status_future)
+        task_status = _BlockingPortalTaskStatus(self, task_status_future)
         f: Future = Future()
         f.add_done_callback(task_done)
-        self._spawn_task_from_thread(func, args, {"task_status": task_status}, name, f)
+        on_schedule: Callable[[], None] | None
+        if settle_on_stop:
+
+            def on_schedule() -> None:
+                # Tracked until the task reports startup (``started()`` removes it)
+                # or the task finishes (``task_done`` removes it).
+                self._pending_starts.add(task_status)
+        else:
+            on_schedule = None
+
+        self._spawn_task_from_thread(
+            func,
+            args,
+            {"task_status": task_status},
+            name,
+            f,
+            on_schedule=on_schedule,
+        )
         return f, task_status_future.result()
 
     def wrap_async_context_manager(

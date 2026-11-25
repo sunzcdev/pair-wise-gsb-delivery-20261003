@@ -128,6 +128,16 @@ to signal readiness by calling ``task_status.started()``:
 
 .. literalinclude:: snippets/threads/start_task.py
 
+If the portal might be shut down (via :meth:`~.BlockingPortal.stop`) before the target
+task has had a chance to call ``task_status.started()``, pass
+``settle_on_stop=True``. The waiting thread is then released promptly with
+:class:`~.PortalShutdownError` instead of blocking until the task finishes. The target
+task itself is not cancelled: tasks that already reported startup keep delivering their
+return value or exception through the returned future, while a
+``task_status.started()`` call arriving after the shutdown is ignored. The default
+(``settle_on_stop=False``) preserves the original behavior of waiting for the task to
+finish.
+
 
 Using asynchronous context managers
 +++++++++++++++++++++++++++++++++++
