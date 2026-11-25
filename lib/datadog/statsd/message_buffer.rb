@@ -21,6 +21,9 @@ module Datadog
         @serializer = serializer
 
         @buffer = String.new
+        # stores the serialized lines currently held in `@buffer` so that
+        # they can be re-grouped if the payload limit changes at runtime
+        @messages = []
         clear_buffer
       end
 
@@ -39,10 +42,7 @@ module Datadog
 
         flush if should_flush?(message_size)
 
-        buffer << "\n" unless buffer.empty?
-        buffer << message
-
-        @message_count += 1
+        append_message(message)
 
         # flush when we're pretty sure that we won't be able
         # to add another message to the buffer
@@ -63,6 +63,33 @@ module Datadog
         clear_buffer
       end
 
+      # Switches the underlying connection and/or the maximum payload size.
+      #
+      # Lines already buffered but not sent yet are kept and re-grouped
+      # according to the new payload limit: packets that were packed for the
+      # previous (larger) limit are split as needed so that every packet sent
+      # through the new connection is compliant. Lines that do not fit in a
+      # single packet of the new limit are explicitly dropped.
+      #
+      # Packets that have already been flushed before the switch are left
+      # untouched (they remain on the previous connection's account).
+      def switch_connection(connection, max_payload_size: nil)
+        raise ArgumentError, 'max_payload_size cannot be <= 0' if max_payload_size && max_payload_size <= 0
+
+        # take a copy: clear_buffer mutates @messages in place
+        pending_messages = @messages.dup
+
+        @connection = connection
+        @max_payload_size = max_payload_size if max_payload_size
+        @bytesize_threshold = nil
+
+        clear_buffer
+
+        pending_messages.each do |message|
+          add(message)
+        end
+      end
+
       private
 
       attr :max_payload_size
@@ -81,7 +108,15 @@ module Datadog
 
       def clear_buffer
         buffer.clear
+        @messages.clear
         @message_count = 0
+      end
+
+      def append_message(message)
+        buffer << "\n" unless buffer.empty?
+        buffer << message
+        @messages << message
+        @message_count += 1
       end
 
       def preemptive_flush?
@@ -95,7 +130,20 @@ module Datadog
           raise Error, 'Message too big for payload limit'
         end
 
+        log_dropped_message(message_size)
         false
+      end
+
+      def log_dropped_message(message_size)
+        return unless connection.respond_to?(:logger)
+
+        logger = connection.logger
+        return unless logger
+
+        logger.error do
+          "Statsd: dropping message of #{message_size} bytes, " \
+            "it exceeds the max payload size of #{max_payload_size} bytes"
+        end
       end
 
       def bytesize_threshold

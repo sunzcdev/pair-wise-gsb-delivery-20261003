@@ -3,6 +3,8 @@
 module Datadog
   class Statsd
     class Connection
+      attr_reader :logger
+
       def initialize(telemetry: nil, logger: nil)
         @telemetry = telemetry
         @logger = logger
@@ -46,7 +48,6 @@ module Datadog
       private
 
       attr_reader :telemetry
-      attr_reader :logger
 
       def connect
         raise 'Should be implemented by subclass'

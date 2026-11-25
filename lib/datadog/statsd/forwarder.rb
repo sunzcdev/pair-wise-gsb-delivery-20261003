@@ -30,6 +30,8 @@ module Datadog
       )
         @transport_type = connection_cfg.transport_type
 
+        @global_tags = global_tags
+
         @telemetry = if telemetry_flush_interval
           Telemetry.new(telemetry_flush_interval,
             container_id,
@@ -116,6 +118,38 @@ module Datadog
         connection.socket_path
       end
 
+      # Switches the live stats outlet to another UDP endpoint that may use a
+      # smaller max packet size.
+      #
+      # Already sent packets stay on the old endpoint's account while lines
+      # still queued or buffered are re-grouped according to the new payload
+      # limit and delivered through the new endpoint.
+      def switch_connection(host, port, max_payload_size: nil)
+        unless @transport_type == :udp
+          raise Error, 'switch_connection is only supported for UDP connections'
+        end
+
+        if max_payload_size
+          raise ArgumentError, 'buffer_max_payload_size cannot be <= 0' if max_payload_size <= 0
+
+          unless telemetry.nil? || telemetry.would_fit_in?(max_payload_size)
+            raise ArgumentError, "buffer_max_payload_size is not high enough to use telemetry (tags=(#{global_tags.inspect}))"
+          end
+        end
+
+        new_connection = ConnectionCfg.new(host: host, port: port)
+          .make_connection(logger: connection.logger, telemetry: telemetry)
+
+        sender.switch_connection(new_connection, max_payload_size: max_payload_size)
+
+        # the old socket is now unreachable, release it. The sender has fully
+        # drained its queue before switching, so no packet can be written to
+        # the old connection anymore.
+        connection.close
+
+        @connection = new_connection
+      end
+
       def close
         sender.stop
         connection.close
@@ -124,6 +158,7 @@ module Datadog
       private
       attr_reader :sender
       attr_reader :connection
+      attr_reader :global_tags
 
       def do_flush_telemetry
         telemetry_snapshot = telemetry.flush

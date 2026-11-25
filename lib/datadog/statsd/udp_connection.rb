@@ -19,6 +19,18 @@ module Datadog
         @socket = nil
       end
 
+      # Redirects the connection to another UDP endpoint.
+      #
+      # The currently open socket (if any) is closed: the next packet will
+      # lazily open a new socket bound to the new host/port. This ensures that
+      # packets written after the switch can never be delivered to the old
+      # endpoint while packets already written stay on the old endpoint's account.
+      def switch_endpoint(host, port)
+        @host = host
+        @port = port
+        close
+      end
+
       def close
         @socket.close if @socket
         @socket = nil

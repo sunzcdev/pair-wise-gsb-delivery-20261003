@@ -12,6 +12,19 @@ module Datadog
     class Sender
       CLOSEABLE_QUEUES = Queue.instance_methods.include?(:close)
 
+      # Control message carrying a connection switch request to the sender
+      # thread. Using a dedicated object keeps it distinct from user payloads
+      # (strings or arrays) and from the other control symbols.
+      class ConnectionSwitch
+        attr_reader :connection
+        attr_reader :max_payload_size
+
+        def initialize(connection, max_payload_size)
+          @connection = connection
+          @max_payload_size = max_payload_size
+        end
+      end
+
       def initialize(message_buffer, telemetry: nil, queue_size: UDP_DEFAULT_BUFFER_SIZE, logger: nil, flush_interval: nil, queue_class: Queue, thread_class: Thread)
         @message_buffer = message_buffer
         @telemetry = telemetry
@@ -59,6 +72,17 @@ module Datadog
         # wait for the sender thread to send a message
         # once the flush is done
         queue.pop
+      end
+
+      # Requests a connection switch on the sender thread and waits for it to
+      # be applied. All messages already pulled off the queue and buffered (but
+      # not sent yet) are re-grouped by the MessageBuffer under the new limit
+      # before any new message is processed.
+      def switch_connection(connection, max_payload_size: nil)
+        raise ArgumentError, 'Start sender first' unless message_queue
+
+        message_queue.push(ConnectionSwitch.new(connection, max_payload_size))
+        rendez_vous
       end
 
       def add(message)
@@ -156,6 +180,8 @@ module Datadog
             case message
             when :flush
               message_buffer.flush
+            when ConnectionSwitch
+              message_buffer.switch_connection(message.connection, max_payload_size: message.max_payload_size)
             when @queue_class
               message.push(:go_on)
             else
@@ -178,6 +204,8 @@ module Datadog
               break
             when :flush
               message_buffer.flush
+            when ConnectionSwitch
+              message_buffer.switch_connection(message.connection, max_payload_size: message.max_payload_size)
             when @queue_class
               message.push(:go_on)
             else

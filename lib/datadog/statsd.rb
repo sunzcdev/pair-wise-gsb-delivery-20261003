@@ -441,6 +441,23 @@ module Datadog
       forwarder.port
     end
 
+    # Switches the live stats outlet to another UDP host/port.
+    #
+    # The new endpoint may accept smaller packets than the current one: lines
+    # already queued or buffered (not sent yet) are re-grouped according to
+    # `buffer_max_payload_size` before being sent to the new endpoint. Packets
+    # already flushed stay on the old endpoint's account and are never sent
+    # twice. A single line that does not fit in the new payload limit is
+    # dropped with an explicit logged reason (or raises when the buffer is
+    # configured with `buffer_overflowing_stategy: :raise`).
+    #
+    # @param [String] host the new statsd host
+    # @param [Integer] port the new statsd port
+    # @option [Integer] buffer_max_payload_size max bytes to buffer/send on the new endpoint
+    def switch_connection(host, port, buffer_max_payload_size: nil)
+      forwarder.switch_connection(host, port, max_payload_size: buffer_max_payload_size)
+    end
+
     def socket_path
       forwarder.socket_path
     end

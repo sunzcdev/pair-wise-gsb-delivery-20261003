@@ -181,6 +181,24 @@ statsd = Datadog::Statsd.new('localhost', 8125, buffer_max_payload_size: 4096)
 statsd.close()
 ```
 
+### Switching the stats outlet at runtime
+
+You can redirect a live UDP client to another host/port, optionally using a
+smaller maximum packet size, with `#switch_connection`:
+
+```ruby
+statsd = Datadog::Statsd.new('localhost', 8125)
+
+# move to another endpoint that only accepts smaller packets
+statsd.switch_connection('localhost', 9125, buffer_max_payload_size: 512)
+```
+
+Packets already sent stay on the old endpoint's account, while lines that are
+still queued or buffered are re-grouped according to the new payload limit and
+delivered through the new endpoint — no line is sent twice. A single line that
+exceeds the new limit is dropped with an explicit logged reason (or raises when
+the client is configured with `buffer_overflowing_stategy: :raise`).
+
 ## Threading model
 
 Starting with version 5.0, `dogstatsd-ruby` employs a new threading model where one instance of `Datadog::Statsd` can be shared between threads and where data sending is non-blocking (asynchronous).

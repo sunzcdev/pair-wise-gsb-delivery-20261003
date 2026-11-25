@@ -47,6 +47,16 @@ module Datadog
         }
       end
 
+      # Drains every queued message into the buffer then switches the
+      # underlying connection and payload limit. Buffered (not yet sent)
+      # lines are re-grouped by the MessageBuffer under the new limit.
+      def switch_connection(connection, max_payload_size: nil)
+        @mx.synchronize {
+          drain_message_queue
+          @message_buffer.switch_connection(connection, max_payload_size: max_payload_size)
+        }
+      end
+
       def start()
         @flush_timer.start if @flush_timer
       end

@@ -73,7 +73,9 @@ describe Datadog::Statsd::Forwarder do
     let(:udp_connection) do
       instance_double(Datadog::Statsd::UDPConnection,
         host: host,
-        port: port
+        port: port,
+        logger: logger,
+        close: true
       )
     end
 
@@ -230,6 +232,84 @@ describe Datadog::Statsd::Forwarder do
     its(:host) { is_expected.to eq '127.0.0.1' }
     its(:port) { is_expected.to eq 1234 }
     its(:socket_path) { is_expected.to be_nil }
+
+    describe '#switch_connection' do
+      let(:new_udp_connection) do
+        instance_double(Datadog::Statsd::UDPConnection,
+          close: true,
+          logger: logger)
+      end
+
+      # only stub the connection factory for the connection created during the
+      # switch, so that the forwarder keeps using udp_connection as its initial one
+      before do
+        allow_any_instance_of(Datadog::Statsd::ConnectionCfg)
+          .to receive(:make_connection)
+          .and_call_original
+        allow(Datadog::Statsd::UDPConnection)
+          .to receive(:new)
+          .and_return(udp_connection, new_udp_connection)
+      end
+
+      it 'asks the sender to switch to a new connection with the new payload limit' do
+        expect(sender)
+          .to receive(:switch_connection)
+          .with(new_udp_connection, max_payload_size: 512)
+
+        subject.switch_connection('10.0.0.2', 9999, max_payload_size: 512)
+      end
+
+      it 'closes the old connection after the switch' do
+        allow(sender).to receive(:switch_connection)
+        allow(udp_connection).to receive(:close)
+
+        expect(udp_connection).to receive(:close)
+
+        subject.switch_connection('10.0.0.2', 9999, max_payload_size: 512)
+      end
+
+      it 'exposes the new endpoint through host/port' do
+        allow(sender).to receive(:switch_connection)
+        allow(new_udp_connection).to receive(:host).and_return('10.0.0.2')
+        allow(new_udp_connection).to receive(:port).and_return(9999)
+
+        subject.switch_connection('10.0.0.2', 9999, max_payload_size: 512)
+
+        expect(subject.host).to eq '10.0.0.2'
+        expect(subject.port).to eq 9999
+      end
+
+      it 'forwards a nil payload limit when none is provided' do
+        expect(sender)
+          .to receive(:switch_connection)
+          .with(new_udp_connection, max_payload_size: nil)
+
+        subject.switch_connection('10.0.0.2', 9999)
+      end
+
+      context 'with a non-positive payload size' do
+        it 'raises an ArgumentError' do
+          expect do
+            subject.switch_connection('10.0.0.2', 9999, max_payload_size: 0)
+          end.to raise_error(ArgumentError, /buffer_max_payload_size cannot be <= 0/)
+        end
+      end
+
+      context 'when telemetry is enabled but does not fit' do
+        let(:telemetry) do
+          instance_double(Datadog::Statsd::Telemetry,
+            would_fit_in?: false)
+        end
+
+        it 'raises an ArgumentError before touching the sender' do
+          expect(sender).not_to receive(:switch_connection)
+
+          expect do
+            subject.switch_connection('10.0.0.2', 9999, max_payload_size: 10)
+          end.to raise_error(ArgumentError, /buffer_max_payload_size is not high enough to use telemetry/)
+        end
+      end
+    end
 
     describe '#close' do
       before do
@@ -436,6 +516,14 @@ describe Datadog::Statsd::Forwarder do
         subject.close
       end
     end
+
+    describe '#switch_connection' do
+      it 'raises because switching endpoints is only supported over UDP' do
+        expect do
+          subject.switch_connection('10.0.0.2', 9999, max_payload_size: 512)
+        end.to raise_error(Datadog::Statsd::Error, /only supported for UDP/)
+      end
+    end
   end
 
   describe '#send_message' do
@@ -448,7 +536,9 @@ describe Datadog::Statsd::Forwarder do
     let(:udp_connection) do
       instance_double(Datadog::Statsd::UDPConnection,
         host: host,
-        port: port
+        port: port,
+        logger: logger,
+        close: true
       )
     end
 

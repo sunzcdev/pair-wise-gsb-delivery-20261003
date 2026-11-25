@@ -141,4 +141,46 @@ describe Datadog::Statsd::SingleThreadSender do
       end
     end
   end
+
+  describe '#switch_connection' do
+    let(:new_connection) do
+      instance_double(Datadog::Statsd::UDPConnection)
+    end
+
+    before do
+      subject.start
+    end
+
+    after do
+      subject.stop
+    end
+
+    it 'drains queued messages into the buffer before switching the connection' do
+      # queue_size - 1 messages stay in the queue (no drain triggered yet)
+      (queue_size - 1).times do |i|
+        expect(message_buffer)
+          .to receive(:add)
+          .with("sample message #{i}")
+          .ordered
+      end
+      expect(message_buffer)
+        .to receive(:switch_connection)
+        .with(new_connection, max_payload_size: 42)
+        .ordered
+
+      (queue_size - 1).times do |i|
+        subject.add("sample message #{i}")
+      end
+
+      subject.switch_connection(new_connection, max_payload_size: 42)
+    end
+
+    it 'forwards the switch without a payload size when none is given' do
+      expect(message_buffer)
+        .to receive(:switch_connection)
+        .with(new_connection, max_payload_size: nil)
+
+      subject.switch_connection(new_connection)
+    end
+  end
 end

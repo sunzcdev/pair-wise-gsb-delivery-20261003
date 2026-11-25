@@ -279,4 +279,49 @@ describe Datadog::Statsd::Sender do
       end
     end
   end
+
+  describe '#switch_connection' do
+    context 'when the sender is not started' do
+      it 'raises an ArgumentError' do
+        expect do
+          subject.switch_connection(double('connection'))
+        end.to raise_error(ArgumentError, /Start sender first/)
+      end
+    end
+
+    context 'when started' do
+      let(:new_connection) do
+        instance_double(Datadog::Statsd::UDPConnection)
+      end
+
+      before do
+        subject.start
+      end
+
+      after do
+        subject.stop
+      end
+
+      it 'applies the connection switch on the sender thread and waits for it' do
+        expect(message_buffer)
+          .to receive(:switch_connection)
+          .with(new_connection, max_payload_size: 42)
+
+        subject.switch_connection(new_connection, max_payload_size: 42)
+      end
+
+      it 'drains previously queued messages before applying the switch' do
+        expect(message_buffer).to receive(:add).with('message 1').ordered
+        expect(message_buffer).to receive(:add).with('message 2').ordered
+        expect(message_buffer)
+          .to receive(:switch_connection)
+          .with(new_connection, max_payload_size: nil)
+          .ordered
+
+        subject.add('message 1')
+        subject.add('message 2')
+        subject.switch_connection(new_connection)
+      end
+    end
+  end
 end

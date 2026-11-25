@@ -66,6 +66,43 @@ describe Datadog::Statsd::UDPConnection do
     end
   end
 
+  describe '#switch_endpoint' do
+    let(:telemetry) do
+      instance_double(Datadog::Statsd::Telemetry, sent: true, dropped_writer: true)
+    end
+
+    it 'updates the host and the port' do
+      subject.switch_endpoint('10.0.0.2', 9999)
+
+      expect(subject.host).to eq '10.0.0.2'
+      expect(subject.port).to eq 9999
+    end
+
+    it 'closes the current socket so the next write opens one on the new endpoint' do
+      subject.write('test') # force socket creation
+
+      expect(udp_socket).to receive(:close)
+
+      subject.switch_endpoint('10.0.0.2', 9999)
+    end
+
+    it 'reconnects to the new endpoint on the next write' do
+      subject.write('test')
+      allow(udp_socket).to receive(:close)
+      subject.switch_endpoint('10.0.0.2', 9999)
+
+      expect(udp_socket).to receive(:connect).with('10.0.0.2', 9999)
+
+      subject.write('test')
+    end
+
+    it 'does not connect eagerly' do
+      expect(UDPSocket).to_not receive(:new)
+
+      subject.switch_endpoint('10.0.0.2', 9999)
+    end
+  end
+
   describe '#write' do
     let(:telemetry) do
       instance_double(Datadog::Statsd::Telemetry, sent: true, dropped_writer: true)
