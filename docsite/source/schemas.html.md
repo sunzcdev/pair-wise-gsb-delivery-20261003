@@ -43,6 +43,40 @@ posts.by_pk(1).one
 # => {:id => 1, :title => "Hello World", status: :draft }
 ```
 
+## Defaults when inserting records
+
+Create commands do not apply schema-level defaults to attributes you omit.
+An omitted attribute is simply left out of the `INSERT` statement, so the
+database can apply its own column default - including defaults that are
+expressions evaluated server-side:
+
+``` ruby
+class Users < ROM::Relation[:sql]
+  schema(infer: true) do
+    attribute :created_at, Types::Time
+  end
+end
+
+# `created_at` is omitted, so the column default applies:
+users.command(:create).call(name: 'Jane')
+# => {id: 1, name: "Jane", created_at: 2025-01-08 10:00:00 UTC}
+```
+
+Passing `nil` explicitly is different: the value is kept as `nil` and the
+regular column constraints apply. Inserting `nil` into a `NOT NULL` column
+raises an error:
+
+``` ruby
+users.command(:create).call(name: 'Jane', created_at: nil)
+# => raises ROM::SQL::NotNullConstraintError
+```
+
+Returned tuples are read back from the database, so they reflect what was
+actually stored - including values generated server-side. When the inserted
+row cannot be read back (for example, when the table has no primary key),
+`ROM::SQL::Commands::Unreadable` is returned in its place instead of guessing
+values in Ruby.
+
 ## PostgreSQL Types
 
 When you define relation schema attributes using custom PG types, the values

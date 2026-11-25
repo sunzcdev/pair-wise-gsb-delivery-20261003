@@ -255,6 +255,70 @@ RSpec.describe 'Commands / Create', :postgres, seeds: false do
       }.to raise_error(ROM::SQL::NotNullConstraintError)
     end
 
+    describe 'database-provided values' do
+      before { inferrable_relations.push(:entries) }
+
+      setup_tables do
+        conn.create_table(:entries) do
+          primary_key :id
+          String :title, null: false
+          Integer :rank, null: false, default: Sequel.function(:abs, -7)
+        end
+      end
+
+      setup_relations do
+        conf.relation(:entries) { schema(infer: true) }
+
+        conf.commands(:entries) do
+          define(:create) { result :one }
+          define(:create_many, type: :create) { result :many }
+        end
+      end
+
+      let(:create_entry) { commands[:entries][:create] }
+      let(:create_entries) { commands[:entries][:create_many] }
+      let(:rows) { conn[:entries].order(:id).all }
+
+      it 'lets the database compute an omitted value and reports it back' do
+        result = create_entry.call(title: 'omitted')
+
+        expect(result).to eql(id: 1, title: 'omitted', rank: 7)
+        expect(rows).to eql([{ id: 1, title: 'omitted', rank: 7 }])
+      end
+
+      it 'keeps an explicit nil separate from an omitted value' do |ex|
+        pending 'MySQL does not enforce NOT NULL for boolean-less integer columns' if mysql?(ex)
+
+        create_entry.call(title: 'omitted')
+
+        expect {
+          create_entry.call(title: 'explicit nil', rank: nil)
+        }.to raise_error(ROM::SQL::NotNullConstraintError)
+
+        expect(rows).to eql([{ id: 1, title: 'omitted', rank: 7 }])
+      end
+
+      it 'reports the same values it stored for multiple records' do
+        result = create_entries.call([{ title: 'omitted' }, { title: 'given', rank: 3 }])
+
+        expect(result).to match_array([
+          { id: 1, title: 'omitted', rank: 7 },
+          { id: 2, title: 'given', rank: 3 }
+        ])
+        expect(result).to match_array(rows)
+      end
+
+      it 'keeps each tuple distinct when explicit nils are involved' do |ex|
+        pending 'MySQL does not enforce NOT NULL for boolean-less integer columns' if mysql?(ex)
+
+        expect {
+          create_entries.call([{ title: 'omitted' }, { title: 'explicit nil', rank: nil }])
+        }.to raise_error(ROM::SQL::NotNullConstraintError)
+
+        expect(rows).to be_empty
+      end
+    end
+
     describe '#execute' do
       context 'with a single record' do
         it 'materializes the result' do

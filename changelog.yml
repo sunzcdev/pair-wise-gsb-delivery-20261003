@@ -1,6 +1,8 @@
 - version: 3.8.0
   summary:
   date: unreleased
+  added:
+  - "`Create` commands leave omitted attributes out of the insert, so column defaults (including server-side expressions) are applied by the database; returned tuples are read back from the database, with `ROM::SQL::Commands::Unreadable` reported when a row can't be read back (@rom-rb)"
   fixed:
   - "Use dataset to fetch record after insert so that read types are properly applied in Create command (@katafrakt)"
   changed:

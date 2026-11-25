@@ -282,7 +282,7 @@ RSpec.describe 'Schema inference for common datatypes', seeds: false do
             end
           end
 
-          it 'sets default value on missing key' do
+          it 'lets the database apply the column default when the key is missing' do
             result = create.call(name: 'Jade')
 
             expect(result).to eql(id: 1, name: 'Jade', age: 18)
@@ -290,6 +290,56 @@ RSpec.describe 'Schema inference for common datatypes', seeds: false do
 
           it 'raises an error on inserting nil value' do
             expect { create.call(name: 'Jade', age: nil) }.to raise_error(ROM::SQL::NotNullConstraintError)
+          end
+        end
+
+        context 'columns with a server-side expression default' do
+          setup_tables do
+            conn.create_table :people do
+              primary_key :id
+              String :name, null: false
+              Integer :age, null: false, default: Sequel.function(:abs, -21)
+            end
+          end
+
+          it 'returns the value actually stored by the database when the key is missing' do
+            result = create.call(name: 'Jade')
+
+            expect(result).to eql(id: 1, name: 'Jade', age: 21)
+          end
+
+          it 'does not invoke the expression when an explicit value is provided' do
+            expect(create.call(name: 'Jade', age: 5)).to eql(id: 1, name: 'Jade', age: 5)
+          end
+        end
+
+        context 'schema-level defaults' do
+          setup_tables do
+            conn.create_table :people do
+              primary_key :id
+              String :name, null: false
+              Integer :age, null: false, default: 18
+            end
+          end
+
+          setup_relations do
+            conf.relation(:people) do
+              schema(infer: true) do
+                attribute :age, Types::Integer.default(99)
+              end
+            end
+          end
+
+          it 'does not fill in omitted attributes with schema-level defaults' do
+            result = create.call(name: 'Jade')
+
+            expect(result).to eql(id: 1, name: 'Jade', age: 18)
+          end
+
+          it 'keeps an explicitly provided value' do
+            result = create.call(name: 'Jade', age: 30)
+
+            expect(result).to eql(id: 1, name: 'Jade', age: 30)
           end
         end
 

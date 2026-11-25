@@ -17,6 +17,15 @@ module ROM
     #
     # @api public
     class Schema < ROM::Schema
+      # Base type used for building input hashes for Create commands
+      #
+      # It deliberately does not apply {ROM::Schema::HASH_SCHEMA}'s type
+      # transformation, because that transformation resolves schema-level
+      # defaults for missing keys.
+      #
+      # @api private
+      CREATE_INPUT_HASH = Types::Coercible::Hash.schema(EMPTY_HASH).freeze
+
       # @!attribute [r] indexes
       #   @return [Array<Index>] Array with schema indexes
       option :indexes, default: -> { EMPTY_SET }
@@ -56,6 +65,26 @@ module ROM
       # @api public
       def group(&)
         GroupDSL.new(self).call(&)
+      end
+
+      # Return an input hash type where omitted attributes are left out
+      #
+      # This is used by Create commands. Unlike {#to_input_hash}, attributes
+      # that were omitted by the caller are not filled in with values coming
+      # from schema-level defaults, so that the database can apply its own
+      # column defaults (which may be expressions evaluated server-side).
+      #
+      # Values that were provided explicitly, including `nil`, are kept as-is
+      # and validated with the attribute's write type - a `nil` still has to
+      # satisfy the column's constraints.
+      #
+      # @return [Dry::Types::Hash]
+      #
+      # @api private
+      def to_create_input_hash
+        CREATE_INPUT_HASH.schema(
+          to_h { |attr| [attr.name, attr.to_create_input_type] }
+        )
       end
 
       # Return a new schema with attributes marked as qualified
@@ -173,7 +202,7 @@ module ROM
         end
       end
 
-      memoize :qualified, :canonical, :joined, :project_pk
+      memoize :qualified, :canonical, :joined, :project_pk, :to_create_input_hash
     end
   end
 end

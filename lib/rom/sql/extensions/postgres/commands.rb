@@ -37,9 +37,16 @@ module ROM
 
           # Executes multi_insert statement and returns inserted tuples
           #
+          # Tuples are batched by the set of columns they provide, so that a
+          # tuple omitting a value still gets the column default applied by
+          # the database, rather than an explicit NULL caused by another
+          # tuple that happens to provide that column.
+          #
           # @api private
           def multi_insert(tuples)
-            returning_dataset.multi_insert(tuples)
+            relation.transaction do
+              tuple_batches(tuples).flat_map { |batch| returning_dataset.multi_insert(batch) }
+            end
           end
 
           # Executes upsert statement (INSERT with ON CONFLICT clause)

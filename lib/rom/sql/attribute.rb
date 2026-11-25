@@ -378,7 +378,60 @@ module ROM
         Attribute[type].meta(sql_expr: ::Sequel.case(mapping, otherwise, self))
       end
 
+      # Return an input type used by Create commands
+      #
+      # The resulting type does not have a schema-level default, so a value
+      # omitted from the input is simply left out and the database gets a
+      # chance to apply its own column default. An explicitly provided `nil`
+      # is still validated against the column constraints.
+      #
+      # The key is marked as optional so that it can be omitted; whether the
+      # omission is acceptable is decided by the database.
+      #
+      # @return [Dry::Types::Type]
+      #
+      # @api private
+      def to_create_input_type
+        to_write_type_without_default.meta(required: false)
+      end
+
+      # Return write type without schema-level defaults
+      #
+      # @return [Dry::Types::Type]
+      #
+      # @api private
+      def to_write_type_without_default
+        without_default(to_write_type)
+      end
+
       private
+
+      # Strip schema-level defaults from a type
+      #
+      # Defaults are handled by dry-types' `Default` type, which may be
+      # wrapped around a plain type or one of the branches of an optional
+      # (sum) type, depending on how it was defined.
+      #
+      # @api private
+      def without_default(type)
+        if type.respond_to?(:default?) && type.default?
+          without_default(type.type)
+        elsif type.is_a?(Dry::Types::Sum) && (stripped = without_sum_defaults(type))
+          stripped
+        else
+          type
+        end
+      end
+
+      # @api private
+      def without_sum_defaults(type)
+        left = without_default(type.left)
+        right = without_default(type.right)
+
+        return if left.equal?(type.left) && right.equal?(type.right)
+
+        (left | right).meta(type.meta)
+      end
 
       # Return Sequel Expression object for an attribute
       #
