@@ -108,6 +108,36 @@ class UsersAccounts < ROM::Relation[:sql]
 end
 ```
 
+## Replacing many-to-many members
+
+The join relation of a many-to-many association usually has its own attributes,
+for example a `rank` that is recorded when a member is added. Use
+`Association#replace` to set the members of one or more owners:
+
+``` ruby
+tasks = container.relations[:tasks]
+tasks.associations[:tags].replace([{id: 1}], [{id: 2, rank: 10}, {id: 3, rank: 20}])
+# => {added: [{task_id: 1, tag_id: 3, rank: 20}],
+#     removed: [{task_id: 1, tag_id: 4, rank: 7}]}
+```
+
+Only join rows that are actually added or removed get written. Join rows for
+members that stay keep all of their values, including extra attributes like
+`:rank`. Extra attributes provided for a member that is already associated are
+ignored, they are only used when a member is inserted.
+
+Every statement is restricted to the provided owners, so join rows of other
+owners are never touched, even when they point at the same target row.
+
+The change is made in a transaction, or in a savepoint when a transaction is
+already open. When inserting a new join row fails, the whole replacement is
+rolled back and the error is raised as a `ROM::SQL` error, so the owner keeps its
+previous members and their join attributes.
+
+The arguments match `Association#persist`: the first argument holds the owner
+tuples and the second one holds the desired members. Both accept a single tuple
+or an array.
+
 ## Aliasing an association
 
 If you want to use a different name for an association, you can use `:as` option.
@@ -272,3 +302,4 @@ Check out API documentation:
 * [api::rom-sql::SQL/Associations](OneToOne)
 * [api::rom-sql::SQL/Associations](ManyToOne)
 * [api::rom-sql::SQL/Associations](ManyToMany)
+* [api::rom-sql::SQL/Associations](Replace)

@@ -2,6 +2,7 @@
 
 require 'rom/associations/many_to_many'
 require 'rom/sql/associations/core'
+require 'rom/sql/associations/replace'
 require 'rom/sql/associations/self_ref'
 
 module ROM
@@ -9,6 +10,7 @@ module ROM
     module Associations
       class ManyToMany < ROM::Associations::ManyToMany
         include Associations::Core
+        include Associations::Replace
         include Associations::SelfRef
 
         # @api public

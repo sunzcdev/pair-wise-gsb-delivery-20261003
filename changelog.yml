@@ -1,6 +1,8 @@
 - version: 3.8.0
   summary:
   date: unreleased
+  added:
+  - "`ManyToMany#replace` for replacing members of many-to-many associations without rewriting the join rows that stay"
   fixed:
   - "Use dataset to fetch record after insert so that read types are properly applied in Create command (@katafrakt)"
   changed:
