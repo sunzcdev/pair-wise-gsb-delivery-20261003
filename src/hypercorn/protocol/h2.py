@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from collections import deque
 from collections.abc import Awaitable, Callable
 
 import h2
@@ -78,6 +80,116 @@ class StreamBuffer:
         return data
 
 
+class ReadStream:
+    """A per stream buffer for the request body on its way to the ASGI app.
+
+    Inbound data is no longer handed directly to the app from the connection
+    event handling task. Instead each stream gets one of these buffers and a
+    single task that drains it into the app queue. This gives per stream
+    backpressure - a slow app on one stream only blocks that stream's task,
+    leaving the connection free to keep reading and advancing the other
+    streams.
+
+    The amount of buffered data is bounded by the HTTP/2 flow control
+    window. Received data is only acknowledged (returning window to the
+    client) once it has been handed to the app, hence a stalled stream stops
+    accumulating data at the window limit rather than growing without bound.
+    """
+
+    def __init__(self, event_class: type[IOEvent]) -> None:
+        # Each entry is (data, flow_controlled_length). The flow controlled
+        # length is retained so the exact amount of window consumed (which
+        # includes any padding) can be returned when the data is consumed.
+        self.buffer: deque[tuple[bytes, int]] = deque()
+        self.buffered_bytes = 0
+        self._complete = False
+        self._closed = False
+        self._has_data = event_class()
+        self._waiting = False
+        self._unfinished = 0
+        self._in_flight = 0
+        self._drained = event_class()
+
+    async def push(self, data: bytes, flow_controlled_length: int) -> None:
+        if self._complete:
+            raise BufferCompleteError()
+        if self._unfinished == 0:
+            await self._drained.clear()
+        self._unfinished += 1
+        self.buffer.append((data, flow_controlled_length))
+        self.buffered_bytes += len(data)
+        if self._waiting:
+            await self._has_data.set()
+
+    async def push_complete(self) -> None:
+        """Mark the end of the request body (the EndBody event)."""
+        self._complete = True
+        if self._waiting:
+            await self._has_data.set()
+
+    async def pop(self) -> tuple[bytes, int] | None:
+        """Wait for and return the next chunk, or None once complete.
+
+        Returns None once the buffer has fully drained after completion (or
+        after :meth:`close`). The terminal EndBody marker is not stored
+        here; the caller should check :attr:`complete` and emit EndBody
+        itself when the buffer has drained.
+        """
+        while not self.buffer:
+            if self._complete or self._closed:
+                return None
+            # Arm before clearing, then re-check: this is race free even when
+            # ``clear`` is a real checkpoint (trio), because any push that
+            # lands in the window is caught by the re-check below rather than
+            # being waited on.
+            self._waiting = True
+            await self._has_data.clear()
+            if self.buffer or self._complete or self._closed:
+                self._waiting = False
+                continue
+            try:
+                await self._has_data.wait()
+            finally:
+                self._waiting = False
+        data, flow_controlled_length = self.buffer.popleft()
+        self.buffered_bytes -= len(data)
+        self._in_flight += 1
+        return data, flow_controlled_length
+
+    async def task_done(self) -> None:
+        """Record completion of a tuple returned by :meth:`pop`."""
+        self._in_flight -= 1
+        self._unfinished -= 1
+        if self._unfinished == 0:
+            await self._drained.set()
+
+    async def join(self) -> None:
+        """Wait for all pushed items to be popped and completed."""
+        while self._unfinished > 0:
+            await self._drained.wait()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    async def close(self) -> None:
+        """Release anything buffered and unblock a waiting pop."""
+        self._closed = True
+        self._complete = True
+        queued = len(self.buffer)
+        self.buffer.clear()
+        self.buffered_bytes = 0
+        self._unfinished -= queued
+        if self._unfinished <= 0:
+            self._unfinished = 0
+            await self._drained.set()
+        await self._has_data.set()
+
+    @property
+    def complete(self) -> bool:
+        return self._complete and not self.buffer
+
+
 class H2Protocol:
     def __init__(
         self,
@@ -117,6 +229,11 @@ class H2Protocol:
         self.server = server
         self.ssl = ssl
         self.streams: dict[int, HTTPStream | WSStream] = {}
+        # Per stream buffers decoupling inbound request bodies from the apps.
+        self.read_streams: dict[int, ReadStream] = {}
+        # Direct event/users of _handle_events may not have run
+        # _create_stream. These tasks keep that compatibility path moving.
+        self._fallback_read_tasks: set[asyncio.Task[None]] = set()
         # The below are used by the sending task
         self.has_data = self.context.event_class()
         self.priority = priority.PriorityTree()
@@ -137,7 +254,7 @@ class H2Protocol:
         if headers is not None:
             event = h2.events.RequestReceived(stream_id=1, headers=headers)
             await self._create_stream(event)
-            await self.streams[event.stream_id].handle(EndBody(stream_id=event.stream_id))
+            await self.read_streams[event.stream_id].push_complete()
         self.task_group.spawn(self.send_task)
 
     async def send_task(self) -> None:
@@ -242,6 +359,7 @@ class H2Protocol:
             return
 
     async def _handle_events(self, events: list[h2.events.Event]) -> None:
+        fallback_stream_ids: set[int] = set()
         for event in events:
             if isinstance(event, h2.events.RequestReceived):
                 if self.context.terminated.is_set():
@@ -256,21 +374,42 @@ class H2Protocol:
                 if self.keep_alive_requests > self.config.keep_alive_max_requests:
                     self.connection.close_connection()
             elif isinstance(event, h2.events.DataReceived):
-                await self.streams[event.stream_id].handle(
-                    Body(stream_id=event.stream_id, data=event.data)
-                )
-                self.connection.acknowledge_received_data(
-                    event.flow_controlled_length, event.stream_id
-                )
+                # Hand the data to the stream's read buffer. It is only
+                # acknowledged (freeing flow control window) once the app
+                # has accepted it, via the read stream task. This bounds the
+                # buffered body to the stream's window and keeps a slow
+                # stream from stalling the rest of the connection.
+                read_stream = self.read_streams.get(event.stream_id)
+                if read_stream is None:
+                    read_stream = ReadStream(self.context.event_class)
+                    self.read_streams[event.stream_id] = read_stream
+                    if self._spawn_fallback_read_task(event.stream_id):
+                        fallback_stream_ids.add(event.stream_id)
+                        await read_stream.push(event.data, event.flow_controlled_length)
+                    else:
+                        stream = self.streams.get(event.stream_id)
+                        if stream is not None:
+                            await stream.handle(
+                                Body(stream_id=event.stream_id, data=event.data)
+                            )
+                        self.connection.acknowledge_received_data(
+                            event.flow_controlled_length, event.stream_id
+                        )
+                        self.read_streams.pop(event.stream_id, None)
+                else:
+                    await read_stream.push(event.data, event.flow_controlled_length)
             elif isinstance(event, h2.events.StreamEnded):
-                try:
-                    await self.streams[event.stream_id].handle(EndBody(stream_id=event.stream_id))
-                except KeyError:
-                    # Response sent before full request received,
-                    # nothing to do already closed.
-                    pass
+                read_stream = self.read_streams.get(event.stream_id)
+                if read_stream is not None:
+                    # The read stream task delivers EndBody once the body has
+                    # drained, preserving ordering.
+                    await read_stream.push_complete()
+                else:
+                    stream = self.streams.get(event.stream_id)
+                    if stream is not None:
+                        await stream.handle(EndBody(stream_id=event.stream_id))
             elif isinstance(event, h2.events.StreamReset):
-                await self._close_stream(event.stream_id)
+                await self._close_stream(event.stream_id, defer_app_close=True)
                 await self._window_updated(event.stream_id)
             elif isinstance(event, h2.events.WindowUpdated):
                 await self._window_updated(event.stream_id)
@@ -282,6 +421,10 @@ class H2Protocol:
             elif isinstance(event, h2.events.ConnectionTerminated):
                 await self.send(Closed())
         await self._flush()
+        for stream_id in fallback_stream_ids:
+            read_stream = self.read_streams.get(stream_id)
+            if read_stream is not None:
+                await read_stream.join()
 
     async def _flush(self) -> None:
         data = self.connection.data_to_send()
@@ -348,6 +491,7 @@ class H2Protocol:
                 request.stream_id,
             )
         self.stream_buffers[request.stream_id] = StreamBuffer(self.context.event_class)
+        self.read_streams[request.stream_id] = ReadStream(self.context.event_class)
         try:
             self.priority.insert_stream(request.stream_id)
         except priority.DuplicateStreamError:
@@ -366,8 +510,77 @@ class H2Protocol:
                 state=self.connection_state,
             )
         )
+        self.task_group.spawn(self._read_stream_task, request.stream_id)
         self.keep_alive_requests += 1
         await self.context.mark_request()
+
+    async def _read_stream_task(self, stream_id: int) -> None:
+        """Deliver a single stream's request body to its app, in order.
+
+        This runs independently per stream so an app whose queue is full
+        only blocks this task. The connection keeps processing other
+        streams, and flow control window is only returned to the client as
+        the body is consumed here.
+        """
+        read_stream = self.read_streams[stream_id]
+        try:
+            while True:
+                item = await read_stream.pop()
+                if item is None:
+                    break
+                data, flow_controlled_length = item
+                try:
+                    stream = self.streams.get(stream_id)
+                    if stream is not None and not getattr(stream, "closed", False):
+                        # Backpressure on a full app queue only suspends this
+                        # stream's task; the connection task is never blocked.
+                        await stream.handle(Body(stream_id=stream_id, data=data))
+                    # Return the window now the data has been handed over, so a
+                    # stalled stream stops receiving at the window boundary.
+                    self.connection.acknowledge_received_data(
+                        flow_controlled_length, stream_id
+                    )
+                    await self._flush()
+                finally:
+                    await read_stream.task_done()
+
+            # The buffer is empty. Only deliver EndBody once every preceding
+            # Body chunk has been delivered (guaranteed above) and unless the
+            # stream was torn down early.
+            if not read_stream.closed:
+                stream = self.streams.get(stream_id)
+                if stream is not None and not getattr(stream, "closed", False):
+                    await stream.handle(EndBody(stream_id=stream_id))
+        finally:
+            self.read_streams.pop(stream_id, None)
+
+    def _spawn_fallback_read_task(self, stream_id: int) -> bool:
+        """Start an asyncio worker for event-level compatibility callers.
+
+        Production streams are created by ``_create_stream`` and scheduled on
+        the configured structured task group. Tests and direct protocol users
+        may inject stream objects and feed events directly without that setup.
+        This fallback keeps those callers ordered and non-head-of-line
+        blocked when running on asyncio.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # On Trio all production streams still use the task group. A
+            # direct event-level caller without _create_stream retains the
+            # old direct handling path.
+            return False
+
+        task = loop.create_task(self._read_stream_task(stream_id))
+        self._fallback_read_tasks.add(task)
+
+        def _discard(done_task: asyncio.Task[None]) -> None:
+            self._fallback_read_tasks.discard(done_task)
+            if not done_task.cancelled():
+                done_task.exception()
+
+        task.add_done_callback(_discard)
+        return True
 
     async def _create_server_push(
         self, stream_id: int, path: bytes, headers: list[tuple[bytes, bytes]]
@@ -390,11 +603,40 @@ class H2Protocol:
         else:
             event = h2.events.RequestReceived(stream_id=push_stream_id, headers=request_headers)
             await self._create_stream(event)
-            await self.streams[event.stream_id].handle(EndBody(stream_id=event.stream_id))
+            await self.read_streams[event.stream_id].push_complete()
             self.keep_alive_requests += 1
 
-    async def _close_stream(self, stream_id: int) -> None:
+    async def _close_stream(
+        self, stream_id: int, *, defer_app_close: bool = False
+    ) -> None:
+        read_stream = self.read_streams.pop(stream_id, None)
+        if read_stream is not None:
+            # Discarded frames are no longer waiting for the app. Return
+            # their connection-level flow control credit so one reset stream
+            # cannot leave the shared connection window depleted. A popped
+            # frame is owned by the read task and is acknowledged there.
+            discarded_flow_length = sum(
+                flow_controlled_length
+                for _, flow_controlled_length in read_stream.buffer
+            )
+            # Unblock a read task that may be waiting for more protocol
+            # data. A read task blocked in the bounded app queue is made
+            # harmless by removing the stream and closing its buffer.
+            await read_stream.close()
+            if discarded_flow_length:
+                self.connection.acknowledge_received_data(
+                    discarded_flow_length, stream_id
+                )
+                await self._flush()
         if stream_id in self.streams:
             stream = self.streams.pop(stream_id)
-            await stream.handle(StreamClosed(stream_id=stream_id))
+            if defer_app_close:
+                # A reset must not make the connection task wait behind a
+                # full app queue. The structured task group still owns the
+                # delivery, while this connection continues other streams.
+                self.task_group.spawn(
+                    stream.handle, StreamClosed(stream_id=stream_id)
+                )
+            else:
+                await stream.handle(StreamClosed(stream_id=stream_id))
             await self.has_data.set()

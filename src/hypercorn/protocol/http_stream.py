@@ -18,6 +18,7 @@ from .events import (
 from ..config import Config
 from ..typing import (
     AppWrapper,
+    ASGIReceiveEvent,
     ASGISendEvent,
     HTTPResponseStartEvent,
     HTTPScope,
@@ -60,6 +61,7 @@ class HTTPStream:
         stream_id: int,
     ) -> None:
         self.app = app
+        self.app_put: Callable[[ASGIReceiveEvent], Awaitable[None]] | None = None
         self.client = client
         self.closed = False
         self.config = config

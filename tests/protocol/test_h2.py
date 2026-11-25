@@ -73,11 +73,13 @@ async def test_stream_buffer_complete() -> None:
 
 @pytest.mark.asyncio
 async def test_protocol_handle_protocol_error() -> None:
+    task_group = AsyncMock()
+    task_group.spawn = Mock()
     protocol = H2Protocol(
         Mock(),
         Config(),
         WorkerContext(None),
-        AsyncMock(),
+        task_group,
         ConnectionState({}),
         False,
         None,
@@ -91,11 +93,13 @@ async def test_protocol_handle_protocol_error() -> None:
 
 @pytest.mark.asyncio
 async def test_protocol_keep_alive_max_requests() -> None:
+    task_group = AsyncMock()
+    task_group.spawn = Mock()
     protocol = H2Protocol(
         Mock(),
         Config(),
         WorkerContext(None),
-        AsyncMock(),
+        task_group,
         ConnectionState({}),
         False,
         None,
