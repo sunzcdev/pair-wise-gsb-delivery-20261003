@@ -366,6 +366,38 @@ formatter = SemanticLogger::Formatters::Ecs.new(namespace: nil)
 SemanticLogger.add_appender(io: $stdout, formatter: formatter)
 ~~~
 
+#### Merging into the top-level ECS document
+
+ECS also permits custom fields at the top level of the document. With `merge: :top_level` the
+named tags and the payload merge there directly, instead of living under `labels` and the
+namespace:
+
+~~~ruby
+formatter = SemanticLogger::Formatters::Ecs.new(merge: :top_level, on_conflict: :ecs)
+SemanticLogger.add_appender(io: $stdout, formatter: formatter)
+~~~
+
+A merged key can then name a field the ECS mapping already wrote — for example a payload of
+`{service: {name: "..."}}` meets the `service` object built from the application and environment,
+or a named tag `service: "billing"` meets that same object. `on_conflict` declares which source
+keeps a contested field:
+
+* `:ecs` (the default) keeps the ECS mapping's value; `:log` keeps the named tag or payload
+  value. With `:log`, two objects at one field are deep-merged, so the payload can supply
+  `service.name` while the ECS mapping keeps `service.environment`.
+* The protected ECS fields `@timestamp` and `ecs` follow their own rule: they always keep the
+  ECS mapping's value, whichever source is preferred.
+* A scalar never replaces an ECS object field: a named tag `service: "billing"` cannot displace
+  the `service` object, under either priority.
+
+Nothing from the log is dropped. A value that loses its field moves to the home its source has
+without top-level merging — a named tag to `labels.<key>`, a payload value to
+`<namespace>.payload.<key>` (or `labels.<key>` when `namespace` is nil) — so the output itself
+shows which source was kept and where the other value went. Between the two log-data sources the
+payload wins over the named tags, as in the `:logfmt` formatter. Merging never mutates the log:
+a payload shared by several entries, including any arrays in it, is left exactly as it was, so
+another appender (such as the `:json` formatter) still reads the original entry by its own rules.
+
 ### Logfmt
 
 `formatter: :logfmt` emits each entry as a single line of `key=value` pairs in

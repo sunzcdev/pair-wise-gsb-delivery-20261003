@@ -182,6 +182,150 @@ module SemanticLogger
           end
         end
 
+        describe "top-level merge conflicts" do
+          # Two entries in one batch share a payload that holds an array, the
+          # named tags write `service` as a scalar, the payload provides
+          # `service.name`, and the appender gives ECS its own valid `service`.
+          let(:items) do
+            [1, 2, 3]
+          end
+
+          let(:payload) do
+            {service: {name: "payload_service"}, items: items}
+          end
+
+          let(:logs) do
+            Array.new(2) do
+              entry             = SemanticLogger::Log.new("EcsTest", level)
+              entry.time        = log_time
+              entry.message     = "Hello World"
+              entry.named_tags  = {service: "billing"}
+              entry.payload     = payload
+              entry
+            end
+          end
+
+          let(:ecs_first) do
+            SemanticLogger::Formatters::Ecs.new(merge: :top_level, on_conflict: :ecs)
+          end
+
+          let(:log_first) do
+            SemanticLogger::Formatters::Ecs.new(merge: :top_level, on_conflict: :log)
+          end
+
+          let(:ecs_batch) do
+            JSON.parse(ecs_first.batch(logs, appender), symbolize_names: true)
+          end
+
+          let(:log_batch) do
+            JSON.parse(log_first.batch(logs, appender), symbolize_names: true)
+          end
+
+          it "keeps the ECS service with :ecs priority and relocates the losers to their homes" do
+            ecs_batch.each do |entry|
+              # The ECS mapping's own service wins the field.
+              assert_equal "test_app", entry.dig(:service, :name)
+              assert_equal "test_env", entry.dig(:service, :environment)
+
+              # The payload's service.name moved to the payload's namespaced home.
+              assert_equal "payload_service", entry.dig(:semantic_logger, :payload, :service, :name)
+
+              # The named tag's scalar, which cannot displace the ECS service
+              # object, moved to the named tags' home.
+              assert_equal "billing", entry.dig(:labels, :service)
+
+              # Non-conflicting payload keys merge at the top level.
+              assert_equal [1, 2, 3], entry[:items]
+            end
+          end
+
+          it "keeps the payload's service.name with :log priority, deep-merged with the ECS service" do
+            log_batch.each do |entry|
+              # The payload won service.name; the ECS mapping kept service.environment.
+              assert_equal "payload_service", entry.dig(:service, :name)
+              assert_equal "test_env", entry.dig(:service, :environment)
+
+              # The named tag's scalar still cannot displace the service object.
+              assert_equal "billing", entry.dig(:labels, :service)
+
+              # The payload won, so nothing of it was relocated.
+              refute entry.key?(:semantic_logger)
+
+              assert_equal [1, 2, 3], entry[:items]
+            end
+          end
+
+          it "formats both entries of the batch identically even though they share one payload" do
+            assert_equal ecs_batch.first, ecs_batch.last
+            assert_equal log_batch.first, log_batch.last
+          end
+
+          it "leaves the shared payload, its array, and the named tags untouched" do
+            ecs_batch
+            log_batch
+
+            assert_equal({service: {name: "payload_service"}, items: [1, 2, 3]}, payload)
+            assert_same items, payload[:items]
+            logs.each do |entry|
+              assert_same payload, entry.payload
+              assert_equal({service: "billing"}, entry.named_tags)
+            end
+          end
+
+          it "still reads the original log by its own rules with the plain JSON formatter" do
+            ecs_batch
+            log_batch
+
+            json = SemanticLogger::Formatters::Json.new
+            logs.each do |entry|
+              parsed = JSON.parse(json.call(entry, appender), symbolize_names: true)
+
+              assert_equal "payload_service", parsed.dig(:payload, :service, :name)
+              assert_equal [1, 2, 3], parsed.dig(:payload, :items)
+              assert_equal "billing", parsed.dig(:named_tags, :service)
+            end
+          end
+
+          it "always relocates protected ECS fields, whichever source is preferred" do
+            logs.each { |entry| entry.payload = payload.merge("@timestamp": "2099-01-01T00:00:00Z", ecs: {version: "0.0"}) }
+
+            [ecs_first, log_first].each do |formatter|
+              parsed = JSON.parse(formatter.call(logs.first, appender), symbolize_names: true)
+
+              # The protected fields keep the ECS mapping's values.
+              assert_equal "2017-01-14T08:32:05.375276Z", parsed[:@timestamp]
+              assert_equal SemanticLogger::Formatters::Ecs::ECS_VERSION, parsed.dig(:ecs, :version)
+
+              # The colliding values moved to the payload's home.
+              assert_equal "2099-01-01T00:00:00Z", parsed.dig(:semantic_logger, :payload, :@timestamp)
+              assert_equal({version: "0.0"}, parsed.dig(:semantic_logger, :payload, :ecs))
+            end
+          end
+
+          it "keeps the metric fields under the namespace" do
+            logs.each do |entry|
+              entry.metric        = "users/registered"
+              entry.metric_amount = 3
+            end
+
+            assert_equal "users/registered", ecs_batch.first.dig(:semantic_logger, :metric)
+            assert_equal 3, ecs_batch.first.dig(:semantic_logger, :metric_amount)
+          end
+
+          it "relocates the payload to labels when the namespace is nil" do
+            formatter = SemanticLogger::Formatters::Ecs.new(merge: :top_level, namespace: nil)
+            parsed    = JSON.parse(formatter.call(logs.first, appender), symbolize_names: true)
+
+            assert_equal "test_app", parsed.dig(:service, :name)
+            assert_equal "payload_service", parsed.dig(:labels, :service, :name)
+          end
+
+          it "rejects an unknown merge or on_conflict option" do
+            assert_raises(ArgumentError) { SemanticLogger::Formatters::Ecs.new(merge: :sideways) }
+            assert_raises(ArgumentError) { SemanticLogger::Formatters::Ecs.new(on_conflict: :nobody) }
+          end
+        end
+
         describe "JSON encoding" do
           it "returns a single line of valid JSON" do
             log.message    = "Hello World"
