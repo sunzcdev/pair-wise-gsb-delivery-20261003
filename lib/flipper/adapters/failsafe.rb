@@ -18,6 +18,11 @@ module Flipper
         @adapter.read_only?
       end
 
+      # Public: Delegate the optional failover read receipt.
+      def read_receipt
+        @adapter.read_receipt if @adapter.respond_to?(:read_receipt)
+      end
+
       def features
         @adapter.features
       rescue *@errors

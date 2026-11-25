@@ -1,3 +1,5 @@
+require 'flipper/adapters/read_receipt'
+
 module Flipper
   module Adapters
     class Failover
@@ -12,8 +14,15 @@ module Flipper
       #             :dual_write - Boolean, whether to update secondary when
       #                           primary is updated
       #             :errors - Array of exception types for which to failover
+      #             :receipt - Boolean, whether to collect a ReadReceipt of
+      #                        where every readable value came from. Defaults
+      #                        to false so existing behavior is unchanged.
 
       attr_reader :primary, :secondary
+
+      # Public: The Flipper::Adapters::ReadReceipt collected when the adapter
+      # is built with `receipt: true`, nil otherwise.
+      attr_reader :read_receipt
 
       def initialize(primary, secondary, options = {})
         @primary = primary
@@ -21,6 +30,7 @@ module Flipper
 
         @dual_write = options.fetch(:dual_write, false)
         @errors = options.fetch(:errors, [ StandardError ])
+        @read_receipt = ReadReceipt.new if options.fetch(:receipt, false)
       end
 
       def adapter_stack
@@ -32,33 +42,53 @@ module Flipper
       end
 
       def features
-        @primary.features
-      rescue *@errors
-        @secondary.features
+        result = @primary.features
+        record_features(result, source: :primary, status: :ok)
+        result
+      rescue *@errors => error
+        result = @secondary.features
+        record_features(result, source: :secondary, status: :degraded, error: error)
+        result
       end
 
       def get(feature)
-        @primary.get(feature)
-      rescue *@errors
-        @secondary.get(feature)
+        result = @primary.get(feature)
+        record_get(feature, result, source: :primary, status: status_for(result))
+        result
+      rescue *@errors => error
+        result = @secondary.get(feature)
+        record_get(feature, result, source: :secondary, status: :degraded, error: error)
+        result
       end
 
       def get_multi(features)
-        @primary.get_multi(features)
-      rescue *@errors
-        @secondary.get_multi(features)
+        result = @primary.get_multi(features)
+        record_multi(features, result, source: :primary)
+        result
+      rescue *@errors => error
+        result = @secondary.get_multi(features)
+        record_multi(features, result, source: :secondary, error: error)
+        result
       end
 
       def get_all(**kwargs)
-        @primary.get_all(**kwargs)
-      rescue *@errors
-        @secondary.get_all(**kwargs)
+        result = @primary.get_all(**kwargs)
+        record_all(result, source: :primary)
+        result
+      rescue *@errors => error
+        result = @secondary.get_all(**kwargs)
+        record_all(result, source: :secondary, error: error)
+        result
       end
 
       def sync_version
-        @primary.sync_version
-      rescue *@errors
-        @secondary.sync_version
+        result = @primary.sync_version
+        record_sync_version(result, source: :primary, status: :ok)
+        result
+      rescue *@errors => error
+        result = @secondary.sync_version
+        record_sync_version(result, source: :secondary, status: :degraded, error: error)
+        result
       end
 
       def sync_version=(version)
@@ -94,6 +124,111 @@ module Flipper
         @primary.disable(feature, gate, thing).tap do
           @secondary.disable(feature, gate, thing) if @dual_write
         end
+      end
+
+      private
+
+      # Internal: A healthy primary that returns the default config is an
+      # explicit "feature has no gate values" answer, not a hole that a stale
+      # secondary value is allowed to fill. Mark it :missing so the receipt
+      # can tell that apart from a stored value.
+      def status_for(result)
+        result == default_config ? :missing : :ok
+      end
+
+      def record_get(feature, result, source:, status:, error: nil)
+        return unless @read_receipt
+        @read_receipt.record(
+          feature.key,
+          source: source,
+          status: status,
+          operation: :get,
+          values: { feature.key => result },
+          error: error,
+        )
+        @read_receipt.record_failure(:get, [feature.key], error) if error
+      end
+
+      def record_multi(features, result, source:, error: nil)
+        return unless @read_receipt
+        keys = features.map(&:key)
+        if error
+          @read_receipt.record(
+            keys,
+            source: source,
+            status: :degraded,
+            operation: :get_multi,
+            values: result,
+            error: error,
+          )
+          @read_receipt.record_failure(:get_multi, keys, error)
+        else
+          keys.each do |key|
+            value = result[key]
+            @read_receipt.record(
+              key,
+              source: source,
+              status: status_for(value),
+              operation: :get_multi,
+              values: { key => value },
+            )
+          end
+        end
+      end
+
+      def record_all(result, source:, error: nil)
+        return unless @read_receipt
+        keys = result.keys
+        if error
+          @read_receipt.record(
+            keys,
+            source: source,
+            status: :degraded,
+            operation: :get_all,
+            values: result,
+            error: error,
+          )
+          @read_receipt.record_failure(:get_all, keys, error)
+        else
+          keys.each do |key|
+            value = result[key]
+            @read_receipt.record(
+              key,
+              source: source,
+              status: status_for(value),
+              operation: :get_all,
+              values: { key => value },
+            )
+          end
+        end
+      end
+
+      def record_features(result, source:, status:, error: nil)
+        return unless @read_receipt
+        key = ReadReceipt.features_key
+        @read_receipt.record(
+          key,
+          source: source,
+          status: status,
+          operation: :features,
+          values: result,
+          error: error,
+        )
+        @read_receipt.record_failure(:features, [key], error) if error
+      end
+
+      def record_sync_version(result, source:, status:, error: nil)
+        return unless @read_receipt
+        key = ReadReceipt.sync_version_key
+        @read_receipt.record(
+          key,
+          source: source,
+          status: status,
+          operation: :sync_version,
+          values: result,
+          error: error,
+        )
+        @read_receipt.record_failure(:sync_version, [key], error) if error
       end
     end
   end

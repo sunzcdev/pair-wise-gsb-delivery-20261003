@@ -30,6 +30,12 @@ module Flipper
         @adapter.read_only?
       end
 
+      # Public: Delegate the optional failover read receipt through the
+      # instrumentation layer.
+      def read_receipt
+        @adapter.read_receipt if @adapter.respond_to?(:read_receipt)
+      end
+
       # Public
       def features
         default_payload = {

@@ -45,6 +45,12 @@ module Flipper
         @adapter.read_only?
       end
 
+      # Public: Delegate the optional failover read receipt so it stays
+      # reachable through arbitrary wrapper stacks (instrumented, cache, ...).
+      def read_receipt
+        @adapter.read_receipt if @adapter.respond_to?(:read_receipt)
+      end
+
       # Override this method to customize the behavior of all delegated methods, and just yield to
       # the block to call the wrapped adapter.
       if RUBY_VERSION >= '3.0'

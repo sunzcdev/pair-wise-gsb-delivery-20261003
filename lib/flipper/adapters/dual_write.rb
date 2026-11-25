@@ -23,6 +23,12 @@ module Flipper
         @remote.read_only? || @local.read_only?
       end
 
+      # Public: Reads are served by the local adapter, so delegate the
+      # optional failover read receipt to it.
+      def read_receipt
+        @local.read_receipt if @local.respond_to?(:read_receipt)
+      end
+
       def features
         @local.features
       end

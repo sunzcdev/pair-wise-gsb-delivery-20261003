@@ -39,6 +39,11 @@ module Flipper
         @adapter.read_only?
       end
 
+      # Public: Delegate the optional failover read receipt through the cache.
+      def read_receipt
+        @adapter.read_receipt if @adapter.respond_to?(:read_receipt)
+      end
+
       # Public: Expire the cache for the set of all features with gates.
       def expire_get_all_cache
         cache_delete @get_all_cache_key

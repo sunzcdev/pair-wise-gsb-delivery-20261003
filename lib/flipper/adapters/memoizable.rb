@@ -24,6 +24,14 @@ module Flipper
         @cache_key_by_feature_key = Hash.new { |hash, key| hash[key] = "feature/#{key}".freeze }
       end
 
+      # Public: The read receipt collected by a wrapped failover adapter, or
+      # nil if the wrapped adapter does not collect one. Memo hits are
+      # restamped with the :memo source on every read so the receipt always
+      # reflects where the returned value actually came from.
+      def read_receipt
+        @adapter.read_receipt if @adapter.respond_to?(:read_receipt)
+      end
+
       # Public
       def features
         if memoizing?
@@ -54,9 +62,21 @@ module Flipper
       # Public
       def get(feature)
         if memoizing?
-          cache.fetch(key_for(feature.key)) do
-            cache[key_for(feature.key)] = preloaded_missing?(feature) ? default_config : @adapter.get(feature)
+          cache_key = key_for(feature.key)
+          if cache.key?(cache_key)
+            restamp_receipt(feature.key, :get)
+            return cache[cache_key]
           end
+
+          if preloaded_missing?(feature)
+            cache[cache_key] = default_config
+            remember_missing_receipt(feature.key, :get)
+          else
+            cache[cache_key] = @adapter.get(feature)
+            remember_receipt(feature.key)
+          end
+
+          cache[cache_key]
         else
           @adapter.get(feature)
         end
@@ -65,9 +85,16 @@ module Flipper
       # Public
       def get_multi(features)
         if memoizing?
+          memoized_keys = []
           uncached_features = features.reject do |feature|
-            cache[key_for(feature.key)] ||= default_config if preloaded_missing?(feature)
-            cache[key_for(feature.key)]
+            cache_key = key_for(feature.key)
+            if preloaded_missing?(feature)
+              cache[cache_key] = default_config
+              remember_missing_receipt(feature.key, :get_multi)
+            end
+            hit = cache.key?(cache_key)
+            memoized_keys << feature.key if hit
+            hit
           end
 
           if uncached_features.any?
@@ -75,12 +102,16 @@ module Flipper
             response.each do |key, hash|
               cache[key_for(key)] = hash
             end
+            uncached_features.each { |feature| remember_receipt(feature.key) }
           end
 
           result = {}
           features.each do |feature|
             result[feature.key] = cache[key_for(feature.key)]
           end
+          # Only values reused from the cache are restamped :memo; values
+          # actively read above keep their primary/secondary provenance.
+          memoized_keys.each { |key| restamp_receipt(key, :get_multi) }
           result
         else
           @adapter.get_multi(features)
@@ -95,6 +126,7 @@ module Flipper
             cache[@features_key].each do |key|
               response[key] = cache[key_for(key)]
             end
+            cache[@features_key].each { |key| restamp_receipt(key, :get_all) }
           else
             response = @adapter.get_all(**kwargs)
             response.each do |key, value|
@@ -102,6 +134,7 @@ module Flipper
             end
             cache[@features_key] = response.keys.to_set
             cache[@get_all_key] = true
+            response.keys.each { |key| remember_receipt(key) }
           end
 
           # Ensures that looking up other features that do not exist doesn't
@@ -129,7 +162,11 @@ module Flipper
       end
 
       def import(source)
-        @adapter.import(source).tap { cache.clear if memoizing? }
+        @adapter.import(source).tap do
+          if memoizing?
+            cache.clear
+          end
+        end
       end
 
       def export(format: :json, version: 1)
@@ -160,6 +197,35 @@ module Flipper
       end
 
       private
+
+      # Internal: Snapshot the failover provenance for a key right after it
+      # was actively read through the wrapped adapter. If the key had been
+      # served from the memo earlier, restore its pre-memo provenance first.
+      def remember_receipt(key)
+        return unless read_receipt
+        read_receipt.restore(key)
+      end
+
+      # Internal: Remember that a preloaded-missing default was synthesized by
+      # the memoizer rather than read from any adapter.
+      def remember_missing_receipt(key, operation)
+        return unless read_receipt
+        read_receipt.record(
+          key,
+          source: :memo,
+          status: :missing,
+          operation: operation,
+          values: { key.to_s => default_config },
+        )
+      end
+
+      # Internal: Re-stamp the receipt when a cached value is reused. The
+      # original primary/secondary provenance is preserved on the entry and
+      # restored the next time the key is actively read.
+      def restamp_receipt(key, operation)
+        return unless read_receipt
+        read_receipt.restamp(key, operation)
+      end
 
       def preloaded_missing?(feature)
         cache[@get_all_key] && cache[@features_key] && !cache[@features_key].include?(feature.key)
