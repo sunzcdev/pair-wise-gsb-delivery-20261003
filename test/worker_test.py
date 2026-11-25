@@ -37,6 +37,7 @@ from luigi.cmdline import luigi_run
 from luigi.mock import MockFileSystem, MockTarget
 from luigi.rpc import RPCError
 from luigi.scheduler import Scheduler
+from luigi.task_status import DONE, FAILED
 from luigi.worker import Worker
 
 luigi.notifications.DEBUG = True
@@ -937,6 +938,114 @@ class WorkerTest(LuigiTestCase):
         failed_ids = set(self.sch.task_list("FAILED", ""))
         self.assertEqual({task.task_id for task in tasks}, failed_ids)
         self.assertTrue(all(self.sch.fetch_error(task_id)["error"] for task_id in failed_ids))
+
+    def test_run_partial_batch_job(self):
+        completed = set()
+        runs = []
+
+        @luigi.parameter.partial_batch_method
+        def join_values(values):
+            return ",".join(values)
+
+        class PartialBatchJob(luigi.Task):
+            values = luigi.parameter.Parameter(batch_method=join_values)
+
+            def run(self):
+                runs.append(self.values)
+                produced = set(self.values.split(","))
+                if len(runs) == 1:
+                    # the first and third member outputs go missing in the
+                    # first batch execution
+                    produced -= {"0", "2"}
+                completed.update(produced)
+
+            def complete(self):
+                return all(value in completed for value in self.values.split(","))
+
+        tasks = [PartialBatchJob(str(i)) for i in range(5)]
+        successful_tasks = [task for task in tasks if task.values not in ("0", "2")]
+        failed_tasks = [task for task in tasks if task.values in ("0", "2")]
+
+        sch = Scheduler(retry_delay=0, remove_delay=1000, worker_disconnect_delay=10, stable_done_cooldown_secs=0)
+        w1 = Worker(scheduler=sch, worker_id="w1")
+        for task in tasks:
+            self.assertTrue(w1.add(task))
+        self.assertTrue(w1.run())
+
+        # all five tasks ran together in a single batch execution
+        self.assertEqual(["0,1,2,3,4"], runs)
+
+        # members were settled individually by result
+        done_ids = set(sch.task_list("DONE", ""))
+        failed_ids = set(sch.task_list("FAILED", ""))
+        for task in successful_tasks:
+            self.assertIn(task.task_id, done_ids)
+        for task in failed_tasks:
+            self.assertIn(task.task_id, failed_ids)
+
+        # the worker history settled each member of the batch by its own result
+        w1_history = {task.task_id: status for task, status, _ in w1._add_task_history}
+        for task in successful_tasks:
+            self.assertEqual(DONE, w1_history[task.task_id])
+        for task in failed_tasks:
+            self.assertEqual(FAILED, w1_history[task.task_id])
+
+        # hand the failed parameters over to the next worker
+        w2 = Worker(scheduler=sch, worker_id="w2")
+        for task in failed_tasks:
+            self.assertTrue(w2.add(task))
+        self.assertTrue(w2.run())
+
+        # the retry only used the not-yet-successful parameters
+        self.assertEqual(["0,1,2,3,4", "0,2"], runs)
+
+        # everything is DONE now
+        done_ids = set(sch.task_list("DONE", ""))
+        for task in tasks:
+            self.assertIn(task.task_id, done_ids)
+            self.assertTrue(task.complete())
+
+        # every member traces back to the same original batch execution
+        def batch_ids(task):
+            scheduler_task = sch._state.get_task(task.task_id)
+            return scheduler_task.batch_history + [scheduler_task.batch_id]
+
+        original_batch_ids = {batch_ids(task)[0] for task in tasks}
+        self.assertEqual(1, len(original_batch_ids))
+
+        # the successful members were only part of the original batch, while
+        # the retried members show both executions
+        for task in successful_tasks:
+            self.assertEqual(1, len(batch_ids(task)))
+        for task in failed_tasks:
+            self.assertEqual(2, len(batch_ids(task)))
+
+    def test_run_non_partial_batch_job_settles_as_a_whole(self):
+        completed = set()
+
+        class CsvBatchJob(luigi.Task):
+            values = luigi.parameter.Parameter(batch_method=",".join)
+
+            def run(self):
+                # only some member outputs are produced
+                completed.update(value for value in self.values.split(",") if value not in ("0", "2"))
+
+            def complete(self):
+                return all(value in completed for value in self.values.split(","))
+
+        tasks = [CsvBatchJob(str(i)) for i in range(5)]
+        for task in tasks:
+            self.assertTrue(self.w.add(task))
+        self.assertTrue(self.w.run())
+
+        # without partial settlement the batch keeps the existing
+        # all-or-nothing behavior: every member gets the batch lead's status,
+        # even though two member outputs are actually missing
+        done_ids = set(self.sch.task_list("DONE", ""))
+        for task in tasks:
+            self.assertIn(task.task_id, done_ids)
+            self.assertIsNone(self.sch._state.get_task(task.task_id).batch_id)
+        self.assertFalse(all(task.complete() for task in tasks))
 
 
 class WorkerKeepAliveTests(LuigiTestCase):

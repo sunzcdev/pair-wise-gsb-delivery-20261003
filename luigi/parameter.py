@@ -22,6 +22,7 @@ See :ref:`Parameter` for more info on how to define parameters.
 
 import abc
 import datetime
+import functools
 import json
 import operator
 import warnings
@@ -77,6 +78,45 @@ class _NoValueType:
 
 
 _no_value = _NoValueType()
+
+
+def partial_batch_method(func):
+    """
+    Decorator marking a ``batch_method`` as supporting partial (per-member)
+    settlement of a batch execution.
+
+    When every batched parameter of a task family uses a batch method marked
+    with this decorator, the worker checks each member of a finished batch
+    individually (via ``complete()``) and reports a per-member result to the
+    scheduler. Members whose output is still missing are settled as FAILED so
+    that only their parameters are retried, while successful members stay
+    DONE. The scheduler keeps the batch membership of the original execution
+    so it can be traced afterwards.
+
+    Batch methods without this marker keep the existing all-or-nothing
+    behavior: the status of the batch as a whole is applied to every member.
+
+    Usage::
+
+        @luigi.parameter.partial_batch_method
+        def join_values(values):
+            return ",".join(values)
+
+        class MyTask(luigi.Task):
+            values = luigi.Parameter(batch_method=join_values)
+    """
+    try:
+        func._luigi_partial_batch_method = True
+        return func
+    except (AttributeError, TypeError):
+        # builtins (e.g. ",".join) do not allow attribute assignment,
+        # so wrap them in a plain function that can carry the marker
+        @functools.wraps(func)
+        def _partial_batch_method(values):
+            return func(values)
+
+        _partial_batch_method._luigi_partial_batch_method = True
+        return _partial_batch_method
 
 
 class ParameterVisibility(IntEnum):
@@ -336,6 +376,14 @@ class Parameter(Generic[T]):
 
     def _is_batchable(self):
         return self._batch_method is not None
+
+    def _supports_partial_settlement(self):
+        """
+        True if the batch method of this parameter was marked with
+        :py:func:`~luigi.parameter.partial_batch_method`, meaning members of
+        a batch execution may be settled individually by result.
+        """
+        return self._is_batchable() and getattr(self._batch_method, "_luigi_partial_batch_method", False)
 
     def parse(self, x):
         """

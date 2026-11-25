@@ -181,6 +181,35 @@ task that ends up running will use resources. The scheduler only checks
 that there are sufficient resources for each task individually before
 batching them all together.
 
+Settling batch members individually
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+By default a batch is settled as a whole: when the combined run finishes,
+every member of the batch gets the same status, even if the run only
+produced the outputs of some members. If a batch method is marked with
+:py:func:`~luigi.parameter.partial_batch_method`, the worker instead checks
+each member of a successfully finished batch via ``complete()`` and reports
+a per-member result to the scheduler. Members whose output is still missing
+are settled as FAILED so that only their parameters are retried (possibly
+by another worker), while the successful members stay DONE. The scheduler
+keeps the batch membership of the original execution on each member (in
+``batch_id``/``batch_history``) so the executions of a batch stay
+traceable.
+
+.. code-block:: python
+
+    @luigi.parameter.partial_batch_method
+    def join_values(values):
+        return ",".join(values)
+
+    class A(luigi.Task):
+        values = luigi.Parameter(batch_method=join_values)
+
+Partial settlement only applies when *all* batched parameters of a task
+family use marked batch methods, and only when the combined run itself
+succeeds; a failed run still fails the whole batch. Batch methods without
+the marker keep the existing all-or-nothing behavior.
+
 Tasks that regularly overwrite the same data source
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

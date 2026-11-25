@@ -60,6 +60,7 @@ from luigi.parameter import (
     TimeDeltaParameter,
     TupleParameter,
     YearParameter,
+    partial_batch_method,
 )
 from luigi.rpc import RemoteScheduler, RPCError
 from luigi.target import Target
@@ -91,6 +92,7 @@ __all__ = [
     "RemoteScheduler",
     "RPCError",
     "parameter",
+    "partial_batch_method",
     "Parameter",
     "DateParameter",
     "MonthParameter",

@@ -614,8 +614,9 @@ class Worker:
             kwargs["owners"] = task._owner_list()
 
         if task_id in self._batch_running_tasks:
+            batch_results = kwargs.get("batch_results") or {}
             for batch_task in self._batch_running_tasks.pop(task_id):
-                self._add_task_history.append((batch_task, status, True))
+                self._add_task_history.append((batch_task, batch_results.get(batch_task.task_id, status), True))
 
         if task and kwargs.get("params"):
             kwargs["param_visibilities"] = task._get_param_visibilities()
@@ -1009,7 +1010,7 @@ class Worker:
                 self.run_succeeded = False
 
         if task_id is not None and "batch_task_ids" in r:
-            batch_tasks = filter(None, [self._scheduled_tasks.get(batch_id) for batch_id in r["batch_task_ids"]])
+            batch_tasks = [task for task in (self._scheduled_tasks.get(batch_id) for batch_id in r["batch_task_ids"]) if task is not None]
             self._batch_running_tasks[task_id] = batch_tasks
 
         return GetWorkResponse(
@@ -1079,6 +1080,34 @@ class Worker:
             logger.info(error_msg)
             self._task_result_queue.put((task_id, FAILED, error_msg, [], []))
 
+    def _get_batch_results(self, task, task_id, status):
+        """
+        Compute per-member results for a finished batch execution.
+
+        Returns a dict mapping each batch member's task_id to its individual
+        status, or None if this batch should be settled as a whole (the
+        existing behavior). Partial settlement only applies when the batch
+        lead ran successfully and the task family opted in by marking all of
+        its batch methods with
+        :py:func:`~luigi.parameter.partial_batch_method`.
+        """
+        if status != DONE or task_id not in self._batch_running_tasks:
+            return None
+
+        batch_tasks = list(self._batch_running_tasks.get(task_id, ()))
+        if not batch_tasks or not task.batch_partial_settlement():
+            return None
+
+        batch_results = {}
+        for batch_task in batch_tasks:
+            try:
+                member_status = DONE if batch_task.complete() else FAILED
+            except Exception:
+                logger.exception("Error checking completeness of batch member %s, marking it as failed", batch_task)
+                member_status = FAILED
+            batch_results[batch_task.task_id] = member_status
+        return batch_results
+
     def _handle_next_task(self):
         """
         We have to catch three ways a task can be "done":
@@ -1115,6 +1144,8 @@ class Worker:
                     self.add(t)
                 new_deps = [t.task_id for t in new_req]
 
+            batch_results = self._get_batch_results(task, task_id, status)
+
             self._add_task(
                 worker=self._id,
                 task_id=task_id,
@@ -1128,6 +1159,7 @@ class Worker:
                 new_deps=new_deps,
                 assistant=self._assistant,
                 retry_policy_dict=_get_retry_policy_dict(task),
+                batch_results=batch_results,
             )
 
             self._running_tasks.pop(task_id)

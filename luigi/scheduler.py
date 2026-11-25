@@ -280,6 +280,10 @@ class Task:
         self.runnable = False
         self.batchable = False
         self.batch_id = None
+        # batch ids of previous batch executions this task was a member of.
+        # Populated for partially-settled batches, whose members keep their
+        # batch membership after settlement so executions stay traceable.
+        self.batch_history = []
 
     def __repr__(self):
         return "Task(%r)" % vars(self)
@@ -527,6 +531,10 @@ class SimpleTaskState:
 
     def set_batch_running(self, task, batch_id, worker_id):
         self.set_status(task, BATCH_RUNNING)
+        if task.batch_id is not None and task.batch_id != batch_id:
+            # a partially-settled member being re-batched: keep the previous
+            # batch membership traceable
+            task.batch_history.append(task.batch_id)
         task.batch_id = batch_id
         task.worker_running = worker_id
         task.resources_running = task.resources
@@ -822,6 +830,7 @@ class Scheduler:
         worker=None,
         batchable=None,
         batch_id=None,
+        batch_results=None,
         retry_policy_dict=None,
         owners=None,
         **kwargs,
@@ -912,6 +921,12 @@ class Scheduler:
         task_is_not_running = task.status not in (RUNNING, BATCH_RUNNING)
         task_started_a_run = status in (DONE, FAILED, RUNNING)
         running_on_this_worker = task.worker_running == worker_id
+
+        if batch_results is not None and task.batch_id is not None and status in (DONE, FAILED):
+            # partially-settled batch: settle each member by its own result
+            # instead of applying the batch lead's status to all of them
+            self._settle_batch_members(task, status, batch_results)
+
         if task_is_not_running or (task_started_a_run and running_on_this_worker) or new_deps:
             # don't allow re-scheduling of task while it is running, it must either fail or succeed on the worker actually running it
             if status != task.status or status == PENDING:
@@ -964,6 +979,23 @@ class Scheduler:
             task.workers.add(worker_id)
             self._state.get_worker(worker_id).tasks.add(task)
             task.runnable = runnable
+
+    def _settle_batch_members(self, task, status, batch_results):
+        """
+        Settle each member of a partially-settled batch execution by its own
+        result, as reported by the worker in ``batch_results``.
+
+        Unlike the all-or-nothing settlement in ``set_status``, the members
+        keep their ``batch_id`` after settlement so the membership of this
+        batch execution remains traceable; it is moved to ``batch_history``
+        if a member is re-batched later.
+        """
+        for batch_task in self._state.get_batch_running_tasks(task.batch_id):
+            member_status = batch_results.get(batch_task.id, status)
+            if member_status not in (DONE, FAILED):
+                member_status = status
+            self._update_task_history(batch_task, member_status)
+            self._state.set_status(batch_task, member_status, self._config)
 
     @rpc_method()
     def announce_scheduling_failure(self, task_name, family, params, expl, owners, **kwargs):

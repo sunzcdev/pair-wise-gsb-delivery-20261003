@@ -394,6 +394,18 @@ class Task(metaclass=Register):
         return [name for name, p in cls.get_params() if p._is_batchable()]
 
     @classmethod
+    def batch_partial_settlement(cls):
+        """
+        True if this task family settles batch executions per member, i.e. it
+        has batched parameters and all of their batch methods were marked
+        with :py:func:`~luigi.parameter.partial_batch_method`. Task families
+        without such batch methods keep the existing all-or-nothing batch
+        settlement.
+        """
+        batch_params = [p for name, p in cls.get_params() if p._is_batchable()]
+        return bool(batch_params) and all(p._supports_partial_settlement() for p in batch_params)
+
+    @classmethod
     def get_param_names(cls, include_significant=False):
         return [name for name, p in cls.get_params() if include_significant or p.significant]
 
