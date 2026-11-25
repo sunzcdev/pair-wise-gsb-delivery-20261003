@@ -1971,10 +1971,11 @@ class DefaultExecutionContext(ExecutionContext):
         else:
             r = None
         if type_ is not None:
-            # apply type post processors to the result
-            proc = type_._cached_result_processor(
-                self.dialect, self.cursor.description[0][1]
-            )
+            # apply type post processors to the result.  Go through
+            # get_result_processor() so execution-scoped type conventions are
+            # honored here as well as in CursorResultMetaData.
+            coltype = self.cursor.description[0][1]
+            proc = self.get_result_processor(type_, "", coltype)
             if proc:
                 return proc(r)
         return r
@@ -2060,7 +2061,53 @@ class DefaultExecutionContext(ExecutionContext):
         for context-sensitive result type handling.
 
         """
-        return type_._cached_result_processor(self.dialect, coltype)
+        static_processor = type_._cached_result_processor(
+            self.dialect, coltype
+        )
+
+        if not type_._has_execution_result_processing:
+            return static_processor
+
+        execution_processor = type_._get_execution_result_processor(
+            self, coltype
+        )
+
+        if execution_processor is None and static_processor is None:
+            # Even when this execution does not add another processing step,
+            # the type has explicitly declared that its processing may depend
+            # on execution state.  Return a marked pass-through so result
+            # metadata containing this type is not cached on the Compiled
+            # object and reused by a different execution.
+            def result_processor(value: Any) -> Any:
+                return value
+
+        elif execution_processor is None:
+            fixed_static_processor = static_processor
+
+            def result_processor(value: Any) -> Any:
+                return fixed_static_processor(value)
+
+        elif static_processor is None:
+            fixed_execution_processor = execution_processor
+
+            def result_processor(value: Any) -> Any:
+                return fixed_execution_processor(value)
+
+        else:
+            fixed_static_processor = static_processor
+            fixed_execution_processor = execution_processor
+
+            def result_processor(value: Any) -> Any:
+                return fixed_execution_processor(
+                    fixed_static_processor(value)
+                )
+
+        setattr(
+            result_processor,
+            "_sa_execution_scoped_result_processor",
+            True,
+        )
+        return result_processor
 
     def get_lastrowid(self) -> int:
         """return self.cursor.lastrowid, or equivalent, after an INSERT.

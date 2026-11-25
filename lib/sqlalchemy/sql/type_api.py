@@ -61,6 +61,7 @@ if typing.TYPE_CHECKING:
     from .sqltypes import TABLEVALUE as TABLEVALUE  # noqa: F401
     from ..engine.interfaces import DBAPIModule
     from ..engine.interfaces import Dialect
+    from ..engine.interfaces import ExecutionContext
 
 _T = TypeVar("_T", bound=Any)
 _T_co = TypeVar("_T_co", bound=Any, covariant=True)
@@ -546,6 +547,55 @@ class TypeEngine(Visitable, Generic[_T]):
         :param coltype: DBAPI coltype argument received in cursor.description.
 
         """
+        return None
+
+    def execution_result_processor(
+        self,
+        execution_context: ExecutionContext,
+        coltype: Any,
+    ) -> Optional[_ResultProcessorType[_T]]:
+        """Return an execution-scoped result value processor.
+
+        This method is an optional extension to
+        :meth:`_types.TypeEngine.result_processor`.  It is invoked for each
+        execution that produces a result set, allowing the returned processor
+        to depend on the actual :class:`.ExecutionContext` and its execution
+        options.  The ordinary dialect-level result processor is still
+        created and cached normally; when both processors are present, the
+        ordinary processor runs first and its result is passed to the
+        execution-scoped processor.
+
+        Types which override this method explicitly declare that their result
+        interpretation may vary by execution.  Such types remain safe to use
+        with the SQL compilation cache via :attr:`.TypeDecorator.cache_ok`;
+        only the per-execution result decoding metadata is not cached on the
+        compiled object.
+
+        Return ``None`` if no additional execution-scoped processing is
+        needed for this execution.
+
+        .. versionadded:: 2.1.11
+
+        """
+        return None
+
+    @util.memoized_property
+    def _has_execution_result_processing(self) -> bool:
+        """Indicate whether this type declares execution-scoped processing."""
+
+        return util.method_is_overridden(
+            self, TypeEngine.execution_result_processor
+        )
+
+    def _get_execution_result_processor(
+        self,
+        execution_context: ExecutionContext,
+        coltype: Any,
+    ) -> Optional[_ResultProcessorType[_T]]:
+        if self._has_execution_result_processing:
+            return self.execution_result_processor(
+                execution_context, coltype
+            )
         return None
 
     def column_expression(
@@ -2092,6 +2142,37 @@ class TypeDecorator(SchemaEventTarget, ExternalType, TypeEngine[_T]):
 
         raise NotImplementedError()
 
+    def process_execution_result_value(
+        self,
+        value: Optional[Any],
+        execution_context: ExecutionContext,
+    ) -> Optional[_T]:
+        """Receive an already processed result value using the current
+        execution context.
+
+        This method is an execution-scoped companion to
+        :meth:`_types.TypeDecorator.process_result_value`.  Override it when
+        result interpretation depends on state that is only known for the
+        current execution, such as an execution option or connection-specific
+        setting.
+
+        The cached dialect and :class:`.TypeDecorator` result processors run
+        first, including :meth:`_types.TypeDecorator.process_result_value`.
+        This method then receives that processed value and the current
+        :class:`.ExecutionContext`.  For example, a mode may be selected with
+        ``context.execution_options["interpretation_mode"]``.
+
+        Like :meth:`_types.TypeDecorator.execution_result_processor`,
+        overriding this method explicitly opts the type into per-execution
+        result decoding without disabling the SQL compilation cache or the
+        ordinary dialect processor cache.
+
+        .. versionadded:: 2.1.11
+
+        """
+
+        raise NotImplementedError()
+
     @util.memoized_property
     def _has_bind_processor(self) -> bool:
         """memoized boolean, check if process_bind_param is implemented.
@@ -2236,6 +2317,47 @@ class TypeDecorator(SchemaEventTarget, ExternalType, TypeEngine[_T]):
         return util.method_is_overridden(
             self, TypeDecorator.process_result_value
         )
+
+    @util.memoized_property
+    def _has_execution_result_value(self) -> bool:
+        """memoized boolean, check if process_execution_result_value is
+        implemented.
+
+        """
+
+        return util.method_is_overridden(
+            self, TypeDecorator.process_execution_result_value
+        )
+
+    @util.memoized_property
+    def _has_execution_result_processing(self) -> bool:
+        return (
+            util.method_is_overridden(
+                self, TypeEngine.execution_result_processor
+            )
+            or self._has_execution_result_value
+        )
+
+    def _get_execution_result_processor(
+        self,
+        execution_context: ExecutionContext,
+        coltype: Any,
+    ) -> Optional[_ResultProcessorType[_T]]:
+        processor = super()._get_execution_result_processor(
+            execution_context, coltype
+        )
+        if processor is not None:
+            return processor
+
+        if self._has_execution_result_value:
+            process_value = self.process_execution_result_value
+
+            def process(value: Optional[Any]) -> Optional[_T]:
+                return process_value(value, execution_context)
+
+            return process
+
+        return None
 
     def result_processor(
         self, dialect: Dialect, coltype: Any

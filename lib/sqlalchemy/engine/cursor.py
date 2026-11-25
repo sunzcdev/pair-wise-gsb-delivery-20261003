@@ -431,6 +431,21 @@ class CursorResultMetaData(ResultMetaData):
             # to the tuplefilters before being used
             self._processors.extend([None] * num_sentinel_cols)
 
+        if any(
+            processor is not None
+            and getattr(
+                processor,
+                "_sa_execution_scoped_result_processor",
+                False,
+            )
+            for processor in self._processors
+        ):
+            # Execution-scoped processors close over the current
+            # ExecutionContext.  They must not be retained by the Compiled
+            # object's cacheable result metadata.  The Compiled cache entry
+            # itself may still be reused.
+            self._safe_for_cache = False
+
         # this is used when using this ResultMetaData in a Core-only cache
         # retrieval context.  it's initialized on first cache retrieval
         # when the _result_disable_adapt_to_context execution option
