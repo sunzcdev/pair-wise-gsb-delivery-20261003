@@ -64,6 +64,7 @@ class Config:
 
     access_log_format = '%(h)s %(l)s %(l)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s"'
     accesslog: logging.Logger | str | None = None
+    access_log_queue_size: int | None = None
     alpn_protocols = ["h2", "http/1.1"]
     alt_svc_headers: list[str] = []
     application_path: str

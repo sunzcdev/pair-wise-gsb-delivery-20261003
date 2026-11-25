@@ -73,6 +73,10 @@ Attribute                  Command line                  Purpose                
 -------------------------- ----------------------------- ----------------------------------------------- ------------------------
 access_log_format          ``--access-logformat``        The log format for the access log, see
                                                          :ref:`how_to_log`.
+access_log_queue_size      N/A                           The bounded queue used to decouple
+                                                         access log writes from the HTTP
+                                                         response, see :ref:`how_to_log`.
+                                                         ``None`` (the default) writes inline.
 accesslog                  ``--access-logfile``          The target logger for access logs, use
                                                          ``-`` for stdout.
 alpn_protocols             N/A                           The HTTP protocols to advertise over            ``h2`` and ``http/1.1``

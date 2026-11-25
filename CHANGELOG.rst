@@ -1,3 +1,12 @@
+Unreleased
+----------
+
+* Add an optional bounded ``access_log_queue_size`` that decouples access
+  log writes from the HTTP response. A stalled log target no longer delays
+  responses; full queues evict the oldest queued successful entry in favour
+  of a failed request and expose per-category drop counters, while retained
+  entries continue to be delivered in order.
+
 0.18.0 2025-11-08
 -----------------
 

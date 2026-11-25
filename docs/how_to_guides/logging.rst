@@ -75,3 +75,33 @@ The logger class can be customised by changing the ``logger_class``
 attribute of the ``Config`` class. This is only possible when using
 the python based configuration file. The
 ``hypercorn.logging.Logger`` class is used by default.
+
+Queued access logging
+---------------------
+
+A log target (a network socket, a slow file, an external agent) can
+block for a long time. By default Hypercorn writes an access log entry
+inline, so a stalled target can delay the HTTP response. Setting the
+``access_log_queue_size`` configuration option to a positive integer
+instead routes access log entries through a bounded queue:
+
+* the HTTP response never waits on the log target - entries are handed
+  to a background pump that performs the actual write off the event
+  loop;
+* the queue is strictly in order, so every entry that is written
+  appears in the order the requests were accepted;
+* the entry currently being written is held outside the queue and can
+  never be revoked;
+* when the queue is full, a new failed request (a response with a
+  ``4xx``/``5xx`` status, or a disconnected request) makes room by
+  evicting the oldest still-queued *successful* entry;
+* if the queue contains only failed entries a new entry is dropped
+  instead. Dropped failed requests are counted by their status code
+  (``disconnect`` for requests that never produced a response), and
+  lost successful entries under the ``success`` category.
+
+The counters are queryable at runtime through
+``Logger.access_log_dropped()`` (and the queue object itself via
+``Logger.access_log_queue``). The default, ``None``, keeps the original
+synchronous, inline behaviour unchanged. When the server stops,
+``Logger.aclose()`` flushes every entry still queued, in order.
