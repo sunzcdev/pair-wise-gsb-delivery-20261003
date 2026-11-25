@@ -154,11 +154,11 @@ class AsyncHTTPClient(Configurable):
     actually creates an instance of an implementation-specific
     subclass, and instances are reused as a kind of pseudo-singleton
     (one per `.IOLoop`). The keyword argument ``force_instance=True``
-    can be used to suppress this singleton behavior. Unless
-    ``force_instance=True`` is used, no arguments should be passed to
-    the `AsyncHTTPClient` constructor. The implementation subclass as
-    well as arguments to its constructor can be set with the static
-    method `configure()`
+    can be used to suppress this singleton behavior. The implementation
+    subclass as well as arguments to its constructor can be set with the
+    static method `configure()`; per-call arguments may also be passed
+    to the constructor (they replace the cached instance for the current
+    `.IOLoop`, see below).
 
     All `AsyncHTTPClient` implementations support a ``defaults``
     keyword argument, which can be used to set default values for
@@ -170,12 +170,53 @@ class AsyncHTTPClient(Configurable):
         client = AsyncHTTPClient(force_instance=True,
             defaults=dict(user_agent="MyUserAgent"))
 
+    The per-`.IOLoop` instance may be replaced while it is still in use:
+    calling the constructor again on the same loop with a different
+    configuration installs a new instance for subsequent default fetches.
+    The previous instance is left untouched (it is neither closed nor
+    cancelled), so requests that are already in flight on it run to
+    completion, and it remains the caller's responsibility to close it
+    when it is no longer needed. A later ``close()`` of a replaced
+    instance does not remove its successor from the cache. For example::
+
+        old = AsyncHTTPClient(defaults=dict(user_agent="Old"))
+        in_flight = old.fetch(url)           # keeps using "Old"
+        new = AsyncHTTPClient(defaults=dict(user_agent="New"))
+        assert AsyncHTTPClient() is new      # later fetches use "New"
+        await in_flight
+        old.close()                          # does not evict ``new``
+
+    This replacement is scoped to the `.IOLoop` on which it happens;
+    clients cached on other loops keep their own configuration.
+    Instances created with ``force_instance=True`` are never cached, so
+    they are unaffected by (and never installed as) the default client.
+
     .. versionchanged:: 5.0
        The ``io_loop`` argument (deprecated since version 4.1) has been removed.
+
+    .. versionchanged:: 6.7
+       Passing constructor arguments when an instance is already cached
+       for the current `.IOLoop` replaces that instance instead of
+       silently ignoring the arguments. The replaced instance keeps
+       running its in-flight requests, and closing it later no longer
+       disturbs the instance that replaced it.
 
     """
 
     _instance_cache: dict[IOLoop, "AsyncHTTPClient"] | None
+    # How a cached instance was built, used by `__new__` to decide whether
+    # it can satisfy a later constructor call. ``_creation_class_configuration``
+    # is the class-level configuration (implementation class plus
+    # `configure()` keyword arguments) in effect at construction time, and
+    # ``_creation_configuration`` is the effective configuration (the
+    # `configure()` keyword arguments with the constructor's own keyword
+    # arguments layered on top). Both are ``None`` on instances that are not
+    # cached (``force_instance=True`` or objects built without going through
+    # ``__new__``).
+    _creation_class_configuration: (
+        tuple[type[Configurable], dict[str, Any]] | None
+    ) = None
+    _creation_configuration: dict[str, Any] | None = None
 
     @classmethod
     def configurable_base(cls) -> type[Configurable]:
@@ -194,6 +235,25 @@ class AsyncHTTPClient(Configurable):
             setattr(cls, attr_name, weakref.WeakKeyDictionary())
         return cast(dict[IOLoop, AsyncHTTPClient], getattr(cls, attr_name))
 
+    @classmethod
+    def _class_configuration(cls) -> tuple[type[Configurable], dict[str, Any]]:
+        """The implementation class and keyword arguments `configure()` would use.
+
+        This is the part of the configuration that applies to every
+        instance built through the base class; it does not include the
+        keyword arguments passed directly to a particular constructor
+        call (those take precedence over, and may be combined with, this
+        class-level configuration).
+        """
+        base = cls.configurable_base()
+        if cls is base:
+            impl = cls.configured_class()
+            _, configured_kwargs = cls._save_configuration()
+            return (impl, dict(configured_kwargs or {}))
+        # Subclasses are constructed directly; configure() of the base
+        # class does not affect them.
+        return (cls, {})
+
     def __new__(cls, force_instance: bool = False, **kwargs: Any) -> "AsyncHTTPClient":
         io_loop = IOLoop.current()
         instance_cache: dict[IOLoop, AsyncHTTPClient] | None
@@ -201,8 +261,18 @@ class AsyncHTTPClient(Configurable):
             instance_cache = None
         else:
             instance_cache = cls._async_clients()
-        if instance_cache is not None and io_loop in instance_cache:
-            return instance_cache[io_loop]
+        # Snapshot the class-level configuration now, before the instance
+        # is built, so we record exactly what was used to build it.
+        class_configuration = cls._class_configuration()
+        if instance_cache is not None:
+            cached = instance_cache.get(io_loop)
+            if cached is not None and cached._is_reusable(class_configuration, kwargs):
+                return cached
+            # Otherwise the cached instance (if any) does not satisfy this
+            # request and is replaced below. The old instance is deliberately
+            # left untouched: it may still have requests in flight, and it
+            # remains the caller's to close (a late close() of it must not
+            # evict its replacement).
         instance = super().__new__(cls, **kwargs)
         # Make sure the instance knows which cache to remove itself from.
         # It can't simply call _async_clients() because we may be in
@@ -210,8 +280,35 @@ class AsyncHTTPClient(Configurable):
         # SimpleAsyncHTTPClient.
         instance._instance_cache = instance_cache
         if instance_cache is not None:
+            instance._creation_class_configuration = class_configuration
+            instance._creation_configuration = class_configuration[1] | kwargs
             instance_cache[instance.io_loop] = instance
         return instance
+
+    def _is_reusable(
+        self,
+        class_configuration: tuple[type[Configurable], dict[str, Any]],
+        kwargs: dict[str, Any],
+    ) -> bool:
+        """Whether this cached instance satisfies a constructor call.
+
+        ``class_configuration`` is the current class-level configuration and
+        ``kwargs`` are the arguments of the call being satisfied.
+        """
+        if self._creation_class_configuration is None:
+            # Not built through __new__; nothing to compare against.
+            return not kwargs
+        if self._creation_class_configuration != class_configuration:
+            # The implementation class or configure() keyword arguments have
+            # changed since this instance was created, so it no longer
+            # reflects the requested configuration.
+            return False
+        if not kwargs:
+            # A bare call asks for "this loop's client", so it accepts
+            # whatever is currently installed, even if that instance was
+            # built with explicit arguments.
+            return True
+        return self._creation_configuration == class_configuration[1] | kwargs
 
     def initialize(self, defaults: dict[str, Any] | None = None) -> None:
         self.io_loop = IOLoop.current()
@@ -229,6 +326,11 @@ class AsyncHTTPClient(Configurable):
         `.IOLoop` is also being closed, or the ``force_instance=True``
         argument was used when creating the `AsyncHTTPClient`.
 
+        If this client has already been replaced in the per-`.IOLoop`
+        cache (because a later constructor call requested a different
+        configuration), ``close()`` only releases this client's own
+        resources; the instance that replaced it stays cached.
+
         No other methods may be called on the `AsyncHTTPClient` after
         ``close()``.
 
@@ -237,14 +339,12 @@ class AsyncHTTPClient(Configurable):
             return
         self._closed = True
         if self._instance_cache is not None:
-            cached_val = self._instance_cache.pop(self.io_loop, None)
-            # If there's an object other than self in the instance
-            # cache for our IOLoop, something has gotten mixed up. A
-            # value of None appears to be possible when this is called
-            # from a destructor (HTTPClient.__del__) as the weakref
-            # gets cleared before the destructor runs.
-            if cached_val is not None and cached_val is not self:
-                raise RuntimeError("inconsistent AsyncHTTPClient cache")
+            # Only remove ourselves; if another instance has replaced us
+            # in the cache, leave it alone. (A value of None can also be
+            # observed when close() is called from a destructor, as the
+            # weakref gets cleared before the destructor runs.)
+            if self._instance_cache.get(self.io_loop) is self:
+                del self._instance_cache[self.io_loop]
 
     def fetch(
         self,

@@ -45,6 +45,7 @@ from tornado.httpclient import (
     HTTPError,
     HTTPRequest,
     HTTPResponse,
+    AsyncHTTPClient,
     _RequestProxy,
 )
 from tornado.httpserver import HTTPServer
@@ -59,7 +60,12 @@ from tornado.test.util import (
     ignore_deprecation,
     refusing_port,
 )
-from tornado.testing import ExpectLog, bind_unused_port, gen_test
+from tornado.testing import (
+    ExpectLog,
+    bind_unused_port,
+    gen_test,
+    get_async_test_timeout,
+)
 from tornado.web import Application, RequestHandler, stream_request_body, url
 
 try:
@@ -137,6 +143,24 @@ class CountdownHandler(RequestHandler):
             self.redirect(self.reverse_url("countdown", count - 1))
         else:
             self.write("Zero")
+
+
+class GateHandler(RequestHandler):
+    """Writes its body only once the test releases it.
+
+    Used to keep a request in flight while the client that issued it is
+    replaced in the per-`IOLoop` cache.
+    """
+
+    def initialize(self, gate: "Event", started: "Event") -> None:
+        self.gate = gate
+        self.started = started
+
+    @gen.coroutine
+    def get(self):
+        self.started.set()
+        yield self.gate.wait()
+        self.write(self.request.headers.get("User-Agent", "no user agent"))
 
 
 class EchoPostHandler(RequestHandler):
@@ -1342,6 +1366,174 @@ class RequestProxyTest(TestCase):
     def test_defaults_none(self):
         proxy = _RequestProxy(HTTPRequest("http://example.com/"), None)
         self.assertIsNone(proxy.auth_username)
+
+
+class ReplaceCachedClientTest(AsyncHTTPTestCase):
+    """Replacing the cached `AsyncHTTPClient` for one `.IOLoop`.
+
+    These tests run on the base `AsyncHTTPClient` (so the real
+    `configure()` path and per-`IOLoop` cache are exercised); they rely on
+    the default implementation being able to talk to the test server.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.saved = AsyncHTTPClient._save_configuration()
+        self.addCleanup(AsyncHTTPClient._restore_configuration, self.saved)
+        # Start from a clean cache for this loop so the assertions below
+        # don't depend on clients left behind by earlier tests.
+        self.addCleanup(self._close_cached_client)
+
+    def _close_cached_client(self):
+        cached = AsyncHTTPClient._async_clients().pop(self.io_loop, None)
+        if cached is not None:
+            cached.close()
+
+    def get_app(self):
+        self.gate = Event()
+        self.request_started = Event()
+        return Application(
+            [
+                url("/user_agent", UserAgentHandler),
+                url(
+                    "/gate",
+                    GateHandler,
+                    dict(gate=self.gate, started=self.request_started),
+                ),
+            ]
+        )
+
+    def _new_default(self, **kwargs):
+        client = AsyncHTTPClient(**kwargs)
+        self.addCleanup(client.close)
+        return client
+
+    def test_new_arguments_replace_cached_instance(self):
+        first = self._new_default(defaults=dict(request_timeout=9))
+        self.assertIs(AsyncHTTPClient(), first)
+        self.assertIs(AsyncHTTPClient(defaults=dict(request_timeout=9)), first)
+
+        second = self._new_default(defaults=dict(request_timeout=3))
+        self.assertIsNot(second, first)
+        self.assertEqual(second.defaults["request_timeout"], 3)
+
+        # Later bare lookups see the replacement, and asking again for the
+        # new configuration is a cache hit rather than yet another client.
+        self.assertIs(AsyncHTTPClient(), second)
+        self.assertIs(AsyncHTTPClient(defaults=dict(request_timeout=3)), second)
+
+    def test_force_instance_is_independent(self):
+        default = self._new_default(defaults=dict(request_timeout=9))
+        separate = AsyncHTTPClient(
+            force_instance=True, defaults=dict(request_timeout=1)
+        )
+        self.addCleanup(separate.close)
+        self.assertIsNot(separate, default)
+        self.assertEqual(separate.defaults["request_timeout"], 1)
+        # Creating a force_instance client leaves the default untouched.
+        self.assertIs(AsyncHTTPClient(), default)
+        # A force_instance client is never installed as the default, even
+        # when its arguments differ from the current default's.
+        self.assertIsNot(AsyncHTTPClient(defaults=dict(request_timeout=9)), separate)
+
+    def test_late_close_does_not_evict_replacement(self):
+        first = self._new_default(defaults=dict(request_timeout=9))
+        second = self._new_default(defaults=dict(request_timeout=3))
+        self.assertIs(AsyncHTTPClient(), second)
+
+        # Closing the replaced client (e.g. from a destructor or a delayed
+        # cleanup) must not remove its successor from the cache.
+        first.close()
+        self.assertIs(AsyncHTTPClient(), second)
+        self.assertIs(AsyncHTTPClient(defaults=dict(request_timeout=3)), second)
+
+        # Closing the current client still removes it, so the next call
+        # builds a fresh instance.
+        second.close()
+        self.assertIsNot(AsyncHTTPClient(), second)
+
+    @gen_test
+    def test_in_flight_request_survives_replacement(self):
+        first = self._new_default(defaults=dict(user_agent="first"))
+        in_flight = first.fetch(self.get_url("/gate"))
+        # Make sure the server has the request before swapping clients, so
+        # the response really is delivered through the replaced client.
+        yield self.request_started.wait()
+
+        second = self._new_default(defaults=dict(user_agent="second"))
+        self.assertIs(AsyncHTTPClient(), second)
+
+        # New fetches on the same loop use the replacement's configuration.
+        response = yield second.fetch(self.get_url("/user_agent"))
+        self.assertEqual(response.body, b"second")
+
+        # The old client finishes its own request with its own config.
+        self.gate.set()
+        response = yield in_flight
+        self.assertEqual(response.body, b"first")
+
+        # Finishing the old request and closing the old client leaves the
+        # replacement installed; a third lookup still hits it.
+        first.close()
+        self.assertIs(AsyncHTTPClient(), second)
+        response = yield AsyncHTTPClient().fetch(self.get_url("/user_agent"))
+        self.assertEqual(response.body, b"second")
+
+    def test_other_loop_keeps_its_own_configuration(self):
+        default = self._new_default(defaults=dict(user_agent="main"))
+
+        other_loop = IOLoop(make_current=False)
+        self.addCleanup(other_loop.close, all_fds=True)
+
+        def make_other_client():
+            # Put the client in a list to work around run_sync's rule that a
+            # non-None return value must be awaitable.
+            created.append(AsyncHTTPClient(defaults=dict(user_agent="other")))
+
+        created: list[AsyncHTTPClient] = []
+        other_loop.run_sync(make_other_client, timeout=get_async_test_timeout())
+        other = created[0]
+        self.addCleanup(other.close)
+        self.assertIsNot(other, default)
+
+        # Replacing the client on this loop (and closing the old one) has
+        # no effect on the other loop's cached client.
+        replacement = self._new_default(defaults=dict(user_agent="main2"))
+        default.close()
+        self.assertIs(AsyncHTTPClient(), replacement)
+
+        found: list[AsyncHTTPClient] = []
+
+        def lookup_other():
+            found.append(AsyncHTTPClient())
+
+        other_loop.run_sync(lookup_other, timeout=get_async_test_timeout())
+        self.assertIs(found[0], other)
+        self.assertEqual(other.defaults["user_agent"], "other")
+
+    def test_configure_replaces_cached_instance(self):
+        first = self._new_default()
+        AsyncHTTPClient.configure(None, defaults=dict(user_agent="configured"))
+        configured = self._new_default()
+        self.assertIsNot(configured, first)
+        self.assertEqual(configured.defaults["user_agent"], "configured")
+        self.assertIs(AsyncHTTPClient(), configured)
+
+        # Closing the instance that predates the configure() call does not
+        # evict the instance that was built with the new configuration.
+        first.close()
+        self.assertIs(AsyncHTTPClient(), configured)
+
+    def test_explicit_arguments_equal_to_configured_are_reused(self):
+        AsyncHTTPClient.configure(None, max_body_size=12345)
+        configured = self._new_default()
+        # Repeating the configured value explicitly asks for the same
+        # effective configuration, so the cached instance is reused.
+        self.assertIs(AsyncHTTPClient(max_body_size=12345), configured)
+        # A different value replaces it.
+        other = self._new_default(max_body_size=54321)
+        self.assertIsNot(other, configured)
+        self.assertIs(AsyncHTTPClient(), other)
 
 
 class HTTPResponseTestCase(TestCase):
