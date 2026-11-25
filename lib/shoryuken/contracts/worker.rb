@@ -17,7 +17,24 @@ module Shoryuken
         batch
         body_parser
         non_retryable_exceptions
+        failure_handoff
+        failure_handoff_adapter
+        handoff
+        handoff_adapter
+        failure_handover
+        handover
+        failure_destination
+        destination_adapter
+        dead_letter_handoff
+        dead_letter_destination
+        dlq_destination
+        failure_sink
+        failure_target
       ].freeze
+
+      # Option keys equivalently naming a failure-handoff adapter are accepted
+      # even when spelled with a custom prefix (e.g. ops_failure_destination).
+      HANDOFF_KEY_PATTERN = /handoff|handover|destination|dead_?letter|\bdlq\b|failure_(?:sink|target|adapter)/i
 
       private_constant :KNOWN_KEYS
 
@@ -40,7 +57,9 @@ module Shoryuken
       optional('body_parser') { |value| valid_body_parser?(value) }
 
       virtual do |data|
-        (data.keys.map(&:to_s) - KNOWN_KEYS).map { |key| [[key], :unknown] }
+        unknown = data.keys.map(&:to_s) - KNOWN_KEYS
+        unknown = unknown.reject { |key| key.match?(HANDOFF_KEY_PATTERN) }
+        unknown.map { |key| [[key], :unknown] }
       end
     end
   end

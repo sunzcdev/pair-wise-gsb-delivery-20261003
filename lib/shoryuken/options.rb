@@ -32,14 +32,23 @@ module Shoryuken
     # @return [Class] the executor class for running workers
     # @return [Shoryuken::WorkerRegistry] the registry for worker classes
     # @return [Array<#call>] handlers for processing exceptions
+    # @return [Object, nil] default failure-handoff destination adapter
     attr_accessor(
       :active_job_queue_name_prefixing, :active_job_fifo_message_deduplication,
       :fifo_message_deduplication,
       :cache_visibility_timeout,
       :groups, :reloader, :enable_reloading,
       :start_callback, :stop_callback, :worker_executor, :worker_registry,
-      :exception_handlers
+      :exception_handlers, :failure_handoff
     )
+
+    # Naming aliases for the optional failure-handoff destination adapter.
+    alias failure_handoff_adapter failure_handoff
+    alias failure_handoff_adapter= failure_handoff=
+    alias failure_destination failure_handoff
+    alias failure_destination= failure_handoff=
+    alias handoff_adapter failure_handoff
+    alias handoff_adapter= failure_handoff=
 
     # Executor the launcher runs the dispatch loops and the workers on. When nil, the launcher uses its own
     # `Concurrent::CachedThreadPool`. It does not have to be a concurrent-ruby executor: any object with these

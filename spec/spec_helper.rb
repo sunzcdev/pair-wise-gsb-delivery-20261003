@@ -125,6 +125,8 @@ RSpec.configure do |config|
 
     Shoryuken.cache_visibility_timeout = false
 
+    Shoryuken.failure_handoff = nil
+
     allow(Shoryuken).to receive(:active_job?).and_return(false)
   end
 end

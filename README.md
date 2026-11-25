@@ -40,6 +40,55 @@ $ bundle
 
 Check the [Getting Started](https://github.com/ruby-shoryuken/shoryuken/wiki/Getting-Started) page.
 
+## Failure handoff for non-retryable exceptions
+
+Messages matched by `non_retryable_exceptions` are deleted immediately by default.
+For workers that should first transfer those permanent failures to another system,
+configure an optional failure-handoff adapter:
+
+```ruby
+class PaymentsWorker
+  include Shoryuken::Worker
+
+  shoryuken_options queue: 'payments',
+                    non_retryable_exceptions: [ArgumentError],
+                    failure_handoff: Payments::FailureDestination.new
+
+  def perform(sqs_msg, body)
+    # ...
+  end
+end
+```
+
+The destination adapter provides idempotent admission and result lookup keyed by
+the **source queue and source message id** (never the SQS receipt handle, which
+changes on redelivery):
+
+```ruby
+class Payments::FailureDestination
+  # Idempotent; called with a Shoryuken::FailureHandoff::Identity and Record.
+  # Return :accepted/:rejected (or a Result/boolean/status hash).
+  def accept_failure(identity, record)
+    # ...
+    :accepted
+  end
+
+  # Return :accepted/:rejected, nil/:not_found, or raise when unavailable.
+  def failure_result(identity)
+    # ...
+  end
+end
+```
+
+Shoryuken deletes the current source receipt only when admission is confirmed.
+When the admission response is lost or the result cannot be resolved, and when
+the destination explicitly rejects the failure, the source message is left in
+the queue. On redelivery (a new receipt, same message id) the same stable
+identity is reused to look up the original admission, so the destination keeps a
+single record and only the currently valid receipt is deleted. Workers without
+`failure_handoff` keep the original immediate-delete behavior. A global adapter
+can be set with `Shoryuken.failure_handoff = adapter`.
+
 ## More Information
 
 For more information check the [wiki page](https://github.com/ruby-shoryuken/shoryuken/wiki).

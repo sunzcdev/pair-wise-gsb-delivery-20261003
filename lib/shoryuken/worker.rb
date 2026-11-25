@@ -125,6 +125,9 @@ module Shoryuken
       # @option opts [Array<Integer>] :retry_intervals Exponential backoff retry intervals in seconds
       # @option opts [Array<Class>, Proc] :non_retryable_exceptions Exception classes or lambda that should
       #   skip retries and delete message immediately
+      # @option opts [Object] :failure_handoff Optional destination adapter for permanent failures. It must
+      #   idempotently admit and allow result lookup by source queue + message ID; source receipts are deleted
+      #   only after admission is confirmed
       # @option opts [Symbol, Proc, #parse, #load] :body_parser (:text) How the message body is parsed before #perform:
       #   `:json`, `:text`, a Proc called with the {Shoryuken::Message}, or an object whose `parse` (preferred) or
       #   `load` is called with the body String
