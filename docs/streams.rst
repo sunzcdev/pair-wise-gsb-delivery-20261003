@@ -122,6 +122,14 @@ The above script gives the following output::
     b'\xc3\xa5\xc3\xa4\xc3\xb6'
     'åäö'
 
+Protocols which change character encoding after a handshake can call
+:meth:`~anyio.streams.text.TextReceiveStream.switch_encoding` at the protocol boundary.
+If one underlying receive contains bytes from both encodings, pass the boundary marker
+(for example, ``boundary=b"\n"``) so that bytes after the marker remain raw and are
+decoded with the new encoding. Switching while the old decoder still has an incomplete
+multibyte character raises the corresponding decoding error and leaves the stream able to
+receive the rest of that character.
+
 .. _FileStreams:
 
 File streams

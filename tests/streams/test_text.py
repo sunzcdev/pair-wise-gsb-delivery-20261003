@@ -55,6 +55,106 @@ async def test_incomplete_character_at_eof(
     receive_stream.close()
 
 
+async def test_switch_encoding_after_decode_error_preserves_read_ahead_bytes() -> None:
+    payload = b"linha\xc3\xa9\n\xff\xfeA\x00"
+    expected = "linhaé\nA"
+
+    for mask in range(1 << (len(payload) - 1)):
+        cuts = [0]
+        cuts.extend(i for i in range(1, len(payload)) if mask & (1 << (i - 1)))
+        cuts.append(len(payload))
+        chunks = [
+            payload[cuts[index] : cuts[index + 1]] for index in range(len(cuts) - 1)
+        ]
+
+        send_stream, receive_stream = create_memory_object_stream[bytes](
+            len(chunks) + 1
+        )
+        text_stream = TextReceiveStream(receive_stream)
+        for chunk in chunks:
+            await send_stream.send(chunk)
+
+        await send_stream.aclose()
+
+        decoded: list[str] = []
+        switched = False
+        while True:
+            try:
+                decoded.append(await text_stream.receive())
+            except UnicodeDecodeError:
+                assert not switched
+                await text_stream.switch_encoding("utf-16")
+                switched = True
+            except EndOfStream:
+                break
+
+        assert switched
+        assert "".join(decoded) == expected
+        await receive_stream.aclose()
+
+
+async def test_switch_encoding_at_byte_boundary_preserves_read_ahead_bytes() -> None:
+    payload = b"linha\xc3\xa9\n\xff\xfeA\x00"
+    expected = "linhaé\nA"
+
+    for mask in range(1 << (len(payload) - 1)):
+        cuts = [0]
+        cuts.extend(i for i in range(1, len(payload)) if mask & (1 << (i - 1)))
+        cuts.append(len(payload))
+        chunks = [
+            payload[cuts[index] : cuts[index + 1]] for index in range(len(cuts) - 1)
+        ]
+
+        send_stream, receive_stream = create_memory_object_stream[bytes](
+            len(chunks) + 1
+        )
+        text_stream = TextReceiveStream(receive_stream)
+        await text_stream.switch_encoding("utf-16", boundary=b"\n")
+
+        for chunk in chunks:
+            await send_stream.send(chunk)
+
+        await send_stream.aclose()
+
+        decoded: list[str] = []
+        while True:
+            try:
+                decoded.append(await text_stream.receive())
+            except EndOfStream:
+                break
+
+        assert "".join(decoded) == expected
+        await receive_stream.aclose()
+
+
+async def test_failed_encoding_switch_leaves_original_decoder_usable() -> None:
+    send_stream, receive_stream = create_memory_object_stream[bytes](1)
+    text_stream = TextReceiveStream(receive_stream)
+
+    await send_stream.send(b"linha\xc3")
+    assert await text_stream.receive() == "linha"
+
+    with pytest.raises(UnicodeDecodeError, match="unexpected end of data"):
+        await text_stream.switch_encoding("utf-16")
+
+    await send_stream.send(b"\xa9\n\xff")
+    with pytest.raises(UnicodeDecodeError, match="invalid start byte"):
+        await text_stream.receive()
+
+    # The valid old-encoding prefix and the read-ahead new-encoding bytes survive.
+    text_stream.switch_encoding("utf-16")
+    assert await text_stream.receive() == "é\n"
+
+    await send_stream.send(b"\xfeA\x00")
+    assert await text_stream.receive() == "A"
+
+    await send_stream.aclose()
+    with pytest.raises(EndOfStream):
+        await text_stream.receive()
+
+    await receive_stream.aclose()
+
+
 async def test_send() -> None:
     send_stream, receive_stream = create_memory_object_stream[bytes](1)
     text_stream = TextSendStream(send_stream)
