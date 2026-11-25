@@ -60,6 +60,28 @@ class NestedOperationError(OperationError):
     """
 
 
+class CompensationError(PyinfraError):
+    """
+    Raised when a compensation (rollback) pass cannot fully restore a host.
+
+    Either a verifier detected that somebody else updated the same target (conflict), a
+    compensation command itself failed, or successful changes had no compensator. The
+    attached report details exactly what was and was not reverted.
+    """
+
+    def __init__(self, host, report) -> None:
+        self.host = host
+        self.report = report
+        summary = getattr(report, "summary_line", None)
+        summary_text = summary() if callable(summary) else "batch was NOT fully restored"
+        stopped_at = getattr(report, "stopped_at", None)
+        conflict_text = f"; stopped at {stopped_at.label}" if stopped_at is not None else ""
+        super().__init__(
+            f"Compensation on {host.name} did not fully restore the host{conflict_text}: "
+            f"{summary_text}",
+        )
+
+
 class FactNotCollected(FactError):
     """
     Base exception raised when a fact could not be collected (e.g. binary absent

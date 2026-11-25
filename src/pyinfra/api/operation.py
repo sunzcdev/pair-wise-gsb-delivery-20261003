@@ -39,6 +39,7 @@ from .util import (
 op_meta_default = object()
 
 if TYPE_CHECKING:
+    from pyinfra.api.compensation import CompensationStatus
     from pyinfra.connectors.util import CommandOutput
 
 
@@ -52,6 +53,7 @@ class OperationMeta:
     _retry_attempts: int = 0
     _max_retries: int = 0
     _retry_succeeded: bool | None = None
+    _compensation_status: CompensationStatus | None = None
 
     def __init__(self, hash, is_change: bool | None):
         self._hash = hash
@@ -79,6 +81,20 @@ class OperationMeta:
         return (
             f"OperationMeta(executed=False, maybeChange={self._maybe_is_change}, hash={self._hash})"
         )
+
+    @property
+    def compensation_status(self) -> CompensationStatus | None:
+        """How rollback treated this operation, or ``None`` if rollback did not run."""
+
+        return self._compensation_status
+
+    @property
+    def was_rolled_back(self) -> bool:
+        """Whether rollback completed with a confirmed reverted status."""
+
+        from .compensation import CompensationStatus
+
+        return self._compensation_status is CompensationStatus.REVERTED
 
     # Completion & status checks
     def set_complete(

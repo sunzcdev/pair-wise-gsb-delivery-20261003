@@ -16,6 +16,13 @@ from pyinfra.progress import progress_spinner
 
 from .arguments import CONNECTOR_ARGUMENT_KEYS, ConnectorArguments
 from .command import FunctionCommand, PyinfraCommand, StringCommand
+from .compensation import (
+    CompensationError,
+    record_compensation,
+    record_unknown_change,
+    record_uncompensated_change,
+    run_compensation,
+)
 from .exceptions import NestedOperationError, PyinfraError
 from .util import (
     format_exception,
@@ -81,6 +88,7 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
     retry_attempt = 0
     did_error = False
     executed_commands = 0
+    applied_commands = 0
     commands: list[PyinfraCommand] = []
     all_output_lines: list[OutputLine] = []
 
@@ -179,6 +187,7 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
                     )
 
         if should_retry:
+            applied_commands = max(applied_commands, executed_commands)
             retry_attempt += 1
             state.trigger_callbacks("operation_host_retry", host, op_hash, retry_attempt, retries)
             op_name = ", ".join(state.get_op_meta(op_hash).names) or "Operation"
@@ -191,6 +200,8 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
             continue
 
         break
+
+    applied_commands = max(applied_commands, executed_commands)
 
     # Handle results
     op_success = return_status = not did_error
@@ -207,6 +218,11 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
         _log_status = format_text(_status_text, "green" if executed_commands > 0 else "cyan")
         logger.info(f"{host.print_prefix}{_log_status}")
 
+        # Record successful changes for compensation should a later operation fail.
+        # No-ops (zero applied commands) made no changes and have nothing to undo.
+        record_compensation(state, host, op_hash, applied_commands)
+        record_uncompensated_change(state, host, op_hash, applied_commands)
+
         state.trigger_callbacks("operation_host_success", host, op_hash, retry_attempt)
     else:
         if ignore_errors:
@@ -216,6 +232,10 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
 
         if executed_commands:
             host_results.partial_ops += 1
+
+        # A failed op which got through at least one command may have changed the
+        # host; record it as unconfirmed rather than guessing a safe compensation.
+        record_unknown_change(state, host, op_hash, applied_commands)
 
         _command_description = f"executed {executed_commands} commands"
         if retry_attempt > 0:
@@ -253,6 +273,21 @@ def _run_host_op_with_context(state: State, host: Host, op_hash: str):
         return run_host_op(state, host, op_hash)
 
 
+def _compensate_host(state: State, host: Host, op_hash: str | None = None) -> None:
+    """
+    Roll back the host's recorded compensatable operations after a failure.
+
+    Runs within the host context so compensator generators and verifiers see the same
+    ``pyinfra.host``/``pyinfra.state`` as the forward operations. A conflict or failed
+    compensation raises ``CompensationError`` (carrying the detailed report); when there
+    is simply nothing to roll back this returns normally and the ordinary failure flow
+    continues.
+    """
+
+    with ctx_host.use(host):
+        run_compensation(state, host, op_hash)
+
+
 def _run_host_ops(state: State, host: Host, progress=None):
     """
     Run all ops for a single server.
@@ -271,6 +306,9 @@ def _run_host_ops(state: State, host: Host, progress=None):
             progress((host, op_hash))
 
         if result is False:
+            # Mark the host failed and undo whatever it successfully changed before
+            # reporting the failure. A compensation conflict raises CompensationError.
+            _fail_host_with_compensation(state, host, op_hash)
             raise PyinfraError(
                 f"Error in operation {', '.join(op_meta.names)} on {host}",
             )
@@ -290,6 +328,10 @@ def _run_serial_ops(state: State):
                     host,
                     progress=progress,
                 )
+            except CompensationError:
+                # The host is already marked failed and its rollback report takes
+                # precedence over the generic failure bookkeeping below.
+                raise
             except PyinfraError:
                 state.fail_hosts({host})
 
@@ -327,9 +369,89 @@ def _run_no_wait_ops(state: State):
                 continue
             if not isinstance(exception, PyinfraError):
                 raise exception
+            # A compensation conflict carries the authoritative rollback report; surface
+            # it rather than folding the host into generic failure bookkeeping.
+            if isinstance(exception, CompensationError):
+                raise exception
             failed_hosts.add(host)
 
         state.fail_hosts(failed_hosts)
+
+
+def _mark_host_failed_silently(state: State, host: Host) -> None:
+    """
+    Record a host failure without the fail-percent / "no hosts remaining" raise that
+    ``fail_hosts`` performs, so compensation can run and surface its own report.
+    """
+
+    state.failed_hosts.add(host)
+    state.active_hosts.discard(host)
+
+
+def _raise_failed_host_checks(state: State) -> None:
+    """
+    Apply the fail-percent / "no hosts remaining" checks normally done inside
+    ``fail_hosts``, after compensation has finished.
+    """
+
+    if not state.active_hosts:
+        raise PyinfraError("No hosts remaining!")
+
+    if state.config.FAIL_PERCENT is not None:
+        activated_count = len(state.activated_hosts)
+        percent_failed = (1 - len(state.active_hosts) / activated_count) * 100
+        if percent_failed > state.config.FAIL_PERCENT:
+            if state.should_raise_failed_hosts and state.should_raise_failed_hosts(state) is False:
+                return
+            raise PyinfraError(
+                f"Over {state.config.FAIL_PERCENT}% of hosts failed "
+                f"({int(round(percent_failed))}%)",
+            )
+
+
+def _fail_host_with_compensation(
+    state: State,
+    host: Host,
+    op_hash: str | None = None,
+) -> None:
+    """
+    Mark a host failed and roll back its successful compensatable changes.
+
+    The host is recorded as failed first (without raising), so it stays in
+    ``failed_hosts`` even when rollback itself fails. Compensation then runs and a
+    conflict or failed compensation command raises ``CompensationError`` - still a
+    ``PyinfraError`` - carrying its detailed report; that error takes precedence over
+    the ordinary fail-percent / "no hosts remaining" checks.
+    """
+
+    _mark_host_failed_silently(state, host)
+    try:
+        _compensate_host(state, host, op_hash)
+    except CompensationError:
+        raise
+    else:
+        _raise_failed_host_checks(state)
+
+
+def _fail_hosts_with_compensation(
+    state: State,
+    hosts: set[Host],
+    op_hash: str | None = None,
+) -> None:
+    """
+    Batch equivalent of :func:`_fail_host_with_compensation`: mark every failed host,
+    compensate them all, then run the ordinary failure checks for the whole batch.
+    """
+
+    for host in hosts:
+        _mark_host_failed_silently(state, host)
+    try:
+        for host in hosts:
+            _compensate_host(state, host, op_hash)
+    except CompensationError:
+        raise
+    else:
+        _raise_failed_host_checks(state)
 
 
 def _run_single_op(state: State, op_hash: str):
@@ -352,7 +474,7 @@ def _run_single_op(state: State, op_hash: str):
                 # Fail each host straight away so the fail percent can stop the
                 # operation before it runs on the remaining hosts.
                 if not result:
-                    state.fail_hosts({host})
+                    _fail_host_with_compensation(state, host, op_hash)
 
     else:
         # Start with the whole inventory in one batch
@@ -384,9 +506,10 @@ def _run_single_op(state: State, op_hash: str):
                     host for greenlet, host in greenlet_to_host.items() if not greenlet.get()
                 }
 
-            # Fail each batch's hosts before starting the next batch, so the fail
-            # percent can stop the operation part way through.
-            state.fail_hosts(failed_hosts)
+            # Roll back each failed host, then mark the whole batch failed so the fail
+            # percent can stop the operation part way through. A compensation conflict
+            # raises CompensationError from inside the helper before that point.
+            _fail_hosts_with_compensation(state, failed_hosts, op_hash)
 
     state.trigger_callbacks("operation_end", op_hash)
 
@@ -405,6 +528,15 @@ def run_ops(state: State, serial: bool = False, no_wait: bool = False):
     state.is_executing = True
 
     with ctx_state.use(state):
+        # Bound compensation to this run: a later failure must not undo records from
+        # an earlier successful ``run_ops`` call on the same state.
+        for host in state.inventory:
+            journal = state.get_compensation_journal(host)
+            journal.begin_run_scopes(
+                len(state.uncompensated_changes.get(host, [])),
+                len(state.unknown_changes.get(host, [])),
+            )
+
         # Run all ops, but server by server
         if serial:
             _run_serial_ops(state)
@@ -415,3 +547,7 @@ def run_ops(state: State, serial: bool = False, no_wait: bool = False):
         else:
             for op_hash in state.get_op_order():
                 _run_single_op(state, op_hash)
+
+        # A successful batch has no pending rollback; clear only this run's records.
+        for host in state.inventory:
+            state.get_compensation_journal(host).end_run()

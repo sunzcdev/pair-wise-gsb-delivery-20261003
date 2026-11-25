@@ -7,10 +7,19 @@ from .command import (
     StringCommand,
     MaskString,
 )
+from .compensation import (
+    AppliedChange,
+    CompensationJournal,
+    CompensationRecord,
+    CompensationReport,
+    CompensationStatus,
+    ManualChange,
+)
 from .hiddenvalue import HiddenValue
 from .config import Config
 from .deploy import deploy
 from .exceptions import (
+    CompensationError,
     DeployError,
     FactPreconditionError,
     FactError,
@@ -31,7 +40,13 @@ from .operation import operation
 from .state import BaseStateCallback, State
 
 __all__ = [
+    "AppliedChange",
     "BaseStateCallback",
+    "CompensationError",
+    "CompensationJournal",
+    "CompensationRecord",
+    "CompensationReport",
+    "CompensationStatus",
     "Config",
     "DeployError",
     "FactBase",
@@ -48,6 +63,7 @@ __all__ = [
     "Host",
     "Inventory",
     "InventoryError",
+    "ManualChange",
     "MaskString",
     "MissingCommandError",
     "OperationError",

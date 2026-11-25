@@ -204,6 +204,9 @@ class MetaArguments(TypedDict):
     _ignore_errors: bool
     _continue_on_error: bool
     _if: list[Callable[[], bool]] | Callable[[], bool] | None
+    _compensate: None | Callable[[], Iterable[Any]]
+    _compensation_verify: None | Callable[[], bool]
+    _compensation_scope: None | str
 
 
 meta_argument_meta: dict[str, ArgumentMeta] = {
@@ -230,6 +233,30 @@ meta_argument_meta: dict[str, ArgumentMeta] = {
     "_if": ArgumentMeta(
         "Only run this operation if these functions return True",
         default=lambda _: [],
+    ),
+    "_compensate": ArgumentMeta(
+        (
+            "Zero-argument generator yielding the commands that undo this operation's "
+            "changes. When a later operation fails on a host, recorded compensations run "
+            "in reverse order. Only operations that succeed and make changes are recorded."
+        ),
+        default=lambda _: None,
+    ),
+    "_compensation_verify": ArgumentMeta(
+        (
+            "Zero-argument callable run before the compensator. Return True when the "
+            "target still matches the state this operation produced; returning False (or "
+            "raising) means somebody else changed it, so rollback stops in a conflict "
+            "state instead of reverting another party's work."
+        ),
+        default=lambda _: None,
+    ),
+    "_compensation_scope": ArgumentMeta(
+        (
+            "Human-readable description of what the verifier checks (e.g. the file path "
+            "or resource name), used to make conflict reports identify the disputed target."
+        ),
+        default=lambda _: None,
     ),
 }
 

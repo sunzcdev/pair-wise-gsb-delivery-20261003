@@ -20,6 +20,7 @@ from .exceptions import PyinfraError
 if TYPE_CHECKING:
     from pyinfra.api.arguments import AllArguments
     from pyinfra.api.command import PyinfraCommand
+    from pyinfra.api.compensation import CompensationJournal, CompensationRecord, CompensationReport
     from pyinfra.api.host import Host
     from pyinfra.api.inventory import Inventory
     from pyinfra.api.operation import OperationMeta
@@ -287,6 +288,28 @@ class State:
             host: StateHostResults() for host in inventory
         }
 
+        # Compensation (rollback) bookkeeping. Records are appended in execution order so
+        # rollback can replay them in reverse. Both are keyed per host because operations
+        # succeed/fail independently on each host.
+        self.compensation_records: dict[Host, list[CompensationRecord]] = {
+            host: [] for host in inventory
+        }
+        # (op_hash, op names) for successful changes without a compensator, so the
+        # rollback report can flag them as requiring manual judgement.
+        self.uncompensated_changes: dict[Host, list[tuple[str, set[str]]]] = {
+            host: [] for host in inventory
+        }
+        # Operations which failed after applying at least one command; their exact
+        # resulting state is unconfirmed and needs human review.
+        self.unknown_changes: dict[Host, list[CompensationRecord]] = {
+            host: [] for host in inventory
+        }
+        from .compensation import CompensationJournal
+
+        self.compensation_journals: dict[Host, CompensationJournal] = {
+            host: CompensationJournal(self.compensation_records[host]) for host in inventory
+        }
+
         # Assign state back references to inventory & config
         inventory.state = config.state = self
         for host in inventory:
@@ -384,6 +407,23 @@ class State:
 
     def get_results_for_host(self, host: Host) -> StateHostResults:
         return self.results[host]
+
+    def get_compensation_journal(self, host: Host) -> CompensationJournal:
+        """Return the per-host compensation journal, creating it for test doubles."""
+
+        from .compensation import CompensationJournal
+
+        if not hasattr(self, "compensation_journals"):
+            self.compensation_journals = {}
+        if not hasattr(self, "compensation_records"):
+            self.compensation_records = {}
+        records = self.compensation_records.setdefault(host, [])
+        return self.compensation_journals.setdefault(host, CompensationJournal(records))
+
+    def get_compensation_report(self, host: Host) -> CompensationReport | None:
+        """Return the latest compensation report for ``host``, if a rollback ran."""
+
+        return self.get_compensation_journal(host).last_report
 
     def get_op_data_for_host(
         self,
