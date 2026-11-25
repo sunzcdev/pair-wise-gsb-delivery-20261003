@@ -9,10 +9,14 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Settings provider sources now keep their values separate instead of flattening them into one merged hash. The loader exposes every source (the environment and each `.env` file) in precedence order, so settings can be resolved by source and lower precedence candidates remain visible when a high precedence value fails.
+- `settings_group` declares a set of settings that are validated together. The group is resolved one source at a time (highest precedence first): the first source that provides every key and whose values pass both the setting constructors and an optional `validate:` callable is accepted as one coherent set, otherwise the group falls back to the next source. Ungrouped settings continue to use ordinary per-key precedence.
 - The Zeitwerk plugin accepts an `enable_reloading:` option, which enables reloading on the loader ahead of `setup`, so Zeitwerk tracks the constants it defines and they can be unloaded later. Applied from the plugin's `after(:configure)` hook, so it is in time whether the loader is set up by the plugin or by the integrating library. (@afomera in #297)
 
 ### Changed
 
+- Settings diagnostics no longer leak underlying exception messages. Each failure reports only the setting key, the source of the failing value (when known) and a failure type (`missing`, `blank`, `invalid` or `group`).
+- `.env` files are now parsed without being merged into the live `ENV`, so one settings load cannot leave environment side effects that a later load (possibly against a different config root) would observe.
 - Provider files are now evaluated with `load` rather than `require`, matching the `ManifestRegistrar`. A provider file is evaluated once per provider registrar rather than once per process, so a second container sharing a provider dir gets its own providers instead of having the file skipped, and a container built afresh picks up changes to it. (@afomera in #297)
 
 ### Deprecated

@@ -75,7 +75,7 @@ RSpec.describe "Settings component" do
       ENV.delete("COERCIBLE_VALUE")
     end
 
-    it "raises InvalidSettingsError with meaningful message" do
+    it "raises InvalidSettingsError with key, source and failure type for each invalid setting" do
       expect {
         settings.integer_value
       }.to raise_error(
@@ -83,8 +83,8 @@ RSpec.describe "Settings component" do
         <<~TEXT
           Could not load settings. The following settings were invalid:
 
-          coercible_value: invalid value for Integer(): "foo"
-          integer_value: "foo" violates constraints (type?(Integer, "foo") failed)
+          coercible_value (source: env): invalid
+          integer_value (source: env): invalid
         TEXT
       )
     end
@@ -114,7 +114,7 @@ RSpec.describe "Settings component" do
       end
     end
 
-    it "raises InvalidSettingsError with meaningful message for settings where the constructor cannot accept nil" do
+    it "raises InvalidSettingsError with key and failure type for settings where the constructor cannot accept nil" do
       expect {
         settings.to_h
       }.to raise_error(
@@ -122,7 +122,7 @@ RSpec.describe "Settings component" do
         <<~TEXT
           Could not load settings. The following settings were invalid:
 
-          missing_value_without_default: nil violates constraints (type?(String, nil) failed)
+          missing_value_without_default: missing
         TEXT
       )
     end
