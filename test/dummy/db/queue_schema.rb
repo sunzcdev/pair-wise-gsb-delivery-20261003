@@ -31,6 +31,20 @@ ActiveRecord::Schema[7.1].define(version: 1) do
     t.index ["process_id", "job_id"], name: "index_solid_queue_claimed_executions_on_process_id_and_job_id"
   end
 
+  create_table "solid_queue_concurrency_releases", charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+    t.bigint "claim_id", null: false
+    t.bigint "job_id", null: false
+    t.string "concurrency_key", null: false
+    t.bigint "semaphore_id"
+    t.integer "concurrency_limit"
+    t.integer "concurrency_duration"
+    t.datetime "released_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["claim_id"], name: "index_solid_queue_concurrency_releases_on_claim_id", unique: true
+    t.index ["job_id"], name: "index_solid_queue_concurrency_releases_on_job_id"
+  end
+
   create_table "solid_queue_failed_executions", charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
     t.bigint "job_id", null: false
     t.text "error"

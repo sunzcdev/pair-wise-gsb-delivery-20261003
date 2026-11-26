@@ -11,6 +11,8 @@ module SolidQueue
       included do
         has_one :blocked_execution
 
+        attr_accessor :concurrency_release
+
         before_destroy :unblock_next_blocked_job, if: -> { concurrency_limited? && ready? }
       end
 
@@ -21,7 +23,9 @@ module SolidQueue
       end
 
       def unblock_next_blocked_job
-        if release_concurrency_lock
+        if concurrency_release
+          concurrency_release.release_for_job(self)
+        elsif release_concurrency_lock
           release_next_blocked_job
         end
       end
@@ -61,6 +65,15 @@ module SolidQueue
         concurrency_lock&.dig("limit")
       end
 
+      def holds_concurrency_slot?
+        if concurrency_lock_recorded?
+          acquired_semaphore_id.present?
+        else
+          # Jobs dispatched before Solid Queue recorded their semaphore, which need their class to know their limit
+          concurrency_limited? && job_class.present?
+        end
+      end
+
       def blocked?
         blocked_execution.present?
       end
@@ -72,15 +85,6 @@ module SolidQueue
       private
         def release_concurrency_lock
           holds_concurrency_slot? && Semaphore.signal(self)
-        end
-
-        def holds_concurrency_slot?
-          if concurrency_lock_recorded?
-            acquired_semaphore_id.present?
-          else
-            # Jobs dispatched before Solid Queue recorded their semaphore, which need their class to know their limit
-            concurrency_limited? && job_class.present?
-          end
         end
 
         def concurrency_lock_recorded?

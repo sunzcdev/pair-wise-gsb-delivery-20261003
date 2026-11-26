@@ -48,6 +48,7 @@ class ActiveSupport::TestCase
 
   def destroy_records
     SolidQueue::Job.destroy_all
+    SolidQueue::ConcurrencyRelease.delete_all if SolidQueue::ConcurrencyRelease.table_exists?
     SolidQueue::Process.destroy_all
     SolidQueue::Semaphore.delete_all
     SolidQueue::RecurringTask.delete_all

@@ -28,6 +28,7 @@ module SolidQueue
     def start
       @maintenance_task = Concurrent::TimerTask.new(run_now: true, execution_interval: interval) do
         if concurrency?
+          ConcurrencyRelease.recover_pending
           expire_semaphores
           unblock_blocked_executions
         end

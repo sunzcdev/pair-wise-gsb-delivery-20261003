@@ -11,6 +11,11 @@ module SolidQueue
 
       class_methods do
         def prune(excluding: nil)
+          # Retry permit returns left pending by an earlier finalization whose
+          # post-commit Semaphore/blocked-job work failed. This is safe when two
+          # pruners run concurrently: each pending release signals at most once.
+          SolidQueue::ConcurrencyRelease.recover_pending
+
           SolidQueue.instrument :prune_processes, size: 0 do |payload|
             prunable.excluding(excluding).non_blocking_lock.find_in_batches(batch_size: 50) do |batch|
               payload[:size] += batch.size
