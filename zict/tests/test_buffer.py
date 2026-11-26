@@ -391,6 +391,158 @@ def test_cancel_restore(event, when):
     assert not buff._cancel_restore
 
 
+def test_peek():
+    """peek() returns the current value without changing the fast layer or the LRU;
+    only a regular __getitem__ promotes a cold key back into fast.
+    """
+    f2s = []
+    s2f = []
+    a = {}
+    b = {}
+    buff = Buffer(
+        a,
+        b,
+        n=10,
+        weight=lambda k, v: v,
+        fast_to_slow_callbacks=lambda k, v: f2s.append(k),
+        slow_to_fast_callbacks=lambda k, v: s2f.append(k),
+    )
+    buff["x"] = 1
+    buff["y"] = 2
+    buff["z"] = 8  # overflows: x is evicted to slow as the coldest key
+    assert a == {"y": 2, "z": 8}
+    assert b == {"x": 1}
+    order_before = list(buff.fast.order)
+
+    # Peeking a fast key does not touch the LRU order
+    assert buff.peek("z") == 8
+    assert list(buff.fast.order) == order_before
+    assert a == {"y": 2, "z": 8}
+    assert b == {"x": 1}
+
+    # Peeking a slow (cold) key does not promote it: the fast layer, the LRU and the
+    # callbacks are all left untouched
+    assert buff.peek("x") == 1
+    assert a == {"y": 2, "z": 8}
+    assert b == {"x": 1}
+    assert list(buff.fast.order) == order_before
+    assert f2s == ["x"]
+    assert s2f == []
+
+    # A genuine miss is reported explicitly
+    with pytest.raises(KeyError, match="missing"):
+        buff.peek("missing")
+
+    # A regular read still follows the existing rules and promotes the key to fast
+    assert buff["x"] == 1
+    assert a == {"x": 1, "z": 8}
+    assert b == {"y": 2}
+    assert s2f == ["x"]
+
+    # After the promotion, peek() keeps reading from fast side-effect free
+    order_before = list(buff.fast.order)
+    assert buff.peek("x") == 1
+    assert list(buff.fast.order) == order_before
+
+
+def test_peek_concurrent_read_and_inspect():
+    """A normal read and a read-only inspection hit the coldest key at the same time;
+    another cold key is only inspected. Only the normal read affects the fast layer and
+    the LRU, while both paths retrieve the current values.
+    """
+    a = {}
+    # A small delay in slow makes the normal read and the inspection realistically
+    # interleave while both are fetching the cold key from the slow layer
+    b = utils_test.SlowDict(0.001)
+    buff = Buffer(a, b, n=10, weight=lambda k, v: v)
+    buff["x"] = 1  # coldest key: will end up in slow
+    buff["y"] = 2  # second coldest key: also in slow
+    buff["z"] = 8
+    buff["w"] = 1  # pushes y out of fast too; fast now holds z, w
+    assert set(buff.fast) == {"z", "w"}
+    assert dict(buff.slow) == {"x": 1, "y": 2}
+
+    fast_before = dict(buff.fast)
+    slow_before = dict(buff.slow)
+    order_before = list(buff.fast.order)
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def normal_read():
+        barrier.wait()
+        results["read"] = buff["x"]
+
+    def read_only_inspect():
+        barrier.wait()
+        results["peek_x"] = buff.peek("x")
+
+    with ThreadPoolExecutor(2) as ex:
+        f1 = ex.submit(normal_read)
+        f2 = ex.submit(read_only_inspect)
+        f1.result(timeout=5)
+        f2.result(timeout=5)
+
+    # Both paths got the current value of the coldest key
+    assert results == {"read": 1, "peek_x": 1}
+
+    # Only the normal read moved x from slow to fast. x weighs 1, so it fits below the
+    # target and nothing is evicted; the fast LRU just gains x at the top.
+    assert set(buff.fast) == {"z", "w", "x"}
+    assert list(buff.fast.order) == ["z", "w", "x"]
+    assert dict(buff.slow) == {"y": 2}
+    assert "x" not in buff.slow
+
+    # The other cold key is only inspected: it must stay in slow and not disturb fast
+    assert buff.peek("y") == 2
+    assert set(buff.fast) == {"z", "w", "x"}
+    assert list(buff.fast.order) == ["z", "w", "x"]
+    assert dict(buff.slow) == {"y": 2}
+
+    # Sanity: the slow-only inspection never caused any promotion
+    assert fast_before == {"z": 8, "w": 1}
+    assert slow_before == {"x": 1, "y": 2}
+    assert order_before == ["z", "w"]
+
+
+def test_peek_missing_during_restore():
+    """If the key is being deleted while another thread is restoring it, a peek() that
+    cannot find the key anywhere reports the missing item explicitly instead of
+    triggering a restore itself.
+    """
+    ev1 = threading.Event()
+    ev2 = threading.Event()
+
+    class Slow(UserDict):
+        def __getitem__(self, k):
+            if k == "x":
+                ev1.set()
+                assert ev2.wait(timeout=5)
+            return super().__getitem__(k)
+
+    buff = Buffer({}, Slow(), n=100, weight=lambda k, v: v)
+    buff.set_noevict("x", 1)
+    buff.fast.evict()
+    assert not buff.fast
+    assert set(buff.slow) == {"x"}
+
+    with ThreadPoolExecutor(1) as ex:
+        # A normal read starts a slow-to-fast restore and blocks inside slow.__getitem__
+        fut = ex.submit(buff.__getitem__, "x")
+        assert ev1.wait(timeout=5)
+
+        # Cancel the restore by deleting the key while it is in flight
+        del buff["x"]
+        ev2.set()
+        with pytest.raises(KeyError, match="x"):
+            fut.result()
+
+    # The key is now in neither layer and peek() reports the miss explicitly
+    assert not buff.fast
+    assert not buff.slow
+    with pytest.raises(KeyError, match="x"):
+        buff.peek("x")
+
+
 @pytest.mark.stress
 @pytest.mark.repeat(utils_test.REPEAT_STRESS_TESTS)
 def test_stress_different_keys_threadsafe():

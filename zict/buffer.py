@@ -181,6 +181,52 @@ class Buffer(ZictBase[KT, VT]):
         except KeyError:
             return self.slow_to_fast(key)
 
+    @locked
+    def peek(self, key: KT) -> VT:
+        """Read-only variant of :meth:`__getitem__`.
+
+        Return the current value of *key* without affecting the caching policy in any
+        way:
+
+        - if *key* is in the fast mapping it is fetched straight from the underlying
+          storage, so its position in the LRU is not changed and no hot key is pushed
+          out of memory;
+        - if *key* is in the slow mapping it is read from there but it is **not**
+          promoted to the fast mapping (no slow-to-fast migration, no eviction, no
+          callbacks).
+
+        This is meant for diagnostics that need to inspect a batch of (possibly cold)
+        items without disturbing the working set. Use :meth:`__getitem__` instead if
+        you want the value to be brought back into the fast mapping.
+
+        Raises
+        ------
+        KeyError
+            if *key* is in neither mapping. This also covers the multithreaded edge
+            case in which *key* is being migrated (evicted to slow or restored to
+            fast) and is momentarily unavailable: in that situation the missing item
+            is reported explicitly instead of triggering a restore.
+        """
+        # Read directly from the LRU backing storage so that the LRU order/weights are
+        # left untouched (LRU.__getitem__ would pull the key to the top).
+        if key in self.fast:
+            return self.fast.d[key]
+        # Fetch from slow without going through slow_to_fast(): do not promote the key,
+        # evict anything, or run the slow_to_fast callbacks. The lock is released while
+        # the (potentially slow) read is in flight, mirroring __getitem__ semantics.
+        try:
+            with self.unlock():
+                return self.slow[key]
+        except KeyError:
+            # A concurrent __getitem__ may have just restored the key from slow to fast
+            # (and deleted it from slow). Try the fast layer once more before giving up,
+            # so that a key which exists somewhere still yields its current value.
+            # A genuine miss, or a key that is being deleted/migrated and is momentarily
+            # in neither layer, still raises KeyError.
+            if key in self.fast:
+                return self.fast.d[key]
+            raise
+
     def __setitem__(self, key: KT, value: VT) -> None:
         with self.lock:
             discard(self.slow, key)

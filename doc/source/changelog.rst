@@ -6,6 +6,8 @@ Changelog
 ------------------
 - Dropped support for Python 3.8 (:pr:`106`) `Guido Imperiale`_
 - New object :class:`KeyMap` (:pr:`110`) `Guido Imperiale`_
+- New read-only method :meth:`Buffer.peek`, which fetches a value without promoting
+  it to the fast mapping or changing the LRU, for diagnostics over cold data
 
 
 3.0.0 - 2023-04-17
