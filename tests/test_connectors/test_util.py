@@ -5,6 +5,7 @@ from pyinfra.api import Config, State, HiddenValue
 from pyinfra.connectors.util import (
     CommandOutput,
     OutputLine,
+    OutputMasker,
     _ensure_askpass_set_for_host,
     execute_command_with_sudo_retry,
     make_unix_command,
@@ -763,3 +764,103 @@ class TestReadOutputBuffers(TestCase):
         output = read_output_buffers([], [b"oops\n"])
         assert output.stdout_lines == []
         assert output.stderr_lines == ["oops"]
+
+    def test_mask_values(self):
+        output = read_output_buffers(
+            [],
+            [b"error: token placeholder-text rejected\n"],
+            mask_values=["placeholder-text"],
+        )
+        # The hidden value is masked, the non-sensitive segments are not
+        assert output.stderr_lines == ["error: token *MASKED* rejected"]
+        # The error source (stdout vs stderr) is preserved
+        assert output.stdout_lines == []
+
+    def test_mask_values_split_across_chunks(self):
+        # The chunk boundary falls in the middle of the hidden value: the
+        # same placeholder arrives in two pieces, then a third chunk carries
+        # a public exception location which must pass through untouched.
+        output = read_output_buffers(
+            [],
+            [
+                b"error: token place",
+                b"holder-text rejected\n",
+                b"Traceback: /srv/app/main.py line 42\n",
+            ],
+            mask_values=["placeholder-text"],
+        )
+        assert output.stderr_lines == [
+            "error: token *MASKED* rejected",
+            "Traceback: /srv/app/main.py line 42",
+        ]
+
+    def test_mask_values_partial_match_at_end_of_stream(self):
+        # A trailing partial match that never completes must be flushed as-is
+        output = read_output_buffers(
+            [],
+            [b"token place\n"],
+            mask_values=["placeholder-text"],
+        )
+        assert output.stderr_lines == ["token place"]
+
+    def test_mask_values_multiple_lines_and_buffers(self):
+        output = read_output_buffers(
+            [b"out placeholder-text\n"],
+            [b"err placeholder-text\n"],
+            mask_values=["placeholder-text"],
+        )
+        assert output.stdout_lines == ["out *MASKED*"]
+        assert output.stderr_lines == ["err *MASKED*"]
+
+
+class TestOutputMasker(TestCase):
+    def test_no_values_is_passthrough(self):
+        masker = OutputMasker()
+        assert masker.mask_chunk("anything") == "anything"
+        assert masker.flush() == ""
+
+    def test_single_chunk(self):
+        masker = OutputMasker(["placeholder-text"])
+        assert masker.mask_chunk("a placeholder-text b") == "a *MASKED* b"
+        assert masker.flush() == ""
+
+    def test_split_across_two_chunks(self):
+        masker = OutputMasker(["placeholder-text"])
+        # First chunk ends inside the placeholder: the partial match is held
+        # back rather than emitted
+        first = masker.mask_chunk("error: token place")
+        assert first == "error: token "
+        second = masker.mask_chunk("holder-text rejected")
+        assert first + second == "error: token *MASKED* rejected"
+        assert masker.flush() == ""
+
+    def test_split_then_public_third_chunk(self):
+        masker = OutputMasker(["placeholder-text"])
+        out = (
+            masker.mask_chunk("error: token place")
+            + masker.mask_chunk("holder-text rejected\n")
+            + masker.mask_chunk("Traceback: /srv/app/main.py line 42")
+            + masker.flush()
+        )
+        assert "placeholder-text" not in out
+        assert out == "error: token *MASKED* rejected\nTraceback: /srv/app/main.py line 42"
+
+    def test_partial_match_flushed_verbatim(self):
+        masker = OutputMasker(["placeholder-text"])
+        out = masker.mask_chunk("ends with place") + masker.flush()
+        assert out == "ends with place"
+
+    def test_value_spanning_newline(self):
+        masker = OutputMasker(["multi\nline-secret"])
+        out = masker.mask_chunk("a multi\n") + masker.mask_chunk("line-secret b") + masker.flush()
+        assert out == "a *MASKED* b"
+
+    def test_overlapping_values_longest_wins(self):
+        masker = OutputMasker(["secret", "top-secret"])
+        out = masker.mask_chunk("a top-secret b") + masker.flush()
+        assert out == "a *MASKED* b"
+
+    def test_repeated_values(self):
+        masker = OutputMasker(["placeholder-text"])
+        out = masker.mask_chunk("placeholder-text and placeholder-text") + masker.flush()
+        assert out == "*MASKED* and *MASKED*"

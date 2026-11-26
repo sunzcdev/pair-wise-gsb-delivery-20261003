@@ -548,6 +548,7 @@ class TestOperationsApi(PatchSSHTestCase):
             ),
             print_output=False,
             print_prefix=inventory.get_host("somehost").print_prefix,
+            mask_values=[],
         )
 
     @patch("pyinfra.connectors.ssh.SSHConnector.check_can_rsync", lambda _: True)
@@ -594,6 +595,7 @@ class TestOperationsApi(PatchSSHTestCase):
             ),
             print_output=False,
             print_prefix=host.print_prefix,
+            mask_values=["PASSWORD"],
         )
 
     @patch("pyinfra.connectors.ssh.SSHConnector.check_can_rsync", lambda _: True)
@@ -656,6 +658,7 @@ class TestOperationsApi(PatchSSHTestCase):
             ),
             print_output=False,
             print_prefix=inventory.get_host("somehost").print_prefix,
+            mask_values=[],
         )
 
     @patch("pyinfra.connectors.ssh.SSHConnector.check_can_rsync", lambda _: True)
@@ -692,6 +695,7 @@ class TestOperationsApi(PatchSSHTestCase):
             ),
             print_output=False,
             print_prefix=inventory.get_host("somehost").print_prefix,
+            mask_values=[],
         )
 
     @patch("pyinfra.connectors.ssh.SSHConnector.check_can_rsync", lambda _: True)
@@ -720,6 +724,7 @@ class TestOperationsApi(PatchSSHTestCase):
             ),
             print_output=False,
             print_prefix=inventory.get_host("somehost").print_prefix,
+            mask_values=[],
         )
 
     def test_rsync_op_failure(self):

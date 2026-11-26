@@ -135,6 +135,7 @@ def run_local_process(
     timeout: int | None = None,
     print_output: bool = False,
     print_prefix: str = "",
+    mask_values: Iterable[str] | None = None,
 ) -> tuple[int, CommandOutput]:
     process = Popen(command, shell=True, stdout=PIPE, stderr=PIPE, stdin=PIPE)
 
@@ -153,6 +154,7 @@ def run_local_process(
         timeout=timeout,
         print_output=print_output,
         print_prefix=print_prefix,
+        mask_values=mask_values,
     )
 
     logger.debug("--> Waiting for exit status...")
@@ -168,6 +170,72 @@ def run_local_process(
 
 # Command output buffer handling
 #
+
+
+MASKED_OUTPUT_VALUE = "*MASKED*"
+
+
+class OutputMasker:
+    """
+    Streaming masker that replaces hidden values (eg ``HiddenValue`` /
+    ``MaskString`` command bits) in command output before it is printed,
+    stored or included in failure summaries.
+
+    Output may arrive in arbitrary chunks and a chunk boundary can fall in
+    the middle of a hidden value, so a trailing partial match is held back
+    until enough of the stream has been seen to decide. Call ``flush`` at
+    end of stream to emit any held-back remainder.
+    """
+
+    def __init__(self, hidden_values: Iterable[str] | None = None):
+        # Longest first so overlapping values mask the most specific match.
+        self.hidden_values = sorted(
+            {value for value in (hidden_values or []) if value},
+            key=len,
+            reverse=True,
+        )
+        # Longest suffix worth holding back: one short of the longest value.
+        self._max_hold = max((len(value) for value in self.hidden_values), default=1) - 1
+        self._pending = ""
+
+    def _replace(self, text: str) -> str:
+        for value in self.hidden_values:
+            text = text.replace(value, MASKED_OUTPUT_VALUE)
+        return text
+
+    def _hold_length(self, text: str) -> int:
+        # Length of the longest suffix of ``text`` that could grow into one of
+        # the hidden values as more of the stream arrives.
+        for length in range(min(self._max_hold, len(text)), 0, -1):
+            suffix = text[-length:]
+            if any(value.startswith(suffix) for value in self.hidden_values):
+                return length
+        return 0
+
+    def mask_chunk(self, chunk: str) -> str:
+        """
+        Mask a chunk of output, returning text safe to emit. A trailing
+        partial match is held back and prepended to the next call.
+        """
+        if not self.hidden_values:
+            return chunk
+
+        text = self._replace(self._pending + chunk)
+        hold = self._hold_length(text)
+        if hold:
+            self._pending = text[-hold:]
+            return text[:-hold]
+        self._pending = ""
+        return text
+
+    def flush(self) -> str:
+        """
+        Emit any held-back remainder at end of stream. The pending text was
+        already masked when it was held back, and no further chunks can
+        complete a hidden value in it.
+        """
+        text, self._pending = self._pending, ""
+        return text
 
 
 @dataclass
@@ -214,9 +282,15 @@ def read_buffer(
     output_queue: Queue[OutputLine],
     print_output=False,
     print_func=None,
+    masker: OutputMasker | None = None,
 ) -> None:
     """
     Reads a file-like buffer object into lines and optionally prints the output.
+
+    Items yielded by ``io`` are treated as chunks, not whole lines: chunk
+    boundaries may fall anywhere (including inside a hidden value being
+    masked), so masked text is accumulated and only complete lines are
+    emitted, with any remainder flushed at end of stream.
     """
 
     def _print(line):
@@ -225,16 +299,34 @@ def read_buffer(
 
         echo(line, err=True)
 
-    for line in io:
-        # Handle local Popen shells returning list of bytes, not strings
-        if not isinstance(line, str):
-            line = line.decode("utf-8")
-
-        line = line.rstrip("\n")
+    def _emit(line):
         output_queue.put(OutputLine(name, line))
 
         if print_output:
             _print(line)
+
+    pending = ""
+
+    for chunk in io:
+        # Handle local Popen shells returning list of bytes, not strings
+        if not isinstance(chunk, str):
+            chunk = chunk.decode("utf-8")
+
+        if masker is not None:
+            chunk = masker.mask_chunk(chunk)
+
+        pending += chunk
+        lines = pending.split("\n")
+        pending = lines.pop()  # last bit is an incomplete line (or empty)
+
+        for line in lines:
+            _emit(line)
+
+    if masker is not None:
+        pending += masker.flush()
+
+    if pending:
+        _emit(pending)
 
 
 def read_output_buffers(
@@ -243,6 +335,7 @@ def read_output_buffers(
     timeout: int | None = None,
     print_output: bool = False,
     print_prefix: str = "",
+    mask_values: Iterable[str] | None = None,
 ) -> CommandOutput:
     output_queue: Queue[OutputLine] = Queue()
 
@@ -256,6 +349,7 @@ def read_output_buffers(
         output_queue,
         print_output=print_output,
         print_func=lambda line: f"{print_prefix}{line}",
+        masker=OutputMasker(mask_values),
     )
     stderr_reader = gevent.spawn(
         read_buffer,
@@ -264,6 +358,7 @@ def read_output_buffers(
         output_queue,
         print_output=print_output,
         print_func=lambda line: f"{print_prefix}{format_text(line, 'red')}",
+        masker=OutputMasker(mask_values),
     )
 
     # Wait on output, with our timeout (or None)

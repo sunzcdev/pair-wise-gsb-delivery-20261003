@@ -10,6 +10,22 @@ from pyinfra.connectors.util import make_unix_command
 from ..util import make_inventory
 
 
+class ChunkedBuffer:
+    """
+    File-like buffer that yields output in arbitrary chunks (not lines),
+    simulating chunk boundaries falling in the middle of command output.
+    """
+
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    def __iter__(self):
+        return iter(self.chunks)
+
+    def close(self):
+        pass
+
+
 @patch("pyinfra.connectors.local.mkstemp", lambda: (None, "__tempfile__"))
 @patch("pyinfra.connectors.local.os.remove", lambda f: None)
 @patch("pyinfra.connectors.local.open", mock_open(read_data="test!"), create=True)
@@ -93,6 +109,59 @@ class TestLocalConnector(TestCase):
             f"{host.print_prefix}>>> sh -c 'echo *MASKED*'",
             err=True,
         )
+
+    @patch("pyinfra.api.output._echo")
+    def test_run_shell_command_masks_hidden_values_in_output(self, fake_echo):
+        """
+        A hidden command value written back to stderr/stdout by the remote
+        command must be masked in printed output and the stored CommandOutput
+        (which feeds failure summaries), while the command itself runs with
+        the real value. The hidden value arrives split across two chunks and
+        a third chunk carries a public exception location.
+        """
+        inventory = make_inventory(hosts=("@local",))
+        State(inventory, Config())
+        host = inventory.get_host("@local")
+
+        command = StringCommand("deploy", "--token", HiddenValue("top-secret-stuff"))
+        fake_process = self.fake_popen_mock()
+        fake_process.returncode = 1
+        fake_process.stdout = ChunkedBuffer([])
+        fake_process.stderr = ChunkedBuffer(
+            [
+                b"error: token top-secret",
+                b"-stuff rejected\n",
+                b"Traceback: /srv/app/main.py line 42\n",
+            ]
+        )
+
+        status, output = host.run_shell_command(command, print_output=True, print_input=True)
+        assert status is False
+
+        # The command executed with the real value
+        self.fake_popen_mock.assert_called_with(
+            "sh -c 'deploy --token top-secret-stuff'",
+            shell=True,
+            stdout=PIPE,
+            stderr=PIPE,
+            stdin=PIPE,
+        )
+
+        # The stored output (used for failure summaries/reports) is masked,
+        # the error source and non-sensitive segments remain intact
+        assert output.stderr_lines == [
+            "error: token *MASKED* rejected",
+            "Traceback: /srv/app/main.py line 42",
+        ]
+        assert "top-secret-stuff" not in output.output
+
+        # The terminal output was masked too
+        fake_echo.assert_any_call(
+            f"{host.print_prefix}>>> sh -c 'deploy --token *MASKED*'",
+            err=True,
+        )
+        for echo_call in fake_echo.call_args_list:
+            assert "top-secret-stuff" not in echo_call.args[0]
 
     def test_run_shell_command_success_exit_codes(self):
         inventory = make_inventory(hosts=("@local",))

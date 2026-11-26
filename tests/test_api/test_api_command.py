@@ -14,6 +14,7 @@ from pyinfra.api import (
     FileUploadCommand,
     FunctionCommand,
     HiddenValue,
+    MaskString,
     QuoteString,
     RsyncCommand,
     StringCommand,
@@ -83,6 +84,36 @@ class TestStringCommand(TestCase):
     def test_path(self):
         cmd = StringCommand("hello", "world", PurePosixPath("/path/to/somewhere"))
         assert str(cmd) == "hello world /path/to/somewhere"
+
+
+class TestStringCommandHiddenValues(TestCase):
+    def test_no_hidden_values(self):
+        cmd = StringCommand("hello", QuoteString("world"))
+        assert cmd.get_hidden_values() == []
+
+    def test_hidden_value(self):
+        cmd = StringCommand("echo", HiddenValue("top-secret"))
+        assert cmd.get_hidden_values() == ["top-secret"]
+        # The command itself still executes with the real value
+        assert cmd.get_raw_value() == "echo top-secret"
+
+    def test_mask_string(self):
+        cmd = StringCommand("echo", MaskString("placeholder-text"))
+        assert cmd.get_hidden_values() == ["placeholder-text"]
+        assert cmd.get_raw_value() == "echo placeholder-text"
+        assert cmd.get_masked_value() == "echo *MASKED*"
+
+    def test_nested_and_quoted(self):
+        cmd = StringCommand(
+            "env",
+            StringCommand("KEY=", QuoteString(HiddenValue("nested-secret")), _separator=""),
+            QuoteString(StringCommand("echo", HiddenValue("inner"))),
+        )
+        assert sorted(cmd.get_hidden_values()) == ["inner", "nested-secret"]
+
+    def test_double_wrapped_hidden_value(self):
+        cmd = StringCommand("echo", HiddenValue(HiddenValue("s3cret")))
+        assert cmd.get_hidden_values() == ["s3cret"]
 
 
 class TestFileCommands(TestCase):

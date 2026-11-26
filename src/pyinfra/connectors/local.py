@@ -88,6 +88,9 @@ class LocalConnector(BaseConnector):
                 timeout=_timeout,
                 print_output=print_output,
                 print_prefix=self.host.print_prefix,
+                # Mask any hidden values the command writes to its output -
+                # the command itself runs with the real values above.
+                mask_values=unix_command.get_hidden_values(),
             )
 
         return_code, combined_output = execute_command_with_sudo_retry(

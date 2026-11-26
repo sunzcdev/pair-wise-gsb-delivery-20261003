@@ -427,6 +427,10 @@ class SSHConnector(BaseConnector):
                 timeout=_timeout,
                 print_output=print_output,
                 print_prefix=self.host.print_prefix,
+                # The remote side may echo hidden values back (eg in error
+                # messages) - mask them from printed/stored output while the
+                # command itself ran with the real values above.
+                mask_values=unix_command.get_hidden_values(),
             )
 
             logger.debug("Waiting for exit status...")
@@ -790,6 +794,7 @@ class SSHConnector(BaseConnector):
                 rsync_command,
                 print_output=print_output,
                 print_prefix=self.host.print_prefix,
+                mask_values=remote_rsync_command.get_hidden_values(),
             )
 
         return_code, output = execute_command_with_sudo_retry(

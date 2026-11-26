@@ -144,6 +144,28 @@ class StringCommand(PyinfraCommand):
     def get_masked_value(self) -> str:
         return self.separator.join(self._get_all_bits(lambda bit: bit.get_masked_value()))
 
+    def get_hidden_values(self) -> list[str]:
+        """
+        Collect the raw (unmasked) values of any ``HiddenValue``/``MaskString``
+        bits in this command, recursing into nested commands. The command still
+        executes with these values (see ``get_raw_value``); they are used to
+        mask any command output that echoes them back.
+        """
+        values: list[str] = []
+
+        for bit in self.bits:
+            if isinstance(bit, QuoteString):
+                bit = bit.obj
+
+            if isinstance(bit, StringCommand):
+                values.extend(bit.get_hidden_values())
+            elif isinstance(bit, HiddenValue):
+                values.append(bit.unmask())
+            elif isinstance(bit, MaskString):
+                values.append(str(bit))
+
+        return values
+
     @override
     def execute(self, state: State, host: Host, connector_arguments: ConnectorArguments):
         connector_arguments.update(self.connector_arguments)
