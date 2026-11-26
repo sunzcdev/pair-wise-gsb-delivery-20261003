@@ -386,9 +386,10 @@ def _read_report(path: str, session: SessionRunner, returncode: int) -> Result:
         return Result(session, status)
     # A child may run more than the scheduled session (e.g. via notify()); its
     # exit code reflects every one of them. Don't report success over a non-zero
-    # child whose first session happened to pass.
+    # child whose first session happened to pass. Mutate the reconstructed
+    # result so its child-written phase/diagnostic report survives.
     if returncode != 0 and result:
-        return Result(session, Status.FAILED, duration=result.duration)
+        result.status = Status.FAILED
     return result
 
 

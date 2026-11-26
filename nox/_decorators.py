@@ -31,6 +31,14 @@ if TYPE_CHECKING:
 
 T = TypeVar("T", bound=Callable[..., Any])
 
+
+def _as_action_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
 __all__ = ["Call", "Func", "_copy_func"]
 
 
@@ -79,6 +87,18 @@ class Func:
         requires: Sequence[str] | None = None,
         download_python: Literal["auto", "never", "always"] | None = None,
         allow_parallel: bool | None = None,
+        host_diagnostics: Sequence[Any] | None = None,
+        diagnostics: Sequence[Any] | None = None,
+        host_diagnostic: Any = None,
+        diagnostic: Any = None,
+        host_actions: Sequence[Any] | None = None,
+        diagnostic_actions: Sequence[Any] | None = None,
+        host_diagnostic_actions: Sequence[Any] | None = None,
+        actions: Sequence[Any] | None = None,
+        diagnostic_action: Any = None,
+        host_diagnostic_action: Any = None,
+        host_checks: Sequence[Any] | None = None,
+        host_check: Any = None,
     ) -> None:
         self.func = func
         self.python = python
@@ -92,6 +112,24 @@ class Func:
         self.requires = list(requires or [])
         self.download_python = download_python
         self.allow_parallel = allow_parallel
+        # ``diagnostics`` is the short alias for the public host-diagnostic
+        # registry. Keep one canonical list so reports cannot count the same
+        # registered action twice.
+        self.host_diagnostics = [
+            *_as_action_list(host_diagnostics),
+            *_as_action_list(diagnostics),
+            *_as_action_list(host_diagnostic),
+            *_as_action_list(diagnostic),
+            *_as_action_list(host_actions),
+            *_as_action_list(diagnostic_actions),
+            *_as_action_list(host_diagnostic_actions),
+            *_as_action_list(actions),
+            *_as_action_list(diagnostic_action),
+            *_as_action_list(host_diagnostic_action),
+            *_as_action_list(host_checks),
+            *_as_action_list(host_check),
+        ]
+        self.diagnostics = self.host_diagnostics
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name={self.name!r})"
@@ -115,7 +153,97 @@ class Func:
             requires=self._requires,
             download_python=self.download_python,
             allow_parallel=self.allow_parallel,
+            host_diagnostics=self.host_diagnostics,
         )
+
+    def add_host_diagnostic(
+        self, target: Any = None, /, *args: Any, **options: Any
+    ) -> Any:
+        """Explicitly register a host-only diagnostic action."""
+
+        from nox.diagnostics import HostDiagnostic  # noqa: PLC0415
+
+        if isinstance(target, HostDiagnostic) and not args and not options:
+            action = target
+        else:
+            action = HostDiagnostic(target, *args, **options)
+        self.host_diagnostics.append(action)
+        # ``__init__`` aliases the same list; keep the alias meaningful for
+        # older Func objects created before this attribute existed.
+        self.diagnostics = self.host_diagnostics
+        return action
+
+    def host_diagnostic(
+        self, target: Any = None, /, *args: Any, **options: Any
+    ) -> Any:
+        """Register a host diagnostic as a decorator or command call."""
+
+        if target is not None and callable(target) and not args and not options:
+            self.add_host_diagnostic(target)
+            return target
+
+        def decorate(func: RawFunc) -> RawFunc:
+            self.add_host_diagnostic(func, *args, **options)
+            return func
+
+        if target is None:
+            return decorate
+        return self.add_host_diagnostic(target, *args, **options)
+
+    # Short and domain-language aliases used by noxfiles and integrations.
+    add_diagnostic = add_host_diagnostic
+
+    def register_host_diagnostic(
+        self, target: Any = None, /, *args: Any, **options: Any
+    ) -> Any:
+        """Register or decorate a host diagnostic with decorator semantics."""
+        return self.host_diagnostic(target, *args, **options)
+
+    register_diagnostic = register_host_diagnostic
+
+    def register_action(
+        self,
+        kind: Any = "host_diagnostic",
+        target: Any = None,
+        /,
+        *args: Any,
+        **options: Any,
+    ) -> Any:
+        """Register either ``(target)`` or ``(kind, target)``."""
+
+        if target is None and not isinstance(kind, str):
+            target = kind
+            kind = "host_diagnostic"
+        if target is None:
+            def decorate(func: RawFunc) -> RawFunc:
+                self.host_diagnostic(
+                    func,
+                    *args,
+                    kind=kind if isinstance(kind, str) else "host_diagnostic",
+                    **options,
+                )
+                return func
+
+            return decorate
+        options.setdefault("kind", kind if isinstance(kind, str) else "host_diagnostic")
+        return self.add_host_diagnostic(target, *args, **options)
+
+    add_action = register_action
+    diagnostic = host_diagnostic
+    host_diagnose = host_diagnostic
+    diagnose_host = host_diagnostic
+    diagnostic_action = host_diagnostic
+    host_diagnostic_action = host_diagnostic
+    host_action = host_diagnostic
+    host_check = host_diagnostic
+    add_diagnostic_action = add_host_diagnostic
+    register_diagnostic_action = register_host_diagnostic
+    add_host_diagnostic_action = add_host_diagnostic
+    register_host_diagnostic_action = register_host_diagnostic
+    add_host_action = add_host_diagnostic
+    register_host_action = register_host_diagnostic
+    add_host_check = add_host_diagnostic
+    register_host_check = register_host_diagnostic
 
     @property
     def requires(self) -> list[str]:
@@ -172,6 +300,7 @@ class Call(Func):
             requires=func.requires,
             download_python=func.download_python,
             allow_parallel=func.allow_parallel,
+            host_diagnostics=getattr(func, "host_diagnostics", []),
         )
         self.call_spec = call_spec
         self.session_signature = session_signature

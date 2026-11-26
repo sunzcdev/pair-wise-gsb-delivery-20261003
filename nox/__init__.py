@@ -31,13 +31,64 @@ from nox._cli import main
 from nox._options import noxfile_options as options
 from nox._parametrize import Param as param  # noqa: N813
 from nox._parametrize import parametrize_decorator as parametrize
+from nox.diagnostics import (
+    DiagnosticAction,
+    DiagnosticReport,
+    DiagnosticState,
+    HostAction,
+    HostCheck,
+    HostDiagnostic,
+    HostDiagnosticAction,
+    diagnostic_action,
+    host_action,
+    host_check,
+    host_diagnostic,
+    register_diagnostic,
+    register_host_diagnostic,
+)
 from nox.registry import session_decorator as session
-from nox.sessions import Session
+from nox.sessions import PhaseReport, PhaseState, Result, Session, Status
+
+# Discoverable aliases for callers/tests using the shorter domain words.
+Diagnostic = HostDiagnostic
+diagnostic = host_diagnostic
+diagnose = host_diagnostic
+register_host_diagnostic = register_host_diagnostic
+register_diagnostic = register_diagnostic
+register_action = register_host_diagnostic
+action = host_diagnostic
+host_action_registration = host_diagnostic
+host_diagnose = host_diagnostic
+diagnose_host = host_diagnostic
 
 needs_version: str | None = None
 
 __all__ = [
+    "Diagnostic",
+    "DiagnosticAction",
+    "DiagnosticReport",
+    "DiagnosticState",
+    "HostAction",
+    "HostCheck",
+    "HostDiagnostic",
+    "HostDiagnosticAction",
+    "PhaseReport",
+    "PhaseState",
+    "Result",
     "Session",
+    "Status",
+    "diagnostic",
+    "diagnose",
+    "diagnostic_action",
+    "host_action",
+    "host_check",
+    "host_diagnostic",
+    "host_diagnose",
+    "diagnose_host",
+    "action",
+    "register_action",
+    "register_diagnostic",
+    "register_host_diagnostic",
     "main",
     "needs_version",
     "options",

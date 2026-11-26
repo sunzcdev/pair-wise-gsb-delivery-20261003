@@ -22,7 +22,7 @@ import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, overload
 
-from ._decorators import Func
+from ._decorators import Func, _as_action_list as _as_list
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -65,6 +65,18 @@ def session_decorator(
     requires: Sequence[str] | None = ...,
     download_python: Literal["auto", "never", "always"] | None = None,
     allow_parallel: bool | None = ...,
+    host_diagnostics: Sequence[Any] | None = ...,
+    diagnostics: Sequence[Any] | None = ...,
+    host_diagnostic: Any = ...,
+    diagnostic: Any = ...,
+    host_actions: Sequence[Any] | None = ...,
+    diagnostic_actions: Sequence[Any] | None = ...,
+    host_diagnostic_actions: Sequence[Any] | None = ...,
+    actions: Sequence[Any] | None = ...,
+    diagnostic_action: Any = ...,
+    host_diagnostic_action: Any = ...,
+    host_checks: Sequence[Any] | None = ...,
+    host_check: Any = ...,
 ) -> Callable[[RawFunc | Func], Func]: ...
 
 
@@ -83,6 +95,18 @@ def session_decorator(
     requires: Sequence[str] | None = None,
     download_python: Literal["auto", "never", "always"] | None = None,
     allow_parallel: bool | None = None,
+    host_diagnostics: Sequence[Any] | None = None,
+    diagnostics: Sequence[Any] | None = None,
+    host_diagnostic: Any = None,
+    diagnostic: Any = None,
+    host_actions: Sequence[Any] | None = None,
+    diagnostic_actions: Sequence[Any] | None = None,
+    host_diagnostic_actions: Sequence[Any] | None = None,
+    actions: Sequence[Any] | None = None,
+    diagnostic_action: Any = None,
+    host_diagnostic_action: Any = None,
+    host_checks: Sequence[Any] | None = None,
+    host_check: Any = None,
 ) -> Func | Callable[[RawFunc | Func], Func]:
     """Designate the decorated function as a session."""
     # If `func` is provided, then this is the decorator call with the function
@@ -106,6 +130,18 @@ def session_decorator(
             requires=requires,
             download_python=download_python,
             allow_parallel=allow_parallel,
+            host_diagnostics=host_diagnostics,
+            diagnostics=diagnostics,
+            host_diagnostic=host_diagnostic,
+            diagnostic=diagnostic,
+            host_actions=host_actions,
+            diagnostic_actions=diagnostic_actions,
+            host_diagnostic_actions=host_diagnostic_actions,
+            actions=actions,
+            diagnostic_action=diagnostic_action,
+            host_diagnostic_action=host_diagnostic_action,
+            host_checks=host_checks,
+            host_check=host_check,
         )
 
     if isinstance(func, Func):
@@ -121,6 +157,20 @@ def session_decorator(
     if python is None:
         python = py
 
+    registered_diagnostics = [
+        *(_as_list(host_diagnostics)),
+        *(_as_list(diagnostics)),
+        *(_as_list(host_diagnostic)),
+        *(_as_list(diagnostic)),
+        *(_as_list(host_actions)),
+        *(_as_list(diagnostic_actions)),
+        *(_as_list(host_diagnostic_actions)),
+        *(_as_list(actions)),
+        *(_as_list(diagnostic_action)),
+        *(_as_list(host_diagnostic_action)),
+        *(_as_list(host_checks)),
+        *(_as_list(host_check)),
+    ]
     reg_name = name or func.__name__
 
     fn = Func(
@@ -135,6 +185,7 @@ def session_decorator(
         requires=requires,
         download_python=download_python,
         allow_parallel=allow_parallel,
+        host_diagnostics=registered_diagnostics,
     )
     if reg_name in _REGISTRY:
         msg = (

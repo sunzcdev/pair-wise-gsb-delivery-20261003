@@ -520,7 +520,7 @@ def create_report(
     with open(global_config.report, "w", encoding="utf-8") as report_file:
         json.dump(
             {
-                "result": int(all(results)),
+                "result": int(final_reduce(results, global_config) == 0),
                 "sessions": [result.serialize() for result in results],
             },
             report_file,
@@ -544,4 +544,18 @@ def final_reduce(results: list[Result], global_config: NoxConfig) -> int:  # noq
     """
     if not all(results):
         return 1
+
+    # Phase reports keep host-diagnostic failures separate from the session's
+    # primary/test status.  When a caller constructed or reconstructed a
+    # successful primary Result without folding that phase into its Status,
+    # still let a failed/aborted diagnostic make the process exit non-zero.
+    for result in results:
+        diagnostic_status = getattr(result, "diagnostic_status", None)
+        if diagnostic_status in {"failed", "aborted"}:
+            return 1
+        phase_report = getattr(result, "phases", None)
+        diagnostic_phase = getattr(phase_report, "diagnostic", None)
+        if getattr(diagnostic_phase, "status", None) in {"failed", "aborted"}:
+            return 1
+
     return 0
