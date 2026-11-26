@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING
 
 from taskiq.abc.broker import AsyncBroker
-from taskiq.acks import AckController
+from taskiq.acks import AckController, AckStage
 from taskiq.exceptions import NoResultError, TaskRejectedError
 from taskiq.message import TaskiqMessage
 
@@ -38,11 +38,15 @@ class Context:
         """
         Acknowledge current message.
 
+        The acknowledgement is recorded with the ``manual`` stage,
+        since the task took responsibility for confirming the delivery
+        through the context.
+
         :raises RuntimeError: if current broker message is not ackable.
         """
         if self._ack_controller is None:
             raise RuntimeError("Current message is not ackable.")
-        await self._ack_controller.ack()
+        await self._ack_controller.ack(stage=AckStage.MANUAL)
 
     async def requeue(self) -> None:
         """

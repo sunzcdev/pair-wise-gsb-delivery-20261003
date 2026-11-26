@@ -9,7 +9,7 @@ from taskiq.abc.formatter import TaskiqFormatter
 from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.abc.result_backend import AsyncResultBackend
 from taskiq.abc.schedule_source import ScheduleSource
-from taskiq.acks import AckableMessage, AcknowledgeType
+from taskiq.acks import AckableMessage, AcknowledgeType, AckStage, ResultSaveStatus
 from taskiq.brokers.inmemory_broker import InMemoryBroker
 from taskiq.brokers.multi_broker import MultiBroker
 from taskiq.brokers.shared_broker import async_shared_broker
@@ -41,6 +41,7 @@ from taskiq.task import AsyncTaskiqTask
 __version__ = version("taskiq")
 
 __all__ = [
+    "AckStage",
     "AckableMessage",
     "AcknowledgeType",
     "AsyncBroker",
@@ -55,6 +56,7 @@ __all__ = [
     "PrometheusMiddleware",
     "ResultGetError",
     "ResultIsReadyError",
+    "ResultSaveStatus",
     "ScheduleSource",
     "ScheduledTask",
     "SecurityError",

@@ -18,7 +18,13 @@ from taskiq_dependencies import DependencyGraph
 
 from taskiq.abc.broker import AckableMessage, AsyncBroker
 from taskiq.abc.middleware import TaskiqMiddleware
-from taskiq.acks import AckController, AcknowledgeType, parse_acknowledge_type
+from taskiq.acks import (
+    AckController,
+    AcknowledgeType,
+    AckStage,
+    ResultSaveStatus,
+    parse_acknowledge_type,
+)
 from taskiq.context import Context
 from taskiq.exceptions import NoResultError
 from taskiq.message import TaskiqMessage
@@ -170,7 +176,7 @@ class Receiver:
                 exc_info=True,
             )
             if ack_controller.is_ackable:
-                await ack_controller.ack()
+                await ack_controller.ack(AckStage.UNPARSABLE)
             return
         logger.debug("Received message: %s", taskiq_msg)
         task = self.broker.find_task(taskiq_msg.task_name)
@@ -180,7 +186,7 @@ class Receiver:
                 taskiq_msg.task_name,
             )
             if ack_controller.is_ackable:
-                await ack_controller.ack()
+                await ack_controller.ack(AckStage.UNKNOWN_TASK)
             return
         logger.debug(
             "Function for task %s is resolved. Executing...",
@@ -202,7 +208,7 @@ class Receiver:
         )
 
         if ack_time == AcknowledgeType.WHEN_RECEIVED and ack_controller.is_ackable:
-            await ack_controller.ack()
+            await ack_controller.ack(AckStage.WHEN_RECEIVED)
 
         result = await self.run_task(
             target=task.original_func,
@@ -211,27 +217,120 @@ class Receiver:
         )
 
         if ack_time == AcknowledgeType.WHEN_EXECUTED and ack_controller.is_ackable:
-            await ack_controller.ack()
+            await ack_controller.ack(AckStage.WHEN_EXECUTED)
 
         for middleware in reversed(self.broker.middlewares):
             if middleware.__class__.post_execute != TaskiqMiddleware.post_execute:
                 await maybe_awaitable(middleware.post_execute(taskiq_msg, result))
 
+        save_status, save_error = await self._save_result(
+            message=taskiq_msg,
+            result=result,
+            ack_controller=ack_controller,
+            ack_time=ack_time,
+            raise_err=raise_err,
+        )
+
+        if not ack_controller.is_ackable or ack_controller.is_acked:
+            return
+
+        if ack_time == AcknowledgeType.WHEN_SAVED:
+            # The lenient policy keeps its historical behavior: the
+            # acknowledgement is attempted after the save block regardless
+            # of whether the write succeeded.
+            await ack_controller.ack(AckStage.WHEN_SAVED)
+            return
+
+        if ack_time == AcknowledgeType.WHEN_SAVED_STRICT:
+            await self._strict_ack(
+                ack_controller=ack_controller,
+                save_status=save_status,
+                save_error=save_error,
+            )
+
+    async def _save_result(
+        self,
+        message: TaskiqMessage,
+        result: TaskiqResult[Any],
+        ack_controller: AckController,
+        ack_time: AcknowledgeType,
+        raise_err: bool,
+    ) -> tuple[ResultSaveStatus, BaseException | None]:
+        """
+        Persist the task result and run post-save middleware hooks.
+
+        Under the strict policy, only failures raised while the result
+        backend writes the result mark the write as unknown. Failures in
+        post_save hooks happen after the write is confirmed and therefore
+        do not change the save status nor block the acknowledgement.
+
+        :param message: parsed task message.
+        :param result: result of the task execution.
+        :param ack_controller: acknowledgement controller for the delivery.
+        :param ack_time: effective acknowledgement policy.
+        :param raise_err: whether save errors should be re-raised.
+        :return: observed save status and the backend error, if any.
+        """
+        if isinstance(result.error, NoResultError):
+            if (
+                ack_time == AcknowledgeType.WHEN_SAVED_STRICT
+                and ack_controller.is_ackable
+            ):
+                # Tasks that explicitly declare no stored result are
+                # acknowledged after execution under a separate agreement.
+                await ack_controller.ack(AckStage.NO_RESULT)
+            return ResultSaveStatus.SKIPPED, None
+
         try:
-            if not isinstance(result.error, NoResultError):
-                await self.broker.result_backend.set_result(taskiq_msg.task_id, result)
-
-                for middleware in reversed(self.broker.middlewares):
-                    if middleware.__class__.post_save != TaskiqMiddleware.post_save:
-                        await maybe_awaitable(middleware.post_save(taskiq_msg, result))
-
+            await self.broker.result_backend.set_result(message.task_id, result)
         except Exception as exc:
             logger.exception("Can't set result in result backend.")
             if raise_err:
-                raise exc
+                raise
+            return ResultSaveStatus.UNKNOWN, exc
 
-        if ack_time == AcknowledgeType.WHEN_SAVED and ack_controller.is_ackable:
-            await ack_controller.ack()
+        # The write is confirmed at this point. Hook failures must not be
+        # confused with an unknown write status.
+        for middleware in reversed(self.broker.middlewares):
+            if middleware.__class__.post_save != TaskiqMiddleware.post_save:
+                try:
+                    await maybe_awaitable(middleware.post_save(message, result))
+                except Exception:
+                    logger.exception("post_save middleware hook failed.")
+                    if raise_err:
+                        raise
+
+        return ResultSaveStatus.CONFIRMED, None
+
+    async def _strict_ack(
+        self,
+        ack_controller: AckController,
+        save_status: ResultSaveStatus,
+        save_error: BaseException | None,
+    ) -> None:
+        """
+        Apply the strict post-save acknowledgement policy.
+
+        :param ack_controller: acknowledgement controller for the delivery.
+        :param save_status: status reported by the result backend write.
+        :param save_error: error raised by the result backend, if any.
+        """
+        if save_status is ResultSaveStatus.CONFIRMED:
+            await ack_controller.ack(AckStage.WHEN_SAVED)
+            return
+
+        if save_status is ResultSaveStatus.SKIPPED:
+            # Defensive fallback: no-result deliveries are normally
+            # acknowledged inside ``_save_result``.
+            await ack_controller.ack(AckStage.NO_RESULT)
+            return
+
+        logger.warning(
+            "Result write is unconfirmed (status=%s, error=%r); "
+            "the message is left unacknowledged for redelivery.",
+            save_status.value,
+            save_error,
+        )
 
     def _get_ack_time(self, message: TaskiqMessage) -> AcknowledgeType:
         """

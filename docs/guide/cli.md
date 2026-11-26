@@ -47,10 +47,18 @@ We have two options for this:
 
 ### Acknowledgements
 
-Taskiq supports four types of acknowledgements:
+Taskiq supports five types of acknowledgements:
 * `when_received` - task is acknowledged when it is **received** by the worker.
 * `when_executed` - task is acknowledged right after it is **executed** by the worker.
 * `when_saved` - task is acknowledged when the result of execution is saved in the result backend.
+  For backwards compatibility this policy is lenient: the acknowledgement is attempted after the
+  save step even if the result backend fails to write the result.
+* `when_saved_strict` - strict post-save acknowledgement. The message is acknowledged only after
+  the result backend confirms the write. If the write fails (for example it times out), the message
+  stays unacknowledged so the broker can redeliver it, and the write status is recorded as `unknown`.
+  Failures in `post_save` middleware hooks happen after the write is confirmed, so they do not block
+  the acknowledgement. A task that explicitly skips storing a result (by raising `NoResultError`)
+  follows a separate agreement and is acknowledged once execution completes.
 * `manual` - task is acknowledged by calling `Context.ack()` inside the task.
 
 This can be configured using `--ack-type` parameter. For example:
@@ -72,6 +80,11 @@ async def critical_task() -> None:
     ...
 
 
+@broker.task(ack_type="when_saved_strict")
+async def strictly_saved_task() -> None:
+    ...
+
+
 @broker.task(ack_type="manual")
 async def manually_acked_task(context: Context = TaskiqDepends()) -> None:
     ...
@@ -80,6 +93,10 @@ async def manually_acked_task(context: Context = TaskiqDepends()) -> None:
 
 If a task has no `ack_type` label, the worker-level `--ack-type` value is used.
 Manual acknowledgement requires a broker that yields `AckableMessage`.
+
+When the broker's ack callable accepts an argument, taskiq calls it with the stage at which the
+delivery was actually acknowledged (see `taskiq.AckStage`, for example `when_saved`, `no_result`
+or `manual`). Legacy zero-argument ack callables keep working unchanged.
 
 ### Type casts
 
@@ -167,7 +184,7 @@ The number of signals before a hard kill can be configured with the `--hardkill-
 * `--no-propagate-errors` - if this parameter is enabled, exceptions won't be thrown in generator dependencies.
 * `--receiver` - python path to custom receiver class.
 * `--receiver_arg` - custom args for receiver.
-* `--ack-type` - Type of acknowledgement. This parameter is used to set when to acknowledge the task. Possible values are `when_received`, `when_executed`, `when_saved`, `manual`. Default is `when_saved`.
+* `--ack-type` - Type of acknowledgement. This parameter is used to set when to acknowledge the task. Possible values are `when_received`, `when_executed`, `when_saved`, `when_saved_strict`, `manual`. Default is `when_saved`.
 * `--max-tasks-per-child` - maximum number of tasks to be executed by a single worker process before restart.
 * `--max-fails` - Maximum number of child process exits.
 * `--shutdown-timeout` - maximum amount of time for graceful broker's shutdown in seconds (default 5).

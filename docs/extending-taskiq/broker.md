@@ -43,6 +43,28 @@ async def listen(self) -> AsyncGenerator[AckableMessage, None]:
       )
 ```
 
+### Acknowledgement stage
+
+The ack callable may accept one argument. In that case taskiq calls it with the stage at which the
+delivery was actually acknowledged. The values come from `taskiq.AckStage` (for example
+`when_received`, `when_executed`, `when_saved`, `no_result` or `manual`). Recording this stage lets
+the broker build acknowledgement receipts that show how far a message got:
+
+```python
+
+def record_ack(stage: str) -> None:
+    # Persist the real stage reached by the delivery.
+    acknowledgement_receipts[message.id] = stage
+
+
+yield AckableMessage(data=message.bytes, ack=record_ack)
+```
+
+A zero-argument ack callable remains fully supported, so existing broker integrations do not need
+to change. Under the `when_saved_strict` policy, messages whose result write is unconfirmed (for
+example a backend timeout) are never acknowledged, in which case the ack callable is not invoked at
+all.
+
 ## Conventions
 
 For brokers, we have several conventions. It's good if your broker implements them.
