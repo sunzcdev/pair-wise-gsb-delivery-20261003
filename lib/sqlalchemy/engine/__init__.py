@@ -20,6 +20,7 @@ from . import util as util
 from .base import Connection as Connection
 from .base import Engine as Engine
 from .base import NestedTransaction as NestedTransaction
+from .base import ReadOnlyScope as ReadOnlyScope
 from .base import RootTransaction as RootTransaction
 from .base import Transaction as Transaction
 from .base import TwoPhaseTransaction as TwoPhaseTransaction

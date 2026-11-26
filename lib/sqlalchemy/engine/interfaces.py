@@ -918,6 +918,35 @@ class Dialect(EventTarget):
     generating foreign key constraints in certain circumstances
     """
 
+    supports_savepoints: bool
+    """``True`` if the dialect is able to emit independent SAVEPOINT
+    statements, i.e. ``SAVEPOINT``, ``ROLLBACK TO SAVEPOINT`` and
+    ``RELEASE SAVEPOINT``.
+
+    This is a declaration made by the dialect about its ability to establish
+    an independent scope inside a caller-owned transaction.  When ``False``,
+    constructs such as :meth:`_engine.Connection.read_only_scope` fall back
+    to statement-level admission checks rather than attempting to emit
+    savepoint SQL that the driver would reject.
+
+    .. versionadded:: 2.1
+
+    """
+
+    supports_read_only_transactions: bool
+    """``True`` if the dialect is able to declare, at the driver or
+    statement level, that a transaction participates in read-only mode
+    (e.g. ``SET TRANSACTION READ ONLY``).
+
+    This is a declaration only; SQLAlchemy Core does not emit such SQL
+    itself.  It indicates to constructs such as
+    :meth:`_engine.Connection.read_only_scope` that read-only behavior can
+    be delegated to the driver rather than enforced by Core.
+
+    .. versionadded:: 2.1
+
+    """
+
     max_identifier_length: int
     """The maximum length of identifier names."""
     max_index_name_length: Optional[int]

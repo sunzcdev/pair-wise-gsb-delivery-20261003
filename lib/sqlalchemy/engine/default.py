@@ -272,6 +272,29 @@ class DefaultDialect(Dialect):
     inline_comments = False
     supports_statement_cache = True
 
+    supports_savepoints = True
+    """whether the dialect can emit independent SAVEPOINT statements.
+
+    The base :class:`.Dialect` implementation emits standard
+    ``SAVEPOINT``/``ROLLBACK TO SAVEPOINT``/``RELEASE SAVEPOINT`` SQL, which
+    most backends accept, so this defaults to ``True``.  Dialects which
+    cannot establish an independent SAVEPOINT should set this to ``False``.
+    :meth:`_engine.Connection.read_only_scope` uses this flag to decide
+    whether an independent inner scope can be established inside a
+    caller-owned transaction.
+
+    """
+
+    supports_read_only_transactions = False
+    """whether the dialect can declare a read-only transaction at the driver
+    or statement level.
+
+    Dialects which can emit a statement such as ``SET TRANSACTION READ ONLY``
+    set this to ``True``.  SQLAlchemy Core does not emit such SQL itself; this
+    flag only signals that read-only semantics may be delegated to the driver.
+
+    """
+
     div_is_floordiv = True
 
     bind_typing = interfaces.BindTyping.NONE

@@ -137,6 +137,11 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
     _transaction: Optional[RootTransaction]
     _nested_transaction: Optional[NestedTransaction]
 
+    # the currently active read-only participation scope, if any.  this is
+    # independent of _transaction / _nested_transaction because a read-only
+    # scope does not own, replace or end the host transaction.
+    _read_only_scope: Optional[ReadOnlyScope]
+
     def __init__(
         self,
         engine: Engine,
@@ -161,6 +166,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             self._dbapi_connection = connection
 
         self._transaction = self._nested_transaction = None
+        self._read_only_scope = None
         self.__savepoint_seq = 0
         self.__in_begin = False
 
@@ -843,6 +849,45 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         if self._allow_autobegin and not self.__in_begin:
             self.begin()
 
+    def _admit_for_read_only_scope(
+        self, statement: Any, reason_fn: Callable[[], Optional[str]]
+    ) -> None:
+        """Refuse *statement* if it would run inside an active read-only
+        participation scope and Core cannot confirm it as read-only.
+
+        The check happens before any compilation or DBAPI interaction, so a
+        refused statement never reaches the driver.  An active scope always
+        refuses statements that are not positively read-only, regardless of
+        whether the dialect can offer an independent savepoint; the savepoint
+        is used only to *restore* inner state, not to make writes acceptable.
+
+        When no scope is active, this method returns immediately and does not
+        invoke *reason_fn*; ordinary :class:`_engine.Connection` usage is
+        therefore completely unaffected.
+
+        """
+        scope = self._read_only_scope
+        if scope is None:
+            return
+
+        reason = reason_fn()
+        if reason is None:
+            scope._admitted_statements += 1
+            return
+
+        raise exc.ReadOnlyScopeError(
+            "Statement of type %s is not admitted within a read-only "
+            "participation scope; SQLAlchemy Core cannot confirm that it is "
+            "read-only, and it was therefore not passed to the driver. "
+            "Reason: %s."
+            % (
+                "str" if isinstance(statement, str) else type(statement).__name__,
+                reason,
+            ),
+            reason=reason,
+            statement=statement,
+        )
+
     def begin(self) -> RootTransaction:
         """Begin a transaction prior to autobegin occurring.
 
@@ -995,6 +1040,82 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             self._autobegin()
 
         return NestedTransaction(self)
+
+    def read_only_scope(self) -> ReadOnlyScope:
+        """Return an explicit read-only participation scope against this
+        :class:`_engine.Connection`.
+
+        This method is used when a caller has been handed a
+        :class:`_engine.Connection` on which a host transaction is already
+        established, and wishes to read the uncommitted state produced by
+        that host transaction without taking ownership of it.  The returned
+        :class:`_engine.ReadOnlyScope` is a context manager that, while
+        active:
+
+        * permits read statements that SQLAlchemy Core can positively
+          confirm are read-only, executed against the same DBAPI connection
+          and therefore inside the same uncommitted transaction state as the
+          host;
+        * refuses any statement Core cannot confirm is read-only *before* it
+          is handed to the DBAPI driver, raising
+          :class:`_exc.ReadOnlyScopeError`, a distinguishable error carrying
+          a ``reason`` code;
+        * never commits, rolls back, invalidates or replaces the host
+          transaction, whether it exits normally, is closed early, or a
+          statement inside it fails.
+
+        When the dialect can provide an independent SAVEPOINT, i.e.
+        :attr:`.Dialect.supports_savepoints` is ``True`` (and no read-only
+        declaration is available at the driver level), the scope establishes
+        a savepoint so that any state the inner block leaves behind can be
+        fully discarded via ``ROLLBACK TO SAVEPOINT`` when the block exits.
+        Because SQLite acknowledges a RELEASE of the outermost savepoint with
+        a COMMIT, the savepoint is deliberately *not* released; it is rolled
+        back on exit in all cases, which restores the state observed at
+        scope entry while leaving the host transaction intact.
+
+        When the dialect reports neither :attr:`.Dialect.supports_savepoints`
+        nor :attr:`.Dialect.supports_read_only_transactions`, there is no
+        independent scope available at the driver level.  In that case only
+        the statement-admission checks above apply, and they are what keep
+        the host transaction's contents untouchable.
+
+        The scope requires that the host has already begun a transaction;
+        if no transaction is present, the scope itself does not autobegin on
+        the caller's behalf and simply proceeds with statement-level
+        admission against the DBAPI connection's implicit state.
+
+        E.g.::
+
+            with engine.begin() as conn:
+                conn.execute(table.insert(), {"id": 1})
+
+                with conn.read_only_scope() as scope:
+                    assert scope.scalar(
+                        select(table.c.id)
+                    ) == 1
+
+                    scope.execute(table.insert(), {"id": 2})
+                    # raises ReadOnlyScopeError; nothing reached the driver
+
+                # host transaction is still active and untouched
+                conn.execute(table.insert(), {"id": 3})
+            # both host rows are committed by the enclosing block
+
+        :return: a :class:`_engine.ReadOnlyScope`.
+
+        .. seealso::
+
+            :attr:`.Dialect.supports_savepoints`
+
+            :attr:`.Dialect.supports_read_only_transactions`
+
+            :class:`_exc.ReadOnlyScopeError`
+
+        .. versionadded:: 2.1
+
+        """
+        return ReadOnlyScope(self)
 
     def begin_twophase(self, xid: Optional[Any] = None) -> TwoPhaseTransaction:
         """Begin a two-phase or XA transaction and return a transaction
@@ -1505,6 +1626,9 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
     ) -> CursorResult[Unpack[TupleAny]]:
         """Execute a sql.FunctionElement object."""
 
+        self._admit_for_read_only_scope(
+            func, lambda: sql_util.READ_ONLY_REASON_FUNCTION
+        )
         return self._execute_clauseelement(
             func.select(), distilled_parameters, execution_options
         )
@@ -1516,6 +1640,10 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         execution_options: CoreExecuteOptionsParameter,
     ) -> Any:
         """Execute a schema.ColumnDefault object."""
+
+        self._admit_for_read_only_scope(
+            default, lambda: sql_util.READ_ONLY_REASON_DEFAULT
+        )
 
         exec_opts = self._execution_options.merge_with(execution_options)
 
@@ -1573,6 +1701,10 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         execution_options: CoreExecuteOptionsParameter,
     ) -> CursorResult[Unpack[TupleAny]]:
         """Execute a schema.DDL object."""
+
+        self._admit_for_read_only_scope(
+            ddl, lambda: sql_util.READ_ONLY_REASON_DDL
+        )
 
         exec_opts = ddl._execution_options.merge_with(
             self._execution_options, execution_options
@@ -1668,6 +1800,10 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         execution_options: CoreExecuteOptionsParameter,
     ) -> CursorResult[Unpack[TupleAny]]:
         """Execute a sql.ClauseElement object."""
+
+        self._admit_for_read_only_scope(
+            elem, lambda: sql_util.read_only_statement_reason(elem)
+        )
 
         exec_opts = elem._execution_options.merge_with(
             self._execution_options, execution_options
@@ -1792,6 +1928,10 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             :pep:`249`
 
         """
+
+        self._admit_for_read_only_scope(
+            statement, lambda: sql_util.READ_ONLY_REASON_TEXTUAL
+        )
 
         distilled_parameters = _distill_raw_params(parameters)
 
@@ -2907,6 +3047,253 @@ class TwoPhaseTransaction(RootTransaction):
 
     def _connection_commit_impl(self) -> None:
         self.connection._commit_twophase_impl(self.xid, self._is_prepared)
+
+
+class ReadOnlyScope:
+    """An explicit read-only participation scope on a
+    :class:`_engine.Connection`.
+
+    Instances are produced by :meth:`_engine.Connection.read_only_scope`.
+    While active, the scope admits statements that Core can confirm are
+    read-only and refuses everything else before the driver is reached, and
+    it never ends, replaces or rolls back the host transaction.
+
+    The object is a context manager; it may also be driven explicitly with
+    :meth:`enter` / :meth:`close`.  :meth:`close` is always safe to call and
+    is idempotent.
+
+    .. seealso::
+
+        :meth:`_engine.Connection.read_only_scope`
+
+    .. versionadded:: 2.1
+
+    """
+
+    __slots__ = (
+        "connection",
+        "is_active",
+        "_savepoint",
+        "_previous_scope",
+        "_admitted_statements",
+        "_on_exit",
+    )
+
+    connection: Connection
+
+    _savepoint: Optional[str]
+
+    def __init__(self, connection: Connection):
+        self.connection = connection
+        self.is_active = False
+        self._savepoint = None
+        self._previous_scope = None
+        self._admitted_statements = 0
+        self._on_exit = None
+
+    # ------------------------------------------------------------------
+    # public accessors
+    # ------------------------------------------------------------------
+
+    @property
+    def dialect(self) -> Dialect:
+        """The :class:`_engine.Dialect` in effect for this scope."""
+
+        return self.connection.dialect
+
+    @property
+    def effective_read_only(self) -> bool:
+        """``True`` if the dialect itself is enforcing read-only semantics
+        for this scope.
+
+        This is ``True`` only when the dialect declares
+        :attr:`.Dialect.supports_read_only_transactions`; otherwise Core
+        enforces read-only behavior through statement admission, so the value
+        is ``False`` while the scope is still read-only from Core's point of
+        view.
+
+        """
+
+        return bool(self.connection.dialect.supports_read_only_transactions)
+
+    @property
+    def uses_savepoint(self) -> bool:
+        """``True`` if this scope established an independent SAVEPOINT."""
+
+        return self._savepoint is not None
+
+    @property
+    def admitted_statement_count(self) -> int:
+        """Number of read-only statements admitted through this scope."""
+
+        return self._admitted_statements
+
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
+
+    def __enter__(self) -> ReadOnlyScope:
+        self.enter()
+        return self
+
+    def __exit__(
+        self, type_: Any, value: Any, traceback: Any
+    ) -> None:
+        self.close()
+
+    def enter(self) -> ReadOnlyScope:
+        """Activate the scope.
+
+        If the dialect supports savepoints and does not itself provide a
+        read-only transaction mode, an independent savepoint is established so
+        that whatever state the inner block creates can be fully discarded when
+        the scope closes, leaving the host transaction's contents exactly as
+        they were.  The host transaction object itself is neither committed,
+        rolled back nor replaced.
+
+        """
+        if self.is_active:
+            raise exc.InvalidRequestError(
+                "This ReadOnlyScope is already active"
+            )
+
+        connection = self.connection
+        dialect = connection.dialect
+
+        self._previous_scope = connection._read_only_scope
+
+        # the savepoint that establishes the independent inner scope is
+        # created *before* the scope becomes active.  Suppress the admission
+        # check for that one internal statement (and for any outermost
+        # read-only scope already in place) so that savepoint SQL itself is
+        # never mistaken for a caller write.
+        connection._read_only_scope = None
+        try:
+            if dialect.supports_read_only_transactions:
+                # the driver itself can declare the read-only transaction; Core
+                # relies on the driver and still applies statement admission so
+                # that unconfirmable constructs never reach the driver.
+                self._savepoint = None
+            elif dialect.supports_savepoints and connection.in_transaction():
+                # only establish a savepoint when the host has already begun
+                # its transaction; without one, SAVEPOINT would itself open an
+                # implicit transaction that the scope would then be responsible
+                # for, which is exactly the ownership this scope avoids.
+                self._savepoint = connection._savepoint_impl()
+            else:
+                self._savepoint = None
+        finally:
+            connection._read_only_scope = self
+
+        self.is_active = True
+        return self
+
+    def close(self) -> None:
+        """Deactivate the scope, restoring the state it observed on entry.
+
+        Statements admitted through this scope never commit or roll back the
+        host transaction.  If an independent savepoint was established, it is
+        rolled back here; in all cases the host transaction object remains the
+        same object it was before the scope began.
+
+        """
+        if not self.is_active:
+            return
+
+        try:
+            if self._savepoint is not None:
+                # suppress admission for the scope's own ROLLBACK TO SAVEPOINT
+                connection = self.connection
+                previous = connection._read_only_scope
+                connection._read_only_scope = None
+                try:
+                    connection._rollback_to_savepoint_impl(self._savepoint)
+                finally:
+                    connection._read_only_scope = previous
+        finally:
+            self.is_active = False
+            self._savepoint = None
+            if self.connection._read_only_scope is self:
+                self.connection._read_only_scope = self._previous_scope
+            self._previous_scope = None
+
+    def rollback(self) -> None:
+        """Alias for :meth:`.ReadOnlyScope.close`."""
+
+        self.close()
+
+    def commit(self) -> None:
+        """Not supported: a read-only scope never commits.
+
+        Attempting to commit through the scope raises
+        :class:`.InvalidRequestError`; the host owns the transaction.
+
+        """
+
+        raise exc.InvalidRequestError(
+            "A read-only participation scope does not commit; the host "
+            "transaction owns the commit boundary.  Use the host "
+            "Connection.commit() instead."
+        )
+
+    # ------------------------------------------------------------------
+    # execution helpers
+    # ------------------------------------------------------------------
+
+    def execute(
+        self,
+        statement: Executable,
+        parameters: Optional[_CoreAnyExecuteParams] = None,
+        *,
+        execution_options: Optional[CoreExecuteOptionsParameter] = None,
+    ) -> CursorResult[Unpack[TupleAny]]:
+        """Execute a statement within this scope.
+
+        Equivalent to :meth:`_engine.Connection.execute` on the underlying
+        connection, except that the statement is subject to the scope's
+        read-only admission checks.
+
+        """
+
+        self._require_active()
+        return self.connection.execute(
+            statement, parameters, execution_options=execution_options
+        )
+
+    def scalar(
+        self,
+        statement: Executable,
+        parameters: Optional[_CoreSingleExecuteParams] = None,
+        *,
+        execution_options: Optional[CoreExecuteOptionsParameter] = None,
+    ) -> Any:
+        """Execute a statement within this scope and return a scalar."""
+
+        self._require_active()
+        return self.connection.scalar(
+            statement, parameters, execution_options=execution_options
+        )
+
+    def scalars(
+        self,
+        statement: Executable,
+        parameters: Optional[_CoreAnyExecuteParams] = None,
+        *,
+        execution_options: Optional[CoreExecuteOptionsParameter] = None,
+    ) -> ScalarResult[Any]:
+        """Execute a statement within this scope and return scalars."""
+
+        self._require_active()
+        return self.connection.scalars(
+            statement, parameters, execution_options=execution_options
+        )
+
+    def _require_active(self) -> None:
+        if not self.is_active:
+            raise exc.InvalidRequestError(
+                "This ReadOnlyScope is not active; use it as a context "
+                "manager or call enter() first."
+            )
 
 
 class Engine(

@@ -375,6 +375,45 @@ class ResourceClosedError(InvalidRequestError):
     object that's in a closed state."""
 
 
+class ReadOnlyScopeError(InvalidRequestError):
+    """A statement was refused execution within a read-only participation
+    scope because SQLAlchemy Core could not confirm that the statement is
+    read-only.
+
+    This error is raised before the statement is passed to the DBAPI driver;
+    it is therefore distinguishable from driver-level errors and it also
+    indicates that no database activity took place for the refused statement.
+
+    The :attr:`.ReadOnlyScopeError.reason` attribute provides a short,
+    machine-friendly identifier for why the statement was refused, such as
+    ``"dml"`` for INSERT/UPDATE/DELETE statements, ``"textual"`` for
+    :func:`_expression.text` or raw string SQL, ``"function"`` for SQL
+    functions, and ``"ddl"`` for DDL constructs.
+
+    .. seealso::
+
+        :meth:`_engine.Connection.read_only_scope`
+
+    .. versionadded:: 2.1
+
+    """
+
+    reason: Optional[str] = None
+    statement: Any = None
+    """the statement object or SQL string that was refused."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: Optional[str] = None,
+        statement: Any = None,
+    ):
+        super().__init__(message)
+        self.reason = reason
+        self.statement = statement
+
+
 class NoSuchColumnError(InvalidRequestError, KeyError):
     """A nonexistent column is requested from a ``Row``."""
 

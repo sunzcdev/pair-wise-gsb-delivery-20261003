@@ -95,6 +95,164 @@ if typing.TYPE_CHECKING:
 
 _CE = TypeVar("_CE", bound="ColumnElement[Any]")
 
+#: reason codes produced by :func:`_sql_util.read_only_statement_reason`.
+READ_ONLY_REASON_DML = "dml"
+READ_ONLY_REASON_DDL = "ddl"
+READ_ONLY_REASON_TEXTUAL = "textual"
+READ_ONLY_REASON_FUNCTION = "function"
+READ_ONLY_REASON_DEFAULT = "default"
+READ_ONLY_REASON_SAVEPOINT = "savepoint"
+READ_ONLY_REASON_EXPRESSION = "expression"
+READ_ONLY_REASON_LOCKING = "locking"
+
+
+def read_only_statement_reason(statement: Any) -> Optional[str]:
+    """Determine whether *statement* is a statement Core can confirm is
+    read-only.
+
+    Returns ``None`` when the statement may be safely admitted under a
+    read-only participation scope.  Otherwise a short reason code is
+    returned describing why the statement cannot be confirmed as read-only.
+
+    The rules are deliberately conservative; Core only admits statements it
+    can positively identify as reading data:
+
+    * :class:`_expression.Select`, :class:`_expression.CompoundSelect` and
+      :class:`_expression.TextualSelect` are admitted, provided their
+      complete expression tree is free of DML, DDL and untrusted textual or
+      function constructs.  This includes the ``RETURNING`` clauses of
+      otherwise read-only selects as well as CTEs, for which the "write" form
+      of the CTE (which embeds an INSERT/UPDATE/DELETE) is detected.
+    * :class:`_expression.TextClause` and plain string SQL are never
+      admitted; Core cannot determine their side effects.
+    * :class:`_expression.FunctionElement` is never admitted as a top-level
+      statement because a SQL function may have arbitrary side effects.
+    * DML (:class:`_expression.UpdateBase`) and DDL
+      (:class:`._schema.ExecutableDDLElement`) are rejected outright.
+    * Any other :class:`_expression.Executable` construct, and any object
+      Core cannot positively classify, is rejected.
+
+    The check walks the full expression tree using the public visitor
+    iteration, so constructs that merely *contain* read-only sub-expressions
+    (such as a scalar subquery) are judged by their complete contents.
+
+    .. versionadded:: 2.1
+
+    """
+    if statement is None:
+        return READ_ONLY_REASON_EXPRESSION
+
+    if isinstance(statement, str):
+        return READ_ONLY_REASON_TEXTUAL
+
+    if not isinstance(statement, ClauseElement):
+        return READ_ONLY_REASON_EXPRESSION
+
+    getattr_ = getattr
+
+    # DDL / DML at the top level is a definite write
+    if _is_ddl_element(statement):
+        return READ_ONLY_REASON_DDL
+
+    if getattr_(statement, "is_dml", False):
+        return READ_ONLY_REASON_DML
+
+    if getattr_(statement, "_is_default_generator", False):
+        return READ_ONLY_REASON_DEFAULT
+
+    if getattr_(statement, "_is_text_clause", False):
+        return READ_ONLY_REASON_TEXTUAL
+
+    if _is_function_element(statement):
+        return READ_ONLY_REASON_FUNCTION
+
+    if _is_savepoint_clause(statement):
+        return READ_ONLY_REASON_SAVEPOINT
+
+    if getattr_(statement, "is_select", False):
+        return _read_only_select_reason(statement)
+
+    # a LambdaElement proxies an inner expression; judge the resolved form
+    if getattr_(statement, "_is_lambda_element", False):
+        resolved = getattr_(statement, "_resolved", None)
+        if resolved is not None and resolved is not statement:
+            return read_only_statement_reason(resolved)
+
+    if getattr_(statement, "_is_column_element", False) and not getattr_(
+        statement, "supports_execution", False
+    ):
+        # a bare SQL expression is not itself a statement
+        return READ_ONLY_REASON_EXPRESSION
+
+    return READ_ONLY_REASON_EXPRESSION
+
+
+def _is_ddl_element(statement: Any) -> bool:
+    # local import to avoid a circular import between sql.util and sql.ddl
+    from .ddl import BaseDDLElement
+
+    return isinstance(statement, BaseDDLElement)
+
+
+def _is_function_element(statement: Any) -> bool:
+    from .functions import FunctionElement
+
+    return isinstance(statement, FunctionElement)
+
+
+def _is_savepoint_clause(statement: Any) -> bool:
+    from .elements import _IdentifiedClause
+
+    return isinstance(statement, _IdentifiedClause)
+
+
+def _read_only_select_reason(statement: Any) -> Optional[str]:
+    from .selectable import ForUpdateArg
+    from .selectable import Select
+    from .selectable import SelectBase
+    from .visitors import iterate
+
+    # a LOCK clause (SELECT .. FOR UPDATE / FOR SHARE) is not read-only.  This
+    # is taken from the top-level SELECT only; the ``ForUpdateArg`` node is
+    # not traversed as a generic element but its presence alone is decisive.
+    if isinstance(statement, SelectBase) and getattr(
+        statement, "_for_update_arg", None
+    ) is not None:
+        arg = statement._for_update_arg
+        assert isinstance(arg, ForUpdateArg)
+        return READ_ONLY_REASON_LOCKING
+
+    if isinstance(statement, Select) and (
+        statement._prefixes or statement._suffixes
+    ):
+        # prefix/suffix text is free-form SQL that Core does not interpret,
+        # e.g. ``prefix_with("FOR UPDATE")``.  refusals are conservative.
+        return READ_ONLY_REASON_TEXTUAL
+
+    for element in iterate(statement):
+        if _is_ddl_element(element):
+            return READ_ONLY_REASON_DDL
+
+        if getattr(element, "is_dml", False):
+            return READ_ONLY_REASON_DML
+
+        if getattr(element, "_is_default_generator", False):
+            return READ_ONLY_REASON_DEFAULT
+
+        if getattr(element, "_is_text_clause", False):
+            return READ_ONLY_REASON_TEXTUAL
+
+        if _is_function_element(element):
+            return READ_ONLY_REASON_FUNCTION
+
+        if _is_savepoint_clause(element):
+            return READ_ONLY_REASON_SAVEPOINT
+
+        if getattr(element, "_for_update_arg", None) is not None:
+            return READ_ONLY_REASON_LOCKING
+
+    return None
+
 
 def join_condition(
     a: FromClause,
