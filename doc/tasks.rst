@@ -331,6 +331,16 @@ There is no predefined range of priorities,
 you can choose whatever (int or float) values you want to use.
 The default value is 0.
 
+A task can inherit a higher priority from the tasks that depend on it.
+If one task requires another one, the dependency becomes as important as the
+most important task requiring it, so that a shared, not yet finished dependency
+is queued in time when one of its consumers has a high priority.
+This inherited priority is recomputed whenever the dependency graph changes:
+as soon as the high priority consumer is cancelled or pruned, or its dynamic
+dependencies stop including the shared dependency, the priority of the shared
+dependency falls back to the highest priority still supported by the consumers
+that remain. The priority explicitly set on a task is never lowered this way.
+
 Warning: task execution order in Luigi is influenced by both dependencies and priorities, but
 in Luigi dependencies come first.
 For example:

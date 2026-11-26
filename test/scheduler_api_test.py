@@ -1736,6 +1736,131 @@ class SchedulerApiTest(unittest.TestCase):
         task_info = self.sch.task_list(PENDING, "")["A"]
         self.assertEqual(task_info["priority"], 10)
 
+    def _priority_of(self, task_id):
+        return self.sch._state.get_task(task_id).priority
+
+    def _explicit_priority_of(self, task_id):
+        return self.sch._state.get_task(task_id).explicit_priority
+
+    def test_shared_dependency_gets_priority_of_most_important_parent(self):
+        # S is a shared, not yet finished dependency of a high and a low priority
+        # parent; it must be queued early because of the high priority parent.
+        self.sch.add_task(worker=WORKER, task_id="S", priority=0)
+        self.sch.add_task(worker=WORKER, task_id="LO", priority=1, deps=["S"])
+        self.sch.add_task(worker=WORKER, task_id="HI", priority=10, deps=["S"])
+        self.sch.add_task(worker=WORKER, task_id="MID", priority=5)
+
+        self.assertEqual(10, self._priority_of("S"))
+        self.assertEqual("S", self.sch.get_work(worker=WORKER)["task_id"])
+
+    def test_shared_dependency_falls_back_when_high_priority_parent_pruned(self):
+        self.sch.add_task(worker=WORKER, task_id="S", priority=0)
+        self.sch.add_task(worker=WORKER, task_id="LO", priority=1, deps=["S"])
+        self.sch.add_task(worker=WORKER, task_id="HI", priority=10, deps=["S"])
+        self.sch.add_task(worker=WORKER, task_id="MID", priority=5)
+
+        # Candidate query before the high priority parent is withdrawn.
+        self.assertEqual(10, self._priority_of("S"))
+        self.assertEqual("S", self.sch.get_work(worker=WORKER)["task_id"])
+
+        # The high priority parent disappears without ever running. Its priority
+        # must no longer be inherited by S, which falls back to the remaining
+        # low priority parent and therefore loses to the independent MID task.
+        self.sch._state.inactivate_tasks(["HI"])
+
+        self.assertEqual(1, self._priority_of("S"))
+        self.assertEqual("MID", self.sch.get_work(worker=WORKER)["task_id"])
+
+    def test_shared_dependency_falls_back_when_high_priority_parent_drops_dep(self):
+        self.sch.add_task(worker=WORKER, task_id="S", priority=0)
+        self.sch.add_task(worker=WORKER, task_id="OTHER", priority=0)
+        self.sch.add_task(worker=WORKER, task_id="LO", priority=1, deps=["S"])
+        self.sch.add_task(worker=WORKER, task_id="HI", priority=10, deps=["S"])
+        self.sch.add_task(worker=WORKER, task_id="MID", priority=5)
+
+        self.assertEqual(10, self._priority_of("S"))
+
+        # Dynamic dependencies of the high priority parent change; S is no longer
+        # required by it whatsoever.
+        self.sch.add_task(worker=WORKER, task_id="HI", deps=["OTHER"])
+
+        self.assertEqual(1, self._priority_of("S"))
+        self.assertEqual(10, self._priority_of("OTHER"))
+        # The initial explicit priority of S is untouched.
+        self.assertEqual(0, self._explicit_priority_of("S"))
+        # The scheduling order follows the real dependency graph: OTHER (now the
+        # high priority one) first, then the independent MID, then S which only
+        # retains its low priority parent.
+        self.assertEqual("OTHER", self.sch.get_work(worker=WORKER)["task_id"])
+        self.assertEqual("MID", self.sch.get_work(worker=WORKER)["task_id"])
+        self.assertEqual("S", self.sch.get_work(worker=WORKER)["task_id"])
+
+    def test_shared_dependency_still_waits_for_other_parent(self):
+        # Removing the high priority parent must not make the shared dependency
+        # runnable while the other parent (LO) still depends on it, and LO must
+        # still wait for the shared dependency.
+        self.sch.add_task(worker=WORKER, task_id="S", priority=0)
+        self.sch.add_task(worker=WORKER, task_id="LO", priority=1, deps=["S"])
+        self.sch.add_task(worker=WORKER, task_id="HI", priority=10, deps=["S"])
+
+        self.assertEqual(10, self._priority_of("S"))
+        self.assertEqual("S", self.sch.get_work(worker=WORKER)["task_id"])
+
+        # HI is withdrawn while S is running; LO keeps the dependency.
+        self.sch._state.inactivate_tasks(["HI"])
+        self.assertEqual(["S"], list(self.sch.task_list(RUNNING, "").keys()))
+        self.assertIsNone(self.sch.get_work(worker=WORKER)["task_id"])  # LO still blocked
+
+        self.sch.add_task(worker=WORKER, task_id="S", status=DONE)
+        self.assertEqual("LO", self.sch.get_work(worker=WORKER)["task_id"])
+
+    def test_explicit_priority_never_lowered_by_falling_back(self):
+        self.sch.add_task(worker=WORKER, task_id="S", priority=10)
+        self.sch.add_task(worker=WORKER, task_id="HI", priority=1, deps=["S"])
+        self.assertEqual(10, self._priority_of("S"))
+
+        # HI goes away; S keeps its own explicit priority.
+        self.sch._state.inactivate_tasks(["HI"])
+        self.assertEqual(10, self._priority_of("S"))
+        self.assertEqual(10, self._explicit_priority_of("S"))
+
+    def test_shared_dependency_falls_back_when_high_priority_parent_is_pruned(self):
+        # Same scenario as above, but going through the regular pruning cycle
+        # instead of inactivating the task directly.
+        self.setTime(0)
+        self.sch.add_task(worker=WORKER, task_id="S", priority=0)
+        self.sch.add_task(worker=WORKER, task_id="LO", priority=1, deps=["S"])
+        self.sch.add_task(worker="other_worker", task_id="HI", priority=10, deps=["S"])
+        self.sch.add_task(worker=WORKER, task_id="MID", priority=5)
+
+        # Candidate query before the high priority parent is pruned.
+        self.assertEqual(10, self._priority_of("S"))
+
+        # The worker running HI goes away and, after the remove delay, HI is
+        # pruned without ever having run.
+        remove_delay = self.get_scheduler_config()["remove_delay"] + 1.0
+        self.setTime(remove_delay)
+        self.sch.ping(worker=WORKER)
+        self.sch.prune()
+        self.setTime(2 * remove_delay)
+        self.sch.ping(worker=WORKER)
+        self.sch.prune()
+
+        self.assertFalse(self.sch._state.has_task("HI"))
+        self.assertEqual(1, self._priority_of("S"))
+        self.assertEqual("MID", self.sch.get_work(worker=WORKER)["task_id"])
+
+    def test_placeholder_dependency_does_not_keep_priority(self):
+        # When a dependency is not known yet the scheduler creates a placeholder
+        # for it. That placeholder must not freeze the inherited priority once
+        # the real task shows up with its own explicit priority.
+        self.sch.add_task(worker=WORKER, task_id="A", priority=5, deps=["S"])
+        self.assertEqual(UNKNOWN, self.sch._state.get_task("S").status)
+
+        self.sch.add_task(worker=WORKER, task_id="S", priority=0)
+        self.assertEqual(5, self._priority_of("S"))
+        self.assertEqual(0, self._explicit_priority_of("S"))
+
     def test_unique_tasks(self):
         self.sch.add_task(worker=WORKER, task_id="A")
         self.sch.add_task(worker=WORKER, task_id="B")

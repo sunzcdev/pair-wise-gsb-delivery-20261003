@@ -260,6 +260,13 @@ class Task:
         self.time_running = None  # Timestamp when picked up by worker
         self.expl = None
         self.priority = priority
+        # The priority explicitly reported for this task by a worker. It is
+        # never lowered, and it acts as a floor for the effective priority that
+        # the task may additionally inherit from its dependents. The reported
+        # priority from the constructor is applied as a regular update by the
+        # scheduler (see ``Scheduler.add_task``), so that dependencies inherit
+        # it as well; here it only serves as the initial floor.
+        self.explicit_priority = self.DEFAULT_PRIORITY
         self.resources = _get_default(resources, {})
         self.family = family
         self.module = module
@@ -442,6 +449,10 @@ class SimpleTaskState:
         self._active_workers = {}  # map from id to a Worker object
         self._task_batchers = {}
         self._metrics_collector = None
+        # Reverse dependency index: maps a task id to the ids of the active tasks
+        # that list it as a dependency, so inherited priorities can be recomputed
+        # when a dependent goes away or stops depending on a task.
+        self._dependents = collections.defaultdict(set)
 
     def get_state(self):
         return self._tasks, self._active_workers, self._task_batchers
@@ -450,6 +461,17 @@ class SimpleTaskState:
         self._tasks, self._active_workers = state[:2]
         if len(state) >= 3:
             self._task_batchers = state[2]
+        self._dependents = collections.defaultdict(set)
+        for task in self._tasks.values():
+            # Normalize tasks persisted by versions that did not track explicit
+            # priorities separately, so that later rebuilds can lower the
+            # inherited part of their priority again.
+            if not hasattr(task, "explicit_priority"):
+                task.explicit_priority = self._explicit_priority(task)
+            self._register_deps(task)
+        # Effective priorities are derived state; rebuild them from the explicit
+        # priorities and the dependency edges that were persisted.
+        self.rebuild_priorities()
 
     def dump(self):
         try:
@@ -509,8 +531,11 @@ class SimpleTaskState:
 
     def get_task(self, task_id, default=None, setdefault=None):
         if setdefault:
-            task = self._tasks.setdefault(task_id, setdefault)
-            self._status_tasks[task.status][task.id] = task
+            task = self._tasks.get(task_id)
+            if task is None:
+                task = self._tasks.setdefault(task_id, setdefault)
+                self._status_tasks[task.status][task.id] = task
+                self._register_deps(task)
             return task
         else:
             return self._tasks.get(task_id, default)
@@ -622,9 +647,189 @@ class SimpleTaskState:
         # The terminology is a bit confusing: we used to "delete" tasks when they became inactive,
         # but with a pluggable state storage, you might very well want to keep some history of
         # older tasks as well. That's why we call it "inactivate" (as in the verb)
+        # Returns the removed task objects so callers can react to edges that disappeared.
+        inactivated = []
+        former_deps = []
         for task in delete_tasks:
             task_obj = self._tasks.pop(task)
             self._status_tasks[task_obj.status].pop(task)
+            self._unregister_deps(task_obj)
+            inactivated.append(task_obj)
+            former_deps.extend(task_obj.deps)
+        if inactivated:
+            # Tasks that disappeared can no longer lift the priority of their
+            # dependencies, so their (former) dependencies need to fall back to
+            # whatever priority the remaining dependents (if any) still require.
+            self.recompute_priority_down(former_deps)
+        return inactivated
+
+    def _register_deps(self, task):
+        for dep in task.deps:
+            self._dependents[dep].add(task.id)
+
+    def _unregister_deps(self, task):
+        for dep in task.deps:
+            dependents = self._dependents.get(dep)
+            if dependents is not None:
+                dependents.discard(task.id)
+                if not dependents:
+                    del self._dependents[dep]
+
+    def set_deps(self, task, deps):
+        """
+        Replace the dependency set of a task, keeping the reverse index in sync.
+        """
+        self._unregister_deps(task)
+        task.deps = set(deps)
+        self._register_deps(task)
+
+    def add_deps(self, task, new_deps):
+        """
+        Add dependencies to a task, keeping the reverse index in sync.
+        """
+        task.deps.update(new_deps)
+        self._register_deps(task)
+
+    def get_dependents(self, task_id):
+        """
+        Return the ids of the active tasks that depend on the given task.
+        """
+        return self._dependents.get(task_id, set())
+
+    @staticmethod
+    def _explicit_priority(task):
+        explicit = getattr(task, "explicit_priority", None)
+        if isinstance(explicit, (int, float)):
+            return explicit
+        # Backwards compatibility with state pickled before explicit priorities
+        # were tracked separately: whatever priority the task had becomes its floor.
+        priority = getattr(task, "priority", Task.DEFAULT_PRIORITY)
+        return priority if isinstance(priority, (int, float)) else Task.DEFAULT_PRIORITY
+
+    def _local_priority(self, task_id):
+        """
+        Effective priority of a single task, given up-to-date priorities of its dependents.
+
+        This is O(1) in the depth of the graph (only the direct dependents are
+        consulted), which keeps the common scheduler heartbeat path cheap.
+        """
+        task = self._tasks.get(task_id)
+        if task is None:
+            return Task.DEFAULT_PRIORITY
+        prio = self._explicit_priority(task)
+        for dependent_id in self._dependents.get(task_id, ()):
+            dependent = self._tasks.get(dependent_id)
+            if dependent is not None and dependent.priority > prio:
+                prio = dependent.priority
+        return prio
+
+    def _compute_priority(self, task_id, memo):
+        """
+        Compute the effective priority of a task (and of its dependents), memoizing results.
+
+        The effective priority of a task is the maximum of its own explicit
+        priority and the effective priorities of the tasks depending on it. This
+        way a dependency is scheduled with the priority of the most important
+        task requiring it, but falls back as soon as that dependent goes away,
+        is pruned or stops depending on it. The explicit priority itself is
+        never lowered.
+
+        The traversal is iterative (an explicit stack of ``(task_id, expanded)``
+        frames) so long dependency chains can't exhaust the recursion limit.
+        Dependency cycles are tolerated by simply ignoring the back edges.
+        """
+        if task_id in memo:
+            return memo[task_id]
+        stack = [(task_id, False)]
+        on_path = set()
+        while stack:
+            node_id, expanded = stack.pop()
+            if node_id in memo:
+                continue
+            if expanded:
+                on_path.discard(node_id)
+                task = self._tasks.get(node_id)
+                prio = self._explicit_priority(task) if task is not None else Task.DEFAULT_PRIORITY
+                # Back edges to tasks still being expanded (cycles) are ignored.
+                for dependent_id in self._dependents.get(node_id, ()):
+                    if dependent_id in memo:
+                        prio = max(prio, memo[dependent_id])
+                if task is not None:
+                    task.priority = prio
+                memo[node_id] = prio
+            else:
+                on_path.add(node_id)
+                stack.append((node_id, True))
+                for dependent_id in self._dependents.get(node_id, ()):
+                    if dependent_id not in memo and dependent_id not in on_path:
+                        stack.append((dependent_id, False))
+        return memo.get(task_id, Task.DEFAULT_PRIORITY)
+
+    def recompute_priority_down(self, task_ids):
+        """
+        Recompute effective priorities for the given tasks, cascading down through dependencies.
+
+        The cascade only continues into a task's dependencies when that task's
+        effective priority actually changed, so calling this repeatedly (which
+        happens on every scheduler heartbeat) stays cheap. Because dependents
+        always hold up-to-date priorities, one level of comparison per task is
+        enough; there is no need to walk back up the graph.
+        """
+        seen = set()
+        stack = list(task_ids)
+        while stack:
+            task_id = stack.pop()
+            if task_id in seen:
+                continue
+            seen.add(task_id)
+            task = self._tasks.get(task_id)
+            if task is None:
+                continue
+            old_priority = task.priority
+            task.priority = self._local_priority(task_id)
+            if task.priority != old_priority:
+                stack.extend(task.deps)
+
+    def rebuild_priorities(self):
+        """
+        Recompute the effective priority of every known task from scratch.
+
+        Used after loading persisted state, where the effective priorities are
+        not stored (they are derived from the explicit priorities and the
+        dependency edges).
+        """
+        memo = {}
+        for task_id in list(self._tasks):
+            self._compute_priority(task_id, memo)
+
+    def update_explicit_priority(self, task, priority):
+        """
+        Raise the explicit priority of a task and propagate the result downstream.
+
+        The priority a worker reports can only increase a task's explicit
+        priority; the effective priority may later decrease again when the tasks
+        that lifted it disappear or stop depending on it (see
+        :meth:`recompute_priority_down`).
+        """
+        if not isinstance(priority, (int, float)):
+            return task.priority
+        explicit_raised = priority > self._explicit_priority(task)
+        if explicit_raised:
+            task.explicit_priority = priority
+        # The inherited part of a task's priority is already up to date (it is
+        # maintained by the downward propagation), so its effective priority can
+        # be computed locally in O(1). This has to happen even when the explicit
+        # priority did not change, because the task may just have materialized
+        # from a placeholder and never been recomputed before.
+        old_priority = task.priority
+        task.priority = self._local_priority(task.id)
+        if explicit_raised or task.priority != old_priority:
+            # A raised explicit priority has to be inherited by the dependencies
+            # even when it did not change this task's own effective priority.
+            # The cascade itself stays cheap: each dependency is only recomputed
+            # once and only recurses further when its priority actually changes.
+            self.recompute_priority_down(task.deps)
+        return task.priority
 
     def get_active_workers(self, last_active_lt=None, last_get_work_gt=None):
         for worker in self._active_workers.values():
@@ -760,15 +965,14 @@ class Scheduler:
         """
         Update priority of the given task.
 
-        Priority can only be increased.
-        If the task doesn't exist, a placeholder task is created to preserve priority when the task is later scheduled.
+        The priority a worker reports for a task is its explicit priority and can
+        only increase it. The effective priority (``task.priority``) used for
+        scheduling is the maximum of that explicit priority and the priorities
+        inherited from the tasks that depend on it. It is recomputed recursively
+        for all dependencies, so it can drop again when a high-priority dependent
+        disappears or no longer depends on a shared dependency.
         """
-        existing_priority = task.priority if isinstance(task.priority, (int, float)) else Task.DEFAULT_PRIORITY
-        task.priority = prio = max(prio, existing_priority)
-        for dep in task.deps or []:
-            t = self._state.get_task(dep)
-            if t is not None and prio > t.priority:
-                self._update_priority(t, prio, worker)
+        self._state.update_explicit_priority(task, prio)
 
     @rpc_method()
     def add_task_batcher(self, worker, task_family, batched_args, max_batch_size=float("inf")):
@@ -936,11 +1140,19 @@ class Scheduler:
             if task.status == DISABLED:
                 self._email_batcher.add_disable(task.pretty_id, task.family, unbatched_params, owners)
 
+        changed_deps = set()
         if deps is not None:
-            task.deps = set(deps)
+            # Replacing the dependency list may add or remove edges. Added ones
+            # have to inherit this task's priority; removed ones have to fall
+            # back to whatever their remaining dependents still require. Both
+            # are handled once this task's own priority is known.
+            old_deps = set(task.deps)
+            self._state.set_deps(task, deps)
+            changed_deps |= old_deps ^ task.deps
 
         if new_deps is not None:
-            task.deps.update(new_deps)
+            self._state.add_deps(task, new_deps)
+            changed_deps |= set(new_deps)
 
         if resources is not None:
             task.resources = resources
@@ -951,10 +1163,19 @@ class Scheduler:
             # Task dependencies might not exist yet. Let's create dummy tasks for them for now.
             # Otherwise the task dependencies might end up being pruned if scheduling takes a long time
             for dep in task.deps or []:
-                t = self._state.get_task(dep, setdefault=self._make_task(task_id=dep, status=UNKNOWN, deps=None, priority=priority))
+                t = self._state.get_task(dep, setdefault=self._make_task(task_id=dep, status=UNKNOWN, deps=None))
                 t.stakeholders.add(worker_id)
 
+        # Update this task's priority first, so that dependencies linked to it
+        # inherit the right value when they are recomputed right after. Note that
+        # the dependencies of unchanged tasks are not recomputed here: their
+        # inherited priority only changes when the edge set changes.
         self._update_priority(task, priority, worker_id)
+
+        if changed_deps:
+            # Dependencies that were added or dropped may inherit a different
+            # priority now; recompute them (and their own dependencies).
+            self._state.recompute_priority_down(changed_deps)
 
         # Because some tasks (non-dynamic dependencies) are `_make_task`ed
         # before we know their retry_policy, we always set it here
