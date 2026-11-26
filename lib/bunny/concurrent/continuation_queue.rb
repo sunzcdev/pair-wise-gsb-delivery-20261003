@@ -36,7 +36,7 @@ module Bunny
             if wait
               ended_at = Bunny::Timestamp.monotonic
               elapsed = ended_at - started_at
-              raise ::Timeout::Error if (elapsed > timeout_in_sec)
+              raise Bunny::ClientTimeout, "continuation timed out" if (elapsed > timeout_in_sec)
             end
           end
           item = @q.shift
@@ -47,6 +47,14 @@ module Bunny
       def clear
         @lock.synchronize do
           @q.clear
+        end
+      end
+
+      def drain
+        @lock.synchronize do
+          items = @q.dup
+          @q.clear
+          items
         end
       end
 

@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "set"
+require "monitor"
 
 require "bunny/concurrent/atomic_fixnum"
 require "bunny/consumer_work_pool"
@@ -221,6 +222,10 @@ module Bunny
       @per_message_continuations = {}
       @per_message_continuations_mutex = @connection.mutex_impl.new
       @outstanding_limit_cond = nil
+
+      @queue_declare_mutex = Monitor.new
+      @queue_declare_attempts = []
+      @late_queue_declare_oks = new_continuation
 
       self.reset_continuations
 
@@ -1379,7 +1384,6 @@ module Bunny
       # just like RabbitMQ does
       safe_name = name.gsub(/[\r\n]/, "")
       is_server_named = (safe_name == AMQ::Protocol::EMPTY_STRING)
-      @pending_queue_declare_name = safe_name
 
       passive = opts.fetch(:passive, false)
       durable = opts.fetch(:durable, false)
@@ -1387,23 +1391,49 @@ module Bunny
       auto_delete = opts.fetch(:auto_delete, false)
       args = opts[:arguments]
 
-      @connection.send_frame(
-        AMQ::Protocol::Queue::Declare.encode(@id,
-          @pending_queue_declare_name,
-          passive,
-          durable,
-          exclusive,
-          auto_delete,
-          false,
-          args))
+      continuation = new_continuation
+      @queue_declare_mutex ||= Monitor.new
+      @queue_declare_attempts ||= []
+      attempt = {
+        name: safe_name,
+        server_named: is_server_named,
+        continuation: continuation,
+        expired: false
+      }
+
+      failed = false
+      sent = false
+
+      @queue_declare_mutex.synchronize do
+        @queue_declare_attempts << attempt
+        @pending_queue_declare_name = safe_name
+
+        @connection.send_frame(
+          AMQ::Protocol::Queue::Declare.encode(@id,
+            safe_name,
+            passive,
+            durable,
+            exclusive,
+            auto_delete,
+            false,
+            args))
+        sent = true
+      end
 
       begin
         with_continuation_timeout do
-          @last_queue_declare_ok = wait_on_continuations
+          @last_queue_declare_ok = wait_on_continuations(continuation)
         end
+        raise @last_queue_declare_ok if @last_queue_declare_ok.is_a?(::Exception)
+        if @last_queue_declare_ok == :network_error
+          raise Bunny::NetworkFailure.new("network failure interrupted queue.declare", nil)
+        end
+      rescue ::Exception
+        failed = true
+        raise
       ensure
-        # clear pending continuation context if it belongs to us
-        @pending_queue_declare_name = nil if @pending_queue_declare_name == safe_name
+        finish_queue_declaration_attempt(attempt, sent, failed)
+        refresh_pending_queue_declare_name
       end
       raise_if_continuation_resulted_in_a_channel_error!
 
@@ -2141,6 +2171,102 @@ module Bunny
         pending_server_named_queue_declaration?
     end
 
+    # Responses for declaration attempts whose call has already timed out are
+    # kept out of the shared continuation queue. This queue is the isolation
+    # boundary for those late, otherwise indistinguishable responses.
+    # @private
+    def late_queue_declare_oks
+      @late_queue_declare_oks ||= new_continuation
+    end
+
+    # @private
+    def handle_queue_declare_ok(method)
+      attempt = nil
+
+      synchronize_queue_declarations do
+        next unless @queue_declare_attempts
+
+        attempt = @queue_declare_attempts.shift
+        if attempt
+          latest = @queue_declare_attempts.last
+          @pending_queue_declare_name = latest ? latest[:name] : nil
+
+          if attempt[:expired]
+            late_queue_declare_oks.push(method)
+          else
+            attempt[:continuation].push(method)
+          end
+        end
+      end
+
+      if attempt
+        if attempt[:expired]
+          @logger.warn "Received a late queue.declare-ok response (#{method.queue}) for a timed-out declaration on channel #{@id}; isolated it from later declarations"
+        end
+        return
+      end
+
+      # Fallback for code that drives #handle_method without a registered
+      # declaration attempt.
+      if can_accept_queue_declare_ok?(method)
+        @continuations.push(method)
+      elsif !pending_server_named_queue_declaration?
+        @logger.warn "Received a queue.declare-ok response for a mismatching queue (#{method.queue} instead of #{@pending_queue_declare_name}) on channel #{@id}, possibly due to concurrent channel use or a timeout, ignoring it"
+      end
+    end
+
+    # @private
+    def finish_queue_declaration_attempt(attempt, sent, failed)
+      stranded = []
+
+      synchronize_queue_declarations do
+        if @queue_declare_attempts&.include?(attempt)
+          if sent && failed
+            attempt[:expired] = true
+          elsif failed
+            @queue_declare_attempts.delete(attempt)
+          end
+        elsif failed
+          stranded = drain_continuation(attempt[:continuation])
+        end
+      end
+
+      stranded.each { |method| late_queue_declare_oks.push(method) }
+    end
+
+    # @private
+    def drain_continuation(continuation)
+      return continuation.drain if continuation.respond_to?(:drain)
+
+      items = []
+      loop { items << continuation.pop(true) }
+    rescue ThreadError
+      items
+    end
+
+    # @private
+    def fail_queue_declaration_attempts(result)
+      synchronize_queue_declarations do
+        attempts = @queue_declare_attempts || []
+        @queue_declare_attempts = []
+        @pending_queue_declare_name = nil
+        attempts.each { |attempt| attempt[:continuation].push(result) }
+      end
+    end
+
+    # @private
+    def synchronize_queue_declarations(&block)
+      (@queue_declare_mutex ||= Monitor.new).synchronize(&block)
+    end
+
+    # @private
+    def refresh_pending_queue_declare_name
+      synchronize_queue_declarations do
+        latest = @queue_declare_attempts&.last
+        @pending_queue_declare_name = latest ? latest[:name] : nil
+      end
+    end
+
     # @private
     def send_basic_cancel_ok(consumer_tag)
       tag = consumer_tag.to_s
@@ -2155,17 +2281,7 @@ module Bunny
       @logger.debug { "Channel#handle_frame on channel #{@id}: #{method.inspect}" }
       case method
       when AMQ::Protocol::Queue::DeclareOk then
-        # safeguard against late arrivals of responses and
-        # so on, see ruby-amqp/bunny#558
-        if can_accept_queue_declare_ok?(method)
-          @continuations.push(method)
-        else
-          if !pending_server_named_queue_declaration?
-            # this response is for an outdated/overwritten
-            # queue.declare, drop it
-            @logger.warn "Received a queue.declare-ok response for a mismatching queue (#{method.queue} instead of #{@pending_queue_declare_name}) on channel #{@id}, possibly due to concurrent channel use or a timeout, ignoring it"
-          end
-        end
+        handle_queue_declare_ok(method)
       when AMQ::Protocol::Queue::DeleteOk then
         @continuations.push(method)
       when AMQ::Protocol::Queue::PurgeOk then
@@ -2242,6 +2358,7 @@ module Bunny
           Thread.new { @on_error.call(self, method) } if @on_error
         else
           @last_channel_error = instantiate_channel_level_exception(method)
+          fail_queue_declaration_attempts(@last_channel_error)
           @continuations.push(method)
         end
 
@@ -2353,20 +2470,24 @@ module Bunny
     end
 
     # @private
-    def wait_on_continuations
+    def wait_on_continuations(continuation = @continuations)
       if @connection.threaded
         t = Thread.current
         @threads_waiting_on_continuations << t
 
         begin
-          @continuations.poll(@connection.continuation_timeout)
+          if continuation.respond_to?(:poll)
+            continuation.poll(@connection.continuation_timeout)
+          else
+            continuation.pop
+          end
         ensure
           @threads_waiting_on_continuations.delete(t)
         end
       else
-        connection.reader_loop.run_once until @continuations.length > 0
+        connection.reader_loop.run_once until continuation.length > 0
 
-        @continuations.pop
+        continuation.pop
       end
     end
 
@@ -2734,6 +2855,11 @@ module Bunny
       @confirms_continuations  = new_continuation
       @basic_get_continuations = new_continuation
       @per_message_continuations_mutex.synchronize { @per_message_continuations.clear }
+
+      if instance_variable_defined?(:@queue_declare_mutex)
+        fail_queue_declaration_attempts(:network_error)
+        @late_queue_declare_oks&.clear
+      end
     end
 
     # @private

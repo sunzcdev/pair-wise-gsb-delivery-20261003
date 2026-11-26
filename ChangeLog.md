@@ -1,6 +1,10 @@
 ## Changes between Bunny 3.6.0 and 3.7.0 (in development)
 
-No changes yet.
+### Timed-out Server-named Queue Declarations Are Isolated
+
+A late `queue.declare-ok` for a server-named queue can no longer be consumed by a later declaration on the same channel.
+Declaration attempts now use isolated continuations and AMQP ordering to attribute responses, while distinguishable RPC replies such as `basic.qos-ok` continue to use the shared continuation queue.
+Late declaration responses are kept out of topology recording.
 
 
 ## Changes between Bunny 3.5.0 and 3.6.0 (Nov 9, 2026)
