@@ -1113,18 +1113,14 @@ module Bunny
 
     # @private
     def recover_topology_with(filter = nil)
-      exchanges = @topology_registry.filtered_exchanges.reject(&:predeclared?)
+      # Entity collections are fetched from the registry per stage rather than
+      # snapshotted once, so that bindings or consumers explicitly removed while
+      # recovery is in progress are not recovered.
+      exchanges = @topology_registry.filtered_exchanges.reject(&:predefined?)
       queues = @topology_registry.filtered_queues
-      queue_bindings = @topology_registry.filtered_queue_bindings
-      exchange_bindings = @topology_registry.filtered_exchange_bindings
-      consumers = @topology_registry.filtered_consumers
-
       if filter
         exchanges = exchanges.select(&filter)
         queues = queues.select(&filter)
-        queue_bindings = queue_bindings.select(&filter)
-        exchange_bindings = exchange_bindings.select(&filter)
-        consumers = consumers.select(&filter)
       end
 
       @logger.debug { "Will recover #{exchanges.size} exchange(s)" }
@@ -1145,6 +1141,13 @@ module Bunny
         end
       end
 
+      queue_bindings = @topology_registry.filtered_queue_bindings
+      exchange_bindings = @topology_registry.filtered_exchange_bindings
+      if filter
+        queue_bindings = queue_bindings.select(&filter)
+        exchange_bindings = exchange_bindings.select(&filter)
+      end
+
       @logger.debug { "Will recover #{queue_bindings.size + exchange_bindings.size} binding(s)" }
       queue_bindings.each do |b|
         begin
@@ -1161,6 +1164,9 @@ module Bunny
           @logger.error "Caught an exception while recovering a binding of exchange #{b.source}: #{e.inspect}"
         end
       end
+
+      consumers = @topology_registry.filtered_consumers
+      consumers = consumers.select(&filter) if filter
 
       @logger.debug { "Will recover #{consumers.size} consumer(s)" }
       consumers.each do |c|

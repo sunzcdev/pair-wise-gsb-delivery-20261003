@@ -1,6 +1,17 @@
 ## Changes between Bunny 3.6.0 and 3.7.0 (in development)
 
-No changes yet.
+### Bindings and Consumers Removed During Topology Recovery Are No Longer Restored
+
+When a server-named queue was re-declared after a connection loss, its recorded
+bindings were updated in place inside a `Set`. Because that changes their `#hash`,
+a `queue.unbind` (or `basic.cancel`) issued while recovery was still in progress no
+longer matched the recorded entry, so the binding or consumer was restored anyway.
+
+The binding set is now rebuilt after the queue rename, keeping `Set` membership
+lookups correct. Topology recovery also re-reads the registry per recovery stage
+instead of snapshotting it once, so bindings and consumers explicitly revoked after
+the new queue name was assigned are respected. Client-named queues keep their
+original name and behavior.
 
 
 ## Changes between Bunny 3.5.0 and 3.6.0 (Nov 9, 2026)

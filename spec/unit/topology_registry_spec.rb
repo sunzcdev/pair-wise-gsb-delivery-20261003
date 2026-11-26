@@ -485,4 +485,24 @@ describe Bunny::TopologyRegistry do
     expect(subject.queues.any? { |_, rq| rq.name == q2_name }).to be ==(false)
     expect(subject.queues.any? { |_, rq| rq.name == q2_new_name }).to be ==(true)
   end
+
+  it "keeps bindings removable after a server-named queue has been renamed" do
+    x_name = "bunny.topology_registry.x.fanout.rename"
+    old_name = "amq.gen.old"
+    new_name = "amq.gen.new"
+
+    subject.record_queue_with(ch, old_name, true, false, true, true, {})
+    subject.record_exchange_with(ch, x_name, :fanout, false, false, {})
+    subject.record_queue_binding_with(ch, x_name, old_name, "rk.kept", {})
+    subject.record_queue_binding_with(ch, x_name, old_name, "rk.dropped", {})
+
+    subject.record_queue_name_change(old_name, new_name)
+    expect(subject.queue_bindings.map(&:destination).uniq).to eq [new_name]
+
+    # the rename must not leave Set members in a stale hash bucket
+    subject.delete_recorded_queue_binding(ch, x_name, new_name, "rk.dropped", {})
+    expect(subject.queue_bindings.size).to eq(1)
+    expect(subject.queue_bindings.map(&:routing_key)).to eq ["rk.kept"]
+    expect(subject.queue_bindings.first.destination).to eq new_name
+  end
 end

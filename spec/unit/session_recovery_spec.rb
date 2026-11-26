@@ -144,6 +144,17 @@ describe Bunny::Session do
   end
 
   describe "#recover_topology" do
+    # A minimal stand-in for AMQ::Protocol::Queue::DeclareOk
+    declare_ok = Struct.new(:queue)
+
+    let(:channel) { double("channel") }
+
+    before do
+      allow(channel).to receive(:queue_bind_without_recording_topology)
+      allow(channel).to receive(:exchange_declare)
+      allow(channel).to receive(:maybe_reinitialize_consumer_pool!)
+    end
+
     it "attempts to recover the remaining consumers when one of them fails" do
       session = new_session
       channel = double("channel")
@@ -159,6 +170,85 @@ describe Bunny::Session do
 
       expect { session.send(:recover_topology) }.not_to raise_error
       expect(recovered.sort).to eq %w[tag-1 tag-2]
+    end
+
+    it "rebuilds surviving bindings and consumers against the new server-assigned queue name" do
+      session = new_session
+
+      old_name = "amq.gen-old"
+      new_name = "amq.gen-new"
+      exchange = "bunny.recovery.x"
+
+      # a server-named queue with two bindings and two consumers
+      session.record_queue_with(channel, old_name, true, false, true, true, {})
+      session.record_exchange_with(channel, exchange, :fanout, false, false, {})
+      session.record_queue_binding_with(channel, exchange, old_name, "rk.kept", {})
+      session.record_queue_binding_with(channel, exchange, old_name, "rk.dropped", {})
+      session.record_consumer_with(channel, "tag.kept", old_name, proc {}, false, false, {})
+      session.record_consumer_with(channel, "tag.dropped", old_name, proc {}, false, false, {})
+
+      # the broker hands out a fresh name when the queue is re-declared
+      allow(channel).to receive(:queue_declare).and_return(declare_ok.new(new_name))
+      allow(channel).to receive(:record_queue_name_change)
+
+      # while the new name is known but the bindings/consumers have not been
+      # rebuilt yet, the business explicitly revokes one binding and one consumer
+      rebound = []
+      allow(session).to receive(:recover_queue_binding).and_wrap_original do |original, rb|
+        if rb.routing_key == "rk.kept"
+          session.delete_recorded_queue_binding(channel, exchange, new_name, "rk.dropped", {})
+          session.delete_recorded_consumer("tag.dropped")
+        end
+        rebound << rb
+        original.call(rb)
+      end
+
+      recovered_consumers = []
+      allow(session).to receive(:recover_consumer) do |rc|
+        recovered_consumers << rc
+      end
+
+      session.send(:recover_topology)
+
+      # only the still-registered binding survives, and it uses the new name
+      expect(rebound.map(&:routing_key)).to eq ["rk.kept"]
+      expect(rebound.first.destination).to eq new_name
+
+      # the cancelled subscription is not recovered either
+      expect(recovered_consumers.map(&:consumer_tag)).to eq ["tag.kept"]
+      expect(recovered_consumers.first.queue_name).to eq new_name
+
+      # the registry itself reflects the rename and the two removals
+      expect(session.topology_registry.queues.keys).to eq [new_name]
+      expect(session.topology_registry.queue_bindings.map(&:destination)).to eq [new_name]
+      expect(session.topology_registry.consumers.keys).to eq ["tag.kept"]
+    end
+
+    it "keeps the original name for client-named queues" do
+      session = new_session
+
+      name = "bunny.recovery.client-named"
+      exchange = "bunny.recovery.x2"
+
+      session.record_queue_with(channel, name, false, true, false, false, {})
+      session.record_exchange_with(channel, exchange, :fanout, true, false, {})
+      session.record_queue_binding_with(channel, exchange, name, "#", {})
+
+      # a client-named queue is re-declared under the very same name
+      allow(channel).to receive(:queue_declare).and_return(declare_ok.new(name))
+      allow(channel).to receive(:record_queue_name_change)
+
+      rebound = []
+      allow(session).to receive(:recover_queue_binding) do |rb|
+        rebound << rb
+      end
+
+      session.send(:recover_topology)
+
+      expect(rebound.size).to eq 1
+      expect(rebound.first.destination).to eq name
+      expect(session.topology_registry.queues.keys).to eq [name]
+      expect(channel).not_to have_received(:record_queue_name_change)
     end
   end
 end

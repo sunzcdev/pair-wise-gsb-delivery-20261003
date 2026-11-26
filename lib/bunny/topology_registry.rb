@@ -348,6 +348,9 @@ module Bunny
         @queue_bindings.each do |rb|
           rb.update_destination_to(new_name) if rb.destination == old_name
         end
+        # Mutating a Set member changes its #hash, so the set has to be rebuilt
+        # or lookups (e.g. a queue.unbind recorded during recovery) would miss it
+        @queue_bindings = Set.new(@queue_bindings)
       end
     end
 
