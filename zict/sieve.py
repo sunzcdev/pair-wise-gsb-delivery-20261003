@@ -112,6 +112,72 @@ class Sieve(ZictBase[KT, VT], Generic[KT, VT, MKT]):
                     if self.key_to_mapping.get(key) is not mapping:
                         discard(mapping, key)
 
+    def migrate(self) -> None:
+        """Move every key to the mapping picked by the current :attr:`selector`.
+
+        This is useful after swapping :attr:`selector` for a new distribution
+        rule: keys written before the change still live in the mappings chosen
+        by the old rule, while new writes already follow the new rule. This
+        method relocates the old keys so that every value ends up in the
+        mapping chosen by the current rule.
+
+        The migration is incremental and resumable:
+
+        - keys are moved one at a time and keys already in the right mapping
+          are skipped, so a call that fails partway through can simply be
+          retried; only the keys that still need migration are moved;
+        - if writing a key to its new mapping fails, the key is left untouched
+          in its original mapping, where it remains fully readable and
+          writable;
+        - if a key is overwritten or deleted by another thread while it is
+          being migrated, the concurrent write wins: the migration of that key
+          is aborted (to be retried later if still needed) and the value
+          written by the other thread is never reverted.
+
+        Raises
+        ------
+        Exception
+            If one or more keys could not be migrated, all remaining keys are
+            still attempted and the first exception encountered is re-raised
+            at the end.
+        """
+        first_exc: Exception | None = None
+        for key in list(self.key_to_mapping):
+            try:
+                self._migrate_key(key)
+            except Exception as exc:
+                if first_exc is None:
+                    first_exc = exc
+        if first_exc is not None:
+            raise first_exc
+
+    @locked
+    def _migrate_key(self, key: KT) -> None:
+        try:
+            old_mapping = self.key_to_mapping[key]
+        except KeyError:
+            return  # The key was deleted by another thread
+        value = old_mapping[key]
+        new_mapping = self.mappings[self.selector(key, value)]
+        if new_mapping is old_mapping:
+            return  # Already in the right mapping
+        self.gen += 1
+        gen = self.gen
+
+        with self.unlock():
+            new_mapping[key] = value
+
+        if self.gen != gen:
+            # The key was overwritten or deleted by another thread while we
+            # were copying it. The concurrent write wins: drop our stale copy
+            # (unless the key now points to the new mapping anyway) and leave
+            # the key unmigrated, so that the move can be retried later.
+            if self.key_to_mapping.get(key) is not new_mapping:
+                discard(new_mapping, key)
+            return
+        self.key_to_mapping[key] = new_mapping
+        discard(old_mapping, key)
+
     def __len__(self) -> int:
         return len(self.key_to_mapping)
 

@@ -6,6 +6,9 @@ Changelog
 ------------------
 - Dropped support for Python 3.8 (:pr:`106`) `Guido Imperiale`_
 - New object :class:`KeyMap` (:pr:`110`) `Guido Imperiale`_
+- New method :meth:`Sieve.migrate`, which relocates existing keys to the mappings
+  chosen by the current selector after the distribution rule changes. The migration
+  is incremental and resumable after failures.
 
 
 3.0.0 - 2023-04-17

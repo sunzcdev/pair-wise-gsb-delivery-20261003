@@ -198,6 +198,133 @@ def test_multithread_race_condition_set_set(
         assert z.key_to_mapping == {"x": z.mappings[2]}
 
 
+def test_migrate():
+    """Change the distribution rule and relocate existing keys"""
+    a = {}
+    b = {}
+    z = Sieve({0: a, 1: b}, lambda k, v: 0)
+    z["x"] = "foo"
+    z["y"] = "bar"
+    assert a == {"x": "foo", "y": "bar"}
+    assert b == {}
+
+    # Swap in a new distribution rule
+    z.selector = lambda k, v: 1
+
+    # New writes follow the new rule; unmigrated old values remain readable
+    # and stay owned by the old mapping until migrated
+    z["w"] = "new"
+    assert b == {"w": "new"}
+    assert z["x"] == "foo"
+    assert z["y"] == "bar"
+    assert len(z) == 3
+
+    z.migrate()
+    assert a == {}
+    assert b == {"x": "foo", "y": "bar", "w": "new"}
+    assert z["x"] == "foo"
+    assert z["y"] == "bar"
+    assert z.key_to_mapping == {"x": b, "y": b, "w": b}
+
+    # Idempotent: nothing left to move
+    z.migrate()
+    assert a == {}
+    assert b == {"x": "foo", "y": "bar", "w": "new"}
+
+
+def test_migrate_failure_resumable():
+    """A failed migration write leaves the key in place and can be retried"""
+
+    class Flaky(UserDict):
+        fail = True
+
+        def __setitem__(self, k, v):
+            if self.fail:
+                raise RuntimeError("boom")
+            super().__setitem__(k, v)
+
+    a = {}
+    b = Flaky()
+    z = Sieve({0: a, 1: b}, lambda k, v: 0)
+    z["x"] = "foo"
+    z["y"] = "bar"
+
+    z.selector = lambda k, v: 1
+    with pytest.raises(RuntimeError, match="boom"):
+        z.migrate()
+
+    # Failed keys are untouched and remain readable
+    assert a == {"x": "foo", "y": "bar"}
+    assert not b
+    assert z["x"] == "foo"
+
+    b.fail = False
+    # Overwriting a key follows the new rule immediately
+    z["x"] = "foo2"
+    assert a == {"y": "bar"}
+    assert b == {"x": "foo2"}
+
+    # Retry: only "y" still needs migration
+    z.migrate()
+    assert a == {}
+    assert b == {"x": "foo2", "y": "bar"}
+    assert z["x"] == "foo2"
+
+
+def test_migrate_concurrent_overwrite_and_failure():
+    """Pause the migration of the second key and inject a failure, while the
+    application overwrites the first key. On retry, only the keys that still
+    need migration are moved and the application-written value is preserved.
+    """
+    in_write = threading.Event()
+    release_write = threading.Event()
+
+    class Slow(UserDict):
+        def __setitem__(self, k, v):
+            if k == "y" and not release_write.is_set():
+                in_write.set()
+                assert release_write.wait(timeout=5)
+                raise RuntimeError("injected")
+            super().__setitem__(k, v)
+
+    a = {}
+    b = Slow()
+    z = Sieve({0: a, 1: b}, lambda k, v: 0)
+    z["x"] = "foo"
+    z["y"] = "bar"
+
+    # New distribution rule
+    z.selector = lambda k, v: 1
+    z["w"] = "new"  # Written straight to the new mapping
+
+    with ThreadPoolExecutor(1) as ex:
+        fut = ex.submit(z.migrate)
+        # "x" has been migrated; the migration of "y" is now paused
+        # halfway through the write to the new mapping
+        assert in_write.wait(timeout=5)
+        # The application overwrites the first key mid-migration
+        z["x"] = "foo2"
+        release_write.set()
+        with pytest.raises(RuntimeError, match="injected"):
+            fut.result()
+
+    # "y" failed to migrate and is still owned by the old mapping;
+    # the application write to "x" was not reverted
+    assert a == {"y": "bar"}
+    assert b == {"x": "foo2", "w": "new"}
+    assert z["x"] == "foo2"
+    assert z["y"] == "bar"
+    assert z.key_to_mapping == {"x": b, "y": a, "w": b}
+
+    # Retry: only "y" still needs migration; "x" keeps the value
+    # written by the application
+    z.migrate()
+    assert a == {}
+    assert b == {"x": "foo2", "y": "bar", "w": "new"}
+    assert z["x"] == "foo2"
+    assert z.key_to_mapping == {"x": b, "y": b, "w": b}
+
+
 @pytest.mark.stress
 @pytest.mark.repeat(utils_test.REPEAT_STRESS_TESTS)
 def test_stress_different_keys_threadsafe():
