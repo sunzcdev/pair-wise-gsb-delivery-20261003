@@ -770,6 +770,102 @@ class Scheduler:
             if t is not None and prio > t.priority:
                 self._update_priority(t, prio, worker)
 
+    def _find_dependency_path(self, start_task_id, target_task_id):
+        """
+        Return the shortest path ``start_task_id -> ... -> target_task_id``
+        following the ``deps`` edges of the dependency graph.
+
+        ``None`` is returned when the target is not reachable from the start.
+        Tasks which are not (yet) known to the scheduler cannot have outgoing
+        edges, so they simply end the traversal.
+        """
+        if start_task_id == target_task_id:
+            return [start_task_id]
+        if not self._state.has_task(start_task_id):
+            return None
+
+        queue = collections.deque([start_task_id])
+        previous = {start_task_id: None}
+
+        while queue:
+            current_id = queue.popleft()
+            current = self._state.get_task(current_id)
+            if current is None:
+                continue
+
+            # Sort the dependencies so that the reported path is deterministic
+            # and therefore easy to reproduce/debug.
+            for dep_id in sorted(current.deps):
+                if dep_id in previous:
+                    continue
+                previous[dep_id] = current_id
+
+                if dep_id == target_task_id:
+                    path = []
+                    node_id = dep_id
+                    while node_id is not None:
+                        path.append(node_id)
+                        node_id = previous[node_id]
+                    path.reverse()
+                    return path
+
+                queue.append(dep_id)
+
+        return None
+
+    def _find_dependency_cycle(self, task_id, new_deps):
+        """
+        Check whether adding the edges ``task_id -> dep`` for all ``new_deps``
+        would introduce a cycle into the dependency graph.
+
+        Adding several edges at once is all-or-nothing: as soon as one of the
+        new edges closes a cycle, the offending dependency together with a
+        locatable cycle path is returned. Otherwise ``None`` is returned.
+
+        A dependency which is merely shared with another task (a "diamond") is
+        not a cycle, and dependencies that are not known yet (for example an
+        :class:`luigi.ExternalTask` without output) cannot close a cycle.
+
+        :return: ``(dependency_id, cycle_path)`` or ``None``
+        """
+        for dep_id in new_deps or ():
+            path = self._find_dependency_path(dep_id, task_id)
+            if path is not None:
+                # ``path`` runs from the new dependency back to the task that
+                # is being updated. Prefixing it with the task makes the new
+                # (back) edge part of the returned cycle.
+                return dep_id, [task_id] + path
+        return None
+
+    def _reject_new_deps(self, task, task_id, new_deps, back_edge_dep, cycle):
+        """
+        Refuse a batch of dynamic dependencies without writing any of its edges.
+
+        The task is marked FAILED and the explanation carries the locatable
+        cycle path so that it can be inspected through ``fetch_error``.
+        """
+        cycle_path = " -> ".join(cycle)
+        message = "Dependency cycle detected, rejecting all {count} new dependencies of {task}: {path}".format(
+            count=len(new_deps), task=task_id, path=cycle_path
+        )
+        logger.warning(message)
+
+        task.expl = message
+        self._update_task_history(task, FAILED)
+        self._state.set_status(task, FAILED, self._config)
+
+        return {
+            "task_id": task_id,
+            "status": task.status,
+            "accepted": False,
+            "rejected": True,
+            "rejected_deps": list(new_deps),
+            "rejected_dep": back_edge_dep,
+            "cycle": cycle,
+            "cycle_path": cycle_path,
+            "message": message,
+        }
+
     @rpc_method()
     def add_task_batcher(self, worker, task_family, batched_args, max_batch_size=float("inf")):
         self._state.set_batcher(worker, task_family, batched_args, max_batch_size)
@@ -832,6 +928,11 @@ class Scheduler:
         * update status of task
         * add additional workers/stakeholders
         * update priority when needed
+
+        ``new_deps`` is applied all-or-nothing.  If any of the new edges would
+        close a dependency cycle, the complete batch is refused: the previous
+        dependencies are kept untouched and a response describing the reject
+        and the cycle path is returned.
         """
         assert worker is not None
         worker_id = worker
@@ -843,6 +944,41 @@ class Scheduler:
             retry_policy_dict = {}
 
         retry_policy = self._generate_retry_policy(retry_policy_dict)
+
+        # A dynamic dependency update is applied all-or-nothing: validate the
+        # complete batch of new edges before touching any state.  A single back
+        # edge rejects the whole group, leaving the previous dependencies (and
+        # every other scheduled task) exactly as they were.
+        pending_new_deps = list(new_deps or ())
+        if pending_new_deps:
+            cycle_info = self._find_dependency_cycle(task_id, pending_new_deps)
+            if cycle_info is not None:
+                back_edge_dep, cycle = cycle_info
+
+                # Record the rejection on the task itself.  It is created
+                # without any dependencies so the refused batch is not
+                # persisted through it either.
+                task = self._state.get_task(task_id)
+                if task is None and worker.enabled:
+                    task = self._make_task(
+                        task_id=task_id,
+                        status=PENDING,
+                        deps=None,
+                        resources=resources,
+                        priority=priority,
+                        family=family,
+                        module=module,
+                        params=params,
+                        param_visibilities=param_visibilities,
+                    )
+                    self._state.get_task(task_id, setdefault=task)
+
+                if task is not None:
+                    return self._reject_new_deps(task, task_id, pending_new_deps, back_edge_dep, cycle)
+
+                # Unknown task and a disabled worker: behave like regular
+                # scheduling and do not create any state.
+                return
 
         if worker.enabled:
             _default_task = self._make_task(

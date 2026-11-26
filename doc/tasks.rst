@@ -213,6 +213,16 @@ you should consider setting the "cache_task_completion" option in the :ref:`work
 To further control how dynamic task requirements are handled internally by worker nodes,
 there is also the option to wrap dependent tasks by :class:`~luigi.task.DynamicRequirements`.
 
+A single ``yield`` may declare several new dependencies at once (for example by
+yielding a list). That batch is applied atomically: if any of the new edges would
+close a dependency cycle, the whole update is refused instead of being partially
+written. The task is then marked as failed with an explanation that contains the
+offending dependency and the full cycle path (``A -> B -> A``), so it can be
+inspected through ``fetch_error`` and the scheduler UI. Pre-existing dependencies
+and other already queued tasks are left untouched, which makes it possible to fix
+the back edge and retry the same round. Sharing a dependency with another task
+(a "diamond") is not a cycle and keeps waiting for the shared task in the usual way.
+
 For an example of a workflow using dynamic dependencies, see
 `examples/dynamic_requirements.py <https://github.com/spotify/luigi/blob/master/examples/dynamic_requirements.py>`_.
 

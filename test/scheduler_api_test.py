@@ -111,6 +111,104 @@ class SchedulerApiTest(unittest.TestCase):
         self.sch.add_task(worker="Y", task_id="A", status=UNKNOWN)
         self.assertEqual({"A"}, set(self.sch.task_list(RUNNING, "").keys()))
 
+    def _deps(self, task_id):
+        """Dependency edges of a task, read through the public graph API."""
+        return set(self.sch.graph().get(task_id, {}).get("deps", ()))
+
+    def test_new_deps_shared_dependency_is_accepted(self):
+        # A diamond: P1 and P2 both depend on the same external dependency E.
+        # Sharing a dependency is not a cycle, so the dynamic update is kept.
+        self.sch.add_task(worker=WORKER, task_id="E", family="E", runnable=False)
+        self.sch.add_task(worker=WORKER, task_id="P1", family="P1", deps=("E",))
+        self.sch.add_task(worker=WORKER, task_id="P2", family="P2", deps=("E",))
+        self.sch.add_task(worker=WORKER, task_id="R", family="R", deps=("P1", "P2"))
+
+        response = self.sch.add_task(worker=WORKER, task_id="P1", family="P1", new_deps=["E"])
+        self.assertIsNone(response)
+        self.assertEqual({"E"}, self._deps("P1"))
+        self.assertEqual({"E"}, self._deps("P2"))
+
+        # The incomplete external task still makes both branches wait.
+        self.assertIsNone(self.sch.get_work(worker=WORKER)["task_id"])
+        self.sch.add_task(worker=WORKER, task_id="E", family="E", status=DONE)
+        self.assertIn(self.sch.get_work(worker=WORKER)["task_id"], ("P1", "P2"))
+
+    def test_new_deps_unknown_external_task_is_accepted(self):
+        # An ExternalTask without output has no scheduler presence yet, it can
+        # never close a cycle.
+        self.sch.add_task(worker=WORKER, task_id="P1", family="P1", deps=("E",))
+        response = self.sch.add_task(worker=WORKER, task_id="P1", family="P1", new_deps=["E2"])
+        self.assertIsNone(response)
+        self.assertEqual({"E", "E2"}, self._deps("P1"))
+
+    def test_new_deps_back_edge_rejects_whole_update(self):
+        # Diamond: R depends on P1 and P2, and both depend on the shared E.
+        # In its second round P1 yields a legal new task N followed by R, an
+        # edge back to its ancestor.  The batch contains a valid edge first but
+        # the whole update must be rejected because of the back edge.
+        self.sch.add_task(worker=WORKER, task_id="E", family="E", status=DONE)
+        self.sch.add_task(worker=WORKER, task_id="P1", family="P1", deps=("E",))
+        self.sch.add_task(worker=WORKER, task_id="P2", family="P2", deps=("E",))
+        self.sch.add_task(worker=WORKER, task_id="R", family="R", deps=("P1", "P2"))
+
+        response = self.sch.add_task(worker=WORKER, task_id="P1", family="P1", status=RUNNING, new_deps=["N", "R"])
+
+        self.assertIsNotNone(response)
+        self.assertTrue(response["rejected"])
+        self.assertFalse(response["accepted"])
+        self.assertEqual(["P1", "R", "P1"], response["cycle"])
+        self.assertEqual("P1 -> R -> P1", response["cycle_path"])
+        self.assertEqual("R", response["rejected_dep"])
+        self.assertIn("P1 -> R -> P1", response["message"])
+
+        # None of the new edges were written, the previous dependencies remain
+        # and the already reachable tasks of the diamond are untouched.
+        self.assertEqual({"E"}, self._deps("P1"))
+        self.assertFalse(self.sch.graph().get("N"))
+        self.assertEqual({"P1", "P2"}, self._deps("R"))
+        self.assertEqual({"E"}, self._deps("P2"))
+        self.assertEqual(DONE, self.sch.task_list("", "", False)["E"]["status"])
+        self.assertEqual(PENDING, self.sch.task_list("", "", False)["P2"]["status"])
+
+        # The violating task is failed with the locatable cause, the other
+        # branch of the diamond is still claimable.
+        self.assertEqual({"P1"}, set(self.sch.task_list(FAILED, "")))
+        self.assertIn("P1 -> R -> P1", self.sch.fetch_error("P1")["error"])
+        self.assertEqual("P2", self.sch.get_work(worker=WORKER)["task_id"])
+
+    def test_new_deps_self_back_edge_is_rejected(self):
+        # A single yield can contain a legal new dependency first and an edge
+        # pointing right back to the very task being updated last.
+        self.sch.add_task(worker=WORKER, task_id="E", family="E", status=DONE)
+        self.sch.add_task(worker=WORKER, task_id="P", family="P", deps=("E",))
+
+        response = self.sch.add_task(worker=WORKER, task_id="P", family="P", status=RUNNING, new_deps=["N", "P"])
+
+        self.assertTrue(response["rejected"])
+        self.assertEqual(["P", "P"], response["cycle"])
+        self.assertEqual("P -> P", response["cycle_path"])
+        self.assertEqual("P", response["rejected_dep"])
+        self.assertEqual({"E"}, self._deps("P"))
+        self.assertFalse(self.sch.graph().get("N"))
+        self.assertEqual(FAILED, self.sch.task_list(FAILED, "")["P"]["status"])
+
+    def test_new_deps_after_fixing_the_back_edge(self):
+        # Retrying the same round with the offending edge removed adds the
+        # legal new dependency exactly once.
+        self.sch.add_task(worker=WORKER, task_id="E", family="E", status=DONE)
+        self.sch.add_task(worker=WORKER, task_id="P1", family="P1", deps=("E",))
+        self.sch.add_task(worker=WORKER, task_id="R", family="R", deps=("P1",))
+
+        self.sch.add_task(worker=WORKER, task_id="P1", family="P1", status=RUNNING, new_deps=["N", "R"])
+        self.assertEqual({"E"}, self._deps("P1"))
+        self.assertFalse(self.sch.graph().get("N"))
+
+        response = self.sch.add_task(worker=WORKER, task_id="P1", family="P1", status=PENDING, new_deps=["N"])
+        self.assertIsNone(response)
+        self.assertEqual({"E", "N"}, self._deps("P1"))
+        self.assertTrue(self.sch.graph().get("N"))
+        self.assertEqual(1, len([t for t in self.sch.graph().keys() if t == "N"]))
+
     def test_retry(self):
         # Try to build A but fails, will retry after 100s
         self.setTime(0)

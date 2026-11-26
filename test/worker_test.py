@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+import collections
 import email.parser
 import functools
 import logging
@@ -37,6 +38,7 @@ from luigi.cmdline import luigi_run
 from luigi.mock import MockFileSystem, MockTarget
 from luigi.rpc import RPCError
 from luigi.scheduler import Scheduler
+from luigi.task_status import FAILED
 from luigi.worker import Worker
 
 luigi.notifications.DEBUG = True
@@ -142,6 +144,89 @@ class DummyErrorTask(Task):
     def run(self):
         self.retry_index += 1
         raise Exception("Retry index is %s for %s" % (self.retry_index, self.task_family))
+
+
+class DiamondSharedExternal(ExternalTask):
+    """External leaf shared by both parents of the diamond."""
+
+    def output(self):
+        return MockTarget("diamond_shared_external")
+
+
+class DiamondLeaf(Task):
+    """The legal dynamic dependency added in a parent's second round."""
+
+    owner = luigi.Parameter()
+
+    # Per-owner run counter so tests can assert the edge was materialised once.
+    runs = collections.defaultdict(int)
+
+    def output(self):
+        return MockTarget("diamond_leaf_%s" % self.owner)
+
+    def run(self):
+        DiamondLeaf.runs[self.owner] += 1
+        with self.output().open("w") as f:
+            f.write("Done!")
+
+
+class DiamondBranch(Task):
+    """Diamond parent that only declares the legal dynamic dependency."""
+
+    label = luigi.Parameter()
+
+    def requires(self):
+        return DiamondSharedExternal()
+
+    def output(self):
+        return MockTarget("diamond_branch_%s" % self.label)
+
+    def run(self):
+        yield DiamondLeaf(owner=self.label)
+        with self.output().open("w") as f:
+            f.write("Done!")
+
+
+class DiamondBranchWithBackEdge(Task):
+    """
+    Diamond parent whose second round declares a ``DiamondLeaf`` first and a
+    back edge to this very parent node last, in one and the same batch.
+    """
+
+    label = luigi.Parameter()
+    # A higher priority makes this the branch the worker picks up first.
+    priority = 10
+    # Non-significant so a corrected retry addresses the very same task id.
+    include_back_edge = luigi.BoolParameter(default=True, significant=False)
+
+    def requires(self):
+        return DiamondSharedExternal()
+
+    def output(self):
+        return MockTarget("diamond_branch_%s" % self.label)
+
+    def run(self):
+        if self.include_back_edge:
+            # Legal edge first, the back edge to this parent last: one batch.
+            yield [DiamondLeaf(owner=self.label), self]
+        else:
+            yield DiamondLeaf(owner=self.label)
+
+        with self.output().open("w") as f:
+            f.write("Done!")
+
+
+class DiamondRootTask(Task):
+    def output(self):
+        return MockTarget("diamond_root")
+
+    def requires(self):
+        # A diamond: both branches share the same external leaf.
+        return [DiamondBranch(label="p1"), DiamondBranchWithBackEdge(label="p2")]
+
+    def run(self):
+        with self.output().open("w") as f:
+            f.write("Done!")
 
 
 class WorkerTest(LuigiTestCase):
@@ -1171,6 +1256,125 @@ class DynamicDependenciesTest(LuigiTestCase):
 class DynamicDependenciesWithMultipleWorkersTest(DynamicDependenciesTest):
     n_workers = 100
     timeout = 10.0  # We run 7 tasks that take 0.5s each so it should take less than 3.5s
+
+
+class DynamicDependencyCycleTest(LuigiTestCase):
+    """
+    A parent can yield several new dependencies in one round.  If one of them
+    points back to an ancestor, the whole batch has to be refused while the
+    pre-existing dependencies and the other queued tasks stay untouched.
+    """
+
+    def setUp(self):
+        super().setUp()
+        MockFileSystem().clear()
+        DiamondLeaf.runs.clear()
+
+    def tearDown(self):
+        MockFileSystem().clear()
+        DiamondLeaf.runs.clear()
+        super().tearDown()
+
+    def _make_worker(self):
+        scheduler = Scheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10, stable_done_cooldown_secs=0)
+        return scheduler, Worker(scheduler=scheduler, worker_id="X", worker_processes=1)
+
+    def _deps_of(self, scheduler, task):
+        return set(scheduler._state.get_task(task.task_id).deps)
+
+    def test_diamond_branches_wait_for_shared_external_task(self):
+        scheduler, worker = self._make_worker()
+        root = DiamondRootTask()
+
+        with worker:
+            self.assertTrue(worker.add(root))
+
+            # Both branches share the same external task; that waits normally
+            # and nothing is runnable while the external task is missing.
+            self.assertFalse(DiamondSharedExternal().complete())
+            self.assertTrue(scheduler._state.has_task(DiamondSharedExternal().task_id))
+            self.assertTrue(worker.run())
+            self.assertFalse(DiamondLeaf(owner="p1").output().exists())
+            self.assertFalse(DiamondLeaf(owner="p2").output().exists())
+
+            # The external dependency is delivered from outside luigi and the
+            # tree is re-checked.
+            with DiamondSharedExternal().output().open("w") as f:
+                f.write("Done!")
+            self.assertTrue(worker.add(root))
+
+            # The branch with the bad batch has a higher priority, so it is the
+            # one the scheduler hands out first.
+            back_branch = DiamondBranchWithBackEdge(label="p2")
+            claimed = scheduler.get_work(worker="X")["task_id"]
+            self.assertEqual(back_branch.task_id, claimed)
+
+            before_deps = self._deps_of(scheduler, back_branch)
+            self.assertEqual({DiamondSharedExternal().task_id}, before_deps)
+
+            worker._run_task(claimed)
+            worker._handle_next_task()
+
+            leaf_of_p2 = DiamondLeaf(owner="p2").task_id
+
+            # Scheduler-side view after the rejection: the original dependency
+            # is still in place and neither the legal leaf nor the back edge to
+            # the parent were written.
+            self.assertEqual(before_deps, self._deps_of(scheduler, back_branch))
+            self.assertFalse(scheduler._state.has_task(leaf_of_p2))
+            self.assertFalse(DiamondLeaf(owner="p2").output().exists())
+
+            # The scheduler recorded the failure with a locatable cycle path
+            # that starts and ends at the offending parent.
+            scheduled = scheduler._state.get_task(back_branch.task_id)
+            self.assertEqual(FAILED, scheduled.status)
+            self.assertEqual(back_branch.task_id, scheduled.expl.partition(": ")[2].split(" -> ")[0])
+            self.assertEqual(back_branch.task_id, scheduled.expl.rsplit(" -> ", 1)[1])
+
+            # The other branch of the diamond is still claimable.
+            self.assertEqual(DiamondBranch(label="p1").task_id, scheduler.get_work(worker="X")["task_id"])
+
+            # Worker-side history agrees with the scheduler-side verdict.
+            self.assertIn(back_branch, {task for (task, status, _ext) in worker._add_task_history if status == FAILED})
+
+            # And the legal branch still runs to completion.
+            worker._run_task(DiamondBranch(label="p1").task_id)
+            worker._handle_next_task()
+            self.assertTrue(worker.add(root))
+            self.assertFalse(worker.run())
+            self.assertTrue(DiamondBranch(label="p1").complete())
+            self.assertTrue(DiamondLeaf(owner="p1").complete())
+            self.assertFalse(root.complete())
+
+    def test_fixed_back_edge_retries_the_same_round_once(self):
+        scheduler, worker = self._make_worker()
+        root = DiamondRootTask()
+
+        with worker:
+            self.assertTrue(worker.add(root))
+            with DiamondSharedExternal().output().open("w") as f:
+                f.write("Done!")
+            self.assertTrue(worker.add(root))
+            # p1 succeeds, p2's batch is rejected because of the back edge.
+            self.assertFalse(worker.run())
+
+            back_branch = DiamondBranchWithBackEdge(label="p2")
+            leaf = DiamondLeaf(owner="p2")
+            self.assertEqual({DiamondSharedExternal().task_id}, self._deps_of(scheduler, back_branch))
+            self.assertEqual(0, DiamondLeaf.runs["p2"])
+
+            # Correct the bad edge for the very same task id and retry the round.
+            corrected = DiamondBranchWithBackEdge(label="p2", include_back_edge=False)
+            self.assertEqual(back_branch.task_id, corrected.task_id)
+            self.assertTrue(worker.add(corrected))
+            self.assertTrue(worker.run())
+
+            # The legal new edge landed exactly once and the branch completed.
+            self.assertEqual({DiamondSharedExternal().task_id, leaf.task_id}, self._deps_of(scheduler, corrected))
+            self.assertEqual(1, DiamondLeaf.runs["p2"])
+            self.assertTrue(leaf.output().exists())
+            self.assertTrue(corrected.output().exists())
+            self.assertTrue(root.complete())
 
 
 class WorkerPingThreadTests(unittest.TestCase):

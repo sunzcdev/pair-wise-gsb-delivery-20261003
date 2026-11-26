@@ -604,25 +604,44 @@ class Worker:
         """
         Call ``self._scheduler.add_task``, but store the values too so we can
         implement :py:func:`luigi.execution_summary.summary`.
+
+        Returns the scheduler's response.  It is usually ``None``, but the
+        scheduler answers with a dict when it rejects an update (for example
+        when the yielded dynamic dependencies would close a cycle).
         """
         task_id = kwargs["task_id"]
         status = kwargs["status"]
         runnable = kwargs["runnable"]
         task = self._scheduled_tasks.get(task_id)
+        history_start = len(self._add_task_history)
+        if task:
+            kwargs["owners"] = task._owner_list()
+
+        if task and kwargs.get("params"):
+            kwargs["param_visibilities"] = task._get_param_visibilities()
+
+        response = self._scheduler.add_task(*args, **kwargs)
+
         if task:
             self._add_task_history.append((task, status, runnable))
-            kwargs["owners"] = task._owner_list()
 
         if task_id in self._batch_running_tasks:
             for batch_task in self._batch_running_tasks.pop(task_id):
                 self._add_task_history.append((batch_task, status, True))
 
-        if task and kwargs.get("params"):
-            kwargs["param_visibilities"] = task._get_param_visibilities()
-
-        self._scheduler.add_task(*args, **kwargs)
+        # If the scheduler refused the update it reports the resulting status
+        # (and an explanation such as a cycle path).  Rewrite the history we
+        # just recorded so that worker-side summaries agree with the scheduler
+        # instead of claiming the task was executed.
+        if isinstance(response, dict) and response.get("rejected"):
+            status = response.get("status") or FAILED
+            for i in range(history_start, len(self._add_task_history)):
+                history_task, _, history_runnable = self._add_task_history[i]
+                self._add_task_history[i] = (history_task, status, history_runnable)
 
         logger.info("Informed scheduler that task   %s   has status   %s", task_id, status)
+
+        return response
 
     def __enter__(self):
         """
@@ -1109,13 +1128,17 @@ class Worker:
                 self._email_task_failure(task, expl)
 
             new_deps = []
+            new_req = []
             if new_requirements:
                 new_req = [load_task(module, name, params) for module, name, params in new_requirements]
-                for t in new_req:
-                    self.add(t)
                 new_deps = [t.task_id for t in new_req]
 
-            self._add_task(
+            # The parent update and the batch of new edges are sent to the
+            # scheduler *before* the yielded tasks are scheduled.  That way the
+            # scheduler can validate the complete batch atomically: if one of
+            # the edges closes a cycle it rejects the whole update and the new
+            # tasks are never added either.
+            response = self._add_task(
                 worker=self._id,
                 task_id=task_id,
                 status=status,
@@ -1129,6 +1152,22 @@ class Worker:
                 assistant=self._assistant,
                 retry_policy_dict=_get_retry_policy_dict(task),
             )
+
+            rejected = isinstance(response, dict) and response.get("rejected")
+            if rejected:
+                # Keep the worker and the scheduler in agreement: none of the
+                # yielded dependencies are scheduled and the run is reported as
+                # failed, just like the scheduler recorded it.
+                logger.warning(
+                    "Scheduler rejected new dependencies for %s: %s",
+                    task_id,
+                    response.get("message") or "dependency cycle",
+                )
+                status = response.get("status") or FAILED
+                new_deps = []
+            else:
+                for t in new_req:
+                    self.add(t)
 
             self._running_tasks.pop(task_id)
 
