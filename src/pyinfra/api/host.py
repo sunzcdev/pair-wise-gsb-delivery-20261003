@@ -27,6 +27,7 @@ from .util import memoize, sha1_hash
 
 if TYPE_CHECKING:
     from pyinfra.api.arguments import AllArguments
+    from pyinfra.api.identity import HostIdentity
     from pyinfra.api.inventory import Inventory
     from pyinfra.api.state import State
 
@@ -193,6 +194,21 @@ class Host:
     @property
     def host_data(self):
         return self.inventory.get_host_data(self.name)
+
+    @property
+    def identity(self) -> HostIdentity:
+        """
+        The identity of the machine this host points at.
+
+        Derived from the connector target (eg ``ssh_hostname``), not from :attr:`name`,
+        so re-pointing an alias at a replacement machine changes the identity while the
+        display name stays the same. See
+        :func:`pyinfra.api.identity.resolve_host_identity`.
+        """
+
+        from .identity import resolve_host_identity
+
+        return resolve_host_identity(self)
 
     @property
     def group_data(self):

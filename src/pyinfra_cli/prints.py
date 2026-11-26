@@ -245,6 +245,13 @@ def print_run_json(state: State, dry: bool) -> None:
         payload["results"] = None
     else:
         payload["results"] = build_results_json(state)
+
+    # Report the explicit identity check that gated plan reuse: which hosts matched and
+    # kept their confirmed record, and which were refused because the name now points at
+    # a different machine (with the old/new targets shown).
+    if state.plan_reuse is not None:
+        payload["plan_reuse"] = state.plan_reuse.as_dict()
+
     print_json(payload)
 
 

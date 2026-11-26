@@ -41,6 +41,30 @@ def run_host_op(state: State, host: Host, op_hash: str) -> bool:
         logger.info(f"{host.print_prefix}{format_text('Skipped', 'blue')}")
         return True
 
+    # Plan reuse: a step already confirmed for this target is not replayed. The snapshot
+    # only serves confirmed steps for hosts whose identity matched, so a re-pointed host
+    # never borrows its previous result. This only applies while executing: prepare still
+    # runs the operation to decide whether it would change anything.
+    confirmed = state.reuse_confirmed_step(host, op_hash) if state.is_executing else None
+    if confirmed is not None:
+        op_data = state.get_op_data_for_host(host, op_hash)
+        host.log(
+            f"{format_text('Reused', 'blue')} confirmed step (identity {host.identity.describe()})",
+        )
+        op_data.operation_meta.mark_reused(
+            confirmed.success,
+            confirmed.did_change,
+            confirmed.commands,
+        )
+        host_results = state.get_results_for_host(host)
+        host_results.ops += 1
+        if confirmed.success:
+            host_results.success_ops += 1
+            state.trigger_callbacks("operation_host_success", host, op_hash, 0)
+        else:  # pragma: no cover - only successful steps are ever stored
+            host_results.error_ops += 1
+        return confirmed.success
+
     op_meta = state.get_op_meta(op_hash)
     logger.debug("Starting operation %r on %s", op_meta.names, host)
 

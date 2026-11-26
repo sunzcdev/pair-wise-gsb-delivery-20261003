@@ -3,6 +3,10 @@
 Core:
 
 - api: name operations and hosts in dependency cycle errors (#2049) (@ynaamane)
+- api: plan reuse across runs, gated by an explicit host identity check (`PlanReuseStore`,
+  `--plan-reuse` / `--save-plan-reuse`). Facts and confirmed steps are bound to the connector
+  target, so re-pointing an inventory name at a replacement machine refuses its old record,
+  while group labels/group data do not invalidate a host's confirmed results.
 
 Operations/facts:
 

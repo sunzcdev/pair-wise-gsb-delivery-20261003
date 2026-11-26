@@ -428,5 +428,7 @@ class TestDirectMainExecution(PatchSSHTestCase):
                 diff=True,
                 retry=0,
                 retry_delay=5,
+                plan_reuse=None,
+                save_plan_reuse=None,
             )
             assert e.args == (0,)

@@ -19,7 +19,7 @@ from pyinfra.api.command import QuoteString, StringCommand
 from pyinfra.api.exceptions import ConnectError
 from pyinfra.api.util import get_file_io, memoize
 
-from .base import BaseConnector, DataMeta
+from .base import BaseConnector, DataMeta, host_to_connector_data
 from .scp import SCPClient
 from .ssh_util import _patch_paramiko_sk_key_support, get_private_key, raise_connect_error
 from .sshuserclient import SSHClient
@@ -34,6 +34,7 @@ from .util import (
 
 if TYPE_CHECKING:
     from pyinfra.api.arguments import ConnectorArguments
+    from pyinfra.api.host import Host
 
 # Downloads are buffered in memory up to this size before spilling over onto disk, so that
 # the local destination is only written once the remote file has arrived in full.
@@ -169,12 +170,27 @@ class SSHConnector(BaseConnector):
     data_meta = connector_data_meta
     data: ConnectorData
 
+    # An inventory name may be re-pointed at a replacement machine by editing
+    # ``ssh_hostname`` (or ``ssh_port``), so both are part of the host identity.
+    identity_keys = ("ssh_hostname", "ssh_port")
+
     client: SSHClient | None = None
 
     @override
     @staticmethod
     def make_names_data(name):
         yield f"@ssh/{name}", {"ssh_hostname": name}, []
+
+    @override
+    @classmethod
+    def get_identity_target(cls, host: Host) -> dict[str, Any] | None:
+        # Mirror ``make_paramiko_kwargs``: an unset ``ssh_hostname`` falls back to the
+        # inventory name, so the target is always concrete.
+        data = host_to_connector_data(cls.data_cls, cls.data_meta, host.data)
+        target: dict[str, Any] = {"ssh_hostname": data["ssh_hostname"] or host.name}
+        if data["ssh_port"]:
+            target["ssh_port"] = int(data["ssh_port"])
+        return target
 
     def make_paramiko_kwargs(self) -> dict[str, Any]:
         kwargs = {

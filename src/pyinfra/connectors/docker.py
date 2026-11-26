@@ -90,6 +90,10 @@ class DockerConnector(BaseConnector):
     data_meta = connector_data_meta
     data: ConnectorData
 
+    # The container/image an alias points at *is* its identity. Platform/architecture
+    # only steer image selection and the tag is an output, so neither is included.
+    identity_keys = ("docker_identifier",)
+
     local: LocalConnector
 
     container_id: str

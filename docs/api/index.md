@@ -76,6 +76,21 @@ print(result2[host].did_change, result2[host].stdout, result2[host].stderr)
 print(get_facts(state, Os))
 ```
 
+## Reusing a plan across runs
+
+`pyinfra.api.plan_reuse.PlanReuseStore` — a saved plan binds every fact and confirmed step to a `HostIdentity`, derived from the connector target rather than the inventory name:
+
+```python
+from pyinfra.api import PlanReuseStore
+
+store = PlanReuseStore.from_dict(payload)   # a previously saved plan
+snapshot = state.set_plan_reuse(store)      # resolve against the current inventory
+
+# snapshot.resolved[host.name].reason is "match" / "identity_changed" / "new_host"
+```
+
+A host whose connector target still matches inherits its confirmed facts and steps; a host whose name now points at a replacement machine is refused (`identity_changed`) and starts empty. Group membership and group data are not part of the identity, so adding an unrelated group label does not discard a host's confirmed record.
+
 ## Observing a run with callbacks
 
 `state.add_callback_handler` lets you subscribe to lifecycle events — connection, per-host operation start/success/error/retry, operation start/end — without writing your own scheduler. This is the hook to use for telemetry, custom progress bars, or pushing results into your own systems.

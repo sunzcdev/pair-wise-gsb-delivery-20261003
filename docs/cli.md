@@ -220,6 +220,32 @@ Interactive prompts from deploy code (e.g. `input(...)`) will still block, so av
 + Log messages and errors are still written to stderr, so redirect with `pyinfra ... --json 2>/dev/null > out.json` if you need stdout to contain only JSON.
 
 
+## Plan reuse
+
+A plan can be saved after one run and reused by a later one, so facts already confirmed for a target are not read again and steps already confirmed are not replayed:
+
+```sh
+# Run the deploy and save the confirmed plan
+pyinfra inventory.py deploy.py --save-plan-reuse plan.json
+
+# Reuse it on the next run
+pyinfra inventory.py deploy.py --plan-reuse plan.json
+```
+
+Reuse is gated by an **explicit identity check**, not by the inventory display name. The identity is the connector target (`ssh_hostname`/`ssh_port` for SSH, `docker_identifier` for Docker, and so on), so:
+
++ An inventory name that has been re-pointed at a replacement machine (its `ssh_hostname` edited while the name is unchanged) is a *different* identity — its record is refused and the host starts from an empty plan rather than borrowing the old facts/steps.
++ Group membership and group data are not part of the identity, so adding a group label (or editing group notes) that does not change what operations do leaves the host matching, and it still resolves its own confirmed record.
++ Set `host_identity` host data to state the identity explicitly when the connector target cannot describe the machine:
+
+```python
+hosts = [
+    ("web-01", {"ssh_hostname": "10.0.0.5", "host_identity": "rack-12-slot-4"}),
+]
+```
+
+With `--json`, the run payload includes a `plan_reuse` section listing, per host, whether its record was reused, the reason (`match`, `identity_changed` or `new_host`), and — when refused — both the previous and the current target, so it is visible *why* nothing was borrowed.
+
 ## Shell Autocompletion
 
 pyinfra can install shell completion for you:

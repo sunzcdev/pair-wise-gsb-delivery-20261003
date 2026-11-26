@@ -29,12 +29,15 @@ from pyinfra.api.util import (
     log_error_or_warning,
     log_host_command_error,
     print_host_combined_output,
+    sha1_hash,
 )
 from pyinfra.connectors.util import CommandOutput
 from pyinfra.context import ctx_host, ctx_state
 from pyinfra.progress import progress_spinner
 
 from .arguments import CONNECTOR_ARGUMENT_KEYS
+from .identity import canonical_json
+from .plan_reuse import PlanReuseSnapshot
 
 if TYPE_CHECKING:
     from pyinfra.api import Host, State
@@ -177,6 +180,24 @@ def _handle_fact_kwargs(state: State, host: Host, cls, args, kwargs):
     return fact_kwargs, global_kwargs
 
 
+def fact_cache_key(name: str, fact_kwargs: dict[str, Any], global_kwargs: dict[str, Any]) -> str:
+    """
+    Build the key under which a fact's confirmed value is stored for plan reuse.
+
+    The key covers the fact name, its own arguments and the connector arguments that can
+    change what the fact reads (sudo/su user, shell, env, ...). Two calls that would run a
+    different command - or the same command as a different user - therefore never share a
+    confirmed value.
+    """
+
+    fact_args = {key: value for key, value in fact_kwargs.items() if key != "self"}
+    executor_args = {
+        key: global_kwargs[key] for key in CONNECTOR_ARGUMENT_KEYS if key in global_kwargs
+    }
+    payload = canonical_json({"fact": name, "args": fact_args, "connector": executor_args})
+    return f"{name}:{sha1_hash(payload)}"
+
+
 def get_facts(state, *args, **kwargs):
     def get_host_fact(host, *args, **kwargs):
         with ctx_host.use(host):
@@ -281,6 +302,28 @@ def _get_fact(
     fact_kwargs, global_kwargs = _handle_fact_kwargs(state, host, cls, args, kwargs)
 
     kwargs_str = get_kwargs_str(fact_kwargs)
+
+    # Plan reuse: serve a fact already confirmed for this target during the plan phase,
+    # but only when the host identity matched (see pyinfra.api.plan_reuse). During execute
+    # the plan is being applied, so confirmed reads are refreshed to reflect changes made
+    # by earlier operations.
+    cache_key: str | None = None
+    if isinstance(getattr(state, "plan_reuse", None), PlanReuseSnapshot) and not state.is_executing:
+        cache_key = fact_cache_key(name, fact_kwargs, global_kwargs)
+        reused_facts = state.reuse_confirmed_facts(host)
+        if cache_key in reused_facts:
+            logger.debug(
+                "Reusing confirmed fact %s (%s) for %s",
+                name,
+                kwargs_str,
+                host.print_prefix,
+            )
+            return reused_facts[cache_key]
+
+    # Facts are only recorded when a caller may persist them (--save-plan-reuse).
+    if getattr(state, "record_facts", False) and cache_key is None:
+        cache_key = fact_cache_key(name, fact_kwargs, global_kwargs)
+
     logger.debug(
         "Getting fact: %s (%s) (ensure_hosts: %r)",
         name,
@@ -423,5 +466,12 @@ def _get_fact(
     # Check we've not failed
     if apply_failed_hosts and not status and not global_kwargs["_ignore_errors"]:
         state.fail_hosts({host})
+
+    # Record the confirmed value so a later plan may reuse it (only successful reads - a
+    # default returned after a failure must not masquerade as confirmed state).
+    if status and getattr(state, "record_facts", False):
+        if cache_key is None:
+            cache_key = fact_cache_key(name, fact_kwargs, global_kwargs)
+        state.record_confirmed_fact(host, cache_key, data)
 
     return data

@@ -4,6 +4,7 @@ from pyinfra import __version__, config, host, inventory, state
 from pyinfra.api import (
     BaseStateCallback,
     Config,
+    ConfirmedStep,
     DeployError,
     FactBase,
     FactError,
@@ -17,6 +18,8 @@ from pyinfra.api import (
     FunctionCommand,
     HiddenValue,
     Host,
+    HostIdentity,
+    HostPlanRecord,
     Inventory,
     InventoryError,
     MaskString,
@@ -24,6 +27,8 @@ from pyinfra.api import (
     OperationError,
     OperationTypeError,
     OperationValueError,
+    PlanReuseSnapshot,
+    PlanReuseStore,
     QuoteString,
     RsyncCommand,
     ShortFactBase,
@@ -31,6 +36,7 @@ from pyinfra.api import (
     StringCommand,
     deploy,
     operation,
+    resolve_host_identity,
 )
 from pyinfra.connectors.scp import SCPClient
 from pyinfra.connectors.sshuserclient import SSHClient
@@ -42,3 +48,11 @@ print(FileDownloadCommand, FileUploadCommand, FunctionCommand, HiddenValue, Host
 print(Inventory, InventoryError, MaskString, MissingCommandError, OperationError)
 print(OperationTypeError, OperationValueError, QuoteString, RsyncCommand)
 print(ShortFactBase, State, StringCommand, deploy, operation, SCPClient, SSHClient)
+print(
+    HostIdentity,
+    HostPlanRecord,
+    PlanReuseSnapshot,
+    PlanReuseStore,
+    ConfirmedStep,
+    resolve_host_identity,
+)

@@ -52,6 +52,9 @@ class OperationMeta:
     _retry_attempts: int = 0
     _max_retries: int = 0
     _retry_succeeded: bool | None = None
+    _reused: bool = False
+    _reused_did_change: bool = False
+    _reused_commands: int = 0
 
     def __init__(self, hash, is_change: bool | None):
         self._hash = hash
@@ -62,6 +65,13 @@ class OperationMeta:
         """
         Return Operation object as a string.
         """
+
+        if self._reused:
+            return (
+                "OperationMeta(reused=True, "
+                f"success={self.did_succeed()}, hash={self._hash}, "
+                f"commands={self._reused_commands})"
+            )
 
         if self._commands is not None:
             retry_info = ""
@@ -104,6 +114,22 @@ class OperationMeta:
     def is_complete(self) -> bool:
         return self._success is not None
 
+    def mark_reused(self, success: bool, did_change: bool, commands: int = 0) -> None:
+        """
+        Mark this operation complete from a step result confirmed by an earlier plan.
+
+        No commands were sent to the target; the confirmed outcome is carried over so
+        reporting still describes what the confirmed step did.
+        """
+
+        if self.is_complete():
+            raise RuntimeError("Cannot complete an already complete operation")
+        self._success = success
+        self._commands = []
+        self._reused_did_change = did_change
+        self._reused_commands = commands
+        self._reused = True
+
     def _raise_if_not_complete(self) -> None:
         if not self.is_complete():
             raise RuntimeError("Cannot evaluate operation result before execution")
@@ -113,6 +139,26 @@ class OperationMeta:
         if self._commands is None:
             return False
         return len(self._commands) > 0
+
+    @property
+    def reused(self) -> bool:
+        """
+        Returns whether this operation's result was reused from a confirmed earlier plan
+        rather than executed against the target.
+        """
+
+        return self._reused
+
+    @property
+    def command_count(self) -> int:
+        """
+        Number of commands this operation ran (or, when reused, the count confirmed by
+        the plan it was reused from).
+        """
+
+        if self._reused:
+            return self._reused_commands
+        return len(self._commands or [])
 
     @property
     def will_change(self) -> bool:
@@ -128,6 +174,8 @@ class OperationMeta:
         return False
 
     def did_change(self) -> bool:
+        if self._reused:
+            return self._reused_did_change
         self._raise_if_not_complete()
         return bool(self._success and len(self._commands or []) > 0)
 

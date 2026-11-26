@@ -41,6 +41,13 @@ class ChrootConnector(BaseConnector):
         self.local = LocalConnector(state, host)
 
     @override
+    @classmethod
+    def get_identity_target(cls, host: "Host") -> dict | None:
+        # The directory being rooted into is the machine the alias points at.
+        chroot_directory = host.data.get("chroot_directory")
+        return {"chroot_directory": chroot_directory} if chroot_directory else None
+
+    @override
     @staticmethod
     def make_names_data(name: str | None = None):
         if not name:

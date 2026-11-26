@@ -57,6 +57,23 @@ class DockerSSHConnector(BaseConnector):
         self.ssh = SSHConnector(state, host)
 
     @override
+    @classmethod
+    def get_identity_target(cls, host: "Host") -> dict | None:
+        # The machine is identified by the remote SSH host plus the container/image it
+        # runs; the inventory alias is only a label for that pair.
+        target = {}
+        ssh_hostname = host.data.get("ssh_hostname")
+        if ssh_hostname:
+            target["ssh_hostname"] = ssh_hostname
+        docker_image = host.data.get("docker_image")
+        if docker_image:
+            target["docker_image"] = docker_image
+        docker_container_id = host.data.get("docker_container_id")
+        if docker_container_id:
+            target["docker_container_id"] = docker_container_id
+        return target or None
+
+    @override
     @staticmethod
     def make_names_data(name):
         try:

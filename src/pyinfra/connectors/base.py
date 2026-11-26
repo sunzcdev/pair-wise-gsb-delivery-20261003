@@ -73,10 +73,44 @@ class BaseConnector(abc.ABC):
     data_cls: type[Any] = ConnectorData
     data_meta: dict[str, DataMeta] = {}
 
+    #: Connector data keys that describe *which machine* a host points at, in the order
+    #: they should appear in the identity. Plan reuse compares these keys when deciding
+    #: whether an inventory name still points at the same target - eg ``ssh_hostname`` /
+    #: ``ssh_port`` for SSH, ``docker_identifier`` for Docker.
+    #:
+    #: Keys not listed here (groups, group data, unrelated host data such as a human
+    #: label) are deliberately excluded: annotating a host must not invalidate the
+    #: results already confirmed for it.
+    identity_keys: tuple[str, ...] = ()
+
     def __init__(self, state: State, host: Host):
         self.state = state
         self.host = host
         self.data = host_to_connector_data(self.data_cls, self.data_meta, host.data)
+
+    @classmethod
+    def get_identity_target(cls, host: Host) -> dict[str, Any] | None:
+        """
+        Return the connector data that identifies *which machine* ``host`` points at.
+
+        Used by plan reuse: an inventory name that still resolves to the same target may
+        inherit results confirmed by an earlier plan, while the same name pointed at a
+        different target may not. Return ``None`` when the connector describes no target,
+        in which case the inventory name is used as the identity.
+
+        The default implementation collects :attr:`identity_keys` from the connector data
+        resolved for ``host``. Connectors whose target has a fallback (eg SSH falling back
+        to the inventory name) or a derived form should override this.
+        """
+
+        data = host_to_connector_data(cls.data_cls, cls.data_meta, host.data)
+        target = {}
+        for key in cls.identity_keys:
+            value = data.get(key)  # type: ignore[attr-defined]
+            if value is None:
+                continue
+            target[key] = value
+        return target or None
 
     @staticmethod
     @abc.abstractmethod

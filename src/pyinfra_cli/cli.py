@@ -1,4 +1,5 @@
 import logging
+import json
 import os.path
 import sys
 import warnings
@@ -18,6 +19,7 @@ from pyinfra.api.connect import connect_all, disconnect_all
 from pyinfra.api.exceptions import NoGroupError, PyinfraError
 from pyinfra.api.facts import get_facts
 from pyinfra.api.operations import run_ops
+from pyinfra.api.plan_reuse import PlanReuseStore
 from pyinfra.api.state import StateStage
 from pyinfra.api.util import get_kwargs_str
 from pyinfra.context import ctx_config, ctx_inventory, ctx_state
@@ -207,6 +209,8 @@ def cli(
     serial: Annotated[bool, Parameter(group=GROUP_EXECUTION)] = False,
     retry: Annotated[int, Parameter(group=GROUP_EXECUTION)] = 0,
     retry_delay: Annotated[int, Parameter(group=GROUP_EXECUTION)] = 5,
+    plan_reuse: Annotated[str | None, Parameter(group=GROUP_EXECUTION)] = None,
+    save_plan_reuse: Annotated[str | None, Parameter(group=GROUP_EXECUTION)] = None,
     ssh_user: Annotated[
         str | None, Parameter(name=["--ssh-user", "--user"], group=GROUP_SSH)
     ] = None,
@@ -296,6 +300,14 @@ def cli(
         Number of times to retry failed operations.
     retry_delay
         Delay in seconds between retry attempts.
+    plan_reuse
+        Reuse facts and confirmed steps from a saved plan file (see
+        ``--save-plan-reuse``). Records are only reused for hosts whose explicit identity
+        still matches, so a host re-pointed at a replacement machine never borrows its
+        previous results.
+    save_plan_reuse
+        Write the facts and confirmed steps of this run to a plan file, for a later
+        ``--plan-reuse``.
     ssh_user
         SSH user to connect as.
     ssh_port
@@ -365,6 +377,8 @@ def cli(
             serial=serial,
             retry=retry,
             retry_delay=retry_delay,
+            plan_reuse=plan_reuse,
+            save_plan_reuse=save_plan_reuse,
             debug=debug,
             debug_all=debug_all,
             debug_facts=debug_facts,
@@ -420,6 +434,8 @@ def _main(
     serial: bool,
     retry: int,
     retry_delay: int,
+    plan_reuse: str | None,
+    save_plan_reuse: str | None,
     debug: bool,
     debug_all: bool,
     debug_facts: bool,
@@ -508,6 +524,16 @@ def _main(
     # Initialise the state
     state.init(inventory, config, initial_limit=initial_limit)
 
+    # Plan reuse: attach a saved plan so facts/confirmed steps for hosts whose identity
+    # still matches are served without being re-read or replayed. The identity check is
+    # explicit - a host whose connector target changed is refused, not matched by name.
+    plan_reuse_store: PlanReuseStore | None = None
+    if plan_reuse:
+        plan_reuse_store = _load_plan_reuse(state, plan_reuse)
+        state.set_plan_reuse(plan_reuse_store)
+    if plan_reuse or save_plan_reuse:
+        state.record_facts = bool(save_plan_reuse)
+
     if command == CliCommands.DEBUG_INVENTORY:
         if json_output:
             print_inventory_json(state)
@@ -576,6 +602,9 @@ def _main(
         print_run_json(state, dry=False)
     else:
         print_results(state)
+
+    if save_plan_reuse:
+        _save_plan_reuse(state, save_plan_reuse, plan_reuse_store)
     _exit()
 
 
@@ -803,6 +832,56 @@ def _set_override_data(
             override_data[key] = value
 
     return override_data
+
+
+def _load_plan_reuse(state: State, filename: str) -> PlanReuseStore:
+    """
+    Load a plan reuse file for ``--plan-reuse``.
+
+    A missing file is an error (the user asked for reuse); a malformed file disables
+    reuse with a warning so the run still produces a complete plan.
+    """
+
+    path = Path(filename)
+    if not path.exists():
+        raise CliError(f"No plan reuse file: {filename}")
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as e:
+        logger.warning(f"Could not parse plan reuse file {filename}: {e}")
+        return PlanReuseStore.from_dict(None)
+
+    store = PlanReuseStore.from_dict(data)
+    if not store.enabled:
+        logger.warning(f"Plan reuse file {filename} was not usable, ignoring")
+    return store
+
+
+def _save_plan_reuse(
+    state: State,
+    filename: str,
+    existing_store: PlanReuseStore | None = None,
+) -> None:
+    """
+    Write this run's confirmed facts/steps for ``--save-plan-reuse``.
+
+    Starting from the store loaded for this run (if any) keeps records for hosts the run
+    did not activate, while every activated host's record is rebound to the identity it
+    actually resolved to.
+    """
+
+    store = existing_store
+    if store is None:
+        store = PlanReuseStore.from_dict(None)
+        store.enabled = True
+        store.records = {}
+
+    data = store.to_dict(state)
+    path = Path(filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    logger.info(f"--> Saved plan reuse data to: {filename}")
 
 
 def _set_fail_prompts(state: State, config: Config) -> None:

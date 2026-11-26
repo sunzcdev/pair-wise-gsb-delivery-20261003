@@ -6,7 +6,7 @@ from enum import IntEnum
 from graphlib import CycleError, TopologicalSorter
 from itertools import pairwise
 from multiprocessing import cpu_count
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from collections.abc import Callable, Iterator
 
 from gevent.pool import Pool
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from pyinfra.api.host import Host
     from pyinfra.api.inventory import Inventory
     from pyinfra.api.operation import OperationMeta
+    from pyinfra.api.plan_reuse import ConfirmedStep, PlanReuseSnapshot, PlanReuseStore
 
 
 # Work out the max parallel we can achieve with the open files limit of the user/process,
@@ -197,6 +198,17 @@ class State:
     current_op_file_number: int = 0
     should_raise_failed_hosts: Callable[[State], bool] | None = None
 
+    # Optional plan reuse snapshot (see pyinfra.api.plan_reuse). When attached, facts
+    # already confirmed for an identity-matched host are served from it during the plan
+    # (prepare) phase, and confirmed steps are not replayed at execute time.
+    plan_reuse: PlanReuseSnapshot | None = None
+    #: Whether to record facts loaded during this run in :attr:`confirmed_facts`, so a
+    #: ``--save-plan-reuse`` run can persist them. Off by default to avoid bookkeeping.
+    record_facts: bool = False
+    #: Facts confirmed during this run, keyed by host name then fact cache key. Populated
+    #: by fact gathering and read back by ``PlanReuseStore.update_from_state``.
+    confirmed_facts: dict[str, dict[str, Any]]
+
     def __init__(
         self,
         inventory: Inventory | None = None,
@@ -269,6 +281,11 @@ class State:
         self.active_hosts: set[Host] = set()
         # Hosts that have failed
         self.failed_hosts: set[Host] = set()
+
+        # Plan reuse / confirmed fact bookkeeping
+        self.plan_reuse = None
+        self.record_facts = False
+        self.confirmed_facts = {}
 
         # Limit hosts changes dynamically to limit operations to a subset of hosts
         self.limit_hosts: list[Host] = initial_limit
@@ -399,6 +416,56 @@ class State:
         op_data: StateOperationHostData,
     ):
         self.ops[host][op_hash] = op_data
+
+    # Plan reuse
+    #
+
+    def set_plan_reuse(self, store: PlanReuseStore) -> PlanReuseSnapshot:
+        """
+        Resolve a :class:`pyinfra.api.plan_reuse.PlanReuseStore` against this state,
+        attach it as :attr:`plan_reuse`, and return the per-run snapshot.
+
+        Each host's stored record is matched by
+        :func:`pyinfra.api.identity.resolve_host_identity`; hosts whose connector target
+        changed are refused and start from an empty plan.
+        """
+
+        snapshot = store.snapshot(self)
+        self.plan_reuse = snapshot
+        return snapshot
+
+    def reuse_confirmed_facts(self, host: Host) -> dict[str, Any]:
+        """
+        Confirmed facts reused for ``host``, keyed by fact cache key.
+
+        Empty when no plan is attached or the host's identity did not match, so a caller
+        can never borrow a fact from a machine the name no longer points at.
+        """
+
+        if self.plan_reuse is None:
+            return {}
+        return self.plan_reuse.facts_for(host)
+
+    def record_confirmed_fact(self, host: Host, cache_key: str, value: Any) -> None:
+        """
+        Record a fact collected during this run, so a later plan may reuse it.
+        """
+
+        if not self.record_facts:
+            return
+        self.confirmed_facts.setdefault(host.name, {})[cache_key] = value
+
+    def reuse_confirmed_step(self, host: Host, op_hash: str) -> ConfirmedStep | None:
+        """
+        Return the confirmed step result for ``op_hash`` on ``host``, or ``None``.
+
+        Only served for identity-matched hosts, so a re-pointed host never borrows its
+        previous step result.
+        """
+
+        if self.plan_reuse is None:
+            return None
+        return self.plan_reuse.confirmed_step(host, op_hash)
 
     def activate_host(self, host: Host):
         """

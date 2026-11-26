@@ -26,13 +26,16 @@ from .exceptions import (
 )
 from .facts import FactBase, ShortFactBase
 from .host import Host
+from .identity import HostIdentity, resolve_host_identity
 from .inventory import Inventory
 from .operation import operation
+from .plan_reuse import ConfirmedStep, HostPlanRecord, PlanReuseSnapshot, PlanReuseStore
 from .state import BaseStateCallback, State
 
 __all__ = [
     "BaseStateCallback",
     "Config",
+    "ConfirmedStep",
     "DeployError",
     "FactBase",
     "FactError",
@@ -46,6 +49,8 @@ __all__ = [
     "FunctionCommand",
     "HiddenValue",
     "Host",
+    "HostIdentity",
+    "HostPlanRecord",
     "Inventory",
     "InventoryError",
     "MaskString",
@@ -53,6 +58,8 @@ __all__ = [
     "OperationError",
     "OperationTypeError",
     "OperationValueError",
+    "PlanReuseSnapshot",
+    "PlanReuseStore",
     "QuoteString",
     "RsyncCommand",
     "ShortFactBase",
@@ -60,4 +67,5 @@ __all__ = [
     "StringCommand",
     "deploy",
     "operation",
+    "resolve_host_identity",
 ]
