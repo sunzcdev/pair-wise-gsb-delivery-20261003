@@ -16,6 +16,7 @@ from typing import (
 from pydantic import BaseModel
 
 from taskiq.abc.middleware import TaskiqMiddleware
+from taskiq.bindings import MessageBindings, current_bindings
 from taskiq.exceptions import SendTaskError
 from taskiq.labels import prepare_label
 from taskiq.message import TaskiqMessage
@@ -152,30 +153,39 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
 
         :returns: taskiq task.
         """
-        logger.debug(
-            "Kicking %s with args=%s and kwargs=%s.",
-            self.task_name,
-            args,
-            kwargs,
-        )
-        message = self._prepare_message(*args, **kwargs)
-        for middleware in self.broker.middlewares:
-            if middleware.__class__.pre_send != TaskiqMiddleware.pre_send:
-                message = await maybe_awaitable(middleware.pre_send(message))
+        # Resolve the complete configuration once. Another task may replace
+        # broker attributes or the shared default broker while send hooks are
+        # awaiting; this send must continue with the version it started with.
+        bindings = MessageBindings.capture(self.broker)
+        bindings_token = current_bindings.set(bindings)
         try:
-            await self.broker.kick(self.broker.formatter.dumps(message))
-        except Exception as exc:
-            raise SendTaskError from exc
+            logger.debug(
+                "Kicking %s with args=%s and kwargs=%s.",
+                self.task_name,
+                args,
+                kwargs,
+            )
+            message = self._prepare_message(*args, **kwargs)
+            for middleware in bindings.middlewares:
+                if middleware.__class__.pre_send != TaskiqMiddleware.pre_send:
+                    message = await maybe_awaitable(middleware.pre_send(message))
+            try:
+                broker_message = bindings.formatter.dumps(message)
+                await bindings.broker.kick(broker_message)
+            except Exception as exc:
+                raise SendTaskError from exc
 
-        for middleware in reversed(self.broker.middlewares):
-            if middleware.__class__.post_send != TaskiqMiddleware.post_send:
-                await maybe_awaitable(middleware.post_send(message))
+            for middleware in reversed(bindings.middlewares):
+                if middleware.__class__.post_send != TaskiqMiddleware.post_send:
+                    await maybe_awaitable(middleware.post_send(message))
 
-        return AsyncTaskiqTask(
-            task_id=message.task_id,
-            result_backend=self.broker.result_backend,
-            return_type=self.return_type,  # type: ignore # (pyright issue)
-        )
+            return AsyncTaskiqTask(
+                task_id=message.task_id,
+                result_backend=bindings.result_backend,
+                return_type=self.return_type,  # type: ignore # (pyright issue)
+            )
+        finally:
+            current_bindings.reset(bindings_token)
 
     async def schedule_by_cron(
         self,

@@ -19,6 +19,7 @@ from taskiq_dependencies import DependencyGraph
 from taskiq.abc.broker import AckableMessage, AsyncBroker
 from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.acks import AckController, AcknowledgeType, parse_acknowledge_type
+from taskiq.bindings import current_bindings
 from taskiq.context import Context
 from taskiq.exceptions import NoResultError
 from taskiq.message import TaskiqMessage
@@ -158,9 +159,31 @@ class Receiver:
         ack_controller = AckController(
             message.ack if isinstance(message, AckableMessage) else None,
         )
+        candidate_bindings = current_bindings.get()
+        active_bindings = (
+            candidate_bindings
+            if candidate_bindings is not None
+            and candidate_bindings.broker is self.broker
+            else None
+        )
+        formatter = (
+            active_bindings.formatter
+            if active_bindings is not None
+            else self.broker.formatter
+        )
+        result_backend = (
+            active_bindings.result_backend
+            if active_bindings is not None
+            else self.broker.result_backend
+        )
+        middlewares = (
+            active_bindings.middlewares
+            if active_bindings is not None
+            else tuple(self.broker.middlewares)
+        )
         message_data = message.data if isinstance(message, AckableMessage) else message
         try:
-            taskiq_msg = self.broker.formatter.loads(message=message_data)
+            taskiq_msg = formatter.loads(message=message_data)
             taskiq_msg.parse_labels()
         except Exception as exc:
             logger.warning(
@@ -186,7 +209,7 @@ class Receiver:
             "Function for task %s is resolved. Executing...",
             taskiq_msg.task_name,
         )
-        for middleware in self.broker.middlewares:
+        for middleware in middlewares:
             if middleware.__class__.pre_execute != TaskiqMiddleware.pre_execute:
                 taskiq_msg = await maybe_awaitable(
                     middleware.pre_execute(
@@ -213,15 +236,15 @@ class Receiver:
         if ack_time == AcknowledgeType.WHEN_EXECUTED and ack_controller.is_ackable:
             await ack_controller.ack()
 
-        for middleware in reversed(self.broker.middlewares):
+        for middleware in reversed(middlewares):
             if middleware.__class__.post_execute != TaskiqMiddleware.post_execute:
                 await maybe_awaitable(middleware.post_execute(taskiq_msg, result))
 
         try:
             if not isinstance(result.error, NoResultError):
-                await self.broker.result_backend.set_result(taskiq_msg.task_id, result)
+                await result_backend.set_result(taskiq_msg.task_id, result)
 
-                for middleware in reversed(self.broker.middlewares):
+                for middleware in reversed(middlewares):
                     if middleware.__class__.post_save != TaskiqMiddleware.post_save:
                         await maybe_awaitable(middleware.post_save(taskiq_msg, result))
 
@@ -274,6 +297,19 @@ class Receiver:
         :return: result of execution.
         """
         loop = asyncio.get_running_loop()
+        candidate_bindings = current_bindings.get()
+        active_bindings = (
+            candidate_bindings
+            if candidate_bindings is not None
+            and candidate_bindings.broker is self.broker
+            else None
+        )
+        if active_bindings is not None:
+            middlewares = active_bindings.middlewares
+            result_backend = active_bindings.result_backend
+        else:
+            middlewares = tuple(self.broker.middlewares)
+            result_backend = self.broker.result_backend
         returned = None
         found_exception: BaseException | None = None
         signature = None
@@ -294,7 +330,12 @@ class Receiver:
             broker_ctx = self.broker.custom_dependency_context
             broker_ctx.update(
                 {
-                    Context: Context(message, self.broker, ack_controller),
+                    Context: Context(
+                        message,
+                        self.broker,
+                        ack_controller,
+                        result_backend=result_backend,
+                    ),
                     TaskiqState: self.broker.state,
                 },
             )
@@ -397,7 +438,7 @@ class Receiver:
         )
         # If exception is found we execute middlewares.
         if found_exception is not None:
-            for middleware in reversed(self.broker.middlewares):
+            for middleware in reversed(middlewares):
                 if middleware.__class__.on_error != TaskiqMiddleware.on_error:
                     await maybe_awaitable(
                         middleware.on_error(

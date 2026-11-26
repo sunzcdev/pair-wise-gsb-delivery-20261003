@@ -57,13 +57,13 @@ class ProgressTracker(Generic[_ProgressType]):
             meta=meta,
         )
 
-        await self.context.broker.result_backend.set_progress(
+        await self.context.result_backend.set_progress(
             self.context.message.task_id,
             progress,
         )
 
     async def get_progress(self) -> TaskProgress[_ProgressType] | None:
         """Get progress."""
-        return await self.context.broker.result_backend.get_progress(
+        return await self.context.result_backend.get_progress(
             self.context.message.task_id,
         )

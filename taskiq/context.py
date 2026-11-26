@@ -1,6 +1,7 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from taskiq.abc.broker import AsyncBroker
+from taskiq.abc.result_backend import AsyncResultBackend
 from taskiq.acks import AckController
 from taskiq.exceptions import NoResultError, TaskRejectedError
 from taskiq.message import TaskiqMessage
@@ -17,12 +18,26 @@ class Context:
         message: TaskiqMessage,
         broker: AsyncBroker,
         ack_controller: AckController | None = None,
+        result_backend: AsyncResultBackend[Any] | None = None,
     ) -> None:
         self.message = message
         self.broker = broker
         self._ack_controller = ack_controller
+        self._result_backend = result_backend
         self.state: TaskiqState = None  # type: ignore
         self.state = broker.state
+
+    @property
+    def result_backend(self) -> AsyncResultBackend[Any]:
+        """Result backend bound to the message, or the broker's current one."""
+        if self._result_backend is not None:
+            return self._result_backend
+        return self.broker.result_backend
+
+    @result_backend.setter
+    def result_backend(self, value: AsyncResultBackend[Any]) -> None:
+        """Allow result backend overrides on a context instance."""
+        self._result_backend = value
 
     @property
     def is_ackable(self) -> bool:
