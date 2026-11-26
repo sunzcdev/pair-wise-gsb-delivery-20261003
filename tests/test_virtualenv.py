@@ -1318,6 +1318,155 @@ def test_find_python_cached(
     assert specs == ["python3.99"]
 
 
+def test_find_python_cache_distinguishes_search_paths_and_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Equal version names do not share entries across PATH conventions."""
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first_exe = first_dir / "python3.12.exe"
+    second_exe = second_dir / "python3.12.exe"
+    first_exe.write_text("first identity", encoding="utf-8")
+    second_exe.write_text("second identity", encoding="utf-8")
+
+    calls: list[str] = []
+
+    def discover(spec: str) -> FakeInterpreter | None:
+        calls.append(spec)
+        for entry in os.environ["PATH"].split(os.pathsep):
+            candidate = Path(entry) / "python3.12.exe"
+            if candidate.exists():
+                return FakeInterpreter(str(candidate))
+        return None
+
+    monkeypatch.setattr(nox.virtualenv, "_discover_interpreter", discover)
+    monkeypatch.setattr(nox.virtualenv, "_get_python_discovery_cache", lambda: None)
+
+    monkeypatch.setenv("PATH", str(first_dir))
+    assert nox.virtualenv._find_python("3.12") == str(first_exe)
+
+    monkeypatch.setenv("PATH", str(second_dir))
+    assert nox.virtualenv._find_python("3.12") == str(second_exe)
+
+    # Returning to the first convention reuses its independent cache entry.
+    monkeypatch.setenv("PATH", str(first_dir))
+    assert nox.virtualenv._find_python("3.12") == str(first_exe)
+    assert len(calls) == 2
+
+    # Replacing the fixed-path artifact invalidates only that entry once.
+    first_exe.write_text("replaced identity", encoding="utf-8")
+    assert nox.virtualenv._find_python("3.12") == str(first_exe)
+    assert nox.virtualenv._find_python("3.12") == str(first_exe)
+    assert len(calls) == 3
+
+
+def test_find_python_cache_revisits_deleted_preferred_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cached path that disappears cannot pin discovery to a dead choice."""
+    preferred = tmp_path / "preferred.exe"
+    fallback = tmp_path / "fallback.exe"
+    preferred.write_text("preferred", encoding="utf-8")
+    fallback.write_text("fallback", encoding="utf-8")
+    answers = iter([str(preferred), str(fallback)])
+    calls = 0
+
+    def discover(_spec: str) -> FakeInterpreter:
+        nonlocal calls
+        calls += 1
+        return FakeInterpreter(next(answers))
+
+    monkeypatch.setattr(nox.virtualenv, "_discover_interpreter", discover)
+    monkeypatch.setattr(nox.virtualenv, "_get_python_discovery_cache", lambda: None)
+
+    assert nox.virtualenv._find_python("3.12") == str(preferred)
+    preferred.unlink()
+    assert nox.virtualenv._find_python("3.12") == str(fallback)
+    assert calls == 2
+
+
+def test_virtualenv_reuse_detects_in_place_interpreter_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A changed fixed-path interpreter changes the reuse/rebuild decision."""
+    interpreter = tmp_path / "python3.12.exe"
+    interpreter.write_text("identity one", encoding="utf-8")
+    envdir = tmp_path / "venv"
+
+    monkeypatch.setattr(
+        nox.virtualenv,
+        "_discover_interpreter",
+        lambda spec: FakeInterpreter(str(interpreter)),  # noqa: ARG005
+    )
+    monkeypatch.setattr(nox.virtualenv, "_get_python_discovery_cache", lambda: None)
+    run = mock.Mock()
+    monkeypatch.setattr(nox.command, "run", run)
+
+    def make_venv() -> VirtualEnv:
+        return nox.virtualenv.VirtualEnv(
+            str(envdir), interpreter="3.12", reuse_existing=True
+        )
+
+    assert make_venv().create() is True
+    assert run.call_count == 1
+    assert (envdir / ".nox-interpreter.json").is_file()
+
+    # An unchanged interpreter is a cache hit and is reused, not rebuilt.
+    assert make_venv().create() is False
+    assert run.call_count == 1
+
+    # Same path, new identity: the existing environment must be rebuilt.
+    interpreter.write_text("identity two", encoding="utf-8")
+    assert make_venv().create() is True
+    assert run.call_count == 2
+
+
+def test_shared_envdir_distinguishes_three_search_choices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A/B/A' selections are distinguished by artifact path and identity."""
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    exe_a = dir_a / "python3.12.exe"
+    exe_b = dir_b / "python3.12.exe"
+    exe_a.write_text("a-one", encoding="utf-8")
+    exe_b.write_text("b-one", encoding="utf-8")
+    envdir = tmp_path / "shared-venv"
+
+    def discover(_spec: str) -> FakeInterpreter | None:
+        for entry in os.environ["PATH"].split(os.pathsep):
+            candidate = Path(entry) / "python3.12.exe"
+            if candidate.exists():
+                return FakeInterpreter(str(candidate))
+        return None
+
+    monkeypatch.setattr(nox.virtualenv, "_discover_interpreter", discover)
+    monkeypatch.setattr(nox.virtualenv, "_get_python_discovery_cache", lambda: None)
+    run = mock.Mock()
+    monkeypatch.setattr(nox.command, "run", run)
+
+    decisions = []
+    selected_dirs = []
+    for stage in ("a", "b", "a-replaced"):
+        monkeypatch.setenv("PATH", str(dir_b if stage == "b" else dir_a))
+        if stage == "a-replaced":
+            exe_a.write_text("a-two", encoding="utf-8")
+
+        venv = nox.virtualenv.VirtualEnv(
+            str(envdir), interpreter="3.12", reuse_existing=True
+        )
+        decisions.append(venv.create())
+        selected_dirs.append(Path(venv._current_interpreter_for_stamp()).parent.name)
+
+    assert decisions == [True, True, True]
+    assert selected_dirs == ["a", "b", "a"]
+    assert run.call_count == 3
+
+
 def test_find_python_invalid_range(monkeypatch: pytest.MonkeyPatch) -> None:
     """Newer python-discovery raises ``ValueError`` on a range it can't parse."""
 

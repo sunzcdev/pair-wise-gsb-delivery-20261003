@@ -29,6 +29,7 @@ __lazy_modules__ = {
 import abc
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import re
@@ -38,7 +39,7 @@ import sys
 import sysconfig
 from pathlib import Path
 from socket import gethostbyname
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from packaging import specifiers, version
 
@@ -203,19 +204,137 @@ def _split_free_threaded(spec: str) -> tuple[str, bool]:
     return stripped, count > 0
 
 
-@functools.cache
-def _find_python(interpreter: str) -> str | None:
-    """Return the path to an interpreter matching *interpreter*, or ``None``.
+def _discovery_search_context() -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Return the process-local inputs that can change interpreter search.
 
-    Cached because discovery is pure (read-only) and would otherwise repeat for
-    every session using the same spec.
+    python-discovery reads ``PATH`` and related environment variables, and some
+    version-manager conventions also read ``.python-version`` files from the
+    current directory. Two runners in one process can therefore request the
+    same version string while searching different locations. Include the whole
+    environment so a convention expressed through another discovery variable is
+    likewise not conflated with an earlier search.
     """
     try:
-        info = _discover_interpreter(interpreter)
-    except ValueError:
-        # python-discovery after 1.6.7 raises on a range it can't parse (``<3.12.``).
-        return None
-    return info.executable if info is not None else None
+        cwd = os.path.realpath(os.getcwd())
+    except OSError:
+        # The current directory can disappear while a long-lived API process is
+        # cleaning up temporary project directories.
+        cwd = ""
+    return cwd, tuple(sorted(os.environ.items()))
+
+
+def _interpreter_identity(executable: str) -> tuple[Any, ...] | None:
+    """Return a stable identity for the interpreter artifact at *executable*.
+
+    A content hash detects an in-place replacement at a fixed path even when an
+    editor or test double preserves the file size or mtime. When the file
+    cannot be read, fall back to its inode/timestamps; a missing path has no
+    identity and causes a cached resolution to be revisited.
+    """
+    try:
+        digest = hashlib.sha256()
+        with open(executable, "rb") as fp:
+            for chunk in iter(lambda: fp.read(1 << 16), b""):
+                digest.update(chunk)
+    except OSError:
+        try:
+            status = os.stat(executable)
+        except OSError:
+            return None
+        return (
+            "stat",
+            status.st_dev,
+            status.st_ino,
+            status.st_mtime_ns,
+            status.st_size,
+        )
+    else:
+        return ("sha256", digest.hexdigest())
+
+
+def _forget_python_discovery_info(executable: str) -> None:
+    """Drop python-discovery's cached metadata for a replaced *executable*."""
+    cached_py_info = sys.modules.get("python_discovery._cached_py_info")
+    cache_map = getattr(cached_py_info, "_CACHE", None)
+    if cache_map is not None:
+        cache_map.pop((Path(executable), None), None)
+
+    cache = _get_python_discovery_cache()
+    if cache is not None:
+        with contextlib.suppress(Exception):
+            # A bad/non-filesystem cache backend should never break resolution.
+            cache.py_info(Path(executable)).remove()
+
+
+class _PythonCacheEntry(NamedTuple):
+    executable: str | None
+    identity: tuple[Any, ...] | None
+
+
+class _PythonCacheInfo(NamedTuple):
+    hits: int
+    misses: int
+    maxsize: int | None
+    currsize: int
+
+
+class _FindPythonCache:
+    """Context-aware, self-invalidating cache for interpreter searches."""
+
+    def __init__(self) -> None:
+        self._entries: dict[
+            tuple[str, tuple[str, tuple[tuple[str, str], ...]]], _PythonCacheEntry
+        ] = {}
+        self.hits = 0
+        self.misses = 0
+
+    def __call__(self, interpreter: str) -> str | None:
+        key = (interpreter, _discovery_search_context())
+        entry = self._entries.get(key)
+
+        if entry is not None:
+            # Negative results and paths that could not be stated when cached
+            # remain cached; mocked test paths are commonly intentionally absent.
+            if entry.executable is None:
+                self.hits += 1
+                return None
+            if _interpreter_identity(entry.executable) == entry.identity:
+                self.hits += 1
+                return entry.executable
+
+            # The fixed path was removed or replaced. Do not return the stale
+            # answer; also force python-discovery to re-interrogate that path.
+            _forget_python_discovery_info(entry.executable)
+
+        self.misses += 1
+        try:
+            info = _discover_interpreter(interpreter)
+        except ValueError:
+            # python-discovery after 1.6.7 raises on a range it can't parse
+            # (``<3.12.``).
+            result: str | None = None
+        else:
+            result = info.executable if info is not None else None
+
+        identity = _interpreter_identity(result) if result is not None else None
+        self._entries[key] = _PythonCacheEntry(result, identity)
+        return result
+
+    def cache_clear(self) -> None:
+        self._entries.clear()
+        self.hits = 0
+        self.misses = 0
+
+    def cache_info(self) -> _PythonCacheInfo:
+        return _PythonCacheInfo(
+            hits=self.hits,
+            misses=self.misses,
+            maxsize=None,
+            currsize=len(self._entries),
+        )
+
+
+_find_python = _FindPythonCache()
 
 
 def _highest_under_upper_bound(
@@ -933,15 +1052,108 @@ class VirtualEnv(ProcessEnv):
 
         return False
 
+    @property
+    def _interpreter_stamp_path(self) -> Path:
+        """Path to Nox's cheap interpreter-identity record for this env."""
+        return Path(self.location) / ".nox-interpreter.json"
+
+    def _current_interpreter_for_stamp(self) -> str | None:
+        """Resolve the interpreter without triggering a download/install."""
+        if isinstance(self._resolved, str):
+            return self._resolved
+        if isinstance(self._resolved, Exception):
+            return None
+        if self.interpreter is None:
+            return sys.executable
+        return _find_python(self.interpreter)
+
+    def _write_interpreter_stamp(self) -> None:
+        """Record the interpreter artifact used to create this environment."""
+        try:
+            executable = self._current_interpreter_for_stamp()
+            if executable is None:
+                return
+            identity = _interpreter_identity(executable)
+            if identity is None:
+                # Installer backends can return a request such as
+                # ``python3.12`` rather than a concrete existing path. There is
+                # nothing cheap and stable to record in that case; retain the
+                # historical reuse behavior instead of invalidating every run.
+                return
+            stamp = {
+                "version": 1,
+                "requested": self.interpreter,
+                "executable": executable,
+                "identity": list(identity),
+            }
+            path = self._interpreter_stamp_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(stamp, sort_keys=True), encoding="utf-8")
+        except OSError:
+            logger.debug("Failed to write interpreter identity stamp.", exc_info=True)
+
+    def _read_interpreter_stamp(self) -> dict[str, Any] | None:
+        try:
+            stamp = json.loads(self._interpreter_stamp_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return stamp if isinstance(stamp, dict) else None
+
+    @staticmethod
+    def _same_interpreter_artifact(old_executable: str, new_executable: str) -> bool:
+        """Whether two path strings name the same on-disk interpreter."""
+        old_norm = os.path.normcase(os.path.abspath(old_executable))
+        new_norm = os.path.normcase(os.path.abspath(new_executable))
+        if old_norm == new_norm:
+            return True
+        with contextlib.suppress(OSError):
+            return os.path.samefile(old_executable, new_executable)
+        return False
+
+    def _check_reused_environment_stamp(self) -> bool:
+        """Compare the current interpreter with the one used at creation.
+
+        Environments created by older Nox versions have no stamp. Those keep
+        the historical permissive reuse behavior so ordinary old environments
+        are not rebuilt merely because Nox learned this check.
+        """
+        stamp = self._read_interpreter_stamp()
+        if stamp is None:
+            return True
+
+        old_executable = stamp.get("executable")
+        old_identity = stamp.get("identity")
+        if not isinstance(old_executable, str) or not isinstance(old_identity, list):
+            return True
+
+        # Resolve through the discovery cache, but do not provision/download a
+        # new interpreter merely to decide whether the old environment is stale.
+        executable = self._current_interpreter_for_stamp()
+        if executable is None:
+            return False
+
+        if not self._same_interpreter_artifact(old_executable, executable):
+            return False
+
+        identity = _interpreter_identity(executable)
+        return identity == tuple(old_identity)
+
     def _check_reused_environment_interpreter(self) -> bool:
         """
-        Check if reused environment interpreter is the same. Currently only checks if
-        NOX_ENABLE_STALENESS_CHECK is set in the environment. See
+        Check if reused environment interpreter is the same.
+
+        Nox's own interpreter stamp always detects a removed, relocated, or
+        in-place replaced interpreter when a prior Nox run created the
+        environment. The older prefix-based subprocess check additionally runs
+        only when NOX_ENABLE_STALENESS_CHECK is set in the environment. See
 
         * https://github.com/wntrblm/nox/issues/449#issuecomment-860030890
         * https://github.com/wntrblm/nox/issues/441
         * https://github.com/pypa/virtualenv/issues/2130
         """
+        if not self._check_reused_environment_stamp():
+            return False
+
         if not os.environ.get("NOX_ENABLE_STALENESS_CHECK", ""):
             return True
 
@@ -1063,6 +1275,9 @@ class VirtualEnv(ProcessEnv):
             )
 
             self._reused = True
+            # Start tracking an environment created by an older Nox version;
+            # this only writes Nox's sidecar stamp and does not rebuild it.
+            self._write_interpreter_stamp()
 
             return False
 
@@ -1099,6 +1314,7 @@ class VirtualEnv(ProcessEnv):
             f" {resolved_interpreter_name} in {self.location_name}"
         )
         nox.command.run(cmd, silent=True, log=nox.options.verbose or False)
+        self._write_interpreter_stamp()
 
         return True
 
