@@ -22,7 +22,7 @@ from .console import console, stdout_console
 from .util import json_encode
 
 if TYPE_CHECKING:
-    from pyinfra.api.state import State
+    from pyinfra.api.state import State, StateOperationHostData
 
 
 ANSI_RE = re.compile(r"\033\[((?:\d|;)*)([a-zA-Z])")
@@ -189,29 +189,116 @@ def build_plan_json(state: State) -> list[dict]:
     return operations
 
 
+def _host_result_record(host: Host, op_data: StateOperationHostData) -> dict[str, Any]:
+    """
+    Build the machine-readable per-host record for one operation.
+
+    ``final_result`` is the outcome of the last verified attempt:
+
+    + ``changed``     - commands ran and succeeded, so the host actually changed
+    + ``no_change``   - ran successfully but produced no commands (idempotent)
+    + ``error``       - the last attempt failed (retries exhausted)
+    + ``skipped``     - never ran; ``skip_reason`` says why (``precondition`` /
+                        ``not_scheduled``)
+
+    ``attempts`` holds every execution attempt in order, including failures that
+    a later retry recovered from. Retried and skipped history is reported here
+    but never counted as a write: only ``changed`` hosts feed ``write_count``.
+    """
+
+    op_meta = op_data.operation_meta
+    final_result: str
+    changed = False
+
+    if op_meta.was_skipped:
+        final_result = "skipped"
+    elif op_meta.did_succeed(_raise_if_not_complete=False):
+        changed = op_meta.did_change()
+        final_result = "changed" if changed else "no_change"
+    else:
+        final_result = "error"
+
+    final_attempt = op_meta.attempts[-1] if op_meta.attempts else None
+
+    return {
+        "host": host.name,
+        "final_result": final_result,
+        "changed": changed,
+        "skip_reason": op_meta.skip_reason,
+        "retried": op_meta.was_retried,
+        "retry_attempts": op_meta.retry_attempts,
+        "attempts": op_meta.attempts,
+        "final_attempt": final_attempt,
+    }
+
+
 def build_results_json(state: State) -> dict:
     operations: list[dict] = []
-    totals = {"hosts": 0, "success": 0, "error": 0, "no_change": 0}
+    totals = {
+        "hosts": 0,
+        "success": 0,
+        "error": 0,
+        "no_change": 0,
+        # Extended counters: writes (actual changes), skips and retries are kept
+        # separate so a retried-then-written op is counted once, as a write.
+        "changed": 0,
+        "skipped": 0,
+        "retried": 0,
+        "write_count": 0,
+    }
+    # Per-host aggregation for the run-level before/after comparison.
+    host_changed: set[str] = set()
+    host_skipped: set[str] = set()
 
     for op_hash in state.get_op_order():
         hosts_in_op = 0
         success: list[str] = []
         error: list[str] = []
         no_change: list[str] = []
+        skipped: list[str] = []
+        host_results: list[dict] = []
 
+        # Iterate every activated host, including ones the operation was never
+        # scheduled on, so skips are visible rather than silently absent.
         for host in state.inventory.iter_activated_hosts():
             if op_hash not in state.ops[host]:
+                record = {
+                    "host": host.name,
+                    "final_result": "skipped",
+                    "changed": False,
+                    "skip_reason": "not_scheduled",
+                    "retried": False,
+                    "retry_attempts": 0,
+                    "attempts": [],
+                    "final_attempt": None,
+                }
+                skipped.append(host.name)
+                host_skipped.add(host.name)
+                host_results.append(record)
                 continue
 
             hosts_in_op += 1
-            op_meta = state.ops[host][op_hash].operation_meta
-            if op_meta.did_succeed(_raise_if_not_complete=False):
-                if op_meta.did_change():
-                    success.append(host.name)
-                else:
-                    no_change.append(host.name)
-            else:
+            op_data = state.ops[host][op_hash]
+            record = _host_result_record(host, op_data)
+            host_results.append(record)
+
+            if record["final_result"] == "changed":
+                success.append(host.name)
+                host_changed.add(host.name)
+            elif record["final_result"] == "no_change":
+                no_change.append(host.name)
+            elif record["final_result"] == "error":
                 error.append(host.name)
+            else:
+                skipped.append(host.name)
+                host_skipped.add(host.name)
+
+        host_results.sort(key=lambda record: record["host"])
+        changed_hosts = sorted(success)
+        skipped_hosts = sorted(skipped)
+        retried_hosts = sorted(
+            record["host"] for record in host_results if record["retried"]
+        )
 
         meta = state.op_meta[op_hash]
         operations.append(
@@ -224,6 +311,13 @@ def build_results_json(state: State) -> dict:
                 "success": sorted(success),
                 "error": sorted(error),
                 "no_change": sorted(no_change),
+                # Per-host verified outcome with the full attempt history.
+                "host_results": host_results,
+                "skipped": skipped_hosts,
+                "retried": retried_hosts,
+                # Before/after comparison: which hosts actually changed state.
+                "changed": changed_hosts,
+                "write_count": len(changed_hosts),
             }
         )
 
@@ -231,11 +325,25 @@ def build_results_json(state: State) -> dict:
         totals["success"] += len(success)
         totals["error"] += len(error)
         totals["no_change"] += len(no_change)
+        totals["changed"] += len(changed_hosts)
+        totals["skipped"] += len(skipped_hosts)
+        totals["retried"] += len(retried_hosts)
+        totals["write_count"] += len(changed_hosts)
+
+    # Run-level before/after comparison: the hosts that truly changed versus the
+    # ones where an op was skipped. A host that retried and then wrote appears in
+    # ``changed``, never in ``skipped``.
+    comparison = {
+        "changed": sorted(host_changed),
+        "skipped": sorted(host_skipped),
+        "write_count": totals["write_count"],
+    }
 
     return {
         "operations": operations,
         "totals": totals,
         "failed_hosts": sorted(host.name for host in state.failed_hosts),
+        "comparison": comparison,
     }
 
 

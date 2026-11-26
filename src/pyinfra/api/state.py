@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from graphlib import CycleError, TopologicalSorter
 from itertools import pairwise
@@ -130,11 +130,36 @@ class StateOperationMeta:
 
 
 @dataclass
+class OperationAttemptRecord:
+    """
+    A single execution attempt of an operation on a host.
+
+    Attempts are numbered from zero (the first run); retries follow with attempt
+    1, 2, ... Commands are stored via their masked ``str`` representation so the
+    record follows the same masking convention as the rest of pyinfra's output.
+    """
+
+    attempt: int
+    success: bool
+    commands: list[str]
+    stdout_lines: list[str]
+    stderr_lines: list[str]
+
+
+@dataclass
 class StateOperationHostData:
     command_generator: Callable[[], Iterator[PyinfraCommand]]
     global_arguments: AllArguments
     operation_meta: OperationMeta
     parent_op_hash: str | None = None
+    # One-element holder shared with the command generator: ``None`` before the
+    # generator first runs, then ``True`` when a ``_if`` precondition blocked the
+    # operation on this host, ``False`` when it passed. A list (rather than the
+    # bool) is used so the generator closure and this object stay in sync.
+    precondition_skipped: list[bool | None] = field(default_factory=lambda: [None])
+    # One entry per actual execution attempt, in order; empty when the op never
+    # ran (precondition/limit/run_once skips).
+    attempts: list[OperationAttemptRecord] = field(default_factory=list)
 
 
 class StateHostMeta:

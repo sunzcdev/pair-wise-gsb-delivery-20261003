@@ -1,0 +1,21 @@
+{
+  "operations": [
+    {
+      "op_hash": "0000000000000000000000000000000000000000",
+      "name": "maintenance write",
+      "names": ["maintenance write"],
+      "args": [],
+      "hosts": 2,
+      "success": ["@fake/web-retry"],
+      "error": [],
+      "no_change": []
+    }
+  ],
+  "totals": {
+    "hosts": 2,
+    "success": 1,
+    "error": 0,
+    "no_change": 0
+  },
+  "failed_hosts": []
+}

@@ -246,9 +246,17 @@ class TestJsonOutput(PatchSSHTestCase):
         assert "plan" in payload
         assert payload["results"] is not None
         results = payload["results"]
-        assert set(results.keys()) == {"operations", "totals", "failed_hosts"}
+        # Original keys are retained for backward compatibility; the machine
+        # readable before/after comparison is added alongside them.
+        assert {
+            "operations",
+            "totals",
+            "failed_hosts",
+            "comparison",
+        } <= set(results.keys())
         assert results["totals"]["hosts"] >= 1
         assert results["failed_hosts"] == []
+        assert set(results["comparison"].keys()) == {"changed", "skipped", "write_count"}
 
     def test_json_debug_operations(self):
         result = run_cli(
@@ -278,7 +286,12 @@ class TestJsonOutput(PatchSSHTestCase):
         result = run_cli("-y", "--json", self.inventory, "server.shell", "echo hi")
         payload = self._parse_stdout(result)
         assert payload["results"] is not None
-        assert set(payload["results"].keys()) == {"operations", "totals", "failed_hosts"}
+        assert {
+            "operations",
+            "totals",
+            "failed_hosts",
+            "comparison",
+        } <= set(payload["results"].keys())
 
     def test_json_deploy_with_exclude(self):
         result = run_cli(

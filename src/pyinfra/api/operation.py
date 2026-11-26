@@ -11,13 +11,14 @@ from functools import wraps
 from inspect import Parameter, signature
 from io import StringIO
 from types import FunctionType
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 from collections.abc import Callable, Generator, Iterator
 
 from typing_extensions import ParamSpec, override
 
 import pyinfra
 from pyinfra import context, logger
+from pyinfra.connectors.util import CommandOutput
 from pyinfra.context import ctx_host, ctx_state
 
 from .arguments import EXECUTION_KWARG_KEYS, AllArguments, pop_global_arguments
@@ -38,9 +39,6 @@ from .util import (
 
 op_meta_default = object()
 
-if TYPE_CHECKING:
-    from pyinfra.connectors.util import CommandOutput
-
 
 class OperationMeta:
     _hash: str
@@ -52,6 +50,8 @@ class OperationMeta:
     _retry_attempts: int = 0
     _max_retries: int = 0
     _retry_succeeded: bool | None = None
+    _attempts: list[dict[str, Any]] = []
+    _skip_reason: str | None = None
 
     def __init__(self, hash, is_change: bool | None):
         self._hash = hash
@@ -88,6 +88,7 @@ class OperationMeta:
         combined_output: CommandOutput,
         retry_attempts: int = 0,
         max_retries: int = 0,
+        attempts: list[dict[str, Any]] | None = None,
     ) -> None:
         if self.is_complete():
             raise RuntimeError("Cannot complete an already complete operation")
@@ -96,6 +97,8 @@ class OperationMeta:
         self._combined_output = combined_output
         self._retry_attempts = retry_attempts
         self._max_retries = max_retries
+        if attempts:
+            self._attempts = attempts
 
         # Determine if operation succeeded after retries
         if retry_attempts > 0:
@@ -203,6 +206,43 @@ class OperationMeta:
             "was_retried": self.was_retried,
             "retry_succeeded": self._retry_succeeded,
         }
+
+    def mark_skipped(self, reason: str) -> None:
+        """
+        Record that this operation never executed on the host, and why.
+
+        ``reason`` is one of ``"precondition"`` (a ``_if`` condition was false)
+        or ``"not_scheduled"`` (the host never received the operation, e.g.
+        ``_run_once`` ran elsewhere or the host was limited out).
+
+        A skip completes the meta as a successful no-change op so downstream
+        result checks do not treat it as unexecuted.
+        """
+        self._skip_reason = reason
+        self._success = True
+        self._commands = []
+        self._combined_output = CommandOutput([])
+
+    @property
+    def attempts(self) -> list[dict[str, Any]]:
+        """
+        Execution attempts in order; empty when the operation never ran.
+        """
+        return list(self._attempts)
+
+    @property
+    def skip_reason(self) -> str | None:
+        """
+        Why the operation did not run on this host, or ``None`` when it ran.
+        """
+        return self._skip_reason
+
+    @property
+    def was_skipped(self) -> bool:
+        """
+        Whether the operation was never executed on this host.
+        """
+        return self._skip_reason is not None
 
 
 def add_op(state: State, op_func, *args, **kwargs):
@@ -339,14 +379,23 @@ def _wrap_operation(func: Callable[P, Generator], _set_in_op: bool = True) -> Py
         # and, if we're diff-ing, we then iterate the generator now to determine if any changes
         # *would* be made based on the *current* remote state.
 
+        # The command generator below records whether a false ``_if`` precondition
+        # stopped the op. The op_data object does not exist when the generator is
+        # defined, so the generator writes into this one-element holder and op_data
+        # aliases the same value once constructed.
+        precondition_skipped: list[bool | None] = [None]
+
         def command_generator() -> Iterator[PyinfraCommand]:
             # Check global _if argument function and do nothing if returns False
             if state.is_executing:
                 _ifs = global_arguments.get("_if")
                 if isinstance(_ifs, list) and not all(_if() for _if in _ifs):
+                    precondition_skipped[0] = True
                     return
                 elif callable(_ifs) and not _ifs():
+                    precondition_skipped[0] = True
                     return
+                precondition_skipped[0] = False
 
             host.in_op = _set_in_op
             host.current_op_hash = op_hash
@@ -385,8 +434,14 @@ def _wrap_operation(func: Callable[P, Generator], _set_in_op: bool = True) -> Py
 
         operation_meta = OperationMeta(op_hash, op_is_change)
 
-        # Add the server-relevant commands
-        op_data = StateOperationHostData(command_generator, global_arguments, operation_meta)
+        # Add the server-relevant commands; pass the same holder the generator
+        # writes its precondition verdict into.
+        op_data = StateOperationHostData(
+            command_generator,
+            global_arguments,
+            operation_meta,
+            precondition_skipped=precondition_skipped,
+        )
         state.set_op_data_for_host(host, op_hash, op_data)
 
         # If we're already in the execution phase, execute this operation immediately

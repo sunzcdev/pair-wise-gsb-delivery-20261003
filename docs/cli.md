@@ -219,6 +219,30 @@ Interactive prompts from deploy code (e.g. `input(...)`) will still block, so av
 + Inventory `data` is serialised as-is. If a host carries values that are not JSON-serialisable (custom Python objects, sets, datetimes with no encoder, etc.) the command will fail. Use primitive/JSON-friendly types in inventory data when you plan to consume the output.
 + Log messages and errors are still written to stderr, so redirect with `pyinfra ... --json 2>/dev/null > out.json` if you need stdout to contain only JSON.
 
+### Results schema (`--json --yes`)
+
+The `results` object keeps the original `operations`, `totals` and `failed_hosts`
+keys and adds a machine-readable before/after comparison. Every operation carries
+a `host_results` list with one entry per activated host:
+
++ `final_result`: the outcome of the host's last verified attempt — `changed`,
+  `no_change`, `error` or `skipped`
++ `attempts`: every execution attempt in order (zero-based), each with its
+  `success` flag, masked `commands` and `stdout_lines`/`stderr_lines`; a failed
+  attempt that a later retry recovered from stays in the history
++ `skip_reason`: `precondition` when a `_if` condition was false, `not_scheduled`
+  when the host never received the operation (e.g. `_run_once` ran elsewhere),
+  otherwise `null`
++ `retried` / `retry_attempts`: whether the op was retried and how many times
+
+Per operation, `changed` lists the hosts that truly changed and `write_count` is
+its length; `skipped` and `retried` are reported separately, so retry and skip
+history never inflates the write count. The top-level `comparison` object
+aggregates `changed`, `skipped` and `write_count` across the whole run. Command
+strings follow the standard masking convention, so `HiddenValue`/`MaskString`
+secrets are emitted as `*MASKED*`. The original fields are unchanged, so tooling
+built against the older format keeps working.
+
 
 ## Shell Autocompletion
 

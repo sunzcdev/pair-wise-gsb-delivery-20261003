@@ -1,3 +1,9 @@
+# Unreleased
+
+Core:
+
+- api: record per-host operation attempt history and expose a machine-readable before/after comparison in `--json` results, keeping skipped/retried history out of the write count while retaining the original output fields
+
 # v3.11.1
 
 Core:

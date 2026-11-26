@@ -17,6 +17,7 @@ from pyinfra.progress import progress_spinner
 from .arguments import CONNECTOR_ARGUMENT_KEYS, ConnectorArguments
 from .command import FunctionCommand, PyinfraCommand, StringCommand
 from .exceptions import NestedOperationError, PyinfraError
+from .state import OperationAttemptRecord
 from .util import (
     format_exception,
     log_error_or_warning,
@@ -32,6 +33,26 @@ if TYPE_CHECKING:
 
 # Run a single host operation
 #
+
+
+def _output_lines_for_buffer(
+    all_output_lines: list[OutputLine | str],
+    buffer_name: str,
+) -> list[str]:
+    """
+    Extract lines for one buffer (stdout/stderr) from collected output.
+
+    Real connectors yield ``OutputLine`` objects, but test doubles (and some
+    legacy paths) append plain strings, which are treated as stdout.
+    """
+    lines = []
+    for line in all_output_lines:
+        if isinstance(line, OutputLine):
+            if line.buffer_name == buffer_name:
+                lines.append(line.line)
+        elif buffer_name == "stdout":
+            lines.append(str(line))
+    return lines
 
 
 def run_host_op(state: State, host: Host, op_hash: str) -> bool:
@@ -149,6 +170,21 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
 
             executed_commands += 1
 
+        # Record this attempt before any retry so the failed history of an op that
+        # later succeeds is preserved. Commands are stored masked, matching how
+        # pyinfra displays them everywhere else. A precondition skip yields no
+        # commands and no attempt at all - it is reported separately below.
+        if op_data.precondition_skipped[0] is not True:
+            op_data.attempts.append(
+                OperationAttemptRecord(
+                    attempt=retry_attempt,
+                    success=not did_error,
+                    commands=[str(command) for command in commands],
+                    stdout_lines=_output_lines_for_buffer(all_output_lines, "stdout"),
+                    stderr_lines=_output_lines_for_buffer(all_output_lines, "stderr"),
+                ),
+            )
+
         # Check if we should retry
         should_retry = False
         if retry_attempt < retries:
@@ -196,6 +232,14 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
     op_success = return_status = not did_error
     host_results = state.get_results_for_host(host)
 
+    # A false ``_if`` precondition means the command generator yielded nothing:
+    # nothing ran, nothing changed, and this is distinct from an idempotent no-op
+    # that genuinely had nothing to do.
+    if op_data.precondition_skipped[0]:
+        op_data.operation_meta.mark_skipped("precondition")
+        logger.info(f"{host.print_prefix}{format_text('Skipped (precondition not met)', 'blue')}")
+        return True
+
     if did_error is False:
         host_results.ops += 1
         host_results.success_ops += 1
@@ -239,6 +283,16 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
         CommandOutput(all_output_lines),
         retry_attempts=retry_attempt,
         max_retries=retries,
+        attempts=[
+            {
+                "attempt": record.attempt,
+                "success": record.success,
+                "commands": list(record.commands),
+                "stdout_lines": list(record.stdout_lines),
+                "stderr_lines": list(record.stderr_lines),
+            }
+            for record in op_data.attempts
+        ],
     )
 
     return return_status
