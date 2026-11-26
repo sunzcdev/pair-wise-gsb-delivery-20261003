@@ -1,5 +1,9 @@
 # Releases
 
+## Unreleased
+
+  - Response statistics now record the connection phases each request actually went through. `Async::HTTP::Statistics#wrap` attributes the pool wait (`#pool_wait_duration`) and connection establishment (`#connect_duration`) to the response which experienced them, so a reused connection reports `connect_duration` as `nil` rather than repeating another request's handshake. A phase which did not happen (`nil`) is distinct from one which happened too fast to measure (`0.0`), the absolute timestamps of each phase allow concurrent requests to be cross-checked against one timeline, and the existing first-chunk and total duration statistics are unchanged.
+
 ## v0.105.0
 
   - Respond with `400 Bad Request` for any `Protocol::HTTP::BadRequest` raised while parsing HTTP/1 or HTTP/2 requests, include the exception class name without reflecting request data, and avoid reporting them as unhandled server errors.

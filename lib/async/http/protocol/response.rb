@@ -12,6 +12,9 @@ module Async
 		module Protocol
 			# An HTTP response received from a server via client protocol implementations.
 			class Response < ::Protocol::HTTP::Response
+				# @attribute [Statistics::Phases | Nil] The connection phases through which this specific request went, if known.
+				attr_accessor :phases
+				
 				# @returns [Connection | Nil] The underlying protocol connection.
 				def connection
 					nil

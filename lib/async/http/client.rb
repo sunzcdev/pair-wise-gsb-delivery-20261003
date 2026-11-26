@@ -13,6 +13,7 @@ require "protocol/http/error"
 require "protocol/http/methods"
 
 require_relative "protocol"
+require_relative "statistics"
 
 module Async
 	module HTTP
@@ -108,9 +109,14 @@ module Async
 					attempt += 1
 					
 					# As we cache pool, it's possible these pool go bad (e.g. closed by remote host). In this case, we need to try again. It's up to the caller to impose a timeout on this. If this is the last attempt, we force a new connection.
-					connection = @pool.acquire
+					connection, phases = acquire_connection
 					
 					response = make_response(request, connection, attempt)
+					
+					# Attach the phases to the response so that response statistics can attribute them to this request:
+					if phases and response.respond_to?(:phases=)
+						response.phases = phases
+					end
 					
 					# This signals that the ensure block below should not try to release the connection, because it's bound into the response which will be returned:
 					connection = nil
@@ -152,6 +158,17 @@ module Async
 			
 			protected
 			
+			# Acquire a connection from the pool, optionally returning the phases which the acquisition went through.
+			# @returns [Tuple(Object, Statistics::Phases | Nil)] The connection and its acquisition phases.
+			def acquire_connection
+				if @pool.respond_to?(:acquire_with_phases)
+					return @pool.acquire_with_phases
+				else
+					# The pool does not support phase recording (e.g. a custom pool):
+					return @pool.acquire, nil
+				end
+			end
+			
 			def make_response(request, connection, attempt)
 				response = request.call(connection)
 				
@@ -173,7 +190,7 @@ module Async
 				
 				self.assign_default_tags(options[:tags] ||= {})
 				
-				Async::Pool::Controller.wrap(**options) do
+				TimingPool.wrap(**options) do
 					Console.debug(self){"Making connection to #{@endpoint.inspect}"}
 					
 					@protocol.client(@endpoint.connect)
