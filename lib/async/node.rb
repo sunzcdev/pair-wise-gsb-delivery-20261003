@@ -345,3 +345,5 @@ module Async
 		end
 	end
 end
+
+require_relative "snapshot"
