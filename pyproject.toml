@@ -44,6 +44,7 @@ dependencies = [
   "attrs>=24.1",
   "colorlog>=6.6,<7",
   "dependency-groups>=1.1",
+  "filelock>=3.12,<5",
   "humanize>=4",
   "packaging>=22",
   "platformdirs>=2",

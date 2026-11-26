@@ -45,6 +45,14 @@ from packaging import specifiers, version
 import nox
 import nox.command
 from nox import _rattler
+from nox._envlock import (
+    EnvironmentLease,
+    EnvironmentLeaseTimeout,
+    EnvironmentLock,
+    environment_lease,
+    environment_lock_path,
+    inspect_environment,
+)
 from nox.logger import logger
 
 if TYPE_CHECKING:
@@ -68,13 +76,19 @@ __all__ = [
     "UV",
     "UV_VERSION",
     "CondaEnv",
+    "EnvironmentLease",
+    "EnvironmentLeaseTimeout",
+    "EnvironmentLock",
     "InterpreterNotFound",
     "PassthroughEnv",
     "ProcessEnv",
     "RattlerEnv",
     "VirtualEnv",
+    "environment_lease",
+    "environment_lock_path",
     "find_uv",
     "get_virtualenv",
+    "inspect_environment",
     "pbs_install_python",
     "uv_install_python",
     "uv_version",
@@ -508,9 +522,52 @@ class ProcessEnv(abc.ABC):
     ) -> None:
         self._bin_paths = None if bin_paths is None else list(bin_paths)
         self._reused = False
+        self._usage_lease: EnvironmentLease | None = None
 
         # .command's env supports None, meaning don't include value even if in parent
         self.env = {**dict.fromkeys(_BLACKLISTED_ENV_VARS), **(env or {})}
+
+    def environment_lease(
+        self, *, exclusive: bool = False, timeout: float | None = None
+    ) -> EnvironmentLease:
+        """Return the cross-process usage/recreate lease for this environment."""
+        location = getattr(self, "location", None)
+        if location is None:
+            msg = "This environment does not have a filesystem location."
+            raise ValueError(msg)
+        return EnvironmentLease(location, exclusive=exclusive, timeout=timeout)
+
+    @contextlib.contextmanager
+    def _creation_lease(self) -> Any:
+        """Use the runner's lifecycle lease or a private creation lease."""
+        if self._usage_lease is not None:
+            yield self._usage_lease
+            return
+
+        location = getattr(self, "location", None)
+        if location is None:
+            yield None
+            return
+
+        lease = EnvironmentLease(location, exclusive=True)
+        self._usage_lease = lease
+        try:
+            with lease:
+                yield lease
+        finally:
+            self._usage_lease = None
+
+    def _require_exclusive_creation_lease(self) -> None:
+        """Upgrade a shared lifecycle lease before deleting an environment."""
+        lease = self._usage_lease
+        if lease is not None and not lease.exclusive:
+            lease.upgrade_to_exclusive()
+
+    @staticmethod
+    def _finish_creation_lease(lease: Any) -> None:
+        """Downgrade a long-lived writer lease so commands can use shared access."""
+        if isinstance(lease, EnvironmentLease) and lease.exclusive and lease.held:
+            lease.downgrade_to_shared()
 
     @property
     def bin_paths(self) -> list[str] | None:
@@ -641,6 +698,8 @@ class CondaEnv(ProcessEnv):
         if os.path.exists(self.location):
             if self.reuse_existing and is_conda:
                 return False
+        self._require_exclusive_creation_lease()
+        if os.path.exists(self.location):
             if is_conda:
                 self._remove_env()
             # Make sure that location is clean
@@ -669,6 +728,11 @@ class CondaEnv(ProcessEnv):
         return [os.path.join(self.location, "bin")]
 
     def create(self) -> bool:
+        """Create the conda environment under an environment lease."""
+        with self._creation_lease() as lease:
+            return self._create_environment(lease)
+
+    def _create_environment(self, lease: EnvironmentLease | None) -> bool:
         """Create the conda env."""
         nox_dir = Path(self.location).parent
         _ensure_gitignore(nox_dir)
@@ -686,6 +750,7 @@ class CondaEnv(ProcessEnv):
             f"Creating {self.venv_backend} env in {self.location_name} with {python_dep}"
         )
         self._create_env(python_dep)
+        self._finish_creation_lease(lease)
         return True
 
     def _create_env(self, python_dep: str) -> None:
@@ -863,14 +928,18 @@ class VirtualEnv(ProcessEnv):
 
     def _clean_location(self) -> bool:
         """Deletes any existing virtual environment"""
+        if os.path.exists(self.location) and (
+            self.reuse_existing
+            and self._check_reused_environment_type()
+            and self._check_reused_environment_links()
+            and self._check_reused_environment_interpreter()
+        ):
+            return False
+
+        # A missing environment still has to be created exclusively; otherwise
+        # two first-time CI entries can build in the same directory at once.
+        self._require_exclusive_creation_lease()
         if os.path.exists(self.location):
-            if (
-                self.reuse_existing
-                and self._check_reused_environment_type()
-                and self._check_reused_environment_links()
-                and self._check_reused_environment_interpreter()
-            ):
-                return False
             # uv clears it for us, and it balks at files left around
             if self.venv_backend != "uv":
                 shutil.rmtree(self.location, ignore_errors=True)
@@ -1052,6 +1121,11 @@ class VirtualEnv(ProcessEnv):
         return [os.path.join(self.location, "bin")]
 
     def create(self) -> bool:
+        """Create the virtualenv or venv under an environment lease."""
+        with self._creation_lease() as lease:
+            return self._create_environment(lease)
+
+    def _create_environment(self, lease: EnvironmentLease | None) -> bool:
         """Create the virtualenv or venv."""
         nox_dir = Path(self.location).parent
         _ensure_gitignore(nox_dir)
@@ -1100,6 +1174,7 @@ class VirtualEnv(ProcessEnv):
         )
         nox.command.run(cmd, silent=True, log=nox.options.verbose or False)
 
+        self._finish_creation_lease(lease)
         return True
 
     @property

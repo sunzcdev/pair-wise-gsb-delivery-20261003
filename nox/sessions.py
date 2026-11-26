@@ -51,6 +51,7 @@ from nox.logger import logger
 from nox.popen import DEFAULT_INTERRUPT_TIMEOUT, DEFAULT_TERMINATE_TIMEOUT
 from nox.virtualenv import (
     CondaEnv,
+    EnvironmentLease,
     PassthroughEnv,
     ProcessEnv,
     RattlerEnv,
@@ -1086,6 +1087,7 @@ class SessionRunner:
         self.posargs: list[str] = list(global_config.posargs)
         self.result: Result | None = None
         self.multi = multi
+        self._lease_stack: contextlib.ExitStack | None = None
 
         if getattr(func, "parametrize", None):
             self.multi = True
@@ -1173,6 +1175,19 @@ class SessionRunner:
             venv_params=self.func.venv_params,
         )
 
+        # The lease has to outlive create(): it protects every subprocess the
+        # session runs. execute() owns the ExitStack and closes it after the
+        # user function has returned or raised.
+        if self._lease_stack is not None and isinstance(
+            self.venv, (VirtualEnv, CondaEnv)
+        ):
+            lease = EnvironmentLease(
+                self.envdir,
+                exclusive=not self.reuse_existing_venv(),
+            )
+            self._lease_stack.enter_context(lease)
+            self.venv._usage_lease = lease  # noqa: SLF001
+
         self.venv.create()
 
     def reuse_existing_venv(self) -> bool:
@@ -1198,10 +1213,12 @@ class SessionRunner:
                     return self.result
 
         start = time.perf_counter()
+        lease_stack = contextlib.ExitStack()
+        self._lease_stack = lease_stack
         try:
             cwd = os.path.realpath(os.path.dirname(self.global_config.noxfile))
 
-            with _chdir(cwd):
+            with lease_stack, _chdir(cwd):
                 self._create_venv()
                 session = Session(self)
                 session.env["NOX_CURRENT_SESSION"] = session.name
@@ -1261,6 +1278,10 @@ class SessionRunner:
             self.result = Result(
                 self, Status.FAILED, duration=time.perf_counter() - start
             )
+        finally:
+            lease_stack.close()
+            if self._lease_stack is lease_stack:
+                self._lease_stack = None
 
         return self.result
 
