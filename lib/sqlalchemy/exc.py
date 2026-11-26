@@ -20,6 +20,7 @@ from typing import Any
 from typing import List
 from typing import Optional
 from typing import overload
+from typing import Sequence
 from typing import Tuple
 from typing import Type
 from typing import Union
@@ -420,6 +421,164 @@ class NoReferenceError(InvalidRequestError):
     table_name: str
 
 
+class RowConversionError(SQLAlchemyError):
+    """A single result row failed to be converted by its type processors.
+
+    This exception is only raised for streaming / buffered results whose
+    row conversion failure handling was explicitly enabled using
+    :meth:`_engine.Result.handle_row_conversion_errors`.  Without that
+    explicit opt-in, the type processor's exception (for instance a
+    ``ValueError`` raised by :meth:`_types.TypeDecorator.process_result_value`)
+    is raised directly, exactly as it always has been.
+
+    The error gives the caller everything needed to decide what should
+    happen with the remainder of the result set:
+
+    * :attr:`.RowConversionError.raw_row` - the unconverted row as returned
+      by the DBAPI driver.
+    * :attr:`.RowConversionError.row_index` - the zero based position of the
+      failing row within the batch that was just fetched from the driver.
+    * :attr:`.RowConversionError.row_number` - the one based position of the
+      failing row within the overall stream of rows.
+    * :attr:`.RowConversionError.rows` - the rows that were already converted
+      successfully before the failure.  These rows are delivered exactly
+      once; they will not be returned again by subsequent fetches.
+    * :attr:`.RowConversionError.orig` - the exception raised by the type
+      processor.
+
+    The caller then resolves the failure in one of two ways:
+
+    * :meth:`.RowConversionError.continue_` (also available as
+      :meth:`.RowConversionError.skip`) - the failing row is skipped; the
+      remaining valid rows of the same batch, if any, stay buffered and are
+      delivered by the next fetch without going back to the driver.
+    * :meth:`.RowConversionError.stop` (also available as
+      :meth:`.RowConversionError.close`) - no further rows are delivered.
+      For synchronous results the cursor is closed immediately.  For
+      asyncio results the close is performed on the connection's greenlet
+      if this method is invoked from within the greenlet (such as from a
+      row conversion handler); otherwise the close is completed by the
+      next fetch or by :meth:`_asyncio.AsyncResult.close`.
+
+    Note that driver level fetch failures are **not** reported using this
+    exception; those continue to be raised through the usual
+    :class:`_exc.DBAPIError` hierarchy and follow the existing cursor and
+    connection cleanup path.
+
+    .. versionadded:: 2.1
+
+    """
+
+    is_row_conversion_error: bool = True
+    """Indicates this exception originates from a type processor, as
+    opposed to a driver level fetch error."""
+
+    raw_row: Any = None
+    """The unconverted row returned by the DBAPI driver."""
+
+    row_index: Optional[int] = None
+    """zero based index of the failing row within its fetched batch."""
+
+    row_number: Optional[int] = None
+    """one based index of the failing row within the overall result stream."""
+
+    rows: Sequence[Any] = ()
+    """rows converted successfully before the failure; delivered only once."""
+
+    orig: Optional[BaseException] = None
+    """the exception raised by the type processor."""
+
+    result: Any = None
+    """the result object that produced this error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        result: Any = None,
+        raw_row: Any = None,
+        row_index: Optional[int] = None,
+        row_number: Optional[int] = None,
+        rows: Sequence[Any] = (),
+        orig: Optional[BaseException] = None,
+    ):
+        super().__init__(message)
+        self.result = result
+        self.raw_row = raw_row
+        self.row_index = row_index
+        self.row_number = row_number
+        self.rows = rows
+        self.orig = orig
+
+    def continue_(self) -> None:
+        """Skip the failing row and keep delivering valid rows.
+
+        The failed row itself is not delivered.  Rows that were already
+        converted successfully are available at
+        :attr:`.RowConversionError.rows`.  Rows still buffered from the same
+        batch are delivered, in order, by the next fetch operation, which
+        continues against the same cursor and execution.
+
+        """
+
+        if self.result is None:
+            raise InvalidRequestError(
+                "This RowConversionError is not associated with a result."
+            )
+        self.result._row_conversion_continue(self)
+
+    skip = continue_
+
+    def stop(self) -> None:
+        """Stop the result; no further rows are delivered.
+
+        The cursor is released (immediately where the current context allows
+        it, otherwise on the next fetch or explicit close).
+
+        """
+
+        if self.result is None:
+            raise InvalidRequestError(
+                "This RowConversionError is not associated with a result."
+            )
+        self.result._row_conversion_stop(self)
+
+    close = stop
+
+
+_row_conversion_error_class_cache: typing.Dict[
+    Type[BaseException], Type[RowConversionError]
+] = {}
+
+
+def row_conversion_error(
+    orig: BaseException, message: str, **kw: Any
+) -> RowConversionError:
+    """Construct a :class:`.RowConversionError`.
+
+    The returned object is also an instance of the original exception's
+    class where possible, so legacy ``except ValueError:`` style handlers
+    continue to work once row conversion failure handling is enabled
+    explicitly.
+
+    """
+
+    orig_cls = type(orig)
+    dynamic_cls = _row_conversion_error_class_cache.get(orig_cls)
+    if dynamic_cls is None:
+        try:
+            dynamic_cls = type(
+                "RowConversionError_%s" % orig_cls.__name__,
+                (RowConversionError, orig_cls),
+                {},
+            )
+        except TypeError:
+            dynamic_cls = RowConversionError
+        _row_conversion_error_class_cache[orig_cls] = dynamic_cls
+
+    return dynamic_cls(message, orig=orig, **kw)
+
+
 class AwaitRequired(InvalidRequestError):
     """Error raised by the async greenlet spawn if no async operation
     was awaited when it required one.
@@ -517,7 +676,15 @@ class StatementError(SQLAlchemyError):
     The wrapped exception object is available in
     the :attr:`.orig` attribute.
 
+    .. attribute:: is_row_conversion_error
+
+        Always ``False`` for statement and DBAPI errors; used to distinguish
+        these from :class:`.RowConversionError`, which reports a value-type
+        processor failure rather than a driver level failure.
+
     """
+
+    is_row_conversion_error: bool = False
 
     statement: Optional[str] = None
     """The string SQL statement being invoked when this exception occurred."""

@@ -908,10 +908,8 @@ class Result(_WithKeys, ResultInternal[Row[Unpack[_Ts]]]):
 
         """
 
-        getter = self._manyrow_getter
-
         while True:
-            partition = getter(self, size)
+            partition = self._fetchmany_rows(size)
             if partition:
                 yield partition
             else:
@@ -945,7 +943,10 @@ class Result(_WithKeys, ResultInternal[Row[Unpack[_Ts]]]):
             return row
 
     def fetchmany(
-        self, size: Optional[int] = None
+        self,
+        size: Optional[int] = None,
+        *,
+        on_row_conversion_error: Optional[Callable[[Any], Any]] = None,
     ) -> Sequence[Row[Unpack[_Ts]]]:
         """Fetch many rows.
 
@@ -957,15 +958,25 @@ class Result(_WithKeys, ResultInternal[Row[Unpack[_Ts]]]):
         To fetch rows in groups, use the :meth:`_engine.Result.partitions`
         method.
 
+        :param on_row_conversion_error: optional callable used for this call
+         to handle a per-row conversion failure explicitly.  See
+         :meth:`_engine.Result.handle_row_conversion_errors` for the
+         contract of this callable.  If omitted, the handler configured with
+         :meth:`_engine.Result.handle_row_conversion_errors` is used, and if
+         no per-row conversion handling was opted into at all, a conversion
+         failure propagates unchanged.
+
         :return: a sequence of :class:`_engine.Row` objects.
 
         .. seealso::
 
             :meth:`_engine.Result.partitions`
 
+            :meth:`_engine.Result.handle_row_conversion_errors`
+
         """
 
-        return self._manyrow_getter(self, size)
+        return self._fetchmany_rows(size, on_row_conversion_error)
 
     def all(self) -> Sequence[Row[Unpack[_Ts]]]:
         """Return all rows in a sequence.
@@ -1359,7 +1370,12 @@ class ScalarResult(FilterResult[_R]):
 
         return self._allrows()
 
-    def fetchmany(self, size: Optional[int] = None) -> Sequence[_R]:
+    def fetchmany(
+        self,
+        size: Optional[int] = None,
+        *,
+        on_row_conversion_error: Optional[Callable[[Any], Any]] = None,
+    ) -> Sequence[_R]:
         """Fetch many objects.
 
         Equivalent to :meth:`_engine.Result.fetchmany` except that
@@ -1367,7 +1383,7 @@ class ScalarResult(FilterResult[_R]):
         are returned.
 
         """
-        return self._manyrow_getter(self, size)
+        return self._fetchmany_rows(size, on_row_conversion_error)
 
     def all(self) -> Sequence[_R]:
         """Return all scalar values in a sequence.
@@ -1636,10 +1652,8 @@ class MappingResult(_WithKeys, FilterResult[RowMapping]):
 
         """
 
-        getter = self._manyrow_getter
-
         while True:
-            partition = getter(self, size)
+            partition = self._fetchmany_rows(size)
             if partition:
                 yield partition
             else:
@@ -1665,7 +1679,12 @@ class MappingResult(_WithKeys, FilterResult[RowMapping]):
         else:
             return row
 
-    def fetchmany(self, size: Optional[int] = None) -> Sequence[RowMapping]:
+    def fetchmany(
+        self,
+        size: Optional[int] = None,
+        *,
+        on_row_conversion_error: Optional[Callable[[Any], Any]] = None,
+    ) -> Sequence[RowMapping]:
         """Fetch many objects.
 
         Equivalent to :meth:`_engine.Result.fetchmany` except that
@@ -1674,7 +1693,7 @@ class MappingResult(_WithKeys, FilterResult[RowMapping]):
 
         """
 
-        return self._manyrow_getter(self, size)
+        return self._fetchmany_rows(size, on_row_conversion_error)
 
     def all(self) -> Sequence[RowMapping]:
         """Return all scalar values in a sequence.

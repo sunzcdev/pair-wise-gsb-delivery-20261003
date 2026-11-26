@@ -489,6 +489,10 @@ ALL_EXC = [
         [lambda cls: cls("msg", "tbl", "col")],
     ),
     (
+        [sa_exceptions.RowConversionError],
+        [lambda cls: cls("msg")],
+    ),
+    (
         [sa_exceptions.StatementError],
         [
             lambda cls: cls("msg", "stmt", (), "orig"),

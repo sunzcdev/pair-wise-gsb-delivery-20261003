@@ -137,6 +137,377 @@ class BaseResultInternal(Generic[_R]):
     _source_supports_scalars: bool
     _yield_per: int | None
 
+    # --- explicit per-row conversion failure handling -----------------------
+    #
+    # off by default so that an exception raised from a type processor
+    # continues to propagate exactly as it always has.
+
+    _row_conversion_errors_enabled: bool = False
+    _row_conversion_error_handler: Callable[[Any], Any] | None = None
+    _row_conversion_raw_buffer: list[Any] | None = None
+    _row_conversion_pending_error: Any = None
+    _row_conversion_stopped: bool = False
+    _row_conversion_needs_close: bool = False
+    _row_conversion_row_count: int = 0
+    _row_conversion_batch_start: int = 0
+
+    def handle_row_conversion_errors(
+        self, handler: Callable[[Any], Any] | None = None
+    ) -> Self:
+        """Explicitly opt in to per-row conversion failure diagnostics.
+
+        By default, an exception raised by a result value type processor
+        (such as :meth:`_types.TypeDecorator.process_result_value`) simply
+        propagates out of the fetch method, and the already fetched rows
+        of the current batch are lost.  Calling this method enables an
+        explicit, per-row failure entry point instead.
+
+        Once enabled, a batch is fetched from the driver once, then converted
+        one row at a time.  If a row fails to convert, a
+        :class:`_exc.RowConversionError` is raised (or handed to ``handler``),
+        which reports the failing row as well as the rows already converted
+        in the current batch.  The caller can then decide to
+        :meth:`_exc.RowConversionError.continue_` past the bad row, or to
+        :meth:`_exc.RowConversionError.stop` the result entirely.  Either way
+        the remaining valid rows of the same batch stay buffered and are
+        delivered from the same cursor, in order, exactly once.
+
+        While this option is enabled, each call to
+        :meth:`_engine.Result.fetchmany` or :meth:`_engine.Result.partitions`
+        consumes at most one batch from the driver: any rows left over from a
+        batch whose conversion was interrupted are delivered first, and only
+        once that batch is exhausted does the result go back to the driver for
+        the next batch.  This guarantees that the rows following a failed row
+        are served from the very same cursor position that produced the batch.
+        The exception is :meth:`_engine.Result.unique`, which continues to
+        fetch batches until the requested number of distinct rows is reached,
+        exactly as it does without this option.
+
+        This option has no effect on how driver errors are raised; those are
+        outside the conversion step and propagate through the usual DBAPI
+        exception path.
+
+        :param handler: optional callable that receives the
+         :class:`_exc.RowConversionError` and returns a decision.  Return
+         ``"continue"`` (or ``"skip"``, or ``None``) to skip the failing
+         row, or ``"stop"`` (or ``"close"``) to stop the result.  The
+         handler may instead call :meth:`_exc.RowConversionError.continue_`
+         or :meth:`_exc.RowConversionError.stop` directly.
+
+        """
+
+        if handler is not None and not callable(handler):
+            raise exc.ArgumentError(
+                "row conversion error handler must be callable"
+            )
+        self._row_conversion_errors_enabled = True
+        if handler is not None:
+            self._row_conversion_error_handler = handler
+        return self  # type: ignore[return-value]
+
+    def _row_conversion_enabled(self) -> bool:
+        """True if per-row conversion handling was opted into on this object
+        or anywhere up its ``_real_result`` chain."""
+
+        obj: Any = self
+        while obj is not None:
+            if getattr(obj, "_row_conversion_errors_enabled", False):
+                return True
+            obj = getattr(obj, "_real_result", None)
+        return False
+
+    def _row_conversion_find_handler(
+        self, handler: Callable[[Any], Any] | None
+    ) -> Callable[[Any], Any] | None:
+        if handler is not None:
+            return handler
+
+        obj: Any = self
+        while obj is not None:
+            configured = getattr(obj, "_row_conversion_error_handler", None)
+            if configured is not None:
+                return cast("Callable[[Any], Any]", configured)
+            obj = getattr(obj, "_real_result", None)
+        return None
+
+    def _fetchmany_rows(
+        self,
+        size: int | None = None,
+        on_row_conversion_error: Callable[[Any], Any] | None = None,
+    ) -> Sequence[_R]:
+        """fetchmany entry point honoring per-row conversion failures."""
+
+        if (
+            on_row_conversion_error is not None
+            or self._row_conversion_enabled()
+            or self._row_conversion_pending_error is not None
+            or self._row_conversion_stopped
+            or self._row_conversion_needs_close
+        ):
+            return self._fetchmany_converted(size, on_row_conversion_error)
+        else:
+            return self._manyrow_getter(self, size)
+
+    def _row_conversion_continue(self, error: Any) -> None:
+        if self._row_conversion_pending_error is error:
+            self._row_conversion_pending_error = None
+        error._decision = "continue"
+
+    def _row_conversion_stop(self, error: Any) -> None:
+        error._decision = "stop"
+        self._row_conversion_pending_error = None
+        self._row_conversion_stopped = True
+        self._row_conversion_raw_buffer = None
+
+        real_result = (
+            self if self._real_result is None else self._real_result
+        )
+        dialect = getattr(real_result, "dialect", None)
+        is_async = bool(dialect is not None and dialect.is_async)
+
+        if is_async:
+            from ..util.concurrency import in_greenlet
+
+            if in_greenlet():
+                real_result._soft_close(hard=False)
+            else:
+                # can't do driver IO from a non-greenlet context; the
+                # release is completed by the next fetch, or by the
+                # AsyncResult's own close().
+                self._row_conversion_needs_close = True
+        else:
+            real_result._soft_close(hard=False)
+
+    def _row_conversion_is_stopped(self) -> bool:
+        return self._row_conversion_stopped or self._row_conversion_needs_close
+
+    def _fetchmany_converted(
+        self,
+        size: int | None,
+        handler: Callable[[Any], Any] | None,
+    ) -> Sequence[_R]:
+        real_result = (
+            self if self._real_result is None else self._real_result
+        )
+
+        if self._row_conversion_needs_close:
+            self._row_conversion_needs_close = False
+            real_result._soft_close(hard=False)
+            return []
+
+        if self._row_conversion_stopped:
+            return []
+
+        if self._row_conversion_pending_error is not None:
+            # caller has not yet decided what to do with the previous
+            # conversion failure; surface the same diagnostic again
+            raise self._row_conversion_pending_error
+
+        if handler is None:
+            handler = self._row_conversion_find_handler(None)
+
+        make_row = self._row_getter[0]
+        post_creational_filter = self._post_creational_filter
+
+        uniques: set[Any] | None = None
+        strategy: Callable[[Any], Any] | None = None
+        if self._unique_filter_state is not None:
+            uniques, strategy = self._unique_strategy
+
+        if size is None:
+            size = real_result._yield_per
+
+        collect: list[Any] = []
+
+        if uniques is None:
+            # a single batch per call: never go back to the driver just to
+            # top up the requested size, so that a batch whose first rows
+            # were served from the conversion buffer is not silently merged
+            # with a fresh, later driver fetch.
+            if self._row_conversion_raw_buffer:
+                self._row_conversion_convert(
+                    collect,
+                    make_row,
+                    post_creational_filter,
+                    uniques,
+                    strategy,
+                    handler,
+                )
+                return collect
+
+            rows = self._fetchmany_impl(size)
+            if not rows:
+                return collect
+            self._row_conversion_start_batch(rows)
+            self._row_conversion_convert(
+                collect,
+                make_row,
+                post_creational_filter,
+                uniques,
+                strategy,
+                handler,
+            )
+            return collect
+
+        # unique filtering: continue fetching batches until the requested
+        # number of distinct rows is collected or the driver is exhausted.
+        num_required: int | None = size
+        if size is None:
+            if real_result._yield_per:
+                num_required = size = real_result._yield_per
+            elif self._row_conversion_raw_buffer:
+                # drain the leftover batch first; its converted count
+                # becomes this call's target size
+                self._row_conversion_convert(
+                    collect,
+                    make_row,
+                    post_creational_filter,
+                    uniques,
+                    strategy,
+                    handler,
+                )
+                if self._row_conversion_is_stopped():
+                    return []
+                size = num_required = len(collect)
+            else:
+                rows = self._fetchmany_impl()
+                if not rows:
+                    return collect
+                size = num_required = len(rows)
+                self._row_conversion_start_batch(rows)
+                self._row_conversion_convert(
+                    collect,
+                    make_row,
+                    post_creational_filter,
+                    uniques,
+                    strategy,
+                    handler,
+                )
+                if self._row_conversion_is_stopped():
+                    return []
+                num_required = size - len(collect)
+
+        assert size is not None
+
+        while num_required:
+            if self._row_conversion_raw_buffer:
+                self._row_conversion_convert(
+                    collect,
+                    make_row,
+                    post_creational_filter,
+                    uniques,
+                    strategy,
+                    handler,
+                )
+                if self._row_conversion_is_stopped():
+                    return []
+                continue
+
+            rows = self._fetchmany_impl(num_required)
+            if not rows:
+                break
+            self._row_conversion_start_batch(rows)
+            self._row_conversion_convert(
+                collect,
+                make_row,
+                post_creational_filter,
+                uniques,
+                strategy,
+                handler,
+            )
+            if self._row_conversion_is_stopped():
+                return []
+            num_required = size - len(collect)
+
+        return collect
+
+    def _row_conversion_start_batch(self, rows: Sequence[Any]) -> None:
+        self._row_conversion_raw_buffer = list(rows)
+        self._row_conversion_batch_start = self._row_conversion_row_count
+
+    def _row_conversion_convert(
+        self,
+        collect: list[Any],
+        make_row: Callable[..., Any] | None,
+        post_creational_filter: Callable[[Any], Any] | None,
+        uniques: set[Any] | None,
+        strategy: Callable[[Any], Any] | None,
+        handler: Callable[[Any], Any] | None,
+    ) -> None:
+        """Convert rows from :attr:`._row_conversion_raw_buffer`.
+
+        On failure, either hands the diagnostic to ``handler`` (and acts on
+        its decision) or raises :class:`_exc.RowConversionError`.  The raw
+        rows that follow the failing row are preserved in the buffer so that
+        the same cursor and batch can continue.
+
+        """
+
+        buf = self._row_conversion_raw_buffer
+        if buf is None:
+            return
+
+        while buf:
+            raw_row = buf[0]
+            row_index = (
+                self._row_conversion_row_count
+                - self._row_conversion_batch_start
+            )
+            self._row_conversion_row_count += 1
+            row_number = self._row_conversion_row_count
+            try:
+                row = make_row(raw_row) if make_row is not None else raw_row
+            except BaseException as err:
+                buf.pop(0)
+                failure = exc.row_conversion_error(
+                    err,
+                    "Could not convert row at result position %s "
+                    "(batch position %s): %s"
+                    % (row_number, row_index, err),
+                    result=self,
+                    raw_row=raw_row,
+                    row_index=row_index,
+                    row_number=row_number,
+                    rows=list(collect),
+                )
+                self._row_conversion_handle_failure(failure, handler)
+                continue
+
+            buf.pop(0)
+
+            if uniques is not None:
+                hashed = strategy(row) if strategy is not None else row
+                if hashed in uniques:
+                    continue
+                uniques.add(hashed)
+
+            if post_creational_filter is not None:
+                row = post_creational_filter(row)
+
+            collect.append(row)
+
+    def _row_conversion_handle_failure(
+        self, failure: Any, handler: Callable[[Any], Any] | None
+    ) -> None:
+        if handler is None:
+            self._row_conversion_pending_error = failure
+            orig = failure.orig
+            if orig is not None:
+                raise failure from orig
+            raise failure
+
+        decision = handler(failure)
+
+        if getattr(failure, "_decision", None) is None:
+            if decision in (False, "stop", "close"):
+                failure.stop()
+            else:
+                failure.continue_()
+
+        if getattr(failure, "_decision", None) == "stop":
+            if not self._row_conversion_is_stopped():
+                failure.stop()
+
     def _fetchiter_impl(
         self,
     ) -> Iterator[_InterimRowType[Row[Unpack[TupleAny]]]]:

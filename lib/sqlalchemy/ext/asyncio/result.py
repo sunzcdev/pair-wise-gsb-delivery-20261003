@@ -9,6 +9,7 @@ from __future__ import annotations
 import operator
 from typing import Any
 from typing import AsyncIterator
+from typing import Callable
 from typing import Iterator
 from typing import Literal
 from typing import Optional
@@ -206,10 +207,10 @@ class AsyncResult(_WithKeys, AsyncCommon[Row[Unpack[_Ts]]]):
 
         """
 
-        getter = self._manyrow_getter
+        getter = self._fetchmany_rows
 
         while True:
-            partition = await greenlet_spawn(getter, self, size)
+            partition = await greenlet_spawn(getter, size)
             if partition:
                 yield partition
             else:
@@ -247,7 +248,10 @@ class AsyncResult(_WithKeys, AsyncCommon[Row[Unpack[_Ts]]]):
             return row
 
     async def fetchmany(
-        self, size: Optional[int] = None
+        self,
+        size: Optional[int] = None,
+        *,
+        on_row_conversion_error: Optional[Callable[[Any], Any]] = None,
     ) -> Sequence[Row[Unpack[_Ts]]]:
         """Fetch many rows.
 
@@ -259,15 +263,24 @@ class AsyncResult(_WithKeys, AsyncCommon[Row[Unpack[_Ts]]]):
         To fetch rows in groups, use the
         :meth:`._asyncio.AsyncResult.partitions` method.
 
+        :param on_row_conversion_error: optional callable used for this call
+         to handle a per-row conversion failure explicitly.  See
+         :meth:`_engine.Result.handle_row_conversion_errors` for the
+         contract of this callable.
+
         :return: a list of :class:`_engine.Row` objects.
 
         .. seealso::
 
             :meth:`_asyncio.AsyncResult.partitions`
 
+            :meth:`_engine.Result.handle_row_conversion_errors`
+
         """
 
-        return await greenlet_spawn(self._manyrow_getter, self, size)
+        return await greenlet_spawn(
+            self._fetchmany_rows, size, on_row_conversion_error
+        )
 
     async def all(self) -> Sequence[Row[Unpack[_Ts]]]:
         """Return all rows in a list.
@@ -580,10 +593,10 @@ class AsyncScalarResult(AsyncCommon[_R]):
 
         """
 
-        getter = self._manyrow_getter
+        getter = self._fetchmany_rows
 
         while True:
-            partition = await greenlet_spawn(getter, self, size)
+            partition = await greenlet_spawn(getter, size)
             if partition:
                 yield partition
             else:
@@ -594,7 +607,12 @@ class AsyncScalarResult(AsyncCommon[_R]):
 
         return await greenlet_spawn(self._allrows)
 
-    async def fetchmany(self, size: Optional[int] = None) -> Sequence[_R]:
+    async def fetchmany(
+        self,
+        size: Optional[int] = None,
+        *,
+        on_row_conversion_error: Optional[Callable[[Any], Any]] = None,
+    ) -> Sequence[_R]:
         """Fetch many objects.
 
         Equivalent to :meth:`_asyncio.AsyncResult.fetchmany` except that
@@ -602,7 +620,9 @@ class AsyncScalarResult(AsyncCommon[_R]):
         are returned.
 
         """
-        return await greenlet_spawn(self._manyrow_getter, self, size)
+        return await greenlet_spawn(
+            self._fetchmany_rows, size, on_row_conversion_error
+        )
 
     async def all(self) -> Sequence[_R]:
         """Return all scalar values in a list.
@@ -713,10 +733,10 @@ class AsyncMappingResult(_WithKeys, AsyncCommon[RowMapping]):
 
         """
 
-        getter = self._manyrow_getter
+        getter = self._fetchmany_rows
 
         while True:
-            partition = await greenlet_spawn(getter, self, size)
+            partition = await greenlet_spawn(getter, size)
             if partition:
                 yield partition
             else:
@@ -743,7 +763,10 @@ class AsyncMappingResult(_WithKeys, AsyncCommon[RowMapping]):
             return row
 
     async def fetchmany(
-        self, size: Optional[int] = None
+        self,
+        size: Optional[int] = None,
+        *,
+        on_row_conversion_error: Optional[Callable[[Any], Any]] = None,
     ) -> Sequence[RowMapping]:
         """Fetch many rows.
 
@@ -753,7 +776,9 @@ class AsyncMappingResult(_WithKeys, AsyncCommon[RowMapping]):
 
         """
 
-        return await greenlet_spawn(self._manyrow_getter, self, size)
+        return await greenlet_spawn(
+            self._fetchmany_rows, size, on_row_conversion_error
+        )
 
     async def all(self) -> Sequence[RowMapping]:
         """Return all rows in a list.

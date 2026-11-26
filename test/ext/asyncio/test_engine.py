@@ -3,6 +3,7 @@ import contextlib
 import inspect as stdlib_inspect
 from unittest.mock import patch
 
+import sqlalchemy as sa
 from sqlalchemy import AssertionPool
 from sqlalchemy import Column
 from sqlalchemy import create_engine
@@ -1598,6 +1599,174 @@ class AsyncResultTest(EngineFixture):
             eq_(u1, 1)
 
 
+class _RejectOnValue(sa.TypeDecorator):
+    """a type whose result processor refuses one selected value"""
+
+    impl = Integer
+    cache_ok = True
+
+    fail_on = 2
+
+    def process_result_value(self, value, dialect):
+        if value == self.fail_on:
+            raise ValueError("cannot convert %r" % (value,))
+        return value
+
+
+class AsyncResultRowConversionTest(EngineFixture):
+    __requires__ = ("server_side_cursors", "async_dialect")
+    __backend__ = True
+
+    @testing.fixture
+    def conv_stmt(self):
+        users = self.tables.users
+        return select(
+            sa.type_coerce(users.c.user_id, _RejectOnValue()).label("user_id")
+        ).order_by(users.c.user_id)
+
+    @async_test
+    async def test_default_behavior_unchanged(self, async_engine, conv_stmt):
+        """without opting in, the processor error propagates as before"""
+
+        async with async_engine.connect() as conn:
+            result = await conn.stream(conv_stmt)
+            with expect_raises(ValueError) as ee:
+                await result.fetchmany(3)
+
+            is_false(isinstance(ee.error, exc.RowConversionError))
+
+            # the driver batch was consumed whole; subsequent rows remain
+            eq_(
+                [row.user_id for row in await result.fetchmany(3)],
+                [4, 5, 6],
+            )
+            await result.close()
+
+    @async_test
+    async def test_continue_same_batch(self, async_engine, conv_stmt):
+        """row before and after the bad row are served from the same cursor"""
+
+        async with async_engine.connect() as conn:
+            result = await conn.stream(conv_stmt)
+            result.handle_row_conversion_errors()
+
+            cursor = result._real_result.cursor
+
+            with expect_raises(exc.RowConversionError) as ee:
+                await result.fetchmany(3)
+
+            failure = ee.error
+            eq_([row.user_id for row in failure.rows], [1])
+            eq_(failure.raw_row, (2,))
+            eq_(failure.row_number, 2)
+            eq_(failure.row_index, 1)
+            is_true(isinstance(failure.orig, ValueError))
+            is_true(failure.is_row_conversion_error)
+
+            failure.continue_()
+
+            third = await result.fetchmany(3)
+            eq_([row.user_id for row in third], [3])
+
+            # still the same execution / cursor
+            is_(result._real_result.cursor, cursor)
+
+            eq_(
+                [row.user_id for row in await result.fetchmany(3)],
+                [4, 5, 6],
+            )
+            await result.close()
+
+    @async_test
+    async def test_continue_via_handler(self, async_engine, conv_stmt):
+        diagnostics = []
+
+        def handler(failure):
+            diagnostics.append(
+                (failure.row_number, [r.user_id for r in failure.rows])
+            )
+            return "continue"
+
+        async with async_engine.connect() as conn:
+            result = await conn.stream(conv_stmt)
+            rows = await result.fetchmany(3, on_row_conversion_error=handler)
+            eq_([row.user_id for row in rows], [1, 3])
+            eq_(diagnostics, [(2, [1])])
+
+            rows = await result.fetchmany(3, on_row_conversion_error=handler)
+            eq_([row.user_id for row in rows], [4, 5, 6])
+            await result.close()
+
+    @async_test
+    async def test_stop_halts_delivery(self, async_engine, conv_stmt):
+        async with async_engine.connect() as conn:
+            result = await conn.stream(conv_stmt)
+            result.handle_row_conversion_errors()
+
+            with expect_raises(exc.RowConversionError) as ee:
+                await result.fetchmany(3)
+
+            eq_([row.user_id for row in ee.error.rows], [1])
+            ee.error.stop()
+
+            # no further rows, and the cursor is released from the stream
+            eq_(await result.fetchmany(3), [])
+            eq_(await result.fetchmany(3), [])
+            is_true(result._real_result._soft_closed)
+            is_none(result._real_result.cursor)
+
+            await result.close()
+
+            # connection is still usable
+            eq_(await conn.scalar(select(1)), 1)
+
+    @async_test
+    async def test_driver_error_distinguished(self, async_engine, conv_stmt):
+        """a real driver failure on the next fetch is not a conversion error"""
+
+        async with async_engine.connect() as conn:
+            result = await conn.stream(conv_stmt)
+            result.handle_row_conversion_errors()
+
+            fetchmany = _cursor.BufferedRowCursorFetchStrategy.fetchmany
+
+            state = {"calls": 0}
+
+            def boom(strategy, res, dbapi_cursor, size=None):
+                state["calls"] += 1
+                if state["calls"] == 2:
+                    raise exc.OperationalError(
+                        "select", None, Exception("driver boom"), None
+                    )
+                return fetchmany(strategy, res, dbapi_cursor, size)
+
+            with mock.patch.object(
+                _cursor.BufferedRowCursorFetchStrategy, "fetchmany", boom
+            ):
+                with expect_raises(exc.RowConversionError) as ee:
+                    await result.fetchmany(3)
+
+                is_false(isinstance(ee.error, exc.DBAPIError))
+                eq_([row.user_id for row in ee.error.rows], [1])
+                ee.error.continue_()
+
+                eq_(
+                    [row.user_id for row in await result.fetchmany(3)],
+                    [3],
+                )
+
+                with expect_raises(exc.DBAPIError) as de:
+                    await result.fetchmany(3)
+
+                is_false(isinstance(de.error, exc.RowConversionError))
+                is_false(de.error.is_row_conversion_error)
+
+            await result.close()
+
+            # connection is still usable
+            eq_(await conn.scalar(select(1)), 1)
+
+
 class TextSyncDBAPI(fixtures.TestBase):
     __requires__ = ("asyncio",)
 
@@ -1775,3 +1944,4 @@ class PoolRegenTest(EngineFixture):
 
         tasks = [thing(engine) for _ in range(10)]
         await asyncio.gather(*tasks)
+

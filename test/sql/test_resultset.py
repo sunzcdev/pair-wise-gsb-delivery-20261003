@@ -4349,3 +4349,126 @@ class AllTuplesTest(fixtures.TablesTest):
             row_messages,
             ["Row (1, 'p1', 'U1')", "Row (2, 'p2', None)"],
         )
+
+
+class RowConversionErrorTest(fixtures.TablesTest):
+    """tests for explicit per-row conversion failure handling"""
+
+    run_create_tables = "each"
+    run_inserts = "each"
+    run_deletes = "each"
+
+    @classmethod
+    def define_tables(cls, metadata):
+        class RejectOnTwo(TypeDecorator):
+            impl = Integer
+            cache_ok = True
+
+            def process_result_value(self, value, dialect):
+                if value == 2:
+                    raise ValueError("cannot convert %r" % (value,))
+                return value
+
+        Table(
+            "conv",
+            metadata,
+            Column("id", RejectOnTwo, primary_key=True),
+            Column("value", Integer),
+        )
+
+    @classmethod
+    def insert_data(cls, connection):
+        connection.execute(
+            cls.tables.conv.insert(),
+            [{"id": i, "value": i * 10} for i in range(1, 9)],
+        )
+
+    def _stmt(self):
+        conv = self.tables.conv
+        return select(conv.c.id).order_by(conv.c.id)
+
+    def test_default_behavior_unchanged(self, connection):
+        """without opting in, the processor error propagates as before"""
+
+        result = connection.execute(self._stmt())
+        with expect_raises(ValueError) as ee:
+            result.fetchmany(3)
+
+        is_false(isinstance(ee.error, exc.RowConversionError))
+
+        eq_([row.id for row in result.fetchmany(3)], [4, 5, 6])
+        result.close()
+
+    def test_continue_same_batch(self, connection):
+        """rows before and after the bad row are served from one cursor"""
+
+        result = connection.execute(self._stmt())
+        result.handle_row_conversion_errors()
+
+        cursor = result.cursor
+
+        with expect_raises(exc.RowConversionError) as ee:
+            result.fetchmany(3)
+
+        failure = ee.error
+        eq_([row.id for row in failure.rows], [1])
+        eq_(failure.raw_row, (2,))
+        eq_(failure.row_number, 2)
+        eq_(failure.row_index, 1)
+        is_true(isinstance(failure.orig, ValueError))
+        is_true(failure.is_row_conversion_error)
+
+        failure.continue_()
+
+        # same cursor, in order, delivered once
+        is_(result.cursor, cursor)
+        eq_([row.id for row in result.fetchmany(3)], [3])
+        eq_([row.id for row in result.fetchmany(3)], [4, 5, 6])
+        result.close()
+
+    def test_continue_via_handler(self, connection):
+        diagnostics = []
+
+        def handler(failure):
+            diagnostics.append(
+                (failure.row_number, [row.id for row in failure.rows])
+            )
+            return "continue"
+
+        result = connection.execute(self._stmt())
+        rows = result.fetchmany(3, on_row_conversion_error=handler)
+        eq_([row.id for row in rows], [1, 3])
+        eq_(diagnostics, [(2, [1])])
+
+        rows = result.fetchmany(3, on_row_conversion_error=handler)
+        eq_([row.id for row in rows], [4, 5, 6])
+        result.close()
+
+    def test_stop_halts_delivery(self, connection):
+        result = connection.execute(self._stmt())
+        result.handle_row_conversion_errors()
+
+        with expect_raises(exc.RowConversionError) as ee:
+            result.fetchmany(3)
+
+        eq_([row.id for row in ee.error.rows], [1])
+        ee.error.stop()
+
+        eq_(result.fetchmany(3), [])
+        eq_(result.fetchmany(3), [])
+        is_true(result._soft_closed)
+        is_(result.cursor, None)
+
+    def test_scalar_filter(self, connection):
+        result = connection.execute(self._stmt()).scalars()
+        result.handle_row_conversion_errors()
+
+        with expect_raises(exc.RowConversionError) as ee:
+            result.fetchmany(3)
+
+        eq_(list(ee.error.rows), [1])
+        ee.error.continue_()
+
+        eq_(list(result.fetchmany(3)), [3])
+        eq_(list(result.fetchmany(3)), [4, 5, 6])
+        result.close()

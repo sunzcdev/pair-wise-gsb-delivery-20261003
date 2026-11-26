@@ -803,6 +803,51 @@ While the :paramref:`_engine.Connection.execution_options.stream_results`
 option may be combined with use of the :meth:`_engine.Result.partitions`
 method, a specific partition size should be passed to
 :meth:`_engine.Result.partitions` so that the entire result is not fetched.
+
+.. _engine_stream_results_row_conversion:
+
+Handling per-row conversion failures explicitly
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A result value type processor, such as
+:meth:`_types.TypeDecorator.process_result_value`,
+may raise an exception for an individual row, for instance when the database
+value cannot be converted into the Python value the type expects.  By default,
+this exception propagates out of the fetch method, which means the rows that
+were already fetched from the driver in the same batch are not delivered.
+
+A streaming result may instead opt in to explicit per-row failure
+handling using :meth:`_engine.Result.handle_row_conversion_errors`.  When
+enabled, each batch is fetched from the driver once and then converted row by
+row; if a row fails, a :class:`.RowConversionError` is raised which reports
+the failing row as well as the rows already converted in the same batch.
+The caller can then choose to continue past the bad row, in which case the
+remaining valid rows of the same batch are delivered from the same cursor in
+order, or to stop the result entirely::
+
+    result = conn.execution_options(stream_results=True).execute(stmt)
+    result.handle_row_conversion_errors()
+
+    try:
+        rows = result.fetchmany(10)
+    except RowConversionError as failure:
+        log.warning(
+            "could not convert row %s: %s", failure.row_number, failure.orig
+        )
+        failure.continue_()  # or failure.stop()
+
+The same option is available on the asyncio :class:`_asyncio.AsyncResult`
+via its :meth:`_asyncio.AsyncResult.fetchmany` method, which also accepts an
+``on_row_conversion_error`` callable used for a single call::
+
+    rows = await result.fetchmany(
+        10, on_row_conversion_error=lambda failure: failure.continue_()
+    )
+
+Driver-level fetch failures are not reported using
+:class:`.RowConversionError`; these continue to be raised through the usual
+:class:`.DBAPIError` hierarchy and follow the existing cursor and connection
+cleanup behavior.
 It is usually more straightforward to use the
 :paramref:`_engine.Connection.execution_options.yield_per` option when setting
 up to use the :meth:`_engine.Result.partitions` method.
