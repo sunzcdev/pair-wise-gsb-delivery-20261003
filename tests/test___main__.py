@@ -49,6 +49,7 @@ def test_load_config(monkeypatch: MonkeyPatch) -> None:
         ("--keyfile", "/path", "keyfile"),
         ("--pid", "/path", "pid_path"),
         ("--root-path", "/path", "root_path"),
+        ("--websocket-close-timeout", 2.5, "websocket_close_timeout"),
         ("--workers", 2, "workers"),
     ],
 )

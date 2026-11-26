@@ -46,12 +46,20 @@ class ASGIWebsocketState(Enum):
     HANDSHAKE = auto()
     CONNECTED = auto()
     RESPONSE = auto()
+    # A close frame has been sent by the server and the response from
+    # the client is awaited, i.e. the close handshake is on-going.
+    CLOSING = auto()
     CLOSED = auto()
     HTTPCLOSED = auto()
 
 
 class FrameTooLargeError(Exception):
     pass
+
+
+# The granularity (in seconds) at which the close handshake wait checks
+# for the peer's confirmation.
+_CLOSE_POLL = 0.1
 
 
 class Handshake:
@@ -196,59 +204,77 @@ class WSStream:
         self.connection: Connection
         self.handshake: Handshake
 
+        # The close code sent by the peer, if a close frame was received.
+        self.peer_close_code: int | None = None
+        self._peer_close_received = False
+        # Guards the single cleanup and single disconnect delivery.
+        self._finalised = False
+        self._disconnect_sent = False
+
     @property
     def idle(self) -> bool:
         return self.state in {ASGIWebsocketState.CLOSED, ASGIWebsocketState.HTTPCLOSED}
 
     async def handle(self, event: Event) -> None:
-        if self.closed:
+        if isinstance(event, StreamClosed):
+            await self._handle_stream_closed()
+        elif self.closed:
             return
         elif isinstance(event, Request):
-            self.start_time = time()
-            self.handshake = Handshake(event.headers, event.http_version)
-            path, _, query_string = event.raw_path.partition(b"?")
-            self.scope = {
-                "type": "websocket",
-                "asgi": {"spec_version": "2.3", "version": "3.0"},
-                "scheme": self.scheme,
-                "http_version": event.http_version,
-                "path": unquote(path.decode("ascii")),
-                "raw_path": path,
-                "query_string": query_string,
-                "root_path": self.config.root_path,
-                "headers": event.headers,
-                "client": self.client,
-                "server": self.server,
-                "state": event.state.copy(),  # type: ignore[typeddict-item]
-                "subprotocols": self.handshake.subprotocols or [],
-                "extensions": {"websocket.http.response": {}},
-            }
-
-            if not valid_server_name(self.config, event):
-                await self._send_error_response(404)
-                self.closed = True
-            elif not self.handshake.is_valid():
-                await self._send_error_response(400)
-                self.closed = True
-            else:
-                self.app_put = await self.task_group.spawn_app(
-                    self.app, self.config, self.scope, self.app_send
-                )
-                await self.app_put({"type": "websocket.connect"})
+            await self._handle_request(event)
+        elif self.state in {ASGIWebsocketState.CLOSED, ASGIWebsocketState.HTTPCLOSED}:
+            # The stream has finished, so any late data is ignored.
+            return
         elif isinstance(event, (Body, Data)) and not self.handshake.accepted:
             await self._send_error_response(400)
             self.closed = True
         elif isinstance(event, (Body, Data)):
             self.connection.receive_data(event.data)
             await self._handle_events()
-        elif isinstance(event, StreamClosed):
+
+    async def _handle_request(self, event: Request) -> None:
+        self.start_time = time()
+        self.handshake = Handshake(event.headers, event.http_version)
+        path, _, query_string = event.raw_path.partition(b"?")
+        self.scope = {
+            "type": "websocket",
+            "asgi": {"spec_version": "2.3", "version": "3.0"},
+            "scheme": self.scheme,
+            "http_version": event.http_version,
+            "path": unquote(path.decode("ascii")),
+            "raw_path": path,
+            "query_string": query_string,
+            "root_path": self.config.root_path,
+            "headers": event.headers,
+            "client": self.client,
+            "server": self.server,
+            "state": event.state.copy(),  # type: ignore[typeddict-item]
+            "subprotocols": self.handshake.subprotocols or [],
+            "extensions": {"websocket.http.response": {}},
+        }
+
+        if not valid_server_name(self.config, event):
+            await self._send_error_response(404)
             self.closed = True
-            if self.app_put is not None:
-                if self.state in {ASGIWebsocketState.HTTPCLOSED, ASGIWebsocketState.CLOSED}:
-                    code = CloseReason.NORMAL_CLOSURE.value
-                else:
-                    code = CloseReason.ABNORMAL_CLOSURE.value
-                await self.app_put({"type": "websocket.disconnect", "code": code})
+        elif not self.handshake.is_valid():
+            await self._send_error_response(400)
+            self.closed = True
+        else:
+            self.app_put = await self.task_group.spawn_app(
+                self.app, self.config, self.scope, self.app_send
+            )
+            await self.app_put({"type": "websocket.connect"})
+
+    async def _handle_stream_closed(self) -> None:
+        # The bearing stream (or connection) is gone, so the close can
+        # no longer be awaited. The app is told once and no stream end
+        # is sent as the protocol has already removed the stream.
+        code = (
+            CloseReason.NORMAL_CLOSURE.value
+            if self.state in {ASGIWebsocketState.CLOSED, ASGIWebsocketState.HTTPCLOSED}
+            else CloseReason.ABNORMAL_CLOSURE.value
+        )
+        await self._finalise(code, send_stream_end=False)
 
     async def app_send(self, message: ASGISendEvent | None) -> None:
         if self.closed:
@@ -262,9 +288,18 @@ class WSStream:
                 await self.config.log.access(
                     self.scope, {"status": 500, "headers": []}, time() - self.start_time
                 )
+                await self.send(StreamClosed(stream_id=self.stream_id))
             elif self.state == ASGIWebsocketState.CONNECTED:
+                # The application failed without closing, so an internal
+                # error close is sent and the stream released directly.
                 await self._send_wsproto_event(CloseConnection(code=CloseReason.INTERNAL_ERROR))
-            await self.send(StreamClosed(stream_id=self.stream_id))
+                await self.send(StreamClosed(stream_id=self.stream_id))
+            elif self.state == ASGIWebsocketState.CLOSING:
+                # Wait for the peer confirmation (or the close timeout),
+                # the stream is released by whichever happens first.
+                pass
+            else:
+                await self.send(StreamClosed(stream_id=self.stream_id))
         else:
             if message["type"] == "websocket.accept" and self.state == ASGIWebsocketState.HANDSHAKE:
                 await self._accept(message)
@@ -287,26 +322,89 @@ class WSStream:
                 else:
                     event = TextMessage(data=message["text"])
                 await self._send_wsproto_event(event)
+            elif message["type"] == "websocket.send" and self.state == ASGIWebsocketState.CLOSING:
+                # Further messages cannot be sent whilst the close is
+                # being confirmed, so they are no-ops.
+                pass
             elif (
-                message["type"] == "websocket.close" and self.state == ASGIWebsocketState.HANDSHAKE
+                message["type"] == "websocket.close"
+                and self.state == ASGIWebsocketState.HANDSHAKE
             ):
                 self.state = ASGIWebsocketState.HTTPCLOSED
                 await self._send_error_response(403)
-            elif message["type"] == "websocket.close":
-                self.state = ASGIWebsocketState.CLOSED
-                await self._send_wsproto_event(
-                    CloseConnection(
-                        code=int(message.get("code", CloseReason.NORMAL_CLOSURE)),
-                        reason=message.get("reason"),
-                    )
+            elif (
+                message["type"] == "websocket.close"
+                and self.state == ASGIWebsocketState.CONNECTED
+            ):
+                await self._send_close(
+                    int(message.get("code", CloseReason.NORMAL_CLOSURE)),
+                    message.get("reason"),
                 )
-                await self.send(EndData(stream_id=self.stream_id))
+            elif (
+                message["type"] == "websocket.close"
+                and self.state == ASGIWebsocketState.CLOSING
+            ):
+                # Only the first close is sent, the rest are no-ops to
+                # allow the app to finish after having closed.
+                pass
             else:
                 raise UnexpectedMessageError(self.state, message["type"])
+
+    async def _send_close(self, code: int, reason: str | None) -> None:
+        # The close frame is sent, but the bearing stream is not ended
+        # here. It stays open until the peer confirms, or until the
+        # configured close timeout elapses. The application can then be
+        # told a confirmed close apart from a timeout.
+        self.state = ASGIWebsocketState.CLOSING
+        await self._send_wsproto_event(CloseConnection(code=code, reason=reason))
+        timeout = self.config.websocket_close_timeout
+        if (
+            not self._finalised
+            and timeout is not None
+            and hasattr(self.task_group, "spawn")
+        ):
+            # The bounded wait runs as a concurrent task so that other
+            # streams (e.g. on the same HTTP/2 connection) are served
+            # whilst this stream awaits its confirmation. When the
+            # timeout is ``None`` no timer is needed: peer/transport
+            # events still finalise the close.
+            self.task_group.spawn(self._close_timeout, timeout)
+
+    async def _close_timeout(self, timeout: float | None) -> None:
+        # The wait is sliced so that a confirmation arriving early ends
+        # the task promptly, rather than keeping the connection's task
+        # group alive for the whole (configured) bound. A ``None``
+        # timeout means the peer confirmation is awaited indefinitely.
+        deadline = None if timeout is None else self.context.time() + timeout
+        while not self._finalised and self.state == ASGIWebsocketState.CLOSING:
+            if deadline is None:
+                await self.context.sleep(_CLOSE_POLL)
+                continue
+            remaining = deadline - self.context.time()
+            if remaining <= 0:
+                break
+            await self.context.sleep(min(_CLOSE_POLL, remaining))
+        if self._finalised or self.state != ASGIWebsocketState.CLOSING:
+            # The peer confirmed (or the stream ended) whilst waiting.
+            return
+        if self._peer_close_received:
+            # The protocol task has received the peer's close and is
+            # sending the matching response/finalisation. Let it own the
+            # terminal code/order rather than racing it with a timeout.
+            return
+        # The peer never confirmed the close within the configured
+        # bound, so the stream is released and the difference is
+        # reported to the app as an abnormal closure.
+        await self._finalise(CloseReason.ABNORMAL_CLOSURE.value)
 
     async def _handle_events(self) -> None:
         for event in self.connection.events():
             if isinstance(event, Message):
+                if self.state != ASGIWebsocketState.CONNECTED:
+                    # No messages are delivered to the application whilst
+                    # the close handshake is in progress.
+                    continue
+
                 try:
                     self.buffer.extend(event)
                 except FrameTooLargeError:
@@ -321,9 +419,39 @@ class WSStream:
             elif isinstance(event, Ping):
                 await self._send_wsproto_event(event.response())
             elif isinstance(event, CloseConnection):
-                if self.connection.state == ConnectionState.REMOTE_CLOSING:
-                    await self._send_wsproto_event(event.response())
-                await self.send(StreamClosed(stream_id=self.stream_id))
+                await self._handle_close(event)
+
+    async def _handle_close(self, event: CloseConnection) -> None:
+        # Record receipt synchronously before any await so a racing
+        # timeout cannot claim that no confirmation was received.
+        self._peer_close_received = True
+        self.peer_close_code = int(event.code) if event.code is not None else None
+        if self.connection.state == ConnectionState.REMOTE_CLOSING:
+            # The peer initiated the close, so it is responded to in
+            # order to complete the handshake before the stream ends.
+            await self._send_wsproto_event(event.response())
+        if self.peer_close_code is None:
+            code = CloseReason.NORMAL_CLOSURE.value
+        else:
+            code = self.peer_close_code
+        await self._finalise(code)
+
+    async def _finalise(self, code: int, send_stream_end: bool = True) -> None:
+        # Ensures the stream is cleaned up, and the disconnect is sent
+        # to the app, exactly once whichever of the peer close, timeout
+        # or transport close arrives first. The state becomes closed so
+        # the stream no longer holds the connection open.
+        if self._finalised:
+            return
+        self._finalised = True
+        self.closed = True
+        self.state = ASGIWebsocketState.CLOSED
+        if send_stream_end:
+            await self.send(EndData(stream_id=self.stream_id))
+            await self.send(StreamClosed(stream_id=self.stream_id))
+        if self.app_put is not None and not self._disconnect_sent:
+            self._disconnect_sent = True
+            await self.app_put({"type": "websocket.disconnect", "code": code})
 
     async def _send_error_response(self, status_code: int) -> None:
         await self.send(

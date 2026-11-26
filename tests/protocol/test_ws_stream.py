@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, call, Mock
 
 import pytest
 import pytest_asyncio
-from wsproto.events import BytesMessage, TextMessage
+from wsproto.connection import Connection, ConnectionType
+from wsproto.events import BytesMessage, CloseConnection, TextMessage
 
 from hypercorn.asyncio.task_group import TaskGroup
 from hypercorn.asyncio.worker_context import WorkerContext
@@ -419,6 +420,7 @@ async def test_send_app_error_connected(stream: WSStream) -> None:
 
 @pytest.mark.asyncio
 async def test_send_connection(stream: WSStream) -> None:
+    stream.config.websocket_close_timeout = None
     await stream.handle(
         Request(
             stream_id=1,
@@ -433,11 +435,148 @@ async def test_send_connection(stream: WSStream) -> None:
     await stream.app_send(cast(WebsocketSendEvent, {"type": "websocket.send", "text": "hello"}))
     await stream.app_send(cast(WebsocketCloseEvent, {"type": "websocket.close"}))
     stream.send.assert_called()  # type: ignore
+    # The close frame is sent, but the bearing stream must not be ended
+    # until the peer confirms (or the close timeout elapses).
     assert stream.send.call_args_list == [  # type: ignore
         call(Response(stream_id=1, headers=[], status_code=200)),
         call(Data(stream_id=1, data=b"\x81\x05hello")),
         call(Data(stream_id=1, data=b"\x88\x02\x03\xe8")),
+    ]
+    assert stream.state == ASGIWebsocketState.CLOSING
+
+
+async def _open_stream(stream: WSStream) -> None:
+    await stream.handle(
+        Request(
+            stream_id=1,
+            http_version="2",
+            headers=[(b"sec-websocket-version", b"13")],
+            raw_path=b"/",
+            method="GET",
+            state=ConnectionState({}),
+        )
+    )
+    await stream.app_send(cast(WebsocketAcceptEvent, {"type": "websocket.accept"}))
+    stream.app_put = AsyncMock()
+    stream.send.reset_mock()  # type: ignore
+
+
+def _peer_close(code: int) -> bytes:
+    return Connection(ConnectionType.CLIENT).send(CloseConnection(code=code))
+
+
+@pytest.mark.asyncio
+async def test_close_confirmed_by_peer(stream: WSStream) -> None:
+    # The confirmation arrives synchronously, so no timer is needed.
+    stream.config.websocket_close_timeout = None
+    await _open_stream(stream)
+    await stream.app_send(
+        cast(WebsocketCloseEvent, {"type": "websocket.close", "code": 1000})
+    )
+    assert stream.state == ASGIWebsocketState.CLOSING
+    assert stream.send.call_args_list == [  # type: ignore
+        call(Data(stream_id=1, data=b"\x88\x02\x03\xe8"))
+    ]
+    # A message received whilst closing must not reach the application.
+    await stream.handle(Data(stream_id=1, data=_peer_close(1000)))
+    assert stream.state == ASGIWebsocketState.CLOSED
+    assert stream.send.call_args_list == [  # type: ignore
+        call(Data(stream_id=1, data=b"\x88\x02\x03\xe8")),
         call(EndData(stream_id=1)),
+        call(StreamClosed(stream_id=1)),
+    ]
+    assert stream.app_put.call_args_list == [  # type: ignore
+        call({"type": "websocket.disconnect", "code": 1000})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_close_timeout_releases_stream(stream: WSStream) -> None:
+    event_loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    stream.config.websocket_close_timeout = 0.05
+    await _open_stream(stream)
+    async with TaskGroup(event_loop) as task_group:
+        stream.task_group = task_group
+        stream.send.reset_mock()  # type: ignore
+        await stream.app_send(
+            cast(WebsocketCloseEvent, {"type": "websocket.close", "code": 1000})
+        )
+        assert stream.state == ASGIWebsocketState.CLOSING
+        await asyncio.sleep(0.1)
+        assert stream.state == ASGIWebsocketState.CLOSED
+        assert stream.send.call_args_list == [  # type: ignore
+            call(Data(stream_id=1, data=b"\x88\x02\x03\xe8")),
+            call(EndData(stream_id=1)),
+            call(StreamClosed(stream_id=1)),
+        ]
+        assert stream.app_put.call_args_list == [  # type: ignore
+            call({"type": "websocket.disconnect", "code": 1006})
+        ]
+
+
+@pytest.mark.asyncio
+async def test_close_ignores_messages_whilst_waiting(stream: WSStream) -> None:
+    stream.config.websocket_close_timeout = 0.05
+    await _open_stream(stream)
+    event_loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    async with TaskGroup(event_loop) as task_group:
+        stream.task_group = task_group
+        await stream.app_send(cast(WebsocketCloseEvent, {"type": "websocket.close"}))
+        await stream.handle(
+            Data(stream_id=1, data=b"\x81\x85&`\x13\x0eN\x05\x7fbI")
+        )
+        assert stream.app_put.call_args_list == []
+        await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_peer_initiated_close_is_echoed(stream: WSStream) -> None:
+    stream.config.websocket_close_timeout = 0.05
+    await _open_stream(stream)
+    await stream.handle(Data(stream_id=1, data=_peer_close(1001)))
+    assert stream.state == ASGIWebsocketState.CLOSED
+    calls = [c.args[0] for c in stream.send.call_args_list]  # type: ignore
+    assert calls == [
+        Data(stream_id=1, data=b"\x88\x02\x03\xe9"),
+        EndData(stream_id=1),
+        StreamClosed(stream_id=1),
+    ]
+    assert stream.app_put.call_args_list == [  # type: ignore
+        call({"type": "websocket.disconnect", "code": 1001})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_close_cleans_up_once(stream: WSStream) -> None:
+    stream.config.websocket_close_timeout = None
+    await _open_stream(stream)
+    await stream.app_send(cast(WebsocketCloseEvent, {"type": "websocket.close"}))
+    await stream.handle(Data(stream_id=1, data=_peer_close(1000)))
+    # A late transport close must not repeat the cleanup or disconnect.
+    await stream.handle(StreamClosed(stream_id=1))
+    assert stream.send.call_args_list == [  # type: ignore
+        call(Data(stream_id=1, data=b"\x88\x02\x03\xe8")),
+        call(EndData(stream_id=1)),
+        call(StreamClosed(stream_id=1)),
+    ]
+    assert stream.app_put.call_args_list == [  # type: ignore
+        call({"type": "websocket.disconnect", "code": 1000})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_transport_close_during_handshake(stream: WSStream) -> None:
+    stream.config.websocket_close_timeout = None
+    await _open_stream(stream)
+    await stream.app_send(cast(WebsocketCloseEvent, {"type": "websocket.close"}))
+    await stream.handle(StreamClosed(stream_id=1))
+    assert stream.state == ASGIWebsocketState.CLOSED
+    # The stream is already gone, so no stream end is sent again.
+    assert stream.send.call_args_list == [  # type: ignore
+        call(Data(stream_id=1, data=b"\x88\x02\x03\xe8"))
+    ]
+    assert stream.app_put.call_args_list == [  # type: ignore
+        call({"type": "websocket.disconnect", "code": 1006})
     ]
 
 

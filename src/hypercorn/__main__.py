@@ -207,6 +207,13 @@ def main(sys_args: list[str] | None = None) -> int:
         default=sentinel,
     )
     parser.add_argument(
+        "--websocket-close-timeout",
+        help="""The time in seconds to wait for the client to confirm a
+        server sent close, before the stream is closed.""",
+        default=sentinel,
+        type=float,
+    )
+    parser.add_argument(
         "--websocket-ping-interval",
         help="""If set this is the time in seconds between pings sent to the client.
         This can be used to keep the websocket connection alive.""",
@@ -295,6 +302,8 @@ def main(sys_args: list[str] | None = None) -> int:
         config.worker_class = args.worker_class
     if args.verify_mode is not sentinel:
         config.verify_mode = args.verify_mode
+    if args.websocket_close_timeout is not sentinel:
+        config.websocket_close_timeout = args.websocket_close_timeout
     if args.websocket_ping_interval is not sentinel:
         config.websocket_ping_interval = args.websocket_ping_interval
     if args.workers is not sentinel:

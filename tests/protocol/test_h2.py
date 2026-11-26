@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, Mock
 
+import h2
+import h2.events
 import pytest
 from h2.connection import H2Connection
 from h2.events import ConnectionTerminated
@@ -116,3 +119,33 @@ async def test_protocol_keep_alive_max_requests() -> None:
     protocol.send.assert_awaited()  # type: ignore
     events = client.receive_data(protocol.send.call_args_list[1].args[0].data)  # type: ignore
     assert isinstance(events[-1], ConnectionTerminated)
+
+
+@pytest.mark.asyncio
+async def test_data_received_for_closed_stream_is_acknowledged() -> None:
+    protocol = H2Protocol(
+        Mock(),
+        Config(),
+        WorkerContext(None),
+        AsyncMock(),
+        ConnectionState({}),
+        False,
+        None,
+        None,
+        AsyncMock(),
+    )
+    protocol.connection = Mock()
+    protocol.connection.data_to_send.return_value = b""
+    events = [
+        h2.events.DataReceived(stream_id=1, data=b"a", flow_controlled_length=1),
+        h2.events.DataReceived(stream_id=3, data=b"b", flow_controlled_length=1),
+    ]
+    protocol.streams = {3: SimpleNamespace(handle=AsyncMock())}
+    # Stream 1 is already gone, which happens after a bounded close,
+    # so the sibling stream 3 must still be delivered to and the
+    # received data acknowledged.
+    await protocol._handle_events(events)
+    protocol.streams[3].handle.assert_awaited()
+    assert [
+        call.args for call in protocol.connection.acknowledge_received_data.call_args_list
+    ] == [(1, 1), (1, 3)]

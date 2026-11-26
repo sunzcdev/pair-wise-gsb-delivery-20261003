@@ -167,6 +167,9 @@ verify_flags               N/A                           SSL context verify flag
 verify_mode                ``--verify-mode``             SSL verify mode for peer's certificate,
                                                          see ssl.VerifyMode enum for possible
                                                          values.
+websocket_close_timeout    ``--websocket-close-timeout`` The time in seconds to wait for the client
+                                                         to confirm a server sent close, before
+                                                         the stream is closed.                           5s
 websocket_max_message_size N/A                           Maximum size of a WebSocket frame.              16MiB
 websocket_ping_interval    ``--websocket-ping-interval`` If set this is the time in seconds between
                                                          pings sent to the client. This can be used

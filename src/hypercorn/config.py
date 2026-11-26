@@ -108,6 +108,7 @@ class Config:
     user: int | None = None
     verify_flags: VerifyFlags | None = None
     verify_mode: VerifyMode | None = None
+    websocket_close_timeout: float | None = 5 * SECONDS
     websocket_max_message_size = 16 * 1024 * 1024 * BYTES
     websocket_ping_interval: float | None = None
     worker_class = "asyncio"
