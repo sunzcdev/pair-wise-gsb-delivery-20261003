@@ -12,19 +12,43 @@ module SolidQueue
 
     def self.retry_all(jobs)
       SolidQueue.instrument(:retry_all, jobs_size: jobs.size) do |payload|
+        retry_rounds = []
+
         transaction do
           job_ids = lock_all_from_jobs(jobs)
-          Job.where(id: job_ids).find_each(&:reset_execution_counters)
+          retried_jobs = Job.where(id: job_ids).to_a
+          retried_jobs.each(&:reset_execution_counters)
 
+          retry_rounds = attach_failed_batches_to_retry_rounds(retried_jobs)
           payload[:size] = dispatch_jobs(job_ids)
         end
+
+        retry_rounds.each(&:start)
       end
     end
 
-    def retry
+    def self.attach_failed_batches_to_retry_rounds(jobs)
+      return [] unless Batch.migrated?
+
+      jobs.select { |job| job.batch_id? && job.batch&.failed? }
+          .group_by(&:batch_id)
+          .map do |batch_id, batch_jobs|
+            batch = Batch.find(batch_id)
+            round = batch.send(:create_retry_round!, batch_jobs.size)
+            batch_jobs.each { |job| job.attach_to_retry_round(round) }
+            round
+          end
+    end
+
+    def retry(retry_batch: nil)
+      if retry_batch.nil? && Batch.migrated? && job.batch&.failed?
+        return job.batch.retry_failed_jobs!(self)
+      end
+
       SolidQueue.instrument(:retry, job_id: job.id) do
         with_lock do
           job.reset_execution_counters
+          job.attach_to_retry_round(retry_batch) if retry_batch
           job.prepare_for_execution
           destroy!
         end

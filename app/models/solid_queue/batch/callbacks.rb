@@ -17,12 +17,14 @@ module SolidQueue
 
       private
         def serialize_callback(value)
-          if value.present?
-            active_job = value.is_a?(ActiveJob::Base) ? value : value.new
-            # We can pick up batch ids from context, but callbacks should never be considered a part of the batch
-            active_job.batch_id = nil
-            active_job.serialize
-          end
+          # Already-serialized callback hashes can be copied onto a retry round.
+          return value if value.is_a?(Hash)
+          return if value.blank?
+
+          active_job = value.is_a?(ActiveJob::Base) ? value : value.new
+          # We can pick up batch ids from context, but callbacks should never be considered a part of the batch
+          active_job.batch_id = nil
+          active_job.serialize
         end
 
         def enqueue_callback_jobs

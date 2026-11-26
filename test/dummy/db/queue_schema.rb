@@ -147,10 +147,15 @@ ActiveRecord::Schema[7.1].define(version: 1) do
     t.datetime "enqueued_at"
     t.datetime "finished_at"
     t.datetime "failed_at"
+    t.integer "round", default: 1, null: false
+    t.bigint "parent_batch_id"
+    t.bigint "original_batch_id"
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
     t.index ["active_job_batch_id"], name: "index_solid_queue_batches_on_active_job_batch_id", unique: true
     t.index ["finished_at"], name: "index_solid_queue_batches_on_finished_at"
+    t.index ["parent_batch_id"], name: "index_solid_queue_batches_on_parent_batch_id"
+    t.index ["round"], name: "index_solid_queue_batches_on_round"
   end
 
   create_table "solid_queue_batch_executions", charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|

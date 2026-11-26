@@ -3,6 +3,7 @@
 module SolidQueue
   class Batch < Record
     class AlreadyFinished < StandardError; end
+    class NothingToRetry < StandardError; end
 
     class PendingMigrations < StandardError
       def initialize(message = "The batches schema hasn't been installed yet. Run `bin/rails solid_queue:update` to copy the pending migrations to your application, and then `bin/rails db:migrate` to run them")
@@ -11,7 +12,7 @@ module SolidQueue
     end
 
     include Callbacks, Status
-    include Clearable, Sweepable
+    include Clearable, Sweepable, Retriable
 
     has_many :jobs
     has_many :batch_executions, dependent: :destroy

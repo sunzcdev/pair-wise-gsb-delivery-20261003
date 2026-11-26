@@ -26,6 +26,10 @@ module SolidQueue
         Batch.migrated? && batch_id?
       end
 
+      def batch_round
+        batch&.round || 1
+      end
+
       private
         def create_batch_execution
           BatchExecution.create_all_from_jobs([ self ])

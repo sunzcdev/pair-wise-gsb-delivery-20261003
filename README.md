@@ -775,7 +775,18 @@ Batches track `total_jobs`, `completed_jobs`, `failed_jobs` and `pending_jobs`, 
 
 - Counters track *logical* jobs, matching what you enqueued: a retry via `retry_on` keeps the job's Active Job ID, so a job that fails twice and then succeeds still contributes 1 to `total_jobs`. Each attempt does get its own row in the batch's `jobs` relation, though.
 - Jobs discarded via `discard_on`, concurrency's `on_conflict: :discard`, or manual discarding count as completed, not failed.
-- Manually retrying a failed job (via `SolidQueue::FailedExecution#retry`) doesn't re-add it to its batch: if the batch already finished as failed, a successful manual retry won't change the batch's status.
+- Manually retrying a failed member creates a new retry-round batch. The original finished batch remains unchanged, while the new batch contains only the failed members and fires its own callbacks with its own `callback_batch_id`. Calling `retry_failed_jobs` twice while a retry round is still active returns that same round, making duplicate form posts safe.
+
+### Retrying failed batch members
+
+After a batch has finished as failed, start a new execution round with only its failed members:
+
+```ruby
+retry_round = batch.retry_failed_jobs
+batch.retry_failed_jobs # => the same unfinished retry_round
+```
+
+The old batch keeps its terminal `failed?` state and counters. `retry_round.round` is `2`, `retry_round.parent_batch` is the original batch, and failed executions reached through the retried jobs report `failed_execution.batch_round`. Callbacks copied to the retry round point at the retry round, so the original failure callback and the next round's callback can each read their own batch state.
 
 ### Batch maintenance
 
