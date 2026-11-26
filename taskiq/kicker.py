@@ -21,6 +21,7 @@ from taskiq.labels import prepare_label
 from taskiq.message import TaskiqMessage
 from taskiq.scheduler.created_schedule import CreatedSchedule
 from taskiq.scheduler.scheduled_task import CronSpec, ScheduledTask
+from taskiq.scope import ResultScope, scope_id_of
 from taskiq.task import AsyncTaskiqTask
 from taskiq.utils import maybe_awaitable
 
@@ -51,6 +52,24 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
         self.custom_task_id: str | None = None
         self.custom_schedule_id: str | None = None
         self.return_type = return_type
+        self.run_scope: str | ResultScope | None = None
+
+    def with_run_scope(
+        self,
+        run_scope: str | ResultScope | None,
+    ) -> "AsyncKicker[_FuncParams, _ReturnType]":
+        """
+        Assign an explicit result ownership scope for this kick.
+
+        The scope defaults to the broker's run scope when this method is not
+        called. ``with_scope`` and ``for_run`` are readable aliases.
+        """
+        self.run_scope = run_scope
+        return self
+
+    with_scope = with_run_scope
+    for_run = with_run_scope
+    with_owner = with_run_scope
 
     def with_labels(
         self,
@@ -162,6 +181,25 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
         for middleware in self.broker.middlewares:
             if middleware.__class__.pre_send != TaskiqMiddleware.pre_send:
                 message = await maybe_awaitable(middleware.pre_send(message))
+
+        scope_id = scope_id_of(self.run_scope) or scope_id_of(
+            getattr(self.broker, "run_scope", None),
+        ) or getattr(self.broker, "scope_id", None)
+        if self.run_scope is not None:
+            register_owner = getattr(
+                self.broker.result_backend,
+                "register_result_owner",
+                None,
+            )
+            if callable(register_owner):
+                await maybe_awaitable(
+                    register_owner(
+                        message.task_id,
+                        scope_id,
+                        overwrite=True,
+                    ),
+                )
+
         try:
             await self.broker.kick(self.broker.formatter.dumps(message))
         except Exception as exc:
@@ -175,6 +213,8 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
             task_id=message.task_id,
             result_backend=self.broker.result_backend,
             return_type=self.return_type,  # type: ignore # (pyright issue)
+            scope_id=scope_id,
+            owner_id=scope_id,
         )
 
     async def schedule_by_cron(

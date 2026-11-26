@@ -2,12 +2,20 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from taskiq.result import TaskiqResult
+from taskiq.scope import ResultScope, RunScope
 
 if TYPE_CHECKING:  # pragma: no cover
     from taskiq.depends.progress_tracker import TaskProgress
 
 
 _ReturnType = TypeVar("_ReturnType")
+
+__all__ = [
+    "AsyncResultBackend",
+    "ResultScope",
+    "RunScope",
+    "TaskiqResult",
+]
 
 
 class AsyncResultBackend(ABC, Generic[_ReturnType]):

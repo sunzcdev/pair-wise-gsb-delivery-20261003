@@ -12,6 +12,31 @@ This is a special broker for local development. It uses the same functions to ex
 but all tasks are executed locally in the current thread.
 By default it uses `InMemoryResultBackend` but this can be overridden.
 
+### Scoped cleanup and shared handles
+
+When several CI runs share one `InmemoryResultBackend`, give each broker an
+explicit `run_id` (or `ResultScope`). Shutting down such a broker removes only
+results owned by that run. A result that was explicitly shared with another
+scope remains readable until every holder releases it or its scope closes.
+
+```python
+backend = InmemoryResultBackend()
+first = InMemoryBroker(await_inplace=True, run_id="run-1").with_result_backend(backend)
+second = InMemoryBroker(await_inplace=True, run_id="run-2").with_result_backend(backend)
+
+first_handle = await my_task.kicker().with_broker(first).kiq()
+shared_handle = second.hold_result(first_handle)
+
+await first.shutdown()
+await shared_handle.wait_result()  # Still readable while run-2 holds it.
+
+await second.shutdown()  # Releases run-2's own results and the shared reference.
+```
+
+Calling `handle.share(holder=scope_id)` creates the same explicit reference
+without a broker. Existing code that does not provide a scope keeps the legacy
+in-memory shutdown behavior.
+
 ## ZeroMQBroker
 
 This broker uses [ZMQ](https://zeromq.org/) to communicate between worker and client processes.

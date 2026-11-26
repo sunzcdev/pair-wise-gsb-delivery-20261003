@@ -35,8 +35,14 @@ from taskiq.middlewares import (
 from taskiq.result import TaskiqResult
 from taskiq.scheduler.scheduled_task import ScheduledTask
 from taskiq.scheduler.scheduler import TaskiqScheduler
+from taskiq.scope import ResultScope, RunScope
 from taskiq.state import TaskiqState
-from taskiq.task import AsyncTaskiqTask
+from taskiq.task import (
+    AsyncTaskiqTask,
+    SharedAsyncTaskiqTask,
+    SharedResult,
+    SharedResultHandle,
+)
 
 __version__ = version("taskiq")
 
@@ -55,10 +61,15 @@ __all__ = [
     "PrometheusMiddleware",
     "ResultGetError",
     "ResultIsReadyError",
+    "ResultScope",
+    "RunScope",
     "ScheduleSource",
     "ScheduledTask",
     "SecurityError",
     "SendTaskError",
+    "SharedAsyncTaskiqTask",
+    "SharedResult",
+    "SharedResultHandle",
     "SimpleRetryMiddleware",
     "SmartRetryMiddleware",
     "TaskiqDepends",
