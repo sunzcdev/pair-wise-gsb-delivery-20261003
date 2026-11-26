@@ -204,6 +204,7 @@ class MetaArguments(TypedDict):
     _ignore_errors: bool
     _continue_on_error: bool
     _if: list[Callable[[], bool]] | Callable[[], bool] | None
+    _validate_plan: bool
 
 
 meta_argument_meta: dict[str, ArgumentMeta] = {
@@ -230,6 +231,17 @@ meta_argument_meta: dict[str, ArgumentMeta] = {
     "_if": ArgumentMeta(
         "Only run this operation if these functions return True",
         default=lambda _: [],
+    ),
+    "_validate_plan": ArgumentMeta(
+        (
+            "Record the commands (and the facts they are based on) when the operation is "
+            "planned, then validate them at execution time. Facts are re-read before the "
+            "operation runs: if unchanged the approved commands run exactly as recorded; if "
+            "changed only this operation is recomputed - a recompute that makes no changes "
+            "is skipped with an explanation, while one that would change write targets or "
+            "expand the change scope stops the deploy and reports the difference."
+        ),
+        default=lambda _: False,
     ),
 }
 

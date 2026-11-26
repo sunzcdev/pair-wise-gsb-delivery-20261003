@@ -66,6 +66,7 @@ class PyinfraOperation(Generic[P], Protocol):
         _ignore_errors: bool = False,
         _continue_on_error: bool = False,
         _if: list[Callable[[], bool]] | Callable[[], bool] | None = None,
+        _validate_plan: bool = False,
         #
         # ExecutionArguments
         #

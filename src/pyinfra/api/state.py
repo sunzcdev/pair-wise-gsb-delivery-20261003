@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from pyinfra.api.host import Host
     from pyinfra.api.inventory import Inventory
     from pyinfra.api.operation import OperationMeta
+    from pyinfra.api.validation import ValidatedOpPlan
 
 
 # Work out the max parallel we can achieve with the open files limit of the user/process,
@@ -279,6 +280,11 @@ class State:
         # Op dict for each host
         self.ops: dict[Host, dict[str, StateOperationHostData]] = {host: {} for host in inventory}
 
+        # Approved plans for validated (``_validate_plan``) operations, per host
+        self.validated_op_plans: dict[Host, dict[str, ValidatedOpPlan]] = {
+            host: {} for host in inventory
+        }
+
         # Meta dict for each host
         self.meta: dict[Host, StateHostMeta] = {host: StateHostMeta() for host in inventory}
 
@@ -399,6 +405,12 @@ class State:
         op_data: StateOperationHostData,
     ):
         self.ops[host][op_hash] = op_data
+
+    def set_validated_op_plan(self, host: Host, op_hash: str, plan: ValidatedOpPlan) -> None:
+        self.validated_op_plans.setdefault(host, {})[op_hash] = plan
+
+    def get_validated_op_plan(self, host: Host, op_hash: str) -> ValidatedOpPlan | None:
+        return self.validated_op_plans.get(host, {}).get(op_hash)
 
     def activate_host(self, host: Host):
         """

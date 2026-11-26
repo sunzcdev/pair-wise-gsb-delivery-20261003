@@ -24,6 +24,7 @@ from .util import (
     log_operation_start,
     print_host_combined_output,
 )
+from .validation import resolve_validated_plan
 
 if TYPE_CHECKING:
     from .inventory import Host
@@ -84,6 +85,55 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
     commands: list[PyinfraCommand] = []
     all_output_lines: list[OutputLine] = []
 
+    # Validated operations run against the plan approved when the operation was
+    # added: re-read the facts the plan was built on and only recompute this
+    # operation if they changed. ``approved_commands`` overrides the command
+    # generator below when set.
+    approved_commands: list[PyinfraCommand] | None = None
+    if global_arguments["_validate_plan"]:
+        plan = state.get_validated_op_plan(host, op_hash)
+        if plan is not None:
+            if op_data.operation_meta.is_complete():
+                # Never replay a validated operation that already reached a
+                # confirmed result (eg a previous run_ops call on this state).
+                already_succeeded = op_data.operation_meta.did_succeed()
+                _log_status = format_text(
+                    "Already complete, not replaying",
+                    "green" if already_succeeded else "red",
+                )
+                logger.info(f"{host.print_prefix}{_log_status}")
+                return already_succeeded
+
+            resolution = resolve_validated_plan(host, op_data, plan)
+
+            if resolution.kind == "skip":
+                host.log_styled(f"Skipped: {resolution.reason}", fg="cyan")
+                approved_commands = []
+
+            elif resolution.kind == "conflict":
+                host_results = state.get_results_for_host(host)
+                if ignore_errors:
+                    host_results.ignored_error_ops += 1
+                    host_results.ops += 1
+                else:
+                    host_results.error_ops += 1
+
+                log_error_or_warning(
+                    host,
+                    ignore_errors,
+                    "validated operation stopped, approved plan no longer matches",
+                    continue_on_error,
+                )
+                if resolution.report:
+                    logger.error(resolution.report)
+
+                op_data.operation_meta.set_complete(False, [], CommandOutput([]))
+                state.trigger_callbacks("operation_host_error", host, op_hash, 0, retries)
+                return ignore_errors
+
+            else:
+                approved_commands = resolution.commands
+
     # Retry loop
     while retry_attempt <= retries:
         did_error = False
@@ -91,7 +141,11 @@ def _run_host_op(state: State, host: Host, op_hash: str) -> bool:
         commands = []
         all_output_lines = []
 
-        for command in op_data.command_generator():
+        command_iterable = (
+            approved_commands if approved_commands is not None else op_data.command_generator()
+        )
+
+        for command in command_iterable:
             commands.append(command)
             status = False
             connector_arguments = base_connector_arguments.copy()

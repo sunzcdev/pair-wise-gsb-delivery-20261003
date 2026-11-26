@@ -35,6 +35,7 @@ from .util import (
     log_operation_start,
     make_hash,
 )
+from .validation import ValidatedOpPlan
 
 op_meta_default = object()
 
@@ -365,7 +366,16 @@ def _wrap_operation(func: Callable[P, Generator], _set_in_op: bool = True) -> Py
                 host.current_op_deploy_data = None
 
         op_is_change = None
-        if state.should_check_for_changes():
+        if global_arguments["_validate_plan"]:
+            # Validated operations always record an approved plan: the full
+            # command list plus every fact read while generating it (recorded
+            # via ``host.get_fact``), for validation at execution time.
+            plan = ValidatedOpPlan()
+            state.set_validated_op_plan(host, op_hash, plan)
+            plan.commands = list(command_generator())
+            plan.recording = False
+            op_is_change = bool(plan.commands)
+        elif state.should_check_for_changes():
             op_is_change = False
             for _ in command_generator():
                 op_is_change = True

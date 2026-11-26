@@ -24,6 +24,7 @@ from .connectors import get_execution_connector
 from .exceptions import ConnectError
 from .facts import FactBase, ShortFactBase, get_fact
 from .util import memoize, sha1_hash
+from .validation import record_fact_read
 
 if TYPE_CHECKING:
     from pyinfra.api.arguments import AllArguments
@@ -369,7 +370,11 @@ class Host:
         Get a fact for this host. Facts are not cached, so the fact's command runs on
         the host each time this is called.
         """
-        return get_fact(self.state, self, name_or_cls, args=args, kwargs=kwargs)
+        value = get_fact(self.state, self, name_or_cls, args=args, kwargs=kwargs)
+        # If a validated operation is currently recording its approved plan,
+        # remember this read so the plan can be validated before execution.
+        record_fact_read(self, name_or_cls, args, kwargs, value)
+        return value
 
     # Connector proxy
     #
