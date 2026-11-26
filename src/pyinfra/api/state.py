@@ -7,7 +7,7 @@ from graphlib import CycleError, TopologicalSorter
 from itertools import pairwise
 from multiprocessing import cpu_count
 from typing import TYPE_CHECKING
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
 from gevent.pool import Pool
 from paramiko import PKey
@@ -270,6 +270,10 @@ class State:
         # Hosts that have failed
         self.failed_hosts: set[Host] = set()
 
+        # Hosts the FAIL_PERCENT threshold is measured against this run, declared
+        # when execution begins - see ``declare_fail_percent_hosts``
+        self.fail_percent_hosts: set[Host] | None = None
+
         # Limit hosts changes dynamically to limit operations to a subset of hosts
         self.limit_hosts: list[Host] = initial_limit
 
@@ -412,6 +416,32 @@ class State:
         self.activated_hosts.add(host)
         self.active_hosts.add(host)
 
+    def declare_fail_percent_hosts(self, hosts: Iterable[Host] | None = None) -> None:
+        """
+        Declare the hosts the ``config.FAIL_PERCENT`` threshold is measured against
+        for this run.
+
+        By default this is every activated host that has operations to execute:
+        hosts filtered out of every operation (eg by host or ``when`` selection)
+        must not inflate the denominator, while hosts that disconnect mid-run
+        remain counted as part of the batch.
+        """
+
+        if hosts is None:
+            hosts = {host for host in self.activated_hosts if self.ops[host]}
+
+        self.fail_percent_hosts = set(hosts) or set(self.activated_hosts)
+
+    def get_fail_percent_hosts(self) -> set[Host]:
+        """
+        Return the hosts the ``config.FAIL_PERCENT`` threshold is measured against:
+        the declared set if any, otherwise every activated host.
+        """
+
+        if self.fail_percent_hosts:
+            return self.fail_percent_hosts
+        return self.activated_hosts
+
     def fail_hosts(self, hosts_to_fail, activated_count=None):
         """
         Flag a ``set`` of hosts as failed, error for ``config.FAIL_PERCENT``.
@@ -419,8 +449,6 @@ class State:
 
         if not hosts_to_fail:
             return
-
-        activated_count = activated_count or len(self.activated_hosts)
 
         logger.debug(
             "Failing hosts: {}".format(
@@ -442,7 +470,15 @@ class State:
             raise PyinfraError("No hosts remaining!")
 
         if self.config.FAIL_PERCENT is not None:
-            percent_failed = (1 - len(active_hosts) / activated_count) * 100
+            if activated_count is None:
+                # Measure against the hosts participating in this run, so hosts
+                # filtered out of every operation don't inflate the denominator.
+                participating_hosts = self.get_fail_percent_hosts()
+                percent_failed = (
+                    len(participating_hosts & self.failed_hosts) / len(participating_hosts)
+                ) * 100
+            else:
+                percent_failed = (1 - len(active_hosts) / activated_count) * 100
 
             if percent_failed > self.config.FAIL_PERCENT:
                 if self.should_raise_failed_hosts and self.should_raise_failed_hosts(self) is False:

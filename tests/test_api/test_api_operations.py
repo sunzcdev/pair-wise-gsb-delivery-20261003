@@ -1647,4 +1647,112 @@ class TestRunSingleOpFailPercent(PatchSSHTestCase):
         assert len(state.failed_hosts) == 2
 
 
+class TestFailPercentParticipatingHosts(TestCase):
+    """
+    `FAIL_PERCENT` is measured against the hosts participating in the run - those
+    with operations to execute - not every connected host: hosts filtered out of
+    every operation (host/when selection) must not inflate the denominator, while
+    hosts that disconnect mid-run remain counted as part of the batch.
+    """
+
+    def _make_state(self, fail_percent):
+        no_delay = {"fake_delay": 0, "fake_delay_jitter": 0}
+        inventory = make_inventory(
+            hosts=tuple(
+                (
+                    f"@fake/web-{i}",
+                    {
+                        **no_delay,
+                        # web-0 fails the first operation command
+                        **(
+                            {"fake_responses": {"echo first": {"success": False}}} if i == 0 else {}
+                        ),
+                    },
+                )
+                for i in range(10)
+            ),
+            # Only two of the ten hosts are selected for the operations
+            selected=(["@fake/web-0", "@fake/web-1"], {}),
+        )
+        state = State(inventory, Config(FAIL_PERCENT=fail_percent))
+        state.current_stage = StateStage.Prepare
+        connect_all(state)
+        assert len(state.active_hosts) == 10
+        return state, inventory
+
+    def test_fail_percent_measured_against_participating_hosts(self):
+        state, inventory = self._make_state(fail_percent=49)
+        web_0 = inventory.get_host("@fake/web-0")
+
+        # Only the two "selected" hosts get the operation
+        add_op(state, server.shell, "echo first", host=inventory.get_group("selected"))
+
+        with self.assertRaises(PyinfraError) as e:
+            run_ops(state)
+
+        # One of the two participating hosts failed: 50% > 49% - measured against
+        # all ten connected hosts (10%) the run would have continued.
+        assert e.exception.args[0] == "Over 49% of hosts failed (50%)"
+        assert state.failed_hosts == {web_0}
+        assert state.fail_percent_hosts == set(inventory.get_group("selected"))
+
+    def test_mid_run_disconnect_stays_in_the_batch(self):
+        state, inventory = self._make_state(fail_percent=50)
+        web_0 = inventory.get_host("@fake/web-0")
+        web_1 = inventory.get_host("@fake/web-1")
+        selected = inventory.get_group("selected")
+
+        add_op(state, server.shell, "echo first", host=selected)
+        add_op(state, server.shell, "echo second", host=selected)
+
+        # web-1 drops its connection after each operation and reconnects - it must
+        # remain part of the fail percent batch and keep running operations.
+        class ReconnectCallback(BaseStateCallback):
+            @staticmethod
+            def operation_end(state, op_hash):
+                web_1.disconnect()
+                web_1.connect()
+
+        state.add_callback_handler(ReconnectCallback())
+
+        # web-0 failing is 50% of the two participating hosts, not over the 50%
+        # threshold, so the run continues on web-1.
+        run_ops(state)
+
+        assert state.failed_hosts == {web_0}
+        assert web_1.connected is True
+
+        # web-1 was accepted for both operations, web-0 only ran the first
+        assert web_1.connector.executed_commands == ["echo first", "echo second"]
+        assert web_0.connector.executed_commands == ["echo first"]
+
+        # The eight hosts filtered out of the operations never ran anything
+        for host in state.inventory:
+            if host not in selected:
+                assert host.connector.executed_commands == []
+
+        # ...and the results report reflects exactly the two participating hosts
+        assert state.get_results_for_host(web_1).success_ops == 2
+        assert state.get_results_for_host(web_0).error_ops == 1
+        assert state.fail_percent_hosts == {web_0, web_1}
+
+    def test_declared_fail_percent_hosts(self):
+        state, inventory = self._make_state(fail_percent=0)
+        web_0 = inventory.get_host("@fake/web-0")
+        web_1 = inventory.get_host("@fake/web-1")
+
+        # Explicitly declare the two hosts the fail percent is measured against,
+        # even though the operation targets every host
+        state.declare_fail_percent_hosts([web_0, web_1])
+
+        add_op(state, server.shell, "echo first")
+
+        with self.assertRaises(PyinfraError) as e:
+            run_ops(state)
+
+        # web-0 failing is 50% of the declared hosts, not 10% of the inventory
+        assert e.exception.args[0] == "Over 0% of hosts failed (50%)"
+        assert state.failed_hosts == {web_0}
+
+
 this_filename = path.join("tests", "test_api", "test_api_operations.py")

@@ -18,7 +18,8 @@ from .exceptions import PyinfraError
 
 
 class ConfigDefaults:
-    # % of hosts which have to fail for all operations to stop
+    # % of hosts which have to fail for all operations to stop, measured against
+    # the hosts participating in the run (see State.declare_fail_percent_hosts)
     FAIL_PERCENT: int | None = None
     # Seconds to timeout SSH connections
     CONNECT_TIMEOUT: int = 10

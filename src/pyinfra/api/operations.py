@@ -404,6 +404,13 @@ def run_ops(state: State, serial: bool = False, no_wait: bool = False):
     # Flag state as deploy in process
     state.is_executing = True
 
+    # Declare the hosts the fail percent threshold is measured against for this
+    # run: those with operations to execute. Hosts filtered out of every operation
+    # must not inflate the denominator, while hosts that disconnect mid-run remain
+    # counted as part of the batch.
+    if state.fail_percent_hosts is None:
+        state.declare_fail_percent_hosts()
+
     with ctx_state.use(state):
         # Run all ops, but server by server
         if serial:
