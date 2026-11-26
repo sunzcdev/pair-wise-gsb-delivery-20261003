@@ -97,7 +97,7 @@ The task history has the following pages:
   e.g. ``data={"foo": "bar"}`` looks for a task with ``foo=bar``.
 * ``/history/by_task_id/{task_id}``
   the latest run of a task given the ``{task_id}``. It is different from just ``{id}``
-  and is a derivative of ``params``. It is available via ``{task_id}`` property of a 
+  and is a derivative of ``params``. It is available via ``{task_id}`` property of a
   ``luigi.Task`` instance or via `luigi.task.task_id_str
   <https://luigi.readthedocs.io/en/stable/api/luigi.task.html#luigi.task.task_id_str>`_.
   This kind of representation is useful for concisely recording URLs in a history tree.
@@ -105,4 +105,36 @@ The task history has the following pages:
 
     .. figure:: history_by_task_id.png
        :alt: By task_id screenshot
-  
+
+Snapshots and the history boundary
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Live task state and the history database are written at different times: a
+status change is accepted by the scheduler immediately, while the matching
+``task_events`` row may be slow, retried, or deliberately held back. To let
+an operator take a consistent sample of a work graph without losing that
+distinction, the scheduler exposes two endpoints:
+
+* ``GET /snapshot?failed_only=true``
+  Saves a snapshot and returns it as JSON. The task graph is sampled at one
+  state revision; ``events`` lists only the history that had actually landed
+  when the sample was taken, and ``outstanding`` lists the events that were
+  already decided but not yet written (with their original ``ts``). ``revision``
+  identifies the sample. Reading the same snapshot again via
+  ``GET /snapshot/{snapshot_id}`` returns exactly the same sample: a later
+  round's status changes or late history writes are never merged into it.
+  A new snapshot reports a new revision and does see whatever has landed since.
+  ``GET /snapshot/{snapshot_id}/history`` returns only the frozen history list
+  for that sample.
+* ``GET /history/boundary``
+  Returns the current live-state revision, the sequence number of the last
+  decided event, and the outstanding (decided but not yet written) events.
+  This is the current edge between the two systems, not a frozen sample.
+
+Outstanding events are retried by the scheduler through the ``flush_task_history``
+RPC. A retried write keeps its original timestamp, so flushing a late event
+makes it visible to *new* snapshots without retroactively changing one that was
+already taken. Ordinary history queries (``/history`` and the ``/history/by_*``
+pages) keep reading the database as before. Stored snapshots and outstanding
+journal entries are included in scheduler state dumps, so their identities can
+also survive a restart.

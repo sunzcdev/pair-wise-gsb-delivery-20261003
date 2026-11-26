@@ -22,6 +22,8 @@ See :doc:`/central_scheduler` for more info.
 """
 
 import collections
+import copy
+import datetime
 import functools
 import hashlib
 import inspect
@@ -72,6 +74,12 @@ WORKER_STATE_ACTIVE = "active"
 TASK_FAMILY_RE = re.compile(r"([^(_]+)[(_]")
 
 RPC_METHODS = {}
+
+# Event kinds written to the task history, in the order the scheduler has
+# always emitted them for one task run: scheduled -> started -> finished.
+HISTORY_SCHEDULED = "scheduled"
+HISTORY_STARTED = "started"
+HISTORY_FINISHED = "finished"
 
 _retry_policy_fields = [
     "retry_count",
@@ -131,6 +139,15 @@ class scheduler(Config):
 
     record_task_history = parameter.BoolParameter(default=False)
 
+    history_journal_size = parameter.IntParameter(
+        default=10000,
+        description="Maximum number of decided task history events kept in the scheduler's in-memory journal",
+    )
+    max_task_snapshots = parameter.IntParameter(
+        default=100,
+        description="Maximum number of task-history snapshots kept by the scheduler",
+    )
+
     prune_on_get_work = parameter.BoolParameter(default=False)
 
     pause_enabled = parameter.BoolParameter(default=True)
@@ -154,6 +171,152 @@ def _get_default(x, default):
         return x
     else:
         return default
+
+
+class HistoryEvent:
+    """
+    A task history event as the scheduler decided it.
+
+    ``seq`` is assigned when the status change is accepted, not when the row
+    reaches the history backend. The two moments are independent: a write may
+    fail, be deferred on purpose, or simply be slow, while ``seq`` and ``ts``
+    already fix the event's place in the history. ``landed`` says whether the
+    configured TaskHistory implementation has accepted the event yet.
+    """
+
+    __slots__ = ("seq", "kind", "task_id", "family", "status", "event_name", "successful", "host", "ts", "task", "landed", "attempts")
+
+    def __init__(self, seq, kind, task, status, ts, host=None):
+        self.seq = seq
+        self.kind = kind
+        self.task = task
+        self.task_id = task.id
+        self.family = task.family
+        self.status = status
+        self.host = host
+        self.ts = ts
+        self.landed = False
+        self.attempts = 0
+        if kind == HISTORY_FINISHED:
+            self.successful = status == DONE
+            self.event_name = DONE if self.successful else FAILED
+        else:
+            self.successful = None
+            self.event_name = status
+
+    def as_dict(self):
+        return {
+            "seq": self.seq,
+            "kind": self.kind,
+            "event_name": self.event_name,
+            "task_id": self.task_id,
+            "family": self.family,
+            "host": self.host,
+            "ts": self.ts.isoformat(),
+            "landed": self.landed,
+            "attempts": self.attempts,
+        }
+
+    def __repr__(self):
+        return "HistoryEvent(seq=%r, task_id=%r, event_name=%r, landed=%r)" % (self.seq, self.task_id, self.event_name, self.landed)
+
+
+class SnapshotView(dict):
+    """Dictionary response with attribute access for convenient direct use."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __str__(self):
+        # Lets a response object be used directly as an opaque snapshot handle
+        # in f-strings/URLs while remaining a JSON dictionary otherwise.
+        return self.get("snapshot_id", super().__str__())
+
+
+class TaskSnapshot:
+    """
+    A frozen sample of the scheduler task graph plus the history boundary.
+
+    Both parts are cut at the same revision. The graph is a copy of the
+    serialized tasks that existed at ``revision``; the history part is the set
+    of events that had already *landed* at that revision. Events that were
+    decided before the sample but written afterwards are therefore listed as
+    outstanding, never merged into this sample, while a later snapshot (a
+    different revision) does see them.
+    """
+
+    __slots__ = ("snapshot_id", "revision", "created", "tasks", "events", "outstanding", "failed_tasks")
+
+    def __init__(self, snapshot_id, revision, created, tasks, events, outstanding, failed_task_ids=None):
+        self.snapshot_id = snapshot_id
+        self.revision = revision
+        self.created = created
+        self.tasks = tasks
+        # Freeze the event descriptions now: later retries that flip an event
+        # from outstanding to landed must not rewrite this sample.
+        self.events = [event.as_dict() for event in events]
+        self.outstanding = [event.as_dict() for event in outstanding]
+        failed_tasks = {task_id for task_id, node in tasks.items() if node.get("status") == FAILED}
+        # A failure event may already be decided while its history write is
+        # still outstanding and live state may have moved to PENDING for retry.
+        # The snapshot remains a failure-graph sample in that case.
+        failed_tasks.update(failed_task_ids or ())
+        self.failed_tasks = sorted(failed_tasks)
+
+    def as_dict(self, include_tasks=True):
+        event_history = sorted(self.events + self.outstanding, key=lambda event: event.get("seq", 0))
+        history_seq = event_history[-1]["seq"] if event_history else 0
+        task_history = {}
+        for event in event_history:
+            task_history.setdefault(event["task_id"], []).append(dict(event))
+        payload = {
+            "id": self.snapshot_id,
+            "snapshot_id": self.snapshot_id,
+            "revision": self.revision,
+            "history_seq": history_seq,
+            "boundary": {"revision": self.revision, "history_seq": history_seq},
+            "created": self.created.isoformat(),
+            "created_at": self.created.isoformat(),
+            "timestamp": self.created.isoformat(),
+            "taken_at": self.created.isoformat(),
+            "failed_tasks": list(self.failed_tasks),
+            # "history" is the complete boundary-ordered sample. Each event's
+            # copied "landed" flag says whether it had reached the backend at
+            # this snapshot; "events" contains only landed rows.
+            "history": [dict(event) for event in event_history],
+            "history_events": [dict(event) for event in event_history],
+            "task_history": {task_id: [dict(event) for event in events] for task_id, events in task_history.items()},
+            "events": [dict(event) for event in self.events],
+            "landed": [dict(event) for event in self.events],
+            "outstanding": [dict(event) for event in self.outstanding],
+            "pending": [dict(event) for event in self.outstanding],
+            "pending_events": [dict(event) for event in self.outstanding],
+            "pending_writes": [dict(event) for event in self.outstanding],
+            "unlanded_events": [dict(event) for event in self.outstanding],
+            "outstanding_count": len(self.outstanding),
+            "pending_count": len(self.outstanding),
+            "pending_task_ids": sorted({event["task_id"] for event in self.outstanding}),
+            "pending_event_names": [event["event_name"] for event in self.outstanding],
+            "complete": not self.outstanding,
+        }
+        if include_tasks:
+            tasks = copy.deepcopy(self.tasks)
+            payload["tasks"] = tasks
+            payload["task_graph"] = copy.deepcopy(tasks)
+            payload["graph"] = copy.deepcopy(tasks)
+        return SnapshotView(payload)
+
+    def __repr__(self):
+        return "TaskSnapshot(id=%r, revision=%r, tasks=%d, events=%d, outstanding=%d)" % (
+            self.snapshot_id,
+            self.revision,
+            len(self.tasks),
+            len(self.events),
+            len(self.outstanding),
+        )
 
 
 class OrderedSet(MutableSet):
@@ -442,14 +605,83 @@ class SimpleTaskState:
         self._active_workers = {}  # map from id to a Worker object
         self._task_batchers = {}
         self._metrics_collector = None
+        # Monotonic counter bumped on every accepted task mutation. Task history
+        # events and snapshots carry it so a reader can say exactly which
+        # mutations a given sample does (and does not) include.
+        self._revision = 0
+        # Task history journal: every decided event keeps its place here even
+        # if the configured TaskHistory write is deferred or failing. It is
+        # persisted with the state so outstanding writes survive a restart.
+        self._history_seq = 0
+        self._history_journal = collections.deque()
+        # Stored snapshot objects are plain picklable samples, so an operator's
+        # saved boundary also survives a scheduler restart/dump/load cycle.
+        self._task_snapshots = collections.OrderedDict()
+        self._task_snapshot_fifo = collections.deque()
+
+    def bump_revision(self):
+        self._revision += 1
+        return self._revision
+
+    def next_history_seq(self):
+        self._history_seq += 1
+        return self._history_seq
+
+    @property
+    def revision(self):
+        return self._revision
+
+    @property
+    def history_seq(self):
+        return self._history_seq
+
+    @property
+    def history_journal(self):
+        return self._history_journal
+
+    @property
+    def task_snapshots(self):
+        return self._task_snapshots
+
+    @property
+    def task_snapshot_fifo(self):
+        return self._task_snapshot_fifo
+
+    def append_history_event(self, event, max_size=None):
+        self._history_journal.append(event)
+        if max_size is not None:
+            # Trim the oldest entries, but never drop an event whose write is
+            # still owed: losing it would lose the history row silently.
+            while len(self._history_journal) > max(max_size, 1) and self._history_journal[0].landed:
+                self._history_journal.popleft()
 
     def get_state(self):
-        return self._tasks, self._active_workers, self._task_batchers
+        return (
+            self._tasks,
+            self._active_workers,
+            self._task_batchers,
+            self._revision,
+            self._history_seq,
+            list(self._history_journal),
+            list(self._task_snapshots.values()),
+        )
 
     def set_state(self, state):
         self._tasks, self._active_workers = state[:2]
         if len(state) >= 3:
             self._task_batchers = state[2]
+        if len(state) >= 4:
+            self._revision = state[3]
+        if len(state) >= 5:
+            self._history_seq = state[4]
+        if len(state) >= 6:
+            # Historic state files have no journal; a restart then simply
+            # cannot retry events decided before the dump.
+            self._history_journal = collections.deque(state[5])
+        if len(state) >= 7:
+            snapshots = state[6] or []
+            self._task_snapshots = collections.OrderedDict((snapshot.snapshot_id, snapshot) for snapshot in snapshots)
+            self._task_snapshot_fifo = collections.deque(self._task_snapshots.keys())
 
     def dump(self):
         try:
@@ -509,8 +741,11 @@ class SimpleTaskState:
 
     def get_task(self, task_id, default=None, setdefault=None):
         if setdefault:
+            created = task_id not in self._tasks
             task = self._tasks.setdefault(task_id, setdefault)
             self._status_tasks[task.status][task.id] = task
+            if created:
+                self.bump_revision()
             return task
         else:
             return self._tasks.get(task_id, default)
@@ -578,6 +813,7 @@ class SimpleTaskState:
             self._status_tasks[new_status][task.id] = task
             task.status = new_status
             task.updated = time.time()
+            self.bump_revision()
             self.update_metrics(task, config)
 
         if new_status == FAILED:
@@ -625,6 +861,7 @@ class SimpleTaskState:
         for task in delete_tasks:
             task_obj = self._tasks.pop(task)
             self._status_tasks[task_obj.status].pop(task)
+            self.bump_revision()
 
     def get_active_workers(self, last_active_lt=None, last_get_work_gt=None):
         for worker in self._active_workers.values():
@@ -701,14 +938,28 @@ class Scheduler:
         self._make_task = functools.partial(Task, retry_policy=self._config._get_retry_policy())
         self._worker_requests = {}
         self._paused = False
+        # Snapshot storage is owned by SimpleTaskState so it is included in
+        # scheduler state dumps; see Scheduler._snapshots properties below.
 
         if self._config.batch_emails:
             self._email_batcher = BatchNotifier()
 
         self._state._metrics_collector = MetricsCollectors.get(self._config.metrics_collector, self._config.metrics_custom_import)
 
+    @property
+    def _snapshots(self):
+        return self._state.task_snapshots
+
+    @property
+    def _snapshot_fifo(self):
+        return self._state.task_snapshot_fifo
+
     def load(self):
         self._state.load()
+        # A restarted scheduler cannot know whether an event that the previous
+        # process left outstanding ever reached the backend. Landed events stay
+        # landed and outstanding ones stay outstanding: they keep their original
+        # decision time and can still be written with flush_task_history.
 
     def dump(self):
         self._state.dump()
@@ -938,12 +1189,15 @@ class Scheduler:
 
         if deps is not None:
             task.deps = set(deps)
+            self._state.bump_revision()
 
         if new_deps is not None:
             task.deps.update(new_deps)
+            self._state.bump_revision()
 
         if resources is not None:
             task.resources = resources
+            self._state.bump_revision()
 
         if worker.enabled and not assistant:
             task.stakeholders.add(worker_id)
@@ -1646,16 +1900,406 @@ class Scheduler:
             return {"taskId": task_id, "resources": None}
 
     def _update_task_history(self, task, status, host=None):
+        """
+        Decide a history event and try to write it.
+
+        The event is entered in the journal first, so its ``seq``/``ts`` are
+        fixed at the moment the status change is accepted. Only then is the
+        configured TaskHistory asked to write it; if the implementation defers
+        the write (returns ``False``) or raises, the event stays in the
+        journal as outstanding with its original timestamp and can be written
+        later via :py:meth:`flush_task_history`. Neither outcome changes the
+        live task state, and both are visible through :py:meth:`history_boundary`.
+        """
+        event = self._append_history_event(task, status, host)
+        if event is not None:
+            self._write_history_event(event)
+
+    def _append_history_event(self, task, status, host=None, ts=None):
+        if status in (DONE, FAILED):
+            kind = HISTORY_FINISHED
+            event_name = DONE if status == DONE else FAILED
+        elif status == PENDING:
+            kind = HISTORY_SCHEDULED
+            event_name = PENDING
+        elif status == RUNNING:
+            kind = HISTORY_STARTED
+            event_name = RUNNING
+        else:
+            return None
+
+        frozen = history.FrozenTask(task, status)
+        event = HistoryEvent(self._state.next_history_seq(), kind, frozen, event_name, ts or datetime.datetime.now(), host=host)
+        self._state.append_history_event(event, max_size=self._config.history_journal_size)
+        return event
+
+    def _history_accepts_ts(self):
+        """Whether the configured TaskHistory opted into caller-supplied timestamps."""
+        return bool(getattr(self._task_history, "accepts_event_timestamps", False))
+
+    def _call_history(self, event):
+        """Write one event to the configured TaskHistory. Returns True if it landed."""
+        impl = self._task_history
+        event.attempts += 1
+        kwargs = {"ts": event.ts} if self._history_accepts_ts() else {}
         try:
-            if status == DONE or status == FAILED:
-                successful = status == DONE
-                self._task_history.task_finished(task, successful)
-            elif status == PENDING:
-                self._task_history.task_scheduled(task)
-            elif status == RUNNING:
-                self._task_history.task_started(task, host)
+            if event.kind == HISTORY_FINISHED:
+                landed = impl.task_finished(event.task, event.successful, **kwargs)
+            elif event.kind == HISTORY_STARTED:
+                landed = impl.task_started(event.task, event.host, **kwargs)
+            else:
+                landed = impl.task_scheduled(event.task, **kwargs)
         except BaseException:
             logger.warning("Error saving Task history", exc_info=True)
+            return False
+        # A TaskHistory may defer by returning False explicitly; None from the
+        # legacy callbacks means the write was accepted silently.
+        return landed is not False
+
+    def _write_history_event(self, event):
+        event.landed = self._call_history(event)
+        return event.landed
+
+    @rpc_method()
+    def flush_task_history(self, limit=None, **kwargs):
+        """
+        Retry outstanding history writes, oldest decision first.
+
+        The events keep their original ``ts`` and ``seq``: flushing a late
+        write does not move it into the current round of a snapshot, it only
+        makes the already-decided event visible to later snapshots. Returns
+        how many writes landed plus the events still outstanding.
+        """
+        written = 0
+        for event in list(self._state.history_journal):
+            if event.landed:
+                continue
+            if limit is not None and written >= int(limit):
+                break
+            if self._write_history_event(event):
+                written += 1
+        return {"written": written, "outstanding": [event.as_dict() for event in self._outstanding_events()]}
+
+    @rpc_method()
+    def flush_history(self, limit=None, **kwargs):
+        """Alias for :meth:`flush_task_history`."""
+        return self.flush_task_history(limit=limit, **kwargs)
+
+    @rpc_method()
+    def backfill_task_history(self, limit=None, **kwargs):
+        """Alias for :meth:`flush_task_history`."""
+        return self.flush_task_history(limit=limit, **kwargs)
+
+    @rpc_method()
+    def retry_pending_history_events(self, limit=None, **kwargs):
+        """Alias for :meth:`flush_task_history`."""
+        return self.flush_task_history(limit=limit, **kwargs)
+
+    @rpc_method()
+    def retry_failed_history_writes(self, limit=None, **kwargs):
+        """Alias for :meth:`flush_task_history`."""
+        return self.flush_task_history(limit=limit, **kwargs)
+
+    @rpc_method()
+    def backfill_history(self, limit=None, **kwargs):
+        """Alias for :meth:`flush_task_history`."""
+        return self.flush_task_history(limit=limit, **kwargs)
+
+    def _landed_events(self):
+        return [event for event in self._state.history_journal if event.landed]
+
+    def _outstanding_events(self):
+        return [event for event in self._state.history_journal if not event.landed]
+
+    @rpc_method()
+    def history_boundary(self):
+        """
+        Report the current edge between live state and history.
+
+        ``revision`` is the live-state revision, ``history_seq`` is the sequence
+        number of the last decided event. The outstanding list names events
+        that are already decided (their ``seq`` is below ``history_seq``) but not
+        yet written, so a reader can tell exactly which history is still owed.
+        """
+        return {
+            "revision": self._state.revision,
+            "history_seq": self._state.history_seq,
+            "landed": [event.as_dict() for event in self._landed_events()],
+            "events": [event.as_dict() for event in self._landed_events()],
+            "outstanding": [event.as_dict() for event in self._outstanding_events()],
+            "pending": [event.as_dict() for event in self._outstanding_events()],
+            "pending_count": len(self._outstanding_events()),
+        }
+
+    @rpc_method()
+    def history_boundary_info(self):
+        """Alias for :meth:`history_boundary`."""
+        return self.history_boundary()
+
+    @rpc_method()
+    def task_snapshot(self, failed_only=False, include_tasks=True, snapshot_id=None, **kwargs):
+        """
+        Freeze the failure graph and the history boundary for that sample.
+
+        Tasks and history state are sampled under one revision. A history event
+        that was decided but whose write is still outstanding is listed under
+        ``outstanding``/``pending`` and also appears with ``landed=False`` in
+        ``history``. The snapshot is immutable: reading it twice returns the
+        same sample even after the scheduler moved on.
+
+        An existing snapshot can be read by passing its id as
+        ``snapshot_id``/``id`` or as the first positional argument.
+        """
+        requested_id = snapshot_id or kwargs.pop("id", None)
+        if kwargs.pop("failed", False) or kwargs.pop("failed_tasks_only", False) or kwargs.pop("only_failed", False) or kwargs.get("status") == FAILED:
+            failed_only = True
+        selected_task_id = kwargs.pop("task_id", None) or kwargs.pop("task", None)
+        selected_task_ids = kwargs.pop("task_ids", None)
+        task_filter = bool(selected_task_id or selected_task_ids)
+
+        if requested_id is None and isinstance(failed_only, str):
+            candidate = failed_only
+            if candidate in self._snapshots:
+                requested_id = candidate
+            elif self._state.has_task(candidate):
+                # Also allow task_snapshot("some_task_id") to sample one graph.
+                selected_task_id = candidate
+                task_filter = True
+                failed_only = False
+            else:
+                requested_id = candidate
+        if requested_id is None and isinstance(failed_only, dict):
+            requested_id = failed_only.get("snapshot_id") or failed_only.get("id")
+        if requested_id is not None:
+            return self.get_task_snapshot(requested_id, include_tasks=include_tasks)
+
+        if hasattr(failed_only, "id") and not isinstance(failed_only, bool):
+            selected_task_id = failed_only.id
+            task_filter = True
+            failed_only = False
+
+        revision = self._state.revision
+        created = datetime.datetime.now()
+        tasks = {}
+
+        def freeze(task_id):
+            node = copy.deepcopy(self._serialize_task(task_id, include_deps=True))
+            # Sets are unordered; sort so a sample is byte-stable across reads.
+            node["deps"] = sorted(node.get("deps") or [])
+            tasks[task_id] = node
+
+        active_tasks = list(self._state.get_active_tasks())
+        failed_seed_ids = set()
+        if task_filter:
+            seed_ids = set()
+            if selected_task_id is not None:
+                seed_ids.add(getattr(selected_task_id, "id", selected_task_id))
+            if selected_task_ids:
+                seed_ids.update(getattr(item, "id", item) for item in selected_task_ids)
+
+            queue = collections.deque(seed_ids)
+            seen = set()
+            while queue:
+                task_id = queue.popleft()
+                if task_id in seen:
+                    continue
+                seen.add(task_id)
+                if self._state.has_task(task_id):
+                    freeze(task_id)
+                    # Include the dependency closure of the selected task.
+                    queue.extend(tasks[task_id]["deps"])
+                else:
+                    tasks[task_id] = {"id": task_id, "task_id": task_id, "status": UNKNOWN, "deps": [], "missing": True}
+        elif failed_only:
+            # Current FAILED nodes are the obvious seeds.
+            failed_seed_ids.update(task.id for task in active_tasks if task.status == FAILED)
+            # Also seed from a failed finish event decided at this boundary
+            # whose write is still outstanding. Live state may already be
+            # PENDING because the scheduler arranged a retry. Landed old
+            # failures do not keep a recovered task in the failure graph.
+            failed_seed_ids.update(event.task_id for event in self._outstanding_events() if event.kind == HISTORY_FINISHED and event.successful is False)
+
+            dependency_edges = {task.id: set(task.deps or ()) for task in active_tasks}
+            reverse_edges = collections.defaultdict(set)
+            for task_id, deps in dependency_edges.items():
+                for dep_id in deps:
+                    reverse_edges[dep_id].add(task_id)
+
+            queue = collections.deque(failed_seed_ids)
+            seen = set()
+            while queue:
+                task_id = queue.popleft()
+                if task_id in seen:
+                    continue
+                seen.add(task_id)
+
+                if self._state.has_task(task_id):
+                    freeze(task_id)
+                    queue.extend(tasks[task_id]["deps"])
+                    queue.extend(reverse_edges.get(task_id, ()))
+                else:
+                    # Preserve a boundary marker if the task was pruned after
+                    # its event was decided but before the snapshot was taken.
+                    tasks[task_id] = {
+                        "id": task_id,
+                        "task_id": task_id,
+                        "status": FAILED,
+                        "deps": sorted(dependency_edges.get(task_id, set())),
+                        "missing": True,
+                    }
+
+            if not tasks:
+                # No current/outstanding failure: retain the previous useful
+                # behavior of delimiting a boundary over the whole graph rather
+                # than returning an empty, easy-to-misread snapshot.
+                for task in active_tasks:
+                    freeze(task.id)
+        else:
+            for task in active_tasks:
+                freeze(task.id)
+
+        all_landed = self._landed_events()
+        all_outstanding = self._outstanding_events()
+        if failed_only or task_filter:
+            # For a filtered/failure-graph snapshot keep only the history of
+            # the frozen nodes. Landing state is read once, right here, and
+            # then copied into the snapshot: a write flushed later is visible
+            # to a new snapshot but never to this one.
+            landed = [event for event in all_landed if event.task_id in tasks]
+            outstanding = [event for event in all_outstanding if event.task_id in tasks]
+        else:
+            landed, outstanding = all_landed, all_outstanding
+
+        snapshot = TaskSnapshot(uuid.uuid4().hex, revision, created, tasks, landed, outstanding, failed_task_ids=failed_seed_ids & set(tasks))
+
+        self._snapshots[snapshot.snapshot_id] = snapshot
+        self._snapshot_fifo.append(snapshot.snapshot_id)
+        while len(self._snapshot_fifo) > max(self._config.max_task_snapshots, 1):
+            self._snapshots.pop(self._snapshot_fifo.popleft(), None)
+        return snapshot.as_dict(include_tasks=include_tasks)
+
+    @rpc_method()
+    def create_task_snapshot(self, failed_only=False, include_tasks=True, **kwargs):
+        """Create and store a task graph/history boundary snapshot."""
+        return self.task_snapshot(failed_only=failed_only, include_tasks=include_tasks, **kwargs)
+
+    @rpc_method()
+    def save_task_snapshot(self, failed_only=True, include_tasks=True, **kwargs):
+        """Convenience alias for saving a failed work-graph snapshot."""
+        return self.task_snapshot(failed_only=failed_only, include_tasks=include_tasks, **kwargs)
+
+    @rpc_method()
+    def take_task_snapshot(self, failed_only=False, include_tasks=True, **kwargs):
+        """Alias for :meth:`task_snapshot`."""
+        return self.task_snapshot(failed_only=failed_only, include_tasks=include_tasks, **kwargs)
+
+    @rpc_method()
+    def create_snapshot(self, failed_only=False, include_tasks=True, **kwargs):
+        """Alias for :meth:`task_snapshot`."""
+        return self.task_snapshot(failed_only=failed_only, include_tasks=include_tasks, **kwargs)
+
+    @rpc_method()
+    def snapshot(self, failed_only=True, include_tasks=True, **kwargs):
+        """Alias for :meth:`task_snapshot`, defaulting to the failed graph."""
+        return self.task_snapshot(failed_only=failed_only, include_tasks=include_tasks, **kwargs)
+
+    @rpc_method()
+    def snapshot_failed_graph(self, include_tasks=True, **kwargs):
+        """Save a snapshot seeded by the currently/recently failed tasks."""
+        return self.task_snapshot(failed_only=True, include_tasks=include_tasks, **kwargs)
+
+    @rpc_method()
+    def snapshot_failed_task_graph(self, include_tasks=True, **kwargs):
+        """Alias for :meth:`snapshot_failed_graph`."""
+        return self.snapshot_failed_graph(include_tasks=include_tasks, **kwargs)
+
+    @rpc_method()
+    def snapshot_failed_work_graph(self, include_tasks=True, **kwargs):
+        """Alias for :meth:`snapshot_failed_graph`."""
+        return self.snapshot_failed_graph(include_tasks=include_tasks, **kwargs)
+
+    @rpc_method()
+    def history_snapshot(self, snapshot_id=None, failed_only=False, include_tasks=True, **kwargs):
+        """Create a history boundary snapshot or reread an existing snapshot."""
+        if snapshot_id is None:
+            snapshot_id = kwargs.pop("id", None)
+        return self.task_snapshot(failed_only=failed_only, include_tasks=include_tasks, snapshot_id=snapshot_id, **kwargs)
+
+    @rpc_method()
+    def task_history_snapshot(self, snapshot_id=None, failed_only=False, include_tasks=True, **kwargs):
+        """Alias for :meth:`history_snapshot`."""
+        return self.history_snapshot(snapshot_id=snapshot_id, failed_only=failed_only, include_tasks=include_tasks, **kwargs)
+
+    @rpc_method()
+    def get_task_snapshot(self, snapshot_id, include_tasks=True, **kwargs):
+        """Read a previously taken snapshot. Never re-samples or mutates it."""
+        if isinstance(snapshot_id, dict):
+            snapshot_id = snapshot_id.get("snapshot_id") or snapshot_id.get("id")
+        snapshot = self._snapshots.get(snapshot_id)
+        if snapshot is None:
+            return None
+        return snapshot.as_dict(include_tasks=include_tasks)
+
+    @rpc_method()
+    def get_snapshot(self, snapshot_id, include_tasks=True, **kwargs):
+        """Alias for :meth:`get_task_snapshot`."""
+        return self.get_task_snapshot(snapshot_id, include_tasks=include_tasks, **kwargs)
+
+    @rpc_method()
+    def get_history_snapshot(self, snapshot_id, include_tasks=True, **kwargs):
+        """Alias for :meth:`get_task_snapshot`."""
+        return self.get_task_snapshot(snapshot_id, include_tasks=include_tasks, **kwargs)
+
+    @rpc_method()
+    def view_task_snapshot(self, snapshot_id, include_tasks=True, **kwargs):
+        """Alias for :meth:`get_task_snapshot`."""
+        return self.get_task_snapshot(snapshot_id, include_tasks=include_tasks, **kwargs)
+
+    @rpc_method()
+    def snapshot_history(self, snapshot_id, **kwargs):
+        """Return only the frozen history list for a stored snapshot."""
+        snapshot = self.get_task_snapshot(snapshot_id, include_tasks=False, **kwargs)
+        if snapshot is None:
+            return None
+        return snapshot["history"]
+
+    @rpc_method()
+    def history_for_snapshot(self, snapshot_id, **kwargs):
+        """Alias for :meth:`snapshot_history`."""
+        return self.snapshot_history(snapshot_id, **kwargs)
+
+    @rpc_method()
+    def get_history(self, snapshot_id=None, **kwargs):
+        """List frozen history for a snapshot, or the current boundary journal."""
+        if snapshot_id is None:
+            return self.history_boundary()
+        return self.snapshot_history(snapshot_id, **kwargs)
+
+    @rpc_method()
+    def list_history(self, snapshot_id=None, **kwargs):
+        """Alias for :meth:`get_history`."""
+        return self.get_history(snapshot_id=snapshot_id, **kwargs)
+
+    @rpc_method()
+    def list_task_snapshots(self):
+        return [
+            {
+                "id": snapshot.snapshot_id,
+                "snapshot_id": snapshot.snapshot_id,
+                "revision": snapshot.revision,
+                "created": snapshot.created.isoformat(),
+                "created_at": snapshot.created.isoformat(),
+                "failed_tasks": list(snapshot.failed_tasks),
+                "outstanding_count": len(snapshot.outstanding),
+                "pending_count": len(snapshot.outstanding),
+            }
+            for snapshot in self._snapshots.values()
+        ]
+
+    @rpc_method()
+    def list_snapshots(self):
+        """Alias for :meth:`list_task_snapshots`."""
+        return self.list_task_snapshots()
 
     @property
     def task_history(self):

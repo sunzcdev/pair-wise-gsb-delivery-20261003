@@ -817,6 +817,19 @@ max_graph_nodes
 record_task_history
   If true, stores task history in a database. Defaults to false.
 
+history_journal_size
+  Maximum number of decided task history events kept in the scheduler's
+  in-memory journal. Each event keeps its decision time (``ts``) and sequence
+  number even when the database write is retried later, so a snapshot can
+  still tell which events are recorded and which are outstanding. Older
+  entries are dropped first; defaults to 10000.
+
+max_task_snapshots
+  Maximum number of task-history snapshots kept by the scheduler. A snapshot
+  freezes the failed work graph and the history that had landed at the sampled
+  revision, so it can be read back unchanged. When the limit is exceeded the
+  oldest snapshot is dropped. Defaults to 100.
+
 remove_delay
   Number of seconds to wait before removing a task that has no
   stakeholders. Defaults to 600 (10 minutes).

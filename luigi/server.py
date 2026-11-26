@@ -265,6 +265,48 @@ class ByParamsHandler(BaseTaskHistoryHandler):
             self.render("recent.html", tasks=tasks)
 
 
+class SnapshotHandler(BaseTaskHistoryHandler):
+    """
+    Save a failing work graph snapshot, or read one back.
+
+    ``GET /snapshot`` takes a new snapshot (the graph and the landed history
+    cut at one revision, with events still owed listed separately).
+    ``GET /snapshot/{snapshot_id}`` re-reads that exact sample; it never
+    re-samples, so a repeated view cannot pick up a newer round.
+    """
+
+    def get(self, snapshot_id=None):
+        if snapshot_id:
+            snapshot = self._scheduler.get_task_snapshot(snapshot_id)
+        else:
+            snapshot = self._scheduler.task_snapshot(failed_only=self.get_argument("failed_only", "false").lower() == "true")
+        if snapshot is None:
+            self.send_error(404)
+            return
+        self.set_header("Content-Type", "application/json")
+        self.write(snapshot)
+
+
+class SnapshotHistoryHandler(BaseTaskHistoryHandler):
+    """List only the frozen execution history for one snapshot identity."""
+
+    def get(self, snapshot_id):
+        history = self._scheduler.snapshot_history(snapshot_id)
+        if history is None:
+            self.send_error(404)
+            return
+        self.set_header("Content-Type", "application/json")
+        self.write({"snapshot_id": snapshot_id, "history": history})
+
+
+class HistoryBoundaryHandler(BaseTaskHistoryHandler):
+    """``GET /history/boundary``: current state revision, history seq and outstanding events."""
+
+    def get(self):
+        self.set_header("Content-Type", "application/json")
+        self.write(self._scheduler.history_boundary())
+
+
 class RootPathHandler(BaseTaskHistoryHandler):
     def get(self):
         # we omit the leading slash in case the visualizer is behind a different
@@ -309,6 +351,10 @@ def app(scheduler):
         (r"/history/by_id/(.*?)", ByIdHandler, {"scheduler": scheduler}),
         (r"/history/by_task_id/(.*?)", ByTaskIdHandler, {"scheduler": scheduler}),
         (r"/history/by_params/(.*?)", ByParamsHandler, {"scheduler": scheduler}),
+        (r"/history/boundary", HistoryBoundaryHandler, {"scheduler": scheduler}),
+        (r"/snapshot", SnapshotHandler, {"scheduler": scheduler}),
+        (r"/snapshot/([^/]+)/history", SnapshotHistoryHandler, {"scheduler": scheduler}),
+        (r"/snapshot/(.*?)", SnapshotHandler, {"scheduler": scheduler}),
         (r"/metrics", MetricsHandler, {"scheduler": scheduler}),
     ]
     api_app = tornado.web.Application(handlers, **settings)

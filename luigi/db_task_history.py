@@ -62,6 +62,10 @@ class DbTaskHistory(task_history.TaskHistory):
 
     CURRENT_SOURCE_VERSION = 1
 
+    # The scheduler hands us the decision time of the event, so a write that
+    # happens late (deferred or retried) still lands with its original ts.
+    accepts_event_timestamps = True
+
     @contextmanager
     def _session(self, session=None):
         if session:
@@ -86,18 +90,21 @@ class DbTaskHistory(task_history.TaskHistory):
 
         _upgrade_schema(self.engine)
 
-    def task_scheduled(self, task):
+    def task_scheduled(self, task, ts=None):
         htask = self._get_task(task, status=PENDING)
-        self._add_task_event(htask, TaskEvent(event_name=PENDING, ts=datetime.datetime.now()))
+        self._add_task_event(htask, TaskEvent(event_name=PENDING, ts=ts or datetime.datetime.now()))
+        return True
 
-    def task_finished(self, task, successful):
+    def task_finished(self, task, successful, ts=None):
         event_name = DONE if successful else FAILED
         htask = self._get_task(task, status=event_name)
-        self._add_task_event(htask, TaskEvent(event_name=event_name, ts=datetime.datetime.now()))
+        self._add_task_event(htask, TaskEvent(event_name=event_name, ts=ts or datetime.datetime.now()))
+        return True
 
-    def task_started(self, task, worker_host):
+    def task_started(self, task, worker_host, ts=None):
         htask = self._get_task(task, status=RUNNING, host=worker_host)
-        self._add_task_event(htask, TaskEvent(event_name=RUNNING, ts=datetime.datetime.now()))
+        self._add_task_event(htask, TaskEvent(event_name=RUNNING, ts=ts or datetime.datetime.now()))
+        return True
 
     def _get_task(self, task, status, host=None):
         if task.id in self.tasks:

@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 import functools
+import json
 import multiprocessing
 import os
 import shutil
@@ -458,6 +459,37 @@ class INETLuigidDaemonServerTest(_INETServerTest):
         shutil.rmtree(self.server_client.tempdir)
 
     server_client_class = ServerClient
+
+
+class SnapshotServerTest(ServerTestBase):
+    def get_app(self):
+        self.scheduler = Scheduler()
+        return luigi.server.app(self.scheduler)
+
+    def test_snapshot_round_trip_and_boundary(self):
+        self.scheduler.add_task(worker="w1", task_id="job", family="Job")
+
+        response = self.fetch("/snapshot?failed_only=false")
+        self.assertEqual(response.code, 200)
+        snapshot = json.loads(response.body)
+        self.assertIn("snapshot_id", snapshot)
+        self.assertIn("history", snapshot)
+        self.assertEqual(set(snapshot["tasks"]), {"job"})
+
+        again = self.fetch("/snapshot/" + snapshot["snapshot_id"])
+        self.assertEqual(again.code, 200)
+        self.assertEqual(json.loads(again.body), snapshot)
+
+        history = self.fetch("/snapshot/" + snapshot["snapshot_id"] + "/history")
+        self.assertEqual(history.code, 200)
+        self.assertEqual(json.loads(history.body)["history"], snapshot["history"])
+
+        boundary = self.fetch("/history/boundary")
+        self.assertEqual(boundary.code, 200)
+        self.assertIn("outstanding", json.loads(boundary.body))
+
+        unknown = self.fetch("/snapshot/does-not-exist")
+        self.assertEqual(unknown.code, 404)
 
 
 class MetricsHandlerTest(unittest.TestCase):
