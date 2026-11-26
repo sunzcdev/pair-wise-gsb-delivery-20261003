@@ -144,6 +144,85 @@ def test_parallel_prerequisite_failure_cascades(
     assert "e" not in calls
 
 
+def test_parallel_dynamic_notifications_merge_with_static_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare = FakeSession("prepare")
+    report = FakeSession("report", deps=[prepare])
+    left = FakeSession("left")
+    right = FakeSession("right")
+
+    class FakeManifest(list[FakeSession]):
+        def resolve_session(self, target: str) -> FakeSession:
+            return {"report": report}[target]
+
+    manifest = FakeManifest([left, right])
+    calls: list[str] = []
+
+    def fake_run_session(
+        session: SessionRunner,
+        _global_config: object,
+        _children: object,
+        **_kwargs: object,
+    ) -> tuple[Result, str]:
+        calls.append(session.friendly_name)
+        result = Result(session, Status.SUCCESS, duration=0.0)
+        if session in (left, right):
+            result.merged_notifications = [
+                {
+                    "target": "report",
+                    "origin": f"noxfile.py:{1 if session is left else 2}",
+                }
+            ]
+        return result, ""
+
+    monkeypatch.setattr(_parallel, "_run_session", fake_run_session)
+    results = _parallel.run_manifest_parallel(
+        typing.cast("Manifest", manifest), _config(), jobs=2
+    )
+
+    by_name = {result.session.friendly_name: result for result in results}
+    assert calls.count("report") == 1
+    assert "prepare" in calls
+    assert calls.index("prepare") < calls.index("report")
+    assert by_name["report"].merged_notification_count == 2
+    assert sorted(by_name["report"].notification_sources) == ["left", "right"]
+    assert all(result.status is Status.SUCCESS for result in results)
+
+
+def test_admission_ledger_merges_interleaved_notifications_once() -> None:
+    ledger = _parallel.AdmissionLedger()
+    target = FakeSession("report")
+    sources = [FakeSession("left"), FakeSession("right")]
+    outcomes: list[bool] = []
+    barrier = threading.Barrier(8)
+
+    def admit(source: FakeSession) -> None:
+        barrier.wait()
+        _record, created = ledger.admit(target, source=source, origin="noxfile.py:1")
+        outcomes.append(created)
+
+    threads = [threading.Thread(target=admit, args=(sources[i % 2],)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert outcomes.count(True) == 1
+    record = ledger.records[target]
+    assert len(record.notifications) == 8
+    assert sorted(record.sources) == ["left", "right"]
+
+
+def test_admission_ledger_cycle_reports_origins() -> None:
+    ledger = _parallel.AdmissionLedger()
+    a = FakeSession("a")
+    b = FakeSession("b")
+    ledger.admit(b, source=a, origin="a.py:10")
+    with pytest.raises(_parallel.AdmissionCycleError, match="a.py:10.*b.py:20"):
+        ledger.admit(a, source=b, origin="b.py:20")
+
+
 def test_parallel_stop_on_first_error(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
     _patch_run_session(monkeypatch, failures=["x"], calls=calls)
@@ -1046,6 +1125,35 @@ def test_notify_refused_in_no_dependencies_mode() -> None:
     with pytest.raises(ValueError, match="notify"):
         session.notify("other")
     runner.manifest.notify.assert_not_called()
+
+
+def test_notify_writes_dynamic_admission_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    admission_file = tmp_path / "notifications.jsonl"
+    monkeypatch.setenv("NOX_DYNAMIC_ADMISSION_FILE", str(admission_file))
+    target = types.SimpleNamespace(name="other", signatures=["other"])
+    runner = types.SimpleNamespace(
+        global_config=types.SimpleNamespace(no_dependencies=True),
+        manifest=mock.Mock(
+            resolve_session=mock.Mock(return_value=target),
+        ),
+        friendly_name="source",
+        name="source",
+        signatures=["source"],
+    )
+    session = Session(typing.cast("SessionRunner", runner))
+
+    session.notify("other", posargs=["--value"])
+
+    runner.manifest.notify.assert_not_called()
+    record = json.loads(admission_file.read_text(encoding="utf-8").strip())
+    assert record["target"] == "other"
+    assert record["source"] == "source"
+    assert record["posargs"] == ["--value"]
+    origin_path, origin_line = record["origin"].rsplit(":", 1)
+    assert origin_path.replace("\\", "/").endswith("tests/test_parallel.py")
+    assert int(origin_line) > 0
 
 
 def test_worker_skips_preview_callback_without_tty(

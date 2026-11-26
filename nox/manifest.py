@@ -401,6 +401,22 @@ class Manifest:
         # Return the list of sessions.
         return sessions
 
+    def resolve_session(self, session: str | SessionRunner) -> SessionRunner:
+        """Return the unique runner selected by *session*.
+
+        Unlike :meth:`__getitem__`, this also finds sessions that exist but
+        have not yet been admitted to the active queue.
+        """
+        for candidate in self._all_sessions:
+            if (
+                candidate == session
+                or candidate.name == session
+                or session in candidate.signatures
+            ):
+                return candidate
+        msg = f"Session {session} not found."
+        raise ValueError(msg)
+
     def notify(
         self, session: str | SessionRunner, posargs: Iterable[str] | None = None
     ) -> bool:
@@ -430,16 +446,11 @@ class Manifest:
 
         # Locate the session in the list of all sessions, and place it at
         # the end of the queue.
-        for s in self._all_sessions:
-            if s == session or s.name == session or session in s.signatures:  # noqa: PLR1714
-                if posargs is not None:
-                    s.posargs = list(posargs)
-                self._queue.append(s)
-                return True
-
-        # The session was not found in the list of sessions.
-        msg = f"Session {session} not found."
-        raise ValueError(msg)
+        session_runner = self.resolve_session(session)
+        if posargs is not None:
+            session_runner.posargs = list(posargs)
+        self._queue.append(session_runner)
+        return True
 
 
 class KeywordLocals(Mapping[str, bool]):

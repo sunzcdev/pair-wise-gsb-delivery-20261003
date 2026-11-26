@@ -33,6 +33,7 @@ import datetime as dt
 import enum
 import hashlib
 import inspect
+import json
 import os
 import pathlib
 import re
@@ -933,10 +934,11 @@ class Session:
         target: str | SessionRunner,
         posargs: Iterable[str] | None = None,
     ) -> None:
-        """Place the given session at the end of the queue.
+        """Place the given session in the scheduler's dynamic admission queue.
 
-        This method is idempotent; multiple notifications to the same session
-        have no effect.
+        This method is idempotent for a given session variant; multiple
+        notifications to the same variant are merged by the parallel scheduler
+        and are recorded in the JSON report's ``merged_notifications`` field.
 
         A common use case is to notify a code coverage analysis session
         from a test session::
@@ -951,6 +953,8 @@ class Session:
                 session.run("coverage")
 
         Now if you run `nox -s test`, the coverage session will run afterwards.
+        Under ``--parallel`` the parent process receives the notification and
+        admits the target together with its static ``requires=`` dependencies.
 
         Args:
             target (str): The session name to notify, as used for ``nox -s``.
@@ -962,18 +966,48 @@ class Session:
                 used instead.
 
         Raises:
-            ValueError: If called under ``--no-dependencies`` (which includes
-                every session run by ``--parallel``): the notified session
-                would run here *in addition to* anywhere else it is scheduled,
-                racing on its virtualenv. Use ``requires=`` instead.
+            ValueError: If called under ``--no-dependencies`` outside the
+                parallel worker admission channel. In ordinary parallel runs
+                the notification is forwarded to the parent scheduler.
         """
-        if self._runner.global_config.no_dependencies:
-            msg = (
-                "session.notify() is not supported with --no-dependencies (which"
-                " --parallel uses to run each session); declare the ordering with"
-                " requires= instead."
+        config = self._runner.global_config
+        admission_file = os.environ.get("NOX_DYNAMIC_ADMISSION_FILE")
+        dynamic_enabled = getattr(config, "dynamic_admission", True)
+        if config.no_dependencies:
+            if not admission_file or not dynamic_enabled:
+                msg = (
+                    "session.notify() is not supported with --no-dependencies (which"
+                    " --parallel uses to run each session) unless Nox's dynamic"
+                    " admission channel is active; declare the ordering with"
+                    " requires= instead."
+                )
+                raise ValueError(msg)
+
+            runner = self._runner
+            target_runner = runner.manifest.resolve_session(target)
+            target_selector = (
+                max(target_runner.signatures, key=len)
+                if target_runner.signatures
+                else target_runner.name
             )
-            raise ValueError(msg)
+            caller = sys._getframe(1)
+            event = {
+                "target": target_selector,
+                "target_signature": target_selector,
+                "target_name": target_runner.name,
+                "target_signatures": list(target_runner.signatures),
+                "posargs": list(posargs) if posargs is not None else None,
+                "source": runner.friendly_name,
+                "source_name": runner.name,
+                "source_signatures": list(runner.signatures),
+                "origin": f"{caller.f_code.co_filename}:{caller.f_lineno}",
+                "pid": os.getpid(),
+            }
+            with open(admission_file, "a", encoding="utf-8") as admission:
+                admission.write(json.dumps(event, sort_keys=True) + "\n")
+                admission.flush()
+            return
+
         if posargs is not None:
             posargs = list(posargs)
         self._runner.manifest.notify(target, posargs)
@@ -1285,6 +1319,8 @@ class Result:
         reason: str | None = None,
         *,
         duration: float = 0.0,
+        merged_notifications: Sequence[Mapping[str, Any]] | None = None,
+        admission: Mapping[str, Any] | None = None,
     ) -> None:
         """Initialize the Result object.
 
@@ -1294,14 +1330,39 @@ class Result:
             status (~nox.sessions.Status): The final result status.
             reason (str): Additional info.
             duration (float): Time taken in seconds.
+            merged_notifications: Dynamic ``notify()`` records merged into this
+                session variant by the parallel scheduler.
+            admission: Admission-ledger summary for this session.
         """
         self.session = session
         self.status = status
         self.reason = reason
         self.duration = duration
+        self.merged_notifications = (
+            [dict(item) for item in merged_notifications]
+            if merged_notifications is not None
+            else []
+        )
+        self.admission = dict(admission) if admission is not None else None
 
     def __bool__(self) -> bool:
         return self.status.value > 0
+
+    @property
+    def notification_sources(self) -> list[str]:
+        """Distinct sessions whose notify() calls were merged into this result."""
+        return list(
+            dict.fromkeys(
+                item["source"]
+                for item in self.merged_notifications
+                if item.get("source")
+            )
+        )
+
+    @property
+    def merged_notification_count(self) -> int:
+        """Number of dynamic notifications merged into this session variant."""
+        return len(self.merged_notifications)
 
     @classmethod
     def aborted_prerequisite(
@@ -1355,7 +1416,7 @@ class Result:
         Returns:
             dict: The serialized result.
         """
-        return {
+        data = {
             "args": getattr(self.session.func, "call_spec", {}),
             "name": self.session.name,
             "result": self.status.name.lower(),
@@ -1364,6 +1425,13 @@ class Result:
             "signatures": self.session.signatures,
             "duration": self.duration,
         }
+        if self.merged_notifications:
+            data["merged_notifications"] = self.merged_notifications
+            data["notification_sources"] = self.notification_sources
+            data["merged_notification_count"] = self.merged_notification_count
+        if self.admission:
+            data["admission"] = self.admission
+        return data
 
     @classmethod
     def from_dict(cls, session: SessionRunner, entry: dict[str, Any]) -> Result:
@@ -1373,4 +1441,6 @@ class Result:
             Status[entry["result"].upper()],
             entry.get("reason"),
             duration=entry.get("duration", 0.0),
+            merged_notifications=entry.get("merged_notifications"),
+            admission=entry.get("admission"),
         )

@@ -184,6 +184,20 @@ class NoxfileOptions(_option_set.OptionsBase):
             ),
         ),
     )
+    dynamic_admission: bool = attrs.field(
+        default=True,
+        validator=av_bool,
+        metadata=opt(
+            "--dynamic-admission",
+            negative_flags=("--no-dynamic-admission",),
+            group="execution",
+            help=(
+                "Admit session.notify() targets into the parallel scheduler at"
+                " runtime, merge duplicate notifications for the same variant,"
+                " and add their static requires= dependencies."
+            ),
+        ),
+    )
     default_venv_backend: str = attrs.field(
         default="virtualenv",
         validator=av_str,

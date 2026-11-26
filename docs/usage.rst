@@ -381,9 +381,16 @@ running.
 
     Because each session runs in its own subprocess that reads only from a pipe,
     sessions cannot prompt for input under ``--parallel`` (``session.interactive``
-    is ``False``). Dynamic session scheduling via ``session.notify`` is not
-    supported in parallel mode and raises an error; use ``requires=`` to order
-    sessions instead.
+    is ``False``).
+
+    ``session.notify()`` is dynamically admitted by the parent scheduler by
+    default (``--no-dynamic-admission`` restores the previous error). Duplicate
+    notifications for the same session variant are merged and only one instance
+    is started; the target's static ``requires=`` graph is added and honored
+    before it starts. The JSON report records the merged calls in
+    ``merged_notifications`` and ``notification_sources``. Direct use of
+    ``--no-dependencies`` without the parallel admission channel still rejects
+    ``notify()`` because there is no parent scheduler to receive it.
 
 
 .. _opt-error-on-missing-interpreters:
