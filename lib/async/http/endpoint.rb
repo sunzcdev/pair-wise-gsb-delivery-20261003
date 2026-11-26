@@ -73,12 +73,17 @@ module Async
 			# @option tls_configuration [IO::Endpoint::TLS::Configuration] the transport-neutral TLS configuration.
 			# @option alpn_protocols [Array(String)] the alpn protocols to negotiate.
 			def initialize(url, endpoint = nil, **options)
+				# Take a deep, independent snapshot of the options so that derived endpoints (including
+				# the ones produced by {#each}) and already established connections never observe later
+				# mutation of the caller's (possibly nested) option hashes:
+				options = deep_freeze_options(options)
+
 				super(**options)
-				
+
 				raise ArgumentError, "URL must be absolute (include scheme, host): #{url}" unless url.absolute?
-				
+
 				@url = url
-				
+
 				if endpoint
 					@endpoint = self.build_endpoint(endpoint)
 				else
@@ -279,7 +284,20 @@ module Async
 			end
 			
 			protected
-			
+
+			# Produce a deep, independent and frozen copy of the endpoint options.
+			#
+			# The generic endpoint only freezes the top-level hash, leaving nested hashes and arrays
+			# shared with the caller. Since {#each} re-passes the options to build sibling endpoints, a
+			# deep snapshot is required so that mutating the caller's input after construction cannot
+			# change this endpoint, its derived endpoints, or connections established from them.
+			#
+			# @parameter options [Hash] The raw options given by the caller.
+			# @returns [Hash] A deeply frozen copy of the options.
+			def deep_freeze_options(options)
+				Protocol::Configured.deep_freeze(options)
+			end
+
 			def tcp_options
 				options = @options.dup
 				

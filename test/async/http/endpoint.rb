@@ -73,7 +73,46 @@ describe Async::HTTP::Endpoint do
 			expect(ssl_endpoint.endpoint.options).not.to be(:key?, :tls_configuration)
 		end
 	end
-	
+
+	with "nested option snapshots" do
+		let(:nested_options) do
+			{nested: {values: [1, 2, 3], label: "original"}}
+		end
+
+		it "deep freezes nested options independently of the caller's hash" do
+			endpoint = subject.parse("http://localhost:9000", **nested_options)
+
+			expect(endpoint.options).to be(:frozen?)
+			expect(endpoint.options[:nested]).to be(:frozen?)
+			expect(endpoint.options[:nested][:values]).to be(:frozen?)
+			expect(endpoint.options[:nested]).not.to be_equal(nested_options[:nested])
+		end
+
+		it "is unaffected by mutation of the input hash after construction" do
+			endpoint = subject.parse("http://localhost:9000", **nested_options)
+
+			nested_options[:nested][:label] = "mutated"
+			nested_options[:nested][:values] << 4
+
+			expect(endpoint.options[:nested][:label]).to be == "original"
+			expect(endpoint.options[:nested][:values]).to be == [1, 2, 3]
+		end
+
+		it "gives each derived endpoint its own independent snapshot" do
+			endpoint = subject.parse("http://localhost:9000", **nested_options)
+
+			derived = endpoint.each.to_a
+
+			expect(derived.size).to be > 1
+			expect(derived.first.options[:nested]).not.to be_equal(derived.last.options[:nested])
+
+			derived.each do |resolved|
+				expect(resolved.options[:nested]).to be(:frozen?)
+				expect(resolved.options[:nested][:values]).to be == [1, 2, 3]
+			end
+		end
+	end
+
 	with ".for" do
 		describe Async::HTTP::Endpoint.for("http", "localhost") do
 			it "should have correct attributes" do
