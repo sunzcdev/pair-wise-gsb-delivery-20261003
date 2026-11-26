@@ -28,6 +28,22 @@ Spooled Temporary File
 ----------------------
 
 :class:`SpooledTemporaryFile` is useful when temporary data is small and should be kept in memory rather than written to disk.
+Once the buffered data grows past ``max_size`` (or :meth:`~SpooledTemporaryFile.rollover` is called explicitly), the contents are handed off to an on-disk temporary file.
+
+The memory-to-disk handoff follows an explicit, all-or-nothing protocol whose current
+stage is exposed by :attr:`~SpooledTemporaryFile.rollover_phase`:
+
+- ``SpooledTemporaryFile.RolloverPhase.SPOOLED``: the data lives in the in-memory buffer.
+- ``SpooledTemporaryFile.RolloverPhase.ROLLING_OVER``: a handoff is in progress. The
+  in-memory buffer remains the authoritative copy while the disk file is being populated.
+- ``SpooledTemporaryFile.RolloverPhase.ROLLED_OVER``: the handoff has completed and the
+  disk file, holding exactly the same contents, is now authoritative.
+
+While a handoff is in progress every other read or write waits for it to settle, so a
+concurrent reader can never observe a partially copied disk stream. If creating or
+populating the disk file fails, the partial disk file is discarded, the phase returns to
+``SPOOLED`` and the rollover can be retried; on success the original cursor position is
+preserved.
 
 **Example:**
 
