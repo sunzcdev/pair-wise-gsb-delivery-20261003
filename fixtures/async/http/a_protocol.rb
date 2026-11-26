@@ -220,19 +220,28 @@ module Async
 				
 				it "can receive response trailer" do
 					skip "Protocol does not support trailers!" unless subject.bidirectional?
-					
+
 					response = client.get("/")
 					expect(response.headers).to have_keys("trailer")
 					headers = response.headers
 					expect(headers).not.to have_keys("etag")
-					
+
 					response_received.resolve(true)
-					
+
 					expect(response.read).to be == "response trailer"
 					expect(response).to be(:success?)
-					
-					# It was sent as a trailer.
-					expect(headers).to have_keys("etag")
+
+					if response.respond_to?(:consumption)
+						# The response headers continue to represent the initial headers; the trailing fields belong to the response's consumption terminal state:
+						expect(headers).not.to have_keys("etag")
+
+						consumption = response.consumption
+						expect(consumption).to be(:finished?)
+						expect(consumption.trailers).to have_keys("etag")
+					else
+						# It was sent as a trailer.
+						expect(headers).to have_keys("etag")
+					end
 				end
 			end
 			

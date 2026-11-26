@@ -14,6 +14,81 @@ module Async
 			module HTTP2
 				# Typically used on the client side for writing a request and reading the incoming response.
 				class Response < Protocol::Response
+					# The terminal state of response body consumption by the application.
+					#
+					# The background reader may receive the entire response, including the trailing headers, before the application has consumed the body. Receiving those frames does not settle this state: it is only settled when the application itself finishes, either by reading the body to the end or by closing it early. Any number of observers may wait for it; cancelling an observer neither closes the body nor affects any other stream on the connection.
+					class Consumption
+						# Initialize an unsettled consumption terminal state.
+						def initialize
+							@promise = Async::Promise.new
+							@trailers = nil
+							@finished = false
+						end
+
+						# @returns [Protocol::HTTP::Headers | Nil] The trailing fields received for this response, if any.
+						attr :trailers
+
+						# @returns [Boolean] Whether the application read the body to the end. If false, the body was closed before being fully consumed.
+						def finished?
+							@finished
+						end
+
+						# @returns [Boolean] Whether the terminal state has been settled.
+						def resolved?
+							@promise.resolved?
+						end
+
+						# Wait for the application to finish consuming the response body. Cancelling the waiting task does not affect the response body or any other stream.
+						#
+						# @returns [Consumption] Itself, once the terminal state is settled.
+						# @raises [Exception] If the stream was terminated by an error.
+						def wait(...)
+							@promise.wait(...)
+
+							return self
+						end
+
+						# Validate and record trailing fields received by the background reader. This does not settle the terminal state: the application has not necessarily consumed the body yet.
+						#
+						# @parameter headers [Array] The trailing header fields.
+						def receive_trailers(headers)
+							trailers = ::Protocol::HTTP::Headers.new([], 0)
+
+							headers.each do |key, value|
+								if key == CONNECTION
+									raise ::Protocol::HTTP2::HeaderError, "Connection header is not allowed!"
+								elsif key.start_with?(":")
+									raise ::Protocol::HTTP2::HeaderError, "Invalid pseudo-header #{key}!"
+								elsif key =~ /[A-Z]/
+									raise ::Protocol::HTTP2::HeaderError, "Invalid upper-case characters in header #{key}!"
+								else
+									trailers.add(key, value, trailer: true)
+								end
+							end
+
+							@trailers = trailers
+						end
+
+						# Settle the terminal state: the application read the body to the end.
+						def finish
+							unless @promise.resolved?
+								@finished = true
+								@promise.resolve(self)
+							end
+						end
+
+						# Settle the terminal state: the application closed the body (or the response) before reading it to the end.
+						def close
+							@promise.resolve(self)
+						end
+
+						# Settle the terminal state with the error that terminated the stream.
+						# @parameter error [Exception] The error which terminated the stream.
+						def reject(error)
+							@promise.reject(error)
+						end
+					end
+
 					# Represents the HTTP/2 stream associated with an outgoing client-side response.
 					class Stream < HTTP2::Stream
 						# Initialize the response stream.
@@ -79,13 +154,23 @@ module Async
 							end
 							
 							@response.headers = @headers
-							
+
 							if @response.valid?
 								if !end_stream
 									# We only construct the input/body if data is coming.
-									@response.body = prepare_input(@length)
-								elsif @response.head?
-									@response.body = ::Protocol::HTTP::Body::Head.new(@length)
+									input = prepare_input(@length)
+
+									# The input notifies the consumption terminal state directly, as the background reader may close the stream (and detach the response) before the application finishes reading the body:
+									input.consumer = @response.consumption
+
+									@response.body = input
+								else
+									if @response.head?
+										@response.body = ::Protocol::HTTP::Body::Head.new(@length)
+									end
+
+									# There is no body for the application to consume:
+									@response.consumption.finish
 								end
 							else
 								send_reset_stream(::Protocol::HTTP2::Error::PROTOCOL_ERROR)
@@ -105,8 +190,19 @@ module Async
 							else
 								headers = nil
 							end
-							
+
 							@response.request.send_interim_response(status, headers)
+						end
+
+						# Process trailing headers received after the response body. Trailing fields belong to the response's consumption terminal state, so the response headers continue to represent only the initial headers.
+						# @parameter headers [Array] The trailing header key-value pairs.
+						# @parameter end_stream [Boolean] Whether the stream ends after these headers.
+						def receive_trailing_headers(headers, end_stream)
+							if response = @response
+								response.consumption.receive_trailers(headers)
+							end
+
+							return headers
 						end
 						
 						# Wait for the headers to be received or for stream reset.
@@ -124,11 +220,16 @@ module Async
 						# @parameter error [Exception | Nil] The error that caused the close, if any.
 						def closed(error)
 							super
-							
-							if @response
+
+							if response = @response
 								@response = nil
+
+								# If the stream was terminated by an error, the body can never be fully consumed. An orderly closure does not settle the consumption terminal state: the application may still be reading buffered data.
+								if error and !(error.is_a?(::Protocol::HTTP2::StreamError) and error.code == ::Protocol::HTTP2::Error::NO_ERROR)
+									response.consumption.reject(error)
+								end
 							end
-							
+
 							unless @ready.resolved?
 								error ||= EOFError.new("Stream closed before response headers were received!")
 								@ready.reject(error)
@@ -140,13 +241,17 @@ module Async
 					# @parameter stream [Stream] The HTTP/2 stream for this response.
 					def initialize(stream)
 						super(stream.connection.version, nil, nil)
-						
+
 						@stream = stream
 						@request = nil
+						@consumption = Consumption.new
 					end
-					
+
 					attr :stream
 					attr :request
+
+					# @returns [Consumption] The terminal state of response body consumption by the application. It is settled when the application reads the body to the end or closes it early; frames received by the background reader do not settle it.
+					attr :consumption
 					
 					# Assign the connection pool, releasing the connection when the stream is closed.
 					# @parameter pool [Async::Pool::Controller] The connection pool.
@@ -177,8 +282,11 @@ module Async
 							code = error ? ::Protocol::HTTP2::Error::INTERNAL_ERROR : ::Protocol::HTTP2::Error::CANCEL
 							@stream.send_reset_stream(code)
 						end
-						
+
 						super
+					ensure
+						# Closing the response settles the consumption terminal state; if the body was already fully consumed, this is a no-op:
+						@consumption.close
 					end
 					
 					# @returns [Boolean] Whether the original request was a HEAD request.
