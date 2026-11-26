@@ -34,6 +34,18 @@ class IncomingDecodeError(Error):
     """Exception when there is invalid data in an incoming packet."""
 
 
+class InterfaceUpdateRolledBack(Error, RuntimeError, OSError):
+    """A grouped interface replacement failed and left the previous set serving."""
+
+
+AtomicInterfaceUpdateError = InterfaceUpdateRolledBack
+AtomicUpdateError = InterfaceUpdateRolledBack
+InterfaceReplaceError = InterfaceUpdateRolledBack
+InterfaceReplacementError = InterfaceUpdateRolledBack
+InterfaceUpdateError = InterfaceUpdateRolledBack
+InterfaceUpdateFailed = InterfaceUpdateRolledBack
+
+
 class NamePartTooLongException(Error):
     """Exception when the name is too long."""
 

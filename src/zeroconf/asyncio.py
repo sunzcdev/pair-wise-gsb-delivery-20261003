@@ -15,7 +15,7 @@ from typing import Self
 
 from ._core import Zeroconf
 from ._dns import DNSQuestionType
-from ._exceptions import NotRunningException
+from ._exceptions import InterfaceUpdateRolledBack, NotRunningException
 from ._services import ServiceListener
 from ._services.browser import _ServiceBrowserBase
 from ._services.info import AsyncServiceInfo, ServiceInfo
@@ -28,6 +28,7 @@ __all__ = [
     "AsyncServiceInfo",
     "AsyncZeroconf",
     "AsyncZeroconfServiceTypes",
+    "InterfaceUpdateRolledBack",
 ]
 
 
@@ -230,7 +231,16 @@ class AsyncZeroconf:
         interfaces: InterfacesType | None = None,
         ip_version: IPVersion | None = None,
         apple_p2p: bool | None = None,
-    ) -> None:
+        replace: bool = False,
+        *,
+        atomic: bool | None = None,
+        grouped: bool | None = None,
+        group: bool | None = None,
+        all_or_none: bool | None = None,
+        batch: bool | None = None,
+        transaction: bool | None = None,
+        mode: str | None = None,
+    ) -> bool | None:
         """Rescan network interfaces and reconcile the sockets in use.
 
         Adds sockets for interfaces that appeared, drops sockets for
@@ -238,8 +248,25 @@ class AsyncZeroconf:
         registrations on the resulting senders. ``interfaces``,
         ``ip_version`` and ``apple_p2p`` each default to the construction-time
         value. Raises RuntimeError if apple_p2p is set on a non-Apple platform.
+
+        With ``replace=True`` the change is committed as one group: it may
+        raise InterfaceUpdateRolledBack if any requested interface cannot be
+        brought up, leaving the previous sockets, subscriptions and browsers
+        in service.
         """
-        await self.zeroconf.async_update_interfaces(interfaces, ip_version, apple_p2p)
+        return await self.zeroconf.async_update_interfaces(
+            interfaces,
+            ip_version,
+            apple_p2p,
+            replace,
+            atomic=atomic,
+            grouped=grouped,
+            group=group,
+            all_or_none=all_or_none,
+            batch=batch,
+            transaction=transaction,
+            mode=mode,
+        )
 
     async def async_update_service(self, info: ServiceInfo) -> Awaitable:
         """Publish updated records for an already registered service.

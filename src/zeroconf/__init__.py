@@ -23,10 +23,17 @@ from ._dns import (  # noqa # import needed for backwards compat
 )
 from ._exceptions import (
     AbstractMethodException,
+    AtomicInterfaceUpdateError,
+    AtomicUpdateError,
     BadTypeInNameException,
     Error,
     EventLoopBlocked,
     IncomingDecodeError,
+    InterfaceReplaceError,
+    InterfaceReplacementError,
+    InterfaceUpdateError,
+    InterfaceUpdateFailed,
+    InterfaceUpdateRolledBack,
     NamePartTooLongException,
     NonUniqueNameException,
     NotRunningException,
@@ -79,6 +86,8 @@ __license__ = "LGPL"
 
 __all__ = [
     "AbstractMethodException",
+    "AtomicInterfaceUpdateError",
+    "AtomicUpdateError",
     "BadTypeInNameException",
     "DNSQuestionType",
     # Exceptions
@@ -87,6 +96,11 @@ __all__ = [
     "IPVersion",
     "IncomingDecodeError",
     "InterfaceChoice",
+    "InterfaceReplaceError",
+    "InterfaceReplacementError",
+    "InterfaceUpdateError",
+    "InterfaceUpdateFailed",
+    "InterfaceUpdateRolledBack",
     "NamePartTooLongException",
     "NonUniqueNameException",
     "NotRunningException",

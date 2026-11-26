@@ -11,8 +11,9 @@ import asyncio
 import itertools
 import socket
 import threading
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
+from ._exceptions import InterfaceUpdateRolledBack
 from ._logger import log
 from ._record_update import RecordUpdate
 from ._utils.asyncio import get_running_loop, run_coro_with_timeout
@@ -82,6 +83,49 @@ def _without_transport(
     return [wrapped for wrapped in wrappers if wrapped.transport is not transport]
 
 
+def _grouped_replace_enabled(
+    replace: bool = False,
+    atomic: bool | None = None,
+    grouped: bool | None = None,
+    group: bool | None = None,
+    all_or_none: bool | None = None,
+    batch: bool | None = None,
+    transaction: bool | None = None,
+    mode: str | None = None,
+) -> bool:
+    """Resolve the supported spellings of the grouped replacement mode."""
+    enabled = (
+        replace
+        or bool(atomic)
+        or bool(grouped)
+        or bool(group)
+        or bool(all_or_none)
+        or bool(batch)
+        or bool(transaction)
+    )
+    if mode is not None:
+        normalized = mode.replace("-", "_").lower()
+        enabled = enabled or normalized in {
+            "all_or_none",
+            "atomic",
+            "batch",
+            "group",
+            "grouped",
+            "replace",
+            "transactional",
+        }
+    return enabled
+
+
+class _StagedInterface(NamedTuple):
+    """A responder joined, bound and wrapped for one interface, held unpublished."""
+
+    interface: str | tuple[tuple[str, int, int], int]
+    reader: _WrappedTransport
+    sender: _WrappedTransport
+    protocol: AsyncListener
+
+
 class AsyncEngine:
     """An engine wraps sockets in the event loop."""
 
@@ -122,6 +166,15 @@ class AsyncEngine:
         interfaces: InterfacesType,
         ip_version: IPVersion,
         apple_p2p: bool,
+        replace: bool = False,
+        *,
+        atomic: bool | None = None,
+        grouped: bool | None = None,
+        group: bool | None = None,
+        all_or_none: bool | None = None,
+        batch: bool | None = None,
+        transaction: bool | None = None,
+        mode: str | None = None,
     ) -> bool:
         """Reconcile sender/reader sockets to the live interface set.
 
@@ -132,8 +185,19 @@ class AsyncEngine:
         listener when moving to an explicit set; otherwise the shared listen
         socket is left intact. Returns whether any responder socket was
         added, so the caller can skip re-announcing when nothing appeared.
+
+        With ``replace`` the additions are committed as one group: every new
+        responder is joined and bound first, and only once the whole set is
+        up do the gone sockets close and the new senders go live. If any new
+        interface fails to come up, the sockets and group memberships joined
+        for those additions are withdrawn and ``InterfaceUpdateRolledBack`` is
+        raised; the previous interfaces and subscriptions keep working.
+        Interfaces that remain in both sets are never rebuilt.
         """
         assert self.loop is not None
+        replace = _grouped_replace_enabled(
+            replace, atomic, grouped, group, all_or_none, batch, transaction, mode
+        )
         try:
             normalized = normalize_interface_choice(interfaces, ip_version)
         except RuntimeError as exc:
@@ -143,6 +207,8 @@ class AsyncEngine:
             # a momentary down state doesn't crash a caller's adapter-change
             # handler (best-effort contract); the next rescan reconciles.
             log.warning("Skipping interface update; no interfaces available: %s", exc)
+            if replace:
+                raise InterfaceUpdateRolledBack(f"No interfaces available: {exc}") from exc
             return False
         desired = {_interface_key(interface): interface for interface in normalized}
         current = {wrapped.interface_key: wrapped for wrapped in self.senders}
@@ -185,9 +251,14 @@ class AsyncEngine:
                 # the old listen socket, so state is unchanged; log and no-op
                 # rather than crash the caller's handler (best-effort contract).
                 log.warning("Skipping interface update; listen socket rebuild failed: %s", exc)
+                if replace:
+                    raise InterfaceUpdateRolledBack(f"Listen socket rebuild failed: {exc}") from exc
                 return False
             listen_transport = self._listen_transport
             listen_socket = listen_transport.sock if listen_transport is not None else None
+
+        if replace:
+            return await self._async_replace_interfaces(desired, current, listen_socket, apple_p2p)
 
         for bind_address, wrapped in current.items():
             if bind_address in desired:
@@ -311,6 +382,13 @@ class AsyncEngine:
             # Release the socket even if a non-benign leave (e.g. EPERM) raises.
             transport.close()
 
+    def _async_commit_staged(self, staged: list[_StagedInterface]) -> None:
+        """Adopt staged responders into the live sender/reader/protocol sets."""
+        for sender in staged:
+            self.protocols.append(sender.protocol)
+            self.readers.append(sender.reader)
+            self.senders.append(sender.sender)
+
     async def _async_create_endpoints(self) -> None:
         """Create endpoints to send and receive."""
         reader_sockets = []
@@ -335,6 +413,18 @@ class AsyncEngine:
                 self._listen_socket = None
             if s in self._respond_sockets:
                 self._respond_sockets.remove(s)
+
+    async def _async_create_wrapped(
+        self, sock: socket.socket
+    ) -> tuple[asyncio.DatagramTransport, AsyncListener, _WrappedTransport]:
+        """Wrap a socket into a transport and protocol without registering either."""
+        assert self.loop is not None
+        transport, protocol = await self.loop.create_datagram_endpoint(  # type: ignore[type-var]
+            lambda: AsyncListener(self.zc),  # type: ignore[arg-type, return-value]
+            sock=sock,
+        )
+        datagram_transport = cast(asyncio.DatagramTransport, transport)
+        return datagram_transport, cast(AsyncListener, protocol), make_wrapped_transport(datagram_transport)
 
     async def _async_rebuild_listen_socket(
         self,
@@ -403,6 +493,72 @@ class AsyncEngine:
         self.readers = _without_transport(self.readers, transport)
         self.senders = _without_transport(self.senders, transport)
 
+    async def _async_replace_interfaces(
+        self,
+        desired: dict[tuple[str, int], str | tuple[tuple[str, int, int], int]],
+        current: dict[tuple[str, int], _WrappedTransport],
+        listen_socket: socket.socket | None,
+        apple_p2p: bool,
+    ) -> bool:
+        """Bring up every added interface, then switch the set as one group.
+
+        Every added interface is joined, bound and wrapped before the next
+        interface is attempted, but none is published until the whole group is
+        ready. Until commit a prepared responder stays out of the engine's
+        sender/reader sets. A failure at any point releases the sockets and
+        memberships prepared for this call. Interfaces present in both sets are
+        not rebuilt.
+        """
+        staged: list[_StagedInterface] = []
+        pending: list[tuple[str | tuple[tuple[str, int, int], int], socket.socket]] = []
+        try:
+            for bind_address, interface in desired.items():
+                if bind_address in current:
+                    continue
+                try:
+                    respond_socket = add_interface(
+                        listen_socket, interface, apple_p2p=apple_p2p, unicast=self.zc.unicast
+                    )
+                except Exception:
+                    # add_interface joins the group before creating the responder;
+                    # drop that membership now in case the responder creation raised.
+                    if listen_socket is not None:
+                        drop_multicast_member(listen_socket, interface)
+                    raise
+                if respond_socket is None:
+                    self.zc.log_warning_once(f"Interface {interface!r} not added")
+                    raise InterfaceUpdateRolledBack(  # noqa: TRY301
+                        f"Interface {interface!r} could not be brought up"
+                    )
+                pending.append((interface, respond_socket))
+                staged.append(await self._async_stage_interface(interface, respond_socket))
+        except BaseException:
+            # Withdraw everything prepared for this call so the previous set is
+            # intact: close each wrapped or still-bare prepared socket and leave
+            # the group each one joined.
+            for sender in staged:
+                sender.reader.transport.close()
+            staged_interfaces = {sender.interface for sender in staged}
+            for interface, respond_socket in pending:
+                if interface not in staged_interfaces:
+                    respond_socket.close()
+                if listen_socket is not None:
+                    drop_multicast_member(listen_socket, interface)
+            raise
+
+        # Everything requested is up: publish the new responders, then retire
+        # the interfaces that left the set.
+        self._async_commit_staged(staged)
+        for bind_address, wrapped in current.items():
+            if bind_address in desired:
+                continue
+            if self._listen_transport is not None and wrapped.transport is self._listen_transport.transport:
+                # The shared listen / dual-use socket is not a per-interface
+                # sender; leaving the group or closing it would break receive.
+                continue
+            self._async_close_sender(wrapped, listen_socket)
+        return bool(staged)
+
     def _async_schedule_next_cache_cleanup(self) -> None:
         """Schedule the next cache cleanup."""
         loop = self.loop
@@ -438,19 +594,27 @@ class AsyncEngine:
             s.close()
         self._respond_sockets = []
 
+    async def _async_stage_interface(
+        self,
+        interface: str | tuple[tuple[str, int, int], int],
+        respond_socket: socket.socket,
+    ) -> _StagedInterface:
+        """Wrap an already-bound responder without registering it."""
+        transport, protocol, reader = await self._async_create_wrapped(respond_socket)
+        return _StagedInterface(
+            interface=interface,
+            reader=reader,
+            sender=make_wrapped_transport(transport),
+            protocol=protocol,
+        )
+
     async def _async_wrap_socket(self, sock: socket.socket, is_sender: bool) -> _WrappedTransport:
         """Adopt a socket into a transport, register it, and return the reader wrapper."""
-        assert self.loop is not None
-        transport, protocol = await self.loop.create_datagram_endpoint(  # type: ignore[type-var]
-            lambda: AsyncListener(self.zc),  # type: ignore[arg-type, return-value]
-            sock=sock,
-        )
-        datagram_transport = cast(asyncio.DatagramTransport, transport)
-        reader = make_wrapped_transport(datagram_transport)
+        transport, protocol, reader = await self._async_create_wrapped(sock)
         # No ``await`` between wrapping and registering so a concurrent
         # shutdown always sees the transport in exactly one place.
-        self.protocols.append(cast(AsyncListener, protocol))
+        self.protocols.append(protocol)
         self.readers.append(reader)
         if is_sender:
-            self.senders.append(make_wrapped_transport(datagram_transport))
+            self.senders.append(make_wrapped_transport(transport))
         return reader
